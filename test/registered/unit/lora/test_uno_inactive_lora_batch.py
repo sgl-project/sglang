@@ -3,7 +3,10 @@
 import unittest
 from types import SimpleNamespace
 
+import torch
+from sglang.srt.lora.backend.ascend_backend import AscendLoRABackend
 from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.speculative.uno_lora import uno_lora_backend_for_device
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -25,6 +28,28 @@ class _InactiveSkippingBackend:
 
 
 class TestUnoInactiveLoRABatch(CustomTestCase):
+    def test_internal_backend_selection(self):
+        self.assertEqual(uno_lora_backend_for_device("npu"), "ascend")
+        self.assertEqual(uno_lora_backend_for_device("npu:0"), "ascend")
+        self.assertEqual(uno_lora_backend_for_device("cuda"), "uno_cublas")
+
+    def test_ascend_explicit_segments_preserve_uno_row_order(self):
+        backend = AscendLoRABackend(max_loras_per_batch=2, device=torch.device("cpu"))
+        backend.prepare_lora_token_segments(
+            segment_lens=[1, 3, 1, 3],
+            weight_indices=[0, 1, 0, 1],
+            lora_ranks=[0, 16],
+            scalings=[0.0, 2.0],
+        )
+
+        info = backend.batch_info
+        self.assertIsNotNone(info)
+        self.assertEqual(info.seg_lens.tolist(), [1, 3, 1, 3])
+        self.assertEqual(info.seg_indptr.tolist(), [0, 1, 4, 5, 8])
+        self.assertEqual(info.weight_indices.tolist(), [0, 1, 0, 1])
+        self.assertEqual(info.expected_tokens, 8)
+        self.assertEqual(info.max_len, 3)
+
     def test_all_base_batch_clears_stale_routing_before_graph_metadata(self):
         backend = _InactiveSkippingBackend()
         manager = LoRAManager.__new__(LoRAManager)

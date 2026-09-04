@@ -319,3 +319,51 @@ class AscendLoRABackend(BaseLoRABackend):
 
         batch_info = self._add_moe_lora_info(forward_batch, batch_info)
         self.batch_info = batch_info
+
+    def prepare_lora_token_segments(
+        self,
+        *,
+        segment_lens: list[int],
+        weight_indices: list[int],
+        lora_ranks: list[int],
+        scalings: list[float],
+    ) -> None:
+        """Install explicit token-row routing for an eager UNO draft pass.
+
+        UNO interleaves one base-only row and ``F - 1`` adapted rows for each
+        request.  Ascend's SGMV kernels already consume segment lengths and
+        adapter indices, so only their metadata needs to be materialized here.
+        """
+        if not segment_lens:
+            raise ValueError("Explicit LoRA token segments must not be empty.")
+        if len(segment_lens) != len(weight_indices):
+            raise ValueError(
+                "LoRA segment lengths and weight indices must have equal length."
+            )
+        if any(length <= 0 for length in segment_lens):
+            raise ValueError("Explicit LoRA token segment lengths must be positive.")
+
+        self.reset_batch_state()
+        segment_lens_tensor = torch.tensor(
+            segment_lens, dtype=torch.int32, device=self.device
+        )
+        segment_indptr = torch.zeros(
+            len(segment_lens) + 1, dtype=torch.int32, device=self.device
+        )
+        segment_indptr[1:] = torch.cumsum(segment_lens_tensor, dim=0)
+
+        self.batch_info = LoRABatchInfo(
+            use_cuda_graph=False,
+            bs=len(segment_lens),
+            num_segments=len(segment_lens),
+            seg_lens=segment_lens_tensor,
+            seg_indptr=segment_indptr,
+            max_len=max(segment_lens),
+            weight_indices=torch.tensor(
+                weight_indices, dtype=torch.int32, device=self.device
+            ),
+            lora_ranks=torch.tensor(lora_ranks, dtype=torch.int32, device=self.device),
+            scalings=torch.tensor(scalings, dtype=torch.float16, device=self.device),
+            permutation=None,
+            expected_tokens=sum(segment_lens),
+        )

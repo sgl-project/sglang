@@ -57,6 +57,13 @@ def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
     )
 
 
+def _is_uno_forward(spec_info: Optional[SpecInput]) -> bool:
+    return spec_info is not None and spec_info.spec_input_type in {
+        SpecInputType.UNO_DRAFT,
+        SpecInputType.UNO_VERIFY,
+    }
+
+
 def _expand_dsa_sparse_indices(topk_indices: torch.Tensor) -> torch.Tensor:
     """Expand [T, K] to [T, 1, K] for NPU sparse attention."""
     if topk_indices.dim() == 2:
@@ -441,6 +448,7 @@ class AscendAttnBackend(AttentionBackend):
             forward_mode=forward_batch.forward_mode,
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
+            in_capture=in_capture,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -453,7 +461,15 @@ class AscendAttnBackend(AttentionBackend):
             # ahead of the device tensor. FIA consumes seq_lens_cpu below, so
             # derive the block-table width from the same source. Otherwise a
             # page-aligned request can expose KV_S=N while asking FIA for N+1.
-            seq_lens_max = forward_batch.seq_lens_cpu.max().item() + spec_tokens_per_req
+            if _is_uno_forward(forward_batch.spec_info):
+                # UNO supplies the final host-side length for each of its two
+                # fixed-width forwards. Adding F again would expose unwritten
+                # KV slots to attention.
+                seq_lens_max = forward_batch.seq_lens_cpu.max().item()
+            else:
+                seq_lens_max = (
+                    forward_batch.seq_lens_cpu.max().item() + spec_tokens_per_req
+                )
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
@@ -493,7 +509,9 @@ class AscendAttnBackend(AttentionBackend):
                 self.device
             ).int()
 
-        self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
+        self.forward_metadata.seq_lens_cpu_int = (
+            forward_batch.seq_lens_cpu.int().clone()
+        )
         if (
             not forward_batch.forward_mode.is_draft_extend_v2()
             and not forward_batch.forward_mode.is_target_verify()
@@ -503,7 +521,9 @@ class AscendAttnBackend(AttentionBackend):
 
         if forward_batch.forward_mode.is_target_verify():
             spec_algorithm = forward_batch.spec_algorithm
-            if spec_algorithm is None or not spec_algorithm.is_dspark():
+            if not _is_uno_forward(forward_batch.spec_info) and (
+                spec_algorithm is None or not spec_algorithm.is_dspark()
+            ):
                 self.forward_metadata.seq_lens_cpu_int += spec_tokens_per_req
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
@@ -705,6 +725,7 @@ class AscendAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         out_cache_loc: Optional[torch.Tensor] = None,
+        in_capture: bool = False,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
@@ -720,7 +741,14 @@ class AscendAttnBackend(AttentionBackend):
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
             )
         max_len = seq_lens_cpu[:bs].max().item()
-        if forward_mode.is_target_verify() and not _is_dflash_verify(spec_info):
+        # During UNO replay seq_lens_cpu is already the final C+F/C+1+F
+        # length. Capture uses a synthetic prefix and still needs the width.
+        uno_host_len_is_final = _is_uno_forward(spec_info) and not in_capture
+        if (
+            forward_mode.is_target_verify()
+            and not _is_dflash_verify(spec_info)
+            and not uno_host_len_is_final
+        ):
             max_len += self.speculative_num_draft_tokens
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             max_len += self.speculative_step_id + 1

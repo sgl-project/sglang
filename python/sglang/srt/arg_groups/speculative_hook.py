@@ -330,8 +330,9 @@ def _handle_dflash(server_args: ServerArgs) -> None:
 def _handle_uno(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 
-    if not cfg.device.startswith("cuda"):
-        raise ValueError("UNO only supports CUDA.")
+    is_npu = cfg.device.startswith("npu")
+    if not cfg.device.startswith(("cuda", "npu")):
+        raise ValueError("UNO only supports CUDA or NPU.")
     if cfg.speculative_draft_model_path is not None:
         raise ValueError(
             "UNO reuses the target model and does not accept "
@@ -370,6 +371,12 @@ def _handle_uno(server_args: ServerArgs) -> None:
         raise ValueError(
             "UNO requires --speculative-eagle-topk to be at least 1, "
             f"got {candidate_top_k}."
+        )
+
+    if is_npu and candidate_top_k != 1:
+        raise ValueError(
+            "UNO on NPU currently supports only the linear sampler "
+            "(--speculative-eagle-topk=1)."
         )
 
     if candidate_top_k > 1:
@@ -484,10 +491,31 @@ def _handle_uno(server_args: ServerArgs) -> None:
             "Mixed chunked prefill is disabled for UNO speculative decoding."
         )
 
+    if is_npu and not cfg.disable_overlap_schedule:
+        # Ascend target-verify metadata consumes exact host sequence lengths.
+        # UNO's overlap path may carry only a conservative host reservation
+        # while the exact frontier remains on device, which is unsuitable for
+        # FIA's host metadata API. Keep the first NPU implementation exact;
+        # overlap can be enabled after a device-resident metadata path exists.
+        declare_resolution(
+            server_args,
+            "_handle_uno",
+            disable_overlap_schedule=True,
+        )
+        logger.warning(
+            "Overlap scheduling is disabled for UNO on NPU to preserve exact "
+            "attention sequence lengths."
+        )
+
     prefill_backend, decode_backend = attention_backends_of(resolved_view(server_args))
-    if (prefill_backend, decode_backend) != ("fa3", "fa3"):
+    required_attention_backend = "ascend" if is_npu else "fa3"
+    if (prefill_backend, decode_backend) != (
+        required_attention_backend,
+        required_attention_backend,
+    ):
         raise ValueError(
-            "UNO requires FA3 for both prefill and decode attention; "
+            f"UNO on {'NPU' if is_npu else 'CUDA'} requires "
+            f"{required_attention_backend!r} for both prefill and decode attention; "
             f"got prefill={prefill_backend!r}, decode={decode_backend!r}."
         )
 
