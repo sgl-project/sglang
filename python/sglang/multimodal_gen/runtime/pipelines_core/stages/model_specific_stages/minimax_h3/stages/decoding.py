@@ -258,6 +258,53 @@ class MiniMaxH3DecodingStage(DecodingStage):
         self.video_vae = video_vae
         self.audio_vae = audio_vae
         self._compiled_audio_vae_decode = ActiveTargetCompiledCallable()
+        self._taehv_decoder = None
+        self._taehv_decoder_key = None
+
+    def _get_taehv_decoder(
+        self,
+        checkpoint_path: str,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
+        key = (checkpoint_path, device, dtype)
+        if self._taehv_decoder is not None and self._taehv_decoder_key == key:
+            return self._taehv_decoder
+        try:
+            from taehv import TAEHV
+        except ImportError as exc:
+            raise RuntimeError(
+                "MiniMax H3 TAEHV decoding requires the `taehv` package"
+            ) from exc
+        decoder = TAEHV(checkpoint_path=checkpoint_path, arch_name="taeh3")
+        decoder = decoder.eval().requires_grad_(False).to(device=device, dtype=dtype)
+        self._taehv_decoder = decoder
+        self._taehv_decoder_key = key
+        return decoder
+
+    def _decode_taehv_video(
+        self,
+        latents: torch.Tensor,
+        *,
+        checkpoint_path: str,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        decoder = self._get_taehv_decoder(
+            checkpoint_path,
+            device=latents.device,
+            dtype=dtype,
+        )
+        latents_ntchw = latents.transpose(1, 2).to(dtype=dtype)
+        frames_ntchw = _required_tensor(
+            decoder.decode_video(
+                latents_ntchw,
+                parallel=True,
+                show_progress_bar=False,
+            ),
+            "TAEHV.decode_video",
+        )
+        return frames_ntchw.transpose(1, 2)
 
     @property
     def role_affinity(self) -> RoleType:
@@ -377,38 +424,47 @@ class MiniMaxH3DecodingStage(DecodingStage):
             self.video_vae = selected_video_vae
             if selected_video_vae.training:
                 selected_video_vae.eval()
-            visual_arch_config = server_args.pipeline_config.vae_config.arch_config
-            visual_decode_latent = _reverse_normalize_latents(
-                visual_latent,
-                mean_values=visual_arch_config.latents_mean,
-                std_values=visual_arch_config.latents_std,
-                name="video_vae",
-            )
+            vae_config = server_args.pipeline_config.vae_config
+            taehv_checkpoint_path = vae_config.taehv_checkpoint_path
             video_vae_dtype = resolve_decode_precision(server_args, "video_vae")
             visual_autocast_enabled = autocast_enabled_for_device(
                 visual_latent, video_vae_dtype, server_args.disable_autocast
             )
-            if visual_autocast_enabled:
+            if visual_autocast_enabled and taehv_checkpoint_path is None:
                 selected_video_vae.prepare_decoder_autocast_weights(video_vae_dtype)
             with autocast_context(
                 video_vae_dtype,
                 server_args.disable_autocast,
                 enabled=visual_autocast_enabled,
             ):
-                video_decode = self._get_vae_decode_fn(
-                    selected_video_vae,
-                    server_args,
-                    decode_fn=selected_video_vae.decode_base,
-                )
-                with set_forward_context(current_timestep=0, attn_metadata=None):
-                    visual_frames = video_decode(visual_decode_latent)
-                visual_frames = selected_video_vae.processor.revert_tensor(
-                    visual_frames
-                )
-                visual_frames = _required_tensor(
-                    visual_frames,
-                    "video_vae.processor.revert_tensor",
-                )
+                if taehv_checkpoint_path is not None:
+                    visual_frames = self._decode_taehv_video(
+                        visual_latent,
+                        checkpoint_path=taehv_checkpoint_path,
+                        dtype=video_vae_dtype,
+                    )
+                else:
+                    visual_arch_config = vae_config.arch_config
+                    visual_decode_latent = _reverse_normalize_latents(
+                        visual_latent,
+                        mean_values=visual_arch_config.latents_mean,
+                        std_values=visual_arch_config.latents_std,
+                        name="video_vae",
+                    )
+                    video_decode = self._get_vae_decode_fn(
+                        selected_video_vae,
+                        server_args,
+                        decode_fn=selected_video_vae.decode_base,
+                    )
+                    with set_forward_context(current_timestep=0, attn_metadata=None):
+                        visual_frames = video_decode(visual_decode_latent)
+                    visual_frames = selected_video_vae.processor.revert_tensor(
+                        visual_frames
+                    )
+                    visual_frames = _required_tensor(
+                        visual_frames,
+                        "video_vae.processor.revert_tensor",
+                    )
                 visual_frames = _canonical_visual_video_frames(
                     visual_frames, batch_size=int(visual_latent.shape[0])
                 )
