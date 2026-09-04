@@ -4,6 +4,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_exec,
     get_parallel,
     get_schedule,
     get_serving,
@@ -2025,6 +2026,29 @@ class _MambaRadixCacheV2TrackEntry(NamedTuple):
     track_seqlen: int
 
 
+def build_replayssm_staggered_force_flush_mask(
+    seq_lens_cpu: torch.Tensor,
+    req_pool_indices_cpu: torch.Tensor,
+    window: int,
+) -> torch.Tensor:
+    """Return the scheduler-owned early-flush mask for one decode iteration.
+
+    Request-pool indices provide stable, approximately balanced phase IDs. The
+    absolute sequence length makes the assignment independent of admission time.
+    After the first early flush, this condition recurs every window decode
+    tokens and therefore stays aligned with the request's natural ring wrap.
+    """
+    if window < 1:
+        raise ValueError(f"ReplaySSM window must be >= 1, got {window}")
+    if seq_lens_cpu.shape != req_pool_indices_cpu.shape:
+        raise ValueError(
+            "seq_lens_cpu and req_pool_indices_cpu must have the same shape, got "
+            f"{seq_lens_cpu.shape} and {req_pool_indices_cpu.shape}"
+        )
+    phase_ids = torch.remainder(req_pool_indices_cpu, window)
+    return torch.remainder(seq_lens_cpu + phase_ids, window) == 0
+
+
 def mamba_lazy_spec_in_window(
     req, mamba_track_interval: int, max_draft_tokens: int
 ) -> bool:
@@ -2278,6 +2302,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_track_mask_cpu: Optional[List[bool]] = None  # shape: [b]
     mamba_track_mask_next_cpu: Optional[List[bool]] = None  # shape: [b]
     mamba_decode_batch_idx_cpu: Optional[List[int]] = None  # shape: [b]
+    # Scheduler-owned correctness-preserving early-flush decisions for ReplaySSM.
+    replayssm_force_flush: torch.Tensor = None  # shape: [b], int32
     # Lazy + spec: this iteration's per-req scatter positions
     # (see mamba_lazy_spec_prepare).
     mamba_lazy_spec_track_positions_cpu: Optional[List[int]] = None  # shape: [b]
@@ -3377,6 +3403,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = self.seq_lens_cpu + 1
         self.orig_seq_lens = self.orig_seq_lens + 1
         # Sum is recomputed lazily by ForwardBatch.init_new.
+        self.replayssm_force_flush = None
+        replayssm_config = get_exec().mamba
+        if replayssm_config.linear_replayssm_phase_policy == "staggered":
+            force_flush_cpu = build_replayssm_staggered_force_flush_mask(
+                self.seq_lens_cpu,
+                self.req_pool_indices_cpu,
+                replayssm_config.linear_replayssm_cache_len,
+            ).to(torch.int32)
+            self.replayssm_force_flush = force_flush_cpu.pin_memory().to(
+                device=self.device, non_blocking=True
+            )
         self.seq_lens_sum = None
 
         if self.hisparse_coordinator is not None:
@@ -3469,6 +3506,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
+        self.replayssm_force_flush = None
         self.seq_lens_sum = None
 
         if self.input_ids is not None:
@@ -3529,6 +3567,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
+        self.replayssm_force_flush = None
         self.seq_lens_sum = None
         # Cat only when both sides hold a real token tensor; otherwise drop to
         # None and let resolve_forward_inputs rebuild from the merged
@@ -3613,6 +3652,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_mask_cpu=self.mamba_track_mask_cpu,
             mamba_track_mask_next_cpu=self.mamba_track_mask_next_cpu,
             mamba_decode_batch_idx_cpu=self.mamba_decode_batch_idx_cpu,
+            replayssm_force_flush=self.replayssm_force_flush,
             mamba_lazy_spec_track_positions_cpu=self.mamba_lazy_spec_track_positions_cpu,
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
