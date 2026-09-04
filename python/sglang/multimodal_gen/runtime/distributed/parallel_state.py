@@ -168,6 +168,26 @@ def _sync_srt_tp_group() -> None:
 
     if srt_parallel_state._TP is None:
         srt_parallel_state._TP = _TP
+    # Sync MOE TP group with the TP group (weights within each expert are
+    # sharded across TP ranks).
+    if srt_parallel_state._MOE_TP is None:
+        srt_parallel_state._MOE_TP = _TP
+    # Create a *single-rank* MOE EP group so that moe_ep_size = 1.
+    # In multimodal_gen there is no separate expert parallelism: every rank
+    # keeps ALL experts and TP shards the weights within each expert.
+    # NPU requires a standalone group (not aliased to _TP).
+    if srt_parallel_state._MOE_EP is None:
+        world_size = torch.distributed.get_world_size()
+        group_ranks = [[r] for r in range(world_size)]
+        backend = torch.distributed.get_backend(_TP.device_group)
+        srt_parallel_state._MOE_EP = GroupCoordinator(
+            group_ranks=group_ranks,
+            local_rank=get_world_group().local_rank,
+            torch_distributed_backend=backend,
+            use_device_communicator=False,
+            use_srt_custom_allreduce=False,
+            group_name="moe_ep_single",
+        )
     if srt_parallel_state._ATTN_TP is None:
         srt_parallel_state._ATTN_TP = _TP
 
@@ -179,6 +199,11 @@ def _clear_srt_tp_group() -> None:
         srt_parallel_state._ATTN_TP = None
     if srt_parallel_state._TP is _TP:
         srt_parallel_state._TP = None
+    if srt_parallel_state._MOE_TP is _TP:
+        srt_parallel_state._MOE_TP = None
+    # _MOE_EP is a dedicated single-rank group, just clear it.
+    if srt_parallel_state._MOE_EP is not None:
+        srt_parallel_state._MOE_EP = None
 
 
 def init_parallel_group_coordinator(

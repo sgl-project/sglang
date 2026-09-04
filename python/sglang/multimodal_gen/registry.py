@@ -60,6 +60,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.glm_image import (
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.hunyuan_image3 import (
+    HunyuanImage3PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
     Ideogram4DistilledPipelineConfig,
     Ideogram4PipelineConfig,
@@ -133,6 +136,9 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     HunyuanSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingParams
+from sglang.multimodal_gen.configs.sample.hunyuan_image3 import (
+    HunyuanImage3SamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.ideogram import (
     Ideogram4FastSamplingParams,
     Ideogram4InstantSamplingParams,
@@ -343,6 +349,7 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "pi05": "Pi05Pipeline",
     "pi0.5": "Pi05Pipeline",
     "hunyuan3d": "Hunyuan3D2Pipeline",
+    "hunyuanimage-3": "HunyuanImage3Pipeline",
     "flux.2-dev-nvfp4": "Flux2NvfpPipeline",
     "fal/ideogram-v4-fast": "Ideogram4FastPipeline",
     "fal/ideogram-v4-instant": "Ideogram4InstantPipeline",
@@ -1153,6 +1160,15 @@ def _register_configs():
             "tencent/Hunyuan3D-2",
         ],
         model_detectors=[lambda hf_id: "hunyuan3d" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=HunyuanImage3SamplingParams,
+        pipeline_config_cls=HunyuanImage3PipelineConfig,
+        hf_model_paths=[
+            "tencent/HunyuanImage-3.0-Instruct",
+            "tencent/HunyuanImage-3.0",
+        ],
+        model_detectors=[lambda hf_id: "hunyuanimage" in hf_id.lower()],
     )
 
     # Helios
