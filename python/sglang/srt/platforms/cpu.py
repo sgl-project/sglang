@@ -116,7 +116,7 @@ class CpuSRTPlatform(CpuDeviceMixin, SRTPlatform):
     to pin host memory to.
     """
 
-    capabilities = PlatformCapabilities(supports_fp8=True, graph_capture=True)
+    capabilities = PlatformCapabilities(graph_capture=True)
 
     def is_pin_memory_available(self, device=None) -> bool:
         return False

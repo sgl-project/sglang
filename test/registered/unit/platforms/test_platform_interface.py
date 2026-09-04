@@ -251,7 +251,6 @@ class TestCudaDeviceMixin(CustomTestCase):
 
     def test_cuda_srt_platform_capabilities(self):
         base = CudaSRTPlatform()
-        self.assertTrue(base.capabilities.supports_fp8)
         self.assertTrue(base.capabilities.graph_capture)
         self.assertTrue(base.capabilities.piecewise_graph)
         self.assertTrue(base.capabilities.supports_triton)
@@ -304,7 +303,6 @@ class TestXpuDeviceMixin(CustomTestCase):
 
     def test_xpu_srt_platform_capabilities(self):
         base = XpuSRTPlatform()
-        self.assertFalse(base.capabilities.supports_fp8)
         self.assertTrue(base.capabilities.graph_capture)
         self.assertTrue(base.capabilities.piecewise_graph)
 

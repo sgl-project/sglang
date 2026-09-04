@@ -47,16 +47,15 @@ class PlatformCapabilities(msgspec.Struct, frozen=True, kw_only=True):
 
     ``supports_triton``: Triton kernels can launch on this device. When
     False, core uses the torch-native allocator and req-to-token writers.
-    ``supports_fp8``: fp8 quantization is served. ``graph_capture``: the
-    decode graph runner (``get_graph_runner_cls``) runs. ``piecewise_graph``:
-    the prefill piecewise compilation backend runs.
+    ``graph_capture``: the decode graph runner (``get_graph_runner_cls``)
+    runs. ``piecewise_graph``: the prefill piecewise compilation backend
+    runs.
     ``hicache_device_kernels``: the sgl_kernel HiCache transfer / write-back
     kernels are available; otherwise the host pools skip their staging
     buffers.
     """
 
     supports_triton: bool = False
-    supports_fp8: bool = False
     graph_capture: bool = False
     piecewise_graph: bool = False
     hicache_device_kernels: bool = False

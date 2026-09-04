@@ -161,11 +161,6 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
             return CPU_QUANTIZATION_METHODS[quantization]
 
     if current_platform.is_out_of_tree():
-        if quantization == "fp8" and not current_platform.capabilities.supports_fp8:
-            raise ValueError(
-                f"Platform {type(current_platform).__name__} does not declare "
-                "capabilities.supports_fp8; fp8 quantization is unavailable."
-            )
         config = current_platform.get_quantization_config(quantization)
 
         # If the platform has a quantization config, use it else use the default

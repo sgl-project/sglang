@@ -20,7 +20,6 @@ class NpuSRTPlatform(NpuDeviceMixin, SRTPlatform):
 
     capabilities = PlatformCapabilities(
         supports_triton=True,
-        supports_fp8=True,
         graph_capture=True,
         piecewise_graph=True,
     )
