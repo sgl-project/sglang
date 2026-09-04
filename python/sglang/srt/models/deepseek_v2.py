@@ -477,8 +477,11 @@ class MoEGate(nn.Module):
         super().__init__()
         self.is_nextn = is_nextn
         self.is_deepseek_v4 = is_deepseek_v4
+        weight_shape = (config.n_routed_experts, config.hidden_size)
         self.weight = nn.Parameter(
-            torch.empty((config.n_routed_experts, config.hidden_size))
+            torch.empty(weight_shape, dtype=torch.float32)
+            if _is_npu
+            else torch.empty(weight_shape)
         )
 
         if config.topk_method == "noaux_tc" and not is_hash_moe:
@@ -509,6 +512,9 @@ class MoEGate(nn.Module):
             weight_dtype=self.weight.dtype,
         )
 
+    def _npu_router_gemm_fp32(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return F.linear(hidden_states.float(), self.weight, None)
+
     def forward(
         self,
         hidden_states,
@@ -524,6 +530,8 @@ class MoEGate(nn.Module):
             )
 
         if get_exec().deterministic.enable_deterministic_inference:
+            if _is_npu:
+                return self._npu_router_gemm_fp32(hidden_states)
             return F.linear(hidden_states, self.weight, None)
 
         if (
@@ -538,6 +546,8 @@ class MoEGate(nn.Module):
                 from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
 
                 return linear_bf16_fp32(hidden_states, self.weight)
+            if _is_npu:
+                return self._npu_router_gemm_fp32(hidden_states)
             return F.linear(hidden_states, self.weight, None)
         else:
             if hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens:
@@ -550,6 +560,8 @@ class MoEGate(nn.Module):
 
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
+            elif _is_npu:
+                logits = self._npu_router_gemm_fp32(hidden_states)
             elif not _is_cuda:
                 logits = F.linear(hidden_states, self.weight, None)
             else:
