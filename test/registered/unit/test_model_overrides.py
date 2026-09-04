@@ -3052,14 +3052,15 @@ class TestQwen3VLHopperServingOverrides(CustomTestCase):
         "large_hopper_qwen3_vl_model_type",
         return_value="qwen3_vl",
     )
-    def test_non_default_explicit_choices_are_not_replaced(self, _mock_model_type):
+    def test_explicit_choices_are_not_replaced(self, _mock_model_type):
         envs.SGLANG_VLM_CACHE_SIZE_MB.set(512)
         envs.SGLANG_MM_FEATURE_CACHE_MB.set(2048)
         updates = qwen3_vl_module._qwen3vl_hopper_serving_overrides(
             self._args(
                 mm_preprocess_cache_size_mb=256,
                 mm_feature_transport="cpu",
-                radix_eviction_policy="priority",
+                radix_eviction_policy="lru",
+                _radix_eviction_policy_explicitly_set=True,
                 prefill_decode_interval=0,
                 decode_attention_backend="fa3",
             ),

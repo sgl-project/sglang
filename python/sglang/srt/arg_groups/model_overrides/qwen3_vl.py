@@ -118,7 +118,10 @@ def _qwen3vl_hopper_serving_overrides(server_args: Any, hf_config: Any) -> dict:
         # Keep a full high-concurrency wave GPU-resident instead of
         # falling back to CPU transport while the scheduler drains it.
         envs.SGLANG_MM_FEATURE_CACHE_MB.set(3 * 1024)
-    if cfg.radix_eviction_policy == "lru":
+    if (
+        cfg.radix_eviction_policy == "lru"
+        and not cfg._radix_eviction_policy_explicitly_set
+    ):
         updates["radix_eviction_policy"] = "priority"
     if cfg.prefill_decode_interval is None:
         updates["prefill_decode_interval"] = 22

@@ -105,6 +105,25 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_radix_eviction_policy_explicitness_is_preserved(self):
+        omitted = prepare_server_args(["--model-path", "dummy"])
+        separated = prepare_server_args(
+            ["--model-path", "dummy", "--radix-eviction-policy", "lru"]
+        )
+        joined = prepare_server_args(
+            ["--model-path", "dummy", "--radix-eviction-policy=lru"]
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write("model-path: dummy\nradix-eviction-policy: lru\n")
+            config_path = f.name
+        self.addCleanup(os.unlink, config_path)
+        configured = prepare_server_args(["--config", config_path])
+
+        self.assertFalse(omitted._radix_eviction_policy_explicitly_set)
+        self.assertTrue(separated._radix_eviction_policy_explicitly_set)
+        self.assertTrue(joined._radix_eviction_policy_explicitly_set)
+        self.assertTrue(configured._radix_eviction_policy_explicitly_set)
+
     def test_weight_cache_daemon_allows_static_eplb(self):
         args = ServerArgs(
             model_path="dummy",

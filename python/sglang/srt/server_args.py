@@ -849,6 +849,12 @@ class ServerArgs:
         ),
         NS("memory"),
     ] = "lru"
+    # Preserve whether the operator wrote the public flag. Its default value is
+    # also "lru", so the value alone cannot distinguish an explicit LRU choice
+    # from an omitted option that a model profile may resolve.
+    _radix_eviction_policy_explicitly_set: A[bool, Arg(no_cli=True), NS("memory")] = (
+        False
+    )
     prefill_only_disable_kv_cache: A[
         bool,
         "Skip the physical KV cache allocation for embedding-mode prefill-only workloads. Currently only valid with --is-embedding, --chunked-prefill-size=-1, --disable-radix-cache, an FA prefill backend, and non-FP4 KV cache so the fa_skip_kv_cache path is active (no layer reads or writes the cache). Other prefill-only workloads such as scoring/MIS may benefit from this later once their attention paths stop using paged KV. Scheduler admission accounting is unchanged; per-layer K/V tensors are sized to (page_size, head_num, head_dim) placeholders so GPU memory is not wasted.",
@@ -4269,7 +4275,15 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         config_merger = ConfigArgumentMerger(parser)
         argv = config_merger.merge_config_with_args(argv)
 
+    radix_eviction_policy_explicitly_set = any(
+        arg == "--radix-eviction-policy" or arg.startswith("--radix-eviction-policy=")
+        for arg in argv
+    )
+
     raw_args = parser.parse_args(argv)
+    raw_args._radix_eviction_policy_explicitly_set = (
+        radix_eviction_policy_explicitly_set
+    )
 
     # Set up basic logging before ServerArgs.__post_init__ so that
     # logger.info / logger.warning calls there are properly formatted.
