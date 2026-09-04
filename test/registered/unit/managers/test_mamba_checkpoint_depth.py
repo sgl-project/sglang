@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.runtime_context import get_context, mamba_track_grid
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
     ServerArgs,
@@ -21,7 +22,7 @@ from sglang.srt.server_args import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 CHUNK = 64
 
@@ -44,17 +45,20 @@ def _track_seqlen(*, tree_page: int, prefix_len: int, extend_len: int) -> int:
     )
     req.prefix_indices = torch.arange(prefix_len, dtype=torch.int64)
     req.set_extend_range(prefix_len, prefix_len + extend_len)
-    req.mamba_ping_pong_track_buffer = torch.tensor([0, 1], dtype=torch.int64)
-    req.mamba_next_track_idx = 0
+    req.kv.mamba_ping_pong_track_buffer = torch.tensor([0, 1], dtype=torch.int64)
+    req.kv.mamba_next_track_idx = 0
     req.mamba_branching_seqlen = None
 
     batch = ScheduleBatch(reqs=[req])
+    batch.model_config = SimpleNamespace(
+        hf_text_config=SimpleNamespace(mamba_chunk_size=CHUNK)
+    )
     batch.tree_cache = SimpleNamespace(page_size=tree_page)
     batch.req_to_token_pool = MagicMock()
     batch.req_to_token_pool.get_mamba_ping_pong_other_idx.return_value = 1
 
     batch._mamba_radix_cache_v2_req_prepare_for_extend(req)
-    return req.mamba_last_track_seqlen
+    return req.kv.mamba_last_track_seqlen
 
 
 class TestMambaCheckpointDepth(unittest.TestCase):
@@ -68,6 +72,25 @@ class TestMambaCheckpointDepth(unittest.TestCase):
     def test_unwidened_tree_page_keeps_the_chunk_grid(self):
         depth = _track_seqlen(tree_page=CHUNK, prefix_len=16384, extend_len=4066)
         self.assertEqual(depth, 20416)
+
+
+class TestMambaTrackGrid(unittest.TestCase):
+    def _grid(self, *, interval: int, tree_page: int, chunk: int = CHUNK) -> int:
+        with get_context().override_server_args(
+            mamba_track_interval=interval, _mamba_cache_chunk_size=chunk
+        ):
+            return mamba_track_grid(tree_page)
+
+    def test_widened_tree_page_rounds_the_interval_up(self):
+        self.assertEqual(self._grid(interval=256, tree_page=512), 512)
+
+    def test_interval_already_on_the_tree_page_is_untouched(self):
+        self.assertEqual(self._grid(interval=256, tree_page=256), 256)
+        self.assertEqual(self._grid(interval=256, tree_page=128), 256)
+        self.assertEqual(self._grid(interval=256, tree_page=64), 256)
+
+    def test_grid_stays_on_the_chunk_size(self):
+        self.assertEqual(self._grid(interval=192, tree_page=64, chunk=128) % 128, 0)
 
 
 if __name__ == "__main__":

@@ -88,7 +88,7 @@ def _activation_time(P: float, delta: float) -> float:
     denom = P * (1.0 + P - delta)
     if denom <= 0 or delta >= 1.0 + P:
         raise ValueError(
-            f"delta={delta} >= 1+P={1+P:.4f}; criterion trivially satisfied."
+            f"delta={delta} >= 1+P={1 + P:.4f}; criterion trivially satisfied."
         )
     return 1.0 / (1.0 + math.sqrt(delta / denom))
 
@@ -219,11 +219,6 @@ class ProgressiveDenoisingStageRouter(PipelineStage):
         raise ValueError(f"Unsupported progressive_mode: {mode!r}")
 
 
-def _get_scm_preset() -> str | None:
-    preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
-    return None if (preset is None or preset == "none") else preset
-
-
 class ProgressiveDenoisingStage(DenoisingStage):
     """DenoisingStage extended with progressive resolution growing.
 
@@ -299,6 +294,13 @@ class ProgressiveDenoisingStage(DenoisingStage):
     ) -> None:
         """Called after each stage transition. Update resolution-dependent state."""
         pass
+
+    def _effective_scm_preset(self) -> str | None:
+        """SCM preset for this request: per-request override, then env default."""
+        preset = self._cache_dit_request_overrides.get(
+            "scm_preset", envs.SGLANG_CACHE_DIT_SCM_PRESET
+        )
+        return None if (preset is None or preset == "none") else preset
 
     def _refresh_cache_dit_context(
         self, n_remaining: int, scm_preset: str | None
@@ -612,7 +614,9 @@ class ProgressiveDenoisingStage(DenoisingStage):
                 # residual-diff decision for the first full-res steps.
                 if self._cache_dit_enabled:
                     n_remaining = n_steps - stage_end
-                    self._refresh_cache_dit_context(n_remaining, _get_scm_preset())
+                    self._refresh_cache_dit_context(
+                        n_remaining, self._effective_scm_preset()
+                    )
                     logger.info(
                         "cache-dit context refreshed at stage transition "
                         "(step %d, %d steps remaining)",

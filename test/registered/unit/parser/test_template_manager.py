@@ -37,7 +37,6 @@ def _patch_hf_transformers_utils(get_tokenizer, get_config=None):
 
 
 class TestTemplateManagerReasoningDetection(unittest.TestCase):
-
     def _detect(self, template, vocab):
         force, config = detect_reasoning_pattern(template)
         parser = detect_reasoning_parser(
@@ -145,15 +144,13 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
             # An explicit boolean=false second argument is equivalent to the
             # one-argument form.
             (
-                "{%- set enable_thinking = enable_thinking"
-                " | default(true, false) -%}",
+                "{%- set enable_thinking = enable_thinking | default(true, false) -%}",
                 True,
             ),
             # Boolean mode with a false default still maps False -> False and
             # True -> True, so it is a working default-off toggle.
             (
-                "{%- set enable_thinking = enable_thinking"
-                " | default(false, true) -%}",
+                "{%- set enable_thinking = enable_thinking | default(false, true) -%}",
                 False,
             ),
             (
@@ -486,6 +483,28 @@ class TestTemplateDetectionRuleMatrix(unittest.TestCase):
         self.assertEqual(config.toggle_param, "enable_thinking")
         self.assertTrue(config.default_enabled)
 
+    def test_k2_horizon_detects_always_on_reasoning_and_tool_parsers(self):
+        template = """
+        {% set tool_call_fmt = tool_call_format | default('xml') %}
+        {% set effort = reasoning_effort | default('high') %}
+        <ifm|think><ifm|think_fast><ifm|think_faster>
+        <ifm|tool_calls><ifm|tool_call>
+        """
+        force, config = detect_reasoning_pattern(template)
+        tokenizer = _DummyTokenizer([])
+
+        self.assertTrue(force)
+        self.assertIsNotNone(config)
+        self.assertEqual(config.special_case, "always")
+        self.assertEqual(
+            detect_reasoning_parser(template, tokenizer, config, force),
+            "k2_horizon",
+        )
+        self.assertEqual(
+            detect_tool_call_parser(template, tokenizer, config, force),
+            "k2_horizon",
+        )
+
 
 class TestToolCallParserDetection(unittest.TestCase):
     """Tests for detect_tool_call_parser() using real model tokenizers."""
@@ -765,6 +784,18 @@ class TestToolCallParserDetection(unittest.TestCase):
         self.assertEqual(result, "minicpm5")
 
 
+def _declared(server_args, field):
+    """What late resolution decided for `field` on this record.
+
+    `resolve_auto_parsers` declares; the field keeps what the operator passed,
+    so the decision is read through the resolution result -- the same surface
+    the config bags are projected from.
+    """
+    from sglang.srt.arg_groups.overrides import resolution_result
+
+    return resolution_result(server_args, field)
+
+
 class TestResolveAutoParsers(unittest.TestCase):
     """Tests for resolve_auto_parsers()."""
 
@@ -790,8 +821,8 @@ class TestResolveAutoParsers(unittest.TestCase):
         with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
             resolve_auto_parsers(args)
 
-        self.assertEqual(args.reasoning_parser, "qwen3")
-        self.assertEqual(args.tool_call_parser, "qwen")
+        self.assertEqual(_declared(args, "reasoning_parser"), "qwen3")
+        self.assertEqual(_declared(args, "tool_call_parser"), "qwen")
 
     def test_resolves_reasoning_parser_only(self):
         args = self._make_server_args(reasoning_parser="auto", tool_call_parser=None)
@@ -800,8 +831,8 @@ class TestResolveAutoParsers(unittest.TestCase):
         with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
             resolve_auto_parsers(args)
 
-        self.assertEqual(args.reasoning_parser, "qwen3")
-        self.assertIsNone(args.tool_call_parser)
+        self.assertEqual(_declared(args, "reasoning_parser"), "qwen3")
+        self.assertIsNone(_declared(args, "tool_call_parser"))
 
     def test_resolves_tool_call_parser_only(self):
         args = self._make_server_args(reasoning_parser="qwen3", tool_call_parser="auto")
@@ -810,14 +841,14 @@ class TestResolveAutoParsers(unittest.TestCase):
         with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
             resolve_auto_parsers(args)
 
-        self.assertEqual(args.reasoning_parser, "qwen3")
-        self.assertEqual(args.tool_call_parser, "qwen")
+        self.assertEqual(_declared(args, "reasoning_parser"), "qwen3")
+        self.assertEqual(_declared(args, "tool_call_parser"), "qwen")
 
     def test_neither_auto_is_noop(self):
         args = self._make_server_args(reasoning_parser="qwen3", tool_call_parser="qwen")
         resolve_auto_parsers(args)
-        self.assertEqual(args.reasoning_parser, "qwen3")
-        self.assertEqual(args.tool_call_parser, "qwen")
+        self.assertEqual(_declared(args, "reasoning_parser"), "qwen3")
+        self.assertEqual(_declared(args, "tool_call_parser"), "qwen")
 
     def test_nonexistent_model_disables_both_parsers(self):
         args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")
@@ -832,8 +863,8 @@ class TestResolveAutoParsers(unittest.TestCase):
         ):
             resolve_auto_parsers(args)
 
-        self.assertIsNone(args.reasoning_parser)
-        self.assertIsNone(args.tool_call_parser)
+        self.assertIsNone(_declared(args, "reasoning_parser"))
+        self.assertIsNone(_declared(args, "tool_call_parser"))
 
     def test_none_chat_template_disables_both_parsers(self):
         args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")
@@ -842,8 +873,8 @@ class TestResolveAutoParsers(unittest.TestCase):
         with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
             resolve_auto_parsers(args)
 
-        self.assertIsNone(args.reasoning_parser)
-        self.assertIsNone(args.tool_call_parser)
+        self.assertIsNone(_declared(args, "reasoning_parser"))
+        self.assertIsNone(_declared(args, "tool_call_parser"))
 
     def test_deepseek_v32_arch_without_chat_template_uses_custom_encoder(self):
         args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")
@@ -855,8 +886,8 @@ class TestResolveAutoParsers(unittest.TestCase):
         ):
             resolve_auto_parsers(args)
 
-        self.assertEqual(args.reasoning_parser, "deepseek-v3")
-        self.assertEqual(args.tool_call_parser, "deepseekv32")
+        self.assertEqual(_declared(args, "reasoning_parser"), "deepseek-v3")
+        self.assertEqual(_declared(args, "tool_call_parser"), "deepseekv32")
 
     def test_deepseek_v4_arch_without_chat_template_uses_custom_encoder(self):
         args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")
@@ -868,8 +899,8 @@ class TestResolveAutoParsers(unittest.TestCase):
         ):
             resolve_auto_parsers(args)
 
-        self.assertEqual(args.reasoning_parser, "deepseek-v4")
-        self.assertEqual(args.tool_call_parser, "deepseekv4")
+        self.assertEqual(_declared(args, "reasoning_parser"), "deepseek-v4")
+        self.assertEqual(_declared(args, "tool_call_parser"), "deepseekv4")
 
     def test_kimi_k3_arch_without_chat_template_uses_custom_encoder(self):
         args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")
@@ -883,8 +914,8 @@ class TestResolveAutoParsers(unittest.TestCase):
         ):
             resolve_auto_parsers(args)
 
-        self.assertEqual(args.reasoning_parser, "kimi_k3")
-        self.assertEqual(args.tool_call_parser, "kimi_k3")
+        self.assertEqual(_declared(args, "reasoning_parser"), "kimi_k3")
+        self.assertEqual(_declared(args, "tool_call_parser"), "kimi_k3")
 
     def test_kimi_k3_model_type_without_architecture_uses_custom_encoder(self):
         args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")
@@ -896,8 +927,8 @@ class TestResolveAutoParsers(unittest.TestCase):
         ):
             resolve_auto_parsers(args)
 
-        self.assertEqual(args.reasoning_parser, "kimi_k3")
-        self.assertEqual(args.tool_call_parser, "kimi_k3")
+        self.assertEqual(_declared(args, "reasoning_parser"), "kimi_k3")
+        self.assertEqual(_declared(args, "tool_call_parser"), "kimi_k3")
 
     def test_deepseek_arch_fallback_runs_when_tokenizer_load_fails(self):
         args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")
@@ -909,8 +940,8 @@ class TestResolveAutoParsers(unittest.TestCase):
         ):
             resolve_auto_parsers(args)
 
-        self.assertEqual(args.reasoning_parser, "deepseek-v3")
-        self.assertEqual(args.tool_call_parser, "deepseekv32")
+        self.assertEqual(_declared(args, "reasoning_parser"), "deepseek-v3")
+        self.assertEqual(_declared(args, "tool_call_parser"), "deepseekv32")
 
     def test_explicit_non_jinja_template_skips_architecture_fallback(self):
         args = self._make_server_args(
@@ -926,8 +957,8 @@ class TestResolveAutoParsers(unittest.TestCase):
             resolve_auto_parsers(args)
 
         get_config.assert_not_called()
-        self.assertIsNone(args.reasoning_parser)
-        self.assertIsNone(args.tool_call_parser)
+        self.assertIsNone(_declared(args, "reasoning_parser"))
+        self.assertIsNone(_declared(args, "tool_call_parser"))
 
     def test_explicit_jinja_template_takes_precedence(self):
         tokenizer = _DummyTokenizer([], chat_template=None)
@@ -947,8 +978,8 @@ class TestResolveAutoParsers(unittest.TestCase):
             with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
                 resolve_auto_parsers(args)
 
-        self.assertEqual(args.reasoning_parser, "deepseek-v3")
-        self.assertEqual(args.tool_call_parser, "deepseekv32")
+        self.assertEqual(_declared(args, "reasoning_parser"), "deepseek-v3")
+        self.assertEqual(_declared(args, "tool_call_parser"), "deepseekv32")
 
 
 if __name__ == "__main__":
