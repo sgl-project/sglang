@@ -900,6 +900,15 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Record bounded consistent hashing policy execution branch for routing decisions
+    pub fn record_worker_bounded_consistent_hashing_policy_branch(branch: &'static str) {
+        counter!(
+            "smg_bounded_consistent_hashing_policy_branch_total",
+            "branch" => branch
+        )
+        .increment(1);
+    }
+
     /// Record prefix hash policy execution branch for routing decisions
     pub fn record_worker_prefix_hash_policy_branch(branch: &'static str) {
         counter!(

@@ -11,8 +11,9 @@
 //! The ring is rebuilt only when workers are added/removed, not per-request.
 //! Uses virtual nodes (150 per worker) for even distribution and blake3 for stable hashing.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
+use arc_swap::ArcSwapOption;
 use dashmap::DashMap;
 use smg_mesh::OptionalMeshSyncManager;
 use uuid::Uuid;
@@ -189,6 +190,13 @@ pub struct WorkerRegistry {
     /// Rebuilt on worker add/remove (copy-on-write).
     hash_rings: Arc<DashMap<String, Arc<HashRing>>>,
 
+    /// Cached ring for non-IGW routing across all regular HTTP workers.
+    /// Membership changes rebuild the ring; request-time health/load checks do not.
+    non_igw_regular_http_hash_ring: ArcSwapOption<HashRing>,
+
+    /// Serializes aggregate ring snapshot/build/publish across registry mutations.
+    non_igw_regular_http_hash_ring_rebuild_lock: Mutex<()>,
+
     /// Workers indexed by worker type
     type_workers: Arc<DashMap<WorkerType, Vec<WorkerId>>>,
 
@@ -210,6 +218,8 @@ impl WorkerRegistry {
             workers: Arc::new(DashMap::new()),
             model_index: Arc::new(DashMap::new()),
             hash_rings: Arc::new(DashMap::new()),
+            non_igw_regular_http_hash_ring: ArcSwapOption::empty(),
+            non_igw_regular_http_hash_ring_rebuild_lock: Mutex::new(()),
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
@@ -233,6 +243,41 @@ impl WorkerRegistry {
         self.hash_rings.get(model_id).map(|r| Arc::clone(&r))
     }
 
+    #[inline]
+    fn is_non_igw_regular_http_worker(worker: &dyn Worker) -> bool {
+        matches!(worker.worker_type(), WorkerType::Regular)
+            && matches!(worker.connection_mode(), ConnectionMode::Http)
+    }
+
+    /// Rebuild the cached ring used by non-IGW regular HTTP routing.
+    ///
+    /// The authoritative worker map defines membership. Health, availability,
+    /// and load are deliberately evaluated by request-time ring predicates.
+    fn rebuild_non_igw_regular_http_hash_ring(&self) {
+        let _guard = self
+            .non_igw_regular_http_hash_ring_rebuild_lock
+            .lock()
+            .unwrap();
+        let workers: Vec<Arc<dyn Worker>> = self
+            .workers
+            .iter()
+            .filter_map(|entry| {
+                let worker = entry.value();
+                Self::is_non_igw_regular_http_worker(worker.as_ref()).then(|| worker.clone())
+            })
+            .collect();
+
+        let ring = (!workers.is_empty()).then(|| Arc::new(HashRing::new(&workers)));
+        self.non_igw_regular_http_hash_ring.store(ring);
+    }
+
+    /// Get the cached ring over all registered regular HTTP workers.
+    ///
+    /// This hot-path read performs only an atomic load and Arc clone.
+    pub fn get_non_igw_regular_http_hash_ring(&self) -> Option<Arc<HashRing>> {
+        self.non_igw_regular_http_hash_ring.load_full()
+    }
+
     /// Set mesh sync manager (thread-safe, can be called after initialization)
     pub fn set_mesh_sync(&self, mesh_sync: OptionalMeshSyncManager) {
         *self.mesh_sync.write().unwrap() = mesh_sync;
@@ -248,7 +293,15 @@ impl WorkerRegistry {
         };
 
         // Store worker
-        self.workers.insert(worker_id.clone(), worker.clone());
+        let previous_worker = self.workers.insert(worker_id.clone(), worker.clone());
+        let worker_is_non_igw_member = Self::is_non_igw_regular_http_worker(worker.as_ref());
+        let non_igw_membership_changed =
+            previous_worker
+                .as_ref()
+                .map_or(worker_is_non_igw_member, |previous| {
+                    Self::is_non_igw_regular_http_worker(previous.as_ref())
+                        != worker_is_non_igw_member
+                });
 
         // Update URL mapping
         self.url_to_id
@@ -281,6 +334,10 @@ impl WorkerRegistry {
             .entry(worker.connection_mode().clone())
             .or_default()
             .push(worker_id.clone());
+
+        if non_igw_membership_changed {
+            self.rebuild_non_igw_regular_http_hash_ring();
+        }
 
         // Sync to mesh if enabled (no-op if mesh is not enabled)
         if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
@@ -344,6 +401,10 @@ impl WorkerRegistry {
                 self.connection_workers.get_mut(worker.connection_mode())
             {
                 conn_workers.retain(|id| id != worker_id);
+            }
+
+            if Self::is_non_igw_regular_http_worker(worker.as_ref()) {
+                self.rebuild_non_igw_regular_http_hash_ring();
             }
 
             worker.set_healthy(false);
@@ -732,7 +793,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::core::{circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder};
+    use crate::core::{circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder, ModelCard};
 
     #[test]
     fn test_worker_registry() {
@@ -831,5 +892,170 @@ mod tests {
         let llama_workers_after = registry.get_by_model("llama-3");
         assert_eq!(llama_workers_after.len(), 1);
         assert_eq!(llama_workers_after[0].url(), "http://worker2:8080");
+    }
+
+    fn ring_contains_url(ring: &HashRing, url: &str) -> bool {
+        ring.find_healthy_url("membership-probe", |candidate| candidate == url) == Some(url)
+    }
+
+    #[test]
+    fn non_igw_regular_http_ring_tracks_membership_and_transient_health() {
+        let registry = WorkerRegistry::new();
+        assert!(registry.get_non_igw_regular_http_hash_ring().is_none());
+
+        let worker_a: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://regular-a:8080")
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .model(ModelCard::new("model-a"))
+                .build(),
+        );
+        let worker_b: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://regular-b:8080")
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .model(ModelCard::new("model-b"))
+                .build(),
+        );
+        let prefill_http: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://prefill:8080")
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: None,
+                })
+                .connection_mode(ConnectionMode::Http)
+                .build(),
+        );
+        let regular_grpc: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://regular-grpc:8080")
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc { port: Some(50051) })
+                .build(),
+        );
+
+        let worker_a_id = registry.register(Arc::clone(&worker_a));
+        let ring_a = registry.get_non_igw_regular_http_hash_ring().unwrap();
+        assert_eq!(ring_a.worker_count(), 1);
+        assert!(ring_contains_url(&ring_a, worker_a.url()));
+        assert!(Arc::ptr_eq(
+            &ring_a,
+            &registry.get_non_igw_regular_http_hash_ring().unwrap()
+        ));
+
+        registry.register(prefill_http);
+        registry.register(regular_grpc);
+        assert!(Arc::ptr_eq(
+            &ring_a,
+            &registry.get_non_igw_regular_http_hash_ring().unwrap()
+        ));
+
+        let worker_b_id = registry.register(Arc::clone(&worker_b));
+        let ring_ab = registry.get_non_igw_regular_http_hash_ring().unwrap();
+        assert!(!Arc::ptr_eq(&ring_a, &ring_ab));
+        assert_eq!(ring_ab.worker_count(), 2);
+        assert!(ring_contains_url(&ring_ab, worker_a.url()));
+        assert!(ring_contains_url(&ring_ab, worker_b.url()));
+
+        let key_for_a = (0..10_000)
+            .map(|index| format!("aggregate-ring-key-{index}"))
+            .find(|key| ring_ab.find_healthy_url(key, |_| true) == Some(worker_a.url()))
+            .expect("could not find key preferring worker A");
+        let available = |url: &str| {
+            registry
+                .get_by_url(url)
+                .is_some_and(|worker| worker.is_available())
+        };
+
+        worker_a.set_healthy(false);
+        assert!(Arc::ptr_eq(
+            &ring_ab,
+            &registry.get_non_igw_regular_http_hash_ring().unwrap()
+        ));
+        assert_eq!(
+            ring_ab.find_healthy_url(&key_for_a, available),
+            Some(worker_b.url())
+        );
+
+        worker_a.set_healthy(true);
+        assert!(Arc::ptr_eq(
+            &ring_ab,
+            &registry.get_non_igw_regular_http_hash_ring().unwrap()
+        ));
+        assert_eq!(
+            ring_ab.find_healthy_url(&key_for_a, available),
+            Some(worker_a.url())
+        );
+
+        worker_a.increment_load();
+        assert!(Arc::ptr_eq(
+            &ring_ab,
+            &registry.get_non_igw_regular_http_hash_ring().unwrap()
+        ));
+        worker_a.decrement_load();
+
+        registry.remove(&worker_b_id);
+        let ring_after_remove = registry.get_non_igw_regular_http_hash_ring().unwrap();
+        assert!(!Arc::ptr_eq(&ring_ab, &ring_after_remove));
+        assert_eq!(ring_after_remove.worker_count(), 1);
+        assert!(ring_contains_url(&ring_after_remove, worker_a.url()));
+        assert!(!ring_contains_url(&ring_after_remove, worker_b.url()));
+
+        registry.remove(&worker_a_id);
+        assert!(registry.get_non_igw_regular_http_hash_ring().is_none());
+    }
+
+    #[test]
+    fn non_igw_regular_http_ring_tracks_same_url_membership_transitions() {
+        let registry = WorkerRegistry::new();
+        let url = "http://same-url:8080";
+
+        let member_v1: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .model(ModelCard::new("model-a"))
+                .build(),
+        );
+        let member_v1_id = registry.register(member_v1);
+        let ring_v1 = registry.get_non_igw_regular_http_hash_ring().unwrap();
+        assert!(ring_contains_url(&ring_v1, url));
+
+        let member_v2: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .model(ModelCard::new("model-b"))
+                .build(),
+        );
+        let member_v2_id = registry.register(member_v2);
+        let ring_v2 = registry.get_non_igw_regular_http_hash_ring().unwrap();
+        assert_eq!(member_v1_id, member_v2_id);
+        assert!(Arc::ptr_eq(&ring_v1, &ring_v2));
+        assert!(ring_contains_url(&ring_v2, url));
+
+        let nonmember: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: None,
+                })
+                .connection_mode(ConnectionMode::Http)
+                .model(ModelCard::new("model-b"))
+                .build(),
+        );
+        let nonmember_id = registry.register(nonmember);
+        assert_eq!(member_v1_id, nonmember_id);
+        assert!(registry.get_non_igw_regular_http_hash_ring().is_none());
+
+        let member_v3: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .model(ModelCard::new("model-c"))
+                .build(),
+        );
+        let member_v3_id = registry.register(member_v3);
+        let ring_v3 = registry.get_non_igw_regular_http_hash_ring().unwrap();
+        assert_eq!(member_v1_id, member_v3_id);
+        assert!(!Arc::ptr_eq(&ring_v2, &ring_v3));
+        assert!(ring_contains_url(&ring_v3, url));
     }
 }
