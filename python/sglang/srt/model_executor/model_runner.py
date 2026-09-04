@@ -1766,7 +1766,12 @@ class ModelRunner:
                 )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
-        no_copy_to_cpu = not get_schedule().disable_overlap_schedule
+        # Verify must move capture rows with accepted KV before publishing them.
+        # The single-stage non-overlap scheduler also copies/finalizes holders.
+        no_copy_to_cpu = not get_schedule().disable_overlap_schedule or (
+            get_parallel().pp_size == 1
+            and forward_batch.forward_mode.is_target_verify()
+        )
         if (
             not self.is_draft_worker
             and (experts_capturer := get_global_experts_capturer()) is not None
