@@ -406,6 +406,26 @@ class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
                 self.assertIn("free_page_reps_group", inspect.getsource(cls))
 
 
+class TestUnifiedSwaFullSideGroup(unittest.TestCase):
+    """`free_full` inside a free group must defer and land at `free_group_end`;
+    the composite carries that pile itself, not through the SWA parent's hooks."""
+
+    def test_full_only_frees_defer_until_group_end(self):
+        from test_unified_swa_shared_virtual_ids import _build
+
+        alloc = _build(64, 32, 2, 4)
+        idx = alloc.alloc(8)
+        alloc.free_swa(idx)
+        before = alloc.full_available_size()
+
+        alloc.free_group_begin()
+        alloc.free_full(idx[:4])
+        alloc.free_full_segment(idx[4:], start_pos=4)
+        self.assertEqual(alloc.full_available_size(), before)
+        alloc.free_group_end()
+        self.assertEqual(alloc.full_available_size(), before + 8)
+
+
 class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
     """The per-decode-step SWA window ratchet frees a CONTIGUOUS row slice
     with host-int, page-aligned bounds — the same shape `free_segment` was
@@ -470,6 +490,25 @@ class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
         ):
             alloc.free_swa(v[: 4 * self.PS], start_pos=0)
             alloc.free_swa(v[4 * self.PS :], start_pos=4 * self.PS)
+
+    def test_full_only_segment_free_never_syncs(self):
+        """The request-finish dead half (swa already tombstoned) frees the full
+        side by page reps: no unique from free_full's token dedup."""
+        alloc = self._swa_composite(lazy=True)
+        v = alloc.alloc(8 * self.PS)
+        alloc.free_swa(v, start_pos=0)
+        before = alloc.full_available_size()
+        with (
+            mock.patch.object(
+                torch, "unique", side_effect=AssertionError("unique = host sync")
+            ),
+            mock.patch.object(
+                torch.Tensor, "item", side_effect=AssertionError("item = host sync")
+            ),
+        ):
+            alloc.free_full_segment(v[: 4 * self.PS], start_pos=0)
+            alloc.free_full_segment(v[4 * self.PS :], start_pos=4 * self.PS)
+        self.assertEqual(alloc.full_available_size(), before + 8 * self.PS)
 
     def test_unaligned_start_pos_is_rejected(self):
         """A mid-page start must fail loudly, not release the head page whole."""
