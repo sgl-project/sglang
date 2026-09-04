@@ -594,7 +594,7 @@ class XPUAttentionBackend(AttentionBackend):
                 -1, self.page_size, layer.tp_v_head_num, layer.head_dim
             )
             if self.is_encoder_decoder and forward_batch.encoder_lens is not None:
-                o = self._forward_mha_page_size1(
+                o = self._forward_attn_flat_page_table(
                     q=q,
                     key_cache=key_cache,
                     value_cache=value_cache,
@@ -796,7 +796,7 @@ class XPUAttentionBackend(AttentionBackend):
         out = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         return out
 
-    def _forward_mha_page_size1(
+    def _forward_attn_flat_page_table(
         self, *, q, key_cache, value_cache, layer, metadata, decode
     ):
         """MHA on XPU via flash_attn_with_kvcache page_size=1.
@@ -944,7 +944,7 @@ class XPUAttentionBackend(AttentionBackend):
             )
 
             if self.is_encoder_decoder and forward_batch.encoder_lens is not None:
-                o = self._forward_mha_page_size1(
+                o = self._forward_attn_flat_page_table(
                     q=q,
                     key_cache=key_cache,
                     value_cache=value_cache,
