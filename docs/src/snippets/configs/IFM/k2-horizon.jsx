@@ -18,8 +18,8 @@ export const config = {
     { id: "3.7b", label: "3.7B", subtitle: "Dense" },
     { id: "7b", label: "7B", subtitle: "Dense" },
     { id: "32b", label: "32B", subtitle: "Dense" },
-    { id: "36b", label: "36B", subtitle: "MoE + MoVA" },
-    { id: "375b", label: "375B", subtitle: "MoE" },
+    { id: "36b", label: "MoVA-36B-A4B", subtitle: "MoE + MoVA" },
+    { id: "375b", label: "375B-A23B", subtitle: "MoE" },
   ],
   quantizations: [
     { id: "bf16", label: "BF16" },
@@ -36,8 +36,8 @@ export const config = {
     "3.7b|bf16": "IFM/K2-Horizon-3.7B",
     "7b|bf16": "IFM/K2-Horizon-7B",
     "32b|bf16": "IFM/K2-Horizon-32B",
-    "36b|bf16": "IFM/K2-Horizon-36B",
-    "375b|bf16": "IFM/K2-Horizon-375B",
+    "36b|bf16": "IFM/K2-Horizon-MoVA-36B-A4B",
+    "375b|bf16": "IFM/K2-Horizon-375B-A23B",
   },
 
   placeholders: {
@@ -85,7 +85,7 @@ sgl-eval run gsm8k \\
   // The page covers a family, so use the largest checkpoint as the canonical
   // issue-form model while each recipe still resolves its exact HF repository.
   github: {
-    cookbookModel: "IFM/K2-Horizon-375B",
+    cookbookModel: "IFM/K2-Horizon-375B-A23B",
   },
 
   playgroundFeatures: {
@@ -99,18 +99,18 @@ sgl-eval run gsm8k \\
           values: [
             null,
             { value: 1, disable: { variant: ["375b"] },
-              disableReason: "375B BF16 does not fit on one H200 at TP=1." },
+              disableReason: "375B-A23B BF16 does not fit on one H200 at TP=1." },
             { value: 2, disable: { variant: ["375b"] },
-              disableReason: "375B BF16 does not fit on two H200 GPUs." },
+              disableReason: "375B-A23B BF16 does not fit on two H200 GPUs." },
             { value: 4, disable: { variant: ["375b"] },
-              disableReason: "375B BF16 requires TP=8 to fit on an eight-H200 node." },
+              disableReason: "375B-A23B BF16 requires TP=8 to fit on an eight-H200 node." },
             8,
           ],
         },
       ],
     },
 
-    // K2 Horizon 36B and 375B contain sparse MoE feed-forward layers. Keep
+    // K2 Horizon MoVA-36B-A4B and 375B-A23B contain sparse MoE feed-forward layers. Keep
     // expert parallelism disabled on the dense variants.
     moe: {
       ep: {
@@ -119,29 +119,29 @@ sgl-eval run gsm8k \\
           null,
           { value: 1,
             disable: { variant: ["0.9b", "3.7b", "7b", "32b"] },
-            disableReason: "Expert parallelism applies only to the sparse 36B and 375B variants." },
+            disableReason: "Expert parallelism applies only to the sparse MoVA-36B-A4B and 375B-A23B variants." },
           { value: 2,
             disable: [
               { when: { variant: ["0.9b", "3.7b", "7b", "32b"] },
-                reason: "Expert parallelism applies only to the sparse 36B and 375B variants." },
+                reason: "Expert parallelism applies only to the sparse MoVA-36B-A4B and 375B-A23B variants." },
               { when: { effTp: [1] },
                 reason: "EP=2 requires an effective TP degree of at least 2." },
             ] },
           { value: 4,
             disable: [
               { when: { variant: ["0.9b", "3.7b", "7b", "32b"] },
-                reason: "Expert parallelism applies only to the sparse 36B and 375B variants." },
+                reason: "Expert parallelism applies only to the sparse MoVA-36B-A4B and 375B-A23B variants." },
               { when: { effTp: [1, 2] },
                 reason: "EP=4 requires an effective TP degree of at least 4." },
             ] },
           { value: 8,
             disable: [
               { when: { variant: ["0.9b", "3.7b", "7b", "32b"] },
-                reason: "Expert parallelism applies only to the sparse 36B and 375B variants." },
+                reason: "Expert parallelism applies only to the sparse MoVA-36B-A4B and 375B-A23B variants." },
               { when: { effTp: [1, 2, 4] },
                 reason: "EP=8 requires an effective TP degree of at least 8." },
               { when: { variant: ["36b"] },
-                reason: "36B has 100 routed experts, which is not divisible by EP=8." },
+                reason: "MoVA-36B-A4B has 100 routed experts, which is not divisible by EP=8." },
             ] },
         ],
       },
