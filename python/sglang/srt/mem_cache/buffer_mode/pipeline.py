@@ -275,13 +275,15 @@ class BufferModePipeline:
         self._anchor_lock_cap_skips = 0
 
     def is_idle(self) -> bool:
-        """No queued or in-flight operation holds host staging or can restart I/O."""
+        """No pending or in-flight buffer-mode transfer work."""
         return not (
-            self.pending_write_queue
+            self.pending_hit_allocs
             or self.staged_prefetches
+            or self.ongoing_buffer_load_back
+            or self.pending_write_queue
+            or self.inflight_backup_node_ids
             or self.ongoing_write_through
             or self.ongoing_backup
-            or self.ongoing_buffer_load_back
         )
 
     # ---- backup pipeline (device -> staging -> storage) ----
@@ -309,7 +311,7 @@ class BufferModePipeline:
     def enqueue_backup_intent(self, node_id: NodeId) -> None:
         """Snapshot a backup intent and commit it to the write queue.
         Admission gates: belief skip, parent-cover, backlog cap, oversize.
-        Drops are silent; the node re-triggers on a later hit."""
+        Rejected intents are counted; the node re-triggers on a later hit."""
         if not self._cache.enable_storage:
             return
         if node_id in self.inflight_backup_node_ids:
@@ -438,7 +440,7 @@ class BufferModePipeline:
     ) -> Optional[BufferBackupState]:
         # Arena-lookup failure = deleted, key-length mismatch vs the snapshot
         # = split, a None FULL device value = evicted. Stale
-        # intents drop silently; the node re-triggers on a later hit.
+        # intents are counted as dropped; the node re-triggers on a later hit.
         snapshot = intent.snapshot
         return self._cache.tree_core.validate_buffer_backup(
             snapshot.node_id, len(snapshot.key)
@@ -453,16 +455,20 @@ class BufferModePipeline:
         page_size = self._cache.page_size
         survivors: deque[_UnifiedBackupIntent] = deque()
         states: dict[NodeId, BufferBackupState] = {}
+        swept_tokens = 0
         for intent in self.pending_write_queue:
             snapshot = intent.snapshot
             state = self._validate_backup_intent(intent)
             if state is None:
                 self.inflight_backup_node_ids.discard(snapshot.node_id)
-                self.write_backlog_tokens_ -= len(snapshot.hash_values) * page_size
+                intent_tokens = len(snapshot.hash_values) * page_size
+                self.write_backlog_tokens_ -= intent_tokens
+                swept_tokens += intent_tokens
                 continue
             survivors.append(intent)
             states[snapshot.node_id] = state
         self.pending_write_queue = survivors
+        self._log_backup_dropped(swept_tokens)
         return states
 
     def flush_pending_writes(self) -> None:
@@ -829,12 +835,14 @@ class BufferModePipeline:
 
         if num_tokens == 0 or prefix_tokens is None:
             # Nothing usable fetched: recompute.
+            cache.discard_storage_prefetch_accounting(req_id)
             self.release_anchor_lock(req_id)
             cc.append_host_mem_release(
                 host_indices[:num_tokens], extra_pools=aux_xfers or None
             )
             cc.prefetch_tokens_occupied -= self._occupied_span(host_indices)
             cache.prefetch_loaded_tokens_by_reqid[req_id] = 0
+            cache.prefetch_loaded_storage_start_by_reqid.pop(req_id, None)
             return True
 
         staged_pages = num_tokens // cache.page_size
@@ -860,6 +868,7 @@ class BufferModePipeline:
             operation_id=operation.id,
         )
         cache.prefetch_loaded_tokens_by_reqid[req_id] = num_tokens
+        cache.prefetch_loaded_storage_start_by_reqid[req_id] = operation.storage_start
         return True
 
     def plan_staged_splice(
@@ -874,6 +883,7 @@ class BufferModePipeline:
             return 0, 0
         splice_tokens = staged_splice_tokens(f, device_prefix_len)
         if splice_tokens == 0:
+            covered_tokens = self._resolve_staged_device_coverage(f, device_prefix_len)
             logger.info(
                 "HiCache staged prefetch released req=%s matched=%d "
                 "device_prefix=%d tokens=%d",
@@ -882,9 +892,17 @@ class BufferModePipeline:
                 device_prefix_len,
                 f.num_tokens,
             )
-            self.release_staged_hold(req_id)
+            reason = None if covered_tokens == f.num_tokens else "shrunk"
+            self.release_staged_hold(req_id, reason=reason)
             return 0, 0
         return splice_tokens, self.staged_prefetch_swa_tokens(req_id)
+
+    def _resolve_staged_device_coverage(
+        self, f: _StagedPrefetch, device_prefix_len: int
+    ) -> int:
+        covered_tokens = min(max(device_prefix_len - f.matched_len, 0), f.num_tokens)
+        self._cache._resolve_storage_prefetch_tokens(f.req_id, covered_tokens)
+        return covered_tokens
 
     def staged_prefetch_swa_tokens(self, req_id: str) -> int:
         """SWA device tokens consuming this staged prefetch will allocate (the
@@ -921,13 +939,17 @@ class BufferModePipeline:
             return unchanged
         cc = cache.cache_controller
 
-        def _drop() -> tuple[torch.Tensor, NodeId]:
+        def _drop(reason: Optional[str]) -> tuple[torch.Tensor, NodeId]:
+            cache._finish_storage_prefetch(req.rid, fulfilled_tokens=0, reason=reason)
             self.release_anchor_lock(req.rid)
             self._free_staging_now(f.host_indices, f.aux_xfers)
             cc.prefetch_tokens_occupied -= f.occupied_tokens
             # Nothing spliced: keep the surfaced host-hit fields truthful.
             req.host_hit_length = 0
             req.swa_host_hit_length = 0
+            req.storage_hit_length = 0
+            req.storage_hit_start = None
+            req.host_hit_is_storage = False
             return unchanged
 
         # A hold staged under a different namespace than the consuming request
@@ -941,11 +963,12 @@ class BufferModePipeline:
                 (f.extra_key, f.cache_salt),
                 (req.extra_key, req.cache_salt),
             )
-            return _drop()
+            return _drop("dropped")
 
         splice_base = len(req.prefix_indices)
         splice_tokens = staged_splice_tokens(f, splice_base)
         if splice_tokens == 0:
+            covered_tokens = self._resolve_staged_device_coverage(f, splice_base)
             logger.warning(
                 "HiCache staged prefetch dropped req=%s matched=%d now=%d "
                 "tokens_wasted=%d locked=%s",
@@ -955,12 +978,14 @@ class BufferModePipeline:
                 f.num_tokens,
                 req.rid in self.anchor_locks,
             )
-            return _drop()
+            reason = None if covered_tokens == f.num_tokens else "shrunk"
+            return _drop(reason)
         trim_tokens = splice_base - f.matched_len
         assert trim_tokens % cache.page_size == 0, (
             f"staged splice trim not page-aligned req={req.rid}: "
             f"matched={f.matched_len} splice_base={splice_base}"
         )
+        cache._resolve_storage_prefetch_tokens(req.rid, trim_tokens)
 
         key = RadixKey(
             array("q", f.key_tokens),
@@ -990,7 +1015,14 @@ class BufferModePipeline:
                 f.num_tokens,
                 req.rid in self.anchor_locks,
             )
-            return _drop()
+            available_end = min(
+                span_end,
+                len(live.device_indices),
+                live.full_kv_hit_length,
+            )
+            available_overlap = max(0, available_end - splice_base)
+            cache._resolve_storage_prefetch_tokens(req.rid, available_overlap)
+            return _drop(None if available_overlap == splice_tokens else "shrunk")
 
         # Evict-before-alloc (mirrors _load_back_transfers): the budget gate
         # counts evictable pages, but cc.load draws from free slots only.
@@ -1007,7 +1039,7 @@ class BufferModePipeline:
                 avail = cache.token_to_kv_pool_allocator.available_size()
             if avail < splice_tokens:
                 # Genuinely no room (locked pages): recompute.
-                return _drop()
+                return _drop("device_capacity")
 
         load_back_id = -(f.operation_id) - 1
         device_indices = cc.load(
@@ -1018,7 +1050,7 @@ class BufferModePipeline:
         if device_indices is None:
             # Transient allocator shortfall despite the evict: recompute
             # (init_load_back's degrade contract).
-            return _drop()
+            return _drop("device_capacity")
 
         swa_dev = next(
             (
@@ -1102,11 +1134,12 @@ class BufferModePipeline:
             cc.prefetch_tokens_occupied,
             self.anchor_locked_tokens_,
         )
-        if cache.enable_storage_metrics and cache.storage_metrics_collector is not None:
-            cache.storage_metrics_collector.log_prefetched_tokens(f.num_tokens)
+        cache._finish_storage_prefetch(
+            f.req_id, fulfilled_tokens=f.num_tokens, reason=None
+        )
         return True
 
-    def release_staged_hold(self, rid: str) -> bool:
+    def release_staged_hold(self, rid: str, reason: Optional[str] = None) -> bool:
         """Free a staged hold outright — anchor pin, host bounce (KV + aux),
         occupancy grant; nothing device-side exists yet. Called for aborts
         and for holds that can no longer splice. Returns True when a hold
@@ -1115,6 +1148,7 @@ class BufferModePipeline:
         staged = self.staged_prefetches.pop(rid, None)
         if staged is None:
             return False
+        self._cache._finish_storage_prefetch(rid, fulfilled_tokens=0, reason=reason)
         self._free_staging_now(staged.host_indices, staged.aux_xfers)
         self._cache.cache_controller.prefetch_tokens_occupied -= staged.occupied_tokens
         return True
