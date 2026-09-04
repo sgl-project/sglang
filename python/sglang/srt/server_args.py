@@ -2900,6 +2900,11 @@ class ServerArgs:
         "Enable asynchronous LoRA weight loading in order to overlap H2D transfers with GPU compute. This should be enabled if you find that your LoRA workloads are bottlenecked by adapter weight loading, for example when frequently loading large LoRA adapters.",
         NS("lora"),
     ] = None
+    lora_no_cpu_backup: A[
+        bool,
+        "Keep streamed LoRA weights on the GPU and drop the staged copy once the adapter is installed in the memory pool, instead of holding a host copy per TP rank. Evicting an adapter from the pool is then refused, so every loaded adapter needs its own slot.",
+        NS("lora"),
+    ] = False
     max_lora_rank: A[
         Optional[int],
         "The maximum rank of LoRA adapters. If not specified, it will be automatically inferred from the adapters provided in --lora-paths.",
