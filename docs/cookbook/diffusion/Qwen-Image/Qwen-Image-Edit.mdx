@@ -35,7 +35,7 @@ Qwen-Image-Edit-2511 is a 20B parameter model optimized for image editing tasks.
 
 ### 3.2 Configuration Tips
 
-Currently supported optimizations are listed [here](/docs/sglang-diffusion/compatibility_matrix).
+See [Performance Optimization](/docs/sglang-diffusion/performance-optimization) for acceleration features and their runtime requirements.
 
 - `--vae-path`: Path to a custom VAE model or HuggingFace model ID (e.g., fal/FLUX.2-Tiny-AutoEncoder). If not specified, the VAE will be loaded from the main model path.
 - `--num-gpus`: Number of GPUs to use
@@ -188,6 +188,13 @@ sglang serve --model-path Qwen/Qwen-Image-Edit-2511
 - `--image-encoder-cpu-offload`: Use CPU offload for image encoder inference.
 - `--vae-cpu-offload`: Use CPU offload for VAE.
 - `--pin-cpu-memory`: Pin memory for CPU offload. Only added as a temp workaround if it throws "CUDA error: invalid argument".
+
+#### 4.2.3 Known LoRA examples
+
+Use `--lora-path` at startup or the [LoRA management API](/docs/sglang-diffusion/api/openai_api#lora-management) to load an adapter. Known Qwen-Image-Edit examples include:
+
+- [`ostris/qwen_image_edit_inpainting`](https://huggingface.co/ostris/qwen_image_edit_inpainting)
+- [`lightx2v/Qwen-Image-Edit-2511-Lightning`](https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning)
 
 ## 5. Benchmark
 

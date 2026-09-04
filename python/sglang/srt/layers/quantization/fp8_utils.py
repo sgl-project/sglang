@@ -1576,9 +1576,9 @@ def quant_weight_ue8m0(
     weight_block_size: List[int],
 ):
     assert weight_block_size == [128, 128]
-    assert (
-        weight_dequant.dtype == torch.bfloat16
-    ), f"{weight_dequant.dtype=} {weight_dequant.shape=}"
+    assert weight_dequant.dtype == torch.bfloat16, (
+        f"{weight_dequant.dtype=} {weight_dequant.shape=}"
+    )
 
     *batch_dims, n, k = weight_dequant.shape
 
@@ -1595,10 +1595,6 @@ def quant_weight_ue8m0(
     )
 
     return out_w, out_s
-
-
-def transform_scale_ue8m0_inplace(param, mn):
-    param.data = transform_scale_ue8m0(param.data, mn=mn)
 
 
 # NOTE copy and modified from DeepGEMM
@@ -1665,9 +1661,9 @@ def inverse_transform_scale_ue8m0(sf_packed, mn):
     sf_fp32 = _inverse_transform_scale_ue8m0_impl(sf_packed)
     # Can call consistency check every time since this is only called on startup
     sf_packed_recreated = transform_scale_ue8m0(sf_fp32, mn=mn, use_torch_impl=True)
-    assert torch.all(
-        sf_packed == sf_packed_recreated
-    ), f"{sf_packed=} {sf_packed_recreated=} {sf_fp32=}"
+    assert torch.all(sf_packed == sf_packed_recreated), (
+        f"{sf_packed=} {sf_packed_recreated=} {sf_fp32=}"
+    )
     return sf_fp32
 
 

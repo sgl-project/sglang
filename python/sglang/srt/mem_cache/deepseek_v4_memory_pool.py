@@ -31,6 +31,13 @@ _is_hip = is_hip()
 ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
 
+def get_dsv4_indexer_bytes_per_token(index_head_dim: int, use_fp4_indexer: bool) -> int:
+    """Return payload and quant-scale bytes for one compressed indexer token."""
+    if use_fp4_indexer:
+        return index_head_dim // 2 + index_head_dim // 32
+    return index_head_dim + index_head_dim // 128 * 4
+
+
 def get_compress_state_ring_size(
     compress_ratio: int, is_speculative: bool = False
 ) -> int:
@@ -175,7 +182,6 @@ class DeepSeekV4SingleKVPool(KVCache):
 
 
 class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
-
     def __init__(
         self,
         size: int,
@@ -285,25 +291,47 @@ class DeepSeekV4IndexerPool(KVCache):
         )
         self.index_head_dim = index_head_dim
         self.use_fp4_indexer = get_exec().kernel.enable_deepseek_v4_fp4_indexer
+        self.uses_aiter_fp4_layout = _is_hip and self.use_fp4_indexer
 
         self._create_buffer()
 
     def get_bytes_per_token(self) -> int:
-        if self.use_fp4_indexer:
-            return self.index_head_dim // 2 + 4
-        return self.index_head_dim + 4
+        return get_dsv4_indexer_bytes_per_token(
+            self.index_head_dim, self.use_fp4_indexer
+        )
 
     def _create_buffer(self):
         page_bytes = self.page_size * self.get_bytes_per_token()
+        num_pages = (self.size + self.page_size + 1) // self.page_size
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.custom_mem_pool
                 else nullcontext()
             ):
+                if self.uses_aiter_fp4_layout:
+                    self.index_k_payload_buffer = [
+                        torch.zeros(
+                            (num_pages, 1, 4, self.page_size, 16),
+                            dtype=torch.uint8,
+                            device=self.device,
+                        ).view(torch.float4_e2m1fn_x2)
+                        for _ in range(self.layer_num)
+                    ]
+                    self.index_k_scale_buffer = [
+                        torch.zeros(
+                            (num_pages, 1, 4, self.page_size),
+                            dtype=torch.uint8,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.index_k_with_scale_buffer = None
+                    return
+
                 self.index_k_with_scale_buffer = [
                     torch.zeros(
-                        (self.size + self.page_size + 1) // self.page_size,
+                        num_pages,
                         page_bytes,
                         dtype=self.index_k_with_scale_buffer_dtype,
                         device=self.device,
@@ -325,6 +353,25 @@ class DeepSeekV4IndexerPool(KVCache):
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         return self.index_k_with_scale_buffer[layer_id]
+
+    def contiguous_page_row_buffers(self) -> List[torch.Tensor]:
+        """Every indexer buffer as 2D page rows, for PD and HiCache transfer.
+
+        FP8 keeps key and scale fused in one buffer per layer; the FP4 layout
+        stores payload and scale separately, so it yields two buffers per layer.
+        """
+        if self.index_k_with_scale_buffer is not None:
+            return self.index_k_with_scale_buffer
+        return [
+            buf.view(torch.uint8).flatten(1)
+            for buf in (*self.index_k_payload_buffer, *self.index_k_scale_buffer)
+        ]
+
+    def get_index_k_fp4_payload_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.index_k_payload_buffer[layer_id]
+
+    def get_index_k_fp4_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.index_k_scale_buffer[layer_id]
 
     def get_index_k_scale_buffer(
         self,
@@ -461,7 +508,6 @@ class DeepSeekV4UnifiedKVPool:
 
 
 class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
-
     def __init__(
         self,
         max_num_reqs: int,
@@ -702,7 +748,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
             for i in c4_locals:
                 _append_compressed_entry(i, 4)
-            for buf in self.c4_indexer_kv_pool.index_k_with_scale_buffer:
+            for buf in self.c4_indexer_kv_pool.contiguous_page_row_buffers():
                 assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
                 data_ptrs.append(buf.data_ptr())
                 data_lens.append(buf.nbytes)
@@ -714,7 +760,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         buf_groups = [
             self.c4_kv_pool.kv_buffer,
-            self.c4_indexer_kv_pool.index_k_with_scale_buffer,
+            self.c4_indexer_kv_pool.contiguous_page_row_buffers(),
             self.c128_kv_pool.kv_buffer,
         ]
 
@@ -980,9 +1026,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_attention_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
         compress_state_pool = self.compress_state_pools[layer_id]
-        assert (
-            compress_state_pool is not None
-        ), "Only c4/c128 layers have attention states."
+        assert compress_state_pool is not None, (
+            "Only c4/c128 layers have attention states."
+        )
         return compress_state_pool
 
     def get_online_c128_mtp_state_slot_offset(self) -> int:
@@ -1051,9 +1097,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_indexer_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
         indexer_compress_state_pool = self.indexer_compress_state_pools[layer_id]
-        assert (
-            indexer_compress_state_pool is not None
-        ), "Only c4 layers have indexer states."
+        assert indexer_compress_state_pool is not None, (
+            "Only c4 layers have indexer states."
+        )
         return indexer_compress_state_pool
 
     def _swa_local_layer_id(self, layer_id: int) -> int:
@@ -1108,6 +1154,18 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
         return self.c4_indexer_kv_pool.get_index_k_with_scale_buffer(compress_layer_id)
+
+    def get_index_k_fp4_payload_buffer(self, layer_id: int) -> torch.Tensor:
+        self.wait_layer_transfer(layer_id)
+        compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
+        assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
+        return self.c4_indexer_kv_pool.get_index_k_fp4_payload_buffer(compress_layer_id)
+
+    def get_index_k_fp4_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        self.wait_layer_transfer(layer_id)
+        compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
+        assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
+        return self.c4_indexer_kv_pool.get_index_k_fp4_scale_buffer(compress_layer_id)
 
     def get_index_k_scale_buffer(
         self,
