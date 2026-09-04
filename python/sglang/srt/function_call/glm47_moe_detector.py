@@ -649,6 +649,28 @@ class Glm47MoeDetector(BaseFormatDetector):
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
+        """Parse a delta and drain every complete tool call in the buffer."""
+        result = self._parse_streaming_increment_once(new_text, tools)
+        calls = list(result.calls)
+        normal_text = result.normal_text
+
+        while re.search(self.func_call_regex, self._buffer, re.DOTALL):
+            buffer_length_before = len(self._buffer)
+            next_result = self._parse_streaming_increment_once("", tools)
+            calls.extend(next_result.calls)
+            normal_text += next_result.normal_text
+
+            if len(self._buffer) >= buffer_length_before:
+                logger.warning(
+                    "GLM tool call parser made no progress while draining its buffer"
+                )
+                break
+
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    def _parse_streaming_increment_once(
+        self, new_text: str, tools: List[Tool]
+    ) -> StreamingParseResult:
         """
         Streaming incremental parsing tool calls for GLM-4.5 and GLM-4.6 format.
         Uses a state machine to convert XML to JSON incrementally for true character-by-character streaming.
