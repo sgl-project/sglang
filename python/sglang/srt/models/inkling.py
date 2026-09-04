@@ -405,7 +405,7 @@ class InklingDecoderLayer(nn.Module):
         attn_out / residual_out and returns None (the eager_on_graph copy-back is
         per-tensor, not per-tuple, so outputs must be pre-allocated buffers)."""
         forward_batch = get_tc_piecewise_forward_context().forward_batch
-        n = forward_batch.num_token_non_padded_cpu
+        n = forward_batch.global_num_token_non_padded_cpu
         # log_scaling_tau is per-token, so narrow it to match the real tokens too.
         hs, res = self._attn_block(
             hidden_states[:n],
@@ -429,7 +429,7 @@ class InklingDecoderLayer(nn.Module):
         """Eager break for the final layer's deferred mlp_sconv: run on the real
         tokens with the live forward_batch, write the padded output buffer."""
         forward_batch = get_tc_piecewise_forward_context().forward_batch
-        n = forward_batch.num_token_non_padded_cpu
+        n = forward_batch.global_num_token_non_padded_cpu
         y = self.mlp_sconv(hidden_states[:n], positions[:n], forward_batch)
         if self.scattered_sconv:
             # y is the [n, H/P] shard; the output buffer is post-gather [n, H].

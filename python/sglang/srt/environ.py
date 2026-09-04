@@ -857,6 +857,11 @@ class Envs:
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
+    # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
+    # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
+    # output columns ride along nearly free.
+    SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
+    SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     # Above 8192 tokens of context, aiter's non-static workspace is large enough
@@ -1397,6 +1402,10 @@ class Envs:
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
+    # ROCm gfx950: fuse inverse-RoPE into the wo_a mxfp8 quant (aiter
+    # inverse_rope_group_quant) instead of a separate fused_rope_inplace + Triton
+    # quant. Off by default; requires SGLANG_OPT_FP8_WO_A_GEMM and the aiter op.
+    SGLANG_OPT_FP8_WO_A_FUSED_INVROPE = EnvBool(False)
     # Route the decode wo_a bf16 batched matmul off rocBLAS/Tensile onto aiter's
     # tuned batched_gemm_bf16 (gfx95). Off by default; see deepseek_v4.py
     # _apply_wo_a_bf16_matmul.
