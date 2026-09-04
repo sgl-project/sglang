@@ -228,6 +228,8 @@ Install the exact InferCast revision paired with the selected FIDB slice, then
 start from [`examples/sim_configs/infercast_silicon.json`](examples/sim_configs/infercast_silicon.json).
 The adapter makes one UMD per-forward call for each `EXTEND`, `MIXED`, or
 `DECODE` iteration and records the provider revision and FIDB stack digest.
+Model/GEMM quantization comes from the pinned `model_id`; attention and KV-cache
+dtypes remain explicit predictor inputs.
 
 Prefix-hit, later chunk, and mixed shapes retain their prepared `(E, P)` values.
 InferCast currently predicts only reduced `P == 0`; non-zero `P` reaches the

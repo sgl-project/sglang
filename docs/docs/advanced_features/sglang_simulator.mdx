@@ -16,7 +16,7 @@ The simulator supports:
 
 - synthetic request rates, ShareGPT workloads, and timestamped Autobench traces;
 - OFFLINE logical-time simulation and BLOCKING wall-clock replay;
-- AIConfigurator, ML, and replay latency predictors;
+- AIConfigurator, InferCast, ML, and replay latency predictors;
 - SGLang prefix caching and [HiCache](/docs/advanced_features/hicache); and
 - serving-compatible TTFT, TPOT, ITL, throughput, and cache-hit metrics.
 
@@ -34,6 +34,10 @@ AIConfigurator is optional. Install the validated extra only when you use an AIC
 ```bash
 python3 -m pip install -e "tools/sglang-simulator[aic]"
 ```
+
+InferCast is also optional. Install the exact InferCast revision paired with
+your FIDB slice and start from
+[`infercast_silicon.json`](https://github.com/sgl-project/sglang/blob/main/tools/sglang-simulator/examples/sim_configs/infercast_silicon.json).
 
 ## Start a simulator server
 
