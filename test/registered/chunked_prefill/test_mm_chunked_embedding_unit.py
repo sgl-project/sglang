@@ -332,6 +332,48 @@ def test_mixed_fresh_embeddings_isolate_short_request_and_preserve_shape():
     assert mm_schedule.embedding_cache.get_single(bad_item.hash) is None
 
 
+def test_overlong_combined_result_only_rejects_mismatched_retry():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    good_item = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        hash=3000,
+        feature=torch.zeros(1),
+        offsets=[(0, 3)],
+    )
+    bad_item = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        hash=3001,
+        feature=torch.zeros(1),
+        offsets=[(0, 5)],
+    )
+    good_embedding = torch.arange(4 * HIDDEN, dtype=torch.float32).reshape(4, HIDDEN)
+    bad_embedding = torch.full((2, HIDDEN), 2.0)
+    encoder = Mock(
+        side_effect=[
+            torch.zeros(11, HIDDEN),
+            good_embedding,
+            bad_embedding,
+        ]
+    )
+
+    embedding, _, errors = mm_schedule._get_chunked_prefill_embedding(
+        encoder,
+        [good_item, bad_item],
+        [0, 1, 2],
+        [0, 0],
+        [4, 6],
+        [[(0, 3)], [(0, 5)]],
+        torch.zeros(10, dtype=torch.long),
+    )
+
+    assert errors == [(1, 6, 2)]
+    assert torch.equal(embedding[:4], good_embedding)
+    assert torch.equal(embedding[4:6], bad_embedding)
+    assert torch.equal(embedding[6:], torch.zeros(4, HIDDEN))
+    assert mm_schedule.embedding_cache.get_single(good_item.hash) is not None
+    assert mm_schedule.embedding_cache.get_single(bad_item.hash) is None
+
+
 if __name__ == "__main__":
     import sys
 
