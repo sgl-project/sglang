@@ -411,10 +411,13 @@ class TestGetDcpLens(CustomTestCase):
             )
             # The allocator widens from get_parallel(), not from the injected
             # server_args stand-in -- drive the cause, not the effect.
-            with patch(
-                "sglang.srt.mem_cache.kv_cache_configurator.current_platform.is_out_of_tree",
-                return_value=False,
-            ), rc.get_parallel().override(attn_dcp_size=dcp_size):
+            with (
+                patch(
+                    "sglang.srt.mem_cache.kv_cache_configurator.current_platform.is_out_of_tree",
+                    return_value=False,
+                ),
+                rc.get_parallel().override(attn_dcp_size=dcp_size),
+            ):
                 allocators[dcp_size] = (
                     KVCacheConfigurator._build_token_to_kv_pool_allocator(
                         configurator,
@@ -436,30 +439,6 @@ class TestGetDcpLens(CustomTestCase):
         self.assertEqual(dcp4_allocator.size, 4096)
         self.assertEqual(dcp4_allocator.page_size, 256)
         self.assertEqual(dcp4_allocator.num_pages, 16)
-
-    def test_dsa_draft_pool_preserves_physical_page_and_backs_virtual_tail(self):
-        physical_page_size = 64
-        max_total_num_tokens = 4096
-        self._sa_override = rc.get_context().override_server_args(
-            page_size=physical_page_size
-        )
-        self._sa_override.install()
-        self.addCleanup(self._sa_override.restore)
-
-        dcp1 = SimpleNamespace(pool_page_size=physical_page_size)
-        dcp4_draft = SimpleNamespace(pool_page_size=physical_page_size * 4)
-
-        self.assertEqual(
-            KVCacheConfigurator._dsa_pool_geometry(dcp1, max_total_num_tokens),
-            (max_total_num_tokens, physical_page_size),
-        )
-        self.assertEqual(
-            KVCacheConfigurator._dsa_pool_geometry(dcp4_draft, max_total_num_tokens),
-            (
-                max_total_num_tokens + physical_page_size * 3,
-                physical_page_size,
-            ),
-        )
 
     def test_live_cell_and_page_ownership_formulas(self):
         dcp_size = 4

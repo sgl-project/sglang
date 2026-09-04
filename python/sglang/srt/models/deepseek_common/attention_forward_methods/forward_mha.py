@@ -504,9 +504,9 @@ class DeepseekMHAForwardMixin:
         if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
             backend = backend.primary
         kv_indices = backend.forward_metadata.page_table_1_flattened
-        assert (
-            kv_indices is not None
-        ), "page_table_1_flattened should have been generated for FP8 MHA path"
+        assert kv_indices is not None, (
+            "page_table_1_flattened should have been generated for FP8 MHA path"
+        )
 
         if _use_aiter_gfx95:
             # ROCm (gfx950) stores the FP8 MLA KV in the raw

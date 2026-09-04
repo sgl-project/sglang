@@ -99,7 +99,6 @@ _is_npu = is_npu()
 
 
 class DeepseekModelNextN(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -222,9 +221,28 @@ class DeepseekModelNextN(nn.Module):
             )
 
             if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
-            else:
-                hidden_states = input_embeds
+                # MM positions in input_ids hold MM_PAD_SHIFT_VALUE+hash sentinels
+                # (far above vocab_size). Use target-produced mm_input_embeds for
+                # these positions and only call embed_tokens on the appended
+                # next-token to avoid embed OOB.
+                input_embeds = forward_batch.mm_input_embeds
+                if (
+                    forward_batch.forward_mode.is_extend()
+                    and forward_batch.contains_mm_inputs()
+                    and not forward_batch.forward_mode.is_draft_extend_v2()
+                ):
+                    assert input_embeds is not None
+                    last_indices = (
+                        forward_batch.extend_start_loc
+                        + forward_batch.extend_seq_lens
+                        - 1
+                    ).long()
+                    input_embeds[last_indices] = self.embed_tokens(
+                        input_ids[last_indices]
+                    )
+                if input_embeds is None:
+                    input_embeds = self.embed_tokens(input_ids)
+            hidden_states = input_embeds
 
             if hidden_states.shape[0] > 0:
                 previous_hidden_states = forward_batch.spec_info.hidden_states

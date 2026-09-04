@@ -7,6 +7,7 @@ from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
     process_content_for_template_format,
 )
+from sglang.srt.utils import VideoData
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -28,13 +29,19 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         select_template = (
             "{{ messages | selectattr('tool_call_id', 'equalto', 'call-a') | list }}"
         )
-        sort_template = "{{ messages | sort(attribute='tool_call_id') }}"
-
         self.assertTrue(jinja_template_may_reorder_tool_results(attribute_template))
         self.assertTrue(jinja_template_may_reorder_tool_results(item_template))
         self.assertTrue(jinja_template_may_reorder_tool_results(get_template))
         self.assertTrue(jinja_template_may_reorder_tool_results(select_template))
-        self.assertTrue(jinja_template_may_reorder_tool_results(sort_template))
+
+    def test_sort_by_tool_call_id_value_is_not_association(self):
+        # sort/groupby order by the id string value, which message-order
+        # canonicalization cannot reproduce, so they must not activate it.
+        sort_template = "{{ messages | sort(attribute='tool_call_id') }}"
+        groupby_template = "{{ messages | groupby('tool_call_id') }}"
+
+        self.assertFalse(jinja_template_may_reorder_tool_results(sort_template))
+        self.assertFalse(jinja_template_may_reorder_tool_results(groupby_template))
 
     def test_tool_call_id_text_does_not_enable_order_recovery(self):
         self.assertFalse(
@@ -341,30 +348,38 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         self.assertEqual(video_data[0], "http://example.com/v.mp4")
         self.assertEqual(result["content"][1], {"type": "video"})
 
-    def test_process_content_video_with_max_dynamic_patch(self):
-        """Test video_url with max_dynamic_patch stores structured dict."""
+    def test_process_content_video_structured_fields_become_video_data(self):
+        """video_url with mdp/fps-style fields lands in VideoData.preprocess_kwargs."""
         msg_dict = {
             "role": "user",
             "content": [
                 {
                     "type": "video_url",
                     "video_url": {
-                        "url": "http://example.com/v.mp4",
+                        "url": "http://example.com/a.mp4",
                         "max_dynamic_patch": 4,
+                    },
+                },
+                {
+                    "type": "video_url",
+                    "video_url": {
+                        "url": "http://example.com/b.mp4",
+                        "fps": 1.5,
+                        "max_frames": 16,
                     },
                 },
             ],
         }
-        image_data = []
         video_data = []
-        audio_data = []
-        modalities = []
-        result = process_content_for_template_format(
-            msg_dict, "openai", image_data, video_data, audio_data, modalities
+        process_content_for_template_format(msg_dict, "openai", [], video_data, [], [])
+        self.assertEqual(
+            [(item.url, item.preprocess_kwargs) for item in video_data],
+            [
+                ("http://example.com/a.mp4", {"max_dynamic_patch": 4}),
+                ("http://example.com/b.mp4", {"fps": 1.5, "max_frames": 16}),
+            ],
         )
-        self.assertEqual(len(video_data), 1)
-        self.assertIsInstance(video_data[0], dict)
-        self.assertEqual(video_data[0]["max_dynamic_patch"], 4)
+        self.assertIsInstance(video_data[0], VideoData)
 
     def test_process_content_v32_encoding(self):
         """Test v32 encoding mode flattens text and ignores structured content parts."""

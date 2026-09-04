@@ -1035,8 +1035,8 @@ class TestNixlStaging(CustomTestCase):
             staging_total_size=4096,
         )
         calls = []
-        mgr.send_kvcache_staged = (
-            lambda *args, **kwargs: calls.append((args, kwargs)) or "handle"
+        mgr.send_kvcache_staged = lambda *args, **kwargs: (
+            calls.append((args, kwargs)) or "handle"
         )
 
         handle, deferred = mgr._do_staging_transfer(

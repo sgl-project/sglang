@@ -66,6 +66,10 @@ from sglang.srt.mem_cache.memory_pool import (
     PageMajorMHATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.multi_ended_allocator import (
+    UnifiedMambaTokenToKVPoolAllocator,
+    UnifiedSWATokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
@@ -103,6 +107,7 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
         not memory_config.enable_hisparse
         and not is_draft_worker
         and not memory_config.enable_hierarchical_cache
+        and not memory_config.enable_unified_cache_external_linker
         and get_disagg().disaggregation_mode == "null"
     )
 
@@ -316,9 +321,9 @@ class KVCacheConfigurator:
                 )
 
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
-            assert (
-                self.memory_pool_config is not None
-            ), "Draft worker requires memory_pool_config"
+            assert self.memory_pool_config is not None, (
+                "Draft worker requires memory_pool_config"
+            )
             config = self.memory_pool_config
         else:
             config = self._resolve_memory_pool_config(pre_model_load_memory)
@@ -360,12 +365,6 @@ class KVCacheConfigurator:
     @property
     def pool_page_size(self) -> int:
         return get_schedule().page_size * self.loc_space_scale
-
-    def _dsa_pool_geometry(self, max_total_num_tokens: int) -> tuple[int, int]:
-        physical_page_size = get_schedule().page_size
-        # Physical page stays 64 for CUDA DSA kernels; only the token pool is grown.
-        pool_size = max_total_num_tokens + self.pool_page_size - physical_page_size
-        return pool_size, physical_page_size
 
     def _derive_pool_sizes(self, *, config: MemoryPoolConfig) -> _PoolSizes:
         max_total_num_tokens = config.max_total_num_tokens
@@ -508,35 +507,43 @@ class KVCacheConfigurator:
         # pool must be sized by that space.
         draft_virtual_id_space: Optional[int] = None
         if self.is_draft_worker and token_to_kv_pool_allocator is not None:
-            from sglang.srt.mem_cache.multi_ended_allocator import (
-                UnifiedMambaTokenToKVPoolAllocator,
-                UnifiedSWATokenToKVPoolAllocator,
-            )
-
-            if isinstance(token_to_kv_pool_allocator, UnifiedSWATokenToKVPoolAllocator):
-                raise ValueError(
-                    "Speculative decoding with --enable-unified-memory is only "
-                    "supported for hybrid-Mamba targets; the unified hybrid-SWA "
-                    "pool's draft sizing (virtual-id space) is not wired yet."
-                )
             if isinstance(
-                token_to_kv_pool_allocator, UnifiedMambaTokenToKVPoolAllocator
+                token_to_kv_pool_allocator,
+                (
+                    UnifiedMambaTokenToKVPoolAllocator,
+                    UnifiedSWATokenToKVPoolAllocator,
+                ),
             ):
-                draft_virtual_id_space = token_to_kv_pool_allocator.size_full
+                draft_virtual_id_space = (
+                    token_to_kv_pool_allocator.draft_virtual_id_space
+                )
                 assert draft_virtual_id_space >= sizes.max_total_num_tokens, (
                     "unified allocator virtual space smaller than the token "
-                    f"budget: size_full={draft_virtual_id_space} < "
+                    f"budget: virtual_id_space={draft_virtual_id_space} < "
                     f"max_total_num_tokens={sizes.max_total_num_tokens}"
                 )
                 # Round UP to page alignment (paged draft backends view the
-                # pool as (-1, page_size, H, D); size_full is not aligned).
+                # pool as (-1, page_size, H, D); the virtual space is not aligned).
                 page = max(int(self.pool_page_size or 1), 1)
                 draft_virtual_id_space = (
                     (draft_virtual_id_space + page - 1) // page * page
                 )
-                sizes = msgspec.structs.replace(
-                    sizes, max_total_num_tokens=draft_virtual_id_space
-                )
+                size_overrides = {
+                    "max_total_num_tokens": draft_virtual_id_space,
+                }
+                if (
+                    isinstance(
+                        token_to_kv_pool_allocator,
+                        UnifiedSWATokenToKVPoolAllocator,
+                    )
+                    and self.is_hybrid_swa
+                ):
+                    size_overrides["full_max_total_num_tokens"] = draft_virtual_id_space
+                    if not self.is_hybrid_swa_mtp_draft or self.draft_swa_full_capacity:
+                        size_overrides["swa_max_total_num_tokens"] = (
+                            draft_virtual_id_space
+                        )
+                sizes = msgspec.structs.replace(sizes, **size_overrides)
 
         # Initialize req_to_token_pool
         if req_to_token_pool is None:
@@ -584,7 +591,8 @@ class KVCacheConfigurator:
             assert token_to_kv_pool.size >= draft_virtual_id_space, (
                 "draft token_to_kv_pool smaller than the shared unified "
                 f"allocator's virtual-id space: pool size="
-                f"{token_to_kv_pool.size} < size_full={draft_virtual_id_space}; "
+                f"{token_to_kv_pool.size} < "
+                f"virtual_id_space={draft_virtual_id_space}; "
                 "verify-window writes at high virtual ids would go out of "
                 "bounds."
             )
@@ -721,9 +729,9 @@ class KVCacheConfigurator:
         config = self.mambaish_config
         assert config is not None and self.is_hybrid_swa
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
-        assert (
-            not self.use_mla_backend
-        ), "unified tri-pool does not support an MLA full side yet"
+        assert not self.use_mla_backend, (
+            "unified tri-pool does not support an MLA full side yet"
+        )
         # Mirror the non-shared path's extra_max_context_len computation.
         extra_max_context_len = 4
         if get_spec().speculative_num_draft_tokens is not None:
@@ -835,9 +843,9 @@ class KVCacheConfigurator:
         # Both sub-pools are page-aware; the SWA composite runs alloc_extend_kernel
         # once in virtual space and binds the new pages on both sub-allocators.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
-        assert (
-            not self.use_mla_backend
-        ), "unified memory pool does not support MLA-SWA hybrid yet"
+        assert not self.use_mla_backend, (
+            "unified memory pool does not support MLA-SWA hybrid yet"
+        )
         # Mirror the non-shared path's extra_max_context_len computation.
         extra_max_context_len = 4
         if get_spec().speculative_num_draft_tokens is not None:
@@ -1261,9 +1269,9 @@ class KVCacheConfigurator:
                 if quant_method is not None and is_float4_e2m1fn_x2(
                     self.kv_cache_dtype
                 ):
-                    assert (
-                        not enable_page_major
-                    ), "page-major KV layout is not supported with fp4 KV cache"
+                    assert not enable_page_major, (
+                        "page-major KV layout is not supported with fp4 KV cache"
+                    )
                 token_to_kv_pool = self._build_mha_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
                     mha_pool_class=mha_pool_class,
@@ -1519,9 +1527,6 @@ class KVCacheConfigurator:
     ) -> KVCache:
         from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
 
-        max_total_num_tokens, pool_page_size = self._dsa_pool_geometry(
-            max_total_num_tokens
-        )
         (
             dsa_cp_layer_shard_rank,
             dsa_cp_layer_shard_size,
@@ -1554,7 +1559,7 @@ class KVCacheConfigurator:
             ]
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
-            page_size=pool_page_size,
+            page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
@@ -2026,27 +2031,33 @@ class KVCacheConfigurator:
         else:
             assert self.is_draft_worker
             if self.is_hybrid_swa:
-                if self.draft_swa_full_capacity:
-                    # Banded depth: the SWA ring is full draft capacity, so use
-                    # an IDENTITY full->swa mapping — store and read locs both
-                    # equal out_cache_loc, and a slot is never evicted before
-                    # the request frees it. The window itself is enforced by the
-                    # FA sliding-window kernel, not by the ring. Layout mirrors
-                    # SWATokenToKVPoolAllocator's mapping (size + page_size
-                    # entries + trailing -1 sentinel so a -1 last_loc maps
-                    # to -1).
+                if isinstance(
+                    token_to_kv_pool_allocator,
+                    DeepSeekV4HiSparseTokenToKVPoolAllocator,
+                ):
+                    swa_allocator = token_to_kv_pool_allocator.logical_attn_allocator
+                else:
+                    swa_allocator = token_to_kv_pool_allocator
+                uses_unified_virtual_ids = isinstance(
+                    swa_allocator, UnifiedSWATokenToKVPoolAllocator
+                )
+                has_draft_swa_layers = (
+                    not self.is_hybrid_swa_mtp_draft or self.draft_swa_full_capacity
+                )
+                if self.draft_swa_full_capacity or (
+                    uses_unified_virtual_ids and has_draft_swa_layers
+                ):
+                    # The draft pool owns independent KV but consumes the target
+                    # allocator's virtual ids directly. Size its SWA side for that
+                    # whole space and use an identity mapping. The trailing -1
+                    # sentinel keeps a -1 last_loc mapped to -1.
                     n = sizes.full_max_total_num_tokens + self.page_size
                     identity_mapping = torch.arange(
                         n + 1, dtype=torch.int64, device=self.device
                     )
                     identity_mapping[-1] = -1
                     token_to_kv_pool.register_mapping(identity_mapping)
-                else:
-                    swa_allocator = getattr(
-                        token_to_kv_pool_allocator,
-                        "logical_attn_allocator",
-                        token_to_kv_pool_allocator,
-                    )
+                elif not uses_unified_virtual_ids:
                     assert isinstance(swa_allocator, SWATokenToKVPoolAllocator)
                     token_to_kv_pool.register_mapping(
                         swa_allocator.full_to_swa_index_mapping
@@ -2127,9 +2138,9 @@ class KVCacheConfigurator:
                 else:
                     additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
             else:
-                assert (
-                    not mamba_extra_buffer_lazy_enabled()
-                ), "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
+                assert not mamba_extra_buffer_lazy_enabled(), (
+                    "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
+                )
                 additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
         elif skip_decode_lock:
             # no_buffer under skip: add the base drop back so effective stays 3,
@@ -2487,9 +2498,9 @@ def calculate_mla_kv_cache_dim(
     # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
     # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
     if kv_cache_dtype == torch.float8_e4m3fn:
-        assert (
-            kv_lora_rank % quant_block_size == 0
-        ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
+        assert kv_lora_rank % quant_block_size == 0, (
+            f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
+        )
 
         return (
             kv_lora_rank

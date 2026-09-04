@@ -160,6 +160,28 @@ def _merge_glm_video_configs(default_config, item_configs):
     return [{**defaults, **dict(config or {})} for config in item_configs]
 
 
+def _hf_sample_frame_indices(
+    video_processor, total_frames, fps, duration, video_config
+):
+    """Sample indices with the model's own HF processor so behavior tracks the pinned transformers."""
+    if video_config.get("max_frames") is not None:
+        return None
+    sample_frames = getattr(video_processor, "sample_frames", None)
+    if sample_frames is None:
+        return None
+    try:
+        from transformers.video_utils import VideoMetadata
+    except ImportError:
+        return None
+    metadata = VideoMetadata(
+        total_num_frames=int(total_frames),
+        fps=float(fps),
+        duration=float(duration),
+    )
+    indices = sample_frames(metadata, fps=video_config.get("fps"))
+    return [int(index) for index in indices]
+
+
 def glm_sample_frame_indices(
     total_frames,
     fps,
@@ -168,7 +190,7 @@ def glm_sample_frame_indices(
     target_fps=None,
     max_frame_count=None,
 ):
-    """Mirror HF's sequential sampler so EPD stays byte-identical, then preserve temporal pairs."""
+    """Fallback sampler for processors without sample_frames or when max_frames is requested."""
     if total_frames <= 0:
         return []
     target_fps = GLM_VIDEO_DEFAULT_FPS if target_fps is None else float(target_fps)
@@ -383,19 +405,33 @@ def glm_decode_frames_at(vr, indices, video_config=None):
     return frames
 
 
-def glm_sample_and_decode_sync(vr, video_config=None):
+def glm_sample_and_decode_sync(vr, video_config=None, video_processor=None):
     video_config = video_config or {}
     fps = vr.avg_fps
-    duration = len(vr) / fps if fps else 0
-    indices = glm_sample_frame_indices(
-        len(vr),
-        fps,
-        duration,
-        target_fps=video_config.get("fps"),
-        max_frame_count=video_config.get("max_frames"),
+    if not fps or fps <= 0:
+        raise ValueError(f"Cannot determine video fps (avg_fps={fps!r})")
+    duration = len(vr) / fps
+    indices = _hf_sample_frame_indices(
+        video_processor, len(vr), fps, duration, video_config
     )
+    if indices is None:
+        indices = glm_sample_frame_indices(
+            len(vr),
+            fps,
+            duration,
+            target_fps=video_config.get("fps"),
+            max_frame_count=video_config.get("max_frames"),
+        )
+    if not indices:
+        raise ValueError("Video frame sampling produced no frames")
     frames = glm_decode_frames_at(vr, indices, video_config)
     return frames, _glm_video_metadata(len(vr), fps, duration, indices)
+
+
+def _passthrough_video_metadata(video, video_config):
+    num_frames = video.shape[0] if hasattr(video, "shape") else len(video)
+    fps = float(video_config.get("fps") or GLM_VIDEO_DEFAULT_FPS)
+    return _glm_video_metadata(num_frames, fps, num_frames / fps, range(num_frames))
 
 
 class Glm4vImageProcessor(SGLangBaseProcessor):
@@ -514,6 +550,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
                             glm_sample_and_decode_sync,
                             video,
                             video_config,
+                            video_processor,
                         )
                     )
                 elif isinstance(video, list) and (
@@ -525,13 +562,23 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
                         )
                     )
                 else:
-                    decode_tasks.append(asyncio.sleep(0, result=(video, None)))
+                    decode_tasks.append(
+                        asyncio.sleep(
+                            0,
+                            result=(
+                                video,
+                                _passthrough_video_metadata(video, video_config),
+                            ),
+                        )
+                    )
 
-            videos_processed = await asyncio.gather(*decode_tasks)
-            for video in base_output.videos:
-                close = getattr(video, "close", None)
-                if callable(close):
-                    close()
+            try:
+                videos_processed = await asyncio.gather(*decode_tasks)
+            finally:
+                for video in base_output.videos:
+                    close = getattr(video, "close", None)
+                    if callable(close):
+                        close()
             base_output.videos, metadata = map(list, zip(*videos_processed))
             if metadata and all(item is not None for item in metadata):
                 video_metadata = metadata
