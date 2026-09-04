@@ -12,6 +12,9 @@ from sglang.test.kits.unified_radix_cache_kit import (
     UnifiedRadixTreeTestMixin,
 )
 from sglang.test.kl_multiturn_utils import get_input_ids
+from sglang.test.kl_test_utils import (
+    test_input_output_logprobs_bitexact_helper as assert_logprobs_bitexact,
+)
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -25,7 +28,7 @@ DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 DSV4_DSPARK_MODEL = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
 DSV4_FLASH_LAUNCH_TIMEOUT = 3600
 
-register_cuda_ci(est_time=4800, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=5400, stage="extra-b", runner_config="4-gpu-h100")
 
 
 def _assert_dsv4_decode_cached_tokens(result, history_len, output_len, label):
@@ -121,6 +124,63 @@ class TestUnifiedDeepSeekV4FlashHiCachePageFirstDirect(
 
     hicache_io_backend = "kernel"
     hicache_mem_layout = "layer_first"
+
+
+# ─── DeepSeek V4 Flash deterministic same-kernel prefill/decode parity ───
+
+
+class TestUnifiedDeepSeekV4FlashSameKernelBitExact(CustomTestCase):
+    """Decode and its prefill replay must score every token identically.
+
+    Deterministic inference makes each kernel batch-invariant and ``flashmla_kv``
+    runs prefill on the decode KV-cache kernel, so both paths compute the same
+    function; a nonzero KL is KV-cache state or metadata corruption, not drift
+    between the sparse-prefill and KV-cache attention kernels.
+    """
+
+    tree_core_backend = "python"
+    max_running_requests = 4
+    max_samples = 8
+    max_new_tokens = 256
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DSV4_FLASH_MODEL
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DSV4_FLASH_LAUNCH_TIMEOUT,
+            other_args=[
+                "--trust-remote-code",
+                "--tp-size",
+                "4",
+                "--enable-deterministic-inference",
+                "--dsv4-prefill-backend",
+                "flashmla_kv",
+                "--cuda-graph-max-bs-decode",
+                str(cls.max_running_requests),
+                "--max-running-requests",
+                str(cls.max_running_requests),
+            ],
+            env=unified_radix_tree_server_env(
+                cls.tree_core_backend,
+                SGLANG_DSV4_FP4_EXPERTS="0",
+            ),
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
+
+    def test_logprobs_bitexact(self):
+        assert_logprobs_bitexact(
+            self.base_url,
+            self.model,
+            max_samples=self.max_samples,
+            max_new_tokens=self.max_new_tokens,
+            trust_remote_code=True,
+        )
 
 
 # ─── DeepSeek V4 Flash + HiCache L3 (file backend) ──────────────────────
