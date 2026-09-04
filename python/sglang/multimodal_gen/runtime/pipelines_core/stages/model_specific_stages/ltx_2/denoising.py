@@ -2719,8 +2719,8 @@ class LTX2DenoisingStage(DenoisingStage):
 
     def _get_negative_prompt_embeds_validator(self, batch: Req):
         """Allow either tensor or list negative prompt embeddings for LTX-2 CFG."""
-        return (
-            lambda x: (not batch.do_classifier_free_guidance)
+        return lambda x: (
+            (not batch.do_classifier_free_guidance)
             or V.is_tensor(x)
             or V.list_not_empty(x)
         )

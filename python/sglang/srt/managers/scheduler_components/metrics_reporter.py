@@ -23,11 +23,13 @@ from sglang.srt.observability.metrics_collector import (
     compute_routing_key_stats,
 )
 from sglang.srt.runtime_context import (
+    exports_expert_balancedness_to_prometheus,
     get_context,
     get_disagg,
     get_observability,
     get_parallel,
     get_spec,
+    logs_expert_balancedness_to_server_log,
 )
 from sglang.srt.utils.device_timer import DeviceTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
@@ -46,6 +48,11 @@ RECORD_STEP_TIME = envs.SGLANG_RECORD_STEP_TIME.get()
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
 CACHE_HIT_RATE_WINDOW_SECONDS = envs.SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS.get()
+# gen_throughput is computed only on decode-stats ticks; when decode is starved
+# (e.g. long chunked-prefill stretches) the last window's value would otherwise
+# be re-exported indefinitely. 30s is far above any healthy decode-stats gap,
+# so past it the true recent decode throughput is ~0.
+GEN_THROUGHPUT_STALENESS_SECONDS = 30.0
 
 
 class _CacheHitRateWindow:
@@ -151,6 +158,16 @@ class SchedulerMetricsReporter:
         # cache_hit_rate stats keep their per-report semantics.
         self.recent_cache_hit_rate = 0.0
 
+    def _current_gen_throughput(self, now: float) -> float:
+        """last_gen_throughput, decayed to 0 once decode-stats stop arriving.
+
+        Mirrors the pause-path zeroing in Scheduler.pause_generation: a stale
+        decode window must not keep exporting its throughput forever.
+        """
+        if now - self.last_decode_stats_tic > GEN_THROUGHPUT_STALENESS_SECONDS:
+            self.last_gen_throughput = 0.0
+        return self.last_gen_throughput
+
     def _init_metrics(
         self,
         tp_rank: int,
@@ -173,9 +190,10 @@ class SchedulerMetricsReporter:
         }.get(getattr(self.scheduler, "device", ""), "cuda graph")
 
         # Cumulative spec-decoding counters (reset every decode_log_interval).
-        # Each update adds (num_correct_drafts + bs, bs).
-        # `*_accept_tokens` = drafts + bonus; `*_correct_drafts` = drafts-only.
+        # `*_accept_tokens` includes accepted drafts and non-draft output tokens;
+        # `*_correct_drafts` counts accepted draft proposals only.
         self.spec_num_accept_tokens = 0  # per-log-interval
+        self.spec_num_correct_drafts = 0
         self.spec_num_forward_ct = 0
         self.spec_total_num_accept_tokens = 0  # lifetime
         self.spec_total_num_forward_ct = 0
@@ -238,7 +256,7 @@ class SchedulerMetricsReporter:
         """Initialize Forward Pass Metrics (FPM) publisher if configured."""
         self.scheduler.enable_fpm = False
         if (
-            self.scheduler.server_args.enable_forward_pass_metrics
+            get_observability().enable_forward_pass_metrics
             and self.scheduler.ps.attn_tp_rank == 0
             and self.scheduler.ps.pp_rank == self.scheduler.ps.pp_size - 1
         ):
@@ -252,7 +270,7 @@ class SchedulerMetricsReporter:
                 else 0
             )
             self.scheduler._fpm_worker_id = (
-                self.scheduler.server_args.forward_pass_metrics_worker_id
+                get_observability().forward_pass_metrics_worker_id
             )
             base_endpoint = get_observability().forward_pass_metrics_ipc_name
             if base_endpoint is None:
@@ -396,16 +414,15 @@ class SchedulerMetricsReporter:
         self,
         bs: int,
         num_correct_drafts: int,
+        num_accept_tokens: int,
         num_block_accept_tokens: int = 0,
         num_cap_tokens: int = 0,
     ):
-        self.spec_num_accept_tokens += num_correct_drafts + bs
+        self.spec_num_accept_tokens += num_accept_tokens
+        self.spec_num_correct_drafts += num_correct_drafts
         self.spec_num_forward_ct += bs
         self.spec_num_block_accept_tokens += num_block_accept_tokens
         self.spec_num_cap_tokens += num_cap_tokens
-
-        # Bonus tokens updated elsewhere
-        self.num_generated_tokens += num_correct_drafts
 
     def _init_estimated_perf_constants(self) -> None:
         model_config = self.scheduler.model_config
@@ -570,6 +587,7 @@ class SchedulerMetricsReporter:
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
         self.spec_num_accept_tokens = 0
+        self.spec_num_correct_drafts = 0
         self.spec_num_forward_ct = 0
         self.spec_total_num_accept_tokens = 0
         self.spec_total_num_forward_ct = 0
@@ -714,6 +732,9 @@ class SchedulerMetricsReporter:
             )
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
+            # Refresh here too: prefill-heavy stretches can run long between
+            # decode-stats ticks, and the gauge must decay rather than hold.
+            self.stats.gen_throughput = self._current_gen_throughput(now)
 
             # Memory pool usage ratios / Absolute token counts
             pool_stats.update_scheduler_stats(self.stats)
@@ -755,13 +776,13 @@ class SchedulerMetricsReporter:
         self,
         can_run_cuda_graph: bool,
         running_batch: ScheduleBatch = None,
-        num_correct_drafts: int = 0,
+        num_generated_tokens: int = 0,
     ):
         batch = running_batch or self.scheduler.running_batch
 
         # Every-iteration work: realtime token counting + status logger
         if self.current_scheduler_metrics_enabled:
-            decode_tokens = batch.batch_size() + num_correct_drafts
+            decode_tokens = num_generated_tokens
             self.metrics_collector.increment_realtime_tokens(
                 # TODO unify this w/ the bumping logic in `Scheduler.num_generated_tokens` accumulator
                 decode_tokens=decode_tokens,
@@ -824,7 +845,7 @@ class SchedulerMetricsReporter:
             spec_block_accept_length = 0
         else:
             spec_accept_length = self.spec_num_accept_tokens / self.spec_num_forward_ct
-            num_correct_drafts = self.spec_num_accept_tokens - self.spec_num_forward_ct
+            num_correct_drafts = self.spec_num_correct_drafts
             if get_spec().speculative_num_draft_tokens:
                 draft_per_round = get_spec().speculative_num_draft_tokens - 1
             else:
@@ -851,7 +872,8 @@ class SchedulerMetricsReporter:
             )
             self.spec_total_num_accept_tokens += self.spec_num_accept_tokens
             self.spec_total_num_forward_ct += self.spec_num_forward_ct
-            self.spec_num_accept_tokens = self.spec_num_forward_ct = 0
+            self.spec_num_accept_tokens = self.spec_num_correct_drafts = 0
+            self.spec_num_forward_ct = 0
             self.spec_num_block_accept_tokens = 0
             self.spec_num_cap_tokens = 0
             msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
@@ -870,8 +892,6 @@ class SchedulerMetricsReporter:
                 spec_snapshot = self._active_spec_config_snapshot()
                 spec_num_steps = spec_snapshot["num_steps"]
                 spec_num_draft_tokens = spec_snapshot["num_draft_tokens"]
-
-        cache_hit_rate = 0.0
 
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             msg += f"pre-allocated usage: {self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.scheduler.max_total_num_tokens:.2f}, "
@@ -930,7 +950,9 @@ class SchedulerMetricsReporter:
             )
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.gen_throughput = self.last_gen_throughput
-            self.stats.cache_hit_rate = cache_hit_rate
+            # cache_hit_rate is prefill-owned (per-report semantics); decode
+            # ticks must not reset it, or the exported gauge reads 0 whenever
+            # a decode report lands between prefill reports.
             self.stats.decode_sum_seq_lens = _decode_total_seq_lens(batch)
 
             # Memory pool usage ratios / Absolute token counts
@@ -1009,9 +1031,7 @@ class SchedulerMetricsReporter:
         if (m := result.expert_distribution_metrics) is not None:
             balancedness = m.eplb_balancedness.item()
 
-            if (
-                self.scheduler.server_args.should_log_expert_balancedness_to_server_log()
-            ):
+            if logs_expert_balancedness_to_server_log():
                 if m.reset_server_log_history:
                     for history in self._eplb_balancedness_history:
                         history.clear()
@@ -1033,10 +1053,7 @@ class SchedulerMetricsReporter:
                     f"gpu_physical_count_sum={gpu_physical_count_sum}"
                 )
 
-            if (
-                self.enable_metrics
-                and self.scheduler.server_args.should_export_expert_balancedness_to_prometheus()
-            ):
+            if self.enable_metrics and exports_expert_balancedness_to_prometheus():
                 assert self.metrics_collector is not None
                 self.metrics_collector.increment_eplb_balancedness(
                     forward_mode=batch.forward_mode.name.lower(),
@@ -1117,7 +1134,7 @@ class SchedulerMetricsReporter:
             active_lora_ids = set()
 
             # For PP mode, check all running micro batches
-            if get_parallel().config.pp_size > 1:
+            if get_parallel().pp_size > 1:
                 for batch in self.scheduler.running_mbs:
                     if batch and hasattr(batch, "reqs"):
                         for req in batch.reqs:

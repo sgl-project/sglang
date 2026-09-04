@@ -134,8 +134,11 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         self.hot_token_id = None
 
         with (
-            empty_context()
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), draft_model_build_scope():
+            empty_context(),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            draft_model_build_scope(),
+        ):
             # Both base classes own initialization, so initialize TpModelWorker
             # explicitly after EagleDraftWorkerBase above.
             TpModelWorker.__init__(
@@ -143,7 +146,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
                 server_args=server_args,
                 gpu_id=gpu_id,
                 # spec workers don't support pipeline parallelism
-                ps=replace(ps, pp_rank=0),
+                ps=replace(ps, pp_rank=0, pp_size=1),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 # The draft runs at absolute target positions.
@@ -163,9 +166,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         self.kv_context: Optional[FrozenKVMTPContext] = None
 
         self.draft_tp_context = (
-            draft_tp_context
-            if get_parallel().config.enable_dp_attention
-            else empty_context
+            draft_tp_context if get_parallel().enable_dp_attention else empty_context
         )
 
         self.draft_attn_backend = None
@@ -722,9 +723,9 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         )
 
         # Frozen MTP does not wire the adaptive controller yet.
-        assert (
-            not get_spec().speculative_adaptive
-        ), "Frozen-KV MTP does not support adaptive speculative decoding yet."
+        assert not get_spec().speculative_adaptive, (
+            "Frozen-KV MTP does not support adaptive speculative decoding yet."
+        )
         self.adaptive_controller = None
 
         # Some dummy tensors (parity with EAGLEWorkerV2 init).
