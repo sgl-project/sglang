@@ -218,15 +218,12 @@ def _split_or_retry_mismatched_combined_embedding(
 ) -> Tuple[List[Optional[torch.Tensor]], List[bool]]:
     embedding = embedding.reshape(-1, embedding.shape[-1])
     expected_total = sum(token_counts)
-    actual_total = embedding.shape[0]
-    if actual_total == expected_total:
+    if embedding.shape[0] == expected_total:
         return list(torch.split(embedding, token_counts, dim=0)), [False] * len(items)
 
     embeddings, count_mismatches = _retry_individual_embeddings(
         data_embedding_func, items
     )
-    if actual_total > expected_total:
-        count_mismatches = [True] * len(items)
     return embeddings, count_mismatches
 
 
@@ -482,10 +479,9 @@ def _batch_encode_per_image_misses(
             # _get_chunked_embedding_by_item.
             per_item_count_mismatch = len(all_miss_embedding) != len(miss_items)
             if per_item_count_mismatch:
-                split_embeddings, _ = _retry_individual_embeddings(
+                split_embeddings, count_mismatches = _retry_individual_embeddings(
                     data_embedding_func, miss_items
                 )
-                count_mismatches = [True] * len(miss_items)
             else:
                 split_embeddings = [
                     emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
@@ -584,10 +580,9 @@ def _get_chunked_embedding_by_item(
             # its storage (a torch.split view would pin the whole concatenated
             # buffer for as long as any single item stays cached).
             if len(all_miss_embedding) != len(miss_items):
-                split_embeddings, _ = _retry_individual_embeddings(
+                split_embeddings, count_mismatches = _retry_individual_embeddings(
                     data_embedding_func, miss_item_list
                 )
-                count_mismatches = [True] * len(miss_items)
             else:
                 split_embeddings = [
                     emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding

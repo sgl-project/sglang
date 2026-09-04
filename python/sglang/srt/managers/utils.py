@@ -239,6 +239,10 @@ def decode_mm_embedding_errors(
     ]
 
 
+def has_mm_embedding_failures(errors: Optional[torch.Tensor]) -> bool:
+    return errors is not None and bool(errors[:, 1].any().item())
+
+
 def complete_mm_embedding_validations(reqs: List[Req], result: torch.Tensor) -> None:
     rows = result.tolist() if result.is_cpu else result.cpu().tolist()
     for req, (validated, _failed, _expected, _actual) in zip(reqs, rows, strict=True):

@@ -13,6 +13,7 @@ from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.managers.utils import has_mm_embedding_failures
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import (
@@ -514,7 +515,9 @@ class NGRAMWorker(BaseSpecWorker):
                     accept_index=accept_index,
                 )
 
-            if on_publish is not None and mm_embedding_errors is None:
+            if on_publish is not None and not has_mm_embedding_failures(
+                mm_embedding_errors
+            ):
                 on_publish(new_seq_lens)
 
             self._update_ngram_corpus(batch)
@@ -548,7 +551,9 @@ class NGRAMWorker(BaseSpecWorker):
             accept_tokens = accept_tokens.flatten()
             next_token_ids = predict
 
-            if on_publish is not None and mm_embedding_errors is None:
+            if on_publish is not None and not has_mm_embedding_failures(
+                mm_embedding_errors
+            ):
                 on_publish(new_seq_lens)
 
         # Construct the next draft input

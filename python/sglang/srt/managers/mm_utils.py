@@ -386,6 +386,45 @@ def _scatter_mm_embedding(
     dest.index_copy_(0, rows[:num_src_rows], src)
 
 
+def _fit_mm_embedding_to_request_masks(
+    embedding: torch.Tensor,
+    mask: torch.Tensor,
+    expected_counts: List[int],
+    input_id_slices: List[Tuple[int, int]],
+    errors: List[Tuple[int, int, int]],
+) -> Tuple[torch.Tensor, List[Tuple[int, int, int]]]:
+    actual_counts = torch.stack(
+        [mask[start:end].sum() for start, end in input_id_slices]
+    ).tolist()
+    mismatched = [
+        i
+        for i, (expected, actual) in enumerate(zip(expected_counts, actual_counts))
+        if expected != actual
+    ]
+    if not mismatched:
+        return embedding, errors
+
+    chunks = list(torch.split(embedding, expected_counts, dim=0))
+    for i in mismatched:
+        chunks[i] = chunks[i][: actual_counts[i]]
+        if chunks[i].shape[0] < actual_counts[i]:
+            chunks[i] = torch.cat(
+                (
+                    chunks[i],
+                    chunks[i].new_zeros(
+                        actual_counts[i] - chunks[i].shape[0], chunks[i].shape[1]
+                    ),
+                )
+            )
+
+    errors_by_request = {req_idx: error for req_idx, *error in errors}
+    for i in mismatched:
+        errors_by_request[i] = (expected_counts[i], actual_counts[i])
+    return torch.cat(chunks, dim=0), [
+        (req_idx, *error) for req_idx, error in errors_by_request.items()
+    ]
+
+
 def embed_mm_inputs(
     mm_inputs_list: List[MultimodalInputs],
     extend_prefix_lens: List[int],
@@ -396,6 +435,7 @@ def embed_mm_inputs(
     data_embedding_func_mapping: Dict[Modality, DataEmbeddingFunc] = None,
     placeholder_tokens: dict[Modality, List[int]] = None,
     use_deepstack: Dict[Modality, bool] = {},
+    input_id_slices: Optional[List[Tuple[int, int]]] = None,
 ) -> Optional[torch.Tensor]:
     """
     Embed multimodal inputs and integrate them with text token embeddings.
@@ -414,6 +454,12 @@ def embed_mm_inputs(
     other_info = {}
     if mm_inputs_list is None:
         return None
+    if input_id_slices is None:
+        input_id_slices = []
+        start = 0
+        for length in extend_seq_lens:
+            input_id_slices.append((start, start + length))
+            start += length
 
     # 1. Calculate the multimodal data which exists in input_ids, with the help of pad_values
     # we assume that multimodal data are represented with its pad_values in input_ids
@@ -469,6 +515,31 @@ def embed_mm_inputs(
                 extend_length=extend_seq_lens,
                 items_offset_list=items_offsets,
             )
+
+            if embedding is not None and mask is not None:
+                expected_counts = [
+                    sum(
+                        max(
+                            min(item_end + 1, prefix + length)
+                            - max(item_start, prefix),
+                            0,
+                        )
+                        for item_start, item_end in offsets
+                    )
+                    for prefix, length, offsets in zip(
+                        extend_prefix_lens,
+                        extend_seq_lens,
+                        items_offsets,
+                        strict=True,
+                    )
+                ]
+                embedding, embedding_errors = _fit_mm_embedding_to_request_masks(
+                    embedding,
+                    mask,
+                    expected_counts,
+                    input_id_slices,
+                    embedding_errors,
+                )
 
             if use_deepstack.get(modality, None) and embedding is not None:
                 embedding, deepstack_embedding = (
@@ -677,6 +748,23 @@ def general_mm_embed_routine(
                 for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
                 if forward_batch.mm_inputs[i] is not None
             ]
+            mm_batch_indices = [
+                i
+                for i, mm_input in enumerate(forward_batch.mm_inputs)
+                if mm_input is not None
+            ]
+            token_starts = []
+            start = 0
+            for seq_len in forward_batch.extend_seq_lens_cpu:
+                token_starts.append(start)
+                start += seq_len
+            input_id_slices = [
+                (
+                    token_starts[i],
+                    token_starts[i] + forward_batch.extend_seq_lens_cpu[i],
+                )
+                for i in mm_batch_indices
+            ]
             server_args = get_server_args()
             # Makes VLM profiles directly attributable: this range includes
             # encoder/ViT execution and multimodal feature placement, while
@@ -707,6 +795,7 @@ def general_mm_embed_routine(
                         data_embedding_func_mapping=data_embedding_funcs,
                         placeholder_tokens=placeholder_tokens,
                         use_deepstack=use_deepstack,
+                        input_id_slices=input_id_slices,
                     )
 
             # add for qwen3_vl deepstack
@@ -741,11 +830,6 @@ def general_mm_embed_routine(
                                             "cpu", non_blocking=True
                                         )
                                     )
-            mm_batch_indices = [
-                i
-                for i, mm_input in enumerate(forward_batch.mm_inputs)
-                if mm_input is not None
-            ]
             forward_batch.mm_embedding_errors = [
                 (mm_batch_indices[req_idx], expected, actual)
                 for req_idx, expected, actual in other_info.get(
