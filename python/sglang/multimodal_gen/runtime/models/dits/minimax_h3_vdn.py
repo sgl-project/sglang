@@ -37,6 +37,11 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.diffusion import (
+    can_use_vdn_frame_stats_prep,
+    can_use_vdn_gather_linear_state,
+    can_use_vdn_linear_epilogue,
+    can_use_vdn_silu_l2norm,
+    can_use_vdn_temporal_conv_act,
     vdn_frame_stats_prep,
     vdn_gather_linear_state,
     vdn_linear_epilogue,
@@ -423,7 +428,7 @@ def linear_features(
     [F, H, S, d] instead (the readout's bmm layout), written by the fused
     kernels directly; the eager path permutes."""
     l2norm = proj != "v"
-    fused = tokens.is_cuda and _use_fused_kernels()
+    fused = _use_fused_kernels()
     heads_n, head_dim = tokens.shape[-2], tokens.shape[-1]
     if frame_major and (num_frames is None or frame_size is None):
         raise ValueError("frame_major needs the (frames, height, width) grid")
@@ -431,13 +436,13 @@ def linear_features(
         if frame_size is None or num_frames is None:
             raise ValueError("the short conv needs the (frames, height, width) grid")
         x, w_tm = conv.spatial(proj, tokens, num_frames, frame_size, heads=heads)
-        if fused:
+        if fused and can_use_vdn_temporal_conv_act(x, heads_n, head_dim):
             # one kernel: 5 taps + SiLU + L2 norm, the conv output never hits HBM
             return vdn_temporal_conv_act(
                 x, w_tm, heads_n, head_dim, l2norm, frame_major=frame_major
             )
         out = _activate(_temporal_shift(x, w_tm).reshape(-1, heads_n, head_dim), l2norm)
-    elif fused:
+    elif fused and can_use_vdn_silu_l2norm(tokens):
         per_frame = frame_size[0] * frame_size[1] if frame_major else None
         return vdn_silu_l2norm(tokens, l2norm, per_frame=per_frame)
     else:
@@ -741,7 +746,7 @@ def gather_linear_state(
         has_after,
         frames,
     ) = _gather_indices(tuple(bounds), num_frames, str(prefix.device))
-    if prefix.is_cuda and _use_fused_kernels():
+    if _use_fused_kernels() and can_use_vdn_gather_linear_state(prefix):
         return vdn_gather_linear_state(
             prefix,
             suffix,
@@ -1023,10 +1028,10 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         value_by_frame = value.view(shape).permute(0, 2, 1, 3)
         beta_by_frame = beta.view(num_frames, per_frame, n_heads).permute(0, 2, 1)
         # 2. per-frame statistics
-        fused = q_raw.is_cuda and _use_fused_kernels()
+        fused = _use_fused_kernels()
         prepared = (
             vdn_frame_stats_prep(key, value, beta, num_frames, per_frame)
-            if fused and self.hybrid.a_fp32
+            if fused and self.hybrid.a_fp32 and can_use_vdn_frame_stats_prep(key, value)
             else None
         )
         A, B = frame_statistics(
@@ -1063,7 +1068,7 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         del prefix, suffix
         # 5. readout
         readout = torch.matmul(query_by_frame, linear_state.transpose(-1, -2))
-        if fused:
+        if fused and can_use_vdn_linear_epilogue(readout):
             return vdn_linear_epilogue(readout, self.norm.weight, gate, self.norm.eps)
         return linear_epilogue(readout, self.norm.weight, gate, self.norm.eps)
 

@@ -139,6 +139,7 @@ tensor copy per residual site.
 |---|---|---|
 | `fused_inplace_qknorm_rope` | JIT CUDA | one bf16 rounding step vs split baseline; `round_norm_before_rope=True` makes it exact; supports compact and full-width NeoX/interleaved caches |
 | `fused_qknorm_rope_pack_kv` | JIT CUDA | as above, also packs prefix K/V |
+| `fused_qknorm_rope_out_of_place` | JIT CUDA | as above, bit-equal to the in-place kernel; reads strided q/k and writes contiguous copies, inputs untouched (VDN-H3 keeps the raw q/k for its linear branch) |
 | `try_fused_flux2_qkv_epilogue` | JIT CUDA | bit-exact vs the selected BF16 chain | FLUX.2 QK RMSNorm + RoPE + joint QKV packing |
 | `try_fused_qwen_qkv_epilogue` | JIT CUDA | bit-exact vs the selected BF16 chain | Qwen-Image QK RMSNorm + RoPE + joint QKV writes; SM100+ |
 | `fused_rope_rotate_half_bitexact` | Triton | bit-exact (elementwise only) |
@@ -148,6 +149,14 @@ tensor copy per residual site.
 | `fused_ltx25_decoder_rope` | JIT CUDA | bit-exact paired 3D RoPE from cached compact axis tables |
 | `apply_rotary_embedding` | Triton (+fallbacks) | close; the generic entry point |
 | `hunyuan_qkv_rope_pack` | Triton | bit-exact; packs QKV and applies RoPE in one pass |
+
+### MiniMax-H3 / VDN-H3 linear branch
+
+| Entry point | Backend | Contract |
+|---|---|---|
+| `vdn_frame_stats_prep`, `vdn_gather_linear_state` | Triton | bit-exact (same products, fp32 gather) |
+| `vdn_temporal_conv_act`, `vdn_silu_l2norm`, `vdn_linear_epilogue` | Triton | one rounding at the store, within one bf16 ulp of the eager chain; the model's own inference kernels, mounted unconditionally by the VDN-H3 branch |
+| `silu_mul_per_tensor_fp8` | Triton | bit-exact SwiGLU + per-tensor fp8 absmax/quant; fp8 producer for the `fp8_per_tensor` path |
 
 ### Data movement and quantized layout producers
 

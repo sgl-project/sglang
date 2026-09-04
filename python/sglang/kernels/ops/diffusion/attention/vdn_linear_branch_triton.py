@@ -11,14 +11,20 @@ times); these kernels read each operand once and round once at the store.
     vdn_silu_l2norm         SiLU [+ L2 norm] over head_dim, strided input ok
     vdn_frame_stats_prep    the four GEMM operands of the frame statistics
                             (kf16, kf32, kf32 * beta, v * beta) in [F, H, S, d]
-                            off one read of k and one of v -- bitwise equal
-                            to the eager chain (widening casts, same products)
+                            off one read of k and one of v
+    vdn_gather_linear_state the alpha-bridged boundary gather over the fp32
+                            state banks
     vdn_linear_epilogue     RMSNorm(d) * gate with the [F, H, S, d] -> [F*S, H*d]
                             transpose folded into the store
 
-Inference-only: they are not bitwise against the eager bf16 chains (one
-rounding instead of one per op; about one bf16 ulp, closer to fp32), which is
-the same contract OpenVDN documents for its inference kernels.
+Numerical contract: vdn_frame_stats_prep and vdn_gather_linear_state are
+bitwise equal to the eager chains (widening casts, same products, fp32
+gather). The three activation kernels round once instead of once per op and
+sit within one bf16 ulp of the eager bf16 chains; they are the model's own
+inference kernels (OpenVDN ships the same contract), so the VDN-H3 branch
+mounts them unconditionally. Verified against the eager chains at the unit
+shapes in test/registered/kernels/ops/diffusion/test_vdn_linear_branch.py and
+at the paper workload on 8x B200 (head_dim 128, 1008 tokens per frame).
 """
 
 from __future__ import annotations
@@ -36,6 +42,68 @@ def _check_head_dim(head_dim: int) -> None:
         raise ValueError(
             f"head_dim must be a power of two >= 16 (tl.arange), got {head_dim}"
         )
+
+
+def _cuda_bf16_rows(t: torch.Tensor) -> bool:
+    return t.is_cuda and t.dtype == torch.bfloat16 and t.stride(-1) == 1
+
+
+def _pow2_head_dim(head_dim: int) -> bool:
+    return head_dim >= 16 and head_dim & (head_dim - 1) == 0
+
+
+def can_use_vdn_temporal_conv_act(x: torch.Tensor, heads: int, head_dim: int) -> bool:
+    """x [T, S, heads * head_dim] bf16 on CUDA, power-of-two head_dim."""
+    return (
+        _cuda_bf16_rows(x)
+        and x.ndim == 3
+        and x.shape[-1] == heads * head_dim
+        and _pow2_head_dim(head_dim)
+        and not torch.compiler.is_compiling()
+    )
+
+
+def can_use_vdn_silu_l2norm(tokens: torch.Tensor) -> bool:
+    """tokens [N, H, d] bf16 on CUDA (any row/head strides), power-of-two d."""
+    return (
+        _cuda_bf16_rows(tokens)
+        and tokens.ndim == 3
+        and _pow2_head_dim(tokens.shape[-1])
+        and not torch.compiler.is_compiling()
+    )
+
+
+def can_use_vdn_frame_stats_prep(key: torch.Tensor, value: torch.Tensor) -> bool:
+    """key/value [F * S, H, d] bf16 on CUDA with matching shapes."""
+    return (
+        _cuda_bf16_rows(key)
+        and _cuda_bf16_rows(value)
+        and key.ndim == 3
+        and key.shape == value.shape
+        and _pow2_head_dim(key.shape[-1])
+        and not torch.compiler.is_compiling()
+    )
+
+
+def can_use_vdn_gather_linear_state(prefix: torch.Tensor) -> bool:
+    """prefix/suffix [F, H, dv, dk] fp32 on CUDA, power-of-two dk."""
+    return (
+        prefix.is_cuda
+        and prefix.dtype == torch.float32
+        and prefix.ndim == 4
+        and _pow2_head_dim(prefix.shape[-1])
+        and not torch.compiler.is_compiling()
+    )
+
+
+def can_use_vdn_linear_epilogue(readout: torch.Tensor) -> bool:
+    """readout [F, H, S, d] bf16 on CUDA, power-of-two d."""
+    return (
+        _cuda_bf16_rows(readout)
+        and readout.ndim == 4
+        and _pow2_head_dim(readout.shape[-1])
+        and not torch.compiler.is_compiling()
+    )
 
 
 # --------------------------------------------------------------------------
@@ -484,6 +552,11 @@ def vdn_gather_linear_state(
 
 
 __all__ = [
+    "can_use_vdn_frame_stats_prep",
+    "can_use_vdn_gather_linear_state",
+    "can_use_vdn_linear_epilogue",
+    "can_use_vdn_silu_l2norm",
+    "can_use_vdn_temporal_conv_act",
     "vdn_frame_stats_prep",
     "vdn_gather_linear_state",
     "vdn_linear_epilogue",
