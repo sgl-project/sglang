@@ -132,7 +132,6 @@ QUANTIZATION_CHOICES = [
     "fp8",  # MOE + linear online quantization.
     "mxfp8",  # MOE + linear online quantization.
     "gptq",
-    "marlin",
     "gptq_marlin",
     "awq_marlin",
     "bitsandbytes",
@@ -2820,6 +2819,23 @@ class ServerArgs:
         "Maximum storage prefetch retries per request when --hicache-storage-prefetch-retry-poll-interval is set.",
         NS("memory"),
     ] = 4
+
+    # -------------------------------------------------------------------------
+    # Unified Radix Cache
+    # -------------------------------------------------------------------------
+    enable_unified_cache_external_linker: A[
+        bool,
+        "Link UnifiedRadixCache directly to an external KV store (direct L3), with no host cache tier.",
+        NS("memory"),
+    ] = False
+    unified_cache_external_linker_backend: A[
+        str,
+        Arg(
+            help="Storage backend for --enable-unified-cache-external-linker.",
+            choices=["mooncake"],
+        ),
+        NS("memory"),
+    ] = "mooncake"
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
