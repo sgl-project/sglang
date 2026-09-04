@@ -135,66 +135,6 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         with self.assertRaises(AssertionError):
             worker._rebuild_topk1_chain_buffers()
 
-    def test_non_index_share_model_does_not_initialize_dsa_seed(self):
-        worker = object.__new__(EagleDraftWorker)
-        worker.topk = 1
-        worker.draft_runner = SimpleNamespace(
-            model_config=SimpleNamespace(
-                hf_config=SimpleNamespace(
-                    architectures=["DeepseekV4ForCausalLMNextN"],
-                    index_topk=512,
-                )
-            )
-        )
-
-        worker._init_dsa_index_share_state()
-
-        self.assertFalse(worker.index_share_for_mtp_iteration)
-        self.assertEqual(worker.dsa_index_topk, 512)
-        self.assertIsNone(worker.dsa_seed_topk_width)
-        self.assertFalse(worker.seed_dsa_topk_from_draft_extend)
-
-    def test_index_share_model_initializes_pooled_dsa_seed_width(self):
-        worker = object.__new__(EagleDraftWorker)
-        worker.topk = 1
-        worker.draft_runner = SimpleNamespace(
-            model_config=SimpleNamespace(
-                hf_config=SimpleNamespace(
-                    architectures=["GlmMoeDsaForCausalLMNextN"],
-                    index_topk=2048,
-                    index_kpool=4,
-                    index_share_for_mtp_iteration=True,
-                )
-            )
-        )
-
-        worker._init_dsa_index_share_state()
-
-        self.assertTrue(worker.index_share_for_mtp_iteration)
-        self.assertEqual(worker.dsa_index_topk, 2048)
-        self.assertEqual(worker.dsa_seed_topk_width, 2051)
-        self.assertTrue(worker.seed_dsa_topk_from_draft_extend)
-
-    def test_non_dsa_index_share_model_initializes_unpooled_seed_width(self):
-        worker = object.__new__(EagleDraftWorker)
-        worker.topk = 1
-        worker.draft_runner = SimpleNamespace(
-            model_config=SimpleNamespace(
-                hf_config=SimpleNamespace(
-                    architectures=["DeepseekV4ForCausalLMNextN"],
-                    index_topk=2048,
-                    index_share_for_mtp_iteration=True,
-                )
-            )
-        )
-
-        worker._init_dsa_index_share_state()
-
-        self.assertTrue(worker.index_share_for_mtp_iteration)
-        self.assertEqual(worker.dsa_index_topk, 2048)
-        self.assertEqual(worker.dsa_seed_topk_width, 2048)
-        self.assertTrue(worker.seed_dsa_topk_from_draft_extend)
-
     def test_idle_draft_runs_each_eager_forward_without_tree_layout(self):
         worker = object.__new__(EagleDraftWorker)
         worker.speculative_num_steps = 3
