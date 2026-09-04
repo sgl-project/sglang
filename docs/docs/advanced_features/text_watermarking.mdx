@@ -39,8 +39,9 @@ python -m sglang.launch_server \
   A value passed with `--watermark-key` is visible in the process command line,
   including `/proc/*/cmdline` on Linux. Use `--watermark-config` for production
   secrets. SGLang redacts both fields from startup logs, request logs, and server
-  information responses, but you must still protect the file and the transport
-  used by clients that send per-request keys.
+  information responses and removes watermark secrets from crash dumps, but you
+  must still protect the file and the transport used by clients that send
+  per-request keys.
 </Warning>
 
 The server arguments are:
@@ -50,7 +51,7 @@ The server arguments are:
 | `--enable-watermark` | disabled | Enables watermark state and accepts per-request watermark configuration. |
 | `--watermark-config PATH` | unset | Loads a JSON object containing exactly `key` and `context_window`. |
 | `--watermark-key HEX` | unset | Sets the default 64-bit key from 1 to 16 hexadecimal digits. Prefer the file option. |
-| `--watermark-context-window N` | `4` | Sets the default and the maximum window that a request may select. |
+| `--watermark-context-window N` | `4` | Sets the default and the maximum window that a request may select, from 1 to 64 tokens. |
 
 `--watermark-config` and `--watermark-key` are mutually exclusive. When a
 configuration file is used, its `context_window` takes precedence over
@@ -84,6 +85,10 @@ The key must contain 1 to 16 hexadecimal digits, with an optional `0x` prefix.
 Invalid keys, requests sent to a server without `--enable-watermark`, and
 windows above the server maximum return HTTP 400.
 
+Request-level keys are credentials carried in the request body. Use an
+authenticated TLS endpoint whenever they cross a host boundary, and avoid
+recording request bodies in proxies or application logs.
+
 ## How generation works
 
 At each non-greedy sampling step, SGLang first applies the ordinary temperature,
@@ -109,9 +114,9 @@ IDs that preceded the completion. All integer arithmetic below wraps to
 unsigned 32 bits.
 
 1. For each generated token at position `t`, take up to `h=context_window`
-   preceding token IDs from the concatenated prompt and completion. Skip an
-   empty context and skip any exact context tuple already scored in this
-   completion.
+   preceding token IDs from the concatenated prompt and completion. With an
+   empty prompt, begin at completion position `h`. Otherwise, skip an empty
+   context and skip any exact context tuple already scored in this completion.
 2. Compute the context hash by starting with `state=0` and applying the
    MurmurHash3 x86 32-bit body mix to each token ID. Finalize
    `state XOR (4 * context_length)` with `fmix32`.
@@ -157,8 +162,13 @@ their own traffic.
 | NGRAM speculative decoding | Supported |
 | EAGLE and EAGLE3 speculative decoding | Supported |
 | NEXTN speculative decoding | Supported through the EAGLE verification path |
+| Other speculative algorithms | Not supported |
 | Speculative rejection sampling | Not supported |
 | Custom logit processors | Not supported together with watermarking |
+| Beam search | Not supported for watermarked requests |
+| Diffusion LLM | Not supported |
+| PD disaggregation | Not supported |
+| Embedded Rust API server | Not supported |
 | Non-CUDA devices | Not supported |
 
 Speculative verification forces a clone of the target logits so log-probability

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import dataclasses
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import msgspec
@@ -17,6 +19,34 @@ _UINT32_SCALE = float(1 << 32)
 
 
 def redact_watermark_secrets(value: Any, *, in_watermark_config: bool = False) -> Any:
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        result = copy.copy(value)
+        for field in dataclasses.fields(value):
+            item = getattr(value, field.name)
+            if field.name in {"watermark_key", "watermark_config"}:
+                object.__setattr__(
+                    result,
+                    field.name,
+                    "<redacted>" if item is not None else None,
+                )
+            elif field.name in {
+                "watermark",
+                "sampling_params",
+                "preferred_sampling_params",
+            }:
+                object.__setattr__(
+                    result,
+                    field.name,
+                    redact_watermark_secrets(
+                        item, in_watermark_config=field.name == "watermark"
+                    ),
+                )
+        return result
+    if isinstance(value, WatermarkRequestConfig):
+        return WatermarkRequestConfig(
+            key="<redacted>" if value.key is not None else None,
+            context_window=value.context_window,
+        )
     if isinstance(value, dict):
         return {
             key: (
@@ -30,12 +60,36 @@ def redact_watermark_secrets(value: Any, *, in_watermark_config: bool = False) -
             )
             for key, item in value.items()
         }
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list):
         return [
             redact_watermark_secrets(item, in_watermark_config=in_watermark_config)
             for item in value
         ]
+    if isinstance(value, tuple):
+        return tuple(
+            redact_watermark_secrets(item, in_watermark_config=in_watermark_config)
+            for item in value
+        )
     return value
+
+
+def redact_watermark_command_line(argv: Sequence[str]) -> str:
+    result = []
+    redact_next = False
+    for argument in argv:
+        if redact_next:
+            result.append("<redacted>")
+            redact_next = False
+        elif argument in {"--watermark-key", "--watermark-config"}:
+            result.append(argument)
+            redact_next = True
+        elif argument.startswith("--watermark-key="):
+            result.append("--watermark-key=<redacted>")
+        elif argument.startswith("--watermark-config="):
+            result.append("--watermark-config=<redacted>")
+        else:
+            result.append(argument)
+    return " ".join(result)
 
 
 class WatermarkRequestConfig(msgspec.Struct, frozen=True, kw_only=True):
@@ -58,9 +112,9 @@ def normalize_watermark_request(value: Any) -> Optional[WatermarkRequestConfig]:
     else:
         if not isinstance(value, dict):
             raise ValueError("watermark must be an object")
-        unknown = sorted(set(value) - {"key", "context_window"})
+        unknown = set(value) - {"key", "context_window"}
         if unknown:
-            raise ValueError(f"watermark contains unknown fields: {unknown!r}")
+            raise ValueError("watermark contains unknown fields")
         key = value.get("key")
         context_window = value.get("context_window")
     if key is not None:
@@ -123,6 +177,28 @@ def _fmix32(value: torch.Tensor) -> torch.Tensor:
     value = value ^ (value >> 13)
     value = (value * 0xC2B2AE35) & _MASK32
     return value ^ (value >> 16)
+
+
+def _hash_context_token_ids(token_ids: Sequence[int]) -> int:
+    state = 0
+    for token_id in token_ids:
+        value = (int(token_id) * 0xCC9E2D51) & _MASK32
+        value = ((value << 15) | (value >> 17)) & _MASK32
+        value = (value * 0x1B873593) & _MASK32
+        state ^= value
+        state = ((state << 13) | (state >> 19)) & _MASK32
+        state = (state * 5 + 0xE6546B64) & _MASK32
+    state ^= len(token_ids) * 4
+    state ^= state >> 16
+    state = (state * 0x85EBCA6B) & _MASK32
+    state ^= state >> 13
+    state = (state * 0xC2B2AE35) & _MASK32
+    state ^= state >> 16
+    return state
+
+
+def _as_signed_int32(value: int) -> int:
+    return value if value < (1 << 31) else value - (1 << 32)
 
 
 def _hash_contexts(
@@ -334,10 +410,57 @@ class WatermarkState:
             tails.append(list(req.get_fill_ids()[-self.context_window :]))
         return tails
 
+    def retracted_context_hashes(
+        self, batch: ScheduleBatch
+    ) -> Optional[list[Optional[list[int]]]]:
+        if not batch.forward_mode.is_extend_without_speculative():
+            return None
+
+        histories: list[Optional[list[int]]] = []
+        has_retracted_request = False
+        for req in batch.reqs:
+            if not req.retracted_stain:
+                histories.append(None)
+                continue
+
+            has_retracted_request = True
+            request_config = req.sampling_params.watermark
+            request_key = (
+                request_config.key
+                if request_config is not None and request_config.key is not None
+                else self.default_key
+            )
+            if request_key is None or req.sampling_params.top_k <= 1:
+                histories.append([])
+                continue
+
+            context_window = (
+                request_config.context_window
+                if request_config is not None
+                and request_config.context_window is not None
+                else self.context_window
+            )
+            token_ids = list(req.origin_input_ids) + list(req.output_ids)
+            seen = set()
+            history = []
+            for position in range(len(req.origin_input_ids), len(token_ids)):
+                context = token_ids[max(0, position - context_window) : position]
+                if not context:
+                    continue
+                context_hash = _hash_context_token_ids(context)
+                if context_hash in seen:
+                    continue
+                seen.add(context_hash)
+                history.append(_as_signed_int32(context_hash))
+            histories.append(history)
+
+        return histories if has_retracted_request else None
+
     def init_from_prompt(
         self,
         req_pool_indices: torch.Tensor,
         prompt_tail_ids: Optional[Sequence[Optional[Sequence[int]]]],
+        context_hash_history: Optional[Sequence[Optional[Sequence[int]]]] = None,
     ) -> None:
         if prompt_tail_ids is None:
             return
@@ -374,6 +497,21 @@ class WatermarkState:
             lengths.to(torch.int64) % self.context_window
         )
         self.num_watermarked_contexts[pool_indices] = 0
+        if context_hash_history is None:
+            return
+        assert len(context_hash_history) == req_pool_indices.shape[0]
+        for batch_position, pool_index in zip(
+            valid_positions, pool_indices.tolist(), strict=True
+        ):
+            history = context_hash_history[batch_position]
+            if history is None:
+                continue
+            history = list(history)[: self.watermarked_context_hashes.shape[1]]
+            if history:
+                self.watermarked_context_hashes[pool_index, : len(history)] = (
+                    torch.tensor(history, dtype=torch.int32, device=device)
+                )
+            self.num_watermarked_contexts[pool_index] = len(history)
 
     def contexts_tail(
         self,
