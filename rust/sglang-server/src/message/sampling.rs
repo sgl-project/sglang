@@ -633,13 +633,17 @@ impl SamplingParams {
                 "Only one of json_schema, regex, ebnf, or structural_tag can be set".into(),
             ));
         }
-        // Not a Python restriction: the rust from_scheduler maps one rid to one response,
-        // so parallel sampling would drop all but the first sample. This is the
-        // only place it is rejected — `n` lives in `sampling_params`, where
-        // Python reads it, and the `/generate` body has no `n` of its own.
+        // INTERNAL INVARIANT, not a client-facing limit. Parallel sampling is a
+        // frontend fan-out: `GenerateBody::into_requests` reads `n`, validates it,
+        // and sets it to 1 on the base request; `expand_parallel_samples` then
+        // makes that many siblings. The scheduler never reads `n` (neither does
+        // Python's), and the response path maps one rid to one response — so a
+        // request that reached here still claiming n samples skipped the fan-out
+        // and would silently get one. Fail loudly instead.
         if self.n != 1 {
             return Err(bad(format!(
-                "n must be 1 (parallel sampling is not supported), got {}",
+                "internal: sampling_params.n must be 1 by the time params are \
+                 normalized (parallel sampling expands before this point), got {}",
                 self.n
             )));
         }
@@ -925,7 +929,7 @@ mod tests {
             (r#"{"temperature": -0.1}"#, "temperature"),
             (r#"{"max_new_tokens": -1}"#, "max_new_tokens"),
             (r#"{"regex": "a", "ebnf": "b"}"#, "Only one of"),
-            (r#"{"n": 2}"#, "n must be 1"),
+            (r#"{"n": 2}"#, "sampling_params.n must be 1"),
             (r#"{"beam_width": 2}"#, "beam_width must be 1"),
             (r#"{"beam_width": 0}"#, "beam_width must be at least 1"),
         ] {

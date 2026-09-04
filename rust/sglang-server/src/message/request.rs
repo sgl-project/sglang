@@ -12,7 +12,7 @@ use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
 use super::response::ResponseSink;
 use super::sampling::{SamplingParams, SamplingParamsInput};
 use super::types::{OneOrMany, OneOrManyItem, TokenIds};
-use crate::message::ids::Rid;
+use crate::message::ids::{Rid, UNIQ_SUFFIX_LEN};
 use crate::utils::fsm::RequestState;
 use crate::utils::{environ::env_i64, error::Error};
 
@@ -127,7 +127,7 @@ impl GenerateBody {
     /// `GenerateReqInput.normalize_batch_and_arguments`; an invalid/inconsistent
     /// batch is [`Error::Validation`], which the handler surfaces with the
     /// variant's own status (400).
-    pub fn into_requests(self) -> Result<(Vec<GenerateRequest>, bool), Error> {
+    pub fn into_requests(self) -> Result<(Vec<GenerateRequest>, bool, usize), Error> {
         let GenerateBody {
             rid,
             text,
@@ -170,6 +170,47 @@ impl GenerateBody {
                 "batch size {declared_n} exceeds the maximum of {}",
                 *MAX_BATCH_REQS_PER_HTTP_REQ
             )));
+        }
+
+        // Parallel sampling (`sampling_params.n`). Read and bounded HERE, before a
+        // single column is allocated, for the same reason `declared_n` is: the
+        // columns below are `vec![_; n]`, so a body that will be rejected must be
+        // rejected first.
+        //
+        // `n` is `i64` on the wire, so it can arrive negative or astronomically
+        // large. `as usize` would turn `-1` into `usize::MAX` and slip past every
+        // bound below, and a plain `declared_n * num_samples` would wrap in release
+        // builds — hence the explicit `try_from` + `checked_mul`. Same shape as
+        // `api_server::openai::completions`, which already caps `prompts * n`.
+        let common_n: i64 = match &sampling_params {
+            None => 1,
+            Some(SamplingParamsInput::One(sp)) => sp.n,
+            Some(SamplingParamsInput::Many(v)) => {
+                // Python `_handle_parallel_sampling` requires one `n` for the batch.
+                let first = v.first().map_or(1, |sp| sp.n);
+                if v.iter().any(|sp| sp.n != first) {
+                    return Err(Error::Validation(
+                        "the same n is required for all entries of sampling_params".into(),
+                    ));
+                }
+                first
+            }
+        };
+        if common_n < 1 {
+            return Err(Error::Validation(format!(
+                "n must be at least 1, got {common_n}"
+            )));
+        }
+        let num_samples = usize::try_from(common_n)
+            .map_err(|_| Error::Validation(format!("n is too large: {common_n}")))?;
+        match declared_n.checked_mul(num_samples) {
+            Some(total) if total <= *MAX_BATCH_REQS_PER_HTTP_REQ => {}
+            _ => {
+                return Err(Error::Validation(format!(
+                    "prompt count times n exceeds the maximum of {}",
+                    *MAX_BATCH_REQS_PER_HTTP_REQ
+                )));
+            }
         }
 
         // Per-item (text, input_ids) columns + whether the input used list form.
@@ -219,7 +260,7 @@ impl GenerateBody {
         }
 
         // A list is per-item; a single object broadcasts to every item.
-        let sps: Vec<SamplingParams> = match sampling_params {
+        let mut sps: Vec<SamplingParams> = match sampling_params {
             None => vec![SamplingParams::default(); n],
             Some(SamplingParamsInput::Many(v)) => {
                 if v.len() != n {
@@ -255,6 +296,14 @@ impl GenerateBody {
                 vec![*sp; n]
             }
         };
+        // The base requests carry `n = 1`: parallel sampling is a frontend fan-out
+        // (`expand_parallel_samples`), and the scheduler never reads `n` — Python's
+        // does not either. `SamplingParams::verify` keeps rejecting anything else as
+        // an internal invariant, so a request that skipped the fan-out cannot reach
+        // the ring silently claiming n samples and get one.
+        for sp in &mut sps {
+            sp.n = 1;
+        }
 
         // rid: absent → mint one uuid per item here, so every request carries its
         // final rid from this point on; a single string fans out as `{rid}_{i}`
@@ -434,7 +483,7 @@ impl GenerateBody {
                 .filter_map(|v| v.as_str().map(str::to_owned))
                 .collect();
         }
-        Ok((requests, is_batch))
+        Ok((requests, is_batch, num_samples))
     }
 }
 
@@ -660,7 +709,13 @@ pub struct GenerateRequest {
 ///
 /// Constructed directly only by tests: `api_server::prefetch` fills its
 /// `prefetched` field, everything else gets it packed inside a `GenerateRequest`.
-#[derive(Debug, Default)]
+///
+/// `Clone` is a DEEP copy, and parallel sampling depends on that: `take_mm_work`
+/// MOVES these fields out of the request, so two siblings sharing one `MmData`
+/// would leave whichever reached `Encoding` second with nothing. `prefetched`'s
+/// `Bytes` are refcounted handles to immutable buffers, so sharing those is safe
+/// and the media is not duplicated — only the handle array is.
+#[derive(Debug, Default, Clone)]
 pub struct MmData {
     pub image_data: Option<rmpv::Value>,
     pub video_data: Option<rmpv::Value>,
@@ -675,6 +730,43 @@ pub struct MmData {
 }
 
 impl GenerateRequest {
+    /// One parallel-sampling sibling of `self`: same prompt, same params, its own
+    /// `rid`.
+    ///
+    /// Written out rather than `#[derive(Clone)]` on `GenerateRequest`: every
+    /// stage below MOVES its request (`take_mm_work` empties the mm fields, the
+    /// `izip!` fan-out consumes each column by value), so the one deep copy in the
+    /// pipeline should be visible at the call site instead of available anywhere.
+    ///
+    /// `sampling_params.n` is already 1 — `into_requests` set it on the base — so
+    /// this does not touch it. `bootstrap_room` is copied VERBATIM, deliberately:
+    /// see `expand_parallel_samples`.
+    fn fork(&self, rid: Rid) -> Self {
+        Self {
+            rid,
+            text: self.text.clone(),
+            input_ids: self.input_ids.clone(),
+            skip_special_tokens: self.skip_special_tokens,
+            sampling_params: self.sampling_params.clone(),
+            stream: self.stream,
+            return_logprob: self.return_logprob,
+            logprob_start_len: self.logprob_start_len,
+            top_logprobs_num: self.top_logprobs_num,
+            token_ids_logprob: self.token_ids_logprob.clone(),
+            return_sampling_mask: self.return_sampling_mask,
+            return_hidden_states: self.return_hidden_states,
+            return_text_in_logprobs: self.return_text_in_logprobs,
+            bootstrap_host: self.bootstrap_host.clone(),
+            bootstrap_port: self.bootstrap_port,
+            bootstrap_room: self.bootstrap_room,
+            bootstrap_pair_key: self.bootstrap_pair_key.clone(),
+            decode_tp_size: self.decode_tp_size,
+            routed_dp_rank: self.routed_dp_rank,
+            disagg_prefill_dp_rank: self.disagg_prefill_dp_rank,
+            mm: self.mm.clone(),
+        }
+    }
+
     /// True when the client already supplied token ids → skip tokenization.
     pub fn already_tokenized(&self) -> bool {
         self.input_ids.as_ref().is_some_and(|v| !v.is_empty())
@@ -783,6 +875,118 @@ fn flatten_column<T>(column: Vec<Option<Option<T>>>) -> Vec<Option<T>> {
     column.into_iter().map(Option::flatten).collect()
 }
 
+/// Expand each base request into `n` parallel-sampling siblings, prompt-major
+/// (`p0s0, p0s1, …, p1s0, …`) so the response array matches Python's
+/// `_handle_batch_request` ordering and the OpenAI adapters' `prompt_index * n +
+/// sample_index`.
+///
+/// Called from the HTTP handler AFTER `prefetch_all`, never from
+/// [`GenerateBody::into_requests`]: prefetch resolves media per request, so
+/// expanding first would download the same URL `n` times.
+///
+/// `bootstrap_room` is carried over UNCHANGED. It looks like each sibling needs a
+/// distinct room (it is the P↔D pairing key), but Python gives all `n` samples of
+/// one prompt the same room — `_normalize_bootstrap_params` computes
+/// `batch_size * n` rooms and then `_handle_batch_request` only ever reads the
+/// first `batch_size` of them. Diverging here would break drop-in parity;
+/// copying it is only sound because the caller rejects `n > 1` under PD.
+///
+/// Only [`expand_parallel_samples`] is exported, not [`GenerateRequest::fork`]:
+/// a bare `fork` invites forgetting the fresh rid, and two live requests sharing
+/// an rid would collide on the detok table.
+pub(crate) fn expand_parallel_samples(
+    base: Vec<GenerateRequest>,
+    n: usize,
+) -> Vec<GenerateRequest> {
+    if n <= 1 {
+        return base;
+    }
+    let mut out = Vec::with_capacity(base.len().saturating_mul(n));
+    for req in base {
+        // The last sibling consumes `req` instead of cloning it, so an `n`-way
+        // expansion performs `n - 1` deep copies rather than `n`.
+        for s in 0..n - 1 {
+            let rid = Rid::from_client(&format!("{}_{s}", req.rid.client_facing()));
+            out.push(req.fork(rid));
+        }
+        let rid = Rid::from_client(&format!("{}_{}", req.rid.client_facing(), n - 1));
+        out.push(GenerateRequest { rid, ..req });
+    }
+    out
+}
+
+/// Bytes one request would cost to clone, counting every variable-length field
+/// [`GenerateRequest::fork`] copies or regenerates.
+///
+/// Missing a field here is a hole, not an inaccuracy: a tiny prompt with a huge
+/// `token_ids_logprob` (or a very long rid) sails past both the request-count cap
+/// and any prompt-size intuition.
+///
+/// Container overhead counts. `impl HeapBytes for String` returns only `len()`,
+/// so summing it over a `Vec<String>` scores a million empty strings as zero —
+/// while the handle array alone is ~24 MB. This mirrors what
+/// `impl HeapBytes for rmpv::Value` already does for arrays (`NODE + ..` per
+/// element).
+fn clone_bytes(req: &GenerateRequest, sample_index_digits: usize) -> usize {
+    // Each sibling mints `{client_rid}_{i}` and `Rid::from_client` appends a
+    // fixed-width uniquifier, so the rid is rebuilt per sibling, not shared.
+    let rid = req
+        .rid
+        .client_facing()
+        .len()
+        .saturating_add(1 + sample_index_digits + UNIQ_SUFFIX_LEN);
+    // Serialized-JSON × measured heap factor is how the broadcast path already
+    // sizes `SamplingParams`; it is the only estimator that reaches
+    // `custom_params` (a `serde_json::Value`, which `HeapBytes` does not cover).
+    let sampling = serde_json::to_string(&req.sampling_params)
+        .map_or(0, |s| s.len())
+        .saturating_mul(JSON_TO_HEAP_FACTOR);
+    let mm = req.mm.as_deref().map_or(0, |m| {
+        m.image_data
+            .heap_bytes()
+            .saturating_add(m.video_data.heap_bytes())
+            .saturating_add(m.audio_data.heap_bytes())
+            // Handles only: the `Bytes` payloads are refcounted, so the media
+            // itself is shared rather than duplicated.
+            .saturating_add(m.prefetched.len().saturating_mul(size_of::<Bytes>()))
+            .saturating_add(vec_string_bytes(&m.mm_hashes))
+    });
+    rid.saturating_add(req.text.heap_bytes())
+        .saturating_add(req.input_ids.heap_bytes())
+        .saturating_add(req.token_ids_logprob.heap_bytes())
+        .saturating_add(sampling)
+        .saturating_add(req.bootstrap_host.heap_bytes())
+        .saturating_add(req.bootstrap_pair_key.heap_bytes())
+        .saturating_add(mm)
+}
+
+/// `Vec<String>`: the handle array plus the contents (see [`clone_bytes`]).
+fn vec_string_bytes(v: &[String]) -> usize {
+    v.len()
+        .saturating_mul(size_of::<String>())
+        .saturating_add(v.iter().map(String::len).sum::<usize>())
+}
+
+/// Reject a parallel-sampling expansion whose clones would exceed
+/// [`MAX_BROADCAST_CLONE_BYTES`]. The request-count cap in `into_requests` does
+/// NOT imply this one: 4096 copies of a 10 MB prompt is ~40 GB, and a failed Rust
+/// allocation calls `abort()`, which is uncatchable and takes the scheduler
+/// process down with the frontend.
+pub(crate) fn check_parallel_sample_budget(
+    payloads: &[GenerateRequest],
+    num_samples: usize,
+) -> Result<(), Error> {
+    if num_samples <= 1 {
+        return Ok(());
+    }
+    let digits = (num_samples - 1).to_string().len();
+    let per_clone = payloads
+        .iter()
+        .map(|req| clone_bytes(req, digits))
+        .fold(0usize, usize::saturating_add);
+    check_broadcast_budget(per_clone, num_samples, "parallel samples")
+}
+
 /// Reject a broadcast whose clones would exceed [`MAX_BROADCAST_CLONE_BYTES`].
 fn check_broadcast_budget(per_clone: usize, n: usize, name: &str) -> Result<(), Error> {
     // `n == 1` is not a broadcast — there is one value and one prompt, so nothing
@@ -833,7 +1037,14 @@ mod tests {
     /// `sampling::tests::TEST_VOCAB`).
     const TEST_VOCAB: u64 = 1000;
 
+    /// The base requests + `is_batch`, dropping `num_samples` — most tests here
+    /// predate parallel sampling and only care about the fan-out columns.
     fn requests(body: &str) -> Result<(Vec<GenerateRequest>, bool), Error> {
+        requests_n(body).map(|(reqs, is_batch, _)| (reqs, is_batch))
+    }
+
+    /// Full `into_requests` output, for the parallel-sampling tests.
+    fn requests_n(body: &str) -> Result<(Vec<GenerateRequest>, bool, usize), Error> {
         serde_json::from_str::<GenerateBody>(body)
             .unwrap()
             .into_requests()
@@ -902,10 +1113,282 @@ mod tests {
     fn split_validates_inputs() {
         assert!(requests(r#"{"text": "a", "input_ids": [1]}"#).is_err());
         assert!(requests(r#"{"stream": true}"#).is_err());
-        // Parallel sampling is rejected where Python reads it — in the params,
-        // at normalization, not here.
-        let (mut ps, _) = requests(r#"{"text": "a", "sampling_params": {"n": 2}}"#).unwrap();
-        assert!(ps[0].sampling_params.normalize(false, TEST_VOCAB).is_err());
+    }
+
+    /// `into_requests` reads `n` but does NOT expand: it returns the BASE requests
+    /// plus the sample count, and the handler expands after `prefetch_all`.
+    ///
+    /// Asserting an expanded length here would be the wrong shape and would push
+    /// the expansion back into this function — which is exactly what must not
+    /// happen, since prefetch resolves media per request and would then fetch the
+    /// same URL `n` times.
+    #[test]
+    fn into_requests_reads_n_without_expanding() {
+        let (mut base, is_batch, num_samples) =
+            requests_n(r#"{"text": "a", "sampling_params": {"n": 2}}"#).unwrap();
+        assert!(!is_batch, "one prompt stays a single request");
+        assert_eq!(base.len(), 1, "into_requests must not expand");
+        assert_eq!(num_samples, 2);
+        // The base carries n=1, so the invariant in `verify` passes downstream.
+        assert_eq!(base[0].sampling_params.n, 1);
+        assert!(base[0].sampling_params.normalize(false, TEST_VOCAB).is_ok());
+
+        let expanded = expand_parallel_samples(base, num_samples);
+        assert_eq!(expanded.len(), 2, "expansion happens here");
+    }
+
+    /// `n` is read from `sampling_params`; a TOP-LEVEL `n` stays ignored (Python's
+    /// `GenerateReqInput` has no such field either — see
+    /// `unported_generate_req_input_fields_are_ignored`).
+    #[test]
+    fn top_level_n_is_not_parallel_sampling() {
+        let (_, _, num_samples) = requests_n(r#"{"text": "a", "n": 5}"#).unwrap();
+        assert_eq!(num_samples, 1, "top-level n must not drive the fan-out");
+    }
+
+    /// `n` is `i64` on the wire, so out-of-range values must be rejected rather
+    /// than cast: `as usize` turns -1 into `usize::MAX`, and a plain multiply
+    /// wraps in release builds — either one slips past every cap below.
+    #[test]
+    fn out_of_range_n_is_rejected_not_cast() {
+        for body in [
+            r#"{"text": "a", "sampling_params": {"n": 0}}"#,
+            r#"{"text": "a", "sampling_params": {"n": -1}}"#,
+            r#"{"text": "a", "sampling_params": {"n": 9223372036854775807}}"#,
+        ] {
+            assert!(
+                requests_n(body).is_err(),
+                "{body} must be rejected, not wrapped or cast"
+            );
+        }
+    }
+
+    /// `prompts * n` is capped by the same knob as the batch itself, and the
+    /// product is computed with `checked_mul` so it cannot wrap into range.
+    #[test]
+    fn prompt_count_times_n_is_capped() {
+        let cap = *MAX_BATCH_REQS_PER_HTTP_REQ;
+        let body = format!(
+            r#"{{"text": ["a", "b"], "sampling_params": {{"n": {}}}}}"#,
+            cap / 2 + 1
+        );
+        let err = requests_n(&body).expect_err("2 * (cap/2 + 1) exceeds the cap");
+        assert!(err.to_string().contains("exceeds the maximum"), "{err}");
+    }
+
+    /// A `sampling_params` LIST must agree on `n` (Python
+    /// `_handle_parallel_sampling` raises for the same reason).
+    #[test]
+    fn sampling_params_list_must_agree_on_n() {
+        let body = r#"{"text": ["a", "b"], "sampling_params": [{"n": 2}, {"n": 3}]}"#;
+        let err = requests_n(body).expect_err("mismatched n must be rejected");
+        assert!(err.to_string().contains("same n"), "{err}");
+    }
+
+    // ----- check_parallel_sample_budget -----
+
+    /// A request whose only large field is `f`, ready to weigh.
+    fn budget_req(f: impl FnOnce(&mut GenerateRequest)) -> GenerateRequest {
+        let mut req = GenerateRequest {
+            rid: Rid::from("r".to_string()),
+            text: Some("hi".into()),
+            ..Default::default()
+        };
+        f(&mut req);
+        req
+    }
+
+    fn over_budget(req: GenerateRequest, n: usize) -> bool {
+        check_parallel_sample_budget(std::slice::from_ref(&req), n).is_err()
+    }
+
+    /// A small prompt fanned out wide is fine — the cap must not reject ordinary
+    /// parallel sampling.
+    #[test]
+    fn budget_allows_small_prompt_with_large_n() {
+        assert!(!over_budget(budget_req(|_| {}), 1024));
+    }
+
+    /// `n == 1` is not an expansion, so nothing is weighed at all.
+    #[test]
+    fn budget_is_skipped_for_one_sample() {
+        let huge = budget_req(|r| r.text = Some("x".repeat(MAX_BROADCAST_CLONE_BYTES)));
+        assert!(!over_budget(huge, 1));
+    }
+
+    /// Every variable-length field `fork` copies is weighed. Each of these is a
+    /// standalone bypass: the prompt stays tiny, so neither the request-count cap
+    /// nor a prompt-size heuristic would catch it.
+    #[test]
+    fn budget_covers_every_cloned_field() {
+        let big = MAX_BROADCAST_CLONE_BYTES / 8;
+        let cases: Vec<(&str, GenerateRequest)> = vec![
+            ("text", budget_req(|r| r.text = Some("x".repeat(big)))),
+            ("rid", budget_req(|r| r.rid = Rid::from("x".repeat(big)))),
+            (
+                "token_ids_logprob",
+                budget_req(|r| r.token_ids_logprob = Some(vec![7; big])),
+            ),
+            (
+                "bootstrap_host",
+                budget_req(|r| r.bootstrap_host = Some("x".repeat(big))),
+            ),
+            (
+                "bootstrap_pair_key",
+                budget_req(|r| r.bootstrap_pair_key = Some("x".repeat(big))),
+            ),
+            (
+                "custom_params",
+                budget_req(|r| {
+                    r.sampling_params.custom_params =
+                        Some(serde_json::json!({ "k": "x".repeat(big) }));
+                }),
+            ),
+            (
+                "image_data",
+                budget_req(|r| {
+                    r.mm = Some(Box::new(MmData {
+                        image_data: Some(rmpv::Value::from("x".repeat(big))),
+                        ..Default::default()
+                    }));
+                }),
+            ),
+        ];
+        for (field, req) in cases {
+            assert!(
+                over_budget(req, 64),
+                "{field} must count toward the clone budget"
+            );
+        }
+    }
+
+    /// `Vec<String>` is weighed by its HANDLE ARRAY plus contents, not contents
+    /// alone. A million EMPTY strings sums to zero bytes of content while the
+    /// handles alone are ~24 MB — summing `len()` would wave this straight
+    /// through. A single long string would pass either way, which is why the
+    /// empties are the case that actually locks the hole.
+    #[test]
+    fn budget_counts_container_handles_not_just_contents() {
+        let empties = MAX_BROADCAST_CLONE_BYTES / size_of::<String>();
+        let req = budget_req(|r| {
+            r.mm = Some(Box::new(MmData {
+                mm_hashes: vec![String::new(); empties],
+                ..Default::default()
+            }));
+        });
+        assert!(
+            over_budget(req, 4),
+            "a Vec of empty Strings still costs its handle array"
+        );
+    }
+
+    /// The reverse hazard: `prefetched` holds refcounted `Bytes`, so cloning a
+    /// sibling shares the media instead of duplicating it. Counting the payload
+    /// would 400 legitimate multimodal requests — only the handle array is real.
+    #[test]
+    fn budget_ignores_shared_media_payloads() {
+        let media = Bytes::from(vec![0u8; MAX_BROADCAST_CLONE_BYTES]);
+        let req = budget_req(|r| {
+            r.mm = Some(Box::new(MmData {
+                prefetched: vec![media],
+                ..Default::default()
+            }));
+        });
+        assert!(
+            !over_budget(req, 64),
+            "refcounted media must not be charged per sibling"
+        );
+    }
+
+    // ----- expand_parallel_samples -----
+
+    /// One prompt, `n = 3`: three siblings with distinct `{rid}_{i}` ids, each
+    /// carrying `n = 1` (the scheduler never fans out).
+    #[test]
+    fn expansion_mints_one_sibling_per_sample() {
+        let (base, _, num_samples) =
+            requests_n(r#"{"text": "a", "rid": "r", "sampling_params": {"n": 3}}"#).unwrap();
+        let out = expand_parallel_samples(base, num_samples);
+
+        assert_eq!(out.len(), 3);
+        let client_rids: Vec<&str> = out.iter().map(|r| r.rid.client_facing()).collect();
+        assert_eq!(client_rids, ["r_0", "r_1", "r_2"]);
+        // Internally unique too — the detok table is keyed by the full rid, and two
+        // live requests sharing a key would evict each other's sink.
+        let uniq: HashSet<&str> = out.iter().map(|r| r.rid.as_str()).collect();
+        assert_eq!(uniq.len(), 3, "sibling rids must be internally distinct");
+        assert!(out.iter().all(|r| r.sampling_params.n == 1));
+    }
+
+    /// Two prompts × `n = 3` come back PROMPT-MAJOR (`p0s0 p0s1 p0s2 p1s0 …`),
+    /// matching Python's `_handle_batch_request` order and the OpenAI adapters'
+    /// `prompt_index * n + sample_index`.
+    #[test]
+    fn expansion_is_prompt_major() {
+        let (base, _, num_samples) =
+            requests_n(r#"{"text": ["a", "b"], "sampling_params": {"n": 3}}"#).unwrap();
+        let out = expand_parallel_samples(base, num_samples);
+
+        assert_eq!(out.len(), 6);
+        let texts: Vec<&str> = out.iter().map(|r| r.text.as_deref().unwrap()).collect();
+        assert_eq!(texts, ["a", "a", "a", "b", "b", "b"]);
+    }
+
+    /// `bootstrap_room` is carried over UNCHANGED.
+    ///
+    /// The tempting "fix" is to make it unique across the flattened index, since
+    /// the room is the P↔D pairing key. Python does not: it computes
+    /// `batch_size * n` rooms and then only ever reads the first `batch_size`, so
+    /// all `n` samples of a prompt share one. Offsetting here would break drop-in
+    /// parity; the handler refuses `n > 1` under PD instead.
+    #[test]
+    fn expansion_leaves_bootstrap_room_untouched() {
+        let (base, _, num_samples) = requests_n(
+            r#"{"text": ["a", "b"], "bootstrap_room": 100, "sampling_params": {"n": 2}}"#,
+        )
+        .unwrap();
+        // The per-prompt offset the batch fan-out already applied.
+        assert_eq!(
+            base.iter().map(|r| r.bootstrap_room).collect::<Vec<_>>(),
+            [Some(100), Some(101)]
+        );
+        let out = expand_parallel_samples(base, num_samples);
+        assert_eq!(
+            out.iter().map(|r| r.bootstrap_room).collect::<Vec<_>>(),
+            [Some(100), Some(100), Some(101), Some(101)],
+            "siblings share their prompt's room, as in Python"
+        );
+    }
+
+    /// `n == 1` is a no-op: the base requests pass through untouched, so a plain
+    /// `/generate` never pays for the expansion path.
+    #[test]
+    fn expansion_is_a_noop_for_one_sample() {
+        let (base, _, num_samples) = requests_n(r#"{"text": "a", "rid": "r"}"#).unwrap();
+        assert_eq!(num_samples, 1);
+        let rid_before = base[0].rid.as_str().to_owned();
+        let out = expand_parallel_samples(base, num_samples);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].rid.as_str(), rid_before, "rid must not be re-minted");
+    }
+
+    /// Multimodal payloads are copied to every sibling — `take_mm_work` MOVES them
+    /// out of whichever request reaches `Encoding`, so siblings must not share.
+    #[test]
+    fn expansion_gives_every_sibling_its_own_mm() {
+        let (base, _, num_samples) =
+            requests_n(r#"{"text": "a", "image_data": "u", "sampling_params": {"n": 3}}"#).unwrap();
+        let mut out = expand_parallel_samples(base, num_samples);
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(GenerateRequest::has_multimodal));
+
+        // Draining one leaves the others intact.
+        let _ = out[0].take_mm_work();
+        assert!(!out[0].has_multimodal());
+        assert!(
+            out[1].has_multimodal() && out[2].has_multimodal(),
+            "siblings must own independent MmData"
+        );
     }
 
     /// Unported `GenerateReqInput` fields are IGNORED, not rejected.
