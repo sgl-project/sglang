@@ -1371,7 +1371,7 @@ class SWAComponent(TreeComponent):
             swa_value = self._translate_full_to_swa(action.incoming_full)
             alloc.set_full_to_swa_mapping(action.kept_full, swa_value)
             alloc.clear_full_to_swa_mapping(action.incoming_full)
-            alloc.free_full(action.incoming_full)
+            alloc.free_full_segment(action.incoming_full, start_pos=0)
             self.tree_core.set_component_device_value(
                 action.node_id, self.component_type, swa_value
             )

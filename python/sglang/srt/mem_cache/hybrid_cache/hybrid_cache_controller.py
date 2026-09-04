@@ -938,6 +938,7 @@ class HybridCacheController(BaseHiCacheController):
             )[: ticket.storage_hit_count // self.page_size]
             operation.all_hash_values = list(operation.hash_value)
             operation.storage_hit_count = ticket.storage_hit_count
+            operation.storage_start = len(ticket.matched_prefix_tokens)
             operation.pool_storage_result = PoolTransferResult.empty()
             if not self._allocate_pp_prefetch_buffers(ticket, operation):
                 operation.host_indices = torch.empty(0, dtype=torch.int64)

@@ -308,6 +308,9 @@ from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec_from_config,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.uno_validation import validate_uno_request
+from sglang.srt.state_capturer.indexer_topk import destroy_global_indexer_capturer
+from sglang.srt.state_capturer.routed_experts import destroy_global_experts_capturer
 from sglang.srt.utils import (
     DynamicGradMode,
     configure_gc_logger,
@@ -480,6 +483,9 @@ class Scheduler(
         self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
         self.enable_session_radix_cache = get_memory().enable_session_radix_cache
         self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
+        self.enable_unified_cache_external_linker = (
+            get_memory().enable_unified_cache_external_linker
+        )
         self.enable_decode_hicache = (
             get_disagg().disaggregation_decode_enable_radix_cache
             and self.enable_hierarchical_cache
@@ -924,6 +930,30 @@ class Scheduler(
                     "grammar-gated reasoning is disabled.",
                     reasoning_parser.detector.think_end_token,
                 )
+
+            selectable_tokens = getattr(
+                reasoning_parser.detector,
+                "request_selectable_think_end_tokens",
+                (),
+            )
+            if selectable_tokens:
+                selectable_sequences = []
+                for end_token in selectable_tokens:
+                    token_ids = self.tokenizer.encode(
+                        end_token, add_special_tokens=False
+                    )
+                    if not token_ids:
+                        raise ValueError(
+                            f"Request-selectable reasoning terminator {end_token!r} "
+                            "could not be encoded"
+                        )
+                    selectable_sequences.append(token_ids)
+                self.model_config.request_selectable_think_end_id_sequences = [
+                    list(sequence)
+                    for sequence in dict.fromkeys(
+                        tuple(sequence) for sequence in selectable_sequences
+                    )
+                ]
 
     def init_mamba_backend(self) -> None:
         if initialize_mamba_selective_state_update_backend is not None:
@@ -1770,6 +1800,8 @@ class Scheduler(
         self.tree_cache.release_host_resources()
         if self.decode_offload_manager is not None:
             self.decode_offload_manager.release_host_resources()
+        destroy_global_experts_capturer()
+        destroy_global_indexer_capturer()
 
         rank_consensus_checker.shutdown()
 
@@ -1787,6 +1819,7 @@ class Scheduler(
         if use_mlx():
             # MLX overlap uses mx.async_eval for CPU/GPU overlap,
             # not PyTorch MPS streams.
+            self.metrics_reporter.start_scheduler_time_accounting()
             dispatch_event_loop(self)
             return
 
@@ -1809,6 +1842,7 @@ class Scheduler(
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
         with self.device_module.StreamContext(self.schedule_stream):
+            self.metrics_reporter.start_scheduler_time_accounting()
             dispatch_event_loop(self)
 
     def _apply_war_barrier(self):
@@ -1833,8 +1867,11 @@ class Scheduler(
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
+            if recv_reqs:
+                self.metrics_reporter.record_scheduler_active()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                self._record_scheduler_state_for_paused_engine()
                 continue
 
             # Get the next batch to run
@@ -1877,8 +1914,11 @@ class Scheduler(
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
+            if recv_reqs:
+                self.metrics_reporter.record_scheduler_active()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                self._record_scheduler_state_for_paused_engine()
                 continue
 
             # Get the next batch to run
@@ -2265,6 +2305,7 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+            get_chunked_req=lambda: self.chunked_req,
         )
 
     def init_rank_consensus_checker(self) -> None:
@@ -2790,6 +2831,14 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        if self.spec_algorithm.is_uno():
+            error_msg = validate_uno_request(req)
+            if error_msg is not None:
+                req.set_finish_with_abort(error_msg)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
+
         if (
             req.return_sampling_mask
             and self.disaggregation_mode != DisaggregationMode.NULL
@@ -3108,6 +3157,15 @@ class Scheduler(
             return False
         return True
 
+    def _release_aborted_request(self, rid: str) -> None:
+        """Drop the cache-side state an aborted request left behind."""
+        if (
+            self.enable_hierarchical_cache
+            or self.enable_hicache_storage
+            or self.enable_unified_cache_external_linker
+        ):
+            self.tree_cache.release_aborted_request(rid)
+
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
         if (
@@ -3134,9 +3192,7 @@ class Scheduler(
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
-                if self.enable_hicache_storage:
-                    # Release prefetch events associated with the request
-                    self.tree_cache.release_aborted_request(candidate_req.rid)
+                self._release_aborted_request(candidate_req.rid)
                 self.waiting_queue.pop(idx)
                 self.beam_coordinator.retire_group(candidate_req)
                 req_to_abort = candidate_req
@@ -3165,9 +3221,7 @@ class Scheduler(
         for req in self.waiting_queue:
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
-                if self.enable_hicache_storage:
-                    # Release prefetch events associated with the request
-                    self.tree_cache.release_aborted_request(req.rid)
+                self._release_aborted_request(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(
                         req,
@@ -3311,6 +3365,11 @@ class Scheduler(
             # it. Drop the marker once the request is actually gone.
             if req.finished() or not req.kv.holds_kv:
                 self._pending_chunked_abort_req = None
+                return
+            # The request moved to another scheduler queue after abort_request
+            # deferred it, so retry against its current location.
+            self._pending_chunked_abort_req = None
+            self.abort_request(AbortReq(rid=req.rid))
             return
 
         prepare_abort(req, "Aborted")
@@ -3323,8 +3382,7 @@ class Scheduler(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
             req.pending_bootstrap = False
-        if self.enable_hicache_storage:
-            self.tree_cache.release_aborted_request(req.rid)
+        self._release_aborted_request(req.rid)
         release_kv_cache(req, self.tree_cache, is_insert=False)
 
         self.chunked_req = None
@@ -3583,7 +3641,11 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_hierarchical_cache or get_memory().enable_flexkv:
+        if (
+            self.enable_hierarchical_cache
+            or get_memory().enable_flexkv
+            or self.enable_unified_cache_external_linker
+        ):
             self.tree_cache.check_hicache_events()
             if self.enable_hicache_storage:
                 self._retry_missed_storage_prefetches()
@@ -3726,10 +3788,17 @@ class Scheduler(
                     # skip staging requests that are ongoing prefetch
                     continue
                 req.pp_prefetch_ticketed = False
-                # Pop the number of tokens loaded from storage (L3 hits)
-                loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+                # Pop the L3-loaded span. Unified cache exposes its absolute
+                # start so cache-mode L2/L3 attribution survives L3-tail eviction.
+                loaded_tokens, loaded_start = self.tree_cache.pop_prefetch_loaded_span(
+                    req.rid
+                )
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
+                    req.storage_hit_start = loaded_start
+                    # Cache-mode host memory is a resident L2 tier. Buffer mode
+                    # marks the staged span below once it is surfaced.
+                    req.host_hit_is_storage = False
 
             req.init_next_round_input(self.tree_cache)
             if (
@@ -3751,6 +3820,13 @@ class Scheduler(
                 if held_tokens > 0:
                     req.host_hit_length = held_tokens
                     req.swa_host_hit_length = held_swa_tokens
+                    req.storage_hit_length = held_tokens
+                    req.storage_hit_start = len(req.prefix_indices)
+                    req.host_hit_is_storage = True
+                elif not (req.host_hit_is_storage and req.host_loaded_length > 0):
+                    req.storage_hit_length = 0
+                    req.storage_hit_start = None
+                    req.host_hit_is_storage = False
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -3762,7 +3838,10 @@ class Scheduler(
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
-                    if self.enable_hierarchical_cache:
+                    if (
+                        self.enable_hierarchical_cache
+                        or self.enable_unified_cache_external_linker
+                    ):
                         # Set batch_is_full after making sure there are requests that can be served
                         running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
                             not running_batch.is_empty()
@@ -3826,7 +3905,7 @@ class Scheduler(
             self.chunked_req is None or len(can_run_list) != 1
         )
 
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
@@ -4065,6 +4144,7 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        self.metrics_reporter.record_scheduler_active()
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
@@ -4475,7 +4555,7 @@ class Scheduler(
                 self.decode_moment_totals,
                 batch_size,
                 step_us,
-                batch_size + result.num_correct_drafts,
+                result.get_num_generated_tokens(batch_size),
             )
 
     def maybe_send_health_check_signal(self):
@@ -4541,7 +4621,9 @@ class Scheduler(
         # path spins without sleeping, so a wall-clock floor bounds the
         # O(queue) get_loads for both sinks; the fully-idle publish runs
         # post-flush below.
-        if not self.is_fully_idle():
+        fully_idle = self.is_fully_idle()
+        if not fully_idle:
+            self.metrics_reporter.record_scheduler_active()
             now = time.monotonic()
             if now - self._last_stall_publish_ts >= LOAD_STALL_REFRESH_S:
                 self._last_stall_publish_ts = now
@@ -4550,6 +4632,7 @@ class Scheduler(
                     self.load_inquirer.get_loads, force=True, snapshot=snapshot
                 )
             return
+        self.metrics_reporter.record_scheduler_idle()
 
         if self.enable_unified_memory:
             try:
@@ -4602,6 +4685,13 @@ class Scheduler(
 
         # sleep until next event
         self.maybe_sleep_on_idle()
+        self.metrics_reporter.record_scheduler_idle()
+
+    def _record_scheduler_state_for_paused_engine(self) -> None:
+        if self.is_fully_idle():
+            self.metrics_reporter.record_scheduler_idle()
+        else:
+            self.metrics_reporter.record_scheduler_active()
 
     def is_fully_idle(self, for_health_check=False) -> bool:
         # Health check piggybacks on running requests in process_output.
@@ -5034,10 +5124,8 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            self._release_aborted_request(req.rid)
             self.beam_coordinator.retire_group(req)
-            if self.enable_hicache_storage:
-                # to release prefetch events associated with the request
-                self.tree_cache.release_aborted_request(req.rid)
             self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -5068,8 +5156,7 @@ class Scheduler(
             for req in self.dllm_manager.pop_aborted_reqs(
                 recv_req.abort_all, recv_req.rid
             ):
-                if self.enable_hicache_storage:
-                    self.tree_cache.release_aborted_request(req.rid)
+                self._release_aborted_request(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(req), req
                 )
@@ -5089,8 +5176,7 @@ class Scheduler(
             for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
-                    if self.enable_hicache_storage:
-                        self.tree_cache.release_aborted_request(req.rid)
+                    self._release_aborted_request(req.rid)
 
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
