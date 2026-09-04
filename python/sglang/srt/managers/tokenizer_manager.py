@@ -1231,6 +1231,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Validate generation-specific fields
         if isinstance(obj, GenerateReqInput):
             self._validate_token_ids_logprob(obj)
+            self._validate_top_logprobs_num(obj)
+            self._validate_input_ids_in_vocab(
+                input_ids, vocab_size=self.model_config.vocab_size
+            )
             requested_hidden_mode = get_request_return_hidden_states_mode(
                 obj.return_hidden_states
             )
@@ -1321,22 +1325,65 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"{token_id}; valid range is [0, {vocab_size})."
                 )
 
+    def _validate_top_logprobs_num(self, obj: GenerateReqInput) -> None:
+        """Reject out-of-range top_logprobs_num before it reaches torch.topk.
+
+        An unbounded value makes the sampler call ``torch.topk(k=n, ...)``
+        with ``n > vocab_size``, which raises inside the scheduler and kills
+        the whole server (DoS). Every value (int or per-request list) must lie
+        within the vocabulary."""
+        top_logprobs_num = obj.top_logprobs_num
+        if top_logprobs_num is None:
+            return
+        if isinstance(top_logprobs_num, int):
+            values = [top_logprobs_num]
+        elif isinstance(top_logprobs_num, (list, tuple)):
+            values = list(top_logprobs_num)
+        else:
+            raise ValueError(
+                "top_logprobs_num must be an integer or a list of integers."
+            )
+
+        vocab_size = self.model_config.vocab_size
+        for v in values:
+            # bool is an int subclass; JSON true/false must not pass as 1/0.
+            if not isinstance(v, int) or isinstance(v, bool):
+                raise ValueError(
+                    "top_logprobs_num must be an integer or a list of integers."
+                )
+            if v < 0 or v > vocab_size:
+                raise ValueError(
+                    f"top_logprobs_num must be in [0, {vocab_size}], got {v}."
+                )
+
     def _validate_input_ids_in_vocab(
-        self, input_ids: Union[List[int], List[List[int]]], vocab_size: int
+        self, input_ids: Optional[Union[List[int], List[List[int]]]], vocab_size: int
     ) -> None:
-        # Handle both single sequence and batch of sequences
+        """Reject out-of-vocabulary input ids before they reach the embedding
+        gather. Negative ids would otherwise trigger a CUDA device-side assert
+        (or a host-side IndexError) inside the model forward, killing the
+        entire server (DoS)."""
+        if not input_ids:
+            return
         if isinstance(input_ids[0], list):
             # Batch of sequences
             for seq in input_ids:
-                if any(id >= vocab_size for id in seq):
+                # bool is an int subclass; JSON true/false must not pass as 1/0.
+                if any(
+                    isinstance(id, bool) or not (0 <= id < vocab_size) for id in seq
+                ):
                     raise ValueError(
-                        f"The input_ids {seq} contains values greater than the vocab size ({vocab_size})."
+                        f"The input_ids {seq} contains values outside the vocab "
+                        f"range [0, {vocab_size})."
                     )
         else:
             # Single sequence
-            if any(id >= vocab_size for id in input_ids):
+            if any(
+                isinstance(id, bool) or not (0 <= id < vocab_size) for id in input_ids
+            ):
                 raise ValueError(
-                    f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
+                    f"The input_ids {input_ids} contains values outside the vocab "
+                    f"range [0, {vocab_size})."
                 )
 
     def _create_tokenized_object(
