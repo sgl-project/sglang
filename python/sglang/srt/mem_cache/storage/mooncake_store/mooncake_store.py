@@ -778,9 +778,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     f"_{self.mha_suffix}_{PoolName.DRAFT}_v",
                 ]
         elif pool_name == PoolName.DRAFT_SWA:
-            from sglang.srt.mem_cache.memory_pool_host import (
-                DeepSeekV4PagedHostPool,
-            )
+            from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
             from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
             if isinstance(

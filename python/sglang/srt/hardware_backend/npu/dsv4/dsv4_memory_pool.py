@@ -53,6 +53,11 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
             return super().create_buffer(num_pages=num_pages)
         kv_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.kv_cache_total_dim = kv_dim
+        # The HiCache assembler uses bytes_per_page_padded as host item_bytes.
+        # For example: kernel_page_size * kv_dim * sizeof(bf16).
+        self.bytes_per_page_padded = (
+            self.kernel_page_size * kv_dim * torch.bfloat16.itemsize
+        )
         # Writes are flat-indexed by loc; kernel_page_size controls the physical
         # page layout exposed to the NPU operators.
         npu_num_pages = (self.size + self.kernel_page_size + 1) // self.kernel_page_size
@@ -414,6 +419,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     # ------------------------------------------------------------------
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
+        self.wait_layer_transfer(layer_id)
         item = self.layer_mapping[layer_id]
         ratio = item.compress_ratio
         if ratio == 0:
@@ -440,6 +446,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         flatten across (num_pages, page_size) and gather the matching tokens —
         shape becomes (num_tokens, 1, dim).
         """
+        self.wait_layer_transfer(layer_id)
         # Index by RAW layer_id, not compress_layer_id (a per-bucket counter that
         # would collide across ratios). swa_kv_pool is sized layer_num=total_layers.
         kv = self.swa_kv_pool.kv_buffer[layer_id]
@@ -460,6 +467,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         from_indexer=True branch returns the dedicated int8 K buffer that
         ``torch.ops.custom.npu_quant_lightning_indexer`` consumes.
         """
+        self.wait_layer_transfer(layer_id)
         item = self.layer_mapping[layer_id]
         if item.compress_ratio == 4:
             if from_indexer:
