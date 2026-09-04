@@ -238,8 +238,19 @@ class MinimaxM2Detector(BaseFormatDetector):
         while True:
             # If we're not in a tool call and don't see a start token, return normal text
             if not self._in_tool_call and self.tool_call_start_token not in self._buf:
-                normal += self._buf
-                self._buf = ""
+                # A trailing fragment of the start token must stay buffered. With
+                # token-by-token streaming the marker arrives in pieces, and
+                # flushing those pieces as normal text both leaks the marker into
+                # user-visible content and loses the tool call entirely.
+                held = self._ends_with_partial_token(
+                    self._buf, self.tool_call_start_token
+                )
+                if held:
+                    normal += self._buf[:-held]
+                    self._buf = self._buf[-held:]
+                else:
+                    normal += self._buf
+                    self._buf = ""
                 break
 
             # Look for tool call start
@@ -304,13 +315,31 @@ class MinimaxM2Detector(BaseFormatDetector):
                         self._buf = self._buf[function_match.end() :]
                         continue
                     else:
-                        # Invalid function name, reset state
-                        logger.warning(f"Invalid function name: {function_name}")
-                        self._reset_streaming_state()
-                        normal += self._buf
-                        self._buf = ""
+                        # Invalid function name. detect_and_parse drops the whole
+                        # invoke block, so skip past it rather than emitting the
+                        # raw markup as user-visible content.
+                        invoke_end = self._buf.find(
+                            self.tool_call_function_end_token, function_match.end()
+                        )
+                        if invoke_end != -1:
+                            logger.warning(f"Invalid function name: {function_name}")
+                            self._buf = self._buf[
+                                invoke_end + len(self.tool_call_function_end_token) :
+                            ]
+                            self._reset_streaming_state(True)
+                            continue
+                        # Block still incomplete; keep buffering until it is.
                         break
                 else:
+                    # No further <invoke> available. If the surrounding block has
+                    # already ended, consume the end token and leave tool-call
+                    # mode, otherwise trailing text stays buffered forever and is
+                    # never emitted as normal content.
+                    end_idx = self._buf.find(self.tool_call_end_token)
+                    if end_idx != -1:
+                        self._buf = self._buf[end_idx + len(self.tool_call_end_token) :]
+                        self._reset_streaming_state(False)
+                        continue
                     # Function name not complete yet, wait for more text
                     break
 
@@ -341,6 +370,19 @@ class MinimaxM2Detector(BaseFormatDetector):
                             self.streamed_args_for_tool[self.current_tool_id] = (
                                 current_streamed + "}"
                             )
+                    else:
+                        # A call with no parameters streams nothing at all, so emit
+                        # the empty object explicitly. detect_and_parse returns
+                        # "{}" here, and without this the streamed arguments stay
+                        # an empty string and never parse as JSON.
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=self.current_tool_id,
+                                name=None,
+                                parameters="{}",
+                            )
+                        )
+                        self.streamed_args_for_tool[self.current_tool_id] = "{}"
 
                     # Complete the tool call
                     self._buf = self._buf[
