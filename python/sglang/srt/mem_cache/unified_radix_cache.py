@@ -938,13 +938,21 @@ class UnifiedRadixCache(BasePrefixCache):
             ):
                 self.session_refs.register_session_ref(req)
 
-    def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
-        if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
+    def cache_unfinished_req(
+        self,
+        req: Req,
+        chunked: bool = False,
+        is_insert: bool = True,
+        **kwargs,
+    ) -> None:
+        if self.session.try_cache_unfinished_req(
+            req, chunked=chunked, is_insert=is_insert, **kwargs
+        ):
             return
 
         token_ids = req.get_fill_ids()
 
-        if self.disable:
+        if not is_insert or self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.kv.req_pool_idx, : len(token_ids)
             ]

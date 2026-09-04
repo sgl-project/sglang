@@ -533,7 +533,9 @@ class RadixCache(BasePrefixCache):
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
 
-    def cache_unfinished_req(self, req: Req, chunked=False):
+    def cache_unfinished_req(
+        self, req: Req, chunked: bool = False, is_insert: bool = True
+    ):
         """Cache request when it is unfinished."""
         if self.disable:
             return
@@ -542,6 +544,14 @@ class RadixCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, : len(token_ids)
         ]
+
+        if not is_insert:
+            # Keep chunked-prefill progress request-owned without publishing it
+            # to the radix tree. cache_protected_len intentionally remains at
+            # the previously matched tree prefix so cache_finished_req can free
+            # this request-owned range when it finishes.
+            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+            return
 
         radix_key = RadixKey(
             token_ids,

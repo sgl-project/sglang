@@ -366,7 +366,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         pass
 
     @abstractmethod
-    def cache_unfinished_req(self, req: Req, **kwargs):
+    def cache_unfinished_req(self, req: Req, is_insert: bool = True, **kwargs):
         pass
 
     def free_kv_row(self, kv: Any, ranges: list[tuple[int, int]]) -> None:
