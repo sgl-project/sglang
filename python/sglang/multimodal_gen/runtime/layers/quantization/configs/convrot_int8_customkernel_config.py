@@ -3,19 +3,21 @@
 
 Quality class: group-wise (default 256) Hadamard rotation followed by per-row
 dynamic INT8 quantization of both activations and weights (ConvRot,
-arXiv:2512.03673). Same-seed outputs are visually equivalent to BF16 but not
-bit-exact; this is not a consistency ground-truth mode.
+arXiv:2512.03673). Same-seed outputs are not bit-exact with BF16 (quality was
+validated against BF16 on Qwen-Image and Qwen-Image-Edit); this is not a
+consistency ground-truth mode.
 
 The rotation is data-free, so weights load in their source dtype from a stock
 BF16 checkpoint and are rotated and quantized in
 ``process_weights_after_loading``. A no-arg ``ConvRotInt8CustomKernelConfig()``
 is the only supported form; there is no serialized checkpoint format.
 
-Recommended ``--quantization-ignored-layers`` for Qwen-Image:
-``img_mod txt_mod txt_mlp.net.2``. Those GEMMs see only a handful of rows
-(the AdaLN modulation runs on one row per batch element, the text-stream
-FFN down-projection on a few dozen), so the rotate-quantize launch plus a
-CTA-starved INT8 GEMM measured slower than the BF16 GEMM they replace.
+Every eligible linear is quantized by default. ``--quantization-ignored-layers
+img_mod txt_mod txt_mlp.net.2`` keeps the Qwen-Image GEMMs that see only a
+handful of rows (the AdaLN modulation runs on one row per batch element, the
+text-stream FFN down-projection on a few dozen) in BF16: less memory saved,
+and only faster where the rotate-quantize launch plus a CTA-starved INT8 GEMM
+measures slower than the BF16 GEMM it replaces.
 """
 
 from __future__ import annotations
@@ -105,7 +107,8 @@ class ConvRotInt8CustomKernelConfig(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
-        return [torch.bfloat16]
+        # The ops are BF16-only; FP16 activations are cast at the op boundary.
+        return [torch.bfloat16, torch.float16]
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -140,11 +143,20 @@ class ConvRotInt8CustomKernelConfig(QuantizationConfig):
         ):
             self.skipped.append(prefix)
             return UnquantizedLinearMethod()
-        # The rotation partitions the input dim into fixed-size groups, so a
-        # layer whose input does not divide evenly simply stays in BF16 rather
-        # than failing the whole model.
-        if layer.input_size % self.group_size:
-            self.skipped.append(f"{prefix}(in={layer.input_size})")
+        # The rotation partitions the input dim into fixed-size groups and the
+        # GEMM epilogue stores 8 BF16 outputs at a time, so a layer whose input
+        # does not divide evenly, or whose output is not a multiple of 8, simply
+        # stays in BF16 rather than failing the whole model. Row-parallel layers
+        # shard the input dim and set the per-shard size before LinearBase asks
+        # for the method; every rank sees the same sizes, so the decision is
+        # rank-consistent.
+        in_size = getattr(layer, "input_size_per_partition", layer.input_size)
+        out_size = getattr(layer, "output_size_per_partition", layer.output_size)
+        if in_size % self.group_size:
+            self.skipped.append(f"{prefix}(in={in_size})")
+            return UnquantizedLinearMethod()
+        if out_size % 8:
+            self.skipped.append(f"{prefix}(out={out_size})")
             return UnquantizedLinearMethod()
         self.selected.append(prefix)
         return ConvRotInt8CustomKernelLinearMethod(self)

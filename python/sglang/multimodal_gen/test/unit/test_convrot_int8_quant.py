@@ -1,5 +1,6 @@
 """Unit tests for the convrot_int8_customkernel online quantization method."""
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -213,3 +214,126 @@ def test_gelu_input_helper_is_bitwise_eager_gelu_then_layer():
     fused = apply_convrot_int8_gelu_input(layer=down, x=up)
     eager, _ = down(F.gelu(up, approximate="tanh"))
     assert torch.equal(fused, eager)
+
+
+class _FakeTpGroup:
+    pass
+
+
+def _with_tp(monkeypatch, tp_size):
+    import sglang.multimodal_gen.runtime.layers.linear as linear
+
+    monkeypatch.setattr(linear, "get_tp_group", lambda: _FakeTpGroup())
+    monkeypatch.setattr(linear, "get_group_rank", lambda group: 0)
+    monkeypatch.setattr(linear, "get_group_size", lambda group: tp_size)
+
+
+@patch(_LOAD_SGL_KERNEL)
+@pytest.mark.parametrize("tp_size,input_size", [(4, 13824), (8, 3072)])
+def test_row_parallel_shard_not_divisible_by_group_stays_bf16(
+    _load, monkeypatch, tp_size, input_size
+):
+    from sglang.multimodal_gen.runtime.layers.linear import RowParallelLinear
+
+    _with_tp(monkeypatch, tp_size)
+    config = ConvRotInt8CustomKernelConfig()
+    layer = RowParallelLinear(
+        input_size, 5120, bias=True, quant_config=config, prefix="blocks.0.ffn.fc_out"
+    )
+    assert isinstance(layer.quant_method, UnquantizedLinearMethod)
+    assert config.skipped == [f"blocks.0.ffn.fc_out(in={input_size // tp_size})"]
+    assert config.selected == []
+
+
+@patch(_LOAD_SGL_KERNEL)
+def test_row_parallel_shard_divisible_by_group_is_quantized(_load, monkeypatch):
+    from sglang.multimodal_gen.runtime.layers.linear import RowParallelLinear
+
+    _with_tp(monkeypatch, 4)
+    config = ConvRotInt8CustomKernelConfig()
+    layer = RowParallelLinear(
+        12288, 3072, bias=True, quant_config=config, prefix="blocks.0.ffn.net.2"
+    )
+    assert isinstance(layer.quant_method, ConvRotInt8CustomKernelLinearMethod)
+    assert config.selected == ["blocks.0.ffn.net.2"]
+
+
+@patch(_LOAD_SGL_KERNEL)
+def test_output_width_not_multiple_of_8_stays_bf16(_load):
+    config = ConvRotInt8CustomKernelConfig()
+    layer = LinearBase(input_size=4096, output_size=4)
+    method = config.get_quant_method(layer, "blocks.0.attn.to_gate_logits")
+    assert isinstance(method, UnquantizedLinearMethod)
+    assert config.skipped == ["blocks.0.attn.to_gate_logits(out=4)"]
+
+
+@patch(_LOAD_SGL_KERNEL)
+def test_column_parallel_shard_output_not_multiple_of_8_stays_bf16(_load, monkeypatch):
+    from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
+
+    _with_tp(monkeypatch, 8)
+    config = ConvRotInt8CustomKernelConfig()
+    # 32 output rows split eight ways leave 4 per rank; the epilogue stores 8 at
+    # a time, so the layer stays in BF16 instead of failing in the first forward.
+    layer = ColumnParallelLinear(
+        4096, 32, bias=True, quant_config=config, prefix="blocks.0.attn.to_gate_logits"
+    )
+    assert isinstance(layer.quant_method, UnquantizedLinearMethod)
+    assert config.skipped == ["blocks.0.attn.to_gate_logits(out=4)"]
+
+
+@requires_kernel
+def test_fp16_activations_are_cast_and_returned_in_fp16():
+    config = ConvRotInt8CustomKernelConfig()
+    layer, weight = _quantized_layer(config, 3072, 3072, "attn.to_q", seed=3)
+    x = torch.randn(2, 64, 3072, device="cuda", dtype=torch.float16)
+    out, _ = layer(x)
+    assert out.dtype == torch.float16
+    ref = F.linear(x.to(torch.bfloat16), weight, layer.bias).to(torch.float16)
+    err = torch.linalg.vector_norm(out.float() - ref.float())
+    rel_l2 = (err / torch.linalg.vector_norm(ref.float())).item()
+    assert rel_l2 < 2e-2, rel_l2
+
+
+@requires_kernel
+def test_lora_merge_mode_is_redirected_to_dynamic_on_int8_base():
+    from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
+
+    config = ConvRotInt8CustomKernelConfig()
+    layer, weight = _quantized_layer(
+        config, 3072, 3072, "transformer_blocks.0.attn.to_q", seed=4
+    )
+    lora = wrap_with_lora_layer(layer, lora_rank=16, lora_alpha=16, snapshot_base=True)
+    layers = {"transformer_blocks.0.attn.to_q": lora}
+    # LoRAPipeline is abstract; the decision only needs its two static helpers.
+    stand_in = SimpleNamespace(
+        _has_quantized_base_weights=LoRAPipeline._has_quantized_base_weights,
+        _uses_dtensor_weights=LoRAPipeline._uses_dtensor_weights,
+    )
+
+    def decide(module_name, layers, mode):
+        return LoRAPipeline._should_merge_lora_for_layers(
+            stand_in, module_name, layers, mode
+        )
+
+    assert decide("transformer_blocks.0.attn.to_q", layers, "auto") is False
+    with pytest.raises(ValueError, match="lora-merge-mode dynamic"):
+        decide("transformer_blocks.0.attn.to_q", layers, "merge")
+
+    gen = torch.Generator(device="cuda").manual_seed(4)
+    lora_a = (torch.randn(16, 3072, device="cuda", generator=gen) * 0.05).to(
+        torch.bfloat16
+    )
+    lora_b = (torch.randn(3072, 16, device="cuda", generator=gen) * 0.05).to(
+        torch.bfloat16
+    )
+    lora.set_lora_weights(
+        lora_a, lora_b, lora_path="test", strength=1.0, merge_weights=False
+    )
+    x = torch.randn(8, 3072, device="cuda", dtype=torch.bfloat16, generator=gen)
+    out, _ = lora(x)
+    delta = (lora_b.float() @ lora_a.float()).to(torch.bfloat16)
+    ref = F.linear(x, weight + delta, layer.bias)
+    err = torch.linalg.vector_norm(out.float() - ref.float())
+    rel_l2 = (err / torch.linalg.vector_norm(ref.float())).item()
+    assert rel_l2 < 2e-2, rel_l2

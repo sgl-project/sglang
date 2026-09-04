@@ -68,7 +68,12 @@ def _load_sgl_kernel() -> None:
 
 
 def _as_rows(x: torch.Tensor) -> torch.Tensor:
-    if x.dtype != torch.bfloat16:
+    # The ops take BF16 only. FP16 activations (autocast-fp16 pipelines) are
+    # cast on the way in and back on the way out; the BF16 rounding is an
+    # order of magnitude below the INT8 quantization error.
+    if x.dtype == torch.float16:
+        x = x.to(torch.bfloat16)
+    elif x.dtype != torch.bfloat16:
         raise ValueError(
             f"convrot_int8_customkernel does not support activation dtype {x.dtype}"
         )
@@ -76,7 +81,8 @@ def _as_rows(x: torch.Tensor) -> torch.Tensor:
 
 
 def _like_input(out: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    return out.reshape(*x.shape[:-1], out.shape[-1])
+    out = out.reshape(*x.shape[:-1], out.shape[-1])
+    return out if out.dtype == x.dtype else out.to(x.dtype)
 
 
 class ConvRotInt8CustomKernelLinearMethod(LinearMethodBase):
@@ -96,14 +102,21 @@ class ConvRotInt8CustomKernelLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
-        # get_quant_method already screened the unsharded input size, so this
-        # only fires under TP > 1, where a row-parallel layer splits the very
-        # dimension the rotation groups over.
+        # get_quant_method already screened the per-shard sizes (both parallel
+        # linears set them before asking for the method), so these are last-
+        # resort assertions for layers that pass different sizes here.
         if input_size_per_partition % self.quant_config.group_size:
             raise ValueError(
                 f"convrot_int8_customkernel needs input_size_per_partition "
                 f"({input_size_per_partition}) divisible by group_size "
-                f"{self.quant_config.group_size}"
+                f"{self.quant_config.group_size}; leave the layer in BF16 with "
+                "--quantization-ignored-layers"
+            )
+        if sum(output_partition_sizes) % 8:
+            raise ValueError(
+                f"convrot_int8_customkernel needs the output size per partition "
+                f"({sum(output_partition_sizes)}) to be a multiple of 8; leave the "
+                "layer in BF16 with --quantization-ignored-layers"
             )
         # Matches UnquantizedLinearMethod so the source weights load in BF16
         # before quantization.
@@ -124,9 +137,10 @@ class ConvRotInt8CustomKernelLinearMethod(LinearMethodBase):
         if weight.dtype == torch.int8:
             return
 
-        # Quantization runs on CUDA, but the model may still be staged on CPU
-        # for offload. Round-trip one layer at a time rather than relying on
-        # the loader's whole-model device move, which would not fit in VRAM.
+        # Quantization runs on CUDA; a layer staged on CPU is round-tripped on
+        # its own. (The transformer loader currently materialises every online-
+        # quantized component on the GPU before this runs, so INT8 saves memory
+        # after load, not during it.)
         home = weight.device
         weight_q, weight_scale = (
             torch.ops.sgl_kernel.convrot_rotate_quantize_activation(
