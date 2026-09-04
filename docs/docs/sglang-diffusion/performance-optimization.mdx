@@ -93,8 +93,66 @@ These settings should preserve model behavior while changing residency, parallel
       <td style={{padding: "9px 12px"}}>Serving many compatible requests concurrently.</td>
       <td style={{padding: "9px 12px"}}><a href="/docs/sglang-diffusion/dynamic_batching">Inference Batching</a></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500}}><code>--async-output-save</code></td>
+      <td style={{padding: "9px 12px"}}>Image/video encoding and disk writes leave the GPU idle between queued requests.</td>
+      <td style={{padding: "9px 12px"}}><a href="/docs/sglang-diffusion/performance-optimization#asynchronous-output-saving">Asynchronous output saving</a></td>
+    </tr>
   </tbody>
 </table>
+
+## Asynchronous output saving
+
+Enable `--async-output-save` to overlap output saving with the next request's GPU
+work during serving. Frame materialization, image/video encoding, and disk writes
+run on a background thread. The flag is disabled by default and does not change
+the model's generation settings or the requested output format.
+
+Use it when you have concurrent requests and saving takes a noticeable share of
+each request, such as PNG images or large videos from a fast model. A client that
+waits for each response before sending the next request has no work to overlap.
+
+### Enable
+
+The feature requires NVIDIA CUDA and the native SGLang backend in monolithic
+serving mode. After following [Installation](/docs/sglang-diffusion/installation),
+you can start this example on one GPU with the public Hugging Face model
+`Tongyi-MAI/Z-Image-Turbo`:
+
+```bash Command
+sglang serve \
+  --model-path Tongyi-MAI/Z-Image-Turbo \
+  --backend sglang \
+  --num-gpus 1 \
+  --batching-max-size 1 \
+  --async-output-save
+```
+
+Send concurrent requests using the [OpenAI-compatible API](/docs/sglang-diffusion/api/openai_api).
+`--batching-max-size 1` keeps each forward separate while allowing requests to
+queue. Grouped and dynamically batched forwards currently keep synchronous output
+saving.
+
+### Scope and tradeoffs
+
+- Only the output rank performs asynchronous saving, and only for requests that
+  save files and return their paths (`save_output=true` and
+  `return_file_paths_only=true` in the sampling parameters).
+- Warmup requests, raw-frame responses, requests with `save_output=false`, and
+  requests with `perf_dump_path` set or `SGLANG_DIFFUSION_STAGE_LOGGING=1` keep the
+  synchronous path. This includes the frame-return path used by `/rollout/generate`.
+- Replies are sent by the scheduler after saving completes. If another forward
+  is running, a ready reply can wait for that forward to finish. Measure both
+  throughput and response latency, especially for long video generations.
+- Up to two pending finalizations retain request outputs in GPU memory. The
+  scheduler waits for capacity before starting another forward; leave memory
+  headroom for the pending outputs as well as inference.
+- Per-request peak memory metrics can include allocations from the next request.
+  Asynchronous finalization skips the usual per-request allocator cache release.
+
+Compare the flag on and off with the same model, output shape, format, and client
+concurrency. Keep it disabled when the reply latency or extra memory outweighs
+the throughput gain.
 
 ## Quality-Tradeoff / Lossy Or Approximate Levers
 
