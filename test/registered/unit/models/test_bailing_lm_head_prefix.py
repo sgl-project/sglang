@@ -53,9 +53,7 @@ class TestBailingLmHeadPrefix(CustomTestCase):
         return quant_config.prefixes
 
     def test_lm_head_receives_qualified_prefix(self):
-        self.assertEqual(
-            self._construct("language_model"), ["language_model.lm_head"]
-        )
+        self.assertEqual(self._construct("language_model"), ["language_model.lm_head"])
 
     def test_lm_head_prefix_is_unqualified_at_model_root(self):
         self.assertEqual(self._construct(""), ["lm_head"])
