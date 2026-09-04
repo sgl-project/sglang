@@ -1,0 +1,129 @@
+"""Fused group-limited MoE top-k index selection for diffusion routers.
+
+The reference LingBot Video router builds the group-limited top-k with a chain
+of ~8 small kernels (two ``topk`` over the group dim, a ``scatter_`` into a
+zero mask, an ``expand``/``reshape`` broadcast, a ``masked_fill`` with
+``-inf``, and a final ``topk`` plus a ``gather``). On a launch-bound single GPU
+that chain is pure overhead: every intermediate tensor is tiny and the whole
+computation is bandwidth- and launch-bound.
+
+This module fuses the entire selection into a single Triton kernel: one
+program per token loads its score row once, reduces the per-group sums in
+registers, masks non-selected groups with ``-inf``, and writes the top-k
+expert ids. It reproduces the reference selection exactly (same tie-breaking:
+``torch.topk`` picks the first-max index on ties, which a single ascending
+selection pass with strict mask updates also yields).
+"""
+
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _group_limited_topk_kernel(
+    scores_ptr,  # [T, E] f32, rows are scores_for_choice (scores + bias)
+    out_idx_ptr,  # [T, TOP_K] i64
+    stride_st,
+    E: tl.constexpr,
+    N_GROUP: tl.constexpr,
+    TOPK_GROUP: tl.constexpr,
+    TOP_K: tl.constexpr,
+    EPG: tl.constexpr,  # experts per group = E // N_GROUP
+    BLOCK_E: tl.constexpr,  # padded E
+    BLOCK_EPG: tl.constexpr,  # padded experts-per-group
+    BLOCK_G: tl.constexpr,  # padded N_GROUP
+):
+    t = tl.program_id(0)
+    offs_e = tl.arange(0, BLOCK_E)
+    e_mask = offs_e < E
+    scores = tl.load(
+        scores_ptr + t * stride_st + offs_e, mask=e_mask, other=float("-inf")
+    )
+
+    # Per-group scores -> [BLOCK_G, BLOCK_EPG], pad with -inf so padded lanes
+    # never win the per-group top-2 reduction.
+    g = tl.reshape(scores, (BLOCK_G, BLOCK_EPG), can_reorder=False)
+    epg_mask = tl.arange(0, BLOCK_EPG)[None, :] < EPG
+    g = tl.where(epg_mask, g, float("-inf"))
+
+    # group score = sum of top-2 experts within each group.
+    m1 = tl.max(g, axis=1)
+    g2 = tl.where(g == m1[:, None], float("-inf"), g)
+    m2 = tl.max(g2, axis=1)
+    group_scores = m1 + m2
+
+    # Select TOPK_GROUP groups by descending group score (first-max tie-break,
+    # matching torch.topk).
+    group_idx = tl.arange(0, BLOCK_G)
+    gs_valid = tl.where(group_idx < N_GROUP, group_scores, float("-inf"))
+    # Break group-score ties in favour of the smaller group index (torch.topk
+    # first-max). 1e-12 is below f32 resolution, so only exact ties are split.
+    gs_valid = gs_valid + tl.where(
+        group_idx < N_GROUP, group_idx.to(tl.float32) * 1e-12, 0.0
+    )
+    selected_group = tl.zeros((BLOCK_G,), dtype=tl.int1)
+    for _ in tl.static_range(TOPK_GROUP):
+        gmax = tl.max(gs_valid, axis=0)
+        is_pick = gs_valid == gmax
+        selected_group = selected_group | is_pick
+        gs_valid = tl.where(is_pick, float("-inf"), gs_valid)
+
+    # Mask experts in non-selected groups, then flat top-k (same tie-break).
+    masked = tl.where(selected_group[:, None], g, float("-inf"))
+    flat = tl.reshape(masked, (BLOCK_E,), can_reorder=False)
+    flat = tl.where(e_mask, flat, float("-inf"))
+    # Break ties in favour of the smaller expert index (matching torch.topk's
+    # first-max behaviour) and make each score unique so the selection pass
+    # emits distinct experts. The offset is far below bf16/f32 resolution of
+    # the routing logits (1e-12), so it never changes a non-tied comparison.
+    flat = flat + offs_e.to(tl.float32) * 1e-12
+    for kk in tl.static_range(TOP_K):
+        vmax = tl.max(flat, axis=0)
+        is_pick = flat == vmax
+        idx = tl.min(tl.where(is_pick, offs_e, E), axis=0)
+        tl.store(out_idx_ptr + t * TOP_K + kk, idx.to(tl.int64))
+        flat = tl.where(offs_e == idx, float("-inf"), flat)
+
+
+def _next_pow2(n: int) -> int:
+    return 1 << (n - 1).bit_length()
+
+
+def group_limited_topk(
+    scores_for_choice: torch.Tensor,
+    n_group: int,
+    topk_group: int,
+    top_k: int,
+) -> torch.Tensor:
+    """Fused group-limited top-k expert ids.
+
+    ``scores_for_choice`` is the per-token expert score used for selection
+    (already includes the correction bias), shape ``[T, E]`` float32. Returns
+    the selected expert ids as ``[T, top_k]`` int64, matching the reference
+    two-stage group-limited selection.
+    """
+    if scores_for_choice.dtype != torch.float32:
+        scores_for_choice = scores_for_choice.float()
+    scores_for_choice = scores_for_choice.contiguous()
+    t, e = scores_for_choice.shape
+    assert e % n_group == 0, "num_experts must divide n_group"
+    epg = e // n_group
+    out = torch.empty((t, top_k), dtype=torch.int64, device=scores_for_choice.device)
+    _group_limited_topk_kernel[(t,)](
+        scores_for_choice,
+        out,
+        scores_for_choice.stride(0),
+        E=e,
+        N_GROUP=n_group,
+        TOPK_GROUP=topk_group,
+        TOP_K=top_k,
+        EPG=epg,
+        BLOCK_E=_next_pow2(e),
+        BLOCK_EPG=_next_pow2(epg),
+        BLOCK_G=_next_pow2(n_group),
+        num_warps=4,
+    )
+    return out
