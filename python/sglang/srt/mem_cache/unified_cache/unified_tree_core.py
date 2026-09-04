@@ -35,7 +35,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
+    _dfs_weight_order,
 )
+from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
@@ -47,6 +49,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     CacheAction,
     ComponentAction,
     FreeDeviceKV,
+    FreeDeviceKVFullOnly,
     ReplaceWriteThroughOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.components import (
@@ -61,6 +64,8 @@ from sglang.srt.mem_cache.unified_cache.components import (
     get_and_increase_time_counter,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+    BufferBackupSnapshot,
+    BufferBackupState,
     DecSwaLockOnlyResult,
     DemoteResult,
     DriveHostEvictionResult,
@@ -117,7 +122,10 @@ class UnifiedTreeNode:
         self.last_access_time = get_and_increase_time_counter()
         self.creation_time = get_and_increase_time_counter()
         self.hash_value = None
+        # Namespace-aware hashes used only for external KV events.
+        self.event_hash_value: Optional[list[str]] = None
         self.hit_count = 0
+        self.external_cache_stored = False
         self.priority = priority
         self.lru_prev: list[UnifiedTreeNode | None] = [None] * (
             _NUM_COMPONENT_TYPES * 2
@@ -367,10 +375,10 @@ class _InsertWalkState(msgspec.Struct):
     value: torch.Tensor
     params: InsertParams
     priority: int
+    result: InsertResult
     total_prefix_length: int = 0
     is_new_leaf: bool = False
     target_node: Optional[UnifiedTreeNode] = None
-    result: Optional[InsertResult] = None
     # Emitted actions awaiting the next barrier flush (or the final step).
     pending_actions: list[CacheAction | ComponentAction] = []
 
@@ -391,6 +399,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.is_eagle = params.is_eagle and ComponentType.MAMBA not in components
         self.enable_hicache = False
         self.enable_storage = False
+        self.enable_external_cache_linker = False
         self.write_through_threshold = 256
         self.is_write_back = False
         self.has_swa_host_pool = False
@@ -415,8 +424,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             self.components_by_type.values()
         )
 
-        self.enable_kv_cache_events = params.enable_kv_cache_events
-        self.kv_event_queue = []
+        self.kv_events = KVCacheEventRecorder(
+            enabled=params.enable_kv_cache_events, page_size=self.page_size
+        )
 
         self.reset()
 
@@ -435,6 +445,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         # The single in-flight resumable insert, if suspended at a barrier.
         self._ongoing_insert_walk_state: Optional[_InsertWalkState] = None
+        self._tracked_unbacked_tokens = 0
+        self._is_tracking_unbacked_tokens = False
 
         self.root_node = self._new_node()
         self.root_node.priority = -sys.maxsize
@@ -511,9 +523,82 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """The hash values owned by this node, excluding its ancestors."""
         return self.node_by_id(node_id).hash_value or []
 
+    def snapshot_buffer_backup(
+        self, node_id: NodeId, pass_prefix_keys: bool
+    ) -> Optional[BufferBackupSnapshot]:
+        node = self._node_arena.get(node_id)
+        if (
+            node is None
+            or node is self.root_node
+            or not node.hash_value
+            or node.component_data[BASE_COMPONENT_TYPE].value is None
+        ):
+            return None
+        parent = node.parent
+        assert parent is not None and node.key is not None
+        return BufferBackupSnapshot(
+            node_id=node.id,
+            parent_node_id=parent.id,
+            parent_is_root=parent is self.root_node,
+            parent_last_hash=parent.get_last_hash_value(),
+            hash_values=list(node.hash_value),
+            key=RadixKey(
+                array("q", node.key.raw_token_ids()),
+                extra_key=node.key.extra_key,
+                is_bigram=node.key.is_bigram,
+                cache_salt=node.key.cache_salt,
+            ),
+            prefix_keys=(
+                node.get_prefix_hash_values(parent) if pass_prefix_keys else None
+            ),
+        )
+
+    def validate_buffer_backup(
+        self, node_id: NodeId, expected_key_length: int
+    ) -> Optional[BufferBackupState]:
+        node = self._node_arena.get(node_id)
+        if (
+            node is None
+            or node.component_data[BASE_COMPONENT_TYPE].value is None
+            or len(node.key) != expected_key_length
+        ):
+            return None
+        parent = node.parent
+        if parent is None:
+            return None
+        return BufferBackupState(
+            parent_node_id=parent.id,
+            parent_is_root=parent is self.root_node,
+            parent_last_hash=parent.get_last_hash_value(),
+        )
+
+    def backfill_missing_hash_values(self) -> int:
+        """Hash every node that was built while storage was disabled.
+
+        Page hashes chain from the parent's last hash, so a node whose parent has
+        none restarts the chain mid-sequence: its keys then encode only a suffix
+        of the prefix they claim to represent, which would alias unrelated
+        requests that happen to start with those tokens. Walks parent-before-child
+        so each node hashes against an already-filled parent. Returns the number
+        of nodes filled.
+        """
+        filled = 0
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            # The root anchors every chain and is seeded with an empty hash list.
+            if node is not self.root_node and node.hash_value is None:
+                node.hash_value = compute_node_hash_values(node, self.page_size)
+                filled += 1
+            stack.extend(node.children.values())
+        return filled
+
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The NodeId anchoring matches; the single root serves every namespace."""
         return self.root_node.id
+
+    def dfs_weight_order(self, node_ids: Sequence[NodeId]) -> list[int]:
+        return _dfs_weight_order(self.root_node, node_ids, self.node_by_id)
 
     def _new_node(self, priority: int = 0) -> UnifiedTreeNode:
         """Create and register a tree node in the arena."""
@@ -639,7 +724,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             action,
         )
 
-    def _match_prefix_helper(self, key: RadixKey) -> tuple[
+    def _match_prefix_helper(
+        self, key: RadixKey
+    ) -> tuple[
         list[torch.Tensor],
         UnifiedTreeNode,
         UnifiedTreeNode,
@@ -652,7 +739,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # nodes can also match, so we separately track the best device-resident
         # match for scheduler prefix indices and locking.
         node = self.root_node
-        child_key = key.child_key(self.page_size)
+        key_offset = 0
+        child_key = key.child_key_at(key_offset, self.page_size)
         value: list[torch.Tensor] = []
         best_match_node = node
         best_match_device_node = node
@@ -693,14 +781,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 best_match_device_value_len = len(value)
                 best_match_device_node = node
 
-        while len(key) > 0 and child_key in node.children:
+        while key_offset < len(key) and child_key in node.children:
             child = node.children[child_key]
 
             # HiCache: dead node (evicted + not backuped) — stop traversal
             if child.evicted and not child.backuped:
                 break
 
-            prefix_len = child.key.match(key, page_size=self.page_size)
+            prefix_len = child.key.match_at(key, key_offset, page_size=self.page_size)
             full_kv_hit_length += prefix_len
             if prefix_len < len(child.key):
                 node, action = self._split_node(child.key, child, prefix_len)
@@ -713,9 +801,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 value.append(child.component_data[BASE_COMPONENT_TYPE].value)
             node = child
             _update_best_if_valid(node)
-            key = key[prefix_len:]
-            if len(key):
-                child_key = key.child_key(self.page_size)
+            key_offset += prefix_len
+            if key_offset < len(key):
+                child_key = key.child_key_at(key_offset, self.page_size)
 
         return (
             value,
@@ -828,6 +916,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if self.is_write_back:
             return False
         node.hit_count += 1
+
+        if self.enable_external_cache_linker:
+            return (
+                not node.external_cache_stored
+                and node.hit_count >= self.write_through_threshold
+            )
+
         return (
             self.enable_hicache
             and not node.backuped
@@ -837,7 +932,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def begin_insert(self, params: InsertParams) -> InsertStepResult:
         """Start the insert, running to its first barrier or completion."""
         # Insert walks are single-flight; a live walk means re-entrancy.
-        assert self._ongoing_insert_walk_state is None, "concurrent insert walks"
+        if self._ongoing_insert_walk_state is not None:
+            raise RuntimeError("concurrent insert walks")
         key = params.key
         value = params.value
         key, value = key.maybe_to_bigram_view(self.is_eagle, value)
@@ -869,12 +965,17 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             value=value,
             params=params,
             priority=priority,
+            result=InsertResult(
+                prefix_len=0,
+                adopted_ranges={} if params.track_adopted_ranges else None,
+            ),
         )
         return self._advance_insert()
 
     def resume_insert(self) -> InsertStepResult:
         """Continue the suspended insert after its step actions were executed."""
-        assert self._ongoing_insert_walk_state is not None, "no in-flight insert"
+        if self._ongoing_insert_walk_state is None:
+            raise RuntimeError("no in-flight insert")
         return self._advance_insert()
 
     def has_ongoing_insert(self) -> bool:
@@ -914,7 +1015,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     @staticmethod
     def _is_deferrable_action(action: CacheAction | ComponentAction) -> bool:
         """Fire-and-forget actions safe to batch until the next barrier."""
-        return isinstance(action, (FreeDeviceKV, ReplaceWriteThroughOnNodeSplit))
+        return isinstance(
+            action,
+            (FreeDeviceKV, FreeDeviceKVFullOnly, ReplaceWriteThroughOnNodeSplit),
+        )
 
     def _insert_walk_step(self, state: _InsertWalkState) -> None:
         """Process one walked node, appending its barrier actions to the state."""
@@ -935,6 +1039,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         if node.evicted:
             self._unevict_node_on_insert(node, state.value[:prefix_len])
+            state.result.record_adopted_range(
+                BASE_COMPONENT_TYPE,
+                state.total_prefix_length,
+                state.total_prefix_length + prefix_len,
+            )
             # FULL was restored from the request's fresh KV. Aux
             # components (e.g. SWA) may still hold tombstones and need
             # to rebuild their value from the same slice.
@@ -946,6 +1055,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     prefix_len=prefix_len,
                     total_prefix_len=state.total_prefix_length,
                     params=state.params,
+                    result=state.result,
                     cache_actions=step_actions,
                 )
         else:
@@ -959,15 +1069,24 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     total_prefix_len=state.total_prefix_length,
                     value_slice=value_slice,
                     params=state.params,
+                    result=state.result,
                     cache_actions=step_actions,
                 )
                 consumed_from = min(consumed_from, comp_consumed_from)
 
             dup_start = max(0, state.params.prev_prefix_len - state.total_prefix_length)
             if dup_start < consumed_from:
-                step_actions.append(
-                    FreeDeviceKV([value_slice[dup_start:consumed_from]])
+                # The duplicate slice may straddle this request's own eviction
+                # floor; below it only the full side is still ours to release.
+                dup = value_slice[dup_start:consumed_from]
+                abs_start = state.total_prefix_length + dup_start
+                swa_already_freed = min(
+                    max(state.params.swa_evicted_seqlen - abs_start, 0), dup.numel()
                 )
+                if swa_already_freed > 0:
+                    step_actions.append(FreeDeviceKVFullOnly([dup[:swa_already_freed]]))
+                if swa_already_freed < dup.numel():
+                    step_actions.append(FreeDeviceKV([dup[swa_already_freed:]]))
 
         if self._inc_hit_count_and_check(node, state.params.chunked):
             step_actions.append(self._build_backup_kv_action(node))
@@ -983,6 +1102,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # only a tombstone for this span (e.g. the whole leaf is outside the SWA
         # window). Materialize it anyway so the Full KV stays cacheable.
         if len(state.key):
+            state.result.record_adopted_range(
+                BASE_COMPONENT_TYPE,
+                state.total_prefix_length,
+                state.total_prefix_length + len(state.key),
+            )
             state.target_node = self._add_new_node(
                 state.node, state.key, state.value, priority=state.priority
             )
@@ -994,10 +1118,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # e.g. Mamba attaches mamba_value to the leaf node
         # All hooks run before their emitted actions execute; an action failure
         # fail-stops the process, so partial-commit state is never observed.
-        state.result = InsertResult(
-            prefix_len=state.total_prefix_length,
-            last_device_node=state.target_node.id,
-        )
+        state.result.prefix_len = state.total_prefix_length
+        state.result.last_device_node = state.target_node.id
         for component in self.components:
             component.commit_insert_component_data(
                 node=state.target_node,
@@ -1054,6 +1176,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.parent = child.parent
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
+        new_node.external_cache_stored = child.external_cache_stored
         new_node.creation_time = child.creation_time
         # Split fragments stay on the anchor's root path for the ack's walk.
         new_node.load_back_pending_id = child.load_back_pending_id
@@ -1064,6 +1187,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         child.key = child.key[split_len:]
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
+        )
+        new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
+            child.event_hash_value, split_len, self.page_size
         )
 
         for component in self.components:
@@ -1109,12 +1235,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
-        if self.enable_storage:
+        if self.enable_storage or self.enable_external_cache_linker:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
-        self._record_store_event(new_node)
+        self.kv_events.record_store(new_node)
         return new_node
 
     def _unevict_node_on_insert(
@@ -1133,7 +1259,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_duplicate_tracking(node)
         if node.parent is not None:
             self._update_evictable_leaf_sets(node.parent)
-        self._record_store_event(node, medium=StorageMedium.GPU)
+        self.kv_events.record_store(node, medium=StorageMedium.GPU)
 
     def _update_evictable_leaf_sets(self, node: UnifiedTreeNode) -> None:
         """Update both device and host leaf sets for a node."""
@@ -1193,21 +1319,40 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Begin a component's device-eviction walk for up to request_cnt tokens."""
         self.components_by_type[component_type].evict_device_start(request_cnt)
 
+    def _begin_tracking_unbacked_tokens(self) -> None:
+        assert not self._is_tracking_unbacked_tokens
+        assert self._tracked_unbacked_tokens == 0
+        self._is_tracking_unbacked_tokens = True
+
+    def _finish_tracking_unbacked_tokens(self) -> int:
+        assert self._is_tracking_unbacked_tokens
+        self._is_tracking_unbacked_tokens = False
+        result = self._tracked_unbacked_tokens
+        self._tracked_unbacked_tokens = 0
+        return result
+
     def evict_device_next_node(
         self, component_type: ComponentType, tracker: dict[ComponentType, int]
     ) -> EvictDeviceNextNodeResult:
-        """Return the next device leaf to evict for a component, or None when done."""
+        """Advance one component eviction step and report whether it progressed."""
         result = EvictDeviceNextNodeResult()
         # The walk reads running totals for its doneness check; the result
         # carries only this step's delta.
         updated_tracker = defaultdict(int, tracker)
-        result.node_id = self.components_by_type[component_type].evict_device_next_node(
-            updated_tracker, result.device_frees, result.host_frees
-        )
+        self._begin_tracking_unbacked_tokens()
+        try:
+            result.node_id = self.components_by_type[
+                component_type
+            ].evict_device_next_node(
+                updated_tracker, result.device_frees, result.host_frees
+            )
+        finally:
+            result.unbacked_tokens = self._finish_tracking_unbacked_tokens()
         for ct, n in updated_tracker.items():
             delta = n - tracker.get(ct, 0)
             if delta:
                 result.tracker[ct] = delta
+        result.made_progress = result.node_id is not None or bool(result.tracker)
         return result
 
     def evict_device_end(self, component_type: ComponentType) -> None:
@@ -1223,25 +1368,31 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result = EvictDeviceLeafResult()
         node = self.node_by_id(node_id)
         assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
-        if not node.backuped:
-            if is_write_back:
-                result.backup_kv = self._build_backup_kv_action(node, write_back=True)
+        self._begin_tracking_unbacked_tokens()
+        try:
+            if not node.backuped:
+                if is_write_back:
+                    result.backup_kv = self._build_backup_kv_action(
+                        node, write_back=True
+                    )
+                    return result
+                # Write-through: node has no backup, delete entirely.
+                self._delete_unbacked_device_leaf(
+                    node,
+                    result.tracker,
+                    device_frees=result.device_frees,
+                    host_frees=result.host_frees,
+                )
                 return result
-            # Write-through: node has no backup, delete entirely.
-            self._delete_unbacked_device_leaf(
+            self._demote(
                 node,
                 result.tracker,
                 device_frees=result.device_frees,
                 host_frees=result.host_frees,
             )
             return result
-        self._demote(
-            node,
-            result.tracker,
-            device_frees=result.device_frees,
-            host_frees=result.host_frees,
-        )
-        return result
+        finally:
+            result.unbacked_tokens = self._finish_tracking_unbacked_tokens()
 
     def drop_subtree_no_host(self, node_id: NodeId) -> DropSubtreeNoHostResult:
         """Write-back fallback when a D-leaf's D->H backup fails under host
@@ -1298,7 +1449,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     ) -> None:
         """Free every component layer on the node and detach it from the LRU
         lists and evictable leaf sets."""
-        self._record_remove_event(node, medium=medium)
+        self.kv_events.record_remove(node, medium=medium)
         for comp in self.components:
             self._evict_component_and_detach_lru(
                 node,
@@ -1417,7 +1568,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Free only the Full host layer; aux host slices stay under their own
         pools' LRU (a host-only aux slice may be a sole copy)."""
         assert self._can_reclaim_full_host_duplicate(node)
-        self._record_remove_event(node, medium=StorageMedium.CPU)
+        self.kv_events.record_remove(node, medium=StorageMedium.CPU)
         self._evict_component_and_detach_lru(
             node,
             self.components_by_type[BASE_COMPONENT_TYPE],
@@ -1442,7 +1593,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         All freed tokens are accumulated into *tracker*."""
         assert self._is_host_leaf(node), f"node {node.id} is not an H-leaf"
 
-        self._record_remove_event(node, medium=StorageMedium.CPU)
+        self.kv_events.record_remove(node, medium=StorageMedium.CPU)
         for comp in self.components:
             _, hf = self._evict_component_and_detach_lru(
                 node,
@@ -1489,7 +1640,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._cascade_evict(
             node, trigger, tracker, device_frees=device_frees, host_frees=host_frees
         )
-        self._record_remove_event(node, medium=StorageMedium.GPU)
+        self.kv_events.record_remove(node, medium=StorageMedium.GPU)
 
         # after device eviction, insert aux components into host LRU.
         self._for_each_component_lru(
@@ -1508,47 +1659,23 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     ):
         """Cascade eviction from trigger to lower-or-equal priority components."""
 
-        is_leaf = False
-        if target == EvictLayer.DEVICE:
-            is_leaf = node in self.evictable_device_leaves
-        elif target == EvictLayer.HOST:
-            is_leaf = node in self.evictable_host_leaves
-
-        trigger_priority = trigger.eviction_priority(is_leaf)
+        is_leaf = self._is_cascade_evict_leaf(node, target)
         base_evicted = False
 
         for comp in self.components:
-            if comp.eviction_priority(is_leaf) <= trigger_priority:
-                if comp is not trigger and comp.node_has_component_data(node, target):
-                    cd = node.component_data[comp.component_type]
-                    # A comp whose TRUE internal priority outranks the trigger
-                    # is only in this loop because leaf-collapse flattened
-                    # priorities; a lock on it is a legit pin and must be
-                    # spared. A lock on a strictly-lower-priority tier is a
-                    # real strand — fall through to the assert below.
-                    if comp.eviction_priority(
-                        is_leaf=False
-                    ) >= trigger.eviction_priority(is_leaf=False):
-                        if EvictLayer.DEVICE in target and cd.lock_ref != 0:
-                            continue
-                        if EvictLayer.HOST in target and cd.host_lock_ref != 0:
-                            continue
-                        if cd.session_ref > 0 and trigger.session_ref(node) == 0:
-                            continue
-                    if EvictLayer.DEVICE in target:
-                        assert cd.lock_ref == 0
-                    if EvictLayer.HOST in target:
-                        assert cd.host_lock_ref == 0
-                    self._evict_component_and_detach_lru(
-                        node,
-                        comp,
-                        target=target,
-                        tracker=tracker,
-                        device_frees=device_frees,
-                        host_frees=host_frees,
-                    )
-                    if comp.component_type == BASE_COMPONENT_TYPE:
-                        base_evicted = True
+            if self._should_cascade_evict_component(
+                node, trigger, comp, target, is_leaf
+            ):
+                self._evict_component_and_detach_lru(
+                    node,
+                    comp,
+                    target=target,
+                    tracker=tracker,
+                    device_frees=device_frees,
+                    host_frees=host_frees,
+                )
+                if comp.component_type == BASE_COMPONENT_TYPE:
+                    base_evicted = True
 
         # Now that all components (including SWA which depends on Full.value)
         # have been freed, we can safely tombstone Full.value.
@@ -1563,6 +1690,48 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             node.component_data[BASE_COMPONENT_TYPE].value = None
 
         self._update_evictable_leaf_sets(node)
+
+    def _is_cascade_evict_leaf(self, node: UnifiedTreeNode, target: EvictLayer) -> bool:
+        if target == EvictLayer.DEVICE:
+            return node in self.evictable_device_leaves
+        if target == EvictLayer.HOST:
+            return node in self.evictable_host_leaves
+        return False
+
+    @staticmethod
+    def _should_cascade_evict_component(
+        node: UnifiedTreeNode,
+        trigger: TreeComponent,
+        comp: TreeComponent,
+        target: EvictLayer,
+        is_leaf: bool,
+    ) -> bool:
+        """Return whether a component is an unlocked cascade-eviction target."""
+        trigger_priority = trigger.eviction_priority(is_leaf)
+        if comp.eviction_priority(is_leaf) > trigger_priority:
+            return False
+        if comp is trigger or not comp.node_has_component_data(node, target):
+            return False
+
+        cd = node.component_data[comp.component_type]
+        # A comp whose TRUE internal priority outranks the trigger is only a
+        # candidate because leaf-collapse flattened priorities; a lock on it is
+        # a legitimate pin and must be spared. A lock on a strictly-lower-
+        # priority tier is a real strand and must trip the assertions below.
+        if comp.eviction_priority(is_leaf=False) >= trigger.eviction_priority(
+            is_leaf=False
+        ):
+            if EvictLayer.DEVICE in target and cd.lock_ref != 0:
+                return False
+            if EvictLayer.HOST in target and cd.host_lock_ref != 0:
+                return False
+            if cd.session_ref > 0 and trigger.session_ref(node) == 0:
+                return False
+        if EvictLayer.DEVICE in target:
+            assert cd.lock_ref == 0
+        if EvictLayer.HOST in target:
+            assert cd.host_lock_ref == 0
+        return True
 
     def _remove_leaf_from_parent(self, node: UnifiedTreeNode):
         for component in self.components:
@@ -1584,6 +1753,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         target: EvictLayer = EvictLayer.DEVICE,
         tracker: Optional[dict[ComponentType, int]] = None,
     ) -> tuple[int, int]:
+        had_host_copy = node.component_data[comp.component_type].host_value is not None
         device_freed, host_freed = comp.evict_component(
             node, target=target, device_frees=device_frees, host_frees=host_frees
         )
@@ -1592,6 +1762,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 tracker[comp.component_type] += device_freed
             elif EvictLayer.HOST in target:
                 tracker[comp.component_type] += host_freed
+        if (
+            self._is_tracking_unbacked_tokens
+            and comp.component_type == BASE_COMPONENT_TYPE
+            and device_freed > 0
+            and not had_host_copy
+        ):
+            self._tracked_unbacked_tokens += device_freed
 
         # Detach from the appropriate LRU list(s)
         ct = comp.component_type
@@ -1619,8 +1796,19 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
           - Full host present    → keep as H-leaf
           - neither              → evict all remaining data, delete, continue up
         """
+        self._iteratively_delete_tombstone_ancestors(
+            deleted_node.parent, tracker, device_frees, host_frees
+        )
+
+    def _iteratively_delete_tombstone_ancestors(
+        self,
+        cur: UnifiedTreeNode,
+        tracker: dict[ComponentType, int],
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> None:
+        """Delete childless tombstone ancestors until a live or locked node is reached."""
         ct = BASE_COMPONENT_TYPE
-        cur = deleted_node.parent
         while cur != self.root_node and len(cur.children) == 0:
             if any(
                 cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
@@ -1851,7 +2039,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     ) -> tuple[PoolTransfer, dict[ComponentType, list[PoolTransfer]]]:
         """Build the H->D load-back KV transfer plus per-component aux transfers."""
         # Component hooks take primitives, not Req: extract its fields here.
-        mamba_pool_idx = req.mamba_pool_idx if req is not None else None
+        mamba_pool_idx = req.kv.mamba_pool_idx if req is not None else None
         node = self.node_by_id(node_id)
         kv_xfer = self.components_by_type[BASE_COMPONENT_TYPE].build_hicache_transfers(
             node, CacheTransferPhase.LOAD_BACK
@@ -1865,24 +2053,42 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
             if t:
                 comp_xfers[comp.component_type] = t
+        # Reject transfers that would claim a node pinned by another load-back
+        # anchor; the empty spec makes the caller back off and recompute.
+        if any(
+            self.node_by_id(nid).load_back_pending_id not in (None, node_id)
+            for xfers in ([kv_xfer], *comp_xfers.values())
+            for xfer in xfers
+            for nid in xfer.nodes_to_load or ()
+        ):
+            empty_kv = PoolTransfer(
+                name=PoolName.KV,
+                host_indices=torch.empty((0,), dtype=torch.int64, device="cpu"),
+                nodes_to_load=[],
+            )
+            return empty_kv, {}
         return kv_xfer, comp_xfers
 
-    def prefetch_anchor_info(self, node_id: NodeId) -> Optional[str]:
-        """The anchor node's key extra_key."""
+    def prefetch_anchor_info(
+        self, node_id: NodeId
+    ) -> tuple[Optional[str], Optional[str]]:
+        """The anchor node's key extra_key and cache_salt."""
         node = self.node_by_id(node_id)
-        return node.key.extra_key if node.key else None
+        if node.key is None:
+            return None, None
+        return node.key.extra_key, node.key.cache_salt
 
     def _build_backup_kv_action(
         self, node: UnifiedTreeNode, write_back: bool = False
     ) -> BackupKV:
-        """Build the backup action for a node and its unbacked ancestors."""
+        """Build the backup action for a node and its not-yet-persisted ancestors."""
         chain = [node]
         if not write_back:
             ancestor = node.parent
             while (
                 ancestor is not None
                 and ancestor is not self.root_node
-                and not ancestor.backuped
+                and not (ancestor.backuped or ancestor.external_cache_stored)
             ):
                 chain.append(ancestor)
                 ancestor = ancestor.parent
@@ -1949,19 +2155,17 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         rebuild is deferred to the orchestration layer."""
         node = self.node_by_id(node_id)
         cache_actions: list[CacheAction | ComponentAction] = []
-        # Pin every node whose host slots the in-flight DMA reads (including
-        # aux-only nodes) against reclaim until the ack.
-        for xfers in ([kv_xfer], *comp_xfers.values()):
-            for xfer in xfers:
-                for nid in xfer.nodes_to_load or ():
-                    pinned = self.node_by_id(nid)
-                    # One live load-back per node; only the same anchor may
-                    # re-pin (a node can sit in Full and aux transfer lists).
-                    assert pinned.load_back_pending_id in (None, node_id), (
-                        f"node {nid} pinned by load-back "
-                        f"{pinned.load_back_pending_id}, new anchor {node_id}"
-                    )
-                    pinned.load_back_pending_id = node_id
+        if self.is_write_back:
+            # Pin Full KV host slots against duplicate reclaim until the ack.
+            # Auxiliary pools have independent host locks and may legitimately
+            # load the same radix node under a different anchor.
+            for nid in kv_xfer.nodes_to_load or ():
+                pinned = self.node_by_id(nid)
+                assert pinned.load_back_pending_id in (None, node_id), (
+                    f"node {nid} pinned by load-back "
+                    f"{pinned.load_back_pending_id}, new anchor {node_id}"
+                )
+                pinned.load_back_pending_id = node_id
         kv_xfer.device_indices = device_indices
         self.components_by_type[BASE_COMPONENT_TYPE].commit_hicache_transfer(
             node,
@@ -1970,7 +2174,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             cache_actions=cache_actions,
         )
         for nid in kv_xfer.nodes_to_load or ():
-            self._record_store_event(self.node_by_id(nid), medium=StorageMedium.GPU)
+            self.kv_events.record_store(self.node_by_id(nid), medium=StorageMedium.GPU)
         for ct, xfers in comp_xfers.items():
             self.components_by_type[ct].commit_hicache_transfer(
                 node,
@@ -1982,14 +2186,21 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         return cache_actions
 
     def finish_load_back(self, anchor_node_id: NodeId) -> None:
-        """Clear the in-flight H->D marks along the anchor's root path at ack
-        time; split fragments stay on the path, so the walk covers them."""
+        """Finalize H->D load-back state along the anchor's root path.
+
+        Write-back clears source-node pins at ack time. Write-through does not
+        use those pins, but still refreshes duplicate tracking after the device
+        copies become visible. Split fragments stay on the path, so the walk
+        covers them.
+        """
         node = self.node_by_id(anchor_node_id)
         while node is not None and node is not self.root_node:
-            if node.load_back_pending_id == anchor_node_id:
+            if self.is_write_back:
+                if node.load_back_pending_id != anchor_node_id:
+                    node = node.parent
+                    continue
                 node.load_back_pending_id = None
-                # The loaded copies become tracked duplicates only now.
-                self._update_duplicate_tracking(node)
+            self._update_duplicate_tracking(node)
             node = node.parent
 
     def mark_write_through_pending(self, node_id: NodeId) -> None:
@@ -2006,7 +2217,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 node.write_through_pending_id = None
                 # The backed-up copy becomes a tracked duplicate only now.
                 self._update_duplicate_tracking(node)
-            self._record_store_event(node, medium=StorageMedium.CPU)
+            self.kv_events.record_store(node, medium=StorageMedium.CPU)
 
     def set_component_device_value(
         self, node_id: NodeId, component_type: ComponentType, value: torch.Tensor

@@ -37,6 +37,7 @@ not the per-rank group membership logic.
 from __future__ import annotations
 
 import sys
+from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
 import pytest
@@ -47,6 +48,45 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 # Import the actual parallel_state module
 parallel_state = pytest.importorskip("sglang.srt.distributed.parallel_state")
+
+
+def test_custom_allreduce_precedes_symmetric_memory_pynccl():
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.world_size = 2
+    coordinator.unique_name = "test"
+    coordinator.hpu_communicator = None
+    coordinator.xpu_communicator = None
+    coordinator.npu_communicator = None
+    coordinator.qr_comm = None
+    coordinator.pymscclpp_comm = None
+    coordinator.torch_symm_mem_comm = None
+    coordinator._fi_workspace_hint = None
+    coordinator.ca_comm = Mock(disabled=False)
+    coordinator.ca_comm.should_custom_ar.return_value = True
+    coordinator.pynccl_comm = Mock()
+    coordinator.pynccl_comm.change_state.return_value = nullcontext()
+    coordinator.is_symmetric_memory_enabled = Mock(return_value=True)
+    coordinator.debug_check_symmetric_mempool = Mock()
+    input_ = Mock(is_cpu=False)
+    custom_output = object()
+
+    with (
+        patch.object(parallel_state.torch.compiler, "is_compiling", return_value=False),
+        patch.object(
+            parallel_state, "outplace_all_reduce", return_value=custom_output
+        ) as outplace_all_reduce,
+    ):
+        output = coordinator.all_reduce(input_)
+
+    assert output is custom_output
+    outplace_all_reduce.assert_called_once_with(
+        input_,
+        group_name="test",
+        outplace_all_reduce_method="ca",
+    )
+    coordinator.pynccl_comm.all_reduce.assert_not_called()
 
 
 def test_parallel_group_construction_tp8_attn_cp2():
@@ -83,7 +123,6 @@ def test_parallel_group_construction_tp8_attn_cp2():
         patch("torch.distributed.get_rank", return_value=0),
         patch("torch.distributed.get_backend", return_value="nccl"),
     ):
-
         # Mock init_model_parallel_group to capture the groups being created
         created_groups = {}
 
@@ -104,7 +143,6 @@ def test_parallel_group_construction_tp8_attn_cp2():
             ),
             patch.object(parallel_state, "get_world_group") as mock_world_group,
         ):
-
             # Mock world group
             mock_world = Mock()
             mock_world.device_group = Mock()
@@ -134,18 +172,18 @@ def test_parallel_group_construction_tp8_attn_cp2():
 
             # Verify ATTN_CP groups
             attn_cp_groups = created_groups.get("attn_cp", [])
-            assert (
-                len(attn_cp_groups) == 4
-            ), f"Expected 4 ATTN_CP groups, got {len(attn_cp_groups)}"
+            assert len(attn_cp_groups) == 4, (
+                f"Expected 4 ATTN_CP groups, got {len(attn_cp_groups)}"
+            )
             expected_attn_cp = [
                 [0, 4],
                 [1, 5],
                 [2, 6],
                 [3, 7],
             ]
-            assert (
-                attn_cp_groups == expected_attn_cp
-            ), f"Wrong ATTN_CP groups: {attn_cp_groups}"
+            assert attn_cp_groups == expected_attn_cp, (
+                f"Wrong ATTN_CP groups: {attn_cp_groups}"
+            )
 
             print("TP=8, Attn CP=2 group construction verified")
 
@@ -183,7 +221,6 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
         patch("torch.distributed.get_rank", return_value=0),
         patch("torch.distributed.get_backend", return_value="nccl"),
     ):
-
         # Mock init_model_parallel_group to capture the groups being created
         created_groups = {}
 
@@ -204,7 +241,6 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
             ),
             patch.object(parallel_state, "get_world_group") as mock_world_group,
         ):
-
             # Mock world group
             mock_world = Mock()
             mock_world.device_group = Mock()
@@ -235,31 +271,31 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
 
             # Verify MOE_EP groups
             moe_ep_groups = created_groups.get("moe_ep", [])
-            assert (
-                len(moe_ep_groups) == 2
-            ), f"Expected 2 MOE_EP groups, got {len(moe_ep_groups)}"
+            assert len(moe_ep_groups) == 2, (
+                f"Expected 2 MOE_EP groups, got {len(moe_ep_groups)}"
+            )
             expected_moe_ep = [
                 [0, 1, 2, 3],
                 [4, 5, 6, 7],
             ]
-            assert (
-                moe_ep_groups == expected_moe_ep
-            ), f"Wrong MOE_EP groups: {moe_ep_groups}"
+            assert moe_ep_groups == expected_moe_ep, (
+                f"Wrong MOE_EP groups: {moe_ep_groups}"
+            )
 
             # Verify MOE_DP groups
             moe_dp_groups = created_groups.get("moe_dp", [])
-            assert (
-                len(moe_dp_groups) == 4
-            ), f"Expected 4 MOE_DP groups, got {len(moe_dp_groups)}"
+            assert len(moe_dp_groups) == 4, (
+                f"Expected 4 MOE_DP groups, got {len(moe_dp_groups)}"
+            )
             expected_moe_dp = [
                 [0, 4],
                 [1, 5],
                 [2, 6],
                 [3, 7],
             ]
-            assert (
-                moe_dp_groups == expected_moe_dp
-            ), f"Wrong MOE_DP groups: {moe_dp_groups}"
+            assert moe_dp_groups == expected_moe_dp, (
+                f"Wrong MOE_DP groups: {moe_dp_groups}"
+            )
 
             print("TP=8, MoE EP=4, MoE CP=2 group construction verified")
 
