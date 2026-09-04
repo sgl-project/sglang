@@ -371,7 +371,7 @@ def _build_cube_attn_metadata(
         num_steps=num_steps,
         device=device,
     )
-    logger.info(
+    logger.debug(
         "cube sparse attention enabled: local_cube_size=%s "
         "topk_ratio_list(len=%d, min=%.4f, max=%.4f)",
         list(local_cube_size),
