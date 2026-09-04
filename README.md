@@ -22,6 +22,10 @@
 <a href="https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#slides"><b>Slides</b></a>
 </p>
 
+<p align="center">
+  <b>English</b> · <a href="README.zh.md">简体中文</a>
+</p>
+
 ## News
 - [2026/07] 🔥 SGLang and Miles add day-0 support for Kimi K3 ([blog](https://lmsys.org/blog/2026-07-27-kimi-k3-day0-support/)).
 - [2026/07] RadixArk and Google bring full SGLang features to TPUs ([blog](https://lmsys.org/blog/2026-07-30-sglang-google-tpu/)).
