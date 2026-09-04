@@ -60,12 +60,23 @@ export const config = {
       // path is CUDA-only, so the row is hidden on the AMD cells. The server
       // already auto-enables it for BF16 on CUDA, hence the default chip is
       // Auto and adds no flag.
+      //
+      // DGX Spark (GB10) is unified memory: the pinned-host copy comes out of
+      // the same 128 GB pool as the GPU weights, so offloading to RAM frees
+      // nothing there and Auto (which resolves to on for this checkpoint) and
+      // On are greyed out — Off is the only pick, and the engine falls back to
+      // it. Re-enable On for DGX Spark once an NVMe-backed PLE table ships
+      // (sgl-project/sglang#37068 / #36567).
       showWhen: (sel) => !["mi350x", "mi355x"].includes(sel.hw),
       default: "auto",
       options: [
         { id: "auto", label: "Auto",
+          disabled: (sel) => sel.hw === "dgx-spark",
+          disableReason: "DGX Spark is unified memory: PLE offload to RAM frees nothing (the pinned table shares the 128 GB pool with the weights). Off is the verified setting until NVMe-backed PLE lands.",
           hints: ["PLE Offload: auto-enabled for BF16 on CUDA, off otherwise"] },
         { id: "on",   label: "On",
+          disabled: (sel) => sel.hw === "dgx-spark",
+          disableReason: "DGX Spark is unified memory: PLE offload to RAM frees nothing (the pinned table shares the 128 GB pool with the weights). Off is the verified setting until NVMe-backed PLE lands.",
           flags: ["--ple-offload-embedding"] },
         { id: "off",  label: "Off",
           flags: ["--no-ple-offload-embedding"] },
@@ -669,9 +680,10 @@ export const config = {
     // the default extra_buffer strategy, 4 with extra_buffer_lazy), and the
     // scheduler silently caps --max-running-requests to what the mamba pool
     // admits unless --max-mamba-cache-size = requests x slots is set.
-    // --no-ple-offload-embedding keeps the FP8 table GPU-resident (TP-sharded):
-    // on unified memory the "offloaded" pinned-host copy would come out of the
-    // same pool anyway. Verified 2026-09-04 on the qwen38flashnext image
+    // The PLE Offload row is forced to Off on this hardware (see overlayDims),
+    // which appends --no-ple-offload-embedding: the FP8 table stays GPU-resident
+    // and TP-sharded, since on unified memory the "offloaded" pinned-host copy
+    // would come out of the same pool anyway. Verified 2026-09-04 on the qwen38flashnext image
     // (SGLang 593134d17a): GSM8K (chat API, thinking off, n=200) 97.0% low
     // latency / 96.5% high throughput, 100k-token prefill 2,840 tok/s.
     //
@@ -692,7 +704,6 @@ export const config = {
         "--tp 2",
         "--quantization modelopt_fp4",
         "--fp4-gemm-backend flashinfer_cutlass",
-        "--no-ple-offload-embedding",
         "--page-size 64",
         "--mamba-track-interval 64",
         "--chunked-prefill-size 4096",
@@ -727,7 +738,6 @@ export const config = {
         "--tp 2",
         "--quantization modelopt_fp4",
         "--fp4-gemm-backend flashinfer_cutlass",
-        "--no-ple-offload-embedding",
         "--page-size 64",
         "--mamba-track-interval 64",
         "--chunked-prefill-size 4096",
