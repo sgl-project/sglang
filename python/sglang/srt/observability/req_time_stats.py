@@ -1089,9 +1089,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             )
 
             if SGLANG_TEST_REQUEST_TIME_STATS:
-                assert (
-                    queue_duration >= 0 and forward_duration >= 0
-                ), f"queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
+                assert queue_duration >= 0 and forward_duration >= 0, (
+                    f"queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
+                )
 
             return f"queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, entry_time={self.format_wallclock(self.wait_queue_entry_time)}"
         elif self.disagg_mode == DisaggregationMode.PREFILL:
@@ -1111,7 +1111,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                         bootstrap_queue_duration >= 0
                         and queue_duration >= 0
                         and forward_duration >= 0
-                    ), f"bootstrap_queue_duration={bootstrap_queue_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
+                    ), (
+                        f"bootstrap_queue_duration={bootstrap_queue_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
+                    )
 
             if (
                 self.bootstrap_done_time > 0
@@ -1121,9 +1123,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                     self.prefill_bootstrap_queue_entry_time, self.bootstrap_done_time
                 )
                 if SGLANG_TEST_REQUEST_TIME_STATS:
-                    assert (
-                        bootstrap_duration >= 0
-                    ), f"bootstrap_duration={bootstrap_duration} < 0"
+                    assert bootstrap_duration >= 0, (
+                        f"bootstrap_duration={bootstrap_duration} < 0"
+                    )
                 bootstrap_fields = (
                     f"bootstrap_duration={self.format_duration(bootstrap_duration)}, "
                 )
@@ -1165,7 +1167,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                         and transfer_duration >= 0
                         and queue_duration >= 0
                         and forward_duration >= 0
-                    ), f"prealloc_duration={prealloc_duration} < 0 or transfer_duration={transfer_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0. {self=}"
+                    ), (
+                        f"prealloc_duration={prealloc_duration} < 0 or transfer_duration={transfer_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0. {self=}"
+                    )
 
             # Break down prealloc_duration into sub-phases
             if self.bootstrap_done_time > 0:
@@ -1176,9 +1180,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                     self.bootstrap_done_time, self.decode_transfer_queue_entry_time
                 )
                 if SGLANG_TEST_REQUEST_TIME_STATS:
-                    assert (
-                        bootstrap_duration >= 0 and alloc_wait_duration >= 0
-                    ), f"bootstrap_duration={bootstrap_duration} < 0 or alloc_wait_duration={alloc_wait_duration} < 0"
+                    assert bootstrap_duration >= 0 and alloc_wait_duration >= 0, (
+                        f"bootstrap_duration={bootstrap_duration} < 0 or alloc_wait_duration={alloc_wait_duration} < 0"
+                    )
                 prealloc_fields = (
                     f"bootstrap_duration={self.format_duration(bootstrap_duration)}, "
                     f"alloc_wait_duration={self.format_duration(alloc_wait_duration)}, "
