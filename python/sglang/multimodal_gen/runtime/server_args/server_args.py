@@ -706,10 +706,16 @@ class ServerArgs(DisaggServerArgsMixin):
         """Best-effort preview of the warmup frame count BCG will capture."""
         try:
             from sglang.multimodal_gen.runtime.warmup_request_builder import (
+                _resolve_warmup_num_frames,
                 get_model_sampling_defaults,
             )
 
-            return getattr(get_model_sampling_defaults(self), "num_frames", None)
+            sampling_defaults = get_model_sampling_defaults(self)
+            return _resolve_warmup_num_frames(
+                self,
+                sampling_defaults,
+                server_based_warmup=True,
+            )
         except Exception:  # pragma: no cover - defensive
             return None
 
