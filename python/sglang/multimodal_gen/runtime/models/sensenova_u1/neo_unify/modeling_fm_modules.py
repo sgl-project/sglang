@@ -180,7 +180,6 @@ class ResBlock(nn.Module):
 
 
 class FlowMatchingHead(nn.Module):
-
     def __init__(self, input_dim, out_dim, dim=1536, layers=12, mlp_ratio=1.0):
         super(FlowMatchingHead, self).__init__()
         self.net = SimpleMLPAdaLN(
