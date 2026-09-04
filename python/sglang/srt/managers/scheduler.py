@@ -1672,6 +1672,18 @@ class Scheduler(
             get_int_env_var(env_var, default_size) if env_var else None
         )
 
+        if (
+            self.truncation_align_size is not None
+            and self.chunked_prefill_size is not None
+            and self.chunked_prefill_size < self.truncation_align_size
+        ):
+            raise ValueError(
+                "chunked_prefill_size must be at least the deterministic prefill "
+                f"alignment size ({self.truncation_align_size}) for the "
+                f"{prefill_backend} attention backend; got "
+                f"chunked_prefill_size={self.chunked_prefill_size}."
+            )
+
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
             [

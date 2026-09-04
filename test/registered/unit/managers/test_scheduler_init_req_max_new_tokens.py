@@ -1,7 +1,9 @@
 import logging
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
+import sglang.srt.managers.scheduler as scheduler_module
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_parallel
@@ -121,6 +123,58 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
                     scheduler = self._new_scheduler()
                     req = self._new_req(max_new_tokens=64)
                     self.assertEqual(self._init_and_check(scheduler, req), 64)
+
+    def test_deterministic_chunked_prefill_requires_alignment_sized_chunk(self):
+        """Reject a configuration that would otherwise requeue every chunk.
+
+        A 129-token request with a 128-token chunk never becomes runnable when
+        deterministic Triton prefill requires 4096-token-aligned truncation.
+        Failing during scheduler initialization avoids starving that request.
+        """
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.chunked_prefill_size = 128
+        deterministic = SimpleNamespace(enable_deterministic_inference=True)
+
+        with (
+            patch.object(
+                scheduler_module,
+                "get_exec",
+                return_value=SimpleNamespace(deterministic=deterministic),
+            ),
+            patch.object(
+                scheduler_module,
+                "attention_backends",
+                return_value=("triton", "triton"),
+            ),
+            patch.object(scheduler_module, "get_int_env_var", return_value=4096),
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "chunked_prefill_size must be at least the deterministic prefill",
+            ):
+                scheduler.init_deterministic_inference_config()
+
+    def test_deterministic_chunked_prefill_accepts_alignment_sized_chunk(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.chunked_prefill_size = 4096
+        deterministic = SimpleNamespace(enable_deterministic_inference=True)
+
+        with (
+            patch.object(
+                scheduler_module,
+                "get_exec",
+                return_value=SimpleNamespace(deterministic=deterministic),
+            ),
+            patch.object(
+                scheduler_module,
+                "attention_backends",
+                return_value=("triton", "triton"),
+            ),
+            patch.object(scheduler_module, "get_int_env_var", return_value=4096),
+        ):
+            scheduler.init_deterministic_inference_config()
+
+        self.assertEqual(scheduler.truncation_align_size, 4096)
 
     def test_context_rule_binds_tighter_than_limit(self):
         max_req_len, input_len = 32, 20
