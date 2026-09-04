@@ -170,6 +170,10 @@ def _alloc_logits(
     if (
         is_decode
         or n > _LOGITS_BUDGET_ELEMS
+        # Short-circuit before the capture probe: it returns a runtime bool that
+        # Dynamo cannot put in the graph, which is fatal under fullgraph piecewise.
+        # Tracing wants the same plain allocation as capture does.
+        or torch.compiler.is_compiling()
         or torch.cuda.is_current_stream_capturing()
     ):
         return torch.empty(
