@@ -214,7 +214,7 @@ def build_kv_cache(
     sliding_window_size: Optional[int] = None
     full_tokens_per_layer: Optional[int] = None
     swa_tokens_per_layer: Optional[int] = None
-    uses_transformers_backend = (
+    uses_transformers_backend = not use_mlx() and (
         get_resolved_model_impl(model_config) == ModelImpl.TRANSFORMERS
     )
 
