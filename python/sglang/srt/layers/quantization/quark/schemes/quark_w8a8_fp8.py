@@ -173,7 +173,14 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
+        # Activations must be a plain bf16 tensor: per-channel FP8 (weight_scale
+        # [N, 1]) is gated off the aiter fused RMSNorm+quant kernel upstream by
+        # _is_block_scale_fp8, so the per-token quant happens in apply_fp8_linear.
+        assert not isinstance(x, tuple), (
+            "quark W8A8 FP8 linear received a pre-quantized tuple; a fused "
+            "RMSNorm+quant producer was not gated off by _is_block_scale_fp8 "
+            "(per-channel FP8 must fall through to the plain bf16 path)."
+        )
         return apply_fp8_linear(
             x,
             layer.weight,
