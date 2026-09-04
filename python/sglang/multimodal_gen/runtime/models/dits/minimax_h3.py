@@ -440,6 +440,7 @@ def _apply_qk_norm(
         and q.stride(-2) == k.stride(-2) == head_dim
         and q_norm.eps == k_norm.eps
         and not torch.compiler.is_compiling()
+        and current_platform.is_cuda()
     ):
         fused_inplace_qknorm(
             q,

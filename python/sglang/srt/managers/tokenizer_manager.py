@@ -831,8 +831,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     ):
                         yield response
         except BaseException:
-            # A batch may fail after partial dispatch; abort dispatched RIDs so
-            # scheduler resources are released.
+            # _init_req_state created a rid_to_state entry per (sub-)request up
+            # front. The normal remover is the scheduler-response path
+            # (_handle_batch_output), so a failure *before* a request reaches the
+            # scheduler -- e.g. input-length validation rejecting an over-context
+            # request -- would otherwise leak those entries forever. Drop
+            # undelivered states, but abort dispatched requests for scheduler-side
+            # cleanup.
             self._release_req_states_on_failure(request_rids)
             raise
 
@@ -1581,6 +1586,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
 
     def _mark_state_dispatched(self, rid: str):
+        """Record that *rid* reached the scheduler.
+
+        Only dispatched requests are aborted (not discarded) by the
+        handler-failure cleanup; see _release_req_states_on_failure.
+        """
         state = self.rid_to_state.get(rid)
         if state is not None:
             state.dispatched = True
@@ -3476,7 +3486,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             time_stats.set_created_time(created_time)
 
     def _release_req_states_on_failure(self, rids: Iterable[str]):
-        """Keep dispatched states until the scheduler acknowledges their abort."""
+        """Release rid_to_state entries created for a failed handler.
+
+        Undelivered states are removed locally. Dispatched requests are aborted
+        and retained until the scheduler response removes them.
+        """
         for rid in rids:
             state = self.rid_to_state.get(rid)
             if state is None:

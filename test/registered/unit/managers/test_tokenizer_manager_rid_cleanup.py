@@ -15,7 +15,7 @@ Covers:
 
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
 
@@ -643,6 +643,27 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
         for r in rids:
             self.assertNotIn(r, tm.rid_to_state)
 
+    def test_parallel_sampling_failure_cleans_generated_rid(self):
+        tm = _make_tm_for_generate(self)
+        obj = GenerateReqInput(
+            text=["hello"],
+            rid=["base"],
+            sampling_params={"n": 2},
+        )
+        tokenized = MagicMock()
+        tokenized.mm_inputs = None
+        tokenized.sampling_params = MagicMock()
+        tm._tokenize_one_request = AsyncMock(return_value=tokenized)
+        tm._send_one_request = Mock(side_effect=RuntimeError("dispatch failed"))
+
+        async def drive():
+            await tm.generate_request(obj).__anext__()
+
+        with self.assertRaisesRegex(RuntimeError, "dispatch failed"):
+            asyncio.run(drive())
+
+        self.assertFalse(tm.rid_to_state)
+
     def test_thinking_budget_rejects_runtime_without_strict_thinking(self):
         tm = _make_tm_for_generate(self)
         obj = GenerateReqInput(
@@ -687,6 +708,53 @@ class TestWaitOneResponseAfterStateFreed(CustomTestCase):
         out = asyncio.run(drive())
         self.assertEqual(out["meta_info"]["id"], rid)
         self.assertEqual(out["text"], "hello")
+
+
+class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
+    """Cancellation after dispatch must stop the scheduler request."""
+
+    @patch(
+        "sglang.srt.managers.tokenizer_manager.wrap_shm_features",
+        side_effect=lambda obj: obj,
+    )
+    def test_cancel_after_dispatch_sends_abort_and_keeps_state(self, _wrap_shm):
+        tm = _make_tm_for_generate(self)
+        tm.cuda_vmm_feature_transport = Mock()
+        tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = AsyncMock(
+            return_value=[]
+        )
+        tm._dispatch_to_scheduler = Mock()
+        rid = "disconnect_zombie"
+        obj = _make_generate_obj(rid, is_single=True)
+        obj.return_prompt_token_ids = False
+        tokenized = MagicMock()
+        tokenized.rid = rid
+        tokenized.mm_inputs = None
+        tm._tokenize_one_request = AsyncMock(return_value=tokenized)
+
+        async def drive():
+            task = asyncio.create_task(tm.generate_request(obj).__anext__())
+            for _ in range(100):
+                await asyncio.sleep(0)
+                if tm._dispatch_to_scheduler.called:
+                    break
+            self.assertTrue(
+                tm._dispatch_to_scheduler.called, "request never dispatched"
+            )
+            state = tm.rid_to_state.get(rid)
+            self.assertIsNotNone(state)
+            self.assertTrue(state.dispatched)
+
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(drive())
+
+        sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
+        aborts = [m for m in sent if isinstance(m, AbortReq) and m.rid == rid]
+        self.assertTrue(aborts, "disconnect must send an AbortReq to the scheduler")
+        self.assertIn(rid, tm.rid_to_state)
 
 
 if __name__ == "__main__":
