@@ -1,10 +1,10 @@
+import contextlib
 import ctypes
 import json
 import logging
 import os
 import time
 import uuid
-import contextlib
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import cached_property
@@ -950,7 +950,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 keys, transfer
             )
             component_keys = self._tag_keys(component_keys)
-            with self.request_context(**self._request_context_from_extra_info(extra_info)):
+            with self.request_context(
+                **self._request_context_from_extra_info(extra_info)
+            ):
                 ex = self._batch_exist(component_keys)
             if key_multiplier > 0:
                 page_exists = [

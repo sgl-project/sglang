@@ -582,9 +582,7 @@ class HybridCacheController(BaseHiCacheController):
         operation.all_hash_values = hash_value
 
         extra_info = HiCacheStorageExtraInfo(
-            prefix_keys=operation.prefix_keys.copy()
-            if operation.prefix_keys
-            else None,
+            prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None,
             extra_info={"request_id": operation.request_id},
         )
         if operation.pool_transfers:
