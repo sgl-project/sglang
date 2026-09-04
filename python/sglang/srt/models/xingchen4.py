@@ -42,6 +42,7 @@ from sglang.srt.configs.xingchen4 import XingChen4Config
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -197,7 +198,9 @@ class mHCModule(nn.Module):
         # Persistent parameters matching the checkpoint weight names
         # (``attn_hc.hc_fn`` / ``attn_hc.hc_scale`` / ``attn_hc.hc_base``).
         # These are exactly the fp32 op operands consumed by the fused kernels.
-        self.hc_fn = nn.Parameter(torch.empty(out_features, self.n * self.hidden_size))
+        self.hc_fn = nn.Parameter(
+            torch.empty(out_features, self.n * self.hidden_size)
+        )
         self.hc_scale = nn.Parameter(torch.empty(3))
         self.hc_base = nn.Parameter(torch.empty(out_features))
 
@@ -626,6 +629,20 @@ class XingChen4DecoderLayer(nn.Module):
         mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
+
+        # KTEPWrapperMethod returns a TP-local partial: GPU expert partitions
+        # are present on their respective ranks, while the complete CPU-expert
+        # contribution exists only on TP rank 0.  Force DeepseekV2MoE to perform
+        # its post-experts all-reduce immediately so the CPU contribution is
+        # counted exactly once.  Deferring this collective to the next layer or
+        # replacing it with reduce-scatter would make the wrapper's communication
+        # contract dependent on a later path.
+        is_kt_moe = isinstance(self.mlp, deepseek_v2.DeepseekV2MoE) and isinstance(
+            self.mlp.experts.quant_method, KTEPWrapperMethod
+        )
+        if is_kt_moe:
+            fuse_mlp_allreduce = False
+            mlp_reduce_scatter = False
 
         with get_forward().scoped(
             fuse_mlp_allreduce=fuse_mlp_allreduce,
