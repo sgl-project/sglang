@@ -83,7 +83,7 @@ def test_get_embedding_and_mask_uses_offset_count_without_readback():
     assert errors == []
 
 
-def test_get_embedding_and_mask_async_asserts_offset_count():
+def test_get_embedding_and_mask_does_not_async_assert_offset_count():
     input_ids = torch.zeros(8, dtype=torch.long)
     input_ids[2:5] = 1
     embedding = torch.arange(12, dtype=torch.float32).reshape(3, 4)
@@ -104,10 +104,7 @@ def test_get_embedding_and_mask_async_asserts_offset_count():
             items_offset_list=[[(2, 4)]],
         )
 
-    assert_async.assert_called_once()
-    condition, message = assert_async.call_args.args
-    assert condition.item()
-    assert "derived from offsets" in message
+    assert_async.assert_not_called()
 
 
 def test_adjust_embedding_length_crops_overlong_embedding():

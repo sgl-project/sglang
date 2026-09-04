@@ -93,7 +93,7 @@ def test_embed_mm_inputs_isolates_offset_mask_count_mismatch():
     input_embedding = nn.Embedding(128, 4)
     input_embedding.weight.data.zero_()
 
-    with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(False):
+    with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True):
         actual, other_info = embed_mm_inputs(
             mm_inputs_list=mm_inputs,
             extend_prefix_lens=[0, 0],
