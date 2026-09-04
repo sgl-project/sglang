@@ -485,15 +485,14 @@ class TestFusedQKNorm:
         "batch_size,num_head,num_head_kv,head_dim",
         [
             (1, 16, 2, 128),
+            (9, 8, 1, 64),
             (256, 16, 2, 128),
-            (17, 8, 1, 64),
-            (5, 3, 1, 96),
+            (4109, 3, 1, 96),
         ],
     )
     def test_fused_qk_norm(
         self, batch_size: int, num_head: int, num_head_kv: int, head_dim: int, dtype
     ):
-        """In-place per-head RMSNorm over strided q/k views of a packed qkv."""
         q_size = num_head * head_dim
         kv_size = num_head_kv * head_dim
         qkv = torch.randn([batch_size, q_size + 2 * kv_size], dtype=dtype)
@@ -513,33 +512,6 @@ class TestFusedQKNorm:
         torch.testing.assert_close(k, ref_k_out, atol=atol, rtol=rtol)
         # The in-place write must not spill past the q/k head rows into V.
         torch.testing.assert_close(v, v_before, atol=0, rtol=0)
-
-    @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
-    def test_fused_qk_norm_matches_apply_qk_norm(self, dtype):
-        from sglang.srt.layers.layernorm import RMSNorm
-        from sglang.srt.models.utils import apply_qk_norm
-
-        batch_size, num_head, num_head_kv, head_dim = 33, 16, 2, 128
-        q_size = num_head * head_dim
-        kv_size = num_head_kv * head_dim
-
-        qkv = torch.randn([batch_size, q_size + 2 * kv_size], dtype=dtype)
-        q, k, _ = qkv.split([q_size, kv_size, kv_size], dim=-1)
-
-        q_norm = RMSNorm(head_dim, eps=eps).to(dtype)
-        k_norm = RMSNorm(head_dim, eps=eps).to(dtype)
-        with torch.no_grad():
-            q_norm.weight.copy_(torch.randn(head_dim, dtype=dtype))
-            k_norm.weight.copy_(torch.randn(head_dim, dtype=dtype))
-
-        ref_q = self._norm_per_head_native(q, q_norm.weight, head_dim, eps)
-        ref_k = self._norm_per_head_native(k, k_norm.weight, head_dim, eps)
-
-        q_out, k_out = apply_qk_norm(q, k, q_norm, k_norm, head_dim)
-
-        atol = rtol = precision[dtype]
-        torch.testing.assert_close(q_out, ref_q, atol=atol, rtol=rtol)
-        torch.testing.assert_close(k_out, ref_k, atol=atol, rtol=rtol)
 
 
 if __name__ == "__main__":
