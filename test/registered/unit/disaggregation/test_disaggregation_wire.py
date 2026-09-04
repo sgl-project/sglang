@@ -383,6 +383,7 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             enable_overlap=False,
             model_config=SimpleNamespace(
                 hf_config=SimpleNamespace(
+                    architectures=["GlmMoeDsaForCausalLM"],
                     index_share_for_mtp_iteration=True,
                     index_topk=3,
                 )
@@ -424,14 +425,16 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             enable_overlap=False,
             model_config=SimpleNamespace(hf_config=SimpleNamespace()),
         )
-        server_args = SimpleNamespace(
+        override = get_context().override_server_args(
             speculative_eagle_topk=1,
             speculative_num_steps=5,
             enable_multi_layer_eagle=False,
         )
+        override.install()
+        self.addCleanup(override.restore)
 
         draft_input = build_eagle_disagg_draft_input(
-            batch, server_args, torch.tensor([11], dtype=torch.int64), None
+            batch, torch.tensor([11], dtype=torch.int64), None
         )
         self.assertIsNone(draft_input.dsa_topk_indices)
         self.assertTrue(draft_input.cuda_graph_compatible)
@@ -456,6 +459,7 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             enable_overlap=False,
             model_config=SimpleNamespace(
                 hf_config=SimpleNamespace(
+                    architectures=["GlmMoeDsaForCausalLM"],
                     index_share_for_mtp_iteration=True,
                     index_topk=3,
                 )
