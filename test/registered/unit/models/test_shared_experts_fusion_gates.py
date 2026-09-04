@@ -607,7 +607,20 @@ class TestWrapperEntryClassGates(_FusionGateCase):
         )
 
         # The normalization the constructor applies, shared with the gate.
-        self.assertIsNone(_mtp_quant_config(_quant("modelopt_mixed")))
+        mixed_bf16_mtp = SimpleNamespace(
+            get_name=lambda: "modelopt_mixed",
+            quantized_layers={"model.layers.0.mlp.experts": {"quant_algo": "NVFP4"}},
+        )
+        self.assertIsNone(_mtp_quant_config(mixed_bf16_mtp))
+        # MIXED_PRECISION checkpoints that quantize the MTP head keep it.
+        mixed_fp8_mtp = SimpleNamespace(
+            get_name=lambda: "modelopt_mixed",
+            quantized_layers={
+                "model.layers.0.mlp.experts": {"quant_algo": "NVFP4"},
+                "mtp.layers.0.mlp.experts": {"quant_algo": "FP8_BLOCK_SCALES"},
+            },
+        )
+        self.assertIs(_mtp_quant_config(mixed_fp8_mtp), mixed_fp8_mtp)
         serialized = SimpleNamespace(
             get_name=lambda: "modelopt_fp4", is_checkpoint_nvfp4_serialized=True
         )
