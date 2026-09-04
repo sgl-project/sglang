@@ -245,9 +245,9 @@ def test_sparse_gqa_vs_reference(bs, nqh, nkh, hd, blk, tk, with_sink, seq_pat, 
     )
     o_ref = o_ref.to(o_kernel.dtype)
 
-    assert torch.allclose(
-        o_kernel.float(), o_ref.float(), rtol=RTOL, atol=ATOL
-    ), f"max abs diff {(o_kernel.float() - o_ref.float()).abs().max().item():.4e}"
+    assert torch.allclose(o_kernel.float(), o_ref.float(), rtol=RTOL, atol=ATOL), (
+        f"max abs diff {(o_kernel.float() - o_ref.float()).abs().max().item():.4e}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -300,9 +300,9 @@ def test_sparse_gqa_topk_exceeds_blocks(
     )
     o_ref = o_ref.to(o_kernel.dtype)
 
-    assert torch.allclose(
-        o_kernel.float(), o_ref.float(), rtol=RTOL, atol=ATOL
-    ), f"max abs diff {(o_kernel.float() - o_ref.float()).abs().max().item():.4e}"
+    assert torch.allclose(o_kernel.float(), o_ref.float(), rtol=RTOL, atol=ATOL), (
+        f"max abs diff {(o_kernel.float() - o_ref.float()).abs().max().item():.4e}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -353,9 +353,9 @@ def test_sparse_gqa_deterministic(bs, nqh, nkh, hd, blk, tk, with_sink, seq_pat,
         topk_idx,
     )
 
-    assert torch.equal(
-        o1, o2
-    ), f"non-deterministic: max diff {(o1.float() - o2.float()).abs().max().item():.4e}"
+    assert torch.equal(o1, o2), (
+        f"non-deterministic: max diff {(o1.float() - o2.float()).abs().max().item():.4e}"
+    )
 
 
 if __name__ == "__main__":
