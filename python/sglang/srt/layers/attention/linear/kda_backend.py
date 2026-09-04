@@ -391,6 +391,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
     # to its dense layout, so ragged verify graphs are supported.
     supports_ragged_verify_graph: bool = True
 
+    # Candidate states remain isolated until acceptance, so target metadata may load
+    # on the MTP plan stream.
+    supports_overlap_plan_stream_graph_load: bool = True
+
     # KDA gets graph padding explicitly and never uses ReplaySSM's host-seqlen
     # force-flush path.
     needs_cpu_seq_lens: bool = False

@@ -472,6 +472,7 @@ def run_eagle_verify(
     metadata_ready_pre_pad: bool,
     finalize_tree_path: bool,
     grammar_barrier=None,
+    verify_handoff_event: Any = None,
     uno_target_max_top_k: Optional[int] = None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
@@ -485,6 +486,7 @@ def run_eagle_verify(
     - ``finalize_tree_path``: single-layer compacts the accepted tree path to
       the front of each per-req block for topk > 1; multi-layer has never run
       this compaction.
+    - ``verify_handoff_event`` gates plan-stream GPU work at the completed draft/tree frontier.
     """
     fwd_stream = torch.get_device_module(device).current_stream()
     verify_input: EagleVerifyInput = batch.spec_info
@@ -496,14 +498,18 @@ def run_eagle_verify(
     # Prepare for target verify in a separate stream
     with plan_stream_ctx:
         if plan_stream is not None:
-            # Verify prep copies draft-produced tree metadata on the plan stream,
-            # so it must not start before the draft frontier.
-            plan_stream.wait_stream(fwd_stream)
+            if verify_handoff_event is not None:
+                plan_stream.wait_event(verify_handoff_event)
+            else:
+                # Workers without an explicit event ring still need a correct
+                # draft/tree frontier before plan-stream GPU work can start.
+                plan_stream.wait_stream(fwd_stream)
         verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
             verify_input,
             req_to_token_pool,
             batch,
             target_worker,
+            overlap_plan_stream=plan_stream is not None,
         )
 
     # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.
