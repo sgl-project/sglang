@@ -798,6 +798,7 @@ class OpenAIServingChat(OpenAIServingBase):
         prompt_tokens: Dict[int, int],
         reasoning_tokens: Dict[int, int],
         completion_tokens: Dict[int, int],
+        first_delta_seen: Optional[Dict[int, bool]] = None,
     ) -> AsyncGenerator[str, None]:
         """Generate SSE chunks for streaming content."""
         offset = stream_offsets.get(index, 0)
@@ -811,6 +812,13 @@ class OpenAIServingChat(OpenAIServingBase):
         # tool-call, or content) so they aren't dropped when a parser is active
         # nor duplicated across chunks; flush any leftover at the end.
         remaining_logprobs = choice_logprobs
+        # Track whether this generation step produced any SSE chunk. The
+        # reasoning / tool-call parsers may swallow a step's text while they
+        # buffer a partial marker, which makes the stream stop looking
+        # per-step and breaks client-side TTFT/ITL measurement. When the
+        # client opted in via stream_options.step_usage_chunks we emit an
+        # empty-delta usage chunk instead, so the step stays observable.
+        step_emitted = False
 
         # Handle reasoning content
         if self.reasoning_parser and request.separate_reasoning:
@@ -842,6 +850,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     usage=usage,
                 )
                 remaining_logprobs = None
+                step_emitted = True
 
         # Handle tool calls
         if self._tool_call_parsing_active(request):
@@ -857,6 +866,7 @@ class OpenAIServingChat(OpenAIServingBase):
             ):
                 if chunk:
                     yield chunk
+                    step_emitted = True
 
             # Send any remaining tool call arguments when generation finishes
             if finish_reason_type is not None and index in parser_dict:
@@ -866,6 +876,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 if remaining_chunk:
                     yield remaining_chunk
+                    step_emitted = True
 
         else:
             # Regular content
@@ -889,6 +900,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     usage=usage,
                 )
                 remaining_logprobs = None
+                step_emitted = True
 
         # Flush logprobs still unattached this step — only when a parser is
         # active, since _process_tool_call_stream may consume the delta and emit
@@ -915,6 +927,46 @@ class OpenAIServingChat(OpenAIServingBase):
                 logprobs=remaining_logprobs,
                 usage=usage,
             )
+            step_emitted = True
+
+        if step_emitted:
+            if first_delta_seen is not None:
+                first_delta_seen[index] = True
+            return
+
+        # Nothing was emitted this step: the reasoning / tool-call parser
+        # swallowed the text while buffering a partial marker. Those tokens
+        # already count in usage, so without a chunk here the client charges
+        # them to TTFT, which shrinks the decode window and inflates the
+        # reported decode speed. Opt-in per request via
+        # stream_options.step_usage_chunks, and only meaningful when the client
+        # also asked for per-chunk usage.
+        if not continuous_usage_stats:
+            return
+        step_usage_chunks = (
+            request.stream_options.step_usage_chunks
+            if request.stream_options
+            else "off"
+        )
+        if step_usage_chunks == "off":
+            return
+        if step_usage_chunks == "first_token" and (
+            first_delta_seen is None or first_delta_seen.get(index, False)
+        ):
+            return
+
+        yield build_sse_content(
+            chunk_id=content["meta_info"]["id"],
+            created=int(time.time()),
+            model=request.model,
+            index=index,
+            usage=UsageProcessor.calculate_token_usage(
+                prompt_tokens=prompt_tokens.get(index, 0),
+                reasoning_tokens=reasoning_tokens.get(index, 0),
+                completion_tokens=completion_tokens.get(index, 0),
+                cached_tokens=self._continuous_usage_cached_details(content),
+            ).model_dump(),
+        )
 
     def _tool_call_parsing_active(self, request: ChatCompletionRequest) -> bool:
         """Whether this request's output runs through the tool-call parser.
@@ -1653,6 +1705,9 @@ class OpenAIServingChat(OpenAIServingBase):
         n_prev_tokens = {}
         has_tool_calls = {}
         finish_reasons = {}
+        # Per-choice: has any delta-carrying chunk been sent yet? Used to keep
+        # the usage heartbeat limited to the pre-first-token window.
+        first_delta_seen = {}
 
         # Usage tracking
         prompt_tokens = {}
@@ -1767,6 +1822,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens,
                     reasoning_tokens=reasoning_tokens,
                     completion_tokens=completion_tokens,
+                    first_delta_seen=first_delta_seen,
                 ):
                     yield chunk
 

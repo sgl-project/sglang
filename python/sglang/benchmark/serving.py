@@ -449,6 +449,18 @@ async def async_request_openai_chat_completions(
         # These will override defaults if present
         payload.update(request_func_input.extra_request_body)
 
+        # Ask the server to report per-chunk usage so TTFT/ITL can be derived from
+        # the token counter instead of from visible text. Without this a step
+        # whose text the reasoning / tool-call parser buffered is invisible to the
+        # client and gets charged to TTFT.
+        step_usage_chunks = getattr(args, "stream_step_usage_chunks", "off")
+        if step_usage_chunks != "off" and payload.get("stream"):
+            stream_options = dict(payload.get("stream_options") or {})
+            stream_options.setdefault("include_usage", True)
+            stream_options.setdefault("continuous_usage_stats", True)
+            stream_options.setdefault("step_usage_chunks", step_usage_chunks)
+            payload["stream_options"] = stream_options
+
         # hack to accommodate different LoRA conventions between SGLang and vLLM.
         if request_func_input.lora_name:
             payload["model"] = request_func_input.lora_name
@@ -501,6 +513,7 @@ async def async_request_openai_chat_completions(
                             _extract_cache_from_sglext(response_json, output)
                     else:
                         # Streaming response
+                        last_counted_tokens = 0
                         async for chunk_bytes in response.content:
                             chunk_bytes = chunk_bytes.strip()
                             if not chunk_bytes:
@@ -514,21 +527,52 @@ async def async_request_openai_chat_completions(
                                 data = json.loads(chunk)
                                 # Check for usage info in final chunks. OpenAI-compatible
                                 # servers may emit usage-only chunks with choices=[].
-                                output_len = (data.get("usage") or {}).get(
-                                    "completion_tokens", output_len
+                                usage_tokens = (data.get("usage") or {}).get(
+                                    "completion_tokens"
                                 )
+                                if usage_tokens is not None:
+                                    output_len = usage_tokens
 
                                 if getattr(args, "cache_report", False):
                                     _extract_cache_from_sglext(data, output)
 
                                 choices = data.get("choices") or []
-                                if not choices:
-                                    continue
 
                                 # Reasoning models stream thoughts via
                                 # `reasoning_content`; count them like content.
-                                delta = choices[0].get("delta") or {}
+                                delta = (
+                                    (choices[0].get("delta") or {}) if choices else {}
+                                )
                                 content = _combine_openai_chat_content(delta)
+
+                                # Prefer the server-reported token counter when it
+                                # is available: it also covers tokens the parsers
+                                # buffered or turned into structured tool_calls,
+                                # neither of which shows up as visible text.
+                                if usage_tokens is not None and (
+                                    usage_tokens > last_counted_tokens
+                                ):
+                                    timestamp = time.perf_counter()
+                                    num_new_tokens = usage_tokens - last_counted_tokens
+                                    if ttft == 0.0:
+                                        ttft = timestamp - st
+                                        output.ttft = ttft
+                                        num_new_tokens -= 1
+                                    if num_new_tokens > 0:
+                                        adjusted_itl = (
+                                            timestamp - most_recent_timestamp
+                                        ) / num_new_tokens
+                                        output.itl.extend(
+                                            [adjusted_itl] * num_new_tokens
+                                        )
+                                    last_counted_tokens = usage_tokens
+                                    most_recent_timestamp = timestamp
+                                    if content:
+                                        generated_text += content
+                                    continue
+
+                                if not choices:
+                                    continue
 
                                 if content:
                                     timestamp = time.perf_counter()
@@ -1134,7 +1178,9 @@ def calculate_metrics(
                 total_input_vision += input_requests[i].vision_prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
-            if use_retokenized_itl:
+            if use_retokenized_itl and len(outputs[i].text_chunks) == len(
+                outputs[i].itl
+            ):
                 for k, itl in enumerate(outputs[i].itl):
                     num_tokens = len(
                         tokenizer.encode(
@@ -1143,6 +1189,10 @@ def calculate_metrics(
                     )
                     adjusted_itl = itl / num_tokens
                     retokenized_itls.extend([adjusted_itl] * num_tokens)
+            elif use_retokenized_itl:
+                # The usage-driven path already spreads each chunk over the
+                # tokens the server counted, so there is nothing to re-tokenize.
+                retokenized_itls.extend(outputs[i].itl)
             else:
                 itls += outputs[i].itl
             ttfts.append(outputs[i].ttft)
@@ -2415,6 +2465,18 @@ def cli_main():
         "--disable-stream",
         action="store_true",
         help="Disable streaming mode.",
+    )
+    parser.add_argument(
+        "--stream-step-usage-chunks",
+        type=str,
+        default="off",
+        choices=["off", "first_token", "all"],
+        help="Request stream_options.step_usage_chunks so the server reports "
+        "decode steps whose text the reasoning / tool-call parser buffered. "
+        "Without it those tokens are invisible to the client and get charged to "
+        "TTFT, which distorts TTFT/ITL/TPOT. 'first_token' fixes TTFT, 'all' "
+        "also gives a correct ITL distribution. Requires a server that supports "
+        "the option (older servers ignore it).",
     )
     parser.add_argument(
         "--return-logprob",
