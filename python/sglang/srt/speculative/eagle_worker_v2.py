@@ -955,32 +955,33 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
 
             if not batch.forward_mode.is_idle():
-                # topk=1: draft_tokens = [seed, t1, ..., t(N-1)]; the chain output is [:, 1:]
-                ret_topk_index = draft_tokens[:, 1:].reshape(bs, -1)
-                # Greedy chain has no real branch scores; 1.0 matches the
-                # draft_extend seed convention.
-                ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
-
-                topk_index = next_draft_input.topk_index
-                topk_p = next_draft_input.topk_p
-
-                if self.hot_token_id is not None:
-                    # The seed is a draft-id argmax; map it to target-id
-                    # space. ret_topk_index is already mapped inside
-                    # draft_forward.
-                    topk_index = self.hot_token_id[topk_index]
-                # [seed | t1..t(N-1)] with width num_draft_tokens - 1; the
-                # next round consumes it via
+                # topk=1: draft_tokens is already the full chain
+                # [seed, t1, ..., t(N-1)] in TARGET id space -- the seed
+                # column is mapped inside draft_forward -- and is already
+                # num_draft_tokens - 1 wide; the next round consumes it via
                 # prepare_verify_input_for_draft_prefetch without re-running
-                # the draft model.
-                topk_index = torch.cat([topk_index, ret_topk_index], dim=1)
-                topk_p = torch.cat([topk_p, ret_topk_p], dim=1)
+                # the draft model. clone() detaches it from the graph
+                # runner's static output buffer, which the next replay
+                # overwrites. Intentional cross-round mutation:
+                # next_draft_input flows to the next round via batch_output
+                # and is NOT restored by the finally block below.
+                next_draft_input.topk_index = draft_tokens.clone()
 
-                # Intentional cross-round mutation: next_draft_input flows to
-                # the next round via batch_output and is NOT restored by the
-                # finally block below.
-                next_draft_input.topk_index = topk_index
-                next_draft_input.topk_p = topk_p
+                # Greedy chain has no real branch scores; 1.0 matches the
+                # draft_extend seed convention. Keeps the seed's
+                # probability at slot 0 and pads the width-1 seed p to the
+                # chain width.
+                next_draft_input.topk_p = torch.cat(
+                    [
+                        next_draft_input.topk_p,
+                        torch.ones(
+                            (bs, self.speculative_num_steps - 1),
+                            dtype=torch.float32,
+                            device=draft_tokens.device,
+                        ),
+                    ],
+                    dim=1,
+                )
         finally:
             (
                 batch.forward_mode,

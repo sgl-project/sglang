@@ -207,7 +207,7 @@ def _check_draft_prefetch(server_args: ServerArgs) -> None:
     # so the resolved algorithm is never "NEXTN" here.
     if cfg.speculative_algorithm not in ("EAGLE3", "EAGLE"):
         raise ValueError(
-            "--enable-draft-prefetch only supports EAGLE/EAGLE3/NEXTN "
+            "--enable-draft-prefetch only supports EAGLE/EAGLE3 "
             f"speculative algorithms, got {cfg.speculative_algorithm}."
         )
     if cfg.enable_multi_layer_eagle:
