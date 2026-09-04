@@ -38,7 +38,6 @@ logger = logging.getLogger(__name__)
 
 
 class TestVisionChunkedPrefill(CustomTestCase):
-
     def prepare_video_messages(self, video_path, max_frames_num=8):
         from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
@@ -189,12 +188,12 @@ class TestVisionChunkedPrefill(CustomTestCase):
         try:
             outputs_chunked = []
             for i, (batch, num_frame) in enumerate(zip(batches, num_frames)):
-                logger.info(f"Chunked test iteration {i+1}/{len(batches)}")
+                logger.info(f"Chunked test iteration {i + 1}/{len(batches)}")
                 output_chunked = self.generate_for_video(
                     batch=batch, num_frame=num_frame
                 )
                 outputs_chunked += [output_chunked]
-                logger.info(f"Chunked test iteration {i+1} completed")
+                logger.info(f"Chunked test iteration {i + 1} completed")
         finally:
             logger.info(f"Killing chunked server pid={chunked_server_pid}")
             kill_process_tree(chunked_server_pid)
@@ -208,12 +207,12 @@ class TestVisionChunkedPrefill(CustomTestCase):
             logger.info(f"Non-chunked server started with pid={no_chunked_server_pid}")
             outputs_no_chunked = []
             for i, (batch, num_frame) in enumerate(zip(batches, num_frames)):
-                logger.info(f"Non-chunked test iteration {i+1}/{len(batches)}")
+                logger.info(f"Non-chunked test iteration {i + 1}/{len(batches)}")
                 output_no_chunked = self.generate_for_video(
                     batch=batch, num_frame=num_frame
                 )
                 outputs_no_chunked += [output_no_chunked]
-                logger.info(f"Non-chunked test iteration {i+1} completed")
+                logger.info(f"Non-chunked test iteration {i + 1} completed")
 
         finally:
             logger.info(f"Killing non-chunked server pid={no_chunked_server_pid}")
