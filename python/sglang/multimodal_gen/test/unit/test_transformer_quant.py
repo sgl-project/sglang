@@ -82,7 +82,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp8LinearMethod,
     _prepare_nvfp4_weight_bytes,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
+from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import (
+    ComfyMXFP8LinearMethod,
+    MXFP8Config,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders import transformer_loader
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
     TransformerLoader,
@@ -1087,6 +1090,60 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             )
 
         self.assertIsInstance(method, NPUMXFP8LinearMethod)
+
+    def test_comfy_mxfp8_scales_are_not_interleaved_twice(self):
+        config = MXFP8Config(
+            is_checkpoint_fp8_serialized=True,
+            layer_markers={"blocks.0.attn.out_proj": {"format": "mxfp8"}},
+        )
+        method = config.get_quant_method(
+            LinearBase(input_size=64, output_size=32), "blocks.0.attn.out_proj"
+        )
+        self.assertIsInstance(method, ComfyMXFP8LinearMethod)
+        self.assertIsInstance(method, SRTFp8LinearMethod)
+        # Renaming the SRT hook would silently restore the double interleave.
+        self.assertTrue(
+            hasattr(SRTFp8LinearMethod, "_process_mxfp8_linear_weight_scale")
+        )
+
+        checkpoint_scale = torch.arange(64, dtype=torch.uint8).reshape(32, 2)
+        layer = torch.nn.Module()
+        layer.weight_scale_inv = torch.nn.Parameter(
+            checkpoint_scale.clone(), requires_grad=False
+        )
+        method.mxfp8_dense_backend = SimpleNamespace(
+            is_flashinfer_cutlass=lambda: True,
+            is_flashinfer_cutedsl=lambda: False,
+        )
+
+        method._process_mxfp8_linear_weight_scale(layer)
+
+        self.assertEqual(layer.weight_scale_inv_swizzled.shape, torch.Size([64]))
+        torch.testing.assert_close(
+            layer.weight_scale_inv_swizzled.data, checkpoint_scale.flatten()
+        )
+
+    def test_config_driven_mxfp8_keeps_srt_scale_processing(self):
+        config = MXFP8Config(is_checkpoint_fp8_serialized=True)
+        method = config.get_quant_method(
+            LinearBase(input_size=64, output_size=32), "blocks.0.attn.out_proj"
+        )
+        self.assertIsNone(config.layer_markers)
+        self.assertIsInstance(method, ComfyMXFP8LinearMethod)
+
+        layer = torch.nn.Module()
+        layer.weight_scale_inv = torch.nn.Parameter(
+            torch.arange(64, dtype=torch.uint8).reshape(32, 2), requires_grad=False
+        )
+        method.mxfp8_dense_backend = SimpleNamespace(
+            is_flashinfer_cutlass=lambda: True,
+            is_flashinfer_cutedsl=lambda: False,
+        )
+        with patch.object(
+            SRTFp8LinearMethod, "_process_mxfp8_linear_weight_scale"
+        ) as srt_hook:
+            method._process_mxfp8_linear_weight_scale(layer)
+        srt_hook.assert_called_once_with(layer)
 
     def test_comfy_full_precision_fp8_dequantizes_before_linear(self):
         layer = torch.nn.Module()
