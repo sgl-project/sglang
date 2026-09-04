@@ -273,7 +273,7 @@ def generate_dashboard(
                     if pct > REGRESSION_THRESHOLD:
                         regressions.append(
                             f"**{cid}** ({fw}): {prev:.2f}s -> {cur:.2f}s "
-                            f"(+{pct*100:.1f}%)"
+                            f"(+{pct * 100:.1f}%)"
                         )
 
     if regressions:
