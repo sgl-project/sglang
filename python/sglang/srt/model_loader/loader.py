@@ -81,6 +81,7 @@ from sglang.srt.connector import (
 )
 from sglang.srt.connector.utils import parse_model_name
 from sglang.srt.distributed import (
+    get_world_rank,
     model_parallel_is_initialized,
 )
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
@@ -3345,7 +3346,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 model,
                 load_config.remote_instance_weight_loader_transfer_engine,
                 f"http://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_seed_instance_service_port}",
-                load_config.tp_rank,
+                get_world_rank(),
             )
             if not success:
                 raise RuntimeError(
@@ -3424,11 +3425,11 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         current_platform.empty_cache()
 
     def load_model_from_remote_instance_by_transfer_engine(
-        self, model, transfer_engine, seed_url, tp_rank
+        self, model, transfer_engine, seed_url, rank
     ) -> bool:
         # get remote weights metadata from source instance
         seed_transfer_engine_session_id, seed_transfer_engine_weight_info = (
-            get_remote_instance_transfer_engine_info_per_rank(seed_url, tp_rank)
+            get_remote_instance_transfer_engine_info_per_rank(seed_url, rank)
         )
         if (
             seed_transfer_engine_session_id is None
