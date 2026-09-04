@@ -117,6 +117,8 @@ LOAD_FORMAT_CHOICES = [
     "remote_instance",
     "fastsafetensors",
     "private",
+    "flashload",
+    "flashclone",
     "runai_streamer",
 ]
 add_load_format_choices = LOAD_FORMAT_CHOICES.extend

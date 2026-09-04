@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -659,6 +660,7 @@ class ModelRunner:
         self.init_token_oracle()
         self.sampler = create_sampler()
         self.load_model()
+        self.maybe_save_flashboot_shard()
         prepare_moe_topk(
             model=self.model,
             model_config=self.model_config,
@@ -690,6 +692,34 @@ class ModelRunner:
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
+
+    def maybe_save_flashboot_shard(self):
+        shard_save_directory = os.environ.get("FB_SHARD_SAVE_DIR")
+        if not shard_save_directory:
+            return
+
+        from sglang.srt.model_loader.loader import ShardedStateLoader
+
+        shard_save_max_size_bytes = int(
+            os.environ.get("FB_SHARD_SAVE_MAXSIZE", str(5 * 1024**3))
+        )
+        if self.is_draft_worker:
+            shard_save_directory = os.path.join(shard_save_directory, "nextn")
+            os.makedirs(shard_save_directory, exist_ok=True)
+        shard_file_pattern = (
+            f"model-rank-{dist.get_rank()}-part-{{part}}.safetensors"
+        )
+        ShardedStateLoader.save_model(
+            self.model,
+            shard_save_directory,
+            shard_file_pattern,
+            shard_save_max_size_bytes,
+        )
+        logger.info(
+            "[flashboot] wrote %s to %s",
+            shard_file_pattern,
+            shard_save_directory,
+        )
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
