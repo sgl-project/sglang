@@ -1499,6 +1499,18 @@ class Envs:
         False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
     )
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    # Absolute ceiling on ONE MQA-logits chunk in the DSA indexer's ragged
+    # prefill path. The fraction above is applied to free memory, which cannot
+    # tell you whether one large CONTIGUOUS block is obtainable, and which in
+    # the opposite regime would authorize a tens-of-GiB allocation on a
+    # nearly-empty device. A chunk this size is servable from the allocator's
+    # existing free blocks. 0 disables the cap.
+    SGLANG_DSA_MQA_LOGITS_MAX_CHUNK_BYTES = EnvInt(256 * 1024 * 1024)
+    # How long a free-memory reading may be reused, in seconds. 0 (default)
+    # never reuses one; > 0 reuses for that long; < 0 reuses forever (the
+    # previous behavior). Reading live is affordable because the budget is only
+    # requested for logits matrices above _MQA_LOGITS_STATIC_SKIP_ELEMS.
+    SGLANG_DSA_MQA_LOGITS_BUDGET_CACHE_S = EnvFloat(0.0)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)

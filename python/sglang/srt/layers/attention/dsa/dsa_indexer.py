@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -209,10 +210,38 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     # aiter's fp8_mqa_logits only compiles below 2 GiB of logits (buffer_store).
     _MQA_LOGITS_MAX_BYTES_ROCM = 2**31 - 1
     _mqa_logits_budget_bytes: Dict[int, int] = {}
+    # device_index -> time.monotonic() when _mqa_logits_budget_bytes was measured.
+    _mqa_logits_budget_at: Dict[int, float] = {}
 
     @staticmethod
     def _mqa_logits_free_mem_fraction() -> float:
         return envs.SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION.get()
+
+    @staticmethod
+    def _mqa_logits_max_chunk_bytes() -> int:
+        return envs.SGLANG_DSA_MQA_LOGITS_MAX_CHUNK_BYTES.get()
+
+    @staticmethod
+    def _mqa_logits_budget_cache_s() -> float:
+        return envs.SGLANG_DSA_MQA_LOGITS_BUDGET_CACHE_S.get()
+
+    @classmethod
+    def _clamp_mqa_logits_budget(cls, budget_bytes: int) -> int:
+        """Apply the absolute per-chunk cap, then the 1-byte floor.
+
+        This is the part a live free-memory reading cannot provide:
+        contiguity. "Free" bytes may be split across segments the allocator
+        cannot merge, so a large contiguous request fails while free memory
+        looks ample. The cap also bounds the opposite regime, where a fraction
+        of a nearly-empty device would authorize a tens-of-GiB allocation.
+        <= 0 disables it. The floor keeps _get_topk_ragged's
+        max_rows = max(1, budget // bytes_per_row) making progress even when the
+        cap is smaller than one row of the logits matrix.
+        """
+        max_chunk_bytes = cls._mqa_logits_max_chunk_bytes()
+        if max_chunk_bytes > 0:
+            budget_bytes = min(budget_bytes, max_chunk_bytes)
+        return max(1, budget_bytes)
 
     def __init__(
         self,
@@ -970,9 +999,24 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
     def _get_mqa_logits_budget_bytes(self, device_index: int) -> int:
         free_mem_fraction = self._mqa_logits_free_mem_fraction()
+        cache_s = self._mqa_logits_budget_cache_s()
         cached_budget = self._mqa_logits_budget_bytes.get(device_index)
-        if cached_budget is not None:
-            return cached_budget
+        # This budget IS the chunk allocation size (see _get_topk_ragged), so a
+        # reading that is allowed to go stale eventually over-states what can be
+        # allocated: one plentiful-memory snapshot would authorize that same
+        # allocation for the life of the process. Default to taking a fresh
+        # reading every time (cache_s == 0). That is affordable because the only
+        # caller, _should_chunk_mqa_logits, returns before asking unless the
+        # logits matrix exceeds _MQA_LOGITS_STATIC_SKIP_ELEMS -- so free memory
+        # is queried only when a large GEMM is about to run anyway.
+        # cache_s > 0 reuses a reading for that long; cache_s < 0 forever.
+        if cached_budget is not None and cache_s != 0.0:
+            if (
+                cache_s < 0.0
+                or time.monotonic() - self._mqa_logits_budget_at.get(device_index, 0.0)
+                < cache_s
+            ):
+                return cached_budget
 
         total_mem = torch.cuda.get_device_properties(device_index).total_memory
 
@@ -992,7 +1036,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # caching it. The first non-capture prefill path will cache the real
         # free-memory budget below.
         if get_is_capture_mode():
-            return static_budget
+            return self._clamp_mqa_logits_budget(static_budget)
 
         # Match the original free-memory guard: logits_bytes * 2 > free_mem.
         # torch.cuda.mem_get_info synchronizes the host, so cache the result,
@@ -1000,8 +1044,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         free_mem, _ = torch.cuda.mem_get_info(device_index)
         budget_bytes = min(int(free_mem * free_mem_fraction), static_budget)
 
-        budget_bytes = max(1, budget_bytes)
+        budget_bytes = self._clamp_mqa_logits_budget(budget_bytes)
         self._mqa_logits_budget_bytes[device_index] = budget_bytes
+        self._mqa_logits_budget_at[device_index] = time.monotonic()
         return budget_bytes
 
     def _should_chunk_mqa_logits(
