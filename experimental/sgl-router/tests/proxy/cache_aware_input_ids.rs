@@ -17,7 +17,6 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::engine_load::EngineLoadTable;
 use sgl_router::policies::factory::build_registry;
 use sgl_router::policies::kv_events::{BlockSizeOracle, HashTree};
 use sgl_router::proxy::Proxy;
@@ -47,18 +46,9 @@ fn build_ctx(url: String) -> Arc<AppContext> {
         model_ids: vec![ModelId(MODEL.into())],
         bootstrap_port: None,
     });
-    // Use the real loaded tokenizers (not the empty-registry test default) so
-    // the cache-aware policy can tokenize at ingress.
-    let policies = Arc::new(
-        build_registry(
-            &cfg,
-            Arc::new(HashTree::new()),
-            Arc::clone(&tokenizers),
-            BlockSizeOracle::new(),
-            EngineLoadTable::new(),
-        )
-        .unwrap(),
-    );
+    // Use the configured tokenizer so the chat path can emit input_ids.
+    let policies =
+        Arc::new(build_registry(&cfg, Arc::new(HashTree::new()), BlockSizeOracle::new()).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
     Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
 }

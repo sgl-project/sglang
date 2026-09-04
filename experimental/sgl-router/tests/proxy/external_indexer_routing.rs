@@ -18,7 +18,6 @@ use sgl_kv_indexer::{
 };
 use sgl_router::config::{AffinityConfig, CachePrefixProvider, PolicyKind};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::engine_load::EngineLoadTable;
 use sgl_router::policies::factory::build_registry;
 use sgl_router::policies::kv_events::{compute_block_hashes, BlockSizeOracle, HashTree};
 use sgl_router::policies::request_tokens_for;
@@ -104,16 +103,8 @@ async fn external_indexer_routes_to_the_cached_worker() {
     }
     let oracle = BlockSizeOracle::new();
     oracle.try_set(1).unwrap();
-    let policies = Arc::new(
-        build_registry(
-            &cfg,
-            Arc::new(HashTree::new()),
-            Arc::clone(&tokenizers),
-            Arc::clone(&oracle),
-            EngineLoadTable::new(),
-        )
-        .unwrap(),
-    );
+    let policies =
+        Arc::new(build_registry(&cfg, Arc::new(HashTree::new()), Arc::clone(&oracle)).unwrap());
     let mut ctx = AppContext::new(
         cfg,
         tokenizers,

@@ -72,8 +72,7 @@ impl Default for ActiveLoadConfig {
 ///
 /// Accepted on the CLI (`--policy`) as `round_robin` / `random` /
 /// `power_of_two` / `load_based` / `fused_score` / `score_policy` /
-/// `session_aware` / `cache_aware` / `cache_aware_zmq` /
-/// `sticky`.
+/// `session_aware` / `cache_aware` / `sticky`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PolicyKind {
     #[default]
@@ -98,11 +97,6 @@ pub enum PolicyKind {
     /// Selects cache-affine prefill candidates from the configured prefix provider.
     #[value(name = "cache_aware")]
     CacheAware,
-    /// Cache-aware routing fed by SGLang's ZMQ KV-cache event publisher.
-    /// Requires the model to have a tokenizer loaded; cache_aware tuning
-    /// lives on `ModelConfig::cache_aware`.
-    #[value(name = "cache_aware_zmq")]
-    CacheAwareZmq,
     /// Sticky-session routing: pins a routing key (read from a
     /// configurable request header) to a worker via an in-memory map, so
     /// stateful sessions land on the same backend. Tuning — header name,
@@ -302,7 +296,7 @@ pub struct ModelConfig {
     /// 可选静态 Bucket 配置；`None` 使用全局 domain。
     pub bucket_config: Option<BucketConfig>,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
-    /// Cache-Aware-ZMQ tuning and Cache-Aware prefix configuration.
+    /// Cache-Aware prefix configuration.
     pub cache_aware: Option<CacheAwareConfig>,
     /// Tuning for the sticky-session policy. `Some` exactly when
     /// `policy = "sticky"` (built by [`crate::config::cli::Cli::into_config`]).
@@ -387,48 +381,12 @@ pub enum CachePrefixProvider {
 }
 
 /// Per-model Cache-Aware configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CacheAwareConfig {
-    /// Lower bound on `matched_blocks / total_blocks` for the tree match
-    /// to win the selection. Below this, the policy falls back to
-    /// min-load. Default 0.5 — a half-cached prompt is still a strong
-    /// signal but not so weak that random hash collisions could trigger
-    /// affinity to an arbitrary worker.
-    pub cache_threshold: f32,
-    /// Absolute load spread (`max - min`) above which the cache check is
-    /// skipped in favour of min-load. Default 32 — picked to dominate
-    /// over typical batch-of-8 effect.
-    pub balance_abs_threshold: usize,
-    /// Multiplicative load spread (`max > min * balance_rel_threshold`)
-    /// that the absolute check is gated on. Default 1.1 — 10 % relative
-    /// difference triggers re-balancing.
-    pub balance_rel_threshold: f32,
     /// Prefix-match source for native Cache-Aware.
     pub prefix_provider: CachePrefixProvider,
     /// External Indexer configuration when `prefix_provider = indexer`.
     pub kv_indexer_endpoint: Option<KvIndexerEndpointConfig>,
-}
-
-impl Default for CacheAwareConfig {
-    fn default() -> Self {
-        Self {
-            cache_threshold: default_cache_threshold(),
-            balance_abs_threshold: default_balance_abs(),
-            balance_rel_threshold: default_balance_rel(),
-            prefix_provider: CachePrefixProvider::default(),
-            kv_indexer_endpoint: None,
-        }
-    }
-}
-
-fn default_cache_threshold() -> f32 {
-    0.5
-}
-fn default_balance_abs() -> usize {
-    32
-}
-fn default_balance_rel() -> f32 {
-    1.1
 }
 
 /// Default routing-key header for the sticky policy. The `x-sgl-` prefix
@@ -525,8 +483,7 @@ pub struct StickyConfig {
     /// Policy used to pick a worker when a request has no routing key, and
     /// to pick the initial worker when a new key is first seen. One of
     /// `round_robin` / `random` / `power_of_two` / `load_based` — the
-    /// dependency-free policies the factory can build standalone (no
-    /// `HashTree` / tokenizer / ZMQ feed).
+    /// dependency-free policies the factory can build standalone.
     pub fallback_policy: StickyFallbackKind,
     /// Evict an assignment after it has been idle (unreferenced) this many
     /// seconds. Bounds the map against unbounded routing-key cardinality.

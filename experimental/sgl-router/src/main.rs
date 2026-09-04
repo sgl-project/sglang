@@ -116,10 +116,9 @@ async fn main() -> Result<()> {
         })
         .transpose()?;
 
-    // Build the KV-event index up front so the cache-aware-zmq policy can
-    // share its `HashTree` handle + `BlockSizeOracle`. An external Indexer makes
-    // the local tree irrelevant to routing, so only discover hash metadata rather
-    // than duplicating every KV event.
+    // Build the local prefix index and block metadata used by the Radix Tree
+    // provider. An external Indexer only needs hash metadata, so it does not
+    // subscribe to the local KV-event stream.
     let block_size_oracle = sgl_router::policies::kv_events::BlockSizeOracle::new();
     let kv_event_http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
@@ -140,9 +139,7 @@ async fn main() -> Result<()> {
         sgl_router::policies::factory::build_registry(
             &cfg,
             kv_index.tree(),
-            Arc::clone(&tokenizers),
             Arc::clone(&block_size_oracle),
-            kv_index.engine_load(),
         )
         .context("build policy registry")?,
     );
