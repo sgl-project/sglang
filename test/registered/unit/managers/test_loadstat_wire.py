@@ -1,6 +1,6 @@
 """Wire contract and port/rank gating for the LoadStat load snapshot.
 
-Locks the msgpack array shape the sgl-router `cache_aware_zmq` policy decodes
+Locks the msgpack array shape the sgl-router Engine Load subscriber decodes
 positionally:
 
     ["LoadStat", num_running_reqs, num_waiting_reqs, num_tokens,

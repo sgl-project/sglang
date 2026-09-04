@@ -25,7 +25,6 @@ The dashboard graphs every family the router emits:
 | `sgl_router_worker_requests_total` | Counter | Per-worker **dispatches** by `worker_url`, `model_id`, `mode`, `outcome` (recorded after dispatch; blind to pre-dispatch drops) |
 | `sgl_router_request_duration_seconds` | Histogram | End-to-end request latency by `model_id` |
 | `sgl_router_ttft_seconds` | Histogram | Time to first token (streaming) by `model_id` |
-| `sgl_router_overlap_blocks` | Histogram | Cache-aware-zmq overlap blocks by `model_id` |
 | `sgl_router_active_load` | Gauge | Per-worker prefill-token / decode-block load |
 | `sgl_router_workers` | Gauge | Registered worker count by `mode` |
 | `sgl_router_worker_health` | Gauge | Per-worker health (1=breaker admits, 0=open) |

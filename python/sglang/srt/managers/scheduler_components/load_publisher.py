@@ -1,10 +1,9 @@
 """Per-scheduler load reporting for load-aware routers.
 
 Each scheduler publishes a periodic `LoadStat` gauge on its own ZMQ PUB
-socket so out-of-process load-aware routers (e.g. sgl-router's
-`cache_aware_zmq` policy) can route on real queue depth instead of a
-router-side in-flight counter. The in-deployment counterpart lives in
-`sglang.srt.managers.load_snapshot` (SHM / PUSH to node 0), which a router
+socket so out-of-process load-aware routers can route on real queue depth
+instead of a router-side in-flight counter. The in-deployment counterpart
+lives in `sglang.srt.managers.load_snapshot` (SHM / PUSH to node 0), which a router
 that only knows the worker URL cannot subscribe to; the port is instead
 advertised via `/server_info` (`runtime_context.describe_kv_events_publisher`).
 The payload is a compact tagged subset of `LoadSnapshot` so the wire
