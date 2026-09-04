@@ -1,9 +1,24 @@
 """Unit tests for GLM-5 Next configuration compatibility."""
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from sglang.srt.configs.glm5_next import Glm5NextTextConfig
+import torch
+import torch.nn.functional as F
+
+from sglang.srt.configs.glm5_next import (
+    Glm5NextConfig,
+    Glm5NextTextConfig,
+    Glm5NextVisionConfig,
+)
 from sglang.srt.configs.mamba_utils import KimiLinearStateShape
+from sglang.srt.models.glm5_next import (
+    Glm5NextForConditionalGeneration,
+    Glm5NextVisionModel,
+    swiglu_clamped,
+)
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -101,6 +116,213 @@ class TestGlm5NextTextConfig(CustomTestCase):
         )
 
         self.assertIs(config.linear_attn_config, linear_attn_config)
+
+
+class TestGlm5NextVisionConfig(CustomTestCase):
+    def test_vision_config_defaults_swiglu_limit_to_none(self):
+        config = Glm5NextVisionConfig()
+        self.assertIsNone(config.swiglu_limit)
+
+    def test_vision_config_preserves_explicit_swiglu_limit(self):
+        config = Glm5NextVisionConfig(swiglu_limit=10.0)
+        self.assertEqual(config.swiglu_limit, 10.0)
+
+    def test_glm5_next_config_instantiates_vision_config_without_swiglu_limit(self):
+        config = Glm5NextConfig(vision_config={})
+        self.assertIsNotNone(config.vision_config)
+        self.assertIsNone(config.vision_config.swiglu_limit)
+
+    def test_glm5_next_config_preserves_vision_swiglu_limit(self):
+        config = Glm5NextConfig(vision_config={"swiglu_limit": 10.0})
+        self.assertIsNotNone(config.vision_config)
+        self.assertEqual(config.vision_config.swiglu_limit, 10.0)
+
+    def test_swiglu_clamped_with_none_matches_unclamped_swiglu(self):
+        x = torch.randn(2, 8, dtype=torch.float32)
+        out_none = swiglu_clamped(x, None)
+        gate, up = torch.chunk(x, 2, dim=-1)
+        expected = F.silu(gate) * up
+        torch.testing.assert_close(out_none, expected)
+
+    def test_swiglu_clamped_with_limit_clamps_activations(self):
+        x = torch.tensor([[100.0, -100.0]], dtype=torch.float32)
+        out_clamped = swiglu_clamped(x, 5.0)
+        gate, up = torch.chunk(x, 2, dim=-1)
+        gate = torch.clamp(gate, max=5.0)
+        up = torch.clamp(up, min=-5.0, max=5.0)
+        expected = F.silu(gate) * up
+        torch.testing.assert_close(out_clamped, expected)
+
+    def test_glm5_next_config_with_none_vision_config(self):
+        config = Glm5NextConfig(vision_config=None)
+        self.assertIsNone(config.vision_config)
+
+    def test_glm5_next_for_conditional_generation_init_with_none_vision_config(self):
+        config = Glm5NextConfig(vision_config=None, encoder_only=True)
+        with (
+            patch(
+                "sglang.srt.models.glm5_next.get_pp_group",
+                return_value=SimpleNamespace(is_last_rank=True, world_size=1),
+            ),
+            get_parallel().override(tp_size=1, attn_tp_size=1),
+            get_context().override_server_args(mm_enable_dp_encoder=False),
+        ):
+            model = Glm5NextForConditionalGeneration(config)
+            self.assertIsNone(model.visual)
+
+    def test_glm5_next_for_conditional_generation_init_with_language_only(self):
+        config = Glm5NextConfig(vision_config={}, language_only=True, encoder_only=True)
+        with (
+            patch(
+                "sglang.srt.models.glm5_next.get_pp_group",
+                return_value=SimpleNamespace(is_last_rank=True, world_size=1),
+            ),
+            get_parallel().override(tp_size=1, attn_tp_size=1),
+            get_context().override_server_args(mm_enable_dp_encoder=False),
+        ):
+            model = Glm5NextForConditionalGeneration(config)
+            self.assertIsNone(model.visual)
+
+    def test_glm5_next_for_conditional_generation_load_weights_with_none_vision_config(
+        self,
+    ):
+        config = Glm5NextConfig(vision_config=None, encoder_only=True)
+        with (
+            patch(
+                "sglang.srt.models.glm5_next.get_pp_group",
+                return_value=SimpleNamespace(is_last_rank=True, world_size=1),
+            ),
+            get_parallel().override(tp_size=1, attn_tp_size=1),
+            get_context().override_server_args(mm_enable_dp_encoder=False),
+            patch(
+                "sglang.srt.models.glm5_next.vision_utils.pad_vit_attn_dummy_heads"
+            ) as mock_pad,
+        ):
+            model = Glm5NextForConditionalGeneration(config)
+            visual_weight = torch.randn(4, 4)
+            weights = [("visual.attn.qkv.weight", visual_weight)]
+            # Should execute cleanly without dereferencing missing vision_config
+            model.load_weights(weights)
+            self.assertIsNone(model.visual)
+            mock_pad.assert_not_called()
+
+    def test_glm5_next_for_conditional_generation_load_weights_with_language_only(
+        self,
+    ):
+        config = Glm5NextConfig(vision_config={}, language_only=True, encoder_only=True)
+        with (
+            patch(
+                "sglang.srt.models.glm5_next.get_pp_group",
+                return_value=SimpleNamespace(is_last_rank=True, world_size=1),
+            ),
+            get_parallel().override(tp_size=1, attn_tp_size=1),
+            get_context().override_server_args(mm_enable_dp_encoder=False),
+            patch(
+                "sglang.srt.models.glm5_next.vision_utils.pad_vit_attn_dummy_heads"
+            ) as mock_pad,
+        ):
+            model = Glm5NextForConditionalGeneration(config)
+            visual_weight = torch.randn(4, 4)
+            weights = [("visual.attn.qkv.weight", visual_weight)]
+            model.load_weights(weights)
+            self.assertIsNone(model.visual)
+            mock_pad.assert_not_called()
+
+    def test_glm5_next_for_conditional_generation_load_weights_with_vision_present(
+        self,
+    ):
+        class _FakeParam:
+            def __init__(self):
+                self.loaded = None
+
+            def weight_loader(self, param, loaded_weight, *args, **kwargs):
+                self.loaded = (param, loaded_weight, args, kwargs)
+
+        param = _FakeParam()
+        params = {"visual.blocks.0.attn.qkv_proj.weight": param}
+        fake_self = SimpleNamespace(
+            config=SimpleNamespace(
+                num_hidden_layers=32,
+                num_nextn_predict_layers=0,
+                n_routed_experts=0,
+                q_lora_rank=None,
+            ),
+            num_fused_shared_experts=0,
+            quant_config=None,
+            encoder_only=True,
+            language_only=False,
+            visual=object(),
+            mm_config=SimpleNamespace(
+                vision_config=SimpleNamespace(num_dummy_heads=2, head_dim=64)
+            ),
+            named_parameters=lambda: list(params.items()),
+        )
+
+        raw_weight = torch.randn(6, 64)
+        padded_weight = torch.randn(8, 64)
+
+        with patch(
+            "sglang.srt.models.glm5_next.vision_utils.pad_vit_attn_dummy_heads",
+            return_value=padded_weight,
+        ) as mock_pad:
+            weights = [("visual.blocks.0.attn.qkv.weight", raw_weight)]
+            Glm5NextForConditionalGeneration.load_weights(fake_self, weights)
+
+            mock_pad.assert_called_once_with(
+                fake_self.mm_config,
+                "visual.blocks.0.attn.qkv_proj.weight",
+                raw_weight,
+            )
+            self.assertIsNotNone(param.loaded)
+            self.assertIs(param.loaded[1], padded_weight)
+
+    def test_glm5_next_vision_model_swiglu_limit_propagation(self):
+        config_with_limit = Glm5NextVisionConfig(
+            depth=2,
+            hidden_size=64,
+            num_heads=4,
+            intermediate_size=128,
+            out_hidden_size=64,
+            patch_size=14,
+            spatial_merge_size=2,
+            temporal_patch_size=1,
+            in_channels=3,
+            swiglu_limit=5.0,
+        )
+        self.assertEqual(config_with_limit.swiglu_limit, 5.0)
+
+        with (
+            get_parallel().override(
+                tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
+            ),
+            get_context().override_server_args(mm_enable_dp_encoder=False),
+        ):
+            model = Glm5NextVisionModel(config_with_limit)
+            self.assertEqual(model.blocks[0].mlp.swiglu_limit, 5.0)
+            self.assertEqual(model.merger.swiglu_limit, 5.0)
+
+        config_omitted = Glm5NextVisionConfig(
+            depth=2,
+            hidden_size=64,
+            num_heads=4,
+            intermediate_size=128,
+            out_hidden_size=64,
+            patch_size=14,
+            spatial_merge_size=2,
+            temporal_patch_size=1,
+            in_channels=3,
+        )
+        self.assertIsNone(config_omitted.swiglu_limit)
+
+        with (
+            get_parallel().override(
+                tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
+            ),
+            get_context().override_server_args(mm_enable_dp_encoder=False),
+        ):
+            model_omitted = Glm5NextVisionModel(config_omitted)
+            self.assertIsNone(model_omitted.blocks[0].mlp.swiglu_limit)
+            self.assertIsNone(model_omitted.merger.swiglu_limit)
 
 
 if __name__ == "__main__":

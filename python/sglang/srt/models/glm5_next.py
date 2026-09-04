@@ -118,10 +118,11 @@ logger = logging.getLogger(__name__)
 
 
 @torch.compile
-def swiglu_clamped(y: torch.Tensor, limit: float):
+def swiglu_clamped(y: torch.Tensor, limit: Optional[float] = None):
     gate, up = torch.chunk(y, 2, dim=-1)
-    gate = torch.clamp(gate, max=limit)
-    up = torch.clamp(up, min=-limit, max=limit)
+    if limit is not None:
+        gate = torch.clamp(gate, max=limit)
+        up = torch.clamp(up, min=-limit, max=limit)
     return F.silu(gate) * up
 
 
@@ -130,7 +131,7 @@ class Glm5NextVisionMLP(GlmOcrVisionMLP):
         self,
         in_features: int,
         hidden_features: int,
-        swiglu_limit: float,
+        swiglu_limit: Optional[float] = None,
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -158,7 +159,7 @@ class Glm5NextVisionPatchMerger(GlmOcrVisionPatchMerger):
         self,
         d_model: int,
         context_dim: int,
-        swiglu_limit: float,
+        swiglu_limit: Optional[float] = None,
         quant_config: Optional[QuantizationConfig] = None,
         bias: bool = False,
         prefix: str = "",
@@ -189,7 +190,7 @@ class Glm5NextVisionBlock(GlmOcrVisionBlock):
         dim: int,
         intermediate_dim: int,
         num_heads: int,
-        swiglu_limit: float,
+        swiglu_limit: Optional[float] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         attn_qkv_bias: bool = True,
@@ -258,6 +259,7 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
             is_neox_style=True,
         )
 
+        swiglu_limit = getattr(vision_config, "swiglu_limit", None)
         self.blocks = nn.ModuleList(
             [
                 Glm5NextVisionBlock(
@@ -269,7 +271,7 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
                     rms_norm_eps=vision_config.rms_norm_eps,
                     attn_qkv_bias=vision_config.attention_bias,
                     use_data_parallel=use_data_parallel,
-                    swiglu_limit=vision_config.swiglu_limit,
+                    swiglu_limit=swiglu_limit,
                 )
                 for layer_idx in range(vision_config.depth)
             ]
@@ -288,7 +290,7 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
             bias=False,
             prefix=add_prefix("merger", prefix),
             use_data_parallel=use_data_parallel,
-            swiglu_limit=vision_config.swiglu_limit,
+            swiglu_limit=swiglu_limit,
         )
 
         self.downsample = nn.Conv2d(
@@ -1101,7 +1103,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        vision_utils.update_vit_attn_dummy_heads_config(config)
+        if getattr(config, "vision_config", None) is not None:
+            vision_utils.update_vit_attn_dummy_heads_config(config)
         self.mm_config = config
         text_config = config.text_config
         self.encoder_only = bool(getattr(config, "encoder_only", False))
@@ -1163,7 +1166,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
         self.visual = None
-        if not self.language_only:
+        if (
+            not self.language_only
+            and getattr(config, "vision_config", None) is not None
+        ):
             self.visual = Glm5NextVisionModel(
                 config.vision_config,
                 quant_config=quant_config,
@@ -1408,7 +1414,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
             is_visual_weight = "visual" in name
             if getattr(self, "encoder_only", False) and not is_visual_weight:
                 continue
-            if getattr(self, "language_only", False) and is_visual_weight:
+            if (
+                getattr(self, "language_only", False)
+                or getattr(self, "visual", None) is None
+            ) and is_visual_weight:
                 continue
 
             if "language_model." in name:
@@ -1416,7 +1425,11 @@ class Glm5NextForConditionalGeneration(nn.Module):
             if "model.visual." in name:
                 name = name.replace("model.visual.", "visual.")
 
-            if "visual" in name:
+            if (
+                "visual" in name
+                and getattr(getattr(self, "mm_config", None), "vision_config", None)
+                is not None
+            ):
                 name = name.replace("attn.qkv.", "attn.qkv_proj.")
                 loaded_weight = vision_utils.pad_vit_attn_dummy_heads(
                     self.mm_config, name, loaded_weight

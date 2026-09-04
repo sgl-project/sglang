@@ -275,7 +275,7 @@ class Glm5NextTextConfig(PretrainedConfig):
 class Glm5NextVisionConfig(GlmOcrVisionConfig):
     def __init__(
         self,
-        swiglu_limit: float,
+        swiglu_limit: Optional[float] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
