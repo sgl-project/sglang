@@ -2,7 +2,8 @@
 
 The example assets are organized by purpose:
 
-- `sim_configs/`: standalone AIC SOL, AIC SILICON, ML, and replay simulator configs;
+- `sim_configs/`: standalone AIC SOL, AIC SILICON, ML, replay, and InferCast
+  simulator configs;
 - `assets/`: the small illustrative ML model, replay table, and test tokenizer;
 - `workloads/`: ShareGPT and timestamped simulator/Autobench workload examples;
 
@@ -14,6 +15,9 @@ python3 examples/build_example_assets.py
 ```
 
 Only load pickle/joblib assets from sources you trust.
+
+The InferCast template requires an exact systems root, provider revision, and
+deployment-specific `max_total_tokens` before use.
 
 For maintained direct-run and serving examples, see
 [`test_simulation_sglang_runner.py`](../test/test_simulation_sglang_runner.py) and
