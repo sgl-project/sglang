@@ -60,7 +60,7 @@ class TestDeepseekV3Basic(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v3)\n" f'{metrics["accuracy"]=:.3f}\n'
+                f'### test_gsm8k (deepseek-v3)\n{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], 0.935)
 
@@ -72,7 +72,7 @@ class TestDeepseekV3Basic(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (deepseek-v3)\n" f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (deepseek-v3)\n{speed=:.2f} token/s\n"
             )
             if is_in_amd_ci():
                 self.assertGreater(speed, 12)

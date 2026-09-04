@@ -10,7 +10,7 @@ from sglang.srt.arg_groups.validation_hook import validate_ib_devices
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="base-b-test-cpu")
+register_cpu_ci(est_time=6, suite="stage-a-test-cpu-intel")
 register_cpu_ci(est_time=10, suite="base-b-test-cpu-arm64")
 
 
@@ -56,17 +56,20 @@ class TestServerArgsIBDeviceValidation(unittest.TestCase):
         real_isdir = os.path.isdir
         real_listdir = os.listdir
 
-        with patch(
-            "sglang.srt.arg_groups.validation_hook.os.path.isdir",
-            side_effect=lambda path: (
-                True if path == "/sys/class/infiniband" else real_isdir(path)
+        with (
+            patch(
+                "sglang.srt.arg_groups.validation_hook.os.path.isdir",
+                side_effect=lambda path: (
+                    True if path == "/sys/class/infiniband" else real_isdir(path)
+                ),
             ),
-        ), patch(
-            "sglang.srt.arg_groups.validation_hook.os.listdir",
-            side_effect=lambda path: (
-                available_devices
-                if path == "/sys/class/infiniband"
-                else real_listdir(path)
+            patch(
+                "sglang.srt.arg_groups.validation_hook.os.listdir",
+                side_effect=lambda path: (
+                    available_devices
+                    if path == "/sys/class/infiniband"
+                    else real_listdir(path)
+                ),
             ),
         ):
             return validate_ib_devices(device_str)
