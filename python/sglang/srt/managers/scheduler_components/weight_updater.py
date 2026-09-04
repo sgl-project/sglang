@@ -517,12 +517,11 @@ class SchedulerWeightUpdaterManager:
                     queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                     if queue is not None:
                         queue.release_memory_occupation()
-            # Hybrid pool clears write CUDA tensors owned by the KV region.
-            # Flush while those tensors are still mapped.
             self.flush_cache()
 
-            # TMS pause unmaps allocations immediately, so cache clears must
-            # finish before the KV region is released.
+            # torch_memory_saver.pause() unmaps the region without waiting for
+            # the device: any kernel still touching KV memory would fault. Drain
+            # the streams before releasing.
             torch.get_device_module().synchronize()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
             self.offload_tags.add(GPU_MEMORY_TYPE_KV_CACHE)
@@ -534,8 +533,8 @@ class SchedulerWeightUpdaterManager:
             )
             torch.distributed.barrier(self.tp_cpu_group)
 
-            # Keep the original low-memory ordering: KV is released before the
-            # static-state clones, then those copies finish before weights unmap.
+            # The static-state clones above are asynchronous D2D copies that read
+            # the weights region; they must complete before the region is unmapped.
             torch.get_device_module().synchronize()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
             self.offload_tags.add(GPU_MEMORY_TYPE_WEIGHTS)

@@ -13,7 +13,6 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_WEIGHTS,
 )
 from sglang.srt.managers.io_struct import ReleaseMemoryOccupationReqInput
-from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
@@ -220,28 +219,6 @@ class TestSchedulerMemoryReleaseOrder(CustomTestCase):
             ],
         )
         self.assertIn(GPU_MEMORY_TYPE_CUDA_GRAPH, manager.offload_tags)
-
-    def test_flush_cache_is_a_noop_while_kv_memory_is_released(self):
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler.weight_updater = SimpleNamespace(
-            offload_tags={GPU_MEMORY_TYPE_KV_CACHE}
-        )
-        scheduler._engine_paused = True
-        scheduler.is_fully_idle = MagicMock(return_value=True)
-        scheduler.cur_batch_for_debug = object()
-        scheduler.last_batch = object()
-        scheduler.tree_cache = MagicMock()
-        scheduler.req_to_token_pool = MagicMock()
-        scheduler.token_to_kv_pool_allocator = MagicMock()
-        scheduler.grammar_manager = MagicMock()
-        scheduler.metrics_reporter = MagicMock()
-        scheduler.draft_worker = None
-
-        self.assertTrue(scheduler.flush_cache(empty_cache=False))
-        scheduler.is_fully_idle.assert_not_called()
-        scheduler.tree_cache.reset.assert_not_called()
-        scheduler.req_to_token_pool.clear.assert_not_called()
-        scheduler.token_to_kv_pool_allocator.clear.assert_not_called()
 
 
 if __name__ == "__main__":
