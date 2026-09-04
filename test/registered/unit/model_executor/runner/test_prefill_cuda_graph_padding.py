@@ -57,19 +57,21 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         runner = self._make_runner()
         runner.use_captured_attn_metadata = False
         attn_backend = mock.Mock()
+        attn_backend.resolve_prefill_shared_read_ends.return_value = mock.sentinel.end
         runner.model_runner = SimpleNamespace(attn_backend=attn_backend)
         forward_batch = self._make_forward_batch(8)
         static_forward_batch = self._make_forward_batch(16)
 
-        runner._prepare_forward_metadata_for_replay(
+        shared_read_ends = runner._prepare_forward_metadata_for_replay(
             forward_batch,
             static_forward_batch,
             num_tokens=16,
         )
 
+        self.assertIs(shared_read_ends, mock.sentinel.end)
         attn_backend.init_forward_metadata.assert_called_once_with(forward_batch)
-        attn_backend.prepare_prefill_shared_read_snapshot.assert_called_once_with(
-            forward_batch, num_qo_tokens=16
+        attn_backend.resolve_prefill_shared_read_ends.assert_called_once_with(
+            forward_batch, num_qo_tokens=16, allow_prepare=True
         )
 
 

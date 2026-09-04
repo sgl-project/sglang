@@ -320,13 +320,15 @@ class EagerRunner(BaseRunner):
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
-            model_runner.attn_backend.prepare_prefill_shared_read_snapshot(
-                forward_batch,
-                num_qo_tokens=len(forward_batch.input_ids),
+            shared_read_ends = (
+                model_runner.attn_backend.resolve_prefill_shared_read_ends(
+                    forward_batch,
+                    num_qo_tokens=len(forward_batch.input_ids),
+                )
             )
             maybe_publish_prefill_shared_read_done(
                 model_runner,
-                forward_batch,
+                shared_read_ends,
                 torch.get_device_module(model_runner.device),
             )
 

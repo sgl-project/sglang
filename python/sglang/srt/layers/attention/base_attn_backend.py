@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Iterable, Optional
 import torch
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.srt.environ import envs
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
@@ -15,7 +17,8 @@ if TYPE_CHECKING:
     )
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
 
 
@@ -59,6 +62,7 @@ class AttentionBackend(ABC):
     # Resolved per-mode backend names, stamped by ModelRunner.init_attention_backend
     prefill_attention_backend_str: Optional[str] = None
     decode_attention_backend_str: Optional[str] = None
+    model_runner: ModelRunner
 
     supports_ragged_verify_graph: bool = False
     # Compute / KV-cache dtype. Only backends that need them (MLA/MHA fp8
@@ -158,15 +162,36 @@ class AttentionBackend(ABC):
             return SharedReadEnds.IN_REPLAY
         return SharedReadEnds.UNKNOWN
 
-    def prepare_prefill_shared_read_snapshot(
-        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
-    ) -> None:
-        """Snapshot late prefill reads before a PRE_REPLAY event is published.
+    def resolve_prefill_shared_read_ends(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        num_qo_tokens: int,
+        allow_prepare: bool = True,
+    ) -> SharedReadEnds:
+        """Resolve one batch's prefill boundary, preparing snapshots if safe."""
+        if (
+            envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get()
+            or envs.SGLANG_FORCE_PREFILL_COARSE_WAR_BARRIER.get()
+        ):
+            return SharedReadEnds.UNKNOWN
+        if forward_batch.forward_mode != ForwardMode.EXTEND:
+            return SharedReadEnds.UNKNOWN
+        spec_algorithm = self.model_runner.spec_algorithm
+        # EAGLE/MTP may have a later draft-extend reader.
+        if not spec_algorithm.is_none() and not spec_algorithm.is_dflash_family():
+            return SharedReadEnds.UNKNOWN
+        if allow_prepare:
+            return self._prepare_prefill_shared_reads(
+                forward_batch, num_qo_tokens=num_qo_tokens
+            )
+        return self.shared_read_ends(forward_batch.forward_mode)
 
-        Runners call this only after the actual eager/replay query geometry is
-        known. Backends that retain scheduler-shared reads into the model
-        forward keep the default no-op and must not declare PRE_REPLAY.
-        """
+    def _prepare_prefill_shared_reads(
+        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+    ) -> SharedReadEnds:
+        """Backend hook for snapshotting scheduler-shared prefill inputs."""
+        return self.shared_read_ends(forward_batch.forward_mode)
 
     # Chunked-prefix FullCG capture has a second model topology and stable
     # prefix buffers. Backends must opt in explicitly so the runner does not
