@@ -494,6 +494,7 @@ async def create_video(
     output_quality: Optional[str] = Form(None),
     output_compression: Optional[int] = Form(None),
     output_path: Optional[str] = Form(None),
+    perf_dump_path: Optional[str] = Form(None),
     extra_params: Optional[str] = Form(None),
     extra_body: Optional[str] = Form(None),
 ):
@@ -645,6 +646,7 @@ async def create_video(
             output_compression=form_value("output_compression", output_compression),
             output_quality=form_value("output_quality", output_quality),
             output_path=form_value("output_path", output_path),
+            perf_dump_path=form_value("perf_dump_path", perf_dump_path),
             diffusers_kwargs=form_value("diffusers_kwargs", None),
             **extra_request_fields,
         )
