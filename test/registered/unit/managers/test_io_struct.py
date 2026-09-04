@@ -770,6 +770,14 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertFalse(req.is_single)
         self.assertEqual(req.batch_size, 2)
 
+    def test_empty_input_embeds_raises_value_error(self):
+        """Empty input_embeds must raise ValueError (HTTP 400), not IndexError (HTTP 500)."""
+        for empty_embeds in ([], [[]]):
+            with self.subTest(input_embeds=empty_embeds):
+                req = GenerateReqInput(input_embeds=empty_embeds)
+                with self.assertRaisesRegex(ValueError, "input_embeds cannot be empty"):
+                    req.normalize_batch_and_arguments()
+
     def test_input_embeds_with_parallel_sampling(self):
         """Test input_embeds normalization with parallel sampling (n > 1)."""
         # Test single input_embeds with parallel sampling

@@ -463,6 +463,8 @@ class GenerateReqInput:
                 self.batch_size = len(self.input_ids)
             self.input_embeds = None
         else:
+            if not self.input_embeds or not self.input_embeds[0]:
+                raise ValueError("input_embeds cannot be empty.")
             if isinstance(self.input_embeds[0][0], float):
                 self.is_single = True
                 self.batch_size = 1
