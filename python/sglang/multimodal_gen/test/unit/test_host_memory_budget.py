@@ -1,5 +1,6 @@
 """Pinned host memory is planned against the cgroup cap, not the whole machine."""
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -195,6 +196,18 @@ class TestNestedCgroup:
 
 
 class TestHostPinBudget:
+    def test_local_workers_split_one_node_allowance(self, monkeypatch):
+        monkeypatch.setattr(
+            host_memory_budget,
+            "host_memory_available_bytes",
+            lambda: 40 * GIB_BYTES,
+        )
+
+        budget = HostPinBudget.for_local_worker(4)
+
+        # The node keeps one 2 GiB reserve, then workers split the remainder.
+        assert budget.spendable_bytes == int(9.5 * GIB_BYTES)
+
     def test_a_component_that_fits_is_granted(self):
         budget = HostPinBudget(available_bytes=40 * GIB_BYTES)
         assert budget.request(component_name="dit", weight_bytes=20 * GIB_BYTES)
@@ -216,6 +229,17 @@ class TestHostPinBudget:
         assert not budget.request(
             component_name="text_encoder", weight_bytes=20 * GIB_BYTES
         )
+
+    def test_released_allowance_can_be_reassigned(self):
+        budget = HostPinBudget(available_bytes=40 * GIB_BYTES)
+        assert budget.request(component_name="encoder", weight_bytes=30 * GIB_BYTES)
+        budget.release(20 * GIB_BYTES)
+        assert budget.request(component_name="dit", weight_bytes=20 * GIB_BYTES)
+
+    def test_cannot_release_uncommitted_allowance(self):
+        budget = HostPinBudget(available_bytes=40 * GIB_BYTES)
+        with pytest.raises(ValueError, match="more pinned-host memory"):
+            budget.release(GIB_BYTES)
 
     def test_the_cap_binds_even_for_the_first_component(self):
         # priority comes from asking first, not from being allowed to overrun
