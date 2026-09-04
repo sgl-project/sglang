@@ -346,15 +346,15 @@ jobs:
           cd test
           python3 run_suite.py --hw npu --suite full-16-npu-a3 --nightly --continue-on-error --timeout-per-file 3600
 
-  full-1-npu-a2:
-    name: full-1-npu-a2
+  full-4-npu-a2:
+    name: full-4-npu-a2
     needs: [set-image-config]
     if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-aarch64-a2-4
       test_type: 'perf'
-      test_suite: full-1-npu-a2
+      test_suite: full-4-npu-a2
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a2 }}
@@ -409,7 +409,7 @@ jobs:
 
   full-poc-multi-node-mix-tests:
     name: full-multi-node-mix-poc
-    needs: [set-image-config, full-acc-2-npu-a3, full-acc-4-npu-a3, full-acc-16-npu-a3, full-1-npu-a2]
+    needs: [set-image-config, full-acc-2-npu-a3, full-acc-4-npu-a3, full-acc-16-npu-a3, full-4-npu-a2]
     if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     strategy:
       fail-fast: false
@@ -437,7 +437,7 @@ jobs:
     if: github.repository == 'sgl-project/sglang' && always()
     needs:
       - nighly-test-npu
-      - full-1-npu-a2
+      - full-4-npu-a2
       - full-1-npu-a3
       - full-2-npu-a3
       - full-4-npu-a3
