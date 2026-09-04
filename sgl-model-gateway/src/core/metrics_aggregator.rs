@@ -11,13 +11,18 @@ pub struct MetricPack {
 type PrometheusExposition = MetricsExposition<PrometheusType, PrometheusValue>;
 type PrometheusFamily = MetricFamily<PrometheusType, PrometheusValue>;
 
+/// `openmetrics_parser`'s Prometheus grammar only accepts `[a-z0-9_]` in metric
+/// names, while the Prometheus text format allows colons and every SGLang engine
+/// metric is prefixed `sglang:`. Colons are swapped for this sentinel before
+/// parsing and restored in the rendered output, so `/engine_metrics` exposes the
+/// exact metric names and label values the engines exported.
+const COLON_SENTINEL: &str = "__smg_colon__";
+
 /// Aggregate Prometheus metrics scraped from multiple sources into a unified one
 pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String> {
     let mut expositions = vec![];
     for metric_pack in metric_packs {
-        let metrics_text = &metric_pack.metrics_text;
-        // openmetrics_parser doesn't handle colons in metric names; replace with underscores
-        let metrics_text = metrics_text.replace(":", "_");
+        let metrics_text = metric_pack.metrics_text.replace(':', COLON_SENTINEL);
 
         let exposition = match openmetrics_parser::prometheus::parse_prometheus(&metrics_text) {
             Ok(x) => x,
@@ -34,7 +39,7 @@ pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String
     }
 
     let text = try_reduce(expositions.into_iter(), merge_exposition)?
-        .map(|x| format!("{x}"))
+        .map(|x| format!("{x}").replace(COLON_SENTINEL, ":"))
         .unwrap_or_default();
     Ok(text)
 }
