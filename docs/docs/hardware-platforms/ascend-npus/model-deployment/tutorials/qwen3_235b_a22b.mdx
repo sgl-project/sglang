@@ -34,7 +34,7 @@ v0.5.16 or a later version.
 | Speculative Decoding          | `--speculative-algorithm EAGLE3 \`<br/>`--speculative-draft-model-path /path/to/draft-model-weights \`<br/>`--speculative-num-steps 3 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 4 \`<br/>`--speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                  |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
-| Context Parallelism           | `--enable-prefill-context-parallel \`<br/>`--attn-cp-size 2 \`<br/>`--moe-dp-size 2`          |
+| Context Parallelism           | `--enable-prefill-cp \`<br/>`--attn-cp-size 2 \`<br/>`--moe-dp-size 2`          |
 
 <Note>
 The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
@@ -293,7 +293,7 @@ python3 -m sglang_router.launch_router \
 
 #### Prefill Context Parallel (PCP) on 2 x Atlas 800I A3
 
-This configuration enables **Prefill Context Parallel** (`--enable-prefill-context-parallel`) to split the context
+This configuration enables **Prefill Context Parallel** (`--enable-prefill-cp`) to split the context
 across CP ranks during prefill, reducing per-device memory pressure and improving TTFT for long sequences.
 PD disaggregation is required. The following command is based on the **W8A8** quantized model.
 
@@ -330,7 +330,7 @@ python3 -m sglang.launch_server \
     --device npu \
     --base-gpu-id 0 \
     --tp-size 16 \
-    --enable-prefill-context-parallel \
+    --enable-prefill-cp \
     --attn-cp-size 2 \
     --moe-dp-size 2 \
     --max-running-requests 1 \
@@ -345,7 +345,7 @@ Key parameters for PCP:
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| `--enable-prefill-context-parallel` | flag | Enable PCP feature |
+| `--enable-prefill-cp` | flag | Enable PCP feature |
 | `--attn-cp-size` | 2 | Split context across 2 CP ranks (each rank handles half the sequence) |
 | `--moe-dp-size` | 2 | MoE DP size, should match `--attn-cp-size` |
 | `--max-running-requests` | 1 | Required by PCP (batch_size=1 constraint) |
