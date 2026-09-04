@@ -455,7 +455,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             eps=self.layer_norm_epsilon,
             group_size=None,
             norm_before_gate=True,
-            device=torch.get_device_module().current_device(),
             dtype=torch.get_default_dtype(),
             **(
                 {"activation": self.output_gate_type}
