@@ -13,7 +13,7 @@ torch-MPS (``tensor_bridge``).  These helpers are that dispatch point
 (#21443).
 
 All sizes are in bytes; callers convert units.  Only stdlib is imported at
-module level so that ``sglang._mps_stub`` (installed from
+module level so that ``sglang._platform_stubs`` (installed from
 ``sglang/__init__``) and the ``multimodal_gen`` platform layer can depend on
 this module without pulling in ``sglang.srt``.
 """

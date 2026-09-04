@@ -15,10 +15,10 @@ reduce into one call and consume *global* top-k expert ids together with
 ``rank_ep`` / ``num_expert_total``, so expert parallelism with contiguous
 expert partitioning works without a local-expert remap.
 
-Only supported on NVIDIA Hopper / Blackwell (sm90+). Note that the HPC-Ops
-kernels are currently tuned primarily for H20: on other GPUs (H100/H200/B200,
-...) the speedup over the default MoE runner may be limited or absent. Enable
-it explicitly with ``--moe-runner-backend hpc_ops``.
+Only supported on NVIDIA Hopper (SM90; the kernels ship sm90a). Note that the
+HPC-Ops kernels are currently tuned primarily for H20: on other SM90 GPUs
+(H100/H200) the speedup over the default MoE runner may be limited or absent.
+Enable it explicitly with ``--moe-runner-backend hpc_ops``.
 """
 
 import functools
@@ -146,12 +146,12 @@ def fused_experts_none_to_hpc_ops(
             "this backend also expects global top-k ids, so other quant "
             "methods must not run with --moe-runner-backend hpc_ops."
         )
-    assert (
-        quant_info.w13_weight.dtype == torch.float8_e4m3fn
-    ), f"expected fp8 w13_weight, got {quant_info.w13_weight.dtype}"
-    assert (
-        quant_info.w2_weight.dtype == torch.float8_e4m3fn
-    ), f"expected fp8 w2_weight, got {quant_info.w2_weight.dtype}"
+    assert quant_info.w13_weight.dtype == torch.float8_e4m3fn, (
+        f"expected fp8 w13_weight, got {quant_info.w13_weight.dtype}"
+    )
+    assert quant_info.w2_weight.dtype == torch.float8_e4m3fn, (
+        f"expected fp8 w2_weight, got {quant_info.w2_weight.dtype}"
+    )
     _check_runner_config_supported(runner_config)
 
     x = dispatch_output.hidden_states

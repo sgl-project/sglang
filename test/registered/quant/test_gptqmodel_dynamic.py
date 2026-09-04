@@ -21,28 +21,14 @@ def check_quant_method(model_path: str, use_marlin_kernel: bool):
     from sglang.srt.configs.device_config import DeviceConfig
     from sglang.srt.configs.load_config import LoadConfig
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.distributed import (
-        init_distributed_environment,
-        initialize_model_parallel,
-    )
     from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
     from sglang.srt.layers.quantization.utils import get_dynamic_override
     from sglang.srt.model_loader import get_model
     from sglang.srt.server_args import ServerArgs
+    from sglang.test.layer_ut_utils import init_single_process_dist
 
-    try:
-        init_distributed_environment(
-            backend="nccl",
-            world_size=1,
-            rank=0,
-            local_rank=0,
-            distributed_init_method="tcp://127.0.0.1:2646",
-        )
-        initialize_model_parallel(tensor_model_parallel_size=1)
-        monkey_patch_vllm_parallel_state()
-    except AssertionError:
-        # ignore this error: tensor model parallel group is already initialized
-        pass
+    init_single_process_dist(backend="nccl")
+    monkey_patch_vllm_parallel_state()
 
     server_args = ServerArgs(model_path=model_path, dtype=torch.float16)
     set_global_server_args_for_scheduler(server_args)

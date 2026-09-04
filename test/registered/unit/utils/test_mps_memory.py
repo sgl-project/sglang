@@ -24,7 +24,7 @@ from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
 import sglang._apple_silicon_memory as apple_mem
-import sglang._mps_stub as mps_stub
+import sglang._platform_stubs as mps_stub
 from sglang.srt.utils.common import get_available_gpu_memory
 from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 from sglang.test.test_utils import CustomTestCase
@@ -328,7 +328,7 @@ class TestGetAvailableGpuMemoryMps(CustomTestCase):
 
 
 class TestMpsStubDeviceProperties(CustomTestCase):
-    """``_mps_stub.get_device_properties`` reports the Metal working set."""
+    """``_platform_stubs.get_device_properties`` reports the Metal working set."""
 
     def setUp(self):
         self._saved_props = mps_stub._cached_props

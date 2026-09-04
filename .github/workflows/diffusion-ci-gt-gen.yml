@@ -186,17 +186,17 @@ jobs:
             diffusion-ci/consistency_gt/official_generated/case_map.json
           sparse-checkout-cone-mode: false
 
-      - name: Prepare sgl-kernel/dist for prebuilt wheel
+      - name: Prepare AOT dist for prebuilt wheel
         if: inputs.kernel_artifact_run_id != ''
         run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
+          ls -alh python/sglang/kernels/aot/dist || true
+          rm -rf python/sglang/kernels/aot/dist/* || true
 
       - name: Download prebuilt sgl-kernel wheel
         if: inputs.kernel_artifact_run_id != ''
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           name: wheel-python3.10-cuda13.0
           run-id: ${{ inputs.kernel_artifact_run_id }}
@@ -364,7 +364,8 @@ jobs:
             --target-time 1800 \
             --max-time 2400 \
             --max-partitions 10 \
-            --parametrized-only
+            --parametrized-only \
+            ${{ inputs.case_ids != '' && format('--case-ids {0}', inputs.case_ids) || '' }}
 
   multimodal-diffusion-gen-1gpu:
     needs: compute-diffusion-partitions
@@ -382,17 +383,17 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Prepare sgl-kernel/dist for prebuilt wheel
+      - name: Prepare AOT dist for prebuilt wheel
         if: inputs.kernel_artifact_run_id != ''
         run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
+          ls -alh python/sglang/kernels/aot/dist || true
+          rm -rf python/sglang/kernels/aot/dist/* || true
 
       - name: Download prebuilt sgl-kernel wheel
         if: inputs.kernel_artifact_run_id != ''
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           name: wheel-python3.10-cuda13.0
           run-id: ${{ inputs.kernel_artifact_run_id }}
@@ -457,17 +458,17 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Prepare sgl-kernel/dist for prebuilt wheel
+      - name: Prepare AOT dist for prebuilt wheel
         if: inputs.kernel_artifact_run_id != ''
         run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
+          ls -alh python/sglang/kernels/aot/dist || true
+          rm -rf python/sglang/kernels/aot/dist/* || true
 
       - name: Download prebuilt sgl-kernel wheel
         if: inputs.kernel_artifact_run_id != ''
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           name: wheel-python3.10-cuda13.0
           run-id: ${{ inputs.kernel_artifact_run_id }}
@@ -480,6 +481,8 @@ jobs:
 
       - name: Generate outputs
         env:
+          HF_TOKEN: ${{ secrets.MINIMAX_H3_HF_TOKEN || secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.MINIMAX_H3_HF_TOKEN || secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           RUNAI_STREAMER_MEMORY_LIMIT: 0
           PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-2gpu }}
         run: |
@@ -532,17 +535,17 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Prepare sgl-kernel/dist for prebuilt wheel
+      - name: Prepare AOT dist for prebuilt wheel
         if: inputs.kernel_artifact_run_id != ''
         run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
+          ls -alh python/sglang/kernels/aot/dist || true
+          rm -rf python/sglang/kernels/aot/dist/* || true
 
       - name: Download prebuilt sgl-kernel wheel
         if: inputs.kernel_artifact_run_id != ''
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           name: wheel-python3.10-cuda13.0
           run-id: ${{ inputs.kernel_artifact_run_id }}

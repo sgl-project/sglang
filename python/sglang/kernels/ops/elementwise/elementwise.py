@@ -1,36 +1,11 @@
-from typing import Optional, Tuple
-
 import torch
 import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.kernels.ops.activation.softcap import softcap_out as fused_softcap
 from sglang.srt.utils import is_hip
-from sglang.srt.utils.custom_op import register_custom_op
 
 _is_hip = is_hip()
-
-
-# cast to float + softcap
-class Softcap:
-    def __init__(self, softcap_const: float):
-        self.softcap_const = softcap_const
-
-    def __call__(self, *args, **kwargs):
-        return self.forward(*args, **kwargs)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.is_cuda:
-            return self.forward_cuda(x)
-        else:
-            return self.forward_native(x)
-
-    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.tanh(x.float() / self.softcap_const) * self.softcap_const
-
-    def forward_cuda(self, x: torch.Tensor, autotune=False) -> torch.Tensor:
-        return fused_softcap(x, self.softcap_const, autotune=autotune)
 
 
 rmsnorm_autotune = triton.autotune(
@@ -128,9 +103,9 @@ fused_dual_residual_rmsnorm_kernel_autotune = rmsnorm_autotune(
 
 def fused_dual_residual_rmsnorm(x, residual, weight1, weight2, eps, autotune=False):
     assert len(x.shape) == 2
-    assert (
-        x.shape == residual.shape and x.dtype == residual.dtype
-    ), f"{x.shape=} {residual.shape=} {x.dtype=} {residual.dtype=}"
+    assert x.shape == residual.shape and x.dtype == residual.dtype, (
+        f"{x.shape=} {residual.shape=} {x.dtype=} {residual.dtype=}"
+    )
     output, mid = torch.empty_like(x), torch.empty_like(x)
     bs, hidden_dim = x.shape
     if autotune:
@@ -211,136 +186,6 @@ def fused_rmsnorm(x, weight, eps, autotune=False, inplace=False):
         output, x, weight, eps=eps, hidden_dim=hidden_dim, **config
     )
     return output
-
-
-class FusedDualResidualRMSNorm:
-    """
-    Fused implementation of
-    y = RMSNorm2(RMSNorm1(x) + residual))
-    """
-
-    def __init__(self, rmsnorm1, rmsnorm2) -> None:  # the one after rmsnorm1
-        self.rmsnorm1 = rmsnorm1
-        self.rmsnorm2 = rmsnorm2
-        self.variance_epsilon = self.rmsnorm1.variance_epsilon
-        assert self.rmsnorm1.variance_epsilon == self.rmsnorm2.variance_epsilon
-        assert self.rmsnorm1.weight.shape == self.rmsnorm2.weight.shape
-
-    def __call__(self, *args, **kwargs):
-        return self.forward(*args, **kwargs)
-
-    def forward(
-        self, x: torch.Tensor, residual: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if x.is_cuda:
-            return self.forward_cuda(x, residual)
-        else:
-            return self.forward_flashinfer(x, residual)
-
-    def forward_cuda(
-        self, x: torch.Tensor, residual: torch.Tensor, autotune=False
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return fused_dual_residual_rmsnorm(
-            x,
-            residual,
-            self.rmsnorm1.weight,
-            self.rmsnorm2.weight,
-            self.variance_epsilon,
-            autotune=autotune,
-        )
-
-    def forward_flashinfer(
-        self,
-        x: torch.Tensor,
-        residual: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        normed1 = self.rmsnorm1(x)
-        residual = normed1 + residual
-        return self.rmsnorm2(residual), residual
-
-    def forward_native(
-        self,
-        x: torch.Tensor,
-        residual: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        normed1 = self.rmsnorm1.forward_native(x)
-        residual = normed1 + residual
-        return self.rmsnorm2.forward_native(residual), residual
-
-
-@triton.jit
-def experts_combine_kernel(
-    out_hidden_states,
-    moe_hidden_states,
-    mlp_hidden_states,
-    combine_k: tl.constexpr,
-    hidden_dim: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    start_index_mlp = pid * hidden_dim
-    start_index_rmoe = pid * hidden_dim * combine_k
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < hidden_dim
-    combine_k_offsets = tl.arange(0, combine_k)
-
-    moe_x = tl.load(
-        moe_hidden_states
-        + start_index_rmoe
-        + combine_k_offsets[:, None] * hidden_dim
-        + offsets[None, :],
-        mask=mask[None, :],
-        other=0.0,
-    )
-    moe_x = tl.sum(moe_x, axis=0)
-    mlp_x = tl.load(mlp_hidden_states + start_index_mlp + offsets, mask=mask, other=0.0)
-    combined_x = (moe_x + mlp_x) / 1.4142135623730951
-
-    tl.store(out_hidden_states + start_index_mlp + offsets, combined_x, mask=mask)
-
-
-@register_custom_op(out_shape="mlp_hidden_states")
-def experts_combine_triton(
-    moe_hidden_states: torch.Tensor,
-    mlp_hidden_states: torch.Tensor,
-    output_buffer: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    assert moe_hidden_states.is_contiguous()
-    assert mlp_hidden_states.is_contiguous()
-
-    if len(moe_hidden_states.shape) == 2:
-        combine_k = 1  # pre-combined
-    else:
-        combine_k = moe_hidden_states.shape[1]
-
-    if output_buffer is None:
-        out_hidden_states = torch.empty_like(mlp_hidden_states)
-    else:
-        flat_output_buffer = output_buffer.view(mlp_hidden_states.dtype).reshape(-1)
-        assert flat_output_buffer.numel() >= mlp_hidden_states.numel()
-        out_hidden_states = flat_output_buffer[: mlp_hidden_states.numel()].reshape(
-            mlp_hidden_states.shape
-        )
-
-    bs, hidden_dim = mlp_hidden_states.shape
-
-    config = {
-        "BLOCK_SIZE": triton.next_power_of_2(hidden_dim),
-        "num_warps": max(
-            min(triton.next_power_of_2(triton.cdiv(hidden_dim, 1024)), 8), 4
-        ),
-    }
-
-    experts_combine_kernel[(bs,)](
-        out_hidden_states,
-        moe_hidden_states,
-        mlp_hidden_states,
-        combine_k,
-        hidden_dim,
-        **config,
-    )
-
-    return out_hidden_states
 
 
 # gelu on first half of vector
@@ -589,9 +434,9 @@ def fused_sigmoid_mul(
         gate_stride_head = gate.stride(1)
     else:
         # Flat path: both tensors have the same shape
-        assert (
-            attn_output.shape == gate.shape
-        ), "attn_output and gate must have the same shape"
+        assert attn_output.shape == gate.shape, (
+            "attn_output and gate must have the same shape"
+        )
         hidden_dim = attn_output.shape[-1]
         num_tokens = attn_output.numel() // hidden_dim
         head_dim = hidden_dim
@@ -620,9 +465,10 @@ def _fused_gate_sigmoid_mul_add_kernel(
     hidden_states_ptr,  # [num_tokens, hidden_dim]
     gate_weight_ptr,  # [hidden_dim]
     shared_output_ptr,  # [num_tokens, hidden_dim]
-    final_hidden_states_ptr,  # [num_tokens, hidden_dim]
+    output_ptr,  # [num_tokens, hidden_dim], optionally also the addend
     hidden_dim: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    DO_ADD: tl.constexpr = True,
     USE_PDL: tl.constexpr = False,
 ):
     pid = tl.program_id(axis=0).to(tl.int64)
@@ -642,41 +488,39 @@ def _fused_gate_sigmoid_mul_add_kernel(
     s = tl.load(shared_output_ptr + row_offset + offsets, mask=mask, other=0.0).to(
         tl.float32
     )
-    f = tl.load(
-        final_hidden_states_ptr + row_offset + offsets, mask=mask, other=0.0
-    ).to(tl.float32)
+    if DO_ADD:
+        f = tl.load(output_ptr + row_offset + offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
 
     if USE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
     gate_val = tl.sigmoid(tl.sum(h * w, axis=0))
-    result = f + gate_val * s
+    result = gate_val * s
+    if DO_ADD:
+        result += f
 
-    tl.store(final_hidden_states_ptr + row_offset + offsets, result, mask=mask)
+    tl.store(output_ptr + row_offset + offsets, result, mask=mask)
 
 
-def fused_gate_sigmoid_mul_add(
+def _launch_fused_gate_sigmoid_mul(
     hidden_states: torch.Tensor,
     gate_weight: torch.Tensor,
     shared_output: torch.Tensor,
-    final_hidden_states: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    do_add: bool,
 ) -> None:
-    """
-    Fused gate-sigmoid-mul-add for MoE shared expert gating.
-
-    Equivalent to:
-        gate = hidden_states @ gate_weight
-        final_hidden_states += sigmoid(gate).unsqueeze(1) * shared_output
-    """
     assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
     assert gate_weight.is_contiguous(), "gate_weight must be contiguous"
     assert shared_output.is_contiguous(), "shared_output must be contiguous"
-    assert final_hidden_states.is_contiguous(), "final_hidden_states must be contiguous"
+    assert output.is_contiguous(), "output must be contiguous"
 
     num_tokens, hidden_dim = hidden_states.shape
     assert gate_weight.shape == (hidden_dim,)
     assert shared_output.shape == (num_tokens, hidden_dim)
-    assert final_hidden_states.shape == (num_tokens, hidden_dim)
+    assert output.shape == (num_tokens, hidden_dim)
 
     max_warps = 16 if _is_hip else 32
     config = {
@@ -689,14 +533,50 @@ def fused_gate_sigmoid_mul_add(
     if num_tokens >= 1024:
         config["num_warps"] = min(config["num_warps"], 8)
 
-    pdl_kwargs = {"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    use_pdl = is_arch_support_pdl()
+    pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
 
     _fused_gate_sigmoid_mul_add_kernel[(num_tokens,)](
         hidden_states,
         gate_weight,
         shared_output,
-        final_hidden_states,
+        output,
         hidden_dim=hidden_dim,
+        DO_ADD=do_add,
+        USE_PDL=use_pdl,
         **config,
         **pdl_kwargs,
+    )
+
+
+def fused_gate_sigmoid_mul(
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    shared_output: torch.Tensor,
+) -> torch.Tensor:
+    """Materialize the gated shared-expert contribution without an add/copy."""
+    output = torch.empty_like(shared_output)
+    _launch_fused_gate_sigmoid_mul(
+        hidden_states,
+        gate_weight,
+        shared_output,
+        output,
+        do_add=False,
+    )
+    return output
+
+
+def fused_gate_sigmoid_mul_add(
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    shared_output: torch.Tensor,
+    final_hidden_states: torch.Tensor,
+) -> None:
+    """Add the gated shared-expert contribution to routed-expert output."""
+    _launch_fused_gate_sigmoid_mul(
+        hidden_states,
+        gate_weight,
+        shared_output,
+        final_hidden_states,
+        do_add=True,
     )

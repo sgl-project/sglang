@@ -31,21 +31,6 @@ from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
-KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: dict[str, str] = {
-    "lerobot/pi05": "Pi05Pipeline",
-    "lerobot--pi05": "Pi05Pipeline",
-    "pi05": "Pi05Pipeline",
-    "pi0.5": "Pi05Pipeline",
-    "hunyuan3d": "Hunyuan3D2Pipeline",
-    "flux.2-dev-nvfp4": "Flux2NvfpPipeline",
-    "fal/ideogram-v4-fast": "Ideogram4FastPipeline",
-    "fal--ideogram-v4-fast": "Ideogram4FastPipeline",
-    "fal/ideogram-v4-instant": "Ideogram4InstantPipeline",
-    "fal--ideogram-v4-instant": "Ideogram4InstantPipeline",
-    "comfy-org/ideogram-4": "Ideogram4Nvfp4Pipeline",
-    "comfy-org--ideogram-4": "Ideogram4Nvfp4Pipeline",
-}
-
 
 def load_diffusion_overlay_registry_from_env() -> dict[str, dict[str, Any]]:
     raw_value = os.getenv("SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY", "").strip()
@@ -82,14 +67,6 @@ def has_diffusion_overlay_registry_match(
         return False
     base_name = os.path.basename(os.path.normpath(model_path))
     return any(base_name == key.rsplit("/", 1)[-1] for key in registry)
-
-
-def is_known_non_diffusers_diffusion_model(model_path: str) -> bool:
-    model_path_lower = model_path.lower()
-    return any(
-        pattern in model_path_lower
-        for pattern in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS
-    )
 
 
 def execute_once(func):
