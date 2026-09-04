@@ -2,6 +2,7 @@ import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -45,7 +46,6 @@ from sglang.srt.models.deepseek_v4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
     _is_npu,
-    hc_head_torch,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
@@ -134,25 +134,13 @@ class DeepseekV4ModelNextN(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ):
-        if x.numel() > 0:
-            from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
-
-            return fused_hc_head(
-                x.contiguous(),
-                hc_fn,
-                hc_scale,
-                hc_base,
-                norm_eps=self.rms_norm_eps,
-                hc_eps=self.hc_eps,
-            )
-        return hc_head_torch(
-            x,
-            hc_fn,
-            hc_scale,
-            hc_base,
-            norm_eps=self.rms_norm_eps,
-            hc_eps=self.hc_eps,
-        )
+        shape, dtype = x.size(), x.dtype
+        x = x.flatten(1).float()
+        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.rms_norm_eps)
+        mixes = F.linear(x, hc_fn) * rsqrt
+        pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
+        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
+        return y.to(dtype)
 
     def forward(
         self,
