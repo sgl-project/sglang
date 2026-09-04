@@ -882,8 +882,9 @@ def test_prefetch_node_accessors_round_trip():
 
     assert not core.is_backuped(leaf)
     assert not core.is_root(leaf)
-    assert core.get_last_hash_value(leaf) == (
-        mem_cache.get_hash_str(array("q", [1, 2]), None, 2)[-1]
+    assert (
+        core.get_last_hash_value(leaf)
+        == (mem_cache.get_hash_str(array("q", [1, 2]), None, 2)[-1])
     )
     assert core.get_prefix_hash_values(leaf) == []
 
@@ -1292,7 +1293,9 @@ def test_swa_straddling_insert_crosses_the_boundary_actions():
     assert free_tail.indices[0].tolist() == [12, 13]
     assert isinstance(rebuild, SWARebuild)
     assert rebuild.source_value.tolist() == [22, 23]
-    assert isinstance(free_duplicates, FreeDeviceKV)
+    # Below the floor the duplicate's SWA peers are gone: full side only.
+    assert isinstance(free_duplicates, FreeDeviceKVFullOnly)
+    assert free_duplicates.indices[0].tolist() == [20, 21]
 
 
 def test_every_pool_name_crosses_the_prefetch_commit_boundary():

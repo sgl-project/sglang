@@ -26,7 +26,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=58, stage="base-b", runner_config="1-gpu-large")
-register_cpu_ci(est_time=101, suite="base-c-test-cpu")
+register_cpu_ci(est_time=101, suite="stage-b-test-cpu-intel")
 
 
 class TestLargeMaxNewTokens(CustomTestCase):
