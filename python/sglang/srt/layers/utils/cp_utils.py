@@ -246,7 +246,8 @@ def dsa_prefill_cp_fused_symm_mem_eligible(
         return False
     if hidden_states.shape[-1] % MOE_RS_CHUNK_WIDTH != 0:
         return False
-    if hidden_states.dtype not in (torch.bfloat16, torch.float16):
+    # AG kernel and its symm buffer are bf16-only.
+    if hidden_states.dtype != torch.bfloat16:
         return False
     # hidden_states is the CP shard here; symm buffers size global tokens.
     m_global = hidden_states.shape[0] * parallel.attn_cp_size
