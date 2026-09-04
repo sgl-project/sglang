@@ -141,7 +141,7 @@ class _StaticAllocRecorder:
         self.clear_calls.append(full)
         self.full_to_swa_index_mapping[full.to(torch.int64)] = 0
 
-    def free_full(self, indices):
+    def free_full_segment(self, indices, *, start_pos):
         self.freed_full.append(indices)
 
     def free(self, indices):
@@ -307,8 +307,8 @@ class TestStaticPoolPathUnchanged(unittest.TestCase):
             ),
             "incoming ids' mapping entries must be zeroed (static recipe)",
         )
-        # Through free_full, not the inner allocator: the latter skips the
-        # free-group defer.
+        # Through free_full_segment, not the inner allocator: the latter skips
+        # the free-group defer.
         self.assertEqual(len(static.freed_full), 1)
         self.assertEqual(static.freed_via_inner, [])
         ((node_id, ct, _),) = probe.tree_core.set_calls
