@@ -1537,7 +1537,7 @@ class CPUGraphRunner:
             if self.is_encoder_decoder
             else empty_context()
         )
-        with replay_context():
+        with _disable_cpu_graph_custom_op_aliasing_check(), replay_context():
             with skip_ctx:
                 dynamic_graph = self.decode_dynamic_graphs.get(skip)
                 can_pad = (
@@ -1741,7 +1741,7 @@ class CPUGraphRunner:
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             if self.enable_torch_compile:
                 self._mark_dynamic_prefill_metadata()
-            with torch.no_grad():
+            with _disable_cpu_graph_custom_op_aliasing_check(), torch.no_grad():
                 self.model_runner.tp_group.barrier()
                 if self._prefill_uses_eager_logits_tail:
                     # The outer model retains its normal forward contract; the
