@@ -260,6 +260,14 @@ def handle_deprecated_args(server_args: Any):
             tool_call_parser=deprecated_tool_call_parsers[cfg.tool_call_parser],
         )
 
+    if cfg.num_continuous_decode_steps != 1:
+        logger.warning(
+            "--num-continuous-decode-steps is deprecated and has no effect. "
+            "Continuous decoding steps were removed when constrained decoding "
+            "became compatible with the overlap scheduler; the flag will be "
+            "removed in a future release."
+        )
+
     # When user passes --enable-flashinfer-allreduce-fusion, enable with auto backend
     if (
         cfg.enable_flashinfer_allreduce_fusion
