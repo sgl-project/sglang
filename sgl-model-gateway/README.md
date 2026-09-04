@@ -907,6 +907,11 @@ The gateway supports role-based access control (RBAC) for control plane APIs (wo
 
 Both methods can be used together. Requests are authenticated in order: API key → JWT token.
 
+For a single service-account key, `CONTROL_PLANE_API_KEYS` is an equivalent
+environment-variable default when `--control-plane-api-keys` is absent. This
+keeps a secret out of a process argument list; an explicit CLI flag overrides
+the environment value.
+
 #### Roles
 
 | Role | Access |

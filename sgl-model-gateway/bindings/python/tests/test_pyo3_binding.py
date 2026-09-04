@@ -267,6 +267,19 @@ class TestBuildControlPlaneAuthConfig:
 
 
 class TestParseControlPlaneApiKeys:
+    def test_environment_default_is_used_only_without_cli_keys(self, monkeypatch):
+        from sglang_router.launch_router import parse_router_args
+
+        monkeypatch.setenv(
+            "CONTROL_PLANE_API_KEYS", "env:Gateway:admin:environment-value"
+        )
+        assert parse_router_args([]).control_plane_api_keys == [
+            ("env", "Gateway", "environment-value", "admin")
+        ]
+        assert parse_router_args(
+            ["--control-plane-api-keys", "cli:Gateway:user:cli-value"]
+        ).control_plane_api_keys == [("cli", "Gateway", "cli-value", "user")]
+
     def test_valid(self):
         result = RouterArgs._parse_control_plane_api_keys(
             ["k1:Service Account:admin:secret123", "k2:Read Only:user:secret456"]
