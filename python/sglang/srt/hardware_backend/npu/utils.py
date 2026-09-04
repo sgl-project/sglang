@@ -35,7 +35,7 @@ def _call_once(fn: Callable):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         if getattr(fn, "_has_been_called", False):
-            logger.debug("Function {} has already been called.", fn.__name__)
+            logger.debug("Function %s has already been called.", fn.__name__)
             return
 
         fn._has_been_called = True
