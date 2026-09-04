@@ -812,8 +812,10 @@ async def get_server_info():
 async def server_info():
     """The startup configuration, plus live scheduler state.
 
-    The values here are the resolution result: what the launcher was given,
-    with every decision resolution made applied over it. Fields the control plane changes
+    Two surfaces, deliberately both: the field values are the resolution
+    result -- what the launcher was given with every decision resolution made
+    applied over it -- and `launch_command` is what was actually asked for,
+    which no amount of reading the resolved values recovers. Fields the control plane changes
     after publication -- the model a weight update swapped in, its load format,
     an operator-set weight version -- are reported by `/model_info`, and the
     HiCache mirror by `GET /hicache/storage-backend`.
@@ -828,6 +830,7 @@ async def server_info():
     return msgspec_to_builtins(
         {
             **server_args.resolved_dict(),
+            "launch_command": server_args.launch_command,
             **_global_state.scheduler_info,
             "startup_time": _global_state.tokenizer_manager.startup_time,
             "internal_states": internal_states,
