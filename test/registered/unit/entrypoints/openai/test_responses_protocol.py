@@ -231,6 +231,26 @@ class ThinkingControlTestCase(CustomTestCase):
         )
         self.assertTrue(req.chat_template_kwargs["enable_thinking"])
 
+    def test_single_thinking_key_is_mirrored(self):
+        req = ResponsesRequest(
+            model="x",
+            input="hi",
+            store=False,
+            chat_template_kwargs={"thinking": False},
+        )
+        self.assertEqual(
+            req.chat_template_kwargs, {"thinking": False, "enable_thinking": False}
+        )
+        req = ResponsesRequest(
+            model="x",
+            input="hi",
+            store=False,
+            chat_template_kwargs={"enable_thinking": True, "thinking": False},
+        )
+        self.assertEqual(
+            req.chat_template_kwargs, {"enable_thinking": True, "thinking": False}
+        )
+
 
 class ResponsesResponseFromRequestTestCase(CustomTestCase):
     def test_requested_text_format_is_echoed(self):
