@@ -2216,6 +2216,57 @@ class AiterAttnBackend(AttentionBackend):
             and layer.qk_head_dim == layer.v_head_dim
         )
 
+    def init_mha_chunk_metadata(
+        self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
+    ) -> None:
+        pass
+
+    def _forward_extend_prefix_chunk(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ):
+        idx = forward_batch.prefix_chunk_idx
+        output, lse = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            self.forward_metadata.qo_indptr,
+            forward_batch.prefix_chunk_cu_seq_lens[idx],
+            self.forward_metadata.max_q_len,
+            forward_batch.prefix_chunk_max_seq_lens[idx],
+            softmax_scale=layer.scaling,
+            causal=False,
+            return_lse=True,
+        )[:2]
+        return output, lse.transpose(0, 1).contiguous()
+
+    def _forward_extend_skip_prefix(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+    ):
+        qo_indptr = self.forward_metadata.qo_indptr
+        max_q_len = self.forward_metadata.max_q_len
+        output, lse = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            qo_indptr,
+            qo_indptr,
+            max_q_len,
+            max_q_len,
+            softmax_scale=layer.scaling,
+            causal=True,
+            return_lse=True,
+        )[:2]
+        return output, lse.transpose(0, 1).contiguous()
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -2227,6 +2278,9 @@ class AiterAttnBackend(AttentionBackend):
         sinks=None,
     ):
         self.logits_soft_cap = layer.logit_cap
+
+        if forward_batch.attn_attend_prefix_cache:
+            return self._forward_extend_prefix_chunk(q, k, v, layer, forward_batch)
 
         cache_loc = (
             forward_batch.out_cache_loc
@@ -2339,6 +2393,8 @@ class AiterAttnBackend(AttentionBackend):
                 and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+                if forward_batch.mha_return_lse:
+                    return self._forward_extend_skip_prefix(q, k, v, layer)
                 if kv_indices.shape[0] == 0 or extend_no_prefix:
                     if self.use_fp8_prefill_attn and self.head_pad_mode != "zero":
                         output = self.mla_fp8_prefill_attn(

@@ -17,16 +17,15 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import use_intel_amx_backend
 
-MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla"]
+MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla", "aiter"]
 
 # ROCm runs dedicated MHA/MLA implementations (forward_mha_rocm.py /
 # forward_mla_rocm.py) so the shared CUDA paths carry no AMD branches. Backend
 # handlers keep returning the generic method; the platform swap happens here.
-# MHA_CHUNKED_KV has no ROCm entry because its accumulation step needs the
-# CUDA-only merge_state_v2 kernel.
 _ROCM_FORWARD_METHODS = {
     AttnForwardMethod.MHA: AttnForwardMethod.MHA_ROCM,
     AttnForwardMethod.MHA_ONE_SHOT: AttnForwardMethod.MHA_ONE_SHOT_ROCM,
+    AttnForwardMethod.MHA_CHUNKED_KV: AttnForwardMethod.MHA_CHUNKED_KV_ROCM,
     AttnForwardMethod.MLA: AttnForwardMethod.MLA_ROCM,
 }
 
@@ -193,6 +192,8 @@ def handle_attention_aiter(attn, forward_batch):
     if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return AttnForwardMethod.MHA
     if forward_batch.forward_mode.is_extend_without_speculative():
+        if not _support_mha_one_shot(attn, forward_batch, "aiter"):
+            return AttnForwardMethod.MHA_CHUNKED_KV
         return AttnForwardMethod.MHA
     else:
         return AttnForwardMethod.MLA
