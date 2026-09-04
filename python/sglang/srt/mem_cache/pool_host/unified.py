@@ -127,6 +127,7 @@ class _SharedPageEnvelopeHostBacking:
             pin_memory=pin_memory,
             allocator=self.allocator,
         )
+        self.capacity_bytes = total_bytes
         self.fd = getattr(self.allocator, "fd", None)
         self._free_extents = [(0, total_bytes)]
         self.registration_owner = pool_names[0]
@@ -208,7 +209,10 @@ class _SharedPageEnvelopeHostBacking:
         return offsets
 
     def _plan_allocations(
-        self, requests: Sequence[tuple[str, int]]
+        self,
+        requests: Sequence[tuple[str, int]],
+        *,
+        free_extents: Sequence[tuple[int, int]] | None = None,
     ) -> tuple[list[tuple[int, int]], list[list[int]]] | None:
         request_groups = []
         for request_index, (name, need_size) in enumerate(requests):
@@ -222,7 +226,7 @@ class _SharedPageEnvelopeHostBacking:
 
         # Place large page envelopes first. Planning uses a copy so an allocation
         # is all-or-nothing even when the two sides need different page sizes.
-        extents = list(self._free_extents)
+        extents = list(self._free_extents if free_extents is None else free_extents)
         offsets = [[] for _ in requests]
         for _, request_index, page_count, name in sorted(
             request_groups, key=lambda group: group[0], reverse=True
@@ -301,6 +305,34 @@ class _SharedPageEnvelopeHostBacking:
             self._free_extents = extents
             return results
 
+    def can_fit_many(self, requests: Sequence[tuple[str, int]]) -> bool:
+        """Whether requests fit in an otherwise empty shared arena."""
+        with self.lock:
+            return (
+                self._plan_allocations(
+                    requests, free_extents=((0, self.capacity_bytes),)
+                )
+                is not None
+            )
+
+    def can_fit_many_then(
+        self,
+        requests: Sequence[tuple[str, int]],
+        following_requests: Sequence[tuple[str, int]],
+        *,
+        empty: bool = False,
+    ) -> bool:
+        """Whether two allocation groups fit in order without mutating state."""
+        with self.lock:
+            free_extents = ((0, self.capacity_bytes),) if empty else self._free_extents
+            first = self._plan_allocations(requests, free_extents=free_extents)
+            if first is None:
+                return False
+            return (
+                self._plan_allocations(following_requests, free_extents=first[0])
+                is not None
+            )
+
     def free(self, name: str, indices: torch.Tensor) -> int:
         with self.lock:
             side = self.sides[name]
@@ -331,6 +363,8 @@ class _SharedPageEnvelopeHostBacking:
 
 class UnifiedPageEnvelopeHostPool(HostKVCache):
     """Host mirror that transfers complete unified-memory page envelopes."""
+
+    stores_page_envelope = True
 
     def __init__(
         self,

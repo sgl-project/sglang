@@ -114,6 +114,7 @@ class HostKVCache(abc.ABC):
     dcp_size = 1
     dcp_rank = 0
     shared_allocation_domain = None
+    stores_page_envelope = False
 
     def __init__(
         self,

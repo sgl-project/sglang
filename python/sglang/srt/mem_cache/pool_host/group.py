@@ -173,6 +173,10 @@ class HostPoolGroup:
     def size_per_token(self):
         return self.anchor_entry.host_pool.size_per_token
 
+    @property
+    def stores_page_envelope(self) -> bool:
+        return self.anchor_entry.host_pool.stores_page_envelope
+
     def clear(self) -> None:
         for entry in self.entries:
             entry.host_pool.clear()

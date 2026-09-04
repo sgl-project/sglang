@@ -904,6 +904,8 @@ class SWAComponent(TreeComponent):
             # device-guaranteed, require a full window.
             return PreparePrefetchResult()
         num_tokens = num_pages * self.cache.page_size
+        if self._swa_kv_pool_host.shared_allocation_domain is not None:
+            return PreparePrefetchResult(deferred_host_allocation=True)
         host_indices = self.cache.host_pool_group.alloc(
             num_tokens,
             pool=PoolName.SWA,
@@ -1005,10 +1007,18 @@ class SWAComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.PREFETCH:
-            assert host_indices is not None
             # Keys are unknowable at build time; placeholders carry the
             # count, _sync_trailing_keys fills the real trailing hashes.
-            num_pages = host_indices.numel() // self.tree_core.page_size
+            if host_indices is None:
+                assert (
+                    self._swa_kv_pool_host.shared_allocation_domain is not None
+                ), "deferred SWA prefetch allocation requires a shared host arena"
+                num_pages = min(
+                    self.full_window_pages,
+                    prefetch_tokens // self.tree_core.page_size,
+                )
+            else:
+                num_pages = host_indices.numel() // self.tree_core.page_size
             return [
                 PoolTransfer(
                     name=PoolName.SWA,

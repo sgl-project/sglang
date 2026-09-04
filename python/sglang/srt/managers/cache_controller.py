@@ -19,7 +19,7 @@ import threading
 import time
 from dataclasses import dataclass
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
 
@@ -326,10 +326,6 @@ class HiCacheController:
         self.storage_backend = None
         self.storage_backend_type = None
         self.enable_storage_metrics = enable_storage_metrics
-        # Buffer mode: wired by the tree cache after attach; the load rate
-        # limiter subtracts write staging from actual pool usage.
-        self.host_write_staged_tokens_fn: Optional[Callable[[], int]] = None
-
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
@@ -1163,20 +1159,33 @@ class HiCacheController:
         Rate limit the prefetching operations to avoid overwhelming the storage backend.
         """
         if self.host_memory_mode == "buffer_only":
-            # Gate on real pool usage: buffer mode allocates hit-sized, so
-            # prefetch_tokens_occupied's requested spans overstate it. Pool
-            # state mutates only at scheduler-thread lockstep points, so this
-            # stays TP-deterministic. Write staging is the write budget's
-            # usage; charging it here would park hits behind its storage drain.
-            used = self.mem_pool_host.size - self.mem_pool_host.available_size()
-            if self.host_write_staged_tokens_fn is not None:
-                used -= self.host_write_staged_tokens_fn()
-            return max(0, used) >= self.prefetch_capacity_limit
+            # Buffer mode charges hit-sized load allocations. Shared Full/SWA
+            # arenas express the exact combined byte footprint in Full-token
+            # units, without conflating fragmentation and write staging.
+            return self.prefetch_tokens_occupied >= self.prefetch_capacity_limit
         # cancel prefetch if too much memory is occupied
         if self.prefetch_tokens_occupied >= self.prefetch_capacity_limit:
             return True
         # todo: more sophisticated rate limiting based on storage backend performance
         return False
+
+    def alloc_prefetch_host_buffers(
+        self, operation: StorageOperation, need_size: int
+    ) -> Optional[torch.Tensor]:
+        """Allocate the host bounce for a storage hit."""
+        return self.mem_pool_host.alloc(need_size)
+
+    def can_fit_prefetch_host_buffers(
+        self, operation: StorageOperation, need_size: int
+    ) -> bool:
+        """Whether a prefetch bounce can fit when its host pools are empty."""
+        return need_size <= self.mem_pool_host.size
+
+    def free_prefetch_host_buffers(
+        self, operation: StorageOperation, host_indices: torch.Tensor
+    ) -> None:
+        """Roll back a hit-sized host bounce before transfer ownership moves."""
+        self.mem_pool_host.free(host_indices)
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         last_hash = operation.last_hash
@@ -1212,19 +1221,39 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                if operation.is_terminated():
+
+                try:
+                    if operation.is_terminated():
+                        hash_value, storage_hit_count = [], 0
+                    else:
+                        hash_value, storage_hit_count = self._storage_hit_query(
+                            operation
+                        )
+                except Exception:
+                    logger.exception(
+                        "HiCache storage query failed for request %s",
+                        operation.request_id,
+                    )
+                    operation.mark_terminate()
                     hash_value, storage_hit_count = [], 0
-                else:
-                    hash_value, storage_hit_count = self._storage_hit_query(operation)
-                storage_hit_count_tensor = torch.tensor(
-                    storage_hit_count, dtype=torch.int
-                )
-                self._all_reduce(
-                    storage_hit_count_tensor,
-                    torch.distributed.ReduceOp.MIN,
-                    self.prefetch_hits_sync_groups,
-                )
-                storage_hit_count = storage_hit_count_tensor.item()
+
+                try:
+                    storage_hit_count_tensor = torch.tensor(
+                        storage_hit_count, dtype=torch.int
+                    )
+                    self._all_reduce(
+                        storage_hit_count_tensor,
+                        torch.distributed.ReduceOp.MIN,
+                        self.prefetch_hits_sync_groups,
+                    )
+                    storage_hit_count = storage_hit_count_tensor.item()
+                except Exception:
+                    logger.exception(
+                        "HiCache storage query synchronization failed for request %s",
+                        operation.request_id,
+                    )
+                    operation.mark_terminate()
+                    hash_value, storage_hit_count = [], 0
 
                 # Record the TP-synced hit count; the scheduler thread decides
                 # at drain time whether to revoke (below threshold) or allocate.

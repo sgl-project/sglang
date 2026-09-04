@@ -56,6 +56,8 @@ class LogicalHostPool:
     compressed side pools use these logical FULL indices as stable page anchors.
     """
 
+    stores_page_envelope = False
+
     def __init__(self, size: int, page_size: int, layout: str = "layer_first"):
         if size % page_size != 0:
             raise ValueError(

@@ -266,6 +266,7 @@ class UnifiedRadixCache(BasePrefixCache):
             "declined_rate_limited": 0,
             "declined_anchor_lost": 0,
             "declined_device_covered": 0,
+            "declined_host_oversize": 0,
             "revoked_insufficient": 0,
             "revoked_full_miss": 0,
             "l3_demand_requests": 0,
@@ -461,9 +462,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 # intents swept per tick), so a cap that binds on live
                 # content would drop-newest and punch storage holes.
                 write_backlog_cap=2 * self.token_to_kv_pool_allocator.size_full,
-            )
-            self.cache_controller.host_write_staged_tokens_fn = (
-                lambda: self.buffer_pipeline.write_staged_tokens_
             )
 
         # State initialization
@@ -1794,7 +1792,7 @@ class UnifiedRadixCache(BasePrefixCache):
             if prep.alloc_failed:
                 alloc_failed = True
                 break
-            if prep.host_indices is None:
+            if prep.host_indices is None and not prep.deferred_host_allocation:
                 continue
             transfers = self.tree_core.build_hicache_transfers(
                 ct,
@@ -2100,7 +2098,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.buffer_pipeline.release_anchor_lock(req_id)
             del self.ongoing_prefetch[req_id]
             self.cache_controller.prefetch_tokens_occupied -= (
-                self._prefetch_occupied_span(prefetch_key, host_indices)
+                self._prefetch_occupied_span(
+                    prefetch_key, host_indices, operation=operation
+                )
             )
             self.prefetch_loaded_tokens_by_reqid[req_id] = 0
             logger.warning(
@@ -2185,7 +2185,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Buffer mode granted occupancy at hit-alloc, sized to the bounce;
         # cache mode reserved the requested span at enqueue.
         self.cache_controller.prefetch_tokens_occupied -= self._prefetch_occupied_span(
-            prefetch_key, host_indices
+            prefetch_key, host_indices, operation=operation
         )
 
     def _invalidate_absent_from_hit_query(self, operation) -> None:
@@ -2233,11 +2233,18 @@ class UnifiedRadixCache(BasePrefixCache):
             "occupancy_ratio": cc.prefetch_tokens_occupied / cap,
         }
 
-    def _prefetch_occupied_span(self, prefetch_key, host_indices) -> int:
+    def _prefetch_occupied_span(
+        self, prefetch_key, host_indices, *, operation=None
+    ) -> int:
         """Occupancy units held by a prefetch: cache mode reserves the
         requested span at enqueue; buffer mode grants at hit-alloc, sized
         to the allocation (0 while still querying / parked)."""
         if self.host_memory_mode == "buffer_only":
+            if (
+                operation is not None
+                and operation.buffer_host_occupied_units is not None
+            ):
+                return operation.buffer_host_occupied_units
             return len(host_indices) if host_indices is not None else 0
         return len(prefetch_key)
 
@@ -2270,7 +2277,9 @@ class UnifiedRadixCache(BasePrefixCache):
         cc.prefetch_tokens_occupied = max(
             0,
             cc.prefetch_tokens_occupied
-            - self._prefetch_occupied_span(prefetch_key, _host_indices),
+            - self._prefetch_occupied_span(
+                prefetch_key, _host_indices, operation=operation
+            ),
         )
 
     def _drain_storage_control_queues_impl(
@@ -2343,11 +2352,25 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.revoke_pending_prefetch(req_id)
                     return True
             alloc_len = operation.storage_hit_count
-            host_indices = cc.mem_pool_host.alloc(alloc_len)
-            if host_indices is None:
+            if buffer_mode and not cc.can_fit_prefetch_host_buffers(
+                operation, alloc_len
+            ):
+                self._prefetch_outcome_stats["declined_host_oversize"] += 1
+                logger.warning(
+                    "HiCache buffer prefetch declined req=%s: the Full/sidecar "
+                    "bounce cannot fit in an empty host arena",
+                    req_id,
+                )
+                self.revoke_pending_prefetch(req_id)
+                return True
+            host_indices = cc.alloc_prefetch_host_buffers(operation, alloc_len)
+            shared_domain = (
+                cc.mem_pool_host.anchor_entry.host_pool.shared_allocation_domain
+            )
+            if host_indices is None and shared_domain is None:
                 self.evict_host(alloc_len)
-                host_indices = cc.mem_pool_host.alloc(alloc_len)
-            if host_indices is None and not buffer_mode:
+                host_indices = cc.alloc_prefetch_host_buffers(operation, alloc_len)
+            if host_indices is None and not buffer_mode and shared_domain is None:
                 # Memory-pressure fallback: a shorter page-aligned prefix.
                 # (Cache mode only — buffer mode parks for the full hit.)
                 available_size = cc.mem_pool_host.available_size()
@@ -2356,7 +2379,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     available_size - (available_size % self.page_size),
                 )
                 if alloc_len >= self.prefetch_threshold:
-                    host_indices = cc.mem_pool_host.alloc(alloc_len)
+                    host_indices = cc.alloc_prefetch_host_buffers(operation, alloc_len)
             if host_indices is None:
                 if buffer_mode:
                     return False
@@ -2368,8 +2391,25 @@ class UnifiedRadixCache(BasePrefixCache):
             operation.host_indices = host_indices
             self.ongoing_prefetch[req_id] = info._replace(host_indices=host_indices)
             if buffer_mode:
-                cc.prefetch_tokens_occupied += alloc_len
-            cc.prefetch_buffer.put(operation)
+                operation.buffer_host_occupied_units = (
+                    self.buffer_pipeline.host_allocation_units(
+                        host_indices, operation.pool_transfers
+                    )
+                )
+                cc.prefetch_tokens_occupied += operation.buffer_host_occupied_units
+            try:
+                cc.prefetch_buffer.put(operation)
+            except Exception:
+                cc.free_prefetch_host_buffers(operation, host_indices)
+                operation.host_indices = None
+                if buffer_mode:
+                    cc.prefetch_tokens_occupied -= operation.buffer_host_occupied_units
+                    operation.buffer_host_occupied_units = None
+                    self.buffer_pipeline.pop_prefix_ctx(req_id)
+                    self.buffer_pipeline.release_anchor_lock(req_id)
+                self.ongoing_prefetch.pop(req_id, None)
+                operation.mark_terminate()
+                raise
             return True
 
         def _drain_and_alloc_storage_hit():

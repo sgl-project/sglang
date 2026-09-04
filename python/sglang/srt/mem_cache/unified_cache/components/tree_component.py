@@ -79,6 +79,9 @@ class PreparePrefetchResult:
     alloc_failed: bool = False
     # The component's pre-allocated host buffer (None = skip the build).
     host_indices: Optional[torch.Tensor] = None
+    # Shared arenas allocate all pool slices atomically after the storage hit
+    # size is known. The component still emits a keys-only transfer.
+    deferred_host_allocation: bool = False
 
 
 class CacheTransferPhase(str, Enum):
