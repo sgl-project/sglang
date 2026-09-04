@@ -842,6 +842,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 ),
             )
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
+            if reasoning_content:
+                reasoning_content = self._strip_template_markers(reasoning_content)
         else:
             reasoning_content = None
             content = final_output
@@ -943,21 +945,33 @@ class OpenAIServingResponses(OpenAIServingChat):
                 logger.error("Required tool JSON parse error: %s", e)
 
         if content:
-            output_text = ResponseOutputText(
-                text=content,
-                annotations=[],  # TODO
-                type="output_text",
-                # logprobs cover all generated tokens, not just the stripped content.
-                logprobs=output_logprobs,
+            cleaned = self._strip_template_artifacts(
+                content, reasoning_separated=reasoning_content is not None
             )
-            message = ResponseOutputMessage(
-                id=f"msg_{random_uuid()}",
-                content=[output_text],
-                role="assistant",
-                status="completed",
-                type="message",
-            )
-            output_items.append(message)
+            if output_logprobs is not None and cleaned != content:
+                logger.debug(
+                    "Dropping response logprobs because template artifacts were "
+                    "stripped from the response text"
+                )
+                output_logprobs = None
+            content = cleaned
+            # Text that was nothing but template syntax still gets a message, so
+            # a stop-finished response never comes back without any output item.
+            if content or not tool_call_items:
+                output_text = ResponseOutputText(
+                    text=content,
+                    annotations=[],  # TODO
+                    type="output_text",
+                    logprobs=output_logprobs,
+                )
+                message = ResponseOutputMessage(
+                    id=f"msg_{random_uuid()}",
+                    content=[output_text],
+                    role="assistant",
+                    status="completed",
+                    type="message",
+                )
+                output_items.append(message)
         output_items.extend(tool_call_items)
         return output_items
 
