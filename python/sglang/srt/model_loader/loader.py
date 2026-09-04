@@ -1711,8 +1711,6 @@ class ShardedStateLoader(BaseModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-        from safetensors.torch import safe_open
-
         local_model_path = self._prepare_weights(
             model_config.model_path, model_config.revision
         )
@@ -1739,34 +1737,43 @@ class ShardedStateLoader(BaseModelLoader):
                     f"pre-sharded checkpoints are currently supported!"
                 )
             state_dict = self._filter_subtensors(model.state_dict())
-            for path in filepaths:
-                with safe_open(path, framework="pt") as f:
-                    for key in f.keys():  # noqa: SIM118
-                        tensor = f.get_tensor(key)
-                        # If loading with LoRA enabled, additional padding may
-                        # be added to certain parameters. We only load into a
-                        # narrowed view of the parameter data.
-                        param_data = state_dict[key].data
-                        param_shape = state_dict[key].shape
-                        for dim, size in enumerate(tensor.shape):
-                            if size < param_shape[dim]:
-                                param_data = param_data.narrow(dim, 0, size)
-                        if tensor.shape != param_shape:
-                            logger.warning(
-                                "loading tensor of shape %s into "
-                                "parameter '%s' of shape %s",
-                                tensor.shape,
-                                key,
-                                param_shape,
-                            )
-                        param_data.copy_(tensor)
-                        state_dict.pop(key)
+            for key, tensor in self.iterate_over_files(filepaths, device_config.device):
+                # If loading with LoRA enabled, additional padding may
+                # be added to certain parameters. We only load into a
+                # narrowed view of the parameter data.
+                param_data = state_dict[key].data
+                param_shape = state_dict[key].shape
+                for dim, size in enumerate(tensor.shape):
+                    if size < param_shape[dim]:
+                        param_data = param_data.narrow(dim, 0, size)
+                if tensor.shape != param_shape:
+                    logger.warning(
+                        "loading tensor of shape %s into parameter '%s' of shape %s",
+                        tensor.shape,
+                        key,
+                        param_shape,
+                    )
+                param_data.copy_(tensor)
+                state_dict.pop(key)
             if state_dict:
                 raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
 
             _post_load_weights(model)
 
         return model.eval()
+
+    def iterate_over_files(
+        self,
+        filepaths: List[str],
+        target_device: torch.device,
+    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        del target_device
+        from safetensors.torch import safe_open
+
+        for path in filepaths:
+            with safe_open(path, framework="pt") as file:
+                for key in file.keys():  # noqa: SIM118
+                    yield key, file.get_tensor(key)
 
     @staticmethod
     def save_model(
@@ -1803,6 +1810,134 @@ class ShardedStateLoader(BaseModelLoader):
                 state_dict_part,
                 os.path.join(path, filename),
             )
+
+
+class FastSafetensorsShardedStateLoader(ShardedStateLoader):
+    """Load rank-local sharded-state checkpoints with FastSafetensors."""
+
+    def __init__(self, load_config: LoadConfig):
+        BaseModelLoader.__init__(self, load_config)
+        extra_config = dict(load_config.model_loader_extra_config or {})
+
+        self.pattern = extra_config.pop("pattern", self.DEFAULT_PATTERN)
+        self.nogds = extra_config.pop("nogds", None)
+        self.bbuf_size_kb = self._positive_int(
+            extra_config.pop("bbuf_size_kb", 16 * 1024), "bbuf_size_kb"
+        )
+        self.max_threads = self._positive_int(
+            extra_config.pop("max_threads", 16), "max_threads"
+        )
+        self.max_copy_block_size = self._positive_int(
+            extra_config.pop("max_copy_block_size", 16 * 1024**3),
+            "max_copy_block_size",
+        )
+        self.debug_log = extra_config.pop("debug_log", False)
+
+        if self.nogds is not None and not isinstance(self.nogds, bool):
+            raise ValueError("nogds must be a boolean or null")
+        if not isinstance(self.debug_log, bool):
+            raise ValueError("debug_log must be a boolean")
+        if extra_config:
+            raise ValueError(
+                "Unexpected extra config keys for load format "
+                f"{load_config.load_format}: {tuple(extra_config)}"
+            )
+
+    @staticmethod
+    def _positive_int(value: Any, name: str) -> int:
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+        return value
+
+    @staticmethod
+    def _is_gds_error(error: BaseException) -> bool:
+        message = str(error).lower()
+        return any(marker in message for marker in ("gds", "cufile", "libcufile"))
+
+    @staticmethod
+    def _resolve_target_device(target_device: torch.device) -> torch.device:
+        device = torch.device(target_device)
+        if device.type == "cuda" and device.index is None:
+            return torch.device("cuda", torch.cuda.current_device())
+        return device
+
+    def iterate_over_files(
+        self,
+        filepaths: List[str],
+        target_device: torch.device,
+    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        device = self._resolve_target_device(target_device)
+        if device.type != "cuda":
+            logger.warning(
+                "fastsafetensors_sharded is unavailable on %s; falling back "
+                "to the standard sharded-state reader",
+                device,
+            )
+            yield from super().iterate_over_files(filepaths, device)
+            return
+
+        try:
+            from fastsafetensors import SafeTensorsFileLoader, SingleGroup
+        except ImportError as exc:
+            raise ImportError(
+                "fastsafetensors is required for load format fastsafetensors_sharded"
+            ) from exc
+
+        all_paths = sorted(str(path) for path in filepaths)
+        use_nogds = self.nogds is True
+
+        while True:
+            loader = None
+            file_buffer = None
+            copy_started = False
+            copy_synchronized = False
+            try:
+                loader = SafeTensorsFileLoader(
+                    SingleGroup(),
+                    str(device),
+                    bbuf_size_kb=self.bbuf_size_kb,
+                    max_threads=self.max_threads,
+                    nogds=use_nogds,
+                    disable_cache=True,
+                    debug_log=self.debug_log,
+                )
+                loader.add_filenames({0: all_paths})
+                file_buffer = loader.copy_files_to_device(
+                    max_copy_block_size=self.max_copy_block_size
+                )
+
+                torch.cuda.synchronize(device)
+                for key in list(file_buffer.key_to_rank_lidx):
+                    tensor = file_buffer.get_tensor(key)
+                    copy_started = True
+                    yield key, tensor
+
+                torch.cuda.current_stream(device).synchronize()
+                copy_synchronized = True
+                return
+            except (RuntimeError, OSError) as exc:
+                can_fallback = (
+                    not copy_started
+                    and self.nogds is None
+                    and not use_nogds
+                    and self._is_gds_error(exc)
+                )
+                if not can_fallback:
+                    raise
+                logger.warning(
+                    "FastSafetensors GDS loading failed; retrying with nogds=True: %s",
+                    exc,
+                )
+                use_nogds = True
+                self.nogds = True
+            finally:
+                if copy_started and not copy_synchronized:
+                    with suppress(Exception):
+                        torch.cuda.current_stream(device).synchronize()
+                if file_buffer is not None:
+                    file_buffer.close()
+                if loader is not None:
+                    loader.close()
 
 
 class PreshardedModelLoader(DefaultModelLoader):
@@ -4316,6 +4451,9 @@ def get_model_loader(
 
     if load_config.load_format == LoadFormat.SHARDED_STATE:
         return ShardedStateLoader(load_config)
+
+    if load_config.load_format == LoadFormat.FASTSAFETENSORS_SHARDED:
+        return FastSafetensorsShardedStateLoader(load_config)
 
     if load_config.load_format == LoadFormat.PRESHARDED:
         return PreshardedModelLoader(load_config)
