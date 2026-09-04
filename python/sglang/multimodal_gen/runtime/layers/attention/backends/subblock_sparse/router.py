@@ -3,8 +3,8 @@
 
 Training-free. Runs *before* attention and produces the ``q2k_block_index`` tensor
 the selected block-sparse kernel consumes. The current BF16 kernels use Q64 x K64
-on both SM90 and SM100; SM90 ``sage_fp8`` uses Q64 x K128. The router accepts both
-block widths so each compute path receives indices in its native geometry.
+on SM90, SM100, and SM120; SM90 ``sage_fp8`` uses Q64 x K128. The router accepts
+both block widths so each compute path receives indices in its native geometry.
 
 Why sub-blocks
 --------------
@@ -69,7 +69,7 @@ the pipeline currently produces.
 
 Usage
 -----
-    router = SubBlockRouter(n_k=4, n_q=4)  # current SM90/SM100 BF16 geometry
+    router = SubBlockRouter(n_k=4, n_q=4)  # current BF16 geometry
     plan = router.route(q, k, sparsity=0.8, softmax_scale=d**-0.5)   # q, k: [B, S, H, D]
     out, _ = bsa_attn_blk64_fwd(q, k, v, plan.index, plan.topk,
                                 block_sizes=SubBlockRouter.block_sizes(S, q.device),
@@ -134,8 +134,24 @@ def load_bsa_attn_blk64_fwd():
     return mod.bsa_attn_blk64_fwd
 
 
+@functools.lru_cache(maxsize=1)
+def load_bsa_attn_sm120_blk64_fwd():
+    """FlashInfer's CuTe-DSL 64-block sparse attention entry point for SM120."""
+    try:
+        from flashinfer.cute_dsl.sparse.bsa_attn_sm120 import (
+            bsa_attn_sm120_blk64_fwd,
+        )
+    except Exception as exc:
+        raise ImportError(
+            "SM120 SubBlock sparse attention requires FlashInfer's "
+            "flashinfer.cute_dsl.sparse.bsa_attn_sm120 module"
+        ) from exc
+
+    return bsa_attn_sm120_blk64_fwd
+
+
 LOG2E = 1.4426950408889634
-BLOCK = 64  # default Q/K block size for the current SM90/SM100 BF16 consumers
+BLOCK = 64  # default Q/K block size for the current BF16 consumers
 BUDGET_GRANULARITY = 8  # Q64 x K64 default; SM90 sage_fp8 uses exact block counts
 VALID_N = (1, 2, 4, 8)  # sub-blocks per query/key block
 
@@ -187,11 +203,11 @@ class SubBlockRouter:
             Splitting Q *alone* (n_q>1 with n_k=1) is worse than not splitting;
             splitting both sides together is what the defaults do. Costs n_q
             times the score matrix, 0.5% of denoise time.
-        block_size_k: native key-block width. It is 64 for the SM90/SM100 BF16
-            kernels and 128 for SM90 ``sage_fp8``.
+        block_size_k: native key-block width. It is 64 for the BF16 kernels and
+            128 for SM90 ``sage_fp8``.
         budget_granularity: rounding applied to the selected block count. The
             Q64 x K64 paths retain the established default of 8 (required by
-            FlashInfer on SM100); SM90 ``sage_fp8`` uses 1.
+            FlashInfer on SM100/SM120); SM90 ``sage_fp8`` uses 1.
 
     Structural block reservation (an attention sink, or forcing the diagonal j == i) was
     measured on 200 real H3 attention cells and is deliberately absent: at a fixed budget
@@ -284,9 +300,9 @@ class SubBlockRouter:
         gq = scores.shape[2]
         topk = _snap_up(math.ceil((1.0 - sparsity) * gk), gk, self.budget_granularity)
         # One pass over the score matrix instead of torch.topk's several. The
-        # output order is unspecified. SM100 BF16 consumes it directly; SM90
-        # sage_fp8 converts it to an order-independent block map. Only the SM90
-        # CuTe BF16 consumer sorts compact active prefixes before expansion.
+        # output order is unspecified. SM100/SM120 BF16 consume it directly;
+        # SM90 sage_fp8 converts it to an order-independent block map. Only the
+        # SM90 CuTe BF16 consumer sorts compact active prefixes before expansion.
         index = fused_topk(scores.reshape(-1, gk), topk).view(b, h, gq, topk)
         return RoutingPlan(index=index, topk=topk, num_blocks=gk)
 

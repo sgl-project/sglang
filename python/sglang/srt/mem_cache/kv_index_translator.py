@@ -227,8 +227,7 @@ class KVIndexTranslator:
 
         if sliding_window:
             assert self._swa_v2p_table is not None, (
-                "fill_packed_read_stream: sliding_window on a pool with no swa "
-                "sub-pool"
+                "fill_packed_read_stream: sliding_window on a pool with no swa sub-pool"
             )
         build_kv_read_table_packed(
             req_to_token=self.req_to_token,
@@ -392,6 +391,22 @@ class KVIndexTranslator:
         )
         self._index_table_memo = (weakref.ref(forward_batch), view)
         return view
+
+    @property
+    def full_v2p_table(self) -> Optional[torch.Tensor]:
+        """The full-attention virtual->physical PAGE table, or None when this
+        pool needs no translation.
+
+        For the DCP page-table builders, whose gather is over a rank's cyclic
+        slice rather than a row prefix, so `build_index_table` cannot serve
+        them.
+        """
+        return self._full_v2p_table
+
+    @property
+    def full_page_multiplier(self) -> int:
+        """Scales a physical page into the id space the per-layer views use."""
+        return self._full_page_multiplier
 
     def bind_and_verify_backends(self, backends) -> None:
         """Boot: make every reachable backend carry THIS translator.
