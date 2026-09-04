@@ -203,6 +203,17 @@ class PromptTokensDetails(BaseModel):
         return data
 
 
+class CompletionTokensDetails(BaseModel):
+    """Completion-side token breakdown, as the OpenAI wire contract shapes it.
+
+    Only the Moonshot/K3 surface populates this today; ``reasoning_tokens`` is
+    also carried as a legacy top-level ``UsageInfo`` field, which stays for
+    backward compatibility.
+    """
+
+    reasoning_tokens: int = 0
+
+
 class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
@@ -210,10 +221,23 @@ class UsageInfo(BaseModel):
     # Used to return cached tokens info when --enable-cache-report is set
     prompt_tokens_details: Optional[PromptTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
+    completion_tokens_details: Optional[CompletionTokensDetails] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Absent unless a surface fills it (K3 does, per its stream spec), so
+        # every other model's usage object keeps its historical shape.
+        if data.get("completion_tokens_details") is None:
+            data.pop("completion_tokens_details", None)
+        return data
 
 
 class StreamOptions(BaseModel):
-    include_usage: Optional[bool] = False
+    # None means "unset": fall back to the server default. An explicit false
+    # must be able to suppress the summary frame even when the server default
+    # turns it on (P2.3), which a False default cannot express.
+    include_usage: Optional[bool] = None
     continuous_usage_stats: Optional[bool] = False
     # Moonshot extension (P0.5): attach delta.internal_content.token_ids to
     # every increment frame — the raw token ids behind that increment.
@@ -1030,6 +1054,10 @@ class ChatCompletionRequest(BaseModel):
     # and reused for every frame (P1.3/P1.4/P1.14 require it constant; computing
     # it per frame drifts across second boundaries on long streams).
     _stream_created_ts: Optional[int] = None
+    # Wire-level response id, derived once from the first engine event. With
+    # n>1 the engine assigns a separate rid per sampled choice, so deriving it
+    # per frame would break the constant-id contract (P0.7/P1.3/P1.14).
+    _stream_wire_id: Optional[str] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -1324,7 +1352,9 @@ class ChatCompletionRequest(BaseModel):
                 sampling_params.pop("structural_tag", None)
                 has_existing_constraints = False
             else:
-                logger.warning("Constrained decoding is not compatible with tool calls.")
+                logger.warning(
+                    "Constrained decoding is not compatible with tool calls."
+                )
         if tool_call_constraint and not has_existing_constraints:
             constraint_type, constraint_value = tool_call_constraint
             if constraint_type == "structural_tag":
@@ -1422,7 +1452,20 @@ class ChatCompletionResponseStreamChoice(BaseModel):
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[
         Literal[
-            "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
+            "stop",
+            "length",
+            "tool_calls",
+            "content_filter",
+            "function_call",
+            "abort",
+            # Moonshot extensions (P1.13); "abort" is mapped onto
+            # server_interrupted on the K3 wire.
+            "unexpected_state",
+            "malformed_byte_sequence",
+            "engine_overloaded",
+            "server_interrupted",
+            "repeat",
+            "unknown",
         ]
     ] = None
     matched_stop: Union[None, int, str] = None

@@ -37,6 +37,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     normalize_tool_content,
 )
 from sglang.srt.environ import envs
+from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
@@ -3854,6 +3855,411 @@ class KimiK3ThinkingTestCase(unittest.TestCase):
             thinking={"type": "enabled", "keep": "all"},
         )
         self.assertIsNone(self.chat._validate_request(request))
+
+
+class K3StreamSpecConformanceTestCase(unittest.TestCase):
+    """Wire-level conformance for the Kimi K3 streaming chat contract.
+
+    Each test names the spec rule it pins. The mock engine stands in for a real
+    K3 server, so these assert the shape sglang puts on the wire, not model
+    behavior; the timing-sensitive rules (UTF-8 stitching, the end-of-thinking
+    boundary, token-id/text fidelity) still need a live engine.
+    """
+
+    _STUB = OpenAIServingChat._KIMI_K3_GENERATION_STUB_TOKENS
+
+    def setUp(self):
+        self.tm = _MockTokenizerManager()
+        self.tm.server_args.incremental_streaming_output = True
+        self.template_manager = _MockTemplateManager()
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.fastapi_request = Mock(spec=Request)
+        self.fastapi_request.headers = {}
+
+    # ------------- helpers -------------
+    def _event(self, *, index=0, rid="rid0", text="hi", finish=None, **meta):
+        info = {
+            "id": rid,
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "reasoning_tokens": 4,
+            "cached_tokens": 6,
+            "output_token_logprobs_length": 0,
+            "finish_reason": finish,
+        }
+        info.update(meta)
+        return {
+            "text": text,
+            "output_ids": [101, 102],
+            "meta_info": info,
+            "index": index,
+        }
+
+    def _stream(self, events, req, usage_headers=None):
+        async def _gen():
+            for e in events:
+                yield e
+
+        self.tm.generate_request = Mock(return_value=_gen())
+
+        async def _run():
+            out = []
+            async for chunk in self.chat._generate_chat_stream(
+                Mock(), req, self.fastapi_request, usage_headers=usage_headers
+            ):
+                out.append(chunk)
+            return out
+
+        return get_or_create_event_loop().run_until_complete(_run())
+
+    @staticmethod
+    def _frames(chunks):
+        return [
+            json.loads(c[len("data: ") :])
+            for c in chunks
+            if c.startswith("data: ") and c.strip() != "data: [DONE]"
+        ]
+
+    def _req(self, **kw):
+        kw.setdefault("model", "kimi-k3")
+        kw.setdefault("messages", [{"role": "user", "content": "Hi?"}])
+        kw.setdefault("stream", True)
+        return ChatCompletionRequest(**kw)
+
+    # ------------- P0.1 / P0.2 -------------
+    def test_summary_frame_carries_both_usage_detail_objects(self):
+        """P0.1/P0.2: the include_usage summary frame must carry
+        completion_tokens_details.reasoning_tokens and
+        prompt_tokens_details.cached_tokens as integers.
+
+        --enable-cache-report stays off here on purpose: the flag gated whether
+        cached_tokens was reported at all, which is what made it disagree with
+        the P0.18 header.
+        """
+        self.tm.server_args.enable_cache_report = False
+        req = self._req(stream_options={"include_usage": True})
+        frames = self._frames(
+            self._stream([self._event(finish={"type": "stop", "matched": None})], req)
+        )
+
+        summary = [f for f in frames if f["choices"] == []]
+        self.assertEqual(len(summary), 1, "expected exactly one summary frame")
+        usage = summary[0]["usage"]
+        self.assertEqual(usage["completion_tokens_details"]["reasoning_tokens"], 4)
+        self.assertEqual(usage["prompt_tokens_details"]["cached_tokens"], 6)
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            self.assertIs(type(usage[key]), int, key)
+
+    def test_end_frame_usage_matches_summary_frame(self):
+        """P0.4 + P0.1: per-choice end-frame usage and the summary agree."""
+        req = self._req(stream_options={"include_usage": True})
+        frames = self._frames(
+            self._stream([self._event(finish={"type": "stop", "matched": None})], req)
+        )
+        end = [f for f in frames if f["choices"] and f["choices"][0]["finish_reason"]]
+        self.assertEqual(len(end), 1)
+        end_usage = end[0]["choices"][0]["usage"]
+        summary_usage = [f for f in frames if f["choices"] == []][0]["usage"]
+        for key in (
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "completion_tokens_details",
+            "prompt_tokens_details",
+        ):
+            self.assertEqual(end_usage[key], summary_usage[key], key)
+
+    def test_other_encodings_keep_the_historical_usage_shape(self):
+        """The detail objects are K3-gated: no other model's usage changes."""
+        self.chat.chat_encoding_spec = None
+        req = self._req(stream_options={"include_usage": True})
+        frames = self._frames(
+            self._stream([self._event(finish={"type": "stop", "matched": None})], req)
+        )
+        summary = [f for f in frames if f["choices"] == []][0]
+        self.assertNotIn("completion_tokens_details", summary["usage"])
+        # ...and no per-choice usage is bolted onto the end frame either.
+        end = [f for f in frames if f["choices"] and f["choices"][0]["finish_reason"]]
+        self.assertEqual(len(end), 1)
+        self.assertIsNone(end[0]["choices"][0].get("usage"))
+
+    # ------------- P0.18 -------------
+    def test_usage_headers_agree_with_the_final_usage(self):
+        """P0.18: X-Msh-Usage-* must equal the usage the client finally sees,
+        with --enable-cache-report off."""
+        self.tm.server_args.enable_cache_report = False
+        headers = {}
+        req = self._req(stream_options={"include_usage": True})
+        frames = self._frames(
+            self._stream(
+                [self._event(finish={"type": "stop", "matched": None})],
+                req,
+                usage_headers=headers,
+            )
+        )
+        usage = [f for f in frames if f["choices"] == []][0]["usage"]
+        self.assertEqual(
+            int(headers["X-Msh-Usage-Prompt-Tokens"]), usage["prompt_tokens"]
+        )
+        self.assertEqual(
+            int(headers["X-Msh-Usage-Cached-Tokens"]),
+            usage["prompt_tokens_details"]["cached_tokens"],
+        )
+        # And the reported prompt count still excludes K3's generation stub.
+        self.assertEqual(usage["prompt_tokens"], 10 - self._STUB)
+
+    # ------------- P0.7 / P1.3 / P1.14 / P2.1 -------------
+    def test_wire_id_is_constant_across_frames_with_n_gt_1(self):
+        """P0.7/P1.3/P1.14: one id for the whole response. The engine gives
+        every sampled choice its own rid, so a per-frame derivation emitted a
+        different id per candidate."""
+        req = self._req(n=2, stream_options={"include_usage": True})
+        chunks = self._stream(
+            [
+                self._event(index=0, rid="a1b2c3d4e5f60718", text="one"),
+                self._event(index=1, rid="99887766554433", text="two"),
+                self._event(
+                    index=0,
+                    rid="a1b2c3d4e5f60718",
+                    text="one.",
+                    finish={"type": "stop", "matched": None},
+                ),
+                self._event(
+                    index=1,
+                    rid="99887766554433",
+                    text="two.",
+                    finish={"type": "stop", "matched": None},
+                ),
+            ],
+            req,
+        )
+        frames = self._frames(chunks)
+        ids = {f["id"] for f in frames}
+        self.assertEqual(len(ids), 1, f"id must be constant, saw {sorted(ids)}")
+        self.assertRegex(ids.pop(), r"^chatcmpl-[0-9a-f]{24}$")
+        created = {f["created"] for f in frames}
+        self.assertEqual(len(created), 1, "created must be constant too (P1.4)")
+        # Both candidates still run a full sequence, one choice element a frame.
+        self.assertTrue(all(len(f["choices"]) <= 1 for f in frames))
+        finished = {
+            f["choices"][0]["index"]
+            for f in frames
+            if f["choices"] and f["choices"][0]["finish_reason"]
+        }
+        self.assertEqual(finished, {0, 1})
+
+    def test_engine_assigns_a_separate_rid_per_sampled_choice(self):
+        """The premise behind pinning the wire id: n>1 fans one request out
+        into one rid per candidate, so meta_info["id"] differs between the
+        frames of a single response."""
+        from sglang.srt.managers.io_struct import GenerateReqInput
+
+        anon = GenerateReqInput(text="hi", sampling_params={"n": 2})
+        anon.normalize_batch_and_arguments()
+        self.assertEqual(len(anon.rid), 2)
+        self.assertNotEqual(anon.rid[0], anon.rid[1])
+
+        # A client-supplied rid is suffixed rather than replaced, but the
+        # per-candidate values still differ.
+        named = GenerateReqInput(text="hi", sampling_params={"n": 2}, rid="fixed")
+        named.normalize_batch_and_arguments()
+        self.assertEqual(named.rid, ["fixed_0", "fixed_1"])
+
+    def test_wire_id_separates_rids_that_share_no_hex(self):
+        """P2.1: distinct rids must not collapse onto one id. Filtering the rid
+        down to its hex characters mapped "req-a" and "req-b" both onto
+        chatcmpl-a000...; hashing keeps them apart."""
+        seen = set()
+        for rid in ("req-a", "req-b", "x", "y"):
+            req = self._req()
+            wire = self.chat._wire_id(req, rid)
+            self.assertRegex(wire, r"^chatcmpl-[0-9a-f]{24}$")
+            seen.add(wire)
+        self.assertEqual(len(seen), 4, f"ids collided: {sorted(seen)}")
+
+    def test_wire_id_sorts_lexicographically_by_time(self):
+        """P2.1: the id's leading bytes encode creation time."""
+        early, late = self._req(), self._req()
+        early._stream_created_ts = 1_700_000_000
+        late._stream_created_ts = 1_700_000_001
+        self.assertLess(
+            self.chat._wire_id(early, "same-rid"),
+            self.chat._wire_id(late, "same-rid"),
+        )
+
+    # ------------- P0.15 / P1.16 -------------
+    def test_abort_becomes_server_interrupted_not_an_error_frame(self):
+        """P0.15 + P1.16: a mid-stream abort is expressed through
+        finish_reason; "abort" is not a value the K3 contract defines, and an
+        error-only SSE frame is explicitly forbidden."""
+        req = self._req()
+        chunks = self._stream(
+            [
+                self._event(text="partial"),
+                self._event(
+                    text="partial",
+                    finish={
+                        "type": "abort",
+                        "status_code": HTTPStatus.INTERNAL_SERVER_ERROR,
+                        "message": "engine died",
+                    },
+                ),
+            ],
+            req,
+        )
+        for c in chunks:
+            self.assertNotIn('"error"', c, f"error-only frame on the wire: {c}")
+        frames = self._frames(chunks)
+        end = [f for f in frames if f["choices"] and f["choices"][0]["finish_reason"]]
+        self.assertEqual(len(end), 1)
+        self.assertEqual(end[0]["choices"][0]["finish_reason"], "server_interrupted")
+        self.assertIsInstance(end[0]["choices"][0]["usage"], dict)
+
+    def test_other_encodings_still_emit_the_abort_error_frame(self):
+        """The P1.16 change is K3-gated; stock sglang behavior is untouched."""
+        self.chat.chat_encoding_spec = None
+        req = self._req()
+        chunks = self._stream(
+            [
+                self._event(text="partial"),
+                self._event(
+                    text="partial",
+                    finish={
+                        "type": "abort",
+                        "status_code": HTTPStatus.INTERNAL_SERVER_ERROR,
+                        "message": "engine died",
+                    },
+                ),
+            ],
+            req,
+        )
+        self.assertTrue(any('"error"' in c for c in chunks))
+
+    # ------------- P0.17 -------------
+    def test_error_body_is_wrapped_in_an_error_envelope(self):
+        """P0.17: pre-stream errors must be {"error": {...}}."""
+        response = self.chat.create_error_response("bad thing", "invalid_request_error")
+        payload = json.loads(bytes(response.body))
+        self.assertIn("error", payload)
+        self.assertEqual(payload["error"]["message"], "bad thing")
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
+        self.assertEqual(response.status_code, 400)
+
+    def test_error_envelope_is_k3_gated(self):
+        self.chat.chat_encoding_spec = None
+        payload = json.loads(bytes(self.chat.create_error_response("bad").body))
+        self.assertNotIn("error", payload)
+        self.assertEqual(payload["message"], "bad")
+
+    # ------------- P0.5 -------------
+    def test_every_increment_frame_carries_internal_content(self):
+        """P0.5: with include_internal_content the token ids must ride on every
+        content / reasoning_content / tool_calls increment frame -- the
+        tool-call path emitted none at all."""
+        req = self._req(
+            stream_options={"include_internal_content": True},
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+        )
+
+        call = ToolCallItem(tool_index=0, name="get_weather", parameters='{"c":"SF"}')
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+        ) as ParserMock:
+            parser = ParserMock.return_value
+            parser.parse_stream_chunk.return_value = ("answer: ", [call])
+            parser.parse_stream_end.return_value = ("", [])
+            parser.detector = Mock(prev_tool_call_arr=None, streamed_args_for_tool=None)
+
+            async def _run():
+                out = []
+                async for chunk in self.chat._generate_stream_content(
+                    content=self._event(text="answer: "),
+                    index=0,
+                    request=req,
+                    stream_offsets={},
+                    reasoning_parser_dict={},
+                    parser_dict={},
+                    has_tool_calls={},
+                    choice_logprobs=None,
+                    finish_reason_type=None,
+                    continuous_usage_stats=False,
+                    prompt_tokens={0: 10},
+                    reasoning_tokens={0: 0},
+                    completion_tokens={0: 2},
+                    internal_token_ids=[101, 102],
+                ):
+                    out.append(chunk)
+                return out
+
+            chunks = get_or_create_event_loop().run_until_complete(_run())
+
+        frames = self._frames(chunks)
+        self.assertTrue(frames, "expected increment frames")
+        increments = 0
+        for f in frames:
+            delta = f["choices"][0]["delta"]
+            if not any(
+                delta.get(k) for k in ("content", "reasoning_content", "tool_calls")
+            ):
+                continue
+            increments += 1
+            ids = delta["internal_content"]["token_ids"]
+            self.assertTrue(ids, f"token_ids must be non-empty: {delta}")
+            self.assertTrue(all(type(i) is int and i >= 0 for i in ids), ids)
+        # normal text + the tool-call open chunk + its argument continuation
+        self.assertGreaterEqual(increments, 3)
+
+    def test_internal_content_absent_unless_requested(self):
+        req = self._req(tools=[{"type": "function", "function": {"name": "w"}}])
+        frames = self._frames(
+            self._stream([self._event(finish={"type": "stop", "matched": None})], req)
+        )
+        for f in frames:
+            if f["choices"]:
+                self.assertNotIn("internal_content", f["choices"][0]["delta"])
+
+    # ------------- P2.3 -------------
+    def test_explicit_include_usage_false_beats_the_server_default(self):
+        """P2.3: a client must be able to suppress the summary frame even when
+        --stream-response-default-include-usage is on."""
+        from sglang.srt.entrypoints.openai.protocol import StreamOptions
+        from sglang.srt.entrypoints.openai.utils import should_include_usage
+
+        self.assertEqual(
+            should_include_usage(StreamOptions(include_usage=False), True)[0], False
+        )
+        # Unset still defers to the server default, in both directions.
+        self.assertEqual(should_include_usage(StreamOptions(), True)[0], True)
+        self.assertEqual(should_include_usage(StreamOptions(), False)[0], False)
+        self.assertEqual(
+            should_include_usage(StreamOptions(include_usage=True), False)[0], True
+        )
+
+    def test_no_summary_frame_by_default(self):
+        req = self._req()
+        frames = self._frames(
+            self._stream([self._event(finish={"type": "stop", "matched": None})], req)
+        )
+        self.assertFalse([f for f in frames if f["choices"] == []])
+
+    # ------------- P1.17 -------------
+    def test_top_logprobs_keeps_ids_that_decode_to_the_same_text(self):
+        """P1.17: top_logprobs length must equal the requested top_logprobs.
+        Keying the top-N by token TEXT collapsed distinct ids that decode
+        identically, returning a short list."""
+        content = self._event(
+            output_token_logprobs=[(-0.1, 1, "a")],
+            output_top_logprobs=[[(-0.1, 1, "a"), (-0.9, 2, "a")]],
+            output_token_logprobs_length=1,
+        )
+        result = self.chat._process_streaming_logprobs(content, 0, 1)
+        self.assertEqual(len(result.content), 1)
+        top = result.content[0].top_logprobs
+        self.assertEqual(len(top), 2, f"top-N collapsed: {top}")
+        self.assertEqual([t.logprob for t in top], [-0.1, -0.9])
+        for entry in top:
+            self.assertEqual(bytes(entry.bytes), entry.token.encode("utf-8"))
 
 
 if __name__ == "__main__":

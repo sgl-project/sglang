@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -50,6 +51,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionTokenLogprob,
     ChatMessage,
     ChoiceLogprobs,
+    CompletionTokensDetails,
     DeltaMessage,
     ErrorResponse,
     FunctionResponse,
@@ -63,6 +65,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolCallProcessingResult,
     ToolChoice,
     TopLogprob,
+    UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
@@ -763,10 +766,15 @@ class OpenAIServingChat(OpenAIServingBase):
         # nor duplicated across chunks; flush any leftover at the end.
         remaining_logprobs = choice_logprobs
 
-        # P0.5: attach this event's delta token ids to the first increment
-        # frame it produces (reasoning or content; one frame per event in the
-        # common case), then clear to avoid duplication.
-        remaining_internal = (
+        # P0.5: this event's delta token ids, attached to EVERY increment
+        # frame the event produces -- the spec requires the key on each of
+        # them, so it is not consumed by the first one the way logprobs are.
+        # One event yields one increment frame in the common case; when it
+        # yields several (the reasoning->content transition, or normal text
+        # plus a tool call) they repeat the same ids, because the ids describe
+        # the event rather than the individual frame. Per-frame attribution
+        # needs incremental decode matching against each frame's text.
+        event_internal = (
             {"token_ids": internal_token_ids} if internal_token_ids else None
         )
 
@@ -791,17 +799,16 @@ class OpenAIServingChat(OpenAIServingBase):
                     ).model_dump()
 
                 yield build_sse_content(
-                    chunk_id=self._wire_id(content["meta_info"]["id"]),
+                    chunk_id=self._wire_id(request, content["meta_info"]["id"]),
                     created=self._stream_created(request),
                     model=request.model,
                     index=index,
                     reasoning_content=reasoning_text,
                     logprobs=remaining_logprobs,
                     usage=usage,
-                    internal_content=remaining_internal,
+                    internal_content=event_internal,
                 )
                 remaining_logprobs = None
-                remaining_internal = None
 
             # P1.7 (Moonshot extension): emit one standalone
             # reasoning_content="" frame as the end-of-thinking boundary, after
@@ -817,8 +824,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     reasoning_over = not getattr(
                         parser.detector, "_in_reasoning", False
                     ) or (
-                        finish_reason_type is not None
-                        and finish_reason_type != "abort"
+                        finish_reason_type is not None and finish_reason_type != "abort"
                     )
                     if (
                         getattr(parser, "_k3_reasoning_seen", False)
@@ -827,7 +833,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     ):
                         parser._k3_boundary_sent = True
                         yield build_sse_content(
-                            chunk_id=self._wire_id(content["meta_info"]["id"]),
+                            chunk_id=self._wire_id(request, content["meta_info"]["id"]),
                             created=self._stream_created(request),
                             model=request.model,
                             index=index,
@@ -845,6 +851,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 has_tool_calls,
                 continuous_usage_stats,
                 flush=finish_reason_type is not None and finish_reason_type != "abort",
+                internal_content=event_internal,
             ):
                 if chunk:
                     yield chunk
@@ -853,7 +860,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if finish_reason_type is not None and index in parser_dict:
                 parser = parser_dict[index]
                 remaining_chunk = self._check_for_unstreamed_tool_args(
-                    parser, content, request, index
+                    parser, content, request, index, internal_content=event_internal
                 )
                 if remaining_chunk:
                     yield remaining_chunk
@@ -871,17 +878,16 @@ class OpenAIServingChat(OpenAIServingBase):
                     ).model_dump()
 
                 yield build_sse_content(
-                    chunk_id=self._wire_id(content["meta_info"]["id"]),
+                    chunk_id=self._wire_id(request, content["meta_info"]["id"]),
                     created=self._stream_created(request),
                     model=request.model,
                     index=index,
                     content=delta,
                     logprobs=remaining_logprobs,
                     usage=usage,
-                    internal_content=remaining_internal,
+                    internal_content=event_internal,
                 )
                 remaining_logprobs = None
-                remaining_internal = None
 
         # Flush logprobs still unattached this step — only when a parser is
         # active, since _process_tool_call_stream may consume the delta and emit
@@ -901,7 +907,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 ).model_dump()
 
             yield build_sse_content(
-                chunk_id=self._wire_id(content["meta_info"]["id"]),
+                chunk_id=self._wire_id(request, content["meta_info"]["id"]),
                 created=self._stream_created(request),
                 model=request.model,
                 index=index,
@@ -1744,6 +1750,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     if finish_reason_type == "abort" and isinstance(
                         finish_reason.get("status_code"), HTTPStatus
                     ):
+                        if self.chat_encoding_spec == "kimi_k3":
+                            # P1.16: a mid-stream failure may only be expressed
+                            # through finish_reason -- an error-only SSE frame
+                            # is exactly what the spec forbids. Record it and
+                            # let the end-frame path below emit it, mapped onto
+                            # server_interrupted.
+                            finish_reasons[index] = finish_reason
+                            break
                         code = finish_reason["status_code"]
                         error = self.create_streaming_error_response(
                             finish_reason.get("message", "Generation aborted."),
@@ -1758,15 +1772,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 # engine event's meta_info arrives (before any byte is yielded;
                 # _handle_streaming_request awaits the first chunk).
                 if usage_headers is not None and not usage_headers:
-                    usage_headers.update(
-                        self._msh_usage_headers(content["meta_info"])
-                    )
+                    usage_headers.update(self._msh_usage_headers(content["meta_info"]))
 
                 # First chunk with role
                 if is_firsts.get(index, True):
                     is_firsts[index] = False
                     yield build_sse_content(
-                        chunk_id=self._wire_id(content["meta_info"]["id"]),
+                        chunk_id=self._wire_id(request, content["meta_info"]["id"]),
                         created=self._stream_created(request),
                         model=request.model,
                         index=index,
@@ -1825,31 +1837,22 @@ class OpenAIServingChat(OpenAIServingBase):
                     final_finish_reason = "tool_calls"
 
                 matched_stop = finish_reason_data.get("matched")
-                # P0.4 (Moonshot extension): the end frame must carry
-                # choices[0].usage — per-choice accounting, independent of
-                # stream_options.include_usage; detail fields
-                # (reasoning_tokens / cached_tokens) must be ints, 0 when absent.
+                # P0.4 (Moonshot extension): the end frame carries per-choice
+                # usage, independent of stream_options.include_usage.
                 choice_usage = None
                 if self.chat_encoding_spec == "kimi_k3":
-                    pt = prompt_tokens.get(idx, 0)
-                    ct = completion_tokens.get(idx, 0)
-                    choice_usage = {
-                        "prompt_tokens": pt,
-                        "completion_tokens": ct,
-                        "total_tokens": pt + ct,
-                        "completion_tokens_details": {
-                            "reasoning_tokens": reasoning_tokens.get(idx, 0) or 0,
-                        },
-                        "prompt_tokens_details": {
-                            "cached_tokens": cached_tokens.get(idx, 0) or 0,
-                        },
-                    }
+                    choice_usage = self._k3_usage(
+                        prompt_tokens=prompt_tokens.get(idx, 0),
+                        completion_tokens=completion_tokens.get(idx, 0),
+                        reasoning_tokens=reasoning_tokens.get(idx, 0) or 0,
+                        cached_tokens=cached_tokens.get(idx, 0) or 0,
+                    )
                 yield build_sse_content(
-                    chunk_id=self._wire_id(content["meta_info"]["id"]),
+                    chunk_id=self._wire_id(request, content["meta_info"]["id"]),
                     created=self._stream_created(request),
                     model=request.model,
                     index=idx,
-                    finish_reason=final_finish_reason,
+                    finish_reason=self._wire_finish_reason(final_finish_reason),
                     matched_stop=matched_stop,
                     choice_usage=choice_usage,
                 )
@@ -1862,7 +1865,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             choice_hidden_states, request.return_hidden_states
                         )
                         hidden_states_chunk = ChatCompletionStreamResponse(
-                            id=self._wire_id(content["meta_info"]["id"]),
+                            id=self._wire_id(request, content["meta_info"]["id"]),
                             created=self._stream_created(request),
                             choices=[
                                 ChatCompletionResponseStreamChoice(
@@ -1914,7 +1917,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 ]
             ):
                 sglext_chunk = ChatCompletionStreamResponse(
-                    id=self._wire_id(content["meta_info"]["id"]),
+                    id=self._wire_id(request, content["meta_info"]["id"]),
                     created=self._stream_created(request),
                     choices=[],  # sglext is at response level
                     model=request.model,
@@ -1950,8 +1953,17 @@ class OpenAIServingChat(OpenAIServingBase):
                     audio_tokens=total_audio_tokens,
                     video_tokens=total_video_tokens,
                 )
+                usage = self._apply_k3_usage_details(
+                    usage,
+                    reasoning_tokens=sum(reasoning_tokens.values()),
+                    cached_tokens=sum(
+                        tok
+                        for idx, tok in cached_tokens.items()
+                        if idx % request.n == 0
+                    ),
+                )
                 usage_chunk = ChatCompletionStreamResponse(
-                    id=self._wire_id(content["meta_info"]["id"]),
+                    id=self._wire_id(request, content["meta_info"]["id"]),
                     created=self._stream_created(request),
                     choices=[],  # Empty choices array as per OpenAI spec
                     model=request.model,
@@ -1962,8 +1974,29 @@ class OpenAIServingChat(OpenAIServingBase):
         except ValueError as e:
             if not stream_started:
                 raise
-            error = self.create_streaming_error_response(str(e))
-            yield f"data: {error}\n\n"
+            if self.chat_encoding_spec == "kimi_k3":
+                # P1.16: no error-only frame; surface it as a finish_reason.
+                # Which candidates were still open is not tracked here, so this
+                # closes index 0 -- the only candidate for the overwhelming
+                # majority of requests, and still better than a frame a strict
+                # client cannot parse.
+                logger.warning("Stream failed mid-response, closing it: %s", e)
+                yield build_sse_content(
+                    chunk_id=self._wire_id(request, ""),
+                    created=self._stream_created(request),
+                    model=request.model,
+                    index=0,
+                    finish_reason="server_interrupted",
+                    choice_usage=self._k3_usage(
+                        prompt_tokens=prompt_tokens.get(0, 0),
+                        completion_tokens=completion_tokens.get(0, 0),
+                        reasoning_tokens=reasoning_tokens.get(0, 0) or 0,
+                        cached_tokens=cached_tokens.get(0, 0) or 0,
+                    ),
+                )
+            else:
+                error = self.create_streaming_error_response(str(e))
+                yield f"data: {error}\n\n"
 
         yield "data: [DONE]\n\n"
 
@@ -1993,9 +2026,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # P0.18: non-streaming responses carry the same X-Msh-Usage-* headers.
         usage_headers = self._msh_usage_headers(ret[0]["meta_info"])
         if usage_headers and isinstance(response, ChatCompletionResponse):
-            return ORJSONResponse(
-                content=response.model_dump(), headers=usage_headers
-            )
+            return ORJSONResponse(content=response.model_dump(), headers=usage_headers)
 
         return response
 
@@ -2167,9 +2198,20 @@ class OpenAIServingChat(OpenAIServingBase):
             audio_tokens=audio_tokens,
             video_tokens=video_tokens,
         )
+        # P0.2 governs every usage object, non-streaming responses included.
+        usage = self._apply_k3_usage_details(
+            usage,
+            reasoning_tokens=sum(
+                r["meta_info"].get("reasoning_tokens", 0) or 0 for r in ret
+            ),
+            cached_tokens=sum(
+                ret[i]["meta_info"].get("cached_tokens", 0) or 0
+                for i in range(0, len(ret), request.n)
+            ),
+        )
 
         return ChatCompletionResponse(
-            id=self._wire_id(ret[0]["meta_info"]["id"]),
+            id=self._wire_id(request, ret[0]["meta_info"]["id"]),
             created=created,
             model=request.model,
             choices=choices,
@@ -2179,13 +2221,23 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
     def _process_logprobs_tokens(
-        self, logprobs: LogProbs, use_token_index: bool = False
+        self,
+        logprobs: LogProbs,
+        use_token_index: bool = False,
+        raw_top_logprobs: Optional[List[Any]] = None,
     ) -> List[ChatCompletionTokenLogprob]:
         """Common helper to process logprobs tokens for both streaming and non-streaming
 
         Args:
             logprobs: LogProbs data from model
             use_token_index: True for non-streaming (use token_idx), False for streaming (use index 0)
+            raw_top_logprobs: the engine's ``(logprob, token_id, token_text)``
+                tuples, per position. Preferred over ``logprobs.top_logprobs``,
+                which is keyed by token TEXT: two ids that decode to the same
+                string collapse into one entry there, so the top-N comes back
+                short of the requested ``top_logprobs`` count. The dict shape is
+                right for /v1/completions (OpenAI's legacy format really is a
+                mapping) and is kept as the fallback.
         """
         token_logprobs = []
 
@@ -2194,7 +2246,21 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             token_bytes = list(token.encode("utf-8"))
             top_logprobs = []
-            if logprobs.top_logprobs:
+            if raw_top_logprobs is not None:
+                entries = (
+                    raw_top_logprobs[token_idx]
+                    if token_idx < len(raw_top_logprobs)
+                    else None
+                ) or []
+                for top_logprob, _top_token_id, top_token in entries:
+                    top_logprobs.append(
+                        TopLogprob(
+                            token=top_token,
+                            bytes=list(top_token.encode("utf-8")),
+                            logprob=top_logprob,
+                        )
+                    )
+            elif logprobs.top_logprobs:
                 # - Non-streaming (use_token_index=True): uses token_idx for full data
                 # - Streaming (use_token_index=False): uses index 0 for pre-sliced data
                 top_logprobs_idx = token_idx if use_token_index else 0
@@ -2227,7 +2293,11 @@ class OpenAIServingChat(OpenAIServingBase):
             output_top_logprobs=ret_item["meta_info"].get("output_top_logprobs", None),
         )
 
-        token_logprobs = self._process_logprobs_tokens(logprobs, use_token_index=True)
+        token_logprobs = self._process_logprobs_tokens(
+            logprobs,
+            use_token_index=True,
+            raw_top_logprobs=ret_item["meta_info"].get("output_top_logprobs", None),
+        )
         return ChoiceLogprobs(content=token_logprobs)
 
     def _stream_created(self, request: ChatCompletionRequest) -> int:
@@ -2241,18 +2311,124 @@ class OpenAIServingChat(OpenAIServingBase):
             request._stream_created_ts = created
         return created
 
-    def _wire_id(self, meta_id: str) -> str:
+    def _wire_id(self, request: ChatCompletionRequest, meta_id: str) -> str:
         """Wire-level response id (P2.1): chatcmpl-<24hex> under kimi_k3.
 
-        Deterministically derived from the scheduler rid so all frames of one
-        request stay identical (P1.3); other encodings keep the raw rid so ops
-        logs still correlate. Non-hex rid chars are stripped and short ids are
-        zero-padded — format stability only.
+        Pinned per request, not derived per frame. With n>1 the engine assigns
+        a separate rid to every sampled choice, so a per-frame derivation emits
+        a different id per candidate and breaks the constant-id contract
+        (P0.7/P1.3/P1.14). The first event to reach here fixes the value for
+        the whole response. Other encodings keep the raw rid so ops logs still
+        correlate.
+
+        Shaped like an ObjectId so ids sort lexicographically by creation time:
+        4 bytes of Unix seconds, then 8 bytes hashed from the rid. The rid is
+        hashed rather than filtered down to its hex characters -- filtering
+        maps distinct rids ("req-a", "req-b") onto one padded id.
         """
         if self.chat_encoding_spec != "kimi_k3":
             return meta_id
-        hexpart = "".join(c for c in meta_id.lower() if c in "0123456789abcdef")
-        return "chatcmpl-" + (hexpart + "0" * 24)[:24]
+        pinned = getattr(request, "_stream_wire_id", None)
+        if pinned is not None:
+            return pinned
+        digest = hashlib.sha256(meta_id.encode("utf-8")).hexdigest()
+        wire_id = (
+            f"chatcmpl-{self._stream_created(request) & 0xFFFFFFFF:08x}{digest[:16]}"
+        )
+        request._stream_wire_id = wire_id
+        return wire_id
+
+    # P0.15/P1.13: "abort" is sglang's internal graceful-abort reason, not a
+    # value the K3 wire contract defines. server_interrupted is its documented
+    # Moonshot equivalent, so a client can tell retryable from terminal.
+    _K3_WIRE_FINISH_REASONS = {"abort": "server_interrupted"}
+
+    def _wire_finish_reason(self, finish_reason: Optional[str]) -> Optional[str]:
+        """Map an sglang finish reason onto the K3 wire vocabulary (P0.15)."""
+        if self.chat_encoding_spec != "kimi_k3" or finish_reason is None:
+            return finish_reason
+        return self._K3_WIRE_FINISH_REASONS.get(finish_reason, finish_reason)
+
+    def _k3_usage(
+        self,
+        *,
+        prompt_tokens: int,
+        completion_tokens: int,
+        reasoning_tokens: int,
+        cached_tokens: int,
+    ) -> Dict[str, Any]:
+        """A complete K3 usage object (P0.1/P0.2/P0.4).
+
+        Both token-detail objects are mandatory on every K3 usage object, as
+        integers, 0 when there is nothing to report, so a client can read them
+        unconditionally instead of branching on presence.
+
+        cached_tokens deliberately ignores --enable-cache-report: the engine
+        always puts the count in meta_info and the flag only gates whether the
+        stock response surfaces it, while the P0.18 accounting headers report
+        it unconditionally. Gating one and not the other made the header and
+        the summary frame disagree whenever a prefix-cache hit landed.
+        """
+        return self._apply_k3_usage_details(
+            UsageInfo(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+                reasoning_tokens=reasoning_tokens,
+            ),
+            reasoning_tokens=reasoning_tokens,
+            cached_tokens=cached_tokens,
+        ).model_dump()
+
+    def _apply_k3_usage_details(
+        self,
+        usage: UsageInfo,
+        *,
+        reasoning_tokens: int,
+        cached_tokens: int,
+    ) -> UsageInfo:
+        """Fill both mandatory K3 token-detail objects on an existing usage.
+
+        A no-op under every other encoding, so their usage keeps its shape.
+        """
+        if self.chat_encoding_spec != "kimi_k3":
+            return usage
+        usage.completion_tokens_details = CompletionTokensDetails(
+            reasoning_tokens=int(reasoning_tokens or 0)
+        )
+        if usage.prompt_tokens_details is None:
+            usage.prompt_tokens_details = PromptTokensDetails(
+                cached_tokens=int(cached_tokens or 0)
+            )
+        else:
+            usage.prompt_tokens_details.cached_tokens = int(cached_tokens or 0)
+        return usage
+
+    def create_error_response(
+        self,
+        message: str,
+        err_type: str = "BadRequestError",
+        status_code: int = 400,
+        param: Optional[str] = None,
+    ) -> ORJSONResponse:
+        """P0.17: K3 clients expect OpenAI's {"error": {...}} envelope.
+
+        sglang's stock body puts message/type/param/code at the top level, so
+        a strict client sees no "error" key at all. Only the K3 surface is
+        re-shaped; every other endpoint keeps the historical body.
+        """
+        if self.chat_encoding_spec != "kimi_k3":
+            return super().create_error_response(message, err_type, status_code, param)
+        error = ErrorResponse(
+            object="error",
+            message=message,
+            type=err_type,
+            param=param,
+            code=status_code,
+        )
+        return ORJSONResponse(
+            content={"error": error.model_dump()}, status_code=status_code
+        )
 
     def _process_tool_call_id(
         self,
@@ -2426,7 +2602,9 @@ class OpenAIServingChat(OpenAIServingBase):
             output_top_logprobs=output_top_logprobs,
         )
 
-        token_logprobs = self._process_logprobs_tokens(logprobs, use_token_index=False)
+        token_logprobs = self._process_logprobs_tokens(
+            logprobs, use_token_index=False, raw_top_logprobs=output_top_logprobs
+        )
         return ChoiceLogprobs(content=token_logprobs)
 
     def _process_reasoning_stream(
@@ -2712,11 +2890,20 @@ class OpenAIServingChat(OpenAIServingBase):
         has_tool_calls: Dict[int, bool],
         continuous_usage_stats: bool = False,
         flush: bool = False,
+        internal_content: Optional[Dict[str, Any]] = None,
     ):
         """Process tool calls in streaming response.
 
         With flush=True (the terminal delta), the parser also drains text it
         held back waiting for a marker that can no longer arrive.
+
+        ``internal_content`` carries this engine event's token ids (P0.5). It
+        rides along on every increment frame the event produces, because the
+        spec requires the key on each of them. When one event yields several
+        increment frames -- the channel transition, or normal text plus a tool
+        call -- they therefore repeat the same ids: the ids describe the event,
+        not the individual frame. Attributing them per frame needs incremental
+        decode matching against each frame's text, which is left as follow-up.
         """
         effective_tools = self._effective_tools(request)
         if index not in parser_dict:
@@ -2768,11 +2955,13 @@ class OpenAIServingChat(OpenAIServingBase):
         if normal_text:
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
-                delta=DeltaMessage(content=normal_text),
+                delta=DeltaMessage(
+                    content=normal_text, internal_content=internal_content
+                ),
                 finish_reason=None,
             )
             chunk = ChatCompletionStreamResponse(
-                id=self._wire_id(content["meta_info"]["id"]),
+                id=self._wire_id(request, content["meta_info"]["id"]),
                 created=self._stream_created(request),
                 choices=[choice_data],
                 model=request.model,
@@ -2842,11 +3031,13 @@ class OpenAIServingChat(OpenAIServingBase):
             for tool_call in tool_call_deltas:
                 choice_data = ChatCompletionResponseStreamChoice(
                     index=index,
-                    delta=DeltaMessage(tool_calls=[tool_call]),
+                    delta=DeltaMessage(
+                        tool_calls=[tool_call], internal_content=internal_content
+                    ),
                     finish_reason=None,
                 )
                 chunk = ChatCompletionStreamResponse(
-                    id=self._wire_id(content["meta_info"]["id"]),
+                    id=self._wire_id(request, content["meta_info"]["id"]),
                     created=self._stream_created(request),
                     choices=[choice_data],
                     model=request.model,
@@ -2855,9 +3046,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 # Add usage stats if continuous_usage_stats is enabled
                 if continuous_usage_stats:
                     prompt_tokens = self._reported_prompt_tokens(content["meta_info"])
-                    completion_tokens = content["meta_info"].get(
-                        "completion_tokens", 0
-                    )
+                    completion_tokens = content["meta_info"].get("completion_tokens", 0)
                     reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
                     chunk.usage = UsageProcessor.calculate_token_usage(
                         prompt_tokens=prompt_tokens,
@@ -2874,6 +3063,7 @@ class OpenAIServingChat(OpenAIServingBase):
         content: Dict[str, Any],
         request: ChatCompletionRequest,
         index: int,
+        internal_content: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """
         Check for any remaining tool call arguments that need to be streamed
@@ -2929,12 +3119,14 @@ class OpenAIServingChat(OpenAIServingBase):
 
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
-                delta=DeltaMessage(tool_calls=[tool_call]),
+                delta=DeltaMessage(
+                    tool_calls=[tool_call], internal_content=internal_content
+                ),
                 finish_reason=None,  # Don't send finish_reason with this chunk
             )
 
             chunk = ChatCompletionStreamResponse(
-                id=self._wire_id(content["meta_info"]["id"]),
+                id=self._wire_id(request, content["meta_info"]["id"]),
                 created=self._stream_created(request),
                 choices=[choice_data],
                 model=request.model,
