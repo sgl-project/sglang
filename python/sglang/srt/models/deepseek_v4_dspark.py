@@ -114,6 +114,13 @@ class DSparkAttention(MqaAttentionBase):
             wo_b_reduce_results=True,
             rope_original_seq_len=0,
         )
+        # wo_b defaults to an all-TP-group reduce; when attn_tp < tp (prefill CP
+        # with attn_cp > 1, or DP attention) o is only sharded over attn_tp, so the
+        # reduce must run over the attn_tp group or it wrongly sums the CP/DP
+        # replicas. Mirrors MQALayer.forward's attn_tp_all_reduce; a no-op when
+        # attn_tp == tp (attn_tp_group is the full TP group there).
+        if self.attn_tp_size < get_parallel().tp_size:
+            self.wo_b.use_dp_attention_reduce = True
         assert (
             self.compress_ratio == 0
         ), "DSpark draft attention requires compress_ratio == 0."

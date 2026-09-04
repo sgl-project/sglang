@@ -135,6 +135,8 @@ class DSparkVerifyPlanner:
         self._dynamic_graph_tier = False
         self._dp_tier_gather_enabled = False
         self._is_verify_all = True
+        self._sync_verify_budget = False
+        self._budget_sync_tensor: Optional[torch.Tensor] = None
         self._uniform_layout_cache: dict = {}
         if self._ragged_verify_mode is not RaggedVerifyMode.STATIC:
             if self._confidence_head is None:
@@ -155,6 +157,17 @@ class DSparkVerifyPlanner:
                 self._ragged_verify_mode is RaggedVerifyMode.COMPACT
                 and is_uninitialized_sps_table(sps_table)
             )
+            # With a real (non-flat) SPS table the per-step budget must be
+            # identical on every rank, otherwise ranks can pick different
+            # cuda-graph tiers and desync collectives (required for compact
+            # under attention-CP).
+            self._sync_verify_budget = (
+                envs.SGLANG_DSPARK_SYNC_VERIFY_BUDGET.get()
+                and get_tp_group().world_size > 1
+                and not self._is_verify_all
+            )
+            if self._sync_verify_budget:
+                self._budget_sync_tensor = torch.empty(1, dtype=torch.int64)
             relay_lag_steps = (
                 0
                 if get_schedule().disable_overlap_schedule
@@ -391,18 +404,36 @@ class DSparkVerifyPlanner:
     ) -> Optional[int]:
         if resolved is None:
             self._budget_planner.note_non_decode_step()
-            return None
-        current_generation = self.model_runner.req_to_token_pool.req_generation[
-            req_pool_indices_cpu.to(torch.int64)
-        ]
-        return int(
-            self._budget_planner.compute_budget(
+            local_budget = None
+        else:
+            current_generation = self.model_runner.req_to_token_pool.req_generation[
+                req_pool_indices_cpu.to(torch.int64)
+            ]
+            local_budget = self._budget_planner.compute_budget(
                 confidence=resolved.confidence,
                 generation=resolved.generation,
                 current_generation=current_generation,
                 req_pool_indices_cpu=req_pool_indices_cpu,
             )
+        return self._sync_budget_across_tp(local_budget)
+
+    def _sync_budget_across_tp(self, budget: Optional[int]) -> Optional[int]:
+        if not self._sync_verify_budget:
+            return budget
+        if self._budget_sync_tensor is None:
+            raise RuntimeError(
+                "_budget_sync_tensor not initialized when sync_verify_budget is True"
+            )
+        tp_group = get_tp_group()
+        local_value = -1 if budget is None else budget
+        self._budget_sync_tensor[0] = local_value if tp_group.rank_in_group == 0 else 0
+        torch.distributed.broadcast(
+            self._budget_sync_tensor,
+            src=tp_group.ranks[0],
+            group=tp_group.cpu_group,
         )
+        synced_value = self._budget_sync_tensor.item()
+        return None if synced_value < 0 else synced_value
 
     def schedule_layout(
         self,

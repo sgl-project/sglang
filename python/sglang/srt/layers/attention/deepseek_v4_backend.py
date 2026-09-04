@@ -625,10 +625,17 @@ class DeepseekV4AttnBackend(
         if read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT:
             return None
         if get_parallel().attn_cp_size > 1:
-            raise NotImplementedError(
-                "DSV4 ragged verify does not support context parallel (CP); "
-                "set SGLANG_RAGGED_VERIFY_MODE off for CP runs."
-            )
+            # Ragged verify never CP-splits tokens (CP is prefill-only), but under
+            # the CP topology every rank must agree on the per-step verify budget /
+            # cuda-graph tier. That is guaranteed by the rank0 budget broadcast;
+            # refuse to run without it.
+            if not envs.SGLANG_DSPARK_SYNC_VERIFY_BUDGET.get():
+                raise NotImplementedError(
+                    "DSV4 ragged verify under context parallel (CP) requires "
+                    "SGLANG_DSPARK_SYNC_VERIFY_BUDGET=1 (rank0 budget broadcast "
+                    "keeps the cuda-graph tier identical across CP ranks); "
+                    "set it, or run SGLANG_RAGGED_VERIFY_MODE=static."
+                )
         if self.online_c128_mtp.enabled():
             raise NotImplementedError(
                 "DSV4 ragged verify does not support online c128 MTP; "
