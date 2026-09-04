@@ -3670,6 +3670,12 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         """Translate virtual token ids to full-pool physical ids for PD."""
         return self.full_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
 
+    def translate_swa_indices_for_transfer(
+        self, kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Virtual token ids -> physical, not kernel-facing, SWA ids for PD."""
+        return self.swa_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
+
     def set_disagg_move_gate(self, gate: Callable[[], bool]) -> None:
         """Install the PD compaction gate on both physical sub-allocators."""
         assert self.lazy_compaction, (

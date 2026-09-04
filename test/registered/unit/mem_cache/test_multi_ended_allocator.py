@@ -30,6 +30,7 @@ import unittest
 
 import torch
 
+from sglang.srt.mem_cache.common import kv_to_page_indices
 from sglang.srt.mem_cache.multi_ended_allocator import (
     FloatMultiEndedAllocator,
     MultiEndedAllocator,
@@ -2734,6 +2735,29 @@ class TestSWACompositeKernelIdSurface(unittest.TestCase):
         v2p_swa = a.swa_attn_allocator.virtual_to_physical
         expected = v2p_swa[v // self.PS] * (self.PS * mult) + v % self.PS
         self.assertTrue(torch.equal(a.translate_loc_from_full_to_swa(v), expected))
+
+    def test_swa_transfer_page_is_physical_not_kernel_scaled(self):
+        mult = 2 * self.SWA_L
+        a = self._build()
+        v = a.alloc(3 * self.PS)
+        self.assertIsNotNone(v)
+
+        physical_pages = a.swa_attn_allocator.virtual_to_physical[
+            v[:: self.PS] // self.PS
+        ]
+        physical_tokens = a.swa_attn_allocator.translate_kv_loc(v)
+        transfer_tokens = a.translate_swa_indices_for_transfer(v)
+        self.assertTrue(torch.equal(transfer_tokens, physical_tokens))
+        self.assertEqual(
+            kv_to_page_indices(transfer_tokens, self.PS).tolist(),
+            physical_pages.tolist(),
+        )
+
+        kernel_tokens = a.translate_loc_from_full_to_swa(v)
+        self.assertEqual(
+            kv_to_page_indices(kernel_tokens, self.PS).tolist(),
+            (physical_pages * mult).tolist(),
+        )
 
     def test_swa_kernel_tombstone_still_lands_on_sink(self):
         """The scaled stride must not break the tombstone clamp: a tombstoned
