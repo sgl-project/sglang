@@ -3460,9 +3460,19 @@ class RemoteInstanceModelLoader(BaseModelLoader):
     def load_model_from_remote_instance_by_transfer_engine(
         self, model, transfer_engine, seed_url, tp_rank
     ) -> bool:
-        # get remote weights metadata from source instance
-        seed_transfer_engine_session_id, seed_transfer_engine_weight_info = (
-            get_remote_instance_transfer_engine_info_per_rank(seed_url, tp_rank)
+        # get remote weights metadata from source instance.
+        # The seed now publishes a backend-tagged dict instead of a positional
+        # (session_id, weights_info_dict) tuple, so read the fields by key.
+        seed_transfer_engine_info = get_remote_instance_transfer_engine_info_per_rank(
+            seed_url, tp_rank
+        )
+        if not seed_transfer_engine_info:
+            logger.error("Cannot get transfer engine session or weight info.")
+            return False
+
+        seed_transfer_engine_session_id = seed_transfer_engine_info.get("session_id")
+        seed_transfer_engine_weight_info = seed_transfer_engine_info.get(
+            "weights_info_dict"
         )
         if (
             seed_transfer_engine_session_id is None

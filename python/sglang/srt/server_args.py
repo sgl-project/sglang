@@ -3313,6 +3313,11 @@ class ServerArgs:
         bool,
         "Expose SchedulerActor.pull_weights for RDT (Ray Direct Transport / NIXL) weight sync. Requires --use-ray; implies --enable-engine-info-bootstrap.",
     ] = False
+    remote_instance_weight_loader_start_seed_via_nixl: A[
+        bool,
+        "Start seed server via NIXL backend for remote instance weight loader.",
+        NS("model"),
+    ] = False
     engine_info_bootstrap_port: A[
         int,
         "Port for the engine info bootstrap server. Default is 6789. Must be set explicitly when running multiple instances on the same node.",
@@ -7608,6 +7613,14 @@ class ServerArgs:
                 self.load_format = "auto"
 
         # Check whether TransferEngine can be used when users want to start seed service that supports TransferEngine backend.
+        if (
+            self.remote_instance_weight_loader_start_seed_via_transfer_engine
+            and self.remote_instance_weight_loader_start_seed_via_nixl
+        ):
+            raise ValueError(
+                "Cannot set --remote-instance-weight-loader-start-seed-via-transfer-engine "
+                "and --remote-instance-weight-loader-start-seed-via-nixl together"
+            )
         if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
             self.remote_instance_weight_loader_start_seed_via_transfer_engine = (
                 self.validate_transfer_engine()
@@ -7636,6 +7649,12 @@ class ServerArgs:
                 "decoding (--speculative-algorithm): the weight cache daemon does "
                 "not export the draft model's weights. Disable one of them "
                 "(--weight-cache-mode off) for this configuration."
+            )
+
+        # Check whether NIXL can be used when users want to start seed service that supports NIXL backend.
+        if self.remote_instance_weight_loader_start_seed_via_nixl:
+            self.remote_instance_weight_loader_start_seed_via_nixl = (
+                self.validate_nixl()
             )
 
     def _is_mistral_native_format(self) -> bool:
@@ -9649,6 +9668,24 @@ class ServerArgs:
         else:
             return True
 
+    def validate_nixl(self):
+        try:
+            nixl_available = importlib.util.find_spec("nixl._api") is not None
+        except (ModuleNotFoundError, ValueError):
+            nixl_available = False
+        if not nixl_available:
+            logger.warning(
+                "Failed to import nixl._api. Does not support using NIXL as remote instance weight loader backend."
+            )
+            return False
+        elif self.enable_memory_saver:
+            logger.warning(
+                "Memory saver is enabled, which is not compatible with NIXL. Does not support using NIXL as remote instance weight loader backend."
+            )
+            return False
+        else:
+            return True
+
     @property
     def _parsed_modelexpress_config(self) -> dict:
         cache = getattr(self, "_mx_config_cache", None)
@@ -9688,6 +9725,7 @@ class ServerArgs:
         """Whether this node (rank 0) hosts the EngineInfoBootstrapServer."""
         return (
             self.remote_instance_weight_loader_start_seed_via_transfer_engine
+            or self.remote_instance_weight_loader_start_seed_via_nixl
             or self.enable_engine_info_bootstrap
         )
 
