@@ -10,7 +10,8 @@ from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -18,6 +19,12 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_forwards_swa_tail_allocation_to_logical_allocator(self):
         allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
         logical_allocator = MagicMock(spec=["alloc_extend_swa_tail"])
