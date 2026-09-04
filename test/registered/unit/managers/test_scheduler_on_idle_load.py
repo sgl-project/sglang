@@ -27,6 +27,7 @@ class TestOnIdleStallPublish(CustomTestCase):
         s.publish_load_snapshot = MagicMock(return_value=None)
         s.load_publisher = MagicMock()
         s.load_inquirer = MagicMock()
+        s.metrics_reporter = MagicMock()
         s._last_stall_publish_ts = float("-inf")
         return s
 
