@@ -12,7 +12,8 @@ use crate::policies::{
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
-    MetricsRegistry, RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
+    MetricsRegistry, PolicySelectionFailureReason, RequestOutcome, StaleRequestOutcome,
+    WorkerModeLabel,
 };
 use crate::workers::{LoadGuard, Worker};
 use axum::body::Body;
@@ -92,6 +93,24 @@ impl Drop for RecordDurationOnDrop {
     fn drop(&mut self) {
         self.metrics
             .observe_request_duration(&self.model, self.start.elapsed().as_secs_f64());
+    }
+}
+
+fn policy_selection_failed(
+    ctx: &AppContext,
+    model: &str,
+    reason: PolicySelectionFailureReason,
+) -> ApiError {
+    ctx.metrics
+        .record_policy_selection_failure(ctx.config.model.policy, reason);
+    tracing::warn!(
+        policy = %ctx.config.model.policy,
+        reason = reason.as_str(),
+        model,
+        "prefill policy selection failed"
+    );
+    ApiError::PolicySelectionFailed {
+        model: model.to_owned(),
     }
 }
 
@@ -239,25 +258,28 @@ pub async fn chat_completions(
         .with_load_snapshot(&load_snapshot);
     let worker = match policy.propose_prefill(candidate_range.workers, &selection_ctx) {
         Some(PrefillProposal::Pair(proposal)) if policy.uses_shared_prefill_admission() => {
-            let decision = resolve_prefill(
-                &candidate_range,
-                &proposal,
-                request_input_tokens,
-                &load_snapshot,
-            )
-            .ok_or_else(|| ApiError::PolicySelectionFailed {
-                model: model_str.clone(),
-            })?;
+            let decision =
+                resolve_prefill(&candidate_range, &proposal, request_input_tokens, &load_snapshot)
+                    .ok_or_else(|| {
+                        policy_selection_failed(
+                            &ctx,
+                            &model_str,
+                            PolicySelectionFailureReason::PrefillAdmissionExhausted,
+                        )
+                    })?;
             policy.commit_prefill_selection(&selection_ctx, proposal.kind, &decision.selected);
             decision.selected
         }
         Some(PrefillProposal::Pair(proposal)) => proposal.primary,
         Some(PrefillProposal::CacheCandidates(proposal)) => {
-            let decision =
-                resolve_cache_candidates(&proposal, request_input_tokens, &load_snapshot)
-                    .ok_or_else(|| ApiError::PolicySelectionFailed {
-                        model: model_str.clone(),
-                    })?;
+            let decision = resolve_cache_candidates(&proposal, request_input_tokens, &load_snapshot)
+                .ok_or_else(|| {
+                    policy_selection_failed(
+                        &ctx,
+                        &model_str,
+                        PolicySelectionFailureReason::CacheCandidatesExhausted,
+                    )
+                })?;
             policy.commit_prefill_selection(
                 &selection_ctx,
                 ProposalKind::CacheAffinity,
@@ -266,9 +288,11 @@ pub async fn chat_completions(
             decision.selected
         }
         None => {
-            return Err(ApiError::PolicySelectionFailed {
-                model: model_str.clone(),
-            });
+            return Err(policy_selection_failed(
+                &ctx,
+                &model_str,
+                PolicySelectionFailureReason::ProposalEmpty,
+            ));
         }
     };
 
