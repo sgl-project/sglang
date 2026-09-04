@@ -1000,6 +1000,29 @@ class MambaRadixCache(BasePrefixCache):
             return
         self.full_lru_list.sanity_check(self)
         self.mamba_lru_list.sanity_check(self)
+        if _MAMBA_DEBUG_ASSERTS:
+            self._sanity_check_child_keys()
+
+    def _sanity_check_child_keys(self) -> None:
+        """Every node must be reachable under the slot its own key derives.
+
+        `_delete_leaf` / `_delete_tombstone_leaf` remove a node with
+        `parent.children.pop(node.key.child_key(page_size))`, so a node filed under
+        any other slot can never be removed: the pop misses, the assert fires far
+        from the write that caused it, and until then the node leaks its KV. Checked
+        here so a drift is attributed to the operation that introduced it.
+        """
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            for slot, child in node.children.items():
+                expected = child.key.child_key(self.page_size)
+                assert slot == expected, (
+                    f"child registered under a slot its key does not derive: "
+                    f"{slot=}, {expected=}, {child.id=}, {node.id=}, "
+                    f"{len(child.key)=}, {self.page_size=}"
+                )
+                stack.append(child)
 
     def evictable_size(self) -> Tuple[int, int]:
         # Note: use full_evictable_size() and mamba_evictable_size() instead.
@@ -1223,6 +1246,17 @@ class MambaRadixCache(BasePrefixCache):
         )
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:
+        # A split must consume at least one full page. `match()` rounds down to a
+        # page multiple, so a caller that only splits when the child's first page
+        # already matched can never land here with 0 -- and a 0 would build a
+        # node whose key is empty, which `child_key()` renders as `()` for
+        # page_size > 1 instead of raising. Such a node is unfindable in its
+        # parent's `children` and only surfaces much later, as an eviction-time
+        # "parent does not have child key, ()". Fail at the corruption instead.
+        assert split_len > 0, (
+            f"_split_node with split_len=0 would create an empty-key node, "
+            f"{child.id=}, {len(child.key)=}, {self.page_size=}"
+        )
         # new_node -> child
         new_node = TreeNode()
         new_node.children = {key[split_len:].child_key(self.page_size): child}
@@ -1243,7 +1277,12 @@ class MambaRadixCache(BasePrefixCache):
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:].clone()
-        new_node.parent.children[key.child_key(self.page_size)] = new_node
+        # Register under the node's OWN key: `_delete_leaf` / `_delete_tombstone_leaf`
+        # look the node up with `node.key.child_key(...)`, so deriving the slot from
+        # anything else (here: the pre-split `key`) lets the two drift apart whenever
+        # `split_len < page_size`, leaving a node that can never be removed. Equal to
+        # `key.child_key(...)` in the healthy `split_len >= page_size` case.
+        new_node.parent.children[new_node.key.child_key(self.page_size)] = new_node
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
         )
