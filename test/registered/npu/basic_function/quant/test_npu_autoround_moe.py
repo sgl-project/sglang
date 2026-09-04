@@ -29,7 +29,6 @@ TEST_MODEL_MATRIX = {
 
 
 class TestAscendAutoRoundMoE(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.models = TEST_MODEL_MATRIX.keys()
