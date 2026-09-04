@@ -412,10 +412,15 @@ class TestSchedulerTimeAccounting(CustomTestCase):
         self.reporter = _make_reporter(self, types.SimpleNamespace())
         self.idle_seconds = []
         self.process_cpu_seconds = []
+        self.stage_seconds = []
         self.reporter.enable_metrics = True
+        self.reporter.scheduler_stage_metrics.enabled = True
         self.reporter.metrics_collector = types.SimpleNamespace(
             increment_scheduler_idle_seconds=self.idle_seconds.append,
             increment_scheduler_process_cpu_seconds=self.process_cpu_seconds.append,
+            increment_scheduler_stage_seconds=lambda **kwargs: (
+                self.stage_seconds.append(kwargs)
+            ),
         )
 
     def test_counts_idle_wall_time_and_process_cpu_time(self):
@@ -452,6 +457,10 @@ class TestSchedulerTimeAccounting(CustomTestCase):
 
         self.assertAlmostEqual(sum(self.idle_seconds), 2.6)
         self.assertAlmostEqual(sum(self.process_cpu_seconds), 1.9)
+        self.assertAlmostEqual(
+            sum(sample["seconds"] for sample in self.stage_seconds), 4.1
+        )
+        self.assertEqual({sample["stage"] for sample in self.stage_seconds}, {"other"})
 
     def test_state_transitions_accumulate_until_periodic_update(self):
         with (
