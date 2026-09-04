@@ -148,6 +148,44 @@ class DSATopKBackend(Enum):
                 logits, lengths, topk, topk_indices_offset, row_starts
             )
 
+        # Packed PAGED extend (GLM DSA prefill: `dsa_prefill_backend` outside the
+        # flashmla_sparse family makes `get_topk_transform_method` return PAGED for
+        # EXTEND). It fails the decode test above on two counts -- rows carry a
+        # per-row score offset `ks`, and there are many rows per request rather
+        # than one -- but the v2 kernel absorbs both through row_starts /
+        # row_to_batch, so the only real requirement left is that the plan was
+        # built over exactly these rows. That excludes the chunked extend path,
+        # whose plan covers the whole forward while each call sees one chunk;
+        # those fall through to the legacy transform below.
+        #
+        # The score layout is checked here rather than left to the helper's
+        # assertions: decode scores come from a producer that guarantees the
+        # kernel's 16B-aligned row stride, but an extend row stride is the batch's
+        # total KV length, which is only a multiple of 4 by luck. A row stride
+        # that does not fit the vectorized load must fall back, not raise.
+        if (
+            self.should_use_topk_v2()
+            and topk_transform_method == TopkTransformMethod.PAGED
+            and batch_idx_list is None
+            and 0 < topk <= 2048
+            and lengths.shape[0] == logits.shape[0]
+            and logits.dtype == torch.float32
+            and logits.stride(1) == 1
+            and logits.stride(0) % 4 == 0
+            and attn_metadata.topk_v2_plan is not None
+            and attn_metadata.topk_v2_plan.shape[0] == logits.shape[0] + 1
+            and attn_metadata.token_to_batch_idx is not None
+            and attn_metadata.token_to_batch_idx.shape[0] == logits.shape[0]
+        ):
+            return _topk_transform_v2_paged(
+                logits,
+                lengths,
+                topk,
+                attn_metadata,
+                row_starts=row_starts,
+                row_to_batch=attn_metadata.token_to_batch_idx,
+            )
+
         # The legacy transforms below read attn_metadata.page_table_1 (page_size=1),
         # which is always present here: the fold only drops it for the decode case
         # dispatched to v2 above.
@@ -278,6 +316,8 @@ def _topk_transform_v2_paged(
     lengths: torch.Tensor,
     topk: int,
     attn_metadata,
+    row_starts: Optional[torch.Tensor] = None,
+    row_to_batch: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused top-k + page-table transform via the DeepSeek-V4 v2 JIT kernel.
 
@@ -291,9 +331,16 @@ def _topk_transform_v2_paged(
     typically 64) yields the same physical slots as gathering the page_size=1
     table, without materializing that wide table.
 
-    This is a committed contract, not a best-effort path: ``topk_transform`` routes
-    here only for the decode-shaped PAGED case, and the fused-decode CUDA graph
-    drops the page_size=1 table for exactly this case (see
+    ``row_starts`` / ``row_to_batch`` (both optional, both ``(num_rows,)`` int32)
+    serve DSA extend, whose scores are packed batch-global: row ``i`` owns the
+    window starting at ``row_starts[i]`` and maps through the page-table row of
+    its request, ``row_to_batch[i]``. Omitting both gives the decode layout
+    (column 0, one table row per score row). The kernel makes selected indices
+    row-local in both cases, so the return value means the same thing.
+
+    This is a committed contract, not a best-effort path: ``topk_transform``
+    routes here only for shapes it has already validated, and for the decode case
+    the fused-decode CUDA graph drops the page_size=1 table (see
     ``dsa_drop_wide_page_table``). The preconditions below are therefore
     invariants the caller must uphold -- they assert (raise) on violation rather
     than fall back to the slow legacy path (which may not even have a page_size=1
@@ -337,7 +384,16 @@ def _topk_transform_v2_paged(
 
     page_size = attn_metadata.page_size
     out = logits.new_empty((num_rows, topk), dtype=torch.int32)
-    topk_transform_paged_v2(logits, lengths, page_table, out, page_size, plan)
+    topk_transform_paged_v2(
+        logits,
+        lengths,
+        page_table,
+        out,
+        page_size,
+        plan,
+        row_starts=(None if row_starts is None else row_starts.to(torch.int32)),
+        row_to_batch=(None if row_to_batch is None else row_to_batch.to(torch.int32)),
+    )
     return out
 
 
