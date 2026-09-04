@@ -1,7 +1,7 @@
 """
 Usage:
 export OPENROUTER_API_KEY=sk-******
-python3 together_example_chat.py
+python3 openrouter_example_chat.py
 """
 
 import os
