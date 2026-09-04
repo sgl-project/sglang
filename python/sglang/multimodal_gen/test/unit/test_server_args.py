@@ -870,7 +870,6 @@ class TestDiffusionModelDetection(unittest.TestCase):
 
 
 class TestMiniMaxH3Routing(unittest.TestCase):
-
     def test_semantic_variants_map_to_checkpoint_partitions(self):
         self.assertEqual(
             MiniMaxH3Pipeline.model_subfolder_for_variant("fl2va"), "FL2VA"

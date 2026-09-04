@@ -326,9 +326,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # Draft workers can use TARGET_VERIFY mode.
-                if (
-                    not self.model_runner.spec_algorithm.supports_target_verify_for_draft()
-                ):
+                if not self.model_runner.spec_algorithm.supports_target_verify_for_draft():
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
         elif self.is_dllm:
@@ -461,6 +459,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             require_gathered_buffer=self.require_gathered_buffer,
             enable_prefill_cp=self.enable_prefill_cp,
             require_mlp_tp_gather=self.require_mlp_tp_gather,
+            attn_tp_sharded_fn=self.model_runner.attn_tp_sequence_sharded,
             dp_size=self.dp_size,
             source=self.buffers,
         )
@@ -493,7 +492,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.capture()
         except RuntimeError as e:
             raise Exception(
-                f"Capture cuda graph failed: {e}\n" f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+                f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
     def _record_in_graph_metadata_prep_done(self):
@@ -917,17 +916,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else None
         )
 
-        # Adjust for attention TP if needed (matching replay path in
-        # populate_from_forward_batch).
+        # Localize the count when this bucket is attn-TP sharded (SP on).
+        attn_tp_sharded = self.model_runner.attn_tp_sequence_sharded(num_tokens)
         buffers.num_token_non_padded[...] = num_tokens
         if (
             enable_num_token_non_padded()
-            and self.require_gathered_buffer
             and not self.enable_prefill_cp
+            and attn_tp_sharded
         ):
             local = compute_local_num_token_non_padded(
                 global_num_token_non_padded=buffers.num_token_non_padded,
                 num_tokens_per_dp=num_tokens,
+                sharded=True,
             )
             buffers.num_token_non_padded.copy_(local)
 
@@ -1011,6 +1011,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
             num_token_non_padded=buffers.num_token_non_padded,
+            attn_tp_sequence_sharded=attn_tp_sharded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
             rids_int=rids_int,
@@ -1167,9 +1168,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.
         if get_exec().graph.debug_cuda_graph:
-            assert isinstance(
-                self.backend, BreakableCudaGraphBackend
-            ), "Breakable CUDA graph is required for --debug-cuda-graph"
+            assert isinstance(self.backend, BreakableCudaGraphBackend), (
+                "Breakable CUDA graph is required for --debug-cuda-graph"
+            )
 
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
             bs, stream_idx=stream_idx, num_tokens=num_tokens
@@ -1529,7 +1530,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen.")
             else:
-
                 capture_mode = (
                     CaptureHiddenMode.NULL
                     if self.model_runner.spec_algorithm.is_standalone()
