@@ -37,11 +37,10 @@ import argparse
 import copy
 import dataclasses
 import functools
-import json
 import logging
 import tempfile
 import uuid
-from typing import Any, Callable, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Optional
 
 from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
 from sglang.srt.arg_groups.arg_utils import NS, A, Arg, add_cli_args_from_dataclass
