@@ -57,6 +57,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         cuda_graph_runner: BaseCudaGraphRunner,
         *,
         enable_memory_saver: bool = False,
+        reuse_output_buffer: bool = False,
     ) -> None:
         self._graphs: Dict[Any, torch.cuda.CUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
@@ -66,6 +67,8 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self._tp_group = cuda_graph_runner.model_runner.tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._precarve = GraphPoolPrecarve()
+        self._reuse_output_buffer = reuse_output_buffer
+        self._output_buffer: Optional[torch.Tensor] = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
@@ -106,15 +109,28 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
         # Two warmups so kernels are loaded and one-time setup is paid before capture.
         # post_warmup_hook lets the attention backend reset state that warmup mutated.
-        for _ in range(2):
+        warmup_output = None
+        for warmup_step in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
             with self._precarve.measure():
-                forward_fn()
+                output = forward_fn()
+            if self._reuse_output_buffer and warmup_step == 1:
+                warmup_output = output
+            del output
             if profiler is not None:
                 profiler.step()
             if post_warmup_hook is not None:
                 post_warmup_hook()
+
+        if self._reuse_output_buffer and self._output_buffer is None:
+            if torch.is_tensor(warmup_output) and warmup_output.ndim > 0:
+                # Prefill replays one shape at a time, so all captured graphs can
+                # write their eager-tail input into the largest shape's buffer.
+                self._output_buffer = torch.empty_like(warmup_output)
+            else:
+                self._reuse_output_buffer = False
+        del warmup_output
 
         graph = torch.cuda.CUDAGraph()
 
@@ -136,6 +152,22 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         ):
             self._precarve.mint()
             out = forward_fn()
+            if self._reuse_output_buffer:
+                output_buffer = self._output_buffer
+                assert output_buffer is not None
+                if (
+                    torch.is_tensor(out)
+                    and out.ndim == output_buffer.ndim
+                    and out.shape[1:] == output_buffer.shape[1:]
+                    and out.shape[0] <= output_buffer.shape[0]
+                    and out.dtype == output_buffer.dtype
+                    and out.device == output_buffer.device
+                ):
+                    shared_out = output_buffer[: out.shape[0]]
+                    shared_out.copy_(out)
+                    out = shared_out
+                else:
+                    self._reuse_output_buffer = False
 
         if profiler is not None:
             profiler.step()
@@ -163,4 +195,5 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
     def cleanup(self) -> None:
         self._graphs.clear()
         self._outputs.clear()
+        self._output_buffer = None
         self._pool = None
