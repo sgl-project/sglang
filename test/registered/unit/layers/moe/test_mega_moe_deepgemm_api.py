@@ -96,6 +96,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             patch.object(mega_moe, "_device_sm", 100),
             patch.object(mega_moe, "get_is_capture_mode", return_value=False),
             patch.object(mega_moe, "get_dp_global_num_tokens", return_value=[9, 17]),
+            patch.object(mega_moe, "is_dsa_enable_prefill_cp", return_value=False),
             patch.object(
                 mega_moe.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK,
                 "get",
