@@ -24,8 +24,7 @@ class TestHelionKDADispatcher(unittest.TestCase):
                 return_value=True,
             ),
             patch(
-                "sglang.srt.layers.attention.linear.kernels.kda_helion."
-                "HelionKDAKernel",
+                "sglang.srt.layers.attention.linear.kernels.kda_helion.HelionKDAKernel",
                 return_value=helion_kernel,
             ) as constructor,
         ):
