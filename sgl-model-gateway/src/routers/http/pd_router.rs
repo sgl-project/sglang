@@ -201,6 +201,30 @@ impl PDRouter {
         error::internal_error("serialization_failed", "Failed to serialize request")
     }
 
+    /// Add the request identity used by both PD workers.
+    ///
+    /// This runs once before the retry loop. A retry may select a different
+    /// worker pair and bootstrap room, but it must remain the same logical
+    /// request and therefore keep the same `rid`.
+    fn inject_request_id_into_value(
+        mut original: Value,
+        request_id: &str,
+    ) -> Result<Value, String> {
+        if original.get("rid").is_some_and(|value| !value.is_null()) {
+            return Ok(original);
+        }
+
+        let obj = original
+            .as_object_mut()
+            .ok_or_else(|| "Request must be a JSON object".to_string())?;
+
+        // Keep one logical request ID here. The engine expands scalar IDs when
+        // handling true batches or parallel sampling, so the gateway must not
+        // interpret chat `n` as the batch size.
+        obj.insert("rid".to_string(), Value::from(request_id));
+        Ok(original)
+    }
+
     fn get_generate_batch_size(req: &GenerateRequest) -> Option<usize> {
         // GenerateRequest doesn't support batch via arrays, only via input_ids
         if let Some(InputIds::Batch(batches)) = &req.input_ids {
@@ -362,7 +386,7 @@ impl PDRouter {
         Ok((prefill_request, decode_request))
     }
 
-    async fn execute_dual_dispatch<T: Serialize + Clone>(
+    async fn execute_dual_dispatch<T: Serialize>(
         &self,
         headers: Option<&HeaderMap>,
         original_request: &T,
@@ -383,15 +407,40 @@ impl PDRouter {
             endpoint,
             bool_to_static_str(context.is_stream),
         );
-        // Clone request once outside the retry loop, then use Arc to share across attempts
-        // This avoids O(retries) clones by sharing the same data
-        let shared_request = Arc::new(original_request.clone());
+        // Resolve the logical request ID once, outside the retry loop. The
+        // middleware normally supplies x-request-id; the fallback keeps direct
+        // router calls and non-standard entry points on the same code path.
+        let request_id = headers
+            .and_then(|headers| headers.get("x-request-id"))
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("req-{}", uuid::Uuid::new_v4().simple()));
+
+        // Keep the generated fallback in the worker headers as well as the
+        // JSON body. This preserves one identity even if RequestIdLayer was
+        // bypassed.
+        let mut dispatch_headers = headers.cloned().unwrap_or_default();
+        if let Ok(value) = HeaderValue::from_str(&request_id) {
+            dispatch_headers.insert("x-request-id", value);
+        }
+        let dispatch_headers = Arc::new(dispatch_headers);
+
+        // Serialize and inject once. Each retry clones this prepared request,
+        // then adds a fresh bootstrap_room for the new transfer attempt.
+        let shared_request = match serde_json::to_value(original_request) {
+            Ok(request) => match Self::inject_request_id_into_value(request, &request_id) {
+                Ok(request) => Arc::new(request),
+                Err(error) => return Self::handle_serialization_error(error),
+            },
+            Err(error) => return Self::handle_serialization_error(error),
+        };
+
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             {
                 move |attempt: u32| {
-                    // Clone Arc (cheap reference count increment) instead of cloning the entire request
                     let shared_request = Arc::clone(&shared_request);
+                    let dispatch_headers = Arc::clone(&dispatch_headers);
                     let context = context.clone();
                     async move {
                         let (prefill, decode) = match self
@@ -415,10 +464,7 @@ impl PDRouter {
                             decode.url()
                         );
 
-                        let mut json_request = match serde_json::to_value(shared_request.as_ref()) {
-                            Ok(v) => v,
-                            Err(e) => return Self::handle_serialization_error(e),
-                        };
+                        let mut json_request = shared_request.as_ref().clone();
 
                         json_request = match Self::inject_bootstrap_into_value(
                             json_request,
@@ -432,7 +478,7 @@ impl PDRouter {
                         let ctx_is_stream = context.is_stream;
                         let response = self
                             .execute_dual_dispatch_internal(
-                                headers,
+                                Some(dispatch_headers.as_ref()),
                                 json_request,
                                 context,
                                 Arc::clone(&prefill),
@@ -1927,6 +1973,42 @@ mod tests {
         assert!(decode_request.body.get("disagg_prefill_dp_rank").is_none());
         assert!(matches!(prefill_request.body, Cow::Borrowed(_)));
         assert!(matches!(decode_request.body, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_build_post_with_headers_forwards_request_id() {
+        let router = create_test_pd_router();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("request-123"));
+
+        let request = router
+            .build_post_with_headers(
+                &router.client,
+                "http://prefill:30000/generate",
+                &json!({"prompt": "hello"}),
+                Some(&headers),
+                false,
+            )
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            request.headers().get("x-request-id"),
+            Some(&HeaderValue::from_static("request-123")),
+        );
+    }
+
+    #[test]
+    fn test_inject_request_id_preserves_existing_and_injects_scalar() {
+        let existing =
+            PDRouter::inject_request_id_into_value(json!({"rid": "client-rid"}), "router-rid")
+                .unwrap();
+        assert_eq!(existing["rid"], "client-rid");
+
+        let request =
+            PDRouter::inject_request_id_into_value(json!({"prompt": ["a", "b"]}), "router-rid")
+                .unwrap();
+        assert_eq!(request["rid"], "router-rid");
     }
 
     #[test]
