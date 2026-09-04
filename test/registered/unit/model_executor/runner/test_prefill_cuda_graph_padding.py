@@ -4,6 +4,7 @@ from unittest import mock
 
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor import forward_batch_info
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -74,8 +75,15 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
             forward_batch, num_qo_tokens=16
         )
 
-    def _megamoe_no_prefill_cp(self):
+    def _megamoe_no_prefill_cp(self, graph_has_dp_gather=False):
         return (
+            mock.patch.object(
+                forward_batch_info,
+                "get_flags",
+                return_value=SimpleNamespace(
+                    dp=SimpleNamespace(prefill_graph_has_dp_gather=graph_has_dp_gather)
+                ),
+            ),
             mock.patch(
                 "sglang.srt.layers.moe.utils.get_moe_a2a_backend",
                 return_value=MoeA2ABackend.MEGAMOE,
@@ -96,8 +104,8 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         # collective sequences deadlocked. The sparse batch must keep MAX_LEN
         # and take the eager fallback like every other a2a backend.
         runner = self._make_runner()
-        a2a, dsa_cp, mla_cp = self._megamoe_no_prefill_cp()
-        with a2a, dsa_cp, mla_cp:
+        flags, a2a, dsa_cp, mla_cp = self._megamoe_no_prefill_cp()
+        with flags, a2a, dsa_cp, mla_cp:
             self.assertFalse(prefill_graph_tolerates_sum_len([8, 0]))
             self.assertTrue(
                 runner._has_inactive_dp_rank(
@@ -107,12 +115,28 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
 
     def test_megamoe_all_ranks_busy_keeps_per_rank_buckets(self):
         runner = self._make_runner()
-        a2a, dsa_cp, mla_cp = self._megamoe_no_prefill_cp()
-        with a2a, dsa_cp, mla_cp:
+        flags, a2a, dsa_cp, mla_cp = self._megamoe_no_prefill_cp()
+        with flags, a2a, dsa_cp, mla_cp:
             self.assertTrue(prefill_graph_tolerates_sum_len([8, 16]))
             self.assertFalse(
                 runner._has_inactive_dp_rank(
                     SimpleNamespace(global_num_tokens_cpu=[8, 16])
+                )
+            )
+
+    def test_megamoe_graph_with_dp_gather_forces_shared_bucket(self):
+        # Regression (#37561): a DP gather recorded inside the prefill graph
+        # carries MAX_LEN geometry, so per-rank buckets deadlock the NCCL
+        # all_gather even when every rank is busy (Kimi-K3 dense layer 0).
+        runner = self._make_runner()
+        flags, a2a, dsa_cp, mla_cp = self._megamoe_no_prefill_cp(
+            graph_has_dp_gather=True
+        )
+        with flags, a2a, dsa_cp, mla_cp:
+            self.assertFalse(prefill_graph_tolerates_sum_len([8, 200]))
+            self.assertTrue(
+                runner._has_inactive_dp_rank(
+                    SimpleNamespace(global_num_tokens_cpu=[8, 0])
                 )
             )
 

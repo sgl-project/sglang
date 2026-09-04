@@ -53,6 +53,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_flags,
     get_lora,
     get_parallel,
 )
@@ -311,6 +312,11 @@ def prefill_graph_tolerates_sum_len(global_num_tokens: list[int]) -> bool:
     from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 
     if not get_moe_a2a_backend().is_megamoe():
+        return False
+    # The graph body is captured with MAX_LEN geometry; a DP gather/scatter
+    # recorded inside it (e.g. Kimi-K3's dense layer over the TP group) only
+    # matches when every DP rank replays the same bucket (#37561).
+    if get_flags().dp.prefill_graph_has_dp_gather:
         return False
     # Under SUM_LEN a 0-token rank keeps ForwardMode.IDLE and runs eager while
     # the busy ranks replay the graph (captured with MAX_LEN collectives); the

@@ -515,6 +515,12 @@ class DpFlags(_FlagGroupBase):
     # Hybrid-SSM models materialize idle ranks via the MAX_LEN fabricated-row
     # conversion (set when hf_config has hybrid_override_pattern).
     max_len_with_idle: bool = False
+    # Set by the prefill CUDA graph runner for the duration of its capture and
+    # latched by the DP gather/scatter helpers when they run inside it. The
+    # graph body records MAX_LEN geometry, so a captured DP gather/scatter only
+    # replays correctly when every DP rank uses the same bucket.
+    capturing_prefill_graph: bool = False
+    prefill_graph_has_dp_gather: bool = False
     # DP gathered-buffer allocation metadata (model hidden size / dtype /
     # device), set by initialize_dp_attention alongside the flags above.
     buffer_hidden_size: Any = None
