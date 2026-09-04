@@ -48,8 +48,9 @@ class KernelBackend(str, Enum):
     FLASHINFER = "flashinfer"
     DEEPGEMM = "deepgemm"
     AITER = "aiter"  # AMD aiter library (device=HIP)
+    SGL_KERNEL_NPU = "sgl_kernel_npu"  # SGLang Ascend kernel package (device=NPU)
     TORCH_NPU = "torch_npu"  # Ascend NPU vendor runtime (device=NPU)
-    # TODO(RFC #29630): more provenance as needed (cpu-avx, sgl_kernel_npu, ...)
+    # TODO(RFC #29630): more provenance as needed (cpu-avx, ...)
 
 
 class DeviceType(str, Enum):
