@@ -584,7 +584,13 @@ class FusedMoE(torch.nn.Module):
         return [
             (name, tensor)
             for name, tensor in sorted(found.items())
-            if name not in ("w13_weight", "w2_weight")
+            if name
+            not in (
+                "w13_weight",
+                "w2_weight",
+                "w13_weight_packed",
+                "w2_weight_packed",
+            )
             and tensor.ndim > 0
             and tensor.shape[0] == num_local_experts
         ]
@@ -603,10 +609,11 @@ class FusedMoE(torch.nn.Module):
         # 1. CPU (always)
         # 2. GPU with flashinfer_trtllm padding (when intermediate_size is padded to 128)
         # 3. GPU with Aiter padding
+        w2_weight = getattr(self, "w2_weight", getattr(self, "w2_weight_packed", None))
         aiter_padded = (
             _use_aiter
-            and hasattr(self, "w2_weight")
-            and getattr(self.w2_weight, "weight_padded", False)
+            and w2_weight is not None
+            and getattr(w2_weight, "weight_padded", False)
         )
 
         return _is_cpu or self.use_flashinfer_trtllm_moe or aiter_padded
@@ -884,7 +891,12 @@ class FusedMoE(torch.nn.Module):
         if not is_weight and not is_scale:
             return False
 
-        weight_param = self.w2_weight if shard_id == "w2" else self.w13_weight
+        runtime_weight_name = "w2_weight" if shard_id == "w2" else "w13_weight"
+        weight_param = getattr(
+            self,
+            runtime_weight_name,
+            getattr(self, f"{runtime_weight_name}_packed", None),
+        )
         scale_param = (
             self.w2_weight_scale_inv if shard_id == "w2" else self.w13_weight_scale_inv
         )

@@ -162,6 +162,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Store parameters needed for KT initialization
         self._layer_params = None
 
+    def prepare_weights_for_post_load(self, layer: torch.nn.Module) -> None:
+        self.gpu_method.prepare_weights_for_post_load(layer)
+
     def create_weights(
         self,
         layer: torch.nn.Module,

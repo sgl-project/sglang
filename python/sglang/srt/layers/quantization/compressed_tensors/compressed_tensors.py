@@ -231,7 +231,10 @@ class CompressedTensorsConfig(QuantizationConfig):
                 logger.info_once(
                     "Using Mxfp4MoEMethod for MXFP4 compressed-tensors MoE"
                 )
-                return Mxfp4MoEMethod(prefix=prefix)
+                return Mxfp4MoEMethod(
+                    prefix=prefix,
+                    checkpoint_weight_suffix="weight_packed",
+                )
 
             layer.scheme = self.get_moe_scheme(layer=layer, layer_name=prefix)
             if layer.scheme is None:  # ignored layer

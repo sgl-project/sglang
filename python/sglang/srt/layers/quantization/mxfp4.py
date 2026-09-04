@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 from dataclasses import replace
 from functools import lru_cache
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Literal, Optional
 
 import torch
 from torch.nn.parameter import Parameter
@@ -380,10 +380,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     def __init__(
         self,
         prefix: str,
+        checkpoint_weight_suffix: Literal["weight", "weight_packed"] = "weight",
     ):
         super().__init__()
 
         self.prefix = prefix
+        self.checkpoint_weight_suffix = checkpoint_weight_suffix
         self.topk_indices_dtype = None
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         self.with_bias = False
@@ -432,6 +434,44 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     "moe_runner_backend=flashinfer_mxfp4 requires SM90, SM100, "
                     "or SM120."
                 )
+
+    def _checkpoint_weight_name(self, fused_weight_name: str) -> str:
+        return f"{fused_weight_name}_{self.checkpoint_weight_suffix}"
+
+    def _bind_runtime_weight_names(self, layer: torch.nn.Module) -> None:
+        """Expose loaded checkpoint weights under the runtime MoE ABI names."""
+        if self.checkpoint_weight_suffix == "weight":
+            return
+
+        bindings = []
+        for fused_weight_name in ("w13", "w2"):
+            checkpoint_name = self._checkpoint_weight_name(fused_weight_name)
+            runtime_name = f"{fused_weight_name}_weight"
+            checkpoint_param = layer._parameters.get(checkpoint_name)
+            runtime_param = layer._parameters.get(runtime_name)
+
+            # Keep this idempotent for callers that finalize an already-loaded
+            # layer more than once.
+            if checkpoint_param is None:
+                if runtime_param is not None:
+                    continue
+                raise RuntimeError(
+                    f"Missing MXFP4 MoE checkpoint parameter {checkpoint_name!r}"
+                )
+            if runtime_param is not None:
+                raise RuntimeError(
+                    f"Both MXFP4 MoE parameters {checkpoint_name!r} and "
+                    f"{runtime_name!r} are registered"
+                )
+
+            bindings.append((checkpoint_name, runtime_name, checkpoint_param))
+
+        for checkpoint_name, runtime_name, checkpoint_param in bindings:
+            delattr(layer, checkpoint_name)
+            layer.register_parameter(runtime_name, checkpoint_param)
+
+    def prepare_weights_for_post_load(self, layer: torch.nn.Module) -> None:
+        self._bind_runtime_weight_names(layer)
 
     def create_weights(
         self,
@@ -555,7 +595,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             ),
             requires_grad=False,
         )
-        layer.register_parameter("w13_weight", w13_weight)
+        layer.register_parameter(self._checkpoint_weight_name("w13"), w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
         w13_weight_scale = torch.nn.Parameter(
@@ -597,7 +637,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             ),
             requires_grad=False,
         )
-        layer.register_parameter("w2_weight", w2_weight)
+        layer.register_parameter(self._checkpoint_weight_name("w2"), w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
         w2_weight_scale = torch.nn.Parameter(
@@ -625,6 +665,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
+        self.prepare_weights_for_post_load(layer)
+
         if self.use_marlin and not self.use_mega_moe:
             from sglang.srt.layers.quantization.marlin_utils import (
                 check_moe_marlin_supports_layer,

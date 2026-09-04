@@ -23,6 +23,31 @@ PROCESS_DEVICE = _process_device()
 
 @unittest.skipUnless(PROCESS_DEVICE is not None, "requires CUDA")
 class TestModulePostLoadStaging(unittest.TestCase):
+    def test_prepares_parameter_rename_before_staging_snapshot(self):
+        class RenameWeightForRuntime:
+            @staticmethod
+            def prepare_weights_for_post_load(module: nn.Module) -> None:
+                weight = module._parameters["weight_packed"]
+                delattr(module, "weight_packed")
+                module.register_parameter("weight", weight)
+
+        module = nn.Module()
+        module.weight_packed = nn.Parameter(torch.ones(2))
+        module.resident = nn.Parameter(torch.ones(1, device=PROCESS_DEVICE))
+        module.quant_method = RenameWeightForRuntime()
+
+        with device_loading_context(module, PROCESS_DEVICE):
+            self.assertFalse(hasattr(module, "weight_packed"))
+            self.assertEqual(module.weight.device, PROCESS_DEVICE)
+            module.weight = nn.Parameter(torch.ones(3, device=PROCESS_DEVICE))
+
+        # The owner has mixed CPU/GPU residency and post-load processing
+        # replaced the renamed parameter. The runtime slot must still inherit
+        # the checkpoint slot's original CPU device.
+        self.assertEqual(module.weight.device.type, "cpu")
+        self.assertEqual(module.weight.shape, (3,))
+        self.assertEqual(module.resident.device, PROCESS_DEVICE)
+
     def test_preserves_unchanged_parameter_and_buffer_storage(self):
         module = nn.Module()
         module.weight = nn.Parameter(torch.arange(4.0).reshape(2, 2))
