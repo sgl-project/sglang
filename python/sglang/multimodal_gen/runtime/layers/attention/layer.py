@@ -928,8 +928,8 @@ class USPAttention(nn.Module):
         ctx_attn_metadata = forward_context.attn_metadata
         if (
             attn_mask is not None
-            and not self.is_cross_attention
             and get_request_skip_softmax_params() is not None
+            and not self.is_cross_attention
         ):
             raise NotImplementedError(
                 "Skip Softmax does not support USPAttention masks."
