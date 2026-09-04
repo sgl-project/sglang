@@ -122,14 +122,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         """Precompute metadata for normal decode mode."""
         max_len = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
 
-        if (
-            _is_cuda
-            and not _is_hip
-            and (
-                self.dsa_index_kpool <= 1
-                or getattr(self, "experimental_kpool_metadata_fusion", False)
-            )
-        ):
+        if _is_cuda and not _is_hip and self.dsa_index_kpool <= 1:
             from sglang.kernels.ops.attention.dsa_metadata import (
                 fused_dsa_decode_metadata,
             )
@@ -167,7 +160,6 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 max_len=max_len,
                 dsa_index_topk=self.dsa_index_topk,
                 real_page_size=self.real_page_size,
-                index_kpool=self.dsa_index_kpool,
             )
             seqlens_expanded = cache_seqlens
             seqlens_expanded_size = bs
