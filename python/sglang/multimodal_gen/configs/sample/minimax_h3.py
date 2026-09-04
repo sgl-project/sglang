@@ -214,16 +214,9 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 "MiniMax H3 does not support enable_teacache: its packed "
                 "video/audio denoise loop has no lossless TeaCache contract"
             )
-        if self.rollout:
-            raise ValueError(
-                "MiniMax H3 does not support rollout: its coupled video/audio "
-                "scheduler has no SchedulerRLMixin contract"
-            )
-        if self.return_trajectory_latents or self.return_trajectory_decoded:
-            raise ValueError(
-                "MiniMax H3 does not support trajectory output for its coupled "
-                "video/audio denoise state"
-            )
+        # Rollout is video-only Flow-GRPO: H3 maps velocity onto the shared
+        # flow-SDE (``to_flow_model_output``) and leaves audio on the
+        # deterministic Euler. Trajectory / env collection is allowed.
         seeds = self.seed if isinstance(self.seed, list) else [self.seed]
         for seed in seeds:
             if seed > _MINIMAX_H3_MAX_SIGNED_SEED:
