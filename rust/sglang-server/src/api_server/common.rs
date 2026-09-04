@@ -8,11 +8,12 @@
 use axum::{
     Router,
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use super::app::AppState;
 use super::guard::AbortGuard;
@@ -33,6 +34,23 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         // alias).
         .route("/get_model_info", get(model_info))
         .route("/model_info", get(model_info))
+        .route("/startup_ready", post(startup_ready))
+}
+
+/// Internal startup latch used by the Python launcher after warmup completes.
+/// It is intentionally separate from `/health_generate`: model_info and warmup
+/// traffic must work before this latch opens, while readiness probes must not.
+async fn startup_ready(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let expected = state.server_args.startup_ready_token.as_str();
+    let supplied = headers
+        .get("x-sglang-startup-token")
+        .and_then(|value| value.to_str().ok());
+    if expected.is_empty() || supplied != Some(expected) {
+        tracing::warn!("startup_ready: rejected invalid startup token");
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    state.ready.store(true, Ordering::Release);
+    StatusCode::OK.into_response()
 }
 
 /// Submit a control request through the request FSM (no tokenization) and await the
@@ -225,6 +243,10 @@ mod tests {
         assert!(
             !text.contains("admin-token"),
             "admin_api_key leaked: {text}"
+        );
+        assert!(
+            !text.contains("test-startup-token"),
+            "startup_ready_token leaked: {text}"
         );
 
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();

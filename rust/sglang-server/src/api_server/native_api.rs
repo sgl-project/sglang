@@ -9,6 +9,7 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -96,8 +97,8 @@ pub(super) fn native_error(code: StatusCode, message: &str, stream: bool) -> Res
 /// restart. The deep-probe handler is built once with
 /// `SGLANG_HEALTH_CHECK_TIMEOUT` frozen in and serves `/health_generate`
 /// always; `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION` (default true, mirroring
-/// Python) decides whether `/health` shares it or is a plain 200 (routing the
-/// request already proves the frontend is up).
+/// Python) decides whether `/health` shares it or only checks startup
+/// readiness.
 fn health_routes() -> Router<Arc<AppState>> {
     let timeout = std::time::Duration::from_secs(
         environ::env_i64("SGLANG_HEALTH_CHECK_TIMEOUT", 20).max(0) as u64,
@@ -106,11 +107,19 @@ fn health_routes() -> Router<Arc<AppState>> {
     let health = if environ::env_bool("SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION", true) {
         probe.clone()
     } else {
-        get(|| async { StatusCode::OK.into_response() })
+        get(health_ready)
     };
     Router::new()
         .route("/health", health)
         .route("/health_generate", probe)
+}
+
+async fn health_ready(State(state): State<Arc<AppState>>) -> Response {
+    if state.ready.load(Ordering::Acquire) {
+        StatusCode::OK.into_response()
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE.into_response()
+    }
 }
 
 /// Sentinel host that makes the KV connector no-op. Parity with
@@ -131,6 +140,10 @@ async fn health_generate(
     State(state): State<Arc<AppState>>,
     timeout: std::time::Duration,
 ) -> Response {
+    if !state.ready.load(Ordering::Acquire) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+
     let baseline = state
         .response_activity
         .load(std::sync::atomic::Ordering::Relaxed);

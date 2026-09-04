@@ -2386,6 +2386,31 @@ def _freeze_gc_after_server_warmup(server_args: ServerArgs):
         logger.warning("post-warmup freeze_gc failed", exc_info=True)
 
 
+def _mark_rust_server_ready(server_args: ServerArgs, port_args: PortArgs) -> bool:
+    assert envs.SGLANG_RUST_SERVER.get()
+    if not port_args.instance_id:
+        logger.error("failed to mark Rust server ready: empty startup token")
+        kill_process_tree(os.getpid())
+        return False
+    ready_key = server_args.admin_api_key or server_args.api_key
+    headers = {"X-SGLang-Startup-Token": port_args.instance_id}
+    if ready_key:
+        headers["Authorization"] = f"Bearer {ready_key}"
+    try:
+        res = requests.post(
+            server_args.url() + "/startup_ready",
+            headers=headers,
+            timeout=10,
+            verify=ssl_verify_of(server_args),
+        )
+        res.raise_for_status()
+        return True
+    except requests.exceptions.RequestException:
+        logger.error("failed to mark Rust server ready", exc_info=True)
+        kill_process_tree(os.getpid())
+        return False
+
+
 def _wait_and_warmup(
     server_args: ServerArgs,
     launch_callback: Optional[Callable[[], None]] = None,
@@ -2830,11 +2855,14 @@ def launch_server(
         # The Rust server serves api-server, tokenizer, and detokenizer, so the
         # main process has no Python HTTP server / tokenizer manager to run.
         # Run a warmup /generate before advertising readiness: the Rust /health
-        # and /get_model_info endpoints are static (200 as soon as the server
-        # binds, before any forward pass), so without this the first real request
+        # binds before any forward pass, so without this the first real request
         # pays the cold-start cost (observed as a >60s first generation).
-        if not get_serving().skip_server_warmup:
-            _execute_server_warmup(server_args)
+        if not get_serving().skip_server_warmup and not _execute_server_warmup(
+            server_args
+        ):
+            return
+        if not _mark_rust_server_ready(server_args, port_args):
+            return
         logger.info("The server is fired up and ready to roll!")
         if launch_callback is not None:
             launch_callback()
