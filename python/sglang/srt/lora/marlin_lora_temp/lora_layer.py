@@ -16,17 +16,7 @@ if TYPE_CHECKING:
 
 def init_experimental_sgl_marlin_lora(layer, base_layer) -> None:
     """Store Marlin quantization metadata on the wrapped layer."""
-    from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
-        CompressedTensorsFusedMoEMethod,
-    )
-    from sglang.srt.layers.quantization.modelopt_quant import (
-        ModelOptNvFp4FusedMoEMethod,
-    )
-
-    assert isinstance(
-        base_layer.quant_method,
-        (CompressedTensorsFusedMoEMethod, ModelOptNvFp4FusedMoEMethod),
-    ), (
+    assert hasattr(base_layer.quant_method, "get_marlin_quant_info"), (
         f"experimental_sgl_marlin requires a quant method exposing "
         f"get_marlin_quant_info, got {type(base_layer.quant_method).__name__}"
     )
