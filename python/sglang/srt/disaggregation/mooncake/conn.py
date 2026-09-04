@@ -1525,13 +1525,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 src_ptrs,
                 dst_ptrs,
                 self.kv_args.prefill_start_layer,
-                getattr(self.kv_args, "prefill_end_layer", None),
+                self.kv_args.prefill_end_layer,
             )
             dst_item_lens = slice_dsa_tail_dst_ptrs_for_pp(
                 src_ptrs,
                 dst_item_lens,
                 self.kv_args.prefill_start_layer,
-                getattr(self.kv_args, "prefill_end_layer", None),
+                self.kv_args.prefill_end_layer,
             )
             transfer_blocks = build_dsa_tail_transfer_blocks(
                 src_ptrs,

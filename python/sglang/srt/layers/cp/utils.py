@@ -47,13 +47,14 @@ def is_glm_dsa_cache_layer_split_enabled(model_runner: "ModelRunner") -> bool:
     Layer split is a prefill-CP-only optimization for DSA (DeepSeek Sparse
     Attention) MLA models (e.g. GLM-5.2). Draft workers keep the full cache.
     """
+    from sglang.srt.configs.hybrid_arch import mambaish_config
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
     return (
         not model_runner.is_draft_worker
         and get_parallel().enable_dsa_cache_layer_split
         and model_runner.use_mla_backend
-        and not getattr(model_runner, "mambaish_config", None)
+        and mambaish_config(model_runner.model_config) is None
         and is_deepseek_dsa(model_runner.model_config.hf_config)
     )
 
