@@ -373,6 +373,10 @@ class ApertusModel(nn.Module):
 
         return hidden_states, aux_hidden_states
 
+    def get_input_embeddings(self) -> nn.Embedding:
+        """Return the text/code-token embedding table used at the first PP rank."""
+        return self.embed_tokens
+
     # If this function is called, it should always initialize KV cache scale
     # factors (or else raise an exception). Thus, handled exceptions should
     # make sure to leave KV cache scale factors in a known good (dummy) state

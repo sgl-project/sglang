@@ -15,10 +15,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 GPT_OSS_CALL_TOKEN = 200012
+APERTUS_TOOLS_SUFFIX_TOKEN = 72
 
 
-def _trim(output, matched, no_stop_trim, *, gpt_oss=False):
-    stub = SimpleNamespace(is_tool_call_parser_gpt_oss=gpt_oss)
+def _trim(output, matched, no_stop_trim, *, gpt_oss=False, apertus2509=False):
+    stub = SimpleNamespace(
+        is_tool_call_parser_gpt_oss=gpt_oss,
+        is_tool_call_parser_apertus2509=apertus2509,
+    )
     finished_reason = None if matched is None else {"matched": matched}
     return DetokenizerManager.trim_matched_stop(
         stub, output, finished_reason, no_stop_trim
@@ -61,6 +65,18 @@ class TestTrimMatchedStop(unittest.TestCase):
         self.assertEqual(
             _trim([1, 2, GPT_OSS_CALL_TOKEN], GPT_OSS_CALL_TOKEN, False, gpt_oss=True),
             [1, 2, GPT_OSS_CALL_TOKEN],
+        )
+
+    def test_token_apertus_tools_suffix_kept(self):
+        # Apertus tools suffix is also an eos; keep it for the tool-call parser.
+        self.assertEqual(
+            _trim(
+                [1, 2, APERTUS_TOOLS_SUFFIX_TOKEN],
+                APERTUS_TOOLS_SUFFIX_TOKEN,
+                False,
+                apertus2509=True,
+            ),
+            [1, 2, APERTUS_TOOLS_SUFFIX_TOKEN],
         )
 
 
