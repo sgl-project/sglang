@@ -25,8 +25,6 @@ if TYPE_CHECKING:
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
-    _kvcache = None
-
     @abc.abstractmethod
     def __init__(
         self,
