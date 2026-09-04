@@ -917,6 +917,9 @@ class ChatCompletionRequest(BaseModel):
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
     use_audio_in_video: bool = False
+    processor_kwargs: Optional[Dict[str, Any]] = None
+    mm_process_config: Optional[Dict[str, Any]] = None
+    io_kwargs: Optional[Dict[str, Any]] = None
 
     images_config: Optional[Dict] = None
     video_config: Optional[Dict] = None
@@ -1641,6 +1644,9 @@ class ResponsesRequest(BaseModel):
     top_k: Optional[int] = None
     min_p: Optional[float] = None
     repetition_penalty: Optional[float] = None
+    processor_kwargs: Optional[Dict[str, Any]] = None
+    mm_process_config: Optional[Dict[str, Any]] = None
+    io_kwargs: Optional[Dict[str, Any]] = None
 
     # Default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
@@ -2067,6 +2073,9 @@ class TranscriptionRequest(BaseModel):
     # Internal fields (not from API)
     audio_data: Optional[bytes] = None
     audio_duration_s: float = 0.0
+    processor_kwargs: Optional[Dict[str, Any]] = None
+    mm_process_config: Optional[Dict[str, Any]] = None
+    io_kwargs: Optional[Dict[str, Any]] = None
 
 
 class TranscriptionUsage(BaseModel):

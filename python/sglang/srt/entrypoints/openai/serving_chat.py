@@ -1155,6 +1155,9 @@ class OpenAIServingChat(OpenAIServingBase):
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
             use_audio_in_video=getattr(request, "use_audio_in_video", False),
+            processor_kwargs=getattr(request, "processor_kwargs", None),
+            mm_process_config=getattr(request, "mm_process_config", None),
+            io_kwargs=getattr(request, "io_kwargs", None),
             return_prompt_token_ids=request.return_prompt_token_ids
             or request.return_token_ids,
         )

@@ -218,6 +218,12 @@ class GenerateReqInput:
     ] = None
     # Whether to extract and process audio from video inputs.
     use_audio_in_video: bool = False
+    # Runtime multimodal processor kwargs forwarded through the API server.
+    processor_kwargs: Optional[Dict[str, Any]] = None
+    # Runtime multimodal process config overrides merged with server defaults.
+    mm_process_config: Optional[Dict[str, Any]] = None
+    # Runtime multimodal IO config overrides keyed by modality.
+    io_kwargs: Optional[Dict[str, Any]] = None
     # Optional request-scoped video processor configuration.
     video_config: Optional[Dict[str, Any]] = None
     # The sampling_params. See descriptions below.
@@ -890,6 +896,9 @@ class GenerateReqInput:
             image_data=self.image_data[i],
             video_data=self.video_data[i],
             audio_data=self.audio_data[i],
+            processor_kwargs=copy.deepcopy(self.processor_kwargs),
+            mm_process_config=copy.deepcopy(self.mm_process_config),
+            io_kwargs=copy.deepcopy(self.io_kwargs),
             mm_hashes=self.mm_hashes[i] if self.mm_hashes is not None else None,
             mm_content_hashes=(
                 self.mm_content_hashes[i]

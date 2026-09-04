@@ -202,6 +202,44 @@ class ChatToolForwardingTestCase(CustomTestCase):
         self.assertFalse(seen["parallel_tool_calls"])
         self.assertEqual(processed.tool_call_constraint[0], "json_schema")
 
+    def test_make_request_preserves_runtime_mm_kwargs(self):
+        serving = make_serving()
+        seen = {}
+
+        def fake_process(chat_request, is_multimodal):
+            seen["processor_kwargs"] = chat_request.processor_kwargs
+            seen["mm_process_config"] = chat_request.mm_process_config
+            seen["io_kwargs"] = chat_request.io_kwargs
+            return MessageProcessingResult(
+                prompt="prompt",
+                prompt_ids=[1, 2, 3],
+                image_data=None,
+                audio_data=None,
+                video_data=None,
+                modalities=[],
+                stop=["</s>"],
+            )
+
+        serving._process_messages = Mock(side_effect=fake_process)
+        request = ResponsesRequest(
+            model="x",
+            input="hello",
+            processor_kwargs={"images_kwargs": {"max_pixels": 1024}},
+            mm_process_config={"image": {"max_pixels": 2048}},
+            io_kwargs={"video": {"frame_count_limit": 8}},
+            store=False,
+        )
+
+        asyncio.run(
+            serving._make_request(request, None, serving.tokenizer_manager.tokenizer)
+        )
+
+        self.assertEqual(
+            seen["processor_kwargs"], {"images_kwargs": {"max_pixels": 1024}}
+        )
+        self.assertEqual(seen["mm_process_config"], {"image": {"max_pixels": 2048}})
+        self.assertEqual(seen["io_kwargs"], {"video": {"frame_count_limit": 8}})
+
     def test_required_tool_choice_without_function_tool_returns_400(self):
         serving = make_serving()
         request = ResponsesRequest(

@@ -964,6 +964,32 @@ class ServingChatTestCase(unittest.TestCase):
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertEqual(kwargs["tools"], expected_tools)
 
+    def test_convert_to_internal_request_preserves_runtime_mm_kwargs(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            processor_kwargs={"images_kwargs": {"max_pixels": 1024}},
+            mm_process_config={"image": {"max_pixels": 2048}},
+            io_kwargs={"video": {"frame_count_limit": 8}},
+        )
+        with patch.object(self.chat, "_process_messages") as proc_mock:
+            proc_mock.return_value = MessageProcessingResult(
+                prompt="Test prompt",
+                prompt_ids=[1, 2, 3],
+                image_data=None,
+                audio_data=None,
+                video_data=None,
+                modalities=[],
+                stop=["</s>"],
+            )
+            adapted, _ = self.chat._convert_to_internal_request(req)
+
+        self.assertEqual(
+            adapted.processor_kwargs, {"images_kwargs": {"max_pixels": 1024}}
+        )
+        self.assertEqual(adapted.mm_process_config, {"image": {"max_pixels": 2048}})
+        self.assertEqual(adapted.io_kwargs, {"video": {"frame_count_limit": 8}})
+
     def test_jinja_tool_schema_fallback_to_flat_function(self):
         """Fallback to function-only schema when template rejects OpenAI wrapper."""
         self.template_manager.chat_template_name = None
