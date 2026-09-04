@@ -555,6 +555,27 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         self.pad_input_ids = self.thinker.pad_input_ids
         self.forward = self.thinker.forward
 
+    def get_embed_and_head(self):
+        # EAGLE3 support: delegate to the thinker (Qwen3VLMoe base implements it).
+        return self.thinker.get_embed_and_head()
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        # EAGLE3 support: aux-hidden capture happens inside the thinker's text
+        # backbone; its forward already threads aux states via its
+        # LogitsProcessor, so this wrapper's forward needs no change.
+        self.thinker.set_eagle3_layers_to_capture(layer_ids)
+
+    # --- DFlash support (same delegation pattern as qwen2_audio.py) ---
+    def get_input_embeddings(self):
+        return self.thinker.get_input_embeddings()
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        self.thinker.set_dflash_layers_to_capture(layer_ids)
+
+    @property
+    def lm_head(self):
+        return self.thinker.lm_head
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
