@@ -39,7 +39,7 @@ from sglang.srt.disaggregation.kv_events import (
     StorageMedium,
 )
 from sglang.srt.managers.schedule_batch import ReqKvInfo
-from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.token import TokenedKVAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
@@ -497,7 +497,7 @@ class TestRadixCache(unittest.TestCase):
             def write(self, indices, values):
                 self.req_to_token[indices] = values
 
-        allocator = TokenToKVPoolAllocator(
+        allocator = TokenedKVAllocator(
             size=16,
             dtype=torch.float16,
             device="cpu",

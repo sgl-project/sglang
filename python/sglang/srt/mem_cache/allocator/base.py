@@ -24,7 +24,74 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 
-class BaseTokenToKVPoolAllocator(abc.ABC):
+class KVFreeSide(abc.ABC):
+    """The release half of an allocator: free, free_segment(s), free groups,
+    available_size. A single pool is one; a hybrid allocator exposes one per
+    side, addressed by full-attention slot ids."""
+
+    page_size: int
+    # None: free right away. A list: hold frees until free_group_end().
+    free_group: list[torch.Tensor] | None
+
+    @abc.abstractmethod
+    def available_size(self):
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def free(self, free_index: torch.Tensor):
+        raise NotImplementedError()
+
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        """Free ``kv_row[start_pos : start_pos + n]`` of one request.
+
+        In page units the segment is ``[start_pos // ps, ceil(end / ps))``:
+        ``start_pos`` sits on a page boundary, the end may fall mid-page, and
+        the whole last page is released. Default: plain free()."""
+        assert start_pos % self.page_size == 0, (
+            f"segment start {start_pos} is not page-aligned"
+        )
+        self.free(free_index)
+
+    def free_segments(self, segments):
+        """Free several ``(free_index, start_pos)`` segments of one request's
+        kv row.
+
+        Each segment covers the pages ``[start_pos // ps, ceil(end / ps))``.
+        Starts sit on page boundaries, ends may fall mid-page, and the page
+        ranges of consecutive segments do not overlap -- so in page units the
+        segments are aligned and disjoint, and every page is released once."""
+        for free_index, start_pos in self._page_disjoint(segments):
+            self.free_segment(free_index, start_pos=start_pos)
+
+    def _page_disjoint(self, segments):
+        ps = self.page_size
+        prev_end = None
+        for free_index, start_pos in segments:
+            n = free_index.numel()
+            if n == 0:
+                continue
+            assert prev_end is None or start_pos // ps > (prev_end - 1) // ps, (
+                f"segment at {start_pos} shares a page with the one ending at {prev_end}"
+            )
+            prev_end = start_pos + n
+            yield free_index, start_pos
+
+    def free_group_begin(self):
+        assert self.free_group is None, "free groups cannot be nested"
+        self.free_group = []
+
+    def free_group_end(self):
+        pending, self.free_group = self.free_group, None
+        if pending:
+            self.free(torch.cat(pending))
+
+    @staticmethod
+    def _copy_for_free_group(free_index: torch.Tensor) -> torch.Tensor:
+        """Take ownership before a caller can mutate a deferred tensor view."""
+        return free_index.clone()
+
+
+class BaseKVAllocator(KVFreeSide):
     @abc.abstractmethod
     def __init__(
         self,
@@ -101,20 +168,6 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             return self.free_pages
         return torch.cat((self.free_pages, self.release_pages))
 
-    def free_group_begin(self):
-        assert self.free_group is None, "free groups cannot be nested"
-        self.free_group = []
-
-    def free_group_end(self):
-        pending, self.free_group = self.free_group, None
-        if pending:
-            self.free(torch.cat(pending))
-
-    @staticmethod
-    def _copy_for_free_group(free_index: torch.Tensor) -> torch.Tensor:
-        """Take ownership before a caller can mutate a deferred tensor view."""
-        return free_index.clone()
-
     def merge_and_sort_free(self):
         if len(self.release_pages) > 0:
             self.free_pages = torch.cat((self.free_pages, self.release_pages))
@@ -160,63 +213,3 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     @abc.abstractmethod
     def alloc(self, need_size: int):
         raise NotImplementedError()
-
-    @abc.abstractmethod
-    def free(self, free_index: torch.Tensor):
-        raise NotImplementedError()
-
-    def free_full(self, free_index: torch.Tensor):
-        """Free slots whose SWA peers the caller already released.
-
-        A hybrid SWA allocator pairs each full-attention slot with an SWA slot
-        that can die first; this releases the full side alone. A single pool has
-        no peer, so it is a plain free()."""
-        self.free(free_index)
-
-    def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
-        """Free ``kv_row[start_pos : start_pos + n]`` of one request.
-
-        In page units the segment is ``[start_pos // ps, ceil(end / ps))``:
-        ``start_pos`` sits on a page boundary, the end may fall mid-page, and
-        the whole last page is released. Default: plain free()."""
-        assert start_pos % self.page_size == 0, (
-            f"segment start {start_pos} is not page-aligned"
-        )
-        self.free(free_index)
-
-    def free_segments(self, segments):
-        """Free several ``(free_index, start_pos)`` segments of one request's
-        kv row.
-
-        Each segment covers the pages ``[start_pos // ps, ceil(end / ps))``.
-        Starts sit on page boundaries, ends may fall mid-page, and the page
-        ranges of consecutive segments do not overlap -- so in page units the
-        segments are aligned and disjoint, and every page is released once."""
-        for free_index, start_pos in self._page_disjoint(segments):
-            self.free_segment(free_index, start_pos=start_pos)
-
-    def free_full_segment(self, free_index: torch.Tensor, *, start_pos: int):
-        """free_full() for a kv-row segment; same start-alignment contract as
-        free_segment(). Default: plain free_full()."""
-        assert start_pos % self.page_size == 0, (
-            f"segment start {start_pos} is not page-aligned"
-        )
-        self.free_full(free_index)
-
-    def free_full_segments(self, segments):
-        """free_segments() for the full side alone; see free_full()."""
-        for free_index, start_pos in self._page_disjoint(segments):
-            self.free_full_segment(free_index, start_pos=start_pos)
-
-    def _page_disjoint(self, segments):
-        ps = self.page_size
-        prev_end = None
-        for free_index, start_pos in segments:
-            n = free_index.numel()
-            if n == 0:
-                continue
-            assert prev_end is None or start_pos // ps > (prev_end - 1) // ps, (
-                f"segment at {start_pos} shares a page with the one ending at {prev_end}"
-            )
-            prev_end = start_pos + n
-            yield free_index, start_pos

@@ -73,7 +73,7 @@ from sglang.srt.runtime_context import (
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.allocator import BaseKVAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -104,7 +104,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
     dllm_enabled: bool
     max_req_len: int
     req_to_token_pool: ReqToTokenPool
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
+    token_to_kv_pool_allocator: BaseKVAllocator
     tree_cache: BasePrefixCache
     future_map: FutureMap
 

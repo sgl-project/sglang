@@ -31,7 +31,7 @@ from sglang.srt.kv_canary.state import CanaryDeviceState
 from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+    from sglang.srt.mem_cache.allocator.swa import HybridSWAKVAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -51,14 +51,14 @@ class CanaryManager:
         launch_capacities: CanaryLaunchCapacities,
         swa_window_size: int = 0,
         token_oracle_manager: Optional[TokenOracleManager] = None,
-        swa_allocator: Optional[SWATokenToKVPoolAllocator] = None,
+        swa_allocator: Optional[HybridSWAKVAllocator] = None,
         speculative_num_steps: int = 1,
         is_eagle_draft_decode: bool = False,
     ) -> None:
         self.config = config
         self._req_to_token_pool = req_to_token_pool
         self._swa_window_size = swa_window_size
-        self._swa_allocator: Optional[SWATokenToKVPoolAllocator] = swa_allocator
+        self._swa_allocator: Optional[HybridSWAKVAllocator] = swa_allocator
         self._outer_step_counter: int = 0
         self._active_single_forward_manager_index: Optional[int] = None
         self._model_forward_bracket_depth: int = 0

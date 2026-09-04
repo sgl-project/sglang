@@ -20,7 +20,7 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
 from sglang.srt.disaggregation.kv_events import OffloadedState
 from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.srt.managers.schedule_batch import ReqKvInfo
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import BaseKVAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -49,7 +49,7 @@ def _make_mock_req(
     return req
 
 
-class _RecordingAllocator(BaseTokenToKVPoolAllocator):
+class _RecordingAllocator(BaseKVAllocator):
     """Single-pool double. Subclassing the base routes free_full / free_segment /
     free_segments into free(), so a new free API cannot slip past the recorder."""
 

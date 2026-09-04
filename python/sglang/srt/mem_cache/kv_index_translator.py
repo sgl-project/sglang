@@ -66,8 +66,8 @@ from sglang.kernels.ops.kvcache.kv_read_table import (
 )
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.multi_ended_allocator import (
-    UnifiedMambaTokenToKVPoolAllocator,
-    UnifiedSWATokenToKVPoolAllocator,
+    UnifiedHybridSWAKVAllocator,
+    UnifiedMambaKVAllocator,
 )
 from sglang.srt.runtime_context import get_parallel
 
@@ -119,7 +119,7 @@ class KVIndexTranslator:
         self.is_translating = (
             isinstance(
                 token_to_kv_pool_allocator,
-                (UnifiedMambaTokenToKVPoolAllocator, UnifiedSWATokenToKVPoolAllocator),
+                (UnifiedMambaKVAllocator, UnifiedHybridSWAKVAllocator),
             )
             and token_to_kv_pool_allocator.get_kvcache() is token_to_kv_pool
         )
@@ -137,7 +137,7 @@ class KVIndexTranslator:
             # DCP read ids stay WIDENED to the consumer: selecting this rank's
             # share changes the length, so only the production site can do it.
             self.defer_read_translate = get_parallel().attn_dcp_size > 1
-            if isinstance(alloc, UnifiedSWATokenToKVPoolAllocator):
+            if isinstance(alloc, UnifiedHybridSWAKVAllocator):
                 self._swa_v2p_table = alloc.swa_v2p_page_table
                 self._swa_page_multiplier = alloc.swa_kernel_page_multiplier
                 self._swa_write_loc_from_full = self._swa_write_loc_unified

@@ -26,8 +26,8 @@ from sglang.srt.disaggregation.kv_events import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import TokenedKVAllocator
+from sglang.srt.mem_cache.allocator.swa import HybridSWAKVAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -519,7 +519,7 @@ def build_fixture(
         # Tree values reach the allocator as start_pos=0 segments, so only the
         # debug cross-check against torch.unique catches a mis-aligned value.
         with envs.SGLANG_DEBUG_MEMORY_POOL.override(True):
-            allocator = SWATokenToKVPoolAllocator(
+            allocator = HybridSWAKVAllocator(
                 size=cfg.kv_size,
                 size_swa=cfg.kv_size,
                 page_size=cfg.page_size,
@@ -540,7 +540,7 @@ def build_fixture(
             enable_memory_saver=False,
             mamba_pool=req_to_token_pool.mamba_pool,
         )
-        allocator = TokenToKVPoolAllocator(
+        allocator = TokenedKVAllocator(
             size=cfg.kv_size,
             dtype=cfg.dtype,
             device=device,
@@ -558,7 +558,7 @@ def build_fixture(
             device=device,
             enable_memory_saver=False,
         )
-        allocator = TokenToKVPoolAllocator(
+        allocator = TokenedKVAllocator(
             size=cfg.kv_size,
             dtype=cfg.dtype,
             device=device,
@@ -1300,7 +1300,7 @@ class UnifiedRadixCacheSuite:
         if not (self.cfg.has_swa and self.cfg.page_size > 1):
             return allocator.alloc(need_size)
 
-        # SWATokenToKVPoolAllocator.alloc() asserts page_size == 1, and
+        # HybridSWAKVAllocator.alloc() asserts page_size == 1, and
         # alloc_extend() requires batch tensors unsuitable for unit tests.
         # Replicate alloc_extend's core logic here.
         ps = self.cfg.page_size
@@ -3720,7 +3720,7 @@ class UnifiedRadixCacheSuite:
         # load-back must evict, not degrade to recompute (run-2 regression).
         def _avail():
             if cons.supports_swa():
-                return cons.token_to_kv_pool_allocator.full_available_size()
+                return cons.token_to_kv_pool_allocator.full.available_size()
             return cons.token_to_kv_pool_allocator.available_size()
 
         filler_base = 90000
@@ -4073,7 +4073,7 @@ class UnifiedRadixCacheSuite:
         # for an un-charged gate to accept.
         extend_need = 2 * ps + 1
         max_new = 8
-        hold = cons_alloc.swa_available_size() - (window + extend_need - 1)
+        hold = cons_alloc.swa.available_size() - (window + extend_need - 1)
         self.assertIsNotNone(cons_alloc.swa_attn_allocator.alloc(hold // ps * ps))
 
         # The adder's SWA gate for this request (_swa_budget_for_req).
@@ -4084,7 +4084,7 @@ class UnifiedRadixCacheSuite:
             + ps
             + (surfaced_swa_hit + ps - 1) // ps * ps
         )
-        budget = cons_alloc.swa_available_size() + cons.swa_evictable_size()
+        budget = cons_alloc.swa.available_size() + cons.swa_evictable_size()
 
         # Consume at admission (init_load_back + request lock).
         held = cons.buffer_pipeline.staged_prefetches[req_id]
@@ -4109,7 +4109,7 @@ class UnifiedRadixCacheSuite:
 
         self.assertEqual(cons.swa_evictable_size(), 0)  # window is protected
         # FULL stays roomy: only SWA can fail below.
-        self.assertGreaterEqual(cons_alloc.full_available_size(), extend_need + ps)
+        self.assertGreaterEqual(cons_alloc.full.available_size(), extend_need + ps)
 
         if reserved <= budget:
             try:
@@ -7559,7 +7559,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         _component_with_cache(ComponentType.FULL, cache).apply_component_action(
             FreeComponentDeviceSlot([indices], component_type=ComponentType.FULL)
         )
-        cache.token_to_kv_pool_allocator.full_attn_allocator.free_segment.assert_called_once_with(
+        cache.token_to_kv_pool_allocator.full.free_segment.assert_called_once_with(
             indices, start_pos=0
         )
 
@@ -7569,7 +7569,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         _component_with_cache(ComponentType.SWA, cache).apply_component_action(
             FreeComponentDeviceSlot([indices], component_type=ComponentType.SWA)
         )
-        cache.token_to_kv_pool_allocator.free_swa.assert_called_once_with(indices)
+        cache.token_to_kv_pool_allocator.swa.free.assert_called_once_with(indices)
 
     def test_apply_component_action_device_kv_mamba_uses_mamba_allocator(self):
         cache = mock.MagicMock()
@@ -7646,7 +7646,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         # translate the source full to SWA and store it on the node (no free)
         alloc.translate_loc_from_full_to_swa.assert_called_once_with(source_value)
         alloc.free.assert_not_called()
-        alloc.free_full.assert_not_called()
+        alloc.full.free.assert_not_called()
         cache.tree_core.set_component_device_value.assert_called_once_with(
             5, ComponentType.SWA, swa_value
         )
@@ -7681,7 +7681,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         alloc.set_full_to_swa_mapping.assert_called_once_with(kept_full, swa_value)
         # the incoming full's stale mapping is cleared, then its slot freed (full-only)
         alloc.clear_full_to_swa_mapping.assert_called_once_with(incoming_full)
-        alloc.free_full_segment.assert_called_once_with(incoming_full, start_pos=0)
+        alloc.full.free_segment.assert_called_once_with(incoming_full, start_pos=0)
         # Never by indexing the tensor: the unified composite has no
         # `full_to_swa_index_mapping` to index into.
         alloc.full_to_swa_index_mapping.__setitem__.assert_not_called()
@@ -8034,7 +8034,7 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         key = RadixKey(array("q", seq))
         evicted = self._alloc(allocator, len(seq))
         # Window eviction already released the peers below the floor.
-        allocator.free_swa(evicted)
+        allocator.swa.free(evicted)
         cache.insert(InsertParams(key=key, value=evicted, swa_evicted_seqlen=len(seq)))
         (leaf,) = _node_children(cache, cache.root_node_handle())
         lock_result = cache.inc_lock_ref(leaf) if lock_full else None
@@ -8068,7 +8068,7 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         seq = list(range(1, 2 * sw + 1))
         key = RadixKey(array("q", seq))
         evicted = self._alloc(allocator, len(seq))
-        allocator.free_swa(evicted[:sw])
+        allocator.swa.free(evicted[:sw])
         cache.insert(InsertParams(key=key, value=evicted, swa_evicted_seqlen=sw))
         value = self._alloc(allocator, len(seq))
         full_available = allocator.full_attn_allocator.available_size()
@@ -8094,7 +8094,7 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         seq = list(range(1, 2 * sw + 1))
         key = RadixKey(array("q", seq))
         evicted = self._alloc(allocator, len(seq))
-        allocator.free_swa(evicted[:sw])
+        allocator.swa.free(evicted[:sw])
         cache.insert(InsertParams(key=key, value=evicted, swa_evicted_seqlen=sw))
         (prefix_node,) = _node_children(cache, cache.root_node_handle())
         (window_node,) = _node_children(cache, prefix_node)
@@ -8126,7 +8126,7 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
 
         value = self._alloc(allocator, len(seq))
         # Window eviction already released the peers below the floor.
-        allocator.free_swa(value[:sw])
+        allocator.swa.free(value[:sw])
         with mock.patch.object(
             cache, "_apply_cache_action", wraps=cache._apply_cache_action
         ) as spy:
@@ -8311,12 +8311,13 @@ class TestReturnedValuesDrain(_InsertWalkSuite):
                 self.assertIs(device_frees[ComponentType.FULL][0], sentinel)
                 self.assertIs(host_frees[ComponentType.FULL][0], sentinel)
 
-    def test_free_values_frees_in_component_insertion_order(self):
-        """Device frees apply before host frees, each in per-component
-        insertion order — the allocator free-list order the pre-split inline
-        frees produced."""
+    def test_free_values_frees_swa_first_then_in_component_insertion_order(self):
+        """Device frees apply before host frees. The SWA layer goes first (the
+        full side's peer check reads the pairing that the swa free clears);
+        the rest keep per-component insertion order."""
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         order = [ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA]
+        device_order = [ComponentType.SWA, ComponentType.FULL, ComponentType.MAMBA]
         device_frees = defaultdict(list)
         host_frees = defaultdict(list)
         for ct in order:
@@ -8345,7 +8346,8 @@ class TestReturnedValuesDrain(_InsertWalkSuite):
             cache._free_values(device_frees, host_frees)
 
         self.assertEqual(
-            freed, [("device", ct) for ct in order] + [("host", ct) for ct in order]
+            freed,
+            [("device", ct) for ct in device_order] + [("host", ct) for ct in order],
         )
         self.assertFalse(device_frees)
         self.assertFalse(host_frees)
@@ -8361,13 +8363,14 @@ class TestReturnedValuesDrain(_InsertWalkSuite):
             device_frees[ct].append(torch.tensor([1]))
         host_frees[ComponentType.FULL].append(torch.tensor([2]))
 
-        def boom_on_swa(action):
-            if action.component_type is ComponentType.SWA:
+        # SWA drains first, so failing on FULL leaves exactly one un-attempted layer.
+        def boom_on_full(action):
+            if action.component_type is ComponentType.FULL:
                 raise RuntimeError("boom")
 
         host_mock = mock.MagicMock()
         with (
-            mock.patch.object(cache, "_apply_cache_action", side_effect=boom_on_swa),
+            mock.patch.object(cache, "_apply_cache_action", side_effect=boom_on_full),
             mock.patch.dict(cache.components, {ComponentType.FULL: host_mock}),
         ):
             with self.assertRaises(RuntimeError):

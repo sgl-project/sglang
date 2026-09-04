@@ -31,7 +31,7 @@ import torch
 from test_swa_locked_full_recover_unified import _DEV, _FakeUnifiedSWAKVPool
 
 from sglang.srt.mem_cache.multi_ended_allocator import (
-    UnifiedSWATokenToKVPoolAllocator,
+    UnifiedHybridSWAKVAllocator,
 )
 from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -65,7 +65,7 @@ def _build(n_full: int, n_swa: int, full_layers: int, swa_layers: int):
         device=_DEV,
         enable_memory_saver=False,
     )
-    return UnifiedSWATokenToKVPoolAllocator(
+    return UnifiedHybridSWAKVAllocator(
         unified_buffer=pool,
         kvcache=_FakeUnifiedSWAKVPool(pool),
         device=_DEV,

@@ -103,7 +103,7 @@ class TestHiSparseUnit(unittest.TestCase):
             global_page_size = PAGE_SIZE
 
         from sglang.srt.mem_cache.allocator.hisparse import (
-            HiSparseTokenToKVPoolAllocator,
+            HiSparseKVAllocator,
         )
         from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 
@@ -120,7 +120,7 @@ class TestHiSparseUnit(unittest.TestCase):
             kv_cache_dim=KV_CACHE_DIM,
             host_to_device_ratio=HOST_TO_DEVICE_RATIO,
         )
-        cls.allocator = HiSparseTokenToKVPoolAllocator(
+        cls.allocator = HiSparseKVAllocator(
             size=SIZE,
             page_size=global_page_size,
             dtype=torch.bfloat16,

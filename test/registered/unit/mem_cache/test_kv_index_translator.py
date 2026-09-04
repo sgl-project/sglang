@@ -50,7 +50,7 @@ from test_multi_ended_allocator import _FakeUnifiedSWAKVPool
 
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator, KVReadTables
 from sglang.srt.mem_cache.multi_ended_allocator import (
-    UnifiedSWATokenToKVPoolAllocator,
+    UnifiedHybridSWAKVAllocator,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
@@ -87,7 +87,7 @@ def _build_composite(ps, collapse=False, n_full_pages=16, n_swa_pages=8):
         page_size=ps,
     )
     kvcache = _FakeUnifiedSWAKVPool(pool)
-    allocator = UnifiedSWATokenToKVPoolAllocator(
+    allocator = UnifiedHybridSWAKVAllocator(
         unified_buffer=pool,
         kvcache=kvcache,
         device=_DEV,

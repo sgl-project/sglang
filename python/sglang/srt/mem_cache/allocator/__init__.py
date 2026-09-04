@@ -1,15 +1,18 @@
 """Token-to-KV-slot allocators. One file per allocation strategy."""
 
-from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.base import BaseKVAllocator, KVFreeSide
+from sglang.srt.mem_cache.allocator.hybrid import BaseHybridSWAKVAllocator
 from sglang.srt.mem_cache.allocator.paged import (
-    PagedTokenToKVPoolAllocator,
+    PagedKVAllocator,
     alloc_extend_naive,
 )
-from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.token import TokenedKVAllocator
 
 __all__ = [
-    "BaseTokenToKVPoolAllocator",
-    "PagedTokenToKVPoolAllocator",
-    "TokenToKVPoolAllocator",
+    "BaseKVAllocator",
+    "BaseHybridSWAKVAllocator",
+    "KVFreeSide",
+    "PagedKVAllocator",
+    "TokenedKVAllocator",
     "alloc_extend_naive",
 ]

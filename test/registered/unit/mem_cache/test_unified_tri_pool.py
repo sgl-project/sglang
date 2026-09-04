@@ -11,12 +11,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Tri-pool composite (`UnifiedMambaSWATokenToKVPoolAllocator`) -- full KV +
+"""Tri-pool composite (`UnifiedMambaHybridSWAKVAllocator`) -- full KV +
 SWA KV + mamba/conv state in ONE unified byte buffer, chain
 ``[mamba (up END) | swa (FLOAT) | full (down END)]``.
 
 Pinned contracts (each guards a distinct failure mode):
-  - chain wiring + the swa side being a `FloatMultiEndedAllocator`;
+  - chain wiring + the swa side being a `FloatMultiEndedKVAllocator`;
   - the JOINT `available_size()` feasibility contract: `alloc(N)` for
     N == available_size() must succeed (full extends into the high band
     first, then the float extends a single side — the predicate models
@@ -41,8 +41,8 @@ import torch
 
 import sglang.srt.mem_cache.multi_ended_allocator as mea
 from sglang.srt.mem_cache.multi_ended_allocator import (
-    FloatMultiEndedAllocator,
-    UnifiedMambaSWATokenToKVPoolAllocator,
+    FloatMultiEndedKVAllocator,
+    UnifiedMambaHybridSWAKVAllocator,
 )
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
@@ -143,7 +143,7 @@ class TestUnifiedTriPool(unittest.TestCase):
         )
         kvcache = _FakeUnifiedSWAKVPool(pool)
         mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
-        allocator = UnifiedMambaSWATokenToKVPoolAllocator(
+        allocator = UnifiedMambaHybridSWAKVAllocator(
             unified_buffer=pool,
             kvcache=kvcache,
             mamba_kvcache=mamba_kv,
@@ -169,7 +169,7 @@ class TestUnifiedTriPool(unittest.TestCase):
         fa = allocator.full_attn_allocator
         sa = allocator.swa_attn_allocator
         ma = allocator.mamba_allocator
-        self.assertIsInstance(sa, FloatMultiEndedAllocator)
+        self.assertIsInstance(sa, FloatMultiEndedKVAllocator)
         self.assertIs(ma.high_peer, sa)
         self.assertIs(sa.low_peer, ma)
         self.assertIs(sa.high_peer, fa)
@@ -246,7 +246,7 @@ class TestUnifiedTriPool(unittest.TestCase):
 
         # Window slide: an INTERIOR block ages out of the SWA window.
         v_mid = self._swa_interior_block(allocator, blocks)
-        allocator.free_swa(v_mid)
+        allocator.swa.free(v_mid)
         # The full side keeps the token; the swa side tombstoned it.
         self.assertTrue(bool((fa.virtual_to_physical[v_mid] >= 0).all()))
         self.assertTrue(bool((sa.virtual_to_physical[v_mid] == -1).all()))
@@ -280,7 +280,7 @@ class TestUnifiedTriPool(unittest.TestCase):
                 boundary = v
                 break
         self.assertIsNotNone(boundary)
-        allocator.free_swa(boundary)
+        allocator.swa.free(boundary)
         allocator.flush_opportunistic()  # the deferred reclaim point
         self.assertEqual(sa._hole_pages(), 0)  # absorbed, not holed
         self.assertEqual(sa._span_pages(), span_pages - 4)
@@ -290,7 +290,7 @@ class TestUnifiedTriPool(unittest.TestCase):
         _, allocator, kvcache, _ = self._build()
         va = allocator.alloc(4)
         self._stamp(allocator, kvcache, va)
-        allocator.free_swa(va)  # tombstone first (aged out of window)
+        allocator.swa.free(va)  # tombstone first (aged out of window)
         allocator.free(va)  # then the request finishes
         fa = allocator.full_attn_allocator
         sa = allocator.swa_attn_allocator
@@ -345,7 +345,7 @@ class TestUnifiedTriPool(unittest.TestCase):
         blocks = [allocator.alloc(4) for _ in range(3)]
         for v in blocks:
             self._stamp(allocator, kvcache, v)
-        allocator.free_swa(self._swa_interior_block(allocator, blocks))
+        allocator.swa.free(self._swa_interior_block(allocator, blocks))
         sa = allocator.swa_attn_allocator
         holes = sa._hole_pages()
         self.assertGreater(holes, 0)
@@ -360,11 +360,11 @@ class TestTriPagedFreeGroup(unittest.TestCase):
     path: free_group_begin -> free_segment -> free_group_end.
 
     Regression (GPU eval_440, Inkling ps=128 boot crash): every other tri test
-    runs at page_size=1, where the page-REPRESENTATIVE machinery
-    (`free_page_reps_group` / `_release_page_reps`, added when the free path
-    was made host-sync-free) is entirely dead code — `free_segment` frees
-    directly. At ps>1 the composite releases reps by calling
-    `swa_attn_allocator.free(..., _pages=...)`, and the float allocator was
+    runs at page_size=1, where the page-REPRESENTATIVE machinery (the sides'
+    reps buffers, added when the free path was made host-sync-free) is
+    entirely dead code — `free_segment` frees directly. At ps>1 the swa side
+    releases reps by calling `swa_attn_allocator.free(..., _pages=...)`, and
+    the float allocator was
     ported from a base that predates that keyword, so the first real decode
     batch died with `TypeError: unexpected keyword argument '_pages'`.
 
@@ -389,7 +389,7 @@ class TestTriPagedFreeGroup(unittest.TestCase):
         )
         kvcache = _FakeUnifiedSWAKVPool(pool)
         mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
-        allocator = UnifiedMambaSWATokenToKVPoolAllocator(
+        allocator = UnifiedMambaHybridSWAKVAllocator(
             unified_buffer=pool,
             kvcache=kvcache,
             mamba_kvcache=mamba_kv,
@@ -411,7 +411,7 @@ class TestTriPagedFreeGroup(unittest.TestCase):
 
         allocator.free_group_begin()
         allocator.free_segment(v, start_pos=0)
-        allocator.free_group_end()  # -> _release_page_reps -> float.free(_pages=)
+        allocator.free_group_end()  # -> swa side reps -> float.free(_pages=)
 
         self.assertEqual(allocator.verify_byte_accounting(), [])
         self.assertGreaterEqual(allocator.available_size(), before)
@@ -473,7 +473,7 @@ class TestTriFreeSwaNoHostSync(unittest.TestCase):
                 torch.Tensor, "item", side_effect=AssertionError("item = host sync")
             ),
         ):
-            alloc.free_swa(v[: 4 * self.PS], start_pos=0)
+            alloc.swa.free_segment(v[: 4 * self.PS], start_pos=0)
         self.assertEqual(alloc.verify_byte_accounting(), [])
 
     def test_float_free_has_no_stale_slot_item_sync(self):
@@ -497,8 +497,8 @@ class TestTriFreeSwaNoHostSync(unittest.TestCase):
         a1, a2 = self._tri(), self._tri()
         v1, v2 = a1.alloc(6 * self.PS), a2.alloc(6 * self.PS)
         self.assertTrue(torch.equal(v1, v2))
-        a1.free_swa(v1[: 4 * self.PS], start_pos=0)
-        a2.free_swa(v2[: 4 * self.PS])
+        a1.swa.free_segment(v1[: 4 * self.PS], start_pos=0)
+        a2.swa.free(v2[: 4 * self.PS])
         self.assertTrue(
             torch.equal(
                 a1.swa_attn_allocator.virtual_to_physical,
@@ -555,10 +555,10 @@ class TestGeneralizedRebalance(unittest.TestCase):
         """Raw end+float+end chain, BOTH orientations in one fixture: the
         up-growing end opens the float's LOW side; the down-growing end opens
         its HIGH side. No layout assumption survives."""
-        from test_multi_ended_allocator import TestFloatMultiEndedAllocator
+        from test_multi_ended_allocator import TestFloatMultiEndedKVAllocator
 
-        inst = TestFloatMultiEndedAllocator(
-            [m for m in dir(TestFloatMultiEndedAllocator) if m.startswith("test_")][0]
+        inst = TestFloatMultiEndedKVAllocator(
+            [m for m in dir(TestFloatMultiEndedKVAllocator) if m.startswith("test_")][0]
         )
         _pool, up_end, fla, down_end, _kv = inst._build_tri()
         v = fla.alloc(8)  # opaque float mid-region
@@ -586,7 +586,7 @@ class TestGeneralizedRebalance(unittest.TestCase):
         """No float in the chain => the remedy must change nothing (the
         2-pool composites keep their exact pre-existing behavior)."""
         from test_multi_ended_allocator import (
-            TestPagedMultiEndedAllocator as _PagedFixture,
+            TestPagedMultiEndedKVAllocator as _PagedFixture,
         )
 
         inst = _PagedFixture(
@@ -846,7 +846,7 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         v = alloc.alloc(8 * self.PS)
         sa = alloc.swa_attn_allocator
         span = sa._span_pages()
-        alloc.free_swa(v[6 * self.PS :], start_pos=6 * self.PS)  # high edge
+        alloc.swa.free_segment(v[6 * self.PS :], start_pos=6 * self.PS)  # high edge
         self.assertGreater(sa._hole_pages(), 0)  # deferred
         self.assertEqual(sa._span_pages(), span)
         moved = alloc.flush_opportunistic()
@@ -861,7 +861,7 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         alloc = self._tri()
         v = alloc.alloc(8 * self.PS)
         sa = alloc.swa_attn_allocator
-        alloc.free_swa(v[6 * self.PS :], start_pos=6 * self.PS)
+        alloc.swa.free_segment(v[6 * self.PS :], start_pos=6 * self.PS)
         self.assertGreater(sa._hole_pages(), 0)
         moves_before = len(sa._inverse_history)
         from sglang.srt.mem_cache.multi_ended_allocator import _relieve_for_alloc
@@ -875,7 +875,7 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         value -- under-reporting is safe, over-reporting would over-admit."""
         alloc = self._tri()
         v = alloc.alloc(8 * self.PS)
-        alloc.free_swa(v[6 * self.PS :], start_pos=6 * self.PS)
+        alloc.swa.free_segment(v[6 * self.PS :], start_pos=6 * self.PS)
         deferred = alloc.available_size()
         alloc.swa_attn_allocator._flush(urgent=False)
         absorbed = alloc.available_size()
@@ -891,7 +891,7 @@ class TestTriDeferredAbsorption(unittest.TestCase):
 
         alloc = self._tri()
         v = alloc.alloc(8 * self.PS)
-        alloc.free_swa(v[2 * self.PS : 4 * self.PS], start_pos=2 * self.PS)
+        alloc.swa.free_segment(v[2 * self.PS : 4 * self.PS], start_pos=2 * self.PS)
         alloc.flush_opportunistic()  # consumes the dirty flag
         sa = alloc.swa_attn_allocator
         self.assertGreater(sa._hole_pages(), 0)  # interior holes remain
@@ -908,10 +908,10 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         alloc = self._tri()
         v = alloc.alloc(8 * self.PS)
         sa = alloc.swa_attn_allocator
-        alloc.free_swa(v[: 2 * self.PS], start_pos=0)  # low-edge holes
+        alloc.swa.free_segment(v[: 2 * self.PS], start_pos=0)  # low-edge holes
         n_after_free = sa._hole_pages()
         alloc.alloc(2 * self.PS)  # drains them back to live
-        alloc.free_swa(v[6 * self.PS :], start_pos=6 * self.PS)  # high edge
+        alloc.swa.free_segment(v[6 * self.PS :], start_pos=6 * self.PS)  # high edge
         self.assertEqual(sa._hole_pages(), n_after_free)  # same COUNT as before
         span = sa._span_pages()
         self.assertGreater(alloc.flush_opportunistic(), 0)  # still absorbed
@@ -930,7 +930,7 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         with mock.patch.object(
             torch.Tensor, "tolist", side_effect=AssertionError("tolist = D2H")
         ):
-            alloc.free_swa(v, start_pos=0)
+            alloc.swa.free_segment(v, start_pos=0)
         self.assertTrue(sa._is_frontier_transparent())
         self.assertEqual(sa._hole_pages(), 0)
 
@@ -1097,7 +1097,7 @@ class TestTriPoolHardening(unittest.TestCase):
             self.assertIsNotNone(v)
             total_alloc_pages += 8
             TestUnifiedTriPool._stamp(self, allocator, kvcache, v)
-            allocator.free_swa(v)  # window slide: tombstones -> holes/absorb
+            allocator.swa.free(v)  # window slide: tombstones -> holes/absorb
             g = fa.alloc(4)  # full-side decode growth
             self.assertIsNotNone(g)
             total_alloc_pages += 4
@@ -1148,7 +1148,7 @@ class TestJointCapacityIsHonoured(unittest.TestCase):
             page_size=page_size,
         )
         kvcache = _FakeUnifiedSWAKVPool(pool)
-        return pool, UnifiedMambaSWATokenToKVPoolAllocator(
+        return pool, UnifiedMambaHybridSWAKVAllocator(
             unified_buffer=pool,
             kvcache=kvcache,
             mamba_kvcache=_FakeKVCache(pool.max_slots("mamba")),
@@ -1256,7 +1256,7 @@ class TestFloatRelocationIsOrderedAgainstTheForward(unittest.TestCase):
             enable_memory_saver=False,
         )
         kvcache = _FakeUnifiedSWAKVPool(pool)
-        alloc = UnifiedMambaSWATokenToKVPoolAllocator(
+        alloc = UnifiedMambaHybridSWAKVAllocator(
             unified_buffer=pool,
             kvcache=kvcache,
             mamba_kvcache=_FakeKVCache(pool.max_slots("mamba")),
@@ -1321,7 +1321,7 @@ class TestFloatRelocationIsOrderedAgainstTheForward(unittest.TestCase):
         """Pin the mechanism: `_settle_inflight_forward` must stream-wait, so
         the fix costs no host sync on the shortfall path."""
         src = inspect.getsource(
-            mea.MultiEndedAllocator._settle_inflight_forward  # noqa: SLF001
+            mea.MultiEndedKVAllocator._settle_inflight_forward  # noqa: SLF001
         )
         self.assertIn("wait_event", src)
         self.assertNotIn(".item()", src)
@@ -1352,7 +1352,7 @@ class TestFloatHoleCreditIsPerSide(unittest.TestCase):
             device=_DEV,
             enable_memory_saver=False,
         )
-        alloc = UnifiedMambaSWATokenToKVPoolAllocator(
+        alloc = UnifiedMambaHybridSWAKVAllocator(
             unified_buffer=pool,
             kvcache=_FakeUnifiedSWAKVPool(pool),
             mamba_kvcache=_FakeKVCache(pool.max_slots("mamba")),
@@ -1367,7 +1367,7 @@ class TestFloatHoleCreditIsPerSide(unittest.TestCase):
 
     def test_credit_sees_both_neighbours(self):
         _alloc, flt = self._float()
-        self.assertIsInstance(flt, FloatMultiEndedAllocator)
+        self.assertIsInstance(flt, FloatMultiEndedKVAllocator)
         low = flt._side_drainable_hole_bytes("low")
         high = flt._side_drainable_hole_bytes("high")
         self.assertEqual(flt._peer_drainable_hole_bytes(), max(low, high))

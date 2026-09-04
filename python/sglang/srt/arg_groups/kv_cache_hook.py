@@ -293,7 +293,7 @@ def _validate_unified_memory_dcp(server_args: Any) -> None:
     assert not model_config_of(server_args).is_hybrid_swa, (
         "--enable-unified-memory with decode context parallelism "
         "(--dcp-size > 1) does not support hybrid sliding-window models: "
-        "UnifiedSWATokenToKVPoolAllocator does not widen its virtual id "
+        "UnifiedHybridSWAKVAllocator does not widen its virtual id "
         "space, and the full->swa mapping is not DCP-sharded."
     )
     cfg = resolving_view(server_args)
@@ -501,7 +501,7 @@ def validate_prefill_only_disable_kv_cache_args(server_args: Any):
         )
 
     # HiSparse selects a different pool class (HiSparseDSATokenToKVPool /
-    # HiSparseTokenToKVPoolAllocator) that is not the no-op pool.
+    # HiSparseKVAllocator) that is not the no-op pool.
     if cfg.enable_hisparse:
         raise ValueError(
             "--prefill-only-disable-kv-cache is incompatible with --enable-hisparse: "

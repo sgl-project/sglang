@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Unit tests for the shared-KV-pool v2 core: UnifiedKVPool views and
-MultiEndedAllocator (virtual<->physical slot ids + eager compaction).
+MultiEndedKVAllocator (virtual<->physical slot ids + eager compaction).
 
 CPU-only — no GPU / Triton needed (the allocator's data-copy delegates to a
 fake kvcache here; the UnifiedKVPool view math is pure torch).
@@ -31,10 +31,10 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.multi_ended_allocator import (
-    FloatMultiEndedAllocator,
-    MultiEndedAllocator,
-    UnifiedMambaTokenToKVPoolAllocator,
-    UnifiedSWATokenToKVPoolAllocator,
+    FloatMultiEndedKVAllocator,
+    MultiEndedKVAllocator,
+    UnifiedHybridSWAKVAllocator,
+    UnifiedMambaKVAllocator,
 )
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
@@ -176,7 +176,7 @@ class TestUnifiedKVPoolViews(unittest.TestCase):
         self.assertTrue(torch.all(temporal_view[2, 6] == -1.25))
 
 
-class TestMultiEndedAllocator(unittest.TestCase):
+class TestMultiEndedKVAllocator(unittest.TestCase):
     def _build_pair(self, n_full_slots=64, n_mamba_slots=16):
         full = _make_mha_spec("full", "up", layer_num=2)
         mamba = _make_mamba_spec("mamba", "down", layer_num=2)
@@ -189,14 +189,14 @@ class TestMultiEndedAllocator(unittest.TestCase):
         )
         full_kv = _FakeKVCache(pool.max_slots("full"))
         mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
-        full_alloc = MultiEndedAllocator(
+        full_alloc = MultiEndedKVAllocator(
             kvcache=full_kv,
             unified_buffer=pool,
             sub_pool_name="full",
             device=_DEV,
             is_id_owner=True,
         )
-        mamba_alloc = MultiEndedAllocator(
+        mamba_alloc = MultiEndedKVAllocator(
             kvcache=mamba_kv,
             unified_buffer=pool,
             sub_pool_name="mamba",
@@ -207,7 +207,7 @@ class TestMultiEndedAllocator(unittest.TestCase):
         mamba_alloc.bind_peer(full_alloc)
         return pool, full_alloc, mamba_alloc, full_kv, mamba_kv
 
-    def _check_invariants(self, alloc: MultiEndedAllocator, kv: _FakeKVCache):
+    def _check_invariants(self, alloc: MultiEndedKVAllocator, kv: _FakeKVCache):
         v2p = alloc.virtual_to_physical
         p2v = alloc.physical_to_virtual
         # live virtual ids = those with v2p != -1, excluding the reserved id 0.
@@ -236,7 +236,7 @@ class TestMultiEndedAllocator(unittest.TestCase):
         )
         self.assertEqual(free_set & set(live_v), set())
 
-    def _alloc(self, alloc: MultiEndedAllocator, kv: _FakeKVCache, n: int):
+    def _alloc(self, alloc: MultiEndedKVAllocator, kv: _FakeKVCache, n: int):
         avail = alloc.available_size()
         v = alloc.alloc(n)
         if n > avail:
@@ -249,7 +249,7 @@ class TestMultiEndedAllocator(unittest.TestCase):
         kv.buf[p] = v
         return v
 
-    def _free(self, alloc: MultiEndedAllocator, kv: _FakeKVCache, v: torch.Tensor):
+    def _free(self, alloc: MultiEndedKVAllocator, kv: _FakeKVCache, v: torch.Tensor):
         p = alloc.virtual_to_physical[v]
         kv.buf[p] = -1  # the freed virtual id's data is gone
         alloc.free(v)
@@ -349,7 +349,7 @@ class TestMultiEndedAllocator(unittest.TestCase):
         )
         full_kv = _FakeKVCache(pool.max_slots("full"))
         mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
-        full_alloc = MultiEndedAllocator(
+        full_alloc = MultiEndedKVAllocator(
             kvcache=full_kv,
             unified_buffer=pool,
             sub_pool_name="full",
@@ -357,7 +357,7 @@ class TestMultiEndedAllocator(unittest.TestCase):
             is_id_owner=True,
             lazy_compaction=True,
         )
-        mamba_alloc = MultiEndedAllocator(
+        mamba_alloc = MultiEndedKVAllocator(
             kvcache=mamba_kv,
             unified_buffer=pool,
             sub_pool_name="mamba",
@@ -603,7 +603,7 @@ class _FakeUnifiedSWAKVPool:
         self._swa_allocator = swa_allocator
 
 
-class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
+class TestUnifiedHybridSWAKVAllocator(unittest.TestCase):
     """Tests for the SWA composite — joint byte-budget, slot-conservation
     leak invariant, tombstone semantics for `free_swa`, divergent compaction
     of the two sub-pools, and the alloc-rollback path.
@@ -648,7 +648,7 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
             enable_memory_saver=False,
         )
         kvcache = _FakeUnifiedSWAKVPool(pool)
-        allocator = UnifiedSWATokenToKVPoolAllocator(
+        allocator = UnifiedHybridSWAKVAllocator(
             unified_buffer=pool,
             kvcache=kvcache,
             device=_DEV,
@@ -747,7 +747,7 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         target = v[1:2]
         target_swa = allocator.swa_attn_allocator.virtual_to_physical[target]
         kvcache.swa_kv_pool.buf[target_swa] = -1
-        allocator.free_swa(target)
+        allocator.swa.free(target)
         tgt = int(target.item())
         # full side still bound:
         self.assertGreaterEqual(
@@ -783,12 +783,12 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         # (compaction runs inside both).
         target_swa = allocator.swa_attn_allocator.virtual_to_physical[target]
         kvcache.swa_kv_pool.buf[target_swa] = -1
-        allocator.free_swa(target)
+        allocator.swa.free(target)
         full_phys = int(allocator.full_attn_allocator.virtual_to_physical[tgt].item())
         kvcache.full_kv_pool.buf[full_phys] = -1
 
         allocator.free_group_begin()
-        allocator.free_full(target)
+        allocator.full.free(target)
         deferred = set(
             int(x) for x in allocator.full_attn_allocator.free_virtual_ids.tolist()
         )
@@ -812,7 +812,7 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         # Tombstone b on swa only.
         b_swa = allocator.swa_attn_allocator.virtual_to_physical[b]
         kvcache.swa_kv_pool.buf[b_swa] = -1
-        allocator.free_swa(b)
+        allocator.swa.free(b)
         # c's full-physical UNCHANGED (full side did not compact):
         self.assertEqual(
             int(allocator.full_attn_allocator.virtual_to_physical[c].item()),
@@ -868,7 +868,7 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
                 # Tombstone all of v on swa only.
                 swa_phys = allocator.swa_attn_allocator.virtual_to_physical[v]
                 kvcache.swa_kv_pool.buf[swa_phys] = -1
-                allocator.free_swa(v)
+                allocator.swa.free(v)
                 live[idx] = ("swa_tomb", v)
             # Invariants after every op.
             self._check_sub_pool_invariants(
@@ -966,7 +966,7 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
             allocator.translate_loc_from_full_to_swa(v, out=wrong_dtype)
 
     # Tombstone-safety clamp for SWA — mirrors the full-side test
-    # in `TestMultiEndedAllocator`. The captured SWA attention kernel reads
+    # in `TestMultiEndedKVAllocator`. The captured SWA attention kernel reads
     # `swa_k_buffer[result[i]]` at replay; without the clamp, a tombstoned
     # `v2p_swa[v] == -1` would index at `swa_k_buffer[-1]` (illegal access).
     def test_swa_translate_loc_from_full_to_swa_clamps_tombstoned(self):
@@ -1011,7 +1011,7 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         check()
         a = self._alloc(allocator, kvcache, 5)
         b = self._alloc(allocator, kvcache, 5)
-        allocator.free_swa(a)  # tombstone swa side only
+        allocator.swa.free(a)  # tombstone swa side only
         self._free(allocator, kvcache, b)  # full free (compaction on both)
         self._free(allocator, kvcache, a)
         c = self._alloc(allocator, kvcache, 3)
@@ -1024,8 +1024,8 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestPagedMultiEndedAllocator(unittest.TestCase):
-    """Per-sub-pool paged tests for `MultiEndedAllocator(page_size=...)`.
+class TestPagedMultiEndedKVAllocator(unittest.TestCase):
+    """Per-sub-pool paged tests for `MultiEndedKVAllocator(page_size=...)`.
 
     All tests use ``page_size = 8`` against a buffer sized for ~16 pages per
     sub-pool. Invariants are page-granular: free-list, v2p/p2v tables, and
@@ -1067,7 +1067,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         )
         full_kv = _FakeKVCache(pool.max_slots("full"))
         swa_kv = _FakeKVCache(pool.max_slots("swa"))
-        full_alloc = MultiEndedAllocator(
+        full_alloc = MultiEndedKVAllocator(
             kvcache=full_kv,
             unified_buffer=pool,
             sub_pool_name="full",
@@ -1075,7 +1075,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             is_id_owner=True,
             page_size=self.PAGE_SIZE,
         )
-        swa_alloc = MultiEndedAllocator(
+        swa_alloc = MultiEndedKVAllocator(
             kvcache=swa_kv,
             unified_buffer=pool,
             sub_pool_name="swa",
@@ -1088,7 +1088,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         return pool, full_alloc, swa_alloc, full_kv, swa_kv
 
     def _stamp_tokens(
-        self, alloc: MultiEndedAllocator, kv: _FakeKVCache, v_tokens: torch.Tensor
+        self, alloc: MultiEndedKVAllocator, kv: _FakeKVCache, v_tokens: torch.Tensor
     ):
         """Mark `kv.buf[phys_token] = some_unique_id` for every returned
         token. Uses the alloc's v2p_page table to compute physical tokens."""
@@ -1102,7 +1102,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         kv.buf[phys_tokens] = v_tokens
 
     def _check_invariants(
-        self, alloc: MultiEndedAllocator, kv: _FakeKVCache, stamped_tokens: dict
+        self, alloc: MultiEndedKVAllocator, kv: _FakeKVCache, stamped_tokens: dict
     ):
         v2p = alloc.virtual_to_physical
         p2v = alloc.physical_to_virtual
@@ -1264,7 +1264,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
     # 7. SWA composite joint byte-budget in page units.
     def test_paged_swa_joint_byte_budget(self):
         from sglang.srt.mem_cache.multi_ended_allocator import (
-            UnifiedSWATokenToKVPoolAllocator,
+            UnifiedHybridSWAKVAllocator,
         )
 
         full_spec = MHASubPoolSpec(
@@ -1295,7 +1295,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             enable_memory_saver=False,
         )
         kvcache = _FakeUnifiedSWAKVPool(pool)
-        allocator = UnifiedSWATokenToKVPoolAllocator(
+        allocator = UnifiedHybridSWAKVAllocator(
             unified_buffer=pool,
             kvcache=kvcache,
             device=_DEV,
@@ -1700,7 +1700,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
     # the SWA composite.
     def test_paged_swa_full_available_size_in_tokens(self):
         from sglang.srt.mem_cache.multi_ended_allocator import (
-            UnifiedSWATokenToKVPoolAllocator,
+            UnifiedHybridSWAKVAllocator,
         )
 
         full_spec = MHASubPoolSpec(
@@ -1734,7 +1734,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         kvcache = _FakeUnifiedSWAKVPool(pool)
         full_max = n_full_pages * PS
         swa_max = n_swa_pages * PS
-        allocator = UnifiedSWATokenToKVPoolAllocator(
+        allocator = UnifiedHybridSWAKVAllocator(
             unified_buffer=pool,
             kvcache=kvcache,
             device=_DEV,
@@ -1778,7 +1778,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             full_max,
         )
 
-    # 15. REGRESSION: UnifiedMambaTokenToKVPoolAllocator.size
+    # 15. REGRESSION: UnifiedMambaKVAllocator.size
     # must be TOTAL TOKENS (available + allocated, both in tokens). At
     # page_size > 1, the earlier `available + allocated_pages` formula gave
     # `tokens + pages` which silently broke the chunk-cache Mamba log lines
@@ -1786,7 +1786,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
     # if radix weren't auto-downgraded to page=1.
     def test_paged_mamba_size_in_tokens(self):
         from sglang.srt.mem_cache.multi_ended_allocator import (
-            UnifiedMambaTokenToKVPoolAllocator,
+            UnifiedMambaKVAllocator,
         )
 
         # Build a minimal Mamba composite: one MHA spec for full + one
@@ -1835,7 +1835,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             full_kv_pool = full_kv
             mamba_pool = mamba_kv
 
-        allocator = UnifiedMambaTokenToKVPoolAllocator(
+        allocator = UnifiedMambaKVAllocator(
             unified_buffer=pool,
             kvcache=_FakeHybridLinearKVPool(),
             device=_DEV,
@@ -1888,7 +1888,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
     # math is covered.
     def test_paged_pool_translate_helper_returns_physical_tokens(self):
         from sglang.srt.mem_cache.multi_ended_allocator import (
-            UnifiedSWATokenToKVPoolAllocator,
+            UnifiedHybridSWAKVAllocator,
         )
         from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
 
@@ -1921,7 +1921,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             enable_memory_saver=False,
         )
         kvcache = _FakeUnifiedSWAKVPool(pool)
-        allocator = UnifiedSWATokenToKVPoolAllocator(
+        allocator = UnifiedHybridSWAKVAllocator(
             unified_buffer=pool,
             kvcache=kvcache,
             device=_DEV,
@@ -2001,7 +2001,7 @@ class TestLazyCompaction(unittest.TestCase):
         )
         full_kv = _FakeKVCache(pool.max_slots("full"))
         mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
-        full_alloc = MultiEndedAllocator(
+        full_alloc = MultiEndedKVAllocator(
             kvcache=full_kv,
             unified_buffer=pool,
             sub_pool_name="full",
@@ -2009,7 +2009,7 @@ class TestLazyCompaction(unittest.TestCase):
             is_id_owner=True,
             lazy_compaction=lazy,
         )
-        mamba_alloc = MultiEndedAllocator(
+        mamba_alloc = MultiEndedKVAllocator(
             kvcache=mamba_kv,
             unified_buffer=pool,
             sub_pool_name="mamba",
@@ -2021,7 +2021,7 @@ class TestLazyCompaction(unittest.TestCase):
         mamba_alloc.bind_peer(full_alloc)
         return pool, full_alloc, full_kv
 
-    def _stamp_kv(self, kv: _FakeKVCache, alloc: MultiEndedAllocator, tokens) -> None:
+    def _stamp_kv(self, kv: _FakeKVCache, alloc: MultiEndedKVAllocator, tokens) -> None:
         """Write a marker into KV[phys] for each freshly-alloced virtual
         token id, so we can later check the data followed any relocation.
         """
@@ -2354,7 +2354,7 @@ class TestO3FusedAllocBind(unittest.TestCase):
         )
         full_kv = _FakeKVCache(pool.max_slots("full"))
         mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
-        fa = MultiEndedAllocator(
+        fa = MultiEndedKVAllocator(
             kvcache=full_kv,
             unified_buffer=pool,
             sub_pool_name="full",
@@ -2363,7 +2363,7 @@ class TestO3FusedAllocBind(unittest.TestCase):
             page_size=page_size,
             lazy_compaction=lazy,
         )
-        ma = MultiEndedAllocator(
+        ma = MultiEndedKVAllocator(
             kvcache=mamba_kv,
             unified_buffer=pool,
             sub_pool_name="mamba",
@@ -2583,7 +2583,7 @@ class TestO3FusedAllocBind(unittest.TestCase):
         )
         full_kv = _FakeKVCache(pool.max_slots("full"))
         swa_kv = _FakeKVCache(pool.max_slots("swa"))
-        fa = MultiEndedAllocator(
+        fa = MultiEndedKVAllocator(
             kvcache=full_kv,
             unified_buffer=pool,
             sub_pool_name="full",
@@ -2591,7 +2591,7 @@ class TestO3FusedAllocBind(unittest.TestCase):
             is_id_owner=True,
             lazy_compaction=True,
         )
-        sa = MultiEndedAllocator(
+        sa = MultiEndedKVAllocator(
             kvcache=swa_kv,
             unified_buffer=pool,
             sub_pool_name="swa",
@@ -2667,7 +2667,7 @@ class TestSWACompositeKernelIdSurface(unittest.TestCase):
             page_size=self.PS,
         )
         kvcache = _FakeUnifiedSWAKVPool(pool)
-        return UnifiedSWATokenToKVPoolAllocator(
+        return UnifiedHybridSWAKVAllocator(
             unified_buffer=pool,
             kvcache=kvcache,
             device=_DEV,
@@ -2799,7 +2799,7 @@ class TestPs64MLACompositeFeasibility(unittest.TestCase):
             full_kv_pool = full_kv
             mamba_pool = mamba_kv
 
-        return UnifiedMambaTokenToKVPoolAllocator(
+        return UnifiedMambaKVAllocator(
             unified_buffer=pool,
             kvcache=_FakeHybridLinearKVPool(),
             device=_DEV,
@@ -2873,14 +2873,14 @@ class TestChainFrontierWalk(unittest.TestCase):
             device=_DEV,
             enable_memory_saver=False,
         )
-        fa = MultiEndedAllocator(
+        fa = MultiEndedKVAllocator(
             kvcache=_FakeKVCache(pool.max_slots("full")),
             unified_buffer=pool,
             sub_pool_name="full",
             device=_DEV,
             is_id_owner=True,
         )
-        ma = MultiEndedAllocator(
+        ma = MultiEndedKVAllocator(
             kvcache=_FakeKVCache(pool.max_slots("mamba")),
             unified_buffer=pool,
             sub_pool_name="mamba",
@@ -2994,7 +2994,7 @@ class TestChainFrontierWalk(unittest.TestCase):
         self.assertEqual(fa._peer_drainable_hole_bytes(), 0)
 
 
-class TestFloatMultiEndedAllocator(unittest.TestCase):
+class TestFloatMultiEndedKVAllocator(unittest.TestCase):
     """Holes-first float middle: midpoint placement, in-place hole recycling,
     larger-gap boundary extension, boundary absorption + park-on-empty
     transparency, and the on-demand data movers (`make_room` boundary
@@ -3022,7 +3022,7 @@ class TestFloatMultiEndedAllocator(unittest.TestCase):
             device=_DEV,
             enable_memory_saver=False,
         )
-        sa = MultiEndedAllocator(
+        sa = MultiEndedKVAllocator(
             kvcache=_FakeKVCache(pool.max_slots("state")),
             unified_buffer=pool,
             sub_pool_name="state",
@@ -3030,7 +3030,7 @@ class TestFloatMultiEndedAllocator(unittest.TestCase):
             is_id_owner=True,
         )
         fkv = _FakeKVCache(pool.max_slots("swa"))
-        fla = FloatMultiEndedAllocator(
+        fla = FloatMultiEndedKVAllocator(
             kvcache=fkv,
             unified_buffer=pool,
             sub_pool_name="swa",
@@ -3038,7 +3038,7 @@ class TestFloatMultiEndedAllocator(unittest.TestCase):
             is_id_owner=True,
         )
         dkv = _FakeKVCache(pool.max_slots("full"))
-        da = MultiEndedAllocator(
+        da = MultiEndedKVAllocator(
             kvcache=dkv,
             unified_buffer=pool,
             sub_pool_name="full",
@@ -3331,7 +3331,7 @@ class TestDcpWidening(unittest.TestCase):
             enable_memory_saver=False,
             page_size=page_size,
         )
-        alloc = MultiEndedAllocator(
+        alloc = MultiEndedKVAllocator(
             kvcache=_FakeKVCache(pool.max_slots("full")),
             unified_buffer=pool,
             sub_pool_name="full",
@@ -3341,7 +3341,7 @@ class TestDcpWidening(unittest.TestCase):
             shards_under_dcp=True,
         )
         # The peer stays slot-granular: mamba state is replicated, not sharded.
-        mamba = MultiEndedAllocator(
+        mamba = MultiEndedKVAllocator(
             kvcache=_FakeKVCache(pool.max_slots("mamba")),
             unified_buffer=pool,
             sub_pool_name="mamba",
@@ -3441,7 +3441,7 @@ class TestDcpWidening(unittest.TestCase):
 
     def _build_composite(self, *, page_size):
         from sglang.srt.mem_cache.multi_ended_allocator import (
-            UnifiedMambaTokenToKVPoolAllocator,
+            UnifiedMambaKVAllocator,
         )
 
         full_spec = _make_mha_spec("full", "up", layer_num=2)
@@ -3462,7 +3462,7 @@ class TestDcpWidening(unittest.TestCase):
             full_kv_pool = full_kv
             mamba_pool = mamba_kv
 
-        return UnifiedMambaTokenToKVPoolAllocator(
+        return UnifiedMambaKVAllocator(
             unified_buffer=pool,
             kvcache=_FakeHybridLinearKVPool(),
             device=_DEV,

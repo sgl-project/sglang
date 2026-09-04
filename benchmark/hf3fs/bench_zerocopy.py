@@ -14,7 +14,7 @@ from sglang.srt.managers.cache_controller import (
     PrefetchOperation,
     StorageOperation,
 )
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import TokenedKVAllocator
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
@@ -62,7 +62,7 @@ token_to_kv_pool = MHATokenToKVPool(
     enable_memory_saver=True,
 )
 
-token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+token_to_kv_pool_allocator = TokenedKVAllocator(
     max_total_num_tokens,
     dtype=kv_cache_dtype,
     device=device,

@@ -170,12 +170,12 @@ class TestUnifiedSWATombstoneClamp(unittest.TestCase):
     """
 
     def _make_bare_pool(self, page_size, v2p, multiplier=1):
-        from sglang.srt.mem_cache.multi_ended_allocator import MultiEndedAllocator
+        from sglang.srt.mem_cache.multi_ended_allocator import MultiEndedKVAllocator
         from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
 
         # A real sub-allocator (not a stand-in): the translation reads its v2p
         # table, and the pool reaches it through the allocator's own method.
-        swa_allocator = object.__new__(MultiEndedAllocator)
+        swa_allocator = object.__new__(MultiEndedKVAllocator)
         # `page_size` is the WIDENED (DCP) surface, `pool_page_size` the physical
         # rows per page; equal at dcp_size == 1, which is what this fixture is.
         swa_allocator.page_size = page_size

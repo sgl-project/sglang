@@ -10,7 +10,7 @@ class BaseSWAKVPool(KVCache):
     """ABC for SWA-like KV pools.
 
     Subclasses expose a `swa_kv_pool` sub-pool plus a full -> swa index
-    mapping. Used by `SWATokenToKVPoolAllocator` and the disagg paths to
+    mapping. Used by `HybridSWAKVAllocator` and the disagg paths to
     handle SWA state separately from the full KV state.
     """
 

@@ -3,7 +3,11 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import (
+    BaseHybridSWAKVAllocator,
+    BaseKVAllocator,
+    KVFreeSide,
+)
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -11,7 +15,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
-class _FakeAllocator(BaseTokenToKVPoolAllocator):
+class _FakeAllocator(BaseKVAllocator):
     """Single-pool double. Subclassing the base routes free_full / free_segment /
     free_segments into free(), so a new free API cannot slip past the recorder."""
 
@@ -34,6 +38,45 @@ class _FakeAllocator(BaseTokenToKVPoolAllocator):
 
     def free(self, free_index: torch.Tensor):
         self.freed.append(free_index.clone())
+
+
+class _FakeSide(KVFreeSide):
+    """One side of the hybrid double: records what reaches it."""
+
+    def __init__(self, page_size: int):
+        self.page_size = page_size
+        self.free_group = None
+        self.freed = []
+
+    def available_size(self):
+        return 1 << 30
+
+    def free(self, free_index: torch.Tensor):
+        self.freed.append(free_index.clone())
+
+
+class _FakeHybridAllocator(BaseHybridSWAKVAllocator):
+    """Hybrid double: a floor split is visible as full-only vs both-sides frees."""
+
+    def __init__(self, page_size: int = 1):
+        BaseKVAllocator.__init__(
+            self,
+            size=1024,
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        self.full = _FakeSide(page_size)
+        self.swa = _FakeSide(page_size)
+
+    def clear(self):
+        self.full.freed = []
+        self.swa.freed = []
+
+    def alloc(self, need_size: int):
+        raise NotImplementedError
 
 
 class _FakeReqToTokenPool:
@@ -281,7 +324,7 @@ def test_trim_overshoot_postcondition():
     page_size = 1
     req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
     req_to_token_pool = _FakeReqToTokenPool(req_to_token)
-    allocator = _FakeAllocator()
+    allocator = _FakeHybridAllocator()
     tree_cache = StreamingSession(
         _FakeInnerCache(req_to_token_pool, allocator, page_size)
     )
@@ -303,7 +346,8 @@ def test_trim_overshoot_postcondition():
     assert len(req.output_ids) == 12
     # Tail [38, 44) freed by _free_kv_aligned, split at the pre-trim eviction
     # floor 42: [38, 42) gave its SWA peers back already, so it goes back full-only.
-    assert [t.tolist() for t in allocator.freed] == [[38, 39, 40, 41], [42, 43]]
+    assert [t.tolist() for t in allocator.full.freed] == [[38, 39, 40, 41], [42, 43]]
+    assert [t.tolist() for t in allocator.swa.freed] == [[42, 43]]
 
 
 def test_trim_overshoot_keeps_cursor_page_aligned_on_paged():
@@ -312,7 +356,7 @@ def test_trim_overshoot_keeps_cursor_page_aligned_on_paged():
     page_size = 16
     req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
     req_to_token_pool = _FakeReqToTokenPool(req_to_token)
-    allocator = _FakeAllocator(page_size=page_size)
+    allocator = _FakeHybridAllocator(page_size=page_size)
     tree_cache = StreamingSession(
         _FakeInnerCache(req_to_token_pool, allocator, page_size)
     )
@@ -332,10 +376,11 @@ def test_trim_overshoot_keeps_cursor_page_aligned_on_paged():
     assert len(req.output_ids) == 12
     # Freed [32, 64): [32, 48) below the old cursor goes back full-only,
     # [48, 64) both halves.
-    assert [t.tolist() for t in allocator.freed] == [
+    assert [t.tolist() for t in allocator.full.freed] == [
         list(range(32, 48)),
         list(range(48, 64)),
     ]
+    assert [t.tolist() for t in allocator.swa.freed] == [list(range(48, 64))]
 
 
 if __name__ == "__main__":

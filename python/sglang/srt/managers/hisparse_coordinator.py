@@ -14,8 +14,8 @@ from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_ds
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.hisparse import (
-    DeepSeekV4HiSparseTokenToKVPoolAllocator,
-    HiSparseTokenToKVPoolAllocator,
+    HiSparseHybridSWAKVAllocator,
+    HiSparseKVAllocator,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseDSATokenToKVPool,
@@ -113,8 +113,8 @@ class HiSparseCoordinator:
         self,
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: Union[
-            HiSparseTokenToKVPoolAllocator,
-            DeepSeekV4HiSparseTokenToKVPoolAllocator,
+            HiSparseKVAllocator,
+            HiSparseHybridSWAKVAllocator,
         ],
         top_k: int,
         device_buffer_size: int,
@@ -136,7 +136,7 @@ class HiSparseCoordinator:
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
 
         self.is_dsv4_hisparse = isinstance(
-            self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
+            self.token_to_kv_pool_allocator, HiSparseHybridSWAKVAllocator
         )
         if self.is_dsv4_hisparse:
             self.mem_pool_device = self.token_to_kv_pool_allocator.hisparse_kvcache
@@ -159,9 +159,7 @@ class HiSparseCoordinator:
                 * self.mem_pool_device.store_dtype.itemsize
             )
         else:
-            assert isinstance(
-                self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
-            )
+            assert isinstance(self.token_to_kv_pool_allocator, HiSparseKVAllocator)
             self.mem_pool_device: HiSparseDSATokenToKVPool = (
                 self.token_to_kv_pool_allocator.get_kvcache()
             )

@@ -37,7 +37,7 @@ from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.allocator import BaseKVAllocator
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +92,7 @@ class PrefetchOperation(StorageOperation):
 class HybridCacheController(BaseHiCacheController):
     def __init__(
         self,
-        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+        token_to_kv_pool_allocator: BaseKVAllocator,
         mem_pool_host: Any,
         page_size: int,
         tp_group: torch.distributed.ProcessGroup,

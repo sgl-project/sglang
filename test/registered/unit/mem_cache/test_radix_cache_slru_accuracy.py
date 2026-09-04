@@ -3,7 +3,7 @@ from array import array
 
 import torch
 
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import TokenedKVAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
@@ -37,7 +37,7 @@ class TestSLRUAccuracy(unittest.TestCase):
         )
 
         # Create token-to-KV pool allocator
-        self.token_to_kv_pool = TokenToKVPoolAllocator(
+        self.token_to_kv_pool = TokenedKVAllocator(
             size=8, dtype=dtype, device=device, kvcache=self.kv_cache, need_sort=False
         )
 

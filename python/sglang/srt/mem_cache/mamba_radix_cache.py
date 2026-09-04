@@ -28,8 +28,8 @@ import torch
 from numpy import float64
 
 from sglang.srt.mem_cache.allocator import (
-    PagedTokenToKVPoolAllocator,
-    TokenToKVPoolAllocator,
+    PagedKVAllocator,
+    TokenedKVAllocator,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -46,7 +46,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.multi_ended_allocator import (
-    UnifiedMambaTokenToKVPoolAllocator,
+    UnifiedMambaKVAllocator,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import split_node_hash_value
@@ -442,13 +442,9 @@ class LRUList:
 class MambaRadixCache(BasePrefixCache):
     def __init__(self, params: CacheInitParams):
         assert (
-            isinstance(params.token_to_kv_pool_allocator, TokenToKVPoolAllocator)
-            or isinstance(
-                params.token_to_kv_pool_allocator, PagedTokenToKVPoolAllocator
-            )
-            or isinstance(
-                params.token_to_kv_pool_allocator, UnifiedMambaTokenToKVPoolAllocator
-            )
+            isinstance(params.token_to_kv_pool_allocator, TokenedKVAllocator)
+            or isinstance(params.token_to_kv_pool_allocator, PagedKVAllocator)
+            or isinstance(params.token_to_kv_pool_allocator, UnifiedMambaKVAllocator)
         )
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator

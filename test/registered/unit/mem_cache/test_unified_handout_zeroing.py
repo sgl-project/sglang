@@ -6,7 +6,7 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.multi_ended_allocator import MultiEndedAllocator
+from sglang.srt.mem_cache.multi_ended_allocator import MultiEndedKVAllocator
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
     MLASubPoolSpec,
@@ -54,7 +54,7 @@ def _build(device, page_size=1, kernel_page_multiplier=None):
         kv_cache_dtype=torch.bfloat16,
         page_size=page_size,
     )
-    allocator = MultiEndedAllocator(
+    allocator = MultiEndedKVAllocator(
         kvcache=kvcache,
         unified_buffer=buf,
         sub_pool_name="full",

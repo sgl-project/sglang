@@ -318,7 +318,7 @@ class DSV4OutCacheLoc:
     Bundles slot indices for full/SWA pools and the two compressed-KV pools
     (C4/C128). Compressor state uses fixed ring storage and explicit
     ``state_loc`` metadata, so it is not part of the token-allocation bundle.
-    Populated by the NPU V4 allocator (DSV4NPUTokenToKVPoolAllocator) when
+    Populated by the NPU V4 allocator (NPUDSV4HybridSWAKVAllocator) when
     the model is DeepSeek-V4 on NPU; left as ``None`` on ForwardBatch
     otherwise.
 
@@ -413,7 +413,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
 
-    # DSV4-NPU only: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator,
+    # DSV4-NPU only: per-pool slot bundle from NPUDSV4HybridSWAKVAllocator,
     # consumed by the Ascend backend for PA_ND block tables. None elsewhere.
     out_cache_loc_dsv4: Optional[DSV4OutCacheLoc] = None
     # The indices to track mamba state with

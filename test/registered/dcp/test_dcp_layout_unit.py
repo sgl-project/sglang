@@ -27,7 +27,7 @@ from sglang.srt.layers.dcp.layout import (
     get_dcp_lens,
 )
 from sglang.srt.layers.linear import QKVParallelLinear
-from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.paged import PagedKVAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -298,7 +298,7 @@ class TestGetDcpLens(CustomTestCase):
         real_kv_size = 1024
         dcp_size = 4
         physical_page_size = 64
-        allocator = PagedTokenToKVPoolAllocator(
+        allocator = PagedKVAllocator(
             size=real_kv_size * dcp_size,
             page_size=physical_page_size * dcp_size,
             dtype=torch.bfloat16,

@@ -104,7 +104,7 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     # aware checks below only apply to the DSA hisparse path.
     if is_hip and is_v4_hisparse:
         # TEMPORARY GUARD: DSv4 HiSparse is not supported on the unified-KV path.
-        # In unified-KV mode c4_kv_pool is None, so DeepSeekV4HiSparseTokenToKVPoolAllocator
+        # In unified-KV mode c4_kv_pool is None, so HiSparseHybridSWAKVAllocator
         # cannot attach and pool init dies with a cryptic AssertionError. Fail fast
         # at startup with a clear message instead. Remove once unified-KV HiSparse lands.
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (

@@ -48,7 +48,7 @@ def _build(lazy: bool):
     # Function-scope import: the fixture is a TestCase subclass, and a
     # module-scope binding would make pytest collect its tests AGAIN here.
     from test_multi_ended_allocator import (
-        TestUnifiedSWATokenToKVPoolAllocator as _SwaFixture,
+        TestUnifiedHybridSWAKVAllocator as _SwaFixture,
     )
 
     inst = _SwaFixture([m for m in dir(_SwaFixture) if m.startswith("test_")][0])
@@ -93,7 +93,7 @@ class TestCapacityMemoCoherence(unittest.TestCase):
                 self.assertIsNotNone(v1)
                 self._assert_memos_fresh(allocator)
 
-                allocator.free_swa(v1[2:6])  # swa-side tombstones
+                allocator.swa.free(v1[2:6])  # swa-side tombstones
                 self._assert_memos_fresh(allocator)
 
                 inst._free(allocator, kvcache, v1)  # both-side free
@@ -134,7 +134,7 @@ class TestCapacityMemoCoherence(unittest.TestCase):
                     elif op == "free_swa" and live:
                         v = live[-1]
                         if v.numel() > 1:
-                            allocator.free_swa(v[: v.numel() // 2])
+                            allocator.swa.free(v[: v.numel() // 2])
                     elif op == "flush":
                         allocator.full_attn_allocator._flush(urgent=True)
                         allocator.swa_attn_allocator._flush(urgent=True)
@@ -170,7 +170,7 @@ class TestCapacityMemoCoherence(unittest.TestCase):
         v = inst._alloc(allocator, kvcache, 8)
         self.assertIsNotNone(v)
         before = allocator.available_size()
-        allocator.free_swa(v[:4])  # swa band only
+        allocator.swa.free(v[:4])  # swa band only
         after = allocator.available_size()
         self.assertEqual(after, allocator._compute_available_size())
         self.assertGreaterEqual(after, before)  # holes only ever add room
@@ -185,10 +185,10 @@ class TestCapacityMemoCoherence(unittest.TestCase):
         Driven on a hand-wired end+float+end chain (the composite arrives
         with the tri phase); the float is exercised alone so no end-pool
         descriptor write can mask a missing span bump."""
-        from test_multi_ended_allocator import TestFloatMultiEndedAllocator
+        from test_multi_ended_allocator import TestFloatMultiEndedKVAllocator
 
-        inst = TestFloatMultiEndedAllocator(
-            [m for m in dir(TestFloatMultiEndedAllocator) if m.startswith("test_")][0]
+        inst = TestFloatMultiEndedKVAllocator(
+            [m for m in dir(TestFloatMultiEndedKVAllocator) if m.startswith("test_")][0]
         )
         _pool, sa, fla, da, _kv = inst._build_tri()
         self.assertEqual(fla._hole_pages(), 0)  # hole-free extension path
@@ -268,7 +268,7 @@ class TestTriCapacityMemoCoherence(unittest.TestCase):
                 self.assertIsNotNone(s1)
                 self._assert_memos_fresh(allocator)
 
-                allocator.free_swa(v1[2:6])  # interior float holes
+                allocator.swa.free(v1[2:6])  # interior float holes
                 self._assert_memos_fresh(allocator)
 
                 allocator.free(v1)  # both-side free

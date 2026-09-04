@@ -17,7 +17,7 @@ from typing import (
 
 import torch
 
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import BaseKVAllocator
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 @runtime_checkable
 class PrefixCacheTrait(Protocol):
     req_to_token_pool: ReqToTokenPool
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
+    token_to_kv_pool_allocator: BaseKVAllocator
     page_size: int
     disable: bool
 

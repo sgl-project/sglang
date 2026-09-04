@@ -8,8 +8,9 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.hisparse import (
-    DeepSeekV4HiSparseTokenToKVPoolAllocator,
+    HiSparseHybridSWAKVAllocator,
 )
+from sglang.srt.mem_cache.allocator.hybrid import BaseHybridSWAKVAllocator
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -19,7 +20,7 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
     def test_forwards_swa_tail_allocation_to_logical_allocator(self):
-        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        allocator = object.__new__(HiSparseHybridSWAKVAllocator)
         logical_allocator = MagicMock(spec=["alloc_extend_swa_tail"])
         allocator.logical_attn_allocator = logical_allocator
 
@@ -57,9 +58,11 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         from sglang.srt.disaggregation.decode import DecodePreallocQueue
 
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
-        logical_allocator = SimpleNamespace(
-            available_size=MagicMock(return_value=32),
-            full_available_size=MagicMock(return_value=512),
+        logical_allocator = MagicMock()
+        logical_allocator.__class__ = BaseHybridSWAKVAllocator
+        logical_allocator.available_size = MagicMock(return_value=32)
+        logical_allocator.full = SimpleNamespace(
+            available_size=MagicMock(return_value=512)
         )
         queue.token_to_kv_pool_allocator = SimpleNamespace(
             logical_attn_allocator=logical_allocator
@@ -74,7 +77,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         budget = queue._allocatable_token_budgets()
 
         self.assertEqual(budget, 512)
-        logical_allocator.full_available_size.assert_called_once_with()
+        logical_allocator.full.available_size.assert_called_once_with()
         logical_allocator.available_size.assert_not_called()
 
     def test_hisparse_prealloc_uses_swa_tail_for_direct_host_path(self):
@@ -117,7 +120,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             device=torch.device("cpu"),
             page_size=256,
             available_size=MagicMock(return_value=fill_len),
-            swa_available_size=MagicMock(return_value=swa_tail_len),
+            swa=SimpleNamespace(available_size=MagicMock(return_value=swa_tail_len)),
             alloc_extend_swa_tail=MagicMock(return_value=kv_loc),
             alloc_logical_only=MagicMock(return_value=kv_loc),
         )

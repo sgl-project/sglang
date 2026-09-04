@@ -66,12 +66,12 @@ class SWAComponent(TreeComponent):
     """
 
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
-        from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+        from sglang.srt.mem_cache.allocator.hybrid import BaseHybridSWAKVAllocator
 
         assert isinstance(
-            params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+            params.token_to_kv_pool_allocator, BaseHybridSWAKVAllocator
         ), (
-            f"SWAComponent requires SWATokenToKVPoolAllocator, got {type(params.token_to_kv_pool_allocator)}"
+            f"SWAComponent requires a BaseHybridSWAKVAllocator, got {type(params.token_to_kv_pool_allocator)}"
         )
         super().__init__(cache, params)
         self._session_leaf_covered_len: dict[str, dict[UnifiedTreeNode, int]] = {}
@@ -183,11 +183,11 @@ class SWAComponent(TreeComponent):
     def _unified_allocator(self):
         """The unified SWA composite, or None when running on the static pool."""
         from sglang.srt.mem_cache.multi_ended_allocator import (
-            UnifiedSWATokenToKVPoolAllocator,
+            UnifiedHybridSWAKVAllocator,
         )
 
         allocator = self.cache.token_to_kv_pool_allocator
-        if isinstance(allocator, UnifiedSWATokenToKVPoolAllocator):
+        if isinstance(allocator, UnifiedHybridSWAKVAllocator):
             return allocator
         return None
 
@@ -1333,7 +1333,7 @@ class SWAComponent(TreeComponent):
         alloc = self.cache.token_to_kv_pool_allocator
         if isinstance(action, FreeComponentDeviceSlot):
             for indices in action.indices:
-                alloc.free_swa(indices)
+                alloc.swa.free(indices)
             return
         if isinstance(action, FreeComponentHostSlot):
             for host_indices in action.host_indices:
@@ -1371,7 +1371,7 @@ class SWAComponent(TreeComponent):
             swa_value = self._translate_full_to_swa(action.incoming_full)
             alloc.set_full_to_swa_mapping(action.kept_full, swa_value)
             alloc.clear_full_to_swa_mapping(action.incoming_full)
-            alloc.free_full_segment(action.incoming_full, start_pos=0)
+            alloc.full.free_segment(action.incoming_full, start_pos=0)
             self.tree_core.set_component_device_value(
                 action.node_id, self.component_type, swa_value
             )

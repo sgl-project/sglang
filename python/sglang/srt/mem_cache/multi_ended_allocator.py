@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""MultiEndedAllocator: one allocator per sub-pool over a `UnifiedKVPool`.
+"""MultiEndedKVAllocator: one allocator per sub-pool over a `UnifiedKVPool`.
 
 `alloc*` run the upstream kernels ONCE in virtual space using `free_virtual_ids`
 as the free-page pointer, then bind consumed virtual pages to physical pages so
@@ -46,12 +46,12 @@ from sglang.kernels.ops.memory.virtual_slot import (
     free_unbind_inplace,
 )
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import BaseKVAllocator, KVFreeSide
+from sglang.srt.mem_cache.allocator.hybrid import BaseHybridSWAKVAllocator
 from sglang.srt.mem_cache.allocator.paged import (
     alloc_decode_kernel,
     alloc_extend_kernel,
 )
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedKVPool,
     UnifiedMLATokenToKVPool,
@@ -72,7 +72,7 @@ _LAZY_COMPACTION_STATS_INTERVAL_SEC = float(
     envs.SGLANG_LOG_LAZY_COMPACTION_STATS_INTERVAL_SEC.get()
 )
 # Signal handler emits each instance's final counters (atexit misses signal exits).
-_STATS_INSTANCES: weakref.WeakSet[MultiEndedAllocator] = weakref.WeakSet()
+_STATS_INSTANCES: weakref.WeakSet[MultiEndedKVAllocator] = weakref.WeakSet()
 _SIGNAL_HANDLERS_INSTALLED = False
 
 
@@ -248,7 +248,7 @@ def _relieve_for_alloc(short_pool, need_tokens: int) -> bool:
     return need_tokens <= short_pool.available_size()
 
 
-class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
+class MultiEndedKVAllocator(BaseKVAllocator):
     """Allocator for one sub-pool over a `UnifiedKVPool`."""
 
     # Capacity-bearing state: any rebind bumps `_capacity_epoch`, invalidating
@@ -314,7 +314,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # --- Page-aware bookkeeping ---
         # Two page sizes, equal unless decode context parallelism is on:
         # `page_size` is VIRTUAL (what the scheduler, the tree cache and the
-        # alloc/free surface speak, matching PagedTokenToKVPoolAllocator's
+        # alloc/free surface speak, matching PagedKVAllocator's
         # widened DCP contract), `pool_page_size` is the PHYSICAL rows one page
         # occupies here. Under DCP a virtual page holds dcp_size logical ids per
         # stored row, of which this rank owns `loc % dcp_size == dcp_rank`;
@@ -355,8 +355,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
         # Chain neighbours: `low_peer` toward byte 0, `high_peer` toward
         # `total_bytes`. Ends have one (`bind_peer`), float middles have both.
-        self.low_peer: Optional[MultiEndedAllocator] = None
-        self.high_peer: Optional[MultiEndedAllocator] = None
+        self.low_peer: Optional[MultiEndedKVAllocator] = None
+        self.high_peer: Optional[MultiEndedKVAllocator] = None
 
         # Inverse history of relocations (spec rollback), at PAGE granularity.
         self._inverse_history: List[
@@ -431,7 +431,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.clear()
 
         logger.info(
-            "[unified-memory-pool] MultiEndedAllocator(%r) ready: grow=%s, max_slots=%d, "
+            "[unified-memory-pool] MultiEndedKVAllocator(%r) ready: grow=%s, max_slots=%d, "
             "min_slot_index=%d, page_size=%d, num_pages=%d, min_page_index=%d, "
             "entry_bytes=%d, entry_bytes_per_page=%d, is_id_owner=%s, "
             "initial_watermark_page=%d, allocatable_pages=%d",
@@ -451,7 +451,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
     # -- chain-neighbor binding --
 
-    def bind_peer(self, peer: MultiEndedAllocator) -> None:
+    def bind_peer(self, peer: MultiEndedKVAllocator) -> None:
         """2-pool END-pair compat: bind the OTHER end as this end's growth-side
         neighbor (grow-up's neighbor sits above; grow-down's below). Float
         middles must be wired explicitly — calling this on/with one raises.
@@ -470,11 +470,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self.low_peer = peer
         self._capacity_epoch += 1  # rewiring changes what the chain walks see
 
-    def bind_low_peer(self, peer: MultiEndedAllocator) -> None:
+    def bind_low_peer(self, peer: MultiEndedKVAllocator) -> None:
         self.low_peer = peer
         self._capacity_epoch += 1  # rewiring changes what the chain walks see
 
-    def bind_high_peer(self, peer: MultiEndedAllocator) -> None:
+    def bind_high_peer(self, peer: MultiEndedKVAllocator) -> None:
         self.high_peer = peer
         self._capacity_epoch += 1  # rewiring changes what the chain walks see
 
@@ -671,7 +671,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             p = p.high_peer
         return total
 
-    def _growth_side_neighbor(self) -> Optional[MultiEndedAllocator]:
+    def _growth_side_neighbor(self) -> Optional[MultiEndedKVAllocator]:
         """Nearest NON-transparent chain member on this pool's GROWTH side --
         the one whose compaction/flush releases bytes reachable at this pool's
         frontier."""
@@ -767,7 +767,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         opens the side facing me. Everything else — side derivation, index
         guard, total-target ask -- is the shared policy."""
         blocker = self._growth_side_neighbor()
-        if not isinstance(blocker, FloatMultiEndedAllocator):
+        if not isinstance(blocker, FloatMultiEndedKVAllocator):
             return
         _float_open_short_side(blocker, {self: -(-need_tokens // self.page_size)})
 
@@ -1153,13 +1153,13 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """
         with record_function("MultiEndedAlloc.alloc"):
             assert self.is_id_owner, (
-                f"MultiEndedAllocator({self.sub_pool_name!r}).alloc called on a "
+                f"MultiEndedKVAllocator({self.sub_pool_name!r}).alloc called on a "
                 "non-id-owner allocator; use alloc_with_virtual instead"
             )
             if need_size <= 0:
                 return torch.empty(0, dtype=torch.int64, device=self.device)
             assert need_size % self.page_size == 0, (
-                f"MultiEndedAllocator({self.sub_pool_name!r}).alloc: need_size="
+                f"MultiEndedKVAllocator({self.sub_pool_name!r}).alloc: need_size="
                 f"{need_size} must be a multiple of page_size={self.page_size}"
             )
             if need_size > self.available_size():
@@ -1197,7 +1197,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 virtual_pages, int(virtual_pages.numel())
             )
             assert phys_pages is not None, (
-                f"MultiEndedAllocator({self.sub_pool_name!r}).alloc_with_virtual: out of "
+                f"MultiEndedKVAllocator({self.sub_pool_name!r}).alloc_with_virtual: out of "
                 "physical room (the composite's byte-budget check should have caught this)"
             )
 
@@ -2050,7 +2050,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             v_moveds_t = self.physical_to_virtual[src_pages_t]
             torch._assert_async(
                 (v_moveds_t >= 0).all(),
-                "invalid p2v mapping in MultiEndedAllocator._flush",
+                "invalid p2v mapping in MultiEndedKVAllocator._flush",
             )
             # Expand to PHYSICAL token granularity (the move kernel is
             # token-granular over pool rows).
@@ -2097,7 +2097,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         frames = inspect.stack()[1:9]
         callers = " <- ".join(f"{f.filename.split('/')[-1]}:{f.lineno}" for f in frames)
         raise AssertionError(
-            f"MultiEndedAllocator({self.sub_pool_name!r}).free: virtual id(s) {bad} have "
+            f"MultiEndedKVAllocator({self.sub_pool_name!r}).free: virtual id(s) {bad} have "
             f"virtual_to_physical == -1 (double-free or never-allocated). "
             f"State: {self.allocator_state_str()}. free_index unique={free_v.tolist()}. "
             f"recent _inverse_history (last 3): "
@@ -2120,7 +2120,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
 
 def _chain_byte_accounting_violations(
-    chain: List[MultiEndedAllocator],
+    chain: List[MultiEndedKVAllocator],
 ) -> List[str]:
     """Conservation for an ordered low→high chain of band allocators: each
     member's own accounting, plus the frontier total order — a member's low
@@ -2148,14 +2148,14 @@ def _chain_byte_accounting_violations(
 
 
 def _end_pair_chain(
-    a: MultiEndedAllocator, b: MultiEndedAllocator
-) -> List[MultiEndedAllocator]:
+    a: MultiEndedKVAllocator, b: MultiEndedKVAllocator
+) -> List[MultiEndedKVAllocator]:
     """Order an end pair low→high by grow direction (the factories and the
     unit fixtures orient the pair differently; the chain check must not care)."""
     return sorted((a, b), key=lambda x: x.grow_direction != "up")
 
 
-class FloatMultiEndedAllocator(MultiEndedAllocator):
+class FloatMultiEndedKVAllocator(MultiEndedKVAllocator):
     """Float MIDDLE cache pool: a span ``[low_wm_page, high_wm_page)`` between
     two chain neighbors, with freed HOLES allowed inside the span.
 
@@ -2194,7 +2194,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
 
     def __init__(self, **kwargs):
         assert not kwargs.get("lazy_compaction", False), (
-            "FloatMultiEndedAllocator is holes-first; the lazy event pipeline "
+            "FloatMultiEndedKVAllocator is holes-first; the lazy event pipeline "
             "is end-pool machinery and must stay off for float middles"
         )
         # Base __init__ ends with self.clear(), which reads these via our
@@ -2203,7 +2203,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         self.high_wm_page = 0
         super().__init__(**kwargs)
         assert self.grow_direction == "float", (
-            f"FloatMultiEndedAllocator needs a 'float' sub-pool spec; got "
+            f"FloatMultiEndedKVAllocator needs a 'float' sub-pool spec; got "
             f"{self.grow_direction!r}"
         )
 
@@ -2706,7 +2706,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         new_entries = self._inverse_history[n_inverse:]
         if new_entries:
             logger.warning(
-                "FloatMultiEndedAllocator.restore_state: %d relocation(s) inside "
+                "FloatMultiEndedKVAllocator.restore_state: %d relocation(s) inside "
                 "a backup window (sub_pool=%s) — float moves are not reversible.",
                 len(new_entries),
                 self.sub_pool_name,
@@ -2735,13 +2735,13 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
 
     # -- band-incompatible base APIs --
 
-    def bind_peer(self, peer: MultiEndedAllocator) -> None:  # pragma: no cover
+    def bind_peer(self, peer: MultiEndedKVAllocator) -> None:  # pragma: no cover
         raise AssertionError(
             "float middles must be wired via bind_low_peer/bind_high_peer"
         )
 
 
-class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+class UnifiedMambaKVAllocator(BaseKVAllocator):
     """Composite allocator for the MHA (full-attn) + Mamba hybrid pair.
 
     The token-slot surface delegates to the full-attn side (`alloc(N)` →
@@ -2780,7 +2780,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # FULL is page-aware; MAMBA stays page_size=1 (state is per-request,
         # orthogonal to the full side's per-token paging), and only FULL shards
         # under DCP: mamba state is replicated on every rank.
-        self.full_attn_allocator = MultiEndedAllocator(
+        self.full_attn_allocator = MultiEndedKVAllocator(
             kvcache=kvcache.full_kv_pool,
             unified_buffer=unified_buffer,
             sub_pool_name="full",
@@ -2792,7 +2792,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             forward_stream=forward_stream,
             lazy_compaction=lazy_compaction,
         )
-        self.mamba_allocator = MultiEndedAllocator(
+        self.mamba_allocator = MultiEndedKVAllocator(
             kvcache=kvcache.mamba_pool,
             unified_buffer=unified_buffer,
             sub_pool_name="mamba",
@@ -2819,7 +2819,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_pages = torch.empty(0, dtype=torch.int64, device=device)
 
         logger.info(
-            "[unified-memory-pool] UnifiedMambaTokenToKVPoolAllocator ready: "
+            "[unified-memory-pool] UnifiedMambaKVAllocator ready: "
             "full max_slots=%d (min_slot_index=%d, page_size=%d, "
             "num_pages=%d), mamba max_slots=%d (min_slot_index=%d), "
             "full_available=%d, mamba_available=%d",
@@ -3041,7 +3041,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
         """Fixed-shape counterpart of `free()`; see
-        `MultiEndedAllocator._page_reps`. The mamba sub-pool is
+        `MultiEndedKVAllocator._page_reps`. The mamba sub-pool is
         slot-granular and untouched by a token free, so only the full side
         needs the representatives.
         """
@@ -3125,25 +3125,142 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return fa.flush_opportunistic() + ma.flush_opportunistic()
 
 
-class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
+class _VirtualFullSide(KVFreeSide):
+    """The full side of the unified pair: the id-owning MultiEndedKVAllocator.
+    Deferral lives in the pool's own group."""
+
+    def __init__(self, pool: MultiEndedKVAllocator, *, max_total_num_tokens: int):
+        self.pool = pool
+        self.page_size = pool.page_size
+        self.free_group = None
+        # Static partition cap: the slot-conservation bound of this side.
+        self.max_total_num_tokens = max_total_num_tokens
+
+    def available_size(self) -> int:
+        # The static-conserve cap bounds a side lending bytes to its peer, the
+        # byte-coordinated view bounds one that has grown into the shared gap;
+        # whichever is tighter is what a scheduler may still allocate.
+        return min(
+            self.max_total_num_tokens - self.pool.allocated_count(),
+            self.pool.schedulable_available_size(),
+        )
+
+    def free(self, free_index: torch.Tensor) -> None:
+        if free_index is None or free_index.numel() == 0:
+            return
+        self.pool.free(free_index.detach().to(torch.int64))
+        if self.pool.free_group is None:
+            self.pool.clear_inverse_history()
+
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
+        if free_index is None or free_index.numel() == 0:
+            return
+        self.pool.free_segment(free_index.detach().to(torch.int64), start_pos=start_pos)
+        if self.pool.free_group is None:
+            self.pool.clear_inverse_history()
+
+    def free_group_begin(self) -> None:
+        self.pool.free_group_begin()
+
+    def free_group_end(self) -> None:
+        self.pool.free_group_end()
+        self.pool.clear_inverse_history()
+
+
+class _VirtualSWASide(KVFreeSide):
+    """The swa side of the unified pair: the non-owner MultiEndedKVAllocator,
+    whose v2p table is the pairing. `-1` there is a tombstone left by an
+    earlier swa free and 0 is the padding sink; both are skipped."""
+
+    def __init__(self, pool: MultiEndedKVAllocator, *, max_total_num_tokens: int):
+        self.pool = pool
+        self.page_size = pool.page_size
+        # Raw full ids; the liveness filter runs once at the flush.
+        self.free_group = None
+        self._pending_reps: Optional[List[torch.Tensor]] = None
+        self.max_total_num_tokens = max_total_num_tokens
+
+    def available_size(self) -> int:
+        # Same two bounds as the full side; see _VirtualFullSide.available_size.
+        return min(
+            self.max_total_num_tokens - self.pool.allocated_count(),
+            self.pool.schedulable_available_size(),
+        )
+
+    def free(self, free_index: torch.Tensor) -> None:
+        if free_index is None or free_index.numel() == 0:
+            return
+        v = free_index.detach().to(torch.int64)
+        if self.free_group is not None:
+            self.free_group.append(self._copy_for_free_group(v))
+            return
+        self._release_tokens(v)
+
+    def _release_tokens(self, v: torch.Tensor) -> None:
+        ps = self.page_size
+        live = v[self.pool.virtual_to_physical[v // ps] > 0]
+        if live.numel() == 0:
+            return
+        if ps == 1:
+            # token == page and the live filter just deduped against the v2p
+            # table, so these ARE unique page ids -- same skip as `_free_lazy`.
+            self.pool.free(live, _pages=live)
+        else:
+            self.pool.free(live)
+        self.pool.clear_inverse_history()
+
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
+        if free_index is None or free_index.numel() == 0:
+            return
+        if self.page_size == 1:
+            self.free(free_index)
+            return
+        reps = self.pool._page_reps(free_index.detach().to(torch.int64), start_pos)
+        if self._pending_reps is not None:
+            self._pending_reps.append(reps)
+            return
+        self._release_reps(reps)
+
+    def _release_reps(self, reps: torch.Tensor) -> None:
+        ps = self.page_size
+        rep_pages = reps // ps
+        live_pages = rep_pages[self.pool.virtual_to_physical[rep_pages] > 0]
+        if live_pages.numel() == 0:
+            return
+        self.pool.free(live_pages * ps, _pages=live_pages)
+        self.pool.clear_inverse_history()
+
+    def free_group_begin(self) -> None:
+        super().free_group_begin()
+        self._pending_reps = []
+
+    def free_group_end(self) -> None:
+        pending, self.free_group = self.free_group, None
+        reps, self._pending_reps = self._pending_reps, None
+        if pending:
+            self._release_tokens(torch.cat(pending))
+        if reps:
+            self._release_reps(torch.cat(reps))
+
+
+class UnifiedHybridSWAKVAllocator(BaseHybridSWAKVAllocator):
     """Composite allocator for the hybrid SWA pair (full + swa MHA sub-pools).
 
-    Inherits from `SWATokenToKVPoolAllocator` only for the isinstance contract;
-    we call grand-parent `BaseTokenToKVPoolAllocator.__init__` directly to skip
-    the parent's static-partition sub-pool allocation (which unified-memory-pool
-    replaces).
+    A `BaseHybridSWAKVAllocator` whose two sides are MultiEndedKVAllocator sub-pools
+    sharing one virtual id space; the swa side's v2p table is the pairing, so
+    there is no full -> swa mapping tensor.
 
     Capacity views:
     - `available_size()`: joint byte-budget, the only safe `alloc(N)` pre-check
       (N slots cost N*(entry_full + entry_swa) shared-gap bytes).
     - `_conserve_*`: slot-conservation, for the LEAK invariant only.
     - `schedulable_*`: byte-coordinated, realizable-with-compaction.
-    - `full_available_size()` / `swa_available_size()`: per-side scheduler view
+    - `full.available_size()` / `swa.available_size()`: per-side scheduler view
       = min(conserve, schedulable).
     """
 
-    # Parent's `size` property has no setter but base init does `self.size = size`;
-    # override with a no-op setter. Reading returns `min(_size_full, _size_swa)`.
+    # Base init does `self.size = size`; absorb it with a no-op setter. Reading
+    # returns `min(_size_full, _size_swa)`.
     @property
     def size(self) -> int:
         return min(self._size_full, self._size_swa)
@@ -3151,6 +3268,14 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     @size.setter
     def size(self, value) -> None:
         pass
+
+    @property
+    def size_swa(self) -> int:
+        return self._size_swa
+
+    @property
+    def size_full(self) -> int:
+        return self._size_full
 
     def __init__(
         self,
@@ -3173,10 +3298,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self._swa_max_total_num_tokens = swa_max_total_num_tokens
         self.page_size = page_size
 
-        # Skip SWATokenToKVPoolAllocator.__init__; call grand-parent base init
-        # directly (its `self.size = size` is absorbed by our no-op setter).
-        BaseTokenToKVPoolAllocator.__init__(
-            self,
+        super().__init__(
             size=full_max_total_num_tokens,
             page_size=page_size,
             dtype=unified_buffer.mha_spec("full").store_dtype,
@@ -3188,7 +3310,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self._kvcache = kvcache
         self.lazy_compaction = lazy_compaction
 
-        self.full_attn_allocator = MultiEndedAllocator(
+        self.full_attn_allocator = MultiEndedKVAllocator(
             kvcache=kvcache.full_kv_pool,
             unified_buffer=unified_buffer,
             sub_pool_name="full",
@@ -3212,9 +3334,15 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             virtual_num_pages=self.full_attn_allocator.num_virtual_ids,
         )
         self._wire_peers()
+        self.full = _VirtualFullSide(
+            self.full_attn_allocator, max_total_num_tokens=full_max_total_num_tokens
+        )
+        self.swa = _VirtualSWASide(
+            self.swa_attn_allocator, max_total_num_tokens=swa_max_total_num_tokens
+        )
 
         # Epoch-keyed memo for the joint capacity view (any chain member's
-        # mutation invalidates -- see `MultiEndedAllocator._chain_capacity_epoch`).
+        # mutation invalidates -- see `MultiEndedKVAllocator._chain_capacity_epoch`).
         self._joint_avail_memo_epoch: Optional[int] = None
         self._joint_avail_memo_tokens: int = 0
 
@@ -3226,14 +3354,12 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
 
         self.free_group = None
-        self.free_page_reps_group: Optional[List[torch.Tensor]] = None
-        self.full_free_group: List[torch.Tensor] = []
         # Empty (not None) for the leak checker.
         self.free_pages = torch.empty(0, dtype=torch.int64, device=device)
         self.release_pages = torch.empty(0, dtype=torch.int64, device=device)
 
         logger.info(
-            "[unified-memory-pool] UnifiedSWATokenToKVPoolAllocator ready: "
+            "[unified-memory-pool] UnifiedHybridSWAKVAllocator ready: "
             "full max_slots=%d (min_slot_index=%d, entry_bytes=%d), "
             "swa max_slots=%d (min_slot_index=%d, entry_bytes=%d), "
             "static caps full=%d swa=%d, joint available=%d",
@@ -3250,10 +3376,10 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     # -- construction hooks (the tri-pool subclass overrides both) --
 
-    def _build_swa_attn_allocator(self, **kwargs) -> MultiEndedAllocator:
+    def _build_swa_attn_allocator(self, **kwargs) -> MultiEndedKVAllocator:
         """The swa sub-allocator: an END pool here (2-pool pair); the tri-pool
         subclass overrides to build the swa FLOAT middle instead."""
-        return MultiEndedAllocator(
+        return MultiEndedKVAllocator(
             sub_pool_name="swa",
             is_id_owner=False,  # non-owner; consumes virtuals minted by full
             **kwargs,
@@ -3341,22 +3467,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self._swa_max_total_num_tokens - self.swa_attn_allocator.allocated_count()
         )
 
-    # PHYSICAL per-side views read by scheduling / eviction consumers. The
-    # `min(...)` is sound under dynamic borrowing: the static-conserve cap bounds
-    # the lending side, the byte-coordinated `schedulable_*` bounds the side that
-    # has grown into the shared gap; whichever is tighter wins.
-    def full_available_size(self) -> int:
-        return min(
-            self._conserve_full_available_size(),
-            self.schedulable_full_available_size(),
-        )
-
-    def swa_available_size(self) -> int:
-        return min(
-            self._conserve_swa_available_size(),
-            self.schedulable_swa_available_size(),
-        )
-
     # Slot-conservation views for the LEAK INVARIANT only, which pairs the static
     # per-layer total with (static cap - live). Schedulers keep the `min(...)`
     # views above: under the floating boundary the byte term dips below the
@@ -3368,7 +3478,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         return self._conserve_swa_available_size()
 
     # Byte-coordinated, realizable-with-compaction views (peer drainable holes
-    # credited — see `MultiEndedAllocator.schedulable_available_size`).
+    # credited — see `MultiEndedKVAllocator.schedulable_available_size`).
     def schedulable_full_available_size(self) -> int:
         return self.full_attn_allocator.schedulable_available_size()
 
@@ -3581,98 +3691,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     # -- free --
 
-    def free(self, free_index: torch.Tensor) -> None:
-        with record_function("UnifiedSWAAlloc.free"):
-            if free_index is None or free_index.numel() == 0:
-                return
-            if self.free_group is not None:
-                self.free_group.append(self._copy_for_free_group(free_index))
-                return
-            # Free both peers; the per-sub-pool v2p IS the mapping, so order isn't
-            # load-bearing. Filter the swa side to skip already-tombstoned virtuals
-            # (`swa.v2p_page == -1` from an earlier `free_swa`); the full side needs
-            # no filter (it's the lifecycle owner, so every value is still bound).
-            v = free_index.detach().to(torch.int64)
-            v_pages = v // self.page_size
-            swa_v2p_pages = self.swa_attn_allocator.virtual_to_physical[v_pages]
-            # `> 0` strict: -1 = tombstoned, 0 = padding-sink page; both skipped.
-            live_token_mask = swa_v2p_pages > 0
-            live_tokens = v[live_token_mask]
-            if live_tokens.numel() > 0:
-                self.swa_attn_allocator.free(live_tokens)
-            self.full_attn_allocator.free(v)
-            self.full_attn_allocator.clear_inverse_history()
-            self.swa_attn_allocator.clear_inverse_history()
-
-    def free_swa(
-        self, free_index: torch.Tensor, *, start_pos: Optional[int] = None
-    ) -> None:
-        """SWA tombstone path: release swa-physical, leave virtual id and
-        full-physical live. Called by the per-step window ratchet and by radix
-        SWA eviction when a node ages past the sliding-window horizon.
-        `swa.v2p_page[v_page] = -1` IS the tombstone.
-
-        ``start_pos`` is the `free_segment` contract: when the caller frees a
-        CONTIGUOUS ascending range whose first token sits at prefix position
-        `start_pos` (the window ratchet does — host-int, page-aligned bounds),
-        page representatives come from stride arithmetic and the swa side is
-        freed with caller-supplied page ids — no `torch.unique`, keeping the
-        per-decode-step free host-sync-free. Without it (radix eviction hands
-        arbitrary node values) the swa side falls back to its own dedup.
-        """
-        if free_index is None or free_index.numel() == 0:
-            return
-        v = free_index.detach().to(torch.int64)
-        ps = self.page_size
-        if start_pos is not None and ps > 1:
-            reps = self.swa_attn_allocator._page_reps(v, start_pos)
-            # Keep only pages still bound on swa (freeing a tombstoned one
-            # would corrupt the hole list). `> 0` strict: -1 = tombstoned,
-            # page 0 = padding sink (never freeable).
-            rep_pages = reps // ps
-            swa_v2p_pages = self.swa_attn_allocator.virtual_to_physical[rep_pages]
-            live_reps = reps[swa_v2p_pages > 0]
-            if live_reps.numel() == 0:
-                return
-            self.swa_attn_allocator.free(live_reps, _pages=live_reps // ps)
-            self.swa_attn_allocator.clear_inverse_history()
-            return
-        v_pages = v // ps
-        # `> 0` strict: -1 = tombstoned, page 0 = padding sink (never freeable).
-        swa_v2p_pages = self.swa_attn_allocator.virtual_to_physical[v_pages]
-        live = v[swa_v2p_pages > 0]
-        if live.numel() == 0:
-            return
-        if ps == 1:
-            # token == page and the live filter just deduped against the v2p
-            # table, so these ARE unique page ids -- same skip as `_free_lazy`.
-            self.swa_attn_allocator.free(live, _pages=live)
-        else:
-            self.swa_attn_allocator.free(live)
-        self.swa_attn_allocator.clear_inverse_history()
-
-    def free_full(self, free_index: torch.Tensor) -> None:
-        """Release the full-physical page and the virtual id, leaving the swa
-        side alone -- the caller already tombstoned it (`swa.v2p_page == -1`)."""
-        if free_index is None or free_index.numel() == 0:
-            return
-        if self.free_group is not None:
-            self.full_free_group.append(self._copy_for_free_group(free_index))
-            return
-        self.full_attn_allocator.free(free_index.detach().to(torch.int64))
-        self.full_attn_allocator.clear_inverse_history()
-
-    def free_full_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
-        if free_index is None or free_index.numel() == 0:
-            return
-        if self.page_size == 1:
-            # token == page: free_full already frees by exact ids, no dedup.
-            self.free_full(free_index)
-            return
-        # The swa v2p is the mapping, so a tombstoned swa page drops out of the
-        # two-sided segment path by itself; full-only is the same call.
-        self.free_segment(free_index, start_pos=start_pos)
-
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:
@@ -3686,56 +3704,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         # Paired with set_full_to_swa_mapping: shared mode has no mapping tensor.
         return
 
-    # -- free-group --
-
-    # Not the SWA parent's hooks: those open the parent's paged full allocator
-    # as a free group, and this composite's sub-pools defer on their own.
-    def free_group_begin(self) -> None:
-        BaseTokenToKVPoolAllocator.free_group_begin(self)
-        self.free_page_reps_group = []
-        self.full_free_group = []
-
-    def free_group_end(self) -> None:
-        pending, self.free_page_reps_group = self.free_page_reps_group, None
-        full_free_group, self.full_free_group = self.full_free_group, []
-        BaseTokenToKVPoolAllocator.free_group_end(self)
-        if full_free_group:
-            self.full_attn_allocator.free(torch.cat(full_free_group))
-            self.full_attn_allocator.clear_inverse_history()
-        if pending:
-            self._release_page_reps(pending)
-
-    def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
-        """Fixed-shape counterpart of `free()`; see
-        `MultiEndedAllocator._page_reps`. Both sides share one
-        derivation -- neither repeats the position-less dedup.
-        """
-        if free_index is None or free_index.numel() == 0:
-            return
-        if self.page_size == 1:
-            self.free(free_index)
-            return
-        reps = self.full_attn_allocator._page_reps(
-            free_index.detach().to(torch.int64), start_pos
-        )
-        if self.free_page_reps_group is None:
-            self._release_page_reps((reps,))
-        else:
-            self.free_page_reps_group.append(reps)
-
-    def _release_page_reps(self, pieces: Sequence[torch.Tensor]) -> None:
-        reps = pieces[0] if len(pieces) == 1 else torch.cat(tuple(pieces))
-        v_pages = reps // self.page_size
-        # Same tombstone filter as `free`, but at PAGE granularity (page_size
-        # times smaller): `> 0` strict -- -1 = tombstoned, 0 = padding sink.
-        swa_v2p_pages = self.swa_attn_allocator.virtual_to_physical[v_pages]
-        live_pages = v_pages[swa_v2p_pages > 0]
-        if live_pages.numel() > 0:
-            self.swa_attn_allocator.free(live_pages * self.page_size, _pages=live_pages)
-        self.full_attn_allocator.free(reps, _pages=v_pages)
-        self.full_attn_allocator.clear_inverse_history()
-        self.swa_attn_allocator.clear_inverse_history()
-
     def verify_byte_accounting(self) -> List[str]:
         return (
             _chain_byte_accounting_violations(
@@ -3745,7 +3713,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
 
     def _joint_capacity_memo_violations(self) -> List[str]:
-        """Idle-time twin of `MultiEndedAllocator._capacity_memo_violations`
+        """Idle-time twin of `MultiEndedKVAllocator._capacity_memo_violations`
         for the composite joint view. Empty == healthy."""
         if (
             self._joint_avail_memo_epoch
@@ -3764,8 +3732,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.full_attn_allocator.clear()
         self.swa_attn_allocator.clear()
         self.free_group = None
-        self.free_page_reps_group = None
-        self.full_free_group = []
 
     # -- Lazy compaction hooks --
 
@@ -3809,7 +3775,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             return fa.flush_opportunistic() + sa.flush_opportunistic()
 
 
-class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
+class UnifiedMambaHybridSWAKVAllocator(UnifiedHybridSWAKVAllocator):
     """Tri-pool composite for models with full KV + SWA KV + mamba/conv state
     (Inkling-class: both `mambaish_config` and `is_hybrid_swa`).
 
@@ -3826,7 +3792,7 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
 
     Token surface: inherited from the SWA composite (full = id-owner of the
     per-token virtual ids; swa binds the same ids via `alloc_with_virtual`,
-    now on a `FloatMultiEndedAllocator`). Per-request state surface: the
+    now on a `FloatMultiEndedKVAllocator`). Per-request state surface: the
     `mamba_allocator` end MEA, wrapped by `UnifiedMambaSlotAllocator` exactly
     like the 2-pool mamba composite.
     """
@@ -3858,7 +3824,7 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
         )
         # Per-request state END pool (grow-up; page_size=1 -- state is
         # per-request, orthogonal to KV paging).
-        self.mamba_allocator = MultiEndedAllocator(
+        self.mamba_allocator = MultiEndedKVAllocator(
             kvcache=mamba_kvcache,
             unified_buffer=unified_buffer,
             sub_pool_name="mamba",
@@ -3882,7 +3848,7 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
         self.release_pages = None
 
         logger.info(
-            "[unified-memory-pool] UnifiedMambaSWATokenToKVPoolAllocator ready: "
+            "[unified-memory-pool] UnifiedMambaHybridSWAKVAllocator ready: "
             "chain=[mamba(up) | swa(float) | full(down)], "
             "mamba max_slots=%d (entry_bytes=%d), joint available=%d",
             self.mamba_allocator.max_slots,
@@ -3892,12 +3858,12 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
 
     # -- construction hooks --
 
-    def _build_swa_attn_allocator(self, **kwargs) -> MultiEndedAllocator:
+    def _build_swa_attn_allocator(self, **kwargs) -> MultiEndedKVAllocator:
         # The swa side is the FLOAT middle. Holes-first: the float never runs
         # the lazy event pipeline regardless of the composite's flag (frees
         # mark holes; allocs recycle them in place).
         kwargs["lazy_compaction"] = False
-        return FloatMultiEndedAllocator(
+        return FloatMultiEndedKVAllocator(
             sub_pool_name="swa",
             is_id_owner=False,  # non-owner; consumes virtuals minted by full
             **kwargs,
@@ -4021,7 +3987,7 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
         demand = self._alloc_demand(need_tokens)
         flt = None
         for b in demand:
-            if isinstance(b, FloatMultiEndedAllocator):
+            if isinstance(b, FloatMultiEndedKVAllocator):
                 flt = b
         _float_open_short_side(flt, demand)
 

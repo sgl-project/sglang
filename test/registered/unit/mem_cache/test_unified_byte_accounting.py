@@ -37,10 +37,8 @@ Derived properties pinned here:
 
 import unittest
 
-from test_multi_ended_allocator import TestPagedMultiEndedAllocator as _PagedFixture
-from test_multi_ended_allocator import (
-    TestUnifiedSWATokenToKVPoolAllocator as _SwaFixture,
-)
+from test_multi_ended_allocator import TestPagedMultiEndedKVAllocator as _PagedFixture
+from test_multi_ended_allocator import TestUnifiedHybridSWAKVAllocator as _SwaFixture
 
 from sglang.srt.mem_cache import multi_ended_allocator as mea
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -67,7 +65,7 @@ class TestHealthyLifecycleReportsClean(unittest.TestCase):
         self.assertEqual(allocator.verify_byte_accounting(), [])
         v = inst._alloc(allocator, kvcache, 8)
         self.assertEqual(allocator.verify_byte_accounting(), [])
-        allocator.free_swa(v[:4])  # tombstone half the swa side
+        allocator.swa.free(v[:4])  # tombstone half the swa side
         self.assertEqual(allocator.verify_byte_accounting(), [])
         inst._free(allocator, kvcache, v)
         self.assertEqual(allocator.verify_byte_accounting(), [])

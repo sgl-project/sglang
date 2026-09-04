@@ -11,12 +11,13 @@ from typing import (
     Tuple,
 )
 
+from sglang.srt.mem_cache.allocator.hybrid import BaseHybridSWAKVAllocator
 from sglang.srt.mem_cache.multi_ended_allocator import (
-    UnifiedMambaSWATokenToKVPoolAllocator,
+    UnifiedMambaHybridSWAKVAllocator,
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.allocator import BaseKVAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
@@ -145,7 +146,7 @@ class PoolStats:
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerPoolStatsObserver:
     tree_cache: BasePrefixCache
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
+    token_to_kv_pool_allocator: BaseKVAllocator
     req_to_token_pool: ReqToTokenPool
     session_controller: Any
     hisparse_coordinator: Any
@@ -293,12 +294,16 @@ class SchedulerPoolStatsObserver:
         # view, never the byte-coordinated one (see
         # `conserve_full_available_size`). Measured ~25-90x inflated otherwise.
         allocator = self.token_to_kv_pool_allocator
-        if isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
+        if isinstance(allocator, UnifiedMambaHybridSWAKVAllocator):
             full_available_size = allocator.conserve_full_available_size()
             swa_available_size = allocator.conserve_swa_available_size()
+        elif isinstance(allocator, BaseHybridSWAKVAllocator):
+            full_available_size = allocator.full.available_size()
+            swa_available_size = allocator.swa.available_size()
         else:
-            full_available_size = allocator.full_available_size()
-            swa_available_size = allocator.swa_available_size()
+            # All-SWA: one pool and no full side.
+            full_available_size = 0
+            swa_available_size = allocator.available_size()
         full_evictable_size = self.tree_cache.full_evictable_size()
         swa_evictable_size = self.tree_cache.swa_evictable_size()
         full_num_used = self.full_tokens_per_layer - (

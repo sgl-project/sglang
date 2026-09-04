@@ -30,7 +30,7 @@ import torch
 class MambaSlotAllocator:
     """Manages the free-list of Mamba pool slot indices.
 
-    Unlike ``BaseTokenToKVPoolAllocator`` which is designed for per-token KV
+    Unlike ``BaseKVAllocator`` which is designed for per-token KV
     pages, Mamba slots are request-level (typically 1 slot per request).
     We keep the interface minimal and do NOT inherit the KV base class.
     """

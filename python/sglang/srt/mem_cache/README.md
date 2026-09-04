@@ -54,7 +54,7 @@ By base class, never by name:
 
 | Inherits from | Home |
 |---|---|
-| `BaseTokenToKVPoolAllocator` | `allocator/<family>.py` |
+| `BaseKVAllocator` | `allocator/<family>.py` |
 | `KVCache`, `BaseSWAKVPool`, `ReqToTokenPool`, `MambaPool` | `pool/<family>.py` |
 | `HostKVCache` | `pool_host/<family>.py` |
 | `HiCacheStorage` | `storage/<backend>/` |
@@ -66,7 +66,7 @@ a new file in that family's module, not a new class in a catch-all one.
 
 `Allocator` means two different things and they do not share a directory:
 
-- **slot allocator** -- a `BaseTokenToKVPoolAllocator` subclass, hands out KV slots,
+- **slot allocator** -- a `BaseKVAllocator` subclass, hands out KV slots,
   lives in `allocator/`.
 - **host tensor allocator** -- `HostTensorAllocator` and its subclasses, hands out pinned
   host memory, lives in `pool_host/common.py` and `storage/`.

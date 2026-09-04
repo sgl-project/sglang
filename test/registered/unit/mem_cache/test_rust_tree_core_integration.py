@@ -1160,7 +1160,7 @@ def test_write_back_load_back_ignores_auxiliary_nodes_for_pending_ownership():
 
 def _swa_cache(window: int = 8, page_size: int = 1):
     """A real UnifiedRadixCache on the Rust tree core with a real SWA allocator."""
-    from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+    from sglang.srt.mem_cache.allocator.swa import HybridSWAKVAllocator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -1183,7 +1183,7 @@ def _swa_cache(window: int = 8, page_size: int = 1):
         full_attention_layer_ids=[1],
         device="cpu",
     )
-    allocator = SWATokenToKVPoolAllocator(
+    allocator = HybridSWAKVAllocator(
         size=64,
         size_swa=64,
         page_size=page_size,
@@ -1864,7 +1864,7 @@ def test_recover_with_locked_full_applies_through_the_python_allocator():
     _accumulate_step(step, tracker, device_frees, host_frees)
     cache.tree_core.evict_device_end(ComponentType.SWA)
     for freed in device_frees[ComponentType.SWA]:
-        allocator.free_swa(freed)
+        allocator.swa.free(freed)
     assert cache.tree_core.get_component_device_value(node, ComponentType.SWA) is None
     incoming = allocator.alloc(2)
     before_free = allocator.full_attn_allocator.available_size()

@@ -42,7 +42,7 @@ class DSV4ReqToTokenTablesMixin:
             enable=enable_memory_saver
         )
 
-        # Back-ref to DSV4NPUTokenToKVPoolAllocator, wired via
+        # Back-ref to NPUDSV4HybridSWAKVAllocator, wired via
         # register_dsv4_allocator after both exist, so free(req) can release
         # c128 pages. None at construction so base clear() runs safely.
         self._dsv4_allocator = None
@@ -73,7 +73,7 @@ class DSV4ReqToTokenTablesMixin:
         self._dsv4_allocator.replace_req_c128_prefix(req_pool_idx, prefix_pages, self)
 
     def register_dsv4_allocator(self, allocator) -> None:
-        """Wire the DSV4NPUTokenToKVPoolAllocator ref so ``free(req)`` can
+        """Wire the NPUDSV4HybridSWAKVAllocator ref so ``free(req)`` can
         release C128 KV pages."""
         self._dsv4_allocator = allocator
 

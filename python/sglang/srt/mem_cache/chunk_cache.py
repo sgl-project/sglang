@@ -7,10 +7,8 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-from sglang.srt.mem_cache.allocator.hisparse import (
-    DeepSeekV4HiSparseTokenToKVPoolAllocator,
-)
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.hybrid import BaseHybridSWAKVAllocator
+from sglang.srt.mem_cache.allocator.swa import PureSWAKVAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -113,14 +111,7 @@ class SWAChunkCache(ChunkCache):
     """ChunkCache with support for sliding window attention."""
 
     def __init__(self, params: CacheInitParams):
-        # DeepSeek V4 HiSparse wraps SWATokenToKVPoolAllocator and exposes the same API.
-        assert isinstance(
-            params.token_to_kv_pool_allocator,
-            (
-                SWATokenToKVPoolAllocator,
-                DeepSeekV4HiSparseTokenToKVPoolAllocator,
-            ),
-        )
+        assert isinstance(params.token_to_kv_pool_allocator, BaseHybridSWAKVAllocator)
         super().__init__(params)
 
         self.sliding_window_size = params.sliding_window_size
@@ -136,7 +127,7 @@ class SWAChunkCache(ChunkCache):
         return EvictResult()
 
 
-class PureSWAChunkCache(SWAChunkCache):
+class PureSWAChunkCache(ChunkCache):
     """ChunkCache for all-SWA models (no full attention layers).
 
     For hybrid models, full_to_swa_index_mapping prevents SWA double-free.
@@ -149,6 +140,18 @@ class PureSWAChunkCache(SWAChunkCache):
     finish. Distinct from the ``cache_protected_len`` prefix, which is owned
     elsewhere and never freed by this path.
     """
+
+    def __init__(self, params: CacheInitParams):
+        assert isinstance(params.token_to_kv_pool_allocator, PureSWAKVAllocator)
+        super().__init__(params)
+        self.sliding_window_size = params.sliding_window_size
+        self.chunked_prefill_size = params.chunked_prefill_size
+
+    def supports_swa(self) -> bool:
+        assert self.sliding_window_size is not None, (
+            "sliding_window_size must be set for PureSWAChunkCache"
+        )
+        return True
 
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int

@@ -1,6 +1,6 @@
 """Regression for SWA alloc_extend page estimation.
 
-Old gate in SWATokenToKVPoolAllocator.alloc_extend added one full page_size
+Old gate in HybridSWAKVAllocator.alloc_extend added one full page_size
 per request unconditionally, refusing extends that fit inside the request's
 last partial page. Fix replaces with get_num_new_pages-based gating.
 """
@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import HybridSWAKVAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -52,7 +52,7 @@ def _make_self(*, page_size: int, full_available: int, swa_available: int):
 
 
 def _call(stub, *, prefix_lens_cpu, seq_lens_cpu, extend_num_tokens):
-    return SWATokenToKVPoolAllocator.alloc_extend(
+    return HybridSWAKVAllocator.alloc_extend(
         stub,
         prefix_lens=prefix_lens_cpu,
         prefix_lens_cpu=prefix_lens_cpu,

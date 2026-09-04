@@ -23,7 +23,7 @@ import torch
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import TokenedKVAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -182,7 +182,7 @@ def create_bench_cache(
 
     # --- KV pool + allocator ---
     if has_swa:
-        from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+        from sglang.srt.mem_cache.allocator.swa import HybridSWAKVAllocator
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         pool = SWAKVPool(
@@ -196,7 +196,7 @@ def create_bench_cache(
             full_attention_layer_ids=_full_attention_layer_ids(),
             device=device,
         )
-        allocator = SWATokenToKVPoolAllocator(
+        allocator = HybridSWAKVAllocator(
             size=kv_size,
             size_swa=kv_size,
             page_size=page_size,
@@ -217,7 +217,7 @@ def create_bench_cache(
             enable_memory_saver=False,
             mamba_pool=req_to_token_pool.mamba_pool if has_mamba else None,
         )
-        allocator = TokenToKVPoolAllocator(
+        allocator = TokenedKVAllocator(
             size=kv_size,
             dtype=_DTYPE,
             device=device,

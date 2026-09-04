@@ -20,11 +20,11 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
     SchedulerPoolStatsObserver,
 )
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import BaseKVAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.multi_ended_allocator import (
-    UnifiedMambaSWATokenToKVPoolAllocator,
+    UnifiedMambaHybridSWAKVAllocator,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
@@ -53,7 +53,7 @@ class SchedulerInvariantChecker:
     swa_tokens_per_layer: Optional[int]
     max_total_num_tokens: int
     tree_cache: BasePrefixCache
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
+    token_to_kv_pool_allocator: BaseKVAllocator
     req_to_token_pool: ReqToTokenPool
     pool_stats_observer: SchedulerPoolStatsObserver
     get_last_batch: Callable
@@ -123,7 +123,7 @@ class SchedulerInvariantChecker:
                 * allocator.page_size
             )
         full_available = ps.full_available_size
-        if isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
+        if isinstance(allocator, UnifiedMambaHybridSWAKVAllocator):
             # Pair the static per-layer total with the conserve view, never the
             # byte-coordinated one -- see `conserve_full_available_size`.
             full_available = allocator.conserve_full_available_size()
@@ -147,7 +147,7 @@ class SchedulerInvariantChecker:
     def _check_swa_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
         allocator = self.token_to_kv_pool_allocator
         swa_available = ps.swa_available_size
-        if isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
+        if isinstance(allocator, UnifiedMambaHybridSWAKVAllocator):
             # Tri-pool: same floating-boundary phantom as the full pool -- use the
             # slot-conservation view, not the byte-coordinated min (see _check_full_pool).
             swa_available = allocator.conserve_swa_available_size()

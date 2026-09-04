@@ -2,8 +2,9 @@ import weakref
 
 import torch
 
-from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.base import BaseKVAllocator, KVFreeSide
+from sglang.srt.mem_cache.allocator.hybrid import BaseHybridSWAKVAllocator
+from sglang.srt.mem_cache.allocator.paged import PagedKVAllocator
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
     HiSparseC4DevicePool,
@@ -12,7 +13,7 @@ from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.utils.common import get_num_new_pages
 
 
-class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+class HiSparseKVAllocator(BaseKVAllocator):
     def __init__(
         self,
         size: int,
@@ -32,7 +33,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.page_size = page_size
         self.need_sort = need_sort
 
-        self.logical_attn_allocator = PagedTokenToKVPoolAllocator(
+        self.logical_attn_allocator = PagedKVAllocator(
             self._size_full,
             self.page_size,
             self.dtype,
@@ -40,7 +41,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             kvcache,
             need_sort,
         )
-        self.hisparse_attn_allocator = PagedTokenToKVPoolAllocator(
+        self.hisparse_attn_allocator = PagedKVAllocator(
             self._size_hisparse,
             self.page_size,
             self.dtype,
@@ -267,10 +268,40 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
 
-class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+class _HiSparseFullSide(KVFreeSide):
+    """The wrapped hybrid's full side, with capacity also bounded by the C4
+    hisparse pool that every full slot needs a compressed slot in."""
+
+    def __init__(self, inner: KVFreeSide, hisparse_pool, compress_ratio: int):
+        self.inner = inner
+        self.hisparse_pool = hisparse_pool
+        self.compress_ratio = compress_ratio
+        self.page_size = inner.page_size
+        self.free_group = None
+
+    def available_size(self) -> int:
+        return min(
+            self.inner.available_size(),
+            self.hisparse_pool.available_size() * self.compress_ratio,
+        )
+
+    def free(self, free_index: torch.Tensor):
+        self.inner.free(free_index)
+
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        self.inner.free_segment(free_index, start_pos=start_pos)
+
+    def free_group_begin(self):
+        self.inner.free_group_begin()
+
+    def free_group_end(self):
+        self.inner.free_group_end()
+
+
+class HiSparseHybridSWAKVAllocator(BaseHybridSWAKVAllocator):
     def __init__(
         self,
-        logical_attn_allocator: BaseTokenToKVPoolAllocator,
+        logical_attn_allocator: BaseKVAllocator,
     ):
         assert isinstance(logical_attn_allocator._kvcache, DeepSeekV4TokenToKVPool)
         assert isinstance(
@@ -291,7 +322,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         self.logical_attn_allocator = logical_attn_allocator
         self._kvcache = logical_attn_allocator._kvcache
-        self.hisparse_attn_allocator = PagedTokenToKVPoolAllocator(
+        self.hisparse_attn_allocator = PagedKVAllocator(
             self._size_hisparse,
             self.hisparse_page_size,
             self.dtype,
@@ -315,7 +346,14 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_pages = None
         self.release_pages = None
         self.free_group = None
-        self.full_free_group = []
+        # The swa side is the wrapped hybrid's; the full side is too, bounded
+        # by the hisparse pool that is ours.
+        self.full = _HiSparseFullSide(
+            logical_attn_allocator.full,
+            self.hisparse_attn_allocator,
+            self.compress_ratio,
+        )
+        self.swa = logical_attn_allocator.swa
         self.clear()
 
         self.hisparse_kvcache.register_mapping(
@@ -351,27 +389,6 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         return self.logical_attn_allocator.translate_loc_from_full_to_swa(kv_indices)
-
-    def full_available_size(self):
-        return min(
-            self.logical_attn_allocator.full_available_size(),
-            self.hisparse_attn_allocator.available_size() * self.compress_ratio,
-        )
-
-    def swa_available_size(self):
-        return self.logical_attn_allocator.swa_available_size()
-
-    def free_swa(self, free_indices: torch.Tensor):
-        self.logical_attn_allocator.free_swa(free_indices)
-
-    def free_full(self, free_indices: torch.Tensor):
-        if free_indices.numel() == 0:
-            return
-
-        if self.free_group is None:
-            self.logical_attn_allocator.free_full(free_indices)
-        else:
-            self.full_free_group.append(self._copy_for_free_group(free_indices))
 
     def available_size(self) -> int:
         return min(
@@ -576,24 +593,3 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         self.full_to_hisparse_device_index_mapping[:-1].fill_(0)
         self.free_group = None
-        self.full_free_group = []
-
-    def free(self, free_index: torch.Tensor):
-        if free_index.numel() == 0:
-            return
-
-        if self.free_group is None:
-            self.logical_attn_allocator.free(free_index)
-        else:
-            self.free_group.append(self._copy_for_free_group(free_index))
-
-    def free_group_begin(self):
-        super().free_group_begin()
-        self.full_free_group = []
-
-    def free_group_end(self):
-        super().free_group_end()
-        if self.full_free_group:
-            full_free_group = self.full_free_group
-            self.full_free_group = []
-            self.free_full(torch.cat(full_free_group))

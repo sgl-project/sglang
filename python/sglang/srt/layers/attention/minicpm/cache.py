@@ -8,7 +8,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.allocator.base import BaseKVAllocator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 
@@ -16,7 +16,7 @@ class MiniCPMCompressedCache:
     def __init__(
         self,
         pool: ReqToTokenPool,
-        allocator: BaseTokenToKVPoolAllocator,
+        allocator: BaseKVAllocator,
         *,
         kernel_size: int,
         kernel_stride: int,
@@ -164,7 +164,7 @@ class MiniCPMCompressedCache:
 
 def attach_compressed_cache(
     pool: ReqToTokenPool,
-    allocator: BaseTokenToKVPoolAllocator,
+    allocator: BaseKVAllocator,
     *,
     kernel_size: int,
     kernel_stride: int,

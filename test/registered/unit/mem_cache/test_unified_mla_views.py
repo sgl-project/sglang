@@ -23,7 +23,7 @@ Covers, CPU-only (pure torch — no GPU / Triton kernels):
     only, and the reserved sink floor covers the whole page-0 envelope;
   - `UnifiedMLATokenToKVPool`: buffer wiring, V-as-prefix-slice, and the
     page-envelope `move_kv_cache` (REAL physical token ids, page-major runs);
-  - `MultiEndedAllocator.translate_kv_loc_for_kernel`: kernel id = v2p-page * (ps*L) +
+  - `MultiEndedKVAllocator.translate_kv_loc_for_kernel`: kernel id = v2p-page * (ps*L) +
     offset, tombstone clamp to the sink, `out=` contract, multiplier-1
     fallback, and correctness across eager compaction.
 
@@ -45,7 +45,7 @@ from sglang.srt.mem_cache.layout.page_major import (
     build_mla_views,
     mla_entry_bytes,
 )
-from sglang.srt.mem_cache.multi_ended_allocator import MultiEndedAllocator
+from sglang.srt.mem_cache.multi_ended_allocator import MultiEndedKVAllocator
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
     MLASubPoolSpec,
@@ -305,7 +305,7 @@ class _FakeKVCache:
 class TestTranslateKvLocForKernel(unittest.TestCase):
     def _build(self, ps=1, n_full_tokens=64, multiplier=_L):
         pool, full, mamba = _make_unified(page_size=ps, n_full_tokens=n_full_tokens)
-        full_alloc = MultiEndedAllocator(
+        full_alloc = MultiEndedKVAllocator(
             kvcache=_FakeKVCache(pool.max_slots("full")),
             unified_buffer=pool,
             sub_pool_name="full",
@@ -314,7 +314,7 @@ class TestTranslateKvLocForKernel(unittest.TestCase):
             page_size=ps,
             kernel_page_multiplier=multiplier,
         )
-        mamba_alloc = MultiEndedAllocator(
+        mamba_alloc = MultiEndedKVAllocator(
             kvcache=_FakeKVCache(pool.max_slots("mamba")),
             unified_buffer=pool,
             sub_pool_name="mamba",

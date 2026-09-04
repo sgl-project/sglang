@@ -51,7 +51,7 @@ def _get_allocator_type() -> str:
 def _evict_swa_for_device_alloc(cache: UnifiedRadixCache, required_size: int) -> None:
     from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
-    available_size = cache.token_to_kv_pool_allocator.swa_available_size()
+    available_size = cache.token_to_kv_pool_allocator.swa.available_size()
     shortfall = max(0, required_size - available_size)
     if shortfall > 0:
         cache.evict_for_alloc(EvictParams(swa_num_tokens=shortfall))

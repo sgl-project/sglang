@@ -22,7 +22,7 @@ if TYPE_CHECKING:
         SchedulerPoolStatsObserver,
     )
     from sglang.srt.managers.tp_worker import BaseTpWorker
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.allocator import BaseKVAllocator
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -39,7 +39,7 @@ class SchedulerLoadInquirer:
     max_running_requests: int
     pool_stats_observer: SchedulerPoolStatsObserver
     tp_worker: BaseTpWorker
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
+    token_to_kv_pool_allocator: BaseKVAllocator
     spec_algorithm: SpeculativeAlgorithm
     get_running_batch: Callable
     get_waiting_queue: Callable

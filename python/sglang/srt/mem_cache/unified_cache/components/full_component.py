@@ -505,7 +505,7 @@ class FullComponent(TreeComponent):
             for indices in action.indices:
                 # tree values are page-aligned copies of a kv row: page-exact segments
                 if self.cache.is_swa_enabled:
-                    alloc.full_attn_allocator.free_segment(indices, start_pos=0)
+                    alloc.full.free_segment(indices, start_pos=0)
                 else:
                     alloc.free_segment(indices, start_pos=0)
             return

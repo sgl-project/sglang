@@ -270,7 +270,7 @@ class TestSwaFullIdxDivergenceCompute(CustomTestCase):
         )
 
     def test_compute_ignores_swa_mapping_zero(self) -> None:
-        # SWATokenToKVPoolAllocator writes 0 into full_to_swa_index_mapping for
+        # HybridSWAKVAllocator writes 0 into full_to_swa_index_mapping for
         # FULL pool slots beyond the sliding window. Those entries are expected,
         # not real divergence, so the count must skip them.
         mapping = _make_identity_mapping(size=64)

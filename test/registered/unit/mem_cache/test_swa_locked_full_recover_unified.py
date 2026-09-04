@@ -43,7 +43,7 @@ import unittest
 import torch
 from test_multi_ended_allocator import _FakeUnifiedSWAKVPool  # sibling fixture
 
-from sglang.srt.mem_cache.multi_ended_allocator import UnifiedSWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.multi_ended_allocator import UnifiedHybridSWAKVAllocator
 from sglang.srt.mem_cache.unified_cache.cache_action import RecoverSWAWithLockedFull
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.swa_component import SWAComponent
@@ -81,7 +81,7 @@ def _build_swa_composite(n_full=64, n_swa=64):
         enable_memory_saver=False,
     )
     kvcache = _FakeUnifiedSWAKVPool(pool)
-    allocator = UnifiedSWATokenToKVPoolAllocator(
+    allocator = UnifiedHybridSWAKVAllocator(
         unified_buffer=pool,
         kvcache=kvcache,
         device=_DEV,
@@ -118,7 +118,7 @@ class _Probe(SWAComponent):
 
 
 class _StaticAllocRecorder:
-    """Stands in for the STATIC SWATokenToKVPoolAllocator: has the mapping
+    """Stands in for the STATIC HybridSWAKVAllocator: has the mapping
     tensor and a real set_full_to_swa_mapping. The handler must keep routing
     static pools through the original recipe."""
 
@@ -129,6 +129,7 @@ class _StaticAllocRecorder:
         self.freed_full = []
         self.freed_via_inner = []
         self.full_attn_allocator = self
+        self.full = self
 
     def set_full_to_swa_mapping(self, full, swa):
         # Honour the write like the real static allocator: the handler routes
@@ -141,7 +142,7 @@ class _StaticAllocRecorder:
         self.clear_calls.append(full)
         self.full_to_swa_index_mapping[full.to(torch.int64)] = 0
 
-    def free_full_segment(self, indices, *, start_pos):
+    def free_segment(self, indices, *, start_pos):
         self.freed_full.append(indices)
 
     def free(self, indices):
@@ -156,7 +157,7 @@ class _StaticAllocRecorder:
 class _RecoverTestBase(unittest.TestCase):
     def _probe(self):
         allocator = _build_swa_composite()
-        self.assertIsInstance(allocator, UnifiedSWATokenToKVPoolAllocator)
+        self.assertIsInstance(allocator, UnifiedHybridSWAKVAllocator)
         return _Probe(allocator), allocator
 
     def _two_ranges(self, allocator, n=4):
@@ -216,7 +217,7 @@ class TestOwnershipTransfer(_RecoverTestBase):
         """Handing the node the padding sink would serve zeros; refuse."""
         probe, allocator = self._probe()
         kept, incoming = self._two_ranges(allocator)
-        allocator.free_swa(incoming)  # donor no longer owns anything
+        allocator.swa.free(incoming)  # donor no longer owns anything
         with self.assertRaises(AssertionError):
             probe._transfer_swa_pages(allocator, kept, incoming)
 
@@ -231,7 +232,7 @@ class TestRecoverActionHandler(_RecoverTestBase):
         probe, allocator = self._probe()
         swa = allocator.swa_attn_allocator
         kept, incoming = self._two_ranges(allocator)
-        allocator.free_swa(kept)  # what eviction does when it tombstones
+        allocator.swa.free(kept)  # what eviction does when it tombstones
         # Snapshot AFTER the setup traffic: the invariant under test is that
         # the recovery handler itself moves ownership without moving capacity.
         swa_live = swa.allocated_count()
@@ -265,7 +266,7 @@ class TestRecoverActionHandler(_RecoverTestBase):
         already-freed ids (instead of the donated ones) reintroduces the sink."""
         probe, allocator = self._probe()
         kept, incoming = self._two_ranges(allocator)
-        allocator.free_swa(kept)
+        allocator.swa.free(kept)
         self.assertTrue(
             bool((allocator.translate_loc_from_full_to_swa(kept) == 0).all()),
             "precondition: a tombstoned range translates to the sink",
@@ -307,8 +308,8 @@ class TestStaticPoolPathUnchanged(unittest.TestCase):
             ),
             "incoming ids' mapping entries must be zeroed (static recipe)",
         )
-        # Through free_full_segment, not the inner allocator: the latter skips
-        # the free-group defer.
+        # Through the full side's free_segment, not the inner allocator: the
+        # latter skips the free-group defer.
         self.assertEqual(len(static.freed_full), 1)
         self.assertEqual(static.freed_via_inner, [])
         ((node_id, ct, _),) = probe.tree_core.set_calls
