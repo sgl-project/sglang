@@ -209,6 +209,7 @@ def test_h3_sampling_params_accept_rollout():
 def test_h3_negated_v_ode_matches_native_euler():
     from types import SimpleNamespace
 
+    import sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin as rl_mixin_module
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
         MiniMaxH3DenoisingStage,
         _prepare_h3_rollout_session,
@@ -216,7 +217,6 @@ def test_h3_negated_v_ode_matches_native_euler():
     from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
         SchedulerRLMixin,
     )
-    import sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin as rl_mixin_module
 
     class _FakeScheduler(SchedulerRLMixin):
         sigmas = torch.tensor([1.0, 0.7, 0.0])

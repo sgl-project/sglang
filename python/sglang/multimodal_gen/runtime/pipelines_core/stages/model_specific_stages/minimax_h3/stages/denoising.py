@@ -23,9 +23,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
-from sglang.multimodal_gen.runtime.post_training.denoise_loop_observer import (
-    get_denoise_loop_observer,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
     MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIG,
 )
@@ -39,6 +36,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.post_training.denoise_loop_observer import (
+    get_denoise_loop_observer,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
