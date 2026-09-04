@@ -5,6 +5,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from functools import lru_cache
@@ -34,6 +35,10 @@ class MemorySnapshot:
     reserved_mb: float  # current reserved memory (actual VRAM)
     peak_allocated_mb: float  # peak allocated since last reset
     peak_reserved_mb: float  # peak reserved since last reset
+    # Peak anonymous host memory (RssAnon) sampled by the worker. Anonymous,
+    # not RSS: file-backed pages the kernel can drop are not a budget cost.
+    # 0.0 where no sampler ran (non-Linux, or an old record).
+    peak_host_anon_mb: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -41,6 +46,7 @@ class MemorySnapshot:
             "reserved_mb": round(self.reserved_mb, 2),
             "peak_allocated_mb": round(self.peak_allocated_mb, 2),
             "peak_reserved_mb": round(self.peak_reserved_mb, 2),
+            "peak_host_anon_mb": round(self.peak_host_anon_mb, 2),
         }
 
 
@@ -125,6 +131,58 @@ def get_git_commit_hash() -> str:
         return "N/A"
 
 
+class _HostAnonSampler:
+    """Tracks this process's peak anonymous host memory (RssAnon).
+
+    The kernel keeps a high-water mark for RSS (VmHWM) but none for the
+    anonymous share, and the anonymous share is the budget cost: file-backed
+    pages are droppable and come back on their own. A 1 s sampling thread is
+    enough resolution for weight-sized (GiB, seconds-long) growth.
+    """
+
+    def __init__(self) -> None:
+        self._peak_kb = 0
+        self._started = False
+        self._lock = threading.Lock()
+
+    def _read_kb(self) -> int:
+        try:
+            with open("/proc/self/status") as handle:
+                for line in handle:
+                    if line.startswith("RssAnon:"):
+                        return int(line.split()[1])
+        except OSError:
+            pass
+        return 0
+
+    def _run(self) -> None:
+        while True:
+            value = self._read_kb()
+            if value > self._peak_kb:
+                self._peak_kb = value
+            time.sleep(1.0)
+
+    def _ensure_started(self) -> None:
+        if self._started:
+            return
+        with self._lock:
+            if self._started:
+                return
+            self._started = True
+            if self._read_kb() == 0:
+                return  # no /proc on this platform; peak stays 0
+            threading.Thread(
+                target=self._run, name="host-anon-sampler", daemon=True
+            ).start()
+
+    def peak_mb(self) -> float:
+        self._ensure_started()
+        return max(self._peak_kb, self._read_kb()) / 1024.0
+
+
+_host_anon_sampler = _HostAnonSampler()
+
+
 def capture_memory_snapshot() -> MemorySnapshot:
     if not torch.get_device_module().is_available():
         return MemorySnapshot(
@@ -132,6 +190,18 @@ def capture_memory_snapshot() -> MemorySnapshot:
             reserved_mb=0.0,
             peak_allocated_mb=0.0,
             peak_reserved_mb=0.0,
+            peak_host_anon_mb=_host_anon_sampler.peak_mb(),
+        )
+
+    if current_platform.is_mps():
+        allocated = torch.mps.current_allocated_memory()
+        reserved = torch.mps.driver_allocated_memory()
+        return MemorySnapshot(
+            allocated_mb=allocated / (1024**2),
+            reserved_mb=reserved / (1024**2),
+            peak_allocated_mb=allocated / (1024**2),
+            peak_reserved_mb=reserved / (1024**2),
+            peak_host_anon_mb=_host_anon_sampler.peak_mb(),
         )
 
     allocated = torch.get_device_module().memory_allocated()
@@ -144,6 +214,7 @@ def capture_memory_snapshot() -> MemorySnapshot:
         reserved_mb=reserved / (1024**2),
         peak_allocated_mb=peak_allocated / (1024**2),
         peak_reserved_mb=peak_reserved / (1024**2),
+        peak_host_anon_mb=_host_anon_sampler.peak_mb(),
     )
 
 

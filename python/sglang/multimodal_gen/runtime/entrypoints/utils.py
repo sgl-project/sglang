@@ -44,6 +44,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
+from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.srt.observability.trace import TraceReqContext
 
 logger = init_logger(__name__)
@@ -610,21 +611,29 @@ def _try_save_cuda_video_direct(
                     assert buffer.tensor is not None
                     for start in range(0, num_frames, chunk_frames):
                         end = min(start + chunk_frames, num_frames)
-                        frames = (
-                            (video[:, start:end] * 255).clamp_(0, 255).to(torch.uint8)
-                        )
-                        frames = frames.permute(1, 2, 3, 0).contiguous()
-                        buffer.tensor[: end - start].copy_(frames, non_blocking=True)
-                        torch.cuda.current_stream(video.device).synchronize()
-                        del frames
-                        _sendfile_all(
-                            process.stdin.fileno(),
-                            buffer.fd,
-                            (end - start) * height * width * 3,
-                        )
-                process.stdin.close()
-                process.stdin = None
-                returncode = process.wait()
+                        with maybe_record_function(
+                            f"VIDEO_CHUNK frames {start}-{end} convert+pipe_to_x264"
+                        ):
+                            frames = (
+                                (video[:, start:end] * 255)
+                                .clamp_(0, 255)
+                                .to(torch.uint8)
+                            )
+                            frames = frames.permute(1, 2, 3, 0).contiguous()
+                            buffer.tensor[: end - start].copy_(
+                                frames, non_blocking=True
+                            )
+                            torch.cuda.current_stream(video.device).synchronize()
+                            del frames
+                            _sendfile_all(
+                                process.stdin.fileno(),
+                                buffer.fd,
+                                (end - start) * height * width * 3,
+                            )
+                with maybe_record_function("FFMPEG_FLUSH stdin_close+wait"):
+                    process.stdin.close()
+                    process.stdin = None
+                    returncode = process.wait()
             finally:
                 if process.stdin is not None:
                     process.stdin.close()
@@ -639,11 +648,12 @@ def _try_save_cuda_video_direct(
                     stderr=stderr_file.read(),
                 )
         return True
-    except Exception as e:
-        logger.warning(
-            "Direct CUDA video save failed; falling back to imageio: %s",
-            str(e),
+    except Exception:
+        logger.warning_once(
+            "Direct CUDA video save failed; falling back to imageio. "
+            "Enable debug logging for exception details."
         )
+        logger.debug("Direct CUDA video save failure", exc_info=True)
         return False
     finally:
         if tmp_wav_path:
@@ -725,11 +735,12 @@ def _try_save_cuda_videos_direct(
     try:
         with ThreadPoolExecutor(max_workers=_MAX_PARALLEL_CUDA_VIDEO_SAVES) as pool:
             return list(pool.map(save_one, range(len(samples))))
-    except Exception as exc:
-        logger.warning(
-            "Parallel CUDA video save failed; falling back to serial output: %s",
-            str(exc),
+    except Exception:
+        logger.warning_once(
+            "Parallel CUDA video save failed; falling back to serial output. "
+            "Enable debug logging for exception details."
         )
+        logger.debug("Parallel CUDA video save failure", exc_info=True)
         return None
 
 
@@ -885,9 +896,13 @@ def prepare_request(
     """
     Create a Req object with sampling_params as a parameter.
     """
+    attention_backend_config = server_args.attention_backend_config or {}
+    vsa_sparsity = attention_backend_config.get(
+        "VSA_sparsity", attention_backend_config.get("sparsity", 0.0)
+    )
     req = Req(
         sampling_params=sampling_params,
-        VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
+        VSA_sparsity=vsa_sparsity,
     )
     sampling_params.apply_request_extra(req)
     if getattr(sampling_params, "max_sequence_length", None) is not None:
@@ -897,8 +912,17 @@ def prepare_request(
     if diffusers_kwargs and "max_sequence_length" in diffusers_kwargs:
         req.max_sequence_length = diffusers_kwargs["max_sequence_length"]
 
-    if not isinstance(req.prompt, str):
-        raise TypeError(f"`prompt` must be a string, but got {type(req.prompt)}")
+    action_prompt = (
+        req.data_type == DataType.ACTION
+        and isinstance(req.prompt, list)
+        and bool(req.prompt)
+        and all(isinstance(item, str) for item in req.prompt)
+    )
+    if not isinstance(req.prompt, str) and not action_prompt:
+        raise TypeError(
+            "`prompt` must be a string, or a non-empty list of strings for "
+            f"batched action requests, but got {type(req.prompt)}"
+        )
 
     req_width = getattr(req, "width", None)
     req_height = getattr(req, "height", None)

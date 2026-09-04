@@ -97,7 +97,7 @@ SGLang from the main branch is required for Qwen3.5. You can install from source
 
 ```bash Command
 # Install from source
-uv pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
+uv pip install --prerelease=allow 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
 
 # Or use Docker (NVIDIA GPUs)
 docker pull lmsysorg/sglang:latest
@@ -128,6 +128,7 @@ This section provides deployment configurations optimized for different hardware
 - Speculative decoding (MTP) can significantly reduce latency for interactive use cases.
 - **H100 FP8:** Add `--enable-symm-mem` to enable NCCL symmetric memory for faster collectives and better performance under multi-GPU settings.
 - **AMD GPUs (MI300X / MI325X / MI355X):** Use `SGLANG_USE_AITER=1` and `SGLANG_USE_AITER_UNIFIED_ATTN=1` with `--attention-backend aiter`, which requires `--page-size 16` and can also enable `--enable-aiter-allreduce-fusion`. Additionally set `AITER_FLYDSL_FORCE=1` to force the AITER FlyDSL MoE kernels and `SGLANG_MAMBA_SSM_DTYPE=bfloat16` to store the Mamba SSM state in bfloat16 (instead of the default float32). For the **MXFP4 checkpoint on MI355X**, set `ROCM_QUICK_REDUCE_QUANTIZATION=INT8` to route multi-GPU collectives through INT8-quantized ROCm quick all-reduce, and drop `--enable-aiter-allreduce-fusion` (the two are mutually exclusive; quick all-reduce is preferred for this recipe).
+- **KV cache offloading (MXFP4 on MI355X):** Selecting **Host DRAM (HiCache)** adds a host-memory tier below the device KV cache, which lets long-context agentic workloads keep more prefix cached and reach higher concurrency than the device KV pool alone allows. It emits `--enable-hierarchical-cache --hicache-ratio 1.5 --hicache-write-policy write_through --hicache-io-backend direct --hicache-mem-layout page_first_direct`. HiCache extends the radix cache, so the generated command drops `--disable-radix-cache` — the two options are mutually exclusive and SGLang rejects them together at startup. `--hicache-ratio 1.5` sizes the host tier at 1.5x the device KV cache, so make sure the node has that much free CPU DRAM per server on top of the model weights. Leave this **Disabled** for fixed-length throughput serving, where the extra host traffic buys nothing.
 - **Watchdog timeout:** Increase `--watchdog-timeout` to `1200` or higher for this large model, as weight loading can take significant time.
 - **Mamba Radix Cache**: Qwen3.5's hybrid Gated Delta Networks architecture supports two mamba scheduling strategies via `--mamba-radix-cache-strategy`:
   - **V1 (`no_buffer`)**: Default. No overlap scheduler, lower memory usage. Required for AMD MI GPUs.
@@ -225,7 +226,7 @@ This section provides deployment configurations optimized for different hardware
 </table>
 
 <Warning>
-**FP8 KV Cache**: `--kv-cache-dtype fp8_e4m3` quantizes the KV cache to FP8 at runtime. Since these FP8 model checkpoints do not include pre-calibrated KV cache scaling factors, SGLang defaults to a scale of 1.0, which may cause noticeable accuracy degradation on reasoning-heavy tasks. It is not included in the generated commands above; add it manually only if memory constraints require the trade-off.
+**FP8 KV Cache**: `--kv-cache-dtype fp8_e4m3` quantizes the KV cache to FP8 at runtime. Since these FP8 model checkpoints do not include pre-calibrated KV cache scaling factors, SGLang defaults to a scale of 1.0, which may cause noticeable accuracy degradation on reasoning-heavy tasks. It is emitted only for the MXFP4-on-MI355X recipe, where it is part of the tuned configuration; for every other combination the generated commands leave it out, so add it manually only if memory constraints require the trade-off.
 </Warning>
 
 - **Xeon CPU service configuration**: Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
@@ -987,6 +988,45 @@ P95 ITL (ms):                            72.10
 P99 ITL (ms):                            149.57
 Max ITL (ms):                            1220.68
 ==================================================
+```
+
+#### 5.2.3 Agentic Long-Context with HiCache DRAM Offload (H200 FP8, MTP)
+
+For agentic workloads, here is how to enable HiCache and MTP.
+
+Container image (pinned for reproducibility):
+`lmsysorg/sglang:nightly-dev-cu13-20260815-a5ba081f`.
+
+Server Launch Command:
+```bash Command
+SGLANG_ENABLE_SPEC_V2=1 \
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3.5-397B-A17B-FP8 \
+  --served-model-name Qwen/Qwen3.5-397B-A17B-FP8 \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --data-parallel-size 1 \
+  --expert-parallel-size 1 \
+  --quantization fp8 \
+  --kv-cache-dtype fp8_e4m3 \
+  --mamba-ssm-dtype bfloat16 \
+  --attention-backend flashinfer \
+  --enable-flashinfer-allreduce-fusion \
+  --mem-fraction-static 0.8 \
+  --stream-interval 50 \
+  --scheduler-recv-interval 10 \
+  --tokenizer-worker-num 6 \
+  --enable-metrics \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --page-size 64 \
+  --enable-hierarchical-cache \
+  --hicache-size 77 \
+  --hicache-io-backend kernel \
+  --hicache-mem-layout page_first \
+  --hicache-write-policy write_through_selective
 ```
 
 ### 5.3 Vision Speed Benchmark
