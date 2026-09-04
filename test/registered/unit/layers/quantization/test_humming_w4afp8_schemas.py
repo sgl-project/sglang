@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -13,13 +14,84 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.layers.linear import LinearBase  # noqa: E402
 from sglang.srt.layers.quantization.humming import (  # noqa: E402
     HummingConfig,
     _StackedBlockFp8CheckpointWeightSchema,
     _W4AFp8CheckpointWeightSchema,
 )
+from sglang.srt.runtime_context import get_context  # noqa: E402
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+
+
+class _TestLinear(LinearBase):
+    def __init__(self):
+        torch.nn.Module.__init__(self)
+
+
+class TestHummingCpDecodeRouting(CustomTestCase):
+    def test_cp_decode_uses_w4afp8_only_for_sharded_attention_projections(self):
+        config = HummingConfig(
+            {
+                "quant_method": "w4afp8",
+                "group_size": 128,
+                "weight_block_size": [128, 128],
+            }
+        )
+        layer = _TestLinear()
+        w4afp8_method = object()
+        humming_method = object()
+
+        with (
+            patch.object(
+                config._w4afp8_config,
+                "get_quant_method",
+                return_value=w4afp8_method,
+            ) as get_w4afp8_method,
+            patch.object(config, "get_quant_config_for_layer", return_value=object()),
+            patch(
+                "sglang.srt.layers.quantization.humming.HummingLinearMethod",
+                return_value=humming_method,
+            ),
+        ):
+            with get_context().override_server_args(
+                tp_size=8,
+                attn_cp_size=8,
+                enable_cp_decode_attn_tp=True,
+            ):
+                for suffix in ("q_b_proj", "o_proj"):
+                    prefix = f"model.layers.0.self_attn.{suffix}"
+                    self.assertIs(config.get_quant_method(layer, prefix), w4afp8_method)
+
+                self.assertIs(
+                    config.get_quant_method(
+                        layer, "model.layers.0.self_attn.kv_b_proj"
+                    ),
+                    humming_method,
+                )
+
+            with get_context().override_server_args(
+                tp_size=8,
+                attn_cp_size=8,
+                enable_cp_decode_attn_tp=False,
+            ):
+                self.assertIs(
+                    config.get_quant_method(layer, "model.layers.0.self_attn.q_b_proj"),
+                    humming_method,
+                )
+
+            with get_context().override_server_args(
+                tp_size=8,
+                attn_cp_size=1,
+                enable_cp_decode_attn_tp=True,
+            ):
+                self.assertIs(
+                    config.get_quant_method(layer, "model.layers.0.self_attn.q_b_proj"),
+                    humming_method,
+                )
+
+        self.assertEqual(get_w4afp8_method.call_count, 2)
 
 
 class TestW4AFp8CheckpointSchema(CustomTestCase):
