@@ -183,7 +183,10 @@ class NPUCudaGraphBackend(BaseGraphBackend):
                     seq_lens_cpu = forward_batch.seq_lens_cpu[: runner.raw_bs]
                     # DFlash/DSpark publish CPU mirrors including the verify
                     # block. Adding it again lets FIA see future candidates.
-                    if not runner.model_runner.spec_algorithm.is_dflash_family():
+                    if (
+                        not runner.model_runner.spec_algorithm.is_dflash_family()
+                        and not runner.model_runner.spec_algorithm.is_uno()
+                    ):
                         seq_lens_cpu = seq_lens_cpu + runner.captured_req_width
                 else:
                     seq_lens_cpu = (
