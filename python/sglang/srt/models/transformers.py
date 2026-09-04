@@ -576,6 +576,24 @@ class TransformersBase(nn.Module):
         self.config = config
         self.text_config = get_hf_text_config(config)
         self.weight_mapper = self.hf_to_sglang_mapper
+
+        # Early-fusion mixed-modal models (e.g. Chameleon) share one vocabulary
+        # across text and image (VQ codebook) tokens and, unlike HF's own
+        # generate() (which gates this via multimodal_generation_mode="text-only"),
+        # sglang's generic wrapper does not implement .generate() at all -- so
+        # nothing stops the sampler from picking a codebook id, which decodes to
+        # an empty/invisible string. Derive the image-token id range once from
+        # the model's own vocabulary_map (keys emitted by the image tokenizer are
+        # named "IMGIMG..." in Chameleon's config) and mask them out of every
+        # next-token distribution by default, unless the config also declares an
+        # explicit image-generation entrypoint (none of sglang's serving paths
+        # support one today, so this is always the desired behavior).
+        self._suppressed_token_ids = None
+        vocabulary_map = getattr(config, "vocabulary_map", None)
+        if vocabulary_map:
+            image_ids = [v for k, v in vocabulary_map.items() if k.startswith("IMGIMG")]
+            if image_ids:
+                self._suppressed_token_ids = torch.tensor(image_ids, dtype=torch.long)
         self.pp_group = get_pp_group()
 
         # Weight loading attrs
@@ -1083,9 +1101,16 @@ class TransformersBase(nn.Module):
             return self.pooler(hidden_states, forward_batch)
 
         assert self.logits_processor is not None and self.lm_head is not None
-        return self.logits_processor(
+        output = self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch, None
         )
+        if self._suppressed_token_ids is not None and output.next_token_logits is not None:
+            output.next_token_logits.index_fill_(
+                -1,
+                self._suppressed_token_ids.to(output.next_token_logits.device),
+                -float("inf"),
+            )
+        return output
 
     # -- Weight loading -----------------------------------------------------
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1346,6 +1371,34 @@ class MultiModalMixin:
         super().__init__(*args, **kwargs)
         self._mm_padding_pattern = MultiModalityDataPaddingPatternMultimodalTokens()
 
+        # Early-fusion models (e.g. Chameleon) keep the decoder stack directly on
+        # the backbone (embed_tokens/layers/norm/rotary_emb as siblings of the
+        # image tokenizer, e.g. vqmodel) instead of nesting it under a separate
+        # "language_model" submodule like compositional VLMs (Qwen2.5-VL, LLaVA,
+        # etc). The class-level hf_to_sglang_mapper assumes the compositional
+        # layout; override those four prefixes back to identity when there is no
+        # "language_model" child so weight names actually match the constructed
+        # module tree.
+        if not any(
+            name == "language_model" for name, _ in self.model.named_children()
+        ):
+            self.weight_mapper = self.weight_mapper | WeightsMapper(
+                orig_to_new_prefix={
+                    "model.layers.": "model.layers.",
+                    "model.embed_tokens.": "model.embed_tokens.",
+                    "model.norm.": "model.norm.",
+                    "model.rotary_emb.": "model.rotary_emb.",
+                }
+            )
+
+        # Fuyu (and any other model whose forward() takes raw patches instead of
+        # a vision-tower's "pixel_values") needs its feature tensor forwarded
+        # under the name its own forward() actually accepts. Detect this from the
+        # real signature rather than hardcoding by architecture name.
+        fwd_params = inspect.signature(self.model.forward).parameters
+        if "pixel_values" not in fwd_params and "image_patches" in fwd_params:
+            self._mm_feature_kwarg = {**self._mm_feature_kwarg, "image": "image_patches"}
+
         # transformers v5 flattened SigLIP/CLIP (dropped the "vision_model"
         # wrapper); older checkpoints still ship "vision_tower.vision_model.*"
         # keys, so remap them when the live model lacks that sub-module.
@@ -1514,6 +1567,18 @@ class MultiModalMixin:
         ):
             mm_inputs = forward_batch.mm_inputs
             target_device = next(self.model.parameters()).device
+            # Only pixel-value-like floating tensors need this -- integer tensors
+            # (e.g. mm_token_type_ids collected above) must stay integer dtype.
+            target_dtype = next(
+                (p.dtype for p in self.model.parameters() if p.is_floating_point()),
+                None,
+            )
+
+            def _to_device_and_dtype(t: torch.Tensor) -> torch.Tensor:
+                if target_dtype is not None and t.is_floating_point():
+                    return t.to(device=target_device, dtype=target_dtype)
+                return t.to(device=target_device)
+
             # 5D features (num_images, num_patches, C, H, W) can't be flattened
             # here: anyres models pad num_patches per HF processor call, so a
             # flattened concat would leave stray padding rows once items with
@@ -1530,7 +1595,7 @@ class MultiModalMixin:
                 for item in mm_input.mm_items or []:
                     for key, value in (item.model_specific_data or {}).items():
                         if isinstance(value, torch.Tensor):
-                            value = value.to(device=target_device)
+                            value = _to_device_and_dtype(value)
                         if key not in kwargs:
                             kwargs[key] = value
                         elif isinstance(value, torch.Tensor) and isinstance(
@@ -1543,7 +1608,7 @@ class MultiModalMixin:
                         )
                         feature = item.feature
                         if isinstance(feature, torch.Tensor):
-                            feature = feature.to(device=target_device)
+                            feature = _to_device_and_dtype(feature)
                             if feature.dim() == 5:
                                 pending_5d_features.setdefault(feature_key, []).append(
                                     feature

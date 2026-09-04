@@ -395,6 +395,8 @@ class BaseMultimodalProcessor(ABC):
             "patch_pixel_values": Modality.IMAGE,
             "block_sizes": Modality.IMAGE,
             "grid_thws": Modality.IMAGE,  # for kimi k2.5
+            "image_patches": Modality.IMAGE,  # Fuyu: raw flattened patches, embedded inside forward()
+            "image_patches_indices": Modality.IMAGE,  # Fuyu: sequence positions for each patch
             # Audio-related attributes
             "audio_features": Modality.AUDIO,
             "audio_feature_lens": Modality.AUDIO,
@@ -413,6 +415,7 @@ class BaseMultimodalProcessor(ABC):
         # name of the feature filed
         # TODO: pass from processors
         self.FEATURE_NAMES = [
+            "image_patches",  # Fuyu: raw flattened patches, treated as the primary feature tensor
             "pixel_values",
             "pixel_values_videos",
             "audio_features",
