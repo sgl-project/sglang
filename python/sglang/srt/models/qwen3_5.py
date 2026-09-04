@@ -132,6 +132,7 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_gfx95 = is_gfx95_supported()
 _is_hip = is_hip()
+_QWEN3_5_MOE_TEXT_MODEL_TYPES = ("qwen3_5_moe_text", "qwen4_exp_text")
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _hip_use_alt_stream = get_bool_env_var("SGLANG_ALT_STREAM") and _is_hip
@@ -931,9 +932,9 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             config, layer_id, quant_config, alt_stream, prefix
         )
 
-        # NOTE: Determine the MLP type based on the number of routed experts
-        # (dense Qwen3.5 has none; Qwen3.5-MoE and derived backbones do).
-        if config.num_experts:
+        # NOTE: Determine the MLP type based on the model type
+        # Qwen3.5 use all layers for MLP / Qwen3.5-MoE use sparse MoE blocks
+        if config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES:
             self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
@@ -950,7 +951,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             is_layer_sparse = True
             is_previous_layer_sparse = True
             is_next_layer_sparse = True
-        else:
+        elif config.model_type == "qwen3_5_text":
             self.mlp = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -962,6 +963,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             is_layer_sparse = False
             is_previous_layer_sparse = False
             is_next_layer_sparse = False
+        else:
+            raise ValueError(f"Invalid model type: {config.model_type}")
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
@@ -1171,8 +1174,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             quant_config=quant_config,
         )
 
-        # Dense MLP for the variant without routed experts
-        if not config.num_experts:
+        # Dense MLP for non-MoE variant
+        if config.model_type == "qwen3_5_text":
             self.mlp = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -1183,7 +1186,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             is_layer_sparse = False
             is_previous_layer_sparse = False
             is_next_layer_sparse = False
-        else:
+        elif config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES:
             self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
@@ -1200,6 +1203,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             is_layer_sparse = True
             is_previous_layer_sparse = True
             is_next_layer_sparse = True
+        else:
+            raise ValueError(f"Invalid model type: {config.model_type}")
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
@@ -1573,14 +1578,14 @@ class Qwen3_5ForCausalLM(nn.Module):
         elif module_name == "gate_up_proj":
             # MoE: shared expert uses shared_expert_intermediate_size
             # Dense: regular MLP uses intermediate_size
-            is_moe = "moe" in getattr(config, "model_type", "")
+            is_moe = config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES
             if is_moe:
                 inter = config.shared_expert_intermediate_size
             else:
                 inter = config.intermediate_size
             return config.hidden_size, inter * 2
         elif module_name == "down_proj":
-            is_moe = "moe" in getattr(config, "model_type", "")
+            is_moe = config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES
             if is_moe:
                 inter = config.shared_expert_intermediate_size
             else:
@@ -1933,8 +1938,6 @@ class Qwen3_5ForCausalLM(nn.Module):
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
-        if not config.num_experts:
-            return None
         return ModelConfigForExpertLocation(
             num_layers=config.num_hidden_layers,
             num_logical_experts=config.num_experts,
@@ -2708,16 +2711,11 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     @classmethod
     def get_model_config_for_expert_location(cls, config):
         text_config = getattr(config, "text_config", config)
-        if not text_config.num_experts:
-            return None
         return ModelConfigForExpertLocation(
             num_layers=text_config.num_hidden_layers,
             num_logical_experts=text_config.num_experts,
             num_groups=None,
         )
-
-
-_QWEN3_5_MOE_TEXT_MODEL_TYPES = ("qwen3_5_moe_text", "qwen4_exp_text")
 
 
 def _qwen3_5_shared_experts_fusion_disable_reason(hf_config, quant_config):
