@@ -297,6 +297,11 @@ def run_eval(args):
         # sgl-eval owns this benchmark's dataset, prompt and grader; there is no
         # simple_eval implementation to fall back to.
         return _run_sgl_eval("mmmu_pro_vision", args)
+    elif args.eval_name in ("aime24", "aime26"):
+        from sglang.test.simple_eval_aime import AIMEEval
+
+        year = int(args.eval_name.replace("aime", ""))
+        eval_obj = AIMEEval(year, args.num_examples, args.num_threads)
     elif args.eval_name == "aime25":
         return _run_sgl_eval("aime25", args)
     elif args.eval_name == "gsm8k":
