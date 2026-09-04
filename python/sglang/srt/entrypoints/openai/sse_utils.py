@@ -13,14 +13,15 @@ _SSE_NL_B = b"\n\n"
 class StreamDelta(msgspec.Struct, omit_defaults=True):
     """Delta content for streaming responses.
 
-    OpenAI Python SDK's ChoiceDelta does not declare reasoning_content; it is
-    surfaced via pydantic `extra`. With omit_defaults=True, defaulting to
-    None would drop the key entirely from the SSE payload, making
-    `data.reasoning_content` raise AttributeError on the client. Keep it
-    required (no default) so it is always serialized as null or a string.
+    None 字段一律不下发(omit_defaults):Kimi 流式规范要求 reasoning_content
+    出现即必须是字符串(P0.12)、结束帧 delta 为空对象(P1.10)、增量帧不混入
+    无关 null 键(P0.10)—— OpenAI 官方流式输出同样不发 null 字段。此前为让
+    OpenAI Python SDK 的 `data.reasoning_content` 属性恒存在而强制序列化
+    null;但键缺失本就是流式契约的状态信号,客户端应按键存在与否分支,为单一
+    SDK 的取值便利违反 wire 契约会被严格客户端(KVV stream-spec)判协议违规。
     """
 
-    reasoning_content: Optional[str]
+    reasoning_content: Optional[str] = None
     role: Optional[str] = None
     content: Optional[str] = None
 
