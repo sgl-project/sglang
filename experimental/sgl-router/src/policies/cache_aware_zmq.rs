@@ -144,14 +144,12 @@ impl CacheAwareZmqPolicy {
             return None;
         }
 
-        // The index may include unhealthy workers or workers in another pool.
         let best_routable_blocks = matches
             .iter()
             .filter(|m| workers.iter().any(|worker| worker.url == m.address))
             .map(|m| m.matched_prefix_blocks)
             .max()
             .unwrap_or(0);
-
         let match_rate = best_routable_blocks as f32 / signal.query_blocks as f32;
         if let Some(metrics) = self.metrics.get() {
             metrics.observe_overlap_blocks(ctx.model().0.as_str(), best_routable_blocks as u64);
@@ -184,8 +182,6 @@ impl Policy for CacheAwareZmqPolicy {
             return Self::pick_min_load(workers);
         }
 
-        // An external signal is authoritative: an empty/unusable result
-        // degrades only to min-load and never consults the local radix tree.
         if let Some(signal) = ctx.external_prefix() {
             return self
                 .select_external(workers, ctx, signal)
@@ -349,6 +345,8 @@ mod tests {
                 circuit_breaker: None,
                 cache_aware: None,
                 sticky: None,
+                fused: None,
+                eligibility: None,
             },
             discovery: crate::config::DiscoveryBackend::StaticUrls(
                 crate::config::StaticUrlsDiscoveryConfig {
@@ -400,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn external_prefix_signal_skips_unroutable_best_match() {
+    fn external_prefix_signal_selects_the_best_routable_match() {
         let mut config = cfg_default();
         config.cache_threshold = 0.0;
         let policy = CacheAwareZmqPolicy::new(
@@ -438,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn external_empty_result_uses_min_load_without_local_tree() {
+    fn external_empty_result_uses_min_load() {
         let tree = Arc::new(HashTree::new());
         let registry = tokenizer_registry_with_tiny();
         let text = "hello world hello world hello world";

@@ -11,11 +11,11 @@ import torch
 from cutlass import Float32, Int32
 from quack.compile_utils import make_fake_tensor as fake_tensor
 
+from sglang.kernels.jit.cute_aot_cache import get_jit_cache
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
     is_batch_invariant,
 )
-from sglang.kernels.ops.attention.flash_attn.cute.cache_utils import get_jit_cache
 from sglang.kernels.ops.attention.flash_attn.cute.testing import is_fake_mode
 
 if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
@@ -27,6 +27,11 @@ if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
     cute_dsl_ptxas.patch()
 
 
+from sglang.kernels.ops.attention.fa4_sm120.dispatch import (
+    get_forward_host,
+    try_cached_paged_decode,
+    try_cached_varlen,
+)
 from sglang.kernels.ops.attention.flash_attn.cute import fa_logging, utils
 from sglang.kernels.ops.attention.flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
@@ -57,11 +62,6 @@ from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm90 import (
 from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm100 import (
     DescaleTensors,
     FlashAttentionForwardSm100,
-)
-from sglang.kernels.ops.attention.fa4_sm120.dispatch import (
-    get_forward_host,
-    try_cached_paged_decode,
-    try_cached_varlen,
 )
 from sglang.kernels.ops.attention.flash_attn.cute.shearing_bias import ShearingBias
 
@@ -1851,9 +1851,17 @@ def _flash_attn_fwd(
     return out, lse
 
 
-_flash_attn_fwd.compile_cache = get_jit_cache("fwd")
-_flash_attn_fwd.compile_cache_shear_bias = get_jit_cache("fwd_shear_bias")
-_flash_attn_fwd.compile_cache_prepare_shear_bias = get_jit_cache(
+def _get_jit_cache(name: str):
+    return get_jit_cache(
+        name,
+        source_paths=(os.path.dirname(os.path.abspath(__file__)),),
+        enable_tvm_ffi=True,
+    )
+
+
+_flash_attn_fwd.compile_cache = _get_jit_cache("fwd")
+_flash_attn_fwd.compile_cache_shear_bias = _get_jit_cache("fwd_shear_bias")
+_flash_attn_fwd.compile_cache_prepare_shear_bias = _get_jit_cache(
     "fwd_prepare_shear_bias"
 )
 
@@ -2521,7 +2529,7 @@ def _flash_attn_fwd_combine(
         )
 
 
-_flash_attn_fwd_combine.compile_cache = get_jit_cache("fwd_combine")
+_flash_attn_fwd_combine.compile_cache = _get_jit_cache("fwd_combine")
 
 
 def flash_attn_combine(

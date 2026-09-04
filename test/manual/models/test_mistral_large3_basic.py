@@ -67,7 +67,7 @@ class TestMistralLarge3Basic(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (mistral-large-3)\n" f'{metrics["score"]=:.3f}\n'
+                f'### test_gsm8k (mistral-large-3)\n{metrics["score"]=:.3f}\n'
             )
             self.assertGreater(metrics["score"], 0.90)
 
@@ -79,7 +79,7 @@ class TestMistralLarge3Basic(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (mistral-large-3)\n" f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (mistral-large-3)\n{speed=:.2f} token/s\n"
             )
             self.assertGreater(speed, 50)
 
