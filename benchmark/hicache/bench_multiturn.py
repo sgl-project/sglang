@@ -17,6 +17,7 @@ from sglang.benchmark.utils import get_tokenizer
 from sglang.test.kits.cache_hit_kit import (
     async_request_openai_chat_completions,
     async_request_sglang_generate,
+    calculate_tpot_statistics,
     gen_payload,
     gen_payload_openai,
 )
@@ -362,6 +363,7 @@ class WorkloadGenerator:
         self.pbar = tqdm(total=self.total_requests)
         self.performance_metrics = {
             "ttft": [],
+            "tpot": [],
             "itl": [],
             "latency": [],
             "prompt_len": [],
@@ -458,6 +460,8 @@ class WorkloadGenerator:
                 current_round = self.client_records[client_id]["round"]
                 self.client_records[client_id]["round"] += 1
                 self.performance_metrics["ttft"].append(response.ttft)
+                if response.tpot is not None:
+                    self.performance_metrics["tpot"].append(response.tpot)
                 self.performance_metrics["itl"].extend(response.itl)
                 self.performance_metrics["latency"].append(response.latency)
                 self.performance_metrics["prompt_len"].append(response.prompt_len)
@@ -582,6 +586,8 @@ class WorkloadGenerator:
         def max_or_zero(sorted_vals):
             return sorted_vals[-1] if sorted_vals else 0.0
 
+        tpot_statistics = calculate_tpot_statistics(self.performance_metrics["tpot"])
+
         performance_data = {
             "summary": {
                 "total_requests": len(self.performance_metrics["ttft"]),
@@ -608,6 +614,7 @@ class WorkloadGenerator:
                 "p99_ttft": percentile(sorted_ttft, 0.99),
                 "median_ttft": percentile(sorted_ttft, 0.5),
                 "max_ttft": max_or_zero(sorted_ttft),
+                **tpot_statistics,
                 "average_itl": (
                     sum(self.performance_metrics["itl"])
                     / len(self.performance_metrics["itl"])
@@ -686,6 +693,11 @@ class WorkloadGenerator:
         print(f"  P99 TTFT: {performance_data['summary']['p99_ttft']:.2f}")
         print(f"  Median TTFT: {performance_data['summary']['median_ttft']:.2f}")
         print(f"  Max TTFT: {performance_data['summary']['max_ttft']:.2f}")
+        print(f"  Average TPOT: {performance_data['summary']['average_tpot']:.4f}")
+        print(f"  P90 TPOT: {performance_data['summary']['p90_tpot']:.4f}")
+        print(f"  P99 TPOT: {performance_data['summary']['p99_tpot']:.4f}")
+        print(f"  Median TPOT: {performance_data['summary']['median_tpot']:.4f}")
+        print(f"  Max TPOT: {performance_data['summary']['max_tpot']:.4f}")
         print(f"  Average ITL: {performance_data['summary']['average_itl']:.4f}")
         print(f"  P90 ITL: {performance_data['summary']['p90_itl']:.4f}")
         print(f"  P99 ITL: {performance_data['summary']['p99_itl']:.4f}")
