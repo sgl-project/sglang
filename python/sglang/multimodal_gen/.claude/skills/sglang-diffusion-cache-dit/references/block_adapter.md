@@ -352,7 +352,7 @@ Pitfalls A and B are the two simplest cases (fix at the call site, or hoist one 
 For sglang, whatever fix pattern you borrow, the resulting code must keep the exact same signature and produce identical output with caching disabled (verify via PSNR/SSIM) — and it lands in the sglang repo, not as a cache-dit PatchFunctor.
 
 
-## More references 
+## More references
 
 We recommend reading the following files for additional context:
 
