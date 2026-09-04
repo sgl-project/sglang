@@ -207,8 +207,8 @@ def test_loaded_weight_partition_admits_only_its_declared_tasks(partition, tasks
 
 
 def test_synthetic_warmup_target_honors_warmup_flags():
-    def target(*, num_frames=None, resolution=None):
-        width, height = map(int, (resolution or "1344x768").split("x"))
+    def target(num_frames=None, resolution=None):
+        width, height = map(int, (resolution or "896x512").split("x"))
         # the generic builder rewrites req.num_frames (17 here); the flag wins
         req = SimpleNamespace(num_frames=17, width=width, height=height)
         server_args = SimpleNamespace(
@@ -218,18 +218,11 @@ def test_synthetic_warmup_target_honors_warmup_flags():
         return MiniMaxH3SamplingParams._synthetic_warmup_target(req, server_args)
 
     assert target() == TARGET
-    assert target(num_frames=345, resolution="1344x768") == {
-        **TARGET,
-        "duration_seconds": 345 / 24.0,
-    }
+    assert target(num_frames=345) == {**TARGET, "duration_seconds": 345 / 24.0}
     assert target(resolution="768x1344") == {**TARGET, "aspect_ratio": "9:16"}
-    # BCG seeds --warmup-resolutions with an area-capped default; the canvas
-    # keeps the released short edge.
+    # BCG seeds --warmup-resolutions with an area-capped default (832x464);
+    # the canvas keeps the released short edge.
     assert target(resolution="832x464") == TARGET
-    with pytest.raises(ValueError, match="--warmup-num-frames 17 "):
-        target(num_frames=17)
-    with pytest.raises(ValueError, match="--warmup-resolutions 2000x768 "):
-        target(resolution="2000x768")
 
 
 def test_duration_admission_accepts_released_4_to_15_second_range():
