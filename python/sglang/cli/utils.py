@@ -4,6 +4,7 @@ import os
 import subprocess
 from functools import lru_cache
 
+import yaml
 from huggingface_hub import HfApi
 
 from sglang.srt.environ import envs
@@ -96,8 +97,55 @@ def get_is_diffusion_model(model_path: str) -> bool:
         return False
 
 
+def _try_get_model_path_from_config(extra_argv) -> str | None:
+    """Best-effort read of a --config YAML file for backend detection.
+
+    Returns the model path declared by a model-path / model config key, or
+    None if the file is missing, unreadable, malformed, or has no model key.
+    Non-string or empty model values are ignored (the authoritative parser
+    reports them later). This is only a hint for backend auto-detection;
+    authoritative parsing and validation still happen later in
+    `prepare_server_args`.
+    """
+
+    config_path = None
+    for i, arg in enumerate(extra_argv):
+        if arg == "--config" and i + 1 < len(extra_argv):
+            config_path = extra_argv[i + 1]
+            break
+
+    if config_path is None:
+        return None
+
+    try:
+        with open(config_path) as f:
+            config = yaml.safe_load(f)
+    except Exception as e:
+        logger.debug("Failed to read config file %s: %s", config_path, e)
+        return None
+
+    if not isinstance(config, dict):
+        return None
+
+    model_path = None
+    for key, value in config.items():
+        if (
+            isinstance(key, str)
+            and isinstance(value, str)
+            and value
+            and key.replace("-", "_") in ("model_path", "model")
+        ):
+            model_path = value
+
+    return model_path
+
+
 def try_get_model_path(extra_argv) -> str | None:
-    """Return a model path from command-line arguments when one is present."""
+    """Return a model path from command-line arguments when one is present.
+
+    Explicit CLI flags take precedence; when none are present, falls back to
+    a best-effort read of the model path from a --config YAML file.
+    """
 
     model_path = None
     for i, arg in enumerate(extra_argv):
@@ -108,6 +156,9 @@ def try_get_model_path(extra_argv) -> str | None:
         elif arg.startswith("--model-path=") or arg.startswith("--model="):
             model_path = arg.split("=", 1)[1]
             break
+
+    if model_path is None:
+        model_path = _try_get_model_path_from_config(extra_argv)
 
     return model_path
 
