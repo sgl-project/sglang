@@ -11,6 +11,7 @@ from sglang.srt.parser.template_detection import (
     detect_reasoning_parser,
     detect_reasoning_pattern,
     detect_tool_call_parser,
+    normalize_reasoning_effort,
     resolve_auto_parsers,
 )
 from sglang.srt.server_args import ServerArgs
@@ -76,6 +77,44 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
             ReasoningToggleConfig(toggle_param="enable_thinking", default_enabled=True),
         )
         self.assertEqual(parser, "glm45")
+
+    GLM53_EFFORT_CONFIG = ReasoningToggleConfig(
+        effort_levels=("low", "high", "max"),
+        effort_aliases=(
+            ("none", "low"),
+            ("minimal", "low"),
+            ("medium", "high"),
+            ("xhigh", "max"),
+        ),
+    )
+
+    def test_glm53_effort_levels_detected_without_toggle(self):
+        template = """
+        [gMASK]<sop>
+        {%- set effective_reasoning_effort = reasoning_effort if reasoning_effort is defined and reasoning_effort in ['low', 'high'] else 'max' -%}
+        <|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}
+        """
+        force, config, parser = self._detect(
+            template, ["<tool_call>", "<|endoftext|>", "<|user|>"]
+        )
+
+        self.assertFalse(force)
+        self.assertEqual(config, self.GLM53_EFFORT_CONFIG)
+        self.assertFalse(config.has_toggle)
+        # glm45 parser detection keys on the enable_thinking toggle config;
+        # an effort-level-only config must not trigger it.
+        self.assertIsNone(parser)
+
+    def test_glm53_effort_alias_mapping(self):
+        config = self.GLM53_EFFORT_CONFIG
+        self.assertEqual(normalize_reasoning_effort("none", config), "low")
+        self.assertEqual(normalize_reasoning_effort("minimal", config), "low")
+        self.assertEqual(normalize_reasoning_effort("medium", config), "high")
+        self.assertEqual(normalize_reasoning_effort("xhigh", config), "max")
+        for supported in ("low", "high", "max"):
+            self.assertEqual(normalize_reasoning_effort(supported, config), supported)
+        self.assertEqual(normalize_reasoning_effort("extreme", config), "extreme")
+        self.assertEqual(normalize_reasoning_effort("medium", None), "medium")
 
     def test_interns1_detects_enable_thinking_default_true(self):
         template = """

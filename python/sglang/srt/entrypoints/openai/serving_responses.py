@@ -789,7 +789,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             return effort not in (None, "none", "no_think")
         if self.template_manager.force_reasoning:
             return True
-        config = self.template_manager.reasoning_config
+        config = self.template_manager.reasoning_toggle_config
         if config is None:
             # Parser-only models (DeepSeek-R1, …) carry the thinking default in
             # the detector itself.
