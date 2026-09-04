@@ -81,6 +81,7 @@ def test_config_manager_passes_infercast_configuration(tmp_path, monkeypatch):
         ConfigManager,
         "_raw_config",
         {
+            "platform": {"accelerator": {"name": "mi350x"}},
             "predictor": {
                 "name": "infercast",
                 "model_id": "model",
@@ -89,7 +90,7 @@ def test_config_manager_passes_infercast_configuration(tmp_path, monkeypatch):
                 "attn_dtype": "bfloat16",
                 "kv_cache_dtype": "fp8",
                 "provider_revision": "a" * 40,
-            }
+            },
         },
     )
     ConfigManager.get_inference_time_predictor(
@@ -104,6 +105,7 @@ def test_config_manager_passes_infercast_configuration(tmp_path, monkeypatch):
     )
     assert captured["systems_root"] == str((tmp_path / "systems").resolve())
     assert captured["model_id"] == "model"
+    assert captured["system"] == "mi350x"
     assert captured["provider_revision"] == "a" * 40
 
 

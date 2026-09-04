@@ -178,6 +178,7 @@ class InferCastTimePredictor(InferTimePredictor):
         config: SchedulerConfig,
         *,
         model_id: str | None,
+        system: str | None,
         systems_root: str | None,
         database_mode: str = "SILICON",
         attn_kernel_impl: str | None,
@@ -194,7 +195,7 @@ class InferCastTimePredictor(InferTimePredictor):
 
         required = {
             "model_id": model_id,
-            "system": hw.name,
+            "system": system,
             "systems_root": systems_root,
             "backend_version": config.backend_version,
             "attn_kernel_impl": attn_kernel_impl,
@@ -227,7 +228,7 @@ class InferCastTimePredictor(InferTimePredictor):
 
         self._validate_dtypes(model, config, attn_dtype, kv_cache_dtype)
         self._model_id = str(model_id)
-        self._system = str(hw.name).lower()
+        self._system = str(system)
         self._provider_revision = str(provider_revision)
         self._runtime = {
             "tp_size": config.tp_size,
