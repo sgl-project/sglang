@@ -118,10 +118,10 @@ def _register_encoder_url_with_bootstrap(server_args: ServerArgs):
     host = get_serving().host
     if not host or host in ("0.0.0.0", "::"):
         host = get_local_ip_auto(get_serving().host)
-    scheme = "https" if server_args.ssl_certfile else "http"
+    scheme = "https" if get_serving().ssl_certfile else "http"
     encoder_url = NetworkAddress(host, get_serving().port).to_url(scheme)
     payload = {"url": encoder_url}
-    bootstrap_urls = list(server_args.encoder_register_urls)
+    bootstrap_urls = list(get_disagg().encoder_register_urls)
     if not bootstrap_urls:
         return
 
@@ -179,11 +179,11 @@ def _unregister_encoder_url_from_bootstrap(server_args: ServerArgs):
     host = get_serving().host
     if not host or host in ("0.0.0.0", "::"):
         host = get_local_ip_auto(get_serving().host)
-    scheme = "https" if server_args.ssl_certfile else "http"
+    scheme = "https" if get_serving().ssl_certfile else "http"
     encoder_url = NetworkAddress(host, get_serving().port).to_url(scheme)
     payload = {"url": encoder_url}
 
-    for bootstrap_url in server_args.encoder_register_urls:
+    for bootstrap_url in get_disagg().encoder_register_urls:
         try:
             resp = http_requests.delete(
                 f"{bootstrap_url}/unregister_encoder_url",

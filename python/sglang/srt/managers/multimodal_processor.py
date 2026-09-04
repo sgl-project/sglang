@@ -6,6 +6,7 @@ import pkgutil
 
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sglang.srt.runtime_context import get_model
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -44,7 +45,7 @@ def import_processors(package_name: str, overwrite: bool = False):
 def get_mm_processor_cls(hf_config, server_args: ServerArgs, model_config=None):
     """The class :func:`get_mm_processor` would instantiate, or ``None`` when the
     architecture has no registered processor."""
-    model_impl = str(getattr(server_args, "model_impl", "auto")).lower()
+    model_impl = str(get_model().model_impl).lower()
     uses_transformers_backend = model_impl == "transformers"
     if model_impl == "auto" and model_config is not None:
         from sglang.srt.model_loader.utils import get_resolved_model_impl
