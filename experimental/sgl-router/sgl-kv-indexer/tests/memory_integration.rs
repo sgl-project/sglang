@@ -17,7 +17,10 @@ use sgl_kv_indexer::pb::{
 use sgl_kv_indexer::{
     InMemoryKvIndexerBackend, KvIndexerBackend, WorkerPrefixInput, COMPONENT_FULL, COMPONENT_SWA,
 };
-use test_kv::{action, apply_request as apply_req, component_report, dram, hbm};
+use test_kv::{
+    action, action_with_parent, apply_request as apply_req, component_report,
+    component_report_with_parent, dram, hbm,
+};
 use tonic::Status;
 
 fn backend() -> InMemoryKvIndexerBackend {
@@ -587,10 +590,19 @@ async fn prefix_fast_path_matches_default_impl() {
     fast.apply_external_kv_batch(report("w-short", "10.0.0.2:1", 1, &[1, 2]))
         .await
         .unwrap();
-    // w-hole holds 1, 3, 4 but not 2: strict prefix must be 1.
-    fast.apply_external_kv_batch(report("w-hole", "10.0.0.3:1", 1, &[1, 3, 4]))
+    // w-hole first learns the same chain, then loses block 2 while descendants
+    // remain placed: strict prefix must be 1.
+    fast.apply_external_kv_batch(report("w-hole", "10.0.0.3:1", 1, &[1, 2, 3, 4]))
         .await
         .unwrap();
+    fast.apply_external_kv_batch(apply_req(
+        "w-hole",
+        "10.0.0.3:1",
+        2,
+        vec![action(ExternalKvActionType::ActionRevoke, hbm(), &[2])],
+    ))
+    .await
+    .unwrap();
     // w-noaddr is unroutable and must be excluded by both paths.
     fast.apply_external_kv_batch(report("w-noaddr", "", 1, &[1, 2]))
         .await
@@ -627,6 +639,64 @@ async fn prefix_fast_path_matches_default_impl() {
 }
 
 #[tokio::test]
+async fn prefix_fast_path_returns_worker_depths_with_uncached_suffix() {
+    let (fast, reference) = shared_state_pair();
+    fast.apply_external_kv_batch(report("w-long", "10.0.0.1:1", 1, &[1, 2, 3]))
+        .await
+        .unwrap();
+    fast.apply_external_kv_batch(report("w-short", "10.0.0.2:1", 1, &[1, 2]))
+        .await
+        .unwrap();
+
+    // Blocks 4 and 5 are the newly appended turn and are not cached anywhere.
+    // They must cap the maximum prefix without disabling the known-prefix path.
+    let query = [1, 2, 3, 4, 5];
+    let fast_response = fast
+        .match_external_kv_prefix(prefix_req(&query))
+        .await
+        .unwrap();
+    let reference_response = reference
+        .match_external_kv_prefix(prefix_req(&query))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        prefix_pairs(&fast_response),
+        prefix_pairs(&reference_response)
+    );
+    assert_eq!(
+        prefix_pairs(&fast_response),
+        vec![("w-long".to_string(), 3), ("w-short".to_string(), 2)]
+    );
+}
+
+#[tokio::test]
+async fn prefix_fast_path_falls_back_on_existing_parent_conflict() {
+    let (fast, reference) = shared_state_pair();
+    fast.apply_external_kv_batch(report("w1", "10.0.0.1:1", 1, &[1, 2]))
+        .await
+        .unwrap();
+    // Hash 9 is an independent root, not a child of hash 1.
+    fast.apply_external_kv_batch(report("w1", "10.0.0.1:1", 2, &[9]))
+        .await
+        .unwrap();
+
+    let query = [1, 9];
+    let fast_response = fast
+        .match_external_kv_prefix(prefix_req(&query))
+        .await
+        .unwrap();
+    let reference_response = reference
+        .match_external_kv_prefix(prefix_req(&query))
+        .await
+        .unwrap();
+    assert_eq!(
+        prefix_pairs(&fast_response),
+        prefix_pairs(&reference_response)
+    );
+}
+
+#[tokio::test]
 async fn prefix_first_block_miss_reads_one_block() {
     let b = backend();
     // No worker holds the first queried block; the scan stops after one read.
@@ -660,6 +730,156 @@ async fn prefix_max_blocks_caps_the_scan() {
     assert_eq!(resp.blocks_read, 2);
     assert_eq!(resp.matches.len(), 1);
     assert_eq!(resp.matches[0].matched_prefix_blocks, 2);
+}
+
+#[tokio::test]
+async fn prefix_complete_revoke_and_restore_propagates_to_descendants() {
+    let (fast, reference) = shared_state_pair();
+    fast.apply_external_kv_batch(report("w1", "10.0.0.1:1", 1, &[1, 2, 3, 4]))
+        .await
+        .unwrap();
+
+    fast.apply_external_kv_batch(apply_req(
+        "w1",
+        "10.0.0.1:1",
+        2,
+        vec![action(ExternalKvActionType::ActionRevoke, hbm(), &[2])],
+    ))
+    .await
+    .unwrap();
+    let after_revoke = fast
+        .match_external_kv_prefix(prefix_req(&[1, 2, 3, 4]))
+        .await
+        .unwrap();
+    assert_eq!(prefix_pairs(&after_revoke), vec![("w1".to_string(), 1)]);
+
+    fast.apply_external_kv_batch(apply_req(
+        "w1",
+        "10.0.0.1:1",
+        3,
+        vec![action_with_parent(
+            ExternalKvActionType::ActionReport,
+            hbm(),
+            Some(1),
+            &[2],
+        )],
+    ))
+    .await
+    .unwrap();
+    let restored = fast
+        .match_external_kv_prefix(prefix_req(&[1, 2, 3, 4]))
+        .await
+        .unwrap();
+    let expected = reference
+        .match_external_kv_prefix(prefix_req(&[1, 2, 3, 4]))
+        .await
+        .unwrap();
+    assert_eq!(prefix_pairs(&restored), vec![("w1".to_string(), 4)]);
+    assert_eq!(prefix_pairs(&restored), prefix_pairs(&expected));
+}
+
+#[tokio::test]
+async fn prefix_complete_fast_path_preserves_cache_hit_rate() {
+    let (fast, reference) = shared_state_pair();
+    let query: Vec<i64> = (1..=64).collect();
+    let worker_count = 32usize;
+    let mut expected_prefix_sum = 0u64;
+    for worker in 0..worker_count {
+        let depth = 1 + (worker * 7 % query.len());
+        expected_prefix_sum += depth as u64;
+        fast.apply_external_kv_batch(report(
+            &format!("w-{worker:02}"),
+            &format!("http://worker-{worker:02}"),
+            1,
+            &query[..depth],
+        ))
+        .await
+        .unwrap();
+    }
+
+    let fast_response = fast
+        .match_external_kv_prefix(prefix_req(&query))
+        .await
+        .unwrap();
+    let reference_response = reference
+        .match_external_kv_prefix(prefix_req(&query))
+        .await
+        .unwrap();
+    assert_eq!(
+        prefix_pairs(&fast_response),
+        prefix_pairs(&reference_response)
+    );
+    assert_eq!(fast_response.matches.len(), worker_count);
+
+    let fast_prefix_sum: u64 = fast_response
+        .matches
+        .iter()
+        .map(|item| item.matched_prefix_blocks as u64)
+        .sum();
+    let reference_prefix_sum: u64 = reference_response
+        .matches
+        .iter()
+        .map(|item| item.matched_prefix_blocks as u64)
+        .sum();
+    assert_eq!(fast_prefix_sum, expected_prefix_sum);
+    assert_eq!(fast_prefix_sum, reference_prefix_sum);
+    let hit_rate = fast_prefix_sum as f64 / (worker_count * query.len()) as f64;
+    let reference_hit_rate = reference_prefix_sum as f64 / (worker_count * query.len()) as f64;
+    assert!((hit_rate - reference_hit_rate).abs() < f64::EPSILON);
+}
+
+#[tokio::test]
+async fn full_only_prefix_complete_fast_path_matches_reference() {
+    let (fast, reference) = shared_state_pair();
+    let full_spec = WorkerCacheSpec {
+        version: 1,
+        components: COMPONENT_FULL,
+        swa_window_tokens: 0,
+        full_tier_mask: (1 << hbm()) | (1 << dram()),
+        swa_tier_mask: 0,
+        mamba_tier_mask: 0,
+    };
+    fast.apply_external_kv_batch(apply_with_spec(
+        "w-full",
+        "10.0.0.1:1",
+        1,
+        full_spec,
+        vec![component_report(
+            hbm(),
+            &[11, 12, 13, 14],
+            &[COMPONENT_FULL; 4],
+            &[16; 4],
+        )],
+    ))
+    .await
+    .unwrap();
+    fast.apply_external_kv_batch(apply_with_spec(
+        "w-full",
+        "10.0.0.1:1",
+        2,
+        full_spec,
+        vec![action(ExternalKvActionType::ActionRevoke, hbm(), &[13])],
+    ))
+    .await
+    .unwrap();
+
+    let query = [11, 12, 13, 14];
+    let fast_response = fast
+        .match_external_kv_prefix(prefix_req(&query))
+        .await
+        .unwrap();
+    let reference_response = reference
+        .match_external_kv_prefix(prefix_req(&query))
+        .await
+        .unwrap();
+    assert_eq!(
+        prefix_pairs(&fast_response),
+        prefix_pairs(&reference_response)
+    );
+    assert_eq!(
+        prefix_pairs(&fast_response),
+        vec![("w-full".to_string(), 2)]
+    );
 }
 
 // --- component-aware placement & prefix -------------------------------------
@@ -766,7 +986,13 @@ async fn partial_eviction_replace_shrinks_component_set() {
         "10.0.0.1:1",
         2,
         swa_spec(),
-        vec![component_report(hbm(), &[2], &[COMPONENT_FULL], &[80])],
+        vec![component_report_with_parent(
+            hbm(),
+            Some(1),
+            &[2],
+            &[COMPONENT_FULL],
+            &[80],
+        )],
     ))
     .await
     .unwrap();
@@ -827,12 +1053,10 @@ async fn duplicate_hash_in_one_report_keeps_last_snapshot() {
         "10.0.0.1:1",
         1,
         swa_spec(),
-        vec![component_report(
-            hbm(),
-            &[1, 1],
-            &[COMPONENT_FULL | COMPONENT_SWA, COMPONENT_FULL],
-            &[80, 80],
-        )],
+        vec![
+            component_report(hbm(), &[1], &[COMPONENT_FULL | COMPONENT_SWA], &[80]),
+            component_report(hbm(), &[1], &[COMPONENT_FULL], &[80]),
+        ],
     ))
     .await
     .unwrap();
