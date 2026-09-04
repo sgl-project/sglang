@@ -8,7 +8,7 @@ import torch
 
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.scheduler import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.speculative.eagle_utils import eagle_sample
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
@@ -35,6 +35,13 @@ class RACERWorker(NGRAMWorker):
         self.racer_ngram = int(os.getenv("SGLANG_RACER_NGRAM", "10"))
         self.racer_max_nodes = int(os.getenv("SGLANG_RACER_MAX_NODES", "10000"))
         self.max_trie_depth = int(os.getenv("SGLANG_RACER_HISTORY_WINDOW", "4096"))
+        self.racer_prompt_warmup = os.getenv(
+            "SGLANG_RACER_PROMPT_WARMUP", "0"
+        ).lower() in ("1", "true", "yes", "on")
+        self.racer_prompt_warmup_chunk = max(
+            1, int(os.getenv("SGLANG_RACER_PROMPT_WARMUP_CHUNK", "64"))
+        )
+        self._warned_prompt_warmup_tp = False
 
         self.racer_stats_enabled = os.getenv("SGLANG_RACER_STATS", "0").lower() in (
             "1",
@@ -148,6 +155,70 @@ class RACERWorker(NGRAMWorker):
             return (time.perf_counter() - start) * 1000.0
         return 0.0
 
+    def _warm_prompt_tokenbin(self, batch, hidden_states: torch.Tensor) -> None:
+        """Populate TokenBin from prompt/extend hidden states without rerunning the model.
+
+        This first implementation is intentionally TP=1 only.  It computes the
+        target LM-head top-k in small chunks to avoid materializing the whole
+        [prompt_tokens, vocab] matrix at once.  Chunked prefill is naturally
+        supported because each EXTEND call warms the rows it just computed.
+        """
+
+        if not self.racer_prompt_warmup:
+            return
+        if self.tp_rank != 0 or self.model_runner.server_args.tp_size != 1:
+            if not self._warned_prompt_warmup_tp:
+                logger.warning(
+                    "RACER prompt TokenBin warm-up currently supports TP=1 only; "
+                    "skipping warm-up for tp_size=%d.",
+                    self.model_runner.server_args.tp_size,
+                )
+                self._warned_prompt_warmup_tp = True
+            return
+        if hidden_states is None or hidden_states.ndim != 2:
+            logger.warning(
+                "RACER prompt warm-up expected rank-2 hidden states, got %s; skipping.",
+                None if hidden_states is None else tuple(hidden_states.shape),
+            )
+            return
+
+        prompt_lens = [int(x) for x in batch.extend_seq_lens_cpu]
+        total = sum(prompt_lens)
+        if total <= 0:
+            return
+        if hidden_states.shape[0] != total:
+            logger.warning(
+                "RACER prompt warm-up hidden/token mismatch: hidden_rows=%d total_extend=%d; "
+                "skipping this extend batch.",
+                hidden_states.shape[0],
+                total,
+            )
+            return
+
+        prompt_tokens = batch.input_ids[:total]
+        model = self.model_runner.model
+        logits_processor = model.logits_processor
+        lm_head = model.lm_head
+        topk = min(self.racer_topk, self.model_runner.model_config.vocab_size)
+
+        topk_chunks: list[torch.Tensor] = []
+        for start in range(0, total, self.racer_prompt_warmup_chunk):
+            end = min(total, start + self.racer_prompt_warmup_chunk)
+            logits = logits_processor._compute_lm_head(
+                hidden_states[start:end], lm_head
+            )
+            ids = torch.topk(logits, k=topk, dim=-1).indices
+            topk_chunks.append(ids.cpu())
+            del logits
+
+        topk_ids = torch.cat(topk_chunks, dim=0)
+        self.ngram_corpus.seed_prompt_logits(
+            [req.rid for req in batch.reqs],
+            prompt_tokens.detach().cpu().numpy(),
+            topk_ids.numpy(),
+            prompt_lens,
+        )
+
     def forward_batch_generation(self, batch, on_publish=None) -> GenerationBatchResult:
         fwd_stream = torch.get_device_module(self.device).current_stream()
         record_stream_for_v2_verify(batch, None, fwd_stream)
@@ -234,12 +305,21 @@ class RACERWorker(NGRAMWorker):
                 self._stats_accept_sum.add_(accept_lens.sum())
                 self._maybe_report_racer_stats()
         else:
-            batch_result = self.target_worker.forward_batch_generation(batch)
+            capture_mode = (
+                CaptureHiddenMode.FULL
+                if self.racer_prompt_warmup and batch.forward_mode.is_extend()
+                else None
+            )
+            batch_result = self.target_worker.forward_batch_generation(
+                batch, capture_hidden_mode=capture_mode
+            )
             logits_output, predict, can_run_cuda_graph = (
                 batch_result.logits_output,
                 batch_result.next_token_ids,
                 batch_result.can_run_cuda_graph,
             )
+            if capture_mode is not None:
+                self._warm_prompt_tokenbin(batch, logits_output.hidden_states)
             new_seq_lens = batch.seq_lens.clone()
             accept_tokens = torch.zeros(
                 bs, self.draft_token_num, dtype=torch.int32, device=self.device
