@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKVPoolHost,
     get_mha_host_pool_cls,
 )
+from sglang.srt.platforms.interface import PlatformCapabilities
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -93,9 +94,12 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
         with (
             mock.patch("sglang.srt.mem_cache.pool_host.mha._is_cuda", True),
             mock.patch("sglang.srt.mem_cache.pool_host.mha._is_hip", False),
-            mock.patch("sglang.srt.mem_cache.pool_host.mha._is_npu", False),
-            mock.patch("sglang.srt.mem_cache.pool_host.mha._is_xpu", False),
-            mock.patch("sglang.srt.mem_cache.pool_host.mha._is_mps", False),
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.mha.current_platform",
+                SimpleNamespace(
+                    capabilities=PlatformCapabilities(hicache_device_kernels=True)
+                ),
+            ),
             mock.patch(
                 "sglang.srt.mem_cache.pool_host.mha.can_use_write_back_jit_kernel",
                 return_value=True,
