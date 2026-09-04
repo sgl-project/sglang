@@ -1,4 +1,4 @@
-"""NPU (Huawei Ascend)device operations for the SRT platform layer."""
+"""NPU device operations for the SRT platform layer."""
 
 from typing import Optional
 
@@ -12,7 +12,7 @@ from sglang.srt.platforms.device_mixin import (
 from sglang.srt.platforms.interface import SRTPlatform
 
 
-class NpuDeviceMixin(DeviceMixin):
+class NPUDeviceMixin(DeviceMixin):
     """NPU implementation of the shared device operations."""
 
     _enum: PlatformEnum = PlatformEnum.NPU
@@ -68,7 +68,7 @@ class NpuDeviceMixin(DeviceMixin):
                 torch.npu.manual_seed_all(seed)
 
 
-class NpuSRTPlatform(NpuDeviceMixin, SRTPlatform):
+class NPUSRTPlatform(NPUDeviceMixin, SRTPlatform):
     """Default in-tree NPU SRT platform."""
 
     def get_default_attention_backend(self) -> str:

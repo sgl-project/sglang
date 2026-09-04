@@ -19,7 +19,7 @@ from sglang.srt.platforms.device_mixin import (
     PlatformEnum,
 )
 from sglang.srt.platforms.interface import SRTPlatform
-from sglang.srt.platforms.npu import NpuSRTPlatform
+from sglang.srt.platforms.npu import NPUSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.platforms.xpu import XpuSRTPlatform
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -326,7 +326,7 @@ class TestNpuDeviceMixin(CustomTestCase):
         super().setUp()
 
     def test_default_get_device_returns_npu_device(self):
-        base = NpuSRTPlatform()
+        base = NPUSRTPlatform()
         self.assertEqual(base.get_device(2), torch.device("npu", 2))
 
     def test_default_get_device_capability_reports_zero(self):
@@ -334,14 +334,14 @@ class TestNpuDeviceMixin(CustomTestCase):
         # variable TORCH_NPU_DEVICE_CAPABILITY purely for native-PyTorch
         # compatibility; it does not reflect the real NPU hardware. The
         # platform therefore reports (0, 0) without consulting torch.npu.
-        base = NpuSRTPlatform()
+        base = NPUSRTPlatform()
         mock_npu = MagicMock()
         with patch.object(torch, "npu", mock_npu, create=True):
             self.assertEqual(base.get_device_capability(1), DeviceCapability(0, 0))
         mock_npu.get_device_capability.assert_not_called()
 
     def test_memory_queries_delegate_to_torch_npu(self):
-        base = NpuSRTPlatform()
+        base = NPUSRTPlatform()
         mock_npu = MagicMock()
         mock_npu.get_device_properties.return_value.total_memory = 32 * 1024**3
         mock_npu.max_memory_allocated.return_value = 5 * 10**8
@@ -358,7 +358,7 @@ class TestNpuDeviceMixin(CustomTestCase):
             mock_npu.mem_get_info.assert_called_once_with(2)
 
     def test_device_info_queries_delegate_to_torch_npu(self):
-        base = NpuSRTPlatform()
+        base = NPUSRTPlatform()
         mock_npu = MagicMock()
         mock_npu.get_device_name.return_value = "Ascend910B4"
         mock_npu.get_device_properties.return_value.uuid = "npu-uuid-0"
@@ -369,7 +369,7 @@ class TestNpuDeviceMixin(CustomTestCase):
             mock_npu.get_device_properties.assert_called_once_with(1)
 
     def test_device_state_ops_delegate_to_torch_npu(self):
-        base = NpuSRTPlatform()
+        base = NPUSRTPlatform()
         mock_npu = MagicMock()
         with patch.object(torch, "npu", mock_npu, create=True):
             device = torch.device("npu", 3)
@@ -381,7 +381,7 @@ class TestNpuDeviceMixin(CustomTestCase):
             mock_npu.synchronize.assert_called_once()
 
     def test_pin_memory_available_for_npu_targets(self):
-        base = NpuSRTPlatform()
+        base = NPUSRTPlatform()
         self.assertTrue(base.is_pin_memory_available())
         self.assertTrue(base.is_pin_memory_available(device="npu"))
         self.assertTrue(base.is_pin_memory_available(device=torch.device("npu", 0)))
@@ -396,7 +396,7 @@ class TestNpuDeviceMixin(CustomTestCase):
             patch("sglang.srt.platforms.device_mixin.np.random.seed") as mock_np_seed,
             patch("sglang.srt.platforms.device_mixin.random.seed") as mock_random_seed,
         ):
-            NpuSRTPlatform.seed_everything(123)
+            NPUSRTPlatform.seed_everything(123)
         mock_random_seed.assert_called_once_with(123)
         mock_np_seed.assert_called_once_with(123)
         mock_torch_seed.assert_called_once_with(123)
@@ -410,14 +410,14 @@ class TestNpuDeviceMixin(CustomTestCase):
             patch("sglang.srt.platforms.device_mixin.np.random.seed") as mock_np_seed,
             patch("sglang.srt.platforms.device_mixin.random.seed") as mock_random_seed,
         ):
-            NpuSRTPlatform.seed_everything(None)
+            NPUSRTPlatform.seed_everything(None)
         mock_random_seed.assert_not_called()
         mock_np_seed.assert_not_called()
         mock_torch_seed.assert_not_called()
         mock_npu.manual_seed_all.assert_not_called()
 
     def test_npu_srt_platform_identity(self):
-        base = NpuSRTPlatform()
+        base = NPUSRTPlatform()
         self.assertTrue(base.is_npu())
         self.assertFalse(base.is_cuda())
         self.assertFalse(base.is_cuda_alike())
@@ -425,13 +425,13 @@ class TestNpuDeviceMixin(CustomTestCase):
         self.assertEqual(base.device_type, "npu")
 
     def test_get_default_attention_backend_is_ascend(self):
-        self.assertEqual(NpuSRTPlatform().get_default_attention_backend(), "ascend")
+        self.assertEqual(NPUSRTPlatform().get_default_attention_backend(), "ascend")
 
     def test_get_dispatch_key_name_is_npu(self):
-        self.assertEqual(NpuSRTPlatform().get_dispatch_key_name(), "npu")
+        self.assertEqual(NPUSRTPlatform().get_dispatch_key_name(), "npu")
 
     def test_npu_srt_platform_capabilities(self):
-        base = NpuSRTPlatform()
+        base = NPUSRTPlatform()
         self.assertTrue(base.supports_fp8())
         self.assertTrue(base.support_cuda_graph())
         self.assertFalse(base.support_piecewise_cuda_graph())
