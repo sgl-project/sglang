@@ -123,6 +123,7 @@ class TestXPUEncoderDecoderVarlen(CustomTestCase):
             causal=causal,
         )
         self.assertEqual(tuple(got.shape), (num_rows, self.H, self.D))
+        self.assertTrue(torch.isfinite(got).all(), "attention output must be finite")
         # bf16 kernel vs fp32 reference: loose tolerance.
         torch.testing.assert_close(got.float(), want, rtol=2e-2, atol=2e-2)
 
@@ -139,6 +140,19 @@ class TestXPUEncoderDecoderVarlen(CustomTestCase):
             cache_seqlens=torch.tensor([4, 6], dtype=torch.int32),
             cu_seqlens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
             causal=True,
+        )
+
+    def test_mixed_empty_batch_on_xpu(self):
+        # Mixed batch: request 0 has no keys (cache_seqlens==0), request 1 has some.
+        # On the real kernel the empty request's rows come back NaN/inf, so the
+        # backend must zero them without corrupting request 1. The SDPA oracle
+        # yields zeros for the empty request (empty-key contraction), so the shared
+        # assert_close plus the finiteness check guard against a regression that
+        # drops the zeroing and leaks NaN into the output.
+        self._check(
+            cache_seqlens=torch.tensor([0, 6], dtype=torch.int32),
+            cu_seqlens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
+            causal=False,
         )
 
 
