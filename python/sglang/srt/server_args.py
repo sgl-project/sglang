@@ -37,11 +37,10 @@ import argparse
 import copy
 import dataclasses
 import functools
-import json
 import logging
 import tempfile
 import uuid
-from typing import Any, Callable, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Optional
 
 from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
 from sglang.srt.arg_groups.arg_utils import NS, A, Arg, add_cli_args_from_dataclass
@@ -96,8 +95,23 @@ from sglang.srt.arg_groups.argparse_actions import LoRAPathAction  # noqa: F401
 # through `sglang.srt.server_args`. The lists and their adders moved to
 # `arg_groups/choices.py` with the field declarations that name them.
 from sglang.srt.arg_groups.choices import (  # noqa: F401
+    ATTENTION_BACKEND_CHOICES,
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
+    DETERMINISTIC_ATTENTION_BACKEND_CHOICES,
+    DISAGG_TRANSFER_BACKEND_CHOICES,
+    DRAFT_ATTENTION_BACKEND_CHOICES,
+    FP4_GEMM_RUNNER_BACKEND_CHOICES,
+    FP8_GEMM_RUNNER_BACKEND_CHOICES,
+    GRAMMAR_BACKEND_CHOICES,
+    LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+    LOAD_FORMAT_CHOICES,
+    MOE_RUNNER_BACKEND_CHOICES,
+    MXFP8_MOE_RUNNER_BACKEND_CHOICES,
+    QUANTIZATION_CHOICES,
+    RADIX_EVICTION_POLICY_CHOICES,
     RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND,
+    RL_ON_POLICY_TARGET_CHOICES,
+    SAMPLING_BACKEND_CHOICES,
     add_attention_backend_choices,
     add_chunked_prefix_cache_attention_backend,
     add_deterministic_attention_backend_choices,
