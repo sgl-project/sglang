@@ -5765,7 +5765,14 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(result.host_hit_length, 0)
         self.assertEqual(result.swa_host_hit_length, _node_key_length(cache, leaf))
 
+    def _skip_swa_branching_on_rust(self) -> None:
+        # TODO(alphabetc1): drop this gate once #37584 ports SWA branching-point
+        # caching to the Rust tree core.
+        if _selected_tree_core_test_backend() == "rust":
+            self.skipTest("SWA branching-point caching is Python-core only")
+
     def test_swa_branching_seqlen_uses_device_full_hit(self):
+        self._skip_swa_branching_on_rust()
         if (
             not self.cfg.has_swa
             or self.cfg.has_mamba
@@ -5817,6 +5824,7 @@ class UnifiedRadixCacheSuite:
         self.assertIsNone(rematch.swa_branching_seqlen)
 
     def test_swa_branching_seqlen_uses_host_full_hit(self):
+        self._skip_swa_branching_on_rust()
         if (
             not self.cfg.has_swa
             or self.cfg.has_mamba
@@ -6685,6 +6693,7 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(comp_xfers[ComponentType.SWA][0].nodes_to_load, [a, b])
 
     def test_hicache_swa_backup_window_stops_at_pending_ancestor(self):
+        self._skip_swa_branching_on_rust()
         if (
             not self.cfg.has_swa
             or self.cfg.has_mamba
