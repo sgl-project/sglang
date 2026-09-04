@@ -144,6 +144,13 @@ emit("MAXTOK", rt.get("max_total_tokens", ""))
 emit("CHUNK", rt["chunked_prefill_size"])
 # swa is DSV4-specific; emit empty when a model omits it so the flag is dropped.
 emit("SWA", rt.get("swa_full_tokens_ratio", ""))
+# --disable-radix-cache used to be hardcoded into both role strings. The default
+# reproduces that, so every recipe that omits the key keeps its argv byte-identical.
+# A HiCache recipe MUST set `disable_radix_cache: false`: server_args
+# _handle_cache_compatibility raises on enable-hierarchical-cache + disable-radix-cache.
+# Only the prefill role is affected in practice -- the PD hook force-disables the
+# radix cache on a decode server anyway unless --disaggregation-decode-enable-radix-cache.
+emit("NORADIX", 1 if rt.get("disable_radix_cache", True) else 0)
 # 1 when the recipe carries a `model:` block (env + server_args written to
 # model_flags.sh); 0 for the DSV4 recipes, which keep the hardcoded DSV4 path.
 emit("HAS_MODEL", 1 if r.get("model") else 0)
@@ -427,6 +434,10 @@ KV_FLAG=""
 PREFILL_TAIL="$PREFILL_DPEP$EXTRA_COMMON$(sp "$WECOMMON")$(sp "$PEXTRA")"
 DECODE_TAIL="$DECODE_DPEP$EXTRA_COMMON$(sp "$WECOMMON")$(sp "$DEXTRA")"
 echo "prefill tail:${PREFILL_TAIL:-<none>} | decode tail:${DECODE_TAIL:-<none>} (pep=$PEP pdp=$PDP dep=$DEP ddp=$DDP mtp=$MTP_ENABLED)"
+# Carries its own leading space so that with the default (NORADIX=1) the role
+# strings below render exactly as the previous hardcoded text.
+RADIX_FLAG=""
+[[ "$NORADIX" == "1" ]] && RADIX_FLAG=" --disable-radix-cache"
 
 if [[ "$HAS_MODEL" == "1" ]]; then
     # Generic path (e.g. Kimi): attention + swa from the recipe, model parsers /
@@ -439,12 +450,12 @@ if [[ "$HAS_MODEL" == "1" ]]; then
     [[ -n "$DATTN" ]] && ATTN_FLAGS="$ATTN_FLAGS --decode-attention-backend $DATTN"
     SWA_FLAG=""
     [[ -n "$SWA" ]] && SWA_FLAG=" --swa-full-tokens-ratio $SWA"
-    PREFILL_COMMON_FLAGS="--trust-remote-code --tp $PTP --disable-radix-cache \
+    PREFILL_COMMON_FLAGS="--trust-remote-code --tp $PTP$RADIX_FLAG \
 $ATTN_FLAGS --max-running-requests $PMAXREQ --page-size $PAGE \
 --mem-fraction-static $PMEMFRAC$SWA_FLAG \
 --chunked-prefill-size $PCHUNK \
 --disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB$KV_FLAG$PREFILL_TAIL"
-    DECODE_COMMON_FLAGS="--trust-remote-code --tp $DTP --disable-radix-cache \
+    DECODE_COMMON_FLAGS="--trust-remote-code --tp $DTP$RADIX_FLAG \
 $ATTN_FLAGS --max-running-requests $DMAXREQ --page-size $PAGE \
 --mem-fraction-static $DMEMFRAC$SWA_FLAG \
 --chunked-prefill-size $CHUNK \
@@ -452,13 +463,13 @@ $ATTN_FLAGS --max-running-requests $DMAXREQ --page-size $PAGE \
 else
     # DSV4 path: for EP<=8 recipes (PTP==DTP, no wide_ep) both role strings equal
     # the pre-Kimi launcher's COMMON_FLAGS exactly.
-    PREFILL_COMMON_FLAGS="--trust-remote-code --tp $PTP --disable-radix-cache \
+    PREFILL_COMMON_FLAGS="--trust-remote-code --tp $PTP$RADIX_FLAG \
 --attention-backend $ATTN --max-running-requests $PMAXREQ --page-size $PAGE \
 --mem-fraction-static $PMEMFRAC --swa-full-tokens-ratio $SWA \
 --chunked-prefill-size $PCHUNK --disable-shared-experts-fusion \
 --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4 \
 --disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB$KV_FLAG$PREFILL_TAIL"
-    DECODE_COMMON_FLAGS="--trust-remote-code --tp $DTP --disable-radix-cache \
+    DECODE_COMMON_FLAGS="--trust-remote-code --tp $DTP$RADIX_FLAG \
 --attention-backend $ATTN --max-running-requests $DMAXREQ --page-size $PAGE \
 --mem-fraction-static $DMEMFRAC --swa-full-tokens-ratio $SWA \
 --chunked-prefill-size $CHUNK --disable-shared-experts-fusion \
