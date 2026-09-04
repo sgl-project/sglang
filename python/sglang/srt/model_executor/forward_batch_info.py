@@ -454,6 +454,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For DP attention
     is_extend_in_batch: bool = False
     can_run_decode_cuda_graph: bool = False
+    # Draft-only companion to the generic DP decode graph vote.
+    can_run_dp_draft_cuda_graph: bool = False
     can_run_dp_prefill_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
 
@@ -707,28 +709,40 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.mark_forward_metadata_ready()
 
     def init_mlp_sync_metadata(
-        self, batch: ScheduleBatch, device: Union[str, torch.device]
+        self,
+        batch: ScheduleBatch,
+        device: Union[str, torch.device],
+        *,
+        is_draft_worker: bool = False,
     ) -> None:
         """Populate per-rank token counts for DP-attention MLP synchronization."""
-        if batch.global_num_tokens is None:
+        global_num_tokens_source = batch.global_num_tokens
+        global_num_tokens_for_logprob_source = batch.global_num_tokens_for_logprob
+        if is_draft_worker and batch.draft_global_num_tokens is not None:
+            global_num_tokens_source = batch.draft_global_num_tokens
+            global_num_tokens_for_logprob_source = (
+                batch.draft_global_num_tokens_for_logprob
+            )
+
+        if global_num_tokens_source is None:
             return
 
-        assert batch.global_num_tokens_for_logprob is not None
+        assert global_num_tokens_for_logprob_source is not None
         if self.spec_info is not None:
             from sglang.srt.speculative.spec_info import spec_scale_global_num_tokens
 
             global_num_tokens, global_num_tokens_for_logprob = (
                 spec_scale_global_num_tokens(
                     self.spec_info,
-                    batch.global_num_tokens,
-                    batch.global_num_tokens_for_logprob,
+                    global_num_tokens_source,
+                    global_num_tokens_for_logprob_source,
                 )
             )
         else:
-            global_num_tokens = batch.global_num_tokens
-            global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
+            global_num_tokens = global_num_tokens_source
+            global_num_tokens_for_logprob = global_num_tokens_for_logprob_source
 
-        self.original_global_num_tokens_cpu = batch.global_num_tokens
+        self.original_global_num_tokens_cpu = global_num_tokens_source
         self.global_num_tokens_cpu = global_num_tokens
         pin_memory = is_pin_memory_available(device)
         self.global_num_tokens_gpu = torch.tensor(
@@ -741,6 +755,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             pin_memory=pin_memory,
         ).to(device, non_blocking=True)
         self.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
+        self.can_run_dp_draft_cuda_graph = batch.can_run_dp_draft_cuda_graph
 
     @classmethod
     def init_new(
@@ -826,6 +841,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_logprob=batch.return_logprob,
             is_extend_in_batch=batch.is_extend_in_batch,
             can_run_decode_cuda_graph=batch.can_run_decode_cuda_graph,
+            can_run_dp_draft_cuda_graph=batch.can_run_dp_draft_cuda_graph,
             can_run_dp_prefill_cuda_graph=batch.can_run_dp_prefill_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
@@ -885,7 +901,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ).to(device, non_blocking=True)
         ret.global_num_token_non_padded_cpu = num_tokens
 
-        ret.init_mlp_sync_metadata(batch, device)
+        ret.init_mlp_sync_metadata(
+            batch, device, is_draft_worker=model_runner.is_draft_worker
+        )
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
@@ -1745,6 +1763,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     ]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_extend() or self.forward_mode.is_idle():
+                if self.forward_mode.is_idle():
+                    self.positions = self.positions[:bs]
+                    self.seq_lens = self.seq_lens[:bs]
+                    self.req_pool_indices = self.req_pool_indices[:bs]
+                    if self.seq_lens_cpu is not None:
+                        self.seq_lens_cpu = self.seq_lens_cpu[:bs]
                 if logits_output.next_token_logits is not None:
                     logits_output.next_token_logits = logits_output.next_token_logits[
                         :bs

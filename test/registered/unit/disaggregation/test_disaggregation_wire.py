@@ -381,6 +381,13 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             reqs=[self._make_req(seed) for seed in seeds],
             device="cpu",
             enable_overlap=False,
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    architectures=["GlmMoeDsaForCausalLM"],
+                    index_share_for_mtp_iteration=True,
+                    index_topk=3,
+                )
+            ),
         )
         # The draft-input shape comes from the spec bag.
         override = get_context().override_server_args(
@@ -394,6 +401,7 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
 
         draft_input = build_eagle_disagg_draft_input(batch, last_tokens, None)
         self.assertTrue(torch.equal(draft_input.dsa_topk_indices, torch.stack(seeds)))
+        self.assertTrue(draft_input.cuda_graph_compatible)
 
         for invalid_seed in (
             None,
@@ -402,6 +410,34 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             batch.reqs[1].output_dsa_topk_indices = invalid_seed
             draft_input = build_eagle_disagg_draft_input(batch, last_tokens, None)
             self.assertIsNone(draft_input.dsa_topk_indices)
+            # A model that shares the DSA index across MTP iterations cannot run
+            # the captured graph without a seed, so the draft must fall back to
+            # eager on every DP rank -- not just the ranks missing the seed.
+            self.assertFalse(draft_input.cuda_graph_compatible)
+
+    def test_decode_input_stays_graph_compatible_without_dsa_index_sharing(self):
+        """Models that don't share the DSA index keep the captured graph even
+        when no seed is transferred; only index_share_for_mtp_iteration models
+        need the seed."""
+        batch = SimpleNamespace(
+            reqs=[self._make_req(None)],
+            device="cpu",
+            enable_overlap=False,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        )
+        override = get_context().override_server_args(
+            speculative_eagle_topk=1,
+            speculative_num_steps=5,
+            enable_multi_layer_eagle=False,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        draft_input = build_eagle_disagg_draft_input(
+            batch, torch.tensor([11], dtype=torch.int64), None
+        )
+        self.assertIsNone(draft_input.dsa_topk_indices)
+        self.assertTrue(draft_input.cuda_graph_compatible)
 
     def test_pd_decode_fused_topk_remaps_wire_positions_to_local_slots(self):
         wire_positions = (
@@ -421,6 +457,13 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             reqs=[self._make_req(seed) for seed in wire_positions],
             device="cpu",
             enable_overlap=False,
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    architectures=["GlmMoeDsaForCausalLM"],
+                    index_share_for_mtp_iteration=True,
+                    index_topk=3,
+                )
+            ),
             req_pool_indices=torch.tensor([3, 1], dtype=torch.int64),
             req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
             seq_lens=torch.tensor([4, 4], dtype=torch.int32),

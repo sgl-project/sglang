@@ -3802,11 +3802,16 @@ class Withable(Generic[T]):
             self._value = None
 
 
-def require_mlp_tp_gather():
+def require_mlp_tp_gather(*, moe_a2a_backend=None):
     """
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
-    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+    from sglang.srt.layers.moe.utils import MoeA2ABackend, get_moe_a2a_backend
+
+    if moe_a2a_backend is None:
+        moe_a2a_backend = get_moe_a2a_backend()
+    elif not isinstance(moe_a2a_backend, MoeA2ABackend):
+        moe_a2a_backend = MoeA2ABackend(moe_a2a_backend)
 
     # elastic-EP scale-up rewrites dp_size on the published config
     if get_parallel().enable_dp_attention:
@@ -3824,9 +3829,9 @@ def require_mlp_tp_gather():
             return True
         elif not get_parallel().enable_dp_lm_head:
             return True
-        elif get_moe_a2a_backend().is_none():
+        elif moe_a2a_backend.is_none():
             return True
-        elif get_moe_a2a_backend().is_flashinfer():
+        elif moe_a2a_backend.is_flashinfer():
             # FlashInfer MoE A2A needs a rank-invariant, DP-synchronized per-rank
             # token count: MoeAlltoAll uses fixed-geometry buffers and the decode
             # cuda-graph bucket must be identical across EP ranks, otherwise ranks
@@ -3836,7 +3841,7 @@ def require_mlp_tp_gather():
             # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
             # max-based graph bucket). See #30432 re: the misleading flag name.
             return True
-        elif get_moe_a2a_backend().is_mori() and get_bool_env_var(
+        elif moe_a2a_backend.is_mori() and get_bool_env_var(
             "SGLANG_MORI_RECV_BOUND", "false"
         ):
             # Same bookkeeping, for the same reason. Bounding mori's receive
