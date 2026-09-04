@@ -24,9 +24,11 @@ use tokio_stream::wrappers::ReceiverStream;
 /// worst-case outstanding bytes to 64 × chunk_size (typically a few MB).
 ///
 /// # Client disconnect
-/// When the axum Body is dropped the receiver is closed; `tx.send()` then
-/// returns `Err`, which breaks the loop — no upstream bytes are read after the
-/// client disconnects.
+/// When the axum Body is dropped the receiver is closed. The pump races the
+/// next upstream chunk against `tx.closed()` in a `select!`, so it stops the
+/// instant the client disconnects, even while awaiting a slow upstream,
+/// rather than only noticing on the next `tx.send()`. Dropping the upstream
+/// stream then closes the worker connection so it can abort its own work.
 ///
 /// # Panic safety
 /// The pump future is wrapped in `AssertUnwindSafe(..).catch_unwind()`. If the
@@ -88,7 +90,24 @@ where
             let _hold = stream_guards;
             let mut on_first_byte = on_first_byte;
             let mut s = stream;
-            while let Some(chunk) = s.next().await {
+            loop {
+                // Race the next upstream chunk against the client going away.
+                // `tx.closed()` resolves the instant the axum body receiver is
+                // dropped (client disconnect), so we stop reading immediately
+                // instead of filling the channel buffer first. Dropping `s`
+                // then closes the upstream connection and the worker can abort
+                // its own work, matching the usual connection-drop propagation.
+                let chunk = tokio::select! {
+                    biased;
+                    _ = tx.closed() => {
+                        tracing::debug!("SSE client disconnected mid-stream");
+                        break;
+                    }
+                    maybe = s.next() => match maybe {
+                        Some(chunk) => chunk,
+                        None => break,
+                    },
+                };
                 let item: Result<Bytes, std::io::Error> = chunk.map_err(|e| {
                     let msg = e.to_string();
                     tracing::warn!(error = %msg, "upstream SSE stream errored mid-flight");
@@ -326,15 +345,13 @@ mod tests {
         );
     }
 
-    /// Regression guard for the backpressure-via-disconnect invariant.
-    ///
-    /// The doc on `bytes_stream_to_body` claims "when the axum Body is dropped
-    /// the receiver is closed; `tx.send()` then returns `Err`, which breaks the
-    /// loop — no upstream bytes are read after the client disconnects." This
-    /// test pins that contract: a refactor that swaps the `if tx.send().await.
-    /// is_err() { break; }` for `let _ = tx.send().await;` would silently
-    /// regress (leaked upstream reads on every client cancel, visible only as
-    /// ops-side memory growth).
+    /// Regression guard for the backpressure-via-disconnect invariant: the
+    /// pump must stop reading upstream shortly after the client disconnects,
+    /// via either the `tx.closed()` select branch or the `tx.send()` error
+    /// path. A refactor that drops both would silently regress: leaked
+    /// upstream reads on every client cancel, visible only as ops-side memory
+    /// growth. (The companion test below pins the select branch specifically,
+    /// for the case where the upstream is pending rather than ready.)
     #[tokio::test]
     async fn bytes_stream_to_body_breaks_on_client_disconnect() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -380,8 +397,9 @@ mod tests {
         drop(data_stream);
 
         // Give the pump generous time to make additional polls if its break is
-        // broken. Healthy code: pump fills the 64-slot channel, then on the
-        // next iteration tx.send().await detects receiver-drop and breaks.
+        // broken. Healthy code breaks promptly after the drop: the select! sees
+        // tx.closed() (or tx.send() errors once the 64-slot channel is full),
+        // so total polls stay near the channel bound, never 1000.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let final_polls = polls.load(Ordering::SeqCst);
         assert!(
@@ -393,5 +411,62 @@ mod tests {
             final_polls < 1000,
             "pump drained the entire upstream after client disconnect ({final_polls} polls); the break-on-tx.send-err path is dead"
         );
+    }
+
+    /// Proves the `tokio::select!` on `tx.closed()`: when the upstream is
+    /// PENDING (waiting for the next token) and the client disconnects, the
+    /// pump must break immediately rather than hang until the next (here,
+    /// never-arriving) upstream chunk. Without the select! the pump parks on
+    /// `s.next()` forever, `on_complete` never fires, and the outer timeout
+    /// trips. This is the disconnect-propagation contract that lets the
+    /// upstream worker see the dropped connection and abort its own work.
+    #[tokio::test]
+    async fn bytes_stream_to_body_breaks_on_disconnect_while_upstream_pending() {
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        // Yields exactly one chunk, then parks Pending forever (never wakes).
+        struct OneThenPending {
+            done: bool,
+        }
+
+        impl futures::Stream for OneThenPending {
+            type Item = Result<Bytes, std::io::Error>;
+
+            fn poll_next(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                if !self.done {
+                    self.done = true;
+                    std::task::Poll::Ready(Some(Ok(Bytes::from_static(b"chunk"))))
+                } else {
+                    std::task::Poll::Pending
+                }
+            }
+        }
+
+        let completed = Arc::new(Notify::new());
+        let completed_setter = completed.clone();
+        let on_complete = Box::new(move |_ok: bool| {
+            completed_setter.notify_one();
+        });
+        let body = bytes_stream_to_body(
+            OneThenPending { done: false },
+            None,
+            Some(on_complete),
+            None,
+        );
+
+        let mut data_stream = body.into_data_stream();
+        let first = data_stream.next().await;
+        assert!(first.is_some(), "expected the one chunk before disconnect");
+        drop(data_stream); // client disconnect while upstream is Pending
+
+        // With the select! on tx.closed(), the pump breaks now and on_complete
+        // fires. Without it, the pump is parked on the pending upstream forever.
+        tokio::time::timeout(std::time::Duration::from_millis(500), completed.notified())
+            .await
+            .expect("pump must break promptly on client disconnect while upstream is pending");
     }
 }
