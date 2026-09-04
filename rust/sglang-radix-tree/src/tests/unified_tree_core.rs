@@ -4,7 +4,7 @@ use tch::Tensor;
 
 use super::*;
 use crate::components::{FULL, MAMBA, SWA};
-use crate::node::ValueSlotIdx;
+use crate::node::{NodeAccessError, ValueSlotIdx};
 use crate::test_utils::{accumulate_step, action_kinds};
 
 fn core() -> UnifiedTreeCore<Vec<i64>> {
@@ -503,7 +503,8 @@ fn locked_anchor_for_dispatch(tc: &mut UnifiedTreeCore<Vec<i64>>) -> NodeIdx_ {
     tc.arena
         .set_device_value(n1, FULL, Tensor::from_slice(&[0i64, 1]));
     tc.component_state_mut(FULL).evictable_size = 2;
-    tc.inc_lock_ref(tc.arena.node(n1).id);
+    tc.inc_lock_ref(tc.arena.node(n1).id)
+        .expect("live test node");
     n1
 }
 
@@ -517,7 +518,8 @@ fn dec_lock_ref_skip_swa_skips_the_swa_component() {
         tc.arena.node(n1).id,
         /* params = */ None,
         /* skip_swa = */ true,
-    );
+    )
+    .expect("live test node");
     assert_eq!(tc.arena.device_lock_ref(n1, FULL), 0);
 }
 
@@ -539,7 +541,7 @@ fn inc_lock_ref_reaches_every_component() {
     tc.arena
         .set_device_value(n1, FULL, Tensor::from_slice(&[0i64, 1]));
     tc.component_state_mut(FULL).evictable_size = 2;
-    tc.inc_lock_ref(tc.arena.node(n1).id);
+    let _ = tc.inc_lock_ref(tc.arena.node(n1).id);
 }
 
 #[test]
@@ -548,7 +550,7 @@ fn dec_lock_ref_without_skip_swa_reaches_every_component() {
     let mut tc = core();
     let n1 = locked_anchor_for_dispatch(&mut tc);
     tc.register_component_(Arc::new(SwaComponentForTest));
-    tc.dec_lock_ref(
+    let _ = tc.dec_lock_ref(
         tc.arena.node(n1).id,
         /* params = */ None,
         /* skip_swa = */ false,
@@ -573,7 +575,8 @@ fn set_component_device_value_sizes_by_the_value_length() {
         tc.arena.node(node).id,
         SWA,
         Tensor::from_slice(&[7i64, 8, 9]),
-    );
+    )
+    .expect("live test node");
     assert!(
         tc.arena
             .device_value(node, SWA)
@@ -597,9 +600,10 @@ fn set_component_device_value_rejects_an_occupied_slot() {
             /* extra_key = */ None,
         )
         .unwrap();
-    tc.set_component_device_value(tc.arena.node(node).id, SWA, Tensor::from_slice(&[7i64]));
+    tc.set_component_device_value(tc.arena.node(node).id, SWA, Tensor::from_slice(&[7i64]))
+        .expect("live test node");
     tc.device_lru_list_mut(SWA).remove_node(node);
-    tc.set_component_device_value(tc.arena.node(node).id, SWA, Tensor::from_slice(&[8i64]));
+    let _ = tc.set_component_device_value(tc.arena.node(node).id, SWA, Tensor::from_slice(&[8i64]));
 }
 
 #[test]
@@ -607,7 +611,7 @@ fn set_component_device_value_rejects_an_occupied_slot() {
 fn set_component_device_value_rejects_a_disabled_component() {
     let mut tc = core();
     let root = tc.arena.root();
-    tc.set_component_device_value(tc.arena.node(root).id, SWA, Tensor::from_slice(&[1i64]));
+    let _ = tc.set_component_device_value(tc.arena.node(root).id, SWA, Tensor::from_slice(&[1i64]));
 }
 
 #[test]
@@ -624,7 +628,7 @@ fn dec_swa_lock_only_dispatches_lower_priority_releases() {
     let root = tc.arena.root();
     let mut device_frees = HashMap::new();
     let mut host_frees = HashMap::new();
-    tc.dec_swa_lock_only(
+    let _ = tc.dec_swa_lock_only(
         tc.arena.node(root).id,
         Some(7),
         &mut device_frees,
@@ -651,7 +655,8 @@ fn dec_swa_lock_only_returns_device_frees_in_the_device_dict() {
         .unwrap();
     tc.arena
         .set_device_value(a, FULL, Tensor::from_slice(&[9i64]));
-    tc.set_component_device_value(tc.arena.node(a).id, SWA, Tensor::from_slice(&[7i64]));
+    tc.set_component_device_value(tc.arena.node(a).id, SWA, Tensor::from_slice(&[7i64]))
+        .expect("live test node");
     let swa = SwaComponent::new(&CacheInitParams {
         swa_sliding_window_size: Some(2),
         ..Default::default()
@@ -669,7 +674,8 @@ fn dec_swa_lock_only_returns_device_frees_in_the_device_dict() {
         result.swa_uuid_for_lock,
         &mut device_frees,
         &mut host_frees,
-    );
+    )
+    .expect("live test node");
     // The fully unlocked D-leaf's SWA value is device-evicted on release;
     // the freed span is reported as the node's Full indices.
     assert!(!tc.arena.has_device_value(a, SWA));
@@ -866,8 +872,18 @@ fn new_node_ids_are_distinct_live_slots() {
         /* extra_key = */ None,
     );
     assert_ne!(a, b);
-    assert_eq!(tc.arena.resolve(tc.arena.node(a).id), a);
-    assert_eq!(tc.arena.resolve(tc.arena.node(b).id), b);
+    assert_eq!(
+        tc.arena
+            .resolve(tc.arena.node(a).id)
+            .expect("live test node"),
+        a
+    );
+    assert_eq!(
+        tc.arena
+            .resolve(tc.arena.node(b).id)
+            .expect("live test node"),
+        b
+    );
 }
 
 // Chain root -> c with a 3-atom key and FULL device value, seeded as a D-leaf.
@@ -1246,9 +1262,17 @@ fn match_prefix_splits_on_a_partial_match() {
     let prefix_node = result.best_match_node_id;
     assert_ne!(prefix_node, tc.arena.node(a).id);
     assert!(result.device_indices.equal(&Tensor::from_slice(&[10i64])));
-    assert_eq!(tc.arena.node(tc.arena.resolve(prefix_node)).key, vec![1]);
+    assert_eq!(
+        tc.arena
+            .node(tc.arena.resolve(prefix_node).expect("live test node"))
+            .key,
+        vec![1]
+    );
     assert_eq!(tc.arena.node(a).key, vec![2]);
-    assert_eq!(tc.arena.node(a).parent(), tc.arena.resolve(prefix_node));
+    assert_eq!(
+        tc.arena.node(a).parent(),
+        tc.arena.resolve(prefix_node).expect("live test node")
+    );
 }
 
 #[test]
@@ -1762,7 +1786,8 @@ fn repeated_deep_swa_matches_keep_the_tree_sane() {
             tc.arena.node(node).id,
             SWA,
             Tensor::from_slice(&vec![0i64; len]),
-        );
+        )
+        .expect("live test node");
     }
     for _ in 0..3 {
         let result = tc.match_prefix(&match_params(&vec![1, 2, 3, 4]));
@@ -1866,7 +1891,7 @@ fn insert_reports_new_and_unevicted_full_ranges() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 3]))
         .best_match_node_id;
-    let leaf = tc.arena.resolve(leaf);
+    let leaf = tc.arena.resolve(leaf).expect("live test node");
     let _ = tc.arena.take_device_value(leaf, FULL);
     tc.component_state_mut(FULL).evictable_size = 0;
     tc.evictable_device_leaves.discard(leaf);
@@ -2032,20 +2057,26 @@ fn insert_unevicts_a_tombstoned_node() {
     let a = tc
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
-    let _ = tc.arena.take_device_value(tc.arena.resolve(a), FULL);
+    let _ = tc
+        .arena
+        .take_device_value(tc.arena.resolve(a).expect("live test node"), FULL);
     tc.component_state_mut(FULL).evictable_size = 0;
-    tc.evictable_device_leaves.discard(tc.arena.resolve(a));
+    tc.evictable_device_leaves
+        .discard(tc.arena.resolve(a).expect("live test node"));
     let result = tc.insert(&insert_params(&vec![1, 2], &[20, 21]));
     assert_eq!(result.prefix_len, 2);
     // The fresh KV revives the node; nothing is duplicate.
     assert!(result.cache_actions.is_empty());
     assert!(
         tc.arena
-            .device_value(tc.arena.resolve(a), FULL)
+            .device_value(tc.arena.resolve(a).expect("live test node"), FULL)
             .equal(&Tensor::from_slice(&[20i64, 21]))
     );
     assert_eq!(tc.evictable_size_(FULL), 2);
-    assert!(tc.evictable_device_leaves.contains(tc.arena.resolve(a)));
+    assert!(
+        tc.evictable_device_leaves
+            .contains(tc.arena.resolve(a).expect("live test node"))
+    );
 }
 
 #[test]
@@ -2059,7 +2090,12 @@ fn insert_priority_floor_applies_along_the_path() {
         priority: 5,
         ..insert_params(&vec![1, 2], &[20, 21])
     });
-    assert_eq!(tc.arena.node(tc.arena.resolve(a)).priority, 5);
+    assert_eq!(
+        tc.arena
+            .node(tc.arena.resolve(a).expect("live test node"))
+            .priority,
+        5
+    );
 }
 
 #[test]
@@ -2069,12 +2105,20 @@ fn insert_chunked_skips_the_hit_count() {
     let a = tc
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
-    let hits_before = tc.arena.node(tc.arena.resolve(a)).hit_count;
+    let hits_before = tc
+        .arena
+        .node(tc.arena.resolve(a).expect("live test node"))
+        .hit_count;
     tc.insert(&InsertParams {
         chunked: true,
         ..insert_params(&vec![1, 2], &[20, 21])
     });
-    assert_eq!(tc.arena.node(tc.arena.resolve(a)).hit_count, hits_before);
+    assert_eq!(
+        tc.arena
+            .node(tc.arena.resolve(a).expect("live test node"))
+            .hit_count,
+        hits_before
+    );
 }
 
 #[test]
@@ -2084,10 +2128,15 @@ fn insert_extension_bumps_the_traversed_node_hit_count_once() {
     let a = tc
         .match_prefix(&match_params(&vec![1, 2, 3]))
         .best_match_node_id;
-    let hits_before = tc.arena.node(tc.arena.resolve(a)).hit_count;
+    let hits_before = tc
+        .arena
+        .node(tc.arena.resolve(a).expect("live test node"))
+        .hit_count;
     tc.insert(&insert_params(&vec![1, 2, 3, 4, 5], &[20, 21, 22, 13, 14]));
     assert_eq!(
-        tc.arena.node(tc.arena.resolve(a)).hit_count,
+        tc.arena
+            .node(tc.arena.resolve(a).expect("live test node"))
+            .hit_count,
         hits_before + 1
     );
 }
@@ -2099,11 +2148,16 @@ fn insert_full_overlap_bumps_the_hit_count_once() {
     let a = tc
         .match_prefix(&match_params(&vec![1, 2, 3]))
         .best_match_node_id;
-    let hits_before = tc.arena.node(tc.arena.resolve(a)).hit_count;
+    let hits_before = tc
+        .arena
+        .node(tc.arena.resolve(a).expect("live test node"))
+        .hit_count;
     // The walk already counted the full overlap; the target is no new leaf.
     tc.insert(&insert_params(&vec![1, 2, 3], &[20, 21, 22]));
     assert_eq!(
-        tc.arena.node(tc.arena.resolve(a)).hit_count,
+        tc.arena
+            .node(tc.arena.resolve(a).expect("live test node"))
+            .hit_count,
         hits_before + 1
     );
 }
@@ -2136,10 +2190,10 @@ fn mark_write_through_pending_stamps_the_node_id_as_the_ack() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1], &[10]));
     let leaf = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
-    tc.mark_write_through_pending(leaf);
+    tc.mark_write_through_pending(leaf).expect("live test node");
     assert_eq!(
         tc.arena
-            .node(tc.arena.resolve(leaf))
+            .node(tc.arena.resolve(leaf).expect("live test node"))
             .write_through_pending_id,
         Some(leaf)
     );
@@ -2150,18 +2204,20 @@ fn finish_write_through_clears_only_the_matching_ack() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1], &[10]));
     let leaf = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
-    tc.mark_write_through_pending(leaf);
-    tc.finish_write_through(vec![leaf], /* ack_id = */ 999_999);
+    tc.mark_write_through_pending(leaf).expect("live test node");
+    tc.finish_write_through(vec![leaf], /* ack_id = */ 999_999)
+        .expect("live test node");
     assert_eq!(
         tc.arena
-            .node(tc.arena.resolve(leaf))
+            .node(tc.arena.resolve(leaf).expect("live test node"))
             .write_through_pending_id,
         Some(leaf)
     );
-    tc.finish_write_through(vec![leaf], /* ack_id = */ leaf);
+    tc.finish_write_through(vec![leaf], /* ack_id = */ leaf)
+        .expect("live test node");
     assert_eq!(
         tc.arena
-            .node(tc.arena.resolve(leaf))
+            .node(tc.arena.resolve(leaf).expect("live test node"))
             .write_through_pending_id,
         None
     );
@@ -2181,15 +2237,18 @@ fn backup_kv_action_chains_unbacked_ancestors_first() {
         .match_prefix(&match_params(&vec![1, 2, 3]))
         .best_match_node_id;
     // a is backuped: the chain stops there and orders ancestors first.
-    tc.arena
-        .set_host_value(tc.arena.resolve(a), FULL, Tensor::from_slice(&[20i64]));
+    tc.arena.set_host_value(
+        tc.arena.resolve(a).expect("live test node"),
+        FULL,
+        Tensor::from_slice(&[20i64]),
+    );
     let action = tc.build_backup_kv_action_(
-        tc.arena.node(tc.arena.resolve(c)),
+        tc.arena.node(tc.arena.resolve(c).expect("live test node")),
         /* write_back = */ false,
     );
     assert_eq!(action.node_ids, vec![b, c]);
     let action = tc.build_backup_kv_action_(
-        tc.arena.node(tc.arena.resolve(c)),
+        tc.arena.node(tc.arena.resolve(c).expect("live test node")),
         /* write_back = */ true,
     );
     assert_eq!(action.node_ids, vec![c]);
@@ -2202,12 +2261,15 @@ fn split_of_a_pending_node_transfers_the_ack_and_emits_the_replace_action() {
     let node = tc
         .match_prefix(&match_params(&vec![1, 2, 3]))
         .best_match_node_id;
-    tc.mark_write_through_pending(node);
-    let (new_node, action) = tc.split_node_(tc.arena.resolve(node), /* split_len = */ 1);
+    tc.mark_write_through_pending(node).expect("live test node");
+    let (new_node, action) = tc.split_node_(
+        tc.arena.resolve(node).expect("live test node"),
+        /* split_len = */ 1,
+    );
     assert_eq!(tc.arena.node(new_node).write_through_pending_id, Some(node));
     assert_eq!(
         tc.arena
-            .node(tc.arena.resolve(node))
+            .node(tc.arena.resolve(node).expect("live test node"))
             .write_through_pending_id,
         Some(node)
     );
@@ -2240,7 +2302,12 @@ fn insert_does_not_hash_without_storage() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
-    assert_eq!(tc.arena.node(tc.arena.resolve(leaf)).hash_value, None);
+    assert_eq!(
+        tc.arena
+            .node(tc.arena.resolve(leaf).expect("live test node"))
+            .hash_value,
+        None
+    );
 }
 
 #[test]
@@ -2260,7 +2327,9 @@ fn insert_hashes_pages_chained_from_the_parent_when_storage_is_on() {
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
     assert_eq!(
-        tc.arena.node(tc.arena.resolve(parent)).hash_value,
+        tc.arena
+            .node(tc.arena.resolve(parent).expect("live test node"))
+            .hash_value,
         Some(vec![
             "34fb5c825de7ca4aea6e712f19d439c1da0c92c37b423936c5f618545ca4fa1f".to_string()
         ])
@@ -2269,21 +2338,25 @@ fn insert_hashes_pages_chained_from_the_parent_when_storage_is_on() {
         .match_prefix(&match_params(&vec![1, 2, 7, 8]))
         .best_match_node_id;
     assert_eq!(
-        tc.arena.node(tc.arena.resolve(child)).hash_value,
+        tc.arena
+            .node(tc.arena.resolve(child).expect("live test node"))
+            .hash_value,
         Some(vec![
             "0bfa9b9c6fd727c7410b6d42b753439911022d34cc6ef99ac43ed7724aa48a75".to_string()
         ])
     );
     // The prefix walk concatenates the chain in root-to-node order.
     assert_eq!(
-        tc.arena.prefix_hash_values(Some(tc.arena.resolve(child))),
+        tc.arena
+            .prefix_hash_values(Some(tc.arena.resolve(child).expect("live test node"))),
         vec![
             "34fb5c825de7ca4aea6e712f19d439c1da0c92c37b423936c5f618545ca4fa1f".to_string(),
             "0bfa9b9c6fd727c7410b6d42b753439911022d34cc6ef99ac43ed7724aa48a75".to_string(),
         ]
     );
     assert_eq!(
-        tc.arena.prefix_hash_values(Some(tc.arena.resolve(parent))),
+        tc.arena
+            .prefix_hash_values(Some(tc.arena.resolve(parent).expect("live test node"))),
         vec!["34fb5c825de7ca4aea6e712f19d439c1da0c92c37b423936c5f618545ca4fa1f".to_string()]
     );
 }
@@ -2330,7 +2403,9 @@ fn insert_coalesces_parent_linked_block_stores() {
         .match_prefix(&match_params(&vec![1, 2, 7, 8]))
         .best_match_node_id;
     assert_eq!(
-        tc.arena.node(tc.arena.resolve(leaf)).hash_value,
+        tc.arena
+            .node(tc.arena.resolve(leaf).expect("live test node"))
+            .hash_value,
         Some(hashes)
     );
     assert!(tc.salted_event_hashes.is_empty());
@@ -2351,7 +2426,7 @@ fn salted_event_hashes_are_sparse_and_removed_with_the_node() {
     let leaf = tc
         .match_prefix(&match_params_in_namespace(&key, None, Some("tenant-a")))
         .best_match_node_id;
-    let leaf_idx = tc.arena.resolve(leaf);
+    let leaf_idx = tc.arena.resolve(leaf).expect("live test node");
     assert_eq!(tc.salted_event_hashes[&leaf].len(), 2);
     assert_eq!(
         tc.arena.node(leaf_idx).hash_value,
@@ -2363,7 +2438,9 @@ fn salted_event_hashes_are_sparse_and_removed_with_the_node() {
     tc.evict_device_start(FULL, key.len());
     let (candidate, step) = tc.evict_device_next_node(FULL, &tracker);
     accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
-    let (_, step) = tc.evict_device_leaf(candidate.unwrap(), false);
+    let (_, step) = tc
+        .evict_device_leaf(candidate.unwrap(), false)
+        .expect("live test node");
     accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
     tc.evict_device_end(FULL);
     tc.take_events();
@@ -2416,7 +2493,10 @@ fn salted_event_hashes_survive_node_split() {
             Some("tenant-a"),
         ))
         .best_match_node_id;
-    let split_parent_idx = tc.arena.node(tc.arena.resolve(split_child)).parent();
+    let split_parent_idx = tc
+        .arena
+        .node(tc.arena.resolve(split_child).expect("live test node"))
+        .parent();
     let split_parent = tc.arena.node(split_parent_idx).id;
     assert_eq!(tc.salted_event_hashes[&split_parent], original_hashes[..1]);
     assert_eq!(tc.salted_event_hashes[&split_child], original_hashes[1..]);
@@ -2548,7 +2628,9 @@ fn eviction_emits_block_removed_with_all_page_hashes() {
         let (node, step) = tc.evict_device_next_node(FULL, &tracker);
         accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
         let Some(node) = node else { break };
-        let (_, step) = tc.evict_device_leaf(node, /* is_write_back = */ false);
+        let (_, step) = tc
+            .evict_device_leaf(node, /* is_write_back = */ false)
+            .expect("live test node");
         accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
     }
     tc.evict_device_end(FULL);
@@ -2610,7 +2692,8 @@ fn finish_write_through_emits_cpu_stored_events() {
     tc.insert(&insert_params(&vec![1], &[10]));
     let leaf = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
     let _ = tc.take_events();
-    tc.finish_write_through(vec![leaf], leaf);
+    tc.finish_write_through(vec![leaf], leaf)
+        .expect("live test node");
     let hashes = crate::node::get_hash_str::<Vec<i64>>(&[1], None, 1);
     assert_eq!(
         tc.take_events(),
@@ -2630,10 +2713,11 @@ fn demoted_events_leaf(tc: &mut UnifiedTreeCore<Vec<i64>>) -> NodeIdx_ {
     tc.set_hicache_enabled();
     tc.insert(&insert_params(&vec![1], &[10]));
     let leaf = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
-    tc.commit_backup(leaf, Tensor::from_slice(&[100i64]), HashMap::new());
-    tc.demote(leaf);
+    tc.commit_backup(leaf, Tensor::from_slice(&[100i64]), HashMap::new())
+        .expect("live test node");
+    tc.demote(leaf).expect("valid demote");
     let _ = tc.take_events();
-    tc.arena.resolve(leaf)
+    tc.arena.resolve(leaf).expect("live test node")
 }
 
 #[test]
@@ -2655,13 +2739,16 @@ fn host_eviction_emits_a_cpu_block_removed() {
 fn load_back_commit_emits_gpu_stored_events() {
     let mut tc = events_core(1);
     let leaf = demoted_events_leaf(&mut tc);
-    let (kv_xfer, comp_xfers) = tc.build_load_back_spec(tc.arena.node(leaf).id, None);
+    let (kv_xfer, comp_xfers) = tc
+        .build_load_back_spec(tc.arena.node(leaf).id, None)
+        .expect("live test node");
     tc.commit_load_back(
         tc.arena.node(leaf).id,
         Tensor::from_slice(&[50i64]),
         kv_xfer,
         comp_xfers,
-    );
+    )
+    .expect("live test node");
     let hashes = crate::node::get_hash_str::<Vec<i64>>(&[1], None, 1);
     assert_eq!(
         tc.take_events(),
@@ -2713,7 +2800,7 @@ fn drop_subtree_emits_removals_for_host_descendants_then_the_leaf() {
     let child = tc
         .arena
         .alloc_child(
-            tc.arena.resolve(leaf),
+            tc.arena.resolve(leaf).expect("live test node"),
             /* key = */ vec![3, 4],
             /* priority = */ 0,
             /* extra_key = */ None,
@@ -2722,9 +2809,9 @@ fn drop_subtree_emits_removals_for_host_descendants_then_the_leaf() {
     tc.arena
         .set_host_value(child, FULL, Tensor::from_slice(&[20i64, 21]));
     tc.update_evictable_leaf_sets_(child);
-    tc.update_evictable_leaf_sets_(tc.arena.resolve(leaf));
+    tc.update_evictable_leaf_sets_(tc.arena.resolve(leaf).expect("live test node"));
     let _ = tc.take_events();
-    let (dropped, _step) = tc.drop_subtree_no_host(leaf);
+    let (dropped, _step) = tc.drop_subtree_no_host(leaf).expect("live test node");
     assert!(dropped);
     // The leaf hashed lazily at its insert store event; the host-only
     // child hashes lazily at removal, chaining from the leaf.
@@ -2786,14 +2873,18 @@ fn split_insert_stores_only_the_new_block_chained_to_the_split_parent() {
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
     assert_eq!(
-        tc.arena.node(tc.arena.resolve(parent)).hash_value,
+        tc.arena
+            .node(tc.arena.resolve(parent).expect("live test node"))
+            .hash_value,
         Some(vec![base_hashes[0].clone()])
     );
     let child = tc
         .match_prefix(&match_params(&vec![1, 2, 3, 4]))
         .best_match_node_id;
     assert_eq!(
-        tc.arena.node(tc.arena.resolve(child)).hash_value,
+        tc.arena
+            .node(tc.arena.resolve(child).expect("live test node"))
+            .hash_value,
         Some(vec![base_hashes[1].clone()])
     );
 }
@@ -2806,7 +2897,7 @@ fn finish_write_through_after_a_split_publishes_both_fragments() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 3, 4]))
         .best_match_node_id;
-    tc.mark_write_through_pending(leaf);
+    tc.mark_write_through_pending(leaf).expect("live test node");
     let _ = tc.take_events();
     let result = tc.insert(&insert_params(&vec![1, 2, 5, 6], &[20, 21, 22, 23]));
     let new_node_id = result
@@ -2836,9 +2927,12 @@ fn finish_write_through_after_a_split_publishes_both_fragments() {
         new_node_id,
         Tensor::from_slice(&[100i64, 101]),
         HashMap::new(),
-    );
-    tc.commit_backup(leaf, Tensor::from_slice(&[102i64, 103]), HashMap::new());
-    tc.finish_write_through(vec![new_node_id, leaf], /* ack_id = */ leaf);
+    )
+    .expect("live test node");
+    tc.commit_backup(leaf, Tensor::from_slice(&[102i64, 103]), HashMap::new())
+        .expect("live test node");
+    tc.finish_write_through(vec![new_node_id, leaf], /* ack_id = */ leaf)
+        .expect("live test nodes");
     let hashes = crate::node::get_hash_str::<Vec<i64>>(&[1, 2, 3, 4], None, 2);
     assert_eq!(
         tc.take_events(),
@@ -2857,13 +2951,13 @@ fn finish_write_through_after_a_split_publishes_both_fragments() {
     // The matching ack cleared the pending mark on both fragments.
     assert_eq!(
         tc.arena
-            .node(tc.arena.resolve(new_node_id))
+            .node(tc.arena.resolve(new_node_id).expect("live test node"))
             .write_through_pending_id,
         None
     );
     assert_eq!(
         tc.arena
-            .node(tc.arena.resolve(leaf))
+            .node(tc.arena.resolve(leaf).expect("live test node"))
             .write_through_pending_id,
         None
     );
@@ -2880,7 +2974,10 @@ fn prefetch_anchor_info_maps_the_namespace() {
     let plain = tc
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
-    assert_eq!(tc.prefetch_anchor_info(plain), (None, None));
+    assert_eq!(
+        tc.prefetch_anchor_info(plain).expect("live test node"),
+        (None, None)
+    );
     let salted = tc
         .match_prefix(&MatchPrefixParams {
             key: &vec![7, 8],
@@ -2888,13 +2985,14 @@ fn prefetch_anchor_info_maps_the_namespace() {
         })
         .best_match_node_id;
     assert_eq!(
-        tc.prefetch_anchor_info(salted),
+        tc.prefetch_anchor_info(salted).expect("live test node"),
         (Some("chat".to_string()), Some("tenant-a".to_string()))
     );
     // A root anchor carries no namespace: the single root serves them all.
     let root = tc.arena.root();
     assert_eq!(
-        tc.prefetch_anchor_info(tc.arena.node(root).id),
+        tc.prefetch_anchor_info(tc.arena.node(root).id)
+            .expect("live test node"),
         (None, None)
     );
     // A node minted by a split inherits the namespace.
@@ -2910,7 +3008,7 @@ fn prefetch_anchor_info_maps_the_namespace() {
         .best_match_node_id;
     assert_ne!(split_mid, salted);
     assert_eq!(
-        tc.prefetch_anchor_info(split_mid),
+        tc.prefetch_anchor_info(split_mid).expect("live test node"),
         (Some("chat".to_string()), Some("tenant-a".to_string()))
     );
 }
@@ -2988,26 +3086,34 @@ fn prefetch_node_accessors_cover_gate_and_hash_chain() {
         .match_prefix(&match_params(&vec![1, 2, 7, 8]))
         .best_match_node_id;
 
-    assert!(!tc.node_backuped(child));
-    assert!(!tc.is_root(child));
+    assert!(!tc.node_backuped(child).expect("live test node"));
+    assert!(!tc.is_root(child).expect("live test node"));
     assert_eq!(
-        tc.get_last_hash_value(child).as_deref(),
+        tc.get_last_hash_value(child)
+            .expect("live test node")
+            .as_deref(),
         Some("0bfa9b9c6fd727c7410b6d42b753439911022d34cc6ef99ac43ed7724aa48a75")
     );
     assert_eq!(
-        tc.get_prefix_hash_values(child),
+        tc.get_prefix_hash_values(child).expect("live test node"),
         vec!["34fb5c825de7ca4aea6e712f19d439c1da0c92c37b423936c5f618545ca4fa1f".to_string()]
     );
 
-    tc.commit_backup(child, Tensor::from_slice(&[102i64, 103]), HashMap::new());
-    assert!(tc.node_backuped(child));
+    tc.commit_backup(child, Tensor::from_slice(&[102i64, 103]), HashMap::new())
+        .expect("live test node");
+    assert!(tc.node_backuped(child).expect("live test node"));
 
     // Roots have no hashes of their own.
     let root = tc.arena.root();
-    assert!(tc.is_root(tc.arena.node(root).id));
-    assert_eq!(tc.get_last_hash_value(tc.arena.node(root).id), None);
+    assert!(tc.is_root(tc.arena.node(root).id).expect("live test node"));
     assert_eq!(
-        tc.get_prefix_hash_values(tc.arena.node(root).id),
+        tc.get_last_hash_value(tc.arena.node(root).id)
+            .expect("live test node"),
+        None
+    );
+    assert_eq!(
+        tc.get_prefix_hash_values(tc.arena.node(root).id)
+            .expect("live test node"),
         Vec::<String>::new()
     );
 }
@@ -3020,8 +3126,14 @@ fn storage_backup_spec_is_none_for_an_unbackuped_node() {
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
     assert!(
-        tc.build_storage_backup_spec(tc.arena.node(tc.arena.resolve(leaf)).id, true)
-            .is_none()
+        tc.build_storage_backup_spec(
+            tc.arena
+                .node(tc.arena.resolve(leaf).expect("live test node"))
+                .id,
+            true
+        )
+        .expect("live test node")
+        .is_none()
     );
 }
 
@@ -3044,12 +3156,20 @@ fn storage_backup_spec_gathers_the_chained_node() {
     let child = tc
         .match_prefix(&match_params(&vec![1, 2, 7, 8]))
         .best_match_node_id;
-    tc.commit_backup(parent, Tensor::from_slice(&[100i64, 101]), HashMap::new());
-    tc.commit_backup(child, Tensor::from_slice(&[102i64, 103]), HashMap::new());
+    tc.commit_backup(parent, Tensor::from_slice(&[100i64, 101]), HashMap::new())
+        .expect("live test node");
+    tc.commit_backup(child, Tensor::from_slice(&[102i64, 103]), HashMap::new())
+        .expect("live test node");
 
     let spec = tc
-        .build_storage_backup_spec(tc.arena.node(tc.arena.resolve(child)).id, true)
-        .unwrap();
+        .build_storage_backup_spec(
+            tc.arena
+                .node(tc.arena.resolve(child).expect("live test node"))
+                .id,
+            true,
+        )
+        .expect("live test node")
+        .expect("backuped node");
     assert!(spec.host_value.equal(&Tensor::from_slice(&[102i64, 103])));
     assert_eq!(spec.token_ids, vec![7, 8]);
     assert_eq!(
@@ -3067,8 +3187,14 @@ fn storage_backup_spec_gathers_the_chained_node() {
     assert!(spec.comp_xfers.is_empty());
 
     let spec = tc
-        .build_storage_backup_spec(tc.arena.node(tc.arena.resolve(child)).id, false)
-        .unwrap();
+        .build_storage_backup_spec(
+            tc.arena
+                .node(tc.arena.resolve(child).expect("live test node"))
+                .id,
+            false,
+        )
+        .expect("live test node")
+        .expect("backuped node");
     assert_eq!(spec.prefix_keys, None);
 }
 
@@ -3086,18 +3212,22 @@ fn prefix_hash_walk_stops_below_an_unhashed_ancestor() {
 fn insert_host_attaches_a_host_only_leaf_under_the_root() {
     let mut tc = core();
     let root = tc.arena.root();
-    let result = tc.insert_host(
-        tc.arena.node(root).id,
-        /* extra_key = */ None,
-        vec![1, 2],
-        Tensor::from_slice(&[100i64, 101]),
-        vec!["h0".to_string(), "h1".to_string()],
-    );
+    let result = tc
+        .insert_host(
+            tc.arena.node(root).id,
+            /* extra_key = */ None,
+            vec![1, 2],
+            Tensor::from_slice(&[100i64, 101]),
+            vec!["h0".to_string(), "h1".to_string()],
+        )
+        .expect("live test node");
     assert_eq!(result.prefix_len, 0);
     assert_eq!(result.total_len, 2);
     assert!(!result.host_insert_dropped);
     let new_node = result.inserted_host_node.unwrap();
-    let node = tc.arena.node(tc.arena.resolve(new_node));
+    let node = tc
+        .arena
+        .node(tc.arena.resolve(new_node).expect("live test node"));
     assert!(node.evicted() && node.backuped());
     assert!(
         node.host_value(FULL)
@@ -3109,7 +3239,7 @@ fn insert_host_attaches_a_host_only_leaf_under_the_root() {
     );
     assert!(
         tc.evictable_host_leaves
-            .contains(tc.arena.resolve(new_node))
+            .contains(tc.arena.resolve(new_node).expect("live test node"))
     );
     tc.sanity_check(&[], &[]);
 }
@@ -3120,22 +3250,26 @@ fn insert_host_allows_a_suffix_under_an_unbacked_write_back_parent() {
     tc.is_write_back = true;
     tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
     let root = tc.arena.root();
-    let result = tc.insert_host(
-        tc.arena.node(root).id,
-        /* extra_key = */ None,
-        vec![1, 2, 3, 4],
-        Tensor::from_slice(&[100i64, 101, 102, 103]),
-        vec!["h0", "h1", "h2", "h3"]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-    );
+    let result = tc
+        .insert_host(
+            tc.arena.node(root).id,
+            /* extra_key = */ None,
+            vec![1, 2, 3, 4],
+            Tensor::from_slice(&[100i64, 101, 102, 103]),
+            vec!["h0", "h1", "h2", "h3"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        )
+        .expect("live test node");
     assert_eq!(result.prefix_len, 2);
     assert_eq!(result.total_len, 4);
     assert!(!result.host_insert_dropped);
-    let new_node = tc
-        .arena
-        .node(tc.arena.resolve(result.inserted_host_node.unwrap()));
+    let new_node = tc.arena.node(
+        tc.arena
+            .resolve(result.inserted_host_node.unwrap())
+            .expect("live test node"),
+    );
     assert!(
         new_node
             .host_value(FULL)
@@ -3153,16 +3287,18 @@ fn insert_host_drops_a_suffix_under_an_unbacked_write_through_parent() {
     tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
     let root = tc.arena.root();
     let nodes_before = tc.arena.len();
-    let result = tc.insert_host(
-        tc.arena.node(root).id,
-        /* extra_key = */ None,
-        vec![1, 2, 3, 4],
-        Tensor::from_slice(&[100i64, 101, 102, 103]),
-        vec!["h0", "h1", "h2", "h3"]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-    );
+    let result = tc
+        .insert_host(
+            tc.arena.node(root).id,
+            /* extra_key = */ None,
+            vec![1, 2, 3, 4],
+            Tensor::from_slice(&[100i64, 101, 102, 103]),
+            vec!["h0", "h1", "h2", "h3"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        )
+        .expect("live test node");
 
     assert_eq!(result.prefix_len, 2);
     assert_eq!(result.total_len, 4);
@@ -3179,15 +3315,17 @@ fn insert_host_drop_preserves_split_actions_and_lengths() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 3]))
         .best_match_node_id;
-    tc.mark_write_through_pending(leaf);
+    tc.mark_write_through_pending(leaf).expect("live test node");
     let root = tc.arena.root();
-    let result = tc.insert_host(
-        tc.arena.node(root).id,
-        /* extra_key = */ None,
-        vec![1, 9],
-        Tensor::from_slice(&[100i64, 101]),
-        vec!["h0".to_string(), "h1".to_string()],
-    );
+    let result = tc
+        .insert_host(
+            tc.arena.node(root).id,
+            /* extra_key = */ None,
+            vec![1, 9],
+            Tensor::from_slice(&[100i64, 101]),
+            vec!["h0".to_string(), "h1".to_string()],
+        )
+        .expect("live test node");
 
     assert_eq!(result.prefix_len, 1);
     assert_eq!(result.total_len, 2);
@@ -3212,18 +3350,23 @@ fn insert_host_splits_a_host_chain_and_divides_the_hash() {
             .into_iter()
             .map(String::from)
             .collect(),
-    );
-    let result = tc.insert_host(
-        tc.arena.node(root).id,
-        /* extra_key = */ None,
-        vec![1, 9],
-        Tensor::from_slice(&[200i64, 201]),
-        vec!["g0".to_string(), "g1".to_string()],
-    );
+    )
+    .expect("live test node");
+    let result = tc
+        .insert_host(
+            tc.arena.node(root).id,
+            /* extra_key = */ None,
+            vec![1, 9],
+            Tensor::from_slice(&[200i64, 201]),
+            vec!["g0".to_string(), "g1".to_string()],
+        )
+        .expect("live test node");
     assert_eq!(result.prefix_len, 1);
-    let new_node = tc
-        .arena
-        .node(tc.arena.resolve(result.inserted_host_node.unwrap()));
+    let new_node = tc.arena.node(
+        tc.arena
+            .resolve(result.inserted_host_node.unwrap())
+            .expect("live test node"),
+    );
     assert!(
         new_node
             .host_value(FULL)
@@ -3256,18 +3399,23 @@ fn insert_host_hash_slices_by_pages_not_atoms() {
         vec![1, 2],
         Tensor::from_slice(&[100i64, 101]),
         vec!["h0".to_string()],
-    );
-    let result = tc.insert_host(
-        tc.arena.node(root).id,
-        /* extra_key = */ None,
-        vec![1, 2, 3, 4],
-        Tensor::from_slice(&[200i64, 201, 202, 203]),
-        vec!["g0".to_string(), "g1".to_string()],
-    );
+    )
+    .expect("live test node");
+    let result = tc
+        .insert_host(
+            tc.arena.node(root).id,
+            /* extra_key = */ None,
+            vec![1, 2, 3, 4],
+            Tensor::from_slice(&[200i64, 201, 202, 203]),
+            vec!["g0".to_string(), "g1".to_string()],
+        )
+        .expect("live test node");
     assert_eq!(result.prefix_len, 2);
-    let new_node = tc
-        .arena
-        .node(tc.arena.resolve(result.inserted_host_node.unwrap()));
+    let new_node = tc.arena.node(
+        tc.arena
+            .resolve(result.inserted_host_node.unwrap())
+            .expect("live test node"),
+    );
     // Two matched atoms are ONE page: only g0 is consumed.
     assert_eq!(new_node.hash_value, Some(vec!["g1".to_string()]));
     assert!(
@@ -3286,29 +3434,33 @@ fn insert_host_full_match_reports_only_a_backuped_node() {
         .best_match_node_id;
     let root = tc.arena.root();
     // The device-only match reports no host node.
-    let result = tc.insert_host(
-        tc.arena.node(root).id,
-        /* extra_key = */ None,
-        vec![1, 2],
-        Tensor::from_slice(&[100i64, 101]),
-        vec!["h0".to_string(), "h1".to_string()],
-    );
+    let result = tc
+        .insert_host(
+            tc.arena.node(root).id,
+            /* extra_key = */ None,
+            vec![1, 2],
+            Tensor::from_slice(&[100i64, 101]),
+            vec!["h0".to_string(), "h1".to_string()],
+        )
+        .expect("live test node");
     assert_eq!(result.prefix_len, 2);
     assert_eq!(result.inserted_host_node, None);
     assert!(!result.host_insert_dropped);
     // Once backuped, the same insert reports the node.
     tc.arena.set_host_value(
-        tc.arena.resolve(leaf),
+        tc.arena.resolve(leaf).expect("live test node"),
         FULL,
         Tensor::from_slice(&[20i64, 21]),
     );
-    let result = tc.insert_host(
-        tc.arena.node(root).id,
-        /* extra_key = */ None,
-        vec![1, 2],
-        Tensor::from_slice(&[100i64, 101]),
-        vec!["h0".to_string(), "h1".to_string()],
-    );
+    let result = tc
+        .insert_host(
+            tc.arena.node(root).id,
+            /* extra_key = */ None,
+            vec![1, 2],
+            Tensor::from_slice(&[100i64, 101]),
+            vec!["h0".to_string(), "h1".to_string()],
+        )
+        .expect("live test node");
     assert_eq!(result.inserted_host_node, Some(leaf));
     assert!(!result.host_insert_dropped);
 }
@@ -3331,20 +3483,23 @@ fn insert_host_panics_on_a_colliding_page() {
         vec![1, 9],
         Tensor::from_slice(&[100i64, 101]),
         vec!["h0".to_string(), "h1".to_string()],
-    );
+    )
+    .expect("live test node");
 }
 
 #[test]
 fn insert_host_empty_key_is_a_noop() {
     let mut tc = core();
     let root = tc.arena.root();
-    let result = tc.insert_host(
-        tc.arena.node(root).id,
-        /* extra_key = */ None,
-        vec![],
-        Tensor::from_slice(&[0i64; 0]),
-        vec![],
-    );
+    let result = tc
+        .insert_host(
+            tc.arena.node(root).id,
+            /* extra_key = */ None,
+            vec![],
+            Tensor::from_slice(&[0i64; 0]),
+            vec![],
+        )
+        .expect("live test node");
     assert_eq!(result.prefix_len, 0);
     assert!(result.mamba_exist);
     assert_eq!(result.inserted_host_node, None);
@@ -3359,8 +3514,11 @@ fn commit_backup_attaches_the_host_value() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
-    tc.commit_backup(leaf, Tensor::from_slice(&[100i64, 101]), HashMap::new());
-    let node = tc.arena.node(tc.arena.resolve(leaf));
+    tc.commit_backup(leaf, Tensor::from_slice(&[100i64, 101]), HashMap::new())
+        .expect("live test node");
+    let node = tc
+        .arena
+        .node(tc.arena.resolve(leaf).expect("live test node"));
     assert!(node.backuped());
     assert!(
         node.host_value(FULL)
@@ -3375,7 +3533,7 @@ fn build_backup_spec_reads_the_device_value() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
-    let (device_value, comp_xfers) = tc.build_backup_spec(leaf);
+    let (device_value, comp_xfers) = tc.build_backup_spec(leaf).expect("live test node");
     assert!(device_value.equal(&Tensor::from_slice(&[10i64, 11])));
     assert!(comp_xfers.is_empty());
 }
@@ -3388,10 +3546,15 @@ fn build_backup_spec_skips_full_kv_for_an_already_backuped_node() {
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
 
-    tc.commit_backup(leaf, Tensor::from_slice(&[100i64, 101]), HashMap::new());
-    assert!(tc.arena.node(tc.arena.resolve(leaf)).backuped());
+    tc.commit_backup(leaf, Tensor::from_slice(&[100i64, 101]), HashMap::new())
+        .expect("live test node");
+    assert!(
+        tc.arena
+            .node(tc.arena.resolve(leaf).expect("live test node"))
+            .backuped()
+    );
 
-    let (device_value, comp_xfers) = tc.build_backup_spec(leaf);
+    let (device_value, comp_xfers) = tc.build_backup_spec(leaf).expect("live test node");
     assert_eq!(device_value.numel(), 0);
     assert!(comp_xfers.is_empty());
 }
@@ -3404,10 +3567,14 @@ fn commit_backup_preserves_full_kv_when_host_indices_are_empty() {
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
 
-    tc.commit_backup(leaf, Tensor::from_slice(&[100i64, 101]), HashMap::new());
-    tc.commit_backup(leaf, Tensor::from_slice(&[] as &[i64]), HashMap::new());
+    tc.commit_backup(leaf, Tensor::from_slice(&[100i64, 101]), HashMap::new())
+        .expect("live test node");
+    tc.commit_backup(leaf, Tensor::from_slice(&[] as &[i64]), HashMap::new())
+        .expect("live test node");
 
-    let node = tc.arena.node(tc.arena.resolve(leaf));
+    let node = tc
+        .arena
+        .node(tc.arena.resolve(leaf).expect("live test node"));
     assert!(
         node.host_value(FULL)
             .equal(&Tensor::from_slice(&[100i64, 101]))
@@ -3424,14 +3591,20 @@ fn backuped_chain(tc: &mut UnifiedTreeCore<Vec<i64>>) -> (NodeIdx_, NodeIdx_) {
     let child = tc
         .match_prefix(&match_params(&vec![1, 2, 3, 4]))
         .best_match_node_id;
-    tc.commit_backup(parent, Tensor::from_slice(&[20i64, 21]), HashMap::new());
-    tc.commit_backup(child, Tensor::from_slice(&[22i64, 23]), HashMap::new());
-    (tc.arena.resolve(parent), tc.arena.resolve(child))
+    tc.commit_backup(parent, Tensor::from_slice(&[20i64, 21]), HashMap::new())
+        .expect("live test node");
+    tc.commit_backup(child, Tensor::from_slice(&[22i64, 23]), HashMap::new())
+        .expect("live test node");
+    (
+        tc.arena.resolve(parent).expect("live test node"),
+        tc.arena.resolve(child).expect("live test node"),
+    )
 }
 
 // Demote `node_id` (device release of a backuped node), discarding the frees.
 fn demote_node(tc: &mut UnifiedTreeCore<Vec<i64>>, node_id: NodeIdx_) {
-    tc.demote(tc.arena.node(node_id).id);
+    tc.demote(tc.arena.node(node_id).id)
+        .expect("backuped live test node");
 }
 
 #[test]
@@ -3451,8 +3624,9 @@ fn build_load_back_spec_collects_the_evicted_chain_ancestors_first() {
     let (parent, child) = backuped_chain(&mut tc);
     demote_node(&mut tc, child);
     demote_node(&mut tc, parent);
-    let (kv_xfer, comp_xfers) =
-        tc.build_load_back_spec(tc.arena.node(child).id, /* req = */ None);
+    let (kv_xfer, comp_xfers) = tc
+        .build_load_back_spec(tc.arena.node(child).id, /* req = */ None)
+        .expect("live test node");
     assert_eq!(kv_xfer.name, PoolName::Kv);
     assert!(
         kv_xfer
@@ -3472,8 +3646,9 @@ fn build_load_back_spec_collects_the_evicted_chain_ancestors_first() {
 fn build_load_back_spec_returns_an_empty_transfer_for_a_device_backed_node() {
     let mut tc = core();
     let (_parent, child) = backuped_chain(&mut tc);
-    let (kv_xfer, comp_xfers) =
-        tc.build_load_back_spec(tc.arena.node(child).id, /* req = */ None);
+    let (kv_xfer, comp_xfers) = tc
+        .build_load_back_spec(tc.arena.node(child).id, /* req = */ None)
+        .expect("live test node");
     let host_indices = kv_xfer.host_indices.unwrap();
     assert_eq!(host_indices.numel(), 0);
     assert_eq!(host_indices.kind(), Kind::Int64);
@@ -3491,14 +3666,17 @@ fn commit_load_back_reattaches_device_slices_and_restores_the_match() {
     // after demotion. Remove them so this test observes the ack-time refresh.
     tc.full_coexisting_host_nodes.discard(parent);
     tc.full_coexisting_host_nodes.discard(child);
-    let (kv_xfer, comp_xfers) =
-        tc.build_load_back_spec(tc.arena.node(child).id, /* req = */ None);
-    let actions = tc.commit_load_back(
-        tc.arena.node(child).id,
-        Tensor::from_slice(&[50i64, 51, 52, 53]),
-        kv_xfer,
-        comp_xfers,
-    );
+    let (kv_xfer, comp_xfers) = tc
+        .build_load_back_spec(tc.arena.node(child).id, /* req = */ None)
+        .expect("live test node");
+    let actions = tc
+        .commit_load_back(
+            tc.arena.node(child).id,
+            Tensor::from_slice(&[50i64, 51, 52, 53]),
+            kv_xfer,
+            comp_xfers,
+        )
+        .expect("live transfer nodes");
     assert!(actions.is_empty());
     assert!(
         tc.arena
@@ -3519,13 +3697,16 @@ fn commit_load_back_reattaches_device_slices_and_restores_the_match() {
     assert_eq!(tc.full_evictable_size(), 4);
     // The orchestrator re-locks the loaded path right after commit; that lock walk
     // also re-evaluates the parent's transient D-leaf membership.
-    tc.inc_lock_ref(tc.arena.node(child).id);
+    tc.inc_lock_ref(tc.arena.node(child).id)
+        .expect("live test node");
     tc.dec_lock_ref(
         tc.arena.node(child).id,
         /* params = */ None,
         /* skip_swa = */ false,
-    );
-    tc.finish_load_back(tc.arena.node(child).id);
+    )
+    .expect("live test node");
+    tc.finish_load_back(tc.arena.node(child).id)
+        .expect("live test node");
     assert!(tc.full_coexisting_host_nodes.contains(parent));
     assert!(tc.full_coexisting_host_nodes.contains(child));
     tc.sanity_check(&[], &[]);
@@ -3551,14 +3732,16 @@ fn device_eviction_and_demote_skip_a_load_back_pinned_chain() {
     demote_node(&mut tc, parent);
     tc.full_coexisting_host_nodes.discard(parent);
     tc.full_coexisting_host_nodes.discard(child);
-    let (kv_xfer, comp_xfers) =
-        tc.build_load_back_spec(tc.arena.node(child).id, /* req = */ None);
+    let (kv_xfer, comp_xfers) = tc
+        .build_load_back_spec(tc.arena.node(child).id, /* req = */ None)
+        .expect("live test node");
     tc.commit_load_back(
         tc.arena.node(child).id,
         Tensor::from_slice(&[50i64, 51, 52, 53]),
         kv_xfer,
         comp_xfers,
-    );
+    )
+    .expect("live transfer nodes");
     let anchor_id = tc.arena.node(child).id;
     assert_eq!(tc.arena.node(parent).load_back_pending_id, Some(anchor_id));
     assert_eq!(tc.arena.node(child).load_back_pending_id, Some(anchor_id));
@@ -3569,9 +3752,10 @@ fn device_eviction_and_demote_skip_a_load_back_pinned_chain() {
     let (next, _) = tc.evict_device_next_node(FULL, &HashMap::new());
     assert_eq!(next, None);
     tc.evict_device_end(FULL);
-    tc.demote(tc.arena.node(child).id);
+    tc.demote(tc.arena.node(child).id).expect("live test node");
     assert!(tc.arena.has_device_value(child, FULL));
-    tc.finish_load_back(tc.arena.node(child).id);
+    tc.finish_load_back(tc.arena.node(child).id)
+        .expect("live test node");
     assert!(!tc.arena.node(parent).is_load_back_pending());
     assert!(!tc.arena.node(child).is_load_back_pending());
     assert!(tc.full_coexisting_host_nodes.contains(parent));
@@ -3581,7 +3765,8 @@ fn device_eviction_and_demote_skip_a_load_back_pinned_chain() {
     let (next, _) = tc.evict_device_next_node(FULL, &HashMap::new());
     assert_eq!(next, Some(tc.arena.node(child).id));
     tc.evict_device_end(FULL);
-    tc.demote(tc.arena.node(child).id);
+    tc.demote(tc.arena.node(child).id)
+        .expect("backuped live test node");
     assert!(!tc.arena.has_device_value(child, FULL));
     tc.sanity_check(&[], &[]);
 }
@@ -3591,37 +3776,44 @@ fn component_has_host_value_only_tracks_the_demote_and_load_back_cycle() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1], &[10]));
     let leaf = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
-    assert!(!tc.component_has_host_value_only(leaf, FULL));
-    tc.commit_backup(leaf, Tensor::from_slice(&[20i64]), HashMap::new());
+    assert!(
+        !tc.component_has_host_value_only(leaf, FULL)
+            .expect("live test node")
+    );
+    tc.commit_backup(leaf, Tensor::from_slice(&[20i64]), HashMap::new())
+        .expect("live test node");
     // Device value still present: backuped but not host-only.
-    assert!(!tc.component_has_host_value_only(leaf, FULL));
-    let leaf_idx = tc.arena.resolve(leaf);
+    assert!(
+        !tc.component_has_host_value_only(leaf, FULL)
+            .expect("live test node")
+    );
+    let leaf_idx = tc.arena.resolve(leaf).expect("live test node");
     demote_node(&mut tc, leaf_idx);
-    assert!(tc.component_has_host_value_only(leaf, FULL));
-    let (kv_xfer, comp_xfers) = tc.build_load_back_spec(leaf, /* req = */ None);
-    tc.commit_load_back(leaf, Tensor::from_slice(&[30i64]), kv_xfer, comp_xfers);
-    assert!(!tc.component_has_host_value_only(leaf, FULL));
-    tc.finish_load_back(leaf);
+    assert!(
+        tc.component_has_host_value_only(leaf, FULL)
+            .expect("live test node")
+    );
+    let (kv_xfer, comp_xfers) = tc
+        .build_load_back_spec(leaf, /* req = */ None)
+        .expect("live test node");
+    tc.commit_load_back(leaf, Tensor::from_slice(&[30i64]), kv_xfer, comp_xfers)
+        .expect("live transfer nodes");
+    assert!(
+        !tc.component_has_host_value_only(leaf, FULL)
+            .expect("live test node")
+    );
+    tc.finish_load_back(leaf).expect("live test node");
     tc.sanity_check(&[], &[]);
 }
 
 #[test]
-#[should_panic(expected = "!node.evicted() && node.backuped()")]
-fn demote_panics_on_an_unbackuped_node() {
-    let mut tc = core();
-    tc.insert(&insert_params(&vec![1], &[10]));
-    let leaf = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
-    tc.demote(leaf);
-}
-
-#[test]
-fn try_demote_rejects_unbackuped_and_evicted_nodes() {
+fn demote_rejects_unbackuped_and_evicted_nodes() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1], &[10]));
     let leaf = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
 
     assert!(matches!(
-        tc.try_demote(leaf),
+        tc.demote(leaf),
         Err(TreeCoreRuntimeError::InvalidDemoteState {
             node_id,
             evicted: false,
@@ -3629,10 +3821,11 @@ fn try_demote_rejects_unbackuped_and_evicted_nodes() {
         }) if node_id == leaf
     ));
 
-    tc.commit_backup(leaf, Tensor::from_slice(&[20i64]), HashMap::new());
-    tc.demote(leaf);
+    tc.commit_backup(leaf, Tensor::from_slice(&[20i64]), HashMap::new())
+        .expect("live test node");
+    tc.demote(leaf).expect("backuped live test node");
     assert!(matches!(
-        tc.try_demote(leaf),
+        tc.demote(leaf),
         Err(TreeCoreRuntimeError::InvalidDemoteState {
             node_id,
             evicted: true,
@@ -3646,13 +3839,31 @@ fn fallible_node_boundaries_reject_stale_handles() {
     let mut tc = core();
     let stale_root = tc.root_node_handle(/* extra_key = */ None);
     tc.reset();
+    let live_root = tc.root_node_handle(/* extra_key = */ None);
 
     assert!(matches!(
-        tc.try_demote(stale_root),
-        Err(TreeCoreRuntimeError::NodeNotAllocated { node_id }) if node_id == stale_root
+        tc.validate_node_handles(&[live_root, stale_root]),
+        Err(NodeAccessError { node_id }) if node_id == stale_root
     ));
     assert!(matches!(
-        tc.try_build_hicache_transfers(
+        tc.insert_host_in_namespace(
+            stale_root,
+            KeyNamespaceRef::default(),
+            vec![1],
+            Tensor::from_slice(&[10i64]),
+            vec!["hash".to_string()],
+        ),
+        Err(TreeCoreRuntimeError::NodeAccess(NodeAccessError { node_id }))
+            if node_id == stale_root
+    ));
+
+    assert!(matches!(
+        tc.demote(stale_root),
+        Err(TreeCoreRuntimeError::NodeAccess(NodeAccessError { node_id }))
+            if node_id == stale_root
+    ));
+    assert!(matches!(
+        tc.build_hicache_transfers(
             FULL,
             stale_root,
             CacheTransferPhase::BackupStorage,
@@ -3661,23 +3872,24 @@ fn fallible_node_boundaries_reject_stale_handles() {
             /* prefetch_tokens = */ 0,
             /* last_hash = */ None,
         ),
-        Err(TreeCoreRuntimeError::NodeNotAllocated { node_id }) if node_id == stale_root
+        Err(TreeCoreRuntimeError::NodeAccess(NodeAccessError { node_id }))
+            if node_id == stale_root
     ));
     assert!(matches!(
-        tc.try_build_load_back_spec(stale_root, /* req = */ None),
-        Err(TreeCoreRuntimeError::NodeNotAllocated { node_id }) if node_id == stale_root
+        tc.build_load_back_spec(stale_root, /* req = */ None),
+        Err(TreeCoreRuntimeError::NodeAccess(NodeAccessError { node_id }))
+            if node_id == stale_root
     ));
     assert!(matches!(
-        tc.try_get_hash_values(stale_root),
-        Err(TreeCoreRuntimeError::NodeNotAllocated { node_id }) if node_id == stale_root
+        tc.get_hash_values(stale_root),
+        Err(NodeAccessError { node_id }) if node_id == stale_root
     ));
     assert!(matches!(
-        tc.try_dfs_weight_order(&[stale_root]),
-        Err(TreeCoreRuntimeError::NodeNotAllocated { node_id }) if node_id == stale_root
+        tc.dfs_weight_order(&[stale_root]),
+        Err(NodeAccessError { node_id }) if node_id == stale_root
     ));
 
-    let live_root = tc.root_node_handle(/* extra_key = */ None);
-    assert!(tc.is_root(live_root));
+    assert!(tc.is_root(live_root).expect("live root"));
 }
 
 #[test]
@@ -3692,8 +3904,9 @@ fn match_prefix_with_hicache_splits_a_host_only_backuped_node() {
         leaf,
         Tensor::from_slice(&[100i64, 101, 102, 103]),
         HashMap::new(),
-    );
-    tc.demote(leaf);
+    )
+    .expect("live test node");
+    tc.demote(leaf).expect("backuped live test node");
     // The partial match splits the host-only node; the host prefix stays usable.
     let result = tc.match_prefix(&match_params(&vec![1, 2, 9]));
     assert_eq!(result.device_indices.numel(), 0);
@@ -3701,7 +3914,10 @@ fn match_prefix_with_hicache_splits_a_host_only_backuped_node() {
     assert_eq!(result.last_device_node_id, tc.arena.node(root).id);
     assert_eq!(result.host_hit_length, 2);
     assert_eq!(result.best_match_node_id, result.last_host_node_id);
-    let parent = tc.arena.resolve(result.best_match_node_id);
+    let parent = tc
+        .arena
+        .resolve(result.best_match_node_id)
+        .expect("live test node");
     let child = tc.arena.node(parent).children[&(KeyNamespace::default(), vec![3])];
     {
         let parent_node = tc.arena.node(parent);
@@ -3738,15 +3954,18 @@ fn mixed_backup_evict_insert_keeps_the_leaf_sets_disjoint() {
     let first = tc
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
-    tc.commit_backup(first, Tensor::from_slice(&[100i64, 101]), HashMap::new());
+    tc.commit_backup(first, Tensor::from_slice(&[100i64, 101]), HashMap::new())
+        .expect("live test node");
     let second = tc
         .match_prefix(&match_params(&vec![101, 102]))
         .best_match_node_id;
-    tc.commit_backup(second, Tensor::from_slice(&[102i64, 103]), HashMap::new());
+    tc.commit_backup(second, Tensor::from_slice(&[102i64, 103]), HashMap::new())
+        .expect("live test node");
     let third = tc
         .match_prefix(&match_params(&vec![201, 202]))
         .best_match_node_id;
-    tc.commit_backup(third, Tensor::from_slice(&[104i64, 105]), HashMap::new());
+    tc.commit_backup(third, Tensor::from_slice(&[104i64, 105]), HashMap::new())
+        .expect("live test node");
     let mut tracker = HashMap::from([(FULL, 0)]);
     let (mut df, mut hf) = (HashMap::new(), HashMap::new());
     tc.evict_device_start(FULL, /* request_cnt = */ 4);
@@ -3754,7 +3973,9 @@ fn mixed_backup_evict_insert_keeps_the_leaf_sets_disjoint() {
         let (leaf, step) = tc.evict_device_next_node(FULL, &tracker);
         accumulate_step(step, &mut tracker, &mut df, &mut hf);
         let Some(leaf) = leaf else { break };
-        let (_, step) = tc.evict_device_leaf(leaf, /* is_write_back = */ false);
+        let (_, step) = tc
+            .evict_device_leaf(leaf, /* is_write_back = */ false)
+            .expect("live test node");
         accumulate_step(step, &mut tracker, &mut df, &mut hf);
     }
     tc.evict_device_end(FULL);
@@ -3803,7 +4024,7 @@ fn unbacked_leaf_with_host_child(tc: &mut UnifiedTreeCore<Vec<i64>>) -> (NodeIdx
     let child = tc
         .arena
         .alloc_child(
-            tc.arena.resolve(leaf),
+            tc.arena.resolve(leaf).expect("live test node"),
             /* key = */ vec![3, 4],
             /* priority = */ 0,
             /* extra_key = */ None,
@@ -3812,8 +4033,8 @@ fn unbacked_leaf_with_host_child(tc: &mut UnifiedTreeCore<Vec<i64>>) -> (NodeIdx
     tc.arena
         .set_host_value(child, FULL, Tensor::from_slice(&[20i64, 21]));
     tc.update_evictable_leaf_sets_(child);
-    tc.update_evictable_leaf_sets_(tc.arena.resolve(leaf));
-    (tc.arena.resolve(leaf), child)
+    tc.update_evictable_leaf_sets_(tc.arena.resolve(leaf).expect("live test node"));
+    (tc.arena.resolve(leaf).expect("live test node"), child)
 }
 
 #[test]
@@ -3822,7 +4043,9 @@ fn drop_subtree_no_host_frees_the_leaf_and_its_host_descendants() {
     let (leaf, _child) = unbacked_leaf_with_host_child(&mut tc);
     let mut tracker = HashMap::from([(FULL, 0)]);
     let (mut df, mut hf) = (HashMap::new(), HashMap::new());
-    let (dropped, step) = tc.drop_subtree_no_host(tc.arena.node(leaf).id);
+    let (dropped, step) = tc
+        .drop_subtree_no_host(tc.arena.node(leaf).id)
+        .expect("live test node");
     accumulate_step(step, &mut tracker, &mut df, &mut hf);
     assert!(dropped);
     // Under EvictLayer::All only device tokens enter the tracker; host
@@ -3857,7 +4080,9 @@ fn drop_subtree_no_host_removes_a_deeper_host_chain_child_first() {
     tc.update_evictable_leaf_sets_(child);
     let mut tracker = HashMap::from([(FULL, 0)]);
     let (mut df, mut hf) = (HashMap::new(), HashMap::new());
-    let (dropped, step) = tc.drop_subtree_no_host(tc.arena.node(leaf).id);
+    let (dropped, step) = tc
+        .drop_subtree_no_host(tc.arena.node(leaf).id)
+        .expect("live test node");
     accumulate_step(step, &mut tracker, &mut df, &mut hf);
     assert!(dropped);
     assert_eq!(tracker[&FULL], 2);
@@ -3875,7 +4100,9 @@ fn drop_subtree_no_host_bails_on_a_locked_descendant() {
         .set_lock_ref_(ValueSlotIdx::host(FULL), 1);
     let mut tracker = HashMap::from([(FULL, 0)]);
     let (mut df, mut hf) = (HashMap::new(), HashMap::new());
-    let (dropped, step) = tc.drop_subtree_no_host(tc.arena.node(leaf).id);
+    let (dropped, step) = tc
+        .drop_subtree_no_host(tc.arena.node(leaf).id)
+        .expect("live test node");
     accumulate_step(step, &mut tracker, &mut df, &mut hf);
     assert!(!dropped);
     assert_eq!(tracker[&FULL], 0);
@@ -3890,7 +4117,9 @@ fn drop_subtree_no_host_bails_on_a_host_locked_root() {
     tc.arena
         .node_mut(leaf)
         .set_lock_ref_(ValueSlotIdx::host(FULL), 1);
-    let (dropped, _step) = tc.drop_subtree_no_host(tc.arena.node(leaf).id);
+    let (dropped, _step) = tc
+        .drop_subtree_no_host(tc.arena.node(leaf).id)
+        .expect("live test node");
     assert!(!dropped);
     assert_eq!(tc.arena.len(), 3);
 }
@@ -3904,7 +4133,7 @@ fn drop_subtree_no_host_panics_on_a_non_device_leaf() {
     let parent = tc
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
-    tc.drop_subtree_no_host(parent);
+    let _ = tc.drop_subtree_no_host(parent);
 }
 
 #[test]
@@ -3915,8 +4144,9 @@ fn drop_subtree_no_host_panics_on_a_backuped_leaf() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
-    tc.commit_backup(leaf, Tensor::from_slice(&[20i64, 21]), HashMap::new());
-    tc.drop_subtree_no_host(leaf);
+    tc.commit_backup(leaf, Tensor::from_slice(&[20i64, 21]), HashMap::new())
+        .expect("live test node");
+    let _ = tc.drop_subtree_no_host(leaf);
 }
 
 #[test]
@@ -3928,20 +4158,26 @@ fn write_back_eviction_frees_the_device_value_exactly_once() {
     let leaf = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
     let mut tracker = HashMap::from([(FULL, 0)]);
     let (mut df, mut hf) = (HashMap::new(), HashMap::new());
-    let (action, step) = tc.evict_device_leaf(leaf, true);
+    let (action, step) = tc.evict_device_leaf(leaf, true).expect("live test node");
     accumulate_step(step, &mut tracker, &mut df, &mut hf);
     assert_eq!(action.unwrap().node_ids, vec![leaf]);
     assert!(df.is_empty() && hf.is_empty());
-    tc.commit_backup(leaf, Tensor::from_slice(&[20i64]), HashMap::new());
-    let (action, step) = tc.evict_device_leaf(leaf, true);
+    tc.commit_backup(leaf, Tensor::from_slice(&[20i64]), HashMap::new())
+        .expect("live test node");
+    let (action, step) = tc.evict_device_leaf(leaf, true).expect("live test node");
     accumulate_step(step, &mut tracker, &mut df, &mut hf);
     assert!(action.is_none());
     assert_eq!(tracker[&FULL], 1);
     assert_eq!(df[&FULL].len(), 1);
     assert!(df[&FULL][0].equal(&Tensor::from_slice(&[10i64])));
     assert!(
-        tc.arena.node(tc.arena.resolve(leaf)).evicted()
-            && tc.arena.node(tc.arena.resolve(leaf)).backuped()
+        tc.arena
+            .node(tc.arena.resolve(leaf).expect("live test node"))
+            .evicted()
+            && tc
+                .arena
+                .node(tc.arena.resolve(leaf).expect("live test node"))
+                .backuped()
     );
     tc.sanity_check(&[], &[]);
 }
@@ -4012,10 +4248,15 @@ fn dfs_weight_order_groups_the_heaviest_subtree_first() {
         .last_device_node_id;
 
     assert_eq!(
-        tc.dfs_weight_order(&[leaf_b, leaf_a2, leaf_a1, leaf_a1, branch_a]),
+        tc.dfs_weight_order(&[leaf_b, leaf_a2, leaf_a1, leaf_a1, branch_a])
+            .expect("live test nodes"),
         vec![2, 3, 1, 4, 0]
     );
-    assert_eq!(tc.dfs_weight_order(&[leaf_b, leaf_a2]), vec![1, 0]);
+    assert_eq!(
+        tc.dfs_weight_order(&[leaf_b, leaf_a2])
+            .expect("live test nodes"),
+        vec![1, 0]
+    );
 }
 
 #[test]
@@ -4023,12 +4264,14 @@ fn get_hash_values_reads_the_nodes_own_hashes() {
     let mut tc = core();
     let (a, _b) = matched_chain(&mut tc);
     assert_eq!(
-        tc.get_hash_values(tc.arena.node(a).id),
+        tc.get_hash_values(tc.arena.node(a).id)
+            .expect("live test node"),
         Vec::<String>::new()
     );
     tc.arena.node_mut(a).hash_value = Some(vec!["h0".to_string(), "h1".to_string()]);
     assert_eq!(
-        tc.get_hash_values(tc.arena.node(a).id),
+        tc.get_hash_values(tc.arena.node(a).id)
+            .expect("live test node"),
         vec!["h0".to_string(), "h1".to_string()]
     );
 }
@@ -4102,10 +4345,15 @@ fn insert_page_size_two_drops_the_unaligned_tail() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
-    assert_eq!(tc.arena.node(tc.arena.resolve(leaf)).key, vec![1, 2]);
+    assert_eq!(
+        tc.arena
+            .node(tc.arena.resolve(leaf).expect("live test node"))
+            .key,
+        vec![1, 2]
+    );
     assert!(
         tc.arena
-            .device_value(tc.arena.resolve(leaf), FULL)
+            .device_value(tc.arena.resolve(leaf).expect("live test node"), FULL)
             .equal(&Tensor::from_slice(&[10i64, 11]))
     );
     tc.sanity_check(&[], &[]);
@@ -4129,7 +4377,12 @@ fn insert_page_size_two_splits_mid_page_divergence_at_the_page_boundary() {
     let prefix = tc
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
-    assert_eq!(tc.arena.node(tc.arena.resolve(prefix)).key, vec![1, 2]);
+    assert_eq!(
+        tc.arena
+            .node(tc.arena.resolve(prefix).expect("live test node"))
+            .key,
+        vec![1, 2]
+    );
     let matched = tc.match_prefix(&match_params(&vec![1, 2, 3, 4]));
     assert!(
         matched
@@ -4158,7 +4411,11 @@ fn match_prefix_page_size_two_splits_at_a_page_boundary() {
     );
     assert_eq!(
         tc.arena
-            .node(tc.arena.resolve(result.best_match_node_id))
+            .node(
+                tc.arena
+                    .resolve(result.best_match_node_id)
+                    .expect("live test node")
+            )
             .key,
         vec![1, 2]
     );
@@ -4195,7 +4452,9 @@ fn evict_walk_page_size_two_empties_the_tree() {
         let (leaf, step) = tc.evict_device_next_node(FULL, &tracker);
         accumulate_step(step, &mut tracker, &mut df, &mut hf);
         let Some(leaf) = leaf else { break };
-        let (_, step) = tc.evict_device_leaf(leaf, /* is_write_back = */ false);
+        let (_, step) = tc
+            .evict_device_leaf(leaf, /* is_write_back = */ false)
+            .expect("live test node");
         accumulate_step(step, &mut tracker, &mut df, &mut hf);
         evicted += 1;
     }
@@ -4821,7 +5080,9 @@ fn evict_walk_and_driver_empty_the_tree_end_to_end() {
         let (leaf, step) = tc.evict_device_next_node(FULL, &tracker);
         accumulate_step(step, &mut tracker, &mut df, &mut hf);
         let Some(leaf) = leaf else { break };
-        let (backup, step) = tc.evict_device_leaf(leaf, /* is_write_back = */ false);
+        let (backup, step) = tc
+            .evict_device_leaf(leaf, /* is_write_back = */ false)
+            .expect("live test node");
         accumulate_step(step, &mut tracker, &mut df, &mut hf);
         assert!(backup.is_none());
         evicted += 1;
@@ -4850,7 +5111,7 @@ fn evict_driver_readmits_the_parent_into_the_walk() {
         let (leaf, step) = tc.evict_device_next_node(FULL, &tracker);
         accumulate_step(step, &mut tracker, &mut df, &mut hf);
         let Some(leaf) = leaf else { break };
-        let (_, step) = tc.evict_device_leaf(leaf, false);
+        let (_, step) = tc.evict_device_leaf(leaf, false).expect("live test node");
         accumulate_step(step, &mut tracker, &mut df, &mut hf);
         evicted += 1;
     }
@@ -4906,7 +5167,8 @@ fn evict_driver_deletes_through_a_tombstone_parent() {
         /* priority = */ 0,
         /* extra_key = */ None,
     );
-    tc.evict_device_leaf(tc.arena.node(b).id, false);
+    tc.evict_device_leaf(tc.arena.node(b).id, false)
+        .expect("live test node");
     assert_eq!(tc.arena.len(), 1);
 }
 
@@ -4916,11 +5178,12 @@ fn insert_after_eviction_reuses_the_slot_but_never_the_handle() {
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     tc.insert(&insert_params(&vec![4], &[13]));
     let leaf = tc.match_prefix(&match_params(&vec![4])).best_match_node_id;
-    let leaf_idx = tc.arena.resolve(leaf);
-    tc.evict_device_leaf(leaf, /* is_write_back = */ false);
+    let leaf_idx = tc.arena.resolve(leaf).expect("live test node");
+    tc.evict_device_leaf(leaf, /* is_write_back = */ false)
+        .expect("live test node");
     assert_eq!(tc.arena.len(), 2);
     // The freed handle no longer resolves.
-    assert!(tc.arena.try_resolve(leaf).is_none());
+    assert!(tc.arena.resolve(leaf).is_err());
     // The splitting insert allocates its prefix node into the freed slot.
     tc.insert(&insert_params(&vec![1, 2, 9], &[20, 21, 29]));
     assert_eq!(tc.arena.len(), 4);
@@ -4928,28 +5191,33 @@ fn insert_after_eviction_reuses_the_slot_but_never_the_handle() {
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
     // Slot recycled, but the stale handle can never alias the new node.
-    assert_eq!(tc.arena.resolve(prefix), leaf_idx);
+    assert_eq!(tc.arena.resolve(prefix).expect("live test node"), leaf_idx);
     assert_ne!(prefix, leaf);
 }
 
 #[test]
-#[should_panic(expected = "is not allocated")]
-fn stale_handle_panics_after_its_node_is_freed() {
+fn stale_handle_returns_err_after_its_node_is_freed() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![4], &[13]));
     let leaf = tc.match_prefix(&match_params(&vec![4])).best_match_node_id;
-    tc.evict_device_leaf(leaf, /* is_write_back = */ false);
-    tc.inc_lock_ref(leaf);
+    tc.evict_device_leaf(leaf, /* is_write_back = */ false)
+        .expect("live test node");
+    assert!(matches!(
+        tc.inc_lock_ref(leaf),
+        Err(NodeAccessError { node_id }) if node_id == leaf
+    ));
 }
 
 #[test]
-#[should_panic(expected = "is not allocated")]
-fn pre_reset_handle_panics_after_reset() {
+fn pre_reset_handle_returns_err_after_reset() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![4], &[13]));
     let leaf = tc.match_prefix(&match_params(&vec![4])).best_match_node_id;
     tc.reset();
-    tc.arena.resolve(leaf);
+    assert!(matches!(
+        tc.arena.resolve(leaf),
+        Err(NodeAccessError { node_id }) if node_id == leaf
+    ));
 }
 
 #[test]
@@ -4962,7 +5230,7 @@ fn evict_driver_rejects_a_non_leaf() {
     let prefix = tc
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
-    tc.evict_device_leaf(prefix, false);
+    let _ = tc.evict_device_leaf(prefix, false);
 }
 
 #[test]
@@ -4972,11 +5240,17 @@ fn evict_driver_write_back_returns_the_backup_action_for_an_unbacked_leaf() {
     let leaf = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
     let mut tracker = HashMap::from([(FULL, 0)]);
     let (mut df, mut hf) = (HashMap::new(), HashMap::new());
-    let (action, step) = tc.evict_device_leaf(leaf, /* is_write_back = */ true);
+    let (action, step) = tc
+        .evict_device_leaf(leaf, /* is_write_back = */ true)
+        .expect("live test node");
     accumulate_step(step, &mut tracker, &mut df, &mut hf);
     // Write-back carries only the leaf itself; nothing is freed yet.
     assert_eq!(action.unwrap().node_ids, vec![leaf]);
-    assert!(!tc.arena.node(tc.arena.resolve(leaf)).evicted());
+    assert!(
+        !tc.arena
+            .node(tc.arena.resolve(leaf).expect("live test node"))
+            .evicted()
+    );
     assert_eq!(tracker[&FULL], 0);
     assert!(df.is_empty() && hf.is_empty());
 }
@@ -4986,21 +5260,32 @@ fn evict_driver_demotes_a_backuped_leaf_to_host_only() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1], &[10]));
     let leaf = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
-    tc.arena
-        .set_host_value(tc.arena.resolve(leaf), FULL, Tensor::from_slice(&[20i64]));
+    tc.arena.set_host_value(
+        tc.arena.resolve(leaf).expect("live test node"),
+        FULL,
+        Tensor::from_slice(&[20i64]),
+    );
     let mut tracker = HashMap::from([(FULL, 0)]);
     let (mut df, mut hf) = (HashMap::new(), HashMap::new());
-    let (action, step) = tc.evict_device_leaf(leaf, false);
+    let (action, step) = tc.evict_device_leaf(leaf, false).expect("live test node");
     accumulate_step(step, &mut tracker, &mut df, &mut hf);
     assert!(action.is_none());
     // The node stays in the tree, now host-only.
-    let node = tc.arena.node(tc.arena.resolve(leaf));
+    let node = tc
+        .arena
+        .node(tc.arena.resolve(leaf).expect("live test node"));
     assert!(node.evicted() && node.backuped());
     assert_eq!(tracker[&FULL], 1);
     assert_eq!(df[&FULL].len(), 1);
     assert!(hf.is_empty());
-    assert!(!tc.evictable_device_leaves.contains(tc.arena.resolve(leaf)));
-    assert!(tc.evictable_host_leaves.contains(tc.arena.resolve(leaf)));
+    assert!(
+        !tc.evictable_device_leaves
+            .contains(tc.arena.resolve(leaf).expect("live test node"))
+    );
+    assert!(
+        tc.evictable_host_leaves
+            .contains(tc.arena.resolve(leaf).expect("live test node"))
+    );
     tc.sanity_check(&[], &[]);
 }
 
@@ -5013,10 +5298,14 @@ fn evict_device_leaf_step_counts_are_independent_of_prior_evictions() {
         .match_prefix(&match_params(&vec![1, 2, 3]))
         .best_match_node_id;
     let second = tc.match_prefix(&match_params(&vec![4])).best_match_node_id;
-    let (_, step) = tc.evict_device_leaf(first, /* is_write_back = */ false);
+    let (_, step) = tc
+        .evict_device_leaf(first, /* is_write_back = */ false)
+        .expect("live test node");
     assert_eq!(step.tracker[&FULL], 3);
     // The second step reports only its own leaf, not a running total.
-    let (_, step) = tc.evict_device_leaf(second, /* is_write_back = */ false);
+    let (_, step) = tc
+        .evict_device_leaf(second, /* is_write_back = */ false)
+        .expect("live test node");
     assert_eq!(step.tracker[&FULL], 1);
     assert_eq!(step.device_frees[&FULL].len(), 1);
 }
@@ -5817,7 +6106,8 @@ fn reset_restores_a_fresh_tree() {
         ..insert_params(&vec![7, 8], &[20, 21])
     });
     let matched = tc.match_prefix(&match_params(&vec![1, 2, 3]));
-    tc.inc_lock_ref(matched.best_match_node_id);
+    tc.inc_lock_ref(matched.best_match_node_id)
+        .expect("live match node");
     assert_eq!(tc.protected_size(), 3);
     // Seed aux LRU, host LRU, and host-leaf state so the reset must clear each.
     let root = tc.arena.root();
@@ -5868,7 +6158,8 @@ fn size_accessors_mirror_the_full_component_state() {
     assert_eq!(tc.protected_size(), 0);
     assert_eq!(tc.component_evictable_size(FULL), 3);
     let matched = tc.match_prefix(&match_params(&vec![1, 2, 3]));
-    tc.inc_lock_ref(matched.best_match_node_id);
+    tc.inc_lock_ref(matched.best_match_node_id)
+        .expect("live match node");
     assert_eq!(tc.protected_size(), 3);
     assert_eq!(tc.full_protected_size(), 3);
     assert_eq!(tc.evictable_size(), 0);
@@ -5957,7 +6248,8 @@ fn walk_for_kv_canary_chains_slots_across_namespaces() {
 fn walk_for_kv_canary_unlocked_only_skips_locked_nodes_but_keeps_the_chain() {
     let mut tc = core();
     let (a, _b) = matched_chain(&mut tc);
-    tc.inc_lock_ref(tc.arena.node(a).id);
+    tc.inc_lock_ref(tc.arena.node(a).id)
+        .expect("live test node");
     assert_eq!(
         sorted_canary_rows(tc.walk_for_kv_canary(true, false)),
         vec![(12, 2, 11)]
@@ -6033,11 +6325,18 @@ fn get_component_device_value_reads_the_full_value() {
         .best_match_node_id;
     assert!(
         tc.get_component_device_value(leaf, FULL)
-            .unwrap()
+            .expect("live test node")
+            .expect("device value")
             .equal(&Tensor::from_slice(&[10i64, 11, 12]))
     );
-    let _ = tc.arena.take_device_value(tc.arena.resolve(leaf), FULL);
-    assert!(tc.get_component_device_value(leaf, FULL).is_none());
+    let _ = tc
+        .arena
+        .take_device_value(tc.arena.resolve(leaf).expect("live test node"), FULL);
+    assert!(
+        tc.get_component_device_value(leaf, FULL)
+            .expect("live test node")
+            .is_none()
+    );
 }
 
 #[test]
@@ -6045,7 +6344,7 @@ fn get_component_device_value_reads_the_full_value() {
 fn get_component_device_value_panics_on_an_unregistered_component() {
     let tc = core();
     let root = tc.arena.root();
-    tc.get_component_device_value(tc.arena.node(root).id, SWA);
+    let _ = tc.get_component_device_value(tc.arena.node(root).id, SWA);
 }
 
 #[test]
@@ -6055,6 +6354,7 @@ fn get_component_device_value_reads_the_registered_components_slot() {
     let (a, _b) = matched_chain(&mut tc);
     assert!(
         tc.get_component_device_value(tc.arena.node(a).id, SWA)
+            .expect("live test node")
             .is_none()
     );
     tc.arena
@@ -6062,7 +6362,8 @@ fn get_component_device_value_reads_the_registered_components_slot() {
     assert_eq!(
         Vec::<i64>::try_from(
             tc.get_component_device_value(tc.arena.node(a).id, SWA)
-                .unwrap()
+                .expect("live test node")
+                .expect("device value")
         )
         .unwrap(),
         vec![5, 6]
@@ -6102,9 +6403,11 @@ fn is_full_device_evicted_flips_when_the_value_tombstones() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 3]))
         .best_match_node_id;
-    assert!(!tc.is_full_device_evicted(leaf));
-    let _ = tc.arena.take_device_value(tc.arena.resolve(leaf), FULL);
-    assert!(tc.is_full_device_evicted(leaf));
+    assert!(!tc.is_full_device_evicted(leaf).expect("live test node"));
+    let _ = tc
+        .arena
+        .take_device_value(tc.arena.resolve(leaf).expect("live test node"), FULL);
+    assert!(tc.is_full_device_evicted(leaf).expect("live test node"));
 }
 
 #[test]
@@ -6122,7 +6425,8 @@ fn set_component_device_value_stores_and_restamps_the_lru() {
         )
         .unwrap();
     assert!(!tc.arena.has_device_value(a, SWA));
-    tc.set_component_device_value(tc.arena.node(a).id, SWA, Tensor::from_slice(&[5i64, 6]));
+    tc.set_component_device_value(tc.arena.node(a).id, SWA, Tensor::from_slice(&[5i64, 6]))
+        .expect("live test node");
     assert!(
         tc.arena
             .device_value(a, SWA)
@@ -6149,7 +6453,8 @@ fn set_component_device_value_migrates_the_node_off_the_host_lru() {
         )
         .unwrap();
     tc.host_lru_list_mut(SWA).insert_mru(a);
-    tc.set_component_device_value(tc.arena.node(a).id, SWA, Tensor::from_slice(&[5i64]));
+    tc.set_component_device_value(tc.arena.node(a).id, SWA, Tensor::from_slice(&[5i64]))
+        .expect("live test node");
     assert!(!tc.host_lru_list(SWA).in_list(Some(a)));
     assert_eq!(tc.host_lru_list(SWA).len(), 0);
     assert_eq!(tc.device_lru_list(SWA).len(), 1);
@@ -6160,7 +6465,7 @@ fn set_component_device_value_migrates_the_node_off_the_host_lru() {
 fn set_component_device_value_rejects_the_base_component() {
     let mut tc = core();
     let root = tc.arena.root();
-    tc.set_component_device_value(
+    let _ = tc.set_component_device_value(
         tc.arena.node(root).id,
         BASE_COMPONENT_TYPE,
         Tensor::from_slice(&[1i64]),
@@ -6175,18 +6480,24 @@ fn collect_full_device_indices_concatenates_in_root_order() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 3, 4, 5]))
         .best_match_node_id;
-    let parent = tc.arena.node(tc.arena.resolve(leaf)).parent();
+    let parent = tc
+        .arena
+        .node(tc.arena.resolve(leaf).expect("live test node"))
+        .parent();
     let root = tc.arena.root();
     assert!(
         tc.collect_full_device_indices(leaf, tc.arena.node(root).id)
+            .expect("live test nodes")
             .equal(&Tensor::from_slice(&[10i64, 11, 12, 13, 14]))
     );
     assert!(
         tc.collect_full_device_indices(leaf, tc.arena.node(parent).id)
+            .expect("live test nodes")
             .equal(&Tensor::from_slice(&[13i64, 14]))
     );
     assert_eq!(
         tc.collect_full_device_indices(tc.arena.node(root).id, tc.arena.node(root).id)
+            .expect("live test nodes")
             .numel(),
         0
     );
@@ -6201,7 +6512,10 @@ fn collect_full_device_indices_panics_on_an_evicted_path() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 3, 4, 5]))
         .best_match_node_id;
-    let parent = tc.arena.node(tc.arena.resolve(leaf)).parent();
+    let parent = tc
+        .arena
+        .node(tc.arena.resolve(leaf).expect("live test node"))
+        .parent();
     let _ = tc.arena.take_device_value(parent, FULL);
     let root = tc.arena.root();
     let _ = tc.collect_full_device_indices(leaf, tc.arena.node(root).id);
@@ -6247,7 +6561,9 @@ fn pretty_format_renders_every_namespace_and_component() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 3, 4, 5]))
         .best_match_node_id;
-    let _ = tc.arena.take_device_value(tc.arena.resolve(leaf), FULL);
+    let _ = tc
+        .arena
+        .take_device_value(tc.arena.resolve(leaf).expect("live test node"), FULL);
     tc.register_component_(Arc::new(SwaComponentForTest));
     tc.arena.node_mut(NodeIdx_(1)).values[SWA.idx()].value = Some(Tensor::from_slice(&[0i64]));
     // Sibling render order follows HashMap iteration, so pin the line set.
@@ -6285,13 +6601,16 @@ fn sanity_check_passes_on_a_healthy_tree() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
-    tc.inc_lock_ref(leaf);
+    tc.inc_lock_ref(leaf).expect("live test node");
     tc.sanity_check(&[(1, leaf)], &[(2, leaf)]);
     tc.dec_lock_ref(
-        tc.arena.node(tc.arena.resolve(leaf)).id,
+        tc.arena
+            .node(tc.arena.resolve(leaf).expect("live test node"))
+            .id,
         /* params = */ None,
         /* skip_swa = */ false,
-    );
+    )
+    .expect("live test node");
     tc.sanity_check(&[], &[]);
 }
 
@@ -6305,7 +6624,9 @@ fn sanity_check_passes_after_the_eviction_walk() {
         let (leaf, step) = tc.evict_device_next_node(FULL, &tracker);
         accumulate_step(step, &mut tracker, &mut df, &mut hf);
         let Some(leaf) = leaf else { break };
-        let (_, step) = tc.evict_device_leaf(leaf, /* is_write_back = */ false);
+        let (_, step) = tc
+            .evict_device_leaf(leaf, /* is_write_back = */ false)
+            .expect("live test node");
         accumulate_step(step, &mut tracker, &mut df, &mut hf);
     }
     tc.evict_device_end(FULL);
@@ -6322,7 +6643,8 @@ fn sanity_check_detects_a_missing_device_leaf() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
-    tc.evictable_device_leaves.discard(tc.arena.resolve(leaf));
+    tc.evictable_device_leaves
+        .discard(tc.arena.resolve(leaf).expect("live test node"));
     tc.sanity_check(&[], &[]);
 }
 
@@ -6333,7 +6655,10 @@ fn sanity_check_detects_an_extra_device_leaf() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
-    let parent = tc.arena.node(tc.arena.resolve(leaf)).parent();
+    let parent = tc
+        .arena
+        .node(tc.arena.resolve(leaf).expect("live test node"))
+        .parent();
     tc.evictable_device_leaves.add(parent);
     tc.sanity_check(&[], &[]);
 }
@@ -6353,7 +6678,9 @@ fn sanity_check_detects_a_dead_node() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
-    let _ = tc.arena.take_device_value(tc.arena.resolve(leaf), FULL);
+    let _ = tc
+        .arena
+        .take_device_value(tc.arena.resolve(leaf).expect("live test node"), FULL);
     tc.sanity_check(&[], &[]);
 }
 
@@ -6363,7 +6690,7 @@ fn try_sanity_check_returns_a_dead_node_error() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
-    let leaf_idx = tc.arena.resolve(leaf);
+    let leaf_idx = tc.arena.resolve(leaf).expect("live test node");
     let _ = tc.arena.take_device_value(leaf_idx, FULL);
 
     let error = tc.try_sanity_check(&[], &[]).unwrap_err();
@@ -6380,7 +6707,10 @@ fn sanity_check_detects_an_evicted_parent_prefix() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
-    let parent = tc.arena.node(tc.arena.resolve(leaf)).parent();
+    let parent = tc
+        .arena
+        .node(tc.arena.resolve(leaf).expect("live test node"))
+        .parent();
     let _ = tc.arena.take_device_value(parent, FULL);
     tc.sanity_check(&[], &[]);
 }
@@ -6392,8 +6722,10 @@ fn sanity_check_detects_a_locked_tombstone() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
-    tc.inc_lock_ref(leaf);
-    let _ = tc.arena.take_device_value(tc.arena.resolve(leaf), FULL);
+    tc.inc_lock_ref(leaf).expect("live test node");
+    let _ = tc
+        .arena
+        .take_device_value(tc.arena.resolve(leaf).expect("live test node"), FULL);
     tc.sanity_check(&[], &[]);
 }
 
@@ -6413,8 +6745,10 @@ fn sanity_check_detects_an_aux_lru_mismatch() {
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
     tc.register_component_(Arc::new(SwaComponentForTest));
-    tc.arena.node_mut(tc.arena.resolve(leaf)).values[SWA.idx()].value =
-        Some(Tensor::from_slice(&[0i64, 0, 0]));
+    tc.arena
+        .node_mut(tc.arena.resolve(leaf).expect("live test node"))
+        .values[SWA.idx()]
+    .value = Some(Tensor::from_slice(&[0i64, 0, 0]));
     tc.sanity_check(&[], &[]);
 }
 
@@ -6501,7 +6835,7 @@ fn sanity_check_detects_a_broken_parent_pointer() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
-    let leaf_idx = tc.arena.resolve(leaf);
+    let leaf_idx = tc.arena.resolve(leaf).expect("live test node");
     tc.arena.node_mut(leaf_idx).parent = Some(NodeIdx_(0));
     tc.sanity_check(&[], &[]);
 }
@@ -6514,9 +6848,13 @@ fn sanity_check_detects_aux_device_without_full() {
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
     tc.register_component_(Arc::new(SwaComponentForTest));
-    tc.arena.node_mut(tc.arena.resolve(leaf)).values[SWA.idx()].value =
-        Some(Tensor::from_slice(&[0i64]));
-    let _ = tc.arena.take_device_value(tc.arena.resolve(leaf), FULL);
+    tc.arena
+        .node_mut(tc.arena.resolve(leaf).expect("live test node"))
+        .values[SWA.idx()]
+    .value = Some(Tensor::from_slice(&[0i64]));
+    let _ = tc
+        .arena
+        .take_device_value(tc.arena.resolve(leaf).expect("live test node"), FULL);
     tc.sanity_check(&[], &[]);
 }
 
@@ -6529,7 +6867,7 @@ fn sanity_check_detects_aux_host_without_full_host() {
         .best_match_node_id;
     tc.register_component_(Arc::new(SwaComponentForTest));
     tc.arena
-        .node_mut(tc.arena.resolve(leaf))
+        .node_mut(tc.arena.resolve(leaf).expect("live test node"))
         .state_mut_(ValueSlotIdx::host(SWA))
         .value = Some(Tensor::from_slice(&[0i64]));
     tc.sanity_check(&[], &[]);
@@ -6543,7 +6881,7 @@ fn sanity_check_detects_an_unbacked_parent_prefix() {
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
     tc.arena
-        .node_mut(tc.arena.resolve(leaf))
+        .node_mut(tc.arena.resolve(leaf).expect("live test node"))
         .state_mut_(ValueSlotIdx::host(FULL))
         .value = Some(Tensor::from_slice(&[30i64]));
     tc.sanity_check(&[], &[]);
@@ -6563,11 +6901,11 @@ fn sanity_check_accepts_a_write_back_child_backed_up_before_its_parent() {
         .match_prefix(&match_params(&vec![1, 2, 3, 4, 5]))
         .best_match_node_id;
     tc.arena
-        .node_mut(tc.arena.resolve(leaf))
+        .node_mut(tc.arena.resolve(leaf).expect("live test node"))
         .state_mut_(ValueSlotIdx::host(FULL))
         .value = Some(Tensor::from_slice(&[13i64, 14]));
     // Register the host value set directly by the test.
-    tc.update_full_coexisting_host_tracking_(tc.arena.resolve(leaf));
+    tc.update_full_coexisting_host_tracking_(tc.arena.resolve(leaf).expect("live test node"));
     tc.sanity_check(&[], &[]);
 }
 
@@ -6579,7 +6917,10 @@ fn sanity_check_detects_an_aux_lock_above_full() {
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
     tc.register_component_(Arc::new(SwaComponentForTest));
-    tc.arena.node_mut(tc.arena.resolve(leaf)).values[SWA.idx()].lock_ref = 5;
+    tc.arena
+        .node_mut(tc.arena.resolve(leaf).expect("live test node"))
+        .values[SWA.idx()]
+    .lock_ref = 5;
     tc.sanity_check(&[], &[]);
 }
 
@@ -6590,10 +6931,15 @@ fn sanity_check_detects_a_missing_host_leaf() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
-    let parent = tc.arena.node(tc.arena.resolve(leaf)).parent();
-    let _ = tc.arena.take_device_value(tc.arena.resolve(leaf), FULL);
+    let parent = tc
+        .arena
+        .node(tc.arena.resolve(leaf).expect("live test node"))
+        .parent();
+    let _ = tc
+        .arena
+        .take_device_value(tc.arena.resolve(leaf).expect("live test node"), FULL);
     tc.arena
-        .node_mut(tc.arena.resolve(leaf))
+        .node_mut(tc.arena.resolve(leaf).expect("live test node"))
         .state_mut_(ValueSlotIdx::host(FULL))
         .value = Some(Tensor::from_slice(&[30i64]));
     tc.arena
@@ -6610,7 +6956,8 @@ fn sanity_check_detects_an_extra_host_leaf() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
-    tc.evictable_host_leaves.add(tc.arena.resolve(leaf));
+    tc.evictable_host_leaves
+        .add(tc.arena.resolve(leaf).expect("live test node"));
     tc.sanity_check(&[], &[]);
 }
 
@@ -6621,7 +6968,8 @@ fn sanity_check_detects_a_leaf_in_both_sets() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
-    tc.evictable_host_leaves.add(tc.arena.resolve(leaf));
+    tc.evictable_host_leaves
+        .add(tc.arena.resolve(leaf).expect("live test node"));
     tc.sanity_check(&[], &[]);
 }
 
@@ -6657,7 +7005,7 @@ fn sanity_check_detects_an_aux_host_lru_mismatch() {
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
     tc.register_component_(Arc::new(SwaComponentForTest));
-    let leaf_idx2 = tc.arena.resolve(leaf);
+    let leaf_idx2 = tc.arena.resolve(leaf).expect("live test node");
     tc.host_lru_list_mut(SWA).insert_mru(leaf_idx2);
     tc.sanity_check(&[], &[]);
 }
@@ -6670,9 +7018,11 @@ fn sanity_check_detects_an_aux_node_in_both_lrus() {
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
     tc.register_component_(Arc::new(SwaComponentForTest));
-    tc.arena.node_mut(tc.arena.resolve(leaf)).values[SWA.idx()].value =
-        Some(Tensor::from_slice(&[0i64, 0, 0]));
-    let leaf_idx = tc.arena.resolve(leaf);
+    tc.arena
+        .node_mut(tc.arena.resolve(leaf).expect("live test node"))
+        .values[SWA.idx()]
+    .value = Some(Tensor::from_slice(&[0i64, 0, 0]));
+    let leaf_idx = tc.arena.resolve(leaf).expect("live test node");
     tc.device_lru_list_mut(SWA).insert_mru(leaf_idx);
     tc.host_lru_list_mut(SWA).insert_mru(leaf_idx);
     tc.sanity_check(&[], &[]);
@@ -6785,21 +7135,18 @@ fn refresh_dispatches_fire_per_walk_phase_in_a_namespace() {
         .best_match_node_id;
     let refreshes = recorder.refreshes.lock().unwrap();
     assert!(!refreshes.is_empty());
-    assert!(
-        refreshes
-            .iter()
-            .any(|&(phase, node)| phase == LRURefreshPhase::Walkdown
-                && node == tc.arena.resolve(leaf))
-    );
-    assert!(refreshes.iter().any(
-        |&(phase, node)| phase == LRURefreshPhase::InsertEnd && node == tc.arena.resolve(leaf)
-    ));
-    assert!(
-        refreshes
-            .iter()
-            .any(|&(phase, node)| phase == LRURefreshPhase::MatchEnd
-                && node == tc.arena.resolve(leaf))
-    );
+    assert!(refreshes.iter().any(|&(phase, node)| {
+        phase == LRURefreshPhase::Walkdown
+            && node == tc.arena.resolve(leaf).expect("live test node")
+    }));
+    assert!(refreshes.iter().any(|&(phase, node)| {
+        phase == LRURefreshPhase::InsertEnd
+            && node == tc.arena.resolve(leaf).expect("live test node")
+    }));
+    assert!(refreshes.iter().any(|&(phase, node)| {
+        phase == LRURefreshPhase::MatchEnd
+            && node == tc.arena.resolve(leaf).expect("live test node")
+    }));
 }
 
 #[test]
@@ -6826,7 +7173,7 @@ fn sanity_check_detects_a_reverse_map_mismatch() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
-    let leaf_idx3 = tc.arena.resolve(leaf);
+    let leaf_idx3 = tc.arena.resolve(leaf).expect("live test node");
     let parent = tc.arena.node(leaf_idx3).parent();
     let key = tc.arena.node(leaf_idx3).key.child_key(1);
     let parent_node = tc.arena.node_mut(parent);
@@ -6844,8 +7191,10 @@ fn sanity_check_detects_a_value_length_mismatch() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
-    tc.arena.node_mut(tc.arena.resolve(leaf)).values[FULL.idx()].value =
-        Some(Tensor::from_slice(&[7i64, 8, 9, 10]));
+    tc.arena
+        .node_mut(tc.arena.resolve(leaf).expect("live test node"))
+        .values[FULL.idx()]
+    .value = Some(Tensor::from_slice(&[7i64, 8, 9, 10]));
     tc.sanity_check(&[], &[]);
 }
 
@@ -6856,13 +7205,16 @@ fn sanity_check_detects_a_host_value_length_mismatch() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
-    let parent = tc.arena.node(tc.arena.resolve(leaf)).parent();
+    let parent = tc
+        .arena
+        .node(tc.arena.resolve(leaf).expect("live test node"))
+        .parent();
     tc.arena
         .node_mut(parent)
         .state_mut_(ValueSlotIdx::host(FULL))
         .value = Some(Tensor::from_slice(&[10i64, 11]));
     tc.arena
-        .node_mut(tc.arena.resolve(leaf))
+        .node_mut(tc.arena.resolve(leaf).expect("live test node"))
         .state_mut_(ValueSlotIdx::host(FULL))
         .value = Some(Tensor::from_slice(&[7i64, 8, 9, 10]));
     tc.sanity_check(&[], &[]);
@@ -6875,7 +7227,9 @@ fn sanity_check_detects_an_empty_key() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
-    tc.arena.node_mut(tc.arena.resolve(leaf)).key = vec![];
+    tc.arena
+        .node_mut(tc.arena.resolve(leaf).expect("live test node"))
+        .key = vec![];
     tc.sanity_check(&[], &[]);
 }
 
@@ -6887,7 +7241,9 @@ fn sanity_check_detects_an_unaligned_key() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 3, 4]))
         .best_match_node_id;
-    tc.arena.node_mut(tc.arena.resolve(leaf)).key = vec![1];
+    tc.arena
+        .node_mut(tc.arena.resolve(leaf).expect("live test node"))
+        .key = vec![1];
     tc.sanity_check(&[], &[]);
 }
 
@@ -6897,9 +7253,12 @@ fn cyclic_child_map_tree() -> UnifiedTreeCore<Vec<i64>> {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
-    let parent = tc.arena.node(tc.arena.resolve(leaf)).parent();
+    let parent = tc
+        .arena
+        .node(tc.arena.resolve(leaf).expect("live test node"))
+        .parent();
     tc.arena
-        .node_mut(tc.arena.resolve(leaf))
+        .node_mut(tc.arena.resolve(leaf).expect("live test node"))
         .children
         .insert((KeyNamespace::default(), vec![50]), parent);
     tc
@@ -6926,7 +7285,10 @@ fn sanity_check_detects_a_host_locked_value_missing_from_the_lru() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
-    let parent = tc.arena.node(tc.arena.resolve(leaf)).parent();
+    let parent = tc
+        .arena
+        .node(tc.arena.resolve(leaf).expect("live test node"))
+        .parent();
     tc.register_component_(Arc::new(SwaComponentForTest));
     // The arena was built Full-only; give the root the stub's lock too.
     tc.arena.node_mut(tc.arena.root()).values[SWA.idx()].lock_ref = 1;
@@ -6934,7 +7296,9 @@ fn sanity_check_detects_a_host_locked_value_missing_from_the_lru() {
         .node_mut(parent)
         .state_mut_(ValueSlotIdx::host(FULL))
         .value = Some(Tensor::from_slice(&[10i64, 11]));
-    let leaf_node = tc.arena.node_mut(tc.arena.resolve(leaf));
+    let leaf_node = tc
+        .arena
+        .node_mut(tc.arena.resolve(leaf).expect("live test node"));
     leaf_node.state_mut_(ValueSlotIdx::host(FULL)).value = Some(Tensor::from_slice(&[30i64]));
     leaf_node.state_mut_(ValueSlotIdx::host(SWA)).value = Some(Tensor::from_slice(&[30i64]));
     leaf_node.state_mut_(ValueSlotIdx::host(SWA)).lock_ref = 1;
@@ -6946,7 +7310,10 @@ fn host_only_aux_leaf(tc: &mut UnifiedTreeCore<Vec<i64>>) -> NodeIdx_ {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
-    let parent = tc.arena.node(tc.arena.resolve(leaf)).parent();
+    let parent = tc
+        .arena
+        .node(tc.arena.resolve(leaf).expect("live test node"))
+        .parent();
     tc.register_component_(Arc::new(SwaComponentForTest));
     // The arena was built Full-only; give the root the stub's lock too.
     tc.arena.node_mut(tc.arena.root()).values[SWA.idx()].lock_ref = 1;
@@ -6954,13 +7321,15 @@ fn host_only_aux_leaf(tc: &mut UnifiedTreeCore<Vec<i64>>) -> NodeIdx_ {
         .node_mut(parent)
         .state_mut_(ValueSlotIdx::host(FULL))
         .value = Some(Tensor::from_slice(&[10i64, 11]));
-    let leaf_node = tc.arena.node_mut(tc.arena.resolve(leaf));
+    let leaf_node = tc
+        .arena
+        .node_mut(tc.arena.resolve(leaf).expect("live test node"));
     leaf_node.state_mut_(ValueSlotIdx::host(FULL)).value = Some(Tensor::from_slice(&[30i64]));
     leaf_node.state_mut_(ValueSlotIdx::host(SWA)).value = Some(Tensor::from_slice(&[30i64]));
     // Register the host values set directly by the test.
     tc.update_full_coexisting_host_tracking_(parent);
-    tc.update_full_coexisting_host_tracking_(tc.arena.resolve(leaf));
-    tc.arena.resolve(leaf)
+    tc.update_full_coexisting_host_tracking_(tc.arena.resolve(leaf).expect("live test node"));
+    tc.arena.resolve(leaf).expect("live test node")
 }
 
 #[test]
@@ -7010,15 +7379,18 @@ fn insert_unevicts_a_tombstoned_deep_node() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 3, 4, 5]))
         .best_match_node_id;
-    let _ = tc.arena.take_device_value(tc.arena.resolve(leaf), FULL);
+    let _ = tc
+        .arena
+        .take_device_value(tc.arena.resolve(leaf).expect("live test node"), FULL);
     tc.component_state_mut(FULL).evictable_size = 3;
-    tc.evictable_device_leaves.discard(tc.arena.resolve(leaf));
+    tc.evictable_device_leaves
+        .discard(tc.arena.resolve(leaf).expect("live test node"));
     let result = tc.insert(&insert_params(&vec![1, 2, 3, 4, 5], &[30, 31, 32, 33, 34]));
     assert_eq!(result.prefix_len, 5);
     // The revived leaf takes its own span of the fresh KV, not the key head.
     assert!(
         tc.arena
-            .device_value(tc.arena.resolve(leaf), FULL)
+            .device_value(tc.arena.resolve(leaf).expect("live test node"), FULL)
             .equal(&Tensor::from_slice(&[33i64, 34]))
     );
     let [CacheAction::FreeDeviceKV(freed)] = result.cache_actions.as_slice() else {
@@ -7122,7 +7494,7 @@ fn suspended_walk_core() -> (UnifiedTreeCore<Vec<i64>>, NodeIdx_, InsertStepResu
         .match_prefix(&match_params(&vec![1, 2, 3]))
         .best_match_node_id;
     let step = tc.begin_insert(&insert_params(&vec![1, 2, 3, 4, 5], &[20, 21, 22, 13, 14]));
-    let a_idx = tc.arena.resolve(a);
+    let a_idx = tc.arena.resolve(a).expect("live test node");
     (tc, a_idx, step)
 }
 
@@ -7206,12 +7578,13 @@ fn resume_insert_completes_after_an_on_path_host_leaf_is_evicted() {
     let h_leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 3, 4, 5, 6, 7, 8]))
         .best_match_node_id;
-    let h_leaf_idx = tc.arena.resolve(h_leaf);
+    let h_leaf_idx = tc.arena.resolve(h_leaf).expect("live test node");
     tc.commit_backup(
         h_leaf,
         Tensor::from_slice(&[104i64, 105, 106, 107]),
         HashMap::new(),
-    );
+    )
+    .expect("live test node");
     demote_node(&mut tc, h_leaf_idx);
     let step = tc.begin_insert(&insert_params(
         &vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
@@ -7225,20 +7598,26 @@ fn resume_insert_completes_after_an_on_path_host_leaf_is_evicted() {
     // The barrier's backup host-evicts the on-path H-leaf before committing.
     let mut tracker = HashMap::from([(FULL, 0)]);
     let (mut df, mut hf) = (HashMap::new(), HashMap::new());
-    tc.evict_host_leaf_(tc.arena.resolve(h_leaf), &mut tracker, &mut df, &mut hf);
+    tc.evict_host_leaf_(
+        tc.arena.resolve(h_leaf).expect("live test node"),
+        &mut tracker,
+        &mut df,
+        &mut hf,
+    );
     assert_eq!(tracker[&FULL], 4);
     tc.commit_backup(
         top,
         Tensor::from_slice(&[100i64, 101, 102, 103]),
         HashMap::new(),
-    );
+    )
+    .expect("live test node");
     let done = tc.resume_insert();
     let result = done.result.expect("the resumed walk completes");
     assert_eq!(result.prefix_len, 4);
     assert!(!tc.has_ongoing_insert());
-    assert!(tc.arena.try_resolve(h_leaf).is_none());
+    assert!(tc.arena.resolve(h_leaf).is_err());
     // The recreated suffix is top's single child, spanning the whole gap.
-    let top_idx = tc.arena.resolve(top);
+    let top_idx = tc.arena.resolve(top).expect("live test node");
     assert_eq!(tc.arena.node(top_idx).children.len(), 1);
     let suffix = *tc.arena.node(top_idx).children.values().next().unwrap();
     assert_eq!(tc.arena.node(suffix).key, vec![5, 6, 7, 8, 9, 10, 11, 12]);
@@ -7267,7 +7646,8 @@ fn aborted_barrier_crossing_refires_on_the_next_insert() {
         tc.arena.node(a).id,
         Tensor::from_slice(&[100i64, 101, 102]),
         HashMap::new(),
-    );
+    )
+    .expect("live test node");
     let done = tc.resume_insert();
     assert_eq!(
         done.result.expect("the resumed walk completes").prefix_len,
@@ -7293,12 +7673,13 @@ fn one_insert_walk_fires_two_crossings_around_a_backuped_middle() {
     let middle = tc
         .match_prefix(&match_params(&vec![1, 2, 3, 4, 5, 6, 7, 8]))
         .best_match_node_id;
-    let middle_idx = tc.arena.resolve(middle);
+    let middle_idx = tc.arena.resolve(middle).expect("live test node");
     tc.commit_backup(
         middle,
         Tensor::from_slice(&[104i64, 105, 106, 107]),
         HashMap::new(),
-    );
+    )
+    .expect("live test node");
     demote_node(&mut tc, middle_idx);
 
     // The device insert restores the middle and adds the unbacked deep leaf.
@@ -7326,7 +7707,11 @@ fn one_insert_walk_fires_two_crossings_around_a_backuped_middle() {
         })
         .collect();
     assert_eq!(backups, vec![vec![top], vec![deep]]);
-    assert!(tc.arena.node(tc.arena.resolve(middle)).backuped());
+    assert!(
+        tc.arena
+            .node(tc.arena.resolve(middle).expect("live test node"))
+            .backuped()
+    );
 }
 
 #[test]
@@ -7454,11 +7839,14 @@ fn reset_invalidates_every_prior_handle() {
         .best_match_node_id;
     tc.reset();
     // Handles are never re-minted, so pre-reset ones miss instead of aliasing.
-    assert!(tc.arena.try_resolve(old_root).is_none());
-    assert!(tc.arena.try_resolve(old_leaf).is_none());
+    assert!(tc.arena.resolve(old_root).is_err());
+    assert!(tc.arena.resolve(old_leaf).is_err());
     let new_root = tc.root_node_handle(/* extra_key = */ None);
     assert_ne!(new_root, old_root);
-    assert_eq!(tc.arena.resolve(new_root), tc.arena.root());
+    assert_eq!(
+        tc.arena.resolve(new_root).expect("live test node"),
+        tc.arena.root()
+    );
     tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
     assert_eq!(
         tc.match_prefix(&match_params(&vec![1, 2]))
@@ -7469,11 +7857,55 @@ fn reset_invalidates_every_prior_handle() {
 }
 
 #[test]
+fn inspection_rejects_stale_handles_without_panicking() {
+    let mut tc = core();
+    let stale_root = tc.root_node_handle(/* extra_key = */ None);
+    tc.reset();
+    let live_root = tc.root_node_handle(/* extra_key = */ None);
+    let expected = NodeAccessError {
+        node_id: stale_root,
+    };
+
+    assert_eq!(tc.inspect_get_parent_node_id(stale_root), Err(expected));
+    assert_eq!(tc.inspect_get_child_node_ids(stale_root), Err(expected));
+    assert_eq!(tc.inspect_get_node_key_length(stale_root), Err(expected));
+    assert_eq!(
+        tc.inspect_set_node_hash_values(stale_root, None),
+        Err(expected)
+    );
+    assert_eq!(
+        tc.inspect_build_backup_node_ids(stale_root, /* write_back = */ false),
+        Err(expected)
+    );
+    assert!(matches!(
+        tc.inspect_get_component_host_value(stale_root, SWA),
+        Err(error) if error == expected
+    ));
+    assert_eq!(tc.inspect_is_node_in_device_lru(stale_root, SWA), Ok(false));
+    assert_eq!(tc.inspect_is_node_in_host_lru(stale_root, SWA), Ok(false));
+    assert!(matches!(
+        tc.inspect_evict_component(stale_root, SWA, EvictLayer::Device),
+        Err(error) if error == expected
+    ));
+    assert!(matches!(
+        tc.inspect_validate_cascade_evict(stale_root, SWA, EvictLayer::Device),
+        Err(TreeCoreRuntimeError::NodeAccess(error)) if error == expected
+    ));
+
+    // Presence-style probes intentionally treat stale handles as absent.
+    assert!(!tc.inspect_contains_node(stale_root));
+    assert!(!tc.inspect_is_device_evictable_leaf(stale_root));
+    assert!(!tc.inspect_is_host_evictable_leaf(stale_root));
+
+    assert_eq!(tc.inspect_get_parent_node_id(live_root), Ok(None));
+}
+
+#[test]
 #[should_panic(expected = "is not enabled")]
 fn component_has_host_value_only_panics_on_a_disabled_component() {
     let tc = core();
     let root = tc.root_node_handle(/* extra_key = */ None);
-    tc.component_has_host_value_only(root, SWA);
+    let _ = tc.component_has_host_value_only(root, SWA);
 }
 
 #[test]
@@ -7559,20 +7991,21 @@ fn run_random_op_sequence(mut tc: UnifiedTreeCore<Vec<i64>>, page: usize, mamba:
             2 => {
                 // Balanced lock round trip on whatever the key matches.
                 let anchor = tc.match_prefix(&match_params(&key)).best_match_node_id;
-                let lock = tc.inc_lock_ref(anchor);
+                let lock = tc.inc_lock_ref(anchor).expect("live match anchor");
                 let params = DecLockRefParams {
                     swa_uuid_for_lock: lock.swa_uuid_for_lock,
                     swa_uuid_for_host_lock: lock.swa_uuid_for_host_lock,
                     skip_lock_node_ids: lock.skip_lock_node_ids,
                 };
-                tc.dec_lock_ref(anchor, Some(&params), /* skip_swa = */ false);
+                tc.dec_lock_ref(anchor, Some(&params), /* skip_swa = */ false)
+                    .expect("live match anchor");
             }
             _ => {
                 // Insert-while-locked churn, the cache_finished_req shape.
                 let matched = tc.match_prefix(&match_params(&key));
                 let anchor = matched.best_match_node_id;
                 let matched_len = matched.device_indices.numel() as usize;
-                let lock = tc.inc_lock_ref(anchor);
+                let lock = tc.inc_lock_ref(anchor).expect("live match anchor");
                 tc.insert(&sequence_insert_params(
                     &key,
                     matched_len,
@@ -7585,7 +8018,8 @@ fn run_random_op_sequence(mut tc: UnifiedTreeCore<Vec<i64>>, page: usize, mamba:
                     swa_uuid_for_host_lock: lock.swa_uuid_for_host_lock,
                     skip_lock_node_ids: lock.skip_lock_node_ids,
                 };
-                tc.dec_lock_ref(anchor, Some(&params), /* skip_swa = */ false);
+                tc.dec_lock_ref(anchor, Some(&params), /* skip_swa = */ false)
+                    .expect("live match anchor");
             }
         }
         if step % 8 == 7 {
@@ -7604,8 +8038,9 @@ fn run_random_op_sequence(mut tc: UnifiedTreeCore<Vec<i64>>, page: usize, mamba:
                         &mut host_frees,
                     );
                     let Some(leaf) = next else { break };
-                    let (_, evict_result) =
-                        tc.evict_device_leaf(leaf, /* is_write_back = */ false);
+                    let (_, evict_result) = tc
+                        .evict_device_leaf(leaf, /* is_write_back = */ false)
+                        .expect("live eviction candidate");
                     accumulate_step(
                         evict_result,
                         &mut tracker,
@@ -7664,7 +8099,9 @@ fn drain_full_device(tc: &mut UnifiedTreeCore<Vec<i64>>) {
         let (leaf, step) = tc.evict_device_next_node(FULL, &tracker);
         accumulate_step(step, &mut tracker, &mut df, &mut hf);
         let Some(leaf) = leaf else { break };
-        let (_, step) = tc.evict_device_leaf(leaf, /* is_write_back = */ false);
+        let (_, step) = tc
+            .evict_device_leaf(leaf, /* is_write_back = */ false)
+            .expect("live test node");
         accumulate_step(step, &mut tracker, &mut df, &mut hf);
     }
     tc.evict_device_end(FULL);
@@ -7686,7 +8123,7 @@ fn an_emptied_namespace_leaves_nothing_behind() {
     drain_full_device(&mut tc);
     // The namespace's nodes evict like any others; its edge map drops with them.
     assert!(!tc.arena.namespace_exists(Some("salted")));
-    assert!(tc.arena.try_resolve(top).is_none());
+    assert!(tc.arena.resolve(top).is_err());
     assert_eq!(tc.arena.len(), 1);
     tc.sanity_check(&[], &[]);
     // A later insert respins the namespace from scratch.
@@ -7729,11 +8166,12 @@ fn a_zero_length_match_anchors_at_the_root() {
         .best_match_node_id;
     assert_eq!(anchor, tc.root_node_handle(Some("salted")));
     // The root handle stays valid across a full namespace eviction.
-    tc.inc_lock_ref(anchor);
+    tc.inc_lock_ref(anchor).expect("live root");
     drain_full_device(&mut tc);
     tc.dec_lock_ref(
         anchor, /* params = */ None, /* skip_swa = */ false,
-    );
-    assert!(tc.arena.try_resolve(anchor).is_some());
+    )
+    .expect("live root");
+    assert!(tc.arena.resolve(anchor).is_ok());
     tc.sanity_check(&[], &[]);
 }

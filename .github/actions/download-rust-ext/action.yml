@@ -53,7 +53,7 @@ runs:
         path: |
           python/sglang/srt/rust_extensions/_*.so
           python/sglang/srt/mem_cache/rust_tree_core/mem_cache*.so
-        key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py', 'python/pyproject.toml', 'python/sglang/srt/rust_extensions/torch_build.py', '.github/workflows/_pr-test-rust-ext-build.yml', 'scripts/ci/utils/stage_rust_ext_modules.sh') }}
+        key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'proto/**', 'python/setup.py', 'python/pyproject.toml', 'python/sglang/srt/rust_extensions/torch_build.py', '.github/workflows/_pr-test-rust-ext-build.yml', 'scripts/ci/utils/stage_rust_ext_modules.sh') }}
 
     # Job-wide, but only setup.py reads it, and only while building.
     # Whether the modules suit this interpreter is not decided here:

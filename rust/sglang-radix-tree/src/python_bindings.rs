@@ -12,7 +12,7 @@ use tch::{Device, Kind, Tensor};
 
 use crate::components::{ComponentType, FULL, MAMBA, SWA};
 use crate::node::ChildKeyType;
-use crate::node::{KeyNamespaceRef, NodeId, TreeCoreRuntimeError};
+use crate::node::{KeyNamespaceRef, NodeAccessError, NodeId, TreeCoreRuntimeError};
 use crate::unified_tree_core::KvCacheEvent;
 use crate::unified_tree_core::{
     BufferBackupSnapshot, BufferBackupState, CacheAction, CacheInitParams, CacheTransferPhase,
@@ -65,17 +65,21 @@ fn parse_evict_layer(target: u8) -> PyResult<EvictLayer> {
     }
 }
 
+fn node_access_error(error: NodeAccessError) -> PyErr {
+    PyKeyError::new_err(error.node_id)
+}
+
 /// Convert an expected tree-core contract failure without unwinding through PyO3.
 fn tree_core_runtime_error(error: TreeCoreRuntimeError) -> PyErr {
     match error {
-        TreeCoreRuntimeError::NodeNotAllocated { node_id } => PyKeyError::new_err(node_id),
+        TreeCoreRuntimeError::NodeAccess(error) => node_access_error(error),
         error => PyRuntimeError::new_err(error.to_string()),
     }
 }
 
 fn tree_core_assertion_error(error: TreeCoreRuntimeError) -> PyErr {
     match error {
-        TreeCoreRuntimeError::NodeNotAllocated { node_id } => PyKeyError::new_err(node_id),
+        TreeCoreRuntimeError::NodeAccess(error) => node_access_error(error),
         error => PyAssertionError::new_err(error.to_string()),
     }
 }
@@ -1082,10 +1086,12 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             .into_iter()
             .map(parse_component_type)
             .collect::<PyResult<Vec<_>>>()?;
-        let result = py.allow_threads(|| {
-            self.core()
-                .inc_lock_ref_with_skip(node_id, &skip_lock_components)
-        });
+        let result = py
+            .allow_threads(|| {
+                self.core()
+                    .inc_lock_ref_with_skip(node_id, &skip_lock_components)
+            })
+            .map_err(node_access_error)?;
         Ok(IncLockRefResultBinding::from_result(result))
     }
 
@@ -1098,7 +1104,8 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         skip_swa: bool,
     ) -> PyResult<()> {
         let params = params.map(|p| p.to_dec_lock_ref_params()).transpose()?;
-        py.allow_threads(|| self.core().dec_lock_ref(node_id, params.as_ref(), skip_swa));
+        py.allow_threads(|| self.core().dec_lock_ref(node_id, params.as_ref(), skip_swa))
+            .map_err(node_access_error)?;
         Ok(())
     }
 
@@ -1116,18 +1123,20 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             .into_iter()
             .map(|(ct, node_ids)| Ok((parse_component_type(ct)?, node_ids)))
             .collect::<PyResult<HashMap<_, _>>>()?;
-        let (device_frees, host_frees) = py.allow_threads(|| {
-            let mut device_frees = HashMap::new();
-            let mut host_frees = HashMap::new();
-            self.core().dec_swa_lock_only_with_skip(
-                node_id,
-                swa_uuid_for_lock,
-                Some(&skip_lock_node_ids),
-                &mut device_frees,
-                &mut host_frees,
-            );
-            (device_frees, host_frees)
-        });
+        let (device_frees, host_frees) = py
+            .allow_threads(|| {
+                let mut device_frees = HashMap::new();
+                let mut host_frees = HashMap::new();
+                self.core().dec_swa_lock_only_with_skip(
+                    node_id,
+                    swa_uuid_for_lock,
+                    Some(&skip_lock_node_ids),
+                    &mut device_frees,
+                    &mut host_frees,
+                )?;
+                Ok((device_frees, host_frees))
+            })
+            .map_err(node_access_error)?;
         Ok((frees_to_py(py, device_frees)?, frees_to_py(py, host_frees)?))
     }
 
@@ -1157,7 +1166,8 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py.allow_threads(|| {
             self.core()
                 .set_component_device_value(node_id, component_type, value)
-        });
+        })
+        .map_err(node_access_error)?;
         Ok(())
     }
 
@@ -1169,11 +1179,13 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         component_type: u8,
     ) -> PyResult<Option<PyTensor>> {
         let component_type = parse_component_type(component_type)?;
-        let value = py.allow_threads(|| {
-            self.core()
-                .get_component_device_value(node_id, component_type)
-                .map(|tensor| tensor.shallow_clone())
-        });
+        let value = py
+            .allow_threads(|| {
+                self.core()
+                    .get_component_device_value(node_id, component_type)
+                    .map(|value| value.map(|tensor| tensor.shallow_clone()))
+            })
+            .map_err(node_access_error)?;
         Ok(value.map(PyTensor))
     }
 
@@ -1221,11 +1233,13 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py: Python<'_>,
         node_id: NodeId,
     ) -> PyResult<EvictDeviceLeafResultBinding> {
-        let (backup, result) = py.allow_threads(move || {
-            let mut core = self.core();
-            let is_write_back = core.is_write_back;
-            core.evict_device_leaf(node_id, is_write_back)
-        });
+        let (backup, result) = py
+            .allow_threads(move || {
+                let mut core = self.core();
+                let is_write_back = core.is_write_back;
+                core.evict_device_leaf(node_id, is_write_back)
+            })
+            .map_err(node_access_error)?;
         Ok(EvictDeviceLeafResultBinding {
             backup_kv: backup
                 .map(|backup| cache_action_to_py(py, CacheAction::BackupKV(backup)))
@@ -1264,11 +1278,14 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py: Python<'_>,
         from_node_id: NodeId,
         until_node_id: NodeId,
-    ) -> PyTensor {
-        PyTensor(py.allow_threads(|| {
-            self.core()
-                .collect_full_device_indices(from_node_id, until_node_id)
-        }))
+    ) -> PyResult<PyTensor> {
+        let value = py
+            .allow_threads(|| {
+                self.core()
+                    .collect_full_device_indices(from_node_id, until_node_id)
+            })
+            .map_err(node_access_error)?;
+        Ok(PyTensor(value))
     }
 
     /// Every FULL device value in the tree, concatenated.
@@ -1337,8 +1354,9 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     }
 
     /// Whether the node's FULL device value has been evicted.
-    fn is_full_device_evicted(&self, py: Python<'_>, node_id: NodeId) -> bool {
+    fn is_full_device_evicted(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
         py.allow_threads(|| self.core().is_full_device_evicted(node_id))
+            .map_err(node_access_error)
     }
 
     /// Mark the host tier (HiCache) as wired.
@@ -1382,7 +1400,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         }
         let result = py
             .allow_threads(move || {
-                self.core().try_insert_host_in_namespace(
+                self.core().insert_host_in_namespace(
                     node_id,
                     KeyNamespaceRef::new(extra_key.as_deref(), cache_salt.as_deref()),
                     key,
@@ -1400,8 +1418,9 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py: Python<'_>,
         node_id: NodeId,
     ) -> PyResult<(PyTensor, Py<PyDict>)> {
-        let (device_value, comp_xfers) =
-            py.allow_threads(|| self.core().build_backup_spec(node_id));
+        let (device_value, comp_xfers) = py
+            .allow_threads(|| self.core().build_backup_spec(node_id))
+            .map_err(node_access_error)?;
         Ok((PyTensor(device_value), comp_xfers_to_py(py, comp_xfers)?))
     }
 
@@ -1412,10 +1431,12 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         node_id: NodeId,
         pass_prefix_keys: bool,
     ) -> PyResult<Option<StorageBackupSpecBinding>> {
-        let spec = py.allow_threads(|| {
-            self.core()
-                .build_storage_backup_spec(node_id, pass_prefix_keys)
-        });
+        let spec = py
+            .allow_threads(|| {
+                self.core()
+                    .build_storage_backup_spec(node_id, pass_prefix_keys)
+            })
+            .map_err(node_access_error)?;
         let Some(spec) = spec else {
             return Ok(None);
         };
@@ -1450,7 +1471,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         let host_indices = host_indices.map(|t| t.0);
         let transfers = py
             .allow_threads(|| {
-                self.core().try_build_hicache_transfers(
+                self.core().build_hicache_transfers(
                     component_type,
                     node_id,
                     phase,
@@ -1477,37 +1498,37 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py: Python<'_>,
         node_id: NodeId,
     ) -> PyResult<(Option<String>, Option<String>)> {
-        py.allow_threads(|| self.core().try_prefetch_anchor_info(node_id))
-            .map_err(tree_core_runtime_error)
+        py.allow_threads(|| self.core().prefetch_anchor_info(node_id))
+            .map_err(node_access_error)
     }
 
     /// Whether the node's Full KV is present on host.
     fn node_backuped(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
-        py.allow_threads(|| self.core().try_node_backuped(node_id))
-            .map_err(tree_core_runtime_error)
+        py.allow_threads(|| self.core().node_backuped(node_id))
+            .map_err(node_access_error)
     }
 
     /// Whether the node is a (default or named) root.
     fn is_root(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
-        py.allow_threads(|| self.core().try_is_root(node_id))
-            .map_err(tree_core_runtime_error)
+        py.allow_threads(|| self.core().is_root(node_id))
+            .map_err(node_access_error)
     }
 
     /// The node's last page hash, or None when it was never hashed.
     fn get_last_hash_value(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Option<String>> {
-        py.allow_threads(|| self.core().try_get_last_hash_value(node_id))
-            .map_err(tree_core_runtime_error)
+        py.allow_threads(|| self.core().get_last_hash_value(node_id))
+            .map_err(node_access_error)
     }
 
     /// The hash chain of the node's ancestors, in root-to-parent order.
     fn get_prefix_hash_values(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Vec<String>> {
-        py.allow_threads(|| self.core().try_get_prefix_hash_values(node_id))
-            .map_err(tree_core_runtime_error)
+        py.allow_threads(|| self.core().get_prefix_hash_values(node_id))
+            .map_err(node_access_error)
     }
 
     fn get_hash_values(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Vec<String>> {
-        py.allow_threads(|| self.core().try_get_hash_values(node_id))
-            .map_err(tree_core_runtime_error)
+        py.allow_threads(|| self.core().get_hash_values(node_id))
+            .map_err(node_access_error)
     }
 
     fn snapshot_buffer_backup(
@@ -1546,8 +1567,8 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     }
 
     fn dfs_weight_order(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<Vec<usize>> {
-        py.allow_threads(|| self.core().try_dfs_weight_order(&node_ids))
-            .map_err(tree_core_runtime_error)
+        py.allow_threads(|| self.core().dfs_weight_order(&node_ids))
+            .map_err(node_access_error)
     }
 
     /// Commit each component's HiCache transfers; returns the new cache actions.
@@ -1582,22 +1603,24 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                 })
             })
             .transpose()?;
-        let (cache_actions, mamba_exist) = py.allow_threads(move || {
-            let mut cache_actions = Vec::new();
-            let mut insert_result = insert_result;
-            self.core().commit_hicache_transfers(
-                node_id,
-                phase,
-                comp_xfers,
-                &mut cache_actions,
-                insert_result.as_mut(),
-                pool_storage_result.as_ref(),
-            );
-            (
-                cache_actions,
-                insert_result.map(|result| result.mamba_exist),
-            )
-        });
+        let (cache_actions, mamba_exist) = py
+            .allow_threads(move || {
+                let mut cache_actions = Vec::new();
+                let mut insert_result = insert_result;
+                self.core().commit_hicache_transfers(
+                    node_id,
+                    phase,
+                    comp_xfers,
+                    &mut cache_actions,
+                    insert_result.as_mut(),
+                    pool_storage_result.as_ref(),
+                )?;
+                Ok((
+                    cache_actions,
+                    insert_result.map(|result| result.mamba_exist),
+                ))
+            })
+            .map_err(node_access_error)?;
         Ok((cache_actions_to_py(py, cache_actions)?, mamba_exist))
     }
 
@@ -1611,7 +1634,8 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     ) -> PyResult<()> {
         let comp_xfers = comp_xfers_from_args(comp_xfers)?;
         let host_indices = host_indices.0;
-        py.allow_threads(move || self.core().commit_backup(node_id, host_indices, comp_xfers));
+        py.allow_threads(move || self.core().commit_backup(node_id, host_indices, comp_xfers))
+            .map_err(node_access_error)?;
         Ok(())
     }
 
@@ -1626,7 +1650,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             mamba_pool_idx: mamba_pool_idx.map(|t| t.0),
         };
         let (kv_xfer, comp_xfers) = py
-            .allow_threads(move || self.core().try_build_load_back_spec(node_id, Some(&req)))
+            .allow_threads(move || self.core().build_load_back_spec(node_id, Some(&req)))
             .map_err(tree_core_assertion_error)?;
         Ok((
             transfer_to_py(py, kv_xfer)?,
@@ -1646,17 +1670,19 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         let kv_xfer = transfer_from_args(kv_xfer)?;
         let comp_xfers = comp_xfers_from_args(comp_xfers)?;
         let device_indices = device_indices.0;
-        let actions = py.allow_threads(move || {
-            self.core()
-                .commit_load_back(node_id, device_indices, kv_xfer, comp_xfers)
-        });
+        let actions = py
+            .allow_threads(move || {
+                self.core()
+                    .commit_load_back(node_id, device_indices, kv_xfer, comp_xfers)
+            })
+            .map_err(node_access_error)?;
         cache_actions_to_py(py, actions)
     }
 
     /// Release a node's device KV once its host copy exists.
     fn demote(&self, py: Python<'_>, node_id: NodeId) -> PyResult<DemoteResultBinding> {
         let result = py
-            .allow_threads(move || self.core().try_demote(node_id))
+            .allow_threads(move || self.core().demote(node_id))
             .map_err(tree_core_assertion_error)?;
         Ok(DemoteResultBinding {
             tracker: tracker_to_py(result.tracker),
@@ -1688,7 +1714,9 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py: Python<'_>,
         tail_node_id: NodeId,
     ) -> PyResult<HostEvictionResultBinding> {
-        let result = py.allow_threads(move || self.core().evict_excess_path_states(tail_node_id));
+        let result = py
+            .allow_threads(move || self.core().evict_excess_path_states(tail_node_id))
+            .map_err(node_access_error)?;
         Ok(HostEvictionResultBinding {
             tracker: tracker_to_py(result.tracker),
             new_device_frees: frees_to_py(py, result.device_frees)?,
@@ -1697,9 +1725,15 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     }
 
     /// Bump the reference count on a node's host-side component locks.
-    fn inc_host_lock_ref(&self, py: Python<'_>, node_id: NodeId) -> IncLockRefResultBinding {
-        let result = py.allow_threads(|| self.core().inc_host_lock_ref(node_id));
-        IncLockRefResultBinding {
+    fn inc_host_lock_ref(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+    ) -> PyResult<IncLockRefResultBinding> {
+        let result = py
+            .allow_threads(|| self.core().inc_host_lock_ref(node_id))
+            .map_err(node_access_error)?;
+        Ok(IncLockRefResultBinding {
             delta: result.delta,
             swa_uuid_for_lock: result.swa_uuid_for_lock,
             swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
@@ -1708,7 +1742,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                 .into_iter()
                 .map(|(ct, node_ids)| (component_type_to_u8(ct), node_ids))
                 .collect(),
-        }
+        })
     }
 
     /// Decrease the reference count on a node's host-side component locks.
@@ -1719,7 +1753,8 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         params: Option<&DecLockRefParamsBinding>,
     ) -> PyResult<()> {
         let params = params.map(|p| p.to_dec_lock_ref_params()).transpose()?;
-        py.allow_threads(|| self.core().dec_host_lock_ref(node_id, params.as_ref()));
+        py.allow_threads(|| self.core().dec_host_lock_ref(node_id, params.as_ref()))
+            .map_err(node_access_error)?;
         Ok(())
     }
 
@@ -1811,7 +1846,9 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py: Python<'_>,
         node_id: NodeId,
     ) -> PyResult<DropSubtreeResultBinding> {
-        let (dropped, result) = py.allow_threads(move || self.core().drop_subtree_no_host(node_id));
+        let (dropped, result) = py
+            .allow_threads(move || self.core().drop_subtree_no_host(node_id))
+            .map_err(node_access_error)?;
         Ok(DropSubtreeResultBinding {
             dropped,
             tracker: tracker_to_py(result.tracker),
@@ -1821,18 +1858,26 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     }
 
     /// Mark a node as having an in-flight write-through backup.
-    fn mark_write_through_pending(&self, py: Python<'_>, node_id: NodeId) {
-        py.allow_threads(|| self.core().mark_write_through_pending(node_id));
+    fn mark_write_through_pending(&self, py: Python<'_>, node_id: NodeId) -> PyResult<()> {
+        py.allow_threads(|| self.core().mark_write_through_pending(node_id))
+            .map_err(node_access_error)
     }
 
     /// Clear the write-through-pending mark on the acked nodes.
-    fn finish_write_through(&self, py: Python<'_>, node_ids: Vec<NodeId>, ack_id: NodeId) {
-        py.allow_threads(|| self.core().finish_write_through(node_ids, ack_id));
+    fn finish_write_through(
+        &self,
+        py: Python<'_>,
+        node_ids: Vec<NodeId>,
+        ack_id: NodeId,
+    ) -> PyResult<()> {
+        py.allow_threads(move || self.core().finish_write_through(node_ids, ack_id))
+            .map_err(node_access_error)
     }
 
     /// Clear the in-flight H->D marks on the anchor's root path at ack time.
-    fn finish_load_back(&self, py: Python<'_>, anchor_node_id: NodeId) {
-        py.allow_threads(|| self.core().finish_load_back(anchor_node_id));
+    fn finish_load_back(&self, py: Python<'_>, anchor_node_id: NodeId) -> PyResult<()> {
+        py.allow_threads(|| self.core().finish_load_back(anchor_node_id))
+            .map_err(node_access_error)
     }
 
     /// Order-sensitive digest of reclaimed coexisting host values.
@@ -1848,7 +1893,8 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         component_type: u8,
     ) -> PyResult<bool> {
         let ct = parse_component_type(component_type)?;
-        Ok(py.allow_threads(|| self.core().component_has_host_value_only(node_id, ct)))
+        py.allow_threads(|| self.core().component_has_host_value_only(node_id, ct))
+            .map_err(node_access_error)
     }
 }
 
@@ -1858,24 +1904,33 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py.allow_threads(|| self.core().inspect_contains_node(node_id))
     }
 
-    fn inspect_get_parent_node_id(&self, py: Python<'_>, node_id: NodeId) -> Option<NodeId> {
+    fn inspect_get_parent_node_id(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+    ) -> PyResult<Option<NodeId>> {
         py.allow_threads(|| self.core().inspect_get_parent_node_id(node_id))
+            .map_err(node_access_error)
     }
 
-    fn inspect_get_child_node_ids(&self, py: Python<'_>, node_id: NodeId) -> Vec<NodeId> {
+    fn inspect_get_child_node_ids(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Vec<NodeId>> {
         py.allow_threads(|| self.core().inspect_get_child_node_ids(node_id))
+            .map_err(node_access_error)
     }
 
-    fn inspect_get_node_key_length(&self, py: Python<'_>, node_id: NodeId) -> usize {
+    fn inspect_get_node_key_length(&self, py: Python<'_>, node_id: NodeId) -> PyResult<usize> {
         py.allow_threads(|| self.core().inspect_get_node_key_length(node_id))
+            .map_err(node_access_error)
     }
 
-    fn inspect_get_node_token_ids(&self, py: Python<'_>, node_id: NodeId) -> Vec<i64> {
+    fn inspect_get_node_token_ids(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Vec<i64>> {
         py.allow_threads(|| self.core().inspect_get_node_token_ids(node_id))
+            .map_err(node_access_error)
     }
 
-    fn inspect_is_node_key_bigram(&self, py: Python<'_>, node_id: NodeId) -> bool {
+    fn inspect_is_node_key_bigram(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
         py.allow_threads(|| self.core().inspect_is_node_key_bigram(node_id))
+            .map_err(node_access_error)
     }
 
     fn inspect_get_component_host_value(
@@ -1885,12 +1940,12 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         component_type: u8,
     ) -> PyResult<Option<PyTensor>> {
         let component_type = parse_component_type(component_type)?;
-        Ok(py
-            .allow_threads(|| {
-                self.core()
-                    .inspect_get_component_host_value(node_id, component_type)
-            })
-            .map(PyTensor))
+        py.allow_threads(|| {
+            self.core()
+                .inspect_get_component_host_value(node_id, component_type)
+        })
+        .map(|value| value.map(PyTensor))
+        .map_err(node_access_error)
     }
 
     fn inspect_get_component_device_lock_ref(
@@ -1900,22 +1955,25 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         component_type: u8,
     ) -> PyResult<u32> {
         let component_type = parse_component_type(component_type)?;
-        Ok(py.allow_threads(|| {
+        py.allow_threads(|| {
             self.core()
                 .inspect_get_component_device_lock_ref(node_id, component_type)
-        }))
+        })
+        .map_err(node_access_error)
     }
 
-    fn inspect_get_node_hit_count(&self, py: Python<'_>, node_id: NodeId) -> i64 {
+    fn inspect_get_node_hit_count(&self, py: Python<'_>, node_id: NodeId) -> PyResult<i64> {
         py.allow_threads(|| self.core().inspect_get_node_hit_count(node_id))
+            .map_err(node_access_error)
     }
 
     fn inspect_get_write_through_pending_id(
         &self,
         py: Python<'_>,
         node_id: NodeId,
-    ) -> Option<usize> {
+    ) -> PyResult<Option<usize>> {
         py.allow_threads(|| self.core().inspect_get_write_through_pending_id(node_id))
+            .map_err(node_access_error)
     }
 
     fn inspect_is_node_in_device_lru(
@@ -1925,10 +1983,11 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         component_type: u8,
     ) -> PyResult<bool> {
         let component_type = parse_component_type(component_type)?;
-        Ok(py.allow_threads(|| {
+        py.allow_threads(|| {
             self.core()
                 .inspect_is_node_in_device_lru(node_id, component_type)
-        }))
+        })
+        .map_err(node_access_error)
     }
 
     fn inspect_is_node_in_host_lru(
@@ -1938,10 +1997,11 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         component_type: u8,
     ) -> PyResult<bool> {
         let component_type = parse_component_type(component_type)?;
-        Ok(py.allow_threads(|| {
+        py.allow_threads(|| {
             self.core()
                 .inspect_is_node_in_host_lru(node_id, component_type)
-        }))
+        })
+        .map_err(node_access_error)
     }
 
     fn inspect_get_component_device_lru_node_ids(
@@ -1964,8 +2024,9 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py.allow_threads(|| self.core().inspect_is_host_evictable_leaf(node_id))
     }
 
-    fn inspect_is_device_leaf(&self, py: Python<'_>, node_id: NodeId) -> bool {
+    fn inspect_is_device_leaf(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
         py.allow_threads(|| self.core().inspect_is_device_leaf(node_id))
+            .map_err(node_access_error)
     }
 
     fn inspect_get_all_node_ids(&self, py: Python<'_>) -> Vec<NodeId> {
@@ -1986,11 +2047,12 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py: Python<'_>,
         node_id: NodeId,
         hash_values: Option<Vec<String>>,
-    ) {
+    ) -> PyResult<()> {
         py.allow_threads(move || {
             self.core()
                 .inspect_set_node_hash_values(node_id, hash_values)
-        });
+        })
+        .map_err(node_access_error)
     }
 
     fn inspect_set_component_device_value_raw(
@@ -2005,8 +2067,8 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py.allow_threads(move || {
             self.core()
                 .inspect_set_component_device_value_raw(node_id, component_type, value)
-        });
-        Ok(())
+        })
+        .map_err(node_access_error)
     }
 
     fn inspect_set_component_host_value_raw(
@@ -2021,8 +2083,8 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py.allow_threads(move || {
             self.core()
                 .inspect_set_component_host_value_raw(node_id, component_type, value)
-        });
-        Ok(())
+        })
+        .map_err(node_access_error)
     }
 
     fn inspect_set_component_device_lock_ref(
@@ -2036,8 +2098,8 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py.allow_threads(|| {
             self.core()
                 .inspect_set_component_device_lock_ref(node_id, component_type, lock_ref)
-        });
-        Ok(())
+        })
+        .map_err(node_access_error)
     }
 
     fn inspect_remove_node_from_device_lru(
@@ -2050,8 +2112,8 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py.allow_threads(|| {
             self.core()
                 .inspect_remove_node_from_device_lru(node_id, component_type)
-        });
-        Ok(())
+        })
+        .map_err(node_access_error)
     }
 
     fn inspect_insert_node_into_host_lru(
@@ -2064,8 +2126,8 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py.allow_threads(|| {
             self.core()
                 .inspect_insert_node_into_host_lru(node_id, component_type)
-        });
-        Ok(())
+        })
+        .map_err(node_access_error)
     }
 
     fn inspect_set_component_evictable_size(
@@ -2096,8 +2158,9 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         Ok(())
     }
 
-    fn inspect_update_duplicate_tracking(&self, py: Python<'_>, node_id: NodeId) {
-        py.allow_threads(|| self.core().inspect_update_duplicate_tracking(node_id));
+    fn inspect_update_duplicate_tracking(&self, py: Python<'_>, node_id: NodeId) -> PyResult<()> {
+        py.allow_threads(|| self.core().inspect_update_duplicate_tracking(node_id))
+            .map_err(node_access_error)
     }
 
     fn inspect_advance_insert_walk_once(&self, py: Python<'_>) -> PyResult<()> {
@@ -2114,10 +2177,12 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     ) -> PyResult<HostEvictionResultBinding> {
         let component_type = parse_component_type(component_type)?;
         let target = parse_evict_layer(target)?;
-        let result = py.allow_threads(|| {
-            self.core()
-                .inspect_evict_component(node_id, component_type, target)
-        });
+        let result = py
+            .allow_threads(|| {
+                self.core()
+                    .inspect_evict_component(node_id, component_type, target)
+            })
+            .map_err(node_access_error)?;
         HostEvictionResultBinding::from_eviction_step(py, result)
     }
 
@@ -2134,7 +2199,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             self.core()
                 .inspect_validate_cascade_evict(node_id, component_type, target)
         })
-        .map_err(PyAssertionError::new_err)
+        .map_err(tree_core_assertion_error)
     }
 
     fn inspect_cleanup_tombstone_ancestors(
@@ -2142,7 +2207,9 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py: Python<'_>,
         node_id: NodeId,
     ) -> PyResult<HostEvictionResultBinding> {
-        let result = py.allow_threads(|| self.core().inspect_cleanup_tombstone_ancestors(node_id));
+        let result = py
+            .allow_threads(|| self.core().inspect_cleanup_tombstone_ancestors(node_id))
+            .map_err(node_access_error)?;
         HostEvictionResultBinding::from_eviction_step(py, result)
     }
 
@@ -2200,6 +2267,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                 best_value_len,
             )
         });
+        let result = result.map_err(node_access_error)?;
         MatchResultBinding::from_match_result(py, result)
     }
 
@@ -2208,11 +2276,12 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py: Python<'_>,
         node_id: NodeId,
         write_back: bool,
-    ) -> Vec<NodeId> {
+    ) -> PyResult<Vec<NodeId>> {
         py.allow_threads(|| {
             self.core()
                 .inspect_build_backup_node_ids(node_id, write_back)
         })
+        .map_err(node_access_error)
     }
 }
 
@@ -2417,7 +2486,7 @@ macro_rules! tree_core_binding {
                 py: Python<'_>,
                 from_node_id: NodeId,
                 until_node_id: NodeId,
-            ) -> PyTensor {
+            ) -> PyResult<PyTensor> {
                 self.inner
                     .collect_full_device_indices(py, from_node_id, until_node_id)
             }
@@ -2479,7 +2548,7 @@ macro_rules! tree_core_binding {
             }
 
             /// Whether the node's FULL device value has been evicted.
-            fn is_full_device_evicted(&self, py: Python<'_>, node_id: NodeId) -> bool {
+            fn is_full_device_evicted(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
                 self.inner.is_full_device_evicted(py, node_id)
             }
 
@@ -2734,7 +2803,11 @@ macro_rules! tree_core_binding {
             }
 
             /// Bump the reference count on a node's host-side component locks.
-            fn inc_host_lock_ref(&self, py: Python<'_>, node_id: NodeId) -> IncLockRefResultBinding {
+            fn inc_host_lock_ref(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<IncLockRefResultBinding> {
                 self.inner.inc_host_lock_ref(py, node_id)
             }
 
@@ -2800,17 +2873,22 @@ macro_rules! tree_core_binding {
             }
 
             /// Mark a node as having an in-flight write-through backup.
-            fn mark_write_through_pending(&self, py: Python<'_>, node_id: NodeId) {
+            fn mark_write_through_pending(&self, py: Python<'_>, node_id: NodeId) -> PyResult<()> {
                 self.inner.mark_write_through_pending(py, node_id)
             }
 
             /// Clear the write-through-pending mark on the acked nodes.
-            fn finish_write_through(&self, py: Python<'_>, node_ids: Vec<NodeId>, ack_id: NodeId) {
+            fn finish_write_through(
+                &self,
+                py: Python<'_>,
+                node_ids: Vec<NodeId>,
+                ack_id: NodeId,
+            ) -> PyResult<()> {
                 self.inner.finish_write_through(py, node_ids, ack_id)
             }
 
             /// Clear the in-flight H->D marks on the anchor's root path at ack time.
-            fn finish_load_back(&self, py: Python<'_>, anchor_node_id: NodeId) {
+            fn finish_load_back(&self, py: Python<'_>, anchor_node_id: NodeId) -> PyResult<()> {
                 self.inner.finish_load_back(py, anchor_node_id)
             }
 
@@ -2843,7 +2921,7 @@ macro_rules! tree_core_binding {
                 &self,
                 py: Python<'_>,
                 node_id: NodeId,
-            ) -> Option<NodeId> {
+            ) -> PyResult<Option<NodeId>> {
                 self.inner.inspect_get_parent_node_id(py, node_id)
             }
 
@@ -2852,22 +2930,34 @@ macro_rules! tree_core_binding {
                 &self,
                 py: Python<'_>,
                 node_id: NodeId,
-            ) -> Vec<NodeId> {
+            ) -> PyResult<Vec<NodeId>> {
                 self.inner.inspect_get_child_node_ids(py, node_id)
             }
 
             #[cfg(feature = "inspection")]
-            fn inspect_get_node_key_length(&self, py: Python<'_>, node_id: NodeId) -> usize {
+            fn inspect_get_node_key_length(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<usize> {
                 self.inner.inspect_get_node_key_length(py, node_id)
             }
 
             #[cfg(feature = "inspection")]
-            fn inspect_get_node_token_ids(&self, py: Python<'_>, node_id: NodeId) -> Vec<i64> {
+            fn inspect_get_node_token_ids(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<Vec<i64>> {
                 self.inner.inspect_get_node_token_ids(py, node_id)
             }
 
             #[cfg(feature = "inspection")]
-            fn inspect_is_node_key_bigram(&self, py: Python<'_>, node_id: NodeId) -> bool {
+            fn inspect_is_node_key_bigram(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<bool> {
                 self.inner.inspect_is_node_key_bigram(py, node_id)
             }
 
@@ -2894,7 +2984,11 @@ macro_rules! tree_core_binding {
             }
 
             #[cfg(feature = "inspection")]
-            fn inspect_get_node_hit_count(&self, py: Python<'_>, node_id: NodeId) -> i64 {
+            fn inspect_get_node_hit_count(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<i64> {
                 self.inner.inspect_get_node_hit_count(py, node_id)
             }
 
@@ -2903,7 +2997,7 @@ macro_rules! tree_core_binding {
                 &self,
                 py: Python<'_>,
                 node_id: NodeId,
-            ) -> Option<usize> {
+            ) -> PyResult<Option<usize>> {
                 self.inner
                     .inspect_get_write_through_pending_id(py, node_id)
             }
@@ -2959,7 +3053,11 @@ macro_rules! tree_core_binding {
             }
 
             #[cfg(feature = "inspection")]
-            fn inspect_is_device_leaf(&self, py: Python<'_>, node_id: NodeId) -> bool {
+            fn inspect_is_device_leaf(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<bool> {
                 self.inner.inspect_is_device_leaf(py, node_id)
             }
 
@@ -2985,7 +3083,7 @@ macro_rules! tree_core_binding {
                 py: Python<'_>,
                 node_id: NodeId,
                 hash_values: Option<Vec<String>>,
-            ) {
+            ) -> PyResult<()> {
                 self.inner
                     .inspect_set_node_hash_values(py, node_id, hash_values)
             }
@@ -3085,7 +3183,11 @@ macro_rules! tree_core_binding {
             }
 
             #[cfg(feature = "inspection")]
-            fn inspect_update_duplicate_tracking(&self, py: Python<'_>, node_id: NodeId) {
+            fn inspect_update_duplicate_tracking(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<()> {
                 self.inner.inspect_update_duplicate_tracking(py, node_id)
             }
 
@@ -3161,7 +3263,7 @@ macro_rules! tree_core_binding {
                 py: Python<'_>,
                 node_id: NodeId,
                 write_back: bool,
-            ) -> Vec<NodeId> {
+            ) -> PyResult<Vec<NodeId>> {
                 self.inner
                     .inspect_build_backup_node_ids(py, node_id, write_back)
             }

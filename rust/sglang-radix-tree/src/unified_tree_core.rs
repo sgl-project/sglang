@@ -16,7 +16,9 @@ use crate::node::EvictableNodeSet;
 use crate::node::Node;
 use crate::node::NodeArena;
 use crate::node::{ChildKeyType, HashDigest, KeyNamespace, KeyNamespaceRef};
-use crate::node::{NUM_VALUE_SLOTS, NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
+use crate::node::{
+    NUM_VALUE_SLOTS, NodeAccessError, NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx,
+};
 use crate::unified_lru_list::UnifiedLRUList;
 use crate::unified_lru_list::{EvictionStrategy, PriorityKey, get_eviction_strategy};
 
@@ -791,7 +793,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// Bump the reference count on a node's component locks.
-    pub fn inc_lock_ref(&mut self, node_id: NodeId) -> IncLockRefResult {
+    pub fn inc_lock_ref(&mut self, node_id: NodeId) -> Result<IncLockRefResult, NodeAccessError> {
         self.inc_lock_ref_with_skip(node_id, &[])
     }
 
@@ -800,8 +802,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &mut self,
         node_id: NodeId,
         skip_lock_components: &[ComponentType],
-    ) -> IncLockRefResult {
-        let node_id = self.arena.resolve(node_id);
+    ) -> Result<IncLockRefResult, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         let node = self.arena.node(node_id);
         let node_handle = node.id;
         let is_root = node.is_root();
@@ -823,7 +825,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 .acquire_component_lock(self, node_id, result, /* lock_host = */ false);
         }
         self.update_evictable_leaf_sets_(node_id);
-        result
+        Ok(result)
     }
 
     /// Decrease the reference count on a node's component locks.
@@ -832,8 +834,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         node_id: NodeId,
         params: Option<&DecLockRefParams>,
         skip_swa: bool,
-    ) -> DecLockRefResult {
-        let node_id = self.arena.resolve(node_id);
+    ) -> Result<DecLockRefResult, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         for i in 0..self.components.len() {
             if skip_swa && self.components[i].component_type() == SWA {
                 continue;
@@ -843,7 +845,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
         self.update_evictable_leaf_sets_(node_id);
         // TODO: delta is not aggregated from components; no caller uses it yet.
-        DecLockRefResult::default()
+        Ok(DecLockRefResult::default())
     }
 
     /// Early-release the SWA portion of a request's tree lock, plus any
@@ -854,14 +856,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         swa_uuid_for_lock: Option<i64>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-    ) {
+    ) -> Result<(), NodeAccessError> {
         self.dec_swa_lock_only_with_skip(
             node_id,
             swa_uuid_for_lock,
             /* skip_lock_node_ids = */ None,
             device_frees,
             host_frees,
-        );
+        )
     }
 
     /// Skip-aware variant used when an acquire deliberately omitted a component.
@@ -872,10 +874,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         skip_lock_node_ids: Option<&HashMap<ComponentType, HashSet<NodeId>>>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-    ) {
-        let node_id = self.arena.resolve(node_id);
+    ) -> Result<(), NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         let Some(swa) = self.try_component_by_type_(SWA) else {
-            return;
+            return Ok(());
         };
         swa.release_window_lock(self, node_id, swa_uuid_for_lock, device_frees, host_frees);
 
@@ -897,12 +899,16 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 );
             }
         }
+        Ok(())
     }
 
     /// Evict shallow Mamba device checkpoints beyond the per-path cap on the
     /// tail's root path; the mamba component drives the walk.
-    pub fn evict_excess_path_states(&mut self, tail_node_id: NodeId) -> EvictionStepResult {
-        let tail_node_id = self.arena.resolve(tail_node_id);
+    pub fn evict_excess_path_states(
+        &mut self,
+        tail_node_id: NodeId,
+    ) -> Result<EvictionStepResult, NodeAccessError> {
+        let tail_node_id = self.arena.resolve(tail_node_id)?;
         let mut result = EvictionStepResult::default();
         let component = self.component_by_type_(MAMBA);
         component.evict_excess_path_states(
@@ -911,12 +917,15 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             &mut result.device_frees,
             &mut result.host_frees,
         );
-        result
+        Ok(result)
     }
 
     /// Bump the reference count on a node's host-side component locks.
-    pub fn inc_host_lock_ref(&mut self, node_id: NodeId) -> IncLockRefResult {
-        let node_id = self.arena.resolve(node_id);
+    pub fn inc_host_lock_ref(
+        &mut self,
+        node_id: NodeId,
+    ) -> Result<IncLockRefResult, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         let mut result = IncLockRefResult::default();
         for i in 0..self.components.len() {
             let component = Arc::clone(&self.components[i]);
@@ -924,7 +933,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 .acquire_component_lock(self, node_id, result, /* lock_host = */ true);
         }
         self.update_evictable_leaf_sets_(node_id);
-        result
+        Ok(result)
     }
 
     /// Decrease the reference count on a node's host-side component locks.
@@ -932,14 +941,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &mut self,
         node_id: NodeId,
         params: Option<&DecLockRefParams>,
-    ) -> DecLockRefResult {
-        let node_id = self.arena.resolve(node_id);
+    ) -> Result<DecLockRefResult, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         for i in 0..self.components.len() {
             let component = Arc::clone(&self.components[i]);
             component.release_component_lock(self, node_id, params, /* lock_host = */ true);
         }
         self.update_evictable_leaf_sets_(node_id);
-        DecLockRefResult::default()
+        Ok(DecLockRefResult::default())
     }
 
     /// Match a key against the tree; returns device indices + boundary NodeIds.
@@ -1189,6 +1198,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             result = component.finalize_match_result_in_tree_core(
                 self,
                 result,
+                best_match_device_node_id,
+                best_match_node_id,
                 params,
                 &value,
                 best_match_device_value_len,
@@ -1216,9 +1227,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// Whether the node's FULL device value has been evicted.
-    pub fn is_full_device_evicted(&self, node_id: NodeId) -> bool {
-        let node_id = self.arena.resolve(node_id);
-        self.arena.node(node_id).evicted()
+    pub fn is_full_device_evicted(&self, node_id: NodeId) -> Result<bool, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        Ok(self.arena.node(node_id).evicted())
     }
 
     /// Concatenate FULL device values from ``from_node`` up to (exclusive)
@@ -1227,9 +1238,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &self,
         from_node_id: NodeId,
         until_node_id: NodeId,
-    ) -> Tensor {
-        let from_node_id = self.arena.resolve(from_node_id);
-        let until_node_id = self.arena.resolve(until_node_id);
+    ) -> Result<Tensor, NodeAccessError> {
+        let from_node_id = self.arena.resolve(from_node_id)?;
+        let until_node_id = self.arena.resolve(until_node_id)?;
         let mut prefix_chunks: Vec<Tensor> = Vec::new();
         let mut node_id = from_node_id;
         while node_id != until_node_id {
@@ -1238,10 +1249,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             node_id = node.parent();
         }
         if prefix_chunks.is_empty() {
-            return self.empty_device_indices.shallow_clone();
+            return Ok(self.empty_device_indices.shallow_clone());
         }
         prefix_chunks.reverse();
-        Tensor::cat(&prefix_chunks, 0)
+        Ok(Tensor::cat(&prefix_chunks, 0))
     }
 
     /// Refresh a node's access tick and component LRU positions.
@@ -2030,8 +2041,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &mut self,
         node_id: NodeId,
         is_write_back: bool,
-    ) -> (Option<BackupKV>, EvictionStepResult) {
-        let node_id = self.arena.resolve(node_id);
+    ) -> Result<(Option<BackupKV>, EvictionStepResult), NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         let mut result = EvictionStepResult::default();
         {
             let node = self.arena.node(node_id);
@@ -2047,12 +2058,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 &mut result.device_frees,
                 &mut result.host_frees,
             );
-            return (None, result);
+            return Ok((None, result));
         }
         if is_write_back {
             let backup = self
                 .build_backup_kv_action_(self.arena.node(node_id), /* write_back = */ true);
-            return (Some(backup), result);
+            return Ok((Some(backup), result));
         }
 
         // Write-through: node has no backup, delete entirely.
@@ -2062,15 +2073,18 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             &mut result.device_frees,
             &mut result.host_frees,
         );
-        (None, result)
+        Ok((None, result))
     }
 
     /// Write-back fallback when a D-leaf's D->H backup fails under host
     /// memory pressure: drop the subtree rooted at the unbacked leaf so
     /// device eviction keeps making progress instead of leaving its KV
     /// unevictable until host space frees up.
-    pub fn drop_subtree_no_host(&mut self, node_id: NodeId) -> (bool, EvictionStepResult) {
-        let node_id = self.arena.resolve(node_id);
+    pub fn drop_subtree_no_host(
+        &mut self,
+        node_id: NodeId,
+    ) -> Result<(bool, EvictionStepResult), NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         let mut result = EvictionStepResult::default();
         {
             let node = self.arena.node(node_id);
@@ -2082,7 +2096,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             // no host state and no in-flight DMA reading its device slots.
             assert!(!node.backuped() && node.write_through_pending_id.is_none());
             if node.is_host_locked() {
-                return (false, result);
+                return Ok((false, result));
             }
         }
         let mut descendants: Vec<NodeIdx_> = Vec::new();
@@ -2096,7 +2110,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         while let Some(cur_id) = stack.pop() {
             let cur = self.arena.node(cur_id);
             if cur.is_device_locked() || cur.is_host_locked() {
-                return (false, result);
+                return Ok((false, result));
             }
             descendants.push(cur_id);
             stack.extend(cur.children.values().copied());
@@ -2127,7 +2141,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             &mut result.device_frees,
             &mut result.host_frees,
         );
-        (true, result)
+        Ok((true, result))
     }
 
     /// Free every component layer on the node and detach it from the LRU
@@ -2289,28 +2303,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     /// Release a node's device KV once its host copy exists; the node stays in the
     /// tree, now host-only.
-    pub fn demote(&mut self, node_id: NodeId) -> EvictionStepResult {
-        let node_id = self.arena.resolve(node_id);
-        let mut result = EvictionStepResult::default();
-        // Skip a deferred demote when a load-back now pins the device indices.
-        if self.arena.node(node_id).is_load_back_pending() {
-            return result;
-        }
-        self.demote_(
-            node_id,
-            &mut result.tracker,
-            &mut result.device_frees,
-            &mut result.host_frees,
-        );
-        result
-    }
-
-    /// Fallible variant of [`Self::demote`].
-    pub fn try_demote(
-        &mut self,
-        node_id: NodeId,
-    ) -> Result<EvictionStepResult, TreeCoreRuntimeError> {
-        let node_id = self.try_resolve_node_handle_(node_id)?;
+    pub fn demote(&mut self, node_id: NodeId) -> Result<EvictionStepResult, TreeCoreRuntimeError> {
+        let node_id = self.arena.resolve(node_id)?;
         let mut result = EvictionStepResult::default();
         // Skip a deferred demote when a load-back now pins the device indices.
         if self.arena.node(node_id).is_load_back_pending() {
@@ -2898,7 +2892,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         key: K,
         host_value: Tensor,
         hash_value: Vec<String>,
-    ) -> InsertResult {
+    ) -> Result<InsertResult, TreeCoreRuntimeError> {
         self.insert_host_in_namespace(
             node_id,
             KeyNamespaceRef::new(extra_key, /* cache_salt = */ None),
@@ -2915,21 +2909,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         key: K,
         host_value: Tensor,
         hash_value: Vec<String>,
-    ) -> InsertResult {
-        self.try_insert_host_in_namespace(node_id, namespace, key, host_value, hash_value)
-            .unwrap_or_else(|error| panic!("{error}"))
-    }
-
-    pub fn try_insert_host_in_namespace(
-        &mut self,
-        node_id: NodeId,
-        namespace: KeyNamespaceRef<'_>,
-        key: K,
-        host_value: Tensor,
-        hash_value: Vec<String>,
     ) -> Result<InsertResult, TreeCoreRuntimeError> {
         let total_len = key.atom_len();
-        let mut node_id = self.arena.resolve(node_id);
+        let mut node_id = self.arena.resolve(node_id)?;
         let anchor = self.arena.node(node_id);
         if !anchor.is_root() && anchor.namespace.as_ref() != namespace {
             return Err(TreeCoreRuntimeError::InsertHostNamespaceMismatch { node_id: anchor.id });
@@ -3047,8 +3029,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     pub fn build_backup_spec(
         &self,
         node_id: NodeId,
-    ) -> (Tensor, HashMap<ComponentType, Vec<PoolTransfer>>) {
-        self.build_backup_spec_(self.arena.node(self.arena.resolve(node_id)))
+    ) -> Result<(Tensor, HashMap<ComponentType, Vec<PoolTransfer>>), NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        Ok(self.build_backup_spec_(self.arena.node(node_id)))
     }
 
     /// Gather device value backup spec.
@@ -3096,11 +3079,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &self,
         node_id: NodeId,
         pass_prefix_keys: bool,
-    ) -> Option<StorageBackupSpec> {
-        let node_id = self.arena.resolve(node_id);
+    ) -> Result<Option<StorageBackupSpec>, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         let node = self.arena.node(node_id);
         if !node.backuped() {
-            return None;
+            return Ok(None);
         }
         let prefix_keys = pass_prefix_keys.then(|| self.arena.prefix_hash_values(node.parent));
         let mut comp_xfers: HashMap<ComponentType, Vec<PoolTransfer>> = HashMap::new();
@@ -3127,13 +3110,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 comp_xfers.insert(component_type, transfers);
             }
         }
-        Some(StorageBackupSpec {
+        Ok(Some(StorageBackupSpec {
             host_value: node.host_value(FULL).shallow_clone(),
             token_ids: K::raw_token_ids(node.key.as_ref()).into_owned(),
             hash_value: node.hash_value.clone(),
             prefix_keys,
             comp_xfers,
-        })
+        }))
     }
 
     /// Route a build_hicache_transfers call to the component for the given type.
@@ -3146,30 +3129,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         token_ids: Option<&[i64]>,
         prefetch_tokens: usize,
         last_hash: Option<&str>,
-    ) -> Option<Vec<PoolTransfer>> {
-        self.try_build_hicache_transfers(
-            component_type,
-            node_id,
-            phase,
-            host_indices,
-            token_ids,
-            prefetch_tokens,
-            last_hash,
-        )
-        .unwrap()
-    }
-
-    pub fn try_build_hicache_transfers(
-        &self,
-        component_type: ComponentType,
-        node_id: NodeId,
-        phase: CacheTransferPhase,
-        host_indices: Option<Tensor>,
-        token_ids: Option<&[i64]>,
-        prefetch_tokens: usize,
-        last_hash: Option<&str>,
     ) -> Result<Option<Vec<PoolTransfer>>, TreeCoreRuntimeError> {
-        let node_id = self.try_resolve_node_handle_(node_id)?;
+        let node_id = self.arena.resolve(node_id)?;
         self.component_by_type_(component_type)
             .build_hicache_transfers(
                 self,
@@ -3188,18 +3149,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &self,
         node_id: NodeId,
         req: Option<&Req>,
-    ) -> (PoolTransfer, HashMap<ComponentType, Vec<PoolTransfer>>) {
-        self.try_build_load_back_spec(node_id, req).unwrap()
-    }
-
-    pub fn try_build_load_back_spec(
-        &self,
-        node_id: NodeId,
-        req: Option<&Req>,
     ) -> Result<(PoolTransfer, HashMap<ComponentType, Vec<PoolTransfer>>), TreeCoreRuntimeError>
     {
         let anchor_id = node_id;
-        let node_id = self.try_resolve_node_handle_(node_id)?;
+        let node_id = self.arena.resolve(node_id)?;
         // Component hooks take primitives, not Req: extract its fields here.
         let mamba_pool_idx = req.and_then(|r| r.mamba_pool_idx.as_ref());
         let mut kv_transfers = self
@@ -3239,23 +3192,21 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             }
         }
         // Reject transfers that would claim a node pinned by another load-back anchor.
-        let any_foreign_pin = kv_xfer
-            .nodes_to_load
-            .iter()
-            .chain(
-                comp_xfers
-                    .values()
-                    .flatten()
-                    .filter_map(|xfer| xfer.nodes_to_load.as_ref()),
-            )
-            .flatten()
-            .any(|&pinned_id| {
-                let pinned_idx = self.arena.resolve(pinned_id);
-                self.arena
-                    .node(pinned_idx)
-                    .load_back_pending_id
-                    .is_some_and(|id| id != anchor_id)
-            });
+        let mut any_foreign_pin = false;
+        for &pinned_id in kv_xfer.nodes_to_load.iter().flatten().chain(
+            comp_xfers
+                .values()
+                .flatten()
+                .filter_map(|xfer| xfer.nodes_to_load.as_ref())
+                .flatten(),
+        ) {
+            let pinned_idx = self.arena.resolve(pinned_id)?;
+            any_foreign_pin |= self
+                .arena
+                .node(pinned_idx)
+                .load_back_pending_id
+                .is_some_and(|id| id != anchor_id);
+        }
         if any_foreign_pin {
             let empty_kv = PoolTransfer {
                 name: PoolName::Kv,
@@ -3268,23 +3219,32 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok((kv_xfer, comp_xfers))
     }
 
-    fn try_resolve_node_handle_(&self, node_id: NodeId) -> Result<NodeIdx_, TreeCoreRuntimeError> {
-        self.arena
-            .try_resolve(node_id)
-            .ok_or(TreeCoreRuntimeError::NodeNotAllocated { node_id })
+    /// Validate that every external node handle names a live node.
+    pub(crate) fn validate_node_handles(&self, node_ids: &[NodeId]) -> Result<(), NodeAccessError> {
+        for &node_id in node_ids {
+            self.arena.resolve(node_id)?;
+        }
+        Ok(())
+    }
+
+    fn validate_pool_transfer_handles<'a>(
+        &self,
+        transfers: impl IntoIterator<Item = &'a PoolTransfer>,
+    ) -> Result<(), NodeAccessError> {
+        for transfer in transfers {
+            if let Some(node_ids) = &transfer.nodes_to_load {
+                self.validate_node_handles(node_ids)?;
+            }
+        }
+        Ok(())
     }
 
     /// The anchor node's caller-defined key and cache salt.
-    pub fn prefetch_anchor_info(&self, node_id: NodeId) -> (Option<String>, Option<String>) {
-        self.try_prefetch_anchor_info(node_id)
-            .unwrap_or_else(|error| panic!("{error}"))
-    }
-
-    pub fn try_prefetch_anchor_info(
+    pub fn prefetch_anchor_info(
         &self,
         node_id: NodeId,
-    ) -> Result<(Option<String>, Option<String>), TreeCoreRuntimeError> {
-        let node_id = self.try_resolve_node_handle_(node_id)?;
+    ) -> Result<(Option<String>, Option<String>), NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         Ok((
             self.arena.node_extra_key(node_id).map(str::to_string),
             self.arena.node_cache_salt(node_id).map(str::to_string),
@@ -3292,38 +3252,20 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// Whether the node's Full KV is present on host.
-    pub fn node_backuped(&self, node_id: NodeId) -> bool {
-        self.try_node_backuped(node_id)
-            .unwrap_or_else(|error| panic!("{error}"))
-    }
-
-    pub fn try_node_backuped(&self, node_id: NodeId) -> Result<bool, TreeCoreRuntimeError> {
-        let node_id = self.try_resolve_node_handle_(node_id)?;
+    pub fn node_backuped(&self, node_id: NodeId) -> Result<bool, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         Ok(self.arena.node(node_id).backuped())
     }
 
     /// Whether the node is a (default or named) root.
-    pub fn is_root(&self, node_id: NodeId) -> bool {
-        self.try_is_root(node_id)
-            .unwrap_or_else(|error| panic!("{error}"))
-    }
-
-    pub fn try_is_root(&self, node_id: NodeId) -> Result<bool, TreeCoreRuntimeError> {
-        let node_id = self.try_resolve_node_handle_(node_id)?;
+    pub fn is_root(&self, node_id: NodeId) -> Result<bool, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         Ok(self.arena.node(node_id).is_root())
     }
 
     /// The node's last page hash, or None when it was never hashed.
-    pub fn get_last_hash_value(&self, node_id: NodeId) -> Option<String> {
-        self.try_get_last_hash_value(node_id)
-            .unwrap_or_else(|error| panic!("{error}"))
-    }
-
-    pub fn try_get_last_hash_value(
-        &self,
-        node_id: NodeId,
-    ) -> Result<Option<String>, TreeCoreRuntimeError> {
-        let node_id = self.try_resolve_node_handle_(node_id)?;
+    pub fn get_last_hash_value(&self, node_id: NodeId) -> Result<Option<String>, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         Ok(self
             .arena
             .node(node_id)
@@ -3332,32 +3274,16 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// The hash chain of the node's ancestors, in root-to-parent order.
-    pub fn get_prefix_hash_values(&self, node_id: NodeId) -> Vec<String> {
-        self.try_get_prefix_hash_values(node_id)
-            .unwrap_or_else(|error| panic!("{error}"))
-    }
-
-    pub fn try_get_prefix_hash_values(
-        &self,
-        node_id: NodeId,
-    ) -> Result<Vec<String>, TreeCoreRuntimeError> {
-        let node_id = self.try_resolve_node_handle_(node_id)?;
+    pub fn get_prefix_hash_values(&self, node_id: NodeId) -> Result<Vec<String>, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         Ok(self
             .arena
             .prefix_hash_values(self.arena.node(node_id).parent))
     }
 
     /// The hash values owned by this node, excluding its ancestors.
-    pub fn get_hash_values(&self, node_id: NodeId) -> Vec<String> {
-        self.try_get_hash_values(node_id)
-            .unwrap_or_else(|error| panic!("{error}"))
-    }
-
-    pub fn try_get_hash_values(
-        &self,
-        node_id: NodeId,
-    ) -> Result<Vec<String>, TreeCoreRuntimeError> {
-        let node_id = self.try_resolve_node_handle_(node_id)?;
+    pub fn get_hash_values(&self, node_id: NodeId) -> Result<Vec<String>, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         Ok(self
             .arena
             .node(node_id)
@@ -3371,7 +3297,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         node_id: NodeId,
         pass_prefix_keys: bool,
     ) -> Option<BufferBackupSnapshot> {
-        let node_id = self.arena.try_resolve(node_id)?;
+        let node_id = self.arena.resolve(node_id).ok()?;
         let node = self.arena.node(node_id);
         if node.is_root() || !node.has_device_value(FULL) {
             return None;
@@ -3401,7 +3327,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         node_id: NodeId,
         expected_key_length: usize,
     ) -> Option<BufferBackupState> {
-        let node_id = self.arena.try_resolve(node_id)?;
+        let node_id = self.arena.resolve(node_id).ok()?;
         let node = self.arena.node(node_id);
         if !node.has_device_value(FULL) || node.key.atom_len() != expected_key_length {
             return None;
@@ -3436,18 +3362,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// Return input indices in depth-first, subtree-weight order.
-    pub fn dfs_weight_order(&self, node_ids: &[NodeId]) -> Vec<usize> {
-        self.try_dfs_weight_order(node_ids)
-            .unwrap_or_else(|error| panic!("{error}"))
-    }
-
-    pub fn try_dfs_weight_order(
-        &self,
-        node_ids: &[NodeId],
-    ) -> Result<Vec<usize>, TreeCoreRuntimeError> {
+    pub fn dfs_weight_order(&self, node_ids: &[NodeId]) -> Result<Vec<usize>, NodeAccessError> {
         let mut node_to_indices: HashMap<NodeIdx_, Vec<usize>> = HashMap::new();
         for (index, &node_id) in node_ids.iter().enumerate() {
-            let node_id = self.try_resolve_node_handle_(node_id)?;
+            let node_id = self.arena.resolve(node_id)?;
             node_to_indices.entry(node_id).or_default().push(index);
         }
 
@@ -3525,8 +3443,17 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         cache_actions: &mut Vec<CacheAction>,
         mut insert_result: Option<&mut InsertResult>,
         pool_storage_result: Option<&PoolTransferResult>,
-    ) {
-        let node_id = self.arena.resolve(node_id);
+    ) -> Result<(), NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        self.validate_pool_transfer_handles(comp_xfers.values().flatten())?;
+        if let Some(insert_result) = insert_result.as_deref() {
+            if let Some(last_device_node_id) = insert_result.last_device_node_id {
+                self.arena.resolve(last_device_node_id)?;
+            }
+            if let Some(inserted_host_node) = insert_result.inserted_host_node {
+                self.arena.resolve(inserted_host_node)?;
+            }
+        }
         for (component_type, transfers) in comp_xfers {
             self.component_by_type_(component_type)
                 .commit_hicache_transfer(
@@ -3539,6 +3466,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     pool_storage_result,
                 );
         }
+        Ok(())
     }
 
     /// Commit a successful backup to the node.
@@ -3547,8 +3475,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         node_id: NodeId,
         host_indices: Tensor,
         comp_xfers: HashMap<ComponentType, Vec<PoolTransfer>>,
-    ) {
-        let node_id = self.arena.resolve(node_id);
+    ) -> Result<(), NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        self.validate_pool_transfer_handles(comp_xfers.values().flatten())?;
         let mut cache_actions: Vec<CacheAction> = Vec::new();
         if host_indices.numel() > 0 {
             let kv_xfer = PoolTransfer {
@@ -3581,6 +3510,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
         assert!(cache_actions.is_empty()); // BACKUP_HOST emits no actions
         self.update_full_coexisting_host_tracking_(node_id);
+        Ok(())
     }
 
     /// Commit a successful H->D load-back onto the node; the SWA full->swa mapping
@@ -3591,9 +3521,16 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         device_indices: Tensor,
         mut kv_xfer: PoolTransfer,
         comp_xfers: HashMap<ComponentType, Vec<PoolTransfer>>,
-    ) -> Vec<CacheAction> {
+    ) -> Result<Vec<CacheAction>, NodeAccessError> {
         let anchor_id = node_id;
-        let node_id = self.arena.resolve(node_id);
+        let node_id = self.arena.resolve(node_id)?;
+        let loaded_node_indices = kv_xfer
+            .nodes_to_load
+            .iter()
+            .flatten()
+            .map(|&loaded_id| self.arena.resolve(loaded_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.validate_pool_transfer_handles(comp_xfers.values().flatten())?;
         let mut cache_actions: Vec<CacheAction> = Vec::new();
         kv_xfer.device_indices = Some(device_indices);
         let nodes_to_load = kv_xfer.nodes_to_load.clone();
@@ -3601,8 +3538,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             // Pin Full KV host slots against duplicate reclaim until the ack.
             // Auxiliary pools have independent host locks and may legitimately
             // load the same radix node under a different anchor.
-            for &pinned_id in nodes_to_load.iter().flatten() {
-                let pinned_idx = self.arena.resolve(pinned_id);
+            for (&pinned_id, &pinned_idx) in
+                nodes_to_load.iter().flatten().zip(&loaded_node_indices)
+            {
                 let pinned = self.arena.node_mut(pinned_idx);
                 assert!(
                     pinned.load_back_pending_id.is_none_or(|id| id == anchor_id),
@@ -3623,8 +3561,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 /* insert_result = */ None,
                 /* pool_storage_result = */ None,
             );
-        for loaded_id in nodes_to_load.unwrap_or_default() {
-            let loaded_idx = self.arena.resolve(loaded_id);
+        for loaded_idx in loaded_node_indices {
             self.record_store_event_(loaded_idx, StorageMedium::Gpu);
         }
         for (component_type, transfers) in comp_xfers {
@@ -3640,7 +3577,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 );
         }
         self.update_evictable_leaf_sets_(node_id);
-        cache_actions
+        Ok(cache_actions)
     }
 
     /// Finalize load-back state along the anchor's root path.
@@ -3648,8 +3585,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// Write-back clears matching Full KV source pins. Write-through has no
     /// pins, but both policies refresh Full host/device duplicate tracking once
     /// the device copies are visible.
-    pub fn finish_load_back(&mut self, anchor_node_id: NodeId) {
-        let mut node_id = Some(self.arena.resolve(anchor_node_id));
+    pub fn finish_load_back(&mut self, anchor_node_id: NodeId) -> Result<(), NodeAccessError> {
+        let mut node_id = Some(self.arena.resolve(anchor_node_id)?);
         while let Some(idx) = node_id {
             if self.arena.node(idx).is_root() {
                 break;
@@ -3666,19 +3603,28 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             self.update_full_coexisting_host_tracking_(idx);
             node_id = self.arena.node(idx).try_parent();
         }
+        Ok(())
     }
 
     /// Mark a node as having an in-flight write-through backup.
-    pub fn mark_write_through_pending(&mut self, node_id: NodeId) {
-        let node_idx = self.arena.resolve(node_id);
+    pub fn mark_write_through_pending(&mut self, node_id: NodeId) -> Result<(), NodeAccessError> {
+        let node_idx = self.arena.resolve(node_id)?;
         self.arena.node_mut(node_idx).write_through_pending_id = Some(node_id);
+        Ok(())
     }
 
     /// Clear the write-through-pending mark (when it matches ack_id) and record the
     /// host store event for each acked node.
-    pub fn finish_write_through(&mut self, node_ids: Vec<NodeId>, ack_id: usize) {
-        for node_id in node_ids {
-            let node_idx = self.arena.resolve(node_id);
+    pub fn finish_write_through(
+        &mut self,
+        node_ids: Vec<NodeId>,
+        ack_id: usize,
+    ) -> Result<(), NodeAccessError> {
+        let node_indices = node_ids
+            .into_iter()
+            .map(|node_id| self.arena.resolve(node_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        for node_idx in node_indices {
             let node = self.arena.node_mut(node_idx);
             if node.write_through_pending_id == Some(ack_id) {
                 node.write_through_pending_id = None;
@@ -3686,6 +3632,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             }
             self.record_store_event_(node_idx, StorageMedium::Cpu);
         }
+        Ok(())
     }
 
     /// Store an auxiliary component's device value onto a node and restamp
@@ -3695,10 +3642,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         node_id: NodeId,
         component_type: ComponentType,
         value: Tensor,
-    ) {
+    ) -> Result<(), NodeAccessError> {
+        let node_idx = self.arena.resolve(node_id)?;
         self.assert_component_enabled_(component_type);
-        let node_idx = self.arena.resolve(node_id);
         self.set_component_device_value_(node_idx, component_type, value);
+        Ok(())
     }
 
     /// Slot-keyed aux store (internal): set the device value and restamp the LRU.
@@ -3727,10 +3675,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &self,
         node_id: NodeId,
         component_type: ComponentType,
-    ) -> Option<&Tensor> {
+    ) -> Result<Option<&Tensor>, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         self.assert_component_enabled_(component_type);
-        self.arena
-            .try_device_value(self.arena.resolve(node_id), component_type)
+        Ok(self.arena.try_device_value(node_id, component_type))
     }
 
     /// Whether the component's data is device-evicted but host-backed.
@@ -3738,11 +3686,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &self,
         node_id: NodeId,
         component_type: ComponentType,
-    ) -> bool {
+    ) -> Result<bool, NodeAccessError> {
+        let node_idx = self.arena.resolve(node_id)?;
         self.assert_component_enabled_(component_type);
-        let node_idx = self.arena.resolve(node_id);
-        !self.arena.has_device_value(node_idx, component_type)
-            && self.arena.has_host_value(node_idx, component_type)
+        Ok(!self.arena.has_device_value(node_idx, component_type)
+            && self.arena.has_host_value(node_idx, component_type))
     }
 
     /// Verify tree-structure, leaf-set, LRU, size, and ongoing-op invariants; raise
@@ -3803,7 +3751,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             ));
         }
         for (&node_handle, hashes) in &self.salted_event_hashes {
-            let Some(node_id) = self.arena.try_resolve(node_handle) else {
+            let Ok(node_id) = self.arena.resolve(node_handle) else {
                 errors.push(format!(
                     "[Events] salted hashes reference freed node {node_handle}"
                 ));
@@ -4160,25 +4108,25 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
         // ── PART 5: Ongoing Operations ──
         for &(op_id, node_id) in ongoing_write_through {
-            match self.arena.try_resolve(node_id) {
-                None => {
+            match self.arena.resolve(node_id) {
+                Err(_) => {
                     errors.push(format!("[Ongoing] write_through node {op_id} not in tree"));
                 }
-                Some(idx) if self.arena.device_lock_ref(idx, FULL) == 0 => {
+                Ok(idx) if self.arena.device_lock_ref(idx, FULL) == 0 => {
                     errors.push(format!("[Ongoing] write_through node {op_id} lock_ref=0"));
                 }
-                Some(_) => {}
+                Ok(_) => {}
             }
         }
         for &(op_id, node_id) in ongoing_load_back {
-            match self.arena.try_resolve(node_id) {
-                None => {
+            match self.arena.resolve(node_id) {
+                Err(_) => {
                     errors.push(format!("[Ongoing] load_back node {op_id} not in tree"));
                 }
-                Some(idx) if self.arena.device_lock_ref(idx, FULL) == 0 => {
+                Ok(idx) if self.arena.device_lock_ref(idx, FULL) == 0 => {
                     errors.push(format!("[Ongoing] load_back node {op_id} lock_ref=0"));
                 }
-                Some(_) => {}
+                Ok(_) => {}
             }
         }
         // Reject load-back pins that would survive their operation.
@@ -4234,43 +4182,53 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     /// Whether the external node handle is currently live.
     pub fn inspect_contains_node(&self, node_id: NodeId) -> bool {
-        self.arena.try_resolve(node_id).is_some()
+        self.arena.resolve(node_id).is_ok()
     }
 
     /// The parent node's external handle, or None for the root.
-    pub fn inspect_get_parent_node_id(&self, node_id: NodeId) -> Option<NodeId> {
-        let node_id = self.arena.resolve(node_id);
-        self.arena
+    pub fn inspect_get_parent_node_id(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Option<NodeId>, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        Ok(self
+            .arena
             .node(node_id)
             .try_parent()
-            .map(|parent_id| self.arena.node(parent_id).id)
+            .map(|parent_id| self.arena.node(parent_id).id))
     }
 
     /// A materialized snapshot of the node's child handles.
-    pub fn inspect_get_child_node_ids(&self, node_id: NodeId) -> Vec<NodeId> {
-        let node_id = self.arena.resolve(node_id);
-        self.arena
+    pub fn inspect_get_child_node_ids(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Vec<NodeId>, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        Ok(self
+            .arena
             .node(node_id)
             .children
             .values()
             .map(|&child_id| self.arena.node(child_id).id)
-            .collect()
+            .collect())
     }
 
     /// Logical radix-key length in key atoms.
-    pub fn inspect_get_node_key_length(&self, node_id: NodeId) -> usize {
-        self.arena.node(self.arena.resolve(node_id)).key.atom_len()
+    pub fn inspect_get_node_key_length(&self, node_id: NodeId) -> Result<usize, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        Ok(self.arena.node(node_id).key.atom_len())
     }
 
     /// Materialized raw token ids spanned by the node key.
-    pub fn inspect_get_node_token_ids(&self, node_id: NodeId) -> Vec<i64> {
-        K::raw_token_ids(self.arena.node(self.arena.resolve(node_id)).key.as_ref()).into_owned()
+    pub fn inspect_get_node_token_ids(&self, node_id: NodeId) -> Result<Vec<i64>, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        Ok(K::raw_token_ids(self.arena.node(node_id).key.as_ref()).into_owned())
     }
 
     /// Whether this core's key representation uses overlapping bigrams.
-    pub fn inspect_is_node_key_bigram(&self, node_id: NodeId) -> bool {
-        let node = self.arena.node(self.arena.resolve(node_id));
-        !node.is_root() && K::IS_BIGRAM
+    pub fn inspect_is_node_key_bigram(&self, node_id: NodeId) -> Result<bool, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        Ok(!self.arena.node(node_id).is_root() && K::IS_BIGRAM)
     }
 
     /// A shallow tensor snapshot of a component's host value.
@@ -4278,12 +4236,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &self,
         node_id: NodeId,
         component_type: ComponentType,
-    ) -> Option<Tensor> {
+    ) -> Result<Option<Tensor>, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         self.assert_component_enabled_(component_type);
-        self.arena
-            .node(self.arena.resolve(node_id))
+        Ok(self
+            .arena
+            .node(node_id)
             .try_host_value(component_type)
-            .map(Tensor::shallow_clone)
+            .map(Tensor::shallow_clone))
     }
 
     /// A component's device lock count on a node.
@@ -4291,23 +4251,25 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &self,
         node_id: NodeId,
         component_type: ComponentType,
-    ) -> u32 {
+    ) -> Result<u32, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         self.assert_component_enabled_(component_type);
-        self.arena
-            .node(self.arena.resolve(node_id))
-            .device_lock_ref(component_type)
+        Ok(self.arena.node(node_id).device_lock_ref(component_type))
     }
 
     /// A node's accumulated match count.
-    pub fn inspect_get_node_hit_count(&self, node_id: NodeId) -> i64 {
-        self.arena.node(self.arena.resolve(node_id)).hit_count
+    pub fn inspect_get_node_hit_count(&self, node_id: NodeId) -> Result<i64, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        Ok(self.arena.node(node_id).hit_count)
     }
 
     /// A node's in-flight write-through acknowledgement id.
-    pub fn inspect_get_write_through_pending_id(&self, node_id: NodeId) -> Option<usize> {
-        self.arena
-            .node(self.arena.resolve(node_id))
-            .write_through_pending_id
+    pub fn inspect_get_write_through_pending_id(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Option<usize>, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        Ok(self.arena.node(node_id).write_through_pending_id)
     }
 
     /// Whether a node is in a component's device LRU.
@@ -4315,12 +4277,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &self,
         node_id: NodeId,
         component_type: ComponentType,
-    ) -> bool {
+    ) -> Result<bool, NodeAccessError> {
         if self.try_component_by_type_(component_type).is_none() {
-            return false;
+            return Ok(false);
         }
-        self.device_lru_list(component_type)
-            .in_list(Some(self.arena.resolve(node_id)))
+        let node_id = self.arena.resolve(node_id)?;
+        Ok(self.device_lru_list(component_type).in_list(Some(node_id)))
     }
 
     /// Whether a node is in a component's host LRU.
@@ -4328,12 +4290,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &self,
         node_id: NodeId,
         component_type: ComponentType,
-    ) -> bool {
+    ) -> Result<bool, NodeAccessError> {
         if self.try_component_by_type_(component_type).is_none() {
-            return false;
+            return Ok(false);
         }
-        self.host_lru_list(component_type)
-            .in_list(Some(self.arena.resolve(node_id)))
+        let node_id = self.arena.resolve(node_id)?;
+        Ok(self.host_lru_list(component_type).in_list(Some(node_id)))
     }
 
     /// Materialize a component's device LRU from most to least recent.
@@ -4354,28 +4316,28 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// Whether a live node belongs to the device-evictable leaf set.
     pub fn inspect_is_device_evictable_leaf(&self, node_id: NodeId) -> bool {
         self.arena
-            .try_resolve(node_id)
-            .is_some_and(|node_id| self.evictable_device_leaves.contains(node_id))
+            .resolve(node_id)
+            .is_ok_and(|node_id| self.evictable_device_leaves.contains(node_id))
     }
 
     /// Whether a live node belongs to the host-evictable leaf set.
     pub fn inspect_is_host_evictable_leaf(&self, node_id: NodeId) -> bool {
         self.arena
-            .try_resolve(node_id)
-            .is_some_and(|node_id| self.evictable_host_leaves.contains(node_id))
+            .resolve(node_id)
+            .is_ok_and(|node_id| self.evictable_host_leaves.contains(node_id))
     }
 
     /// Whether the node is currently eligible as a Full device leaf.
-    pub fn inspect_is_device_leaf(&self, node_id: NodeId) -> bool {
-        let node_id = self.arena.resolve(node_id);
+    pub fn inspect_is_device_leaf(&self, node_id: NodeId) -> Result<bool, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         let node = self.arena.node(node_id);
         if node.is_root() || node.evicted() || node.is_device_locked() {
-            return false;
+            return Ok(false);
         }
-        !node
+        Ok(!node
             .children
             .values()
-            .any(|&child_id| self.arena.has_device_value(child_id, FULL))
+            .any(|&child_id| self.arena.has_device_value(child_id, FULL)))
     }
 
     /// Materialize every live tree node handle.
@@ -4396,9 +4358,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &mut self,
         node_id: NodeId,
         hash_values: Option<Vec<String>>,
-    ) {
-        let node_id = self.arena.resolve(node_id);
+    ) -> Result<(), NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         self.arena.node_mut(node_id).hash_value = hash_values;
+        Ok(())
     }
 
     /// Replace a component's device value without updating bookkeeping.
@@ -4407,13 +4370,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         node_id: NodeId,
         component_type: ComponentType,
         value: Option<Tensor>,
-    ) {
+    ) -> Result<(), NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         self.assert_component_enabled_(component_type);
-        let node_id = self.arena.resolve(node_id);
         self.arena
             .node_mut(node_id)
             .state_mut_(ValueSlotIdx::device(component_type))
             .value = value;
+        Ok(())
     }
 
     /// Replace a component's host value without updating bookkeeping.
@@ -4422,13 +4386,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         node_id: NodeId,
         component_type: ComponentType,
         value: Option<Tensor>,
-    ) {
+    ) -> Result<(), NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         self.assert_component_enabled_(component_type);
-        let node_id = self.arena.resolve(node_id);
         self.arena
             .node_mut(node_id)
             .state_mut_(ValueSlotIdx::host(component_type))
             .value = value;
+        Ok(())
     }
 
     /// Replace a component's device lock count without updating bookkeeping.
@@ -4437,12 +4402,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         node_id: NodeId,
         component_type: ComponentType,
         lock_ref: u32,
-    ) {
+    ) -> Result<(), NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         self.assert_component_enabled_(component_type);
-        let node_id = self.arena.resolve(node_id);
         self.arena
             .node_mut(node_id)
             .set_lock_ref_(ValueSlotIdx::device(component_type), lock_ref);
+        Ok(())
     }
 
     /// Remove a node from a component's device LRU.
@@ -4450,11 +4416,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &mut self,
         node_id: NodeId,
         component_type: ComponentType,
-    ) {
+    ) -> Result<(), NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         self.assert_component_enabled_(component_type);
-        let node_id = self.arena.resolve(node_id);
         self.device_lru_list_mut(component_type)
             .remove_node(node_id);
+        Ok(())
     }
 
     /// Insert a node as a component's most-recent host-LRU entry.
@@ -4462,10 +4429,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &mut self,
         node_id: NodeId,
         component_type: ComponentType,
-    ) {
+    ) -> Result<(), NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         self.assert_component_enabled_(component_type);
-        let node_id = self.arena.resolve(node_id);
         self.host_lru_list_mut(component_type).insert_mru(node_id);
+        Ok(())
     }
 
     /// Replace a component's evictable-device token count.
@@ -4489,9 +4457,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// Refresh Full device/host duplicate tracking for a node.
-    pub fn inspect_update_duplicate_tracking(&mut self, node_id: NodeId) {
-        let node_id = self.arena.resolve(node_id);
+    pub fn inspect_update_duplicate_tracking(
+        &mut self,
+        node_id: NodeId,
+    ) -> Result<(), NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         self.update_full_coexisting_host_tracking_(node_id);
+        Ok(())
     }
 
     /// Advance one suspended insert walk step without flushing its pending actions.
@@ -4514,9 +4486,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         node_id: NodeId,
         component_type: ComponentType,
         target: EvictLayer,
-    ) -> EvictionStepResult {
+    ) -> Result<EvictionStepResult, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         self.assert_component_enabled_(component_type);
-        let node_id = self.arena.resolve(node_id);
         let mut result = EvictionStepResult::default();
         self.evict_component_and_detach_lru_(
             node_id,
@@ -4526,7 +4498,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             target,
             Some(&mut result.tracker),
         );
-        result
+        Ok(result)
     }
 
     /// Validate component locks for a cascade without mutating the tree.
@@ -4535,9 +4507,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         node_id: NodeId,
         trigger_component_type: ComponentType,
         target: EvictLayer,
-    ) -> Result<(), String> {
+    ) -> Result<(), TreeCoreRuntimeError> {
+        let node_id = self.arena.resolve(node_id)?;
         self.assert_component_enabled_(trigger_component_type);
-        let node_id = self.arena.resolve(node_id);
         let is_leaf = match target {
             EvictLayer::Device => self.evictable_device_leaves.contains(node_id),
             EvictLayer::Host => self.evictable_host_leaves.contains(node_id),
@@ -4556,14 +4528,18 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 is_leaf,
                 trigger_priority,
                 trigger_internal_priority,
-            )?;
+            )
+            .map_err(TreeCoreRuntimeError::InspectionAssertion)?;
         }
         Ok(())
     }
 
     /// Delete childless tombstone ancestors starting at `node_id`.
-    pub fn inspect_cleanup_tombstone_ancestors(&mut self, node_id: NodeId) -> EvictionStepResult {
-        let node_id = self.arena.resolve(node_id);
+    pub fn inspect_cleanup_tombstone_ancestors(
+        &mut self,
+        node_id: NodeId,
+    ) -> Result<EvictionStepResult, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
         let mut result = EvictionStepResult::default();
         self.iteratively_delete_tombstone_leaf_(
             node_id,
@@ -4571,7 +4547,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             &mut result.device_frees,
             &mut result.host_frees,
         );
-        result
+        Ok(result)
     }
 
     /// Run one component's real match-result finalizer.
@@ -4582,16 +4558,33 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         params: &MatchPrefixParams<'_, K>,
         value_chunks: &[Tensor],
         best_value_len: usize,
-    ) -> MatchResult {
-        self.component_by_type_(component_type)
-            .finalize_match_result_in_tree_core(self, result, params, value_chunks, best_value_len)
+    ) -> Result<MatchResult, NodeAccessError> {
+        let last_device_node_idx = self.arena.resolve(result.last_device_node_id)?;
+        self.arena.resolve(result.last_host_node_id)?;
+        let best_match_node_idx = self.arena.resolve(result.best_match_node_id)?;
+        Ok(self
+            .component_by_type_(component_type)
+            .finalize_match_result_in_tree_core(
+                self,
+                result,
+                last_device_node_idx,
+                best_match_node_idx,
+                params,
+                value_chunks,
+                best_value_len,
+            ))
     }
 
     /// Build the ordered device-to-host backup node list.
-    pub fn inspect_build_backup_node_ids(&self, node_id: NodeId, write_back: bool) -> Vec<NodeId> {
-        let node_id = self.arena.resolve(node_id);
-        self.build_backup_kv_action_(self.arena.node(node_id), write_back)
-            .node_ids
+    pub fn inspect_build_backup_node_ids(
+        &self,
+        node_id: NodeId,
+        write_back: bool,
+    ) -> Result<Vec<NodeId>, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        Ok(self
+            .build_backup_kv_action_(self.arena.node(node_id), write_back)
+            .node_ids)
     }
 }
 

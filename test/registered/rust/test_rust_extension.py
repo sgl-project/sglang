@@ -162,6 +162,7 @@ crate-type = ["cdylib"]
             self.assertEqual(crate.library, "demo_extension")
             self.assertEqual(crate.python_module, "demo._core")
             self.assertEqual(crate.features, ("python",))
+            self.assertEqual(crate.source_inputs, ())
 
             with self.assertRaisesRegex(
                 ModuleNotFoundError, r"declared modules: \['demo\._core'\]"
@@ -207,6 +208,36 @@ crate-type = ["cdylib"]
                     changed_source.target_fingerprint,
                     inspection.target_fingerprint,
                 )
+
+    def test_fingerprint_covers_declared_external_source_inputs(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = self._workspace(root)
+            proto = root / "proto/demo.proto"
+            proto.parent.mkdir()
+            proto.write_text("message Demo {}\n", encoding="utf-8")
+            manifest = workspace / "demo/Cargo.toml"
+            manifest.write_text(
+                manifest.read_text(encoding="utf-8").replace(
+                    'features = ["python"]',
+                    'features = ["python"]\nsource-inputs = ["../../proto"]',
+                ),
+                encoding="utf-8",
+            )
+
+            crate = rust_extension._discover_crate(workspace, "demo._core")
+            self.assertEqual(crate.source_inputs, (proto.parent.resolve(),))
+            with mock.patch.object(
+                rust_extension,
+                "_command_version",
+                side_effect=lambda command, *args, **kwargs: f"{command} 1.0",
+            ):
+                first = rust_extension._build_context(crate)
+                proto.write_text("message Changed {}\n", encoding="utf-8")
+                changed = rust_extension._build_context(crate)
+
+            self.assertNotEqual(first.fingerprint, changed.fingerprint)
+            self.assertEqual(first.target_fingerprint, changed.target_fingerprint)
 
     def test_auto_builds_once_then_uses_cache(self):
         with TemporaryDirectory() as directory:
@@ -444,7 +475,7 @@ crate-type = ["cdylib"]
                 },
             )
 
-            self.assertEqual(build.environment["LIBTORCH_USE_PYTORCH"], "1")
+            self.assertEqual(build.environment["LIBTORCH_USE_PYTORCH"], str(torch_root))
             self.assertEqual(build.environment["LIBTORCH_BYPASS_VERSION_CHECK"], "1")
             self.assertIn(str(compat_header), build.environment["CXXFLAGS"])
             self.assertIn(
@@ -522,11 +553,13 @@ crate-type = ["cdylib"]
         self.assertNotIn(module_name, sys.modules)
 
     def test_checked_in_crates_are_discovered_from_wheel_metadata(self):
-        for python_module, package, library, features in (
+        grpc_proto = (rust_extension._RUST_WORKSPACE.parent / "proto").resolve()
+        for python_module, package, library, features, source_inputs in (
             (
                 "sglang.srt.rust_extensions._server",
                 "sglang-server",
                 "sglang_server",
+                (),
                 (),
             ),
             (
@@ -534,18 +567,21 @@ crate-type = ["cdylib"]
                 "sglang-grpc",
                 "sglang_grpc_core",
                 (),
+                (grpc_proto,),
             ),
             (
                 "sglang.srt.rust_extensions._multimodal",
                 "sglang-mm",
                 "sglang_mm_core",
                 ("python", "parallel"),
+                (),
             ),
             (
                 "sglang.srt.mem_cache.rust_tree_core.mem_cache",
                 "sglang-radix-tree",
                 "mem_cache",
                 ("python-extension",),
+                (),
             ),
         ):
             crate = rust_extension._discover_crate(
@@ -554,6 +590,7 @@ crate-type = ["cdylib"]
             self.assertEqual(crate.package, package)
             self.assertEqual(crate.library, library)
             self.assertEqual(crate.features, features)
+            self.assertEqual(crate.source_inputs, source_inputs)
 
 
 if __name__ == "__main__":

@@ -7767,6 +7767,61 @@ class _InsertWalkSuite(CustomTestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
+class TestUnifiedTreeCoreSWAPrefetchBackends(_InsertWalkSuite):
+    cfg = CacheConfig(
+        components=(ComponentType.FULL, ComponentType.SWA), sliding_window_size=4
+    )
+
+    def test_mid_tree_shortened_swa_prefetch_is_released(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        prefix = [1, 2]
+        self._insert(cache, allocator, req_to_token_pool, prefix)
+        anchor = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", prefix)))
+        ).last_device_node
+
+        cache.tree_core.is_write_back = True
+        suffix = [3, 4]
+        insert_result = cache.tree_core.insert_host(
+            anchor,
+            RadixKey(array("q", suffix)),
+            torch.tensor([100, 101], dtype=torch.int64),
+            ["h3", "h4"],
+        )
+        self.assertIsNotNone(insert_result.inserted_host_node)
+
+        swa_host_indices = torch.tensor([30, 31], dtype=torch.int64)
+        actions = []
+        cache.tree_core.commit_hicache_transfers(
+            anchor,
+            CacheTransferPhase.PREFETCH,
+            {
+                ComponentType.SWA: [
+                    PoolTransfer(
+                        name=PoolName.SWA,
+                        host_indices=swa_host_indices,
+                    )
+                ]
+            },
+            cache_actions=actions,
+            insert_result=insert_result,
+            pool_storage_result=PoolTransferResult(
+                kv_hit_pages=len(suffix),
+                extra_pool_hit_pages={PoolName.SWA: len(suffix)},
+            ),
+        )
+
+        self.assertIsNone(
+            _host_value(cache, insert_result.inserted_host_node, ComponentType.SWA)
+        )
+        self.assertEqual(len(actions), 1)
+        self.assertIsInstance(actions[0], FreeComponentHostSlot)
+        self.assertEqual(actions[0].component_type, ComponentType.SWA)
+        self.assertEqual(len(actions[0].host_indices), 1)
+        self.assertTrue(torch.equal(actions[0].host_indices[0], swa_host_indices))
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
 class TestResumableInsertWalk(_InsertWalkSuite):
     cfg = CacheConfig()
 
