@@ -72,7 +72,7 @@ def query_marlin_supported_quant_types(
 ):
     if device_capability is None:
         major, minor = get_device_capability()
-        capability = major * 10 + minor
+        capability = major * 10 + minor if major is not None else None
         device_capability = -1 if capability is None else capability
 
     if device_capability < 80:
@@ -110,7 +110,7 @@ def _check_marlin_supported(
 
     if device_capability is None:
         major, minor = get_device_capability()
-        capability = major * 10 + minor
+        capability = major * 10 + minor if major is not None else None
         device_capability = -1 if capability is None else capability
 
     supported_types = query_marlin_supported_quant_types(
