@@ -19,9 +19,66 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+        FlashinferCombineInput,
+        FlashinferDispatchOutput,
+    )
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
         StandardDispatchOutput,
+    )
+
+
+def _map_flashinfer_expert_ids_to_local(
+    topk_ids: torch.Tensor, runner_config: MoeRunnerConfig
+) -> torch.Tensor:
+    """Convert FlashInfer's global receive IDs to Triton's local IDs.
+
+    FlashInfer keeps the global expert ID in each received route and marks
+    routes not owned by the receiving rank with ``num_experts``.  The Triton
+    alignment/kernel path instead expects local IDs in ``[0, num_local_experts)``
+    and uses ``-1`` as its dropped-route sentinel.
+
+    This adapter intentionally covers only the static, contiguous expert
+    layout.  EPLB relocation/redundant experts and fused shared experts need a
+    dispatcher-specific mapping and must not silently pass through this path.
+    """
+
+    num_experts = runner_config.num_experts
+    num_local_experts = runner_config.num_local_experts
+    if num_experts is None or num_local_experts is None:
+        raise ValueError("FlashInfer-to-Triton requires global and local expert counts")
+
+    num_shared_experts = runner_config.num_fused_shared_experts or 0
+    if num_shared_experts:
+        raise NotImplementedError(
+            "FlashInfer-to-Triton does not support fused shared experts yet"
+        )
+
+    from sglang.srt.runtime_context import get_parallel
+
+    parallel = get_parallel()
+    ep_size = parallel.moe_ep_size
+    ep_rank = parallel.moe_ep_rank
+    if ep_size <= 0 or ep_rank < 0 or ep_rank >= ep_size:
+        raise ValueError(
+            "FlashInfer-to-Triton received an invalid MoE EP rank/size: "
+            f"rank={ep_rank}, size={ep_size}"
+        )
+    if num_experts % ep_size != 0 or num_local_experts != num_experts // ep_size:
+        raise NotImplementedError(
+            "FlashInfer-to-Triton requires an equal contiguous expert partition: "
+            f"num_experts={num_experts}, num_local_experts={num_local_experts}, "
+            f"moe_ep_size={ep_size}"
+        )
+
+    expert_start = ep_rank * num_local_experts
+    expert_end = expert_start + num_local_experts
+    valid = (topk_ids >= expert_start) & (topk_ids < expert_end)
+    return torch.where(
+        valid,
+        topk_ids - expert_start,
+        torch.full_like(topk_ids, -1),
     )
 
 
@@ -315,6 +372,49 @@ def pre_permute_standard_to_triton(
     )
 
 
+@register_pre_permute("flashinfer", "triton")
+def pre_permute_flashinfer_to_triton(
+    dispatch_output: FlashinferDispatchOutput,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> TritonRunnerInput:
+    """Adapt FlashInfer A2A output to the regular Triton runner.
+
+    FlashInfer uses its A2A path for decode, while its prefill path returns a
+    standard dispatch object.  Keep prefill on the existing standard adapter;
+    only decode needs the global-to-local expert-ID conversion here.
+    """
+
+    if dispatch_output.format.is_standard():
+        return pre_permute_standard_to_triton(
+            dispatch_output, quant_info, runner_config, running_state
+        )
+
+    if dispatch_output.hidden_states_scale is not None:
+        raise NotImplementedError(
+            "FlashInfer-to-Triton currently supports BF16 activation payloads "
+            "only; scaled payloads require a matching Triton quantization path"
+        )
+
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+
+    topk_output = dispatch_output.topk_output
+    topk_output = topk_output._replace(
+        topk_ids=_map_flashinfer_expert_ids_to_local(
+            topk_output.topk_ids, runner_config
+        )
+    )
+    standard_output = StandardDispatchOutput(
+        hidden_states=dispatch_output.hidden_states,
+        hidden_states_scale=None,
+        topk_output=topk_output,
+    )
+    return pre_permute_standard_to_triton(
+        standard_output, quant_info, runner_config, running_state
+    )
+
+
 @register_post_permute("triton", "standard")
 def post_permute_triton_to_standard(
     runner_output: TritonRunnerOutput,
@@ -330,3 +430,17 @@ def post_permute_triton_to_standard(
     return StandardCombineInput(
         hidden_states=runner_output.hidden_states,
     )
+
+
+@register_post_permute("triton", "flashinfer")
+def post_permute_triton_to_flashinfer(
+    runner_output: TritonRunnerOutput,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> FlashinferCombineInput:
+    """Wrap Triton's output for FlashInfer's reverse A2A combine."""
+
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferCombineInput
+
+    return FlashinferCombineInput(hidden_states=runner_output.hidden_states)
