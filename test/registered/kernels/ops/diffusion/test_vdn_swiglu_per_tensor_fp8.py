@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 
@@ -38,3 +40,7 @@ def test_silu_mul_per_tensor_fp8_rejects_unsupported_input() -> None:
     assert not can_use_silu_mul_per_tensor_fp8(x)
     with pytest.raises(ValueError):
         silu_mul_per_tensor_fp8(x)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

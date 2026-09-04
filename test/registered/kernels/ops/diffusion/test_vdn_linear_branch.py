@@ -7,6 +7,8 @@ chain (their documented contract). The whole-branch wiring (fused vs eager
 chain through the real forward) lives with the model tests.
 """
 
+import sys
+
 import pytest
 import torch
 
@@ -122,3 +124,7 @@ def test_predicates_reject_unsupported_inputs() -> None:
     assert not can_use_vdn_silu_l2norm(odd)
     with pytest.raises(ValueError):
         vdn_silu_l2norm(odd, True)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
