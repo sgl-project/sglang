@@ -94,6 +94,23 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 
+_LEGACY_LLADA2_FP8_CONFIG_DEFAULTS = {
+    "embedding_dropout": 0.0,
+    "moe_router_enable_expert_bias": True,
+    "norm_topk_prob": True,
+    "router_dtype": "fp32",
+    "score_function": "sigmoid",
+}
+
+
+def _apply_legacy_llada2_fp8_config_defaults(config: PretrainedConfig) -> None:
+    if not getattr(config, "use_fp8_experts", False):
+        return
+    for name, default in _LEGACY_LLADA2_FP8_CONFIG_DEFAULTS.items():
+        if not hasattr(config, name):
+            setattr(config, name, default)
+
+
 split_qkv_rmsnorm_rope_pos_cache_half_npu = None
 if _is_npu:
     try:
@@ -811,6 +828,7 @@ class LLaDA2MoeModelLM(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        _apply_legacy_llada2_fp8_config_defaults(config)
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config

@@ -194,6 +194,10 @@ class TestLLaDAImageTextConditioning(unittest.TestCase):
                 "sglang.multimodal_gen.runtime.pipelines_core.stages.llada_image_conditioning.get_sp_parallel_rank",
                 return_value=1,
             ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.stages.llada_image_conditioning.prepare_diffusers_component_path_for_loading",
+                side_effect=lambda path: f"resolved:{path}",
+            ),
         ):
             runner = LLaDAImageTextEncoderRunner(
                 model_root="/unused/model",
@@ -205,6 +209,10 @@ class TestLLaDAImageTextConditioning(unittest.TestCase):
                     nccl_port=29500,
                     trust_remote_code=True,
                     revision=None,
+                    component_paths={
+                        "text_encoder": "/custom/text_encoder",
+                        "tokenizer": "/custom/tokenizer",
+                    },
                     pipeline_config=SimpleNamespace(
                         text_encoder_mem_fraction_static=0.1
                     ),
@@ -220,6 +228,7 @@ class TestLLaDAImageTextConditioning(unittest.TestCase):
                     nccl_port=29500,
                     trust_remote_code=False,
                     revision="pinned-rev",
+                    component_paths={},
                     pipeline_config=SimpleNamespace(
                         text_encoder_mem_fraction_static=0.1
                     ),
@@ -227,6 +236,16 @@ class TestLLaDAImageTextConditioning(unittest.TestCase):
             )
 
         self.assertIs(runner.worker, fake_worker)
+        self.assertEqual(runner.server_args.model_path, "resolved:/custom/text_encoder")
+        self.assertEqual(
+            runner.server_args.tokenizer_path, "resolved:/custom/tokenizer"
+        )
+        self.assertEqual(
+            untrusted_runner.server_args.model_path, "/unused/model/text_encoder"
+        )
+        self.assertEqual(
+            untrusted_runner.server_args.tokenizer_path, "/unused/model/tokenizer"
+        )
         self.assertIsNone(runner.server_args.page_size)
         self.assertEqual(runner.page_size, resolved_page_size)
         self.assertEqual(

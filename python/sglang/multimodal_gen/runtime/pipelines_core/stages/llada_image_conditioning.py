@@ -19,6 +19,22 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    prepare_diffusers_component_path_for_loading,
+)
+
+
+def _resolve_llada_image_component_path(
+    model_root: str,
+    server_args: ServerArgs,
+    component_name: str,
+) -> str:
+    override_path = (getattr(server_args, "component_paths", {}) or {}).get(
+        component_name
+    )
+    if override_path is not None:
+        return prepare_diffusers_component_path_for_loading(override_path)
+    return str(Path(model_root) / component_name)
 
 
 def ensure_conditioning_mask_active(attn_backend) -> None:
@@ -68,14 +84,19 @@ class LLaDAImageTextEncoderRunner:
         self.queryformer = queryformer
         self.text_projection = text_projection
         self.tokenizer = tokenizer
-        text_encoder_path = str(Path(model_root) / "text_encoder")
+        text_encoder_path = _resolve_llada_image_component_path(
+            model_root, server_args, "text_encoder"
+        )
+        tokenizer_path = _resolve_llada_image_component_path(
+            model_root, server_args, "tokenizer"
+        )
         device = get_local_torch_device()
         gpu_id = device.index
         if gpu_id is None:
             gpu_id = int(os.environ.get("LOCAL_RANK", "0"))
         srt_args = SRTServerArgs(
             model_path=text_encoder_path,
-            tokenizer_path=str(Path(model_root) / "tokenizer"),
+            tokenizer_path=tokenizer_path,
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.revision,
             skip_tokenizer_init=True,

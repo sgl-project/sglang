@@ -1246,7 +1246,20 @@ class ModelConfig:
 
         llada_fp8_experts = _hf_attr(self.hf_config, "llada_fp8_experts")
         if llada_fp8_experts is None:
-            return None
+            if _hf_attr(self.hf_config, "use_fp8_experts") is not True:
+                return None
+            logger.warning_once(
+                "The legacy LLaDA2 use_fp8_experts flag is deprecated; "
+                "publish llada_fp8_experts metadata instead."
+            )
+            llada_fp8_experts = {
+                "enabled": True,
+                "format": "e4m3fn",
+                "weight_granularity": "per_expert_2d_block",
+                "weight_block_size": [128, 128],
+                "activation_method": "dynamic_absmax_rtn",
+                "activation_granularity": "per_token",
+            }
         if not isinstance(llada_fp8_experts, dict):
             llada_fp8_experts = llada_fp8_experts.to_dict()
         if not llada_fp8_experts.get("enabled", False):

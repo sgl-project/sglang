@@ -42,15 +42,19 @@ class TestLLaDA2Fp8(CustomTestCase):
         architecture="LLaDA2MoeModelLM",
         quantization_config=None,
         compression_config=None,
+        use_fp8_experts=None,
     ):
         model_config = ModelConfig.__new__(ModelConfig)
         model_config.model_path = self.model_dir.name
-        model_config.hf_config = PretrainedConfig(
+        config_kwargs = dict(
             architectures=[architecture],
             quantization_config=quantization_config,
             compression_config=compression_config,
             llada_fp8_experts=custom_config,
         )
+        if use_fp8_experts is not None:
+            config_kwargs["use_fp8_experts"] = use_fp8_experts
+        model_config.hf_config = PretrainedConfig(**config_kwargs)
         return model_config
 
     def test_parses_experts_only_block_fp8(self):
@@ -86,11 +90,54 @@ class TestLLaDA2Fp8(CustomTestCase):
         self.assertTrue(fp8_config.llada_experts_only)
         self.assertEqual(fp8_config.weight_block_size, [128, 128])
 
+    def test_parses_legacy_experts_only_fp8_flag(self):
+        model_config = self._model_config(None, use_fp8_experts=True)
+
+        self.assertEqual(
+            model_config._parse_quant_hf_config(),
+            {
+                "quant_method": "fp8",
+                "activation_scheme": "dynamic",
+                "weight_block_size": [128, 128],
+                "llada_experts_only": True,
+            },
+        )
+
+        disabled = self._model_config(None, use_fp8_experts=False)
+        self.assertIsNone(disabled._parse_llada_fp8_experts_config())
+
+    def test_legacy_flag_restores_only_missing_runtime_fields(self):
+        from sglang.srt.models.llada2 import (
+            _apply_legacy_llada2_fp8_config_defaults,
+        )
+
+        legacy_config = SimpleNamespace(
+            use_fp8_experts=True,
+            router_dtype="bfloat16",
+        )
+        _apply_legacy_llada2_fp8_config_defaults(legacy_config)
+
+        self.assertEqual(legacy_config.embedding_dropout, 0.0)
+        self.assertTrue(legacy_config.moe_router_enable_expert_bias)
+        self.assertTrue(legacy_config.norm_topk_prob)
+        self.assertEqual(legacy_config.score_function, "sigmoid")
+        self.assertEqual(legacy_config.router_dtype, "bfloat16")
+
+        standard_config = SimpleNamespace(use_fp8_experts=False)
+        _apply_legacy_llada2_fp8_config_defaults(standard_config)
+        self.assertFalse(hasattr(standard_config, "embedding_dropout"))
+        self.assertFalse(hasattr(standard_config, "score_function"))
+
     def test_experts_only_mode_requires_llada_specific_opt_in(self):
         non_llada_config = self._model_config(
             _experts_only_config(), architecture="Qwen2ForCausalLM"
         )
         self.assertIsNone(non_llada_config._parse_llada_fp8_experts_config())
+
+        legacy_non_llada = self._model_config(
+            None, architecture="Qwen2ForCausalLM", use_fp8_experts=True
+        )
+        self.assertIsNone(legacy_non_llada._parse_llada_fp8_experts_config())
 
         generic_fp8_config = Fp8Config.from_config(
             {
