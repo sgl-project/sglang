@@ -94,7 +94,6 @@ class TestSchedulePolicyHRRN(CustomTestCase):
         self.assertEqual(waiting_queue[0].rid, "long_old")
         self.assertEqual(waiting_queue[1].rid, "short_new")
 
-
     def test_calc_priority_hrrn_cached_length_affects_order(self):
         """Cached prefix length shortens uncached, so reqs with the same input
         length can sort differently by HRRN. Also verifies rid tie-break for
