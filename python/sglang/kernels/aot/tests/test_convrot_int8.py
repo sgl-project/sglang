@@ -37,9 +37,30 @@ PRODUCTION_M = [3, 20, 2048, 4096]
 PRODUCTION_KN = [(3072, 3072), (3072, 12288), (12288, 3072)]
 
 
-def _make_inputs(M, K, N, with_bias, seed=0):
+def _channel_shift(z, gen):
+    K = z.shape[-1]
+    scale = (1 + 0.3 * torch.randn(K, device="cuda", generator=gen)).abs()
+    shift = 0.5 + 0.3 * torch.randn(K, device="cuda", generator=gen)
+    return (z * scale + shift).to(z.dtype)
+
+
+# Activation statistics a data-free rotation must be indifferent to. GELU
+# outputs and shifted rows are what the DiT feeds the down-projections; the
+# Sylvester transform concentrated a group's mean into one coefficient and
+# ran 1.8-2.8x the Gaussian error on these, the regular Hadamard stays within
+# 1.15x.
+INPUT_FAMILIES = {
+    "gauss": lambda z, gen: z,
+    "gelu": lambda z, gen: torch.nn.functional.gelu(2 * z, approximate="tanh"),
+    "dc": lambda z, gen: z + 1.0,
+    "chan_shift": _channel_shift,
+}
+
+
+def _make_inputs(M, K, N, with_bias, seed=0, family="gauss"):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, generator=gen)
+    x = INPUT_FAMILIES[family](x, gen)
     weight = (
         torch.randn(N, K, device="cuda", dtype=torch.bfloat16, generator=gen) * 0.02
     )
@@ -96,6 +117,51 @@ def test_rotate_quantize_matches_hadamard_reference(M, group_size):
     # dense reference matmul; measured drift on the row absmax is ~1e-4.
     torch.testing.assert_close(x_scale, ref_scale, rtol=1e-3, atol=0)
     assert (x_q.int() - ref_q.int()).abs().max().item() <= 1
+
+
+def _fused_rel_l2(M, K, N, family):
+    x, weight, weight_q, weight_scale, bias = _make_inputs(
+        M, K, N, with_bias=True, family=family
+    )
+    out = convrot_int8_fused_linear(
+        x, weight_q, weight_scale, bias=bias, group_size=GROUP_SIZE
+    )
+    ref = torch.nn.functional.linear(x, weight, bias)
+    err = torch.linalg.vector_norm(out.float() - ref.float())
+    return (err / torch.linalg.vector_norm(ref.float())).item()
+
+
+@pytest.mark.parametrize("family", [f for f in INPUT_FAMILIES if f != "gauss"])
+@pytest.mark.parametrize("K,N", PRODUCTION_KN)
+def test_error_is_independent_of_input_statistics(family, K, N):
+    M = 2048
+    gauss = _fused_rel_l2(M, K, N, "gauss")
+    other = _fused_rel_l2(M, K, N, family)
+    assert other < 2e-2, other
+    assert other / gauss < 1.25, (family, other, gauss)
+
+
+@pytest.mark.parametrize("group_size", [64, 128, 256, 512])
+@pytest.mark.parametrize("K", [1024, 3072, 12288, 16384, 33792, 57856])
+def test_rotate_quantize_matches_hadamard_reference_wide_rows(K, group_size):
+    # K + group_size leaves a partial last tile; 16384 < K selects the
+    # 1024-thread launch and K > 32768 the two-pass one.
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    for k in (K, K + group_size):
+        x = torch.randn(3, k, device="cuda", dtype=torch.bfloat16, generator=gen)
+        x_q, x_scale = convrot_rotate_quantize_activation(x, group_size=group_size)
+        ref_q, ref_scale = _reference_rotate_quantize(x, group_size=group_size)
+        torch.testing.assert_close(x_scale, ref_scale, rtol=1e-3, atol=0)
+        assert (x_q.int() - ref_q.int()).abs().max().item() <= 1
+
+
+def test_rejects_misaligned_view():
+    base = torch.randn(20 * 3072 + 8, device="cuda", dtype=torch.bfloat16)
+    # Contiguous, but the storage offset is one element: the vectorized loads
+    # need 16-byte alignment and the op says so instead of faulting.
+    x = base[1 : 1 + 20 * 3072].view(20, 3072)
+    with pytest.raises(RuntimeError, match="aligned"):
+        convrot_rotate_quantize_activation(x, group_size=GROUP_SIZE)
 
 
 @pytest.mark.parametrize("M", PRODUCTION_M)
@@ -200,6 +266,14 @@ def test_rejects_invalid_arguments():
     with pytest.raises(RuntimeError, match="weight_q must be int8"):
         convrot_int8_fused_linear(
             x, weight_q.to(torch.int32), weight_scale, bias=bias, group_size=GROUP_SIZE
+        )
+    with pytest.raises(RuntimeError, match="multiple of 8"):
+        convrot_int8_fused_linear(
+            x,
+            weight_q[: N - 4].contiguous(),
+            weight_scale[: N - 4],
+            bias=bias[: N - 4],
+            group_size=GROUP_SIZE,
         )
     narrow_weight_q = weight_q[:, :2048].contiguous()
     with pytest.raises(RuntimeError, match=r"weight_q must be \[N, K\]"):

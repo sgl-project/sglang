@@ -14,7 +14,8 @@ limitations under the License.
 ==============================================================================*/
 
 // ConvRot (arXiv:2512.03673) INT8 W8A8 linear. Activations pass through a
-// group-wise Walsh-Hadamard rotation and per-row dynamic INT8 quantization;
+// group-wise Hadamard rotation (Kronecker power of the regular 4x4 matrix, see
+// the rotate kernel) and per-row dynamic INT8 quantization;
 // weights are rotated and quantized offline with the same row-wise transform
 // (convrot_rotate_quantize_activation on the [N, K] weight). The GEMM is a
 // CUTLASS dense INT8 kernel whose epilogue applies the per-row (activation) x
@@ -32,6 +33,7 @@ limitations under the License.
 #include <cutlass/numeric_types.h>
 #include <torch/all.h>
 
+#include <algorithm>
 #include <array>
 #include <cute/tensor.hpp>
 #include <cutlass/epilogue/collective/collective_builder.hpp>
@@ -59,15 +61,23 @@ namespace sgl_kernel_convrot_int8_detail {
 using namespace cute;
 
 // ---------------------------- Rotate + quantize ----------------------------
-// One block per row. Each warp owns whole GroupSize-wide groups and holds a
-// group as (reg_slot * 32 + lane): index bits below 5 are lane shuffles and bits
-// from 5 up are same-thread register slots, so the transform itself needs no
-// block barrier; the only barrier combines the per-warp abs-max partials.
-// 512 threads: at small M the per-CTA round count (num_groups / warps) is the
-// wall time, not occupancy. Measured; smem is still the occupancy limit at
-// K = 12288.
-constexpr int kConvRotBlockThreads = 512;
-constexpr int kConvRotWarpsPerBlock = kConvRotBlockThreads / 32;
+// Register-resident: a warp holds a 1024-element tile of one row as 32 fp32 per
+// lane, so there is no K-proportional shared memory and no smem bound on K. Lanes
+// are split into GroupSize/32-lane clusters, one group per cluster (q = lane within
+// the cluster, r = register 0..31). In-group index bits held in r are {0,1,2,4,6}
+// (G >= 128) or {0..4} (G = 64), the rest come from q: bits 0-2 in r make each
+// lane's data four runs of 8 contiguous elements (16-B loads, 8-B int8 stores), and
+// every radix-4 digit above the first has one bit in r and one in q, so a stage
+// costs one shuffle per element and the transform needs no block barrier. A row is
+// ceil(K / 1024) warps; up to 32 of them (K <= 32768) keep the rotated row in
+// registers across the single abs-max barrier. Wider rows take the two-pass variant
+// (rotate for the abs-max, re-read the row from L2 and rotate again to quantize).
+constexpr int kRotTileElems = 1024;
+constexpr int kRotElemsPerLane = 32;
+constexpr int kRotMaxWarps = 32;
+constexpr int kRotSmallTiles = 16;  // n_tiles <= 16 (K <= 16384) runs under a 512-thread register cap
+constexpr int kRotTargetWarpsPerBlock = 8;
+constexpr unsigned kRotFullMask = 0xffffffffu;
 
 // GELU (tanh approximation) matching ATen's CUDA kernel bit-for-bit: same fp32
 // constants and association order, libdevice tanhf. The sm90 library build
@@ -84,174 +94,278 @@ struct ATenGeluTanh {
   }
 };
 
+template <int GroupSize>
+struct RotLayout {
+  static_assert(GroupSize == 64 || GroupSize == 128 || GroupSize == 256 || GroupSize == 512, "");
+  static constexpr int kLanesPerGroup = GroupSize / 32;
+  static constexpr int kGroupsPerTile = 32 / kLanesPerGroup;
+  // In-group offset of register run j (registers 8j .. 8j+7) for lane-in-cluster q.
+  __device__ static __forceinline__ int run_offset(int q, int j) {
+    if constexpr (GroupSize == 64) {
+      return (q << 5) | (j << 3);
+    } else {
+      return ((q & 1) << 3) | ((j & 1) << 4) | (((q >> 1) & 1) << 5) | ((j >> 1) << 6) | (((q >> 2) & 1) << 7) |
+             (((q >> 3) & 1) << 8);
+    }
+  }
+};
+
+// Regular (non-Sylvester) Hadamard, the Kronecker power of
+//   H4 = [[1,1,1,-1], [1,1,-1,1], [1,-1,1,1], [-1,1,1,1]]:
+// one 4-point stage per base-4 digit of the in-group index, y_d = S - 2 x_{d^3}
+// with S the sum of the four elements that differ only in that digit. Every row
+// of the product sums to +1, so a group's mean stays spread over the
+// coefficients. The Sylvester transform (row 0 all ones) concentrates it into
+// one coefficient at sqrt(GroupSize) x; that coefficient becomes the row absmax
+// and coarsens the INT8 step for the whole row, measured 1.3-1.9x more error on
+// GELU outputs and other non-zero-mean inputs. Same matrix as comfy-kitchen's
+// ConvRot path. Group sizes with an odd bit count finish with one 2-point stage
+// on the top bit.
+// S is always formed as (own + low-bit partner) + (high-bit partner + both), which
+// is the same fp32 expression for the four members of a quartet (a + b == b + a
+// bitwise), so the result does not depend on which lane or register holds an
+// element. All v[] indices are compile-time constants after unrolling; a
+// lane-dependent index would put the array in local memory.
+
+// Both digit bits in the register index (B0 = low bit, B1 = high bit).
+template <int B0, int B1>
+__device__ __forceinline__ void rot_stage_regreg(float (&v)[kRotElemsPerLane]) {
+  CUTLASS_PRAGMA_UNROLL
+  for (int r = 0; r < kRotElemsPerLane; r++) {
+    if ((r & (B0 | B1)) == 0) {
+      const float a0 = v[r], a1 = v[r | B0], a2 = v[r | B1], a3 = v[r | B0 | B1];
+      const float S = (a0 + a1) + (a2 + a3);
+      v[r] = S - 2.f * a3;
+      v[r | B0] = S - 2.f * a2;
+      v[r | B1] = S - 2.f * a1;
+      v[r | B0 | B1] = S - 2.f * a0;
+    }
+  }
+}
+
+// Low digit bit in the register index (RB), high digit bit in the lane (xor X).
+template <int RB, int X>
+__device__ __forceinline__ void rot_stage_split(float (&v)[kRotElemsPerLane]) {
+  CUTLASS_PRAGMA_UNROLL
+  for (int r = 0; r < kRotElemsPerLane; r++) {
+    if ((r & RB) == 0) {
+      const float a = v[r], b = v[r | RB];
+      const float ap = __shfl_xor_sync(kRotFullMask, a, X);
+      const float bp = __shfl_xor_sync(kRotFullMask, b, X);
+      const float S = (a + b) + (ap + bp);
+      v[r] = S - 2.f * bp;
+      v[r | RB] = S - 2.f * ap;
+    }
+  }
+}
+
+// 2-point stage on a register bit (RB) ...
+template <int RB>
+__device__ __forceinline__ void rot_stage_2pt_reg(float (&v)[kRotElemsPerLane]) {
+  CUTLASS_PRAGMA_UNROLL
+  for (int r = 0; r < kRotElemsPerLane; r++) {
+    if ((r & RB) == 0) {
+      const float a = v[r], b = v[r | RB];
+      v[r] = a + b;
+      v[r | RB] = a - b;
+    }
+  }
+}
+
+// ... or on a lane bit (xor X); `hi` = this lane holds the bit-set element.
+template <int X>
+__device__ __forceinline__ void rot_stage_2pt_lane(float (&v)[kRotElemsPerLane], bool hi) {
+  CUTLASS_PRAGMA_UNROLL
+  for (int r = 0; r < kRotElemsPerLane; r++) {
+    const float mine = v[r];
+    const float p = __shfl_xor_sync(kRotFullMask, mine, X);
+    v[r] = hi ? (p - mine) : (mine + p);
+  }
+}
+
+template <int GroupSize>
+__device__ __forceinline__ void rot_rotate_tile(float (&v)[kRotElemsPerLane], int q) {
+  if constexpr (GroupSize == 64) {
+    rot_stage_regreg<1, 2>(v);  // digit 0: in-group bits 0,1
+    rot_stage_regreg<4, 8>(v);  // digit 1: bits 2,3
+    rot_stage_split<16, 1>(v);  // digit 2: bit 4 (reg) / bit 5 (lane)
+  } else {
+    rot_stage_regreg<1, 2>(v);  // digit 0: bits 0,1
+    rot_stage_split<4, 1>(v);   // digit 1: bit 2 (reg) / bit 3 (lane)
+    rot_stage_split<8, 2>(v);   // digit 2: bit 4 (reg) / bit 5 (lane)
+    if constexpr (GroupSize == 128) {
+      rot_stage_2pt_reg<16>(v);  // bit 6 (reg)
+    } else {
+      rot_stage_split<16, 4>(v);  // digit 3: bit 6 (reg) / bit 7 (lane)
+      if constexpr (GroupSize == 512) {
+        rot_stage_2pt_lane<8>(v, (q & 8) != 0);  // bit 8 (lane)
+      }
+    }
+  }
+}
+
 // GeluInput fuses the F.gelu(approximate="tanh") that otherwise precedes an
 // FFN down-projection. The GELU result is rounded to BF16 and back before the
 // butterfly, so the rotated values are bitwise those of the eager
 // store-then-reload path.
 template <int GroupSize, bool GeluInput>
-__global__ void convrot_rotate_quantize_activation_kernel(
-    const __nv_bfloat16* __restrict__ x, int8_t* __restrict__ x_q, float* __restrict__ row_scale, int K) {
-  static_assert(GroupSize >= 64 && (GroupSize & (GroupSize - 1)) == 0, "GroupSize must be a power of two >= 64");
-  constexpr int kElemsPerThread = GroupSize / 32;
-  constexpr unsigned kFullMask = 0xffffffffu;
+__device__ __forceinline__ void
+rot_load_tile(const __nv_bfloat16* __restrict__ grp, int q, bool active, float (&v)[kRotElemsPerLane]) {
+  CUTLASS_PRAGMA_UNROLL
+  for (int j = 0; j < 4; j++) {
+    uint4 pk = make_uint4(0u, 0u, 0u, 0u);
+    if (active) pk = *reinterpret_cast<const uint4*>(grp + RotLayout<GroupSize>::run_offset(q, j));
+    const uint32_t w[4] = {pk.x, pk.y, pk.z, pk.w};
+    CUTLASS_PRAGMA_UNROLL
+    for (int e = 0; e < 4; e++) {
+      v[8 * j + 2 * e] = __uint_as_float(w[e] << 16);
+      v[8 * j + 2 * e + 1] = __uint_as_float(w[e] & 0xffff0000u);
+    }
+  }
+  if constexpr (GeluInput) {
+    CUTLASS_PRAGMA_UNROLL
+    for (int r = 0; r < kRotElemsPerLane; r++) {
+      v[r] = __bfloat162float(__float2bfloat16(ATenGeluTanh{}(v[r])));
+    }
+  }
+}
 
-  extern __shared__ float srow[];
-  const int row = blockIdx.x;
-  const int tid = threadIdx.x;
-  const int lane = tid & 31;
-  const int warp_id = tid >> 5;
+template <int GroupSize>
+__device__ __forceinline__ void rot_quant_store_tile(
+    int8_t* __restrict__ grp_out, int q, bool active, const float (&v)[kRotElemsPerLane], float inv_scale) {
+  CUTLASS_PRAGMA_UNROLL
+  for (int j = 0; j < 4; j++) {
+    uint32_t w[2];
+    CUTLASS_PRAGMA_UNROLL
+    for (int h = 0; h < 2; h++) {
+      int32_t qv[4];
+      CUTLASS_PRAGMA_UNROLL
+      for (int e = 0; e < 4; e++) {
+        float t = v[8 * j + 4 * h + e] * inv_scale;
+        t = fmaxf(-127.f, fminf(127.f, t));
+        qv[e] = __float2int_rn(t);  // == lrintf on the clamped range
+      }
+      const uint32_t lo = __byte_perm((uint32_t)qv[0], (uint32_t)qv[1], 0x0040);
+      const uint32_t hi = __byte_perm((uint32_t)qv[2], (uint32_t)qv[3], 0x0040);
+      w[h] = __byte_perm(lo, hi, 0x5410);
+    }
+    if (active) *reinterpret_cast<uint2*>(grp_out + RotLayout<GroupSize>::run_offset(q, j)) = make_uint2(w[0], w[1]);
+  }
+}
+
+__device__ __forceinline__ float rot_warp_max(float a) {
+  CUTLASS_PRAGMA_UNROLL
+  for (int off = 16; off > 0; off >>= 1) {
+    a = fmaxf(a, __shfl_xor_sync(kRotFullMask, a, off));
+  }
+  return a;
+}
+
+// Block = dim3(32 * warps_per_row, rows_per_block): threadIdx.y is the row within
+// the block, threadIdx.x >> 5 the tile within the row. Resident: warps_per_row ==
+// n_tiles and the rotated row stays in registers across the barrier. Two-pass
+// (!Resident, K > 32768): 32 warps stride over the tiles.
+template <int GroupSize, bool GeluInput, int MaxThreads, bool Resident>
+__global__ void __launch_bounds__(MaxThreads) convrot_rotate_quantize_activation_kernel(
+    const __nv_bfloat16* __restrict__ x, int8_t* __restrict__ x_q, float* __restrict__ row_scale, int M, int K) {
+  using Layout = RotLayout<GroupSize>;
+  __shared__ float warp_amax[kRotMaxWarps];
+
+  const int lane = threadIdx.x & 31;
+  const int tile0 = threadIdx.x >> 5;
+  const int warps_per_row = blockDim.x >> 5;
+  const int row_in_block = threadIdx.y;
+  const int block_warp = row_in_block * warps_per_row + tile0;
+  const int row = blockIdx.x * blockDim.y + row_in_block;
+  const bool row_valid = row < M;               // padding rows compute on zeros and still reach the barrier
+  const int c = lane / Layout::kLanesPerGroup;  // group within the tile
+  const int q = lane % Layout::kLanesPerGroup;  // lane within the group
   const int num_groups = K / GroupSize;
+  const int n_tiles = (K + kRotTileElems - 1) / kRotTileElems;
   const __nv_bfloat16* row_in = x + (int64_t)row * K;
+  int8_t* row_out = x_q + (int64_t)row * K;
   // H / sqrt(GroupSize) on both operands keeps (Ux) . (Uw) == x . w exactly.
   const float inv_sqrt_group = rsqrtf((float)GroupSize);
 
+  float v[kRotElemsPerLane];
   float local_amax = 0.f;
-  for (int g = warp_id; g < num_groups; g += kConvRotWarpsPerBlock) {
-    const __nv_bfloat16* gbase_in = row_in + (int64_t)g * GroupSize;
-    float reg[kElemsPerThread];
+  const int g0 = tile0 * Layout::kGroupsPerTile + c;
+  const bool active0 = row_valid && (g0 < num_groups);
+  if constexpr (Resident) {
+    rot_load_tile<GroupSize, GeluInput>(row_in + (int64_t)g0 * GroupSize, q, active0, v);
+    rot_rotate_tile<GroupSize>(v, q);
     CUTLASS_PRAGMA_UNROLL
-    for (int k = 0; k < kElemsPerThread; k++) {
-      reg[k] = __bfloat162float(gbase_in[k * 32 + lane]);
-      if constexpr (GeluInput) {
-        reg[k] = __bfloat162float(__float2bfloat16(ATenGeluTanh{}(reg[k])));
-      }
+    for (int r = 0; r < kRotElemsPerLane; r++) {
+      v[r] *= inv_sqrt_group;
+      local_amax = fmaxf(local_amax, fabsf(v[r]));
     }
-
-    // Regular (non-Sylvester) Hadamard, the Kronecker power of
-    //   H4 = [[1,1,1,-1], [1,1,-1,1], [1,-1,1,1], [-1,1,1,1]]:
-    // one 4-point stage per base-4 digit of the in-group index, y_d = S - 2 x_{d^3}
-    // with S the sum of the four elements that differ only in that digit. Every row
-    // of the product sums to +1, so a group's mean stays spread over the
-    // coefficients. The Sylvester transform (row 0 all ones) concentrates it into
-    // one coefficient at sqrt(GroupSize) x; that coefficient becomes the row absmax
-    // and coarsens the INT8 step for the whole row, measured 1.3-1.9x more error on
-    // GELU outputs and other non-zero-mean inputs. Same matrix as comfy-kitchen's
-    // ConvRot path. Index bits: 0-4 lane, 5+ register slot; digit (bits 4,5)
-    // straddles both. Group sizes with an odd bit count finish with one 2-point
-    // stage on the top register bit.
-    auto h4_mix = [](float v0, float v1, float v2, float v3, int d) -> float {
-      // vals indexed by digit value; the sum is formed in a fixed order so the four
-      // threads/slots of a quartet produce bitwise the same S.
-      float vals[4];
-      vals[d] = v0;
-      vals[d ^ 1] = v1;
-      vals[d ^ 2] = v2;
-      vals[d ^ 3] = v3;
-      const float S = (vals[0] + vals[1]) + (vals[2] + vals[3]);
-      return S - 2.f * vals[d ^ 3];
-    };
-
-    // Digits 0 and 1: lane bits (0,1) and (2,3).
-    CUTLASS_PRAGMA_UNROLL
-    for (int shift = 0; shift < 4; shift += 2) {
-      const int s1 = 1 << shift;
-      const int d = (lane >> shift) & 3;
+  } else {
+    CUTLASS_PRAGMA_NO_UNROLL
+    for (int t = tile0; t < n_tiles; t += warps_per_row) {
+      const int g = t * Layout::kGroupsPerTile + c;
+      const bool active = row_valid && (g < num_groups);
+      rot_load_tile<GroupSize, GeluInput>(row_in + (int64_t)g * GroupSize, q, active, v);
+      rot_rotate_tile<GroupSize>(v, q);
       CUTLASS_PRAGMA_UNROLL
-      for (int k = 0; k < kElemsPerThread; k++) {
-        const float mine = reg[k];
-        const float p1 = __shfl_xor_sync(kFullMask, mine, s1);
-        const float p2 = __shfl_xor_sync(kFullMask, mine, 2 * s1);
-        const float p3 = __shfl_xor_sync(kFullMask, mine, 3 * s1);
-        reg[k] = h4_mix(mine, p1, p2, p3, d);
+      for (int r = 0; r < kRotElemsPerLane; r++) {
+        local_amax = fmaxf(local_amax, fabsf(v[r] * inv_sqrt_group));
       }
-    }
-
-    // Digit 2: lane bit 4 (partner one shuffle away) and register bit 0 (partner
-    // one slot away).
-    {
-      const int lane_bit = (lane >> 4) & 1;
-      CUTLASS_PRAGMA_UNROLL
-      for (int k = 0; k < kElemsPerThread; k += 2) {
-        const float a = reg[k];
-        const float b = reg[k + 1];
-        const float a16 = __shfl_xor_sync(kFullMask, a, 16);
-        const float b16 = __shfl_xor_sync(kFullMask, b, 16);
-        // slot k holds digit value lane_bit, slot k+1 holds lane_bit | 2.
-        reg[k] = h4_mix(a, a16, b, b16, lane_bit);
-        reg[k + 1] = h4_mix(b, b16, a, a16, lane_bit | 2);
-      }
-    }
-
-    // Digit 3: register bits 1 and 2 (GroupSize >= 256).
-    if constexpr (kElemsPerThread >= 8) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int k = 0; k < kElemsPerThread; k += 8) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int lo = 0; lo < 2; lo++) {
-          const float v0 = reg[k + lo];
-          const float v1 = reg[k + lo + 2];
-          const float v2 = reg[k + lo + 4];
-          const float v3 = reg[k + lo + 6];
-          reg[k + lo] = h4_mix(v0, v1, v2, v3, 0);
-          reg[k + lo + 2] = h4_mix(v1, v0, v3, v2, 1);
-          reg[k + lo + 4] = h4_mix(v2, v3, v0, v1, 2);
-          reg[k + lo + 6] = h4_mix(v3, v2, v1, v0, 3);
-        }
-      }
-    }
-
-    // Leftover top bit (GroupSize 128: register bit 1; 512: register bit 3): 2-point stage.
-    if constexpr (kElemsPerThread == 4 || kElemsPerThread == 16) {
-      constexpr int kTop = kElemsPerThread / 2;
-      CUTLASS_PRAGMA_UNROLL
-      for (int k = 0; k < kElemsPerThread; k++) {
-        if ((k & kTop) == 0) {
-          const float a = reg[k];
-          const float b = reg[k + kTop];
-          reg[k] = a + b;
-          reg[k + kTop] = a - b;
-        }
-      }
-    }
-
-    float* gbase_row = srow + (int64_t)g * GroupSize;
-    CUTLASS_PRAGMA_UNROLL
-    for (int k = 0; k < kElemsPerThread; k++) {
-      reg[k] *= inv_sqrt_group;
-      local_amax = fmaxf(local_amax, fabsf(reg[k]));
-      gbase_row[k * 32 + lane] = reg[k];
     }
   }
 
-  CUTLASS_PRAGMA_UNROLL
-  for (int off = 16; off > 0; off >>= 1) {
-    local_amax = fmaxf(local_amax, __shfl_xor_sync(kFullMask, local_amax, off));
-  }
-  __shared__ float warp_amax[kConvRotWarpsPerBlock];
-  if (lane == 0) warp_amax[warp_id] = local_amax;
+  local_amax = rot_warp_max(local_amax);
+  if (lane == 0) warp_amax[block_warp] = local_amax;
   __syncthreads();
 
-  __shared__ float s_inv_scale;
-  if (tid == 0) {
-    float amax = 0.f;
-    CUTLASS_PRAGMA_UNROLL
-    for (int w = 0; w < kConvRotWarpsPerBlock; w++)
-      amax = fmaxf(amax, warp_amax[w]);
-    const float scale = (amax > 0.f) ? (amax / 127.f) : 1.f;
-    row_scale[row] = scale;
-    s_inv_scale = 1.f / scale;
-  }
-  __syncthreads();
+  // Every thread folds its row's warp partials (max is order-independent), so no
+  // second barrier is needed; the scale expressions are the same as before.
+  const float amax = rot_warp_max(lane < warps_per_row ? warp_amax[row_in_block * warps_per_row + lane] : 0.f);
+  const float scale = (amax > 0.f) ? (amax / 127.f) : 1.f;
+  const float inv_scale = 1.f / scale;
+  if (row_valid && tile0 == 0 && lane == 0) row_scale[row] = scale;
 
-  int8_t* row_out = x_q + (int64_t)row * K;
-  const float inv_scale = s_inv_scale;
-  for (int i = tid; i < K; i += kConvRotBlockThreads) {
-    float v = srow[i] * inv_scale;
-    v = fmaxf(-127.f, fminf(127.f, v));
-    row_out[i] = static_cast<int8_t>(lrintf(v));
+  if constexpr (Resident) {
+    rot_quant_store_tile<GroupSize>(row_out + (int64_t)g0 * GroupSize, q, active0, v, inv_scale);
+  } else {
+    CUTLASS_PRAGMA_NO_UNROLL
+    for (int t = tile0; t < n_tiles; t += warps_per_row) {
+      const int g = t * Layout::kGroupsPerTile + c;
+      const bool active = row_valid && (g < num_groups);
+      rot_load_tile<GroupSize, GeluInput>(row_in + (int64_t)g * GroupSize, q, active, v);
+      rot_rotate_tile<GroupSize>(v, q);
+      CUTLASS_PRAGMA_UNROLL
+      for (int r = 0; r < kRotElemsPerLane; r++)
+        v[r] *= inv_sqrt_group;
+      rot_quant_store_tile<GroupSize>(row_out + (int64_t)g * GroupSize, q, active, v, inv_scale);
+    }
   }
 }
 
 template <int GroupSize, bool GeluInput>
 void launch_rotate_quantize_kernel(
     const __nv_bfloat16* x, int8_t* x_q, float* row_scale, int M, int K, cudaStream_t stream) {
-  auto kernel = convrot_rotate_quantize_activation_kernel<GroupSize, GeluInput>;
-  const size_t smem_bytes = (size_t)K * sizeof(float);
-  // The kernel's static smem also counts against the 48KB default, hence the margin.
-  if (smem_bytes > 47 * 1024) {
-    CHECK_CUDA_SUCCESS(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes));
+  if (M == 0) return;
+  // Rows are K * 2 >= 128 bytes and the in-row offsets multiples of 16 bytes, so
+  // the base pointers carry the whole 16-B load / 8-B store alignment requirement.
+  TORCH_CHECK(
+      (reinterpret_cast<uintptr_t>(x) & 15) == 0 && (reinterpret_cast<uintptr_t>(x_q) & 7) == 0,
+      "convrot_int8: x must be 16-byte aligned and x_q 8-byte aligned");
+  const int n_tiles = (K + kRotTileElems - 1) / kRotTileElems;
+  if (n_tiles <= kRotMaxWarps) {
+    const int rows_per_block = std::max(1, std::min(M, kRotTargetWarpsPerBlock / n_tiles));
+    const dim3 block(32 * n_tiles, rows_per_block);
+    const dim3 grid((M + rows_per_block - 1) / rows_per_block);
+    if (n_tiles <= kRotSmallTiles) {
+      convrot_rotate_quantize_activation_kernel<GroupSize, GeluInput, 512, true>
+          <<<grid, block, 0, stream>>>(x, x_q, row_scale, M, K);
+    } else {
+      convrot_rotate_quantize_activation_kernel<GroupSize, GeluInput, 1024, true>
+          <<<grid, block, 0, stream>>>(x, x_q, row_scale, M, K);
+    }
+  } else {
+    convrot_rotate_quantize_activation_kernel<GroupSize, GeluInput, 1024, false>
+        <<<dim3(M), dim3(32 * kRotMaxWarps, 1), 0, stream>>>(x, x_q, row_scale, M, K);
   }
-  kernel<<<dim3(M), dim3(kConvRotBlockThreads), smem_bytes, stream>>>(x, x_q, row_scale, K);
   CHECK_CUDA_SUCCESS(cudaGetLastError());
 }
 
@@ -780,6 +894,8 @@ void check_weight(
   TORCH_CHECK(weight_scale.scalar_type() == torch::kFloat32, "convrot_int8: weight_scale must be float32");
   TORCH_CHECK(weight_q.size(1) == K, "convrot_int8: weight_q must be [N, K] with K = ", K, ", got ", weight_q.sizes());
   const int64_t N = weight_q.size(0);
+  // Every GEMM path stores the BF16 output 8 elements at a time.
+  TORCH_CHECK(N % 8 == 0, "convrot_int8: N (weight rows) must be a multiple of 8, got ", N);
   TORCH_CHECK(weight_scale.numel() == N, "convrot_int8: weight_scale must have N = ", N, " elements");
   if (bias.has_value()) {
     CHECK_INPUT(bias.value());
