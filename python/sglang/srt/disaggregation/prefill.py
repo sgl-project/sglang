@@ -469,6 +469,7 @@ class PrefillBootstrapQueue:
                     tp_group,
                 )
             else:
+
                 def _empty():
                     return [] if not return_failed_reqs else ([], [])
 
@@ -497,7 +498,9 @@ class PrefillBootstrapQueue:
                     return _empty()
 
                 rid_to_req = {req.rid: req for req in self.queue}
-                aligned_reqs = [rid_to_req[rid] for rid in common_rids if rid in rid_to_req]
+                aligned_reqs = [
+                    rid_to_req[rid] for rid in common_rids if rid in rid_to_req
+                ]
                 if not aligned_reqs:
                     return _empty()
 

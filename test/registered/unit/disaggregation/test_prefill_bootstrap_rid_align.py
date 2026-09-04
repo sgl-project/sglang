@@ -92,9 +92,7 @@ class TestPrefillBootstrapRidAlign(CustomTestCase):
                 "sglang.srt.disaggregation.prefill.dist.all_reduce",
                 side_effect=all_reduce,
             ) as reduce,
-            patch(
-                "sglang.srt.disaggregation.prefill.dist.all_gather_object"
-            ) as gather,
+            patch("sglang.srt.disaggregation.prefill.dist.all_gather_object") as gather,
             patch(
                 "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group"
             ) as poll,
