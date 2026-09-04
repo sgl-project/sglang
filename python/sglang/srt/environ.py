@@ -1609,8 +1609,6 @@ class Envs:
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
     SGLANG_TRACE_QWEN35_FINAL_NORM = EnvBool(False)
     SGLANG_QWEN35_NATIVE_FINAL_NORM = EnvBool(False)
-    # One switch enables deferred MoE finalize and AR + residual + RMSNorm.
-    SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION = EnvBool(False)
     # Distinct workspace configurations allowed in one process. Production
     # uses one model/configuration per rank, so fail closed on accidental reuse.
     SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION_MAX_INSTANCES = EnvInt(1)

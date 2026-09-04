@@ -351,7 +351,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             inplace=not _needs_hidden_after_experts,
             enable_qwen35_fp8_deferred_finalize=(
                 config.model_type == "qwen3_5_moe_text"
-                and envs.SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION.get()
+                and get_exec().comm.flashinfer_allreduce_fusion_backend == "cute-dsl"
             ),
         )
 
@@ -794,11 +794,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if defer_finalize:
             if shared_output is None:
                 raise RuntimeError("Qwen deferred finalize requires shared output")
-            from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-                Qwen35MoeFinalizeHandoff,
-            )
+            from sglang.srt.layers.moe.cutedsl_ar_fusion import MoeFinalizeHandoff
 
-            return Qwen35MoeFinalizeHandoff.from_flashinfer(
+            return MoeFinalizeHandoff.from_flashinfer(
                 final_hidden_states,
                 gated_shared_output=shared_output,
                 m=num_tokens,

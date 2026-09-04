@@ -123,6 +123,11 @@ class DeepseekModelNextN(nn.Module):
 
         self.vocab_size = config.vocab_size
 
+        # The MTP draft layer never fuses: it has no successor layer to consume
+        # a deferred MoE finalize. DeepseekV2ForCausalLM's pre-capture hook
+        # reads this off whichever inner model it wraps.
+        self.flashinfer_mnnvl_cutedsl_fusion = None
+
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,

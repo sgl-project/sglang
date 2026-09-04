@@ -163,7 +163,7 @@ def _disable_shared_experts_fusion() -> bool:
     # The deferred-finalize ABI needs the shared expert as a separate, gated
     # local contribution; it cannot consume a shared slot fused into routed MoE.
     return bool(
-        envs.SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION.get()
+        get_exec().comm.flashinfer_allreduce_fusion_backend == "cute-dsl"
         or is_shared_experts_fusion_disabled()
     )
 
@@ -199,17 +199,17 @@ def _use_mnnvl_cutedsl_fusion(config: Qwen3_5TextConfig, is_nextn: bool) -> bool
     return bool(
         not is_nextn
         and config.model_type == "qwen3_5_moe_text"
-        and envs.SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION.get()
+        and get_exec().comm.flashinfer_allreduce_fusion_backend == "cute-dsl"
     )
 
 
 def _layer_communicator_class(config: Qwen3_5TextConfig, is_nextn: bool):
     if _use_mnnvl_cutedsl_fusion(config, is_nextn):
-        from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-            Qwen35FlashInferLayerCommunicator,
+        from sglang.srt.layers.moe.cutedsl_ar_fusion import (
+            CuteDSLFusionLayerCommunicator,
         )
 
-        return Qwen35FlashInferLayerCommunicator
+        return CuteDSLFusionLayerCommunicator
     return LayerCommunicator
 
 
@@ -286,22 +286,15 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
 
 
 def _finish_mlp_output(hidden_states, *, expect_deferred: bool):
-    if not expect_deferred:
-        if not isinstance(hidden_states, torch.Tensor):
-            from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-                Qwen35MoeFinalizeHandoff,
-            )
+    from sglang.srt.layers.moe.cutedsl_ar_fusion import MoeFinalizeHandoff
 
-            if isinstance(hidden_states, Qwen35MoeFinalizeHandoff):
-                raise RuntimeError("unexpected deferred-finalize handoff")
+    if not expect_deferred:
+        if isinstance(hidden_states, MoeFinalizeHandoff):
+            raise RuntimeError("unexpected deferred-finalize handoff")
         hidden_states._sglang_needs_allreduce_fusion = True
         return hidden_states
 
-    from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-        Qwen35MoeFinalizeHandoff,
-    )
-
-    if not isinstance(hidden_states, Qwen35MoeFinalizeHandoff):
+    if not isinstance(hidden_states, MoeFinalizeHandoff):
         raise RuntimeError("Qwen3.5 expected a FlashInfer deferred-finalize handoff")
     return hidden_states
 
@@ -991,8 +984,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             fuse_mlp_allreduce
             and isinstance(hidden_states, torch.Tensor)
             and isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
-            and hasattr(self.layer_communicator, "should_use_finalize")
-            and self.layer_communicator.should_use_finalize(
+            and self.layer_communicator.should_defer_moe_finalize(
                 forward_batch, int(hidden_states.shape[0])
             )
         )
@@ -1418,8 +1410,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             fuse_mlp_allreduce
             and isinstance(hidden_states, torch.Tensor)
             and isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
-            and hasattr(self.layer_communicator, "should_use_finalize")
-            and self.layer_communicator.should_use_finalize(
+            and self.layer_communicator.should_defer_moe_finalize(
                 forward_batch, int(hidden_states.shape[0])
             )
         )
@@ -1612,26 +1603,33 @@ class Qwen3_5ForCausalLM(nn.Module):
                     "layers: "
                     f"{unsupported_layers}"
                 )
-            from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-                Qwen35FlashInferFusionService,
-                Qwen35FlashInferLayerCommunicator,
+            from sglang.srt.layers.moe.cutedsl_ar_fusion import (
+                CuteDSLFusionLayerCommunicator,
+                install_cutedsl_fusion,
             )
 
-            self.flashinfer_mnnvl_cutedsl_fusion = Qwen35FlashInferFusionService(
+            wrong_communicator = [
+                layer.layer_id
+                for layer in self.layers
+                if not isinstance(
+                    layer.layer_communicator, CuteDSLFusionLayerCommunicator
+                )
+            ]
+            if wrong_communicator:
+                raise RuntimeError(
+                    "Qwen3.5 fusion-enabled layers have the wrong communicator: "
+                    f"{wrong_communicator}"
+                )
+            self.flashinfer_mnnvl_cutedsl_fusion = install_cutedsl_fusion(
+                self.layers,
                 hidden_size=config.hidden_size,
                 top_k=config.num_experts_per_tok,
                 rms_epsilon=config.rms_norm_eps,
-            )
-            for layer in self.layers:
-                communicator = layer.layer_communicator
-                if not isinstance(communicator, Qwen35FlashInferLayerCommunicator):
-                    raise RuntimeError(
-                        "Qwen3.5 fusion-enabled layer has the wrong communicator"
-                    )
-                communicator.fusion_service = self.flashinfer_mnnvl_cutedsl_fusion
-            logger.info(
-                "Installed one Qwen3.5 FlashInfer fusion handle for %d layers",
-                len(self.layers),
+                # Every layer was checked above.
+                can_defer_finalize=lambda layer: True,
+                # Qwen3.5's final GemmaRMSNorm closes out the last handoff.
+                final_norm_consumes_handoff=True,
+                label="Qwen3.5",
             )
 
         # Final normalization
@@ -1648,11 +1646,11 @@ class Qwen3_5ForCausalLM(nn.Module):
     def prepare_before_cuda_graph_capture(self, model_runner) -> None:
         if self.flashinfer_mnnvl_cutedsl_fusion is None:
             return
-        from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-            prepare_qwen35_flashinfer_fusion,
-        )
+        from sglang.srt.layers.moe.cutedsl_ar_fusion import prepare_cutedsl_fusion
 
-        prepare_qwen35_flashinfer_fusion(self, model_runner)
+        prepare_cutedsl_fusion(
+            self.flashinfer_mnnvl_cutedsl_fusion, model_runner, label="Qwen3.5"
+        )
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
         self.layers_to_capture = layers_to_capture
@@ -1743,11 +1741,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         use_native_final_norm = envs.SGLANG_QWEN35_NATIVE_FINAL_NORM.get()
         is_deferred_finalize = False
         if self.flashinfer_mnnvl_cutedsl_fusion is not None:
-            from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-                Qwen35MoeFinalizeHandoff,
-            )
+            from sglang.srt.layers.moe.cutedsl_ar_fusion import MoeFinalizeHandoff
 
-            is_deferred_finalize = isinstance(hidden_states, Qwen35MoeFinalizeHandoff)
+            is_deferred_finalize = isinstance(hidden_states, MoeFinalizeHandoff)
 
         if is_deferred_finalize:
             if residual is None or self.flashinfer_mnnvl_cutedsl_fusion is None:

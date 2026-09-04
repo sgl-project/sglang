@@ -1,4 +1,17 @@
-"""Qwen3.5 integration for FlashInfer MNNVL CuTe DSL AllReduce fusion."""
+"""Model-agnostic FlashInfer MNNVL CuTe DSL AllReduce fusion.
+
+Two fusion patterns share one workspace, both consumed at the *next* layer's
+input RMSNorm:
+
+* AllReduce + residual add + RMSNorm, replacing ``prepare_mlp``'s collective.
+* MoE finalize + shared-expert add + AllReduce + residual add + RMSNorm, when
+  the MoE runner hands back an unfinalized :class:`MoeFinalizeHandoff` instead
+  of a tensor.
+
+Nothing here is per-architecture. The only thing that differs between model
+families is which attribute of their RMSNorm holds the gamma the fused kernel
+reads, and :func:`fused_norm_gamma` answers that from the norm module itself.
+"""
 
 from __future__ import annotations
 
@@ -16,11 +29,31 @@ from sglang.srt.layers.communicator import (
     get_attn_tp_context,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_exec, get_parallel
 
 logger = logging.getLogger(__name__)
+
+
+def fused_norm_gamma(layernorm: torch.nn.Module) -> Optional[torch.Tensor]:
+    """The gamma the fused RMSNorm reads, or None for a norm it cannot serve.
+
+    The kernel computes ``x * (gamma + weight_bias)`` with ``weight_bias=0``, so
+    the gamma has to be the multiplier as applied. ``GemmaRMSNorm`` keeps that
+    as ``gemma_weight`` (the checkpoint weight pre-folded to ``w + 1``) while a
+    plain ``RMSNorm`` applies ``weight`` directly.
+
+    Returning None rather than raising is load-bearing: the eligibility
+    predicates call this to decline a layer whose norm is a flavour the kernel
+    has no gamma for.
+    """
+    if isinstance(layernorm, GemmaRMSNorm):
+        return layernorm.gemma_weight
+    if isinstance(layernorm, RMSNorm) and layernorm.has_weight:
+        return layernorm.weight
+    return None
 
 
 def is_supported_forward_mode(forward_mode: ForwardMode) -> bool:
@@ -53,7 +86,7 @@ def resolve_max_m(model_runner) -> int:
 
 
 @dataclass(frozen=True)
-class Qwen35MoeFinalizeHandoff:
+class MoeFinalizeHandoff:
     """Unfinalized routed output plus the separately gated shared contribution."""
 
     routed_output: torch.Tensor
@@ -69,7 +102,7 @@ class Qwen35MoeFinalizeHandoff:
         *,
         gated_shared_output: torch.Tensor,
         m: int,
-    ) -> Qwen35MoeFinalizeHandoff:
+    ) -> MoeFinalizeHandoff:
         top_k = int(deferred_output.top_k)
         return cls(
             routed_output=deferred_output.gemm2_out.view(
@@ -84,7 +117,7 @@ class Qwen35MoeFinalizeHandoff:
         )
 
 
-class Qwen35FlashInferFusionService:
+class CuteDSLFusionService:
     """A lightweight model handle for the process-local FlashInfer workspace."""
 
     def __init__(
@@ -122,7 +155,8 @@ class Qwen35FlashInferFusionService:
             top_k=self.top_k,
             max_m=int(max_m),
             rms_epsilon=self.rms_epsilon,
-            # GemmaRMSNorm.gemma_weight is already checkpoint weight + 1.
+            # fused_norm_gamma() hands over the multiplier as applied, so the
+            # kernel's x * (gamma + weight_bias) wants no bias for any flavour.
             weight_bias=0.0,
         )
         self._workspace = workspace
@@ -135,7 +169,7 @@ class Qwen35FlashInferFusionService:
 
     def finalize(
         self,
-        handoff: Qwen35MoeFinalizeHandoff,
+        handoff: MoeFinalizeHandoff,
         residual: torch.Tensor,
         gamma: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -170,7 +204,7 @@ class Qwen35FlashInferFusionService:
 
     def _validate_finalize(
         self,
-        handoff: Qwen35MoeFinalizeHandoff,
+        handoff: MoeFinalizeHandoff,
         residual: torch.Tensor,
         gamma: torch.Tensor,
     ) -> None:
@@ -216,10 +250,20 @@ class Qwen35FlashInferFusionService:
             raise ValueError("gamma must be contiguous BF16 [hidden_size]")
 
 
-class Qwen35FlashInferLayerCommunicator(LayerCommunicator):
-    """Qwen-only hooks; generic LayerCommunicator remains backend agnostic."""
+class CuteDSLFusionLayerCommunicator(LayerCommunicator):
+    """Fusion hooks; the generic LayerCommunicator stays backend agnostic."""
 
-    fusion_service: Qwen35FlashInferFusionService | None = None
+    fusion_service: CuteDSLFusionService | None = None
+
+    # Whether this layer's MoE runner can hand back an unfinalized output.
+    # Recorded by install_cutedsl_fusion(); the finalize pattern is unreachable
+    # without one, while the plain AR+RMSNorm pattern stays available.
+    experts_can_defer_finalize: bool = False
+
+    # Whether a handoff produced here would actually be consumed: the next
+    # layer takes one in prepare_attn, or -- for the last layer -- the model's
+    # own final norm does. Recorded by install_cutedsl_fusion().
+    handoff_has_consumer: bool = False
 
     def prepare_attn(
         self,
@@ -229,19 +273,26 @@ class Qwen35FlashInferLayerCommunicator(LayerCommunicator):
         quant_format: str = "",
         post_residual_addition=None,
     ):
-        if isinstance(hidden_states, Qwen35MoeFinalizeHandoff):
+        if isinstance(hidden_states, MoeFinalizeHandoff):
             if not self.should_use_finalize(forward_batch, hidden_states.m):
-                raise RuntimeError("received deferred MoE output on an ineligible path")
+                raise RuntimeError(
+                    "received deferred MoE output on an ineligible path "
+                    f"(M={hidden_states.m}, mode={forward_batch.forward_mode})"
+                )
             if residual is None:
                 raise RuntimeError("deferred MoE finalize requires residual input")
-            if not hasattr(self.input_layernorm, "gemma_weight"):
-                raise RuntimeError("deferred Qwen finalize requires GemmaRMSNorm")
+            gamma = fused_norm_gamma(self.input_layernorm)
+            if gamma is None:
+                raise RuntimeError(
+                    "deferred MoE finalize requires a fusable RMSNorm flavour"
+                )
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
             assert self.fusion_service is not None
-            return self.fusion_service.finalize(
-                hidden_states, residual, self.input_layernorm.gemma_weight
+            hidden_states, residual = self.fusion_service.finalize(
+                hidden_states, residual, gamma
             )
+            return self._finish_prepare_attn(hidden_states, residual, forward_batch)
         return super().prepare_attn(
             hidden_states,
             residual,
@@ -266,7 +317,7 @@ class Qwen35FlashInferLayerCommunicator(LayerCommunicator):
             return self.fusion_service.all_reduce_residual_rms_norm(
                 hidden_states,
                 residual,
-                self.post_attention_layernorm.gemma_weight,
+                fused_norm_gamma(self.post_attention_layernorm),
             )
         return super().prepare_mlp(hidden_states, residual, forward_batch, cache=cache)
 
@@ -285,7 +336,7 @@ class Qwen35FlashInferLayerCommunicator(LayerCommunicator):
         return (
             self._common_eligible(forward_batch, m)
             and residual is not None
-            and hasattr(self.post_attention_layernorm, "gemma_weight")
+            and fused_norm_gamma(self.post_attention_layernorm) is not None
             and norm_fn
             is CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual
             and residual_input_mode is ScatterMode.TP_ATTN_FULL
@@ -295,12 +346,35 @@ class Qwen35FlashInferLayerCommunicator(LayerCommunicator):
         )
 
     def should_use_finalize(self, forward_batch: ForwardBatch, m: int) -> bool:
+        """Consumer side: whether prepare_attn here can absorb a handoff.
+
+        Deliberately independent of this layer's own MoE runner -- consuming is
+        a property of the fused kernel and the topology, not of who produced.
+        """
         parallel = get_parallel()
         return (
             self._common_eligible(forward_batch, m)
             and self.layer_scatter_modes.mlp_mode is not ScatterMode.SCATTERED
             and parallel.moe_ep_size == 1
         )
+
+    def should_defer_moe_finalize(
+        self, forward_batch: ForwardBatch, m: int | None = None
+    ) -> bool:
+        """Producer side: whether this layer's MoE may hand one off.
+
+        Beyond consumer eligibility this needs a runner that can produce a
+        handoff and somewhere for it to land. Deferring skips the post-experts
+        all-reduce on the promise of a handoff, so a layer whose successor
+        cannot consume must not defer -- nothing would perform the collective.
+        The producer's own eligibility stands in for the successor's; every
+        fusion layer of a model shares its scatter modes and topology.
+        """
+        if not (self.experts_can_defer_finalize and self.handoff_has_consumer):
+            return False
+        if m is None:
+            m = int(forward_batch.input_ids.shape[0])
+        return self.should_use_finalize(forward_batch, m)
 
     def _common_eligible(self, forward_batch: ForwardBatch, m: int) -> bool:
         parallel = get_parallel()
@@ -319,20 +393,90 @@ class Qwen35FlashInferLayerCommunicator(LayerCommunicator):
     def should_fuse_mlp_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:
-        m = (
-            int(forward_batch.input_ids.shape[0])
-            if getattr(forward_batch, "input_ids", None) is not None
-            else 0
-        )
-        if self.should_use_finalize(forward_batch, m):
-            # The Qwen model consumes the final layer's handoff with its final
-            # GemmaRMSNorm, so this is intentionally also true for that layer.
+        if self.should_defer_moe_finalize(forward_batch):
+            # True even on the last layer when the model's final norm consumes
+            # the handoff; handoff_has_consumer is what decides that.
             return True
         return super().should_fuse_mlp_allreduce_with_next_layer(forward_batch)
 
 
-def prepare_qwen35_flashinfer_fusion(model, model_runner) -> None:
-    service = getattr(model, "flashinfer_mnnvl_cutedsl_fusion", None)
+def install_cutedsl_fusion(
+    layers,
+    *,
+    hidden_size: int,
+    top_k: int,
+    rms_epsilon: float,
+    can_defer_finalize,
+    final_norm_consumes_handoff: bool = False,
+    label: str,
+) -> CuteDSLFusionService | None:
+    """Give every fusion-enabled layer in ``layers`` one shared workspace handle.
+
+    ``layers`` are the decoder layers this rank actually built -- each must carry
+    a ``layer_communicator``, so a PP-padded list is sliced to the local range
+    before it gets here.
+
+    The workspace compiles per ``(hidden_size, top_k, rms_epsilon)``, which every
+    MoE layer of a model shares, so one handle serves the whole model. Returns it,
+    or None when no layer got a fusion communicator.
+
+    ``can_defer_finalize(layer) -> bool`` says whether that layer's MoE runner can
+    hand back an unfinalized output; layers where it cannot keep the plain
+    AR+RMSNorm fusion and never advertise the finalize pattern.
+
+    ``final_norm_consumes_handoff`` says the model's own final norm closes out
+    the last layer's handoff. Without it the last layer never defers, because
+    nothing would perform the all-reduce that deferring skips.
+    """
+    fusion_layers = [
+        layer
+        for layer in layers
+        if isinstance(layer.layer_communicator, CuteDSLFusionLayerCommunicator)
+    ]
+    if not fusion_layers:
+        return None
+
+    service = CuteDSLFusionService(
+        hidden_size=hidden_size,
+        top_k=top_k,
+        rms_epsilon=rms_epsilon,
+    )
+    for index, layer in enumerate(layers):
+        communicator = layer.layer_communicator
+        if not isinstance(communicator, CuteDSLFusionLayerCommunicator):
+            continue
+        # A handoff is consumed by the next layer's prepare_attn, so the next
+        # layer must have a communicator that can absorb one. The last layer
+        # falls to the model's final norm.
+        successor = layers[index + 1] if index + 1 < len(layers) else None
+        if successor is None:
+            has_consumer = final_norm_consumes_handoff
+        else:
+            has_consumer = isinstance(
+                successor.layer_communicator, CuteDSLFusionLayerCommunicator
+            )
+        communicator.fusion_service = service
+        communicator.experts_can_defer_finalize = bool(can_defer_finalize(layer))
+        communicator.handoff_has_consumer = has_consumer
+    logger.info(
+        "Installed one %s FlashInfer MNNVL CuTe DSL fusion handle for %d of %d layers "
+        "(%d can defer the MoE finalize)",
+        label,
+        len(fusion_layers),
+        len(layers),
+        sum(
+            layer.layer_communicator.experts_can_defer_finalize
+            and layer.layer_communicator.handoff_has_consumer
+            for layer in fusion_layers
+        ),
+    )
+    return service
+
+
+def prepare_cutedsl_fusion(
+    service: CuteDSLFusionService | None, model_runner, *, label: str
+) -> None:
+    """Compile the workspace before graph capture; a no-op without a handle."""
     if service is None:
         return
     if model_runner.server_args.enable_pdmux:
@@ -342,6 +486,7 @@ def prepare_qwen35_flashinfer_fusion(model, model_runner) -> None:
         )
     service.prepare(max_m=resolve_max_m(model_runner))
     logger.info(
-        "Prepared Qwen3.5 FlashInfer MNNVL CuTe DSL fusion workspace for M_max=%d",
+        "Prepared %s FlashInfer MNNVL CuTe DSL fusion workspace for M_max=%d",
+        label,
         service.max_m,
     )

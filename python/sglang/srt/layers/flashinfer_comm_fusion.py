@@ -53,6 +53,14 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
             "FlashInfer allreduce fusion requires SM90 or SM10X NVIDIA GPUs."
         )
 
+    if backend == "cute-dsl":
+        if not get_platform().is_sm100:
+            raise ValueError(
+                "FlashInfer allreduce fusion cute-dsl backend requires a "
+                "Blackwell system."
+            )
+        return backend
+
     if backend == "auto":
         if is_multi_node:
             if get_platform().is_sm100:
@@ -76,6 +84,16 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
             "system, or SM90 single-node."
         )
     return backend
+
+
+def uses_cutedsl_ar_fusion() -> bool:
+    """Whether the CuTe DSL backend is selected.
+
+    It owns both fusion patterns through its own workspace (see
+    ``layers/flashinfer_mnnvl_cutedsl.py``), so the legacy TRTLLM/MNNVL
+    workspace, its group tagging, and its dispatch paths all stand down.
+    """
+    return get_exec().comm.flashinfer_allreduce_fusion_backend == "cute-dsl"
 
 
 def resolve_flashinfer_allreduce_fusion_backend() -> Optional[str]:
@@ -688,7 +706,7 @@ def ensure_workspace_initialized(
     use_attn_tp_group: bool = True,
 ):
     """Ensure workspace is initialized."""
-    if _flashinfer_allreduce_unavailable:
+    if _flashinfer_allreduce_unavailable or uses_cutedsl_ar_fusion():
         return False
 
     if not is_flashinfer_available() or _flashinfer_comm is None:

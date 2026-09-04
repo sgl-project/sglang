@@ -278,11 +278,19 @@ class BaseRunner(ABC):
         with custom_all_reduce.register_graph_buffers).
         """
         mr = self.model_runner
-        if get_exec().comm.flashinfer_allreduce_fusion_backend is None:
-            return
-
         from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
-        from sglang.srt.layers.flashinfer_comm_fusion import pre_initialize_workspaces
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            pre_initialize_workspaces,
+            uses_cutedsl_ar_fusion,
+        )
+
+        # The CuTe DSL backend builds its own workspace from the model's
+        # prepare_before_cuda_graph_capture hook.
+        if (
+            get_exec().comm.flashinfer_allreduce_fusion_backend is None
+            or uses_cutedsl_ar_fusion()
+        ):
+            return
 
         pre_initialize_workspaces(
             max_token_num=FUSE_ALLREDUCE_MAX_BATCH_SIZE,

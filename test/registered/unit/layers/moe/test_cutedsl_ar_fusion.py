@@ -9,8 +9,8 @@ from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
     FlashInferMNNVLCuteDSLARFusion,
     _with_early_finalize_shared_load,
 )
-from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-    Qwen35MoeFinalizeHandoff,
+from sglang.srt.layers.moe.cutedsl_ar_fusion import (
+    MoeFinalizeHandoff,
     is_supported_forward_mode,
     resolve_max_m,
 )
@@ -61,7 +61,7 @@ def test_supported_forward_modes(forward_mode, expected):
 
 
 @patch(
-    "sglang.srt.layers.moe.qwen35_flashinfer_fusion.cutedsl_moe_max_num_tokens",
+    "sglang.srt.layers.moe.cutedsl_ar_fusion.cutedsl_moe_max_num_tokens",
     return_value=8192,
 )
 def test_framework_capacity_is_maximum_of_all_sources(_cutedsl_moe_max_num_tokens):
@@ -88,7 +88,7 @@ def test_deferred_handoff_reuses_producer_storage():
         top_k=top_k,
     )
 
-    handoff = Qwen35MoeFinalizeHandoff.from_flashinfer(
+    handoff = MoeFinalizeHandoff.from_flashinfer(
         deferred,
         gated_shared_output=gated_shared_output,
         m=m,
