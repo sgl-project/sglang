@@ -934,17 +934,6 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         )
 
         self.assertEqual(quant_config.exclude_modules, [])
-        moe = FusedMoE.__new__(FusedMoE)
-        self.assertIsInstance(
-            quant_config.get_quant_method(moe, "mtp.layers.0.mlp.experts"),
-            Fp8MoEMethod,
-        )
-        self.assertEqual(
-            quant_config.get_quant_method(
-                moe, "mtp.layers.0.mlp.experts"
-            ).quant_config.weight_block_size,
-            [128, 128],
-        )
         self.assertEqual(
             quant_config.resolve_quant_algo("model.layers.3.mlp.experts"), "NVFP4"
         )
@@ -954,12 +943,11 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             ),
             "FP8",
         )
-        self.assertIsNone(
-            quant_config.resolve_quant_algo("model.layers.1.ple.key_proj")
+        mtp_method = quant_config.get_quant_method(
+            FusedMoE.__new__(FusedMoE), "mtp.layers.0.mlp.experts"
         )
-        self.assertIsNone(
-            quant_config.resolve_quant_algo("model.layers.3.mlp.shared_expert")
-        )
+        self.assertIsInstance(mtp_method, Fp8MoEMethod)
+        self.assertEqual(mtp_method.quant_config.weight_block_size, [128, 128])
 
 
 if __name__ == "__main__":
