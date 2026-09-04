@@ -250,7 +250,13 @@ def declare_direct_writes(
         for field in dataclasses.fields(server_args)
     }
     already = len(getattr(server_args, "_resolved_overrides", None) or ())
-    result = resolve(server_args)
+    # The one place the input seal comes off. The plugin writes the record;
+    # the diff below captures what it moved into the stash so the projection
+    # and the bags carry it.
+    from sglang.srt.server_args import record_writable
+
+    with record_writable(server_args):
+        result = resolve(server_args)
     stash = getattr(server_args, "_resolved_overrides", None)
     if stash is None:
         stash = []

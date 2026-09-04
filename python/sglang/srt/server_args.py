@@ -40,6 +40,7 @@ import functools
 import logging
 import tempfile
 import uuid
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
@@ -269,6 +270,11 @@ class ServerArgs:
             )
         from sglang.srt.arg_groups.pipeline import run_resolution_pipeline
 
+        # Sealed for the duration, not just afterwards: everything below this
+        # line reads the input and declares against it, and the one channel
+        # that still writes the record (`declare_direct_writes`, for
+        # out-of-tree platform plugins) asks for the seal to be lifted by name.
+        self._input_frozen = True
         try:
             run_resolution_pipeline(self)
         except BaseException:
@@ -276,6 +282,8 @@ class ServerArgs:
             # idempotent over their own output.
             self._resolution_failed = True
             raise
+        finally:
+            self._input_frozen = False
         # Set here too, because the dummy/absent-model path returns before the
         # end of the pipeline that normally sets it: the gate is about whether
         # the handlers ran, not how far they got.
@@ -689,19 +697,28 @@ class ServerArgs:
         return cfg.startup_weight_load_mode == "overlap"
 
     def __setattr__(self, name, value):
-        # Once resolution has finished the record is the READ-ONLY raw input
-        # the config bags were projected from. Resolved config changes go to the bags via
-        # get_context().override(source, ...); a value one runner or worker
-        # owns travels as a constructor argument to it.
-        if getattr(self, "_resolution_finished", False) and (
-            not name.startswith("_") or name in _underscore_field_names()
-        ):
-            raise AttributeError(
-                f"server_args.{name} assigned after resolution; server_args is "
-                "read-only -- use get_context().override(source, ...) to change "
-                "resolved config; a value one runner owns travels as a "
-                "constructor argument."
-            )
+        # The record holds the operator's input. It is writable while the
+        # caller is still assembling it and sealed from the moment resolution
+        # starts: a resolver that writes a field would overwrite the very thing
+        # the record exists to remember, and the decision it meant to record
+        # belongs in the stash, where it carries a source and does not destroy
+        # the input it was derived from.
+        if not name.startswith("_") or name in _underscore_field_names():
+            if getattr(self, "_input_frozen", False):
+                raise AttributeError(
+                    f"server_args.{name} assigned during resolution; the record "
+                    "is the operator's input and resolution does not write it -- "
+                    "declare the decision with declare_resolution(server_args, "
+                    "source, **fields) so it carries a source and leaves the "
+                    "input intact."
+                )
+            if getattr(self, "_resolution_finished", False):
+                raise AttributeError(
+                    f"server_args.{name} assigned after resolution; server_args is "
+                    "read-only -- use get_context().override(source, ...) to change "
+                    "resolved config; a value one runner owns travels as a "
+                    "constructor argument."
+                )
         object.__setattr__(self, name, value)
 
     def enable_mamba_extra_buffer(self) -> bool:
@@ -861,6 +878,27 @@ def get_global_server_args() -> ServerArgs:
     ``sglang.srt.runtime_context`` in new code."""
 
     return get_context().server_args
+
+
+@contextmanager
+def record_writable(server_args: Any):
+    """Lift the input seal for a resolver that genuinely writes the record.
+
+    There is exactly one: `declare_direct_writes`, which hands the record to an
+    out-of-tree platform plugin that sets fields on it. Those implementations
+    live outside this tree and cannot be converted by editing a resolver here,
+    so the write stays and is captured into the stash afterwards. Naming the
+    exception is the point -- an in-tree resolver that reaches for this is
+    doing something it should be declaring instead.
+    """
+    frozen = getattr(server_args, "_input_frozen", False)
+    if frozen:
+        object.__setattr__(server_args, "_input_frozen", False)
+    try:
+        yield
+    finally:
+        if frozen:
+            object.__setattr__(server_args, "_input_frozen", True)
 
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:

@@ -2935,6 +2935,72 @@ class TestDcpKvEventContract(CustomTestCase):
         self.assertEqual(kv_event_block_size_of(resolving_view(args)), 8)
 
 
+class TestTheInputIsSealedDuringResolution(CustomTestCase):
+    """The record holds what the operator asked for, and resolution does not
+    write it -- enforced, not merely observed.
+
+    The guard used to arm only once resolution had *finished*, so for the whole
+    length of the pipeline nothing stopped a resolver from assigning a field.
+    Nothing in-tree did, but a resolver that started to would overwrite the
+    input the record exists to remember, and the defect is invisible: the value
+    it wrote is indistinguishable from a value the operator typed.
+    """
+
+    def test_a_write_before_resolution_is_fine(self):
+        """Callers assemble the record however they like."""
+        server_args = ServerArgs(model_path="/tmp/x")
+        server_args.tp_size = 2
+        self.assertEqual(server_args.tp_size, 2)
+
+    def test_a_write_during_resolution_is_refused(self):
+        server_args = ServerArgs(model_path="dummy", device="cuda")
+        # The seal is what the pipeline runs under; drive it directly rather
+        # than injecting a violation into a real handler.
+        object.__setattr__(server_args, "_input_frozen", True)
+        with self.assertRaisesRegex(AttributeError, "during resolution"):
+            server_args.tp_size = 4
+        # and the message says what to do instead
+        try:
+            server_args.tp_size = 4
+        except AttributeError as caught:
+            self.assertIn("declare_resolution", str(caught))
+
+    def test_the_seal_comes_off_when_resolution_ends(self):
+        """`_resolution_finished` takes over; the two messages are different
+        because the fix is different."""
+        server_args = ServerArgs(model_path="dummy", device="cuda")
+        server_args.resolve_once()
+        self.assertFalse(getattr(server_args, "_input_frozen", False))
+        with self.assertRaisesRegex(AttributeError, "after resolution"):
+            server_args.tp_size = 4
+
+    def test_the_named_exception_lifts_it(self):
+        """`declare_direct_writes` hands the record to an out-of-tree platform
+        plugin that sets fields on it; that is the only channel."""
+        from sglang.srt.server_args import record_writable
+
+        server_args = ServerArgs(model_path="dummy", device="cuda")
+        object.__setattr__(server_args, "_input_frozen", True)
+        with record_writable(server_args):
+            server_args.tp_size = 4
+        self.assertEqual(server_args.tp_size, 4)
+        # and it goes back on afterwards
+        with self.assertRaisesRegex(AttributeError, "during resolution"):
+            server_args.tp_size = 8
+
+    def test_a_failed_resolution_does_not_leave_it_sealed(self):
+        """A record that failed resolution is still the operator's input, and
+        `resolve_once` already refuses to re-run on it. Leaving the seal armed
+        would make the failure look like a different one to anyone inspecting
+        the record afterwards."""
+        server_args = ServerArgs(
+            model_path="dummy", device="cuda", prefill_decode_interval=-5
+        )
+        with self.assertRaisesRegex(ValueError, "prefill-decode-interval"):
+            server_args.resolve_once()
+        self.assertFalse(getattr(server_args, "_input_frozen", False))
+
+
 class TestLaunchCommand(CustomTestCase):
     """The record answers what was asked for, not only what was decided.
 
