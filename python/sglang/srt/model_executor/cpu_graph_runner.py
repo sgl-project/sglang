@@ -137,9 +137,9 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     # Users can customize the batch sizes supported by cpu_graph, such as:
     # --cuda-graph-bs-decode 1 2 4 8 16
     capture_bs = get_exec().graph.cuda_graph_config.decode.bs
-    assert (
-        max(capture_bs) <= get_exec().graph.torch_compile_max_bs
-    ), f"{capture_bs=}, {get_exec().graph.torch_compile_max_bs=}"
+    assert max(capture_bs) <= get_exec().graph.torch_compile_max_bs, (
+        f"{capture_bs=}, {get_exec().graph.torch_compile_max_bs=}"
+    )
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
@@ -619,21 +619,21 @@ class CPUGraphRunner:
         self.captured_req_width = 1
 
         assert not get_lora().enable_lora, "CPUGraphRunner does not support LoRA yet."
-        assert (
-            not self.enable_two_batch_overlap
-        ), "CPUGraphRunner does not support two batch overlap yet."
-        assert (
-            not self.require_mlp_tp_gather
-        ), "CPUGraphRunner does not support MLP TP gather yet."
-        assert (
-            not self.require_mlp_sync
-        ), "CPUGraphRunner does not support MLP sync yet."
-        assert (
-            not self.require_gathered_buffer
-        ), "CPUGraphRunner does not support gathered buffer yet."
-        assert (
-            model_runner.spec_algorithm.is_none()
-        ), "CPUGraphRunner does not support speculative inference yet."
+        assert not self.enable_two_batch_overlap, (
+            "CPUGraphRunner does not support two batch overlap yet."
+        )
+        assert not self.require_mlp_tp_gather, (
+            "CPUGraphRunner does not support MLP TP gather yet."
+        )
+        assert not self.require_mlp_sync, (
+            "CPUGraphRunner does not support MLP sync yet."
+        )
+        assert not self.require_gathered_buffer, (
+            "CPUGraphRunner does not support gathered buffer yet."
+        )
+        assert model_runner.spec_algorithm.is_none(), (
+            "CPUGraphRunner does not support speculative inference yet."
+        )
 
         assert self.dp_size == 1, "CPUGraphRunner does not support DP yet."
         assert self.pp_size == 1, "CPUGraphRunner does not support PP yet."
@@ -952,9 +952,9 @@ class CPUGraphRunner:
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        assert (
-            pp_proxy_tensors is None
-        ), "PPProxyTensors is not supported in CPUGraphRunner yet."
+        assert pp_proxy_tensors is None, (
+            "PPProxyTensors is not supported in CPUGraphRunner yet."
+        )
 
         replay_context = (
             model_capture_mode if self.is_encoder_decoder else empty_context

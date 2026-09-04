@@ -66,6 +66,7 @@ from sglang.srt.mem_cache.layout.page_major import (
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
     maybe_init_custom_mem_pool,
+    set_mla_kv_buffer_dcp_sharded_triton,
     set_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton_fp8_quant,
     set_mla_kv_scale_buffer_triton,
@@ -293,9 +294,9 @@ class ReqToTokenPool:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
         reusing = [i for i, r in enumerate(reqs) if r.kv.holds_kv]
-        assert all(
-            reqs[i].kv.kv_allocated_len > 0 for i in reusing
-        ), "a reused row must carry allocated KV"
+        assert all(reqs[i].kv.kv_allocated_len > 0 for i in reusing), (
+            "a reused row must carry allocated KV"
+        )
 
         select_index = self.alloc_rows(len(reqs) - len(reusing))
         if select_index is None:
@@ -554,9 +555,9 @@ class MambaPool:
                 # mamba layers/slots share one contiguous byte buffer; conv and
                 # temporal are strided views into it (see mem_cache/layout/
                 # page_major.py). Only the standard CUDA Triton path is supported.
-                assert not _is_npu and not (
-                    _is_cpu and _cpu_has_amx_support
-                ), "envelope_layout mamba is only supported on the CUDA path"
+                assert not _is_npu and not (_is_cpu and _cpu_has_amx_support), (
+                    "envelope_layout mamba is only supported on the CUDA path"
+                )
                 max_slots = size + 1
                 entry_bytes = mamba_entry_bytes(
                     layer_num=num_mamba_layers,
@@ -1359,9 +1360,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 pass
             else:
                 mid = self.mamba_allocator.alloc(1)
-                assert (
-                    mid is not None
-                ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
+                assert mid is not None, (
+                    f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
+                )
                 req.kv.mamba_pool_idx = mid[0]
                 req.kv.mamba_needs_clear = True
                 # GDN ReplaySSM: a freshly (re)assigned slot starts an empty
@@ -1383,13 +1384,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 mamba_ping_pong_track_buffers.append(
                     req.kv.mamba_ping_pong_track_buffer
                 )
-        assert len(select_index) == len(
-            mamba_indices
-        ), "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
+        assert len(select_index) == len(mamba_indices), (
+            "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
+        )
         if self.enable_mamba_extra_buffer:
-            assert len(select_index) == len(
-                mamba_ping_pong_track_buffers
-            ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
+            assert len(select_index) == len(mamba_ping_pong_track_buffers), (
+                "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
+            )
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
         self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
@@ -1533,7 +1534,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 assert mamba_ping_pong_track_buffer_to_keep in [
                     0,
                     1,
-                ], f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
+                ], (
+                    f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
+                )
                 # Avoid Python-list advanced indexing on a device tensor.
                 # The ping-pong buffer size is either 2 (normal) or 1 (spec decode).
                 if self.mamba_ping_pong_track_buffer_size == 2:
@@ -1853,7 +1856,9 @@ class MHATokenToKVPool(KVCache):
         self.v_head_dim = (
             swa_v_head_dim
             if swa_v_head_dim is not None
-            else v_head_dim if v_head_dim is not None else head_dim
+            else v_head_dim
+            if v_head_dim is not None
+            else head_dim
         )
 
         # Layout: NHD (default) | HND (SGLANG_USE_HND_KVCACHE) | vectorized_5d (ROCm AITER).
@@ -2885,9 +2890,9 @@ class MHATokenToKVPool(KVCache):
         if N == 0:
             return
 
-        assert (
-            self._kv_copy_config is not None
-        ), "KV copy not initialized. Set enable_kv_cache_copy=True in __init__"
+        assert self._kv_copy_config is not None, (
+            "KV copy not initialized. Set enable_kv_cache_copy=True in __init__"
+        )
 
         cfg = self._kv_copy_config
         cap = int(cfg.get("num_locs_upper", 256))
@@ -3657,8 +3662,9 @@ class HybridLinearKVPool(KVCache):
         self.head_num = head_num
         self.head_dim = head_dim
         self.mamba_pool = mamba_pool
-        # virtual->physical mamba-slot translate for the HiCache offload path;
-        # identity for a static pool, the allocator's `translate` for the unified pool.
+        # Identity even though the unified pool holds VIRTUAL mamba ids: its
+        # composite allocator implements neither `get_cpu_copy` nor
+        # `load_cpu_copy`, the only readers, so those ids never arrive here.
         self._mamba_translate = lambda ids: ids
         self.use_mla = use_mla
         if full_kv_pool is not None:
@@ -3673,9 +3679,9 @@ class HybridLinearKVPool(KVCache):
                 TokenToKVPoolClass = current_platform.get_mha_kv_pool_cls()
                 quant_method_kwarg = {}
             elif _is_npu:
-                assert not is_float4_e2m1fn_x2(
-                    dtype
-                ), "FP4 is not supported on NPU yet."
+                assert not is_float4_e2m1fn_x2(dtype), (
+                    "FP4 is not supported on NPU yet."
+                )
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMHATokenToKVPool,
                 )
@@ -4078,6 +4084,32 @@ class MLATokenToKVPool(KVCache):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
+    # Has the WRITE loc arriving here already had the DCP owner rule resolved?
+    # False: this pool takes a WIDENED loc. The unified pool resolves it in
+    # `KVIndexTranslator.rebind_write_loc` and flips this. Not derivable from
+    # `kernel_page_blocks`: that is `layer_num`, so a rank owning one
+    # full-attention layer is translated with blocks_per_page 1.
+    write_loc_is_dcp_resolved = False
+
+    @property
+    def _write_loc_dcp_span(self) -> int:
+        """How many logical ids one stored row spans in the write-loc space."""
+        return 1 if self.write_loc_is_dcp_resolved else get_parallel().attn_dcp_size
+
+    def _scatter_mla_rows(
+        self,
+        dst_buffer: torch.Tensor,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ) -> None:
+        if self.write_loc_is_dcp_resolved:
+            set_mla_kv_buffer_triton(dst_buffer, loc, cache_k_nope, cache_k_rope)
+        else:
+            set_mla_kv_buffer_dcp_sharded_triton(
+                dst_buffer, loc, cache_k_nope, cache_k_rope
+            )
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -4095,12 +4127,15 @@ class MLATokenToKVPool(KVCache):
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
         assert not self.dsa_kv_cache_store_fp8
-        parallel = get_parallel()
-        if parallel.dcp_enabled:
-            valid_mask = loc % parallel.attn_dcp_size == parallel.attn_dcp_rank
-            if not valid_mask.all():
-                loc = loc[valid_mask]
-                cache_k = cache_k[valid_mask]
+        # No DCP-aware variant is possible: the two backends reaching this door
+        # disagree on the loc space (flashinfer-MLA widened, Triton collapsed).
+        assert self.write_loc_is_dcp_resolved or not get_parallel().dcp_enabled, (
+            "MLATokenToKVPool.set_kv_buffer has no DCP-aware write path. Under "
+            "--dcp-size > 1 the MLA write must go through set_mla_kv_buffer, "
+            "whose kernel resolves the owner rule; reaching the combined-row "
+            "door means an attention backend took a write path that never "
+            "declared which loc space it emits."
+        )
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
@@ -4118,6 +4153,10 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ) -> None:
+        assert not (
+            self.write_loc_is_dcp_resolved
+            and (self.use_dsa or self.dsa_kv_cache_store_fp8)
+        ), "the DSA write paths have no resolved-loc variant"
         if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
             # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
@@ -4139,12 +4178,7 @@ class MLATokenToKVPool(KVCache):
             # Reuse existing two-tensor write kernel (works with FP8 byte layout)
             # cache_k_nope_fp8: (num_tokens, 1, 528) uint8 [nope_fp8(512) | scales(16)]
             # cache_k_rope_fp8: (num_tokens, 1, 128) uint8 [rope_bf16_bytes(128)]
-            set_mla_kv_buffer_triton(
-                dst_buffer,
-                loc,
-                cache_k_nope_fp8,
-                cache_k_rope_fp8,
-            )
+            self._scatter_mla_rows(dst_buffer, loc, cache_k_nope_fp8, cache_k_rope_fp8)
         else:
             if cache_k_nope.dtype != self.dtype:
                 cache_k_nope = cache_k_nope.to(self.dtype)
@@ -4153,12 +4187,7 @@ class MLATokenToKVPool(KVCache):
                 cache_k_nope = cache_k_nope.view(self.store_dtype)
                 cache_k_rope = cache_k_rope.view(self.store_dtype)
 
-            set_mla_kv_buffer_triton(
-                dst_buffer,
-                loc,
-                cache_k_nope,
-                cache_k_rope,
-            )
+            self._scatter_mla_rows(dst_buffer, loc, cache_k_nope, cache_k_rope)
 
     def set_mla_kv_buffer(
         self,
@@ -4168,11 +4197,11 @@ class MLATokenToKVPool(KVCache):
         cache_k_rope: torch.Tensor,
         layer_id_override: Optional[int] = None,
     ):
-        # loc is widened under DCP; the kernel divides by the world size itself.
+        # loc is widened under DCP unless the pool declares it resolved.
         maybe_detect_oob(
             loc,
             0,
-            (self.size + self.page_size) * get_parallel().attn_dcp_size,
+            (self.size + self.page_size) * self._write_loc_dcp_span,
             "set_mla_kv_buffer (MLA)",
         )
         maybe_detect_kernel_facing_loc(
@@ -4379,7 +4408,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
                 cache_k_nope = cache_k_nope.view(self.store_dtype)
                 cache_k_rope = cache_k_rope.view(self.store_dtype)
 
-            set_mla_kv_buffer_triton(
+            self._scatter_mla_rows(
                 self.kv_buffer[layer_id - self.start_layer],
                 loc,
                 cache_k_nope_fp4,
@@ -4451,13 +4480,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
         if _is_hip:
             if aiter_can_use_preshuffle_paged_mqa():
-                assert (
-                    self.page_size % 16 == 0
-                ), f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
+                assert self.page_size % 16 == 0, (
+                    f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
+                )
             else:
-                assert (
-                    self.page_size == 1
-                ), f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
+                assert self.page_size == 1, (
+                    f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
+                )
         else:
             assert self.page_size == 64
         self.index_key_cache = self._create_index_key_cache()
