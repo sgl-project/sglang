@@ -118,6 +118,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--num-inference-steps {STEPS}` and `--seed {SEED}`
 - `--num-outputs-per-prompt {N}` / `--num-outputs {N}`: generate multiple outputs for each prompt. A scalar seed expands as `seed + output_index`.
 - `--quality {lossless,extra-high,high}`: cumulative request-level optimization tier. `lossless` (default) keeps the selected deployment's reference path and all unconditional bit-exact replacements. `extra-high` adds only request-gated DiT/VAE kernel fusions; the tier does not itself enable sparse, caching, or other approximate paths. `high` includes the complete `extra-high` set and may also enable model-owned approximate optimizations. Separately configured quantization, attention, or caching options still apply. Support and validation constraints are model-specific.
+- `skip_softmax_params` (online request only): explicitly enables lossy BLASST/Skip-Softmax attention for compatible FA self-attention layers. See [Attention Backends](../attention_backends#request-scoped-skip-softmax).
 - `--height {HEIGHT}`, `--width {WIDTH}`, `--num-frames {N}`, `--fps {FPS}`
 - `--output-path {PATH}`, `--output-file-name {NAME}`, `--save-output`, `--return-frames`
 

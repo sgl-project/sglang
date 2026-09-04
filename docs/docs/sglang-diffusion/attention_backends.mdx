@@ -789,6 +789,53 @@ dense switching; under ring parallelism the target must be ring-capable. Note
 `sage_attn` / `sage_attn_3` are lossy (quantized attention) — validate quality
 on your workload.
 
+### Request-scoped Skip Softmax
+
+Skip Softmax (BLASST) keeps the QK matmul, but skips the exponential,
+softmax-state update, V load, and PV matmul for attention tiles whose estimated
+softmax mass is below a threshold. It is an explicit lossy optimization backed
+by the FlashInfer kernels shipped with SGLang's pinned dependencies. See the
+[BLASST paper](https://arxiv.org/abs/2512.12087) and NVIDIA's
+[video-generation study](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.md)
+for the algorithm and measured quality/performance trade-offs.
+
+Pass `skip_softmax_params` in one image or video request. The runtime routes
+compatible self-attention layers through the FA/FlashInfer path for that batch;
+cross-attention keeps its normal backend, and the next request restores the
+server default.
+
+```python
+client.videos.create(
+    model="<MODEL_PATH_OR_ID>",
+    prompt="...",
+    extra_body={
+        "skip_softmax_params": {
+            "threshold_scale_factor": 500.0,
+            "start_step": 14,
+        }
+    },
+)
+```
+
+- `threshold_scale_factor` is required and must be positive. The kernel uses
+  `threshold_scale_factor / context_length`; larger values skip more work and
+  usually increase quality loss.
+- `start_step` is the zero-based denoising step at which sparse execution
+  starts. It defaults to `0`; keeping early high-noise steps dense is generally
+  safer.
+
+There is intentionally no default threshold. Calibrate the threshold and start
+step against output-quality metrics for each model, resolution, step count, and
+deployment backend; values tuned for one workload are not portable.
+
+Current support is FP16/BF16, head dimension 128 or 256, and unmasked
+self-attention on Hopper SM90 and Blackwell SM100/SM103/SM107. Ulysses sequence
+parallelism is supported because the kernel runs after its all-to-all. Ring
+Attention, attention masks, `torch.compile`, and breakable CUDA graphs reject
+the request instead of silently running dense attention. Models that merely
+offer an FA backend do not automatically qualify: the runtime still checks the
+GPU, dtype, head dimension, attention role, and execution mode.
+
 ### Using SpargeAttention
 
 Install the optional CUDA extension, then select the backend explicitly:

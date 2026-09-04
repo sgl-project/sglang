@@ -59,6 +59,57 @@ QUALITY_LEVELS: tuple[str, ...] = ("lossless", "extra-high", "high")
 KERNEL_FUSION_QUALITY_LEVELS = frozenset({"extra-high", "high"})
 
 
+@dataclass(frozen=True)
+class SkipSoftmaxParams:
+    """Validated request-scoped BLASST/Skip-Softmax controls."""
+
+    threshold_scale_factor: float
+    start_step: int = 0
+
+
+def resolve_skip_softmax_params(
+    params: dict[str, Any] | None,
+) -> SkipSoftmaxParams | None:
+    if params is None:
+        return None
+    if not isinstance(params, dict):
+        raise ValueError(f"skip_softmax_params must be a dict, got {params!r}")
+
+    valid_keys = {"threshold_scale_factor", "start_step"}
+    unknown = sorted(set(params) - valid_keys)
+    if unknown:
+        raise ValueError(
+            f"Unknown skip_softmax_params keys: {unknown}. "
+            f"Valid keys: {sorted(valid_keys)}."
+        )
+    if "threshold_scale_factor" not in params:
+        raise ValueError("skip_softmax_params requires 'threshold_scale_factor'.")
+
+    threshold = params["threshold_scale_factor"]
+    if (
+        isinstance(threshold, bool)
+        or not isinstance(threshold, (int, float))
+        or not math.isfinite(float(threshold))
+        or float(threshold) <= 0
+    ):
+        raise ValueError(
+            "skip_softmax_params.threshold_scale_factor must be a finite "
+            f"positive number, got {threshold!r}"
+        )
+
+    start_step = params.get("start_step", 0)
+    if (
+        isinstance(start_step, bool)
+        or not isinstance(start_step, int)
+        or start_step < 0
+    ):
+        raise ValueError(
+            "skip_softmax_params.start_step must be a non-negative int, "
+            f"got {start_step!r}"
+        )
+    return SkipSoftmaxParams(float(threshold), start_step)
+
+
 def quality_allows_kernel_fusions(quality: str) -> bool:
     """Return whether a quality level includes request-gated kernel fusions."""
     return quality in KERNEL_FUSION_QUALITY_LEVELS
@@ -231,6 +282,11 @@ class SamplingParams:
     # "sage_attn_3"; sage is lossy). Incompatible server settings reject the
     # request; see DenoisingStage._maybe_override_attention_backend.
     attention_backend_override: str | None = None
+
+    # Request-scoped BLASST/Skip-Softmax sparse attention. This is an explicit
+    # lossy opt-in; compatible self-attention layers are dispatched through
+    # FlashInfer while cross-attention remains on its normal backend.
+    skip_softmax_params: dict[str, Any] | None = None
 
     # Spectrum parameters
     enable_spectrum: bool = False
@@ -484,6 +540,8 @@ class SamplingParams:
             raise ValueError(
                 f"quality must be one of {list(QUALITY_LEVELS)}, got {self.quality!r}"
             )
+
+        resolve_skip_softmax_params(self.skip_softmax_params)
 
         # These are always required to be sane regardless of pipeline.
         if (
