@@ -230,9 +230,9 @@ class RustServer:
 
         # Invariant: control requests always carry a rust-minted rid; without
         # one the response is unroutable, so fail loudly rather than drop it.
-        assert (
-            recv_req.rid is not None
-        ), f"control response without rid: {type(output).__name__}"
+        assert recv_req.rid is not None, (
+            f"control response without rid: {type(output).__name__}"
+        )
         # No local try/except: a failed push propagates to run_scheduler_process's
         # outer handler, which logs the full traceback (scheduler-fatal either way).
         payload = (
@@ -359,7 +359,9 @@ class RustServer:
                     assert len(col) in (
                         0,
                         batch_size,
-                    ), f"extras column {name}: {len(col)} entries for a batch of {batch_size}"
+                    ), (
+                        f"extras column {name}: {len(col)} entries for a batch of {batch_size}"
+                    )
                     populated |= len(col) > 0
                 if populated:
                     active.append(extra)

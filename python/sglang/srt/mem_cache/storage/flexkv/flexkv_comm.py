@@ -627,9 +627,9 @@ class FlexKVLayerDoneCounter:
 
     def update_producer(self) -> int:
         self.producer_index = (self.producer_index + 1) % self.num_counters
-        assert self.events[
-            self.producer_index
-        ]._finished, "Producer event should be finished before reuse"
+        assert self.events[self.producer_index]._finished, (
+            "Producer event should be finished before reuse"
+        )
         return self.producer_index
 
     def set_consumer(self, task_id: int) -> None:
