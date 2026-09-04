@@ -56,6 +56,12 @@ def set_global_indexer_capturer(capturer: Optional[IndexerTopkCapturer]):
     get_resources().indexer_capturer = capturer
 
 
+def destroy_global_indexer_capturer():
+    if (capturer := get_resources().indexer_capturer) is not None:
+        capturer.destroy()
+    get_resources().indexer_capturer = None
+
+
 def maybe_capture_indexer_topk(
     layer_id: int, topk_indices: Optional[torch.Tensor]
 ) -> Optional[torch.Tensor]:
