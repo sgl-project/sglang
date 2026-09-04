@@ -30,14 +30,6 @@ Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
     throw std::runtime_error(
         "draft_token_num must be greater than 0, current value: " + std::to_string(param_.draft_token_num));
   }
-  switch (param_.global_tree_mode) {
-    case GlobalTreeMode::DISABLED:
-    case GlobalTreeMode::PATH_PROBABILITY:
-    case GlobalTreeMode::SPECIFICITY_PATH_PROBABILITY:
-      break;
-    default:
-      throw std::runtime_error("Unknown global tree mode");
-  }
   for (auto config : param_.batch_draft_token_num) {
     if (config != std::numeric_limits<decltype(config)>::max()) {
       if (!(config <= param_.draft_token_num)) {
