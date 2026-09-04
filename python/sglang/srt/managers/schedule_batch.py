@@ -1870,7 +1870,9 @@ class Req(ReqDllmMixin):
         )
         self.kv.retraction_backup = RetractionBackup(
             cpu_tensors=token_to_kv_pool_allocator.get_cpu_copy(
-                token_indices, mamba_indices=self.kv.mamba_pool_idx
+                token_indices,
+                mamba_indices=self.kv.mamba_pool_idx,
+                req_pool_idx=self.kv.req_pool_idx,
             ),
             mamba_cpu=(
                 mamba_pool.get_cpu_copy(self.kv.mamba_pool_idx.unsqueeze(0))
@@ -1894,6 +1896,9 @@ class Req(ReqDllmMixin):
             self.kv.retraction_backup.cpu_tensors,
             token_indices,
             mamba_indices=self.kv.mamba_pool_idx,
+            # req_pool_idx was reallocated on resume, so request-scoped state
+            # must be addressed with the current one, not the saved one.
+            req_pool_idx=self.kv.req_pool_idx,
         )
         self.kv.retraction_backup = None
 
