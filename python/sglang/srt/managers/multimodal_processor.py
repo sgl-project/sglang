@@ -42,7 +42,7 @@ def import_processors(package_name: str, overwrite: bool = False):
                     PROCESSOR_MAPPING[arch] = cls
 
 
-def get_mm_processor_cls(hf_config, server_args: ServerArgs, model_config=None):
+def get_mm_processor_cls(hf_config, model_config=None):
     """The class :func:`get_mm_processor` would instantiate, or ``None`` when the
     architecture has no registered processor."""
     model_impl = str(get_model().model_impl).lower()
@@ -80,7 +80,7 @@ def get_mm_processor(
     model_config=None,
     **kwargs,
 ) -> BaseMultimodalProcessor:
-    processor_cls = get_mm_processor_cls(hf_config, server_args, model_config)
+    processor_cls = get_mm_processor_cls(hf_config, model_config)
     if processor_cls is None:
         raise ValueError(
             f"No processor registered for architecture: {hf_config.architectures}.\n"

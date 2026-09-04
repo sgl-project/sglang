@@ -109,7 +109,7 @@ def reuse_hccl_comm():
         create_group(group_name, group().ranks, group_options)
 
 
-def init_ms_distributed(world_size, rank, local_rank, server_args, port):
+def init_ms_distributed(world_size, rank, local_rank, port):
     if get_parallel().dist_init_addr:
         dist_init_method = f"tcp://{get_parallel().dist_init_addr}"
     else:

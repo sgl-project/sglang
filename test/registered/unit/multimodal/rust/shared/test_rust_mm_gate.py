@@ -33,7 +33,7 @@ def processor_cls_for(architecture, model_type):
     # `model_impl` is read from the bags now, so it has to be published rather
     # than handed over on a stand-in.
     publish(ServerArgs(model_path="dummy", model_impl="sglang"), role="tokenizer")
-    return get_mm_processor_cls(hf_config, None)
+    return get_mm_processor_cls(hf_config)
 
 
 class TestRustMmGate(CustomTestCase):

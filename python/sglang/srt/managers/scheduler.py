@@ -992,7 +992,7 @@ class Scheduler(
         # Initialize GEMM-related configuration for FP8 and FP4 backends.
         initialize_fp8_gemm_config()
         initialize_fp4_gemm_config()
-        initialize_bf16_gemm_config(self.server_args)
+        initialize_bf16_gemm_config()
 
         # This must be called after initialize_moe_config
         self.require_mlp_sync = require_mlp_sync()

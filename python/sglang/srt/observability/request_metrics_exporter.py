@@ -9,7 +9,6 @@ from typing import List, Optional, Union
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
-from sglang.srt.runtime_context import get_observability
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -84,7 +83,10 @@ class FileRequestMetricsExporter(RequestMetricsExporter):
         out_skip_names: Optional[set[str]],
     ):
         super().__init__(server_args, obj_skip_names, out_skip_names)
-        self.export_dir = get_observability().export_metrics_to_file_dir
+        # Given at construction, not read from the process: the exporter is
+        # handed the directory it writes to, and a test builds several with
+        # different ones.
+        self.export_dir = server_args.export_metrics_to_file_dir
         os.makedirs(self.export_dir, exist_ok=True)
 
         # File handler state management
@@ -213,7 +215,7 @@ def create_request_metrics_exporters(
     """Create and configure `RequestMetricsExporter`s based on server args."""
     metrics_exporters = []
 
-    if get_observability().export_metrics_to_file:
+    if server_args.export_metrics_to_file:
         metrics_exporters.append(
             FileRequestMetricsExporter(server_args, obj_skip_names, out_skip_names)
         )
