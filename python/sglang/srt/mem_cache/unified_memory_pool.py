@@ -135,9 +135,9 @@ class MHASubPoolSpec(SubPoolSpec):
         assert self.head_dim > 0, f"head_dim must be positive; got {self.head_dim}"
         if self.v_head_dim is None:
             object.__setattr__(self, "v_head_dim", self.head_dim)
-        assert (
-            self.v_head_dim > 0
-        ), f"v_head_dim must be positive; got {self.v_head_dim}"
+        assert self.v_head_dim > 0, (
+            f"v_head_dim must be positive; got {self.v_head_dim}"
+        )
 
     def k_row_bytes(self) -> int:
         return self.head_num * self.head_dim * self.store_dtype.itemsize
@@ -190,12 +190,12 @@ class MLASubPoolSpec(SubPoolSpec):
 
     def __post_init__(self):
         super().__post_init__()
-        assert (
-            self.kv_lora_rank > 0
-        ), f"kv_lora_rank must be positive; got {self.kv_lora_rank}"
-        assert (
-            self.qk_rope_head_dim > 0
-        ), f"qk_rope_head_dim must be positive; got {self.qk_rope_head_dim}"
+        assert self.kv_lora_rank > 0, (
+            f"kv_lora_rank must be positive; got {self.kv_lora_rank}"
+        )
+        assert self.qk_rope_head_dim > 0, (
+            f"qk_rope_head_dim must be positive; got {self.qk_rope_head_dim}"
+        )
 
     @property
     def kv_cache_dim(self) -> int:
@@ -308,13 +308,13 @@ class UnifiedKVPool:
         page_size: int = 1,
     ):
         assert page_size >= 1, f"page_size must be >= 1; got {page_size}"
-        assert (
-            len(sub_pool_specs) >= 2
-        ), f"UnifiedKVPool needs >= 2 sub-pools; got {len(sub_pool_specs)}"
+        assert len(sub_pool_specs) >= 2, (
+            f"UnifiedKVPool needs >= 2 sub-pools; got {len(sub_pool_specs)}"
+        )
         names = [s.name for s in sub_pool_specs]
-        assert len(set(names)) == len(
-            names
-        ), f"sub-pool names must be unique; got {names}"
+        assert len(set(names)) == len(names), (
+            f"sub-pool names must be unique; got {names}"
+        )
         # Per-spec direction validity already ran in each spec's __post_init__.
         up_specs = [s for s in sub_pool_specs if s.grow_direction == "up"]
         down_specs = [s for s in sub_pool_specs if s.grow_direction == "down"]
@@ -440,23 +440,23 @@ class UnifiedKVPool:
 
     def mha_spec(self, name: str) -> MHASubPoolSpec:
         s = self._specs_by_name[name]
-        assert isinstance(
-            s, MHASubPoolSpec
-        ), f"sub-pool {name!r} is {type(s).__name__}, expected MHASubPoolSpec"
+        assert isinstance(s, MHASubPoolSpec), (
+            f"sub-pool {name!r} is {type(s).__name__}, expected MHASubPoolSpec"
+        )
         return s
 
     def mla_spec(self, name: str) -> MLASubPoolSpec:
         s = self._specs_by_name[name]
-        assert isinstance(
-            s, MLASubPoolSpec
-        ), f"sub-pool {name!r} is {type(s).__name__}, expected MLASubPoolSpec"
+        assert isinstance(s, MLASubPoolSpec), (
+            f"sub-pool {name!r} is {type(s).__name__}, expected MLASubPoolSpec"
+        )
         return s
 
     def mamba_spec(self, name: str) -> MambaSubPoolSpec:
         s = self._specs_by_name[name]
-        assert isinstance(
-            s, MambaSubPoolSpec
-        ), f"sub-pool {name!r} is {type(s).__name__}, expected MambaSubPoolSpec"
+        assert isinstance(s, MambaSubPoolSpec), (
+            f"sub-pool {name!r} is {type(s).__name__}, expected MambaSubPoolSpec"
+        )
         return s
 
     def max_slots(self, name: str) -> int:
@@ -812,12 +812,12 @@ class UnifiedMambaPool(MambaPool):
         self.conv_shard_groups = None
         self.conv_slice_axis = spec.conv_slice_axis
 
-        assert (
-            conv_views[0].shape[0] == self.num_mamba_layers
-        ), f"conv_views layers={conv_views[0].shape[0]} vs expected {self.num_mamba_layers}"
-        assert (
-            conv_views[0].shape[1] == self._max_size + 1
-        ), f"conv_views slots={conv_views[0].shape[1]} vs expected {self._max_size + 1}"
+        assert conv_views[0].shape[0] == self.num_mamba_layers, (
+            f"conv_views layers={conv_views[0].shape[0]} vs expected {self.num_mamba_layers}"
+        )
+        assert conv_views[0].shape[1] == self._max_size + 1, (
+            f"conv_views slots={conv_views[0].shape[1]} vs expected {self._max_size + 1}"
+        )
 
         # Per-draft-token intermediate buffers have a different outer size
         # (spec_state_size+1), so they're NOT in the shared buffer; allocate locally.
@@ -1683,12 +1683,12 @@ def init_unified_swa_pools(
     # Both sub-allocators are page-aware: one virtual ID space at PAGE granularity,
     # two physical sub-pools compacting pages independently.
     assert page_size >= 1, f"page_size must be >= 1, got {page_size}"
-    assert (
-        len(full_attention_layer_ids) > 0
-    ), "SWA-hybrid with zero full-attention layers is degenerate"
-    assert (
-        len(swa_attention_layer_ids) > 0
-    ), "SWA-hybrid with zero SWA-attention layers is degenerate"
+    assert len(full_attention_layer_ids) > 0, (
+        "SWA-hybrid with zero full-attention layers is degenerate"
+    )
+    assert len(swa_attention_layer_ids) > 0, (
+        "SWA-hybrid with zero SWA-attention layers is degenerate"
+    )
 
     store_dtype = _store_dtype_for(kv_cache_dtype)
     # full-attn at the high-byte end (grow-down), swa at the low-byte end (grow-up).
@@ -1865,12 +1865,12 @@ def init_unified_mamba_swa_pools(
     )
 
     assert page_size >= 1, f"page_size must be >= 1, got {page_size}"
-    assert (
-        len(full_attention_layer_ids) > 0
-    ), "tri-pool with zero full-attention layers is degenerate"
-    assert (
-        len(swa_attention_layer_ids) > 0
-    ), "tri-pool with zero SWA-attention layers is degenerate"
+    assert len(full_attention_layer_ids) > 0, (
+        "tri-pool with zero full-attention layers is degenerate"
+    )
+    assert len(swa_attention_layer_ids) > 0, (
+        "tri-pool with zero SWA-attention layers is degenerate"
+    )
     assert len(mamba_layer_ids) > 0, "tri-pool with zero state layers is degenerate"
 
     store_dtype = _store_dtype_for(kv_cache_dtype)

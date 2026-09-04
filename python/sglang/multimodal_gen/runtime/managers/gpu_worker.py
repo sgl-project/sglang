@@ -78,6 +78,7 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
 )
+from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.multimodal_gen.runtime.utils.realtime_video import (
     RAW_RGB_CONTENT_TYPE,
     build_raw_rgb_frame_batches,
@@ -446,8 +447,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     ),
                     log_reqs=[req],
                     return_req=False,
-                    save_output_paths=lambda output_batch, req=req: self._save_output_paths(
-                        req, output_batch
+                    save_output_paths=lambda output_batch, req=req: (
+                        self._save_output_paths(req, output_batch)
                     ),
                     error_context=f"grouped request {req.request_id}",
                     execution_start_time=group_start_time,
@@ -616,7 +617,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         output_metrics: list[Any],
         deferred: bool,
     ) -> None:
-        self._materialize_output_transport(output_batch, req, save_output_paths)
+        req_label = req.request_id[:8] if req.request_id else "unnamed"
+        with maybe_record_function(f"SAVE_OUTPUTS {req_label}"):
+            self._materialize_output_transport(output_batch, req, save_output_paths)
         self._record_output_peak_memory(output_batch)
 
         collect_perf = (
@@ -641,7 +644,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             and output_batch.output is None
             and not req.return_raw_frames
         ):
-            torch.get_device_module().empty_cache()
+            with maybe_record_function("EMPTY_CACHE"):
+                torch.get_device_module().empty_cache()
 
         if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
             if not req.is_warmup:

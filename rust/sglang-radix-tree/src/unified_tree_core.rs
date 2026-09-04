@@ -312,6 +312,7 @@ pub enum PoolName {
     Indexer,
     DeepseekV4C4,
     DeepseekV4C4Indexer,
+    DeepseekV4C4IndexerScale,
     DeepseekV4C128,
     DeepseekV4C4State,
     DeepseekV4C4IndexerState,
@@ -1539,13 +1540,31 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
             let dup_start = state.prev_prefix_len.saturating_sub(cursor);
             if dup_start < consumed_from {
-                state
-                    .pending_actions
-                    .push(CacheAction::FreeDeviceKV(vec![value_slice.narrow(
-                        0,
-                        dup_start as i64,
-                        (consumed_from - dup_start) as i64,
-                    )]));
+                // The duplicate slice may straddle this request's own eviction
+                // floor; below it only the full side is still ours to release.
+                let dup_len = consumed_from - dup_start;
+                let swa_already_freed = state
+                    .swa_evicted_seqlen
+                    .saturating_sub(cursor + dup_start)
+                    .min(dup_len);
+                if swa_already_freed > 0 {
+                    state
+                        .pending_actions
+                        .push(CacheAction::FreeDeviceKVFullOnly(vec![value_slice.narrow(
+                            0,
+                            dup_start as i64,
+                            swa_already_freed as i64,
+                        )]));
+                }
+                if swa_already_freed < dup_len {
+                    state.pending_actions.push(CacheAction::FreeDeviceKV(vec![
+                        value_slice.narrow(
+                            0,
+                            (dup_start + swa_already_freed) as i64,
+                            (dup_len - swa_already_freed) as i64,
+                        ),
+                    ]));
+                }
             }
         }
 
@@ -3649,10 +3668,39 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
     }
 
-    /// Mark a node as having an in-flight write-through backup.
-    pub fn mark_write_through_pending(&mut self, node_id: NodeId) {
-        let node_idx = self.arena.resolve(node_id);
-        self.arena.node_mut(node_idx).write_through_pending_id = Some(node_id);
+    /// Mark every node covered by one in-flight write-through backup, and return
+    /// them ancestors first: publish links each host store event to its parent.
+    pub fn mark_write_through_pending(
+        &mut self,
+        node_ids: Vec<NodeId>,
+        ack_id: NodeId,
+    ) -> Vec<NodeId> {
+        let mut marked: Vec<(usize, NodeId)> = Vec::with_capacity(node_ids.len());
+        for node_id in node_ids {
+            let node_idx = self.arena.resolve(node_id);
+            let depth = self.depth_from_root_(node_idx);
+            let node = self.arena.node_mut(node_idx);
+            assert!(
+                node.write_through_pending_id.is_none()
+                    || node.write_through_pending_id == Some(ack_id),
+                "node {} is already pending under a different write-through ack",
+                node.id
+            );
+            node.write_through_pending_id = Some(ack_id);
+            marked.push((depth, node_id));
+        }
+        marked.sort_unstable();
+        marked.into_iter().map(|(_, node_id)| node_id).collect()
+    }
+
+    fn depth_from_root_(&self, node_idx: NodeIdx_) -> usize {
+        let mut depth = 0;
+        let mut node = self.arena.node(node_idx);
+        while !node.is_root() {
+            depth += 1;
+            node = self.arena.node(node.parent());
+        }
+        depth
     }
 
     /// Clear the write-through-pending mark (when it matches ack_id) and record the
