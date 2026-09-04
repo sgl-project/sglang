@@ -1823,7 +1823,7 @@ class DeepseekV4AscendAttnBackend(
                 "seqused_kv": actual_seq_lengths_kv,
             }
             metadata_op, _ = _sparse_attn_ops()
-            c1a_metadata = metadata_op(**c1a_kwargs)
+        c1a_metadata = metadata_op(**c1a_kwargs)
         kernel_metadata = {"c1a_metadata": c1a_metadata}
 
         if self._dsv4_has_c4:
@@ -2202,13 +2202,6 @@ class DeepseekV4AscendMultiStepDraftBackend:
             DeepseekV4AscendAttnBackend(model_runner, speculative_step_id=step_id)
             for step_id in range(speculative_num_steps)
         ]
-        # DSV4 draft workers currently disable every compressor.  Avoid deriving
-        # per-step compressed-cache locations that no child backend can consume;
-        # the boolean selection otherwise emits four dynamic NonZero calls per
-        # EAGLE cycle (two draft steps x C4/C128 for the common 3-step setup).
-        self._needs_step_compressed_locs = any(
-            bool(backend._dsv4_compress_ratios) for backend in self.attn_backends
-        )
 
     def common_template(self, forward_batch: ForwardBatch, call_fn):
         assert forward_batch.spec_info is not None
@@ -2268,44 +2261,17 @@ class DeepseekV4AscendMultiStepDraftBackend:
         )
         swa_steps = swa_steps.permute((2, 0, 1)).reshape(self.speculative_num_steps, -1)
 
-        def step_compress(loc, ratio: int):
-            if loc is None or loc.numel() == 0:
-                return loc
-            raw_bs = step_width // self.topk
-            seq_lens = forward_batch.seq_lens[:raw_bs].to(torch.int64)
-            positions = seq_lens[:, None, None] + torch.arange(
-                self.speculative_num_steps,
-                device=seq_lens.device,
-                dtype=seq_lens.dtype,
-            )
-            positions = positions.expand(-1, self.topk, -1)
-            should_compress = ((positions + 1) % ratio) == 0
-            counts = should_compress.reshape(-1).to(torch.int64)
-            offsets = torch.cumsum(counts, dim=0) - counts
-            step_mask = should_compress[:, :, step_id].reshape(-1)
-            step_offsets = offsets.reshape(
-                raw_bs, self.topk, self.speculative_num_steps
-            )[:, :, step_id].reshape(-1)
-            return loc[step_offsets[step_mask].to(torch.int64)]
-
-        if self._needs_step_compressed_locs:
-            out_c4_loc = step_compress(bundle.out_c4_loc, 4)
-            out_c128_loc = step_compress(bundle.out_c128_loc, 128)
-        else:
-            out_c4_loc = (
-                None if bundle.out_c4_loc is None else bundle.out_c4_loc.new_empty((0,))
-            )
-            out_c128_loc = (
-                None
-                if bundle.out_c128_loc is None
-                else bundle.out_c128_loc.new_empty((0,))
-            )
-
         return DSV4OutCacheLoc(
             out_full_loc=full_steps[step_id],
             out_swa_loc=swa_steps[step_id],
-            out_c4_loc=out_c4_loc,
-            out_c128_loc=out_c128_loc,
+            out_c4_loc=(
+                None if bundle.out_c4_loc is None else bundle.out_c4_loc.new_empty((0,))
+            ),
+            out_c128_loc=(
+                None
+                if bundle.out_c128_loc is None
+                else bundle.out_c128_loc.new_empty((0,))
+            ),
         )
 
     def _with_step_cache_locs(self, forward_batch: ForwardBatch, step_id: int, call_fn):

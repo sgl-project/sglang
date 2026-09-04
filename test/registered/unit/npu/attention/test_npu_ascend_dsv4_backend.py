@@ -270,14 +270,12 @@ class TestVerifyCompressPositions(unittest.TestCase):
 
 
 class TestMultiStepDraftCompressedLocs(unittest.TestCase):
-    def test_skips_unused_compressed_locs_but_preserves_full_and_swa_steps(self):
+    def test_draft_steps_skip_compressed_locs_but_preserve_full_and_swa(self):
         backend = DeepseekV4AscendMultiStepDraftBackend.__new__(
             DeepseekV4AscendMultiStepDraftBackend
         )
         backend.topk = 1
         backend.speculative_num_steps = 3
-        backend._needs_step_compressed_locs = False
-
         bundle = SimpleNamespace(
             out_full_loc=torch.arange(6, dtype=torch.int64),
             out_swa_loc=torch.arange(10, 16, dtype=torch.int64),
@@ -727,6 +725,41 @@ class TestSparseAttentionMetadata(unittest.TestCase):
                 for call in metadata_op.call_args_list:
                     self.assertIs(call.kwargs["cu_seqlens_q"], cu_seqlens_q)
                     self.assertIs(call.kwargs["seqused_kv"], seqused_kv)
+
+    def test_dspark_host_metadata_receives_host_sequence_lengths(self):
+        cu_seqlens_q = torch.tensor([0, 2, 3], dtype=torch.int32)
+        seqused_kv = torch.tensor([8, 12], dtype=torch.int32)
+        cu_seqlens_q_cpu = cu_seqlens_q.clone()
+        seqused_kv_cpu = seqused_kv.clone()
+
+        with patch("torch.ops.npu", MagicMock(), create=True) as npu_ops:
+            backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+            backend.forward_metadata = SimpleNamespace(
+                actual_seq_lengths_q_pa_cpu=cu_seqlens_q_cpu,
+                seq_lens_cpu_int=seqused_kv_cpu,
+            )
+            backend._is_dspark_draft_worker = True
+            backend._dsv4_sliding_window_size = 128
+            backend._dsv4_q_head_num = 64
+            backend._dsv4_kv_head_num = 1
+            backend._dsv4_head_dim = 512
+            backend._dsv4_has_c4 = False
+            backend._dsv4_has_c128 = False
+
+            kernel_metadata = backend._kernel_metadata_from_parts(
+                bs=2,
+                actual_seq_lengths_q_pa=cu_seqlens_q,
+                actual_seq_lengths_kv=seqused_kv,
+                block_tables=torch.zeros((2, 1), dtype=torch.int32),
+                max_seqlen_q=2,
+                is_nextn=False,
+            )
+
+        metadata_op = npu_ops.sparse_attn_sharedkv_metadata_host
+        metadata_op.assert_called_once()
+        self.assertIs(kernel_metadata["c1a_metadata"], metadata_op.return_value)
+        self.assertIs(metadata_op.call_args.kwargs["cu_seqlens_q"], cu_seqlens_q_cpu)
+        self.assertIs(metadata_op.call_args.kwargs["seqused_kv"], seqused_kv_cpu)
 
 
 class TestGetKvIndices(unittest.TestCase):

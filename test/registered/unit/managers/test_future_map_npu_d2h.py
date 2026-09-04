@@ -254,3 +254,7 @@ def test_npu_bootstrap_without_publish_uses_device_gather():
     assert batch.seq_lens_sum == 17
     assert future_map.publish_ready is None
     assert future_map.npu_seq_lens_d2h_done.synchronize_count == 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
