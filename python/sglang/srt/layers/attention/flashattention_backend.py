@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
@@ -2200,18 +2201,20 @@ class FlashAttentionBackend(AttentionBackend):
 
         # This is being used by normal decode and draft decode when topk == 1
         self.decode_cuda_graph_metadata = {
-            "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
+            "cache_seqlens": self.alloc_cuda_graph_state(
+                "decode.cache_seqlens", (max_bs,), torch.int32, self.device
+            ),
             "cu_seqlens_q": torch.arange(
                 0, max_bs + 1, dtype=torch.int32, device=self.device
             ),
-            "cu_seqlens_k": torch.zeros(
-                max_bs + 1, dtype=torch.int32, device=self.device
+            "cu_seqlens_k": self.alloc_cuda_graph_state(
+                "decode.cu_seqlens_k", (max_bs + 1,), torch.int32, self.device
             ),
-            "page_table": torch.zeros(
-                max_bs,
-                max_num_pages,
-                dtype=torch.int32,
-                device=self.device,
+            "page_table": self.alloc_cuda_graph_state(
+                "decode.page_table",
+                (max_bs, max_num_pages),
+                torch.int32,
+                self.device,
             ),
             "strided_indices": torch.arange(
                 0, self.max_context_len, self.page_size, device=self.device
@@ -2221,8 +2224,8 @@ class FlashAttentionBackend(AttentionBackend):
         # Size: 1 (semaphore) + round_up(max_bs, 4) * 4 (causal decode vectors)
         if self._get_scheduler_metadata is not None and not self.use_mla:
             b_rounded = ((max_bs + 3) // 4) * 4
-            self._sched_meta_buf = torch.zeros(
-                1 + b_rounded * 4, dtype=torch.int32, device=self.device
+            self._sched_meta_buf = self.alloc_cuda_graph_state(
+                "sched_meta", (1 + b_rounded * 4,), torch.int32, self.device
             )
         else:
             self._sched_meta_buf = None
@@ -2240,33 +2243,39 @@ class FlashAttentionBackend(AttentionBackend):
             max_pages_per_block = (attn_chunk_size + page_size - 1) // page_size
 
             self.decode_cuda_graph_local_attn_metadata = {
-                "local_query_start_loc": torch.zeros(
-                    max_virtual_batches + 1, dtype=torch.int32, device=self.device
+                "local_query_start_loc": self.alloc_cuda_graph_state(
+                    "local_attn.local_query_start_loc",
+                    (max_virtual_batches + 1,),
+                    torch.int32,
+                    self.device,
                 ),
-                "local_seqused_k": torch.zeros(
-                    max_virtual_batches, dtype=torch.int32, device=self.device
+                "local_seqused_k": self.alloc_cuda_graph_state(
+                    "local_attn.local_seqused_k",
+                    (max_virtual_batches,),
+                    torch.int32,
+                    self.device,
                 ),
-                "local_block_table": torch.zeros(
-                    max_virtual_batches,
-                    max_pages_per_block,
-                    dtype=torch.int32,
-                    device=self.device,
+                "local_block_table": self.alloc_cuda_graph_state(
+                    "local_attn.local_block_table",
+                    (max_virtual_batches, max_pages_per_block),
+                    torch.int32,
+                    self.device,
                 ),
             }
 
         if self.use_sliding_window_kv_pool:
-            self.decode_cuda_graph_metadata["swa_page_table"] = torch.zeros(
-                max_bs,
-                max_num_pages,
-                dtype=torch.int32,
-                device=self.device,
+            self.decode_cuda_graph_metadata["swa_page_table"] = (
+                self.alloc_cuda_graph_state(
+                    "decode.swa_page_table",
+                    (max_bs, max_num_pages),
+                    torch.int32,
+                    self.device,
+                )
             )
             # SWA write-target buffer; metadata binds a [:num_tokens] view,
             # refilled from the live out_cache_loc before each replay.
-            self.cuda_graph_swa_out_cache_loc = torch.zeros(
-                max_num_tokens,
-                dtype=torch.int64,
-                device=self.device,
+            self.cuda_graph_swa_out_cache_loc = self.alloc_cuda_graph_state(
+                "swa_out_cache_loc", (max_num_tokens,), torch.int64, self.device
             )
 
         # This is used by draft decode's first half of metadata when topk > 1
@@ -2328,16 +2337,18 @@ class FlashAttentionBackend(AttentionBackend):
             and self.speculative_num_draft_tokens > 0
         ):
             # "page_table_draft_decode" will be set only when spec decoding enabled to save memory
-            self.decode_cuda_graph_metadata["page_table_draft_decode"] = torch.zeros(
-                max_bs,
-                max_num_pages,
-                dtype=torch.int32,
-                device=self.device,
+            self.decode_cuda_graph_metadata["page_table_draft_decode"] = (
+                self.alloc_cuda_graph_state(
+                    "decode.page_table_draft_decode",
+                    (max_bs, max_num_pages),
+                    torch.int32,
+                    self.device,
+                )
             )
 
             self.target_verify_metadata = {
-                "cache_seqlens": torch.zeros(
-                    max_bs, dtype=torch.int32, device=self.device
+                "cache_seqlens": self.alloc_cuda_graph_state(
+                    "verify.cache_seqlens", (max_bs,), torch.int32, self.device
                 ),
                 "cu_seqlens_q": torch.arange(
                     0,
@@ -2346,14 +2357,14 @@ class FlashAttentionBackend(AttentionBackend):
                     dtype=torch.int32,
                     device=self.device,
                 ),
-                "cu_seqlens_k": torch.zeros(
-                    max_bs + 1, dtype=torch.int32, device=self.device
+                "cu_seqlens_k": self.alloc_cuda_graph_state(
+                    "verify.cu_seqlens_k", (max_bs + 1,), torch.int32, self.device
                 ),
-                "page_table": torch.zeros(
-                    max_bs,
-                    max_num_pages,
-                    dtype=torch.int32,
-                    device=self.device,
+                "page_table": self.alloc_cuda_graph_state(
+                    "verify.page_table",
+                    (max_bs, max_num_pages),
+                    torch.int32,
+                    self.device,
                 ),
                 "strided_indices": torch.arange(
                     0, self.max_context_len, self.page_size, device=self.device
@@ -2369,25 +2380,26 @@ class FlashAttentionBackend(AttentionBackend):
                 num_draft_tokens=self.speculative_num_draft_tokens,
                 device=self.device,
                 is_read=self.topk > 1,
+                allocate=partial(self.alloc_cuda_graph_state, "verify_mask"),
             )
 
             self.draft_extend_metadata = {
-                "cache_seqlens": torch.zeros(
-                    max_bs, dtype=torch.int32, device=self.device
+                "cache_seqlens": self.alloc_cuda_graph_state(
+                    "draft_extend.cache_seqlens", (max_bs,), torch.int32, self.device
                 ),
                 "cu_seqlens_q": torch.zeros(
                     max_bs + 1,
                     dtype=torch.int32,
                     device=self.device,
                 ),
-                "cu_seqlens_k": torch.zeros(
-                    max_bs + 1, dtype=torch.int32, device=self.device
+                "cu_seqlens_k": self.alloc_cuda_graph_state(
+                    "draft_extend.cu_seqlens_k", (max_bs + 1,), torch.int32, self.device
                 ),
-                "page_table": torch.zeros(
-                    max_bs,
-                    max_num_pages,
-                    dtype=torch.int32,
-                    device=self.device,
+                "page_table": self.alloc_cuda_graph_state(
+                    "draft_extend.page_table",
+                    (max_bs, max_num_pages),
+                    torch.int32,
+                    self.device,
                 ),
                 "strided_indices": torch.arange(
                     0, self.max_context_len, self.page_size, device=self.device
@@ -2395,17 +2407,21 @@ class FlashAttentionBackend(AttentionBackend):
             }
 
             if self.use_sliding_window_kv_pool:
-                self.target_verify_metadata["swa_page_table"] = torch.zeros(
-                    max_bs,
-                    max_num_pages,
-                    dtype=torch.int32,
-                    device=self.device,
+                self.target_verify_metadata["swa_page_table"] = (
+                    self.alloc_cuda_graph_state(
+                        "verify.swa_page_table",
+                        (max_bs, max_num_pages),
+                        torch.int32,
+                        self.device,
+                    )
                 )
-                self.draft_extend_metadata["swa_page_table"] = torch.zeros(
-                    max_bs,
-                    max_num_pages,
-                    dtype=torch.int32,
-                    device=self.device,
+                self.draft_extend_metadata["swa_page_table"] = (
+                    self.alloc_cuda_graph_state(
+                        "draft_extend.swa_page_table",
+                        (max_bs, max_num_pages),
+                        torch.int32,
+                        self.device,
+                    )
                 )
 
         if self.topk > 1:

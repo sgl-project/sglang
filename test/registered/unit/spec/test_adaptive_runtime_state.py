@@ -80,21 +80,52 @@ class TestAdaptiveController(unittest.TestCase):
         self.assertEqual(
             worker.build_calls,
             [
-                (1, 2, [1]),
                 (3, 4, [1, 2]),
+                (1, 2, [1]),
             ],
         )
         self.assertEqual(worker.applied_steps, [3])
 
-    def test_registered_initial_state_is_reused(self):
+    def test_states_are_built_widest_step_first_regardless_of_pruning(self):
+        worker = _FakeWorker(initial_steps=3)
+        policy = _FakePolicy()
+        policy.candidate_steps = [1, 3, 7]
+        bs_for_step = {7: [1, 2, 4], 3: [1, 2, 4, 8, 16], 1: [1, 2, 4, 8, 16, 32]}
+        policy.cuda_graph_bs_for_step = lambda step: bs_for_step[step]
+        controller = AdaptiveController(worker, policy)
+
+        controller.init_states(cuda_graph_bs=[1, 2, 4, 8, 16, 32])
+
+        self.assertEqual(
+            worker.build_calls,
+            [
+                (7, 8, [1, 2, 4]),
+                (3, 4, [1, 2, 4, 8, 16]),
+                (1, 2, [1, 2, 4, 8, 16, 32]),
+            ],
+        )
+
+    def test_states_are_built_by_descending_steps_without_cuda_graph(self):
+        worker = _FakeWorker(initial_steps=3)
+        policy = _FakePolicy()
+        policy.candidate_steps = [1, 3, 7]
+        controller = AdaptiveController(worker, policy)
+
+        controller.init_states(cuda_graph_bs=None)
+
+        self.assertEqual(worker.build_calls, [(7, 8, None), (3, 4, None), (1, 2, None)])
+        self.assertEqual(worker.applied_steps, [3])
+
+    def test_activation_is_idempotent_by_state_identity(self):
         worker = _FakeWorker(initial_steps=3)
         controller = AdaptiveController(worker, _FakePolicy())
-        controller.register(_make_state(3))
-
         controller.init_states()
 
-        self.assertEqual(worker.build_calls, [(1, 2, None)])
-        self.assertEqual(worker.applied_steps, [3])
+        controller._activate(3)
+        controller._activate(1)
+        controller._activate(1)
+
+        self.assertEqual(worker.applied_steps, [3, 1])
 
     def test_batch_activation_is_idempotent(self):
         worker = _FakeWorker(initial_steps=3)

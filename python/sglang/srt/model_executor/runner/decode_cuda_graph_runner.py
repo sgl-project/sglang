@@ -226,6 +226,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # In-graph metadata prep: shared buffers -> in-graph private data
         self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
+        self._hidden_states_out: Optional[torch.Tensor] = None
 
         # --- core state ------------------------------------------------
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
@@ -441,7 +442,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.model_runner.get_pp_proxy_residual_num_blocks()
             ),
         )
-        self.buffers.share_buffers()
+        self.buffers.share_buffers(exclude={"next_token_logits_buffer"})
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
         # physical tensors, stable data_ptr for capture vs replay). Provides
         # the unified fill_from / slot access surface, replacing
@@ -1052,8 +1053,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self._profiler = profile_context
 
         # share_buffers() coalesces seq_lens / seq_lens_cpu through the process-
-        # wide pool, so they may alias a buffer seeded by an earlier runner (the
-        # eager registry fills them with 0). The capture-time attention-metadata
+        # wide pool, so they may alias a buffer seeded by an earlier runner with
+        # a different fill value. The capture-time attention-metadata
         # plan reads these as the per-request KV length, and the prefill wrapper
         # (DLLM_EXTEND) asserts kv_len >= qo_len, so restore the fill value the
         # captured graph needs before capturing.
@@ -1233,6 +1234,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
                 for capture_hook in self.model_runner.capture_tail_hooks:
                     capture_hook(self, out, forward_batch, num_tokens)
+                self._stage_hidden_states(out)
                 return out
 
             self.deepep_adapter.capture(is_extend_in_batch=False)
@@ -1270,6 +1272,26 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     capture_inputs=None,
                     post_warmup_hook=post_warmup_hook,
                 )
+
+    def _stage_hidden_states(self, out) -> None:
+        """Stage hidden states into the shared static output buffer."""
+        if (
+            not isinstance(out, LogitsProcessorOutput)
+            or out.hidden_states is None
+            or out.hidden_states.dim() != 2
+            or self.enable_return_hidden_states
+        ):
+            return
+        hidden_states = out.hidden_states
+        if self._hidden_states_out is None:
+            self._hidden_states_out = (
+                self.model_runner.graph_shared_output.get_hidden_states_buffer(
+                    hidden_states.shape[1], hidden_states.dtype, rows=self.max_num_token
+                )
+            )
+        staged = self._hidden_states_out[: hidden_states.shape[0]]
+        staged.copy_(hidden_states)
+        out.hidden_states = staged
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
         if self.capture_hidden_mode < forward_batch.capture_hidden_mode:

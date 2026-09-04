@@ -270,11 +270,19 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             dsa_seed_topk_capture=dsa_seed_topk_capture,
         )
-        # The values depend on captured_req_width, while adaptive speculative
-        # decoding owns multiple runners whose select_index buffers all have
-        # shape [max_bs]. Sharing by field name and shape would alias those
-        # width-specific indices and can make a narrower graph gather OOB.
-        self.buffers.share_buffers(exclude={"select_index"})
+        # These init values depend on captured_req_width, while adaptive
+        # speculative decoding owns multiple runners whose [max_bs] buffers
+        # would otherwise alias by field name; a narrower graph capturing with
+        # another width's values can gather OOB.
+        self.buffers.share_buffers(
+            exclude={
+                "select_index",
+                "extend_seq_lens",
+                "num_correct_drafts",
+                "num_accept_tokens",
+                "next_token_logits_buffer",
+            }
+        )
 
         self.backend = resolve_decode_backend(self)
 
@@ -509,8 +517,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         if bs * self.captured_req_width != num_tokens:
             buffers.seq_lens.fill_(self.seq_len_fill_value)
-            buffers.out_cache_loc.zero_()
-            buffers.positions.zero_()
+            buffers.out_cache_loc[: self.max_num_token].zero_()
+            buffers.positions[: self.max_num_token].zero_()
             # Pair with seq_lens fill: padded rows must point at reserved
             # req_pool slot 0 (req_to_token[0, :] is all zeros from init).
             buffers.req_pool_indices.zero_()

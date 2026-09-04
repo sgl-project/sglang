@@ -18,6 +18,7 @@ import dataclasses
 import unittest
 from types import SimpleNamespace
 from typing import Optional
+from unittest import mock
 
 import torch
 
@@ -625,10 +626,10 @@ class TestPoolBackedAlloc(unittest.TestCase):
             r2.get_slot("ids").buffer.data_ptr(),
         )
 
-    def test_sharing_is_independent_of_registration_order(self):
+    def test_smaller_request_aliases_the_largest_registration(self):
         from sglang.srt.model_executor import input_buffers
 
-        def _ptrs(first_tokens, second_tokens):
+        def _buffers(first_tokens, second_tokens):
             input_buffers._forward_input_buffer_pool.clear()
             r1 = self._reg(max_num_tokens=first_tokens, share_pool=True)
             r1.register_slot(self._ids_slot("ids"))
@@ -637,18 +638,165 @@ class TestPoolBackedAlloc(unittest.TestCase):
             return r1.get_slot("ids").buffer, r2.get_slot("ids").buffer
 
         # Same size: shares in either order.
-        a, b = _ptrs(16, 16)
+        a, b = _buffers(16, 16)
         self.assertEqual(a.data_ptr(), b.data_ptr())
-        b2, a2 = _ptrs(16, 16)
+        b2, a2 = _buffers(16, 16)
         self.assertEqual(a2.data_ptr(), b2.data_ptr())
 
-        # Different sizes: never shares, regardless of which registers first
-        # (the old strictly-larger rule shared big-then-small but not
-        # small-then-big — that asymmetry is what this fix removes).
-        big_first, small_after = _ptrs(32, 16)
-        self.assertNotEqual(big_first.data_ptr(), small_after.data_ptr())
-        small_first, big_after = _ptrs(16, 32)
+        # Big then small: the small request is a prefix view of the big buffer.
+        big_first, small_after = _buffers(32, 16)
+        self.assertEqual(big_first.data_ptr(), small_after.data_ptr())
+        self.assertEqual(tuple(small_after.shape), (16,))
+        small_after.fill_(7)
+        self.assertTrue(torch.all(big_first[:16] == 7))
+        self.assertTrue(torch.all(big_first[16:] == 0))
+
+        # Small then big: the big request keeps its own storage (the small
+        # buffer, possibly already captured, is never repointed) and becomes
+        # canonical for later requests that fit.
+        small_first, big_after = _buffers(16, 32)
         self.assertNotEqual(small_first.data_ptr(), big_after.data_ptr())
+        r3 = self._reg(max_num_tokens=16, share_pool=True)
+        r3.register_slot(self._ids_slot("ids"))
+        self.assertEqual(r3.get_slot("ids").buffer.data_ptr(), big_after.data_ptr())
+        self.assertNotEqual(
+            r3.get_slot("ids").buffer.data_ptr(), small_first.data_ptr()
+        )
+
+    def test_pool_namespace_isolates_registries(self):
+        graph = self._reg(max_num_tokens=16, share_pool=True)
+        graph.register_slot(self._ids_slot("ids"))
+        eager_a = CudaGraphBufferRegistry(
+            device=torch.device("cpu"),
+            max_bs=8,
+            max_num_tokens=32,
+            share_pool=True,
+            pool_namespace="eager",
+        )
+        eager_a.register_slot(self._ids_slot("ids"))
+        eager_b = CudaGraphBufferRegistry(
+            device=torch.device("cpu"),
+            max_bs=8,
+            max_num_tokens=32,
+            share_pool=True,
+            pool_namespace="eager",
+        )
+        eager_b.register_slot(self._ids_slot("ids"))
+
+        self.assertNotEqual(
+            graph.get_slot("ids").buffer.data_ptr(),
+            eager_a.get_slot("ids").buffer.data_ptr(),
+        )
+        self.assertEqual(
+            eager_a.get_slot("ids").buffer.data_ptr(),
+            eager_b.get_slot("ids").buffer.data_ptr(),
+        )
+
+    def test_graph_state_pool_is_namespaced_and_pool_first(self):
+        from sglang.srt.model_executor import input_buffers
+
+        input_buffers._forward_input_buffer_pool.clear()
+        private = torch.zeros((8, 4), dtype=torch.int64)
+        self.assertIs(
+            input_buffers.share_graph_state_buffer(None, "kv_indices", private),
+            private,
+        )
+
+        target_a = input_buffers.alloc_graph_state_buffer(
+            "adaptive.target", "kv_indices", (16, 4), torch.int64, "cpu"
+        )
+        with mock.patch("torch.full", wraps=torch.full) as spy:
+            target_b = input_buffers.alloc_graph_state_buffer(
+                "adaptive.target", "kv_indices", (8, 4), torch.int64, "cpu"
+            )
+        spy.assert_not_called()
+        draft = input_buffers.alloc_graph_state_buffer(
+            "adaptive.draft_extend",
+            "kv_indices",
+            (8, 4),
+            torch.int64,
+            "cpu",
+            fill_value=3,
+        )
+        self.assertEqual(target_b.data_ptr(), target_a.data_ptr())
+        self.assertEqual(tuple(target_b.shape), (8, 4))
+        self.assertNotEqual(draft.data_ptr(), target_a.data_ptr())
+        self.assertTrue(torch.all(draft == 3))
+
+        grid_a = input_buffers.alloc_graph_state_grid(
+            "adaptive.draft_decode", "kv_indices", 7, 32, torch.int64, "cpu"
+        )
+        grid_b = input_buffers.alloc_graph_state_grid(
+            "adaptive.draft_decode", "kv_indices", 3, 16, torch.int64, "cpu"
+        )
+        self.assertEqual(grid_b.data_ptr(), grid_a.data_ptr())
+        self.assertEqual(tuple(grid_b.shape), (3, 16))
+        self.assertEqual(grid_b.stride(0), grid_a.stride(0))
+        self.assertEqual(grid_b[2].data_ptr(), grid_a[2].data_ptr())
+        self.assertTrue(grid_b[1].is_contiguous())
+        wider = input_buffers.alloc_graph_state_grid(
+            "adaptive.draft_decode", "kv_indices", 2, 64, torch.int64, "cpu"
+        )
+        self.assertNotEqual(wider.data_ptr(), grid_a.data_ptr())
+        private_grid = input_buffers.alloc_graph_state_grid(
+            None, "kv_indices", 2, 8, torch.int64, "cpu"
+        )
+        self.assertEqual(tuple(private_grid.shape), (2, 8))
+        self.assertNotEqual(private_grid.data_ptr(), grid_a.data_ptr())
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs a cuda device")
+    def test_graph_state_pool_first_hits_across_device_spellings(self):
+        from sglang.srt.model_executor import input_buffers
+
+        input_buffers._forward_input_buffer_pool.clear()
+        first = input_buffers.alloc_graph_state_buffer(
+            "adaptive.target", "kv_indices", (16,), torch.int32, "cuda"
+        )
+        with mock.patch("torch.full", wraps=torch.full) as spy:
+            second = input_buffers.alloc_graph_state_buffer(
+                "adaptive.target",
+                "kv_indices",
+                (8,),
+                torch.int32,
+                torch.device("cuda", torch.cuda.current_device()),
+            )
+        spy.assert_not_called()
+        self.assertEqual(second.data_ptr(), first.data_ptr())
+
+    def test_share_input_buffer_aliases_row_prefixes_only(self):
+        from sglang.srt.model_executor import input_buffers
+
+        input_buffers._forward_input_buffer_pool.clear()
+        wide = input_buffers.share_input_buffer(
+            "hidden_states", torch.zeros((16, 4), dtype=torch.int64)
+        )
+        narrow = input_buffers.share_input_buffer(
+            "hidden_states", torch.zeros((8, 4), dtype=torch.int64)
+        )
+        self.assertEqual(narrow.data_ptr(), wide.data_ptr())
+        self.assertEqual(tuple(narrow.shape), (8, 4))
+        self.assertEqual(narrow.stride(), torch.zeros((8, 4)).stride())
+
+        other_rows = input_buffers.share_input_buffer(
+            "hidden_states", torch.zeros((8, 3), dtype=torch.int64)
+        )
+        self.assertNotEqual(other_rows.data_ptr(), wide.data_ptr())
+        other_dtype = input_buffers.share_input_buffer(
+            "hidden_states", torch.zeros((8, 4), dtype=torch.int32)
+        )
+        self.assertNotEqual(other_dtype.data_ptr(), wide.data_ptr())
+        other_name = input_buffers.share_input_buffer(
+            "positions", torch.zeros((8, 4), dtype=torch.int64)
+        )
+        self.assertNotEqual(other_name.data_ptr(), wide.data_ptr())
+
+        mrope_wide = input_buffers.share_input_buffer(
+            "mrope_positions", torch.zeros((3, 16), dtype=torch.int64)
+        )
+        mrope_narrow = input_buffers.share_input_buffer(
+            "mrope_positions", torch.zeros((3, 8), dtype=torch.int64)
+        )
+        self.assertNotEqual(mrope_narrow.data_ptr(), mrope_wide.data_ptr())
 
     def test_forward_input_buffers_can_exclude_width_specific_fields(self):
         first = _PoolInputBuffers(
@@ -1113,6 +1261,11 @@ class TestBuildPrefillRegistry(unittest.TestCase):
     """Token-axis prefill registry (piecewise / breakable runners): ZERO-tail
     padding, input_embeds reset-only, mamba bs-axis copy, source adoption."""
 
+    def setUp(self):
+        from sglang.srt.model_executor import input_buffers
+
+        input_buffers._forward_input_buffer_pool.clear()
+
     def _src(self, **extra):
         base = dict(
             input_ids=torch.zeros(16, dtype=torch.int64),
@@ -1512,6 +1665,11 @@ class TestPrefillNumTokenNonPaddedPostFill(unittest.TestCase):
 class TestFillOncePolicy(unittest.TestCase):
     """FILL_ONCE initializes the whole buffer at alloc and never resets the
     padded tail per iter (unlike FILL_SENTINEL)."""
+
+    def setUp(self):
+        from sglang.srt.model_executor import input_buffers
+
+        input_buffers._forward_input_buffer_pool.clear()
 
     def test_fill_once_inits_once_and_keeps_tail(self):
         reg = CudaGraphBufferRegistry(

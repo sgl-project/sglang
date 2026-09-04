@@ -256,6 +256,22 @@ def capture_cuda_graphs(
             capture_time=0,
         )
 
+    prealloc_symmetric_memory_pool(
+        is_draft_worker=model_runner.is_draft_worker,
+        enable_symm_mem=get_exec().comm.enable_symm_mem,
+        device=model_runner.device,
+        forward_stream=model_runner.forward_stream,
+    )
+
+    # A target whose decode capture is deferred (adaptive speculative decoding
+    # builds every state itself) finishes these once those captures are done.
+    if capture_decode_cuda_graph or model_runner.is_draft_worker:
+        finish_graph_capture(model_runner)
+
+    return CudaGraphsCapture(eager_runner=eager_runner, prefill=prefill, decode=decode)
+
+
+def finish_graph_capture(model_runner: ModelRunner) -> None:
     # Register forward hooks AFTER cuda-graph capture so their tensor ops are
     # not traced into any captured graph — capture stays hook-free and hooks
     # fire only on the eager forward path (capture replay never runs Python
@@ -265,17 +281,8 @@ def capture_cuda_graphs(
             model_runner.model, model_runner.server_args.forward_hooks
         )
 
-    prealloc_symmetric_memory_pool(
-        is_draft_worker=model_runner.is_draft_worker,
-        enable_symm_mem=get_exec().comm.enable_symm_mem,
-        device=model_runner.device,
-        forward_stream=model_runner.forward_stream,
-    )
-
     if model_runner.canary_manager is not None and not model_runner.is_draft_worker:
         model_runner.canary_manager.mark_init_finished()
-
-    return CudaGraphsCapture(eager_runner=eager_runner, prefill=prefill, decode=decode)
 
 
 def capture_prefill_graph(

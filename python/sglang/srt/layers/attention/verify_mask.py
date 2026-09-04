@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable, Optional
 
 import msgspec
 import torch
@@ -54,6 +54,10 @@ class VerifyMask(msgspec.Struct, frozen=True):
         return bs <= self.max_bs
 
 
+def _zeros(shape, dtype, device) -> torch.Tensor:
+    return torch.zeros(shape, dtype=dtype, device=device)
+
+
 def maybe_create_verify_mask(
     *,
     is_draft_runner: bool,
@@ -64,16 +68,17 @@ def maybe_create_verify_mask(
     device: torch.device | str,
     is_read: bool,
     dtype: torch.dtype = torch.bool,
+    allocate: Callable[..., torch.Tensor] = _zeros,
 ) -> Optional[VerifyMask]:
     """Allocate for the captured max batch; None when nothing verifies."""
     if is_draft_runner or skip_prefill or not num_draft_tokens:
         return None
     mode = default_tree_mask_mode() if is_read else TreeMaskMode.QLEN_ONLY
     return VerifyMask(
-        buffer=torch.zeros(
-            tree_mask_numel(mode, max_bs, num_draft_tokens, max_context_len),
-            dtype=dtype,
-            device=device,
+        buffer=allocate(
+            (tree_mask_numel(mode, max_bs, num_draft_tokens, max_context_len),),
+            dtype,
+            device,
         ),
         mode=mode,
         max_bs=max_bs,

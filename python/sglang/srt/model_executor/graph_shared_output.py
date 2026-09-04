@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import torch
 
@@ -27,6 +27,7 @@ class GraphSharedOutput:
         self.device = torch.device(device)
         self.max_rows = max_rows
         self._logits_buffers: Dict[int, torch.Tensor] = {}
+        self._hidden_states_buffers: Dict[Tuple[int, torch.dtype], torch.Tensor] = {}
 
     @classmethod
     def create_for_model_runner(
@@ -66,4 +67,20 @@ class GraphSharedOutput:
                 (self.max_rows, vocab_size), dtype=torch.float, device=self.device
             )
             self._logits_buffers[vocab_size] = buffer
+        return buffer[:rows]
+
+    def get_hidden_states_buffer(
+        self, width: int, dtype: torch.dtype, *, rows: int
+    ) -> torch.Tensor:
+        assert rows <= self.max_rows, (
+            f"shared hidden-states buffer holds {self.max_rows} rows but caller "
+            f"needs {rows} (width={width})"
+        )
+        key = (width, dtype)
+        buffer = self._hidden_states_buffers.get(key)
+        if buffer is None:
+            buffer = torch.empty(
+                (self.max_rows, width), dtype=dtype, device=self.device
+            )
+            self._hidden_states_buffers[key] = buffer
         return buffer[:rows]

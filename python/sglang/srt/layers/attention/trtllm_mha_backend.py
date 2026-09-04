@@ -325,12 +325,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         return kvcache if isinstance(kvcache, SWAKVPool) else None
 
     def _alloc_swa_page_table(
-        self, max_bs: int, max_num_pages: int
+        self, name: str, max_bs: int, max_num_pages: int
     ) -> Optional[torch.Tensor]:
         """Allocate a SWA page_table buffer, or return None for non-SWA models."""
         if self._swa_kv_pool is None:
             return None
-        return torch.zeros(max_bs, max_num_pages, dtype=torch.int32, device=self.device)
+        return self.alloc_cuda_graph_state(
+            name, (max_bs, max_num_pages), torch.int32, self.device
+        )
 
     def _fill_page_table_device(
         self,
@@ -470,20 +472,26 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Initialize CUDA graph state for TRTLLM MHA."""
         max_num_pages = self.max_num_pages
         self.decode_cuda_graph_metadata = {
-            "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
-            "page_table": torch.zeros(
-                max_bs,
-                max_num_pages,
-                dtype=torch.int32,
-                device=self.device,
+            "cache_seqlens": self.alloc_cuda_graph_state(
+                "decode.cache_seqlens", (max_bs,), torch.int32, self.device
             ),
-            "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
+            "page_table": self.alloc_cuda_graph_state(
+                "decode.page_table",
+                (max_bs, max_num_pages),
+                torch.int32,
+                self.device,
+            ),
+            "swa_page_table": self._alloc_swa_page_table(
+                "decode.swa_page_table", max_bs, max_num_pages
+            ),
         }
 
         # SWA write-target buffer; bound as a [:num_tokens] view in
         # _build_cuda_graph_metadata and refilled by the fused metadata kernel.
         self.cuda_graph_swa_out_cache_loc = (
-            torch.zeros(max_num_tokens, dtype=torch.int64, device=self.device)
+            self.alloc_cuda_graph_state(
+                "swa_out_cache_loc", (max_num_tokens,), torch.int64, self.device
+            )
             if self.use_sliding_window_kv_pool
             else None
         )
@@ -495,22 +503,28 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self.decode_cuda_graph_metadata["cu_seqlens_q"] = torch.arange(
                 0, max_bs + 1, dtype=torch.int32, device=self.device
             )
-            self.decode_cuda_graph_metadata["cu_seqlens_k"] = torch.zeros(
-                max_bs + 1, dtype=torch.int32, device=self.device
+            self.decode_cuda_graph_metadata["cu_seqlens_k"] = (
+                self.alloc_cuda_graph_state(
+                    "decode.cu_seqlens_k", (max_bs + 1,), torch.int32, self.device
+                )
             )
-            self.decode_cuda_graph_metadata["page_table_draft_decode"] = torch.zeros(
-                max_bs,
-                max_num_pages,
-                dtype=torch.int32,
-                device=self.device,
+            self.decode_cuda_graph_metadata["page_table_draft_decode"] = (
+                self.alloc_cuda_graph_state(
+                    "decode.page_table_draft_decode",
+                    (max_bs, max_num_pages),
+                    torch.int32,
+                    self.device,
+                )
             )
             self.decode_cuda_graph_metadata["swa_page_table_draft_decode"] = (
-                self._alloc_swa_page_table(max_bs, max_num_pages)
+                self._alloc_swa_page_table(
+                    "decode.swa_page_table_draft_decode", max_bs, max_num_pages
+                )
             )
 
             self.target_verify_metadata = {
-                "cache_seqlens": torch.zeros(
-                    max_bs, dtype=torch.int32, device=self.device
+                "cache_seqlens": self.alloc_cuda_graph_state(
+                    "verify.cache_seqlens", (max_bs,), torch.int32, self.device
                 ),
                 # Static uniform preset (Q_MODE_NONE: the fused kernel never
                 # rewrites it). Ragged verify overwrites the [:bs+1] slice
@@ -523,48 +537,57 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     dtype=torch.int32,
                     device=self.device,
                 ),
-                "cu_seqlens_k": torch.zeros(
-                    max_bs + 1, dtype=torch.int32, device=self.device
+                "cu_seqlens_k": self.alloc_cuda_graph_state(
+                    "verify.cu_seqlens_k", (max_bs + 1,), torch.int32, self.device
                 ),
-                "page_table": torch.zeros(
-                    max_bs,
-                    max_num_pages,
-                    dtype=torch.int32,
-                    device=self.device,
+                "page_table": self.alloc_cuda_graph_state(
+                    "verify.page_table",
+                    (max_bs, max_num_pages),
+                    torch.int32,
+                    self.device,
                 ),
-                "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
+                "swa_page_table": self._alloc_swa_page_table(
+                    "verify.swa_page_table", max_bs, max_num_pages
+                ),
             }
             if self.expand_encoder_only_verify:
                 max_verify_rows = max_bs * self.speculative_num_draft_tokens
-                self.target_verify_metadata["encoder_cache_seqlens"] = torch.zeros(
-                    max_verify_rows, dtype=torch.int32, device=self.device
+                self.target_verify_metadata["encoder_cache_seqlens"] = (
+                    self.alloc_cuda_graph_state(
+                        "verify.encoder_cache_seqlens",
+                        (max_verify_rows,),
+                        torch.int32,
+                        self.device,
+                    )
                 )
-                self.target_verify_metadata["encoder_page_table"] = torch.zeros(
-                    max_verify_rows,
-                    max_num_pages,
-                    dtype=torch.int32,
-                    device=self.device,
+                self.target_verify_metadata["encoder_page_table"] = (
+                    self.alloc_cuda_graph_state(
+                        "verify.encoder_page_table",
+                        (max_verify_rows, max_num_pages),
+                        torch.int32,
+                        self.device,
+                    )
                 )
 
             self.draft_extend_metadata = {
-                "cache_seqlens": torch.zeros(
-                    max_bs, dtype=torch.int32, device=self.device
+                "cache_seqlens": self.alloc_cuda_graph_state(
+                    "draft_extend.cache_seqlens", (max_bs,), torch.int32, self.device
                 ),
-                "cu_seqlens_q": torch.zeros(
-                    max_bs + 1,
-                    dtype=torch.int32,
-                    device=self.device,
+                "cu_seqlens_q": self.alloc_cuda_graph_state(
+                    "draft_extend.cu_seqlens_q", (max_bs + 1,), torch.int32, self.device
                 ),
-                "cu_seqlens_k": torch.zeros(
-                    max_bs + 1, dtype=torch.int32, device=self.device
+                "cu_seqlens_k": self.alloc_cuda_graph_state(
+                    "draft_extend.cu_seqlens_k", (max_bs + 1,), torch.int32, self.device
                 ),
-                "page_table": torch.zeros(
-                    max_bs,
-                    max_num_pages,
-                    dtype=torch.int32,
-                    device=self.device,
+                "page_table": self.alloc_cuda_graph_state(
+                    "draft_extend.page_table",
+                    (max_bs, max_num_pages),
+                    torch.int32,
+                    self.device,
                 ),
-                "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
+                "swa_page_table": self._alloc_swa_page_table(
+                    "draft_extend.swa_page_table", max_bs, max_num_pages
+                ),
             }
 
     def _build_cuda_graph_metadata(

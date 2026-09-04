@@ -1137,7 +1137,10 @@ class HybridLinearAttnBackend(AttentionBackend):
             init(forward_batch, disable_flashinfer_ragged)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        for attn_backend in self.attn_backend_list:
+        for i, attn_backend in enumerate(self.attn_backend_list):
+            attn_backend.cuda_graph_state_namespace = (
+                self.child_cuda_graph_state_namespace(f"child{i}")
+            )
             attn_backend.init_cuda_graph_state(max_bs, max_num_tokens)
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):

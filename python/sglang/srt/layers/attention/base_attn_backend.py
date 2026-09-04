@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from abc import ABC
 from enum import Enum
-from typing import TYPE_CHECKING, Iterable, Optional
+from typing import TYPE_CHECKING, Iterable, Optional, Union
 
 import torch
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.srt.model_executor.input_buffers import (
+    alloc_graph_state_buffer,
+    share_graph_state_buffer,
+)
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
@@ -59,6 +63,8 @@ class AttentionBackend(ABC):
     # Resolved per-mode backend names, stamped by ModelRunner.init_attention_backend
     prefill_attention_backend_str: Optional[str] = None
     decode_attention_backend_str: Optional[str] = None
+
+    cuda_graph_state_namespace: Optional[str] = None
 
     supports_ragged_verify_graph: bool = False
     # Compute / KV-cache dtype. Only backends that need them (MLA/MHA fp8
@@ -192,6 +198,32 @@ class AttentionBackend(ABC):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Init the global shared states for cuda graph."""
         raise NotImplementedError()
+
+    def share_cuda_graph_state(self, name: str, buffer: torch.Tensor) -> torch.Tensor:
+        return share_graph_state_buffer(self.cuda_graph_state_namespace, name, buffer)
+
+    def alloc_cuda_graph_state(
+        self,
+        name: str,
+        shape: Union[int, Iterable[int]],
+        dtype: torch.dtype,
+        device,
+        *,
+        fill_value: float = 0,
+    ) -> torch.Tensor:
+        return alloc_graph_state_buffer(
+            self.cuda_graph_state_namespace,
+            name,
+            (shape,) if isinstance(shape, int) else tuple(shape),
+            dtype,
+            device,
+            fill_value=fill_value,
+        )
+
+    def child_cuda_graph_state_namespace(self, tag: str) -> Optional[str]:
+        if self.cuda_graph_state_namespace is None:
+            return None
+        return f"{self.cuda_graph_state_namespace}.{tag}"
 
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self,
