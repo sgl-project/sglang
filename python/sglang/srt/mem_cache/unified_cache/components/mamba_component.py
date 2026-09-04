@@ -56,6 +56,11 @@ if TYPE_CHECKING:
     )
 
 
+# ComponentData.metadata flag: a request other than the inserter matched this
+# node's mamba state, so coverage thinning must never pick it.
+MAMBA_REUSED_KEY = "mamba_reused"
+
+
 class MambaComponent(TreeComponent):
     component_type = ComponentType.MAMBA
 
@@ -132,8 +137,14 @@ class MambaComponent(TreeComponent):
             case LRURefreshPhase.WALKDOWN:
                 return
             case LRURefreshPhase.MATCH_END:
-                if node.component_data[ct].value is not None:
-                    self.tree_core.lru_lists[ct].reset_node_mru(node)
+                cd = node.component_data[ct]
+                if cd.value is not None:
+                    lru = self.tree_core.lru_lists[ct]
+                    # The inserter's own re-match after a chunk insert lands on
+                    # the MRU node; any other match proves the state is reused.
+                    if not lru.is_mru(node):
+                        cd.metadata[MAMBA_REUSED_KEY] = True
+                    lru.reset_node_mru(node)
             case LRURefreshPhase.INSERT_END:
                 return
             case _:
@@ -446,8 +457,9 @@ class MambaComponent(TreeComponent):
         leaves the smallest gap between its neighbours keeps that path's
         checkpoint coverage spread out; a plain tail eviction strips it
         shallow-first, which is the inverse of what a branch match needs.
-        Forks, locked, session-referenced and leaf holders are boundaries,
-        never victims. Returns x when there is nothing better to thin.
+        Forks, locked, session-referenced, reused (matched by another request)
+        and leaf holders are boundaries, never victims. Returns x when there is
+        nothing better to thin.
         """
         ct = self.component_type
         root = self.tree_core.root_node
@@ -482,7 +494,10 @@ class MambaComponent(TreeComponent):
         for i, (_, node) in enumerate(holders):
             cd = node.component_data[ct]
             if node is not x and (
-                len(node.children) != 1 or cd.lock_ref > 0 or cd.session_ref > 0
+                len(node.children) != 1
+                or cd.lock_ref > 0
+                or cd.session_ref > 0
+                or cd.metadata.get(MAMBA_REUSED_KEY)
             ):
                 continue
             lo = holders[i - 1][0] if i > 0 else prev_depth

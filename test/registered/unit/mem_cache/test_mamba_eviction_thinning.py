@@ -12,10 +12,12 @@ import torch
 
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
+    MAMBA_REUSED_KEY,
     MambaComponent,
 )
 from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     ComponentType,
+    LRURefreshPhase,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedLRUList, UnifiedTreeNode
@@ -161,6 +163,34 @@ class TestMambaEvictionThinning(CustomTestCase):
         _, freed = _evict_one(component)
 
         self.assertEqual(freed, [2])
+
+    def test_state_matched_by_another_request_is_never_thinned(self):
+        """Regression for the shared-prefix hit-rate drop: a group's boundary
+        state is refreshed to MRU by every member's match, but a geometry-only
+        victim rule could still thin it because a member's private tail sits
+        right below it. A MATCH_END on a non-MRU node marks the state reused,
+        and reused states are boundaries for thinning."""
+        component, nodes, core = _build_chain([4, 1, 1, 4])
+        # A later request matches depth 5 (not the MRU node, which is depth 10).
+        component.refresh_lru(LRURefreshPhase.MATCH_END, nodes[1], core.root_node)
+        self.assertTrue(nodes[1].component_data[MAMBA].metadata[MAMBA_REUSED_KEY])
+
+        _, freed = _evict_one(component)
+
+        # Depth 5 would be the min-gap victim (2 vs 5); it is spared, and the
+        # remaining candidates tie so the tail goes as before.
+        self.assertEqual(freed, [1])
+        self.assertIsNotNone(nodes[1].component_data[MAMBA].value)
+
+    def test_inserter_re_match_on_the_mru_node_does_not_mark_reuse(self):
+        """cache_unfinished_req re-matches the node it just inserted; that
+        match must not protect the state or thinning would never apply to an
+        in-flight chain."""
+        component, nodes, core = _build_chain([4, 1, 1, 4])
+        component.refresh_lru(LRURefreshPhase.MATCH_END, nodes[-1], core.root_node)
+
+        self.assertNotIn(MAMBA_REUSED_KEY, nodes[-1].component_data[MAMBA].metadata)
+        self.assertEqual(_evict_one(component)[1], [2])
 
     def test_device_leaf_at_the_tail_is_still_deleted_as_a_leaf(self):
         component, nodes, core = _build_chain([1, 1])

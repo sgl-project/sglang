@@ -179,6 +179,9 @@ pub struct Node<K: ChildKeyType> {
     pub write_through_pending_id: Option<usize>,
     /// Load-back anchor currently reading this node's host slots.
     pub load_back_pending_id: Option<NodeId>,
+    /// Set once a request other than the inserter matched this node's mamba
+    /// state; coverage thinning never picks such a node.
+    pub mamba_reused: bool,
     /// Monotonic access tick for LRU ordering (exact; not wall-clock).
     pub last_access_counter: i64,
     /// Tick stamped at construction.
@@ -392,6 +395,7 @@ impl<K: ChildKeyType> Node<K> {
             hash_value: Some(Vec::new()),
             write_through_pending_id: None,
             load_back_pending_id: None,
+            mamba_reused: false,
             last_access_counter: 0,
             creation_counter: 0,
             hit_count: 0,
@@ -414,6 +418,7 @@ impl<K: ChildKeyType> Node<K> {
             hash_value: None,
             write_through_pending_id: None,
             load_back_pending_id: None,
+            mamba_reused: false,
             last_access_counter: 0,
             creation_counter: 0,
             hit_count: 0,

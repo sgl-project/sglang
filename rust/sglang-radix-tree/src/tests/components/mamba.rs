@@ -1266,21 +1266,7 @@ fn mamba_device_eviction_victim_minimizes_the_merged_gap() {
     // instead, and the tie between depths 4 and 6 falls back to the tail.
     for locked in [false, true] {
         let mut tc = mamba_core(/* page_size = */ 1);
-        let root = tc.arena.root();
-        let mut parent = root;
-        let mut nodes = Vec::new();
-        for (i, key_len) in [4usize, 1, 1, 4].iter().enumerate() {
-            let key: Vec<i64> = vec![i as i64; *key_len];
-            let node = tc
-                .arena
-                .alloc_child(
-                    parent, key, /* priority = */ 0, /* extra_key = */ None,
-                )
-                .unwrap();
-            set_mamba_device(&mut tc, node, i as i64 + 1);
-            nodes.push(node);
-            parent = node;
-        }
+        let nodes = uneven_chain(&mut tc);
         if locked {
             tc.arena
                 .node_mut(nodes[1])
@@ -1292,6 +1278,50 @@ fn mamba_device_eviction_victim_minimizes_the_merged_gap() {
         assert_eq!(freed, vec![if locked { 1 } else { 2 }], "locked={locked}");
         assert!(tc.arena.has_device_value(nodes[1], MAMBA) || !locked);
     }
+}
+
+// Depths 4, 5, 6, 10 with slots 1..=4; the LRU tail is the shallowest node.
+fn uneven_chain(tc: &mut UnifiedTreeCore<Vec<i64>>) -> Vec<NodeIdx_> {
+    let mut parent = tc.arena.root();
+    let mut nodes = Vec::new();
+    for (i, key_len) in [4usize, 1, 1, 4].iter().enumerate() {
+        let key: Vec<i64> = vec![i as i64; *key_len];
+        let node = tc
+            .arena
+            .alloc_child(
+                parent, key, /* priority = */ 0, /* extra_key = */ None,
+            )
+            .unwrap();
+        set_mamba_device(tc, node, i as i64 + 1);
+        nodes.push(node);
+        parent = node;
+    }
+    nodes
+}
+
+#[test]
+fn mamba_state_matched_by_another_request_is_never_thinned() {
+    // A MATCH_END on a non-MRU node marks the state reused; thinning then
+    // spares depth 5 although it is the min-gap victim, and the tail goes.
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let nodes = uneven_chain(&mut tc);
+    let mamba = mamba_component();
+    mamba.refresh_lru(&mut tc, LRURefreshPhase::MatchEnd, nodes[1]);
+    assert!(tc.arena.node(nodes[1]).mamba_reused);
+
+    assert_eq!(evict_one_mamba_slot(&mut tc), vec![1]);
+    assert!(tc.arena.has_device_value(nodes[1], MAMBA));
+}
+
+#[test]
+fn mamba_inserter_re_match_on_the_mru_node_does_not_mark_reuse() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let nodes = uneven_chain(&mut tc);
+    let mamba = mamba_component();
+    mamba.refresh_lru(&mut tc, LRURefreshPhase::MatchEnd, nodes[3]);
+    assert!(!tc.arena.node(nodes[3]).mamba_reused);
+
+    assert_eq!(evict_one_mamba_slot(&mut tc), vec![2]);
 }
 
 #[test]

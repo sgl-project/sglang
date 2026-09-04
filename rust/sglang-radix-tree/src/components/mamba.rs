@@ -64,8 +64,9 @@ impl MambaComponent {
     /// leaves the smallest gap between its neighbours keeps that path's
     /// checkpoint coverage spread out; a plain tail eviction strips it
     /// shallow-first, which is the inverse of what a branch match needs.
-    /// Forks, locked, load-back-pinned and leaf holders are boundaries, never
-    /// victims. Returns `x` when there is nothing better to thin.
+    /// Forks, locked, load-back-pinned, reused (matched by another request)
+    /// and leaf holders are boundaries, never victims. Returns `x` when there
+    /// is nothing better to thin.
     fn thinning_victim<K: ChildKeyType>(tree_core: &UnifiedTreeCore<K>, x: NodeIdx_) -> NodeIdx_ {
         let arena = &tree_core.arena;
         if arena.node(x).children.len() != 1 {
@@ -111,7 +112,8 @@ impl MambaComponent {
             if node_id != x
                 && (node.children.len() != 1
                     || node.device_lock_ref(MAMBA) > 0
-                    || node.is_load_back_pending())
+                    || node.is_load_back_pending()
+                    || node.mamba_reused)
             {
                 continue;
             }
@@ -176,6 +178,11 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             LRURefreshPhase::Walkdown => {}
             LRURefreshPhase::MatchEnd => {
                 if tree_core.arena.has_device_value(node_id, MAMBA) {
+                    // The inserter's own re-match after a chunk insert lands on
+                    // the MRU node; any other match proves the state is reused.
+                    if !tree_core.device_lru_list(MAMBA).is_mru(node_id) {
+                        tree_core.arena.node_mut(node_id).mamba_reused = true;
+                    }
                     tree_core.device_lru_list_mut(MAMBA).reset_node_mru(node_id);
                 }
             }
