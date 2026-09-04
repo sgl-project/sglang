@@ -615,19 +615,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._node_arena.pop(node.id, None)
 
     def inc_lock_ref(
-        self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
+        self, node_id: NodeId, lock_mamba: bool = True
     ) -> IncLockRefResult:
         node = self.node_by_id(node_id)
         result = IncLockRefResult()
+        # The result records what was locked; the paired dec mirrors it.
+        result.mamba_lock_acquired = lock_mamba
         for component in self.components:
-            if component.component_type in skip_lock_components:
-                # Leave this component's value evictable and record every
-                # non-root node (incl tombstones) so the matching dec skips a
-                # lock we never took, which may be another req's on a shared node.
-                if node is not self.root_node:
-                    result.skip_lock_node_ids.setdefault(
-                        component.component_type, set()
-                    ).add(node.id)
+            if not lock_mamba and component.component_type == ComponentType.MAMBA:
                 continue
             result = component.acquire_component_lock(node=node, result=result)
         self._update_evictable_leaf_sets(node)
@@ -636,12 +631,26 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def dec_lock_ref(
         self,
         node_id: NodeId,
-        params: Optional[DecLockRefParams] = None,
+        params: DecLockRefParams,
         skip_swa: bool = False,
     ) -> DecLockRefResult:
         node = self.node_by_id(node_id)
-        for component in self.components:
-            if skip_swa and component.component_type == ComponentType.SWA:
+        mamba_lock_acquired = params.mamba_lock_acquired
+        # SWA early release also releases lower-priority components.
+        swa_priority = None
+        if skip_swa:
+            swa_component = self.components_by_type.get(ComponentType.SWA)
+            if swa_component is not None:
+                swa_priority = swa_component.eviction_priority(is_leaf=False)
+        # Release auxiliaries before Full refreshes leaf membership.
+        for component in reversed(self.components):
+            ct = component.component_type
+            if swa_priority is not None and (
+                ct == ComponentType.SWA
+                or component.eviction_priority(is_leaf=False) < swa_priority
+            ):
+                continue
+            if not mamba_lock_acquired and ct == ComponentType.MAMBA:
                 continue
             component.release_component_lock(node=node, params=params)
         self._update_evictable_leaf_sets(node)
@@ -651,8 +660,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def dec_swa_lock_only(
         self,
         node_id: NodeId,
-        swa_uuid_for_lock: Optional[int],
-        skip_lock_node_ids: Optional[dict] = None,
+        params: DecLockRefParams,
     ) -> DecSwaLockOnlyResult:
         """Early-release the SWA portion of a request's tree lock, plus any
         strictly-lower-priority locks (e.g. Mamba) co-located on the node."""
@@ -662,20 +670,21 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if swa_component is None:
             return result
         swa_component.release_window_lock(
-            node, swa_uuid_for_lock, result.device_frees, result.host_frees
+            node, params.swa_uuid_for_lock, result.device_frees, result.host_frees
         )
 
-        # Drop strictly-lower-priority locks (e.g. Mamba) co-located on the node,
-        # honoring skip ids so we don't drop a lock a partial inc never took
-        # (matters for FULL+SWA+MAMBA models, e.g. Inkling).
+        # Drop strictly-lower-priority locks (e.g. Mamba) co-located on the
+        # node, skipping any the paired inc never took (matters for
+        # FULL+SWA+MAMBA models, e.g. Inkling).
         swa_priority = swa_component.eviction_priority(is_leaf=False)
-        dec_params = DecLockRefParams(
-            swa_uuid_for_lock=swa_uuid_for_lock,
-            skip_lock_node_ids=skip_lock_node_ids or {},
-        )
         for comp in self.components:
+            if (
+                not params.mamba_lock_acquired
+                and comp.component_type == ComponentType.MAMBA
+            ):
+                continue
             if comp.eviction_priority(is_leaf=False) < swa_priority:
-                comp.release_component_lock(node, dec_params)
+                comp.release_component_lock(node, params)
         return result
 
     def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
@@ -689,10 +698,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         return result
 
     def dec_host_lock_ref(
-        self, node_id: NodeId, params: Optional[DecLockRefParams] = None
+        self, node_id: NodeId, params: DecLockRefParams
     ) -> DecLockRefResult:
         node = self.node_by_id(node_id)
-        for component in self.components:
+        for component in reversed(self.components):
             component.release_component_lock(node=node, params=params, lock_host=True)
         self._update_evictable_leaf_sets(node)
         return DecLockRefResult()
@@ -1253,7 +1262,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         assert cd.value is None
         n = len(fresh_value)
         cd.value = fresh_value.clone()
-        self.component_evictable_size_[ct] += n
+        if cd.lock_ref > 0:
+            self.component_protected_size_[ct] += n
+        else:
+            self.component_evictable_size_[ct] += n
         self._update_evictable_leaf_sets(node)
         # A backuped node restored from fresh KV is a duplicate right away.
         self._update_duplicate_tracking(node)
@@ -1875,7 +1887,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         return True
 
     def _is_host_leaf(self, node: UnifiedTreeNode) -> bool:
-        """H-leaf: evicted, Full host value present, no children, unlocked, not root.
+        """H-leaf: evicted, Full host value present, no children, unlocked on
+        both tiers, not root.
 
         Only the Full (base) component host_value is required; auxiliary
         components are not mandatory for H-leaf membership. In-flight DMA
@@ -1885,6 +1898,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if not node.backuped:
             return False
         if any(cd.host_lock_ref > 0 for cd in node.component_data):
+            return False
+        # Segment locks count evicted nodes too: a device-locked candidate is
+        # a live segment's anchor, and _evict_host_leaf would delete it.
+        if any(cd.lock_ref > 0 for cd in node.component_data):
             return False
         if len(node.children) > 0:
             return False
@@ -2245,12 +2262,18 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # Full uses leaf sets, not LRU; its stores go through the insert paths.
         assert component_type != BASE_COMPONENT_TYPE
         node = self.node_by_id(node_id)
-        node.component_data[component_type].value = value
+        cd = node.component_data[component_type]
+        cd.value = value
         host_lru = self.host_lru_lists[component_type]
         if host_lru.in_list(node):
             host_lru.remove_node(node)
         self.lru_lists[component_type].insert_mru(node)
-        self.component_evictable_size_[component_type] += len(value)
+        # A value materialized under lock is protected; the last release
+        # moves it to evictable.
+        if cd.lock_ref > 0:
+            self.component_protected_size_[component_type] += len(value)
+        else:
+            self.component_evictable_size_[component_type] += len(value)
 
     def get_component_device_value(
         self, node_id: NodeId, component_type: ComponentType
@@ -2348,8 +2371,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     E(f"node {nid} {ct} host_lock_ref={cd.host_lock_ref}")
                 if ct != FCT and fl < cd.lock_ref:
                     E(f"node {nid} full_lock={fl} < {ct}_lock={cd.lock_ref}")
-                if cd.value is None and cd.lock_ref > 0:
-                    E(f"node {nid} {ct} evicted but lock_ref={cd.lock_ref}")
+                # Locked tombstones are legal: segment locks count every
+                # node in [start, boundary], data-bearing or not.
 
             # Collect expected leaf qualification (single pass)
             if self._is_device_leaf(node):

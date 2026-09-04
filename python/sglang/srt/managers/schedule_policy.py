@@ -945,11 +945,9 @@ class PrefillAdder:
 
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)
-        if self.is_hybrid_swa:
-            req.swa_uuid_for_lock = result.swa_uuid_for_lock
-        # match locks this node's components, so clear any stale skip set
-        # carried from a previous scheduling of this req.
-        req.skip_lock_node_ids = {}
+        # Persist the release receipt.
+        req.swa_uuid_for_lock = result.swa_uuid_for_lock
+        req.mamba_lock_acquired = result.mamba_lock_acquired
 
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
@@ -1047,9 +1045,8 @@ class PrefillAdder:
         try:
             result = self.tree_cache.inc_lock_ref(last_node)
             if self.tree_cache.is_tree_cache():
-                # init_load_back may revive SWA/Mamba tombstones while this
-                # temporary admission lock is held. Release must mirror the
-                # exact nodes skipped at acquire time.
+                # Replay the acquire's receipt (SWA boundary uuid, mamba flag)
+                # so release takes back exactly what this temporary lock took.
                 dec_lock_params = result.to_dec_params()
             yield None
         finally:

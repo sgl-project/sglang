@@ -290,7 +290,6 @@ fn device_lock_moves_the_slot_between_evictable_and_protected_once() {
         IncLockRefResult::default(),
         /* lock_host = */ false,
     );
-    assert!(result.skip_lock_node_ids.is_empty());
     assert_eq!(tc.evictable_size_(MAMBA), 0);
     assert_eq!(tc.protected_size_(MAMBA), 1);
     mamba.acquire_component_lock(
@@ -310,14 +309,13 @@ fn device_lock_moves_the_slot_between_evictable_and_protected_once() {
 }
 
 #[test]
-fn skip_aware_lock_records_only_the_mamba_target() {
+fn lock_without_mamba_records_the_receipt_and_leaves_mamba_evictable() {
     let (mut tc, parent, leaf) = hybrid_lock_core();
     let leaf_handle = tc.arena.node(leaf).id;
 
-    let result = tc.inc_lock_ref_with_skip(leaf_handle, &[MAMBA]);
+    let result = tc.inc_lock_ref(leaf_handle, /* lock_mamba = */ false);
 
-    assert_eq!(result.skip_lock_node_ids[&MAMBA].len(), 1);
-    assert!(result.skip_lock_node_ids[&MAMBA].contains(&leaf_handle));
+    assert!(!result.mamba_lock_acquired);
     assert_eq!(tc.arena.node(parent).device_lock_ref(MAMBA), 0);
     assert_eq!(tc.arena.node(leaf).device_lock_ref(MAMBA), 0);
     assert_eq!(tc.evictable_size_(MAMBA), 2);
@@ -325,33 +323,40 @@ fn skip_aware_lock_records_only_the_mamba_target() {
     assert_eq!(tc.arena.node(parent).device_lock_ref(FULL), 1);
     assert_eq!(tc.arena.node(leaf).device_lock_ref(FULL), 1);
 
-    tc.dec_lock_ref(
-        leaf_handle,
-        Some(&DecLockRefParams {
-            swa_uuid_for_lock: result.swa_uuid_for_lock,
-            skip_lock_node_ids: result.skip_lock_node_ids,
-            ..Default::default()
-        }),
-        /* skip_swa = */ false,
-    );
+    // The receipt replays exactly what was taken: FULL only.
+    let params = DecLockRefParams {
+        swa_uuid_for_lock: result.swa_uuid_for_lock,
+        mamba_lock_acquired: result.mamba_lock_acquired,
+        ..Default::default()
+    };
+    tc.dec_lock_ref(leaf_handle, &params, /* skip_swa = */ false);
     assert_eq!(tc.arena.node(parent).device_lock_ref(FULL), 0);
     assert_eq!(tc.arena.node(leaf).device_lock_ref(FULL), 0);
+    assert_eq!(tc.evictable_size_(MAMBA), 2);
+    assert_eq!(tc.protected_size_(MAMBA), 0);
 }
 
 #[test]
-fn swa_only_release_honors_a_skipped_mamba_target() {
+fn swa_only_release_spares_another_holders_mamba_lock() {
     let (mut tc, _parent, leaf) = hybrid_lock_core();
     let leaf_handle = tc.arena.node(leaf).id;
-    let owner = tc.inc_lock_ref(leaf_handle);
-    let skipped = tc.inc_lock_ref_with_skip(leaf_handle, &[MAMBA]);
+    let owner = tc.inc_lock_ref(leaf_handle, /* lock_mamba = */ true);
+    let holder = tc.inc_lock_ref(leaf_handle, /* lock_mamba = */ false);
+    assert!(owner.mamba_lock_acquired);
+    assert!(!holder.mamba_lock_acquired);
     assert_eq!(tc.arena.node(leaf).device_lock_ref(MAMBA), 1);
 
+    // The holder's early SWA release must not drop the owner's mamba lock.
+    let holder_params = DecLockRefParams {
+        swa_uuid_for_lock: holder.swa_uuid_for_lock,
+        mamba_lock_acquired: holder.mamba_lock_acquired,
+        ..Default::default()
+    };
     let mut device_frees = HashMap::new();
     let mut host_frees = HashMap::new();
-    tc.dec_swa_lock_only_with_skip(
+    tc.dec_swa_lock_only(
         leaf_handle,
-        skipped.swa_uuid_for_lock,
-        Some(&skipped.skip_lock_node_ids),
+        &holder_params,
         &mut device_frees,
         &mut host_frees,
     );
@@ -361,31 +366,20 @@ fn swa_only_release_honors_a_skipped_mamba_target() {
     assert_eq!(tc.arena.node(leaf).device_lock_ref(MAMBA), 1);
     assert_eq!(tc.protected_size_(MAMBA), 1);
 
-    let skipped_params = DecLockRefParams {
-        swa_uuid_for_lock: skipped.swa_uuid_for_lock,
-        skip_lock_node_ids: skipped.skip_lock_node_ids,
-        ..Default::default()
-    };
-    tc.dec_lock_ref(
-        leaf_handle,
-        Some(&skipped_params),
-        /* skip_swa = */ true,
-    );
+    tc.dec_lock_ref(leaf_handle, &holder_params, /* skip_swa = */ true);
+    assert_eq!(tc.arena.node(leaf).device_lock_ref(MAMBA), 1);
     let owner_params = DecLockRefParams {
         swa_uuid_for_lock: owner.swa_uuid_for_lock,
-        skip_lock_node_ids: owner.skip_lock_node_ids,
+        mamba_lock_acquired: owner.mamba_lock_acquired,
         ..Default::default()
     };
-    tc.dec_lock_ref(
-        leaf_handle,
-        Some(&owner_params),
-        /* skip_swa = */ false,
-    );
+    tc.dec_lock_ref(leaf_handle, &owner_params, /* skip_swa = */ false);
+    assert_eq!(tc.arena.node(leaf).device_lock_ref(MAMBA), 0);
     assert_eq!(tc.protected_size_(MAMBA), 0);
 }
 
 #[test]
-fn tombstone_lock_is_recorded_and_replayed_at_release() {
+fn tombstone_lock_is_counted_with_no_ledger_move() {
     let mut tc = mamba_core(/* page_size = */ 1);
     let [a] = chain::<1>(&mut tc);
     let mamba = mamba_component();
@@ -395,11 +389,12 @@ fn tombstone_lock_is_recorded_and_replayed_at_release() {
         IncLockRefResult::default(),
         /* lock_host = */ false,
     );
-    assert!(result.skip_lock_node_ids[&MAMBA].contains(&tc.arena.node(a).id));
-    assert_eq!(tc.arena.node(a).device_lock_ref(MAMBA), 0);
-    // The replayed skip set keeps the release from touching the node.
+    assert_eq!(tc.arena.node(a).device_lock_ref(MAMBA), 1);
+    assert_eq!(tc.evictable_size_(MAMBA), 0);
+    assert_eq!(tc.protected_size_(MAMBA), 0);
+    // The paired release decrements the counted tombstone, ledger untouched.
     let params = DecLockRefParams {
-        skip_lock_node_ids: result.skip_lock_node_ids.clone(),
+        mamba_lock_acquired: result.mamba_lock_acquired,
         ..DecLockRefParams::default()
     };
     mamba.release_component_lock(&mut tc, a, Some(&params), /* lock_host = */ false);
@@ -418,7 +413,6 @@ fn root_locks_are_noops() {
         IncLockRefResult::default(),
         /* lock_host = */ false,
     );
-    assert!(result.skip_lock_node_ids.is_empty());
     mamba.release_component_lock(&mut tc, root, None, /* lock_host = */ false);
     assert_eq!(tc.evictable_size_(MAMBA), 0);
 }
@@ -1746,7 +1740,7 @@ fn branching_from_a_host_full_hit_is_reusable_after_insert() {
 }
 
 #[test]
-fn skip_set_release_after_a_restore_and_relock_keeps_the_new_lock() {
+fn release_after_a_restore_and_relock_keeps_the_other_lock() {
     let mut tc = mamba_core(/* page_size = */ 1);
     let [a] = chain::<1>(&mut tc);
     let mamba = mamba_component();
@@ -1756,25 +1750,25 @@ fn skip_set_release_after_a_restore_and_relock_keeps_the_new_lock() {
         IncLockRefResult::default(),
         /* lock_host = */ false,
     );
-    assert!(first.skip_lock_node_ids[&MAMBA].contains(&tc.arena.node(a).id));
-    // The tombstone is restored and a second request locks it before the
-    // first release replays its skip set.
-    set_mamba_device(&mut tc, a, 7);
+    assert_eq!(tc.arena.node(a).device_lock_ref(MAMBA), 1);
+    // The tombstone is restored under the held lock (credited to protected)
+    // and a second request stacks its own lock on it.
+    tc.set_component_device_value_(a, MAMBA, Tensor::from_slice(&[7i64]));
     let _ = mamba.acquire_component_lock(
         &mut tc,
         a,
         IncLockRefResult::default(),
         /* lock_host = */ false,
     );
-    assert_eq!(tc.arena.node(a).device_lock_ref(MAMBA), 1);
+    assert_eq!(tc.arena.node(a).device_lock_ref(MAMBA), 2);
     assert_eq!(tc.evictable_size_(MAMBA), 0);
     assert_eq!(tc.protected_size_(MAMBA), 1);
     let params = DecLockRefParams {
-        skip_lock_node_ids: first.skip_lock_node_ids.clone(),
+        mamba_lock_acquired: first.mamba_lock_acquired,
         ..DecLockRefParams::default()
     };
     mamba.release_component_lock(&mut tc, a, Some(&params), /* lock_host = */ false);
-    // The replayed skip keeps the restored node's fresh lock intact.
+    // The first release takes back exactly its own ref.
     assert_eq!(tc.arena.node(a).device_lock_ref(MAMBA), 1);
     assert_eq!(tc.protected_size_(MAMBA), 1);
     mamba.release_component_lock(&mut tc, a, None, /* lock_host = */ false);

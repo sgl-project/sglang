@@ -129,39 +129,33 @@ class EvictResult:
 
 @dataclasses.dataclass
 class IncLockRefResult:
-    """Result of an inc_lock_ref operation."""
+    """Receipt returned by ``inc_lock_ref``.
+
+    The SWA UUID marks the segment boundary; ``None`` means root.
+    ``mamba_lock_acquired`` records whether Mamba was included.
+    """
 
     delta: Optional[int] = None
     swa_uuid_for_lock: Optional[int] = None
     swa_uuid_for_host_lock: Optional[int] = None
-    # Component nodes that were tombstones at acquire time. Replaying this set
-    # at release prevents a short-lived lock from consuming a later load-back or
-    # request lock after that tombstone becomes a valid device value.
-    skip_lock_node_ids: dict[ComponentType, set[int]] = dataclasses.field(
-        default_factory=dict
-    )
+    mamba_lock_acquired: bool = False
 
     def to_dec_params(self) -> DecLockRefParams:
         """Convert to the corresponding DecLockRefParams for dec_lock_ref."""
         return DecLockRefParams(
             swa_uuid_for_lock=self.swa_uuid_for_lock,
             swa_uuid_for_host_lock=self.swa_uuid_for_host_lock,
-            skip_lock_node_ids={
-                component_type: set(node_ids)
-                for component_type, node_ids in self.skip_lock_node_ids.items()
-            },
+            mamba_lock_acquired=self.mamba_lock_acquired,
         )
 
 
 @dataclasses.dataclass
 class DecLockRefParams:
-    """Parameters for dec_lock_ref operation."""
+    """Receipt required by unified-tree ``dec_lock_ref``."""
 
     swa_uuid_for_lock: Optional[int] = None
     swa_uuid_for_host_lock: Optional[int] = None
-    skip_lock_node_ids: dict[ComponentType, set[int]] = dataclasses.field(
-        default_factory=dict
-    )
+    mamba_lock_acquired: bool = False
 
 
 @dataclasses.dataclass

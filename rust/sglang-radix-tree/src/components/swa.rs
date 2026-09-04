@@ -3,7 +3,7 @@
 //! SWA values arrive pool-resolved; the full->SWA index translation happens at
 //! the cache boundary.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use tch::{Kind, Tensor};
 
@@ -394,11 +394,9 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         }
 
         let swa_evicted_seqlen = params.swa_evicted_seqlen;
-        assert_eq!(
-            node.device_lock_ref(SWA),
-            0,
-            "tombstone Swa lock_ref should be 0, node {node_id}"
-        );
+        // A locked tombstone is legal (segment locks count every node); the
+        // full-value swap below is safe because full lock_ref >= swa
+        // lock_ref, so a locked-SWA node always takes the Recover branch.
         assert_eq!(
             swa_evicted_seqlen % tree_core.page_size,
             0,
@@ -481,11 +479,6 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         if node.has_device_value(SWA) {
             return;
         }
-        assert_eq!(
-            node.device_lock_ref(SWA),
-            0,
-            "tombstone Swa lock_ref should be 0 on unevict, node {node_id}"
-        );
         let swa_evicted_seqlen = params.swa_evicted_seqlen;
         assert_eq!(
             swa_evicted_seqlen % tree_core.page_size,
@@ -573,26 +566,33 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         let (new_parent, child) = tree_core.arena.node_pair_mut(new_parent_id, child_id);
         let split_len = new_parent.key.atom_len() as i64;
         new_parent.copy_device_lock_ref(SWA, child);
+        new_parent.copy_host_lock_ref(SWA, child);
         if child.has_device_value(SWA) {
             Node::redistribute_child_device_value(new_parent, child, SWA, split_len);
         }
         if child.has_host_value(SWA) {
             Node::redistribute_child_host_value(new_parent, child, SWA, split_len);
-            // Device-tombstoned sides park in the host LRU.
-            let parent_is_tombstone = !new_parent.has_device_value(SWA);
-            let child_is_tombstone = !child.has_device_value(SWA);
+            // Device-tombstoned sides park in the host LRU. Host-locked
+            // halves stay out of it: in-flight IO holds them, and host
+            // acquire removed the node at 0->1.
+            let parent_parks =
+                !new_parent.has_device_value(SWA) && new_parent.host_lock_ref(SWA) == 0;
+            let child_parks = !child.has_device_value(SWA) && child.host_lock_ref(SWA) == 0;
             let host_lru = tree_core.host_lru_list_mut(SWA);
-            if parent_is_tombstone {
+            if parent_parks {
                 host_lru.insert_mru(new_parent_id);
             }
-            if child_is_tombstone && !host_lru.in_list(Some(child_id)) {
+            if child_parks && !host_lru.in_list(Some(child_id)) {
                 host_lru.insert_mru(child_id);
             }
         }
 
-        // parent inherits the swa_uuid from child for swa lock ref
+        // The window-boundary uuids mark the node's older edge, which the
+        // split moves to the parent — both tiers migrate with it.
         let swa_uuid = tree_core.arena.node_mut(child_id).swa_uuid.take();
         tree_core.arena.node_mut(new_parent_id).swa_uuid = swa_uuid;
+        let swa_host_uuid = tree_core.arena.node_mut(child_id).swa_host_uuid.take();
+        tree_core.arena.node_mut(new_parent_id).swa_host_uuid = swa_host_uuid;
     }
 
     fn evict_component(
@@ -1016,46 +1016,44 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         mut result: IncLockRefResult,
         lock_host: bool,
     ) -> IncLockRefResult {
-        let ct = SWA;
+        // Lock the contiguous segment covering the trailing window.
+        //
+        // Every node in [node, boundary] is counted, tombstones included, so
+        // the paired release decrements the same contiguous segment with no
+        // carried skip state. Coverage is position-based (key length); the
+        // boundary node is always uuid-stamped, so a release without a uuid
+        // means the segment reached the root. Ledger/LRU transitions track
+        // only data-bearing nodes; a value materialized later under lock is
+        // credited to protected by set_component_device_value.
         let sliding_window_size = self.sliding_window_size;
-        let mut swa_lock_size = 0;
+        let mut covered = 0;
         let mut swa_uuid = None;
 
-        // Tombstoned nodes (cd.value is None) have no SWA chunk to protect
-        // skip them and keep walking up. This path is hit when HiCache
-        // backs up a FULL present internal node whose SWA was already evicted.
         let mut cur = node_id;
         loop {
             let node = tree_core.arena.node_mut(cur);
-            if node.is_root() || swa_lock_size >= sliding_window_size {
+            if node.is_root() || covered >= sliding_window_size {
                 break;
             }
             let parent = node.parent();
-            if !Self::has_value(node, lock_host) {
-                result
-                    .skip_lock_node_ids
-                    .entry(ct)
-                    .or_default()
-                    .insert(node.id);
-                cur = parent;
-                continue;
-            }
             let key_len = node.key.atom_len();
+            let has_value = Self::has_value(node, lock_host);
+            let value_len = Self::value_len(node, lock_host);
             let newly_locked = Self::lock_ref(node, lock_host) == 0;
             Self::inc_lock_ref(node, lock_host);
-            swa_lock_size += Self::value_len(node, lock_host);
-            if newly_locked {
+            if newly_locked && has_value {
                 if lock_host {
                     let host_lru = tree_core.host_lru_list_mut(SWA);
                     if host_lru.in_list(Some(cur)) {
                         host_lru.remove_node(cur);
                     }
                 } else {
-                    tree_core.dec_evictable_size(SWA, key_len);
-                    tree_core.inc_protected_size(SWA, key_len);
+                    tree_core.dec_evictable_size(SWA, value_len);
+                    tree_core.inc_protected_size(SWA, value_len);
                 }
             }
-            if swa_lock_size >= sliding_window_size {
+            covered += key_len;
+            if covered >= sliding_window_size {
                 swa_uuid = Some(Self::ensure_swa_uuid(tree_core, cur, lock_host));
             }
             cur = parent;
@@ -1076,7 +1074,6 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         params: Option<&DecLockRefParams>,
         lock_host: bool,
     ) {
-        let ct = SWA;
         let swa_uuid_for_lock = params.and_then(|p| {
             if lock_host {
                 p.swa_uuid_for_host_lock
@@ -1084,12 +1081,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 p.swa_uuid_for_lock
             }
         });
-        let empty = HashSet::new();
-        let skip_lock_node_ids = params
-            .and_then(|p| p.skip_lock_node_ids.get(&ct))
-            .unwrap_or(&empty);
 
-        // A node in skip_lock_node_ids was a tombstone when this lock was acquired.
         let mut cur = node_id;
         loop {
             let node = tree_core.arena.node_mut(cur);
@@ -1097,27 +1089,27 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 break;
             }
             let parent = node.parent();
-            if skip_lock_node_ids.contains(&node.id) {
-                cur = parent;
-                continue;
-            }
             let lock_ref = Self::lock_ref(node, lock_host);
-            if lock_ref == 0 {
-                cur = parent;
-                continue;
-            }
-            if lock_ref == 1 {
+            // Acquire counted every segment node and splits copy refs, so a
+            // zero here means the release does not mirror its acquire.
+            assert!(
+                lock_ref > 0,
+                "SWA segment release hit {}lock_ref=0 on node {cur}",
+                if lock_host { "host_" } else { "" }
+            );
+            let has_value = Self::has_value(node, lock_host);
+            let value_len = Self::value_len(node, lock_host);
+            if lock_ref == 1 && has_value {
                 if lock_host {
-                    if !node.has_device_value(SWA) && node.has_host_value(SWA) {
+                    if !node.has_device_value(SWA) {
                         let host_lru = tree_core.host_lru_list_mut(SWA);
                         if !host_lru.in_list(Some(cur)) {
                             host_lru.insert_mru(cur);
                         }
                     }
                 } else {
-                    let key_len = node.device_value_len(SWA);
-                    tree_core.inc_evictable_size(SWA, key_len);
-                    tree_core.dec_protected_size(SWA, key_len);
+                    tree_core.inc_evictable_size(SWA, value_len);
+                    tree_core.dec_protected_size(SWA, value_len);
                 }
             }
             Self::dec_lock_ref(tree_core.arena.node_mut(cur), lock_host);
@@ -1130,15 +1122,14 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         }
     }
 
-    /// Early-release the SWA lock along [node, swa_uuid_for_lock] while
-    /// leaving Full and Mamba locks intact.
+    /// Early-release the SWA lock along [node, swa_uuid_for_lock]; this
+    /// method touches only SWA state. The wrapping `dec_swa_lock_only` also
+    /// drops strictly-lower-priority co-located locks (e.g. Mamba) per the
+    /// receipt; the Full lock stays so the request's prefix is protected.
     ///
     /// Called when a request's decode position has advanced past the sliding
-    /// window — the SWA portion of the tree lock is no longer needed but the
-    /// Full lock must stay so the request's prefix is protected.
-    ///
-    /// Caller (UnifiedRadixCache.dec_swa_lock_only) must ensure this is
-    /// invoked at most once per (node, swa_uuid_for_lock) pair.
+    /// window. The caller must invoke this at most once per
+    /// (node, swa_uuid_for_lock) pair.
     fn release_window_lock(
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
@@ -1155,21 +1146,16 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 break;
             }
             let parent = node.parent();
-            // Acquire skips tombstoned nodes; release must skip them too. Same
-            // for nodes with lock_ref == 0 — acquire never credited them.
-            if !node.has_device_value(SWA) || node.device_lock_ref(SWA) == 0 {
-                if swa_uuid_for_lock.is_some() && node.swa_uuid == swa_uuid_for_lock {
-                    break;
-                }
-                cur = parent;
-                continue;
-            }
-
+            assert!(
+                node.device_lock_ref(SWA) > 0,
+                "SWA window release hit lock_ref=0 on node {cur}"
+            );
+            let has_value = node.has_device_value(SWA);
+            let value_len = node.device_value_len(SWA);
             node.dec_device_lock_ref(SWA);
-            if node.device_lock_ref(SWA) == 0 {
-                let key_len = node.key.atom_len();
-                tree_core.dec_protected_size(SWA, key_len);
-                tree_core.inc_evictable_size(SWA, key_len);
+            if node.device_lock_ref(SWA) == 0 && has_value {
+                tree_core.dec_protected_size(SWA, value_len);
+                tree_core.inc_evictable_size(SWA, value_len);
                 if tree_core.is_evictable_device_leaf_(tree_core.arena.node(cur)) {
                     tree_core.evict_component_and_detach_lru_(
                         cur,
