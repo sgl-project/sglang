@@ -11,6 +11,8 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.flush_wrapper import (
     SchedulerFlushWrapper,
 )
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams, EvictResult
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 register_cpu_ci(est_time=14, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
@@ -37,7 +39,7 @@ class TestSchedulerFlushCache(unittest.TestCase):
         output = scheduler.flush_wrapper.handle(FlushCacheReqInput(timeout_s=None))
 
         self.assertFalse(output.success)
-        scheduler.flush_cache.assert_called_once()
+        scheduler.flush_cache.assert_called_once_with(False)
 
     def test_immediate_flush_when_idle(self):
         """Positive timeout but already idle → flush immediately."""
@@ -47,7 +49,21 @@ class TestSchedulerFlushCache(unittest.TestCase):
         output = scheduler.flush_wrapper.handle(FlushCacheReqInput(timeout_s=5.0))
 
         self.assertTrue(output.success)
-        scheduler.flush_cache.assert_called_once()
+        scheduler.flush_cache.assert_called_once_with(False)
+
+    def test_preserve_hicache_storage_is_forwarded(self):
+        scheduler = self._new_scheduler()
+        scheduler.is_fully_idle.return_value = True
+
+        output = scheduler.flush_wrapper.handle(
+            FlushCacheReqInput(
+                timeout_s=5.0,
+                preserve_hicache_storage=True,
+            )
+        )
+
+        self.assertTrue(output.success)
+        scheduler.flush_cache.assert_called_once_with(True)
 
     def test_defers_when_busy(self):
         """Positive timeout + busy → defers, returns None."""
@@ -82,13 +98,16 @@ class TestSchedulerFlushCache(unittest.TestCase):
     def test_pending_flush_completes_on_idle(self):
         scheduler = self._new_scheduler()
         scheduler.is_fully_idle.return_value = True
-        req = FlushCacheReqInput(timeout_s=1.0)
+        req = FlushCacheReqInput(
+            timeout_s=1.0,
+            preserve_hicache_storage=True,
+        )
         scheduler.flush_wrapper._pending = (req, 111.0)
 
         scheduler.flush_wrapper.check_pending()
 
         self.assertIsNone(scheduler.flush_wrapper._pending)
-        scheduler.flush_cache.assert_called_once()
+        scheduler.flush_cache.assert_called_once_with(True)
         out = scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args[0]
         self.assertTrue(out.success)
 
@@ -121,6 +140,75 @@ class TestSchedulerFlushCache(unittest.TestCase):
 
         self.assertIsNotNone(scheduler.flush_wrapper._pending)
         scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
+
+    def test_checkpoint_hicache_storage_drains_all_components(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_hierarchical_cache = True
+        scheduler.enable_hicache_storage = True
+        scheduler.server_args = MagicMock(hicache_host_memory_mode="cache")
+        scheduler.tree_cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        scheduler.tree_cache.full_evictable_size = MagicMock(side_effect=[10, 0])
+        scheduler.tree_cache.swa_evictable_size = MagicMock(side_effect=[4, 0])
+        scheduler.tree_cache.mamba_evictable_size = MagicMock(side_effect=[2, 0])
+        scheduler.tree_cache.full_protected_size = MagicMock(return_value=0)
+        scheduler.tree_cache.swa_protected_size = MagicMock(return_value=0)
+        scheduler.tree_cache.mamba_protected_size = MagicMock(return_value=0)
+        scheduler.tree_cache.evict = MagicMock(
+            return_value=EvictResult(
+                num_tokens_evicted=10,
+                swa_num_tokens_evicted=4,
+                mamba_num_evicted=2,
+            )
+        )
+        scheduler.tree_cache.writing_check = MagicMock()
+        scheduler.tree_cache.check_hicache_events = MagicMock()
+        scheduler.tree_cache.ongoing_backup = {1: object()}
+
+        def drain_backup():
+            scheduler.tree_cache.ongoing_backup.clear()
+
+        scheduler.tree_cache.check_hicache_events.side_effect = drain_backup
+
+        self.assertTrue(scheduler._checkpoint_hicache_storage())
+        scheduler.tree_cache.evict.assert_called_once_with(
+            EvictParams(num_tokens=10, swa_num_tokens=4, mamba_num=2)
+        )
+        scheduler.tree_cache.writing_check.assert_called_once_with(write_back=True)
+        scheduler.tree_cache.check_hicache_events.assert_called_once()
+
+    def test_checkpoint_hicache_storage_requires_storage_backend(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_hierarchical_cache = True
+        scheduler.enable_hicache_storage = False
+        scheduler.server_args = MagicMock(hicache_host_memory_mode="cache")
+        scheduler.tree_cache = MagicMock()
+
+        self.assertFalse(scheduler._checkpoint_hicache_storage())
+        scheduler.tree_cache.evict.assert_not_called()
+
+    def test_checkpoint_hicache_storage_rejects_buffer_only_mode(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_hierarchical_cache = True
+        scheduler.enable_hicache_storage = True
+        scheduler.server_args = MagicMock(hicache_host_memory_mode="buffer_only")
+        scheduler.tree_cache = MagicMock()
+
+        self.assertFalse(scheduler._checkpoint_hicache_storage())
+        scheduler.tree_cache.evict.assert_not_called()
+
+    def test_checkpoint_hicache_storage_rejects_protected_entries(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_hierarchical_cache = True
+        scheduler.enable_hicache_storage = True
+        scheduler.server_args = MagicMock(hicache_host_memory_mode="cache")
+        scheduler.tree_cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        scheduler.tree_cache.full_protected_size = MagicMock(return_value=1)
+        scheduler.tree_cache.swa_protected_size = MagicMock(return_value=0)
+        scheduler.tree_cache.mamba_protected_size = MagicMock(return_value=0)
+        scheduler.tree_cache.evict = MagicMock()
+
+        self.assertFalse(scheduler._checkpoint_hicache_storage())
+        scheduler.tree_cache.evict.assert_not_called()
 
 
 if __name__ == "__main__":

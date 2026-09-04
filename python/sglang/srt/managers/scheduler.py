@@ -4867,9 +4867,95 @@ class Scheduler(
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
-    def flush_cache(self, empty_cache: bool = True):
+    def _checkpoint_hicache_storage(self) -> bool:
+        """Persist all evictable UnifiedRadixCache state before a cache reset."""
+        if not self.enable_hierarchical_cache or not self.enable_hicache_storage:
+            logger.warning(
+                "Cannot preserve HiCache storage because hierarchical storage "
+                "is not enabled."
+            )
+            return False
+        if self.server_args.hicache_host_memory_mode != "cache":
+            logger.warning(
+                "Preserving HiCache storage before flush currently requires "
+                "--hicache-host-memory-mode cache."
+            )
+            return False
+
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        tree_cache = self.tree_cache
+        if not isinstance(tree_cache, UnifiedRadixCache):
+            logger.warning(
+                "Preserving HiCache storage before flush currently requires "
+                "UnifiedRadixCache, got %s.",
+                type(tree_cache).__name__,
+            )
+            return False
+
+        protected = (
+            tree_cache.full_protected_size(),
+            tree_cache.swa_protected_size(),
+            tree_cache.mamba_protected_size(),
+        )
+        if any(protected):
+            logger.warning(
+                "Cannot checkpoint HiCache while cache entries are protected: "
+                "full=%d swa=%d mamba=%d",
+                *protected,
+            )
+            return False
+
+        requested = EvictParams(
+            num_tokens=tree_cache.full_evictable_size(),
+            swa_num_tokens=tree_cache.swa_evictable_size(),
+            mamba_num=tree_cache.mamba_evictable_size(),
+        )
+        if requested.num_tokens or requested.swa_num_tokens or requested.mamba_num:
+            tree_cache.evict(requested)
+            remaining = (
+                tree_cache.full_evictable_size(),
+                tree_cache.swa_evictable_size(),
+                tree_cache.mamba_evictable_size(),
+            )
+            if any(remaining):
+                logger.warning(
+                    "HiCache checkpoint eviction was incomplete: "
+                    "full=%d swa=%d mamba=%d",
+                    *remaining,
+                )
+                return False
+
+        tree_cache.writing_check(write_back=True)
+        deadline = time.monotonic() + 300.0
+        while tree_cache.ongoing_backup:
+            tree_cache.check_hicache_events()
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "HiCache checkpoint timed out with %d storage writes pending.",
+                    len(tree_cache.ongoing_backup),
+                )
+                return False
+            time.sleep(0.01)
+
+        logger.info(
+            "HiCache checkpoint completed before flush: full=%d swa=%d mamba=%d",
+            requested.num_tokens,
+            requested.swa_num_tokens,
+            requested.mamba_num,
+        )
+        return True
+
+    def flush_cache(
+        self,
+        empty_cache: bool = True,
+        preserve_hicache_storage: bool = False,
+    ):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
         if self.is_fully_idle():
+            if preserve_hicache_storage and not self._checkpoint_hicache_storage():
+                return False
             self.cur_batch_for_debug = None
             self.last_batch = None
             self.tree_cache.reset()

@@ -128,10 +128,14 @@ Flush the radix cache. It will be automatically triggered when the model weights
 
 Parameters:
 - `timeout` (query, float, default `0`, unit: seconds): Wait time for idle state before flushing. `0` means fail fast if not idle. When HiCache async operations are in-flight, a non-zero timeout allows the server to wait until idle before flushing, avoiding unnecessary 400 errors.
+- `preserve_hicache_storage` (query, bool, default `false`): Before flushing, synchronously checkpoint all evictable cache-mode `UnifiedRadixCache` state to the configured HiCache storage backend. The request fails without clearing the in-memory cache if hierarchical storage is unavailable, buffer-only host mode is active, cache entries are protected, or the checkpoint cannot finish.
 
 ```bash Command
 # With timeout (wait up to 30s for idle state)
 curl -s -X POST "http://127.0.0.1:30000/flush_cache?timeout=30"
+
+# Preserve HiCache state across a graceful server restart
+curl -s -X POST "http://127.0.0.1:30000/flush_cache?timeout=30&preserve_hicache_storage=true"
 ```
 
 ```python Example
