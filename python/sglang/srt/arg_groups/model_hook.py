@@ -67,6 +67,7 @@ def _validate_dsa_tbo_index_sharing(server_args: Any, hf_config: Any) -> None:
             f"indexer_types={indexer_types!r}."
         )
 
+
 def _rocm_fp8_wo_a_supported() -> bool:
     """True when ROCm can run the DeepSeek-V4 fp8 wo_a GEMM (gfx950 + aiter)."""
     try:
