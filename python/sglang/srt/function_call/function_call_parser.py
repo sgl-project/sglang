@@ -106,7 +106,22 @@ class FunctionCallParser:
         "inkling": InklingDetector,
     }
 
-    def __init__(self, tools: List[Tool], tool_call_parser: str, tokenizer=None):
+    def __init__(
+        self,
+        tools: List[Tool],
+        tool_call_parser: str,
+        tokenizer=None,
+        parallel_tool_calls: bool = True,
+    ):
+        # parallel_tool_calls=False (OpenAI semantics: at most one tool call
+        # per assistant turn) is honored by grammar constraints only in the
+        # required/strict-auto modes; plain-auto emissions were previously
+        # unconstrained AND unenforced, so clients that set the flag could
+        # still receive several calls. Enforce it at parse time: non-stream
+        # keeps the first call; streaming locks onto the first tool_index
+        # and drops items for later ones.
+        self.parallel_tool_calls = parallel_tool_calls
+        self._single_call_locked_index: Optional[int] = None
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
             kwargs = {}
@@ -137,6 +152,18 @@ class FunctionCallParser:
             return False
         return self.detector.has_tool_call(text)
 
+    def _enforce_single_call(
+        self, calls: list[ToolCallItem]
+    ) -> list[ToolCallItem]:
+        """With parallel_tool_calls=False, pass through only the first tool
+        call's streaming items (a call spans several chunks sharing one
+        tool_index) and drop items belonging to any later call."""
+        if self.parallel_tool_calls or not calls:
+            return calls
+        if self._single_call_locked_index is None:
+            self._single_call_locked_index = calls[0].tool_index
+        return [c for c in calls if c.tool_index == self._single_call_locked_index]
+
     def parse_non_stream(self, full_text: str) -> Tuple[str, list[ToolCallItem]]:
         """
         One-time parsing of the full text to extract tool calls.
@@ -154,6 +181,8 @@ class FunctionCallParser:
         has_tool_call = self.detector.has_tool_call(full_text)
         parsed_result = self.detector.detect_and_parse(full_text, self.tools)
         tool_call_list = parsed_result.calls
+        if not self.parallel_tool_calls and len(tool_call_list) > 1:
+            tool_call_list = tool_call_list[:1]
         if tool_call_list or has_tool_call:
             return parsed_result.normal_text, tool_call_list
         else:
@@ -183,7 +212,7 @@ class FunctionCallParser:
             final_calls.extend(sp_result.calls)
             final_normal_text = sp_result.normal_text
 
-        return final_normal_text, final_calls
+        return final_normal_text, self._enforce_single_call(final_calls)
 
     def parse_stream_end(self) -> Tuple[str, list[ToolCallItem]]:
         """Flush detector state once the stream ends.
@@ -194,7 +223,7 @@ class FunctionCallParser:
         if not self.tools:
             return "", []
         sp_result = self.detector.finish(self.tools)
-        return sp_result.normal_text, sp_result.calls
+        return sp_result.normal_text, self._enforce_single_call(sp_result.calls)
 
     def get_legacy_structural_tag(
         self, at_least_one: bool = False
