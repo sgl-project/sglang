@@ -680,19 +680,39 @@ def _is_rerunnable_test_path(path):
     return "manual" not in path.split("/") and _collects_pytest_tests(path)
 
 
+def _move_changes_dispatch(previous_filename, filename):
+    """Whether a content-free move still changes how `filename` dispatches."""
+    previous_filename = previous_filename or ""
+    is_mm = filename.startswith(MULTIMODAL_TEST_DIR + "/")
+    if is_mm != previous_filename.startswith(MULTIMODAL_TEST_DIR + "/"):
+        return True
+    if not _is_rerunnable_test_path(previous_filename):
+        return True
+    return is_mm and (
+        detect_multimodal_suite(previous_filename)[0]
+        != detect_multimodal_suite(filename)[0]
+    )
+
+
 def changed_test_files(pr):
     """Rerunnable test files the PR adds or edits, as repo-relative paths.
 
-    A pure move reports `renamed` with no content change; dropping those keeps a
-    mass file move from expanding to every test it shifted, while a moved-and-
-    edited test still reruns.
+    A pure move reports `renamed` with an empty diff and is dropped, unless the
+    move itself changes dispatch: into a CI root, across the multimodal
+    boundary, or onto a different multimodal pool.
     """
     return sorted(
         f.filename
         for f in pr.get_files()
         if f.status != "removed"
-        and f.changes > 0
         and _is_rerunnable_test_path(f.filename)
+        and (
+            f.changes > 0
+            or (
+                f.status == "renamed"
+                and _move_changes_dispatch(f.previous_filename, f.filename)
+            )
+        )
     )
 
 

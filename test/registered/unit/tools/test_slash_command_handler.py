@@ -98,31 +98,65 @@ class TestConfiguredTestGroups(CustomTestCase):
 class TestChangedTestFiles(CustomTestCase):
     def test_only_dispatchable_changed_test_files_are_selected(self):
         """`--changed` feeds the dispatcher directly, so every path it returns must
-        be runnable: no deleted tests, helpers, source, pure moves, `manual/`
-        files, or multimodal `test_*.py` that collect nothing."""
+        be runnable: no deleted tests, helpers, source, `manual/` files, or
+        multimodal `test_*.py` that collect nothing. A pure move is dropped only
+        when it leaves dispatch alone."""
         handler = _load_handler()
         mm = handler.MULTIMODAL_TEST_DIR
         pr = SimpleNamespace(
             get_files=lambda: [
-                SimpleNamespace(filename=name, status=status, changes=changes)
-                for name, status, changes in [
+                SimpleNamespace(
+                    filename=name,
+                    status=status,
+                    changes=changes,
+                    previous_filename=previous,
+                )
+                for name, status, changes, previous in [
                     (
                         "test/registered/unit/mem_cache/test_radix_cache_unit.py",
                         "modified",
                         4,
+                        None,
                     ),
-                    ("test/registered/core/test_srt_endpoint.py", "removed", 12),
-                    ("test/registered/unit/mem_cache/helpers.py", "modified", 2),
-                    ("python/sglang/srt/mem_cache/radix_cache.py", "modified", 7),
-                    ("test/manual/test_not_registered.py", "added", 20),
-                    ("test/registered/spec/test_moved_untouched.py", "renamed", 0),
-                    ("test/registered/spec/test_moved_and_edited.py", "renamed", 9),
-                    (f"{mm}/server/test_server_common.py", "modified", 3),
-                    (f"{mm}/server/test_server_utils.py", "modified", 3),
-                    (f"{mm}/unit/manual/test_fp4_linear.py", "modified", 3),
+                    ("test/registered/core/test_srt_endpoint.py", "removed", 12, None),
+                    ("test/registered/unit/mem_cache/helpers.py", "modified", 2, None),
+                    ("python/sglang/srt/mem_cache/radix_cache.py", "modified", 7, None),
+                    ("test/manual/test_not_registered.py", "added", 20, None),
+                    (
+                        "test/registered/spec/test_moved_untouched.py",
+                        "renamed",
+                        0,
+                        "test/registered/core/test_moved_untouched.py",
+                    ),
+                    (
+                        "test/registered/spec/test_moved_into_ci.py",
+                        "renamed",
+                        0,
+                        "test/manual/test_moved_into_ci.py",
+                    ),
+                    (
+                        f"{mm}/2_gpu/test_moved_pool.py",
+                        "renamed",
+                        0,
+                        f"{mm}/unit/test_moved_pool.py",
+                    ),
+                    (
+                        "test/registered/spec/test_moved_and_edited.py",
+                        "renamed",
+                        9,
+                        "test/registered/core/test_moved_and_edited.py",
+                    ),
+                    (f"{mm}/server/test_server_common.py", "modified", 3, None),
+                    (f"{mm}/server/test_server_utils.py", "modified", 3, None),
+                    (f"{mm}/unit/manual/test_fp4_linear.py", "modified", 3, None),
                     # Absent from the checkout, as a fork-added file is; kept so
                     # resolve_test_file() reports `File not found` for it.
-                    (f"{mm}/server/test_server_added_by_fork.py", "added", 30),
+                    (
+                        f"{mm}/server/test_server_added_by_fork.py",
+                        "added",
+                        30,
+                        None,
+                    ),
                 ]
             ]
         )
@@ -130,6 +164,7 @@ class TestChangedTestFiles(CustomTestCase):
             root = Path(tmp) / mm
             (root / "server").mkdir(parents=True)
             (root / "unit" / "manual").mkdir(parents=True)
+            (root / "2_gpu").mkdir(parents=True)
             (root / "server" / "test_server_common.py").write_text(
                 "def test_diffusion_generation():\n    pass\n"
             )
@@ -139,15 +174,20 @@ class TestChangedTestFiles(CustomTestCase):
             (root / "unit" / "manual" / "test_fp4_linear.py").write_text(
                 "class TestFp4Linear:\n    def test_it(self):\n        pass\n"
             )
+            (root / "2_gpu" / "test_moved_pool.py").write_text(
+                "def test_two_gpu():\n    pass\n"
+            )
             previous_cwd = os.getcwd()
             try:
                 os.chdir(tmp)
                 self.assertEqual(
                     handler.changed_test_files(pr),
                     [
+                        f"{mm}/2_gpu/test_moved_pool.py",
                         f"{mm}/server/test_server_added_by_fork.py",
                         f"{mm}/server/test_server_common.py",
                         "test/registered/spec/test_moved_and_edited.py",
+                        "test/registered/spec/test_moved_into_ci.py",
                         "test/registered/unit/mem_cache/test_radix_cache_unit.py",
                     ],
                 )
