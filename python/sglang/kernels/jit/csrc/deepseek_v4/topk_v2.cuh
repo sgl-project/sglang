@@ -177,6 +177,7 @@ SGL_DEVICE void trivial_transform(const TopKProblem& problem, int32_t* raw_outpu
 
 template <TopKMode kMode>
 SGL_DEVICE void problem_transform(TopKProblem& problem, int32_t* output_ptr, int32_t* raw_output_ptr) {
+  static_assert(kMode != TopKMode::INDICES, "problem_transform requires page-table output");
   static_assert(kMaxTopK % kBlockSize == 0);
   constexpr uint32_t kNumElems = kMaxTopK / kBlockSize;
   int32_t source_index[kNumElems];
