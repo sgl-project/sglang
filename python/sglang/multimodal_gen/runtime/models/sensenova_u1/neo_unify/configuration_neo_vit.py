@@ -19,7 +19,6 @@ def _as_singleton_tuple(value: Any) -> tuple[Any, ...]:
 
 
 class NEOVisionConfig(PretrainedConfig):
-
     model_type = "neo_vision"
 
     def __init__(

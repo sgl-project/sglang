@@ -176,9 +176,9 @@ class NEOChatConfig(PretrainedConfig):
             logger.info(
                 "llm_config is None. Initializing the LlamaConfig config with default values (`LlamaConfig`)."
             )
-        assert (
-            "architectures" in llm_config
-        ), "Should specify architecture in llm_config"
+        assert "architectures" in llm_config, (
+            "Should specify architecture in llm_config"
+        )
 
         if isinstance(vision_config, dict):
             self.vision_config = NEOVisionConfig(**vision_config)

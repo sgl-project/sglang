@@ -73,7 +73,6 @@ class TimestepEmbedder(nn.Module):
 
 
 class ResBlock(nn.Module):
-
     def __init__(self, channels, mlp_ratio=1.0):
         super().__init__()
         self.channels = channels

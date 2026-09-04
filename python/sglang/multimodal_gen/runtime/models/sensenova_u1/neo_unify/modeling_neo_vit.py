@@ -272,9 +272,9 @@ class NEOVisionModel(PreTrainedModel):
         if pixel_embeds is not None:
             hidden_states = pixel_embeds
         else:
-            assert (
-                pixel_values.dim() == 2
-            ), f"pixel_values must be 2D for native resolution, got: {pixel_values.dim()}"
+            assert pixel_values.dim() == 2, (
+                f"pixel_values must be 2D for native resolution, got: {pixel_values.dim()}"
+            )
             hidden_states = self.embeddings(pixel_values, grid_hw=grid_hw)
 
         return BaseModelOutputWithPooling(
