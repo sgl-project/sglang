@@ -7,6 +7,7 @@ worker polls check_xfer_state), so the ack must come from the transfer worker
 after its DONE barrier -- never from the bootstrap thread for an active room.
 """
 
+import threading
 import unittest
 from unittest.mock import MagicMock
 
@@ -25,6 +26,8 @@ def _prefill_mgr(cls=CommonKVManager, enabled=True):
     mgr.enable_deferred_decode_kv_release = enabled
     mgr._deferred_ack_targets = {}
     mgr._staging_outstanding = {}
+    if cls is NixlKVManager:
+        mgr._staging_outstanding_lock = threading.Lock()
     mgr.request_status = {}
     mgr._sent = []
     # Capture acks instead of opening a socket.
