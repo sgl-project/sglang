@@ -2919,14 +2919,33 @@ class ServerArgs(DisaggServerArgsMixin):
         return self.scheduler_endpoint_for(0)
 
     def scheduler_endpoint_for(self, replica: int) -> str:
-        """Ingress endpoint of one DP replica's driver rank."""
+        """Ingress endpoint of one DP replica's driver rank.
+
+        The scheduler ingress is an unauthenticated pickle-RPC endpoint
+        (``managers/scheduler.py`` ``recv_reqs`` deserializes client bytes
+        with ``pickle.loads``), so it must never be derived from the public
+        ``--host``: binding it to ``0.0.0.0`` would expose unsafe
+        deserialization to the network (CVE-2026-3059 family). Wildcard hosts
+        are pinned to loopback; only an explicit non-wildcard host (used for
+        intentional cross-machine deployments) is honored.
+        """
         scheduler_host = self.host
-        if scheduler_host is None or scheduler_host == "localhost":
+        if scheduler_host is None or scheduler_host in (
+            "localhost",
+            "0.0.0.0",
+            "::",
+        ):
             scheduler_host = "127.0.0.1"
+            host_is_ipv6 = False
+        else:
+            host_is_ipv6 = is_valid_ipv6_address(scheduler_host)
         if self.scheduler_ports is not None:
             port = self.scheduler_ports[replica]
         else:
             port = self.scheduler_port + replica
+        # IPv6 literals must be bracketed in an endpoint string.
+        if host_is_ipv6:
+            return f"tcp://[{scheduler_host}]:{port}"
         return f"tcp://{scheduler_host}:{port}"
 
     @property

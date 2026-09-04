@@ -3301,5 +3301,57 @@ class TestDirectGpuWeightLoading(unittest.TestCase):
                 tp_args._validate_direct_gpu_weight_loading()
 
 
+class TestSchedulerEndpointBinding(unittest.TestCase):
+    """The scheduler ingress is an unauthenticated pickle-RPC endpoint; it must
+    never follow a wildcard --host (see ServerArgs.scheduler_endpoint_for)."""
+
+    def _from_dict_without_model_resolution(self, kwargs):
+        return _from_dict_without_model_resolution(kwargs)
+
+    def test_wildcard_host_pinned_to_loopback(self):
+        args = self._from_dict_without_model_resolution(
+            {"model_path": "/fake/model", "host": "0.0.0.0", "scheduler_port": 5555}
+        )
+        self.assertEqual(args.scheduler_endpoint_for(0), "tcp://127.0.0.1:5555")
+
+    def test_ipv6_wildcard_host_pinned_to_loopback(self):
+        args = self._from_dict_without_model_resolution(
+            {"model_path": "/fake/model", "host": "::", "scheduler_port": 5555}
+        )
+        self.assertEqual(args.scheduler_endpoint_for(0), "tcp://127.0.0.1:5555")
+
+    def test_default_host_stays_loopback(self):
+        args = self._from_dict_without_model_resolution(
+            {"model_path": "/fake/model", "scheduler_port": 5555}
+        )
+        self.assertEqual(args.scheduler_endpoint_for(0), "tcp://127.0.0.1:5555")
+
+    def test_explicit_host_is_honored(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/fake/model",
+                "host": "10.1.2.3",
+                "scheduler_port": 5555,
+            }
+        )
+        self.assertEqual(args.scheduler_endpoint_for(0), "tcp://10.1.2.3:5555")
+
+    def test_explicit_ipv6_host_is_bracketed(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/fake/model",
+                "host": "::1",
+                "scheduler_port": 5555,
+            }
+        )
+        self.assertEqual(args.scheduler_endpoint_for(0), "tcp://[::1]:5555")
+
+    def test_replica_ports_increment_on_loopback(self):
+        args = self._from_dict_without_model_resolution(
+            {"model_path": "/fake/model", "host": "0.0.0.0", "scheduler_port": 5555}
+        )
+        self.assertEqual(args.scheduler_endpoint_for(1), "tcp://127.0.0.1:5556")
+
+
 if __name__ == "__main__":
     unittest.main()
