@@ -680,12 +680,44 @@ class ServerArgs(DisaggServerArgsMixin):
                 "model default warmup resolution. Requests at other "
                 "resolutions run eager."
             )
+        if self._is_video_gen_task() and self.warmup_num_frames is None:
+            default_frames = self._bcg_default_warmup_num_frames()
+            logger.info(
+                "[Diffusion BCG] --warmup-num-frames unset; capturing the "
+                "model default warmup frame count (%s). Requests with a "
+                "different frame count run eager. Pass --warmup-num-frames N "
+                "matching your served frame count.",
+                default_frames,
+            )
         if self.bcg_text_buckets is not None and not any(
             int(b) > 0 for b in self.bcg_text_buckets
         ):
             raise ValueError(
                 "--bcg-text-buckets must contain at least one positive integer."
             )
+
+    def _is_video_gen_task(self) -> bool:
+        pipeline_config = getattr(self, "pipeline_config", None)
+        task_type = getattr(pipeline_config, "task_type", None)
+        is_video_gen = getattr(task_type, "is_video_gen", None)
+        return bool(is_video_gen()) if callable(is_video_gen) else False
+
+    def _bcg_default_warmup_num_frames(self):
+        """Best-effort preview of the warmup frame count BCG will capture."""
+        try:
+            from sglang.multimodal_gen.runtime.warmup_request_builder import (
+                _resolve_warmup_num_frames,
+                get_model_sampling_defaults,
+            )
+
+            sampling_defaults = get_model_sampling_defaults(self)
+            return _resolve_warmup_num_frames(
+                self,
+                sampling_defaults,
+                server_based_warmup=True,
+            )
+        except Exception:  # pragma: no cover - defensive
+            return None
 
     def _adjust_breakable_cuda_graph_support(self):
         if not self.enable_breakable_cuda_graph:
