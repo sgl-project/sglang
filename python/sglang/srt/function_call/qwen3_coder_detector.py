@@ -1,4 +1,3 @@
-import ast
 import json
 import logging
 import re
@@ -11,7 +10,11 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import infer_type_from_json_schema
+from sglang.srt.function_call.utils import (
+    get_schema_properties,
+    infer_type_from_json_schema,
+    safe_literal_eval,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,9 +81,10 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 except AttributeError:
                     return {}
 
-                if isinstance(params, dict) and "properties" in params:
-                    return params["properties"]
-                elif isinstance(params, dict):
+                if isinstance(params, dict):
+                    properties = get_schema_properties(params)
+                    if properties or "properties" in params:
+                        return properties
                     return params
                 else:
                     return {}
@@ -164,7 +168,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         f"'{func_name}', will try other methods to parse it."
                     )
             try:
-                param_value = ast.literal_eval(param_value)  # safer
+                param_value = safe_literal_eval(param_value)
             except Exception:
                 logger.warning(
                     f"Parsed value '{param_value}' of parameter '{param_name}' cannot be converted via Python `ast.literal_eval()` in tool '{func_name}', degenerating to string."

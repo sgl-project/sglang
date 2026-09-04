@@ -44,7 +44,7 @@
 #include <type_traits>
 #include <unordered_map>
 
-namespace {
+namespace sglang {
 
 template <typename DType, uint32_t kNumGPU>
 struct InklingAllReduceTrait {
@@ -669,4 +669,4 @@ void inkling_multimem_full_oneshot(
       n);
 }
 
-}  // namespace
+}  // namespace sglang

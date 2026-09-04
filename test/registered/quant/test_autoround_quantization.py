@@ -26,9 +26,11 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=120, stage="extra-a", runner_config="1-gpu-large")
 
-MMLU_NUM_EXAMPLES = 32
+MMLU_NUM_EXAMPLES = 256
 MMLU_NUM_THREADS = 32
-MMLU_SCORE_THRESHOLD = 22 / MMLU_NUM_EXAMPLES
+# The unquantized model scores 0.68-0.70 over 256 questions; int8 gives up a
+# point or two, then the 0.05 margin the other eval thresholds use.
+MMLU_SCORE_THRESHOLD = 0.63
 
 
 class TestAutoRoundQuantization(CustomTestCase):

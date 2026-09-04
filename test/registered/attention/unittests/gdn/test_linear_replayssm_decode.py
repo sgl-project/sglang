@@ -33,21 +33,17 @@ L sweep:
 Runnable as ``pytest`` and as ``__main__``.
 """
 
-import sys
 import unittest
-from pathlib import Path
 
 import torch
-
-from sglang.test.test_utils import CustomTestCase
 
 # Mirror sibling GDN unittests: register for CUDA/AMD CI. This is a kernel-math
 # unit test; it lives with the other linear-attention kernel correctness tests.
 # The registry calls MUST be module-level (the CI collector / check-registered-
 # tests hook parses them statically via AST and only scans top-level statements
 # -- a try/except wrapper hides them and fails the hook).
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-large-amd")

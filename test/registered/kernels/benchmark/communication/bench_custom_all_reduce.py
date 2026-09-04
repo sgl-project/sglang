@@ -34,7 +34,7 @@ DTYPE_ITEMSIZE = DTYPE.itemsize
 MESSAGE_SIZES_KB = [2**x for x in range(2, 17)]
 MESSAGE_SIZES_KB += [192, 384, 640, 768, 896, 1536, 3072]
 MESSAGE_SIZES_KB.sort()
-WORLD_SIZES = list(range(2, 9))
+WORLD_SIZES = list(range(2, 9)) + [16]
 MAX_BYTES = max(MESSAGE_SIZES_KB) * 1024
 # trtllm allreduce_fusion only supports these world sizes.
 FI_SUPPORTED_WORLD_SIZES = (2, 4, 8)
@@ -246,7 +246,7 @@ def benchmark(message_KB: int, provider: str):
         )
     if provider == "aot" and world_size not in AOT_SUPPORTED_WORLD_SIZES:
         marker.skip(
-            f"AOT custom_all_reduce needs world_size in " f"{AOT_SUPPORTED_WORLD_SIZES}"
+            f"AOT custom_all_reduce needs world_size in {AOT_SUPPORTED_WORLD_SIZES}"
         )
     _init_all_backends()
     backend = BACKEND_FACTORY[provider]()

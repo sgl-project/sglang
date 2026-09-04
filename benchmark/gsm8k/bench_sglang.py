@@ -53,9 +53,9 @@ def main(args):
     if args.enable_thinking:
         from transformers import AutoTokenizer
 
-        assert (
-            args.tokenizer_path is not None
-        ), "--tokenizer-path is required when --enable-thinking is set"
+        assert args.tokenizer_path is not None, (
+            "--tokenizer-path is required when --enable-thinking is set"
+        )
         tokenizer = AutoTokenizer.from_pretrained(
             args.tokenizer_path, trust_remote_code=True
         )
@@ -89,7 +89,7 @@ def main(args):
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
-                enable_thinking=True,
+                **args.chat_template_kwargs,
             )
         questions.append(raw_question)
         labels.append(get_answer_value(lines[i]["answer"]))
@@ -183,6 +183,14 @@ if __name__ == "__main__":
         "--enable-thinking",
         action="store_true",
         help="Enable thinking mode by wrapping prompts with chat template",
+    )
+    parser.add_argument(
+        "--chat-template-kwargs",
+        type=json.loads,
+        default='{"enable_thinking": true}',
+        help="JSON dict passed through to tokenizer.apply_chat_template. "
+        "The thinking-toggle kwarg name is model-specific, e.g. "
+        "'{\"enable_thinking\": true}' (Qwen) or '{\"thinking\": true}' (Kimi).",
     )
     parser.add_argument(
         "--tokenizer-path",

@@ -4,7 +4,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
-import types
 import unittest
 
 import torch
@@ -14,12 +13,27 @@ from sglang.srt.eplb.expert_location import (
     append_trivial_expert_slots,
     compute_logical_to_rank_dispatch_physical_map,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import CustomTestCase
 
 
-def _make_server_args(ep_size: int, nnodes: int):
-    """Minimal server_args stub for expert placement tests."""
-    return types.SimpleNamespace(ep_size=ep_size, nnodes=nnodes, ep_join_mode=None)
+def _published(
+    ep_size: int,
+    nnodes: int,
+    moe_a2a_backend: str = "deepep",
+    ep_join_mode=None,
+):
+    """Scoped publish of the config the placement functions read.
+
+    `moe_a2a_backend` defaults to an a2a backend because these tests cover the
+    rank-local collapse, which is skipped when there is no a2a backend.
+    """
+    return get_context().override_server_args(
+        ep_size=ep_size,
+        nnodes=nnodes,
+        moe_a2a_backend=moe_a2a_backend,
+        ep_join_mode=ep_join_mode,
+    )
 
 
 def _make_logical_to_all_physical_map(
@@ -65,7 +79,6 @@ class TestComputeLogicalToRankDispatchPhysicalMap(CustomTestCase):
     NUM_LAYERS = 2
 
     def setUp(self):
-        self.server_args = _make_server_args(self.EP_SIZE, self.NNODES)
         self.logical_to_all_physical = _make_logical_to_all_physical_map(
             num_layers=self.NUM_LAYERS,
             num_logical_experts=self.NUM_LOGICAL,
@@ -74,14 +87,14 @@ class TestComputeLogicalToRankDispatchPhysicalMap(CustomTestCase):
         )
 
     def _call(self, ep_rank, seed=42):
-        return compute_logical_to_rank_dispatch_physical_map(
-            server_args=self.server_args,
-            logical_to_all_physical_map=self.logical_to_all_physical.clone(),
-            ep_size=self.EP_SIZE,
-            num_physical_experts=self.NUM_PHYSICAL,
-            ep_rank=ep_rank,
-            seed=seed,
-        )
+        with _published(self.EP_SIZE, self.NNODES):
+            return compute_logical_to_rank_dispatch_physical_map(
+                logical_to_all_physical_map=self.logical_to_all_physical.clone(),
+                ep_size=self.EP_SIZE,
+                num_physical_experts=self.NUM_PHYSICAL,
+                ep_rank=ep_rank,
+                seed=seed,
+            )
 
     # ------------------------------------------------------------------ shape & range
 
@@ -155,26 +168,25 @@ class TestComputeLogicalToRankDispatchPhysicalMap(CustomTestCase):
             num_physical_experts=self.NUM_PHYSICAL,
             replicas_per_logical=2,
         )
-        result = compute_logical_to_rank_dispatch_physical_map(
-            server_args=self.server_args,
-            logical_to_all_physical_map=logical_to_all_physical,
-            ep_size=self.EP_SIZE,
-            num_physical_experts=self.NUM_PHYSICAL,
-            ep_rank=0,
-        )
+        with _published(self.EP_SIZE, self.NNODES):
+            result = compute_logical_to_rank_dispatch_physical_map(
+                logical_to_all_physical_map=logical_to_all_physical,
+                ep_size=self.EP_SIZE,
+                num_physical_experts=self.NUM_PHYSICAL,
+                ep_rank=0,
+            )
         self.assertEqual(result.shape, (1, self.NUM_LOGICAL))
         self.assertTrue(torch.all(result >= 0))
 
     def test_single_node(self):
         """With nnodes=1, all GPUs are on the same node."""
-        server_args = _make_server_args(ep_size=4, nnodes=1)
-        result = compute_logical_to_rank_dispatch_physical_map(
-            server_args=server_args,
-            logical_to_all_physical_map=self.logical_to_all_physical.clone(),
-            ep_size=self.EP_SIZE,
-            num_physical_experts=self.NUM_PHYSICAL,
-            ep_rank=0,
-        )
+        with _published(ep_size=4, nnodes=1):
+            result = compute_logical_to_rank_dispatch_physical_map(
+                logical_to_all_physical_map=self.logical_to_all_physical.clone(),
+                ep_size=self.EP_SIZE,
+                num_physical_experts=self.NUM_PHYSICAL,
+                ep_rank=0,
+            )
         self.assertEqual(result.shape, (self.NUM_LAYERS, self.NUM_LOGICAL))
         self.assertTrue(torch.all(result >= 0))
         self.assertTrue(torch.all(result < self.NUM_PHYSICAL))
@@ -186,13 +198,13 @@ class TestComputeLogicalToRankDispatchPhysicalMap(CustomTestCase):
             torch.arange(self.NUM_PHYSICAL, dtype=torch.int64).unsqueeze(0).unsqueeze(0)
         )
         mapping = mapping.expand(self.NUM_LAYERS, 1, self.NUM_PHYSICAL).clone()
-        result = compute_logical_to_rank_dispatch_physical_map(
-            server_args=self.server_args,
-            logical_to_all_physical_map=mapping,
-            ep_size=self.EP_SIZE,
-            num_physical_experts=self.NUM_PHYSICAL,
-            ep_rank=0,
-        )
+        with _published(self.EP_SIZE, self.NNODES):
+            result = compute_logical_to_rank_dispatch_physical_map(
+                logical_to_all_physical_map=mapping,
+                ep_size=self.EP_SIZE,
+                num_physical_experts=self.NUM_PHYSICAL,
+                ep_rank=0,
+            )
         self.assertEqual(result.shape, (self.NUM_LAYERS, 1))
         self.assertTrue(torch.all(result >= 0))
 
@@ -201,16 +213,13 @@ class TestComputeLogicalToRankDispatchPhysicalMap(CustomTestCase):
         physical_to_logical = append_trivial_expert_slots(
             physical_to_logical, count=16, num_logical_experts=64
         )
-        server_args = _make_server_args(ep_size=5, nnodes=1)
-        server_args.ep_join_mode = "scale"
-
-        logical_to_physical = _compute_logical_to_all_physical_map(
-            server_args=server_args,
-            physical_to_logical_map=physical_to_logical,
-            num_logical_experts=64,
-            ep_size=5,
-            moe_ep_rank=4,
-        )
+        with _published(ep_size=5, nnodes=1, ep_join_mode="scale"):
+            logical_to_physical = _compute_logical_to_all_physical_map(
+                physical_to_logical_map=physical_to_logical,
+                num_logical_experts=64,
+                ep_size=5,
+                moe_ep_rank=4,
+            )
 
         self.assertEqual(logical_to_physical[0, :16, 0].tolist(), list(range(64, 80)))
 

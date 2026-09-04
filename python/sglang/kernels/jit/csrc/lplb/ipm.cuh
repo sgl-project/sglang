@@ -28,7 +28,7 @@
 #include <cstdint>
 #include <cublasdx.hpp>
 
-namespace {
+namespace sglang {
 
 template <int NC, int NV>
 struct ipm_smem {
@@ -272,4 +272,4 @@ void ipm_solve(tvm::ffi::TensorView A, tvm::ffi::TensorView b, tvm::ffi::TensorV
       static_cast<const float*>(c.data_ptr()));
 }
 
-}  // namespace
+}  // namespace sglang

@@ -112,10 +112,10 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         self.device = model_runner.device
         self.max_context_len = model_runner.model_config.context_len
         self.num_heads = model_runner.model_config.get_num_attention_heads(
-            model_runner.server_args.tp_size
+            get_parallel().tp_size
         )
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            model_runner.server_args.tp_size
+            get_parallel().tp_size
         )
         self.head_size = model_runner.model_config.head_dim
 
@@ -126,11 +126,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
-        self.kv_cache_dtype_str = getattr(
-            model_runner,
-            "kv_cache_dtype_str",
-            model_runner.server_args.kv_cache_dtype,
-        )
+        self.kv_cache_dtype_str = model_runner.kv_cache_dtype_str
         self.page_size = model_runner.page_size
 
         assert self.num_heads % self.num_kv_heads == 0

@@ -135,15 +135,15 @@ class _SGLangPlugin(_AuxFrameworkPlugin):
         seq_lens = step_data["seq_lens"]
         rids_raw = step_data.get("rids")
 
-        assert isinstance(
-            input_ids, torch.Tensor
-        ), f"input_ids: expected Tensor, got {type(input_ids)}"
-        assert isinstance(
-            positions, torch.Tensor
-        ), f"positions: expected Tensor, got {type(positions)}"
-        assert isinstance(
-            seq_lens, torch.Tensor
-        ), f"seq_lens: expected Tensor, got {type(seq_lens)}"
+        assert isinstance(input_ids, torch.Tensor), (
+            f"input_ids: expected Tensor, got {type(input_ids)}"
+        )
+        assert isinstance(positions, torch.Tensor), (
+            f"positions: expected Tensor, got {type(positions)}"
+        )
+        assert isinstance(seq_lens, torch.Tensor), (
+            f"seq_lens: expected Tensor, got {type(seq_lens)}"
+        )
 
         seq_lens_list: list[int] = seq_lens.tolist()
         num_seqs: int = len(seq_lens_list)
