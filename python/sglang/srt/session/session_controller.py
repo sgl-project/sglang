@@ -319,7 +319,8 @@ class Session:
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs
         new_req.tokenizer = tokenizer
-        if carry_fill is not None:
+        # Incoming multimodal padding may rewrite origin IDs without changing length.
+        if carry_fill is not None and req.mm_inputs is None:
             new_req.full_untruncated_fill_ids = carry_fill
 
         if abort:

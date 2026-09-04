@@ -16,8 +16,20 @@ import unittest
 from array import array
 from types import SimpleNamespace
 
+import torch
+
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternMultimodalTokens,
+)
+from sglang.srt.managers.schedule_batch import (
+    FINISH_LENGTH,
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.session.session_controller import Session
+from sglang.srt.session.session_controller import Session, SessionController
 from sglang.test.test_utils import CustomTestCase
 
 VOCAB = 1 << 20
@@ -56,12 +68,41 @@ class TestSessionTokenShare(CustomTestCase):
     def setUp(self):
         self.session = Session(capacity_of_str_len=0, session_id="s", streaming=True)
 
-    def _create(self, rid, input_ids, max_new_tokens=8):
+    def _create(self, rid, input_ids, max_new_tokens=8, parent=None):
+        recv = _recv(rid, input_ids, max_new_tokens=max_new_tokens)
+        recv.session_params.rid = parent
         return self.session.create_req(
-            _recv(rid, input_ids, max_new_tokens=max_new_tokens),
+            recv,
             tokenizer=None,
             vocab_size=VOCAB,
         )
+
+    def _create_mm(self, rid, parent=None):
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            offsets=[(1, 2)],
+            feature=torch.arange(8, dtype=torch.float32).reshape(2, 4),
+        )
+        item.set_hash(17)
+        recv = _recv(rid, [50, 9, 9, 51])
+        recv.session_params.rid = parent
+        recv.mm_inputs = MultimodalProcessorOutput(mm_items=[item], im_token_id=9)
+        req = self.session.create_req(recv, tokenizer=None, vocab_size=VOCAB)
+        self.assertFalse(req.finished())
+        mm = MultimodalInputs.from_processor_output(recv.mm_inputs)
+        SessionController.adjust_mm_offsets(recv, req, mm)
+        origin = req.origin_input_ids
+        # Match scheduler admission: GLM-style padding replaces the origin array.
+        req.origin_input_ids = array(
+            "q",
+            MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
+                origin, mm
+            ),
+        )
+        self.assertIsNot(req.origin_input_ids, origin)
+        self.assertEqual(len(req.origin_input_ids), len(origin))
+        req.extend_image_inputs(mm)
+        return req, item
 
     def _decode_and_finish(self, req, output, baked=None):
         """Simulate decode then a successful finish.
@@ -75,7 +116,107 @@ class TestSessionTokenShare(CustomTestCase):
         req.output_ids.extend(output[:baked])
         req._refresh_fill_ids()
         req.output_ids.extend(output[baked:])
-        self.session.finish_req(req)
+        req.finished_reason = FINISH_LENGTH(len(req.output_ids))
+        if self.session.streaming:
+            self.session.finish_req(req)
+
+    def test_mm_padding_refresh_and_text_carry(self):
+        for streaming in (True, False):
+            with self.subTest(streaming=streaming):
+                self.session = Session(0, session_id="s", streaming=streaming)
+                r1 = self._create("r1", [100, 101])
+                self._decode_and_finish(r1, [1, 2, 3], baked=2)
+
+                r2, item = self._create_mm("r2", parent="r1")
+                expected = [100, 101, 1, 2, 3, 50, item.pad_value, item.pad_value, 51]
+                self.assertEqual(item.offsets, [(6, 7)])
+                self.assertEqual(list(r2.origin_input_ids), expected)
+                self.assertEqual(
+                    list(r2.origin_input_ids_unpadded),
+                    [100, 101, 1, 2, 3, 50, 9, 9, 51],
+                )
+                r2._refresh_fill_ids()
+                r2.set_extend_range(5, len(expected))
+                self.assertEqual(list(r2.get_fill_ids()), expected)
+                self.assertEqual(list(r2.get_fill_ids()[5:]), expected[5:])
+
+                r2.output_ids.extend([4, 5])
+                r2._refresh_fill_ids()
+                fill = r2.full_untruncated_fill_ids
+                r2._refresh_fill_ids()
+                self.assertIs(r2.full_untruncated_fill_ids, fill)
+                r2.set_extend_range(5, len(expected) + 2)
+                self.assertEqual(list(r2.get_fill_ids()), expected + [4, 5])
+                self.assertEqual(list(r2.origin_input_ids), expected)
+                self._decode_and_finish(r2, [6], baked=0)
+
+                r3 = self._create("r3", [60], parent="r2")
+                self.assertEqual(list(r3.origin_input_ids), expected + [4, 5, 6, 60])
+                if streaming:
+                    self.assertIs(r3.origin_input_ids, r2.origin_input_ids)
+                    self.assertIs(r3.full_untruncated_fill_ids, fill)
+                else:
+                    self.assertIsNot(r3.origin_input_ids, r2.origin_input_ids)
+                r3._refresh_fill_ids()
+                self.assertEqual(r3.full_untruncated_fill_ids, r3.origin_input_ids)
+                self.assertIs(r3.multimodal_inputs.mm_items[0], item)
+
+    def test_abort_around_mm_turn_preserves_committed_history(self):
+        for previous_mm in (False, True):
+            with self.subTest(previous_mm=previous_mm):
+                self.session = Session(0, session_id="s", streaming=True)
+                if previous_mm:
+                    r1, item = self._create_mm("r1")
+                    feature = item.feature
+                    offsets = item.offsets[:]
+                else:
+                    r1 = self._create("r1", [100, 101])
+                self._decode_and_finish(r1, [1, 2, 3], baked=2)
+                origin = list(r1.origin_input_ids)
+                unpadded = list(r1.origin_input_ids_unpadded)
+                committed = (
+                    self.session.committed_origin_len,
+                    self.session.committed_unpadded_len,
+                    self.session.committed_fill_len,
+                )
+                mm = r1.multimodal_inputs
+
+                if previous_mm:
+                    r2 = self._create("r2", [70, 71])
+                    self.assertIs(
+                        r2.full_untruncated_fill_ids, r1.full_untruncated_fill_ids
+                    )
+                else:
+                    r2, _ = self._create_mm("r2")
+                r2.output_ids.extend([6, 7])
+                r2._refresh_fill_ids()
+                self.session.abort_req()
+                self.assertIs(self.session.req_nodes["r1"].req, r1)
+                self.assertEqual(
+                    (
+                        self.session.committed_origin_len,
+                        self.session.committed_unpadded_len,
+                        self.session.committed_fill_len,
+                    ),
+                    committed,
+                )
+
+                r3 = self._create("r3", [60])
+                self.assertEqual(list(r3.origin_input_ids), origin + [1, 2, 3, 60])
+                self.assertEqual(
+                    list(r3.origin_input_ids_unpadded), unpadded + [1, 2, 3, 60]
+                )
+                r3._refresh_fill_ids()
+                self.assertEqual(r3.full_untruncated_fill_ids, r3.origin_input_ids)
+                self.assertIs(r3.multimodal_inputs, mm)
+                if previous_mm:
+                    self.assertEqual(len(mm.mm_items), 1)
+                    self.assertIs(mm.mm_items[0], item)
+                    self.assertIs(item.feature, feature)
+                    self.assertEqual(item.offsets, offsets)
+                    torch.testing.assert_close(
+                        feature, torch.arange(8, dtype=torch.float32).reshape(2, 4)
+                    )
 
     def test_normal_multi_turn_share_and_carry(self):
         in1, out1 = list(range(100, 110)), [1, 2, 3]
