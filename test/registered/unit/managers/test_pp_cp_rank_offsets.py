@@ -93,6 +93,11 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
             ),
             patch(
                 "sglang.srt.managers.scheduler_components.request_receiver."
+                "attn_cp_tp_broadcast_pyobj",
+                side_effect=lambda requests: requests,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver."
                 "broadcast_pyobj"
             ) as broadcast,
         ):
@@ -126,6 +131,11 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
                 "sglang.srt.managers.scheduler_components.request_receiver."
                 "is_ep_scale_joiner",
                 return_value=False,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver."
+                "attn_cp_tp_broadcast_pyobj",
+                side_effect=lambda requests: requests,
             ),
             patch(
                 "sglang.srt.managers.scheduler_components.request_receiver."
