@@ -7,10 +7,13 @@
 // Attention (QSA) — over an ultra-sparse MoE, plus an in-checkpoint
 // multi-step-trained MTP head. Multimodal (text + image in, text out).
 //
-// Every recipe on this page is single-node: BF16 and FP8 run TP4 (so four GPUs
-// of an 8-GPU H200/B200/B300 host, or a whole 4-GPU GB300 node), NVFP4 runs on
-// a single GPU, and the AMD cells run TP8. That fits because 6B active params
-// keeps compute small and the N-gram table is the only large weight block.
+// Every datacenter recipe on this page is single-node: BF16 and FP8 run TP4 (so
+// four GPUs of an 8-GPU H200/B200/B300 host, or a whole 4-GPU GB300 node), NVFP4
+// runs on a single GPU, and the AMD cells run TP8. That fits because 6B active
+// params keeps compute small and the N-gram table is the only large weight block.
+// The one multi-node shape is NVFP4 on a pair of DGX Sparks (GB10): the 126 GiB
+// checkpoint does not fit one 128 GB unified-memory box, so it runs TP=2 across
+// two of them over the 200GbE ConnectX-7 link.
 //
 // A hardware x quantization x strategy combination with no launch recipe has no
 // cell, and the engine greys it out.
@@ -18,7 +21,7 @@
 export const config = {
   modelName: "Qwen3.8-Flash-Next",
 
-  supportedHardware: ["h200", "b200", "b300", "gb300", "mi350x", "mi355x"],
+  supportedHardware: ["h200", "b200", "b300", "gb300", "dgx-spark", "mi350x", "mi355x"],
 
   variants: [
     { id: "default", label: "Default" },
@@ -39,8 +42,11 @@ export const config = {
     { id: "balanced",        label: "Balanced"        },
     { id: "high-throughput", label: "High Throughput" },
   ],
+  // `multi-N` id carries the node count for `--nnodes N`; only the DGX Spark
+  // NVFP4 cells use it.
   nodesOptions: [
-    { id: "single", label: "Single Node" },
+    { id: "single",  label: "Single Node" },
+    { id: "multi-2", label: "Multi-Node"  },
   ],
 
   // Orthogonal knobs — layered onto the matched cell, never part of the cell
@@ -77,6 +83,8 @@ export const config = {
   placeholders: {
     HOST_IP:   { target: "command", label: "Bind host",         default: "0.0.0.0"         },
     PORT:      { target: "command", label: "Bind port",         default: "30000"           },
+    NODE0_IP:  { target: "command", label: "Head node IP",      default: "<node0-ip>"      },
+    NODE_RANK: { target: "command", label: "This node rank",    default: "<node-rank>"     },
     HF_TOKEN:  { target: "command", label: "HF token (Docker)", default: "<your-hf-token>" },
     CURL_HOST: { target: "curl",    label: "Server host",       default: "localhost"       },
     CURL_PORT: { target: "curl",    label: "Server port",       default: "30000"           },
@@ -111,8 +119,20 @@ export const config = {
   // Launch images — this is a day-0 model with no release cut, so both tags are
   // purpose-built rather than a version. The ROCm build targets CDNA4 (gfx950)
   // and is not interchangeable with the CUDA one.
+  // Prepended as `# ...` comments above multi-node commands.
+  multiNodeHints: {
+    "dgx-spark": [
+      "Run the same command on both Sparks: rank 1 first, then rank 0 (node 0 = --dist-init-addr host).",
+      "Point the rendezvous and NCCL at the ConnectX-7 link, not the management NIC:",
+      "  NCCL_SOCKET_IFNAME=<200GbE-nic>  GLOO_SOCKET_IFNAME=<200GbE-nic>",
+      "LD_PRELOAD selects the image's NCCL 2.30.7; the system 2.28.3 it ships alongside",
+      "deadlocks cross-node decode CUDA graphs. Check the log line 'sglang is using nccl=='.",
+    ],
+  },
+
   dockerImages: {
     h200:   "lmsysorg/sglang:qwen38flashnext",
+    "dgx-spark": "lmsysorg/sglang:qwen38flashnext",
     b200:   "lmsysorg/sglang:qwen38flashnext",
     b300:   "lmsysorg/sglang:qwen38flashnext",
     gb300:  "lmsysorg/sglang:qwen38flashnext",
@@ -633,6 +653,90 @@ export const config = {
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
         "--reasoning-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ==== NVFP4 on 2x DGX Spark (GB10, sm_121) — the only multi-node shape ====
+    // One GB10 has 128 GB of unified memory and the NVFP4 checkpoint is 126 GiB
+    // (78 GiB experts+dense, 47.7 GiB FP8 N-gram table), so a single Spark cannot
+    // hold it; TP=2 across two Sparks over ConnectX-7 200GbE gives ~65 GB of
+    // weights per node. Both cells are the model card's TP=2 recipe (modelopt_fp4,
+    // flashinfer_cutlass FP4 GEMM, page 64, mamba track interval 64, 4096-token
+    // prefill chunks, 262k context) with the concurrency pinned explicitly:
+    // the hybrid model reserves mamba state slots per running request (5 with
+    // the default extra_buffer strategy, 4 with extra_buffer_lazy), and the
+    // scheduler silently caps --max-running-requests to what the mamba pool
+    // admits unless --max-mamba-cache-size = requests x slots is set.
+    // --no-ple-offload-embedding keeps the FP8 table GPU-resident (TP-sharded):
+    // on unified memory the "offloaded" pinned-host copy would come out of the
+    // same pool anyway. Verified 2026-09-04 on the qwen38flashnext image
+    // (SGLang 593134d17a): GSM8K (chat API, thinking off, n=200) 97.0% low
+    // latency / 96.5% high throughput, 100k-token prefill 2,840 tok/s.
+    //
+    // Low latency: in-checkpoint MTP head (NEXTN 3/1/4), 24 concurrent
+    // requests (120 mamba slots), 1.35M-token KV pool, MTP accept length
+    // 3.2-3.7 on non-thinking output.
+    {
+      match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2" },
+      verified: true,
+      warn: "2x DGX Spark only (GB10 pair, TP=2 over ConnectX-7). Use Docker mode with the qwen38flashnext image and keep the LD_PRELOAD line: the image ships two NCCL copies and the default 2.28.3 deadlocks cross-node decode CUDA graphs. Memory headroom at --mem-fraction-static 0.85 is ~8-12 GiB per node; keep a host memory watchdog for long-context runs. See [DGX Spark notes](#spark-note).",
+      env: [
+        "LD_PRELOAD=/opt/sglang/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2",
+        "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--quantization modelopt_fp4",
+        "--fp4-gemm-backend flashinfer_cutlass",
+        "--no-ple-offload-embedding",
+        "--page-size 64",
+        "--mamba-track-interval 64",
+        "--chunked-prefill-size 4096",
+        "--context-length 262144",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--max-running-requests 24",
+        "--max-mamba-cache-size 120",
+        "--reasoning-parser qwen3",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // High throughput: speculation off, 96 concurrent requests. extra_buffer_lazy
+    // allocates the mamba track buffer lazily (4 slots per request instead of
+    // 5), so 384 slots admit 96 requests while leaving a 753k-token KV pool;
+    // 355 tok/s aggregate on the GSM8K run at 96-way concurrency.
+    {
+      match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "multi-2" },
+      verified: true,
+      warn: "2x DGX Spark only (GB10 pair, TP=2 over ConnectX-7). Use Docker mode with the qwen38flashnext image and keep the LD_PRELOAD line: the image ships two NCCL copies and the default 2.28.3 deadlocks cross-node decode CUDA graphs. At 96 concurrent requests the KV pool is ~753k tokens (~7.8k per request when full); lower --max-running-requests for long-context workloads. See [DGX Spark notes](#spark-note).",
+      env: [
+        "LD_PRELOAD=/opt/sglang/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2",
+        "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--quantization modelopt_fp4",
+        "--fp4-gemm-backend flashinfer_cutlass",
+        "--no-ple-offload-embedding",
+        "--page-size 64",
+        "--mamba-track-interval 64",
+        "--chunked-prefill-size 4096",
+        "--context-length 262144",
+        "--mamba-radix-cache-strategy extra_buffer_lazy",
+        "--max-running-requests 96",
+        "--max-mamba-cache-size 384",
+        "--reasoning-parser qwen3",
+        "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

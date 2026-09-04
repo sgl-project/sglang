@@ -65,6 +65,20 @@ export const benchmarks = [
   { match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" } },
   { match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" } },
   { match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" } },
+  // 2x DGX Spark, TP=2, lmsysorg/sglang:qwen38flashnext (SGLang 593134d17a),
+  // 2026-09-04. GSM8K here is the chat-API protocol with thinking off, n=200
+  // (not the full 1,319-question set the datacenter rows use); AIME26 and
+  // MMMU-Pro not run.
+  {
+    match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2" },
+    sglang_version: "qwen38flashnext image @ 593134d17a",
+    accuracy: { gsm8k_pct: 97.0 },
+  },
+  {
+    match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "multi-2" },
+    sglang_version: "qwen38flashnext image @ 593134d17a",
+    accuracy: { gsm8k_pct: 96.5 },
+  },
   { match: { hw: "mi350x", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
   { match: { hw: "mi350x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" } },
   { match: { hw: "mi355x", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
