@@ -93,6 +93,52 @@ class _Processor(MediaArtifactCacheMixin):
 
 
 class TestMediaArtifactProcessor(unittest.TestCase):
+    def test_snapshot_submit_failure_keeps_already_submitted_io_reserved(self):
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+
+        class _BlockingProcessor(_Processor):
+            def snapshot_media_source(self, source, modality):
+                worker_started.set()
+                release_worker.wait()
+                return snapshot_media(source)
+
+        processor = _BlockingProcessor()
+        real_submit = processor.io_executor.submit
+        submit_count = 0
+
+        def fail_second_submit(*args, **kwargs):
+            nonlocal submit_count
+            submit_count += 1
+            if submit_count == 2:
+                raise RuntimeError("submit failed")
+            return real_submit(*args, **kwargs)
+
+        processor.io_executor.submit = fail_second_submit
+        admission = MultimodalPreprocessingAdmission(2)
+        lease = admission.acquire(2)
+
+        async def drive():
+            with lease.activate():
+                with self.assertRaisesRegex(RuntimeError, "submit failed"):
+                    await processor.prepare_media_artifacts([b"started", b"rejected"])
+            self.assertTrue(await asyncio.to_thread(worker_started.wait, 1))
+            lease.release()
+            self.assertEqual(admission.inflight_items, 2)
+            release_worker.set()
+
+            async def wait_for_release():
+                while admission.inflight_items:
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(wait_for_release(), timeout=1)
+
+        try:
+            asyncio.run(drive())
+        finally:
+            release_worker.set()
+            processor.close()
+
     def test_kimi_artifact_hash_error_keeps_sibling_io_reserved(self):
         """The Kimi artifact mixin submits all snapshot I/O before hash checks."""
         sibling_started = threading.Event()

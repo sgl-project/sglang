@@ -7,6 +7,8 @@ from types import SimpleNamespace
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.multimodal_preprocessing_admission import (
     MultimodalPreprocessingAdmission,
+    MultimodalPreprocessingBusy,
+    MultimodalPreprocessingRequestTooLarge,
     count_preprocessed_multimodal_items,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -81,6 +83,22 @@ class TestMultimodalPreprocessingAdmission(CustomTestCase):
         admission = MultimodalPreprocessingAdmission(max_inflight_items=1)
         with self.assertRaises(ValueError):
             admission.try_acquire(0)
+
+    def test_acquire_distinguishes_permanent_limit_from_transient_pressure(self):
+        admission = MultimodalPreprocessingAdmission(max_inflight_items=3)
+        existing = admission.acquire(2)
+        try:
+            with self.assertRaises(MultimodalPreprocessingBusy) as busy:
+                admission.acquire(2)
+            self.assertEqual(busy.exception.inflight_items, 2)
+            self.assertEqual(admission.inflight_items, 2)
+
+            with self.assertRaises(MultimodalPreprocessingRequestTooLarge) as large:
+                admission.try_acquire(4)
+            self.assertEqual(large.exception.max_inflight_items, 3)
+            self.assertEqual(admission.inflight_items, 2)
+        finally:
+            existing.release()
 
     def test_owner_release_waits_for_tracked_background_future(self):
         async def drive():

@@ -18,6 +18,33 @@ class _DoneCallbackFuture(Protocol):
     def add_done_callback(self, callback: Any) -> None: ...
 
 
+class MultimodalPreprocessingRequestTooLarge(ValueError):
+    """The request can never fit in this admission controller."""
+
+    def __init__(self, item_count: int, max_inflight_items: int) -> None:
+        self.item_count = item_count
+        self.max_inflight_items = max_inflight_items
+        super().__init__(
+            f"request needs {item_count} item slots, but the limit is "
+            f"{max_inflight_items}"
+        )
+
+
+class MultimodalPreprocessingBusy(RuntimeError):
+    """The request fits by itself, but not alongside current work."""
+
+    def __init__(
+        self, item_count: int, inflight_items: int, max_inflight_items: int
+    ) -> None:
+        self.item_count = item_count
+        self.inflight_items = inflight_items
+        self.max_inflight_items = max_inflight_items
+        super().__init__(
+            f"request needs {item_count} item slots with {inflight_items}/"
+            f"{max_inflight_items} currently reserved"
+        )
+
+
 _current_lease: contextvars.ContextVar[
     Optional[MultimodalPreprocessingAdmissionLease]
 ] = contextvars.ContextVar("current_mm_preprocessing_admission_lease", default=None)
@@ -143,17 +170,30 @@ class MultimodalPreprocessingAdmission:
         with self._lock:
             return self._inflight_items
 
-    def try_acquire(
-        self, item_count: int
-    ) -> Optional[MultimodalPreprocessingAdmissionLease]:
-        """Reserve ``item_count`` atomically, or return ``None`` without waiting."""
+    def acquire(self, item_count: int) -> MultimodalPreprocessingAdmissionLease:
+        """Reserve items or classify a permanent limit from transient pressure."""
         if item_count <= 0:
             raise ValueError("item_count must be positive")
         with self._lock:
+            if item_count > self.max_inflight_items:
+                raise MultimodalPreprocessingRequestTooLarge(
+                    item_count, self.max_inflight_items
+                )
             if item_count > self.max_inflight_items - self._inflight_items:
-                return None
+                raise MultimodalPreprocessingBusy(
+                    item_count, self._inflight_items, self.max_inflight_items
+                )
             self._inflight_items += item_count
         return MultimodalPreprocessingAdmissionLease(self, item_count)
+
+    def try_acquire(
+        self, item_count: int
+    ) -> Optional[MultimodalPreprocessingAdmissionLease]:
+        """Reserve items, returning ``None`` only for transient pressure."""
+        try:
+            return self.acquire(item_count)
+        except MultimodalPreprocessingBusy:
+            return None
 
     def _release(self, item_count: int) -> None:
         with self._lock:

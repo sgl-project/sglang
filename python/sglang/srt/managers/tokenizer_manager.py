@@ -97,6 +97,8 @@ from sglang.srt.managers.mm_utils import wrap_shm_features
 from sglang.srt.managers.multimodal_preprocessing_admission import (
     MultimodalPreprocessingAdmission,
     MultimodalPreprocessingAdmissionLease,
+    MultimodalPreprocessingBusy,
+    MultimodalPreprocessingRequestTooLarge,
     count_preprocessed_multimodal_items,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -877,30 +879,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         item_count = count_preprocessed_multimodal_items(obj)
         if item_count == 0:
             return None
-        if item_count > admission.max_inflight_items:
+        try:
+            return admission.acquire(item_count)
+        except MultimodalPreprocessingRequestTooLarge as error:
             raise fastapi.HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST,
                 detail=(
-                    f"The request needs {item_count} multimodal preprocessing "
+                    f"The request needs {error.item_count} multimodal preprocessing "
                     f"item slots, which exceeds the configured per-worker maximum "
-                    f"of {admission.max_inflight_items}. Reduce the request's media "
+                    f"of {error.max_inflight_items}. Reduce the request's media "
                     "items or increase "
                     "--max-mm-preprocessing-inflight-items-per-worker."
                 ),
-            )
-
-        lease = admission.try_acquire(item_count)
-        if lease is None:
+            ) from error
+        except MultimodalPreprocessingBusy as error:
             raise fastapi.HTTPException(
                 status_code=HTTPStatus.SERVICE_UNAVAILABLE,
                 detail=(
                     "Multimodal preprocessing is at capacity: "
-                    f"the request needs {item_count} item slot(s), "
-                    f"with {admission.inflight_items}/"
-                    f"{admission.max_inflight_items} currently reserved."
+                    f"the request needs {error.item_count} item slot(s), "
+                    f"with {error.inflight_items}/"
+                    f"{error.max_inflight_items} currently reserved."
                 ),
-            )
-        return lease
+            ) from error
 
     async def _await_mm_preprocessing(
         self,

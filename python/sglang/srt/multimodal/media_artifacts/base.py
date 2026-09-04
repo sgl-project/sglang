@@ -326,14 +326,13 @@ class MediaArtifactCacheMixin:
             load_indices.append(index)
 
         # 2. read cache: build artifact key from media snapshot then try reading cache
-        snapshot_futures = {
-            index: self.io_executor.submit(
+        snapshot_futures = {}
+        for index in load_indices:
+            future = self.io_executor.submit(
                 self.snapshot_media_source, media_data[index], modality
             )
-            for index in load_indices
-        }
-        for future in snapshot_futures.values():
             track_mm_preprocessing_future(future)
+            snapshot_futures[index] = future
         for index, future in snapshot_futures.items():
             snapshot = await asyncio.wrap_future(future)
             caller_hash = content_hashes[index]
