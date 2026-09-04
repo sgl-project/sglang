@@ -255,12 +255,12 @@ class ZImageAttention(nn.Module):
         self.enable_zimage_qk_fusion = quant_config is None
 
         tp_size = get_tp_world_size()
-        assert (
-            num_heads % tp_size == 0
-        ), f"num_heads {num_heads} must be divisible by tp world size {tp_size}"
-        assert (
-            num_kv_heads % tp_size == 0
-        ), f"num_kv_heads {num_kv_heads} must be divisible by tp world size {tp_size}"
+        assert num_heads % tp_size == 0, (
+            f"num_heads {num_heads} must be divisible by tp world size {tp_size}"
+        )
+        assert num_kv_heads % tp_size == 0, (
+            f"num_kv_heads {num_kv_heads} must be divisible by tp world size {tp_size}"
+        )
         self.local_num_heads = num_heads // tp_size
         self.local_num_kv_heads = num_kv_heads // tp_size
 
@@ -704,9 +704,9 @@ class RopeEmbedder:
         self.theta = theta
         self.axes_dims = axes_dims
         self.axes_lens = axes_lens
-        assert len(axes_dims) == len(
-            axes_lens
-        ), "axes_dims and axes_lens must have the same length"
+        assert len(axes_dims) == len(axes_lens), (
+            "axes_dims and axes_lens must have the same length"
+        )
 
         self.cos_cached = None
         self.sin_cached = None

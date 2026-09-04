@@ -228,8 +228,8 @@ def _patch_removed_symbols():
 
         if not hasattr(_u, "is_flash_attn_greater_or_equal_2_10"):
             if hasattr(_u, "is_flash_attn_greater_or_equal"):
-                _u.is_flash_attn_greater_or_equal_2_10 = (
-                    lambda: _u.is_flash_attn_greater_or_equal("2.10.0")
+                _u.is_flash_attn_greater_or_equal_2_10 = lambda: (
+                    _u.is_flash_attn_greater_or_equal("2.10.0")
                 )
             else:
                 _u.is_flash_attn_greater_or_equal_2_10 = lambda: False

@@ -813,8 +813,9 @@ class TestDSAIndexerAllocationPolicy(CustomTestCase):
         mr.model_config.hf_config.index_topk_freq = 4
         mr.model_config.hf_config.index_skip_topk_offset = 3
 
-        with get_memory().override(enable_hierarchical_cache=True), mock_cpu_env(
-            kv_size=1
+        with (
+            get_memory().override(enable_hierarchical_cache=True),
+            mock_cpu_env(kv_size=1),
         ):
             from sglang.srt.model_executor.pool_configurator import (
                 DefaultPoolConfigurator,
