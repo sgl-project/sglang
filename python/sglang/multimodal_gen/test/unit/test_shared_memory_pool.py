@@ -666,3 +666,21 @@ def test_shared_pool_keeps_the_full_layout_when_asked():
         (0,),
         (36,),
     ]
+
+
+def test_shared_pool_cpu_allocator_defaults_respect_explicit_choices():
+    from sglang.multimodal_gen.runtime.server_args.auto_tune import (
+        SHARED_POOL_CPU_ALLOCATOR_DEFAULTS,
+        apply_shared_pool_cpu_allocator_defaults,
+    )
+
+    environ = {"MIMALLOC_PURGE_DELAY": "50"}
+    applied = apply_shared_pool_cpu_allocator_defaults(environ)
+    assert applied == ["MIMALLOC_ALLOW_LARGE_OS_PAGES"]
+    assert environ == {
+        "MIMALLOC_PURGE_DELAY": "50",
+        "MIMALLOC_ALLOW_LARGE_OS_PAGES": SHARED_POOL_CPU_ALLOCATOR_DEFAULTS[
+            "MIMALLOC_ALLOW_LARGE_OS_PAGES"
+        ],
+    }
+    assert apply_shared_pool_cpu_allocator_defaults(environ) == []
