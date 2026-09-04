@@ -6,11 +6,10 @@ and a realtime session always lands on the same replica it started on.
 
 import itertools
 
-from sglang.multimodal_gen.runtime.entrypoints.utils import SetLoraReq, ShutdownReq
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import (
-    _CONTROL_REQ_TYPES,
+    _is_warmup_batch,
     _merge_fanout_results,
     _select_replica,
 )
@@ -41,11 +40,11 @@ def test_session_requests_stick_to_one_replica():
     assert _select_replica([_req()], 4, counter) == 0
 
 
-def test_control_reqs_are_recognized():
-    assert isinstance(SetLoraReq(lora_nickname="x", lora_path="y"), _CONTROL_REQ_TYPES)
-    assert isinstance(ShutdownReq(), _CONTROL_REQ_TYPES)
-    assert not isinstance([_req()], _CONTROL_REQ_TYPES)
-    assert not isinstance(_req(), _CONTROL_REQ_TYPES)
+def test_warmup_reqs_are_fanned_out_to_every_replica():
+    assert _is_warmup_batch(_req(is_warmup=True))
+    assert _is_warmup_batch([_req(is_warmup=True), _req(is_warmup=True)])
+    assert not _is_warmup_batch(_req())
+    assert not _is_warmup_batch([])
 
 
 def test_fanout_merge_surfaces_the_failing_replica():
