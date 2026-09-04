@@ -330,8 +330,7 @@ def check_server_args(server_args: Any):
 
         if check_mooncake_custom_mem_pool_enabled()[0]:
             raise ValueError(
-                "SGLANG_MOONCAKE_CUSTOM_MEM_POOL is not supported on --device xpu; "
-                "unset it."
+                "SGLANG_CUSTOM_MEM_POOL is not supported on --device xpu; unset it."
             )
 
     # Check metrics labels
