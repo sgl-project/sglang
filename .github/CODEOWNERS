@@ -96,3 +96,4 @@
 /python/sglang/kernels/jit/csrc/ngram_corpus @hnyls2002 @Qiaolin-Yu @kpham-sgl
 /python/sglang/srt/models/laguna.py @Jiminator
 /python/sglang/srt/configs/laguna.py @Jiminator
+/tools/sglang-simulator @littlefatfat @hzh0425 @zhuzi-z @LinSiyuan814

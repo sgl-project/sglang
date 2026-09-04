@@ -26,6 +26,7 @@ from sglang.kernels.ops.diffusion import (
     mount_fused_linear_gelu,
     mount_fused_ln_modulate,
     mount_hunyuan_qknorm,
+    mount_lingbot_video_gated_residual,
     mount_lingbot_video_rmsnorm,
     mount_ltx2_rms_norm_modulate,
     mount_nvfp4_bias_gelu,
@@ -36,6 +37,7 @@ from sglang.kernels.ops.diffusion import (
     unmount_fused_linear_gelu,
     unmount_fused_ln_modulate,
     unmount_hunyuan_qknorm,
+    unmount_lingbot_video_gated_residual,
     unmount_lingbot_video_rmsnorm,
     unmount_ltx2_rms_norm_modulate,
     unmount_nvfp4_bias_gelu,
@@ -216,6 +218,11 @@ _QUALITY_FUSION_HANDLERS: tuple[
         unmount_lingbot_video_rmsnorm,
     ),
     (
+        "LingBot Video per-token gated residual",
+        mount_lingbot_video_gated_residual,
+        unmount_lingbot_video_gated_residual,
+    ),
+    (
         "SANA-Video BF16-input linear attention",
         mount_sana_video_linear_attention,
         unmount_sana_video_linear_attention,
@@ -314,6 +321,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     @property
     def role_affinity(self):
         return RoleType.DENOISER
+
+    def default_workload_iterations(
+        self, batch: Req, num_inference_steps: int
+    ) -> int | None:
+        return num_inference_steps
 
     def __init__(
         self, transformer, scheduler, pipeline=None, transformer_2=None, vae=None
@@ -706,7 +718,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         self._quality_fusions_mounted = want
         for description in sorted(mounted_fusions):
-            logger.info("Mounted %s for quality=%s", description, quality)
+            logger.debug("Mounted %s for quality=%s", description, quality)
 
     def _cache_dit_dual_model_name(self) -> str:
         return "wan2.2"
@@ -1936,7 +1948,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # to avoid device-sync caused by timestep comparison
         timesteps_cpu = ctx.timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
-        batch.record_stage_iterations(num_timesteps)
         # Re-resolve the explicit-range gate so the per-step markers
         # below honor this request's is_warmup state. Layer hooks are
         # registered by the residency manager at the use-site.
