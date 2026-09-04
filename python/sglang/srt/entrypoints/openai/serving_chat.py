@@ -1657,12 +1657,12 @@ class OpenAIServingChat(OpenAIServingBase):
         has_tool_calls = {}
         finish_reasons = {}
         # P0.5(Moonshot 扩展):include_internal_content 时逐帧附带增量 token ids。
-        # 引擎流事件自带 output_ids(增量模式为 delta;否则为累计列表,按偏移切片)。
+        # 引擎流事件自带 output_ids(增量模式为 delta;否则按 completion_tokens 计数取尾部)。
         internal_content_on = bool(
             request.stream_options
             and getattr(request.stream_options, "include_internal_content", False)
         )
-        token_id_offsets: Dict[int, int] = {}
+        internal_prev_completion: Dict[int, int] = {}
 
         # Usage tracking
         prompt_tokens = {}
@@ -1769,17 +1769,23 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                     stream_started = True
 
-                # P0.5:取本事件的增量 token ids(增量模式事件即 delta;
-                # 累计模式按已消费偏移切片)。
+                # P0.5:取本事件的增量 token ids(增量流式模式事件即 delta)。
                 internal_token_ids = None
                 if internal_content_on:
                     all_ids = content.get("output_ids") or []
                     if self.tokenizer_manager.server_args.incremental_streaming_output:
                         internal_token_ids = list(all_ids)
                     else:
-                        prev = token_id_offsets.get(index, 0)
-                        internal_token_ids = list(all_ids[prev:])
-                        token_id_offsets[index] = len(all_ids)
+                        # 非增量模式事件携带的是累计 output_ids 的【引用】,且背压
+                        # 合并(_coalesce)会把同一引用拼接成多份重复 —— 按列表长度
+                        # 记偏移会切出垃圾。改用 meta_info.completion_tokens 计数:
+                        # 本事件新增 k 个 token,取尾部 k 个;重复拼接的尾部恒为
+                        # 真实累计序列的尾部,对两种坑都稳健。
+                        cur = content["meta_info"].get("completion_tokens", 0) or 0
+                        prev = internal_prev_completion.get(index, 0)
+                        k = cur - prev
+                        internal_token_ids = list(all_ids[-k:]) if k > 0 else []
+                        internal_prev_completion[index] = cur
 
                 # Generate streaming content (override in subclass for custom behavior)
                 async for chunk in self._generate_stream_content(
