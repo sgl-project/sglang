@@ -5,10 +5,7 @@ import torch
 from torch import nn
 
 from sglang.srt.configs import NanbeigeConfig
-from sglang.srt.distributed import (
-    get_pp_group,
-    get_tensor_model_parallel_world_size,
-)
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -29,6 +26,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers
 
 logger = logging.getLogger(__name__)
@@ -104,7 +102,7 @@ class NanbeigeAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_id = layer_id
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
 
         self.attention_dropout = config.attention_dropout
         self.hidden_size = config.hidden_size
