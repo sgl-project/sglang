@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import os
+import time
 
 import torch
 
@@ -21,6 +23,8 @@ from sglang.srt.speculative.spec_utils import (
 )
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 
+logger = logging.getLogger(__name__)
+
 
 class RACERWorker(NGRAMWorker):
     """RACER on top of SGLang's irregular-tree TARGET_VERIFY path."""
@@ -31,14 +35,104 @@ class RACERWorker(NGRAMWorker):
         self.racer_ngram = int(os.getenv("SGLANG_RACER_NGRAM", "10"))
         self.racer_max_nodes = int(os.getenv("SGLANG_RACER_MAX_NODES", "10000"))
         self.max_trie_depth = int(os.getenv("SGLANG_RACER_HISTORY_WINDOW", "4096"))
+
+        self.racer_stats_enabled = os.getenv("SGLANG_RACER_STATS", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        self.racer_stats_interval = max(
+            1, int(os.getenv("SGLANG_RACER_STATS_INTERVAL", "100"))
+        )
+
         self.ngram_corpus = RacerDraftProvider(
             draft_token_num=self.draft_token_num,
             ngram=self.racer_ngram,
             topk=self.racer_topk,
             max_nodes=self.racer_max_nodes,
+            stats_enabled=self.racer_stats_enabled,
         )
 
-    def _update_copy_logits(self, batch, logits_output) -> None:
+        self._stats_rounds = 0
+        self._stats_requests = 0
+        self._stats_borders = 0
+        self._stats_retrieval_selected = 0
+        self._stats_tokenbin_budget = 0
+        self._stats_tokenbin_paths = 0
+        self._stats_nodes_before_padding = 0
+        self._stats_padding_nodes = 0
+        self._stats_padding_rounds = 0
+        self._stats_proposal_ms = 0.0
+        self._stats_copy_logits_ms = 0.0
+        self._stats_accept_sum = torch.zeros(
+            (), dtype=torch.float32, device=self.device
+        )
+
+    def _reset_racer_stats(self) -> None:
+        self._stats_rounds = 0
+        self._stats_requests = 0
+        self._stats_borders = 0
+        self._stats_retrieval_selected = 0
+        self._stats_tokenbin_budget = 0
+        self._stats_tokenbin_paths = 0
+        self._stats_nodes_before_padding = 0
+        self._stats_padding_nodes = 0
+        self._stats_padding_rounds = 0
+        self._stats_proposal_ms = 0.0
+        self._stats_copy_logits_ms = 0.0
+        self._stats_accept_sum.zero_()
+
+    def _collect_proposal_stats(self) -> None:
+        if not self.racer_stats_enabled:
+            return
+        for stats in self.ngram_corpus.consume_last_batch_stats():
+            self._stats_requests += 1
+            self._stats_borders += int(stats["borders"])
+            self._stats_retrieval_selected += int(stats["retrieval_selected"])
+            self._stats_tokenbin_budget += int(stats["tokenbin_budget"])
+            self._stats_tokenbin_paths += int(stats["tokenbin_paths"])
+            self._stats_nodes_before_padding += int(stats["nodes_before_padding"])
+            padding_nodes = int(stats["padding_nodes"])
+            self._stats_padding_nodes += padding_nodes
+            self._stats_padding_rounds += int(padding_nodes > 0)
+            self._stats_proposal_ms += float(stats["proposal_ms"])
+
+    def _maybe_report_racer_stats(self) -> None:
+        if (
+            not self.racer_stats_enabled
+            or self._stats_rounds < self.racer_stats_interval
+        ):
+            return
+
+        requests = max(1, self._stats_requests)
+        avg_accept_len = float(self._stats_accept_sum.item()) / requests
+        logger.info(
+            "[RACER_STATS] rounds=%d reqs=%d K=%d avg_accept_len=%.3f "
+            "avg_borders=%.2f avg_retrieval_selected=%.2f "
+            "avg_tokenbin_budget=%.2f avg_tokenbin_paths=%.2f "
+            "avg_nodes_before_padding=%.2f padding_rounds=%d/%d(%.1f%%) "
+            "avg_padding_nodes=%.2f proposal_ms/req=%.3f copy_logits_ms/round=%.3f",
+            self._stats_rounds,
+            self._stats_requests,
+            self.draft_token_num,
+            avg_accept_len,
+            self._stats_borders / requests,
+            self._stats_retrieval_selected / requests,
+            self._stats_tokenbin_budget / requests,
+            self._stats_tokenbin_paths / requests,
+            self._stats_nodes_before_padding / requests,
+            self._stats_padding_rounds,
+            requests,
+            100.0 * self._stats_padding_rounds / requests,
+            self._stats_padding_nodes / requests,
+            self._stats_proposal_ms / requests,
+            self._stats_copy_logits_ms / max(1, self._stats_rounds),
+        )
+        self._reset_racer_stats()
+
+    def _update_copy_logits(self, batch, logits_output) -> float:
+        start = time.perf_counter() if self.racer_stats_enabled else 0.0
         bs = len(batch.reqs)
         k = self.draft_token_num
         logits = logits_output.next_token_logits[: bs * k]
@@ -50,6 +144,9 @@ class RACERWorker(NGRAMWorker):
             draft_tokens.detach().cpu().numpy(),
             topk_ids.detach().cpu().numpy(),
         )
+        if self.racer_stats_enabled:
+            return (time.perf_counter() - start) * 1000.0
+        return 0.0
 
     def forward_batch_generation(self, batch, on_publish=None) -> GenerationBatchResult:
         fwd_stream = torch.get_device_module(self.device).current_stream()
@@ -59,6 +156,7 @@ class RACERWorker(NGRAMWorker):
         set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
         self._prepare_for_speculative_decoding(batch)
         set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
+        self._collect_proposal_stats()
 
         verify_input: NgramVerifyInput = batch.spec_info
         accept_lens = torch.ones(bs, dtype=torch.int32, device=self.device)
@@ -69,7 +167,7 @@ class RACERWorker(NGRAMWorker):
                 batch_result.logits_output,
                 batch_result.can_run_cuda_graph,
             )
-            self._update_copy_logits(batch, logits_output)
+            self._stats_copy_logits_ms += self._update_copy_logits(batch, logits_output)
 
             verify_input = batch.spec_info
             grammar_mask = None
@@ -130,6 +228,11 @@ class RACERWorker(NGRAMWorker):
                 self.ngram_corpus.erase_match_state(list(departed_rids))
             self._prev_decode_rids = cur_rids
             batch.forward_mode = ForwardMode.DECODE
+
+            if self.racer_stats_enabled:
+                self._stats_rounds += 1
+                self._stats_accept_sum.add_(accept_lens.sum())
+                self._maybe_report_racer_stats()
         else:
             batch_result = self.target_worker.forward_batch_generation(batch)
             logits_output, predict, can_run_cuda_graph = (
