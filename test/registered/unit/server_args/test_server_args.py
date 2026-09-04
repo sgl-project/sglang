@@ -1177,7 +1177,7 @@ class TestContextParallelServerArgs(CustomTestCase):
             attention_backend="dsa",
         )
 
-        handle_legacy_cp_arguments(server_args)
+        handle_legacy_cp_runtime_compatibility(server_args)
         handle_context_parallelism(server_args)
 
         self.assertTrue(
