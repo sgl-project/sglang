@@ -209,7 +209,6 @@ def test_loaded_weight_partition_admits_only_its_declared_tasks(partition, tasks
 def test_synthetic_warmup_target_honors_warmup_flags():
     def target(num_frames=None, resolution=None):
         width, height = map(int, (resolution or "896x512").split("x"))
-        # the generic builder rewrites req.num_frames (17 here); the flag wins
         req = SimpleNamespace(num_frames=17, width=width, height=height)
         server_args = SimpleNamespace(
             warmup_num_frames=num_frames,
@@ -220,8 +219,6 @@ def test_synthetic_warmup_target_honors_warmup_flags():
     assert target() == TARGET
     assert target(num_frames=345) == {**TARGET, "duration_seconds": 345 / 24.0}
     assert target(resolution="768x1344") == {**TARGET, "aspect_ratio": "9:16"}
-    # BCG seeds --warmup-resolutions with an area-capped default (832x464);
-    # the canvas keeps the released short edge.
     assert target(resolution="832x464") == TARGET
 
 

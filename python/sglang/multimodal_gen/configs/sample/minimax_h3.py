@@ -153,8 +153,7 @@ class MiniMaxH3SamplingParams(SamplingParams):
 
     @staticmethod
     def _synthetic_warmup_target(req: Any, server_args: Any) -> dict[str, Any]:
-        """The released 5 s 768p 16:9 clip, or the served duration / aspect ratio
-        when ``--warmup-num-frames`` / ``--warmup-resolutions`` declare them."""
+        """Warmup canvas from ``--warmup-num-frames`` / ``--warmup-resolutions``."""
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
             MINIMAX_H3_RECOMMENDED_SHORT_EDGE,
             MINIMAX_H3_SUPPORTED_FPS,
@@ -168,15 +167,10 @@ class MiniMaxH3SamplingParams(SamplingParams):
             "aspect_ratio": "16:9",
             "duration_seconds": 5.0,
         }
-        # The flag, not req.num_frames: the generic builder caps that at its
-        # video frame budget and H3 pins it to 1 until admission, which also
-        # range-checks the duration.
         if server_args.warmup_num_frames is not None:
             target["duration_seconds"] = (
                 server_args.warmup_num_frames / MINIMAX_H3_SUPPORTED_FPS
             )
-        # Only the ratio: 768 is the one released short edge, and BCG seeds the
-        # flag with an area-capped default that must not shrink the canvas.
         if server_args.warmup_resolutions is not None:
             ratio = req.width / req.height
 
