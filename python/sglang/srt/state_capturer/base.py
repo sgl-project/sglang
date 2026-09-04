@@ -5,9 +5,18 @@ from typing import Optional
 import torch
 
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.pool_host.common import (
+    ALLOC_MEMORY_FUNCS,
+    HostTensorAllocator,
+    _cuda_host_unregister,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
+
+_is_cuda = is_cuda()
+_is_hip = is_hip()
 
 _GB = 1024 * 1024 * 1024
 _MB = 1024 * 1024
@@ -52,18 +61,30 @@ class BaseDeviceCache:
 
 
 class BaseHostCache:
-    def __init__(self, num_tokens: int, num_layers: int, topk_size: int, name: str):
-        self.buffer = torch.zeros(
+    def __init__(
+        self, num_tokens: int, num_layers: int, topk_size: int, name: str, device: str
+    ):
+        alloc = ALLOC_MEMORY_FUNCS[device]
+        self.buffer = alloc(
             (num_tokens, num_layers, topk_size),
             dtype=torch.int32,
             device="cpu",
             pin_memory=True,
+            allocator=HostTensorAllocator(),
         )
+        self.buffer.zero_()
         self.num_tokens = num_tokens
         self.num_layers = num_layers
         self.topk_size = topk_size
         self.name = name
         self._log_allocation()
+
+    def destroy(self):
+        if self.buffer is None:
+            return
+        if _is_cuda or _is_hip:
+            _cuda_host_unregister(self.buffer)
+        self.buffer = None
 
     def get_buffer_size_bytes(self):
         return get_tensor_size_bytes(self.buffer)
@@ -115,7 +136,9 @@ class BaseTopkCapturer:
         self.num_layers = num_layers
         self.topk_size = topk_size
 
-        self.host_cache = BaseHostCache(num_tokens, num_layers, topk_size, name=name)
+        self.host_cache = BaseHostCache(
+            num_tokens, num_layers, topk_size, name=name, device=device
+        )
         self.device_cache = BaseDeviceCache(
             max_batch_size,
             num_layers,
@@ -126,6 +149,9 @@ class BaseTopkCapturer:
 
     def capture(self, layer_id: int, topk_indices: torch.Tensor):
         self.device_cache.capture(layer_id, topk_indices)
+
+    def destroy(self):
+        self.host_cache.destroy()
 
     def _get_local_slice(
         self,

@@ -16,11 +16,9 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import ScheduleBatch
-    from sglang.srt.server_args import ServerArgs
 
 
 class ScheduleBatchDisaggregationDecodeMixin:
-
     def prepare_for_prebuilt(self: ScheduleBatch):
         """
         Prepare a prebuilt extend by populate metadata
@@ -44,24 +42,24 @@ class ScheduleBatchDisaggregationDecodeMixin:
         # Fill the tensor in one pass
         offset = 0
         for i, req in enumerate(reqs):
-            req_pool_indices.append(req.req_pool_idx)
+            req_pool_indices.append(req.kv.req_pool_idx)
             pre_len = len(req.prefix_indices)
 
-            chunk = self.req_to_token_pool.req_to_token[req.req_pool_idx][
+            chunk = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx][
                 pre_len : pre_len + req.extend_range.length
             ]
-            assert (
-                offset + req.extend_range.length <= total_size
-            ), f"Exceeds total size: offset={offset}, req.extend_range.length={req.extend_range.length}, total_size={total_size}"
+            assert offset + req.extend_range.length <= total_size, (
+                f"Exceeds total size: offset={offset}, req.extend_range.length={req.extend_range.length}, total_size={total_size}"
+            )
             out_cache_loc[offset : offset + req.extend_range.length] = chunk
             offset += req.extend_range.length
 
             seq_len = len(req.origin_input_ids) + max(0, len(req.output_ids) - 1)
             seq_lens.append(seq_len)
             if len(req.output_ids) == 0:
-                assert (
-                    seq_len - pre_len == req.extend_range.length
-                ), f"seq_len={seq_len}, pre_len={pre_len}, req.extend_range.length={req.extend_range.length}"
+                assert seq_len - pre_len == req.extend_range.length, (
+                    f"seq_len={seq_len}, pre_len={pre_len}, req.extend_range.length={req.extend_range.length}"
+                )
 
             if not req.retracted_stain:
                 # Clamp to avoid double-counting: already_computed is seeded from
@@ -113,7 +111,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
     def process_prebuilt(
         self: ScheduleBatch,
-        server_args: ServerArgs,
         future_map: FutureMap,
     ):
         """Assign the buffered last input id to schedule batch"""
@@ -146,7 +143,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
         spec_info = self.spec_algorithm.build_disagg_draft_input(
             self,
-            server_args,
             last_tokens_tensor,
             future_map,
         )

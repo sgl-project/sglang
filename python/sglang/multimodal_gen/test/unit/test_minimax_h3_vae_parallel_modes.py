@@ -62,16 +62,20 @@ def test_unvalidated_decode_modes_are_rejected(mode):
 
 
 def test_vit_attention_uses_local_usp_backend_dispatch():
-    module = (
-        "sglang.multimodal_gen.runtime.models.vaes." "minimax_h3_video_vae.attention"
-    )
+    module = "sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.attention"
     with (
         mock.patch(f"{module}.current_platform.is_cuda", return_value=True),
         mock.patch(f"{module}.USPAttention", autospec=True) as usp_attention,
     ):
         Attention(heads=2, dim_head=64)
 
-    assert usp_attention.call_args.kwargs["skip_sequence_parallel"] is True
+    kwargs = usp_attention.call_args.kwargs
+    assert kwargs["skip_sequence_parallel"] is True
+    assert kwargs["default_attention_backend"] == AttentionBackendEnum.TORCH_SDPA
+    assert kwargs["supported_attention_backends"] == {
+        AttentionBackendEnum.FA,
+        AttentionBackendEnum.TORCH_SDPA,
+    }
 
 
 def test_vit_qk_norm_supports_affine_free_rmsnorm():
@@ -92,9 +96,7 @@ def test_audio_vae_attention_defaults_to_local_sdpa_and_allows_fa():
             self.input_dtype = query.dtype
             return query
 
-    module = (
-        "sglang.multimodal_gen.runtime.models.vaes." "minimax_h3_audio_vae.audio_vae"
-    )
+    module = "sglang.multimodal_gen.runtime.models.vaes.minimax_h3_audio_vae.audio_vae"
     recording_fa = RecordingFA()
     with (
         mock.patch(f"{module}.current_platform.is_cuda", return_value=True),

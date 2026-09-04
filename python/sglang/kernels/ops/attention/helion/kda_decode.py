@@ -210,6 +210,10 @@ def _select_decode_kernel(
     return _helion_fused_recurrent_kda_packed_decode
 
 
+def _is_power_of_two(value: int) -> bool:
+    return value > 0 and value & (value - 1) == 0
+
+
 def validate_packed_decode_inputs(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
@@ -280,6 +284,11 @@ def validate_packed_decode_inputs(
     if initial_state.stride(-1) != 1:
         raise ValueError("`initial_state` must be contiguous in the last dim.")
     HV, V, K = initial_state.shape[-3:]
+    if not _is_power_of_two(K) or not _is_power_of_two(V):
+        raise ValueError(
+            "Helion KDA decode requires power-of-two key and value head "
+            f"dimensions (got K={K}, V={V})."
+        )
     if a.shape[1] != HV * K:
         raise ValueError(
             f"`a` must have shape [B, HV*K] with HV={HV}, K={K} "
