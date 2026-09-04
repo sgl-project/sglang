@@ -1,0 +1,130 @@
+---
+title: "Deployment Best Practices Knowledge Base"
+metatags:
+  description: "Searchable Ascend NPU deployment knowledge base for SGLang: model-specific best practices, quantization comparisons, hardware sizing, and troubleshooting links."
+keywords:
+  - deployment
+  - best practices
+  - knowledge base
+  - ascend npu
+  - benchmark
+  - quantization
+  - performance tuning
+---
+
+This page is the **entry point** for Ascend NPU deployment knowledge in SGLang. It indexes existing model tutorials, benchmark-backed best-practice pages, evaluation guides, and cross-cutting tuning topics so you can find the right document quickly.
+
+Use your browser's in-page search (`Ctrl+F` / `Cmd+F`) or the site search box with the keywords listed in each section.
+
+## How to Use This Knowledge Base
+
+| If you need… | Start here |
+| --- | --- |
+| First-time environment setup | [Installation](/docs/hardware-platforms/ascend-npus/getting-started/installation) → [Quick Start](/docs/hardware-platforms/ascend-npus/getting-started/quick_start) |
+| A specific model's launch commands | [Model catalog](#model-catalog) below |
+| Benchmark numbers and optimal configs | Model **Best Practices** page in the catalog |
+| Step-by-step deployment walkthrough | Model **Tutorial** page in the catalog |
+| Quantization choices | [Quantization guide](/docs/hardware-platforms/ascend-npus/optimization/quantization) + model pages |
+| Graph mode tuning | [NPU Graph Mode Usage Guide](/docs/hardware-platforms/ascend-npus/optimization/npu_graph_mode) |
+| Profiling bottlenecks | [Performance Profiling](/docs/hardware-platforms/ascend-npus/optimization/profiling) |
+| Accuracy / perf test methodology | [Accuracy Evaluation](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation), [Performance Testing](/docs/hardware-platforms/ascend-npus/evaluation/performance_testing) |
+| Errors during serving | [Troubleshooting and FAQ](/docs/hardware-platforms/ascend-npus/faq) |
+
+## Model Catalog
+
+Each row links to the **tutorial** (deployment steps) and **best practices** (benchmark tables + recommended commands).
+
+| Model | Tutorial | Best Practices | Typical tags |
+| --- | --- | --- | --- |
+| DeepSeek-R1 | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_r1) | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_r1) | MoE, MLA, PD, speculative |
+| DeepSeek-V3.2 | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_v3_2) | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_v3_2) | MoE, MLA, DeepEP |
+| GLM-5.1 | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_1) | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/glm_5_1) | MoE, large scale |
+| GLM-5.2 | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_2) | — | MoE |
+| Kimi-K2.6 | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/kimi_k2_6) | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/kimi_k2_6) | MoE, multimodal |
+| MiniMax-M2.5 | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/minimax_m2_5) | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/minimax_m2_5) | MoE |
+| MiMo-V2-Flash | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/mimo_v2_flash) | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/mimo_v2_flash) | MoE |
+| Qwen3-8B | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_8b) | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_8b) | dense, low latency |
+| Qwen3-8-Max | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_8_max) | — | dense |
+| Qwen3-32B | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_32b) | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_32b) | dense |
+| Qwen3-30B-A3B | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_30b_a3b) | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_30b_a3b) | MoE |
+| Qwen3-235B-A22B | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_235b_a22b) | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_235b_a22b) | MoE, large scale |
+| Qwen3.5-397B | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_5_397b) | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_5_397b) | MoE |
+| Qwen3.6-27B | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_6_27b) | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_27b) | dense |
+| Qwen3.6-35B-A3B | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_6_35b_a3b) | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_35b_a3b) | MoE |
+| Qwen3-Next-80B-A3B-Instruct | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_next_80b_a3b_instruct) | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_next_80b_a3b_instruct) | MoE, Next |
+| Hy3 | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/hy3) | — | multimodal |
+
+## Cross-Cutting Best Practices
+
+### Hardware and topology
+
+| Topic | Guidance | Reference |
+| --- | --- | --- |
+| Atlas 800I A2 vs A3 | A3 cards expose 2 dies per card; `--tp-size` is often 2× card count | [Glossary — Hardware](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) |
+| Network interfaces | Set `HCCL_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME` to the RDMA/RoCE-facing NIC | Model tutorials |
+| CPU governor | Set `performance` governor before large benchmarks | Best-practice launch scripts |
+
+### Quantization selection
+
+| Goal | Typical choice | Notes |
+| --- | --- | --- |
+| Lowest latency on supported models | W8A8 INT8 / model-specific Ascend quant | See per-model best-practice tables |
+| Memory reduction on MoE | W4A16 / W8A8 with Ascend kernels | Check [Quantization](/docs/hardware-platforms/ascend-npus/optimization/quantization) compatibility |
+| Accuracy-sensitive workloads | FP16/BF16 baseline first | Compare with [Accuracy Evaluation](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation) |
+
+### Deployment modes
+
+| Mode | When to use | Documentation hooks |
+| --- | --- | --- |
+| Colocated (PD Mixed) | Single cluster, simpler ops | Most Qwen3 best-practice tables |
+| PD disaggregation | Scale prefill/decode independently | DeepSeek / large MoE tutorials, [FAQ PD section](/docs/hardware-platforms/ascend-npus/faq) |
+| Speculative decoding | Lower TPOT on supported models | `--speculative-algorithm`, model-specific draft paths |
+
+### Performance switches (quick index)
+
+| Switch / env | Purpose | Deep dive |
+| --- | --- | --- |
+| `--cuda-graph-bs` | NPU Graph capture sizes | [NPU Graph Mode Guide](/docs/hardware-platforms/ascend-npus/optimization/npu_graph_mode) |
+| `--disable-radix-cache` | Prefix cache control | [Parameter Tuning](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning) |
+| `SGLANG_NPU_USE_MLAPO=1` | MLA fusion for DeepSeek-style models | Parameter Tuning |
+| `SGLANG_NPU_USE_MULTI_STREAM=1` | MoE shared/routed overlap | Parameter Tuning |
+| `--enable-dp-attention` | DP attention for throughput | Model best practices |
+| `--moe-a2a-backend deepep` | Expert parallel comms | [Expert Parallelism](/docs/advanced_features/expert_parallelism) |
+
+## Performance Data and Charts
+
+Benchmark tables with TPOT/throughput numbers live on each model **Best Practices** page (see [Model catalog](#model-catalog)). When comparing configurations:
+
+1. Match **hardware generation** (A2 vs A3), **card count**, and **dataset** (input+output lengths).
+2. Compare **quantization** and **deploy mode** columns before tuning micro-parameters.
+3. Use [Performance Testing](/docs/hardware-platforms/ascend-npus/evaluation/performance_testing) to reproduce numbers on your cluster.
+
+Example high-signal pages with multiple benchmark rows:
+
+- [Qwen3-8B Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_8b) — low-latency vs high-throughput tables
+- [DeepSeek-R1 Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_r1) — large-scale MoE configurations
+- [Qwen3-235B-A22B Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_235b_a22b) — multi-node sizing
+
+## Common Issues Index
+
+| Symptom / keyword | FAQ entry |
+| --- | --- |
+| PD disaggregation GLOO / context corruption | [FAQ §1](/docs/hardware-platforms/ascend-npus/faq#1-context-corruption-with-gloo-oppreamblelength--opnbytes-in-pd-disaggregation) |
+| Graph mode Fill / ACL 507000 | [FAQ §2](/docs/hardware-platforms/ascend-npus/faq#2-graph-mode-aclnninplacefillscalar-error) |
+| Prefill alloc / aivec errors | [FAQ §3](/docs/hardware-platforms/ascend-npus/faq#3-alloc_extend_kernel-error) |
+| Too many captured graphs | [NPU Graph Mode — Troubleshooting](/docs/hardware-platforms/ascend-npus/optimization/npu_graph_mode#troubleshooting-quick-reference) |
+
+## Maintenance
+
+This knowledge base is a **curated index** over the Ascend NPU doc tree. When adding a new model:
+
+1. Publish tutorial + best-practice pages under `model-deployment/`.
+2. Add a row to the [Model catalog](#model-catalog) table here.
+3. Link new quantization/graph/PD notes in [Cross-Cutting Best Practices](#cross-cutting-best-practices).
+
+## See Also
+
+- [Supported Models](/docs/hardware-platforms/ascend-npus/reference/support_models)
+- [Supported Features](/docs/hardware-platforms/ascend-npus/reference/support_features)
+- [Environment Variables](/docs/hardware-platforms/ascend-npus/reference/environment_variables)
+- [Parameter Tuning](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning)
