@@ -2134,6 +2134,9 @@ class ProfileReq(BaseReq, kw_only=True):
     profile_stages: Optional[List[str]] = None
     # Add iteration-level annotations (KV / request aggregates) for roofline-style analysis
     detailed_annotations: bool = False
+    # Whether to additionally capture a PyTorch Execution Trace (ET) for
+    # graph-level debuggability. Written next to the chrome trace as *.et.json.
+    record_execution_trace: bool = False
 
 
 class ProfileReqOutput(BaseReq, kw_only=True):
