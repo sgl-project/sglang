@@ -24,6 +24,7 @@ from sglang.srt.function_call.gemma4_detector import Gemma4Detector
 from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
+from sglang.srt.function_call.glm53_flash_detector import Glm53FlashDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
 from sglang.srt.function_call.hermes_detector import HermesDetector
 from sglang.srt.function_call.hunyuan_detector import HunyuanDetector
@@ -76,6 +77,7 @@ class FunctionCallParser:
         "glm": Glm4MoeDetector,
         "glm45": Glm4MoeDetector,
         "glm47": Glm47MoeDetector,
+        "glm53": Glm53FlashDetector,
         "gpt-oss": GptOssDetector,
         "k2_horizon": K2V3Detector,
         "kimi_k2": KimiK2Detector,
