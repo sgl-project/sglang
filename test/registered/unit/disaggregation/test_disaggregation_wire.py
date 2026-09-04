@@ -366,7 +366,12 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
         buffers.set_buf(self._make_req(seed))
         buffers.set_buf(self._make_req(None, metadata_buffer_index=1))
 
-        self.assertTrue(torch.equal(buffers.output_dsa_topk_indices[0], seed))
+        self.assertTrue(
+            torch.equal(
+                buffers.output_dsa_topk_indices[0],
+                seed.to(buffers.output_dsa_topk_indices.device),
+            )
+        )
         self.assertEqual(buffers.output_dsa_topk_indices[1].tolist(), [-1, -1, -1])
         ptrs, data_lens, item_lens = buffers.get_buf_infos()
         self.assertEqual(ptrs[-2], buffers.output_dsa_topk_indices.data_ptr())

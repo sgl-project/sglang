@@ -81,10 +81,8 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
         receiver = _make_receiver(ps)
         control_req = SimpleNamespace(kind="control")
         parallel = SimpleNamespace(
-            config=SimpleNamespace(
-                enable_dp_attention=True,
-                enable_dp_attention_local_control_broadcast=True,
-            )
+            enable_dp_attention=True,
+            enable_dp_attention_local_control_broadcast=True,
         )
 
         with (
@@ -114,10 +112,8 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
         receiver = _make_receiver(ps)
         control_req = SimpleNamespace(kind="control")
         parallel = SimpleNamespace(
-            config=SimpleNamespace(
-                enable_dp_attention=True,
-                enable_dp_attention_local_control_broadcast=False,
-            )
+            enable_dp_attention=True,
+            enable_dp_attention_local_control_broadcast=False,
         )
 
         with (

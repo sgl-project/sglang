@@ -481,13 +481,11 @@ class TestW4A8MxfpGmmInputScale(unittest.TestCase):
 
 
 class TestW4A8MxfpGmmChain(unittest.TestCase):
-    def test_applies_swiglu_limit_before_swiglu(self):
-        # The clamp must be wired in *before* npu_swiglu using the layer's
-        # configured swiglu_limit; dropping the clamp (or applying it after)
-        # silently changes routed-expert output on near-limit activations.
-        gate_up = torch.tensor([[8.0, -9.0, 9.0, -9.0]])
-        activated = torch.randn(1, 2)
-        expected = torch.randn(1, 2)
+    def test_passes_swiglu_limit_to_quant(self):
+        gate_up = torch.randn(1, 64)
+        activated = torch.randn(1, 32)
+        activated_scale = torch.randn(1, 1)
+        expected = torch.randn(1, 32)
         layer = SimpleNamespace(
             w13_weight=MagicMock(),
             w13_weight_scale_inv=MagicMock(),
@@ -501,7 +499,9 @@ class TestW4A8MxfpGmmChain(unittest.TestCase):
                 fp4_moe_methods, "w4a8_mxfp_gmm", side_effect=[gate_up, expected]
             ) as gmm,
             patch.object(
-                torch.ops.npu, "npu_swiglu", return_value=activated, create=True
+                fp4_moe_methods,
+                "swiglu_quant",
+                return_value=(activated, activated_scale),
             ) as swiglu,
         ):
             output = npu_apply_without_routing_weights_w4a4_mxfp(
@@ -514,12 +514,11 @@ class TestW4A8MxfpGmmChain(unittest.TestCase):
             )
 
         self.assertIs(output, expected)
-        self.assertTrue(
-            torch.equal(
-                swiglu.call_args.args[0], torch.tensor([[7.0, -9.0, 7.0, -7.0]])
-            )
-        )
+        self.assertTrue(torch.equal(swiglu.call_args.args[0], gate_up))
+        self.assertTrue(swiglu.call_args.kwargs["do_limit"])
+        self.assertEqual(swiglu.call_args.kwargs["limit"], 7.0)
         self.assertIs(gmm.call_args_list[1].kwargs["input"], activated)
+        self.assertIs(gmm.call_args_list[1].kwargs["input_scale"], activated_scale)
 
 
 class TestProcessWeightsAfterLoadingZeroScale(unittest.TestCase):

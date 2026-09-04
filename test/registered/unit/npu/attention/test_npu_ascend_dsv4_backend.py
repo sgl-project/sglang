@@ -732,7 +732,13 @@ class TestSparseAttentionMetadata(unittest.TestCase):
         cu_seqlens_q_cpu = cu_seqlens_q.clone()
         seqused_kv_cpu = seqused_kv.clone()
 
-        with patch("torch.ops.npu", MagicMock(), create=True) as npu_ops:
+        with (
+            patch("torch.ops.npu", MagicMock(), create=True) as npu_ops,
+            patch(
+                "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._sparse_attn_ops",
+                return_value=(MagicMock(), MagicMock()),
+            ),
+        ):
             backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
             backend.forward_metadata = SimpleNamespace(
                 actual_seq_lengths_q_pa_cpu=cu_seqlens_q_cpu,
@@ -759,7 +765,10 @@ class TestSparseAttentionMetadata(unittest.TestCase):
         metadata_op.assert_called_once()
         self.assertIs(kernel_metadata["c1a_metadata"], metadata_op.return_value)
         self.assertIs(metadata_op.call_args.kwargs["cu_seqlens_q"], cu_seqlens_q_cpu)
-        self.assertIs(metadata_op.call_args.kwargs["seqused_kv"], seqused_kv_cpu)
+        actual_seqused_kv = metadata_op.call_args.kwargs["seqused_kv"]
+        torch.testing.assert_close(actual_seqused_kv, seqused_kv_cpu[:2])
+        self.assertEqual(actual_seqused_kv.dtype, torch.int32)
+        self.assertEqual(actual_seqused_kv.device.type, "cpu")
 
 
 class TestGetKvIndices(unittest.TestCase):
