@@ -189,7 +189,7 @@ python -m sglang_router.launch_server \
   --model meta-llama/Llama-3.1-8B-Instruct \
   --tp-size 1 \
   --dp-size 8 \
-  --grpc-mode \
+  --smg-grpc-mode \
   --log-level debug \
   --router-prometheus-port 10001 \
   --router-tool-call-parser llama \
@@ -222,7 +222,7 @@ Use SRT gRPC workers to unlock the highest throughput and access native reasonin
 # Workers expose gRPC endpoints
 python -m sglang.launch_server \
   --model meta-llama/Llama-3.1-8B-Instruct \
-  --grpc-mode \
+  --smg-grpc-mode \
   --port 20000
 
 # Router
@@ -2268,7 +2268,7 @@ gRPC mode provides the highest performance for SGLang workers:
 # Start workers in gRPC mode
 python -m sglang.launch_server \
   --model meta-llama/Llama-3.1-8B-Instruct \
-  --grpc-mode \
+  --smg-grpc-mode \
   --port 20000
 
 # Configure gateway for gRPC
@@ -2806,7 +2806,7 @@ python -m sglang_router.launch_router \
 
 ### gRPC Connection Issues
 
-Ensure workers are started with `--grpc-mode` and verify `--model-path` or `--tokenizer-path` is provided to the router.
+Ensure workers are started with `--smg-grpc-mode` and verify `--model-path` or `--tokenizer-path` is provided to the router.
 
 ### Tokenizer Loading Failures
 
