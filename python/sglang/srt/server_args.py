@@ -129,6 +129,7 @@ from sglang.srt.arg_groups.choices import (  # noqa: F401
     add_radix_supported_deterministic_attention_backend_choices,
     add_rl_on_policy_target_choices,
 )
+from sglang.srt.arg_groups.fields import collect_input_fields
 from sglang.srt.arg_groups.fields.device import (
     Device,
 )
@@ -188,30 +189,7 @@ from sglang.srt.utils.common import (  # noqa: F401
 )
 
 
-@dataclasses.dataclass
-class ServerArgs(
-    Serving,
-    Mm,
-    ExecFeatures,
-    Schedule,
-    Memory,
-    Parallel,
-    Device,
-    Observability,
-    ExecKernel,
-    ExecMamba,
-    ExecGraph,
-    ExecComm,
-    ExecMoe,
-    Spec,
-    Disagg,
-    Lora,
-    ExecOverlap,
-    ExecOffload,
-    ExecDllm,
-    ExecDeterministic,
-    Model,
-):
+class ServerArgs:
     """Server-wide configuration for SGLang.
 
     Adding new arguments
@@ -720,6 +698,55 @@ class ServerArgs(
         """``load_format`` overrides the seed's: a draft runner loading under
         ``--speculative-draft-load-format`` needs its own transfer engine."""
         return remote_instance_transfer_engine_of(resolving_view(self), load_format)
+
+
+# ---------------------------------------------------------------------------
+# The record is assembled, not inherited.
+#
+# Its fields are exactly the operator's input, and the classes below are the
+# statement of that: a namespace declares its input fields and its derived ones
+# side by side, and only the input half is collected here. Inheriting the
+# namespace classes would have made the record's contents a property of which
+# classes happen to appear in a base list -- correct today, and silently wrong
+# the first time a derived field is declared in an inherited class.
+#
+# The order is the order the fields were declared in before the split, so the
+# CLI registers its options in the same sequence and `model_path` stays the
+# first positional argument.
+# ---------------------------------------------------------------------------
+
+_INPUT_NAMESPACES = [
+    Model,
+    ExecDeterministic,
+    ExecDllm,
+    ExecOffload,
+    ExecOverlap,
+    Lora,
+    Disagg,
+    Spec,
+    ExecMoe,
+    ExecComm,
+    ExecGraph,
+    ExecMamba,
+    ExecKernel,
+    Observability,
+    Device,
+    Parallel,
+    Memory,
+    Schedule,
+    ExecFeatures,
+    Mm,
+    Serving,
+]
+
+_annotations, _defaults, _namespaces = collect_input_fields(_INPUT_NAMESPACES)
+ServerArgs.__annotations__ = {**_annotations, **ServerArgs.__annotations__}
+# The assembled record has no base classes, so it carries the map the classes
+# used to answer through their `_NS_PATH`.
+ServerArgs._NS_BY_FIELD = _namespaces
+for _name, _value in _defaults.items():
+    setattr(ServerArgs, _name, _value)
+ServerArgs = dataclasses.dataclass(ServerArgs)
 
 
 # --------------------------------------------------------------------------
