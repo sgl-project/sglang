@@ -123,7 +123,7 @@ def test_mori_sender_tracks_worker_ownership_until_completion():
 
 def test_mori_abort_after_submission_still_waits_for_completion():
     manager = MoriKVManager.__new__(MoriKVManager)
-    manager._should_skip_transfer = Mock(side_effect=[False, False, True])
+    manager._should_skip_transfer = Mock(side_effect=[False, True])
     manager._submit_kv_transfer = Mock(return_value=(["status"], ["target"]))
     manager._wait_transfer_completion = Mock(return_value=None)
     chunk = SimpleNamespace(
