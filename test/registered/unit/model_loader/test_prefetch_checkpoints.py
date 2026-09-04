@@ -379,13 +379,12 @@ class TestPrefetchDispatch(CustomTestCase):
         return DefaultModelLoader(load_config)
 
     def _make_source(self):
-        # model_config=None skips maybe_add_mtp_safetensors.
-        return SimpleNamespace(
+        # model_config=None skips maybe_add_mtp_safetensors. A real Source
+        # (not a stand-in) so new fields with defaults are picked up.
+        return DefaultModelLoader.Source(
             model_or_path="/dummy",
             revision=None,
             fall_back_to_pt=False,
-            model_config=None,
-            prefix="",
         )
 
     def _server_args(self, prefetch, disable_mmap=False, drop_cache=False):
