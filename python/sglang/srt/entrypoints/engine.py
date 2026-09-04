@@ -796,7 +796,19 @@ class Engine(EngineScoreMixin, EngineBase):
                         f"tp_rank={tp_rank} is ready"
                     )
         except BaseException:
-            cls._terminate_weight_cache_daemons(daemon_procs)
+            for pp_rank in pp_rank_range:
+                for tp_rank in tp_rank_range:
+                    gpu_id = compute_local_gpu_id(
+                        pp_rank,
+                        tp_rank,
+                        pp_size_per_node,
+                        tp_size_per_node,
+                        base_gpu_id=server_args.base_gpu_id,
+                        gpu_id_step=server_args.gpu_id_step,
+                    )
+                    cls._terminate_weight_cache_daemon(
+                        daemon_procs[pp_rank * tp_rank_range + tp_rank], gpu_id
+                    )
             raise
 
         logger.info(
@@ -806,8 +818,8 @@ class Engine(EngineScoreMixin, EngineBase):
         return daemon_procs
 
     @staticmethod
-    def _terminate_weight_cache_daemons(procs, timeout: float = 10.0):
-        """Gracefully stop engine-spawned weight cache daemons.
+    def _terminate_weight_cache_daemon(p, gpu_id, timeout: float = 10.0):
+        """Gracefully stop engine-spawned weight cache daemon.
 
         Send SIGTERM first so each daemon's signal handler can unlink its
         ``.sock``/``.ready`` files, then SIGKILL any straggler. This matters
@@ -817,20 +829,17 @@ class Engine(EngineScoreMixin, EngineBase):
         confusing "socket exists but connection refused" instead of a clean
         "no daemon" path.
         """
-        if not procs:
-            return
-        for p in procs:
-            if p.is_alive():
-                p.terminate()  # SIGTERM -> daemon cleanup handler runs
-        for p in procs:
-            p.join(timeout=timeout)
-            if p.is_alive():
-                logger.warning(
-                    f"Weight cache daemon (pid={p.pid}) did not exit within "
-                    f"{timeout}s of SIGTERM; sending SIGKILL."
-                )
-                p.kill()
-                p.join()
+        if p.is_alive():
+            p.terminate()  # SIGTERM -> daemon cleanup handler runs
+        p.join(timeout=timeout)
+        if p.is_alive():
+            logger.warning(
+                f"Weight cache daemon (pid={p.pid}) did not exit within "
+                f"{timeout}s of SIGTERM; sending SIGKILL."
+            )
+            p.kill()
+            p.join()
+        cleanup_stale_daemon_files(current_platform.get_device_uuid(gpu_id))
 
     @classmethod
     def _launch_scheduler_processes(
