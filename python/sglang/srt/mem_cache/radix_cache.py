@@ -608,7 +608,7 @@ class RadixCache(BasePrefixCache):
         print(f"#tokens: {self.total_size()}")
 
     def total_size(self):
-        return self._total_size_helper()
+        return self.evictable_size_ + self.protected_size_
 
     def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
@@ -853,17 +853,6 @@ class RadixCache(BasePrefixCache):
         if node not in self.evictable_leaves:
             self.evictable_leaves.add(node)
 
-    def _total_size_helper(self):
-        total_size = 0
-        stack = [self.root_node]
-        while stack:
-            current_node = stack.pop()
-            total_size += len(current_node.value)
-            for child in current_node.children.values():
-                if child.evicted:
-                    continue
-                stack.append(child)
-        return total_size
 
 
 if __name__ == "__main__":
