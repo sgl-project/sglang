@@ -126,6 +126,7 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     tm.server_args.weight_version = "1"
     tm.server_args.crash_dump_folder = ""
     tm.server_args.dp_size = 1
+    tm.tokenizer_ipc_name = None
     tm.disaggregation_mode = "none"
     tm.rid_to_state = {}
     tm.enable_metrics = False
@@ -455,7 +456,7 @@ def _make_generate_obj(rid, is_single):
 
 
 class TestDiscardPendingReqStates(CustomTestCase):
-    """Direct tests for _discard_pending_req_states."""
+    """Direct tests for _abort_and_discard_pending_req_states."""
 
     def test_discard_single(self):
         tm = _make_tokenizer_manager(self)
@@ -464,7 +465,7 @@ class TestDiscardPendingReqStates(CustomTestCase):
         obj = Mock(spec=GenerateReqInput)
         obj.is_single = True
         obj.rid = rid
-        tm._discard_pending_req_states(obj)
+        tm._abort_and_discard_pending_req_states(obj)
         self.assertNotIn(rid, tm.rid_to_state)
 
     def test_discard_batch_removes_all(self):
@@ -475,7 +476,7 @@ class TestDiscardPendingReqStates(CustomTestCase):
         obj = Mock(spec=GenerateReqInput)
         obj.is_single = False
         obj.rid = list(rids)
-        tm._discard_pending_req_states(obj)
+        tm._abort_and_discard_pending_req_states(obj)
         for r in rids:
             self.assertNotIn(r, tm.rid_to_state)
 
@@ -486,7 +487,7 @@ class TestDiscardPendingReqStates(CustomTestCase):
         obj = Mock(spec=GenerateReqInput)
         obj.is_single = False
         obj.rid = ["p1", "already_gone"]
-        tm._discard_pending_req_states(obj)  # must not raise
+        tm._abort_and_discard_pending_req_states(obj)  # must not raise
         self.assertNotIn("p1", tm.rid_to_state)
 
 
