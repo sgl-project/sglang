@@ -24,7 +24,12 @@ from smg_grpc_proto import sglang_encoder_pb2, sglang_encoder_pb2_grpc
 from sglang.srt.disaggregation.encoder.server import MMEncoder, launch_encoder
 from sglang.srt.managers.io_struct import async_sock_send, wrap_as_pickle
 from sglang.srt.managers.schedule_batch import Modality
-from sglang.srt.runtime_context import get_disagg
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_parallel,
+    get_serving,
+    publish,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import random_uuid
 from sglang.srt.utils.network import NetworkAddress, get_zmq_socket
@@ -201,6 +206,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
 
 
 async def serve_grpc_encoder(server_args: ServerArgs):
+    publish(server_args, role="encoder")
     ctx = mp.get_context("spawn")
     zmq_ctx = zmq.asyncio.Context(10)
     ipc_path_prefix = random_uuid()
@@ -211,11 +217,11 @@ async def serve_grpc_encoder(server_args: ServerArgs):
         dist_init_method = na.to_tcp()
     else:
         dist_init_method = NetworkAddress(
-            server_args.host or "127.0.0.1", port_args.nccl_port
+            get_serving().host or "127.0.0.1", port_args.nccl_port
         ).to_tcp()
 
     send_sockets: List[zmq.Socket] = []
-    for rank in range(1, server_args.tp_size):
+    for rank in range(1, get_parallel().tp_size):
         schedule_path = f"ipc:///tmp/{ipc_path_prefix}_schedule_{rank}"
         send_sockets.append(
             get_zmq_socket(zmq_ctx, zmq.PUSH, schedule_path, bind=False)
@@ -253,7 +259,9 @@ async def serve_grpc_encoder(server_args: ServerArgs):
     )
     reflection.enable_server_reflection(SERVICE_NAMES, server)
 
-    listen_addr = NetworkAddress(server_args.host, server_args.port).to_host_port_str()
+    listen_addr = NetworkAddress(
+        get_serving().host, get_serving().port
+    ).to_host_port_str()
     server.add_insecure_port(listen_addr)
 
     await server.start()
