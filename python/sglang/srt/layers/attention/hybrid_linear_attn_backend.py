@@ -70,10 +70,9 @@ class MambaAttnBackendBase(AttentionBackend):
         # backends on runners without a real model_config.
         self._model_runner = model_runner
         self._mamba_chunk_size: Optional[int] = None
-        # Fused replay-prep state-indices fast path (fused_replay_state_indices):
-        # requires the static hybrid pool whose v2p translate is the identity —
-        # the unified pool overrides translate_mamba_indices with an allocator
-        # lookup that is not a flat table gather.
+        # Fused replay-prep state-indices fast path: the pool decides, since
+        # only it knows whether `fused_replay_state_indices` can reproduce its
+        # own mamba translate.
         pool = self.req_to_token_pool
         self._fused_state_indices_ok = (
             torch.device(self.device).type == "cuda"
@@ -1011,13 +1010,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         ) or getattr(linear_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False)
 
     def capture_write_loc_dest(self, forward_batch: ForwardBatch):
-        """Forward to the full-attention backend, which owns the KV write.
-
-        The runner hands the write-loc translate THIS object, so inheriting the
-        base class's None means the inner backend's capture-stable buffer never
-        gets filled -- its captured store then bakes a per-step tensor's address
-        and reads freed memory on replay.
-        """
+        """Forward to the full-attention backend, which owns the KV write."""
         return self.full_attn_backend.capture_write_loc_dest(forward_batch)
 
     @property

@@ -87,13 +87,7 @@ class HybridAttnBackend(AttentionBackend):
             return self.prefill_backend
 
     def capture_write_loc_dest(self, forward_batch: ForwardBatch):
-        """Forward to whichever half owns the KV write for this mode.
-
-        The write-loc translate is handed this wrapper, so leaving the base
-        class's None here means the inner backend's capture-stable buffer is
-        never filled and its captured store reads a per-step tensor's freed
-        address on replay.
-        """
+        """Forward to whichever half owns the KV write for this mode."""
         return self._select_backend(forward_batch.forward_mode).capture_write_loc_dest(
             forward_batch
         )

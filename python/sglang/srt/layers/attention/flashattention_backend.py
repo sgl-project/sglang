@@ -1112,9 +1112,9 @@ class FlashAttentionBackend(AttentionBackend):
             if self.use_sliding_window_kv_pool:
                 metadata.swa_page_table = kv_view.sliding_window_ids
                 if forward_batch.out_cache_loc is not None:
-                    # The swa write loc was computed from the still-VIRTUAL
-                    # loc at ForwardBatch construction; re-running the
-                    # full->swa map on the kernel-facing loc would be garbage.
+                    # Phase 2 maps FULL kernel-facing ids to SWA ones through
+                    # p2v, so it must run after the write-loc rebind, never on
+                    # a still-virtual loc.
                     metadata.swa_out_cache_loc = (
                         self.kv_index_translator.sliding_window_write_loc_for(
                             forward_batch.out_cache_loc

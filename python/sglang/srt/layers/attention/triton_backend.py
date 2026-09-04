@@ -334,6 +334,9 @@ class TritonAttnBackend(AttentionBackend):
         else:
             self.kv_indptr = kv_indptr_buf
 
+        # Created in `init_cuda_graph_state`, and only for a translating pool;
+        # `capture_write_loc_dest` reads it before that on an eager-only run.
+        self.cuda_graph_out_cache_loc_full_physical: Optional[torch.Tensor] = None
         # Sliding window may need a second buffer for interleaved attention types
         self.window_kv_indptr = None
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
@@ -731,17 +734,22 @@ class TritonAttnBackend(AttentionBackend):
         them to slot 0, the reserved sink in every id space.
         """
         buf = self.cuda_graph_out_cache_loc_full_physical
-        return None if buf is None else (buf, buf.numel())
+        if buf is None:
+            return None
+        # Sized by the DECODE runner's `init_cuda_graph_state`, so only the
+        # decode-shaped graphs may claim it; a prefill capture asking for it
+        # would alias two graphs onto one buffer.
+        mode = forward_batch.forward_mode
+        if not (mode.is_decode_or_idle() or mode.is_target_verify()):
+            return None
+        return buf, buf.numel()
 
     def _fill_cuda_graph_write_locs(
         self, forward_batch: ForwardBatch, bs: int
     ) -> Optional[torch.Tensor]:
-        """The capture-stable WRITE loc, or None for a non-unified pool.
-
-        `rebind_write_loc` already translated into the buffer this backend
-        named, so out_cache_loc IS its live view; nothing to copy. Reading it
-        here (rather than at capture time) keeps the post-compaction v2p.
-        """
+        """The capture-stable WRITE loc, or None for a non-unified pool:
+        `out_cache_loc` is already the live view of the buffer this backend
+        named, so there is nothing to copy."""
         if not self.kv_index_translator.is_translating:
             return None
         return forward_batch.out_cache_loc

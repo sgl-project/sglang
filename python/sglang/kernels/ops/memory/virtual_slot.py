@@ -231,9 +231,9 @@ def write_loc_to_kernel_id_kernel(
     mask = offs < N
     loc = tl.load(loc_ptr + offs, mask=mask, other=0).to(tl.int64)
 
-    # Slot 0 is the reserved padding sink, and a padded write loc means it, so
-    # 0 maps to kernel id 0 rather than through v2p. This pool grows DOWN, so
-    # `v2p[0]` can name a top page whose id runs past the buffer's rows.
+    # Slot 0 is the reserved padding sink and a padded write loc means it, so 0
+    # short-circuits to kernel id 0. The gather would agree (the allocator pins
+    # `v2p[0] = 0`); this keeps the sink true if that pinning is ever relaxed.
     keep = mask & (loc > 0)
     if DCP_SIZE > 1:
         keep = keep & ((loc % DCP_SIZE) == DCP_RANK)

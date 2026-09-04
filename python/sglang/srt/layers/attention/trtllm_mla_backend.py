@@ -789,14 +789,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self._decode_kernel_loc = None
 
     def _kv_write_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
-        """The loc an unfused KV scatter writes at.
-
-        One tensor for every path now: `rebind_write_loc` translated into the
-        buffer this backend named via `capture_write_loc_dest`, so under a
-        captured decode `out_cache_loc` IS that buffer's live view, and
-        elsewhere it is the per-forward tensor. Kept as a named hook because
-        the subclasses call it.
-        """
+        """The loc an unfused KV scatter writes at, one tensor for every
+        path: under a captured decode `out_cache_loc` is the live view of the
+        buffer this backend named, and elsewhere a per-forward tensor."""
         return forward_batch.out_cache_loc
 
     def _resolve_fused_write_loc(

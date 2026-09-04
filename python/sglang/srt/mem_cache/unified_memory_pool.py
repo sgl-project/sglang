@@ -1113,6 +1113,8 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         plain gather this table serves directly -- which is what makes
         `mamba_translate_is_fusable` true despite the override below.
         """
+        if self.mamba_allocator is None:
+            return None
         return self.mamba_allocator.virtual_to_physical
 
     def translate_mamba_indices(self, virtual_ids: torch.Tensor) -> torch.Tensor:

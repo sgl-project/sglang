@@ -1628,13 +1628,13 @@ class KVWriteLoc:
     All location info lives here (in the attention metadata), NOT in the pool:
     - ``loc``: the generic per-token write location (``out_cache_loc``).
       KERNEL-FACING on every pool: physical by allocation on non-unified
-      pools, rebound at ForwardBatch construction (``rebind_write_loc``) on
-      the unified pool.
+      pools, rebound at attention-metadata init (``rebind_write_loc``) on the
+      unified pool.
     - ``swa_loc``: the SWA-sub-pool location for hybrid SWA pools (``None``
       otherwise); under the unified pool the translator derives it from the
       same rebound loc (``sliding_window_write_loc_for``).
-    - ``full_loc``: OPTIONAL full-attention-sub-pool location. Since the
-      construction-time rebind it is the SAME id space as ``loc``, so pools
+    - ``full_loc``: OPTIONAL full-attention-sub-pool location. It is the SAME
+      id space as ``loc`` once the rebind has run, so pools
       fall back to ``loc`` when it is ``None`` -- only triton's captured path
       still passes its capture-stable
       ``ForwardMetadata.out_cache_loc_full_physical`` buffer here (a
