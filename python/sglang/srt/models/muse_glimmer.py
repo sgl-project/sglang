@@ -57,7 +57,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.models.utils import apply_qk_norm, permute_inv
+from sglang.srt.models.utils import WeightsMapper, apply_qk_norm, permute_inv
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, is_cuda
 
@@ -930,6 +930,31 @@ class MuseGlimmerForConditionalGeneration(MuseGlimmerForCausalLM):
 
     checkpoint_uses_vendor_names = True
     builds_vision_tower = True
+
+    # The vendor export names its decoder ``model.language_model.*`` while this
+    # implementation builds ``model.*``. ``load_weights`` already bridges that for the
+    # tensors (see ``_vendor_weight_name``), but a ModelOpt MIXED_PRECISION checkpoint
+    # carries a second name-keyed structure that nothing translated: the
+    # ``quantized_layers`` map in ``hf_quant_config.json``, which assigns FP8 or
+    # W4A16_NVFP4 per individual layer.
+    #
+    # ``ModelOptMixedPrecisionConfig._quantized_layer_prefix_candidates`` only bridges
+    # ``language_model.model.`` <-> ``model.language_model.``; neither matches this
+    # model's plain ``model.``. Every lookup then returns None, the linears are built
+    # unquantized, and the NVFP4-packed weights no longer fit:
+    #
+    #   AssertionError: param_data.shape=[4096, 6656] != loaded_weight.shape=[4096, 3328]
+    #
+    # Derived from ``_VENDOR_RENAMES`` rather than repeated, so the two cannot drift.
+    # ``self_attn.gate_proj -> self_attn.output_gate_proj`` is required: without it that
+    # one projection stays unquantized and fails with the same assertion.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.language_model.": "model.",
+            "model.vision_": "vision_",
+        },
+        orig_to_new_substr=dict(_VENDOR_RENAMES),
+    )
 
     def __init__(
         self,
