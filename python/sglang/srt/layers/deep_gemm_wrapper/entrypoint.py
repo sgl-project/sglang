@@ -12,13 +12,34 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
 )
-from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
-    from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor  # noqa: F401
+    from deep_gemm.utils.layout import (
+        get_mn_major_tma_aligned_tensor as _get_mn_major_tma_aligned_tensor,
+    )
+
+    def get_mn_major_tma_aligned_tensor(sf: torch.Tensor) -> torch.Tensor:
+        """Transform ``sf`` into an MN-major, TMA-aligned layout for DeepGEMM.
+
+        When ``sf`` is already in that layout, sgl-deep-gemm's fast path
+        (<= 0.1.4.post1) returns a NON-OWNING ``torch::from_blob`` alias of
+        ``sf`` across the TVM-FFI boundary. Callers rebind the result over
+        their only reference (``x = get_mn_major_tma_aligned_tensor(x)``),
+        which frees the storage while the GEMM still reads through the alias
+        -- a use-after-free that surfaces as NaN logits or "pointer resides
+        on host memory" during CUDA graph capture once the allocator reuses
+        the block. Hand back ``sf`` itself in that case so ownership is
+        preserved.
+        """
+        out = _get_mn_major_tma_aligned_tensor(sf)
+        if out.data_ptr() == sf.data_ptr():
+            assert out.shape == sf.shape and out.stride() == sf.stride()
+            return sf
+        return out
+
 
 _SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
 
@@ -51,7 +72,6 @@ def grouped_gemm_nt_f8f8bf16_masked(
         with configure_deep_gemm_num_sms(
             overlap_args.num_sms if overlap_args is not None else None
         ):
-
             fp4_kwargs = {}
             if recipe_a is not None:
                 fp4_kwargs["recipe_a"] = recipe_a
@@ -223,13 +243,13 @@ def tf32_hc_prenorm_gemm(
     deep_gemm.tf32_hc_prenorm_gemm(x, fn, out, sqrsum, num_splits=num_splits)
 
 
-def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
+def update_deep_gemm_config(gpu_id: int):
     # deep_gemm.set_pdl can initialize CUDA state, so run it only after the
     # scheduler/TP worker has been forked and assigned a GPU.
     if envs.SGLANG_DEEPGEMM_PDL.get() and hasattr(deep_gemm, "set_pdl"):
         deep_gemm.set_pdl(True)
 
-    compile_utils.update_deep_gemm_config(gpu_id, server_args)
+    compile_utils.update_deep_gemm_config(gpu_id)
 
 
 @contextmanager

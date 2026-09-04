@@ -224,6 +224,10 @@ class VocabParallelEmbedding(torch.nn.Module):
         prefix: full name of the layer in the state dict
     """  # noqa: E501
 
+    # Attached by quant methods for a quantized ParallelLMHead; see
+    # LinearBase.scheme.
+    scheme = None
+
     def __init__(
         self,
         num_embeddings: int,
@@ -269,9 +273,9 @@ class VocabParallelEmbedding(torch.nn.Module):
         num_added_embeddings = num_embeddings - self.org_vocab_size
         self.use_presharded_weights = use_presharded_weights
         if use_presharded_weights:
-            assert (
-                num_added_embeddings == 0
-            ), "Lora is not supported with presharded weights."
+            assert num_added_embeddings == 0, (
+                "Lora is not supported with presharded weights."
+            )
 
         self.org_vocab_size_padded = pad_vocab_size(
             self.org_vocab_size, self.padding_size
@@ -493,7 +497,9 @@ class VocabParallelEmbedding(torch.nn.Module):
             assert loaded_weight.shape[output_dim] == (
                 self.org_vocab_size
                 // (self.tp_size if self.use_presharded_weights else 1)
-            ), f"{self.org_vocab_size=} {self.use_presharded_weights=} {loaded_weight.shape[output_dim]=}"
+            ), (
+                f"{self.org_vocab_size=} {self.use_presharded_weights=} {loaded_weight.shape[output_dim]=}"
+            )
 
         # Copy the data.
         if not self.use_presharded_weights:
@@ -503,6 +509,8 @@ class VocabParallelEmbedding(torch.nn.Module):
 
     def _use_triton_embedding(self, input_: torch.Tensor) -> bool:
         """Whether the fused Triton kernel can replace the mask+gather+fill unit."""
+        if _is_npu:
+            return False
         if self.tp_size == 1:
             return False
         if not isinstance(self.quant_method, UnquantizedEmbeddingMethod):

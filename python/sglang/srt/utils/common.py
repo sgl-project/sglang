@@ -25,6 +25,7 @@ import gc
 import importlib
 import inspect
 import io
+import ipaddress
 import itertools
 import json
 import logging
@@ -37,6 +38,7 @@ import re
 import resource
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -64,6 +66,7 @@ from typing import (
     Callable,
     Dict,
     Generic,
+    Iterator,
     List,
     NamedTuple,
     Optional,
@@ -75,7 +78,7 @@ from typing import (
 )
 from unittest import SkipTest
 from unittest.case import _ShouldStop
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import numpy as np
 import orjson
@@ -86,7 +89,7 @@ import torch
 import torch.distributed as dist
 import triton
 from packaging import version as pkg_version
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
@@ -97,11 +100,17 @@ from typing_extensions import Literal
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_flags,
+    get_model,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 if TYPE_CHECKING:
-    from sglang.srt.server_args import ServerArgs
+    pass
 
 logger = logging.getLogger(__name__)
 torch_release = pkg_version.parse(torch.__version__).release
@@ -288,6 +297,15 @@ is_sm100_supported = lru_cache(maxsize=1)(
         _check_cuda_device_version, device_capability_majors=[10], cuda_version=(12, 8)
     )
 )
+# Datacenter Blackwell (SM100) plus SM110; excludes consumer Blackwell (SM120).
+# This is the arch set flash_attn.cute accepts for the absorbed-MLA qv argument.
+is_sm100_or_sm110_supported = lru_cache(maxsize=1)(
+    partial(
+        _check_cuda_device_version,
+        device_capability_majors=[10, 11],
+        cuda_version=(12, 8),
+    )
+)
 is_sm80_supported = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version, device_capability_majors=[8], cuda_version=(11, 0)
@@ -300,14 +318,22 @@ is_sm90_supported = lru_cache(maxsize=1)(
 )
 
 
-try:
-    import sgl_kernel  # noqa: F401
+# GB10 (DGX Spark and OEM equivalents). Not expressible via
+# _check_cuda_device_version, which only matches on the major.
+@lru_cache(maxsize=1)
+def is_sm121() -> bool:
+    return is_cuda() and torch.cuda.get_device_capability() == (12, 1)
 
-    is_intel_amx_backend_available = hasattr(
-        torch.ops.sgl_kernel, "convert_weight_packed"
-    )
-except:
-    is_intel_amx_backend_available = False
+
+@lru_cache(maxsize=1)
+def _is_intel_amx_backend_available():
+    try:
+        import sgl_kernel  # noqa: F401
+
+        return hasattr(torch.ops.sgl_kernel, "convert_weight_packed")
+    except Exception:
+        return False
+
 
 try:
     # move torch.cpu._is_amx_tile_supported() from cpu_has_amx_support
@@ -318,7 +344,7 @@ except:
 
 
 def cpu_has_amx_support():
-    return is_amx_tile_supported and is_intel_amx_backend_available
+    return is_amx_tile_supported and _is_intel_amx_backend_available()
 
 
 def use_intel_amx_backend(layer):
@@ -331,10 +357,6 @@ def xpu_has_xmx_support():
         # currently only PVC/LNL/BMG supports F64, so we only support these now
         return torch.xpu.get_device_properties().has_fp64
     return False
-
-
-def use_intel_xpu_backend():
-    return get_bool_env_var("SGLANG_USE_SGL_XPU") and is_xpu()
 
 
 @lru_cache(maxsize=1)
@@ -434,23 +456,9 @@ def get_available_gpu_memory(
 
         if empty_cache:
             empty_device_cache(torch.xpu)
-        # Use mem_get_info() with a sanity cap to avoid KV-cache over-allocation
-        # on drivers that incorrectly return total memory as free memory.
-        # Consistent with the fallback: free = max(0, total - allocated).
-        try:
-            free_gpu_memory, total_gpu_memory = torch.xpu.mem_get_info(gpu_id)
-            used_memory = float(torch.xpu.memory_allocated(gpu_id))
-            free_gpu_memory = min(
-                float(free_gpu_memory),
-                max(0.0, float(total_gpu_memory) - used_memory),
-            )
-        except Exception:
-            # Fallback for devices/drivers that do not support querying free memory
-            used_memory = float(torch.xpu.memory_allocated(gpu_id))
-            total_gpu_memory = float(
-                torch.xpu.get_device_properties(gpu_id).total_memory
-            )
-            free_gpu_memory = max(0.0, total_gpu_memory - used_memory)
+        used_memory = torch.xpu.memory_allocated(gpu_id)
+        total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
+        free_gpu_memory = total_gpu_memory - used_memory
 
     elif device == "hpu":
         num_gpus = torch.hpu.device_count()
@@ -557,6 +565,18 @@ def get_dispatch_device_backend():
 @lru_cache(maxsize=1)
 def get_device_module():
     return torch.get_device_module()
+
+
+def create_device_stream(device):
+    """Create a device stream for the given device type."""
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    return torch.get_device_module(device).Stream(device=device)
+
+
+def device_stream_context(stream):
+    """Return the appropriate stream context manager for ``stream``."""
+    return torch.get_device_module(stream.device).stream(stream)
 
 
 def get_amdgpu_memory_capacity():
@@ -837,6 +857,18 @@ def get_device_name(device_id: int = 0) -> str:
 
 
 @lru_cache(maxsize=1)
+def is_mnnvl_fabric_device() -> bool:
+    """Whether the GPU sits on an MNNVL fabric (cross-node NVLink), keyed on
+    the device name: the GB200/GB300 superchips. Used to auto-select
+    fabric-dependent communication paths (NCCL cuMem/MNNVL, custom all-reduce
+    v2 multinode, DCP fi_a2a)."""
+    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
+        return False
+    name = (torch.cuda.get_device_name(0) or "").upper()
+    return any(tag in name for tag in ("GB200", "GB300"))
+
+
+@lru_cache(maxsize=1)
 def is_habana_available() -> bool:
     return find_spec("habana_frameworks") is not None
 
@@ -970,7 +1002,7 @@ def get_compiler_backend(mode=None) -> str:
     if hasattr(torch, "npu") and torch.npu.is_available():
         try:
             import torchair
-            import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
+            import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce  # noqa: F401
             from torchair.configs.compiler_config import CompilerConfig
         except ImportError:
             raise ImportError(
@@ -997,21 +1029,11 @@ def set_cuda_arch():
         )
 
 
-def mxfp_supported():
-    """
-    Returns whether the current platform supports MX types.
-    """
-    if torch.version.hip:
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return any(gfx in gcn_arch for gfx in ["gfx95"])
-    else:
-        return False
-
-
 @lru_cache(maxsize=1)
 def is_gfx95_supported():
-    """
-    Returns whether the current platform supports MX types.
+    """Whether the device is an AMD gfx95 GPU (the MX-capable ROCm arch).
+
+    False on every non-HIP build, so callers do not need their own is_hip().
     """
     if torch.version.hip:
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
@@ -1028,6 +1050,18 @@ def is_gfx942_supported():
     if torch.version.hip:
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
         return any(gfx in gcn_arch for gfx in ["gfx942"])
+    else:
+        return False
+
+
+@lru_cache(maxsize=1)
+def is_gfx1250_supported():
+    """
+    Returns whether the current platform is AMD RDNA4 (gfx1250).
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx1250"])
     else:
         return False
 
@@ -1139,29 +1173,13 @@ def get_device_sm_nvidia_smi():
 
 
 @contextmanager
-def maybe_reindex_device_id(gpu_id: int):
-
-    if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() is False or not is_cuda_alike():
+def maybe_reindex_device_id(gpu_id: int) -> Iterator[int]:
+    if not envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get():
         yield gpu_id
         return
 
-    original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if original_cuda_visible_devices:
-        cuda_visible_devices = original_cuda_visible_devices.split(",")
-    else:
-        cuda_visible_devices = []
-
-    str_gpu_id = cuda_visible_devices[gpu_id] if cuda_visible_devices else str(gpu_id)
-    os.environ["CUDA_VISIBLE_DEVICES"] = str_gpu_id
-
-    logger.debug(f"Set CUDA_VISIBLE_DEVICES to {str_gpu_id}")
-
-    yield 0
-
-    if original_cuda_visible_devices:
-        os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices
-    else:
-        del os.environ["CUDA_VISIBLE_DEVICES"]
+    with current_platform.reindex_device_id(gpu_id) as reindexed_device_id:
+        yield reindexed_device_id
 
 
 cached_device_index = -1
@@ -1414,7 +1432,6 @@ def calculate_time(show=False, min_cost_ms=0.0):
 
 
 class LayerFn(Protocol):
-
     def __call__(self, idx: int, prefix: str) -> torch.nn.Module: ...
 
 
@@ -1493,6 +1510,158 @@ def set_random_seed(seed: int) -> None:
 
 _mm_http_session = threading.local()
 
+_DEFAULT_MEDIA_URL_MAX_FILE_SIZE_MB = 64
+_MAX_MEDIA_URL_REDIRECTS = 5
+_MEDIA_URL_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+_allowed_media_domains: frozenset[str] = frozenset()
+_media_url_max_file_size_bytes = _DEFAULT_MEDIA_URL_MAX_FILE_SIZE_MB * 1024 * 1024
+
+
+def _normalize_media_domain(domain: str) -> str:
+    if not isinstance(domain, str):
+        raise ValueError("allowed media domains must be strings")
+
+    domain = domain.strip().rstrip(".")
+    if not domain:
+        raise ValueError("allowed media domains cannot be empty")
+    if "://" in domain or any(char in domain for char in "/?#@"):
+        raise ValueError(
+            f"Invalid allowed media domain {domain!r}: provide a hostname only"
+        )
+
+    # Brackets are URL syntax, not part of an IPv6 hostname.
+    if domain.startswith("[") and domain.endswith("]"):
+        domain = domain[1:-1]
+    try:
+        return str(ipaddress.ip_address(domain))
+    except ValueError:
+        if ":" in domain:
+            raise ValueError(
+                f"Invalid allowed media domain {domain!r}: ports are not supported"
+            )
+
+    try:
+        normalized = domain.encode("idna").decode("ascii").lower()
+    except UnicodeError as e:
+        raise ValueError(f"Invalid allowed media domain {domain!r}") from e
+    if not normalized:
+        raise ValueError("allowed media domains cannot be empty")
+    return normalized
+
+
+def configure_media_url_security(
+    allowed_media_domains: Optional[Sequence[str]] = None,
+    max_file_size_mb: int = _DEFAULT_MEDIA_URL_MAX_FILE_SIZE_MB,
+) -> list[str]:
+    """Configure process-wide safeguards for client-supplied media URLs.
+
+    A serving worker hosts one engine configuration, while media loading fans
+    out to worker threads. Keeping the immutable policy here makes the same
+    checks apply to image, video, audio, cache, and model-specific loaders.
+    """
+
+    if max_file_size_mb < 0:
+        raise ValueError("media_url_max_file_size_mb must be non-negative")
+
+    normalized_domains = sorted(
+        {_normalize_media_domain(domain) for domain in allowed_media_domains or []}
+    )
+    global _allowed_media_domains, _media_url_max_file_size_bytes
+    _allowed_media_domains = frozenset(normalized_domains)
+    _media_url_max_file_size_bytes = max_file_size_mb * 1024 * 1024
+    return normalized_domains
+
+
+def _assert_media_url_allowed(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
+        raise ValueError(f"Invalid media URL: {url!r}")
+
+    hostname = _normalize_media_domain(parsed.hostname)
+    if _allowed_media_domains and hostname not in _allowed_media_domains:
+        raise ValueError(
+            "Media URL domain is not allowed. "
+            f"Allowed domains: {sorted(_allowed_media_domains)}; "
+            f"input domain: {hostname}"
+        )
+
+
+def download_remote_media(url: str, timeout: float) -> bytes:
+    """Download one HTTP(S) media object under the configured URL policy.
+
+    Redirects are followed manually so every destination is validated before
+    a connection is made. The response is streamed to enforce both the total
+    request deadline and the configured byte limit without first buffering an
+    attacker-controlled body in memory.
+    """
+
+    if timeout <= 0:
+        raise ValueError("media URL timeout must be positive")
+
+    session = get_mm_http_session()
+    deadline = time.monotonic() + timeout
+    current_url = url
+
+    for redirect_count in range(_MAX_MEDIA_URL_REDIRECTS + 1):
+        # Validate the same normalized URL representation that requests sends
+        # to urllib3. This avoids parser disagreements around backslashes and
+        # userinfo separators.
+        prepared_url = requests.Request("GET", current_url).prepare().url
+        if prepared_url is None:
+            raise ValueError(f"Invalid media URL: {current_url!r}")
+        _assert_media_url_allowed(prepared_url)
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise requests.exceptions.Timeout(
+                f"Timed out while downloading media URL: {url}"
+            )
+
+        with session.get(
+            prepared_url,
+            allow_redirects=False,
+            stream=True,
+            timeout=remaining,
+        ) as response:
+            location = response.headers.get("Location")
+            if response.status_code in _MEDIA_URL_REDIRECT_STATUS_CODES and location:
+                if redirect_count == _MAX_MEDIA_URL_REDIRECTS:
+                    raise requests.exceptions.TooManyRedirects(
+                        f"Media URL exceeded {_MAX_MEDIA_URL_REDIRECTS} redirects: {url}"
+                    )
+                current_url = urljoin(response.url, location)
+                continue
+
+            response.raise_for_status()
+            max_bytes = _media_url_max_file_size_bytes
+            content_length = response.headers.get("Content-Length")
+            if max_bytes and content_length is not None:
+                try:
+                    declared_size = int(content_length)
+                except ValueError:
+                    declared_size = None
+                if declared_size is not None and declared_size > max_bytes:
+                    raise ValueError(
+                        f"Remote media exceeds the {max_bytes} byte download limit"
+                    )
+
+            content = bytearray()
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                if time.monotonic() > deadline:
+                    raise requests.exceptions.Timeout(
+                        f"Timed out while downloading media URL: {url}"
+                    )
+                if max_bytes and len(content) + len(chunk) > max_bytes:
+                    raise ValueError(
+                        f"Remote media exceeds the {max_bytes} byte download limit"
+                    )
+                content.extend(chunk)
+            return bytes(content)
+
+    raise AssertionError("unreachable")
+
 
 def get_mm_http_session() -> requests.Session:
     """Per-thread HTTP session for multimodal downloads, to pool/reuse TCP
@@ -1507,8 +1676,17 @@ def get_mm_http_session() -> requests.Session:
     return session
 
 
+# Raised by the loaders below when client-supplied media cannot be fetched or
+# decoded. ValueError is in the set because invalid base64 raises binascii.Error.
+CLIENT_MEDIA_EXCEPTIONS = (
+    ValueError,
+    UnidentifiedImageError,
+    requests.exceptions.RequestException,
+)
+
+
 def load_audio(
-    audio_file: str, sr: Optional[int] = None, mono: bool = True
+    audio_file: Union[str, bytes], sr: Optional[int] = None, mono: bool = True
 ) -> np.ndarray:
     if sr is None:
         sr = 16000
@@ -1522,15 +1700,31 @@ def load_audio(
         audio_file.startswith("http://") or audio_file.startswith("https://")
     ):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
-        with get_mm_http_session().get(audio_file, timeout=timeout) as response:
-            response.raise_for_status()
-            source = response.content
+        source = download_remote_media(audio_file, timeout=timeout)
     elif isinstance(audio_file, str) and audio_file.startswith("file://"):
         source = unquote(urlparse(audio_file).path)
     elif isinstance(audio_file, str):
         source = audio_file
     else:
         raise ValueError(f"Invalid audio format: {audio_file}")
+
+    from sglang.srt.multimodal.audio_from_video import (
+        decode_audio_container,
+        is_audio_container,
+    )
+
+    if isinstance(source, bytes):
+        header = source[:16]
+    else:
+        with open(source, "rb") as audio_stream:
+            header = audio_stream.read(16)
+
+    if is_audio_container(header):
+        return decode_audio_container(
+            source,
+            target_sr=sr,
+            mono=mono,
+        )
 
     if _BACKEND == "torchcodec":
         from torchcodec.decoders import AudioDecoder
@@ -1557,10 +1751,13 @@ def load_audio(
     import torch
     import torchaudio
 
-    if isinstance(source, bytes):
-        audio, original_sr = sf.read(BytesIO(source))
-    else:
-        audio, original_sr = sf.read(source)
+    try:
+        if isinstance(source, bytes):
+            audio, original_sr = sf.read(BytesIO(source))
+        else:
+            audio, original_sr = sf.read(source)
+    except sf.LibsndfileError as e:
+        raise ValueError(f"Could not decode audio: {e}") from e
 
     if mono and len(audio.shape) > 1:
         audio = np.mean(audio, axis=1)
@@ -1588,6 +1785,15 @@ class ImageData:
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
     max_dynamic_patch: Optional[int] = None
     preprocess_kwargs: Optional[Dict] = None
+    content_hash: Optional[str] = None
+
+
+GLM_MEDIA_CONFIG_KEYS = (
+    "fps",
+    "max_frames",
+    "max_tokens_per_frame",
+    "max_image_tokens",
+)
 
 
 @dataclass
@@ -1597,9 +1803,50 @@ class VideoData:
 
 
 image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+GPUImageDecodeMode = Union[bool, Literal["nvjpeg_fancy"]]
 
 
-def is_jpeg_with_cuda(image_bytes: bytes = b"", gpu_image_decode: bool = True) -> bool:
+def smart_to_rgb(
+    image: Union[torch.Tensor, Image.Image],
+) -> Union[torch.Tensor, Image.Image]:
+    if not isinstance(image, Image.Image):
+        return image
+
+    if image.mode in ("RGBA", "LA") or "transparency" in image.info:
+        image = image.convert("RGBA")
+        width, height = image.size
+        edge_pixels = []
+
+        for x in range(0, width, max(1, width // 20)):
+            for y in (0, height - 1):
+                pixel = image.getpixel((x, y))
+                if pixel[3] > 128:
+                    edge_pixels.append(pixel[:3])
+
+        for y in range(0, height, max(1, height // 20)):
+            for x in (0, width - 1):
+                pixel = image.getpixel((x, y))
+                if pixel[3] > 128:
+                    edge_pixels.append(pixel[:3])
+
+        if edge_pixels:
+            avg_brightness = sum(sum(pixel) for pixel in edge_pixels) / (
+                len(edge_pixels) * 3
+            )
+            background_color = (32, 32, 32) if avg_brightness > 128 else (240, 240, 240)
+        else:
+            background_color = (255, 255, 255)
+
+        background = Image.new("RGB", image.size, background_color)
+        background.paste(image, mask=image.getchannel("A"))
+        return background
+
+    return image.convert("RGB")
+
+
+def is_jpeg_with_cuda(
+    image_bytes: bytes = b"", gpu_image_decode: GPUImageDecodeMode = True
+) -> bool:
     """
     Check three conditions:
     1. whether CUDA is available.
@@ -1613,10 +1860,19 @@ def is_jpeg_with_cuda(image_bytes: bytes = b"", gpu_image_decode: bool = True) -
     return False
 
 
+@lru_cache(maxsize=16)
+def _warn_fancy_jpeg_fallback(error: str) -> None:
+    logger.warning(
+        "High-fidelity GPU JPEG decode is unavailable; falling back to PIL. "
+        "Install the Kimi-K3 serving image or NVIDIA nvImageCodec. Error: %s",
+        error,
+    )
+
+
 def _load_image(
     image_bytes: bytes = b"",
     image_file: str = "",
-    gpu_image_decode: bool = True,
+    gpu_image_decode: GPUImageDecodeMode = True,
 ) -> Union[torch.Tensor, Image.Image]:
     """
     Try to decode JPEG with nvJPEG on GPU and return a torch device tensor,
@@ -1627,19 +1883,42 @@ def _load_image(
         image_bytes = get_image_bytes(image_file)
     if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
         try:
+            if gpu_image_decode == "nvjpeg_fancy":
+                from sglang.srt.utils.nvjpeg_decoder import (
+                    decode_jpeg_with_fancy_upsampling,
+                )
+
+                return decode_jpeg_with_fancy_upsampling(image_bytes)
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
             image_tensor = decode_jpeg(encoded_image, device="cuda")
             return image_tensor
         except Exception as e:
-            logger.warning(
-                f"Failed to decode JPEG on GPU, falling back to CPU. Error: {e}"
-            )
-    return Image.open(BytesIO(image_bytes))
+            if gpu_image_decode == "nvjpeg_fancy":
+                _warn_fancy_jpeg_fallback(f"{type(e).__name__}: {e}")
+            else:
+                logger.warning(
+                    "Failed to decode JPEG on GPU, falling back to CPU. Error: %s",
+                    e,
+                )
+    try:
+        image = Image.open(BytesIO(image_bytes))
+    except OSError as e:
+        raise ValueError(f"Could not decode image: {e}") from e
+    return _fully_load_pil_image(image)
+
+
+def _fully_load_pil_image(image: Image.Image) -> Image.Image:
+    """Force PIL's lazy decode while malformed input is still request-local."""
+    try:
+        image.load()
+    except OSError as e:
+        raise ValueError(f"Could not decode image: {e}") from e
+    return image
 
 
 def load_image(
     image_file: Union[Image.Image, str, ImageData, bytes],
-    gpu_image_decode: bool = True,
+    gpu_image_decode: GPUImageDecodeMode = True,
 ) -> tuple[Union[torch.Tensor, Image.Image], Optional[tuple[int, int]]]:
     """
     Load image from multiple input formats, including:
@@ -1651,7 +1930,7 @@ def load_image(
     image = None
     image_size: Optional[tuple[int, int]] = None
     if isinstance(image_file, Image.Image):
-        image = image_file
+        image = _fully_load_pil_image(image_file)
         image_size = (image.width, image.height)
     elif isinstance(image_file, bytes):
         image = _load_image(image_bytes=image_file, gpu_image_decode=gpu_image_decode)
@@ -1683,13 +1962,7 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
         return image_file
     if image_file.startswith(("http://", "https://")):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = get_mm_http_session().get(image_file, timeout=timeout)
-        try:
-            response.raise_for_status()
-            result = response.content
-        finally:
-            response.close()
-        return result
+        return download_remote_media(image_file, timeout=timeout)
     if image_file.startswith(("file://", "/")):
         with open(image_file, "rb") as f:
             return f.read()
@@ -1715,11 +1988,7 @@ def _normalize_video_input(
     elif isinstance(video_file, str):
         if video_file.startswith(("http://", "https://")):
             timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
-            with get_mm_http_session().get(
-                video_file, stream=True, timeout=timeout
-            ) as response:
-                response.raise_for_status()
-                return response.content
+            return download_remote_media(video_file, timeout=timeout)
         elif video_file.startswith("data:"):
             _, encoded = video_file.split(",", 1)
             return pybase64.b64decode(encoded, validate=True)
@@ -1731,6 +2000,20 @@ def _normalize_video_input(
             return pybase64.b64decode(video_file, validate=True)
     else:
         return None
+
+
+def get_video_bytes(video_file: Union[str, bytes, VideoData]) -> bytes:
+    """Normalize a video input and return its encoded bytes."""
+    if isinstance(video_file, VideoData):
+        video_file = video_file.url
+
+    source = _normalize_video_input(video_file)
+    if isinstance(source, bytes):
+        return source
+    if isinstance(source, str):
+        with open(source, "rb") as f:
+            return f.read()
+    raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
 
 def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
@@ -1746,7 +2029,13 @@ def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
         raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
     device = "cuda" if use_gpu else "cpu"
-    return VideoDecoderWrapper(source, device=device)
+    try:
+        return VideoDecoderWrapper(source, device=device)
+    except (ImportError, MemoryError):
+        raise  # missing backend / OOM is not a bad payload
+    except Exception as e:
+        # Broad on purpose: torchcodec raises RuntimeError, decord its own type.
+        raise ValueError(f"Could not decode video: {e}") from e
 
 
 def sample_video_frames(video, *, desired_fps: int, max_frames: int) -> list[int]:
@@ -1820,12 +2109,16 @@ def suppress_noisy_warnings():
     cutlass_dsl_noisy = {
         (
             DeprecationWarning,
-            "Use explicit `struct.scalar.ptr` for pointer instead.",
+            "Using `struct.scalar` as pointer is deprecated.",
         ),
         (
             UserWarning,
             "NamedBarrier wait also arrives on the barrier. "
             "Routing call to NamedBarrier.arrive_and_wait().",
+        ),
+        (
+            DeprecationWarning,
+            "builtin type swigvarlink has no __module__ attribute",
         ),
     }
     for cat, msg in cutlass_dsl_noisy:
@@ -1907,7 +2200,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.14")
+        min_version: Minimum version required (e.g., "0.6.18")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -1981,14 +2274,17 @@ def kill_process_tree(
     parent_pid,
     include_parent: bool = True,
     skip_pid: int = None,
-    wait_timeout: Optional[float] = None,
+    wait_timeout: Optional[float] = 60,
 ):
     """Kill the process and all its child processes.
 
     `wait_timeout` (seconds) blocks until every killed process is reaped and
-    raises `RuntimeError` on timeout; `None` is fire-and-forget. The
-    `parent_pid == os.getpid()` branch calls `sys.exit(0)` and cannot wait
-    for itself -- use `include_parent=False` if child reap must finish first.
+    raises `RuntimeError` on timeout. SIGKILL only queues the teardown, so
+    returning without waiting leaves the GPU context, the pinned host memory
+    and the ports held for seconds; pass `None` only where blocking is
+    unacceptable, such as a `__del__`. The `parent_pid == os.getpid()` branch
+    calls `sys.exit(0)` and cannot wait for itself -- use
+    `include_parent=False` if child reap must finish first.
     """
     logger.info(
         f"kill_process_tree called: parent_pid={parent_pid}, "
@@ -2001,10 +2297,10 @@ def kill_process_tree(
 
     try:
         itself = psutil.Process(parent_pid)
+        children = itself.children(recursive=True)
     except psutil.NoSuchProcess:
         return
 
-    children = itself.children(recursive=True)
     killed = []
     for child in children:
         if child.pid == skip_pid:
@@ -2099,6 +2395,8 @@ def configure_logger(server_args, prefix: str = ""):
     maybe_ms = ".%(msecs)03d" if envs.SGLANG_LOG_MS.get() else ""
     format = f"[%(asctime)s{maybe_ms}{prefix}] %(message)s"
     logging.basicConfig(
+        # Runs before publish, and for multimodal_gen's ServerArgs, which
+        # never publishes these bags -- so the record, not the bag.
         level=getattr(logging, server_args.log_level.upper()),
         format=format,
         datefmt="%Y-%m-%d %H:%M:%S",
@@ -2162,7 +2460,9 @@ def broadcast_pyobj(
     device = torch.device(
         "cuda"
         if torch.cuda.is_available() and not force_cpu_device
-        else "musa" if is_musa() and not force_cpu_device else "cpu"
+        else "musa"
+        if is_musa() and not force_cpu_device
+        else "cpu"
     )
 
     if rank == src:
@@ -2329,25 +2629,30 @@ class RefCountedGauge:
                 self._gauge.dec()
 
 
-def add_prometheus_track_response_middleware(app):
+def add_prometheus_track_response_middleware(
+    app, extra_labels: Optional[Dict[str, str]] = None
+):
     from prometheus_client import Counter, Gauge
+
+    extra_labels = extra_labels or {}
+    extra_label_names = list(extra_labels.keys())
 
     http_request_counter = Counter(
         name="sglang:http_requests_total",
         documentation="Total number of HTTP requests by endpoint and method",
-        labelnames=["endpoint", "method"],
+        labelnames=extra_label_names + ["endpoint", "method"],
     )
 
     http_response_counter = Counter(
         name="sglang:http_responses_total",
         documentation="Total number of HTTP responses by endpoint and status code",
-        labelnames=["endpoint", "status_code", "method"],
+        labelnames=extra_label_names + ["endpoint", "status_code", "method"],
     )
 
     http_requests_active = Gauge(
         name="sglang:http_requests_active",
         documentation="Number of currently active HTTP requests",
-        labelnames=["endpoint", "method"],
+        labelnames=extra_label_names + ["endpoint", "method"],
         multiprocess_mode="livesum",
     )
 
@@ -2373,8 +2678,8 @@ def add_prometheus_track_response_middleware(app):
         method = request.method
         routing_key = request.headers.get("x-smg-routing-key")
 
-        http_request_counter.labels(endpoint=path, method=method).inc()
-        http_requests_active.labels(endpoint=path, method=method).inc()
+        http_request_counter.labels(**extra_labels, endpoint=path, method=method).inc()
+        http_requests_active.labels(**extra_labels, endpoint=path, method=method).inc()
         if routing_key:
             routing_keys_active.inc(routing_key)
 
@@ -2382,6 +2687,7 @@ def add_prometheus_track_response_middleware(app):
             response = await call_next(request)
 
             http_response_counter.labels(
+                **extra_labels,
                 endpoint=path,
                 method=method,
                 status_code=str(response.status_code),
@@ -2389,7 +2695,9 @@ def add_prometheus_track_response_middleware(app):
 
             return response
         finally:
-            http_requests_active.labels(endpoint=path, method=method).dec()
+            http_requests_active.labels(
+                **extra_labels, endpoint=path, method=method
+            ).dec()
             if routing_key:
                 routing_keys_active.dec(routing_key)
 
@@ -2429,9 +2737,9 @@ def init_custom_process_group(
         rendezvous,
     )
 
-    assert (store is None) or (
-        init_method is None
-    ), "Cannot specify both init_method and store."
+    assert (store is None) or (init_method is None), (
+        "Cannot specify both init_method and store."
+    )
 
     if store is not None:
         assert world_size > 0, "world_size must be positive if using store"
@@ -2951,13 +3259,13 @@ class UvicornAccessLogFilter(logging.Filter):
 def set_uvicorn_logging_configs(server_args=None):
     from uvicorn.config import LOGGING_CONFIG
 
-    LOGGING_CONFIG["formatters"]["default"][
-        "fmt"
-    ] = "[%(asctime)s] %(levelprefix)s %(message)s"
+    LOGGING_CONFIG["formatters"]["default"]["fmt"] = (
+        "[%(asctime)s] %(levelprefix)s %(message)s"
+    )
     LOGGING_CONFIG["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
-    LOGGING_CONFIG["formatters"]["access"][
-        "fmt"
-    ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    LOGGING_CONFIG["formatters"]["access"]["fmt"] = (
+        '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    )
     LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
 
     _configure_uvicorn_access_log_filter(LOGGING_CONFIG, server_args)
@@ -3153,6 +3461,29 @@ def parse_connector_type(url: str) -> str:
     return m.group(1)
 
 
+def run_with_deadline(fn: Callable[[], Any], *, timeout_s: float, what: str) -> Any:
+    result: list = []
+    error: list = []
+
+    def _target():
+        try:
+            result.append(fn())
+        except BaseException as e:
+            error.append(e)
+
+    # An overrunning fn cannot be cancelled; only process exit reaps the daemon thread.
+    thread = threading.Thread(target=_target, daemon=True)
+    thread.start()
+    thread.join(timeout_s)
+    if thread.is_alive():
+        raise RuntimeError(
+            f"{what} did not return within {timeout_s}s on {socket.gethostname()}"
+        )
+    if error:
+        raise error[0]
+    return result[0]
+
+
 def retry(
     fn,
     max_retry: int,
@@ -3202,9 +3533,10 @@ def has_hf_quant_config(model_path: str) -> bool:
     Returns:
         True if hf_quant_config.json exists, False otherwise.
     """
-    # Check if the model_path is a local path
-    if os.path.exists(os.path.join(model_path, "hf_quant_config.json")):
-        return True
+    # Local paths are decided on the filesystem; the hub helpers below
+    # reject them as invalid repo ids.
+    if os.path.isdir(model_path):
+        return os.path.isfile(os.path.join(model_path, "hf_quant_config.json"))
 
     from huggingface_hub import try_to_load_from_cache
 
@@ -3334,10 +3666,12 @@ def bind_or_assign(target, source):
 
 # TODO(hebiao064): Accelerate FA3 Spec Decode with topk > 1.
 # TODO(hebiao064): Improve the acc rate for FA3 Spec Decode with topk == 1 and page_size > 1.
-def is_no_spec_infer_or_topk_one(server_args):
-    return server_args.speculative_eagle_topk is None or (
-        server_args.speculative_eagle_topk == 1
-        and (server_args.page_size == 1 or server_args.page_size is None)
+def is_no_spec_infer_or_topk_one(cfg):
+    """``cfg`` is a resolving config view, not the published record: the
+    resolution pipeline is the only caller, and it asks mid-resolution."""
+    return cfg.speculative_eagle_topk is None or (
+        cfg.speculative_eagle_topk == 1
+        and (cfg.page_size == 1 or cfg.page_size is None)
     )
 
 
@@ -3427,17 +3761,18 @@ def dispose_tensor(x: torch.Tensor):
     interfering with torch.compile's memory tracking and graph recording.
     """
 
-    # Skip disposal during piecewise CUDA graph capture/replay: freeing the
-    # backing storage would invalidate addresses recorded in the graph.
-    # Local import avoids a circular dependency.
+    # Skip disposal under a captured prefill graph (piecewise or breakable):
+    # freeing the backing storage would invalidate addresses recorded in the
+    # graph. Local imports avoid a circular dependency.
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        is_in_breakable_cuda_graph,
+    )
     from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
         is_in_tc_piecewise_cuda_graph,
     )
 
-    if is_in_tc_piecewise_cuda_graph():
+    if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return
-
-    from sglang.srt.runtime_context import get_flags
 
     if get_flags().capture.disable_dispose_tensor:
         return
@@ -3467,15 +3802,16 @@ class Withable(Generic[T]):
             self._value = None
 
 
-def require_mlp_tp_gather(server_args: ServerArgs):
+def require_mlp_tp_gather():
     """
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
-    if server_args.enable_dp_attention:
-        assert server_args.dp_size > 1, "dp_size must be greater than 1"
-        if server_args.elastic_ep_backend is not None:
+    # elastic-EP scale-up rewrites dp_size on the published config
+    if get_parallel().enable_dp_attention:
+        assert get_parallel().dp_size > 1, "dp_size must be greater than 1"
+        if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import (
                 elastic_expanded_world_enabled,
             )
@@ -3483,10 +3819,10 @@ def require_mlp_tp_gather(server_args: ServerArgs):
             if elastic_expanded_world_enabled():
                 return True
         if (
-            server_args.moe_dense_tp_size is None
+            get_parallel().moe_dense_tp_size is None
         ):  # TODO(ch-wan): some MoE models do not have dense layers
             return True
-        elif not server_args.enable_dp_lm_head:
+        elif not get_parallel().enable_dp_lm_head:
             return True
         elif get_moe_a2a_backend().is_none():
             return True
@@ -3500,16 +3836,29 @@ def require_mlp_tp_gather(server_args: ServerArgs):
             # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
             # max-based graph bucket). See #30432 re: the misleading flag name.
             return True
+        elif get_moe_a2a_backend().is_mori() and get_bool_env_var(
+            "SGLANG_MORI_RECV_BOUND", "false"
+        ):
+            # Same bookkeeping, for the same reason. Bounding mori's receive
+            # buffer means baking a fan-in size into a captured graph, and the
+            # fan-in depends on what the *peers* send. Without a DP-synchronized
+            # bucket every rank buckets its own batch, so a rank on a narrow tier
+            # can be handed rows by a peer on a wider one; the only bound valid
+            # under that is the widest tier's, which is 4-16x looser than the
+            # batch actually being run and costs more in expert-GEMM tiles than
+            # the trim saves. With uniform buckets the per-tier fan-in is exact.
+            # Scoped to the opt-in gate so the default path is untouched.
+            return True
         else:
             return (
-                server_args.moe_dense_tp_size
-                > server_args.tp_size // server_args.dp_size
+                get_parallel().moe_dense_tp_size
+                > get_parallel().tp_size // get_parallel().dp_size
             )
     else:
         return False
 
 
-def require_attn_tp_gather(server_args: ServerArgs):
+def require_attn_tp_gather():
     """
     Check if the input of attention is scattered.
     """
@@ -3517,26 +3866,56 @@ def require_attn_tp_gather(server_args: ServerArgs):
     # and do not consume the upstream gathered_buffer. Without this, the
     # cuda graph runner pads num_tokens to attn_tp_size, which can cause
     # autotuners to pick suboptimal kernel variants at small batches.
-    if server_args.disable_attn_tp_gather:
+
+    if get_parallel().disable_attn_tp_gather:
         return False
 
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
-    if not get_moe_a2a_backend().is_none() or server_args.moe_dense_tp_size is not None:
-        if server_args.enable_dp_attention:
-            return server_args.dp_size < server_args.tp_size
+    if (
+        not get_moe_a2a_backend().is_none()
+        or get_parallel().moe_dense_tp_size is not None
+    ):
+        if get_parallel().enable_dp_attention:
+            return get_parallel().dp_size < get_parallel().tp_size
         else:
             return True
     else:
         return False
 
 
-def require_gathered_buffer(server_args: ServerArgs):
-    return require_mlp_tp_gather(server_args) or require_attn_tp_gather(server_args)
+def require_gathered_buffer():
+    return require_mlp_tp_gather() or require_attn_tp_gather()
 
 
-def require_mlp_sync(server_args: ServerArgs):
-    return server_args.enable_dp_attention or require_gathered_buffer(server_args)
+def require_mlp_sync():
+
+    return get_parallel().enable_dp_attention or require_gathered_buffer()
+
+
+def get_cuda_graph_batch_size_alignment() -> int:
+    alignment = 1
+    if get_exec().overlap.enable_two_batch_overlap:
+        alignment *= 2
+    if require_gathered_buffer():
+        alignment *= get_parallel().attn_tp_size
+    if alignment % get_parallel().attn_cp_size != 0:
+        alignment *= get_parallel().attn_cp_size
+    return alignment
+
+
+def get_cuda_graph_max_batch_size(max_batch_size: int) -> int:
+    return ceil_align(max_batch_size, get_cuda_graph_batch_size_alignment())
+
+
+def get_eager_max_batch_size(max_batch_size: int) -> int:
+    if not require_mlp_sync():
+        return max_batch_size
+
+    from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+
+    max_batch_size = ceil_align(max_batch_size, get_parallel().attn_tp_size)
+    return ceil_align(max_batch_size, get_cp_padding_align_size())
 
 
 def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optional[str]:
@@ -3610,9 +3989,9 @@ def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> 
     device = devices.pop()
 
     if transpose_dims:
-        assert len(weight_names) == len(
-            transpose_dims
-        ), "len(weight_names) should be equal to len(transpose_dims)"
+        assert len(weight_names) == len(transpose_dims), (
+            "len(weight_names) should be equal to len(transpose_dims)"
+        )
 
     for i, weight_name in enumerate(weight_names):
         weight_tensor = getattr(module, weight_name)
@@ -3752,7 +4131,7 @@ def configure_gc_logger():
             logger.info(
                 f"GC end: Time {time.time()} | Generation {gen} | "
                 f"Duration: {duration:.4f}s | Collected: {collected} | Uncollectable: {uncollectable} "
-                f'{"(LONG GC)" if duration > 0.1 else ""}'
+                f"{'(LONG GC)' if duration > 0.1 else ''}"
             )
 
     gc.callbacks.append(gc_callback)
@@ -3763,14 +4142,20 @@ def ceil_align(x: int, y: int) -> int:
     return ceil_div(x, y) * y
 
 
-def spec_decode_alloc_len_per_request(server_args) -> int:
+def spec_decode_alloc_len_per_request(
+    *,
+    page_size,
+    speculative_num_steps,
+    speculative_eagle_topk,
+    speculative_num_draft_tokens,
+) -> int:
     """Per-request KV tokens a (spec-v1) decode step allocates: the draft-decode
-    topk*num_steps peak vs. the verify num_draft_tokens, page-aligned.
+    topk*num_steps peak vs. the verify num_draft_tokens, page-aligned. A pure
+    function of the resolved values its one caller reads off the bags.
     """
-    page_size = server_args.page_size
-    len_per_topk = server_args.speculative_num_steps or 1
-    spec_topk = server_args.speculative_eagle_topk or 1
-    spec_tokens = server_args.speculative_num_draft_tokens or 1
+    len_per_topk = speculative_num_steps or 1
+    spec_topk = speculative_eagle_topk or 1
+    spec_tokens = speculative_num_draft_tokens or 1
 
     if page_size > 1 and spec_topk > 1:
         # last partial page and ceil alignment
@@ -3826,9 +4211,9 @@ def get_physical_cpus_by_numa():
     for cpu, core, socket, node in cpu_info:
         key = (core, socket)
         if key not in physical_by_node[node]:
-            physical_by_node[node][
-                key
-            ] = cpu  # pick first CPU seen for that physical core
+            physical_by_node[node][key] = (
+                cpu  # pick first CPU seen for that physical core
+            )
 
     # Retrieves CPUs that the current process is allowed to run on
     cpus_allowed_list = psutil.Process().cpu_affinity()
@@ -4051,6 +4436,9 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "gate_up_proj",
     "embed_tokens",
     "lm_head",
+    # Inkling attention projections (merged q/k/v/r and its row-parallel output).
+    "qkvr",
+    "wo_ud",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"
@@ -4144,15 +4532,7 @@ class ConcurrentCounter:
 
 @lru_cache(maxsize=1)
 def is_triton_kernels_available() -> bool:
-    if importlib.util.find_spec("triton_kernels") is None:
-        return False
-    try:
-        ragged_metadata_spec = importlib.util.find_spec(
-            "triton_kernels.tensor_details.ragged_tensor"
-        )
-    except ModuleNotFoundError:
-        return False
-    return ragged_metadata_spec is not None
+    return importlib.util.find_spec("triton_kernels") is not None
 
 
 def json_list_type(value):
@@ -4222,9 +4602,9 @@ class CachedKernel:
 
         # Check that no parameters have default values
         for name, param in self.signature.parameters.items():
-            assert (
-                param.default is inspect.Parameter.empty
-            ), f"Parameter '{name}' has a default value. Default parameters are not supported in cached kernels."
+            assert param.default is inspect.Parameter.empty, (
+                f"Parameter '{name}' has a default value. Default parameters are not supported in cached kernels."
+            )
 
         functools.update_wrapper(self, original_fn)
         self.kernel_cache = {}
@@ -4237,9 +4617,9 @@ class CachedKernel:
         Index with grid to get a launcher function.
         Returns a launcher that will handle caching based on the key function.
         """
-        assert (
-            isinstance(grid, tuple) and len(grid) <= 3
-        ), "Grid must be a tuple with at most 3 dimensions."
+        assert isinstance(grid, tuple) and len(grid) <= 3, (
+            "Grid must be a tuple with at most 3 dimensions."
+        )
 
         # Normalize grid once
         if len(grid) < 3:
@@ -4336,10 +4716,13 @@ def cached_triton_kernel(key_fn=None):
     return decorator
 
 
-def reserve_rope_cache_for_long_sequences(
-    model, server_args, model_config, logger=None
-):
-    """Pre-expand RoPE cache for long sequences and speculative decoding."""
+def reserve_rope_cache_for_long_sequences(model, model_config, logger=None):
+    """Pre-expand RoPE cache for long sequences and speculative decoding.
+
+    Runs inside `ModelRunner`, past publish, so the three config inputs come
+    from the bags: the context length and the two speculative counts are
+    resolution's answers.
+    """
     from sglang.srt.environ import envs
 
     SAFETY_FACTOR = envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.get()
@@ -4348,7 +4731,7 @@ def reserve_rope_cache_for_long_sequences(
 
     # 1) Estimate base context upper bound
     base_ctx = (
-        getattr(server_args, "context_length", None)
+        get_model().context_length
         or getattr(model_config, "context_len", None)
         or getattr(model_config, "max_model_len", None)
         or getattr(model_config.hf_text_config, "max_position_embeddings", None)
@@ -4356,8 +4739,8 @@ def reserve_rope_cache_for_long_sequences(
     )
 
     # 2) Speculative decoding expansion
-    steps = int(getattr(server_args, "speculative_num_steps", 0) or 0)
-    draft = int(getattr(server_args, "speculative_num_draft_tokens", 0) or 0)
+    steps = int(get_spec().speculative_num_steps or 0)
+    draft = int(get_spec().speculative_num_draft_tokens or 0)
     reserve = base_ctx + steps * draft * SAFETY_FACTOR + MARGIN
 
     # 3) Align to reduce reallocation frequency

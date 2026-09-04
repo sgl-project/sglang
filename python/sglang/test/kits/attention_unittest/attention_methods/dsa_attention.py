@@ -263,6 +263,9 @@ class TinyDSAModelConfig:
         self.hf_text_config = self.hf_config
         self.linear_attn_registry_result = None
 
+    def get_max_num_attention_heads(self) -> int:
+        return self.num_attention_heads
+
 
 class DSAMockModelRunner(ModelRunner):
     def __init__(
@@ -289,6 +292,13 @@ class DSAMockModelRunner(ModelRunner):
         # 656 bytes/token while the model still projects K/V in BF16;
         # `set_mla_kv_buffer` does the quantize on the way in.
         self.kv_cache_dtype = torch.float8_e4m3fn if fp8_kv_cache else dtype
+        self.kv_cache_dtype_str = "auto"
+        # This runner's own resolved backends (production stamps these in
+        # ModelRunner.initialize); a draft runner would carry its own.
+        self.prefill_attention_backend_str = case.backend
+        self.decode_attention_backend_str = case.backend
+        self.draft_attention_backend = None
+        self.is_draft_worker = False
         # For TARGET_VERIFY / DRAFT_EXTEND, the DSA backend uses
         # `self.speculative_num_draft_tokens` to size `seqlens_expanded`
         # (`dsa_backend.py:482-486,510-515`). When zero, deep_gemm's
@@ -354,6 +364,7 @@ class DSAMockModelRunner(ModelRunner):
             triton_attention_split_tile_size=None,
         )
         self.server_args = self._server_args_override.install()
+        self.max_running_requests = pool_batch_size
         self.req_to_token_pool = ReqToTokenPool(
             size=pool_batch_size,
             max_context_len=max_context_len,
@@ -393,6 +404,7 @@ class DSAMockModelRunner(ModelRunner):
             kv_cache_dim=pool_kv_cache_dim,
         )
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
+        self.init_kv_index_translator()
         self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
@@ -1132,11 +1144,14 @@ def dsa_impl_capability(impl: str) -> tuple[bool, str]:
 
     if impl == "fa3":
         try:
-            from sglang.jit_kernel.flash_attention import (  # noqa: F401
+            from sglang.kernels.ops.attention.flash_attention import (  # noqa: F401
                 flash_attn_with_kvcache,
             )
         except ImportError as exc:
-            return False, f"sglang.jit_kernel.flash_attention unavailable: {exc}"
+            return (
+                False,
+                f"sglang.kernels.ops.attention.flash_attention unavailable: {exc}",
+            )
         # sgl-kernel flash_attn is compiled for SM9.x (Hopper) only;
         # it raises NotImplementedError on Blackwell (SM10.x+).
         if major < 9 or major >= 10:
@@ -1441,8 +1456,7 @@ def run_dsa_sparse_cuda_graph_decode_impl_variant_case(
         )
     if not case.forward_mode.is_decode():
         raise ValueError(
-            "run_dsa_sparse_cuda_graph_decode_impl_variant_case expects a "
-            "DECODE case."
+            "run_dsa_sparse_cuda_graph_decode_impl_variant_case expects a DECODE case."
         )
     from ..runner_modes.cuda_graph_decode_runner import (
         run_dsa_sparse_cuda_graph_decode_case,

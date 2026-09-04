@@ -54,8 +54,17 @@ MAX_VALID_PORT = 65535
 
 
 def wait_port_available(
-    port: int, port_name: str, timeout_s: int = 30, raise_exception: bool = True
+    port: int,
+    port_name: str,
+    timeout_s: Optional[int] = None,
+    raise_exception: bool = True,
 ) -> bool:
+    if timeout_s is None:
+        # A killed server can hold its ports well past kill_process_tree()'s
+        # return while GPU teardown completes (>30s observed on GB300), so CI
+        # raises this via SGLANG_WAIT_PORT_TIMEOUT before relaunching a server
+        # on the same port plan.
+        timeout_s = int(os.environ.get("SGLANG_WAIT_PORT_TIMEOUT", "30"))
     if port < 0 or port > MAX_VALID_PORT:
         raise ValueError(
             f"{port_name} has invalid port number {port}. "
@@ -79,7 +88,7 @@ def wait_port_available(
                 logger.info(
                     f"port {port} is in use. Waiting for {i} seconds for {port_name} to be available. {error_message}"
                 )
-        time.sleep(0.1)
+        time.sleep(1)
 
     if raise_exception:
         raise ValueError(

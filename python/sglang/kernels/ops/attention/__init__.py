@@ -16,6 +16,7 @@ _TRITON_KERNELS = [
     ("extend_attention", "build_unified_kv_indices"),
     ("prefill_attention", "context_attention_fwd"),
     ("merge_state", "merge_state_triton"),
+    ("suffix_attention_merge", "merge_suffix_attention_in_place"),
     ("metadata", "get_num_kv_splits_triton"),
     ("metadata", "prepare_swa_spec_page_table_triton"),
     ("metadata", "normal_decode_set_metadata"),
@@ -24,11 +25,15 @@ _TRITON_KERNELS = [
     ("dsa_metadata", "fused_dsa_draft_extend_metadata"),
     ("rocm_mla_decode_rope", "decode_attention_fwd_grouped_rope"),
     ("verify_splitkv", "verify_splitkv_fwd"),
+    ("unified_attention_3d_mtp", "unified_attention_3d_mtp_func"),
     ("pad", "pad_sequence_with_mask"),
     ("pad", "pad_draft_extend_query"),
     ("pad", "unpad_draft_extend_output"),
     ("pad", "seqlens_expand_triton"),
     ("position", "compute_position_triton"),
+    ("dsv4_attn_metadata_kernels", "expand_prefill_causally"),
+    ("dsv4_attn_metadata_kernels", "build_page_table_positions"),
+    ("dsv4_attn_metadata_kernels", "build_causal_swa_page_indices"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(
@@ -91,12 +96,11 @@ for _mod, _fn in [
     ("dsa.triton_sparse_mla", "triton_sparse_mla_fwd"),
     ("dsa.transform_index", "transform_index_page_table_prefill"),
     ("dsa.transform_index", "transform_index_page_table_decode"),
+    ("dsa.transform_index", "prepare_trtllm_nope_sparse_metadata"),
     ("dsa.cp_split", "dsa_cp_round_robin_split_q_seqs_kernel"),
     ("dsv4.fp4_indexer", "quantize_fp4_indexer_tensor"),
     ("dsv4.fp4_indexer", "store_fp4_index_k_cache"),
-    ("dsv4.fused_scale", "fused_scale"),
     ("dsv4.rms_normalize_hip", "rms_normalize_triton"),
-    ("dsv4.compress_c128_hip", "_compress_forward_c128_triton"),
 ]:
     register_kernel(
         KernelSpec(
@@ -115,6 +119,8 @@ for _mod, _fn in [
     ("flash_mla_sm120", "flash_mla_with_kvcache_sm120"),
     ("dcp_kernels", "create_dcp_kv_indices"),
     ("dcp_kernels", "correct_attn_out"),
+    ("dcp_kernels", "dcp_lse_combine_triton"),
+    ("dcp_kernels", "dcp_pack_a2a_send"),
     ("pa_page_table", "_build_pa_page_table"),
     ("nsa_triton_decode", "triton_sparse_attn_decode"),
 ]:
@@ -133,7 +139,6 @@ for _mod, _fn in [
     ("deepseek_v4_rope", "precompute_freqs_cis"),
     ("fused_qk_norm_rope_store", "fused_qk_norm_rope_swa_store"),
     ("fused_qk_rmsnorm_rope_gate", "fused_qk_gemma_rmsnorm_rope_gate"),
-    ("fused_qk_norm", "fused_qk_norm"),
     ("rotary_triton", "triton_mrope_fused"),
     ("rotary_triton", "triton_ernie45_rope_fused_inplace"),
     ("mrope", "apply_interleaved_rope_triton"),

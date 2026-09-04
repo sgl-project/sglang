@@ -9,6 +9,7 @@ from sglang.srt.hardware_backend.npu.moe.finalize_routing import (
     NPUFinalizeRouting,
 )
 from sglang.srt.hardware_backend.npu.moe.init_routing import (
+    MXFP8_QUANT_MODE,
     NPUMoEInitRouting_v2,
 )
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -84,6 +85,10 @@ class AscendTPDispatcher(BaseDispatcher):
             self.init = NPUMoEInitRouting_v2(quant_mode=1)
             self.finalize = NPUFinalizeRouting(drop_pad_mode=2)
             self.group_list_type = 1
+        elif self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.MXFP8:
+            self.init = NPUMoEInitRouting_v2(quant_mode=MXFP8_QUANT_MODE)
+            self.finalize = NPUFinalizeRouting(drop_pad_mode=2)
+            self.group_list_type = 1
         else:
             raise ValueError(
                 f"Unsupported ascend_dispatcher_output_dtype: {self.ascend_dispatcher_output_dtype}"
@@ -95,6 +100,7 @@ class AscendTPDispatcher(BaseDispatcher):
         topk_weights, topk_ids, _ = topk_output
         topk_weights = topk_weights.to(hidden_states.dtype)
         topk_ids = topk_ids.to(torch.int32)
+        top_k = topk_weights.shape[-1]
 
         (
             permuted_hidden_states,
@@ -105,7 +111,7 @@ class AscendTPDispatcher(BaseDispatcher):
             hidden_states,
             topk_ids,
             self.num_experts,
-            self.top_k,
+            top_k,
         )
 
         self._dispatch_output = AscendTPDispatchOutput(

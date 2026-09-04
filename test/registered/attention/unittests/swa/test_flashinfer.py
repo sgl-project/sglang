@@ -1,15 +1,10 @@
-import sys
 import unittest
-from pathlib import Path
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_flashinfer_available
-from sglang.test.test_utils import CustomTestCase
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
     DenseAttentionCase,
@@ -27,6 +22,7 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_
 from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
     run_dense_split_op_extend_case,
 )
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
@@ -44,6 +40,21 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
     CASES = make_swa_no_prefix_input_config_cases(
         "flashinfer"
     ) + make_swa_prefix_input_config_cases("flashinfer")
+    # Paged-only prefill has no ragged pass / custom prefix mask, so the kernel
+    # must enforce the window; the long case puts tokens past the window.
+    PAGED_MODE_CASES = CASES + (
+        DenseAttentionCase(
+            name="swa_extend_no_prefix_above_window_long",
+            backend="flashinfer",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(0, 0, 0),
+            extend_lens=(6, 8, 12),
+            sliding_window_size=4,
+        ),
+    )
     # Above-window decode case requires the `extend_window` reference rule
     # (window+1 keys), not the `min_seq_len_window` rule — FlashInfer's
     # decode metadata uses `clamp(seq_lens, max=window+1)` per
@@ -109,6 +120,22 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
             1,
             "dflash",
         ),
+        (
+            DenseAttentionCase(
+                name="runner_dflash_verify_swa_window_edges",
+                backend="flashinfer",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                # Straddle the window: one request below, one at, one above.
+                prefix_lens=(1, 4, 9),
+                extend_lens=(3, 3, 3),
+                sliding_window_size=4,
+            ),
+            1,
+            "dflash",
+        ),
     )
     SPEC_VERIFY_CUDA_GRAPH_CASES = (
         (
@@ -137,6 +164,17 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
                     head_dim=self.HEAD_DIM,
                     hidden_size=self.HIDDEN_SIZE,
                 )
+
+    def test_projected_swa_attention_cases_paged_mode(self):
+        for case in self.PAGED_MODE_CASES:
+            with self.subTest(case=case.name, backend=case.backend, mode="paged"):
+                with envs.SGLANG_FLASHINFER_USE_PAGED.override(True):
+                    run_dense_attention_case(
+                        self,
+                        case,
+                        head_dim=self.HEAD_DIM,
+                        hidden_size=self.HIDDEN_SIZE,
+                    )
 
     # Layout-robustness. See dense/test_triton.py for the full rationale.
     # The default `shuffled_pages` is already exercised by

@@ -31,7 +31,7 @@ _HIP = frozenset({CapabilityRequirement.HIP})
 # — the canonical OR-semantics case that a device-baked backend name couldn't.
 _CUDA_HIP = frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP})
 # JIT before AOT to match the production path (srt/layers/activation.py imports
-# from sglang.jit_kernel.activation on CUDA); auto-selection must not invert it.
+# from sglang.kernels.ops.activation.activation on CUDA); auto-selection must not invert it.
 _ACT_PRIORITY = (
     KernelBackend.JIT,
     KernelBackend.AOT,
@@ -82,7 +82,7 @@ class _GatedActivationOp(BaseFusedOp):
         expert_ids: Optional[torch.Tensor] = None,
         expert_step: int = 1,
     ) -> torch.Tensor:
-        import sglang.jit_kernel.activation as jit_activation
+        import sglang.kernels.ops.activation.activation as jit_activation
 
         return getattr(jit_activation, self.kernel_attr)(
             input, out, expert_ids, expert_step
@@ -119,7 +119,7 @@ class SiluAndMulOp(_GatedActivationOp):
     }
     descriptions = {
         KernelBackend.AOT: "silu_and_mul (sgl_kernel wheel).",
-        KernelBackend.JIT: "silu_and_mul (sglang.jit_kernel).",
+        KernelBackend.JIT: "silu_and_mul (sglang.kernels.jit).",
         KernelBackend.AITER: "silu_and_mul (aiter, ROCm).",
         KernelBackend.TORCH: "silu_and_mul (pure-torch reference).",
     }
@@ -153,7 +153,7 @@ class GeluAndMulOp(_GatedActivationOp):
     kernel_attr = "gelu_and_mul"
     descriptions = {
         KernelBackend.AOT: "gelu_and_mul (sgl_kernel wheel).",
-        KernelBackend.JIT: "gelu_and_mul (sglang.jit_kernel).",
+        KernelBackend.JIT: "gelu_and_mul (sglang.kernels.jit).",
         KernelBackend.TORCH: "gelu_and_mul (pure-torch reference).",
     }
 
@@ -170,7 +170,7 @@ class GeluTanhAndMulOp(_GatedActivationOp):
     kernel_attr = "gelu_tanh_and_mul"
     descriptions = {
         KernelBackend.AOT: "gelu_tanh_and_mul (sgl_kernel wheel).",
-        KernelBackend.JIT: "gelu_tanh_and_mul (sglang.jit_kernel).",
+        KernelBackend.JIT: "gelu_tanh_and_mul (sglang.kernels.jit).",
         KernelBackend.TORCH: "gelu_tanh_and_mul (pure-torch reference).",
     }
 
@@ -180,11 +180,98 @@ class GeluTanhAndMulOp(_GatedActivationOp):
         return F.gelu(gate, approximate="tanh")
 
 
+class ReLU2Op(BaseFusedOp):
+    """``out = relu(input) ** 2`` (single-input, not gated).
+
+    The real kernel is the CUDA JIT path (``sglang.kernels.ops.activation.activation.relu2``,
+    used in production on CUDA); elsewhere the torch reference runs.
+    """
+
+    op = "activation.relu2"
+    priority = (KernelBackend.JIT, KernelBackend.TORCH)
+    capabilities = {KernelBackend.JIT: _CUDA}
+    format_signature = FormatSignature(
+        supported_dtypes=_ACT_DTYPES,
+        description="relu(x) ** 2; returns tensor",
+    )
+    descriptions = {
+        KernelBackend.JIT: "relu(x)**2 (sglang.kernels.jit).",
+        KernelBackend.TORCH: "relu(x)**2 (pure-torch reference).",
+    }
+
+    def forward_native(
+        self, input: torch.Tensor, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        import torch.nn.functional as F
+
+        x = F.relu(input)
+        result = x * x
+        if out is None:
+            return result
+        out.copy_(result)
+        return out
+
+    def forward_jit(
+        self, input: torch.Tensor, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        from sglang.kernels.ops.activation.activation import relu2
+
+        result = relu2(input)
+        if out is None:
+            return result
+        out.copy_(result)
+        return out
+
+
+class QuickGELUOp(BaseFusedOp):
+    """``out = input * sigmoid(1.702 * input)`` (single-input, not gated).
+
+    Only ROCm has a native kernel (``sgl_kernel.gelu_quick``, AOT on HIP); CUDA
+    uses the torch reference in production, so no CUDA backend is registered.
+    """
+
+    op = "activation.gelu_quick"
+    priority = (KernelBackend.AOT, KernelBackend.TORCH)
+    capabilities = {KernelBackend.AOT: _HIP}
+    format_signature = FormatSignature(
+        supported_dtypes=_ACT_DTYPES,
+        description="x * sigmoid(1.702 * x); returns tensor",
+    )
+    descriptions = {
+        KernelBackend.AOT: "quick GELU (sgl_kernel wheel, ROCm).",
+        KernelBackend.TORCH: "quick GELU (pure-torch reference).",
+    }
+
+    def forward_native(
+        self, input: torch.Tensor, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        import torch
+
+        result = input * torch.sigmoid(1.702 * input)
+        if out is None:
+            return result
+        out.copy_(result)
+        return out
+
+    def forward_aot(
+        self, input: torch.Tensor, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        import torch
+        from sgl_kernel import gelu_quick
+
+        if out is None:
+            out = torch.empty(input.shape, dtype=input.dtype, device=input.device)
+        gelu_quick(input, out)
+        return out
+
+
 _SILU_AND_MUL = register_fused_op(SiluAndMulOp(), __name__, "_SILU_AND_MUL")
 _GELU_AND_MUL = register_fused_op(GeluAndMulOp(), __name__, "_GELU_AND_MUL")
 _GELU_TANH_AND_MUL = register_fused_op(
     GeluTanhAndMulOp(), __name__, "_GELU_TANH_AND_MUL"
 )
+_RELU2 = register_fused_op(ReLU2Op(), __name__, "_RELU2")
+_GELU_QUICK = register_fused_op(QuickGELUOp(), __name__, "_GELU_QUICK")
 
 
 def silu_and_mul(
@@ -208,13 +295,27 @@ def gelu_tanh_and_mul(
     return _GELU_TANH_AND_MUL(input, out)
 
 
+def relu2(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """``out = relu(input) ** 2``."""
+    return _RELU2(input, out)
+
+
+def gelu_quick(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """``out = input * sigmoid(1.702 * input)``."""
+    return _GELU_QUICK(input, out)
+
+
 __all__ = [
     "SiluAndMulOp",
     "GeluAndMulOp",
     "GeluTanhAndMulOp",
+    "ReLU2Op",
+    "QuickGELUOp",
     "silu_and_mul",
     "gelu_and_mul",
     "gelu_tanh_and_mul",
+    "relu2",
+    "gelu_quick",
 ]
 
 
