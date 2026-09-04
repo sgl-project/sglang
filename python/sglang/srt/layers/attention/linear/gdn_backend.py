@@ -2,6 +2,8 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.debug_utils import pr2874_state  # PR2874
+
 from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
@@ -522,6 +524,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
+            fresh_cache_indices = cache_indices[~has_initial_states]
+            if fresh_cache_indices.numel() > 0:
+                torch._assert_async(
+                    torch.count_nonzero(ssm_states[fresh_cache_indices]) == 0,
+                    f"PR2874 fresh temporal state is nonzero before GDN layer {layer.layer_id}",
+                )
+
         # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
         # chunk_gated_delta_rule) write state back in place assuming a contiguous
         # slot layout, so they silently drop the write to the strided envelope
@@ -592,6 +601,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 query_start_loc=query_start_loc,
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             ).transpose(0, 1)[:seq_len]
+
+        pr2874_probe = pr2874_state.layers if pr2874_state.active else None
+        if pr2874_probe is not None and not is_target_verify:
+            layer_probe = pr2874_probe[layer.layer_id]
+            layer_probe.update(
+                post_conv_shape=tuple(mixed_qkv.shape),
+                post_conv_dtype=str(mixed_qkv.dtype),
+                post_conv_finite=torch.isfinite(mixed_qkv).all(),
+                post_conv_max_abs=(
+                    mixed_qkv.abs().max()
+                    if mixed_qkv.numel() > 0
+                    else mixed_qkv.new_zeros((), dtype=torch.float32)
+                ),
+            )
 
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
@@ -702,6 +725,70 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 state_checkpoint_every_n_tokens=(
                     forward_metadata.state_checkpoint_every_n_tokens
                 ),
+            )
+
+            if pr2874_probe is not None:
+                layer_probe.update(
+                    post_recurrent_shape=tuple(core_attn_out.shape),
+                    post_recurrent_dtype=str(core_attn_out.dtype),
+                    post_recurrent_finite=torch.isfinite(core_attn_out).all(),
+                    post_recurrent_max_abs=(
+                        core_attn_out.abs().max()
+                        if core_attn_out.numel() > 0
+                        else core_attn_out.new_zeros((), dtype=torch.float32)
+                    ),
+                )
+                stat_keys = (
+                    "input_finite",
+                    "input_max_abs",
+                    "mixed_qkv_finite",
+                    "mixed_qkv_max_abs",
+                    "post_conv_finite",
+                    "post_conv_max_abs",
+                    "post_recurrent_finite",
+                    "post_recurrent_max_abs",
+                )
+                stat_values = torch.stack(
+                    [layer_probe[key].to(torch.float32) for key in stat_keys]
+                ).tolist()
+                for key, value in zip(stat_keys, stat_values):
+                    layer_probe[key] = (
+                        bool(value) if key.endswith("_finite") else float(value)
+                    )
+                first_nonfinite = next(
+                    (
+                        stage
+                        for stage in (
+                            "input",
+                            "mixed_qkv",
+                            "post_conv",
+                            "post_recurrent",
+                        )
+                        if not layer_probe[f"{stage}_finite"]
+                    ),
+                    None,
+                )
+                if (
+                    first_nonfinite is not None
+                    and pr2874_state.first_nonfinite is None
+                ):
+                    pr2874_state.first_nonfinite = (
+                        layer.layer_id,
+                        first_nonfinite,
+                    )
+                print(
+                    "[DEBUG gdn_backend.GDNAttnBackend.forward_extend] "
+                    f"PR2874 first_post_resume_target_extend "
+                    f"rank={pr2874_state.rank} "
+                    f"layer={layer.layer_id} first_nonfinite={first_nonfinite!r} "
+                    f"batch_first_nonfinite={pr2874_state.first_nonfinite!r} "
+                    f"stats={layer_probe!r}",
+                    flush=True,
+                )
+
+            torch._assert_async(
+                torch.isfinite(core_attn_out).all(),
+                f"PR2874 nonfinite GDN output at layer {layer.layer_id}",
             )
 
             if is_npu() and last_recurrent_state is not None:

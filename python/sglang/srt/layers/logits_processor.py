@@ -666,6 +666,11 @@ class LogitsProcessor(nn.Module):
 
         logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
 
+        torch._assert_async(
+            torch.isfinite(logits).all(),
+            "PR2874 nonfinite local logits before TP gather",
+        )
+
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
@@ -680,6 +685,11 @@ class LogitsProcessor(nn.Module):
                 used_tp_lm_head_all_to_all = True
             else:
                 logits = self._logits_gatherer(logits)
+
+            torch._assert_async(
+                torch.isfinite(logits).all(),
+                "PR2874 nonfinite logits after TP gather",
+            )
 
         if not used_tp_lm_head_all_to_all:
             logits = self._scatter_dp_attn_logits(

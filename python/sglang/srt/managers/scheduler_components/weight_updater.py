@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 import msgspec
 import torch
 
+from sglang.srt.debug_utils import tms_diag  # TMSDIAG
 from sglang.srt.constants import (
     GPU_MEMORY_ALL_TYPES,
     GPU_MEMORY_TYPE_CUDA_GRAPH,
@@ -355,6 +356,7 @@ class SchedulerWeightUpdaterManager:
             ignore_waiting=scheduler is not None and scheduler._engine_paused
         ), "release_memory_occupation should be called only when server is idle."
 
+        tms_diag.on_release(self)  # TMSDIAG
         tags = recv_req.tags
 
         if tags is None or len(tags) == 0:
@@ -434,6 +436,11 @@ class SchedulerWeightUpdaterManager:
                     if queue is not None:
                         queue.resume_memory_occupation()
 
+            # Temporary PR2874 diagnostic: trace the next 6 target EXTENDs after
+            # the kv resume (the whole first prefill wave, not just batch 1).
+            self.tp_worker.model_runner._pr2874_probe_next_target_extend = 6
+
+        tms_diag.on_resume(self)  # TMSDIAG
         return ResumeMemoryOccupationReqOutput()
 
     def check_weights(self, recv_req: CheckWeightsReqInput):

@@ -19,6 +19,8 @@ from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
+
+from sglang.srt.debug_utils import pr2874_state  # PR2874
 import torch.nn as nn
 import triton
 
@@ -639,6 +641,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
+        pr2874_probe = pr2874_state.layers if pr2874_state.active else None
+        if pr2874_probe is not None:
+            probe_input = (
+                hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+            )
+            pr2874_probe[self.layer_id] = {
+                "input_shape": tuple(probe_input.shape),
+                "input_dtype": str(probe_input.dtype),
+                "input_finite": torch.isfinite(probe_input).all(),
+                "input_max_abs": (
+                    probe_input.abs().max()
+                    if probe_input.numel() > 0
+                    else probe_input.new_zeros((), dtype=torch.float32)
+                ),
+            }
+
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )
@@ -672,6 +690,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 lambda x: x.reshape(x.shape[0], -1), (query, key, value)
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
+
+        if pr2874_probe is not None:
+            pr2874_probe[self.layer_id].update(
+                mixed_qkv_shape=tuple(mixed_qkv.shape),
+                mixed_qkv_dtype=str(mixed_qkv.dtype),
+                mixed_qkv_finite=torch.isfinite(mixed_qkv).all(),
+                mixed_qkv_max_abs=(
+                    mixed_qkv.abs().max()
+                    if mixed_qkv.numel() > 0
+                    else mixed_qkv.new_zeros((), dtype=torch.float32)
+                ),
+            )
 
         core_attn_out = self.attn(
             forward_batch,

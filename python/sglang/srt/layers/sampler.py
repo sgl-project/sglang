@@ -94,6 +94,10 @@ class Sampler(nn.Module):
         if sampling_info.has_custom_logit_processor:
             apply_custom_logit_processor(logits, sampling_info)
         sanitize_nan_logits(logits, "sampler: next_token_logits")
+        torch._assert_async(
+            torch.isfinite(logits).all(),
+            "PR2874 sampler received nonfinite logits",
+        )
         return logits
 
     def forward(
@@ -156,7 +160,19 @@ class Sampler(nn.Module):
                 original_logprobs = torch.log_softmax(logits, dim=-1)
 
             # Post process logits
+            torch._assert_async(
+                torch.isfinite(sampling_info.temperatures).all(),
+                "PR2874 sampler received nonfinite temperatures",
+            )
+            torch._assert_async(
+                (sampling_info.temperatures > 0).all(),
+                "PR2874 sampler received nonpositive temperatures",
+            )
             logits.div_(sampling_info.temperatures)
+            torch._assert_async(
+                torch.isfinite(logits).all(),
+                "PR2874 temperature scaling produced nonfinite logits",
+            )
 
             # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
             logprobs_via_logsoftmax_kernel = None
@@ -205,6 +221,14 @@ class Sampler(nn.Module):
                 # In-place op to save memory
                 logits[:] = torch.softmax(logits, dim=-1)
                 probs = logits
+                torch._assert_async(
+                    torch.isfinite(probs).all(),
+                    "PR2874 softmax produced nonfinite probabilities",
+                )
+                torch._assert_async(
+                    (probs >= 0).all(),
+                    "PR2874 softmax produced negative probabilities",
+                )
 
                 batch_next_token_ids = self._sample_from_probs(
                     probs, sampling_info, positions, simple_sampling_case

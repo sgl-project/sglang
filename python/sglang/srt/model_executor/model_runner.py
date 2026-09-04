@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from typing import List, Optional, Union
 
 import torch
+
+from sglang.srt.debug_utils import pr2874_state  # PR2874
 import torch.distributed as dist
 
 from sglang.srt.configs.load_config import LoadConfig
@@ -358,6 +360,10 @@ class ModelRunner:
         self.attention_chunk_size = model_config.attention_chunk_size
         self.enable_elastic_ep = server_args.elastic_ep_backend is not None
         self.forward_pass_id = 0
+        # Temporary PR2874 diagnostic: armed by resume_memory_occupation with a
+        # countdown; consumed by the next N target EXTENDs that can read Mamba
+        # state (the first post-resume wave is several prefill batches).
+        self._pr2874_probe_next_target_extend = 0
         self._pending_elastic_scale_update = None
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
@@ -1701,14 +1707,122 @@ class ModelRunner:
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             return
+
+        probe_first_post_resume = self._pr2874_probe_next_target_extend > 0
+        if probe_first_post_resume:
+            self._pr2874_probe_next_target_extend -= 1
+            forward_batch._pr2874_gdn_probe = {}
+            forward_batch._pr2874_probe_rank = self.ps.tp_rank
+            forward_batch._pr2874_first_nonfinite = None
+            pr2874_state.activate(self.ps.tp_rank)
+
+            req_mamba_logical = pool.get_mamba_indices(
+                forward_batch.req_pool_indices
+            )
+            req_mamba_physical = pool.translate_mamba_indices(req_mamba_logical)
+            logical_clear_indices = forward_batch.mamba_clear_indices
+            physical_clear_indices = (
+                pool.translate_mamba_indices(logical_clear_indices)
+                if logical_clear_indices is not None
+                else None
+            )
+            mamba_pool = pool.mamba_pool
+            conv_tensors = mamba_pool.mamba_cache.conv
+            descriptor_cached_before_probe = "_conv_slot_desc" in vars(mamba_pool)
+            conv_fuse_ok = mamba_pool._conv_fuse_ok
+            descriptor = mamba_pool._conv_slot_desc if conv_fuse_ok else None
+            descriptor_state = {
+                "fuse_ok": conv_fuse_ok,
+                "cached_before_probe": descriptor_cached_before_probe,
+            }
+            if descriptor is not None:
+                expected_ptr = [tensor.data_ptr() for tensor in conv_tensors]
+                expected_feat = [tensor[0, 0].numel() for tensor in conv_tensors]
+                expected_layer_stride = [
+                    tensor.stride(0) for tensor in conv_tensors
+                ]
+                expected_slot_stride = [tensor.stride(1) for tensor in conv_tensors]
+                descriptor_ptr = descriptor.ptr.tolist()
+                descriptor_feat = descriptor.feat.tolist()
+                descriptor_layer_stride = descriptor.layer_stride.tolist()
+                descriptor_slot_stride = descriptor.slot_stride.tolist()
+                descriptor_state.update(
+                    ptr=descriptor_ptr,
+                    feat=descriptor_feat,
+                    layer_stride=descriptor_layer_stride,
+                    slot_stride=descriptor_slot_stride,
+                    matches_actual=(
+                        descriptor_ptr == expected_ptr
+                        and descriptor_feat == expected_feat
+                        and descriptor_layer_stride == expected_layer_stride
+                        and descriptor_slot_stride == expected_slot_stride
+                    ),
+                )
+
+            print(
+                "[DEBUG model_runner._maybe_execute_deferred_mamba_cow_and_clear] "
+                f"PR2874 first_post_resume_target_extend rank={self.ps.tp_rank} "
+                f"batch_size={forward_batch.batch_size} "
+                f"forward_mode={forward_batch.forward_mode!r} "
+                f"req_pool_indices_meta={(type(forward_batch.req_pool_indices).__name__, tuple(forward_batch.req_pool_indices.shape), str(forward_batch.req_pool_indices.dtype))} "
+                f"req_pool_indices={forward_batch.req_pool_indices.tolist()} "
+                f"extend_prefix_lens={forward_batch.extend_prefix_lens.tolist()} "
+                f"req_mamba_logical={req_mamba_logical.tolist()} "
+                f"req_mamba_physical={req_mamba_physical.tolist()} "
+                f"clear_logical={logical_clear_indices.tolist() if logical_clear_indices is not None else None} "
+                f"clear_physical={physical_clear_indices.tolist() if physical_clear_indices is not None else None} "
+                f"conv_layouts={[(tuple(t.shape), tuple(t.stride()), t.data_ptr()) for t in conv_tensors]} "
+                f"descriptor={descriptor_state!r}",
+                flush=True,
+            )
+        else:
+            pr2874_state.deactivate()
+            req_mamba_logical = None
+            req_mamba_physical = None
+            logical_clear_indices = None
+            physical_clear_indices = None
+
         if (
             forward_batch.mamba_clear_indices is not None
             and len(forward_batch.mamba_clear_indices) > 0
         ):
             # mamba_pool is a pure PHYSICAL store; translate before zeroing or
             # clear_slots zeroes the wrong physical slots.
-            pool.mamba_pool.clear_slots(
-                pool.translate_mamba_indices(forward_batch.mamba_clear_indices)
+            clear_indices = (
+                physical_clear_indices
+                if probe_first_post_resume
+                else pool.translate_mamba_indices(forward_batch.mamba_clear_indices)
+            )
+            pool.mamba_pool.clear_slots(clear_indices)
+
+        if probe_first_post_resume:
+            state_stats = {"conv": [], "temporal": None}
+            if physical_clear_indices is not None and len(physical_clear_indices) > 0:
+                selected_indices = physical_clear_indices.to(torch.long)
+
+                def selected_state_stats(tensor: torch.Tensor):
+                    selected = tensor[:, selected_indices]
+                    return {
+                        "shape": tuple(selected.shape),
+                        "dtype": str(selected.dtype),
+                        "finite": bool(torch.isfinite(selected).all().item()),
+                        "count_nonzero": int(torch.count_nonzero(selected).item()),
+                        "max_abs": float(selected.abs().max().item()),
+                    }
+
+                state_stats["conv"] = [
+                    selected_state_stats(tensor) for tensor in conv_tensors
+                ]
+                state_stats["temporal"] = selected_state_stats(
+                    mamba_pool.mamba_cache.temporal
+                )
+
+            print(
+                "[DEBUG model_runner._maybe_execute_deferred_mamba_cow_and_clear] "
+                f"PR2874 post_clear rank={self.ps.tp_rank} "
+                f"physical_slots={physical_clear_indices.tolist() if physical_clear_indices is not None else None} "
+                f"state_stats={state_stats!r}",
+                flush=True,
             )
         if (
             forward_batch.mamba_cow_src_indices is not None
@@ -1850,8 +1964,28 @@ class ModelRunner:
         #       was executed after we processed last batch's results.
 
         # Calculate logits bias and apply it to next_token_logits.
+        logits = logits_output.next_token_logits
+        torch._assert_async(
+            torch.isfinite(logits).all(),
+            "PR2874 nonfinite logits before sampling metadata",
+        )
+        for name in (
+            "acc_additive_penalties",
+            "acc_scaling_penalties",
+            "logit_bias",
+        ):
+            value = getattr(sampling_info, name, None)
+            if value is not None:
+                torch._assert_async(
+                    torch.isfinite(value).all(),
+                    f"PR2874 nonfinite sampling metadata: {name}",
+                )
         sampling_info.update_regex_vocab_mask()
-        sampling_info.apply_logits_bias(logits_output.next_token_logits)
+        sampling_info.apply_logits_bias(logits)
+        torch._assert_async(
+            torch.isfinite(logits).all(),
+            "PR2874 sampling metadata produced nonfinite logits",
+        )
 
         # Release the vocab_mask GPU tensor immediately after it has been applied
         # to the logits. In overlap scheduling, the sampling_info (and its
