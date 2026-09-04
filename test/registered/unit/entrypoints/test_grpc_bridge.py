@@ -44,14 +44,14 @@ def _make_runtime_handle(responses):
 
 
 class TestNativeGrpcReadiness(CustomTestCase):
-    def test_readiness_is_inverse_of_pause_state(self):
-        tokenizer_manager = SimpleNamespace(is_pause=False)
+    def test_readiness_comes_from_tokenizer_manager(self):
+        tokenizer_manager = SimpleNamespace(is_ready=lambda: True)
         handle = RuntimeHandle.__new__(RuntimeHandle)
         handle.tokenizer_manager = tokenizer_manager
 
         self.assertTrue(handle.get_is_ready())
 
-        tokenizer_manager.is_pause = True
+        tokenizer_manager.is_ready = lambda: False
         self.assertFalse(handle.get_is_ready())
 
 

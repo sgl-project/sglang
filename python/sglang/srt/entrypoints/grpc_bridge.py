@@ -442,7 +442,7 @@ class RuntimeHandle:
         )
 
     def get_is_ready(self) -> bool:
-        return not self.tokenizer_manager.is_pause
+        return self.tokenizer_manager.is_ready()
 
     def tokenize(self, text: str, add_special_tokens: bool = True) -> str:
         tokenizer = self.tokenizer_manager.tokenizer
