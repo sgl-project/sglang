@@ -960,7 +960,6 @@ class ModelRunner:
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
             shared_index_layers=resolve_shared_index_layers(
                 hf_text_config=self.model_config.hf_text_config,
-                pp_size=self.ps.pp_size,
                 is_speculative=self.spec_algorithm.is_speculative(),
             ),
         )

@@ -48,14 +48,17 @@ class HiSparseTokenStats(NamedTuple):
 def resolve_shared_index_layers(
     *,
     hf_text_config,
-    pp_size: int,
     is_speculative: bool,
 ) -> Optional[List[bool]]:
     """Per-layer "reuses the previous layer's top-k index" pattern, or None.
 
     Mirrors DeepseekV2AttentionMLA's skip_topk derivation (index_topk_pattern /
     index_topk_freq / cli_factor); None when the model has no sharing or the
-    prefetch cannot run (PP, speculative decoding, kill-switch).
+    prefetch cannot run (speculative decoding, kill-switch).
+
+    The returned pattern is model-global; under pipeline parallelism the
+    coordinator slices it to the KV pool's layer range (see
+    `HiSparseCoordinator._init_shared_index_prefetch`).
     """
     if not is_deepseek_dsa(hf_text_config):
         return None
@@ -67,11 +70,10 @@ def resolve_shared_index_layers(
         pattern = [dsa_layer_skips_topk(hf_text_config, i) for i in range(num_layers)]
     if not any(pattern):
         return None
-    if pp_size != 1 or is_speculative:
+    if is_speculative:
         logger.warning(
-            "HiSparse shared-index prefetch is unsupported under pipeline "
-            "parallelism / speculative decoding; falling back to synchronous "
-            "swap-in."
+            "HiSparse shared-index prefetch is unsupported under speculative "
+            "decoding; falling back to synchronous swap-in."
         )
         return None
     if envs.SGLANG_DISABLE_HISPARSE_PREFETCH.get():
@@ -81,6 +83,45 @@ def resolve_shared_index_layers(
         )
         return None
     return pattern
+
+
+def _localize_shared_index_layers(
+    pattern: List[bool], *, start_layer: int, layer_num: int
+) -> Optional[List[bool]]:
+    """Cut the model-global skip pattern down to one rank's KV pool layers.
+
+    Returns None (-> synchronous swap-in) when the pattern cannot be mapped:
+
+    - It does not cover ``[start_layer, start_layer + layer_num)``, i.e. the
+      attention-layer count differs from num_hidden_layers (Longcat doubles it).
+    - The stage's first layer is a skip layer. The model itself can carry the
+      top-k index across a pipeline boundary (deepseek_v2 forwards
+      `topk_indices` via PPProxyTensors), but the anchor's *miss plan* lives in
+      this rank's device memory and cannot, so the stage has nothing to replay.
+      Avoidable with an anchor-aligned split via SGLANG_PP_LAYER_PARTITION.
+    """
+    end_layer = start_layer + layer_num
+    if len(pattern) < end_layer:
+        logger.warning(
+            "HiSparse shared-index prefetch disabled: pattern length %d does "
+            "not cover KV pool layers [%d, %d); using synchronous swap-in.",
+            len(pattern),
+            start_layer,
+            end_layer,
+        )
+        return None
+    local = pattern[start_layer:end_layer]
+    if local[0]:
+        logger.warning(
+            "HiSparse shared-index prefetch disabled: this stage starts on "
+            "layer %d, a shared-index (skip) layer, so its anchor's miss plan "
+            "lives on the previous rank and cannot be replayed here. Use "
+            "SGLANG_PP_LAYER_PARTITION to split on an anchor layer. Falling "
+            "back to synchronous swap-in.",
+            start_layer,
+        )
+        return None
+    return local
 
 
 def _build_prefetch_groups(
@@ -217,6 +258,11 @@ class HiSparseCoordinator:
 
         # initialize data structures for swap-in kernel
         layer_num = self.mem_pool_device.layer_num
+        # Under pipeline parallelism the device/host KV pools only hold this
+        # rank's slice, so every per-layer structure below is indexed 0..layer_num,
+        # while callers hand us the model-global `layer.layer_id`. Subtract the
+        # pool's start_layer to convert, same convention as memory_pool.py.
+        self.start_layer = self.mem_pool_device.start_layer
         self.req_device_buffer_tokens = torch.full(
             (layer_num, max_num_req_slots, self.padded_buffer_size),
             -1,
@@ -270,17 +316,17 @@ class HiSparseCoordinator:
     ) -> None:
         """Set up the plan-then-IO prefetch for shared-index (IndexShare) models:
         the anchor's kernel records its miss plan and skip layers replay it on
-        `prefetch_stream`, overlapping their IO with the intervening compute."""
-        if shared_index_layers is not None and len(shared_index_layers) != layer_num:
-            # Attention-layer count differs from num_hidden_layers (e.g. Longcat
-            # doubles it): pattern would be misindexed, fall back to synchronous.
-            logger.warning(
-                "HiSparse shared-index prefetch disabled: pattern length %d != "
-                "KV pool layer_num %d; using synchronous swap-in.",
-                len(shared_index_layers),
-                layer_num,
+        `prefetch_stream`, overlapping their IO with the intervening compute.
+
+        `shared_index_layers` is model-global; slice it to this rank's KV pool
+        range so the pattern (and the groups built from it) is pool-local.
+        """
+        if shared_index_layers is not None:
+            shared_index_layers = _localize_shared_index_layers(
+                shared_index_layers,
+                start_layer=self.start_layer,
+                layer_num=layer_num,
             )
-            shared_index_layers = None
         self._is_shared_index_layer = list(shared_index_layers or [False] * layer_num)
         self.enable_prefetch = any(self._is_shared_index_layer)
         self._prefetch_groups, self._prefetch_slot = _build_prefetch_groups(
@@ -939,10 +985,12 @@ class HiSparseCoordinator:
         req_pool_indices: torch.Tensor,
         compressed_seq_lens: torch.Tensor,
         top_k_result: torch.Tensor,
-        layer_id: int,
+        local_layer_id: int,
         record_plan: bool = False,
     ) -> torch.Tensor:
         """Run the full plan+IO swap-in kernel for one layer; return its slot table.
+
+        `local_layer_id` is pool-local (see `self.start_layer`).
 
         record_plan (set on the anchor of a shared-index group) also records the
         miss plan into self._miss_{src,dst,count} for the skip layers to replay.
@@ -966,15 +1014,15 @@ class HiSparseCoordinator:
         )
         swap_in_fn(
             top_k_tokens=top_k_result,
-            device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
+            device_buffer_tokens=self.req_device_buffer_tokens[local_layer_id],
             host_cache_locs=self.req_to_host_pool,
-            device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
-            host_cache=self.mem_pool_host.kv_buffer[layer_id],
-            device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+            device_buffer_locs=self.req_device_buffer_token_locs[local_layer_id],
+            host_cache=self.mem_pool_host.kv_buffer[local_layer_id],
+            device_buffer=self.mem_pool_device.kv_buffer[local_layer_id],
             top_k_device_locs=top_k_indices,
             req_pool_indices=req_pool_indices,
             seq_lens=compressed_seq_lens,
-            lru_slots=self.lru_slots[layer_id],
+            lru_slots=self.lru_slots[local_layer_id],
             item_size_bytes=self.item_size_bytes,
             num_top_k=self.top_k,
             hot_buffer_size=self.device_buffer_size,
@@ -986,16 +1034,19 @@ class HiSparseCoordinator:
         )
         return top_k_indices
 
-    def _run_copy_only_kernel(self, num_reqs: int, skip_layer: int) -> None:
+    def _run_copy_only_kernel(self, num_reqs: int, local_skip_layer: int) -> None:
         """Replay the anchor's recorded miss plan into a skip layer's buffers
-        (IO-only; the anchor's slot table stays valid -- lockstep layout)."""
+        (IO-only; the anchor's slot table stays valid -- lockstep layout).
+
+        `local_skip_layer` is pool-local (see `self.start_layer`).
+        """
         copy_cache_planned_mla(
             miss_src=self._miss_src[:num_reqs],
             miss_dst=self._miss_dst[:num_reqs],
             miss_count=self._miss_count[:num_reqs],
             num_real_reqs=self.num_real_reqs,
-            host_cache=self.mem_pool_host.kv_buffer[skip_layer],
-            device_buffer=self.mem_pool_device.kv_buffer[skip_layer],
+            host_cache=self.mem_pool_host.kv_buffer[local_skip_layer],
+            device_buffer=self.mem_pool_device.kv_buffer[local_skip_layer],
             item_size_bytes=self.item_size_bytes,
             num_blocks=self._prefetch_copy_blocks,
             is_dsv4_layout=self.is_dsv4_hisparse,
@@ -1011,30 +1062,34 @@ class HiSparseCoordinator:
     ) -> torch.Tensor:
         """Swap selected top-k tokens into device memory and return their indices.
 
+        `layer_id` is the model-global layer id; every per-layer structure here
+        is pool-local, so convert through `self.start_layer` first.
+
         With prefetch enabled, anchors swap in synchronously (recording the miss
         plan) and prefetch their skip layers' copies; skip layers just wait.
         """
+        local_layer_id = layer_id - self.start_layer
         if not self.enable_prefetch:
             return self._run_swap_in_kernel(
-                req_pool_indices, compressed_seq_lens, top_k_result, layer_id
+                req_pool_indices, compressed_seq_lens, top_k_result, local_layer_id
             )
 
         num_reqs = req_pool_indices.size(0)
-        if self._is_shared_index_layer[layer_id]:
+        if self._is_shared_index_layer[local_layer_id]:
             # Skip layer: wait for its prefetched copy; the anchor's slot table
             # applies (shared index + lockstep buffers).
-            slot = self._prefetch_slot[layer_id]
+            slot = self._prefetch_slot[local_layer_id]
             self._prefetch_events[slot].wait(device_module.current_stream())
             return self.top_k_device_locs_buffer[:num_reqs]
 
         # Anchor: swap in synchronously (recording the plan), then prefetch the
         # skip layers' copies on the side stream.
-        group = self._prefetch_groups.get(layer_id)
+        group = self._prefetch_groups.get(local_layer_id)
         anchor_locs = self._run_swap_in_kernel(
             req_pool_indices,
             compressed_seq_lens,
             top_k_result,
-            layer_id,
+            local_layer_id,
             record_plan=group is not None,
         )
         if group:
