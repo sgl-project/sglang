@@ -163,6 +163,20 @@ class TinyGemmLinear(ReplicatedLinear):
         return super().forward(x)
 
 
+def _moe_weights_are_mxfp4(quant_config: QuantizationConfig) -> bool:
+    """True when the MoE experts consume mxfp4 weights, under any quant method."""
+    name = quant_config.get_name()
+    if name == "mxfp4":
+        return True
+    if name != "quark":
+        return False
+    from sglang.srt.layers.quantization.quark.quark import QuarkConfig
+
+    return isinstance(quant_config, QuarkConfig) and (
+        quant_config.has_mx_w4a8_global_config()
+    )
+
+
 def _resolve_moe_input_pad_multiple(
     quant_config: Optional[QuantizationConfig],
 ) -> int:
@@ -178,10 +192,11 @@ def _resolve_moe_input_pad_multiple(
         return 0
     if not (_is_hip and envs.SGLANG_USE_AITER.get()):
         return 0
-    # Only the MXFP4 path needs the 256-multiple pad on hidden_size; other
-    # quant methods (or unquantized bf16) consume the unpadded layernorm
-    # output directly.
-    if quant_config.get_name() != "mxfp4":
+    # Only mxfp4 weights need the 256-multiple pad on hidden_size; other quant
+    # methods (or unquantized bf16) consume the unpadded layernorm output
+    # directly. Gate on that requirement rather than on the quant method's
+    # name: Quark's W4A8 scheme is mxfp4-weighted too, and reports "quark".
+    if not _moe_weights_are_mxfp4(quant_config):
         return 0
     if get_parallel().tp_size != 1:
         # Mid-layer hidden_states still flow through CommunicateWith...
