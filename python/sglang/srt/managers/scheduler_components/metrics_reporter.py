@@ -53,6 +53,8 @@ CACHE_HIT_RATE_WINDOW_SECONDS = envs.SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS.get()
 # be re-exported indefinitely. 30s is far above any healthy decode-stats gap,
 # so past it the true recent decode throughput is ~0.
 GEN_THROUGHPUT_STALENESS_SECONDS = 30.0
+# Update scheduler time counters every 1 second.
+_SCHEDULER_TIME_ACCOUNTING_INTERVAL_NS = 1_000_000_000
 
 
 class _CacheHitRateWindow:
@@ -122,6 +124,44 @@ class PrefillStats:
             num_new_seqs=len(adder.can_run_list),
             num_pending_tokens=num_pending_tokens,
         )
+
+
+@dataclass(slots=True)
+class _SchedulerTimeAccountingSnapshot:
+    start_ns: int
+    last_sample_ns: int
+    start_process_cpu_ns: int
+    accumulate_idle_ns: int
+    # Whether the last sample was idle (for example, no work on the engine).
+    is_idle: bool
+
+    @classmethod
+    def init(
+        cls, now_ns: int, now_process_cpu_ns: int, is_idle: bool
+    ) -> _SchedulerTimeAccountingSnapshot:
+        return cls(
+            start_ns=now_ns,
+            last_sample_ns=now_ns,
+            start_process_cpu_ns=now_process_cpu_ns,
+            accumulate_idle_ns=0,
+            is_idle=is_idle,
+        )
+
+    def sample(self, now_ns: int, is_idle: bool) -> None:
+        if self.is_idle:
+            self.accumulate_idle_ns += now_ns - self.last_sample_ns
+        self.last_sample_ns = now_ns
+        self.is_idle = is_idle
+
+    def should_record(self, now_ns: int) -> bool:
+        return now_ns - self.start_ns >= _SCHEDULER_TIME_ACCOUNTING_INTERVAL_NS
+
+    def reset(self, now_ns: int, now_process_cpu_ns: int, is_idle: bool) -> None:
+        self.start_ns = now_ns
+        self.last_sample_ns = now_ns
+        self.start_process_cpu_ns = now_process_cpu_ns
+        self.accumulate_idle_ns = 0
+        self.is_idle = is_idle
 
 
 @dataclass(kw_only=True)
@@ -216,6 +256,9 @@ class SchedulerMetricsReporter:
                 self._mfu_log_write_bytes = 0.0
 
         self.fwd_occupancy = float("nan")
+        self._scheduler_time_accounting: Optional[_SchedulerTimeAccountingSnapshot] = (
+            None
+        )
 
         self.forward_pass_device_timer: Optional[DeviceTimer] = None
 
@@ -1195,6 +1238,46 @@ class SchedulerMetricsReporter:
         self._device_timer_window_batch_count += 1
         if self._device_timer_window_batch_count >= self.decode_log_interval:
             self._device_timer_window_batch_count = 0
+
+    def start_scheduler_time_accounting(self) -> None:
+        if not self.enable_metrics:
+            return
+        self._scheduler_time_accounting = _SchedulerTimeAccountingSnapshot.init(
+            time.monotonic_ns(), time.process_time_ns(), True
+        )
+
+    def record_scheduler_active(self) -> None:
+        self._record_scheduler_time(is_idle=False)
+
+    def record_scheduler_idle(self) -> None:
+        self._record_scheduler_time(is_idle=True)
+
+    def _record_scheduler_time(self, is_idle: bool) -> None:
+        if not self.enable_metrics:
+            return
+
+        now_wall_ns = time.monotonic_ns()
+        accounting = self._scheduler_time_accounting
+        if accounting is None:
+            self._scheduler_time_accounting = _SchedulerTimeAccountingSnapshot.init(
+                now_wall_ns, time.process_time_ns(), is_idle
+            )
+            return
+
+        accounting.sample(now_wall_ns, is_idle)
+        if not accounting.should_record(now_wall_ns):
+            return
+
+        now_process_cpu_ns = time.process_time_ns()
+        elapsed_process_cpu_ns = now_process_cpu_ns - accounting.start_process_cpu_ns
+        if accounting.accumulate_idle_ns > 0:
+            self.metrics_collector.increment_scheduler_idle_seconds(
+                accounting.accumulate_idle_ns / 1e9
+            )
+        self.metrics_collector.increment_scheduler_process_cpu_seconds(
+            elapsed_process_cpu_ns / 1e9
+        )
+        accounting.reset(now_wall_ns, now_process_cpu_ns, is_idle)
 
     def _reset_device_timer_window(self):
         """Exclude idle time and invalidate the last forward-occupancy sample."""

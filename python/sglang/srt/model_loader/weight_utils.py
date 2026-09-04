@@ -259,6 +259,23 @@ def _resolve_explicit_draft_quant_config(
     return quant_config
 
 
+def _modelopt_quant_section(config: dict) -> dict:
+    """Return ModelOpt quant settings from nested or flat ``hf_quant_config.json``.
+
+    Nested LLM format::
+
+        {"quantization": {"quant_algo": "FP8", "exclude_modules": [...]}}
+
+    Flat format (``config.json`` ``quantization_config`` / Cosmos3-style exports)::
+
+        {"quant_algo": "FP8", "ignore": [...], "quant_method": "modelopt", ...}
+    """
+    quantization = config.get("quantization")
+    if isinstance(quantization, dict):
+        return quantization
+    return config
+
+
 # TODO(woosuk): Move this to other place.
 def get_quant_config(
     model_config: ModelConfig,
@@ -386,12 +403,17 @@ def get_quant_config(
     quant_config_file = quant_config_files[0]
     with open(quant_config_file) as f:
         config = json.load(f)
+        quant_section = _modelopt_quant_section(config)
         if remap_prefix is not None:
-            exclude_modules = [
-                replace_prefix(key, remap_prefix)
-                for key in config["quantization"]["exclude_modules"]
-            ]
-            config["quantization"]["exclude_modules"] = exclude_modules
+            # Nested configs use ``exclude_modules``; flat ModelOpt exports use ``ignore``.
+            exclude_key = (
+                "exclude_modules" if "exclude_modules" in quant_section else "ignore"
+            )
+            if exclude_key in quant_section:
+                quant_section[exclude_key] = [
+                    replace_prefix(key, remap_prefix)
+                    for key in quant_section[exclude_key]
+                ]
         config["packed_modules_mapping"] = packed_modules_mapping
 
         if model_config.quantization == "bitsandbytes":
@@ -399,7 +421,7 @@ def get_quant_config(
         elif model_config.quantization.startswith("modelopt") and (
             config.get("producer", {}).get("name", "").startswith("modelopt")
         ):
-            quant_algo = config["quantization"]["quant_algo"]
+            quant_algo = quant_section.get("quant_algo")
             if quant_algo is None:
                 # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
                 if model_config.hf_config.architectures[0] != "LlamaForCausalLMEagle3":
@@ -423,15 +445,19 @@ def get_quant_config(
         )
 
 
-def _check_index_files_exist(snapshot_dir: str) -> Tuple[bool, Optional[str]]:
+def _check_index_files_exist(
+    snapshot_dir: str, allow_patterns: Optional[List[str]] = None
+) -> Tuple[bool, Optional[str]]:
     """
-    Check if all files listed in safetensors index files actually exist on disk.
+    Check if files listed in safetensors index files actually exist on disk.
 
     This catches cases where the snapshot directory exists but files are missing
-    (e.g., due to incomplete downloads or corrupted cache).
+    (e.g., due to incomplete downloads or corrupted cache). If allow_patterns is
+    provided, only indexed files matching those patterns are validated.
 
     Args:
         snapshot_dir: Path to the model snapshot directory
+        allow_patterns: Optional source patterns to scope validation.
 
     Returns:
         Tuple of (all_exist, error_message)
@@ -453,6 +479,15 @@ def _check_index_files_exist(snapshot_dir: str) -> Tuple[bool, Optional[str]]:
             if not weight_map:
                 continue
             required_files = set(weight_map.values())
+            if allow_patterns is not None:
+                required_files = {
+                    fn
+                    for fn in required_files
+                    if any(
+                        fnmatch.fnmatch(fn.replace(os.sep, "/"), pattern)
+                        for pattern in allow_patterns
+                    )
+                }
             missing_files = [
                 fn
                 for fn in required_files
@@ -555,7 +590,9 @@ def _find_local_hf_snapshot_dir_unlocked(
     # Check for missing files from index (lightweight, for all users)
     # This catches incomplete downloads before they cause cryptic load errors
     if local_weight_files:
-        is_complete, error_msg = _check_index_files_exist(found_local_snapshot_dir)
+        is_complete, error_msg = _check_index_files_exist(
+            found_local_snapshot_dir, allow_patterns
+        )
         if not is_complete:
             log_info_on_rank0(
                 logger,
@@ -715,7 +752,10 @@ def download_safetensors_index_file_from_hf(
 # So, we use the index_file to
 # look up which safetensors files should be used.
 def filter_duplicate_safetensors_files(
-    hf_weights_files: List[str], hf_folder: str, index_file: str
+    hf_weights_files: List[str],
+    hf_folder: str,
+    index_file: str,
+    allow_patterns: Optional[List[str]] = None,
 ) -> List[str]:
     # model.safetensors.index.json is a mapping from keys in the
     # torch state_dict to safetensors file holding that weight.
@@ -739,9 +779,18 @@ def filter_duplicate_safetensors_files(
     for weight_name in weight_map:
         weight_files_in_index.add(os.path.join(hf_folder, weight_map[weight_name]))
     # Fail fast if the index references shard files that are not on disk (e.g. an
-    # incomplete or interrupted download). Otherwise those shards are silently
-    # dropped and the model loads with uninitialized weights.
-    missing_files = sorted(f for f in weight_files_in_index if not os.path.isfile(f))
+    # incomplete or interrupted download). For subfolder-scoped loads, only
+    # validate the indexed shards that match the requested source patterns.
+    if allow_patterns is None:
+        files_to_validate = weight_files_in_index
+    else:
+        files_to_validate = set()
+        for f in weight_files_in_index:
+            rel_path = os.path.relpath(f, hf_folder).replace(os.sep, "/")
+            if any(fnmatch.fnmatch(rel_path, pattern) for pattern in allow_patterns):
+                files_to_validate.add(f)
+
+    missing_files = sorted(f for f in files_to_validate if not os.path.isfile(f))
     if missing_files:
         raise RuntimeError(
             f"{index_file} references {len(missing_files)} shard file(s) missing "

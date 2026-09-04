@@ -388,6 +388,7 @@ def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
     )
     copy_done = CopyDone()
     scheduler = object.__new__(Scheduler)
+    scheduler.metrics_reporter = Mock()
     scheduler.forward_ct = 0
     scheduler._sched_idled = False
     scheduler.scripted_scheduler_hook = None

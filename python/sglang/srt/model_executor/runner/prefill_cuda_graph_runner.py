@@ -382,6 +382,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             enable_prefill_cp=(
                 is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
             ),
+            attn_tp_sharded_fn=self.model_runner.attn_tp_sequence_sharded,
             source=self.buffers,
         )
 
@@ -646,10 +647,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         buf = self.buffer_registry.get_slot("num_token_non_padded").buffer
         buf.fill_(num_tokens)
-        if require_gathered_buffer():
+        # Localize the count when this bucket is attn-TP sharded (SP on).
+        if self.model_runner.attn_tp_sequence_sharded(num_tokens):
             local = compute_local_num_token_non_padded(
                 global_num_token_non_padded=buf,
                 num_tokens_per_dp=num_tokens,
+                sharded=True,
             )
             buf.copy_(local)
         return buf
@@ -1393,7 +1396,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 # Ported from main #27468.
                 capture_hidden_mode=self.capture_hidden_mode,
                 num_token_non_padded=self._capture_num_token_non_padded(num_tokens),
-                num_token_non_padded_cpu=num_tokens,
+                global_num_token_non_padded_cpu=num_tokens,
+                attn_tp_sequence_sharded=self.model_runner.attn_tp_sequence_sharded(
+                    num_tokens
+                ),
                 global_forward_mode=ForwardMode.EXTEND,
                 # All-None ids are safe: kernels no-op at rank 0 and replay
                 # refreshes the static batch info with live values.
@@ -1663,7 +1669,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             spec_info=padded_spec_info,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             num_token_non_padded=num_token_non_padded,
-            num_token_non_padded_cpu=forward_batch.num_token_non_padded_cpu,
+            global_num_token_non_padded_cpu=forward_batch.global_num_token_non_padded_cpu,
+            attn_tp_sequence_sharded=self.model_runner.attn_tp_sequence_sharded(
+                static_num_tokens
+            ),
             global_forward_mode=pcg_global_forward_mode,
             lora_ids=forward_batch.lora_ids,
             sampling_info=forward_batch.sampling_info,
@@ -1788,10 +1797,20 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         original_layer_forward = self.layer_model.forward
         self.layer_model.forward = replay_layer_forward
-        # For Full, run the eager tail against the raw user-facing batch so it
-        # uses real request metadata instead of padded slots. BCG has no
-        # request-slot padding, so static_forward_batch is already the serving batch.
-        tail_batch = forward_batch if full_path else static_forward_batch
+        if full_path:
+            # Run the eager tail against the raw user-facing batch so it uses
+            # real request metadata instead of padded slots. Its SP verdict came
+            # from the unpadded count, though, while the captured body froze one
+            # at the padded bucket count; the two can differ, so carry the body's
+            # on a private view rather than mutating the caller's batch.
+            tail_batch = copy.copy(forward_batch)
+            tail_batch.attn_tp_sequence_sharded = (
+                static_forward_batch.attn_tp_sequence_sharded
+            )
+        else:
+            # BCG has no request-slot padding, so static_forward_batch is
+            # already the serving batch and already holds the body's verdict.
+            tail_batch = static_forward_batch
         if not full_path:
             # MTP consumes the target model's live multimodal embeddings in its
             # eager wrapper before the captured transformer body is replayed.

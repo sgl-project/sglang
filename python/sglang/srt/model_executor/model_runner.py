@@ -1510,6 +1510,13 @@ class ModelRunner:
         """Customize a runner-created dummy batch before attention metadata initialization."""
         return forward_batch
 
+    def attn_tp_sequence_sharded(self, num_tokens: int) -> bool:
+        """Whether this forward (``num_tokens`` tokens) is attn-TP sharded (SP).
+        Extension point for per-forward SP gating; the default behavior shards iff
+        it holds a gathered buffer.
+        """
+        return require_gathered_buffer()
+
     def _prepare_eager_forward_batch(self, forward_batch: ForwardBatch) -> None:
         """Pad / normalize a batch for the eager (non-cuda-graph) forward.
 
@@ -1524,20 +1531,21 @@ class ModelRunner:
         else:
             forward_batch.prepare_attn_tp_scatter_input(self)
 
-        # Normalize num_token_non_padded to be local to this attention TP rank if needed.
-        # The skip is scoped to DSACPLayerCommunicator-style CP (DSA, MLA): those
-        # flavors already feed a zigzag-split rank-local layout whose token count
-        # should not be further divided by attn_tp_size. MHA-arch prefill CP
-        # (Qwen3/Qwen2 MoE) keeps the attn_tp-replicated layout and wants the
-        # adjustment to run — see docs/design/prefill-cp-mla.md §Phase 5.
-        if (
-            forward_batch.num_token_non_padded is not None
-            and forward_batch.global_num_tokens_gpu is not None
-            and require_gathered_buffer()
-            and not is_dsa_enable_prefill_cp()
-            and not is_mla_prefill_cp_enabled()
-        ):
-            forward_batch.adjust_num_token_non_padded_for_attn_tp()
+        # Derive the LOCAL num_token_non_padded from the GLOBAL scalar. sharded is
+        # cleared for DSACPLayerCommunicator-style CP (DSA, MLA): those flavors
+        # already feed a zigzag-split rank-local layout whose token count should
+        # not be further divided by attn_tp_size, so they keep the full count.
+        # MHA-arch prefill CP (Qwen3/Qwen2 MoE) keeps the attn_tp-replicated
+        # layout and wants sharding to apply — see docs/design/prefill-cp-mla.md
+        # §Phase 5.
+        if forward_batch.global_num_token_non_padded is not None:
+            forward_batch.set_local_num_token_non_padded(
+                sharded=(
+                    forward_batch.attn_tp_sequence_sharded
+                    and not is_dsa_enable_prefill_cp()
+                    and not is_mla_prefill_cp_enabled()
+                ),
+            )
 
         # Hisparse coordinator — backends now read it from self.model_runner.
         if self.hisparse_coordinator is not None:
