@@ -1085,8 +1085,20 @@ class GemmaRMSNorm(BaseFusedOp):
     def _weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight)
+        self.refresh_derived_buffers()
+
+    def refresh_derived_buffers(self) -> None:
+        """Recompute gemma_weight from the current weight.
+
+        Loaders that overwrite parameters in bulk instead of going through
+        _weight_loader leave this cache stale, and it is what forward actually
+        reads. R-Fork's remote_instance path is one: it broadcasts
+        model.named_parameters(), which excludes buffers, so without this the
+        buffer keeps its ones_like init -- every Gemma-style norm silently
+        degrades to w = 1.0 while weight itself looks correct.
+        """
         # Keep storage stable for CUDA graphs or fused paths that capture this buffer.
-        torch.add(param.data, 1.0, out=self.gemma_weight)
+        torch.add(self.weight.data, 1.0, out=self.gemma_weight)
 
     def _forward_impl(
         self,
@@ -1443,3 +1455,16 @@ class RMSNormWithoutScale(BaseFusedOp):
 
     def extra_repr(self):
         return f"{self.hidden_size}, eps={self.eps}"
+
+
+def refresh_derived_weight_buffers(model: torch.nn.Module) -> None:
+    """Recompute every weight-derived buffer in model from its parameters.
+
+    Bulk weight loaders bypass the per-parameter weight_loader hooks, so any
+    module caching a transform of its weight in a buffer is left stale. Buffers
+    are also invisible to loaders that iterate named_parameters(), so they are
+    never transferred either -- the value has to be rebuilt locally.
+    """
+    for module in model.modules():
+        if isinstance(module, GemmaRMSNorm):
+            module.refresh_derived_buffers()
