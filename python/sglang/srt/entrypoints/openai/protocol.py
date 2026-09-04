@@ -566,6 +566,10 @@ class ChatCompletionMessageContentVideoURL(BaseModel):
     url: str
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
+    fps: Optional[float] = None
+    max_frames: Optional[int] = None
+    max_tokens_per_frame: Optional[int] = None
+    max_image_tokens: Optional[int] = None
 
 
 class ChatCompletionMessageContentAudioURL(BaseModel):
@@ -915,6 +919,7 @@ class ChatCompletionRequest(BaseModel):
     use_audio_in_video: bool = False
 
     images_config: Optional[Dict] = None
+    video_config: Optional[Dict] = None
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
@@ -2028,6 +2033,7 @@ class MessageProcessingResult:
     tool_call_constraint: Optional[ToolCallConstraint] = None
     skip_special_tokens: bool = True
     require_reasoning: bool = False
+    reasoning_end_token_ids: Optional[List[int]] = None
 
 
 class ToolCallProcessingResult(NamedTuple):
