@@ -97,6 +97,60 @@ def test_dp_cuda_graph_global_routing_does_not_require_logprob_metadata(
     assert lm_head_batch_infos is None
 
 
+def test_dp_cuda_graph_mixed_prefill_gathers_lm_head_routes_from_replay_view(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    local_batch_info = _batch_info([1, 2], [1, 1])
+    local_batch_info.use_cuda_graph = True
+    graph_batch_info = _batch_info([0, 0, 0, 0], [1, 1, 1, 1])
+    graph_batch_info.use_cuda_graph = True
+    monkeypatch.setattr(
+        "sglang.srt.lora.backend.triton_backend.get_attention_dp_rank", lambda: 0
+    )
+
+    gather_count = 0
+
+    def gather(output, local, forward_batch):
+        nonlocal gather_count
+        if gather_count == 0:
+            assert local.tolist() == [1, 2]
+            output.copy_(torch.tensor([1, 2, 0, 0], dtype=torch.int32))
+        else:
+            assert local.tolist() == [1]
+            assert forward_batch.dp_padding_mode is DpPaddingMode.SUM_LEN
+            output.copy_(torch.tensor([1, 2], dtype=torch.int32))
+        gather_count += 1
+
+    monkeypatch.setattr(
+        "sglang.srt.lora.backend.triton_backend.dp_gather_replicate", gather
+    )
+    replay_view = SimpleNamespace(
+        global_num_tokens_cpu=[2, 2],
+        global_num_tokens_gpu=torch.tensor([2, 2]),
+        global_num_tokens_for_logprob_cpu=[1, 1],
+        global_num_tokens_for_logprob_gpu=torch.tensor([1, 1]),
+        is_extend_in_batch=True,
+        dp_padding_mode=DpPaddingMode.MAX_LEN,
+        dp_local_start_pos=None,
+        dp_local_num_tokens=None,
+    )
+
+    _, global_batch_info, lm_head_batch_infos = gather_dp_attention_lora_batch_info(
+        replay_view,
+        local_batch_info,
+        graph_batch_info,
+        True,
+        0,
+        _batch_info([1], [1]),
+    )
+
+    assert gather_count == 2
+    assert global_batch_info is graph_batch_info
+    assert lm_head_batch_infos is not None
+    lm_head_batch_info, _ = lm_head_batch_infos
+    assert _routes(lm_head_batch_info) == [1, 2]
+
+
 def test_prepare_global_routing_gathers_pruned_lm_head_routes(
     monkeypatch: pytest.MonkeyPatch,
 ):

@@ -1,3 +1,4 @@
+import copy
 import dataclasses
 from typing import List, Optional, Tuple
 
@@ -161,14 +162,14 @@ def gather_dp_attention_lora_batch_info(
         return local_batch_info, global_batch_info, None
 
     assert forward_batch.global_num_tokens_for_logprob_gpu is not None
-    routing_forward_batch = dataclasses.replace(
-        forward_batch,
-        global_num_tokens_cpu=global_num_tokens,
-        global_num_tokens_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
-        dp_padding_mode=DpPaddingMode.SUM_LEN,
-        dp_local_start_pos=None,
-        dp_local_num_tokens=None,
+    routing_forward_batch = copy.copy(forward_batch)
+    routing_forward_batch.global_num_tokens_cpu = global_num_tokens
+    routing_forward_batch.global_num_tokens_gpu = (
+        forward_batch.global_num_tokens_for_logprob_gpu
     )
+    routing_forward_batch.dp_padding_mode = DpPaddingMode.SUM_LEN
+    routing_forward_batch.dp_local_start_pos = None
+    routing_forward_batch.dp_local_num_tokens = None
     _, global_weight_indices = _gather_dp_attention_weight_indices(
         routing_forward_batch,
         local_lm_head_batch_info or local_batch_info,
