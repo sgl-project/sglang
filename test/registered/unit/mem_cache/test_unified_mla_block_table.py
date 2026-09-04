@@ -261,32 +261,32 @@ class TestFa3MetadataBlockTable(unittest.TestCase):
         max_seq_pages = (int(sl.max().item()) + page_size - 1) // page_size
 
         if v2p:
-            # The translator's canonical, then the wrapper copies its rows.
-            canonical = torch.zeros((bs, max_pages), dtype=torch.int32, device=_DEV)
-            build_kv_read_table(
-                req_to_token=rt,
-                req_pool_indices=rpi,
-                seq_lens=sl.to(torch.int64),
-                v2p=v2p_full,
-                multiplier=mult,
-                page_size=page_size,
-                max_pages=max_pages,
-                out=canonical,
-            )
-            rows = torch.arange(bs, dtype=torch.int64, device=_DEV)
+            # Unified: the fused call does the prefix sum only, and the builder
+            # writes the page table itself -- bounded by the `cache_seqlens`
+            # that call just produced, which is what a reader bounds by too.
             normal_decode_set_metadata(
                 cache_seqlens,
                 cu_seqlens_k,
                 page_table,
-                canonical,
-                rows,
+                rt,
+                rpi,
                 max_seq_pages,
                 sl.to(torch.int64),
                 0,
                 page_size,
                 None,
                 None,
-                src_is_read_table=True,
+                skip_page_table=True,
+            )
+            build_kv_read_table(
+                req_to_token=rt,
+                req_pool_indices=rpi,
+                seq_lens=cache_seqlens,
+                v2p=v2p_full,
+                multiplier=mult,
+                page_size=page_size,
+                max_pages=max_pages,
+                out=page_table,
             )
         else:
             normal_decode_set_metadata(

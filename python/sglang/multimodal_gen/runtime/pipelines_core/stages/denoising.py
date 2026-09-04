@@ -706,7 +706,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         self._quality_fusions_mounted = want
         for description in sorted(mounted_fusions):
-            logger.info("Mounted %s for quality=%s", description, quality)
+            logger.debug("Mounted %s for quality=%s", description, quality)
 
     def _cache_dit_dual_model_name(self) -> str:
         return "wan2.2"
@@ -1521,9 +1521,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # 1. Prepare latent inputs in the model's compute dtype.
         latent_model_input = ctx.latents.to(ctx.target_dtype)
         if batch.image_latent is not None:
-            assert (
-                not server_args.pipeline_config.task_type == ModelTaskType.TI2V
-            ), "image latents should not be provided for TI2V task"
+            assert not server_args.pipeline_config.task_type == ModelTaskType.TI2V, (
+                "image latents should not be provided for TI2V task"
+            )
             latent_model_input = torch.cat(
                 [latent_model_input, batch.image_latent], dim=1
             ).to(ctx.target_dtype)
