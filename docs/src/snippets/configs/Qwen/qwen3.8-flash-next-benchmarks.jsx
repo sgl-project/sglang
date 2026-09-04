@@ -72,12 +72,12 @@ export const benchmarks = [
   {
     match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2" },
     sglang_version: "qwen38flashnext image @ 593134d17a",
-    accuracy: { gsm8k_pct: 97.0 },
+    accuracy: { gsm8k_pct: 97.5 },
   },
   {
     match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "multi-2" },
     sglang_version: "qwen38flashnext image @ 593134d17a",
-    accuracy: { gsm8k_pct: 96.5 },
+    accuracy: { gsm8k_pct: 97.0 },
   },
   { match: { hw: "mi350x", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
   { match: { hw: "mi350x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" } },

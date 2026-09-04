@@ -674,8 +674,11 @@ export const config = {
     // (78 GiB experts+dense, 47.7 GiB FP8 N-gram table), so a single Spark cannot
     // hold it; TP=2 across two Sparks over ConnectX-7 200GbE gives ~65 GB of
     // weights per node. Both cells are the model card's TP=2 recipe (modelopt_fp4,
-    // flashinfer_cutlass FP4 GEMM, page 64, mamba track interval 64, 4096-token
-    // prefill chunks, 262k context) with the concurrency pinned explicitly:
+    // flashinfer_cutlass FP4 GEMM, page 64, 4096-token prefill chunks, 262k
+    // context) minus its `--mamba-track-interval 64` (the default 256 satisfies
+    // the page-size/draft-token constraints and leaves a ~40% larger KV pool;
+    // re-verified) and `--trust-remote-code` (not needed, the architecture is
+    // native), with the concurrency pinned explicitly:
     // the hybrid model reserves mamba state slots per running request (5 with
     // the default extra_buffer strategy, 4 with extra_buffer_lazy), and the
     // scheduler silently caps --max-running-requests to what the mamba pool
@@ -684,12 +687,12 @@ export const config = {
     // which appends --no-ple-offload-embedding: the FP8 table stays GPU-resident
     // and TP-sharded, since on unified memory the "offloaded" pinned-host copy
     // would come out of the same pool anyway. Verified 2026-09-04 on the qwen38flashnext image
-    // (SGLang 593134d17a): GSM8K (chat API, thinking off, n=200) 97.0% low
-    // latency / 96.5% high throughput, 100k-token prefill 2,840 tok/s.
+    // (SGLang 593134d17a): GSM8K (chat API, thinking off, n=200) 97.5% low
+    // latency / 97.0% high throughput, 100k-token prefill 2,400-2,840 tok/s.
     //
     // Low latency: in-checkpoint MTP head (NEXTN 3/1/4), 24 concurrent
-    // requests (120 mamba slots), 1.35M-token KV pool, MTP accept length
-    // 3.2-3.7 on non-thinking output. No env is required: the image loads its
+    // requests (120 mamba slots), 1.48M-token KV pool, MTP accept length
+    // 3.5-3.7 on non-thinking output. No env is required: the image loads its
     // pip NCCL 2.30.7 by default (verified via /proc/<pid>/maps), and the cell
     // passed the same checks without PYTORCH_CUDA_ALLOC_CONF — see the notes
     // for when expandable_segments is still worth setting.
@@ -699,13 +702,11 @@ export const config = {
       warn: "2x DGX Spark only (GB10 pair, TP=2 over ConnectX-7); use Docker mode with the qwen38flashnext image. Memory headroom at --mem-fraction-static 0.85 is ~8-12 GiB per node — keep a host memory watchdog for long-context runs. See [DGX Spark notes](#spark-note).",
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
         "--quantization modelopt_fp4",
         "--fp4-gemm-backend flashinfer_cutlass",
         "--page-size 64",
-        "--mamba-track-interval 64",
         "--chunked-prefill-size 4096",
         "--context-length 262144",
         "--speculative-algorithm NEXTN",
@@ -722,21 +723,19 @@ export const config = {
     },
     // High throughput: speculation off, 96 concurrent requests. extra_buffer_lazy
     // allocates the mamba track buffer lazily (4 slots per request instead of
-    // 5), so 384 slots admit 96 requests while leaving a 753k-token KV pool;
-    // 355 tok/s aggregate on the GSM8K run at 96-way concurrency.
+    // 5), so 384 slots admit 96 requests while leaving a 1.07M-token KV pool;
+    // 332 tok/s aggregate on the GSM8K run at 96-way concurrency.
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "multi-2" },
       verified: true,
-      warn: "2x DGX Spark only (GB10 pair, TP=2 over ConnectX-7); use Docker mode with the qwen38flashnext image. At 96 concurrent requests the KV pool is ~753k tokens (~7.8k per request when full); lower --max-running-requests for long-context workloads. See [DGX Spark notes](#spark-note).",
+      warn: "2x DGX Spark only (GB10 pair, TP=2 over ConnectX-7); use Docker mode with the qwen38flashnext image. At 96 concurrent requests the KV pool is ~1.07M tokens (~11k per request when full); lower --max-running-requests for long-context workloads. See [DGX Spark notes](#spark-note).",
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
         "--quantization modelopt_fp4",
         "--fp4-gemm-backend flashinfer_cutlass",
         "--page-size 64",
-        "--mamba-track-interval 64",
         "--chunked-prefill-size 4096",
         "--context-length 262144",
         "--mamba-radix-cache-strategy extra_buffer_lazy",
