@@ -232,7 +232,14 @@ torch2cute_dtype_map = {
 }
 
 
-_shear_bias_workspace: dict = {}
+# Avoid allocating a torch.cuda.Stream wrapper on every relative-bias call.
+_get_current_stream_raw = torch._C._cuda_getCurrentRawStream
+_shear_bias_workspace: dict[tuple[int, int], torch.Tensor] = {}
+
+
+def clear_shear_bias_workspace() -> None:
+    """Drop cached eager-mode sheared-bias staging buffers."""
+    _shear_bias_workspace.clear()
 
 
 def _round_up_to_tile(size: int, tile_size: int) -> int:
@@ -242,20 +249,25 @@ def _round_up_to_tile(size: int, tile_size: int) -> int:
 
 
 def _shear_bias_empty(shape, dtype, device):
-    # Grow-only per-device workspace: the sheared-bias staging tensor is large
+    # Grow-only per-stream workspace: the sheared-bias staging tensor is large
     # (total_q x num_head x rel_extent_padded) and call shapes vary, so per-call
     # torch.empty fragments the caching allocator until GPU memory is exhausted.
     # Contents never persist across calls (written by the shear kernel, read by
-    # the fwd kernel within the same call); assumes attention calls on a device
-    # are serialized. Bypassed under graph capture (a capture-pool pointer must
-    # not leak into eager use) and fake mode (a fake tensor must not be cached).
+    # the fwd kernel within the same call). Different streams need distinct
+    # buffers because their producer-consumer pairs can overlap. Bypassed under
+    # graph capture (a capture-pool pointer must not leak into eager use) and
+    # fake mode (a fake tensor must not be cached).
     if is_fake_mode() or torch.cuda.is_current_stream_capturing():
         return torch.empty(shape, dtype=dtype, device=device)
     nbytes = math.prod(shape) * dtype.itemsize
-    buf = _shear_bias_workspace.get(device)
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    workspace_key = (device_index, _get_current_stream_raw(device_index))
+    buf = _shear_bias_workspace.get(workspace_key)
     if buf is None or buf.numel() < nbytes:
         buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
-        _shear_bias_workspace[device] = buf
+        _shear_bias_workspace[workspace_key] = buf
     return buf[:nbytes].view(dtype).view(shape)
 
 
