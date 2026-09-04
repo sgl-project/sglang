@@ -205,14 +205,13 @@ class RustServer:
                 obj.input_ids = ids
                 pos += nbytes
             if self.mm_spec is not None and isinstance(obj, TokenizedGenerateReqInput):
-                # The buffers rode the Rust sidecar, parked before the ring push;
-                # wrapping them into tensors is the only Python step of the Rust
-                # path. `None` for a text-only request on a multimodal model.
-                mm_result = self.server.take_mm_result(obj.rid)
-                if mm_result is not None:
-                    obj.mm_inputs = RustMmProcessor.build_output(
-                        self.mm_spec, mm_result
-                    )
+                # The buffers were parked in the Rust result store before the
+                # ring push; wrapping them into tensors is the only Python step
+                # of the Rust path. `None` for a text-only request on a
+                # multimodal model.
+                encoded = self.server.take_mm_result(obj.rid)
+                if encoded is not None:
+                    obj.mm_inputs = RustMmProcessor.wrap_encoded(self.mm_spec, encoded)
             out.append(obj)
         return out
 

@@ -1393,27 +1393,15 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
             self._compact_pending(freed_p_pages)
 
-    def _page_reps_pieces(
-        self, free_index: torch.Tensor, start_pos: int
-    ) -> Tuple[torch.Tensor, ...]:
-        """Page-representative TOKEN slices of one kv-row segment.
-
-        Mirrors `PagedTokenToKVPoolAllocator.free_segment`: a page's tokens sit
-        consecutively in the kv row, so with `start_pos` known on the host the
-        representatives are stride slices -- no `torch.unique`, whose
-        data-dependent output shape forces a device sync.
-
-        Exact for any segment shape: a partial head page is the `[:1]` term, a
-        partial tail page the final stride step.
-        """
+    def _page_reps(self, free_index: torch.Tensor, start_pos: int) -> torch.Tensor:
+        """One token of every page touched by a page-aligned kv-row segment:
+        the fixed-shape stand-in for `unique(free_index // page_size)`."""
         ps = self.page_size
-        offset = start_pos % ps
-        if offset == 0:
-            return (free_index[::ps],)
-        return (free_index[:1], free_index[ps - offset :: ps])
+        assert start_pos % ps == 0, f"segment start {start_pos} is not page-aligned"
+        return free_index[::ps]
 
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
-        """Fixed-shape counterpart of `free()`; see `_page_reps_pieces`.
+        """Fixed-shape counterpart of `free()`; see `_page_reps`.
 
         Contract: see base; a page must be freed by only one call per group.
         """
@@ -1423,12 +1411,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             # token == page: nothing to dedup, the plain path is already exact.
             self.free(free_index)
             return
-        pieces = self._page_reps_pieces(free_index.detach().to(torch.int64), start_pos)
+        reps = self._page_reps(free_index.detach().to(torch.int64), start_pos)
         if self.free_page_reps_group is None:
-            reps = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
             self.free(reps, _pages=reps // self.page_size)
         else:
-            self.free_page_reps_group.extend(pieces)
+            self.free_page_reps_group.append(reps)
 
     def _free_lazy(
         self, free_index: torch.Tensor, pages: Optional[torch.Tensor] = None
@@ -2899,6 +2886,10 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return (self.full_attn_allocator.max_slots - 1) * get_parallel().attn_dcp_size
 
     @property
+    def draft_virtual_id_space(self) -> int:
+        return self.size_full
+
+    @property
     def size_mamba(self) -> int:
         return self.mamba_allocator.max_slots - 1
 
@@ -3050,7 +3041,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
         """Fixed-shape counterpart of `free()`; see
-        `MultiEndedAllocator._page_reps_pieces`. The mamba sub-pool is
+        `MultiEndedAllocator._page_reps`. The mamba sub-pool is
         slot-granular and untouched by a token free, so only the full side
         needs the representatives.
         """
@@ -3059,13 +3050,13 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.page_size == 1:
             self.free(free_index)
             return
-        pieces = self.full_attn_allocator._page_reps_pieces(
+        reps = self.full_attn_allocator._page_reps(
             free_index.detach().to(torch.int64), start_pos
         )
         if self.free_page_reps_group is None:
-            self._release_page_reps(pieces)
+            self._release_page_reps((reps,))
         else:
-            self.free_page_reps_group.extend(pieces)
+            self.free_page_reps_group.append(reps)
 
     def _release_page_reps(self, pieces: Sequence[torch.Tensor]) -> None:
         reps = pieces[0] if len(pieces) == 1 else torch.cat(tuple(pieces))
@@ -3236,6 +3227,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
         self.free_group = None
         self.free_page_reps_group: Optional[List[torch.Tensor]] = None
+        self.full_free_group: List[torch.Tensor] = []
         # Empty (not None) for the leak checker.
         self.free_pages = torch.empty(0, dtype=torch.int64, device=device)
         self.release_pages = torch.empty(0, dtype=torch.int64, device=device)
@@ -3400,6 +3392,10 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     # `size_full` / `size_swa` are inherited; they read `_size_full`/`_size_swa`
     # (set to the static caps). We do NOT report `max_slots - 1`: under unified
     # memory pool that ~= full_max + swa_max and would over-promise.
+
+    @property
+    def draft_virtual_id_space(self) -> int:
+        return self.full_attn_allocator.max_slots - 1
 
     def debug_print(self) -> str:
         return (
@@ -3629,8 +3625,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         v = free_index.detach().to(torch.int64)
         ps = self.page_size
         if start_pos is not None and ps > 1:
-            pieces = self.swa_attn_allocator._page_reps_pieces(v, start_pos)
-            reps = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
+            reps = self.swa_attn_allocator._page_reps(v, start_pos)
             # Keep only pages still bound on swa (freeing a tombstoned one
             # would corrupt the hole list). `> 0` strict: -1 = tombstoned,
             # page 0 = padding sink (never freeable).
@@ -3667,6 +3662,17 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.full_attn_allocator.free(free_index.detach().to(torch.int64))
         self.full_attn_allocator.clear_inverse_history()
 
+    def free_full_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
+        if free_index is None or free_index.numel() == 0:
+            return
+        if self.page_size == 1:
+            # token == page: free_full already frees by exact ids, no dedup.
+            self.free_full(free_index)
+            return
+        # The swa v2p is the mapping, so a tombstoned swa page drops out of the
+        # two-sided segment path by itself; full-only is the same call.
+        self.free_segment(free_index, start_pos=start_pos)
+
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:
@@ -3682,19 +3688,26 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     # -- free-group --
 
+    # Not the SWA parent's hooks: those open the parent's paged full allocator
+    # as a free group, and this composite's sub-pools defer on their own.
     def free_group_begin(self) -> None:
-        super().free_group_begin()
+        BaseTokenToKVPoolAllocator.free_group_begin(self)
         self.free_page_reps_group = []
+        self.full_free_group = []
 
     def free_group_end(self) -> None:
         pending, self.free_page_reps_group = self.free_page_reps_group, None
-        super().free_group_end()
+        full_free_group, self.full_free_group = self.full_free_group, []
+        BaseTokenToKVPoolAllocator.free_group_end(self)
+        if full_free_group:
+            self.full_attn_allocator.free(torch.cat(full_free_group))
+            self.full_attn_allocator.clear_inverse_history()
         if pending:
             self._release_page_reps(pending)
 
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
         """Fixed-shape counterpart of `free()`; see
-        `MultiEndedAllocator._page_reps_pieces`. Both sides share one
+        `MultiEndedAllocator._page_reps`. Both sides share one
         derivation -- neither repeats the position-less dedup.
         """
         if free_index is None or free_index.numel() == 0:
@@ -3702,13 +3715,13 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         if self.page_size == 1:
             self.free(free_index)
             return
-        pieces = self.full_attn_allocator._page_reps_pieces(
+        reps = self.full_attn_allocator._page_reps(
             free_index.detach().to(torch.int64), start_pos
         )
         if self.free_page_reps_group is None:
-            self._release_page_reps(pieces)
+            self._release_page_reps((reps,))
         else:
-            self.free_page_reps_group.extend(pieces)
+            self.free_page_reps_group.append(reps)
 
     def _release_page_reps(self, pieces: Sequence[torch.Tensor]) -> None:
         reps = pieces[0] if len(pieces) == 1 else torch.cat(tuple(pieces))
@@ -3752,6 +3765,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.swa_attn_allocator.clear()
         self.free_group = None
         self.free_page_reps_group = None
+        self.full_free_group = []
 
     # -- Lazy compaction hooks --
 
