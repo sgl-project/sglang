@@ -296,14 +296,34 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         not cfg.enable_lmcache
     ), "--enable-unified-memory is not yet compatible with --enable-lmcache."
     if cfg.enable_hierarchical_cache:
+        model_config = model_config_of(server_args)
+        assert not use_mla_backend(server_args), (
+            "--enable-unified-memory with hierarchical cache does not support "
+            "MLA models yet."
+        )
+        assert mambaish_config(model_config) is None, (
+            "--enable-unified-memory with hierarchical cache does not support "
+            "recurrent-state models yet."
+        )
+        assert cfg.speculative_algorithm is None, (
+            "--enable-unified-memory with hierarchical cache does not support "
+            "speculative decoding yet."
+        )
+        assert cfg.hicache_io_backend in {"kernel", "direct"}, (
+            "--enable-unified-memory with hierarchical cache supports only "
+            "the kernel and direct I/O backends."
+        )
         assert cfg.pp_size == 1, (
             "--enable-unified-memory with hierarchical cache does not support "
             "pipeline parallelism (--pp-size > 1)."
         )
-        if cfg.hicache_storage_backend in {"mooncake", "nixl"}:
+        supported_storage_backends = {None, "file", "sim", "mori", "shm"}
+        if cfg.hicache_storage_backend not in supported_storage_backends:
             raise ValueError(
                 "--enable-unified-memory with hierarchical cache does not "
-                "support the Mooncake or NIXL storage backends."
+                "support this storage backend yet; supported backends are "
+                "file, sim, mori, and shm. Got "
+                f"{cfg.hicache_storage_backend!r}."
             )
         assert not envs.SGLANG_DISABLE_LAZY_COMPACTION.get(), (
             "--enable-unified-memory with hierarchical cache requires lazy "
