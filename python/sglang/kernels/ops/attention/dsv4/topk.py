@@ -75,11 +75,7 @@ def topk_transform_paged(
 _PLAN_METADATA_INTS_PER_BATCH = 2
 
 
-def plan_topk_v2(
-    seq_lens: torch.Tensor,
-    static_threshold: int = 0,
-    out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = 0) -> torch.Tensor:
     """Preprocess the per-batch routing plan for :func:`topk_transform_paged_v2`.
 
     IMPORTANT: every entry of ``seq_lens`` must be NON-NEGATIVE. The device
@@ -88,17 +84,12 @@ def plan_topk_v2(
     the plan, and drives the transform kernel into an illegal memory access.
     Producers of padded rows must clamp their lengths to 0 (0 selects the
     trivial all-(-1) output path, which is safe).
-
-    ``out``, when given, must be a plan previously produced by this function
-    for the same batch size (shape ``(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)``)
-    and is rewritten in place instead of allocating a fresh buffer.
     """
     module = _jit_topk_v2_module()
-    if out is None:
-        bs = seq_lens.shape[0]
-        out = seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
-    module.topk_plan(seq_lens, out, static_threshold)
-    return out
+    bs = seq_lens.shape[0]
+    metadata = seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
+    module.topk_plan(seq_lens, metadata, static_threshold)
+    return metadata
 
 
 def topk_transform_ragged_v2(

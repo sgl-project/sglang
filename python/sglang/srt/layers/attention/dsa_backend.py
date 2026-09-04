@@ -4,7 +4,6 @@ import logging
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
-    Callable,
     Dict,
     List,
     Literal,
@@ -58,7 +57,6 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dsa_backend_kpool import (
     DeepseekSparseAttnBackendKPoolMixin,
-    _is_kpool_metadata_fusion_supported,
     _KPoolForwardInputs,
 )
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
@@ -74,7 +72,6 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
 from sglang.srt.layers.attention.dsa.kpool_plan import (
     KPoolExtendPlan,
     KPoolWritePlan,
-    refresh_kpool_pool_schedule_from,
 )
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_round_robin_split,
@@ -197,25 +194,6 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
     return seqlens_32.contiguous().view(-1, 1)
 
 
-_PLAN_TOPK_V2 = None
-
-
-def _get_plan_topk_v2():
-    """Lazy, cached resolver for the JIT top-k v2 plan refresher.
-
-    Deliberately NOT a module-scope import: sglang.kernels.ops.attention.dsv4.topk
-    builds/loads a JIT extension on first import and must not run at
-    sglang.srt import time. After the first call this is a global read
-    instead of the per-replay import statement it replaces.
-    """
-    global _PLAN_TOPK_V2
-    if _PLAN_TOPK_V2 is None:
-        from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
-
-        _PLAN_TOPK_V2 = plan_topk_v2
-    return _PLAN_TOPK_V2
-
-
 @dataclass(frozen=True)
 class DSAFlashMLAMetadata:
     """Metadata only needed by FlashMLA"""
@@ -327,46 +305,6 @@ def _cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
     return _compiled_cat([qk_nope, qk_rope], dim=dim)
 
 
-class _DSAInGraphVerifyMetadataState:
-    """Captured refreshes require fixed input-buffer identities at replay.
-    Mismatches must fail because captured nodes would overwrite fallback metadata."""
-
-    __slots__ = (
-        "prefill_impl_state",
-        "residual_launch",
-        "_seq_lens_ptr",
-        "_seq_lens_stride",
-        "_req_pool_indices_ptr",
-        "_req_pool_indices_stride",
-    )
-
-    def __init__(
-        self,
-        *,
-        prefill_impl_state: Tuple[bool, str],
-        seq_lens: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        residual_launch: Optional[Callable[[], None]],
-    ):
-        self.prefill_impl_state = prefill_impl_state
-        self.residual_launch = residual_launch
-        self._seq_lens_ptr = seq_lens.data_ptr()
-        self._seq_lens_stride = seq_lens.stride(0)
-        self._req_pool_indices_ptr = req_pool_indices.data_ptr()
-        self._req_pool_indices_stride = req_pool_indices.stride(0)
-
-    def matches(self, seq_lens: torch.Tensor, req_pool_indices: torch.Tensor) -> bool:
-        # A [:bs] slice keeps the base data_ptr/stride, so the raw incoming
-        # graph-runner buffers compare equal to the sliced views recorded at
-        # capture time.
-        return (
-            seq_lens.data_ptr() == self._seq_lens_ptr
-            and req_pool_indices.data_ptr() == self._req_pool_indices_ptr
-            and seq_lens.stride(0) == self._seq_lens_stride
-            and req_pool_indices.stride(0) == self._req_pool_indices_stride
-        )
-
-
 _DSA_IMPL_T: TypeAlias = Literal[
     "flashmla_sparse",
     "flashmla_sparse_q8",
@@ -417,44 +355,6 @@ class DeepseekSparseAttnBackend(
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
         self.needs_cpu_seq_lens = self.dsa_index_kpool > 1
-        # The env is global, so unsupported KPool geometry or platforms must fall back.
-        _kpool_fusion_requested = (
-            envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION.get()
-        )
-        _kpool_fusion_supported = _is_kpool_metadata_fusion_supported(
-            self.dsa_index_kpool,
-            self.real_page_size,
-            self.dsa_index_topk,
-        )
-        _kpool_fusion_platform_ok = is_cuda() and not _is_hip
-        self.experimental_kpool_metadata_fusion = (
-            _kpool_fusion_requested
-            and _kpool_fusion_supported
-            and _kpool_fusion_platform_ok
-        )
-        if (
-            _kpool_fusion_requested
-            and self.dsa_index_kpool > 1
-            and not _kpool_fusion_supported
-        ):
-            logger.warning(
-                "SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION is set but this "
-                "DSA backend's geometry is outside the validated envelope "
-                "(index_kpool=%s, page_size=%s, index_topk=%s; required: "
-                "page_size=64, page-aligned pool, pool-aligned topk) — keeping "
-                "the eager metadata path for this backend.",
-                self.dsa_index_kpool,
-                self.real_page_size,
-                self.dsa_index_topk,
-            )
-        # Replay may refresh target-verify metadata in-graph; DG_OUT_OF_GRAPH
-        # leaves only the DeepGEMM schedule builds outside.
-        self.ingraph_verify_metadata_enabled = (
-            envs.SGLANG_EXPERIMENTAL_DSA_INGRAPH_VERIFY_METADATA.get()
-        )
-        self.ingraph_verify_metadata_dg_out_of_graph = (
-            envs.SGLANG_EXPERIMENTAL_DSA_INGRAPH_VERIFY_METADATA_DG_OUT_OF_GRAPH.get()
-        )
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
@@ -881,10 +781,9 @@ class DeepseekSparseAttnBackend(
         # nothing to refresh.
         if metadata.topk_v2_plan is None:
             return
-        # Write straight into the captured buffer: same shape/dtype by
-        # construction (it was built by plan_topk_v2 at capture), so the
-        # per-replay staging alloc + copy_ launch are pure overhead.
-        _get_plan_topk_v2()(metadata.dsa_seqlens_expanded, out=metadata.topk_v2_plan)
+        from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
+
+        metadata.topk_v2_plan.copy_(plan_topk_v2(metadata.dsa_seqlens_expanded))
 
     def _get_fused_topk_page_table(self, topk_indices: torch.Tensor) -> torch.Tensor:
         if (
@@ -1635,33 +1534,6 @@ class DeepseekSparseAttnBackend(
 
         metadata: DSAMetadata = self.decode_cuda_graph_metadata[bs]
 
-        # Captured graphs recompute device metadata, so this path retains only
-        # host state and any out-of-graph DeepGEMM residual.
-        if forward_mode.is_target_verify():
-            ingraph_state = getattr(metadata, "_ingraph_verify_metadata", None)
-            if ingraph_state is not None:
-                if not ingraph_state.matches(seq_lens, req_pool_indices):
-                    raise RuntimeError(
-                        "DSA in-graph verify metadata: this replay's seq_lens"
-                        " / req_pool_indices do not alias the static buffers "
-                        "captured into the verify graph; the captured refresh"
-                        " nodes would read buffers this caller never filled. "
-                        "Replay TARGET_VERIFY only through the graph runner's"
-                        " registry buffers, or disable "
-                        "SGLANG_EXPERIMENTAL_DSA_INGRAPH_VERIFY_METADATA."
-                    )
-                self.use_mha, self.dsa_prefill_impl = ingraph_state.prefill_impl_state
-                if ingraph_state.residual_launch is not None:
-                    ingraph_state.residual_launch()
-                if not getattr(self, "_ingraph_verify_hit_logged", False):
-                    self._ingraph_verify_hit_logged = True
-                    logger.info(
-                        "DSA in-graph verify metadata replay engaged (bs=%d)",
-                        bs,
-                    )
-                self.forward_metadata = metadata
-                return
-
         self.set_dsa_prefill_impl(forward_batch=None)
 
         seq_lens = seq_lens[:bs]
@@ -1675,13 +1547,7 @@ class DeepseekSparseAttnBackend(
             # Normal Decode
             max_len = self._graph_page_table_width(metadata)
 
-            if (
-                is_cuda()
-                and not _is_hip
-                and (
-                    self.dsa_index_kpool <= 1 or self.experimental_kpool_metadata_fusion
-                )
-            ):
+            if is_cuda() and not _is_hip and self.dsa_index_kpool <= 1:
                 fused_dsa_decode_metadata(
                     seq_lens=seq_lens,
                     req_pool_indices=req_pool_indices,
@@ -1696,7 +1562,6 @@ class DeepseekSparseAttnBackend(
                     max_len=max_len,
                     dsa_index_topk=self.dsa_index_topk,
                     real_page_size=self.real_page_size,
-                    index_kpool=self.dsa_index_kpool,
                 )
                 cache_seqlens = metadata.cache_seqlens_int32
                 dsa_cache_seqlens = metadata.dsa_cache_seqlens_int32
@@ -1722,13 +1587,7 @@ class DeepseekSparseAttnBackend(
         elif forward_mode.is_target_verify():
             max_seqlen_k = self._graph_page_table_width(metadata)
 
-            if (
-                is_cuda()
-                and not _is_hip
-                and (
-                    self.dsa_index_kpool <= 1 or self.experimental_kpool_metadata_fusion
-                )
-            ):
+            if is_cuda() and not _is_hip and self.dsa_index_kpool <= 1:
                 paged_mqa_ctx_lens_2d = None
                 if (
                     self.speculative_num_draft_tokens >= 2
@@ -1758,7 +1617,6 @@ class DeepseekSparseAttnBackend(
                     real_page_size=self.real_page_size,
                     next_n=self.speculative_num_draft_tokens,
                     paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
-                    index_kpool=self.dsa_index_kpool,
                 )
                 target_verify_ctx_lens_written = paged_mqa_ctx_lens_2d is not None
                 cache_seqlens = metadata.cache_seqlens_int32
@@ -1825,13 +1683,7 @@ class DeepseekSparseAttnBackend(
                 device=self.device,
             )
 
-            if (
-                is_cuda()
-                and not _is_hip
-                and (
-                    self.dsa_index_kpool <= 1 or self.experimental_kpool_metadata_fusion
-                )
-            ):
+            if is_cuda() and not _is_hip and self.dsa_index_kpool <= 1:
                 fused_dsa_draft_extend_metadata(
                     seq_lens=seq_lens,
                     extend_seq_lens=extend_seq_lens,
@@ -1852,7 +1704,6 @@ class DeepseekSparseAttnBackend(
                     max_extend_len=self.speculative_num_draft_tokens,
                     max_total_len=bs * self.speculative_num_draft_tokens,
                     static_extend_len=True,
-                    index_kpool=self.dsa_index_kpool,
                 )
                 cache_seqlens = metadata.cache_seqlens_int32
                 seqlens_expanded = metadata.dsa_seqlens_expanded[:total_extend_len]
@@ -1965,220 +1816,6 @@ class DeepseekSparseAttnBackend(
 
         self.forward_metadata = metadata
 
-    def _ingraph_verify_metadata_eligible(self) -> bool:
-        """Config-level eligibility for the in-graph TARGET_VERIFY refresh.
-
-        Mirrors the eligibility of the fused replay body: the recorded nodes
-        replicate exactly the FUSED verify
-        sequence, so configs that would take the unfused aten fallback
-        (kpool > 1 without the fusion gate), DCP, HIP, or flashmla_kv (whose
-        per-replay metadata recompute is host-side) stay out-of-graph.
-        """
-        return (
-            self.ingraph_verify_metadata_enabled
-            and is_cuda()
-            and not _is_hip
-            and not get_parallel().dcp_enabled
-            and (self.dsa_index_kpool <= 1 or self.experimental_kpool_metadata_fusion)
-            and self.dsa_decode_impl != "flashmla_kv"
-        )
-
-    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
-        """Record target-verify refreshes only for capture-safe configurations.
-        Replay reads the same static input buffers with updated contents."""
-        if not forward_batch.forward_mode.is_target_verify():
-            return
-        if not self._ingraph_verify_metadata_eligible():
-            return
-        bs = forward_batch.batch_size
-        metadata = self.decode_cuda_graph_metadata.get(bs)
-        if metadata is None:
-            return
-        self._record_ingraph_verify_metadata(
-            metadata,
-            bs,
-            forward_batch.seq_lens[:bs],
-            forward_batch.req_pool_indices[:bs],
-        )
-
-    def _record_ingraph_verify_metadata(
-        self,
-        metadata: DSAMetadata,
-        bs: int,
-        seq_lens: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-    ) -> None:
-        """Publish replay state only after every structural check passes.
-        Otherwise the generic out-of-graph path remains responsible."""
-        if metadata.paged_mqa_schedule_metadata is None:
-            return
-        next_n = self.speculative_num_draft_tokens
-        if not next_n:
-            return
-        expanded_size = bs * next_n
-        max_seqlen_k = self._graph_page_table_width(metadata)
-
-        paged_mqa_ctx_lens_2d = None
-        if (
-            next_n >= 2
-            and get_platform().is_sm100
-            and metadata.paged_mqa_ctx_lens_2d is not None
-            and metadata.paged_mqa_ctx_lens_2d.dim() == 2
-            and metadata.paged_mqa_ctx_lens_2d.size(0) == bs
-            and metadata.paged_mqa_ctx_lens_2d.size(1) == next_n
-        ):
-            paged_mqa_ctx_lens_2d = metadata.paged_mqa_ctx_lens_2d
-        ctx_lens_written = paged_mqa_ctx_lens_2d is not None
-
-        if ctx_lens_written:
-            # DG-native layout: the fused kernel writes ctx lens straight
-            # into the captured (bs, next_n) buffer; the schedule reads it.
-            schedule_src_2d = metadata.paged_mqa_ctx_lens_2d
-            ctx_lens_copy_src = None
-        else:
-            if (
-                next_n >= 2 and get_platform().is_sm100
-            ):  # Degenerate capture (DG-native ctx-lens layout expected but
-                # missing); keep the whole refresh out-of-graph.
-                return
-            seqlens_view = metadata.dsa_seqlens_expanded[:expanded_size]
-            if not seqlens_view.is_contiguous():
-                return
-            schedule_src_2d = seqlens_view.view(-1, 1)
-            if metadata.paged_mqa_ctx_lens_2d is None:
-                # Verify capture always materializes the 2D ctx-lens buffer;
-                # if missing, leave the object.__setattr__ publication to
-                # the generic path.
-                return
-            ctx_lens_copy_src = schedule_src_2d
-
-        fused_dsa_target_verify_metadata(
-            seq_lens=seq_lens,
-            req_pool_indices=req_pool_indices,
-            req_to_token=self.req_to_token,
-            cache_seqlens=metadata.cache_seqlens_int32,
-            cu_seqlens_k=metadata.cu_seqlens_k,
-            page_table_1=metadata.page_table_1,
-            seqlens_expanded=metadata.dsa_seqlens_expanded,
-            dsa_cache_seqlens=metadata.dsa_cache_seqlens_int32,
-            dsa_cu_seqlens_k=metadata.dsa_cu_seqlens_k,
-            real_page_table=metadata.real_page_table,
-            bs=bs,
-            max_seqlen_k=max_seqlen_k,
-            dsa_index_topk=self.dsa_index_topk,
-            real_page_size=self.real_page_size,
-            next_n=next_n,
-            paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
-            index_kpool=self.dsa_index_kpool,
-        )
-
-        dg_in_graph = not self.ingraph_verify_metadata_dg_out_of_graph
-        num_sms = deep_gemm.get_num_sms()
-        if dg_in_graph:
-            # Copy into the static buffer to keep the captured destination stable.
-            metadata.paged_mqa_schedule_metadata.copy_(
-                deep_gemm.get_paged_mqa_logits_metadata(schedule_src_2d, 64, num_sms)
-            )
-        if ctx_lens_copy_src is not None:
-            metadata.paged_mqa_ctx_lens_2d.copy_(ctx_lens_copy_src)
-
-        if metadata.topk_v2_plan is not None:
-            # A preallocated output avoids allocation during capture.
-            _get_plan_topk_v2()(
-                metadata.dsa_seqlens_expanded, out=metadata.topk_v2_plan
-            )
-
-        self._update_kpool_metadata_replay(
-            metadata,
-            seq_lens,
-            req_pool_indices,
-            ForwardMode.TARGET_VERIFY,
-            include_deep_gemm_schedule=dg_in_graph,
-        )
-
-        residual_launch = None
-        if not dg_in_graph:
-            residual_launch = self._build_ingraph_verify_dg_residual(
-                metadata,
-                next_n,
-                seq_lens,
-                num_sms,
-                ctx_lens_written,
-            )
-
-        self.set_dsa_prefill_impl(forward_batch=None)
-        state = _DSAInGraphVerifyMetadataState(
-            prefill_impl_state=(self.use_mha, self.dsa_prefill_impl),
-            seq_lens=seq_lens,
-            req_pool_indices=req_pool_indices,
-            residual_launch=residual_launch,
-        )
-        # Undeclared attribute on the frozen dataclass: dropped by both
-        # recapture (fresh DSAMetadata) and dataclasses.replace().
-        object.__setattr__(metadata, "_ingraph_verify_metadata", state)
-        logger.info(
-            "DSA in-graph verify metadata recorded: bs=%d next_n=%d "
-            "ctx_lens_written=%s dg_in_graph=%s",
-            bs,
-            next_n,
-            ctx_lens_written,
-            dg_in_graph,
-        )
-
-    def _build_ingraph_verify_dg_residual(
-        self,
-        metadata: DSAMetadata,
-        next_n: int,
-        seq_lens: torch.Tensor,
-        num_sms: int,
-        ctx_lens_written: bool,
-    ) -> Callable[[], None]:
-        """Rebuild residual schedules from raw seq_lens before graph replay.
-        Captured metadata still contains the previous replay's values then."""
-        schedule_dst = metadata.paged_mqa_schedule_metadata
-        dg_get = deep_gemm.get_paged_mqa_logits_metadata
-        pool_size = self.dsa_index_kpool
-        slots_per_page = self._kpool_slots_per_page()
-        kpool_plan = metadata.kpool_write_plan if pool_size > 1 else None
-        has_pool_schedule = (
-            kpool_plan is not None and kpool_plan.pool_schedule_metadata is not None
-        )
-        # Built lazily INSIDE the residual: this builder runs during stream
-        # capture, where a torch.arange would be RECORDED (contents undefined
-        # until the graph first replays) instead of executed; the residual
-        # itself always runs out-of-graph, so its first call materializes the
-        # constant eagerly.
-        offsets_box: List[Optional[torch.Tensor]] = [None]
-
-        def residual() -> None:
-            offsets = offsets_box[0]
-            if offsets is None:
-                offsets = torch.arange(
-                    1, next_n + 1, dtype=torch.int32, device=seq_lens.device
-                )
-                offsets_box[0] = offsets
-            seq_lens_i32 = seq_lens.to(torch.int32)
-            if ctx_lens_written:
-                src = (
-                    (seq_lens_i32 + next_n).view(-1, 1).expand(-1, next_n).contiguous()
-                )
-            else:
-                src = (seq_lens_i32.view(-1, 1) + offsets).reshape(-1, 1).contiguous()
-            schedule_dst.copy_(dg_get(src, 64, num_sms))
-            if has_pool_schedule:
-                pool_seqlens_per_q = torch.div(
-                    seq_lens_i32.view(-1, 1) + offsets,
-                    pool_size,
-                    rounding_mode="floor",
-                ).reshape(-1)
-                refresh_kpool_pool_schedule_from(
-                    metadata,
-                    pool_seqlens_per_q,
-                    slots_per_page=slots_per_page,
-                )
-
-        return residual
-
     def init_forward_metadata_replay_cuda_graph_from_precomputed(
         self,
         bs: int,
@@ -2198,43 +1835,6 @@ class DeepseekSparseAttnBackend(
 
         metadata = self.decode_cuda_graph_metadata[bs]
 
-        self._copy_base_replay_buffers(bs, metadata, precomputed, forward_mode)
-
-        # Refresh the schedule because stale shape decomposition can deadlock
-        # DeepGEMM paged MQA.
-        if is_cuda():
-            if forward_mode.is_decode_or_idle():
-                seqlens_32_2d = _to_2d_context_lens(metadata.cache_seqlens_int32, bs)
-            else:
-                seqlens_32_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
-                    forward_mode,
-                    metadata.cache_seqlens_int32,
-                    metadata.dsa_seqlens_expanded,
-                    bs,
-                )
-            self._refresh_paged_mqa_schedule_metadata(metadata, seqlens_32_2d)
-            self._refresh_topk_v2_plan(metadata)
-            if metadata.paged_mqa_ctx_lens_2d is None:
-                object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
-            else:
-                metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
-
-        self._update_kpool_metadata_from_precomputed(
-            metadata, precomputed, forward_mode
-        )
-
-        self.forward_metadata = metadata
-
-    def _copy_base_replay_buffers(
-        self,
-        bs: int,
-        metadata: DSAMetadata,
-        precomputed: PrecomputedMetadata,
-        forward_mode: ForwardMode,
-    ) -> None:
-        """Copy the captured base buffers of `metadata` from `precomputed`
-        (fused CUDA kernel with a per-tensor fallback).  Shared between the
-        full replay path above and `_copy_replay_metadata_from_sibling`."""
         # Track whether fused kernel succeeded
         fused_kernel_succeeded = False
 
@@ -2355,86 +1955,28 @@ class DeepseekSparseAttnBackend(
                 flashmla_metadata = metadata.flashmla_metadata.slice(slice(0, size + 1))
                 flashmla_metadata.copy_(precomputed.flashmla_metadata)
 
-    @staticmethod
-    def _sibling_replay_metadata_compatible(dst: DSAMetadata, src: DSAMetadata) -> bool:
-        """Check that both sides expose the same optional derived buffers."""
-
-        def _match(a, b) -> bool:
-            return (a is None) == (b is None)
-
-        if not (
-            _match(dst.paged_mqa_schedule_metadata, src.paged_mqa_schedule_metadata)
-            and _match(dst.topk_v2_plan, src.topk_v2_plan)
-            and _match(dst.pooled_cache_seqlens_int32, src.pooled_cache_seqlens_int32)
-            and _match(dst.pooled_real_page_table, src.pooled_real_page_table)
-            and _match(
-                dst.pooled_paged_mqa_schedule_metadata,
-                src.pooled_paged_mqa_schedule_metadata,
-            )
-            and _match(dst.kpool_write_plan, src.kpool_write_plan)
-        ):
-            return False
-        dst_plan, src_plan = dst.kpool_write_plan, src.kpool_write_plan
-        if dst_plan is not None and not (
-            _match(dst_plan.pool_seqlens_per_q, src_plan.pool_seqlens_per_q)
-            and _match(dst_plan.seqlens_per_q, src_plan.seqlens_per_q)
-            and _match(dst_plan.pool_schedule_metadata, src_plan.pool_schedule_metadata)
-            and _match(dst_plan.effective_n_per_batch, src_plan.effective_n_per_batch)
-        ):
-            return False
-        return True
-
-    def _copy_replay_metadata_from_sibling(
-        self,
-        src_backend: DeepseekSparseAttnBackend,
-        bs: int,
-        precomputed: PrecomputedMetadata,
-        forward_mode: ForwardMode,
-    ) -> None:
-        """Copy replay metadata from a sibling using the same precomputed input."""
-        metadata = self.decode_cuda_graph_metadata.get(bs)
-        src_metadata = src_backend.decode_cuda_graph_metadata.get(bs)
-        if (
-            # The derived-copy body below is CUDA-only; any other platform
-            # must take the full recompute, not a partial copy that would
-            # leave the DeepGEMM schedule / top-k plan / kpool metadata
-            # stale.
-            not is_cuda()
-            or _is_hip
-            or not forward_mode.is_decode_or_idle()
-            or metadata is None
-            or src_metadata is None
-            # `src_backend` must have run the full recompute path for this bs
-            # in this replay, so its derived buffers are fresh.
-            or src_backend.forward_metadata is not src_metadata
-            or not self._sibling_replay_metadata_compatible(metadata, src_metadata)
-        ):
-            self.init_forward_metadata_replay_cuda_graph_from_precomputed(
-                bs=bs, precomputed=precomputed, forward_mode=forward_mode
-            )
-            return
-
-        self.set_dsa_prefill_impl(forward_batch=None)
-        self._copy_base_replay_buffers(bs, metadata, precomputed, forward_mode)
-
+        # Refresh the schedule because stale shape decomposition can deadlock
+        # DeepGEMM paged MQA.
         if is_cuda():
-            if metadata.paged_mqa_schedule_metadata is not None:
-                metadata.paged_mqa_schedule_metadata.copy_(
-                    src_metadata.paged_mqa_schedule_metadata
+            if forward_mode.is_decode_or_idle():
+                seqlens_32_2d = _to_2d_context_lens(metadata.cache_seqlens_int32, bs)
+            else:
+                seqlens_32_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
+                    forward_mode,
+                    metadata.cache_seqlens_int32,
+                    metadata.dsa_seqlens_expanded,
+                    bs,
                 )
-            if metadata.topk_v2_plan is not None:
-                metadata.topk_v2_plan.copy_(src_metadata.topk_v2_plan)
-            # Decode: the 2D ctx lens are a (bs, 1) view of this backend's own
-            # cache_seqlens_int32 (just refreshed by the base copy above); keep
-            # the exact refresh the recompute path performs -- it is a single
-            # small view/copy, not part of the duplicated derived work.
-            seqlens_32_2d = _to_2d_context_lens(metadata.cache_seqlens_int32, bs)
+            self._refresh_paged_mqa_schedule_metadata(metadata, seqlens_32_2d)
+            self._refresh_topk_v2_plan(metadata)
             if metadata.paged_mqa_ctx_lens_2d is None:
                 object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
             else:
                 metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
 
-        self._copy_kpool_metadata_from_sibling(metadata, src_metadata)
+        self._update_kpool_metadata_from_precomputed(
+            metadata, precomputed, forward_mode
+        )
 
         self.forward_metadata = metadata
 
@@ -4074,12 +3616,6 @@ class DeepseekSparseAttnMultiStepBackend:
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata(forward_batch)
 
-    def _multistep_dedup_enabled(self) -> bool:
-        """The effective fusion gate includes geometry and platform support."""
-        return getattr(
-            self.attn_backends[0], "experimental_kpool_metadata_fusion", False
-        )
-
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
@@ -4251,31 +3787,15 @@ class DeepseekSparseAttnMultiStepBackend:
                         forward_mode=ForwardMode.DECODE,
                     )
         else:
-            # Backend 0 fully refreshes; later backends may copy its derived metadata.
-            dedup = self._multistep_dedup_enabled()
-            self.attn_backends[
-                0
-            ].init_forward_metadata_replay_cuda_graph_from_precomputed(
-                bs=bs,
-                precomputed=precomputed,
-                forward_mode=ForwardMode.DECODE,
-            )
-            for i in range(1, self.speculative_num_steps - 1):
-                if dedup:
-                    self.attn_backends[i]._copy_replay_metadata_from_sibling(
-                        src_backend=self.attn_backends[0],
-                        bs=bs,
-                        precomputed=precomputed,
-                        forward_mode=ForwardMode.DECODE,
-                    )
-                else:
-                    self.attn_backends[
-                        i
-                    ].init_forward_metadata_replay_cuda_graph_from_precomputed(
-                        bs=bs,
-                        precomputed=precomputed,
-                        forward_mode=ForwardMode.DECODE,
-                    )
+            # Copy to each backend and refresh its derived metadata independently.
+            for i in range(self.speculative_num_steps - 1):
+                self.attn_backends[
+                    i
+                ].init_forward_metadata_replay_cuda_graph_from_precomputed(
+                    bs=bs,
+                    precomputed=precomputed,
+                    forward_mode=ForwardMode.DECODE,
+                )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         for i in range(self.speculative_num_steps - 1):

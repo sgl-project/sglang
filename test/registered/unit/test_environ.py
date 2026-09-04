@@ -100,6 +100,23 @@ class TestEnvField(unittest.TestCase):
 
 
 class TestDeprecatedEnvRegistry(unittest.TestCase):
+    def test_removed_dsa_metadata_options_warn_at_import(self):
+        old_names = (
+            "SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION",
+            "SGLANG_EXPERIMENTAL_DSA_INGRAPH_VERIFY_METADATA",
+            "SGLANG_EXPERIMENTAL_DSA_INGRAPH_VERIFY_METADATA_DG_OUT_OF_GRAPH",
+        )
+        result = subprocess.run(
+            [sys.executable, "-Walways", "-c", "import sglang.srt.environ"],
+            env={**os.environ, **dict.fromkeys(old_names, "1")},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        for old_name in old_names:
+            with self.subTest(old_name=old_name):
+                self.assertIn(f"{old_name} is deprecated", result.stderr)
+
     def _apply(self, old_name, deprecation):
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
