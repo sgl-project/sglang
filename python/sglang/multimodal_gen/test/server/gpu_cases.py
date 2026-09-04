@@ -1132,20 +1132,6 @@ ONE_GPU_CASES += ONE_GPU_MODELOPT_FP8_CASES
 TWO_GPU_CASES = _with_default_num_gpus(TWO_GPU_CASES, 2)
 
 
-ONE_GPU_5090_PERF_CASE_IDS = frozenset(
-    {
-        "zimage_image_t2i",
-        "flux_2_klein_base_image_t2i",
-        "wan2_1_t2v_1.3b",
-    }
-)
-ONE_GPU_5090_SKIP_CONSISTENCY_CASE_IDS = frozenset(
-    {
-        "turbo_wan2_1_t2v_1.3b",
-    }
-)
-
-
 def _select_5090_canary_cases(case_ids: tuple[str, ...]) -> list[DiffusionTestCase]:
     cases_by_id = {case.id: case for case in ONE_GPU_CASES}
     missing = [case_id for case_id in case_ids if case_id not in cases_by_id]
@@ -1155,11 +1141,8 @@ def _select_5090_canary_cases(case_ids: tuple[str, ...]) -> list[DiffusionTestCa
     return [
         replace(
             cases_by_id[case_id],
-            run_perf_check=case_id in ONE_GPU_5090_PERF_CASE_IDS,
-            run_consistency_check=(
-                cases_by_id[case_id].run_consistency_check
-                and case_id not in ONE_GPU_5090_SKIP_CONSISTENCY_CASE_IDS
-            ),
+            run_perf_check=True,
+            run_consistency_check=True,
         )
         for case_id in case_ids
     ]
@@ -1187,8 +1170,8 @@ def _make_5090_flux_layerwise_cpu_offload_case() -> DiffusionTestCase:
             output_size="512x512",
             extras={"num_inference_steps": 4, "seed": 0},
         ),
-        run_perf_check=False,
-        run_consistency_check=False,
+        run_perf_check=True,
+        run_consistency_check=True,
         run_component_accuracy_check=False,
         run_models_api_check=False,
         run_t2v_input_reference_check=False,
@@ -1256,7 +1239,7 @@ def _make_5090_h3_consumer_budget_case() -> DiffusionTestCase:
         ),
         run_perf_check=True,
         perf_repeat_requests=2,
-        run_consistency_check=False,
+        run_consistency_check=True,
         run_component_accuracy_check=False,
         run_models_api_check=False,
         run_t2v_input_reference_check=False,
