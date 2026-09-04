@@ -729,6 +729,7 @@ class SchedulerDisaggregationPrefillMixin:
             result.indexer_topk_output = None
 
         logprob_pt = 0
+        aborted_reqs: List[Req] = []
         assert batch.spec_info is result.next_draft_input
         draft_input = result.next_draft_input
         draft_hidden_states_cpu = None
@@ -762,6 +763,13 @@ class SchedulerDisaggregationPrefillMixin:
         ):
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
+
+                if is_aborted(req):
+                    if self._retire_aborted_prefill_result(req):
+                        req.time_stats.set_completion_time()
+                        aborted_reqs.append(req)
+                    advance_logprob_pt(i, req)
+                    continue
 
                 # Test hook: exercise the release/requeue retry path.
                 if req.pending_bootstrap and should_force_retry(req):
@@ -831,16 +839,19 @@ class SchedulerDisaggregationPrefillMixin:
                     req.extend_range is not None
                     and req.extend_range.end >= len(req.origin_input_ids)
                 )
-                if req.pending_bootstrap and not still_chunking:
-                    self.optimistic_release_and_requeue(req)
+
+                # Abort is terminal. In particular, do not requeue an aborted
+                # optimistic request merely because bootstrap is still pending.
+                if is_aborted(req):
+                    if not still_chunking and self._retire_aborted_prefill_result(req):
+                        req.time_stats.set_completion_time()
+                        aborted_reqs.append(req)
                     advance_logprob_pt(i, req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
                     continue
 
-                # Optimistic bootstrap can fail while this overlapped chunk is
-                # already running. Drop aborted chunks instead of sending KV.
-                if is_aborted(req):
-                    self.clear_pending_chunk_send(req)
+                if req.pending_bootstrap and not still_chunking:
+                    self.optimistic_release_and_requeue(req)
                     advance_logprob_pt(i, req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
                     continue
@@ -874,6 +885,12 @@ class SchedulerDisaggregationPrefillMixin:
                 batch,
                 auxiliary_output,
                 auxiliary_output_starts,
+            )
+
+        if aborted_reqs:
+            self.output_streamer.stream_output(
+                aborted_reqs,
+                any(req.return_logprob for req in aborted_reqs),
             )
 
         can_run_cuda_graph = result.can_run_cuda_graph
@@ -1029,6 +1046,40 @@ class SchedulerDisaggregationPrefillMixin:
         for the process lifetime.
         """
         self.disagg_prefill_pending_chunk_rids.discard(req.rid)
+
+    def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
+        """Release an aborted request still owned by a completed prefill batch.
+
+        Returns whether this result performed the terminal cleanup. A bootstrap
+        failure or deferred chunked-abort may have already released the request;
+        delayed overlap results for those paths must be ignored.
+        """
+        self.clear_pending_chunk_send(req)
+        owns_resources = (
+            req.is_holding_kv
+            or req.mamba_pool_idx is not None
+            or req.metadata_buffer_index >= 0
+        )
+        if not owns_resources:
+            return False
+
+        try:
+            req.disagg_kv_sender.abort()
+        except Exception:
+            logger.warning(
+                "Failed to abort KV transfer while retiring request %s",
+                req.rid,
+                exc_info=True,
+            )
+        if req.to_finish is not None and not req.finished():
+            req.update_finish_state()
+        maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
+        req.pending_bootstrap = False
+        if self.enable_hicache_storage:
+            self.tree_cache.release_aborted_request(req.rid)
+        if req.is_holding_kv or req.mamba_pool_idx is not None:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+        return True
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
         self.clear_pending_chunk_send(req)
