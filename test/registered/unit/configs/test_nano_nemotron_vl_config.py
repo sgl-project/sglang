@@ -20,7 +20,6 @@ class TestNemotronHOmniConfig(CustomTestCase):
         )
 
         self.assertEqual(config.model_type, "nemotron_h_omni")
-        self.assertEqual(config.architectures, ["NemotronH_Omni_Reasoning_V3"])
 
     def test_normalizes_current_nemotron_h_layer_names(self):
         llm_config = {

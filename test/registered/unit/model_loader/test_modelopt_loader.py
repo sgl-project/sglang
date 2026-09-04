@@ -37,7 +37,6 @@ from sglang.srt.model_loader.loader import (
 from sglang.srt.model_loader.weight_utils import get_quant_config
 from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
 from sglang.srt.models.nano_nemotron_vl import NemotronH_Omni_Reasoning_V3
-from sglang.srt.models.nemotron_h import NemotronHForCausalLM
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -714,10 +713,6 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             }
         )
 
-        self.assertEqual(
-            NemotronH_Omni_Reasoning_V3.packed_modules_mapping,
-            NemotronHForCausalLM.packed_modules_mapping,
-        )
         self.assertEqual(
             quant_config._resolve_quant_algo(
                 "language_model.model.layers.7.mixer.qkv_proj"

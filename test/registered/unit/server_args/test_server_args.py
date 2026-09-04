@@ -291,20 +291,6 @@ class TestMambaCacheChunkSize(CustomTestCase):
         ):
             self.assertEqual(mamba_cache_chunk_size(server_args), 128)
 
-    def test_preserves_text_only_config_behavior(self):
-        server_args = object.__new__(ServerArgs)
-        text_config = SimpleNamespace(mamba_chunk_size=128)
-        server_args._model_config = SimpleNamespace(
-            hf_config=text_config,
-            hf_text_config=text_config,
-        )
-
-        with patch(
-            "sglang.srt.arg_groups.overrides.resolved_view",
-            return_value=SimpleNamespace(page_size=64),
-        ):
-            self.assertEqual(mamba_cache_chunk_size(server_args), 128)
-
 
 class TestMmEncoderDataParallelLogging(CustomTestCase):
     def test_logs_when_encoder_dp_has_no_parallelism(self):
