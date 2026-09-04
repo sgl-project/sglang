@@ -4,6 +4,7 @@ import atexit
 import logging
 import threading
 import time
+from collections import defaultdict
 from dataclasses import replace
 from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
@@ -153,6 +154,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.disable = params.disable
+        self._pending_frees: Optional[dict[ComponentType, list[torch.Tensor]]] = None
 
         if params.enable_metrics:
             self.init_metrics_collector()
@@ -642,7 +644,16 @@ class UnifiedRadixCache(BasePrefixCache):
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
-        """Free a tree-side step's returned device and host values right away."""
+        """Free a tree-side step's returned device and host values right away;
+        during a batched eviction walk, device frees are accumulated instead.
+        Host frees always run immediately: a backup later in the same walk may
+        depend on host space released by an earlier drop."""
+        if self._pending_frees is not None:
+            pending_device = self._pending_frees
+            for ct in list(device_frees):
+                pending_device[ct].extend(device_frees.pop(ct))
+            self._drain_host_frees(host_frees)
+            return
         # Both drains must run even if one raises.
         try:
             self._drain_device_frees(device_frees)
@@ -711,6 +722,22 @@ class UnifiedRadixCache(BasePrefixCache):
         request_by_type: dict[ComponentType, int],
         tracker: dict[ComponentType, int],
         available_size_targets: Optional[dict[ComponentType, int]] = None,
+    ) -> None:
+        batch_frees = self._pending_frees is None
+        if batch_frees:
+            self._pending_frees = defaultdict(list)
+        try:
+            self._evict_components_inner(request_by_type, tracker)
+        finally:
+            if batch_frees:
+                pending_device = self._pending_frees
+                self._pending_frees = None
+                self._drain_device_frees(pending_device)
+
+    def _evict_components_inner(
+        self,
+        request_by_type: dict[ComponentType, int],
+        tracker: dict[ComponentType, int],
     ) -> None:
         # Buffer mode: eviction always wins over queued backup intents — a
         # destroyed victim's intent is stale-swept and the content rewrites
