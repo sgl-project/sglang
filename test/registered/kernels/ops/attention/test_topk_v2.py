@@ -388,12 +388,15 @@ def test_topk_v2_oversized_exact_tie_fills_one_tail_slot() -> None:
     k, high_count, tie_count = 2048, 2047, 3000
     high = 2.0 + torch.arange(high_count, dtype=torch.float32, device="cuda") * 1e-3
     tie = torch.full((tie_count,), 0.75, dtype=torch.float32, device="cuda")
-    scores = torch.cat([tie, high]).unsqueeze(0)
+    values = torch.cat([tie, high])
     assert (
-        int((_coarse_keys_12(scores[0]) == _coarse_keys_12(tie[:1])[0]).sum())
-        == tie_count
+        int((_coarse_keys_12(values) == _coarse_keys_12(tie[:1])[0]).sum()) == tie_count
     )
-    seq_lens = torch.tensor([scores.shape[1]], dtype=torch.int32, device="cuda")
+    logical_length = values.numel()
+    padded = torch.empty((1, (logical_length + 3) & ~3), device="cuda")
+    padded[0, :logical_length] = values
+    scores = padded[:, :logical_length]
+    seq_lens = torch.tensor([logical_length], dtype=torch.int32, device="cuda")
 
     our_raw = _run_raw(scores, seq_lens, k)
     ref_raw = _reference(scores, seq_lens, k)
