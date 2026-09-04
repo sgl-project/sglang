@@ -1737,8 +1737,6 @@ class Qwen3_5ForCausalLM(nn.Module):
             )
 
         # The final layer has no successor to consume its deferred MoE tail.
-        trace_final_norm = envs.SGLANG_TRACE_QWEN35_FINAL_NORM.get()
-        use_native_final_norm = envs.SGLANG_QWEN35_NATIVE_FINAL_NORM.get()
         is_deferred_finalize = False
         if self.flashinfer_mnnvl_cutedsl_fusion is not None:
             from sglang.srt.layers.moe.cutedsl_ar_fusion import MoeFinalizeHandoff
@@ -1746,50 +1744,16 @@ class Qwen3_5ForCausalLM(nn.Module):
             is_deferred_finalize = isinstance(hidden_states, MoeFinalizeHandoff)
 
         if is_deferred_finalize:
-            if residual is None or self.flashinfer_mnnvl_cutedsl_fusion is None:
+            if residual is None:
                 raise RuntimeError("invalid final deferred MoE handoff")
             hidden_states, _ = self.flashinfer_mnnvl_cutedsl_fusion.finalize(
                 hidden_states, residual, self.norm.gemma_weight
             )
         elif hidden_states.shape[0] != 0:
-            if trace_final_norm:
-                print(
-                    "SGLANG_TRACE_QWEN35_FINAL_NORM "
-                    f"stage=pre_sync_enter hidden={tuple(hidden_states.shape)} "
-                    f"hidden_stride={hidden_states.stride()} "
-                    f"hidden_dtype={hidden_states.dtype} "
-                    f"hidden_contiguous={hidden_states.is_contiguous()} "
-                    f"residual={None if residual is None else tuple(residual.shape)} "
-                    f"native={use_native_final_norm}",
-                    flush=True,
-                )
-                torch.cuda.synchronize()
-                print(
-                    "SGLANG_TRACE_QWEN35_FINAL_NORM stage=pre_sync_returned",
-                    flush=True,
-                )
             if residual is None:
-                hidden_states = (
-                    self.norm.forward_native(hidden_states)
-                    if use_native_final_norm
-                    else self.norm(hidden_states)
-                )
+                hidden_states = self.norm(hidden_states)
             else:
-                hidden_states, _ = (
-                    self.norm.forward_native(hidden_states, residual)
-                    if use_native_final_norm
-                    else self.norm(hidden_states, residual)
-                )
-            if trace_final_norm:
-                print(
-                    "SGLANG_TRACE_QWEN35_FINAL_NORM stage=post_sync_enter",
-                    flush=True,
-                )
-                torch.cuda.synchronize()
-                print(
-                    "SGLANG_TRACE_QWEN35_FINAL_NORM stage=post_sync_returned",
-                    flush=True,
-                )
+                hidden_states, _ = self.norm(hidden_states, residual)
 
         if len(aux_hidden_states) == 0:
             return hidden_states

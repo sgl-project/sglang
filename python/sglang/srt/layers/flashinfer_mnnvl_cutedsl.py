@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import logging
-import threading
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -240,17 +239,6 @@ def _with_early_finalize_shared_load(config):
     return replace(config, profiles=tuple(profiles))
 
 
-@dataclass(frozen=True, slots=True)
-class _WorkspaceSignature:
-    hidden_size: int
-    top_k: int
-    rms_epsilon: float
-    weight_bias: float
-    max_m: int
-    device_index: int
-    process_group_identity: int
-
-
 class FlashInferMNNVLCuteDSLARFusion:
     """One graph-stable workspace serving both supported fusion patterns."""
 
@@ -277,7 +265,6 @@ class FlashInferMNNVLCuteDSLARFusion:
         self.weight_bias = float(weight_bias)
         self.process_group = process_group
         self.device = torch.device(device)
-        self._destroyed = False
 
         with torch.cuda.device(self.device):
             self.device = torch.device("cuda", torch.cuda.current_device())
@@ -355,7 +342,7 @@ class FlashInferMNNVLCuteDSLARFusion:
             dist.barrier(group=process_group)
 
     def supports(self, m: int) -> bool:
-        if self._destroyed or not 1 <= int(m) <= self.max_m:
+        if not 1 <= int(m) <= self.max_m:
             return False
         return self.workspace.is_buffer_size_sufficient(
             tp_size=dist.get_world_size(self.process_group),
@@ -373,19 +360,13 @@ class FlashInferMNNVLCuteDSLARFusion:
         gated_shared_output: torch.Tensor,
         residual: torch.Tensor,
         gamma: torch.Tensor,
-        norm_output: torch.Tensor | None = None,
-        residual_output: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         m = int(permuted_indices.shape[0])
         if not self.supports(m):
             raise ValueError(f"workspace does not support M={m}")
         shape = (m, self.hidden_size)
-        if norm_output is None:
-            norm_output = torch.empty(shape, dtype=torch.bfloat16, device=self.device)
-        if residual_output is None:
-            residual_output = torch.empty(
-                shape, dtype=torch.bfloat16, device=self.device
-            )
+        norm_output = torch.empty(shape, dtype=torch.bfloat16, device=self.device)
+        residual_output = torch.empty(shape, dtype=torch.bfloat16, device=self.device)
 
         pattern = self._patterns.kMoEFinalizeARResidualRMSNorm
         self._allreduce_fusion(
@@ -413,16 +394,12 @@ class FlashInferMNNVLCuteDSLARFusion:
         local_contribution: torch.Tensor,
         residual: torch.Tensor,
         gamma: torch.Tensor,
-        norm_output: torch.Tensor | None = None,
-        residual_output: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         m = int(local_contribution.shape[0])
         if not self.supports(m):
             raise ValueError(f"workspace does not support M={m}")
-        if norm_output is None:
-            norm_output = torch.empty_like(local_contribution)
-        if residual_output is None:
-            residual_output = torch.empty_like(local_contribution)
+        norm_output = torch.empty_like(local_contribution)
+        residual_output = torch.empty_like(local_contribution)
 
         pattern = self._patterns.kARResidualRMSNorm
         self._allreduce_fusion(
@@ -439,15 +416,8 @@ class FlashInferMNNVLCuteDSLARFusion:
         )
         return norm_output, residual_output
 
-    def destroy(self) -> None:
-        if self._destroyed:
-            return
-        self.workspace.destroy()
-        self._destroyed = True
 
-
-_WORKSPACES: dict[_WorkspaceSignature, FlashInferMNNVLCuteDSLARFusion] = {}
-_WORKSPACES_LOCK = threading.RLock()
+_WORKSPACE: FlashInferMNNVLCuteDSLARFusion | None = None
 
 
 def get_flashinfer_mnnvl_cutedsl_ar_fusion(
@@ -458,70 +428,31 @@ def get_flashinfer_mnnvl_cutedsl_ar_fusion(
     rms_epsilon: float,
     weight_bias: float,
 ) -> FlashInferMNNVLCuteDSLARFusion:
-    """Look up, or before graph capture create, the process-local workspace."""
+    """Build the process-local workspace. Must run before graph capture."""
     if not torch.cuda.is_available():
         raise RuntimeError("MNNVL CuTe DSL fusion requires CUDA")
 
     from sglang.srt.distributed.parallel_state import get_tp_group
 
-    device = torch.device("cuda", torch.cuda.current_device())
-    process_group = get_tp_group().device_group
-    domain = (
-        int(hidden_size),
-        int(top_k),
-        float(rms_epsilon),
-        float(weight_bias),
-        int(device.index),
-        id(process_group),
+    global _WORKSPACE
+    if _WORKSPACE is not None:
+        raise RuntimeError(
+            "a second MNNVL CuTe DSL fusion workspace was requested; each one "
+            "rendezvouses its own NVLS region, and a process serves one model"
+        )
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "creating an MNNVL CuTe DSL fusion workspace during CUDA Graph "
+            "capture is forbidden"
+        )
+
+    _WORKSPACE = FlashInferMNNVLCuteDSLARFusion(
+        hidden_size=hidden_size,
+        top_k=top_k,
+        max_m=max_m,
+        rms_epsilon=rms_epsilon,
+        weight_bias=weight_bias,
+        process_group=get_tp_group().device_group,
+        device=torch.device("cuda", torch.cuda.current_device()),
     )
-
-    with _WORKSPACES_LOCK:
-        compatible = [
-            (signature.max_m, instance)
-            for signature, instance in _WORKSPACES.items()
-            if (
-                signature.hidden_size,
-                signature.top_k,
-                signature.rms_epsilon,
-                signature.weight_bias,
-                signature.device_index,
-                signature.process_group_identity,
-            )
-            == domain
-            and signature.max_m >= int(max_m)
-        ]
-        if compatible:
-            return min(compatible, key=lambda item: item[0])[1]
-
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "creating an MNNVL CuTe DSL fusion workspace during CUDA Graph "
-                "capture is forbidden"
-            )
-        if _WORKSPACES:
-            # Each workspace rendezvouses its own NVLS symmetric-memory region.
-            raise RuntimeError(
-                "a second MNNVL CuTe DSL fusion workspace was requested; one "
-                "model configuration per process"
-            )
-
-        signature = _WorkspaceSignature(
-            hidden_size=int(hidden_size),
-            top_k=int(top_k),
-            rms_epsilon=float(rms_epsilon),
-            weight_bias=float(weight_bias),
-            max_m=int(max_m),
-            device_index=int(device.index),
-            process_group_identity=id(process_group),
-        )
-        instance = FlashInferMNNVLCuteDSLARFusion(
-            hidden_size=hidden_size,
-            top_k=top_k,
-            max_m=max_m,
-            rms_epsilon=rms_epsilon,
-            weight_bias=weight_bias,
-            process_group=process_group,
-            device=device,
-        )
-        _WORKSPACES[signature] = instance
-        return instance
+    return _WORKSPACE

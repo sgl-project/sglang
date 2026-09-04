@@ -156,9 +156,6 @@ def test_wrapper_calls_only_the_stable_unified_api():
     gated_shared_output = torch.empty(4, 8, dtype=torch.bfloat16)
     residual = torch.empty(4, 8, dtype=torch.bfloat16)
     gamma = torch.empty(8, dtype=torch.bfloat16)
-    norm_output = torch.empty_like(residual)
-    residual_output = torch.empty_like(residual)
-
     wrapper.moe_finalize_all_reduce_rms_norm(
         routed_output=routed_output,
         expert_weights=expert_weights,
@@ -166,8 +163,6 @@ def test_wrapper_calls_only_the_stable_unified_api():
         gated_shared_output=gated_shared_output,
         residual=residual,
         gamma=gamma,
-        norm_output=norm_output,
-        residual_output=residual_output,
     )
 
     assert calls[0]["launch_with_pdl"] is True
@@ -177,8 +172,6 @@ def test_wrapper_calls_only_the_stable_unified_api():
         local_contribution=residual,
         residual=residual,
         gamma=gamma,
-        norm_output=norm_output,
-        residual_output=residual_output,
     )
 
     assert calls[1]["pattern"] == 1

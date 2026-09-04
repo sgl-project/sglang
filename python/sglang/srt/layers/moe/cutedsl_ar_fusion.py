@@ -119,10 +119,6 @@ class CuteDSLFusionService:
         self.max_m: int | None = None
         self._workspace = None
 
-    @property
-    def is_prepared(self) -> bool:
-        return self._workspace is not None
-
     def prepare(self, *, max_m: int) -> None:
         if self._workspace is not None:
             assert self.max_m is not None
@@ -148,9 +144,8 @@ class CuteDSLFusionService:
         self.max_m = workspace.max_m
 
     def supports(self, m: int) -> bool:
-        if self._workspace is None or self.max_m is None:
-            return False
-        return 1 <= int(m) <= self.max_m and self._workspace.supports(m)
+        """False before prepare(), so it doubles as the readiness check."""
+        return self._workspace is not None and self._workspace.supports(m)
 
     def finalize(
         self,
@@ -158,7 +153,6 @@ class CuteDSLFusionService:
         residual: torch.Tensor,
         gamma: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        self._validate_finalize(handoff, residual, gamma)
         assert self._workspace is not None
         return self._workspace.moe_finalize_all_reduce_rms_norm(
             routed_output=handoff.routed_output,
@@ -175,64 +169,12 @@ class CuteDSLFusionService:
         residual: torch.Tensor,
         gamma: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        self._validate_matrix(local_contribution, "local_contribution")
-        self._validate_matrix(residual, "residual", m=local_contribution.shape[0])
-        self._validate_gamma(gamma)
-        if not self.supports(local_contribution.shape[0]):
-            raise ValueError(f"unsupported M={local_contribution.shape[0]}")
         assert self._workspace is not None
         return self._workspace.all_reduce_residual_rms_norm(
             local_contribution=local_contribution,
             residual=residual,
             gamma=gamma,
         )
-
-    def _validate_finalize(
-        self,
-        handoff: MoeFinalizeHandoff,
-        residual: torch.Tensor,
-        gamma: torch.Tensor,
-    ) -> None:
-        if not self.supports(handoff.m):
-            raise ValueError(f"unsupported M={handoff.m}")
-        self._validate_matrix(handoff.routed_output, "routed_output", exact_m=False)
-        expected_metadata = (handoff.m, self.top_k)
-        if tuple(handoff.expert_weights.shape) != expected_metadata:
-            raise ValueError("expert_weights must have shape [M, top_k]")
-        if tuple(handoff.permuted_indices.shape) != expected_metadata:
-            raise ValueError("permuted_indices must have shape [M, top_k]")
-        if handoff.expert_weights.dtype != torch.bfloat16:
-            raise ValueError("expert_weights must be BF16")
-        if handoff.permuted_indices.dtype != torch.int32:
-            raise ValueError("permuted_indices must be Int32")
-        self._validate_matrix(
-            handoff.gated_shared_output, "gated_shared_output", m=handoff.m
-        )
-        self._validate_matrix(residual, "residual", m=handoff.m)
-        self._validate_gamma(gamma)
-
-    def _validate_matrix(
-        self,
-        tensor: torch.Tensor,
-        name: str,
-        *,
-        m: int | None = None,
-        exact_m: bool = True,
-    ) -> None:
-        if tensor.ndim != 2 or tensor.shape[1] != self.hidden_size:
-            raise ValueError(f"{name} must have shape [M, hidden_size]")
-        if m is not None and exact_m and tensor.shape[0] != int(m):
-            raise ValueError(f"{name} has the wrong M dimension")
-        if tensor.dtype != torch.bfloat16 or not tensor.is_contiguous():
-            raise ValueError(f"{name} must be contiguous BF16")
-
-    def _validate_gamma(self, gamma: torch.Tensor) -> None:
-        if (
-            tuple(gamma.shape) != (self.hidden_size,)
-            or gamma.dtype != torch.bfloat16
-            or not gamma.is_contiguous()
-        ):
-            raise ValueError("gamma must be contiguous BF16 [hidden_size]")
 
 
 class CuteDSLFusionLayerCommunicator(LayerCommunicator):
@@ -355,7 +297,6 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
         parallel = get_parallel()
         return bool(
             self.fusion_service is not None
-            and self.fusion_service.is_prepared
             and is_supported_forward_mode(forward_batch.forward_mode)
             and self.fusion_service.supports(m)
             and not is_dp_attention_enabled()
