@@ -418,6 +418,8 @@ class LayerScatterModes:
                 or enable_dwdp()
             ):
                 return ScatterMode.SCATTERED
+            if enable_moe_fully_dp():
+                return ScatterMode.SCATTERED
             # DSA CP and MLA CP both don't support MOE_FULL yet; fall back to FULL.
             if is_enable_moe_cp_allgather() and not (
                 is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
@@ -465,6 +467,23 @@ class LayerScatterModes:
 
 def enable_moe_dense_fully_dp():
     return get_parallel().moe_dense_tp_size == 1
+
+
+def enable_moe_fully_dp():
+    parallel = get_parallel()
+    return (
+        is_dp_attention_enabled()
+        and parallel.pp_size == 1
+        and not parallel.dcp_enabled
+        and parallel.attn_cp_size == 1
+        and parallel.attn_dp_size == parallel.tp_size
+        and parallel.attn_tp_size == 1
+        and parallel.moe_ep_size == 1
+        and parallel.moe_tp_size == 1
+        and parallel.moe_dp_size == parallel.attn_dp_size
+        and parallel.moe_dense_tp_size == 1
+        and get_moe_a2a_backend().is_none()
+    )
 
 
 def enable_dwdp():
@@ -969,6 +988,15 @@ class CommunicateContext:
         tp_size = get_parallel().tp_size
         tp_rank = get_parallel().tp_rank
         moe_cp_size = get_moe_cp_size()
+        if enable_moe_fully_dp():
+            moe_full_size = tp_size // attn_cp_size
+        else:
+            if attn_cp_size % moe_cp_size != 0:
+                raise ValueError(
+                    "Attention CP size must be divisible by the MoE DP group size"
+                )
+            cp_per_moe = attn_cp_size // moe_cp_size
+            moe_full_size = tp_size // cp_per_moe
         process_group_sizes = {
             ScatterMode.SCATTERED: 1,
             ScatterMode.TP_ATTN_FULL: attn_tp_size,
@@ -976,7 +1004,7 @@ class CommunicateContext:
             # With context parallel enabled, we should exclude
             # the attn_cp_size from the total tp_size
             ScatterMode.FULL: tp_size // attn_cp_size,
-            ScatterMode.MOE_FULL: tp_size // (attn_cp_size // moe_cp_size),
+            ScatterMode.MOE_FULL: moe_full_size,
         }
         return cls(
             process_group_sizes=process_group_sizes,

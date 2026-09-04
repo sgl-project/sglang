@@ -367,6 +367,10 @@ class WeightsUpdater:
         """Update model weights from disk without restarting the server."""
         logger.info(f"Updating weights from disk: {model_path}")
 
+        rejected, message = self._reject_if_partial_update()
+        if rejected:
+            return False, message
+
         try:
             modules_to_update = self._collect_modules(target_modules)
         except ValueError as e:
@@ -439,6 +443,17 @@ class WeightsUpdater:
 
         logger.info(message)
         return success, message
+
+    def _reject_if_partial_update(self) -> tuple[bool, str]:
+        config = self.pipeline.server_args.pipeline_config
+        if config.supports_hot_weight_updates():
+            return False, ""
+        message = (
+            "pipeline holds components outside generic module discovery, a "
+            "runtime weight update would leave them at the old checkpoint"
+        )
+        logger.error(message)
+        return True, message
 
     def _collect_modules(
         self, target_modules: list[str] | None
@@ -527,6 +542,9 @@ class WeightsUpdater:
         lora_alpha: int | None = None,
         lora_rank: int | None = None,
     ) -> tuple[bool, str]:
+        rejected, message = self._reject_if_partial_update()
+        if rejected:
+            return False, message
         if weight_update_mode == LORA_MERGE_WEIGHT_UPDATE_MODE:
             return self._update_lora_from_tensor(
                 named_tensors=named_tensors,

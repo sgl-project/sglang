@@ -21,6 +21,10 @@ from sglang.kernels.ops.layernorm.norm import (
     can_use_fused_inplace_qknorm,
     fused_inplace_qknorm,
 )
+from sglang.kernels.ops.layernorm.rmsnorm_hf import (
+    is_supported_rmsnorm_hf_hidden_size,
+    rmsnorm_hf,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -91,11 +95,13 @@ class RMSNorm(CustomOp):
         eps: float = 1e-6,
         dtype: torch.dtype = torch.float32,
         var_hidden_size: Optional[int] = None,
+        cast_x_before_out_mul: bool = False,
     ) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
         self.hidden_size = hidden_size
+        self.cast_x_before_out_mul = cast_x_before_out_mul
         self.variance_size_override = (
             None if var_hidden_size == hidden_size else var_hidden_size
         )
@@ -115,6 +121,22 @@ class RMSNorm(CustomOp):
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         shape = x.shape
+        if self.cast_x_before_out_mul:
+            if residual is not None or self.variance_size_override is not None:
+                return self.forward_native(x, residual)
+            x_2d = x.contiguous().reshape(-1, shape[-1])
+            if (
+                x_2d.dtype in (torch.float16, torch.bfloat16)
+                and self.weight.dtype == x_2d.dtype
+                and is_supported_rmsnorm_hf_hidden_size(x_2d.shape[-1])
+            ):
+                return rmsnorm_hf(
+                    x_2d,
+                    self.weight.data,
+                    self.variance_epsilon,
+                ).view(shape)
+            return self.forward_native(x)
+
         x = x.reshape(-1, shape[-1])
         if residual is not None:
             residual_shape = residual.shape
@@ -189,10 +211,13 @@ class RMSNorm(CustomOp):
 
         variance = x_var.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.variance_epsilon)
-        weight = self.weight
-        if x.device.type == "mps" and weight.dtype != x.dtype:
-            weight = weight.to(dtype=x.dtype)
-        x = (x * weight).to(orig_dtype)
+        if self.cast_x_before_out_mul:
+            x = self.weight * x.to(orig_dtype)
+        else:
+            weight = self.weight
+            if x.device.type == "mps" and weight.dtype != x.dtype:
+                weight = weight.to(dtype=x.dtype)
+            x = (x * weight).to(orig_dtype)
         if residual is None:
             return x
         else:

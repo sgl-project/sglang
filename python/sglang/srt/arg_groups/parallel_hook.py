@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 def handle_context_parallelism(server_args: Any):
 
     cfg = resolving_view(server_args)
+    model_arch = None
     if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
         from sglang.srt.configs.model_config import is_deepseek_dsa
         from sglang.srt.layers.cp.utils import CP_V2_DEFAULT_MODEL_CLASSES
@@ -111,8 +112,21 @@ def handle_context_parallelism(server_args: Any):
         )
 
     if view.attn_cp_size != cfg.moe_dp_size:
-        assert cfg.moe_dp_size == 1, (
-            "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
+        assert cfg.moe_dp_size == 1 or (
+            view.enable_dp_attention
+            and model_arch == "LLaDA2MoeModelLM"
+            and view.ep_size == 1
+            and view.pp_size == 1
+            and cfg.tp_size == cfg.dp_size
+            and cfg.dp_size == cfg.moe_dp_size
+            and view.enable_dp_lm_head
+            and view.attn_cp_size == 1
+            and view.dcp_size == 1
+            and view.moe_dense_tp_size == 1
+            and view.moe_a2a_backend == "none"
+        ), (
+            "attn_cp_size != moe_dp_size requires moe_dp_size == 1 or "
+            "the LLaDA2 full-replica topology"
         )
 
     from sglang.srt.layers.cp.base import init_cp_strategy

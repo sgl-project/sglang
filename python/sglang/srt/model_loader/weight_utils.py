@@ -301,6 +301,12 @@ def get_quant_config(
                 model_config, quant_cls.from_config(hf_quant_config)
             )
 
+    if model_config.quantization == "fp8":
+        hf_quant_config = model_config._parse_llada_fp8_experts_config()
+        if hf_quant_config is not None:
+            hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
+            return quant_cls.from_config(hf_quant_config)
+
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
     if model_config.quantization == "bitsandbytes":
         if (

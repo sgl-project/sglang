@@ -436,6 +436,35 @@ class PipelineConfig:
         """Return whether one request's outputs run through DiT/VAE sequentially."""
         return False
 
+    def validate_num_outputs_per_prompt(
+        self, num_outputs_per_prompt: int, server_args
+    ) -> None:
+        """Validate a request's per-prompt output count for this pipeline."""
+        del num_outputs_per_prompt, server_args
+
+    def supports_memory_release(self) -> bool:
+        """Return whether release_memory_occupation can offload this pipeline."""
+        return True
+
+    def supports_hot_weight_updates(self) -> bool:
+        """Return whether runtime weight updates cover this pipeline fully."""
+        return True
+
+    def validate_request_sampling_params(self, sampling_params, server_args) -> None:
+        """Validate a request's sampling params for this pipeline.
+
+        May also run before full request materialization with a lightweight
+        object that only carries width, height, max_sequence_length,
+        num_outputs_per_prompt, diffusers_kwargs, enable_cache_dit,
+        cache_dit_params, attention_backend_override, and cfg_gate_step,
+        so overrides must not require other sampling fields.
+        """
+        del sampling_params, server_args
+
+    def validate_edit_source_count(self, source_count: int, server_args) -> None:
+        """Validate the number of source images before they are materialized."""
+        del source_count, server_args
+
     def estimate_request_cost(self, batch) -> float:
         """Return the relative cost used for batching admission caps.
 

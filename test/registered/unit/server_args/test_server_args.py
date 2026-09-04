@@ -1034,8 +1034,13 @@ class TestContextParallelServerArgs(CustomTestCase):
             tp_size=1,
             dp_size=1,
             moe_dp_size=1,
+            moe_dense_tp_size=None,
+            moe_a2a_backend="none",
             ep_size=1,
             pp_size=1,
+            enable_dp_attention=False,
+            enable_dp_lm_head=False,
+            dcp_size=1,
             enable_aiter_allreduce_fusion=False,
         )
         defaults.update(overrides)
@@ -1116,6 +1121,55 @@ class TestContextParallelServerArgs(CustomTestCase):
 
         self.assertTrue(is_cp_enabled())
         self.assertTrue(is_interleave())
+
+    def test_llada2_full_replica_is_the_only_mismatched_cp_exception(self):
+        cases = [
+            ("llada2_exact", "LLaDA2MoeModelLM", {}, True),
+            ("different_architecture", "Qwen3MoeForCausalLM", {}, False),
+            ("partial_replication", "LLaDA2MoeModelLM", {"tp_size": 4}, False),
+            ("dcp_enabled", "LLaDA2MoeModelLM", {"dcp_size": 2}, False),
+            (
+                "sharded_lm_head",
+                "LLaDA2MoeModelLM",
+                {"enable_dp_lm_head": False},
+                False,
+            ),
+        ]
+
+        for name, architecture, overrides, should_pass in cases:
+            with self.subTest(name=name):
+                topology = dict(
+                    model_path="dummy",
+                    tp_size=2,
+                    dp_size=2,
+                    enable_dp_attention=True,
+                    enable_dp_lm_head=True,
+                    attn_cp_size=1,
+                    moe_dp_size=2,
+                    moe_dense_tp_size=1,
+                    moe_a2a_backend="none",
+                    ep_size=1,
+                )
+                topology.update(overrides)
+                server_args = self._new_cp_args(**topology)
+                server_args._model_config = SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=[architecture]),
+                    is_multimodal=False,
+                )
+
+                with patch.object(
+                    envs.SGLANG_ENABLE_CP_V2,
+                    "is_set",
+                    return_value=True,
+                ):
+                    if should_pass:
+                        handle_context_parallelism(server_args)
+                    else:
+                        with self.assertRaisesRegex(
+                            AssertionError,
+                            "full-replica topology",
+                        ):
+                            handle_context_parallelism(server_args)
 
     def test_registered_cp_legacy_args_map_to_unified_strategy(self):
         cases = [

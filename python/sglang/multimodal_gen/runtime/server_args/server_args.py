@@ -399,6 +399,9 @@ class ServerArgs(DisaggServerArgsMixin):
     use_fsdp_inference: bool | None = None
     pin_cpu_memory: bool = True
     ltx2_two_stage_device_mode: str | None = None
+    llada_image_max_pixel_area: int | None = None
+    llada_image_max_text_tokens: int | None = None
+    llada_image_max_total_pixel_area: int | None = None
     _explicit_arg_names: set[str] = field(default_factory=set, repr=False)
     _automatic_component_attention_backend_keys: set[str] = field(
         default_factory=set, init=False, repr=False
@@ -2517,6 +2520,35 @@ class ServerArgs(DisaggServerArgsMixin):
                 "'original' keeps official two-stage semantics without premerged stage2, "
                 "'resident' keeps both transformers resident on GPU. "
                 "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise original."
+            ),
+        )
+        parser.add_argument(
+            "--llada-image-max-pixel-area",
+            type=int,
+            default=ServerArgs.llada_image_max_pixel_area,
+            help=(
+                "LLaDA-Image only. Largest accepted output pixel area per "
+                "request. Defaults to the pipeline config value of 2048*2048."
+            ),
+        )
+        parser.add_argument(
+            "--llada-image-max-text-tokens",
+            type=int,
+            default=ServerArgs.llada_image_max_text_tokens,
+            help=(
+                "LLaDA-Image only. Largest accepted request "
+                "max_sequence_length. Defaults to the pipeline config value "
+                "of 3584 and cannot exceed it."
+            ),
+        )
+        parser.add_argument(
+            "--llada-image-max-total-pixel-area",
+            type=int,
+            default=ServerArgs.llada_image_max_total_pixel_area,
+            help=(
+                "LLaDA-Image only. Largest accepted output pixel area times "
+                "the per-prompt output count. Defaults to the pipeline "
+                "config value of ten 1024x1024 outputs."
             ),
         )
         parser.add_argument(

@@ -556,6 +556,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Encoder-decoder cross-attention mask
     cross_attention_custom_mask: Optional[torch.Tensor] = None
 
+    # LLaDA-Image conditioning text lengths, declared so batch rebuilds
+    # carry them to the llada2_cfg_flashinfer backend
+    llada_image_conditioning_text_lens_cpu: Optional[List[int]] = None
+
     # For DP attention (padding / local info)
     dp_padding_mode: Optional[DpPaddingMode] = None
     # for extend, local start pos and num tokens is different in logits processor

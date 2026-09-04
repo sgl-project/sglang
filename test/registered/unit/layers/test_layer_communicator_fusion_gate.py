@@ -3,7 +3,13 @@ import unittest
 from unittest.mock import patch
 
 from sglang.srt.layers import communicator as comm
-from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode
+from sglang.srt.layers.communicator import (
+    CommunicateContext,
+    LayerCommunicator,
+    LayerScatterModes,
+    ScatterMode,
+    enable_moe_fully_dp,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -59,6 +65,115 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
 
     def test_pure_ep_still_fuses(self):
         self.assertTrue(self._should_fuse(moe_ep_size=4, moe_tp_size=1))
+
+
+class TestFullReplicaMoE(CustomTestCase):
+    def _topology(self, **overrides):
+        topology = dict(
+            tp_rank=0,
+            tp_size=2,
+            pp_size=1,
+            dcp_enabled=False,
+            attn_tp_rank=0,
+            attn_tp_size=1,
+            attn_dp_size=2,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            moe_ep_size=1,
+            moe_tp_size=1,
+            moe_dp_size=2,
+            moe_dense_tp_size=1,
+            dwdp_size=1,
+        )
+        topology.update(overrides)
+        return topology
+
+    def test_full_replica_sparse_mlp_stays_local(self):
+        backend = types.SimpleNamespace(is_none=lambda: True)
+        mode_args = dict(
+            num_layers=2,
+            layer_id=0,
+            is_layer_sparse=True,
+            is_previous_layer_sparse=None,
+            is_next_layer_sparse=True,
+        )
+        with (
+            patch.object(comm, "is_dp_attention_enabled", return_value=True),
+            patch.object(comm, "get_moe_a2a_backend", return_value=backend),
+            patch.object(
+                comm,
+                "should_use_flashinfer_cutlass_moe_fp4_allgather",
+                return_value=False,
+            ),
+            patch.object(comm, "is_enable_moe_cp_allgather", return_value=False),
+            patch.object(comm, "is_dsa_enable_prefill_cp", return_value=False),
+            patch.object(comm, "is_mla_prefill_cp_enabled", return_value=False),
+            patch.object(
+                comm,
+                "get_parallel",
+                return_value=types.SimpleNamespace(**self._topology()),
+            ),
+        ):
+            self.assertTrue(enable_moe_fully_dp())
+            self.assertIs(
+                LayerScatterModes.init_new(**mode_args).mlp_mode,
+                ScatterMode.SCATTERED,
+            )
+
+        with (
+            patch.object(comm, "is_dp_attention_enabled", return_value=True),
+            patch.object(comm, "get_moe_a2a_backend", return_value=backend),
+            patch.object(
+                comm,
+                "should_use_flashinfer_cutlass_moe_fp4_allgather",
+                return_value=False,
+            ),
+            patch.object(comm, "is_enable_moe_cp_allgather", return_value=False),
+            patch.object(comm, "is_dsa_enable_prefill_cp", return_value=False),
+            patch.object(comm, "is_mla_prefill_cp_enabled", return_value=False),
+            patch.object(
+                comm,
+                "get_parallel",
+                return_value=types.SimpleNamespace(**self._topology(moe_tp_size=2)),
+            ),
+        ):
+            self.assertFalse(enable_moe_fully_dp())
+            self.assertIs(
+                LayerScatterModes.init_new(**mode_args).mlp_mode,
+                ScatterMode.FULL,
+            )
+
+    def test_full_replica_moe_full_width_is_defined(self):
+        backend = types.SimpleNamespace(is_none=lambda: True)
+        with (
+            patch.object(comm, "is_dp_attention_enabled", return_value=True),
+            patch.object(comm, "get_moe_a2a_backend", return_value=backend),
+            patch.object(comm, "get_moe_cp_size", return_value=2),
+            patch.object(
+                comm,
+                "get_parallel",
+                return_value=types.SimpleNamespace(**self._topology()),
+            ),
+        ):
+            context = CommunicateContext.init_new()
+
+        self.assertEqual(context.process_group_sizes[ScatterMode.FULL], 2)
+        self.assertEqual(context.process_group_sizes[ScatterMode.MOE_FULL], 2)
+
+    def test_invalid_non_replica_moe_width_fails_early(self):
+        backend = types.SimpleNamespace(is_none=lambda: True)
+        with (
+            patch.object(comm, "is_dp_attention_enabled", return_value=True),
+            patch.object(comm, "get_moe_a2a_backend", return_value=backend),
+            patch.object(comm, "get_moe_cp_size", return_value=2),
+            patch.object(
+                comm,
+                "get_parallel",
+                return_value=types.SimpleNamespace(**self._topology(moe_tp_size=2)),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "must be divisible"):
+                CommunicateContext.init_new()
 
 
 if __name__ == "__main__":
