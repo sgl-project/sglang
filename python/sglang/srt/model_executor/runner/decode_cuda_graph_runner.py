@@ -210,7 +210,17 @@ def build_replay_fb_view(
             else forward_batch.lora_ids + [None] * (bs - len(forward_batch.lora_ids))
         ),
         can_run_dp_cuda_graph=forward_batch.can_run_dp_cuda_graph,
+        is_extend_in_batch=forward_batch.is_extend_in_batch,
         global_num_tokens_cpu=global_num_tokens_cpu,
+        global_num_tokens_gpu=buffers.global_num_tokens_gpu,
+        global_num_tokens_for_logprob_cpu=(
+            forward_batch.global_num_tokens_for_logprob_cpu
+        ),
+        global_num_tokens_for_logprob_gpu=(
+            forward_batch.global_num_tokens_for_logprob_gpu
+        ),
+        dp_local_start_pos=None,
+        dp_local_num_tokens=None,
         dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
     )
 
