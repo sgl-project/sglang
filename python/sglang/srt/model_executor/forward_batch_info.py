@@ -304,13 +304,19 @@ def compute_local_num_token_non_padded_cpu(
     return min(max(global_num_token_non_padded - rank_offset, 0), tokens_per_rank)
 
 
-def prefill_graph_tolerates_sum_len() -> bool:
+def prefill_graph_tolerates_sum_len(global_num_tokens: list[int]) -> bool:
     """Whether MegaMoE may replay prefill graphs with local shapes."""
     from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
     from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 
     if not get_moe_a2a_backend().is_megamoe():
+        return False
+    # Under SUM_LEN a 0-token rank keeps ForwardMode.IDLE and runs eager while
+    # the busy ranks replay the graph (captured with MAX_LEN collectives); the
+    # two sides issue different NCCL sequences and deadlock (#37561). MAX_LEN
+    # fabricates an EXTEND row on the idle rank so every rank replays.
+    if len(global_num_tokens) > 1 and min(global_num_tokens) == 0:
         return False
     return not (is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled())
 
@@ -1348,7 +1354,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             and self.is_extend_in_batch
             and prefill_cg.bs
             and max(global_num_tokens) <= max(prefill_cg.bs)
-            and not prefill_graph_tolerates_sum_len()
+            and not prefill_graph_tolerates_sum_len(global_num_tokens)
         ):
             dp_padding_mode = DpPaddingMode.MAX_LEN
         self.dp_padding_mode = dp_padding_mode
