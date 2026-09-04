@@ -108,7 +108,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         logger.info("Using experimental C++ radix tree implementation.")
         return RadixCacheCpp(params=params, server_args=server_args)
 
-    if server_args.enable_unified_cache_external_linker:
+    if get_memory().enable_unified_cache_external_linker:
         return _create_unified_radix_cache(ctx, server_args, params)
 
     if ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0:
@@ -196,8 +196,8 @@ def _create_unified_radix_cache(
         ctx.tp_worker.register_hicache_layer_transfer_counter(
             cache.cache_controller.layer_done_counter
         )
-    elif server_args.enable_unified_cache_external_linker:
-        backend = server_args.unified_cache_external_linker_backend
+    elif get_memory().enable_unified_cache_external_linker:
+        backend = get_memory().unified_cache_external_linker_backend
         if backend == "mooncake":
             from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
                 MooncakeDirectLinker,
