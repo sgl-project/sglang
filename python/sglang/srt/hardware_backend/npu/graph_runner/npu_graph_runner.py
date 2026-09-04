@@ -42,7 +42,6 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
-    get_parallel,
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
@@ -65,7 +64,12 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    PPProxyTensors,
+    compute_local_num_token_non_padded_cpu,
+    enable_num_token_non_padded,
+)
 
 
 @contextmanager
@@ -112,20 +116,16 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         self.update_attr_name = None
         self.update_attr_type = None
         self.model_runner = model_runner
-        # DFLASH target verify under dp attention: the captured dp-gather
-        # geometry goes stale when per-rank batch sizes diverge (uneven
-        # batching / partial batches), corrupting the verify output. Fall
-        # back to eager, mirroring the draft worker's dp-attention policy.
-        self._dflash_dp_eager = (
-            not model_runner.is_draft_worker
-            and model_runner.spec_algorithm.is_dflash_family()
-            and get_parallel().enable_dp_attention
-        )
-        if self._dflash_dp_eager:
-            logger.warning(
-                "Disable DFLASH target verify graph replay because dp "
-                "attention is enabled (verify runs eager)."
-            )
+        # DFLASH target verify under dp attention replays through the generic
+        # DP graph machinery: the scheduler-level DP vote
+        # (forward_batch.can_run_decode_cuda_graph, checked by the base
+        # can_run_graph under require_mlp_sync) keeps all DP ranks on the same
+        # graph/eager decision, and load_batch pads every rank to the same
+        # global max bucket (via _max_dp_batch_size) so the captured dp-gather
+        # geometry stays valid even when per-rank batch sizes diverge. Idle DP
+        # ranks replay the graph with fabricated dummy rows; on NPU
+        # _mask_topk_ids_padded_region is a no-op, so those rows dispatch as
+        # real tokens and never hit the 0-token a2a path.
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         self.if_use_v2 = any(
@@ -133,11 +133,6 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM", "Step3p5ForCausalLM")
             for arch in (model_runner.model_config.hf_config.architectures or [])
         )
-
-    def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
-        if self._dflash_dp_eager:
-            return False
-        return super().can_run_graph(forward_batch)
 
     def _init_arch_map(self):
         if self.is_dllm:
@@ -258,6 +253,37 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             self.raw_bs = raw_bs
             self.raw_num_token = raw_bs * self.captured_req_width
             self.bs = bs
+            # The pre-planned path bypasses load_batch, so the DeepEP dispatch
+            # mode recorded at capture time must be restored here (mirrors the
+            # replay() call at the top of load_batch); an interleaved eager
+            # extend may have switched it.
+            self.deepep_adapter.replay()
+            # DP-attention graph state: the captured graph binds the static
+            # global_num_tokens / num_token_non_padded buffers. Without this
+            # refresh, replay reads whatever the last capture (a different bs
+            # bucket) left there, the dp-gather segments misalign across
+            # ranks, and verify rejects every draft token (accept length
+            # collapses to 1). Mirror the capture-side uniform
+            # [padded_num_tokens] * dp_size, same as fill_from's post_fill.
+            if self.require_mlp_tp_gather:
+                _padded_num_tokens = bs * self.captured_req_width
+                self.buffers.global_num_tokens_gpu.fill_(_padded_num_tokens)
+                self.buffers.global_num_tokens_for_logprob_gpu.fill_(
+                    _padded_num_tokens
+                )
+            if (
+                enable_num_token_non_padded()
+                and self.require_gathered_buffer
+                and not self.enable_prefill_cp
+            ):
+                self.buffers.num_token_non_padded.fill_(
+                    compute_local_num_token_non_padded_cpu(
+                        global_num_token_non_padded=(
+                            forward_batch.num_token_non_padded_cpu
+                        ),
+                        num_tokens_per_dp=bs * self.captured_req_width,
+                    )
+                )
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (

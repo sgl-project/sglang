@@ -357,11 +357,6 @@ def initialize_dp_attention(
     dp = get_flags().dp
     dp.max_len_with_idle = (
         getattr(model_config.hf_config, "hybrid_override_pattern", None) is not None
-        # Escape hatch: force MAX_LEN padding (fabricated dummy rows) whenever
-        # an idle DP rank (0 tokens) joins the collective. Works around MoE
-        # a2a backends whose 0-token dispatch/combine path corrupts the
-        # active ranks' tokens.
-        or server_args.enable_dp_idle_max_len_padding
     )
     enable_dp_attention = get_parallel().enable_dp_attention
     dp_size = get_parallel().dp_size

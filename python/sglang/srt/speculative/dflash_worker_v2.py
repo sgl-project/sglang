@@ -2158,6 +2158,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 idle_verify_forward_batch, _ = idle_verify_input.prepare_for_verify(
                     batch, self._target_worker
                 )
+                # Symmetric eager fallback: when any DP rank is idle, the
+                # active ranks run an EAGER verify (see the idle-guard below).
+                # An IDLE batch votes True for the decode graph, so the idle
+                # rank would otherwise replay the graph and assume the padded
+                # bucket layout ([bucket]*dp_size) while the eager active rank
+                # uses the raw SUM_LEN counts — the DP-gather segment offsets
+                # disagree and the active rank gathers garbage (permanent KV
+                # pollution). Force the idle rank to eager as well.
+                idle_verify_forward_batch.can_run_decode_cuda_graph = False
                 self._target_worker.forward_batch_generation(
                     batch=None,
                     forward_batch=idle_verify_forward_batch,
@@ -2441,6 +2450,22 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
+
+        # DP-attention correctness guard: an idle DP rank runs a 0-token
+        # EAGER verify (see the is_idle branch above), so its DP-gather
+        # contribution follows the raw scheduler counts (MAX_LEN/SUM_LEN
+        # padding), while a graph-replaying rank assumes every rank
+        # contributes the padded bucket ([bucket]*dp_size in fill_from).
+        # The two views disagree on segment offsets, so any rank whose
+        # data sits after the idle segment gathers garbage. Fall back to
+        # eager verify (symmetric, known-good) whenever any DP rank is
+        # idle this round.
+        if (
+            get_parallel().enable_dp_attention
+            and verify_forward_batch.original_global_num_tokens_cpu is not None
+            and min(verify_forward_batch.original_global_num_tokens_cpu) == 0
+        ):
+            verify_forward_batch.can_run_decode_cuda_graph = False
 
         target_out = self.target_worker.forward_batch_generation(
             batch=None,

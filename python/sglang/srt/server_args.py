@@ -1093,14 +1093,6 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = False
-    enable_dp_idle_max_len_padding: A[
-        bool,
-        "Under DP attention, pad idle DP ranks (0 tokens) up to the max "
-        "length with fabricated dummy rows during extend batches. Works "
-        "around MoE a2a backends whose 0-token dispatch/combine path "
-        "corrupts the active ranks' tokens.",
-        NS("parallel"),
-    ] = False
     enable_tp_lm_head_all_to_all: A[
         Optional[bool],
         Arg(
