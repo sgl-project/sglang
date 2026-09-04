@@ -49,12 +49,11 @@ for module in mem_cache mem_cache_inspection; do
     cp "${tree_core[@]}" rust-ext-staging/mem_cache/rust_tree_core/
     built+=("${tree_core[@]}")
 done
-status=0
-
 max_allowed="${MAX_GLIBC:-}"
-[ -n "${max_allowed}" ] || exit $status
+[ -n "${max_allowed}" ] || exit 0
 
 # Newer glibc than the test runners fails at import: "GLIBC_2.xx not found".
+status=0
 for so in "${built[@]}"; do
     # Its own invocation, not the head of a pipeline: there its failure is
     # invisible, and the empty symbol list a wrong-arch objdump leaves behind reads
