@@ -148,6 +148,44 @@ def indexed_gate_bf16_(
     return _indexed_gate_bf16(x, x, gate, other, indices)
 
 
+def can_use_indexed_gate_bf16_cpu(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    other: torch.Tensor,
+    indices: torch.Tensor,
+) -> bool:
+    return (
+        x.device.type == "cpu"
+        and gate.device.type == "cpu"
+        and other.device.type == "cpu"
+        and indices.device.type == "cpu"
+        and x.dtype == torch.bfloat16
+        and gate.dtype == torch.bfloat16
+        and other.dtype == torch.bfloat16
+        and indices.dtype in (torch.int32, torch.int64)
+        and x.dim() == gate.dim() == other.dim() == 2
+        and indices.dim() == 1
+        and x.is_contiguous()
+        and gate.is_contiguous()
+        and other.is_contiguous()
+        and indices.is_contiguous()
+        and x.shape == other.shape
+        and x.shape[0] == indices.numel()
+        and x.shape[1] == gate.shape[1]
+    )
+
+
+def indexed_gate_bf16_cpu_(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    other: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    import sgl_kernel  # noqa: F401
+
+    return torch.ops.sgl_kernel.indexed_gate_bf16_(x, gate, other, indices)
+
+
 def indexed_gate_bf16(
     x: torch.Tensor,
     gate: torch.Tensor,

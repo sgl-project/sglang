@@ -21,10 +21,12 @@ from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding_,
 )
 from sglang.kernels.ops.diffusion import (
+    can_use_indexed_gate_bf16_cpu,
     can_use_fused_inplace_qknorm_rope,
     fused_inplace_qknorm_rope,
     indexed_gate_bf16,
     indexed_gate_bf16_,
+    indexed_gate_bf16_cpu_,
     indexed_scale_shift_bf16_,
 )
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
@@ -151,6 +153,7 @@ def _diffusers_h3_checkpoint(
 
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
+_FORCE_CPU_INDEXED_GATE_FALLBACK_ENV = "SGLANG_MINIMAX_H3_INDEXED_GATE_FORCE_FALLBACK"
 _MPS_MLP_TOKEN_CHUNK_SIZE = 128
 # keep MPS activation chunks below the allocator high-watermark; CUDA keeps
 # its fused full-sequence projection
@@ -409,6 +412,14 @@ def _modulate_gate(
         if allow_inplace:
             return indexed_gate_bf16_(x, gate, other, indices)
         return indexed_gate_bf16(x, gate, other, indices)
+    if (
+        allow_inplace
+        and not envs.SGLANG_MINIMAX_H3_INDEXED_GATE_FORCE_FALLBACK
+        and not torch.compiler.is_compiling()
+        and dtype == _BF16_DTYPE
+        and can_use_indexed_gate_bf16_cpu(x, gate, other, indices)
+    ):
+        return indexed_gate_bf16_cpu_(x, gate, other, indices)
     return (x + gate.index_select(0, indices) * other).to(dtype)
 
 
