@@ -369,6 +369,19 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def cache_unfinished_req(self, req: Req, **kwargs):
         pass
 
+    def free_kv_row(self, kv: Any, ranges: list[tuple[int, int]]) -> None:
+        """Give back ascending, disjoint, half-open row-position ranges
+        of the ``kv`` record's row; one call keeps a shared page freed once.
+        """
+        from sglang.srt.mem_cache.common import free_kv_row_segments
+
+        row = self.req_to_token_pool.req_to_token[kv.req_pool_idx]
+        free_kv_row_segments(
+            self.token_to_kv_pool_allocator,
+            [(row[start:end], start) for start, end in ranges],
+            swa_evicted_seqlen=kv.swa_evicted_seqlen,
+        )
+
     @abstractmethod
     def evict(self, params: EvictParams) -> EvictResult:
         pass
@@ -425,6 +438,21 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         Preparing KV cache loading from host to device.
         """
         raise NotImplementedError()
+
+    def finish_storage_prefetch_admission(
+        self, req_id: str, fulfilled_tokens: int, reason: Optional[str]
+    ) -> None:
+        """Resolve storage-hit accounting once a request is admitted.
+
+        Non-storage caches have no lifecycle state to resolve.
+        """
+
+    def discard_storage_prefetch_accounting(self, req_id: str) -> None:
+        """Forget storage-hit lifecycle state without emitting a result."""
+
+    def pop_prefetch_loaded_span(self, req_id: str) -> tuple[int, Optional[int]]:
+        """Pop L3-loaded tokens and their absolute prefix start, if known."""
+        return self.pop_prefetch_loaded_tokens(req_id), None
 
     def ready_to_load_host_cache(self) -> Any:
         """
