@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SwiGLU (silu(gate) * up, bf16 rounding after the SiLU and after the product,
-as the eager formula) fused with the per-tensor fp8 absmax, for the fp8
-per-tensor GEMM path: the fc1 output is read once, the bf16 product and its
-scale come out together, and a static per-tensor quant produces the fc2 fp8
-input. Replaces silu, mul and the dynamic absmax pass (three extra passes over
-the [rows, hidden] activation).
+"""SwiGLU fused with the per-tensor fp8 absmax for the ``fp8_per_tensor`` path.
 
-Numerical contract: bit-exact (scale and fp8 payload) against eager
-``silu(gate) * up`` followed by ``sgl_per_tensor_quant_fp8``; an fp8 producer
-of the ``fp8_per_tensor`` deployment path, not quality-gated. Verified at
-[1, 256], [333, 512], [2048, 14336] and the H3 fc1 shape [13000, 28672]."""
+Reads the fc1 output once, writes the bf16 product (rounded after the SiLU and
+after the product, as eager) and its scale, then a static per-tensor quant
+yields the fc2 fp8 input: three passes fewer than silu, mul and dynamic quant.
+
+Bit-exact (scale and payload) against eager ``silu(gate) * up`` +
+``sgl_per_tensor_quant_fp8``; an fp8 producer of the deployment path, not
+quality-gated. Verified at [1, 256], [333, 512], [2048, 14336] and the H3 fc1
+shape [13000, 28672]."""
 
 from __future__ import annotations
 

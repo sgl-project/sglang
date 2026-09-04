@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""VDN-H3 hybrid attention inside a MiniMax-H3 DiT block: the per-head softmax
-gate, the Video Delta linear branch and its output projection, the Ulysses
-exchange that shards both branches by head, and the request-static attention
-metadata. ``MiniMaxH3Attention`` owns one instance as ``hybrid`` and hands it
-the raw q/k/v; nothing else in the base H3 model changes."""
+"""VDN-H3 hybrid attention inside a MiniMax-H3 DiT block: per-head softmax gate,
+Video Delta linear branch and its output projection, the Ulysses exchange that
+shards both branches by head, and the request-static attention metadata.
+``MiniMaxH3Attention`` owns one instance as ``hybrid`` and hands it raw q/k/v."""
 
 from __future__ import annotations
 
@@ -91,8 +90,7 @@ class MiniMaxH3VDNHybridAttention(nn.Module):
         prefix: str,
         local_heads: int,
     ) -> MiniMaxH3VDNHybridAttention | None:
-        """None for the dense model and for the token refiner (VDN converts
-        the transformer blocks only)."""
+        """None for the dense model and the token refiner (VDN converts the DiT blocks only)."""
         if arch.hybrid_attention is None or not prefix.startswith("blocks."):
             return None
         return cls(
@@ -114,11 +112,8 @@ class MiniMaxH3VDNHybridAttention(nn.Module):
         ulysses_active: bool,
         ring_active: bool,
     ) -> torch.Tensor:
-        """VDN-H3: out = to_out(gate_sm * window_softmax) + to_out_linear(linear).
-
-        Everything computed from x here (gates, beta) is row-local, so it runs
-        on this rank's row shard before the core exchanges rows for heads.
-        """
+        """out = to_out(gate_sm * window_softmax) + to_out_linear(branch); gates and
+        beta are row-local and computed before the core exchanges rows for heads."""
         if ring_active:
             raise NotImplementedError(
                 "VDN-H3 hybrid attention does not support ring parallelism"
@@ -169,9 +164,8 @@ def _vdn_frame_partial_sums(
     num_frames: int,
     tokens_per_frame: int,
 ) -> torch.Tensor:
-    """fp32 [F, hidden] per-frame sums of this rank's video rows: complete
-    frames reduce as one [frames, tokens, hidden] sum, the two partial frames
-    at the shard edges as two row sums. Deterministic, bf16 rows read once."""
+    # fp32 [F, hidden] sums of this rank's video rows: whole frames as one reduction,
+    # the two edge frames as row sums; deterministic, bf16 read once
     hidden = x.shape[-1]
     sums = torch.zeros(num_frames, hidden, dtype=_FP32_DTYPE, device=x.device)
     lo = max(row_start, video_start)
@@ -201,11 +195,8 @@ def _vdn_frame_partial_sums(
 def _vdn_a2a_rows_to_heads(
     field: torch.Tensor, *, ulysses_ws: int, role: str, process_group
 ) -> tuple[torch.distributed.Work, torch.Tensor]:
-    """Async all-to-all of one q/k/v field [L, H, d] (row shard, every head)
-    -> receive buffer readable as a contiguous [S, H / ws, d] of this rank's
-    heads (row shards are contiguous and rank-ordered, so no relayout on
-    receipt; each field lands contiguous, which the window K/V gathers and the
-    branch's conv read directly)."""
+    # [L, H, d] row shard -> contiguous [S, H / ws, d] of this rank's heads (rank-ordered
+    # row shards need no relayout on receipt)
     from sglang.multimodal_gen.runtime.layers.usp import _a2a_staging_buffer
 
     rows, total_heads, head_dim = field.shape
@@ -232,9 +223,7 @@ def _vdn_a2a_rows_to_heads(
 def _vdn_a2a_heads_to_rows(
     out: torch.Tensor, *, ulysses_ws: int, role: str, process_group
 ) -> tuple[torch.distributed.Work, torch.Tensor]:
-    """Async inverse: [S, H / ws, d] head-shard output -> receive buffer
-    [ws, L, H / ws, d] (source rank major); :func:`_vdn_merge_heads` turns it
-    into the row shard after the wait."""
+    # [S, H / ws, d] -> [ws, L, H / ws, d] source-rank major; _vdn_merge_heads after wait
     from sglang.multimodal_gen.runtime.layers.usp import _a2a_staging_buffer
 
     seq_len, local_heads, head_dim = out.shape
@@ -249,8 +238,7 @@ def _vdn_a2a_heads_to_rows(
 
 
 def _vdn_merge_heads(recv: torch.Tensor) -> torch.Tensor:
-    """[ws, L, h, d] (source rank major) -> [L, ws * h, d]: rank-major heads
-    are the global head order."""
+    # [ws, L, h, d] -> [L, ws * h, d]; rank-major heads are the global head order
     ulysses_ws, rows, local_heads, head_dim = recv.shape
     merged = usp_merge_heads(recv.view(ulysses_ws, rows, 1, local_heads, head_dim))
     return merged.reshape(rows, ulysses_ws * local_heads, head_dim)
@@ -269,8 +257,7 @@ def _vdn_window_softmax(
     cu_seqlens_host: tuple[int, ...] | None,
     max_seqlen: int,
 ) -> torch.Tensor:
-    """Gated window softmax on out-of-place QK-normed + RoPE'd copies of the
-    raw q/k [S, h, d] (the branch keeps reading the raw tensors)."""
+    # the branch keeps reading the raw q/k, so norm + RoPE write copies
     cos_sin_cache, positions = rope_cache
     if attention._use_fused_qknorm_rope and not torch.compiler.is_compiling():
         q_sm = torch.empty(q.shape, dtype=q.dtype, device=q.device)
@@ -324,8 +311,7 @@ def _vdn_linear_readout(
     frame_mean: torch.Tensor,
     head_range: slice | None,
 ) -> torch.Tensor:
-    """Linear branch on the raw q/k/v [S, h, d] for the ``head_range`` heads:
-    video rows in, [V, h * d] out (text rows seed the state)."""
+    # video rows in, [V, h * d] out; text rows seed the state
     layout = meta.layout
     video = slice(layout.video_start, layout.video_end)
     text = slice(0, layout.text_len)
@@ -360,20 +346,10 @@ def _minimax_h3_hybrid_attention_core_impl(
     max_seqlen: int,
     ulysses_active: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """VDN-H3 hybrid attention core: window softmax + linear branch.
-
-    Takes the RAW (pre-QK-norm, pre-RoPE) q/k/v because the linear branch
-    consumes them NoPE; QK-norm + RoPE run out of place on the softmax
-    branch's copies. ``gate_hidden`` is the 128-wide output_gate.down hidden
-    of the rows; the gate's ``up`` runs here (under Ulysses on the head shard
-    after an all-gather, so the H x d gate never crosses the fabric). Under
-    Ulysses q, k, v and the per-head scalars travel as four async all-to-alls
-    that land contiguous on the head shard, norm + RoPE use the request's
-    full-sequence RoPE cache, and the frame mean is one all-reduce of partial
-    sums. The branch is per-head independent given (beta, gate, alpha), so head
-    sharding is exact. Returns (gated softmax output [T_local, H, d], linear
-    readout [T_local, H * d] or None when the window covers the whole clip).
-    """
+    """Window softmax + linear branch on RAW (pre-norm, pre-RoPE) q/k/v.
+    ``gate_hidden`` is the 128-wide output_gate.down hidden of the rows. Returns
+    (gated softmax output [T_local, H, d], linear readout [T_local, H * d] or
+    None when the window covers the whole clip)."""
     from sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_h3 import (
         HybridWindowAttentionH3Metadata,
     )
@@ -447,9 +423,6 @@ def _vdn_ulysses_hybrid_core(
     gate_hidden: torch.Tensor,
     softmax,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Ulysses path: four async all-to-alls (q, k, v, per-head scalars) land
-    contiguous on the head shard; the gate hidden is all-gathered; the frame
-    mean is one all-reduce; both outputs return through the inverse."""
     from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
 
     layout = meta.layout
@@ -542,8 +515,7 @@ def _vdn_return_to_rows(
     ulysses_ws: int,
     process_group,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Both branch outputs [S, h, d] back to their row owners with the return
-    trips in flight together -> ([L, H, d], [L, H * d] or None)."""
+    # [S, h, d] per branch -> ([L, H, d], [L, H * d] or None), both trips in flight together
     outs = [out for out in (softmax_out, linear_out) if out is not None]
     returning = [
         _vdn_a2a_heads_to_rows(
@@ -575,12 +547,9 @@ def prepare_hybrid_attention_metadata(
     server_args,
     device: torch.device,
 ) -> Callable[[int], Any] | None:
-    """Request-static VDN-H3 hybrid attention metadata (window plan, packed
-    layout, full-sequence RoPE cache under Ulysses), or None off that path.
-
-    Unlike VSA-H3's per-step top-k, the chunk window and anchors depend only
-    on the packed layout, so one metadata object serves every step.
-    """
+    """Request-static hybrid attention metadata (window plan, packed layout,
+    full-sequence RoPE cache under Ulysses) for every step and block, or None
+    when the transformer runs another backend."""
     model._resolve_attention_backend_once()
     if (
         model._resolved_attention_backend

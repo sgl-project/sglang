@@ -1,14 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Online fp8 with one scale per tensor: ``--quantization fp8_per_tensor``.
+"""``--quantization fp8_per_tensor``: online fp8 with one scale per tensor.
 
 Weights quantize per tensor at load, activations take a dynamic per-tensor
-scale, and the GEMM runs on cuBLASLt (``torch._scaled_mm``); ~20% faster DiT
-GEMMs than the per-channel CUTLASS path on SM100 at the same block-level
-error (a different fp8 sample, as with any fp8 path). ``fc2``-style consumers
-may hand ``apply`` a prequantized ``(fp8, scale)`` tuple from a fused
-activation + quant kernel. Layers with unaligned K/N or fp32 params keep the
-per-channel path.
-"""
+scale, the GEMM runs on cuBLASLt (``torch._scaled_mm``). ``apply`` also takes
+a prequantized ``(fp8, scale)`` tuple from a fused activation + quant kernel.
+Layers with unaligned K/N or fp32 params keep the per-channel path."""
 
 from typing import Optional
 

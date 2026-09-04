@@ -170,8 +170,7 @@ def vdn_h3_layout_from_packed(
 
 
 def _head_sharded_loader(shard_dim: int):
-    """Weight loader that takes this TP rank's contiguous slice along
-    ``shard_dim`` (rows laid out head-major, so a head slice is contiguous)."""
+    # head-major output rows: TP shards by head, the checkpoint stores all heads
 
     def _loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         tp_size = get_tp_world_size()
@@ -201,7 +200,6 @@ def _make_param(
 def _head_sharded_linear(
     in_features: int, out_features: int, *, bias: bool, prefix: str
 ) -> ColumnParallelLinear:
-    """bf16 linear whose output rows are head-major and TP-sharded by head."""
     return ColumnParallelLinear(
         in_features,
         out_features,
@@ -216,7 +214,6 @@ def _head_sharded_linear(
 def _replicated_linear(
     in_features: int, out_features: int, *, prefix: str
 ) -> ReplicatedLinear:
-    """bf16 bottleneck projection shared by every head (replicated under TP)."""
     return ReplicatedLinear(
         in_features,
         out_features,
@@ -385,8 +382,7 @@ class VDNShortConv(nn.Module):
 
 
 def _branch_norm(dim: int, eps: float = 1e-6) -> nn.RMSNorm:
-    """Weight holder for the branch's RMSNorm(head_dim); the arithmetic runs in
-    linear_epilogue / vdn_linear_epilogue (fp32 second moment, one rounding)."""
+    # weight holder only; the arithmetic runs in the epilogue (fp32 second moment)
     return nn.RMSNorm(dim, eps=eps, dtype=_BF16)
 
 
@@ -396,8 +392,7 @@ def _branch_norm(dim: int, eps: float = 1e-6) -> nn.RMSNorm:
 
 
 def _temporal_shift(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """Depthwise 5-tap conv over frames as shift-multiply-add. x [F, S, C];
-    w [C, 5] in x's dtype; zero padded, symmetric."""
+    # depthwise 5-tap conv over frames, zero padded, symmetric; x [F, S, C], w [C, 5]
     k = SHORT_CONV_KERNEL
     pad = k // 2
     xp = F.pad(x, (0, 0, 0, 0, pad, pad))
@@ -577,10 +572,8 @@ def run_scans(
 def _compose_chunk(
     transitions: torch.Tensor, injections: torch.Tensor, reverse: bool
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fold each chunk's frames into one affine map S -> S @ M + C, batched
-    over every chunk at once. transitions [n, C, H, dk, dk], injections
-    [n, C, H, dv, dk] (frame-within-chunk leading, so each step's operands
-    are contiguous slices) -> (M [C, H, dk, dk], C [C, H, dv, dk])."""
+    # fold each chunk's frames into one affine map S -> S @ M + C, batched over chunks;
+    # transitions [n, C, H, dk, dk], injections [n, C, H, dv, dk] -> (M, C) per chunk
     order = list(range(transitions.shape[0]))
     if reverse:
         order.reverse()
@@ -603,12 +596,8 @@ def _compose_chunk(
 def _boundary_frames(
     num_frames: int, chunk: int, frame_offset: int, device: str
 ) -> tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """(num_chunks, prefix frames = each chunk's last frame and their chunk
-    indices, suffix frames = each chunk's first frame and their chunk indices;
-    frames outside the clip dropped).
-    Chunks are aligned on the original clip, where frame ``f`` here is
-    ``f + frame_offset``; the grid pads ``frame_offset`` leading frames and
-    fills the last chunk."""
+    # frames the chunked gather reads (prefix: chunk ends, suffix: chunk starts) with
+    # their chunk indices; frame f here is f + frame_offset on the clip the chunks align to
     padded = frame_offset + num_frames
     num_chunks = -(-padded // chunk)
     ends = [
@@ -705,9 +694,8 @@ def run_boundary_scans(
 def _gather_indices(
     bounds: tuple[tuple[int, int], ...], num_frames: int, device: str
 ) -> tuple[torch.Tensor, ...]:
-    """Index tensors of the boundary gather, built once per (bounds, F,
-    device): they depend on the geometry only, and rebuilding them from
-    Python lists per block would cost two synchronizing H2D copies each."""
+    # built once per (bounds, F, device): rebuilding from Python lists per block
+    # costs two synchronizing H2D copies
     dev = torch.device(device)
     last_before = torch.tensor([lo for lo, _ in bounds], device=dev) - 1
     first_after = torch.tensor([hi for _, hi in bounds], device=dev) + 1

@@ -133,7 +133,7 @@ def _cat_ranges(ranges: list[tuple[int, int]], *, device: torch.device) -> torch
 def _chunk_groups(
     raw_bounds: list[tuple[int, int]], dense_rows: set[int]
 ) -> list[list[int]]:
-    """Consecutive window frames with identical bounds share one varlen segment."""
+    # consecutive window frames with identical bounds share one varlen segment
     groups: list[list[int]] = []
     for f in range(len(raw_bounds)):
         if f in dense_rows:
@@ -155,9 +155,8 @@ def _window_passes(
     max_gather_rows: int,
     device: torch.device,
 ) -> list[dict]:
-    """One varlen call per pass; a pass holds consecutive chunk groups whose
-    gathered K/V rows stay under ``max_gather_rows`` (bounds the transient,
-    every query still sees exactly its kept set in one call)."""
+    # one varlen call per pass; a pass holds consecutive chunk groups whose gathered
+    # K/V rows stay under max_gather_rows (bounds the transient, same arithmetic)
     passes: list[dict] = []
     current: list[tuple] = []
     current_rows = 0
