@@ -47,6 +47,33 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 
+def _allocate_output_buffer(output: Any) -> Optional[torch.Tensor]:
+    if not torch.is_tensor(output) or output.ndim == 0:
+        return None
+    return torch.empty_like(output)
+
+
+def _output_fits_buffer(output: Any, output_buffer: torch.Tensor) -> bool:
+    return (
+        torch.is_tensor(output)
+        and output.ndim == output_buffer.ndim
+        and output.shape[1:] == output_buffer.shape[1:]
+        and output.shape[0] <= output_buffer.shape[0]
+        and output.dtype == output_buffer.dtype
+        and output.device == output_buffer.device
+    )
+
+
+def _copy_output_to_buffer(
+    output: Any, output_buffer: torch.Tensor
+) -> Optional[torch.Tensor]:
+    if not _output_fits_buffer(output, output_buffer):
+        return None
+    shared_output = output_buffer[: output.shape[0]]
+    shared_output.copy_(output)
+    return shared_output
+
+
 class FullCudaGraphBackend(BaseCudaGraphBackend):
     """One torch.cuda.CUDAGraph per shape; attention metadata is
     captured inside the graph. Memory-saver-aware.
@@ -123,7 +150,11 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
-        self._initialize_output_buffer(warmup_output)
+        if self._reuse_output_buffer and self._output_buffer is None:
+            # Prefill captures the largest shape first and replays one shape at
+            # a time, so all graphs can share this eager-tail input buffer.
+            self._output_buffer = _allocate_output_buffer(warmup_output)
+            self._reuse_output_buffer = self._output_buffer is not None
         del warmup_output
 
         graph = torch.cuda.CUDAGraph()
@@ -145,46 +176,20 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream),
         ):
             self._precarve.mint()
-            out = self._copy_output_to_buffer(forward_fn())
+            out = forward_fn()
+            if self._reuse_output_buffer:
+                output_buffer = self._output_buffer
+                assert output_buffer is not None
+                shared_output = _copy_output_to_buffer(out, output_buffer)
+                self._reuse_output_buffer = shared_output is not None
+                if shared_output is not None:
+                    out = shared_output
 
         if profiler is not None:
             profiler.step()
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
-
-    def _initialize_output_buffer(self, output: Any) -> None:
-        if not self._reuse_output_buffer or self._output_buffer is not None:
-            return
-        if not torch.is_tensor(output) or output.ndim == 0:
-            self._reuse_output_buffer = False
-            return
-        # Prefill captures the largest shape first and replays one shape at a
-        # time, so all graphs can share this eager-tail input buffer.
-        self._output_buffer = torch.empty_like(output)
-
-    def _copy_output_to_buffer(self, output: Any) -> Any:
-        if not self._reuse_output_buffer:
-            return output
-        output_buffer = self._output_buffer
-        assert output_buffer is not None
-        if not self._output_fits_buffer(output, output_buffer):
-            self._reuse_output_buffer = False
-            return output
-        shared_output = output_buffer[: output.shape[0]]
-        shared_output.copy_(output)
-        return shared_output
-
-    @staticmethod
-    def _output_fits_buffer(output: Any, output_buffer: torch.Tensor) -> bool:
-        return (
-            torch.is_tensor(output)
-            and output.ndim == output_buffer.ndim
-            and output.shape[1:] == output_buffer.shape[1:]
-            and output.shape[0] <= output_buffer.shape[0]
-            and output.dtype == output_buffer.dtype
-            and output.device == output_buffer.device
-        )
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
