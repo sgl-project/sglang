@@ -10,7 +10,7 @@ import torch
 import torchvision
 from torchvision.transforms import InterpolationMode
 
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
 from sglang.srt.models.minimax_m3_vl import MiniMaxM3SparseForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -281,3 +281,27 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
             im_token_id=self.IM_TOKEN_ID,
             video_token_id=self.VIDEO_TOKEN_ID,
         )
+
+    def get_mm_data(self, prompt, embeddings, **kwargs):
+        # The base implementation drops the vision [START]/[END] wrappers that
+        # the colocated path inserts around image/video spans; reinsert them so
+        # the EPD layout matches colocated token-for-token.
+        output = super().get_mm_data(prompt, embeddings, **kwargs)
+        input_ids = list(output.input_ids)
+        shift = 0
+        for item in output.mm_items:
+            if not item.offsets:
+                continue
+            if item.modality not in (Modality.IMAGE, Modality.VIDEO):
+                continue
+            new_offsets = []
+            for start, end in item.offsets:
+                start += shift
+                end += shift
+                input_ids.insert(start, self.IM_START_TOKEN_ID)
+                input_ids.insert(end + 2, self.IM_END_TOKEN_ID)
+                new_offsets.append((start + 1, end + 1))
+                shift += 2
+            item.offsets = new_offsets
+        output.input_ids = input_ids
+        return output

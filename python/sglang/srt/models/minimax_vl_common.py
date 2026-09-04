@@ -791,6 +791,15 @@ def _run_vision_tower(
     return vision_tower(pixel_values, grid_thw=grid_thw)
 
 
+def _to_vision_device(
+    vision_tower: MiniMaxVLVisionModel, pixel_values: torch.Tensor
+) -> torch.Tensor:
+    # The EPD encode server hands CPU tensors to the model; no-op when the
+    # tensor is already on the right device.
+    device = vision_tower.vision_model.embeddings.patch_embedding.weight.device
+    return pixel_values.to(device)
+
+
 def get_image_feature(
     vision_tower: MiniMaxVLVisionModel,
     items: List[MultimodalDataItem],
@@ -799,6 +808,8 @@ def get_image_feature(
     pixel_values = torch.cat([item.feature for item in items], dim=0).type(
         vision_tower.dtype
     )
+    if not use_data_parallel:
+        pixel_values = _to_vision_device(vision_tower, pixel_values)
     image_grid_thw: list[list[int]] = []
     for item in items:
         image_grid_thw.extend(item.image_grid_thw.tolist())
@@ -815,6 +826,8 @@ def get_video_feature(
     pixel_values = torch.cat([item.feature for item in items], dim=0).type(
         vision_tower.dtype
     )
+    if not use_data_parallel:
+        pixel_values = _to_vision_device(vision_tower, pixel_values)
     video_grid_thw: list[list[int]] = []
     for item in items:
         video_grid_thw.extend(item.video_grid_thw.tolist())
