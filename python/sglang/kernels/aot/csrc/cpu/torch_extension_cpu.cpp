@@ -516,6 +516,24 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
     bool use_qk_l2norm_in_kernel,
     double softplus_beta = 1.0,
     double softplus_threshold = 20.0);
+// fused_sigmoid_gating_delta_rule_update_spec
+at::Tensor fused_sigmoid_gating_delta_rule_update_spec_cpu(
+    const at::Tensor& A_log,
+    const at::Tensor& dt_bias,
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& a,
+    const at::Tensor& b,
+    at::Tensor& initial_state_source,
+    const at::Tensor& initial_state_indices,
+    at::Tensor& intermediate_states_buffer,
+    const at::Tensor& intermediate_state_indices,
+    int64_t steps,
+    bool use_qk_l2norm_in_kernel,
+    bool disable_state_update,
+    double softplus_beta = 1.0,
+    double softplus_threshold = 20.0);
 // fused_gdn_gating
 std::tuple<at::Tensor, at::Tensor>
 fused_gdn_gating_cpu(const at::Tensor& A_log, const at::Tensor& a, const at::Tensor& b, const at::Tensor& dt_bias);
@@ -893,6 +911,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "a, Tensor b, Tensor(a!) initial_state_source, Tensor initial_state_indices, Tensor cu_seqlens, bool "
       "use_qk_l2norm_in_kernel, float softplus_beta=1.0, float softplus_threshold=20.0) -> Tensor");
   m.impl("fused_sigmoid_gating_delta_rule_update_cpu", torch::kCPU, &fused_sigmoid_gating_delta_rule_update_cpu);
+  // fused_sigmoid_gating_delta_rule_update_spec
+  m.def(
+      "fused_sigmoid_gating_delta_rule_update_spec_cpu(Tensor A_log, Tensor dt_bias, Tensor q, Tensor k, Tensor v, "
+      "Tensor a, Tensor b, Tensor(a!) initial_state_source, Tensor initial_state_indices, "
+      "Tensor(b!) intermediate_states_buffer, Tensor intermediate_state_indices, int steps, bool "
+      "use_qk_l2norm_in_kernel, bool disable_state_update, float softplus_beta=1.0, float softplus_threshold=20.0) "
+      "-> Tensor");
+  m.impl(
+      "fused_sigmoid_gating_delta_rule_update_spec_cpu", torch::kCPU, &fused_sigmoid_gating_delta_rule_update_spec_cpu);
   // fused_gdn_gating
   m.def("fused_gdn_gating_cpu(Tensor A_log, Tensor a, Tensor b, Tensor dt_bias) -> (Tensor, Tensor)");
   m.impl("fused_gdn_gating_cpu", torch::kCPU, &fused_gdn_gating_cpu);

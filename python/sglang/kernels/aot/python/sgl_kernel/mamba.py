@@ -95,8 +95,18 @@ def _causal_conv1d_update_cpu_verify(
     with directly, so it has to do the arithmetic.
     """
     seq_len = mixed_qkv.size(-1)
+    width = conv_weights.size(-1)
     cache_idx = conv_state_indices.to(torch.int64)
     window_idx = intermediate_state_indices.to(torch.int64)
+
+    # The decode kernel appends the raw input to the state, so the state after
+    # token t is just the width-1 window of [initial_state, block] ending at t.
+    # Batching them avoids one index_put_ per token, which costs ~12us
+    # regardless of how few bytes it moves.
+    extended = torch.cat([conv_states[cache_idx], mixed_qkv], dim=-1)
+    intermediate_conv_window[window_idx, :seq_len] = extended.unfold(-1, width - 1, 1)[
+        :, :, 1:
+    ].permute(0, 2, 1, 3)
 
     # Roll a scratch copy so the real pool only sees the final state.
     scratch = conv_states[cache_idx].contiguous()
@@ -117,7 +127,6 @@ def _causal_conv1d_update_cpu_verify(
             -1,
             True,
         )
-        intermediate_conv_window[window_idx, t] = scratch
 
     conv_states[cache_idx] = scratch
 
@@ -236,10 +245,11 @@ def fused_sigmoid_gating_delta_rule_update_cpu(
             softplus_threshold,
         )
 
-    # Target verify. The C++ op consumes one token per sequence and rolls the
-    # state in place, so replaying the draft chain step by step against a
-    # scratch copy reproduces the fused kernel's snapshots while leaving the
-    # real ssm_states untouched (disable_state_update).
+    # Target verify. Tokens arrive packed as n * steps + t, which is exactly the
+    # layout the spec op expects, so the whole draft block goes out in a single
+    # dispatch: the kernel walks t sequentially per (sequence, v_head) and writes
+    # the state after each token straight into intermediate_states_buffer. The
+    # committed ssm_states are only read unless disable_state_update is False.
     assert not is_kda, "KDA target_verify is not supported on CPU"
     assert a.dim() == 2, f"expected per-token gating [tokens, heads], got {a.shape}"
 
@@ -247,38 +257,24 @@ def fused_sigmoid_gating_delta_rule_update_cpu(
     steps = q.shape[1] // batch
     _assert_linear_chain(retrieve_parent_token, steps)
 
-    state_idx = initial_state_indices.to(torch.int64)
-    scratch = initial_state_source[state_idx].contiguous()
-    step_state_indices = torch.arange(batch, dtype=torch.int32, device=q.device)
-    step_cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=q.device)
-    # The caller hands over the whole pool-sized table; the kernel reads it
-    # positionally per request, so only the first `batch` rows are ours.
-    window_idx = intermediate_state_indices[:batch].to(torch.int64)
-
-    core_attn_out = q.new_empty((1, q.shape[1], v.shape[2], v.shape[3]))
-    for t in range(steps):
-        # Token `t` of sequence `n` sits at n * steps + t in the packed axis.
-        out_t = torch.ops.sgl_kernel.fused_sigmoid_gating_delta_rule_update_cpu(
-            A_log,
-            dt_bias,
-            q[:, t::steps].contiguous(),
-            k[:, t::steps].contiguous(),
-            v[:, t::steps].contiguous(),
-            a[t::steps].contiguous(),
-            b[t::steps].contiguous(),
-            scratch,
-            step_state_indices,
-            step_cu_seqlens,
-            use_qk_l2norm_in_kernel,
-            softplus_beta,
-            softplus_threshold,
-        )
-        core_attn_out[:, t::steps] = out_t[:, 0]
-        intermediate_states_buffer[window_idx, t] = scratch
-
-    if not disable_state_update:
-        initial_state_source[state_idx] = scratch
-    return core_attn_out
+    return torch.ops.sgl_kernel.fused_sigmoid_gating_delta_rule_update_spec_cpu(
+        A_log,
+        dt_bias,
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        a.contiguous(),
+        b.contiguous(),
+        initial_state_source,
+        initial_state_indices,
+        intermediate_states_buffer,
+        intermediate_state_indices.contiguous(),
+        steps,
+        use_qk_l2norm_in_kernel,
+        disable_state_update,
+        softplus_beta,
+        softplus_threshold,
+    )
 
 
 def chunk_gated_delta_rule_cpu(
