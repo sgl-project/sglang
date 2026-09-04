@@ -129,6 +129,7 @@ from sglang.srt.arg_groups.choices import (  # noqa: F401
     add_radix_supported_deterministic_attention_backend_choices,
     add_rl_on_policy_target_choices,
 )
+from sglang.srt.arg_groups.fields import collect_input_fields
 from sglang.srt.arg_groups.fields.device import (
     Device,
 )
@@ -188,30 +189,7 @@ from sglang.srt.utils.common import (  # noqa: F401
 )
 
 
-@dataclasses.dataclass
-class ServerArgs(
-    Serving,
-    Mm,
-    ExecFeatures,
-    Schedule,
-    Memory,
-    Parallel,
-    Device,
-    Observability,
-    ExecKernel,
-    ExecMamba,
-    ExecGraph,
-    ExecComm,
-    ExecMoe,
-    Spec,
-    Disagg,
-    Lora,
-    ExecOverlap,
-    ExecOffload,
-    ExecDllm,
-    ExecDeterministic,
-    Model,
-):
+class ServerArgs:
     """Server-wide configuration for SGLang.
 
     Adding new arguments
@@ -252,9 +230,10 @@ class ServerArgs(
        Everything else should use the ``A[T, ...]`` annotation.
 
     The fields live in ``arg_groups/fields/`` -- one class per config
-    namespace, composed here. Reverse-MRO order puts the last base's fields
-    first, which is why ``Model`` is last: ``model_path`` is the one field
-    with no default, so it has to stay the first positional argument.
+    namespace, assembled here rather than inherited, so what the record holds
+    is one readable call and not a property of a base-class list. The order
+    they appear in is ``POSITIONAL_FIELD_ORDER``, not the order the namespaces
+    are listed in: field order *is* the positional constructor signature.
     """
 
     def __post_init__(self):
@@ -720,6 +699,56 @@ class ServerArgs(
         """``load_format`` overrides the seed's: a draft runner loading under
         ``--speculative-draft-load-format`` needs its own transfer engine."""
         return remote_instance_transfer_engine_of(resolving_view(self), load_format)
+
+
+# ---------------------------------------------------------------------------
+# The record is assembled, not inherited.
+#
+# Its fields are exactly the operator's input, and the classes below are the
+# statement of that: a namespace declares its input fields and its derived ones
+# side by side, and only the input half is collected here. Inheriting the
+# namespace classes would have made the record's contents a property of which
+# classes happen to appear in a base list -- correct today, and silently wrong
+# the first time a derived field is declared in an inherited class.
+#
+# This list is a set, not an order: `collect_input_fields` orders what it
+# collects by `arg_groups/field_order.py`, which records the field order this
+# record had before the split. Grouping by namespace would otherwise move the
+# positional constructor's arguments onto different fields.
+# ---------------------------------------------------------------------------
+
+_INPUT_NAMESPACES = [
+    Model,
+    ExecDeterministic,
+    ExecDllm,
+    ExecOffload,
+    ExecOverlap,
+    Lora,
+    Disagg,
+    Spec,
+    ExecMoe,
+    ExecComm,
+    ExecGraph,
+    ExecMamba,
+    ExecKernel,
+    Observability,
+    Device,
+    Parallel,
+    Memory,
+    Schedule,
+    ExecFeatures,
+    Mm,
+    Serving,
+]
+
+_annotations, _defaults, _namespaces = collect_input_fields(_INPUT_NAMESPACES)
+ServerArgs.__annotations__ = {**_annotations, **ServerArgs.__annotations__}
+# The assembled record has no base classes, so it carries the map the classes
+# used to answer through their `_NS_PATH`.
+ServerArgs._NS_BY_FIELD = _namespaces
+for _name, _value in _defaults.items():
+    setattr(ServerArgs, _name, _value)
+ServerArgs = dataclasses.dataclass(ServerArgs)
 
 
 # --------------------------------------------------------------------------
