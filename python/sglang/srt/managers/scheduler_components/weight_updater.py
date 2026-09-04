@@ -503,9 +503,6 @@ class SchedulerWeightUpdaterManager:
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
 
-        for tag in tags:
-            self.offload_tags.add(tag)
-
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             if scheduler is not None:
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
@@ -520,8 +517,15 @@ class SchedulerWeightUpdaterManager:
                     queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                     if queue is not None:
                         queue.release_memory_occupation()
-            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
+            # Hybrid pool clears write CUDA tensors owned by the KV region.
+            # Flush while those tensors are still mapped.
             self.flush_cache()
+
+            # TMS pause unmaps allocations immediately, so cache clears must
+            # finish before the KV region is released.
+            torch.get_device_module().synchronize()
+            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
+            self.offload_tags.add(GPU_MEMORY_TYPE_KV_CACHE)
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self._assert_weight_cache_inactive("release_memory_occupation")
@@ -529,12 +533,20 @@ class SchedulerWeightUpdaterManager:
                 self.tp_worker.model_runner.model
             )
             torch.distributed.barrier(self.tp_cpu_group)
+
+            # Keep the original low-memory ordering: KV is released before the
+            # static-state clones, then those copies finish before weights unmap.
+            torch.get_device_module().synchronize()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
+            self.offload_tags.add(GPU_MEMORY_TYPE_WEIGHTS)
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
+            if not (
+                GPU_MEMORY_TYPE_KV_CACHE in tags or GPU_MEMORY_TYPE_WEIGHTS in tags
+            ):
+                torch.get_device_module().synchronize()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
-
-        torch.get_device_module().synchronize()
+            self.offload_tags.add(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
         return ReleaseMemoryOccupationReqOutput()
 
