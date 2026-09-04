@@ -139,8 +139,10 @@ class FlashAttentionBackend(AttentionBackend):
             - It will spawn num_steps FlashAttentionBackend for the draft worker
 
     Note about CUDA Graph:
-    - We only support CUDA Graph for Decode (Normal Decode and Draft Decode) and Target Verify.
-    - We don't support CUDA Graph for Extend and Draft Extend.
+    - We only support CUDA Graph for Decode (Normal Decode and Draft Decode), Target Verify,
+      and single-layer EAGLE Draft Extend (DRAFT_EXTEND_V2; guarded off for sliding-window
+      KV pools, see supports_draft_extend_cuda_graph).
+    - We don't support CUDA Graph for Extend.
     - When server init, init_cuda_graph_state will be called first and then init_cuda_graph_capture will be called.
     - For each forward batch, init_replay_cuda_graph will be called first and then replay the graph.
     """
@@ -468,6 +470,12 @@ class FlashAttentionBackend(AttentionBackend):
             not self.use_sliding_window_kv_pool
             or self.token_to_kv_pool.full_to_swa_index_mapping is not None
         )
+
+    def supports_draft_extend_cuda_graph(self) -> bool:
+        # SWA models translate out_cache_loc into the sliding-window pool when
+        # rebuilding draft-extend metadata; that combination has not been
+        # exercised under the draft-extend graph runner, so keep it eager.
+        return not self.use_sliding_window_kv_pool
 
     def init_forward_metadata_out_graph(
         self,

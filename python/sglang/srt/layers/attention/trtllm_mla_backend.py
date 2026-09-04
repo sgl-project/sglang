@@ -1792,6 +1792,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 o_sf_scale=1.0,
             )
 
+    def supports_draft_extend_cuda_graph(self) -> bool:
+        return True
+
 
 class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
     """Multi-step draft backend for TRT-LLM MLA used by EAGLE."""

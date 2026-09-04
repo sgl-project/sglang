@@ -18,14 +18,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner i
 )
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
-from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
-from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
-from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
-from sglang.srt.layers.attention.trtllm_mla_backend import (
-    TRTLLMMLABackend,
-)
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     speculative_moe_a2a_backend_context,
@@ -434,42 +427,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 or isinstance(self.draft_extend_attn_backend, DeepseekSparseAttnBackend)
             )
 
-        graph_supported_backend_types = [
-            TritonAttnBackend,
-            TRTLLMMLABackend,
-            TRTLLMHAAttnBackend,
-            TokenspeedMLABackend,
-            FlashInferAttnBackend,
-        ]
-        if _is_cuda or _is_musa:
-            # DSA is CUDA-only; import lazily so non-CUDA builds don't pull in
-            # deep_gemm and the rest of the sparse-attention stack at import time.
-            from sglang.srt.layers.attention.dsa_backend import (
-                DeepseekSparseAttnBackend,
-            )
-
-            graph_supported_backend_types.append(DeepseekSparseAttnBackend)
-            from sglang.srt.layers.attention.deepseek_v4_backend import (
-                DeepseekV4AttnBackend,
-            )
-
-            graph_supported_backend_types.append(DeepseekV4AttnBackend)
-        if _is_cuda:
-            # FlashMLA is CUDA-only; import lazily so CPU builds don't pull
-            # sgl_kernel.flash_mla at import time.
-            from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
-
-            graph_supported_backend_types.append(FlashMLABackend)
-
-        graph_supported_backend = isinstance(
-            self.draft_extend_attn_backend,
-            tuple(graph_supported_backend_types),
+        # Backends declare draft-extend graph support by overriding
+        # AttentionBackend.supports_draft_extend_cuda_graph().
+        graph_supported_backend = (
+            self.draft_extend_attn_backend is not None
+            and self.draft_extend_attn_backend.supports_draft_extend_cuda_graph()
         )
         supports_cuda_draft_extend_graph = (
             _is_cuda or _is_musa
         ) and graph_supported_backend
         # Capture extend
-        # TODO: support draft extend cuda graph for more attention backends
         if (
             self.draft_extend_attn_backend
             and not envs.SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH.get()

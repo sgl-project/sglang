@@ -3422,6 +3422,9 @@ class DeepseekSparseAttnBackend(
             num_splits=num_splits,
         )
 
+    def supports_draft_extend_cuda_graph(self) -> bool:
+        return True
+
 
 class DeepseekSparseAttnMultiStepBackend:
     # Per-step draft decode replays from precomputed GPU metadata; opt out so
