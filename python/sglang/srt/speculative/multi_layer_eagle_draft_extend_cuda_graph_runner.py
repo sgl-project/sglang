@@ -354,7 +354,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             extend_start_loc=extend_start_loc,
             extend_num_tokens=self.captured_req_width * bs,
-            num_token_non_padded_cpu=self.captured_req_width * bs,
+            global_num_token_non_padded_cpu=self.captured_req_width * bs,
             return_hidden_states_before_norm=True,
         )
         return forward_batch
