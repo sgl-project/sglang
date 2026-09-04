@@ -3059,10 +3059,7 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.local_attn_metadata = None
             return
         if self.page_size > 1:
-            # Local virtual batches index the paged KV cache by logical page and
-            # store physical page indices. Eager metadata stores one physical
-            # token location per column, so select one location per logical page
-            # and convert each physical token location to its physical page.
+            # Convert the eager token table to physical page indices.
             page_table = page_table[:, :: self.page_size] // self.page_size
 
         cu_seqlens_q_np = cu_seqlens_q.cpu().numpy()
@@ -3459,8 +3456,7 @@ def make_local_attention_virtual_batches(
         seq_lens_np: Sequence lengths (numpy array)
         block_table: Block table for KV cache
         page_size: Size of each page in the KV cache
-        preserve_attn_chunk_size: Keep `attn_chunk_size` as the model-defined
-            attention boundary even when all current sequences are shorter.
+        preserve_attn_chunk_size: Skip sequence-length-based chunk normalization.
 
     Returns:
         seqlens_q_local: Query sequence lengths for local attention
@@ -3469,11 +3465,8 @@ def make_local_attention_virtual_batches(
         block_table_local: Block table for local attention
     """
     if not preserve_attn_chunk_size:
-        # Adjust attention_chunk_size based on the actual sequence length
-        # to avoid index out of bounds errors
         max_seq_len = seq_lens_np.max()
         effective_chunk_size = min(attn_chunk_size, max_seq_len)
-        # Make sure effective_chunk_size is divisible by page_size
         effective_chunk_size = (effective_chunk_size // page_size) * page_size
         if effective_chunk_size < page_size:
             effective_chunk_size = page_size
