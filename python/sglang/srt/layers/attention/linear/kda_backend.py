@@ -319,6 +319,14 @@ class KDAKernelDispatcher:
             **kwargs,
         )
 
+    def effective_extend_kernel(self, lower_bound: Optional[float]):
+        """The kernel ``extend`` will actually run: safe-gate models reroute
+        kernels without ``supports_safe_gate`` to Triton."""
+        kernel = self.extend_kernel
+        if lower_bound is not None and not getattr(kernel, "supports_safe_gate", True):
+            kernel = self.triton_kernel
+        return kernel
+
     def extend(
         self,
         q: torch.Tensor,
@@ -332,11 +340,7 @@ class KDAKernelDispatcher:
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        kernel = self.extend_kernel
-        if kwargs.get("lower_bound") is not None and not getattr(
-            kernel, "supports_safe_gate", True
-        ):
-            kernel = self.triton_kernel
+        kernel = self.effective_extend_kernel(kwargs.get("lower_bound"))
         return kernel.extend(
             q,
             k,
@@ -877,7 +881,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # states into (rows follow the batch; untracked rows stay unread).
             # A kernel that does not declare support would leave the buffer
             # unwritten and corrupt prefix-cache restores — fail loudly here.
-            extend_kernel = self.kernel_dispatcher.extend_kernel
+            # Check the kernel the dispatcher will actually run (safe-gate
+            # reroute included), not just the configured one.
+            extend_kernel = self.kernel_dispatcher.effective_extend_kernel(
+                layer.lower_bound
+            )
             assert extend_kernel.supports_track_state_snapshot, (
                 f"{type(extend_kernel).__name__} cannot write the fp32 track "
                 f"snapshot required by the mamba track path; use "

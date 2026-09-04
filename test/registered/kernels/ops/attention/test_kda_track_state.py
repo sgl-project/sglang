@@ -12,14 +12,21 @@ register_cuda_ci(est_time=180, stage="base-c", runner_config="4-gpu-gb300")
 CHUNK_SIZE = 64
 
 _BACKENDS = {"triton": chunk_kda}
+HELION_AVAILABLE = True
 try:
+    import helion  # noqa: F401
+except ModuleNotFoundError as error:
+    # A broken install (transitive import failure) must stay loud; only the
+    # absent package downgrades the run to triton-only.
+    if error.name != "helion":
+        raise
+    HELION_AVAILABLE = False
+if HELION_AVAILABLE:
     from sglang.kernels.ops.attention.helion.kda_prefill import (
         chunk_kda as helion_chunk_kda,
     )
 
     _BACKENDS["helion"] = helion_chunk_kda
-except ImportError:
-    pass
 
 
 def _make_varlen_inputs(seed, lens, num_heads=2, head_dim=128):
@@ -76,6 +83,13 @@ def _run_chunk_kda(
 
 
 class TestKdaTrackState(CustomTestCase):
+    def test_helion_backend_ran(self):
+        """Visibility hook: without helion installed the snapshot check above
+        runs triton-only and the Helion track configs go untested — surface
+        that as an explicit skip instead of a silent pass."""
+        if not HELION_AVAILABLE:
+            self.skipTest("helion is not installed; triton backend only")
+
     @torch.inference_mode()
     def test_track_state_snapshots_fp32_accumulator(self):
         """Bug regression: the mamba radix track path snapshots the SSM state at

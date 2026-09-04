@@ -1396,6 +1396,13 @@ def chunk_kda(
         scale = k.shape[-1] ** -0.5
     if initial_state is None or initial_state_indices is None:
         raise ValueError("KDA prefill requires an indexed initial-state pool")
+    assert (track_state is None) == (track_chunk_idx is None), (
+        "track_state and track_chunk_idx must be passed together"
+    )
+    if track_state is not None:
+        assert track_state.dtype == torch.float32, (
+            f"track_state must be fp32, got {track_state.dtype}"
+        )
 
     num_tokens = q.shape[1]
     if g.shape[1] < num_tokens or beta.shape[1] < num_tokens:
@@ -1423,6 +1430,8 @@ def chunk_kda(
             dt_bias=dt_bias,
             lower_bound=lower_bound,
             output_intermediate_states=output_intermediate_states,
+            track_state=track_state,
+            track_chunk_idx=track_chunk_idx,
         )
 
     q = q.contiguous()

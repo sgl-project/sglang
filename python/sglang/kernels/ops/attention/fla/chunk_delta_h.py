@@ -361,11 +361,20 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_indices: Optional[torch.LongTensor] = None,
     use_exp2: bool = False,
     track_state: Optional[torch.Tensor] = None,
-    track_chunk_idx: Optional[torch.LongTensor] = None,
+    track_chunk_idx: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert not (use_exp2 and g is not None), (
         "use_exp2 covers only the per-channel gk path; scalar g stays natural-exp"
     )
+    assert (track_state is None) == (track_chunk_idx is None), (
+        "track_state and track_chunk_idx must be passed together"
+    )
+    if track_state is not None:
+        # The caller rounds once to the pool dtype; a narrower buffer would
+        # silently double-round the snapshot.
+        assert track_state.dtype == torch.float32, (
+            f"track_state must be fp32, got {track_state.dtype}"
+        )
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = CHUNK_SIZE
