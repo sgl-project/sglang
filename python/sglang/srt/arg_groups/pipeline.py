@@ -301,6 +301,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         validate_cutedsl_a2a_token_budget,
         validate_deepep_v2_dispatch_token_budget,
         validate_deepep_v2_speculative_draft,
+        validate_mori_decode_dispatch_token_budget,
     )
 
     handle_moe_kernel_config(server_args)
@@ -367,5 +368,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Validate after all batch-size declarations are visible.
     validate_deepep_v2_speculative_draft(server_args)
     validate_deepep_v2_dispatch_token_budget(server_args)
+    validate_mori_decode_dispatch_token_budget(server_args)
 
     server_args._resolution_finished = True
