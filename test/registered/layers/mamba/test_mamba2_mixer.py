@@ -3,8 +3,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/2c58742dff8613a3bd7496f2008ce927e18d38d1/tests/kernels/mamba/test_mamba_mixer2.py
 
 
-from unittest.mock import patch
-
 import pytest
 import torch
 
@@ -15,6 +13,7 @@ from sglang.srt.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device, get_device_count
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -43,9 +42,9 @@ def test_mixer2_gated_norm_multi_gpu(
     if device not in ["cuda", "xpu"]:
         pytest.skip("Test only supports CUDA and XPU devices")
 
-    assert (
-        get_device_count() >= NUM_GPUS
-    ), f"This test requires at least {NUM_GPUS} GPUs, but only {get_device_count()} available"
+    assert get_device_count() >= NUM_GPUS, (
+        f"This test requires at least {NUM_GPUS} GPUs, but only {get_device_count()} available"
+    )
 
     hidden_size, n_groups = hidden_size_n_groups
     num_processes = NUM_GPUS
@@ -109,10 +108,13 @@ def mixer2_gated_norm_tensor_parallel(
     gate_states = torch.randn(batch_size, seq_len, hidden_size)
 
     import sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated as m2
-    import sglang.srt.model_loader.weight_utils as wu
 
-    # Convenience: Avoid calling initialize_dp_attention
-    with patch.object(wu, "get_attention_tp_rank", return_value=local_rank):
+    # Force the TP topology through the context (the weight loader reads
+    # get_parallel().attn_tp_rank, Mixer2RMSNormGated reads tp_size / tp_rank);
+    # avoids calling initialize_dp_attention.
+    with get_parallel().override(
+        attn_tp_rank=local_rank, tp_size=world_size, tp_rank=local_rank
+    ):
         # create gated-norm with TP
         mixer = m2.Mixer2RMSNormGated(
             full_hidden_size=hidden_size,
@@ -120,10 +122,8 @@ def mixer2_gated_norm_tensor_parallel(
         )
         mixer.weight.weight_loader(mixer.weight, weight)
 
-    with (
-        patch.object(m2, "get_tensor_model_parallel_world_size", return_value=1),
-        patch.object(m2, "get_tensor_model_parallel_rank", return_value=0),
-    ):
+    # m2 reads tp via get_parallel().tp_size/rank — force it through the context.
+    with get_parallel().override(tp_size=1, tp_rank=0):
         # create gated-norm without TP to compute reference
         mixer_single_gpu = m2.Mixer2RMSNormGated(
             full_hidden_size=hidden_size,

@@ -1,5 +1,22 @@
-"""Unit tests for class-level DI on the five *MetricsCollector classes via
-ServerArgs.stat_loggers — no server, no model loading."""
+"""Pure-CPU unit tests for ``ServerArgs.stat_loggers`` DI plumbing.
+
+These tests cover the small, in-process pieces of the ``stat_loggers``
+dependency injection feature:
+
+* The four DI hook class attributes (``_counter_cls``/``_gauge_cls``/
+  ``_histogram_cls``/``_summary_cls``) default to ``None`` on every
+  collector, so the existing prometheus_client backend is used unchanged.
+* ``resolve_collector_class()`` returns the registered subclass when a role
+  is present in ``stat_loggers`` and falls back to the default otherwise.
+* Without any subclass override, collectors instantiate the real
+  prometheus_client classes.
+
+The full Engine-level integration test (which boots ``sgl.Engine`` and
+verifies that emissions land on a FakeRayMetric-style recording double in
+the scheduler subprocess) lives in
+``test/registered/observability/test_metrics.py`` alongside the other
+GPU-backed metrics tests.
+"""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -22,21 +39,54 @@ from sglang.srt.observability.metrics_collector import (
     TokenizerMetricsCollector,
     resolve_collector_class,
 )
+from sglang.srt.runtime_context import get_context, reset_context
 
 
-class _StubArgs:
-    """Minimal ServerArgs stand-in. Avoids triggering heavy ServerArgs import chain."""
+class _BoundRecordingMetric:
+    def __init__(self, metric, labels):
+        self.metric = metric
+        self.labels = labels
 
-    def __init__(self, stat_loggers=None):
-        self.stat_loggers = stat_loggers
+    def inc(self, value=1):
+        self.metric.increments.append((self.labels, value))
+
+    def observe(self, value):
+        self.metric.observations.append((self.labels, value))
+
+    def set(self, value):
+        self.metric.sets.append((self.labels, value))
 
 
-# ── _gauge_cls / _counter_cls / _histogram_cls / _summary_cls override surface ──
+class _RecordingMetric:
+    """Small prometheus_client-compatible metric that preserves labels."""
+
+    def __init__(self, *args, name=None, labelnames=(), **kwargs):
+        self.name = name if name is not None else args[0]
+        self.labelnames = tuple(labelnames)
+        self.increments = []
+        self.observations = []
+        self.sets = []
+
+    def labels(self, *values, **labels):
+        if values:
+            labels = dict(zip(self.labelnames, values, strict=True))
+        return _BoundRecordingMetric(self, labels)
+
+
+class _RecordingTokenizerMetricsCollector(TokenizerMetricsCollector):
+    _counter_cls = _RecordingMetric
+    _gauge_cls = _RecordingMetric
+    _histogram_cls = _RecordingMetric
+
+
+class _RecordingStorageMetricsCollector(StorageMetricsCollector):
+    _counter_cls = _RecordingMetric
+    _histogram_cls = _RecordingMetric
 
 
 class TestCollectorClassAttrs(unittest.TestCase):
-    """All five collectors expose four DI hook class attrs, all defaulting to None
-    so the existing prometheus_client backend is used unchanged."""
+    """All five collectors expose four DI hook class attrs, all defaulting to
+    None so the existing prometheus_client backend is used unchanged."""
 
     def test_scheduler_collector_attrs_default_none(self):
         self.assertIsNone(SchedulerMetricsCollector._counter_cls)
@@ -60,35 +110,38 @@ class TestCollectorClassAttrs(unittest.TestCase):
         self.assertIsNone(RadixCacheMetricsCollector._histogram_cls)
 
 
-# ── resolve_collector_class helper ──
-
-
 class TestResolveCollectorClass(unittest.TestCase):
-    def test_returns_default_when_server_args_none(self):
-        cls = resolve_collector_class(None, "scheduler", SchedulerMetricsCollector)
-        self.assertIs(cls, SchedulerMetricsCollector)
+    """The role table is read from the published `observability` bag."""
+
+    def _resolve(self, role, default_cls, **fields):
+        if not fields:
+            return resolve_collector_class(role, default_cls)
+        with get_context().override_server_args(**fields):
+            return resolve_collector_class(role, default_cls)
+
+    def test_returns_default_when_nothing_is_published(self):
+        reset_context()
+        self.assertIs(
+            resolve_collector_class("scheduler", SchedulerMetricsCollector),
+            SchedulerMetricsCollector,
+        )
 
     def test_returns_default_when_stat_loggers_none(self):
-        cls = resolve_collector_class(
-            _StubArgs(stat_loggers=None), "scheduler", SchedulerMetricsCollector
-        )
+        cls = self._resolve("scheduler", SchedulerMetricsCollector, stat_loggers=None)
         self.assertIs(cls, SchedulerMetricsCollector)
 
     def test_returns_default_when_stat_loggers_empty(self):
-        cls = resolve_collector_class(
-            _StubArgs(stat_loggers={}), "scheduler", SchedulerMetricsCollector
-        )
+        cls = self._resolve("scheduler", SchedulerMetricsCollector, stat_loggers={})
         self.assertIs(cls, SchedulerMetricsCollector)
 
     def test_returns_default_when_role_missing(self):
-        # Different role registered. Default still wins for "scheduler".
         class MyTokenizer(TokenizerMetricsCollector):
             pass
 
-        cls = resolve_collector_class(
-            _StubArgs(stat_loggers={"tokenizer": MyTokenizer}),
+        cls = self._resolve(
             "scheduler",
             SchedulerMetricsCollector,
+            stat_loggers={"tokenizer": MyTokenizer},
         )
         self.assertIs(cls, SchedulerMetricsCollector)
 
@@ -96,10 +149,10 @@ class TestResolveCollectorClass(unittest.TestCase):
         class MyScheduler(SchedulerMetricsCollector):
             pass
 
-        cls = resolve_collector_class(
-            _StubArgs(stat_loggers={"scheduler": MyScheduler}),
+        cls = self._resolve(
             "scheduler",
             SchedulerMetricsCollector,
+            stat_loggers={"scheduler": MyScheduler},
         )
         self.assertIs(cls, MyScheduler)
 
@@ -113,87 +166,61 @@ class TestResolveCollectorClass(unittest.TestCase):
         self.assertEqual(STAT_LOGGER_ROLE_EXPERT_DISPATCH, "expert_dispatch")
 
 
-# ── DI swap behavior — actually instantiate with a custom backend ──
-
-
-class _RecordingGauge:
-    """Test double that mirrors prometheus_client.Gauge constructor signature.
-    Records every instantiation so the test can assert the override took effect."""
-
-    instances = []
-
-    def __init__(self, *args, **kwargs):
-        type(self).instances.append((args, kwargs))
-
-    def labels(self, **kwargs):
-        return self
-
-    def set(self, value):
-        pass
-
-    def inc(self, amount=1):
-        pass
-
-
-class _RecordingCounter(_RecordingGauge):
-    pass
-
-
-class _RecordingHistogram(_RecordingGauge):
-    def observe(self, value):
-        pass
-
-
-class _RecordingSummary(_RecordingGauge):
-    def observe(self, value):
-        pass
-
-
-class TestDISwap(unittest.TestCase):
-    """Subclasses that set the DI hooks at class level cause the collector to
-    instantiate the test doubles instead of prometheus_client classes."""
-
-    def setUp(self):
-        _RecordingGauge.instances = []
-        _RecordingCounter.instances = []
-        _RecordingHistogram.instances = []
-        _RecordingSummary.instances = []
-
-    def test_radix_cache_di_swap(self):
-        """Smallest collector (4 metrics, Counter + Histogram) — verifies the
-        DI shim flows through both class types."""
-
-        class RaySwapRadixCache(RadixCacheMetricsCollector):
-            _counter_cls = _RecordingCounter
-            _histogram_cls = _RecordingHistogram
-
-        labels = {"cache_type": "test"}
-        RaySwapRadixCache(labels=labels)
-
-        # 4 instruments total in RadixCacheMetricsCollector:
-        # eviction_duration_seconds (H), eviction_num_tokens (C),
-        # load_back_duration_seconds (H), load_back_num_tokens (C).
-        self.assertEqual(len(_RecordingCounter.instances), 2)
-        self.assertEqual(len(_RecordingHistogram.instances), 2)
-
-    def test_expert_dispatch_di_swap(self):
-        """Smallest collector (1 Histogram metric)."""
-
-        class RaySwapExpert(ExpertDispatchCollector):
-            _histogram_cls = _RecordingHistogram
-
-        RaySwapExpert(ep_size=4)
-        self.assertEqual(len(_RecordingHistogram.instances), 1)
+class TestDefaultBackend(unittest.TestCase):
+    """Without any subclass override, collectors instantiate the real
+    prometheus_client classes; the existing behavior is unchanged."""
 
     def test_default_path_uses_prometheus_client(self):
-        """Without any subclass override, the collector instantiates the real
-        prometheus_client classes — the existing behavior is unchanged."""
         labels = {"cache_type": "test_default"}
         collector = RadixCacheMetricsCollector(labels=labels)
-        # The instruments must be real prometheus_client objects, not test doubles.
         self.assertIsInstance(collector.eviction_num_tokens, prometheus_client.Counter)
         self.assertIsInstance(
             collector.eviction_duration_seconds, prometheus_client.Histogram
+        )
+
+
+class TestHiCacheMetrics(unittest.TestCase):
+    def test_cached_tokens_uses_literal_storage_source(self):
+        labels = {"model_name": "test"}
+        with get_context().override_server_args(
+            prompt_tokens_buckets=None, generation_tokens_buckets=None
+        ):
+            collector = _RecordingTokenizerMetricsCollector(labels=labels)
+
+        collector.observe_one_finished_request(
+            labels=labels,
+            prompt_tokens=20,
+            generation_tokens=2,
+            cached_tokens=12,
+            e2e_latency=0.1,
+            has_grammar=False,
+            cached_tokens_details={
+                "device": 3,
+                "host": 4,
+                "storage": 5,
+                "storage_backend": "BackendShim",
+            },
+        )
+
+        by_source = {
+            metric_labels["cache_source"]: value
+            for metric_labels, value in collector.cached_tokens_total.increments
+        }
+        self.assertEqual(by_source, {"device": 3, "host": 4, "storage": 5})
+
+    def test_storage_prefetch_lifecycle_metrics(self):
+        labels = {"model_name": "test"}
+        collector = _RecordingStorageMetricsCollector(labels=labels)
+
+        collector.log_storage_prefetch_hit_tokens(21)
+        collector.log_storage_prefetch_unfulfilled_tokens(4, "storage_transfer")
+
+        self.assertEqual(
+            collector.storage_prefetch_hit_tokens_total.increments, [(labels, 21)]
+        )
+        self.assertEqual(
+            collector.storage_prefetch_unfulfilled_tokens_total.increments,
+            [({**labels, "reason": "storage_transfer"}, 4)],
         )
 
 

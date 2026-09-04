@@ -1,18 +1,18 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import asyncio
-import base64
+import dataclasses
 import inspect
 import json
 import os
-import re
 import shutil
 import tempfile
 import time
 from contextlib import contextmanager
-from typing import Any, Generator, List, Optional, Union
+from functools import cache
+from typing import Any, Generator, List, Literal, Optional, Union
 
 import httpx
-from fastapi import UploadFile
+from fastapi import HTTPException, UploadFile
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
@@ -30,6 +30,8 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+from sglang.multimodal_gen.runtime.utils.common import parse_size
+from sglang.multimodal_gen.runtime.utils.image_io import save_base64_image_to_path
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     log_batch_completion,
@@ -52,6 +54,23 @@ logger = init_logger(__name__)
 OUTPUT_QUALITY_MAPPER = {"maximum": 100, "high": 90, "medium": 55, "low": 35}
 DEFAULT_FPS = 24
 DEFAULT_VIDEO_SECONDS = 4
+
+
+def _bad_request(message: str) -> HTTPException:
+    return HTTPException(status_code=400, detail=message)
+
+
+def _parse_size_or_raise(size: str) -> tuple[int, int]:
+    width, height = parse_size(size)
+    if width is None or height is None or width <= 0 or height <= 0:
+        raise _bad_request("size must be formatted as positive WIDTHxHEIGHT")
+    return width, height
+
+
+def _validate_positive_int(kwargs: dict[str, Any], name: str) -> None:
+    value = kwargs.get(name)
+    if value is not None and int(value) <= 0:
+        raise _bad_request(f"{name} must be positive")
 
 
 def flatten_extra_params(payload: Any) -> dict[str, Any]:
@@ -78,6 +97,81 @@ def flatten_extra_params(payload: Any) -> dict[str, Any]:
     return payload
 
 
+_REQUEST_EXTRA_CONTAINERS = (
+    "extra_body",
+    "extra_json",
+    "extra_args",
+    "extra_params",
+)
+
+
+def _parse_request_extra_container(value: Any) -> dict[str, Any]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return {}
+    if not isinstance(value, dict):
+        return {}
+    return flatten_extra_params(dict(value))
+
+
+def request_extra_value(request: Any, field_name: str) -> Any:
+    """Read an extension field while preserving top-level precedence.
+
+    This function only handles transport compatibility. Callers must first use
+    the active SamplingParams subclass to decide which model-owned fields are
+    valid; transport helpers must not introduce per-model allowlists.
+    """
+
+    extra = dict(getattr(request, "model_extra", None) or {})
+    direct = {
+        key: value
+        for key, value in extra.items()
+        if key not in _REQUEST_EXTRA_CONTAINERS
+    }
+    direct = flatten_extra_params(direct)
+    if field_name in direct and direct[field_name] is not None:
+        return direct[field_name]
+
+    for container_name in _REQUEST_EXTRA_CONTAINERS:
+        nested = _parse_request_extra_container(extra.get(container_name))
+        if field_name in nested and nested[field_name] is not None:
+            return nested[field_name]
+    return None
+
+
+@cache
+def get_declared_request_extra_fields(
+    sampling_params_cls: type[SamplingParams],
+    api: Literal["image", "video"],
+) -> frozenset[str]:
+    """Return the active model's accepted fields, including transport aliases."""
+
+    if api == "image":
+        return sampling_params_cls.image_request_extra_fields()
+    return sampling_params_cls.video_request_extra_fields()
+
+
+@cache
+def get_sampling_request_extra_fields(
+    sampling_params_cls: type[SamplingParams],
+    api: Literal["image", "video"],
+) -> frozenset[str]:
+    """Return declared extension fields that can initialize SamplingParams.
+
+    A video declaration may also contain transport-only aliases. Those remain
+    on the request for the model's lowering hook instead of being passed to the
+    dataclass constructor.
+    """
+
+    declared = get_declared_request_extra_fields(sampling_params_cls, api)
+    init_fields = {
+        field.name for field in dataclasses.fields(sampling_params_cls) if field.init
+    }
+    return declared & init_fields
+
+
 @contextmanager
 def temp_dir_if_disabled(
     configured_path: str | None,
@@ -93,17 +187,6 @@ def temp_dir_if_disabled(
             yield tmp
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
-
-
-def _parse_size(size: str) -> tuple[int, int] | tuple[None, None]:
-    try:
-        parts = size.lower().replace(" ", "").split("x")
-        if len(parts) != 2:
-            raise ValueError
-        w, h = int(parts[0]), int(parts[1])
-        return w, h
-    except Exception:
-        return None, None
 
 
 def choose_output_image_ext(
@@ -135,13 +218,21 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     # parse "WxH" size string if provided
     size = kwargs.pop("size", None)
     if size:
-        w, h = _parse_size(size)
-        if w is not None:
-            # treat None dimensions as unset so parsed size can fill them
-            if kwargs.get("width") is None:
-                kwargs["width"] = w
-            if kwargs.get("height") is None:
-                kwargs["height"] = h
+        w, h = _parse_size_or_raise(size)
+        # treat None dimensions as unset so parsed size can fill them
+        if kwargs.get("width") is None:
+            kwargs["width"] = w
+        if kwargs.get("height") is None:
+            kwargs["height"] = h
+
+    for name in (
+        "width",
+        "height",
+        "num_frames",
+        "num_inference_steps",
+        "num_outputs_per_prompt",
+    ):
+        _validate_positive_int(kwargs, name)
 
     # filter out None values to let SamplingParams defaults apply
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
@@ -163,6 +254,33 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
             sampling_params.output_compression = resolved
 
     return sampling_params
+
+
+def resolve_sampling_params_cls(server_args: Any) -> type[SamplingParams]:
+    """Resolve the model-owned sampling contract selected for this server.
+
+    Shared API code must dispatch through this type instead of branching on a
+    model ID or importing individual model configurations.
+    """
+
+    sampling_params_cls = SamplingParams
+    if server_args.pipeline_class_name:
+        from sglang.multimodal_gen.registry import get_pipeline_config_classes
+
+        config_classes = get_pipeline_config_classes(server_args.pipeline_class_name)
+        if config_classes is not None:
+            _, sampling_params_cls = config_classes
+    if sampling_params_cls is SamplingParams:
+        from sglang.multimodal_gen.registry import get_model_info
+
+        model_info = get_model_info(
+            server_args.model_path,
+            backend=server_args.backend,
+            model_id=server_args.model_id,
+        )
+        if model_info is not None:
+            sampling_params_cls = model_info.sampling_param_cls
+    return sampling_params_cls
 
 
 async def save_image_to_path(
@@ -227,7 +345,7 @@ async def _maybe_url_image(
         if prefer_remote_source:
             return img_url
         # encode image base64 url and persist on disk
-        input_path = await _save_base64_image_to_path(img_url, target_path)
+        input_path = save_base64_image_to_path(img_url, target_path)
         return input_path
     else:
         raise ValueError("Unsupported image url format")
@@ -324,53 +442,17 @@ async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
         )
 
 
-async def _save_base64_image_to_path(base64_data: str, target_path: str) -> str:
-    """Decode base64 image data and save to target path."""
-
-    _B64_FMT_HINT = (
-        "Failed to decode base64 image. "
-        "Expected format: `data:[<media-type>];base64,<data>`"
-    )
-
-    # split `data:[<media-type>][;base64],<data>` to media-type base64 data
-    pattern = r"data:(.*?)(;base64)?,(.*)"
-    match = re.match(pattern, base64_data)
-    if not match:
-        raise ValueError(_B64_FMT_HINT)
-    media_type = match.group(1)
-    is_base64 = match.group(2)
-    if not is_base64:
-        raise ValueError(f"{_B64_FMT_HINT} (missing ;base64 marker)")
-    data = match.group(3)
-    if not data:
-        raise ValueError(f"{_B64_FMT_HINT} (empty data payload)")
-    # get ext from url
-    if media_type.startswith("image/"):
-        ext = media_type.split("/")[-1].lower()
-        if ext == "jpeg":
-            ext = "jpg"
-    else:
-        ext = "jpg"
-    target_path = f"{target_path}.{ext}"
-    os.makedirs(os.path.dirname(target_path), exist_ok=True)
-
-    try:
-        image_data = base64.b64decode(data)
-        with open(target_path, "wb") as f:
-            f.write(image_data)
-
-        return target_path
-    except Exception as e:
-        raise Exception(f"Failed to decode base64 image: {str(e)}")
-
-
 async def process_generation_batch(
     scheduler_client: AsyncSchedulerClient,
     batch,
+    *,
+    scheduler_batches=None,
 ) -> tuple[list[str], OutputBatch]:
     total_start_time = time.perf_counter()
     with trace_req(batch.trace_ctx), log_generation_timer(logger, batch.prompt):
-        result = await scheduler_client.forward([batch])
+        result = await scheduler_client.forward(
+            scheduler_batches if scheduler_batches is not None else [batch]
+        )
 
         if (
             result.output is None
@@ -456,7 +538,33 @@ def add_common_data_to_response(
     if result.metrics and result.metrics.total_duration_s > 0:
         response["inference_time_s"] = result.metrics.total_duration_s
 
+    if result.usage is not None:
+        usage = dict(result.usage)
+        cached_tokens = usage.pop("cached_tokens", None)
+        enable_cache_report = getattr(
+            get_global_server_args(), "enable_cache_report", False
+        )
+        if (
+            enable_cache_report
+            and cached_tokens is not None
+            and int(cached_tokens) > 0
+            and usage.get("prompt_tokens_details") is None
+        ):
+            usage["prompt_tokens_details"] = {"cached_tokens": int(cached_tokens)}
+        response["usage"] = usage
+
     response["id"] = request_id
+
+    if result.action_pred is not None:
+        t = result.action_pred
+        response["action"] = {
+            "data": t.tolist(),
+            "shape": list(t.shape),
+            "dtype": str(t.dtype).replace("torch.", ""),
+            "raw_action_dim": result.action_raw_action_dim,
+            "action_mode": result.action_mode,
+            "domain_id": result.action_domain_id,
+        }
 
     return response
 

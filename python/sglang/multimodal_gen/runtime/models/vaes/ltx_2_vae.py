@@ -12,7 +12,21 @@ from diffusers.models.embeddings import PixArtAlphaCombinedTimestepSizeEmbedding
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
-from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_decode_parallel_rank,
+    get_decode_parallel_world_size,
+)
+from sglang.multimodal_gen.runtime.layers.parallel_conv import (
+    SpatialParallelConv3d,
+    disable_spatial_parallel_decode,
+    gather_and_trim_height,
+    split_height_for_parallel_decode,
+)
+from sglang.multimodal_gen.runtime.models.vaes.common import (
+    ParallelTiledVAE,
+    can_install_spatial_shard_parallel_decode,
+    should_run_spatial_shard_parallel_decode,
+)
 
 
 @lru_cache(maxsize=128)
@@ -216,6 +230,29 @@ class LTX2VideoCausalConv3d(nn.Module):
 
         hidden_states = self.conv(hidden_states)
         return hidden_states
+
+
+def _make_spatial_parallel_conv3d(conv: nn.Conv3d) -> SpatialParallelConv3d:
+    spatial_conv = SpatialParallelConv3d(
+        in_channels=conv.in_channels,
+        out_channels=conv.out_channels,
+        kernel_size=conv.kernel_size,
+        stride=conv.stride,
+        padding=conv.padding,
+        dilation=conv.dilation,
+        groups=conv.groups,
+        bias=conv.bias is not None,
+        padding_mode=conv.padding_mode,
+    )
+    spatial_conv.weight = conv.weight
+    spatial_conv.bias = conv.bias
+    return spatial_conv
+
+
+def _enable_ltx_decoder_spatial_parallel(decoder: nn.Module) -> None:
+    for module in decoder.modules():
+        if isinstance(module, LTX2VideoCausalConv3d) and type(module.conv) is nn.Conv3d:
+            module.conv = _make_spatial_parallel_conv3d(module.conv)
 
 
 # Like LTXVideoResnetBlock3d, but uses new causal Conv3d, normal Conv3d for the conv_shortcut, and the spatial padding
@@ -829,6 +866,15 @@ class LTX23VideoMidBlock3d(nn.Module):
 
 
 # Like LTXVideoUpBlock3d but with no conv_in and the updated LTX2VideoResnetBlock3d
+# Per-stage upsampling strides, selected by the decoder's `upsample_type`.
+# LTX-2 upsamples every stage in 3D; LTX-2.5 mixes spatial- and temporal-only.
+_UPSAMPLE_STRIDES: dict[str, tuple[int, int, int]] = {
+    "spatial": (1, 2, 2),
+    "temporal": (2, 1, 1),
+    "spatiotemporal": (2, 2, 2),
+}
+
+
 class LTX2VideoUpBlock3d(nn.Module):
     r"""
     Up block used in the LTXVideo model.
@@ -864,6 +910,7 @@ class LTX2VideoUpBlock3d(nn.Module):
         resnet_eps: float = 1e-6,
         resnet_act_fn: str = "swish",
         spatio_temporal_scale: bool = True,
+        upsample_type: str = "spatiotemporal",
         inject_noise: bool = False,
         timestep_conditioning: bool = False,
         upsample_residual: bool = False,
@@ -899,7 +946,7 @@ class LTX2VideoUpBlock3d(nn.Module):
                 [
                     LTXVideoUpsampler3d(
                         out_channels * upscale_factor,
-                        stride=(2, 2, 2),
+                        stride=_UPSAMPLE_STRIDES[upsample_type],
                         residual=upsample_residual,
                         upscale_factor=upscale_factor,
                         spatial_padding_mode=spatial_padding_mode,
@@ -1199,6 +1246,7 @@ class LTX2VideoDecoder3d(nn.Module):
         timestep_conditioning: bool = False,
         upsample_residual: Tuple[bool, ...] = (True, True, True),
         upsample_factor: Tuple[bool, ...] = (2, 2, 2),
+        upsample_type: Tuple[str, ...] | None = None,
         spatial_padding_mode: str = "reflect",
     ) -> None:
         super().__init__()
@@ -1208,12 +1256,17 @@ class LTX2VideoDecoder3d(nn.Module):
         self.out_channels = out_channels * patch_size**2
         self.is_causal = is_causal
 
+        if upsample_type is None:
+            upsample_type = ("spatiotemporal",) * len(block_out_channels)
+
         block_out_channels = tuple(reversed(block_out_channels))
         spatio_temporal_scaling = tuple(reversed(spatio_temporal_scaling))
         layers_per_block = tuple(reversed(layers_per_block))
         inject_noise = tuple(reversed(inject_noise))
         upsample_residual = tuple(reversed(upsample_residual))
         upsample_factor = tuple(reversed(upsample_factor))
+        # Deliberately not reversed: upstream indexes `upsample_type` in
+        # decoder order, the sibling lists in encoder order.
         output_channel = block_out_channels[0]
 
         self.conv_in = LTX2VideoCausalConv3d(
@@ -1246,6 +1299,7 @@ class LTX2VideoDecoder3d(nn.Module):
                 num_layers=layers_per_block[i + 1],
                 resnet_eps=resnet_norm_eps,
                 spatio_temporal_scale=spatio_temporal_scaling[i],
+                upsample_type=upsample_type[i],
                 inject_noise=inject_noise[i + 1],
                 timestep_conditioning=timestep_conditioning,
                 upsample_residual=upsample_residual[i],
@@ -1587,49 +1641,65 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
             config.arch_config.decoder_spatio_temporal_scaling
         )
         decoder_layers_per_block = config.arch_config.decoder_layers_per_block
-        decoder_inject_noise = getattr(
-            config.arch_config, "decoder_inject_noise", (False, False, False, False)
-        )
+        decoder_inject_noise = config.arch_config.decoder_inject_noise
         if isinstance(decoder_inject_noise, bool):
             decoder_inject_noise = (decoder_inject_noise,) * 4
         else:
             decoder_inject_noise = tuple(decoder_inject_noise)
-        upsample_residual = getattr(
-            config.arch_config, "upsample_residual", (True, True, True)
-        )
+        upsample_residual = config.arch_config.upsample_residual
         if isinstance(upsample_residual, bool):
             upsample_residual = (upsample_residual,) * 3
         else:
             upsample_residual = tuple(upsample_residual)
-        upsample_factor = getattr(config.arch_config, "upsample_factor", (2, 2, 2))
+        upsample_factor = config.arch_config.upsample_factor
         if isinstance(upsample_factor, int):
             upsample_factor = (upsample_factor,) * 3
         else:
             upsample_factor = tuple(upsample_factor)
-        timestep_conditioning = getattr(
-            config.arch_config, "timestep_conditioning", False
-        )
+        upsample_type = config.arch_config.upsample_type
+        if upsample_type is not None:
+            upsample_type = tuple(upsample_type)
+        timestep_conditioning = config.arch_config.timestep_conditioning
         use_ltx23_video_decoder = (
-            str(getattr(config.arch_config, "video_decoder_variant", "ltx_2"))
-            == "ltx_2_3"
+            str(config.arch_config.video_decoder_variant) == "ltx_2_3"
         )
+        use_ltx23_condition_encoder = (
+            str(config.arch_config.video_encoder_variant) == "ltx_2_3_condition"
+        )
+        self._use_ltx23_condition_encoder = use_ltx23_condition_encoder
         decoder_causal = config.arch_config.decoder_causal
         decoder_spatial_padding_mode = config.arch_config.decoder_spatial_padding_mode
 
-        self.encoder = LTX2VideoEncoder3d(
-            in_channels,
-            latent_channels,
-            block_out_channels,
-            down_block_types,
-            spatio_temporal_scaling,
-            layers_per_block,
-            downsample_type,
-            patch_size,
-            patch_size_t,
-            resnet_norm_eps,
-            encoder_causal,
-            encoder_spatial_padding_mode,
-        )
+        if use_ltx23_condition_encoder:
+            from sglang.multimodal_gen.runtime.models.vaes.ltx_2_3_condition_encoder import (
+                LTX23VideoConditionEncoder,
+            )
+
+            video_encoder_config = dict(
+                config.arch_config.video_encoder_config
+                or config.arch_config.video_decoder_config
+            )
+            if not video_encoder_config:
+                raise ValueError(
+                    "LTX-2.3 condition video encoder requires video_encoder_config "
+                    "or video_decoder_config."
+                )
+            self.encoder = LTX23VideoConditionEncoder(video_encoder_config)
+        else:
+            self.encoder = LTX2VideoEncoder3d(
+                in_channels,
+                latent_channels,
+                block_out_channels,
+                down_block_types,
+                spatio_temporal_scaling,
+                layers_per_block,
+                downsample_type,
+                patch_size,
+                patch_size_t,
+                resnet_norm_eps,
+                encoder_causal,
+                encoder_spatial_padding_mode,
+            )
 
         if use_ltx23_video_decoder:
             video_decoder_config = dict(config.arch_config.video_decoder_config)
@@ -1676,6 +1746,7 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
                 timestep_conditioning=timestep_conditioning,
                 upsample_residual=upsample_residual,
                 upsample_factor=upsample_factor,
+                upsample_type=upsample_type,
                 spatial_padding_mode=decoder_spatial_padding_mode,
             )
 
@@ -1683,6 +1754,10 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         latents_std = torch.ones((latent_channels,), requires_grad=False)
         self.register_buffer("latents_mean", latents_mean, persistent=True)
         self.register_buffer("latents_std", latents_std, persistent=True)
+        self._spatial_parallel_decode_enabled = False
+        if can_install_spatial_shard_parallel_decode(self.config):
+            _enable_ltx_decoder_spatial_parallel(self.decoder)
+            self._spatial_parallel_decode_enabled = True
 
         # When decoding a batch of video latents at a time, one can save memory by slicing across the batch dimension
         # to perform decoding of a single video latent at a time.
@@ -1713,6 +1788,12 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         self.tile_sample_stride_height = 448
         self.tile_sample_stride_width = 448
         self.tile_sample_stride_num_frames = 8
+
+    def _should_use_spatial_parallel_decode(self, z: torch.Tensor) -> bool:
+        return (
+            self._spatial_parallel_decode_enabled
+            and should_run_spatial_shard_parallel_decode(self.config, z)
+        )
 
     def enable_tiling(
         self,
@@ -1759,6 +1840,9 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         )
 
     def _encode(self, x: torch.Tensor, causal: Optional[bool] = None) -> torch.Tensor:
+        if self._use_ltx23_condition_encoder:
+            return self.encoder(x)
+
         batch_size, num_channels, num_frames, height, width = x.shape
 
         if self.use_framewise_decoding and num_frames > self.tile_sample_min_num_frames:
@@ -1788,6 +1872,18 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
                 The latent representations of the encoded videos. If `return_dict` is True, a
                 [`~models.autoencoder_kl.AutoencoderKLOutput`] is returned, otherwise a plain `tuple` is returned.
         """
+        if self._use_ltx23_condition_encoder:
+            if self.use_slicing and x.shape[0] > 1:
+                encoded_slices = [
+                    self._encode(x_slice, causal=causal) for x_slice in x.split(1)
+                ]
+                h = torch.cat(encoded_slices)
+            else:
+                h = self._encode(x, causal=causal)
+            if not return_dict:
+                return (h,)
+            return DecoderOutput(sample=h)
+
         if self.use_slicing and x.shape[0] > 1:
             encoded_slices = [
                 self._encode(x_slice, causal=causal) for x_slice in x.split(1)
@@ -1829,7 +1925,24 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         ):
             return self.tiled_decode(z, temb, causal=causal, return_dict=return_dict)
 
-        dec = self.decoder(z, temb, causal=causal)
+        if self._should_use_spatial_parallel_decode(z):
+            expected_height = (
+                z.shape[-2] * self.config.arch_config.spatial_compression_ratio
+            )
+            z, expected_height = split_height_for_parallel_decode(
+                z,
+                expected_height=expected_height,
+                world_size=get_decode_parallel_world_size(),
+                rank=get_decode_parallel_rank(),
+            )
+            dec = gather_and_trim_height(
+                self.decoder(z, temb, causal=causal), expected_height
+            )
+        elif self._spatial_parallel_decode_enabled:
+            with disable_spatial_parallel_decode():
+                dec = self.decoder(z, temb, causal=causal)
+        else:
+            dec = self.decoder(z, temb, causal=causal)
 
         if not return_dict:
             return (dec,)

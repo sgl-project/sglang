@@ -51,9 +51,9 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         *args,
         **kwargs,
     ) -> torch.Tensor:
-        assert (
-            extra_embeddings is None
-        ), "Extra embeddings for lora a is not supported yet in chunked backend"
+        assert extra_embeddings is None, (
+            "Extra embeddings for lora a is not supported yet in chunked backend"
+        )
         output_tensor = sgemm_lora_a_embedding_fwd(
             inputs=input_ids,
             weights=weights,
@@ -164,7 +164,7 @@ class TorchNativeLoRABackend(BaseLoRABackend):
     def init_cuda_graph_batch_info(
         self,
         max_bs_in_cuda_graph: int,
-        num_tokens_per_bs: int,
+        num_tokens_per_req: int,
     ):
         with torch.device("cuda"):
             self.cuda_graph_batch_info = TorchNativeLoRABatchInfo(
@@ -172,14 +172,14 @@ class TorchNativeLoRABackend(BaseLoRABackend):
                 bs=max_bs_in_cuda_graph,
                 num_segments=self.max_loras_per_batch,
                 seg_lens=torch.full(
-                    (max_bs_in_cuda_graph,), num_tokens_per_bs, dtype=torch.int32
+                    (max_bs_in_cuda_graph,), num_tokens_per_req, dtype=torch.int32
                 ),
                 seg_indptr=torch.zeros(max_bs_in_cuda_graph + 1, dtype=torch.int32),
                 weight_indices=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
                 lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
                 scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
                 permutation=None,
-                max_len=num_tokens_per_bs,
+                max_len=num_tokens_per_req,
             )
 
             # Initialize seg_indptr for CUDA graph as they remain constant
@@ -197,6 +197,7 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         lora_ranks: list[int],
         scalings: list[float],
         use_cuda_graph: bool,
+        use_prefill_cuda_graph: bool = False,
     ):
         # Do not use merge optimization for graph mode
         # Use pinned memory to avoid synchronizations during host-to-device transfer
@@ -247,9 +248,9 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         num_segments = len(weight_indices_tensor)
 
         if use_cuda_graph:
-            assert (
-                self.cuda_graph_batch_info is not None
-            ), "CUDA Graph batch info is not initialized."
+            assert self.cuda_graph_batch_info is not None, (
+                "CUDA Graph batch info is not initialized."
+            )
             batch_info = self.cuda_graph_batch_info
             batch_info.bs = forward_batch.batch_size
             batch_info.num_segments = num_segments

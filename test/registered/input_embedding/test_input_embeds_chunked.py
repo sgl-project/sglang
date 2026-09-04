@@ -21,7 +21,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -32,6 +36,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=43, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=43, suite="stage-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=54, suite="stage-b-test-cpu-intel")
 
 CHUNKED_PREFILL_SIZE = 256
 
@@ -94,7 +99,7 @@ class TestInputEmbedsChunkedAndRetract(CustomTestCase):
                     "--disable-radix-cache",
                     "--chunked-prefill-size",
                     str(CHUNKED_PREFILL_SIZE),
-                    "--cuda-graph-max-bs",
+                    "--cuda-graph-max-bs-decode",
                     "4",
                 ],
             )

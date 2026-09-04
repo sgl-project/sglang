@@ -186,7 +186,6 @@ class InternS1ForConditionalGeneration(nn.Module):
             name = "vision_model." + name[len("model.vision_tower.") :]
 
         if name.startswith("vision_model.encoder.layer"):
-
             name = name.replace(r".layer.", r".layers.")
             name = name.replace(r".attention.", r".attn.attn.")
             name = name.replace(r".projection_layer.", r".proj.")
@@ -211,7 +210,7 @@ class InternS1ForConditionalGeneration(nn.Module):
                 ckpt_gate_proj_name="gate_proj",
                 ckpt_down_proj_name="down_proj",
                 ckpt_up_proj_name="up_proj",
-                num_experts=self.config.num_experts,
+                num_experts=self.config.text_config.num_experts,
             )
 
         params_dict = dict(self.named_parameters())

@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 from compressed_tensors import CompressionFormat
 
-from sglang.srt.distributed import get_moe_expert_parallel_rank, get_tp_group
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -17,6 +17,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_flashinfer_available, next_power_of_2, set_weight_attrs
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,8 @@ logger = logging.getLogger(__name__)
 __all__ = ["CompressedTensorsMxInt4MoE"]
 
 if TYPE_CHECKING:
+    from compressed_tensors.quantization import QuantizationArgs
+
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         StandardDispatchOutput,
@@ -45,9 +48,13 @@ if is_flashinfer_available():
 
 
 class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
-    def __init__(self, quant_config: CompressedTensorsConfig):
+    def __init__(
+        self, quant_config: CompressedTensorsConfig, weight_quant: QuantizationArgs
+    ):
         self.quant_config = quant_config
-        config = self.quant_config.target_scheme_map["Linear"].get("weights")
+        # Per-layer scheme already resolved by get_moe_scheme(); reuse it directly
+        # (mixed-precision MoE has no "Linear" config group to fall back on).
+        config = weight_quant
         self.num_bits = config.num_bits
         self.packed_factor = 32 // config.num_bits
         self.strategy = config.strategy
@@ -59,13 +66,13 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
             and config.num_bits == 4
         ), "MxInt4 only supports group strategy with group size 32"
         assert config.symmetric, "Only symmetric quantization is supported for MoE"
-        assert (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-        ), "MxInt4 only supports flashinfer_trtllm backend"
-        assert (
-            not config.actorder
-        ), "Actorder is not supported by flashinfer_trtllm backend"
-        self.moe_ep_rank = get_moe_expert_parallel_rank()
+        assert get_moe_runner_backend().is_flashinfer_trtllm(), (
+            "MxInt4 only supports flashinfer_trtllm backend"
+        )
+        assert not config.actorder, (
+            "Actorder is not supported by flashinfer_trtllm backend"
+        )
+        self.moe_ep_rank = get_parallel().moe_ep_rank
 
         if self.quant_config.quant_format != CompressionFormat.pack_quantized.value:
             raise ValueError(
@@ -88,9 +95,9 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        assert (
-            params_dtype == torch.bfloat16
-        ), f"Params dtype should be torch.bfloat16, but got: {params_dtype}"
+        assert params_dtype == torch.bfloat16, (
+            f"Params dtype should be torch.bfloat16, but got: {params_dtype}"
+        )
 
         extra_weight_attrs.update({"quant_method": self.strategy})
         w13_weight = torch.nn.Parameter(
@@ -294,9 +301,9 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
     ) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        assert (
-            self.moe_runner_config.is_gated
-        ), "Only gated MoEs are supported for flashinfer mxint4"
+        assert self.moe_runner_config.is_gated, (
+            "Only gated MoEs are supported for flashinfer mxint4"
+        )
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output

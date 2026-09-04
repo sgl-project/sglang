@@ -41,6 +41,13 @@ class SanaArchConfig(DiTArchConfig):
 
     param_names_mapping: dict = field(
         default_factory=lambda: {
+            # self linear-attn: merge q/k/v into to_qkv (concat order q, k, v)
+            r"^(transformer_blocks\.\d+\.attn1)\.to_q\.(.*)$": (r"\1.to_qkv.\2", 0, 3),
+            r"^(transformer_blocks\.\d+\.attn1)\.to_k\.(.*)$": (r"\1.to_qkv.\2", 1, 3),
+            r"^(transformer_blocks\.\d+\.attn1)\.to_v\.(.*)$": (r"\1.to_qkv.\2", 2, 3),
+            # cross-attn: merge k/v into to_kv (q stays separate)
+            r"^(transformer_blocks\.\d+\.attn2)\.to_k\.(.*)$": (r"\1.to_kv.\2", 0, 2),
+            r"^(transformer_blocks\.\d+\.attn2)\.to_v\.(.*)$": (r"\1.to_kv.\2", 1, 2),
             r"^transformer\.(.*)$": r"\1",
         }
     )

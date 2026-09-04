@@ -58,7 +58,7 @@ class HiCacheRestoreResult(Enum):
 class DecodeHiCachePreallocMixin:
     """HiCache hooks for ``DecodePreallocQueue``: issue prefetch + reserve tokens."""
 
-    def _build_decode_prefix_match(self, req: "Req", result: Any) -> DecodePrefixMatch:
+    def _build_decode_prefix_match(self, req: Req, result: Any) -> DecodePrefixMatch:
         """Convert a ``match_prefix_for_req`` result into ``DecodePrefixMatch``.
 
         Performs the optional L3 storage hit length query when decode-side
@@ -72,17 +72,19 @@ class DecodeHiCachePreallocMixin:
         last_host_node = None
         if self.scheduler.enable_decode_hicache:
             last_host_node = result.last_host_node
-            if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
+            if self.tree_cache.is_backuped(last_host_node) or self.tree_cache.is_root(
+                last_host_node
+            ):
                 matched_len = l1_prefix_len + l2_host_hit_length
                 suffix_tokens = req.origin_input_ids[matched_len:]
-                last_hash = last_host_node.get_last_hash_value()
+                last_hash = self.tree_cache.get_last_hash_value(last_host_node)
                 prefix_keys = (
-                    last_host_node.get_prefix_hash_values(last_host_node.parent)
+                    self.tree_cache.get_prefix_hash_values(last_host_node)
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
                 l3_storage_hit_length = self.tree_cache.query_storage_hit_length(
-                    last_host_node,
+                    result.last_host_node,
                     suffix_tokens,
                     last_hash,
                     prefix_keys,
@@ -93,11 +95,13 @@ class DecodeHiCachePreallocMixin:
             l2_host_hit_length=l2_host_hit_length,
             l3_storage_hit_length=l3_storage_hit_length,
             last_device_node=result.last_device_node,
-            last_host_node=last_host_node if l3_storage_hit_length > 0 else None,
+            last_host_node=(
+                result.last_host_node if l3_storage_hit_length > 0 else None
+            ),
         )
 
     def _start_hicache_prefetch(
-        self, req: "Req", prefix_match: Optional["DecodePrefixMatch"]
+        self, req: Req, prefix_match: Optional[DecodePrefixMatch]
     ) -> None:
         """Issue L3 storage prefetch after admission succeeds.
 
@@ -110,19 +114,24 @@ class DecodeHiCachePreallocMixin:
         ):
             return
         try:
-            node = prefix_match.last_host_node
             matched_len = prefix_match.l1_prefix_len + prefix_match.l2_host_hit_length
             suffix = req.origin_input_ids[
                 matched_len : matched_len + prefix_match.l3_storage_hit_length
             ]
-            last_hash = node.get_last_hash_value()
+            last_hash = self.tree_cache.get_last_hash_value(prefix_match.last_host_node)
             prefix_keys = (
-                node.get_prefix_hash_values(node.parent)
+                self.tree_cache.get_prefix_hash_values(prefix_match.last_host_node)
                 if self.tree_cache.hicache_storage_pass_prefix_keys
                 else None
             )
             self.tree_cache.prefetch_from_storage(
-                req.rid, node, suffix, last_hash, prefix_keys
+                req.rid,
+                prefix_match.last_host_node,
+                suffix,
+                last_hash,
+                prefix_keys,
+                extra_key=req.extra_key,
+                cache_salt=req.cache_salt,
             )
             prefix_match.prefetch_registered = (
                 req.rid in self.tree_cache.ongoing_prefetch
@@ -152,7 +161,7 @@ class DecodeHiCachePreallocMixin:
 class HiCacheRestoreGatedKVReceiver:
     """Wraps a kv_receiver so KVPoll.Success is gated on HiCache restore READY."""
 
-    def __init__(self, decode_req: "DecodeRequest"):
+    def __init__(self, decode_req: DecodeRequest):
         self.decode_req = decode_req
 
     def poll(self) -> KVPoll:
@@ -168,7 +177,7 @@ class HiCacheRestoreGatedKVReceiver:
 class DecodeHiCacheTransferMixin:
     """HiCache hooks for ``DecodeTransferQueue``: drive restore state machine."""
 
-    def _clean_hicache_prefetch_resources(self, decode_req: "DecodeRequest") -> None:
+    def _clean_hicache_prefetch_resources(self, decode_req: DecodeRequest) -> None:
         if (
             decode_req.prefix_match is not None
             and decode_req.prefix_match.prefetch_registered
@@ -178,7 +187,7 @@ class DecodeHiCacheTransferMixin:
             self.tree_cache.dec_lock_ref(decode_req.hicache_restored_node)
             decode_req.hicache_restored_node = None
 
-    def _try_hicache_queue_load_back(self, dr: "DecodeRequest") -> bool:
+    def _try_hicache_queue_load_back(self, dr: DecodeRequest) -> bool:
         """Queue one L2->L1 load_back op for ``dr``; True iff a DMA was queued.
 
         On success, ``dr.hicache_restored_node`` and ``hicache_restored_kv_indices``
@@ -237,15 +246,13 @@ class DecodeHiCacheTransferMixin:
             return False
         return True
 
-    def _process_hicache_local_restores(
-        self, decode_reqs: List["DecodeRequest"]
-    ) -> None:
+    def _process_hicache_local_restores(self, decode_reqs: List[DecodeRequest]) -> None:
         if not hasattr(self.tree_cache, "is_load_back_event_done"):
             return
 
         # Filter once: keep only PENDING reqs that still need restore work;
         # trivially-done reqs (no prefix_match / nothing to restore) flip to READY.
-        active: List["DecodeRequest"] = []
+        active: List[DecodeRequest] = []
         for dr in decode_reqs:
             if dr.hicache_restore_status != HiCacheRestoreResult.PENDING:
                 continue
@@ -291,7 +298,7 @@ class DecodeHiCacheTransferMixin:
         for dr in queued:
             dr.hicache_load_consumer_index = consumer_index
 
-    def _commit_hicache_local_restore_to_req(self, decode_req: "DecodeRequest") -> None:
+    def _commit_hicache_local_restore_to_req(self, decode_req: DecodeRequest) -> None:
         prefix_match = decode_req.prefix_match
         if prefix_match is None or not prefix_match.needs_local_restore:
             return
@@ -300,7 +307,7 @@ class DecodeHiCacheTransferMixin:
 
         self.tree_cache.req_to_token_pool.write(
             (
-                decode_req.req.req_pool_idx,
+                decode_req.req.kv.req_pool_idx,
                 slice(prefix_match.l1_prefix_len, prefix_match.decode_prefix_len),
             ),
             decode_req.hicache_restored_kv_indices,

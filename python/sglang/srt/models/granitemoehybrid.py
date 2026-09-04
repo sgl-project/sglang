@@ -2,22 +2,16 @@ from typing import Iterable, Optional
 
 import torch
 from torch import nn
-from transformers.models.granitemoeshared import GraniteMoeSharedConfig
 
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
-from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     Mamba2AttnBackend,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import (
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
+from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -32,49 +26,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.transformers import maybe_prefix
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import make_layers
 
-from .granitemoe import GraniteMoeMoE
-
-
-# in vLLM this is in a separate file, but keeping it here for decoupling
-class GraniteMoeSharedMLP(nn.Module):
-    def __init__(
-        self,
-        config: GraniteMoeSharedConfig,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-
-        self.input_size = config.hidden_size
-        self.hidden_size = config.shared_intermediate_size
-        self.input_linear = MergedColumnParallelLinear(
-            input_size=self.input_size,
-            output_sizes=[self.hidden_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.input_linear",
-        )
-        self.output_linear = RowParallelLinear(
-            self.hidden_size,
-            self.input_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.output_linear",
-        )
-        if config.hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {config.hidden_act}. "
-                "Only silu is supported for now."
-            )
-        self.act_fn = SiluAndMul()
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.input_linear(hidden_states)
-        x = self.act_fn(gate_up)
-        x, _ = self.output_linear(x)
-        return x
+from .granitemoe import GraniteMoeMoE, GraniteMoeSharedMLP
 
 
 class GraniteMoeHybridMambaDecoderLayer(nn.Module):
@@ -112,7 +67,7 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 layer_id=layer_idx,
                 quant_config=quant_config,
-                tp_size=get_tensor_model_parallel_world_size(),
+                tp_size=get_parallel().tp_size,
                 prefix=f"{prefix}.block_sparse_moe",
             )
 
@@ -192,7 +147,7 @@ class GraniteMoeHybridAttention(nn.Module):
         self.total_num_kv_heads = config.num_key_value_heads
 
         # TensorParallel logic
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
         if self.total_num_kv_heads >= tp_size:
@@ -224,7 +179,6 @@ class GraniteMoeHybridAttention(nn.Module):
         )
 
         if config.position_embedding_type == "rope":
-
             self.rotary_emb = get_rope(
                 head_size=self.head_dim,
                 rotary_dim=self.head_dim,  # its not in the config
@@ -299,7 +253,7 @@ class GraniteMoeHybridAttentionDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 layer_id=layer_idx,
                 quant_config=quant_config,
-                tp_size=get_tensor_model_parallel_world_size(),
+                tp_size=get_parallel().tp_size,
                 prefix=f"{prefix}.block_sparse_moe",
             )
 

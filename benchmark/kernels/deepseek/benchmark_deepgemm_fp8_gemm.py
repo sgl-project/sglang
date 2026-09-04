@@ -12,7 +12,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 )
 
 from sglang.benchmark.bench_utils import run_bench
-from sglang.srt.layers.quantization.fp8_kernel import (
+from sglang.kernels.ops.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_deepgemm as w8a8_block_fp8_matmul,
 )
 
@@ -59,7 +59,6 @@ def tl_gemm(
             bx,
             by,
         ):
-
             A_shared = T.alloc_shared(A_shared_shape, in_dtype)
             B_shared = T.alloc_shared(B_shared_shape, in_dtype)
             C_shared = T.alloc_shared(C_shared_shape, out_dtype)
@@ -350,7 +349,7 @@ def get_benchmark(tp_size):
         tflops = flops / (ms * 1e-3) / 1e12
 
         # Print shape-specific results with TFLOPS
-        print(f"Time: {ms*1000:.2f} ms, TFLOPS: {tflops:.2f}")
+        print(f"Time: {ms * 1000:.2f} ms, TFLOPS: {tflops:.2f}")
         return ms * 1000, max_ms * 1000, min_ms * 1000  # convert to ms
 
     return benchmark

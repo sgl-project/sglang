@@ -5,7 +5,6 @@ import torch
 from tqdm import tqdm
 from tqdm.std import EMA
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.int4fp8_utils import (
     pack_int4_to_int32,
     quantize_fp8_scale_tensorwise,
@@ -18,6 +17,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import BAR_FORMAT, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -71,7 +71,7 @@ class QuarkInt4Fp8Config(QuantizationConfig):
 
         self.num_quant_layers = 0
 
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_rank = get_parallel().tp_rank
 
         # The weight iterator already has a progress bar on rank=0, account for that.
         position = 1 + tqdm._get_free_pos()
@@ -138,7 +138,7 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
 
         self.online_quant_progress_bar = self.quant_config.online_quant_progress_bar
 
-        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_rank = get_parallel().tp_rank
 
         if not _is_hip:
             raise NotImplementedError(
@@ -387,9 +387,9 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
                     int4_rescale = (
                         layer.w13_fp8_scale[expert_id][shard_id] / max_w13_scale_fp8
                     )
-                    layer.w13_int4_scale[expert_id][
-                        start : start + shard_size
-                    ] *= int4_rescale
+                    layer.w13_int4_scale[expert_id][start : start + shard_size] *= (
+                        int4_rescale
+                    )
                 start += shard_size
 
         layer.w13_fp8_scale = torch.nn.Parameter(max_w13_scales, requires_grad=False)
@@ -432,9 +432,9 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
         moe_runner_config = self.moe_runner_config
 
         # TODO: add triton kernel and add check get_bool_env_var("CK_MOE")
-        assert (
-            not moe_runner_config.no_combine
-        ), f"no_combine={moe_runner_config.no_combine} is not supported."
+        assert not moe_runner_config.no_combine, (
+            f"no_combine={moe_runner_config.no_combine} is not supported."
+        )
 
         quant_info = AiterMoeQuantInfo(
             w13_weight=layer.w13_weight,

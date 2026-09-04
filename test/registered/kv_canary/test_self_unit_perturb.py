@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import RealKvSource
+from sglang.kernels.ops.kv_canary.verify import RealKvSource
 from sglang.srt.kv_canary.buffer_group import PoolKind
 from sglang.srt.kv_canary.perturb import (
     real_kv_post_forward,
@@ -27,7 +27,7 @@ from sglang.srt.kv_canary.perturb.utils import (
     flip_first_byte_in_source,
     pick_target_group,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
     DEFAULT_DEVICE,
     make_buffer_group,
@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 register_cuda_ci(est_time=10, stage="extra-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=10, suite="extra-a-test-1-gpu-small-amd")
 
 
 class TestParseTargetGroupKind(CustomTestCase):
@@ -158,22 +159,27 @@ class TestPerturbManager(CustomTestCase):
         forward_batch = make_forward_batch(device, bs=1, seq_lens_list=(1,))
         calls: list[str] = []
 
-        with patch.object(
-            manager,
-            "perturb_real_kv_post_forward",
-            lambda batch: calls.append("real_kv_post_forward"),
-        ), patch.object(
-            manager,
-            "perturb_req_to_token",
-            lambda batch: calls.append("req_to_token"),
-        ), patch.object(
-            manager,
-            "perturb_real_kv_used",
-            lambda batch: calls.append("real_kv_used"),
-        ), patch.object(
-            manager,
-            "perturb_real_kv_unused_cache",
-            lambda batch: calls.append("real_kv_unused_cache"),
+        with (
+            patch.object(
+                manager,
+                "perturb_real_kv_post_forward",
+                lambda batch: calls.append("real_kv_post_forward"),
+            ),
+            patch.object(
+                manager,
+                "perturb_req_to_token",
+                lambda batch: calls.append("req_to_token"),
+            ),
+            patch.object(
+                manager,
+                "perturb_real_kv_used",
+                lambda batch: calls.append("real_kv_used"),
+            ),
+            patch.object(
+                manager,
+                "perturb_real_kv_unused_cache",
+                lambda batch: calls.append("real_kv_unused_cache"),
+            ),
         ):
             manager.perturb_post_forward(maybe_inaccurate_forward_batch=forward_batch)
 
@@ -393,10 +399,13 @@ class TestRealKvUsedPerturb(CustomTestCase):
 
         pool_snapshot = pool.req_to_token.clone()
         source_snapshot = source.tensor.clone()
-        with patch.object(torch, "rand", return_value=torch.tensor(0.0)), patch.object(
-            real_kv_unused_cache_module,
-            "_pick_sweep_slot_for_group",
-            return_value=3,
+        with (
+            patch.object(torch, "rand", return_value=torch.tensor(0.0)),
+            patch.object(
+                real_kv_unused_cache_module,
+                "_pick_sweep_slot_for_group",
+                return_value=3,
+            ),
         ):
             manager.perturb(maybe_inaccurate_forward_batch=forward_batch)
 
@@ -435,10 +444,13 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
         manager.attach_radix_cache(make_radix_cache([[], [3]], device=device))
 
         snapshot = source.tensor.clone()
-        with patch.object(torch, "rand", return_value=torch.tensor(0.0)), patch.object(
-            torch,
-            "randint",
-            return_value=torch.tensor(0),
+        with (
+            patch.object(torch, "rand", return_value=torch.tensor(0.0)),
+            patch.object(
+                torch,
+                "randint",
+                return_value=torch.tensor(0),
+            ),
         ):
             manager.perturb_real_kv_unused_cache(None)
 

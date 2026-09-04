@@ -39,7 +39,7 @@ from sglang.utils import terminate_process
 mp.set_start_method("spawn", force=True)
 
 register_cuda_ci(est_time=145, stage="extra-a", runner_config="2-gpu-large")
-register_amd_ci(est_time=72, suite="stage-b-test-2-gpu-large-amd")
+register_amd_ci(est_time=72, stage="extra-a", runner_config="2-gpu-large-amd")
 
 
 def verify_params_close(params1, params2, error_msg):
@@ -211,7 +211,7 @@ def init_process_dst(
                 str(base_gpu_id),
                 "--tp-size",
                 str(tp_size),
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 2,
                 "--tokenizer-path",
                 model_name,
@@ -302,7 +302,7 @@ def test_load_weights_from_remote_instance(
         try:
             key, value = param_queue.get(timeout=5)
             results[key] = value
-        except Exception as e:
+        except Exception:
             if all(not p.is_alive() for p in context.processes):
                 break
 
@@ -350,7 +350,6 @@ def test_load_weights_from_remote_instance(
 
 
 class TestLoadWeightsFromRemoteInstance(CustomTestCase):
-
     def test_load_weights_from_remote_instance(self):
 
         assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"

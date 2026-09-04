@@ -4,12 +4,12 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-from sglang.srt.mem_cache.memory_pool_host import (
+from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
-    DSAIndexerPoolHost,
-    MLATokenToKVPoolHost,
     alloc_with_pin_memory,
 )
+from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -146,13 +146,19 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
 
     @unittest.skipIf(
         is_hip(),
-        '`io_backend="kernel"` path in memory_pool_host.backup_from_device_all_layer '
+        '`io_backend="kernel"` path in MLATokenToKVPoolHost.backup_from_device_all_layer '
         "raises ValueError on AMD (only the `direct` IO backend is wired for ROCm). "
         "The other 62 tests in this file pass on AMD.",
     )
     def test_device_to_host_indexer_kernel(self):
         self._run_device_to_host_indexer_copy(io_backend="kernel")
 
+    @unittest.skipIf(
+        is_hip(),
+        "DSATokenToKVPool with page_size=1 (used on HIP) trips the ROCm 7.2.0 "
+        "HIP-preshuffle assert `page_size % 16 == 0` during pool construction "
+        "(seen on pr-test-amd-rocm720). The rest of this file passes on AMD.",
+    )
     def test_device_to_host_indexer_direct(self):
         self._run_device_to_host_indexer_copy(io_backend="direct")
 

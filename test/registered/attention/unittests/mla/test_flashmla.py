@@ -1,16 +1,10 @@
-import sys
 import unittest
-from pathlib import Path
 
 import torch
 import triton
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.test.test_utils import CustomTestCase
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from sglang.test.kits.attention_unittest.attention_methods.mla_attention import (
     MLAAttentionCase,
     build_mla_attention_fixture,
@@ -20,9 +14,6 @@ from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner i
     _init_cuda_graph_capture_metadata,
     _init_cuda_graph_replay_metadata,
     run_mla_cuda_graph_decode_case,
-)
-from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (
-    run_mla_eagle_draft_extend_case,
 )
 from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner import (
     run_mla_eagle_draft_cuda_graph_runner_case,
@@ -36,6 +27,7 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_
 from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
     run_mla_split_op_extend_case,
 )
+from sglang.test.test_utils import CustomTestCase
 
 MLA_SHAPE_KWARGS = dict(
     kv_lora_rank=512,
@@ -203,17 +195,6 @@ class TestFlashMLAAttentionBackendCorrectness(CustomTestCase):
             1,
         ),
     )
-    DRAFT_EXTEND_CASES = (
-        MLAAttentionCase(
-            name="runner_eagle_draft_extend_mla_flashmla_ragged_accept",
-            backend="flashmla",
-            forward_mode=ForwardMode.DRAFT_EXTEND,
-            num_heads=4,
-            page_size=64,
-            prefix_lens=(5, 8),
-            extend_lens=(2, 4),
-        ),
-    )
     EAGLE_DRAFT_RUNNER_CASES = (
         (
             MLAAttentionCase(
@@ -338,11 +319,6 @@ class TestFlashMLAAttentionBackendCorrectness(CustomTestCase):
                     **MLA_SHAPE_KWARGS,
                 )
 
-    def test_runner_mode_eagle_draft_extend_cases(self):
-        for case in self.DRAFT_EXTEND_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
-                run_mla_eagle_draft_extend_case(self, case, **MLA_SHAPE_KWARGS)
-
     @unittest.skipIf(_DECODE_REQUIRES_SM90A, _DECODE_SKIP_REASON)
     def test_runner_mode_eagle_draft_cuda_graph_runner_cases(self):
         for case, topk, num_draft_tokens in self.EAGLE_DRAFT_RUNNER_CASES:
@@ -403,8 +379,9 @@ class TestFlashMLAAttentionBackendCorrectness(CustomTestCase):
         )
 
         fixture = self._build_target_verify_metadata_fixture(case)
-        with torch.no_grad(), forward_context(
-            ForwardContext(attn_backend=fixture.backend)
+        with (
+            torch.no_grad(),
+            forward_context(ForwardContext(attn_backend=fixture.backend)),
         ):
             fixture.backend.init_forward_metadata(fixture.forward_batch)
 

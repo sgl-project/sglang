@@ -23,7 +23,7 @@ jobs:
       - name: Fetch latest PR info
         if: github.event_name == 'pull_request'
         id: pr
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -79,7 +79,7 @@ jobs:
 
       - name: Enforce rate limit for low-permission actors (optional)
         if: github.event_name == 'pull_request' && inputs.cool-down-minutes > 0
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |

@@ -25,6 +25,30 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
+def _spec_result(index):
+    return {
+        "text": f"choice-{index}",
+        "meta_info": {
+            "id": "cmpl-spec-test",
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "cached_tokens": 0,
+            "finish_reason": {"type": "stop"},
+            "weight_version": "default",
+            "spec_accept_rate": 0.5,
+            "spec_accept_length": 2.0,
+            "spec_cap_length": index + 1.0,
+            "spec_block_accept_length": index + 0.5,
+            "spec_num_correct_drafts": 1,
+            "spec_num_proposed_drafts": 2,
+            "spec_verify_ct": 1,
+            "spec_correct_drafts_histogram": [0, 1],
+            "spec_cap_lens_histogram": [index, 1],
+        },
+        "index": index,
+    }
+
+
 class _MockTemplateManager:
     """Minimal mock for TemplateManager."""
 
@@ -34,6 +58,7 @@ class _MockTemplateManager:
         self.completion_template_name: Optional[str] = (
             None  # Set to None to avoid template processing
         )
+        self.jinja_template_may_reorder_tool_results = False
 
 
 class ServingCompletionTestCase(unittest.TestCase):
@@ -60,21 +85,35 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.fastapi_request = Mock(spec=Request)
 
     # ---------- prompt-handling ----------
-    def test_single_string_prompt(self):
-        req = CompletionRequest(model="x", prompt="Hello world", max_tokens=100)
-        internal, _ = self.sc._convert_to_internal_request(req)
-        self.assertEqual(internal.text, "Hello world")
-
     def test_single_token_ids_prompt(self):
         req = CompletionRequest(model="x", prompt=[1, 2, 3, 4], max_tokens=100)
         internal, _ = self.sc._convert_to_internal_request(req)
         self.assertEqual(internal.input_ids, [1, 2, 3, 4])
 
-    # ---------- echo-handling ----------
-    def test_echo_with_string_prompt_streaming(self):
-        req = CompletionRequest(model="x", prompt="Hello", max_tokens=1, echo=True)
-        self.assertEqual(self.sc._get_echo_text(req, 0), "Hello")
+    def test_cache_salt_and_extra_key_remain_distinct(self):
+        req = CompletionRequest(
+            model="x",
+            prompt=[1, 2, 3, 4],
+            max_tokens=1,
+            cache_salt="tenant-a",
+            extra_key="classification",
+        )
+        internal, _ = self.sc._convert_to_internal_request(req)
+        self.assertEqual(internal.cache_salt, "tenant-a")
+        self.assertEqual(internal.extra_key, "classification")
 
+    def test_single_request_rejects_batched_cache_salt(self):
+        req = CompletionRequest(
+            model="x",
+            prompt=[1, 2, 3, 4],
+            max_tokens=1,
+            cache_salt=["tenant-a"],
+        )
+        internal, _ = self.sc._convert_to_internal_request(req)
+        with self.assertRaisesRegex(ValueError, "single request"):
+            internal.normalize_batch_and_arguments()
+
+    # ---------- echo-handling ----------
     def test_echo_with_list_of_strings_streaming(self):
         req = CompletionRequest(
             model="x", prompt=["A", "B"], max_tokens=1, echo=True, n=1
@@ -140,6 +179,17 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertIn("json_schema", sampling_params)
         self.assertIsInstance(sampling_params["json_schema"], str)
 
+    def test_response_format_json_schema_missing_schema(self):
+        """Test that json_schema response_format without a schema raises a ValueError."""
+        req = CompletionRequest(
+            model="x",
+            prompt="Generate a JSON object:",
+            max_tokens=100,
+            response_format={"type": "json_schema"},
+        )
+        with self.assertRaises(ValueError):
+            self.sc._build_sampling_params(req)
+
     def test_response_format_structural_tag(self):
         """Test that response_format structural_tag is correctly processed in sampling params."""
         req = CompletionRequest(
@@ -165,15 +215,20 @@ class ServingCompletionTestCase(unittest.TestCase):
         # (but might have json_schema from the legacy json_schema field)
         self.assertIsNone(sampling_params.get("structural_tag"))
 
-    def test_logprobs_false_non_streaming(self):
-        """Test that logprobs=False doesn't cause KeyError in non-streaming response."""
+    def test_non_streaming_response(self):
         req = CompletionRequest(
-            model="x", prompt="Hello", max_tokens=10, logprobs=False
+            model="x",
+            prompt="Hello",
+            max_tokens=10,
+            logprobs=False,
+            return_token_ids=True,
         )
 
         mock_ret = [
             {
                 "text": " world",
+                "output_ids": [3, 4],
+                "prompt_token_ids": [1, 2],
                 "meta_info": {
                     "id": "test-id",
                     "prompt_tokens": 1,
@@ -189,6 +244,8 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertEqual(len(response.choices), 1)
         self.assertEqual(response.choices[0].text, " world")
         self.assertEqual(len(response.choices[0].logprobs.top_logprobs), 0)
+        self.assertEqual(response.choices[0].token_ids, [3, 4])
+        self.assertEqual(response.choices[0].prompt_token_ids, [1, 2])
 
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
@@ -256,6 +313,76 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertGreaterEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
 
+    def test_streaming_token_ids_deltas_cover_output_exactly(self):
+        req = CompletionRequest(
+            model="x",
+            prompt="Hi",
+            max_tokens=10,
+            stream=True,
+            return_token_ids=True,
+        )
+        adapted_request, _ = self.sc._convert_to_internal_request(req)
+        self.sc.tokenizer_manager.server_args.stream_response_default_include_usage = (
+            False
+        )
+
+        for incremental in (False, True):
+            with self.subTest(incremental_streaming_output=incremental):
+                self.sc.tokenizer_manager.server_args.incremental_streaming_output = (
+                    incremental
+                )
+                texts = ("a", "b", "c") if incremental else ("a", "ab", "abc")
+                output_ids = (
+                    ([5], [6], [7]) if incremental else ([5], [5, 6], [5, 6, 7])
+                )
+                chunks = [
+                    {
+                        "text": text,
+                        "output_ids": ids,
+                        "prompt_token_ids": [1, 2],
+                        "meta_info": {
+                            "id": "cmpl-test",
+                            "prompt_tokens": 2,
+                            "completion_tokens": i + 1,
+                            "finish_reason": {"type": "stop"} if i == 2 else None,
+                        },
+                        "index": 0,
+                    }
+                    for i, (text, ids) in enumerate(zip(texts, output_ids))
+                ]
+
+                async def _mock_generate(*args, _chunks=chunks, **kwargs):
+                    for chunk in _chunks:
+                        yield chunk
+
+                self.sc.tokenizer_manager.generate_request = _mock_generate
+
+                async def run_stream():
+                    return [
+                        chunk
+                        async for chunk in self.sc._generate_completion_stream(
+                            adapted_request, req, self.fastapi_request
+                        )
+                    ]
+
+                loop = get_or_create_event_loop()
+                raw_chunks = loop.run_until_complete(run_stream())
+
+                choices = []
+                for raw in raw_chunks:
+                    if not raw.startswith("data: ") or raw.strip() == "data: [DONE]":
+                        continue
+                    data = json.loads(raw[len("data: ") :])
+                    choices.extend(data.get("choices", []))
+
+                token_ids = [tid for c in choices for tid in c.get("token_ids", [])]
+                text = "".join(c["text"] for c in choices)
+                self.assertEqual(text, "abc")
+                self.assertEqual(token_ids, [5, 6, 7])
+                self.assertEqual(choices[0]["prompt_token_ids"], [1, 2])
+                for choice in choices[1:]:
+                    self.assertNotIn("prompt_token_ids", choice)
+
     def test_non_streaming_cached_tokens_details_emits_sglext(self):
         """Test that non-streaming completion responses emit cached token details in sglext."""
 
@@ -297,6 +424,103 @@ class ServingCompletionTestCase(unittest.TestCase):
                 "storage_backend": "file",
             },
         )
+
+    def test_parallel_sampling_returns_spec_details_per_choice(self):
+        req = CompletionRequest(
+            model="x",
+            prompt="Hello world",
+            max_tokens=100,
+            n=2,
+            return_spec_tokens_details=True,
+        )
+        ret = [_spec_result(index) for index in range(2)]
+
+        response = self.sc._build_completion_response(req, ret, 1234567890)
+
+        details = response.sglext.spec_tokens_details
+        self.assertEqual(len(details), 2)
+        self.assertEqual(details[0].spec_cap_length, 1.0)
+        self.assertEqual(details[0].spec_block_accept_length, 0.5)
+        self.assertEqual(details[0].spec_cap_lens_histogram, [0, 1])
+        self.assertEqual(details[1].spec_cap_length, 2.0)
+        self.assertEqual(details[1].spec_block_accept_length, 1.5)
+        self.assertEqual(details[1].spec_cap_lens_histogram, [1, 1])
+
+        single_req = req.model_copy(update={"n": 1})
+        single_response = self.sc._build_completion_response(
+            single_req, ret[:1], 1234567890
+        )
+        self.assertEqual(
+            single_response.sglext.spec_tokens_details.spec_cap_length,
+            1.0,
+        )
+
+        disabled_req = single_req.model_copy(
+            update={"return_spec_tokens_details": False}
+        )
+        disabled_response = self.sc._build_completion_response(
+            disabled_req, ret[:1], 1234567890
+        )
+        self.assertIsNone(disabled_response.sglext)
+
+    def test_streaming_parallel_sampling_orders_spec_details_by_choice(self):
+        async def mock_generate(*args, **kwargs):
+            for index in (1, 0):
+                yield _spec_result(index)
+
+        self.sc.tokenizer_manager.generate_request = mock_generate
+        req = CompletionRequest(
+            model="x",
+            prompt="Hello world",
+            max_tokens=100,
+            n=2,
+            stream=True,
+            return_spec_tokens_details=True,
+        )
+        adapted_request, _ = self.sc._convert_to_internal_request(req)
+
+        async def run_stream(request):
+            return [
+                chunk
+                async for chunk in self.sc._generate_completion_stream(
+                    adapted_request, request, self.fastapi_request
+                )
+            ]
+
+        chunks = get_or_create_event_loop().run_until_complete(run_stream(req))
+        parsed = [
+            json.loads(chunk[len("data: ") :])
+            for chunk in chunks
+            if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]"
+        ]
+        details = next(chunk["sglext"] for chunk in parsed if "sglext" in chunk)[
+            "spec_tokens_details"
+        ]
+        self.assertEqual([item["spec_cap_length"] for item in details], [1.0, 2.0])
+        self.assertEqual(
+            [item["spec_cap_lens_histogram"] for item in details],
+            [[0, 1], [1, 1]],
+        )
+
+        async def mock_single_generate(*args, **kwargs):
+            async for content in mock_generate():
+                if content["index"] == 0:
+                    yield content
+
+        self.sc.tokenizer_manager.generate_request = mock_single_generate
+        single_req = req.model_copy(update={"n": 1})
+        single_chunks = get_or_create_event_loop().run_until_complete(
+            run_stream(single_req)
+        )
+        single_parsed = [
+            json.loads(chunk[len("data: ") :])
+            for chunk in single_chunks
+            if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]"
+        ]
+        single_details = next(
+            chunk["sglext"] for chunk in single_parsed if "sglext" in chunk
+        )["spec_tokens_details"]
+        self.assertIsInstance(single_details, dict)
 
     def test_streaming_cached_tokens_details_emits_sglext(self):
         """Test that streaming completion responses emit cached token details in sglext."""

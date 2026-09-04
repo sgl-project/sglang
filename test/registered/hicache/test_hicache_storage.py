@@ -6,7 +6,7 @@ register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-small-amd")
 import time
 import unittest
 
-from sglang.srt.utils import is_hip, kill_process_tree
+from sglang.srt.utils import is_hip
 from sglang.test.kits.eval_accuracy_kit import MMLUMixin
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -14,14 +14,15 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 _is_hip = is_hip()
 
 
 class TestHiCache(CustomTestCase, MMLUMixin):
-    mmlu_score_threshold = 0.65
-    mmlu_num_examples = 64
+    mmlu_score_threshold = 0.64
+    mmlu_num_examples = 256
     mmlu_num_threads = 32
 
     @classmethod
@@ -47,7 +48,7 @@ class TestHiCache(CustomTestCase, MMLUMixin):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process)
         time.sleep(5)
 
 

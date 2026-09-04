@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["."]
+members = [".", "sgl-kv-indexer"]
 
 [package]
 name = "sgl-router"
@@ -33,6 +33,7 @@ axum = { version = "0.8", features = ["macros", "tracing"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace", "compression-gzip", "cors", "timeout", "request-id"] }
 reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"], default-features = false }
+sgl-kv-indexer = { path = "sgl-kv-indexer" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -43,6 +44,16 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # this pulls no openssl/native-tls (matching reqwest's rustls-tls above).
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
 
+# Chat-template rendering for cache-aware routing: the engine caches tokens
+# AFTER applying the model's chat template, so the router renders the same
+# template (from tokenizer_config.json) before hashing — otherwise its query
+# token_ids diverge from the engine's stored blocks. `pycompat` supplies the
+# Python str/dict methods HF chat templates rely on (.startswith, .items, ...).
+minijinja = { version = "2", features = ["loop_controls", "json"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+# `strftime_now` chat-template helper (some templates inject the current date).
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
 # Utilities
 anyhow = "1"
 thiserror = "2"
@@ -52,7 +63,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 futures = "0.3"
 bytes = "1"
 rand = "0.8"
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 dashmap = "6"
 kube = { version = "0.96", features = ["runtime", "derive"] }
 k8s-openapi = { version = "0.23", features = ["v1_31"] }
@@ -76,6 +87,7 @@ serde_json = "1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1.42", features = ["test-util"] }
+tonic = { version = "0.14.6", features = ["transport"] }
 # Low-level msgpack encoder used to hand-construct wire bytes in
 # kv_events golden-bytes tests (decode-only path uses rmp-serde).
 rmp = "0.8"

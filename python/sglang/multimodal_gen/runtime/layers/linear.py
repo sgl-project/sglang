@@ -10,7 +10,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
-from sglang.kernel_api_logging import wrap_method_with_debug_kernel_once
+from sglang.kernels.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_tp_group,
@@ -33,11 +33,11 @@ from sglang.multimodal_gen.runtime.models.parameter import (
     PerTensorScaleParameter,
     RowvLLMParameter,
 )
-
-# yapf: enable
-from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+# yapf: enable
+from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 
 logger = init_logger(__name__)
 
@@ -53,7 +53,6 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "GPTQMarlin24LinearMethod",
     "TPUInt8LinearMethod",
     "GPTQLinearMethod",
-    "FBGEMMFp8LinearMethod",
     "ModelOptFp8LinearMethod",
     "ModelOptFp4LinearMethod",
     "ComfyUIFp4LinearMethod",
@@ -127,6 +126,26 @@ class LinearMethodBase(QuantizeMethodBase):
         raise NotImplementedError
 
 
+def apply_unquantized_linear(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Apply a plain linear projection with the runtime's reference semantics."""
+    if x.device.type == "mps":
+        if x.dtype == weight.dtype and (bias is None or bias.dtype == x.dtype):
+            return F.linear(x, weight, bias)
+        return F.linear(
+            x.to(torch.float32),
+            weight.to(torch.float32),
+            None if bias is None else bias.to(torch.float32),
+        ).to(x.dtype)
+
+    return (
+        F.linear(x, weight, bias)
+        if IS_AMP_SUPPORTED or bias is None
+        else F.linear(x, weight, bias.to(x.dtype))
+    )
+
+
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
 
@@ -155,12 +174,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def apply(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
-        output = (
-            F.linear(x, layer.weight, bias)
-            if IS_AMP_SUPPORTED or bias is None
-            else F.linear(x, layer.weight, bias.to(x.dtype))
-        )  # NOTE: explicit dtype cast for bias is needed on platforms where amp isn't supported
-        return output
+        return apply_unquantized_linear(x, layer.weight, bias)
 
 
 class LinearBase(torch.nn.Module):
@@ -298,6 +312,73 @@ class ReplicatedLinear(LinearBase):
         s += f", output_features={self.output_size}"
         s += f", bias={self.bias is not None}"
         return s
+
+
+class MergedReplicatedLinear(ReplicatedLinear):
+    """Packed replicated linear layers with shard-aware weight loading.
+
+    This is the non-tensor-parallel counterpart of
+    :class:`MergedColumnParallelLinear`. It keeps independently stored logical
+    projections in one physical weight so eager inference launches one GEMM.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_sizes: list[int],
+        bias: bool = True,
+        skip_bias_add: bool = False,
+        params_dtype: torch.dtype | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
+        self.output_sizes = output_sizes
+        super().__init__(
+            input_size=input_size,
+            output_size=sum(output_sizes),
+            bias=bias,
+            skip_bias_add=skip_bias_add,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            output_sizes=output_sizes,
+            prefix=prefix,
+        )
+
+    def weight_loader(
+        self,
+        param: Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: int | str | None = None,
+    ) -> None:
+        if loaded_shard_id is None:
+            return super().weight_loader(param, loaded_weight)
+
+        if isinstance(loaded_shard_id, str):
+            try:
+                loaded_shard_id = {"q": 0, "k": 1, "v": 2}[loaded_shard_id]
+            except KeyError as exc:
+                raise ValueError(f"Invalid merged shard id: {loaded_shard_id}") from exc
+        if not 0 <= loaded_shard_id < len(self.output_sizes):
+            raise ValueError(f"Invalid merged shard id: {loaded_shard_id}")
+        param_data = param.data
+        output_dim = getattr(param, "output_dim", None)
+        if output_dim is not None:
+            shard_offset = sum(self.output_sizes[:loaded_shard_id])
+            shard_size = self.output_sizes[loaded_shard_id]
+            param_data = param_data.narrow(output_dim, shard_offset, shard_size)
+        elif getattr(param, "is_metadata", False):
+            shard_size = loaded_weight.shape[0]
+            param_data = param_data.narrow(0, loaded_shard_id * shard_size, shard_size)
+        elif getattr(param, "needs_scalar_to_array", False):
+            param_data, loaded_weight = adjust_scalar_to_fused_array(
+                param_data, loaded_weight, loaded_shard_id
+            )
+        if tuple(param_data.shape) != tuple(loaded_weight.shape):
+            raise ValueError(
+                f"Tried to load merged shard of size {loaded_weight.size()} "
+                f"to a parameter slice of size {param_data.size()}"
+            )
+        param_data.copy_(loaded_weight)
 
 
 class ColumnParallelLinear(LinearBase):
@@ -479,6 +560,10 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         prefix: str = "",
         tp_group: dist.ProcessGroup = None,
     ):
+        tp_group = tp_group or get_tp_group()
+        # Set output_sizes BEFORE super().__init__() so ColumnParallelLinear derives
+        # per-shard output_partition_sizes.
+        self.output_sizes = output_sizes
         super().__init__(
             input_size=input_size,
             output_size=sum(output_sizes),
@@ -490,7 +575,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             prefix=prefix,
             tp_group=tp_group,
         )
-        self.output_sizes = output_sizes
         assert all(output_size % self.tp_size == 0 for output_size in output_sizes)
 
     def weight_loader(
@@ -621,6 +705,12 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
         if loaded_shard_id is None:
             if isinstance(param, PerTensorScaleParameter):
+                if loaded_weight.numel() == 1 and param.data.numel() > 1:
+                    param.data.fill_(loaded_weight.reshape(-1)[0])
+                    return
+                if loaded_weight.shape == param.data.shape:
+                    param.data.copy_(loaded_weight)
+                    return
                 param.load_merged_column_weight(loaded_weight=loaded_weight, shard_id=0)
                 return
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):
@@ -838,6 +928,12 @@ class QKVParallelLinear(ColumnParallelLinear):
     ):
         if loaded_shard_id is None:  # special case for certain models
             if isinstance(param, PerTensorScaleParameter):
+                if loaded_weight.numel() == 1 and param.data.numel() > 1:
+                    param.data.fill_(loaded_weight.reshape(-1)[0])
+                    return
+                if loaded_weight.shape == param.data.shape:
+                    param.data.copy_(loaded_weight)
+                    return
                 param.load_qkv_weight(loaded_weight=loaded_weight, shard_id=0)
                 return
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):

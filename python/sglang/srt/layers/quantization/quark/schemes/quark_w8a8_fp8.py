@@ -5,12 +5,12 @@ from typing import Any, Callable, Optional, cast
 import torch
 from torch.nn import Parameter
 
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     cutlass_fp8_supported,
@@ -30,7 +30,6 @@ if _use_aiter:
 
 
 class QuarkW8A8Fp8(QuarkLinearScheme):
-
     def __init__(
         self, weight_config: dict[str, Any], input_config: Optional[dict[str, Any]]
     ):

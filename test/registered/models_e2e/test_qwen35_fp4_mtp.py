@@ -3,7 +3,6 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.reasoning_kit import ReasoningTokenUsageMixin
@@ -15,7 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=740, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=800, stage="base-c", runner_config="4-gpu-b200")
 
 QWEN35_FP4_MODEL = "nvidia/Qwen3.5-397B-A17B-NVFP4"
 ACC_THRESHOLDS = {QWEN35_FP4_MODEL: {"gsm8k": 0.95}}
@@ -38,6 +37,8 @@ MTP_BASE_ARGS = [
     "--attention-backend",
     "trtllm_mha",
     "--quantization",
+    "modelopt_fp4",
+    "--speculative-draft-model-quantization",
     "modelopt_fp4",
     "--speculative-algorithm",
     "NEXTN",
@@ -92,7 +93,6 @@ class TestQwen35FP4MTP(ReasoningTokenUsageMixin, CustomTestCase):
         cls.model = QWEN35_FP4_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.init_reasoning_token_verifier()
-        envs.SGLANG_ENABLE_SPEC_V2.set(True)
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -102,14 +102,22 @@ class TestQwen35FP4MTP(ReasoningTokenUsageMixin, CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        envs.SGLANG_ENABLE_SPEC_V2.set(False)
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
         _run_mtp_gsm8k(self)
 
 
-class TestQwen35FP4MTPFlashInfer(ReasoningTokenUsageMixin, CustomTestCase):
+class TestQwen35FP4MTPReplaySSM(ReasoningTokenUsageMixin, CustomTestCase):
+    """MTP with the ReplaySSM spec-verify fold protocol.
+
+    Pins the FlashInfer GDN (bf16-state) kernel stack explicitly: the
+    --mamba-ssm-dtype bfloat16 in MTP_BASE_ARGS overrides the float32
+    default that --enable-linear-replayssm-spec would set, and the three
+    linear-attn backend flags keep decode/prefill/verify on FlashInfer
+    even if the auto-selection defaults drift.
+    """
+
     reasoning_parser_name = "qwen3"
 
     @classmethod
@@ -117,22 +125,24 @@ class TestQwen35FP4MTPFlashInfer(ReasoningTokenUsageMixin, CustomTestCase):
         cls.model = QWEN35_FP4_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.init_reasoning_token_verifier()
-        envs.SGLANG_ENABLE_SPEC_V2.set(True)
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=MTP_BASE_ARGS
             + [
+                "--enable-linear-replayssm-spec",
                 "--linear-attn-decode-backend",
                 "flashinfer",
-                "--enforce-disable-flashinfer-allreduce-fusion",
+                "--linear-attn-prefill-backend",
+                "flashinfer",
+                "--linear-attn-verify-backend",
+                "flashinfer",
             ],
         )
 
     @classmethod
     def tearDownClass(cls):
-        envs.SGLANG_ENABLE_SPEC_V2.set(False)
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):

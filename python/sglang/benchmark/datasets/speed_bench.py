@@ -1,4 +1,4 @@
-"""SPEED-Bench (nvidia/SPEED-Bench) dataset for SGLang bench_serving.
+"""SPEED-Bench (nvidia/SPEED-Bench) dataset for the SGLang serving benchmark.
 
 Reads the pre-downloaded throughput_1k JSONL produced by prepare_speed_bench.sh
 (or equivalent), optionally filtering by category (low_entropy / mixed /
