@@ -192,11 +192,6 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "DFLASH speculative decoding only supports CUDA and NPU devices."
         )
 
-    if resolved_view(server_args).enable_dp_attention:
-        raise ValueError(
-            "Currently DFLASH speculative decoding does not support dp attention."
-        )
-
     if cfg.pp_size != 1:
         raise ValueError(
             "Currently DFLASH speculative decoding only supports pp_size == 1."
