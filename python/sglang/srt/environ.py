@@ -658,6 +658,8 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
+    # A wedged RDMA stack fails startup here instead of at the scheduler watchdog.
+    SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT = EnvInt(60)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
@@ -675,7 +677,6 @@ class Envs:
     # ===================================================================
     # Distributed and model-parallel runtime
     # ===================================================================
-    SGLANG_ENABLE_CP_V2 = EnvBool(False)
     SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
     # Comma-separated bundle indices for Ray Custom PG mode (e.g., "0,1,2,7").
     SGLANG_RAY_BUNDLE_INDICES = EnvStr("")
@@ -723,9 +724,9 @@ class Envs:
     SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE = EnvBool(False)
     # Positive cache TTL for filesystem metadata lookups (-1 disables positive expiration)
     SGLANG_HICACHE_FILE_BACKEND_METADATA_TTL = EnvFloat(5.0)
-    # Buffer mode: pin a staged prefetch's device anchor from IO commit to
-    # consumption so eviction cannot waste the fetch; cap = fraction of pool.
-    SGLANG_ENABLE_HICACHE_BUFFER_ANCHOR_LOCK = EnvBool(False)
+    # Buffer mode: staged prefetches pin their device anchor from IO commit
+    # to consumption so eviction cannot waste the fetch. Cap = fraction of
+    # the pool the pins may hold; 0 disables pinning.
     SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP = EnvFloat(0.5)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
@@ -856,6 +857,11 @@ class Envs:
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
+    # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
+    # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
+    # output columns ride along nearly free.
+    SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
+    SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     # Above 8192 tokens of context, aiter's non-static workspace is large enough
@@ -1396,6 +1402,10 @@ class Envs:
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
+    # ROCm gfx950: fuse inverse-RoPE into the wo_a mxfp8 quant (aiter
+    # inverse_rope_group_quant) instead of a separate fused_rope_inplace + Triton
+    # quant. Off by default; requires SGLANG_OPT_FP8_WO_A_GEMM and the aiter op.
+    SGLANG_OPT_FP8_WO_A_FUSED_INVROPE = EnvBool(False)
     # Route the decode wo_a bf16 batched matmul off rocBLAS/Tensile onto aiter's
     # tuned batched_gemm_bf16 (gfx95). Off by default; see deepseek_v4.py
     # _apply_wo_a_bf16_matmul.
@@ -1751,6 +1761,9 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
         note="Note the unit change: milliseconds -> seconds.",
     ),
     # Removed without replacement.
+    "SGLANG_ENABLE_CP_V2": _DeprecatedEnv(
+        note="Strategy-based prefill context parallelism is now the only generic implementation."
+    ),
     "SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2": _DeprecatedEnv(),
     # Superseded by the unified JIT per_token_group_quant, the default CUDA path.
     "SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT": _DeprecatedEnv(),
@@ -1765,6 +1778,10 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     "SGLANG_FLASHINFER_PR4266_SOURCE": _DeprecatedEnv(),
     # DSV4 compressor V2 is always used.
     "SGLANG_OPT_USE_COMPRESSOR_V2": _DeprecatedEnv(),
+    "SGLANG_ENABLE_HICACHE_BUFFER_ANCHOR_LOCK": _DeprecatedEnv(
+        note="Buffer-mode anchor pinning is always on; set "
+        "SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP=0 to disable it."
+    ),
     # Replaced by CLI flags.
     "SGLANG_ENABLE_GRPC": _DeprecatedEnv(
         note="Please use '--grpc-port' to enable the native gRPC server."
