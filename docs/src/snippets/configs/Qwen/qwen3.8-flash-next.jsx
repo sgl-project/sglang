@@ -136,8 +136,8 @@ export const config = {
       "Run the same command on both Sparks: rank 1 first, then rank 0 (node 0 = --dist-init-addr host).",
       "Point the rendezvous and NCCL at the ConnectX-7 link, not the management NIC:",
       "  NCCL_SOCKET_IFNAME=<200GbE-nic>  GLOO_SOCKET_IFNAME=<200GbE-nic>",
-      "LD_PRELOAD selects the image's NCCL 2.30.7; the system 2.28.3 it ships alongside",
-      "deadlocks cross-node decode CUDA graphs. Check the log line 'sglang is using nccl=='.",
+      "The image loads NCCL 2.30.7 (needed for cross-node decode CUDA graphs);",
+      "confirm with the startup log line 'sglang is using nccl=='.",
     ],
   },
 
@@ -689,15 +689,15 @@ export const config = {
     //
     // Low latency: in-checkpoint MTP head (NEXTN 3/1/4), 24 concurrent
     // requests (120 mamba slots), 1.35M-token KV pool, MTP accept length
-    // 3.2-3.7 on non-thinking output.
+    // 3.2-3.7 on non-thinking output. No env is required: the image loads its
+    // pip NCCL 2.30.7 by default (verified via /proc/<pid>/maps), and the cell
+    // passed the same checks without PYTORCH_CUDA_ALLOC_CONF — see the notes
+    // for when expandable_segments is still worth setting.
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2" },
       verified: true,
-      warn: "2x DGX Spark only (GB10 pair, TP=2 over ConnectX-7). Use Docker mode with the qwen38flashnext image and keep the LD_PRELOAD line: the image ships two NCCL copies and the default 2.28.3 deadlocks cross-node decode CUDA graphs. Memory headroom at --mem-fraction-static 0.85 is ~8-12 GiB per node; keep a host memory watchdog for long-context runs. See [DGX Spark notes](#spark-note).",
-      env: [
-        "LD_PRELOAD=/opt/sglang/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2",
-        "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
-      ],
+      warn: "2x DGX Spark only (GB10 pair, TP=2 over ConnectX-7); use Docker mode with the qwen38flashnext image. Memory headroom at --mem-fraction-static 0.85 is ~8-12 GiB per node — keep a host memory watchdog for long-context runs. See [DGX Spark notes](#spark-note).",
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -727,11 +727,8 @@ export const config = {
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "multi-2" },
       verified: true,
-      warn: "2x DGX Spark only (GB10 pair, TP=2 over ConnectX-7). Use Docker mode with the qwen38flashnext image and keep the LD_PRELOAD line: the image ships two NCCL copies and the default 2.28.3 deadlocks cross-node decode CUDA graphs. At 96 concurrent requests the KV pool is ~753k tokens (~7.8k per request when full); lower --max-running-requests for long-context workloads. See [DGX Spark notes](#spark-note).",
-      env: [
-        "LD_PRELOAD=/opt/sglang/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2",
-        "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
-      ],
+      warn: "2x DGX Spark only (GB10 pair, TP=2 over ConnectX-7); use Docker mode with the qwen38flashnext image. At 96 concurrent requests the KV pool is ~753k tokens (~7.8k per request when full); lower --max-running-requests for long-context workloads. See [DGX Spark notes](#spark-note).",
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
