@@ -977,7 +977,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         torch.ones(
                             (bs, self.speculative_num_steps - 1),
                             dtype=next_draft_input.topk_p.dtype,
-                            device=next_draft_input.topk_p.dtype.device,
+                            device=next_draft_input.topk_p.device,
                         ),
                     ],
                     dim=1,
