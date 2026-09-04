@@ -93,11 +93,11 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader i
 from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
     inspect_minimax_h3_safetensors,
     resolve_minimax_h3_checkpoint_quantization,
+    validate_minimax_h3_checkpoint_variant,
 )
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     TransformerQuantLoadSpec,
     _enforce_quantized_component_offload_capability,
-    _filter_duplicate_precision_variant_safetensors,
     _Flux2Nvfp4FallbackAdapter,
     _needs_device_weight_postprocess,
     _resolve_quant_config,
@@ -127,6 +127,9 @@ from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     _resolve_quant_method_name,
     build_nvfp4_config_from_safetensors_list,
     get_quant_config,
+)
+from sglang.multimodal_gen.runtime.weights.source import (
+    filter_duplicate_precision_variant_safetensors,
 )
 from sglang.multimodal_gen.tools.build_modelopt_nvfp4_transformer import (
     _updated_quant_config,
@@ -725,6 +728,18 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                     )
                 )
 
+    def test_minimax_h3_hybrid_checkpoint_accepts_selected_partition(self):
+        checkpoint = "/cache/minimax_h3_hybrid_fl2va_ref2va_b25-49.safetensors"
+
+        validate_minimax_h3_checkpoint_variant([checkpoint], "fl2va")
+        validate_minimax_h3_checkpoint_variant([checkpoint], "ref2va")
+
+    def test_minimax_h3_single_partition_checkpoint_rejects_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            validate_minimax_h3_checkpoint_variant(
+                ["/cache/minimax_h3_fl2va.safetensors"], "ref2va"
+            )
+
     def test_inspect_minimax_h3_safetensors_detects_curve_and_comfy_format(self):
         marker = json.dumps(
             {
@@ -1199,7 +1214,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             "/tmp/transformer/other.safetensors",
         ]
 
-        resolved = _filter_duplicate_precision_variant_safetensors(files)
+        resolved = filter_duplicate_precision_variant_safetensors(files)
 
         self.assertEqual(
             resolved,
@@ -1215,7 +1230,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             "/tmp/transformer/diffusion_pytorch_model.fp16.safetensors",
         ]
 
-        resolved = _filter_duplicate_precision_variant_safetensors(files)
+        resolved = filter_duplicate_precision_variant_safetensors(files)
 
         self.assertEqual(resolved, files)
 

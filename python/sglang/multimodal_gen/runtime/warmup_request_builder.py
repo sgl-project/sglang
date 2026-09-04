@@ -571,12 +571,18 @@ def build_warmup_reqs(
         if warmup_resolutions is None
         else None
     )
-    # Explicit --warmup-resolutions choose the probe's shape, not whether the
-    # planner gets calibrated: the step floor and the stage timers stay on.
-    # Without them a 2-step warmup ran a single DiT iteration on a pipeline
-    # that denoises steps-1 times, and every layer measured as one-shot.
+    # Most explicit warmup resolutions are deliberately lightweight and are
+    # not representative residency probes. Pipelines such as MiniMax H3 opt in
+    # because their explicit shape is the intended planner calibration shape.
+    calibrate_explicit_resolution = (
+        warmup_resolutions is not None
+        and server_args.pipeline_config.calibrate_auto_residency_with_explicit_warmup_resolutions
+        is True
+    )
     collect_auto_residency_metrics = (
-        server_based_warmup and auto_residency_args_skip_reason(server_args) is None
+        server_based_warmup
+        and (warmup_resolutions is None or calibrate_explicit_resolution)
+        and auto_residency_args_skip_reason(server_args) is None
     )
     if collect_auto_residency_metrics and sampling_defaults.num_inference_steps:
         warmup_steps = min(

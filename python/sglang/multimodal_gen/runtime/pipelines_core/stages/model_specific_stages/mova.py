@@ -152,6 +152,11 @@ class MOVATimestepPreparationStage(PipelineStage):
 
 
 class MOVADenoisingStage(PipelineStage):
+    def default_workload_iterations(
+        self, batch: Req, num_inference_steps: int
+    ) -> int | None:
+        return num_inference_steps
+
     """Run MOVA dual-tower denoising loop."""
 
     def __init__(self, video_dit, video_dit_2, audio_dit, dual_tower_bridge, scheduler):
@@ -474,7 +479,6 @@ class MOVADenoisingStage(PipelineStage):
 
         boundary_ratio = server_args.pipeline_config.boundary_ratio
         total_steps = paired_timesteps.shape[0]
-        batch.record_stage_iterations(total_steps)
         cfg_rank = get_classifier_free_guidance_rank()
         enable_cfg_parallel = server_args.enable_cfg_parallel
 

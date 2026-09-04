@@ -145,6 +145,12 @@ class CausalDMDRealtimeCacheContext:
 
 
 class CausalDMDDenoisingStage(DenoisingStage):
+    def default_workload_iterations(
+        self, batch: Req, num_inference_steps: int
+    ) -> int | None:
+        # blocks x fixed DMD steps, known only once the block sizes are laid out
+        return None
+
     """
     Denoising stage for causal diffusion.
     """

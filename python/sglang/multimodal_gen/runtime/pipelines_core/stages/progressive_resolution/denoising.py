@@ -516,7 +516,6 @@ class ProgressiveDenoisingStage(DenoisingStage):
 
         scheduler = ctx.scheduler
         n_steps = int(batch.num_inference_steps)
-        batch.record_stage_iterations(n_steps)
         timesteps_cpu = ctx.timesteps.cpu()
 
         transition_steps = find_transition_steps(
