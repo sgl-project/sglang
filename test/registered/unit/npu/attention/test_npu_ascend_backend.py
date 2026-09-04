@@ -13,6 +13,7 @@ import torch
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=5, suite="base-a-test-1-npu-a2")
+register_npu_ci(est_time=5, suite="nightly-1-npu-a2", nightly=True)
 
 # Mock NPU-only modules before importing the source module.
 for _ in (
