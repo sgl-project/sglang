@@ -165,6 +165,11 @@ class SanaWMPipelineConfig(PipelineConfig):
             # Conservative auto-FSDP gate for the 720p world-model path. Users
             # can still force FSDP explicitly on smaller cards.
             fsdp_auto_min_available_memory_gb=60,
+            # The 720p two-stage DiT+refiner fits comfortably on high-memory
+            # cards; keeping it resident avoids per-layer H2D/D2H and is
+            # bit-exact vs offloaded (measured: e2e -38% on a 275GB B300).
+            keep_resident_min_available_gb=120,
+            keep_resident_components=("dit", "vae"),
         )
 
     # --- Latent shape ---

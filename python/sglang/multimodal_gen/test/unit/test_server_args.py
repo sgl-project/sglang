@@ -1595,6 +1595,8 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
         self.assertEqual(sana_wm_deployment.dit_layerwise_offload_modes, ("memory",))
+        self.assertEqual(sana_wm_deployment.keep_resident_min_available_gb, 120)
+        self.assertEqual(sana_wm_deployment.keep_resident_components, ("dit", "vae"))
 
         fast_hunyuan_deployment = FastHunyuanConfig().get_model_deployment_config()
         self.assertEqual(fast_hunyuan_deployment.keep_resident_min_available_gb, 60)
