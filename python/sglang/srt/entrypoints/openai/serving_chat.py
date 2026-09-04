@@ -197,10 +197,13 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
 KIMI_K3_IMAGE_PLACEHOLDER = "<|kimi_image_placeholder|>"
 KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED = "<| kimi_image_placeholder |>"
 
+# Keep in sync with Glm4vImageProcessor.models (multimodal/processors/glm4v.py):
+# a model family added there but not here silently disables neutralization.
 GLM_V_ARCHITECTURES = frozenset(
     {
         "Glm4vForConditionalGeneration",
         "Glm4vMoeForConditionalGeneration",
+        "Glm5NextForConditionalGeneration",
         "GlmOcrForConditionalGeneration",
     }
 )

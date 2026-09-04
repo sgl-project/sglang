@@ -452,6 +452,7 @@ class ServingChatTestCase(CustomTestCase):
             ("Glm4vForConditionalGeneration", True),
             ("Glm4vMoeForConditionalGeneration", True),
             ("GlmOcrForConditionalGeneration", True),
+            ("Glm5NextForConditionalGeneration", True),
             ("LlamaForCausalLM", False),
         ):
             with self.subTest(architecture=architecture):
