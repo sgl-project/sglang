@@ -761,8 +761,7 @@ def _validate_embedding_part(
         )
     if current.num_parts != embedding_data.num_parts:
         raise ValueError(
-            f"num_parts changed from {current.num_parts} to "
-            f"{embedding_data.num_parts}"
+            f"num_parts changed from {current.num_parts} to {embedding_data.num_parts}"
         )
     if current.ready_list[embedding_data.part_idx]:
         raise ValueError(f"duplicate embedding part {embedding_data.part_idx}")
@@ -1623,8 +1622,7 @@ async def _extract_encoder_error(responses, endpoint, context, encode_requests=N
         if isinstance(resp, asyncio.TimeoutError):
             timeout_val = envs.SGLANG_ENCODER_HTTP_TIMEOUT.get()
             logger.error(
-                f"Encoder {endpoint} timeout ({timeout_val}s) for {ctx} "
-                f"(request {i})"
+                f"Encoder {endpoint} timeout ({timeout_val}s) for {ctx} (request {i})"
             )
             return (
                 f"Encoder {endpoint} timeout ({timeout_val}s)",
@@ -1853,9 +1851,9 @@ def _view_pool_buffer_by_modality(raw_buffer, embedding_data, dtype):
         if info is None:
             mod_info[mod] = [start, end, shape[0], shape[1]]
         else:
-            assert (
-                info[3] == shape[1]
-            ), f"hidden_dim mismatch in modality {mod}: {info[3]} vs {shape[1]}"
+            assert info[3] == shape[1], (
+                f"hidden_dim mismatch in modality {mod}: {info[3]} vs {shape[1]}"
+            )
             assert info[1] == start, f"non-contiguous parts in modality {mod}"
             info[1] = end
             info[2] += shape[0]

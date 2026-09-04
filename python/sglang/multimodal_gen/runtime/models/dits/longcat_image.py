@@ -268,9 +268,9 @@ class _LongCatJointAttention(nn.Module):
         super().__init__()
         tp_size = get_tp_world_size()
         self.num_local_heads = num_attention_heads // tp_size
-        assert (
-            num_attention_heads % tp_size == 0
-        ), f"num_attention_heads ({num_attention_heads}) must be divisible by tp_size ({tp_size})"
+        assert num_attention_heads % tp_size == 0, (
+            f"num_attention_heads ({num_attention_heads}) must be divisible by tp_size ({tp_size})"
+        )
         self.head_dim = attention_head_dim
         inner_dim = num_attention_heads * attention_head_dim
 
@@ -429,9 +429,9 @@ class _LongCatSingleAttention(nn.Module):
         super().__init__()
         tp_size = get_tp_world_size()
         self.num_local_heads = num_attention_heads // tp_size
-        assert (
-            num_attention_heads % tp_size == 0
-        ), f"num_attention_heads ({num_attention_heads}) must be divisible by tp_size ({tp_size})"
+        assert num_attention_heads % tp_size == 0, (
+            f"num_attention_heads ({num_attention_heads}) must be divisible by tp_size ({tp_size})"
+        )
         self.head_dim = attention_head_dim
         inner_dim = num_attention_heads * attention_head_dim
 
