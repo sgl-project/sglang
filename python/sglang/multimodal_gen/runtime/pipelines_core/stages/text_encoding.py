@@ -331,10 +331,13 @@ class TextEncodingStage(ConditionEncodingStage):
         ]
 
         def align_negative_batch_dim(
-            tensor: torch.Tensor, target_batch: int, name: str
+            tensor: torch.Tensor,
+            target_batch: int,
+            name: str,
+            *,
+            batchless_2d: bool = True,
         ) -> torch.Tensor:
-            # 2-D: seq × dim with no batch dim — implicitly batch=1.
-            if tensor.ndim == 2:
+            if batchless_2d and tensor.ndim == 2:
                 if target_batch > 1:
                     return tensor.unsqueeze(0).repeat(target_batch, 1, 1)
                 return tensor
@@ -371,7 +374,7 @@ class TextEncodingStage(ConditionEncodingStage):
             for idx, nm in enumerate(neg_masks_list):
                 target_batch = target_batch_sizes[min(idx, len(target_batch_sizes) - 1)]
                 nm = align_negative_batch_dim(
-                    nm, target_batch, "negative_attention_mask"
+                    nm, target_batch, "negative_attention_mask", batchless_2d=False
                 )
                 batch.negative_attention_mask.append(nm)
 
@@ -380,7 +383,7 @@ class TextEncodingStage(ConditionEncodingStage):
         for idx, nm in enumerate(neg_embeds_masks_list):
             target_batch = target_batch_sizes[min(idx, len(target_batch_sizes) - 1)]
             nm = align_negative_batch_dim(
-                nm, target_batch, "negative_prompt_embeds_mask"
+                nm, target_batch, "negative_prompt_embeds_mask", batchless_2d=False
             )
             batch.negative_prompt_embeds_mask.append(nm)
         for idx, seq_lens in enumerate(neg_seq_lens_list):
