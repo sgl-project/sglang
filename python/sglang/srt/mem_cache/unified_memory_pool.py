@@ -643,6 +643,11 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         )
         return raw[: page_count * self._page_bytes].view(page_count, self._page_bytes)
 
+    @property
+    def grow_direction(self) -> str:
+        """Physical growth direction used by this sub-pool's L1 allocator."""
+        return self._unified_buffer.spec(self._sub_pool_name).grow_direction
+
     def _physical_to_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
         return (indices // self.page_size) * (
             self.page_size * self.kernel_page_blocks

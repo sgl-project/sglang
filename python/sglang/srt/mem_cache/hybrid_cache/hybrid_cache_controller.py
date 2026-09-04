@@ -17,7 +17,10 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     HiCacheController as BaseHiCacheController,
 )
-from sglang.srt.managers.cache_controller import LayerDoneCounter, PrefetchAck
+from sglang.srt.managers.cache_controller import (
+    LayerDoneCounter,
+    PrefetchAck,
+)
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
@@ -31,6 +34,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
+from sglang.srt.mem_cache.pool_host.base import HostKVCache
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
 if TYPE_CHECKING:
@@ -88,6 +92,13 @@ class PrefetchOperation(StorageOperation):
 
 
 class HybridCacheController(BaseHiCacheController):
+    @staticmethod
+    def _uses_shared_host_layout(host_pool: Any) -> bool:
+        return (
+            isinstance(host_pool, HostKVCache)
+            and host_pool.shared_allocation_domain is not None
+        )
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -398,11 +409,10 @@ class HybridCacheController(BaseHiCacheController):
             and entry.host_pool.shared_allocation_domain is domain
         )
 
-        # A failed shared reservation may need bytes currently held by either
-        # component. Reclaim only the byte shortfall (or one page when failure
-        # is due to fragmentation), retrying after every successful eviction.
-        # The callbacks release only evictable tree entries; protected retraction
-        # backups remain safe.
+        # alloc_many compacts the shared layout before reporting failure. Reclaim
+        # only the remaining byte or per-side logical-slot shortfall, retrying
+        # after every successful eviction. The callbacks release only evictable
+        # tree entries; protected retraction backups remain safe.
         while True:
             made_progress = False
             for entry in candidates:
@@ -672,6 +682,8 @@ class HybridCacheController(BaseHiCacheController):
             return op.host_indices, op.device_indices, op.pool_transfers
 
         def move_for_pool(host_pool, host_indices, device_indices):
+            if self._uses_shared_host_layout(host_pool):
+                return host_indices, device_indices
             if getattr(host_pool, "can_use_write_back_jit", False):
                 if host_indices.is_cuda:
                     host_indices = host_indices.cpu()
@@ -923,16 +935,30 @@ class HybridCacheController(BaseHiCacheController):
     def move_hybrid_indices(
         self, operation: CacheOperation
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
-        host_indices, device_indices = self.move_indices(
-            operation.host_indices, operation.device_indices
-        )
+        anchor_pool = self.mem_pool_host.anchor_entry.host_pool
+        if self._uses_shared_host_layout(anchor_pool):
+            host_indices, device_indices = (
+                operation.host_indices,
+                operation.device_indices,
+            )
+        else:
+            host_indices, device_indices = self.move_indices(
+                operation.host_indices, operation.device_indices
+            )
         resolved_pool_transfers = None
         if operation.pool_transfers:
             resolved_pool_transfers = []
             for transfer in operation.pool_transfers:
-                transfer_host_indices, transfer_device_indices = self.move_indices(
-                    transfer.host_indices, transfer.device_indices
-                )
+                host_pool = self.mem_pool_host.entry_map[transfer.name].host_pool
+                if self._uses_shared_host_layout(host_pool):
+                    transfer_host_indices, transfer_device_indices = (
+                        transfer.host_indices,
+                        transfer.device_indices,
+                    )
+                else:
+                    transfer_host_indices, transfer_device_indices = self.move_indices(
+                        transfer.host_indices, transfer.device_indices
+                    )
                 # Keep the original PoolTransfer unchanged because tree-owned
                 # transfers may still reference radix-tree host state. The
                 # controller only needs a normalized execution-time copy.
@@ -949,6 +975,10 @@ class HybridCacheController(BaseHiCacheController):
         return host_indices, device_indices, resolved_pool_transfers
 
     def _page_transfer(self, operation: PrefetchOperation) -> bool:
+        with self.mem_pool_host.layout_lease():
+            return self._page_transfer_with_stable_layout(operation)
+
+    def _page_transfer_with_stable_layout(self, operation: PrefetchOperation) -> bool:
         # KV pools and KV-derived pools first — determines actual completed page count
         kv_completed_pages = super()._page_transfer(operation)
 
@@ -994,6 +1024,10 @@ class HybridCacheController(BaseHiCacheController):
         return
 
     def _page_backup(self, operation):
+        with self.mem_pool_host.layout_lease():
+            return self._page_backup_with_stable_layout(operation)
+
+    def _page_backup_with_stable_layout(self, operation):
         # MLA KV is replicated across TP ranks and should still be written only
         # by TP0. Rank-sharded sidecars still need every TP rank.
         backup_transfers = [

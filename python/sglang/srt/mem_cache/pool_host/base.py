@@ -298,6 +298,44 @@ class HostKVCache(abc.ABC):
         """
         raise NotImplementedError()
 
+    def prepare_transfer_indices(
+        self, host_indices, device_indices, io_backend
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Resolve indices that must remain stable through one L2 submission.
+
+        Normal host pools expose physical indices directly and controllers have
+        already moved them to the backend-required device. Shared compacting
+        pools override this hook and resolve their logical ids while the transfer
+        engine holds a layout lease.
+        """
+        return host_indices, device_indices
+
+    def backup_from_device_all_layer_physical(
+        self, device_pool, host_indices, device_indices, io_backend
+    ) -> None:
+        self.backup_from_device_all_layer(
+            device_pool, host_indices, device_indices, io_backend
+        )
+
+    def load_to_device_per_layer_physical(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
+    ) -> None:
+        self.load_to_device_per_layer(
+            device_pool,
+            host_indices,
+            device_indices,
+            layer_id,
+            io_backend,
+            is_draft=is_draft,
+        )
+
     @abc.abstractmethod
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         """
