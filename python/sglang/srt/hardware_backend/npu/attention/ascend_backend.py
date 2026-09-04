@@ -77,7 +77,6 @@ def _reshape_kv_for_fia_nz(
 
 @dataclass
 class ForwardMetadata:
-
     # calculated map for kv positions [bs * maxseqlen]
     block_tables: Optional[torch.Tensor] = None
 
@@ -305,7 +304,6 @@ def _cp_allgather_and_save_kv_npu(
 
 
 class AscendAttnBackend(AttentionBackend):
-
     def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
         super().__init__()
         self.forward_metadata = None
@@ -2076,15 +2074,22 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
             if forward_batch.forward_mode.is_draft_extend_v2():
-                actual_seq_lengths = (
-                    np.array(forward_batch.extend_seq_lens_cpu).cumsum().tolist()
-                )
+                extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+                if not self.graph_mode:
+                    extend_seq_lens_cpu = extend_seq_lens_cpu[
+                        : forward_batch._original_batch_size
+                    ]
+                actual_seq_lengths = np.array(extend_seq_lens_cpu).cumsum().tolist()
             else:
                 actual_seq_lengths = np.arange(
                     self.speculative_num_draft_tokens,
                     self.speculative_num_draft_tokens + query.shape[0],
                     self.speculative_num_draft_tokens,
                 )
+
+            if not self.graph_mode:
+                actual_bs = len(actual_seq_lengths)
+                actual_seq_lengths_kv = actual_seq_lengths_kv[:actual_bs]
 
             is_swa_layer = layer.sliding_window_size != -1
             if (

@@ -1483,7 +1483,6 @@ def _lean_attention_decode_kernel(
     # Use a regular while loop instead of tl.static_range with a dynamic bound to avoid
     # Triton compiler crashes in the Coalesce pass (max_output_tile_cnt is runtime-computed).
     while iter < cta_end_tile_gid:
-
         tile_row_idx = iter // tiles_per_khead
         tile_idx = tile_row_idx * batch_size
         tile_iter = tile_row_idx * tiles_per_khead
