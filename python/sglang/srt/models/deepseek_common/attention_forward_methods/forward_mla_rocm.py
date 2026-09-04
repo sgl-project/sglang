@@ -765,7 +765,28 @@ class DeepseekMLARocmForwardMixin:
                         ),
                     )
         else:
-            if self._skip_rope_for_aiter_fused_mla():
+            q = None
+            k = None
+            k3_fused_q_cache = getattr(self, "_try_fused_mla_q_cache", None)
+            if (
+                k3_fused_q_cache is not None
+                and self.current_attention_backend in ("aiter", "triton", "triton_mla")
+                and not get_parallel().dcp_enabled
+                and forward_batch.forward_mode.is_decode_or_idle()
+            ):
+                result = k3_fused_q_cache(
+                    q_nope_out,
+                    q_pe,
+                    k_nope,
+                    k_pe,
+                    positions,
+                    forward_batch.out_cache_loc,
+                )
+                if result is not None:
+                    q, k = result
+                    save_kv_cache = False
+
+            if q is None and self._skip_rope_for_aiter_fused_mla():
                 q, _, _, k = _fused_rope_cat_and_cache(
                     self,
                     q_nope_out,
@@ -776,7 +797,7 @@ class DeepseekMLARocmForwardMixin:
                     forward_batch.out_cache_loc,
                 )
                 save_kv_cache = False
-            else:
+            elif q is None:
                 q = torch.cat([q_nope_out, q_pe], dim=-1)
                 k = torch.cat([k_nope, k_pe], dim=-1)
 

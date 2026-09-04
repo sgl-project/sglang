@@ -2091,6 +2091,29 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             reduce_results=not self.all_reduce_fusion,
             alt_stream=alt_stream,
         )
+        self._k3_mla_q_cache_fusion = (
+            _is_hip and envs.SGLANG_K3_AITER_MLA_Q_CACHE_FUSION.get()
+        )
+        if self._k3_mla_q_cache_fusion:
+            self.register_buffer(
+                "_k3_identity_rope_cos",
+                torch.ones((1, 32), dtype=torch.bfloat16),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_k3_identity_rope_sin",
+                torch.zeros((1, 32), dtype=torch.bfloat16),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_k3_mla_q_cache_scale",
+                torch.ones((1,), dtype=torch.float32),
+                persistent=False,
+            )
+        else:
+            self.register_buffer("_k3_identity_rope_cos", None, persistent=False)
+            self.register_buffer("_k3_identity_rope_sin", None, persistent=False)
+            self.register_buffer("_k3_mla_q_cache_scale", None, persistent=False)
         if split_gguf_kv_b:
             del self.fused_qkv_a_proj_with_mqa
             del self.kv_b_proj
@@ -2239,6 +2262,80 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 return _orig_o_proj_forward(x, *args, **kwargs)
 
             self.o_proj.forward = _gated_o_proj_forward
+
+    def _try_fused_mla_q_cache(
+        self,
+        q_nope_out: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        positions: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        if not self._k3_mla_q_cache_fusion:
+            return None
+
+        from sglang.kernels.ops.kimi_k3 import mla_q_cache_aiter_hip
+        from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+
+        kv_cache = get_token_to_kv_pool().get_key_buffer(self.attn_mqa.layer_id)
+        scale = self.attn_mqa.k_scale
+        if scale is None:
+            scale = self._k3_mla_q_cache_scale
+        cos_cache = self._k3_identity_rope_cos
+        sin_cache = self._k3_identity_rope_sin
+        if (
+            not isinstance(scale, torch.Tensor)
+            or not isinstance(self._k3_mla_q_cache_scale, torch.Tensor)
+            or cos_cache is None
+            or sin_cache is None
+        ):
+            return None
+
+        # AITER decode uses FP8 Q when the cache is FP8. Triton decode keeps
+        # Q/Q-PE in BF16 while sharing the same fused FP8 cache write.
+        triton_decode = self.current_attention_backend in ("triton", "triton_mla")
+        q_out_dtype = q_nope_out.dtype if triton_decode else kv_cache.dtype
+        out = torch.empty(
+            (*q_nope_out.shape[:-1], self.kv_lora_rank + self.qk_rope_head_dim),
+            dtype=q_out_dtype,
+            device=q_nope_out.device,
+        )
+        if not mla_q_cache_aiter_hip.covered(
+            q_nope_out,
+            q_pe,
+            k_nope,
+            k_pe,
+            kv_cache,
+            out_cache_loc,
+            positions,
+            scale,
+            cos_cache,
+            sin_cache,
+            out,
+            self._k3_mla_q_cache_scale,
+        ):
+            return None
+        q = mla_q_cache_aiter_hip.run(
+            q_nope=q_nope_out,
+            q_pe=q_pe,
+            k_nope=k_nope,
+            k_pe=k_pe,
+            kv_cache=kv_cache,
+            slot_mapping=out_cache_loc,
+            positions=positions,
+            k_scale=scale,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            out=out,
+            q_scale=self._k3_mla_q_cache_scale,
+        )
+        k_placeholder = torch.empty(
+            (k_nope.shape[0], 1, self.kv_lora_rank + self.qk_rope_head_dim),
+            dtype=k_nope.dtype,
+            device=k_nope.device,
+        )
+        return q, k_placeholder
 
     @staticmethod
     def _split_kv_b_weight_loader(param, loaded_weight) -> None:
