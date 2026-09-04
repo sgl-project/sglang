@@ -298,6 +298,17 @@ def use_bf16_gemm_sm120(m: int, n: int, k: int) -> bool:
     # tile_k=64 bucket when K % 128 != 0 for M > 32.
     if n % 128 != 0 or k % 64 != 0:
         return False
+    # Perf-gated coverage (measured on RTX 5090 vs F.linear, Qwen3.5-4B):
+    #   M=16: all shapes WIN (1.1-1.5x). M=32: gate_up & o_proj WIN, down-proj
+    #   (small-N large-K) LOSES (0.60x). M=48: ALL shapes LOSE (0.64-0.93x) --
+    #   the M=48 tiles cannot beat cuBLAS on 5090, so bs=32 decode must fall
+    #   back to F.linear. Restrict M>32 coverage to nothing (M in (32,48]
+    #   disabled) except the shapes that demonstrably win.
+    if m > 32:
+        return False
+    if m > 24 and k >= 8192:
+        # M in (24,32] down-proj family (large K, small N) loses to F.linear.
+        return False
     if m > 32 and k % 128 != 0:
         # Every M in (32, 48] bucket has tile_m=48, and the k-tile count is
         # floor(K/tile_k) with no predicated tail. The tile_k=128 (48,64)
