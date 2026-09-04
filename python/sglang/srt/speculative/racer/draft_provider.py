@@ -5,7 +5,7 @@ from typing import Sequence
 
 import numpy as np
 
-from sglang.srt.speculative.racer.automaton import RacerAutomaton
+from sglang.srt.speculative.racer.refill_automaton import BinaryRefillRacerAutomaton
 from sglang.srt.speculative.racer.stats import InstrumentedRacerAutomaton
 
 
@@ -26,13 +26,17 @@ class RacerDraftProvider:
         self.topk = int(topk)
         self.max_nodes = int(max_nodes)
         self.stats_enabled = bool(stats_enabled)
-        self._states: dict[object, RacerAutomaton] = {}
+        self._states: dict[object, BinaryRefillRacerAutomaton] = {}
         self._last_batch_stats: list[dict[str, int | float]] = []
 
-    def _state(self, req_id: object) -> RacerAutomaton:
+    def _state(self, req_id: object) -> BinaryRefillRacerAutomaton:
         state = self._states.get(req_id)
         if state is None:
-            cls = InstrumentedRacerAutomaton if self.stats_enabled else RacerAutomaton
+            cls = (
+                InstrumentedRacerAutomaton
+                if self.stats_enabled
+                else BinaryRefillRacerAutomaton
+            )
             state = cls(
                 ngram=self.ngram,
                 topk=self.topk,
@@ -53,7 +57,6 @@ class RacerDraftProvider:
             self._states.pop(rid, None)
 
     def batch_put(self, batch_tokens) -> None:
-        # History is synchronized from the request context in batch_get().
         return None
 
     def batch_get(
