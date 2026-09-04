@@ -955,7 +955,6 @@ class SanaWMDenoisingStage(DenoisingStage):
             cfg_parallel,
             float(getattr(batch, "guidance_scale", 1.0) or 1.0),
         )
-        batch.record_stage_iterations(len(timesteps))
         log_sana_wm_tensor_stats("denoise.input_latents", latents)
 
         start_time = time.perf_counter()

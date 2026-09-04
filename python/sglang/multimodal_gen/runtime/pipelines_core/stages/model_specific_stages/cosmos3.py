@@ -1093,6 +1093,11 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
 
 
 class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
+    def default_workload_iterations(
+        self, batch: Req, num_inference_steps: int
+    ) -> int | None:
+        return num_inference_steps
+
     """Cosmos3 denoise loop, including CFG and the parallelism modes.
 
     The UND pathway runs once and its K/V is cached per cache_key (``cond`` /
@@ -1488,7 +1493,6 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         action_fps = getattr(batch.sampling_params, "action_fps", None)
         timesteps = batch.timesteps
         guidance_scale = batch.guidance_scale
-        batch.record_stage_iterations(len(timesteps))
 
         # Seed the scheduler's stochastic (SDE) noise from the request seed so it
         # is identical on every sequence-parallel rank; otherwise each rank draws

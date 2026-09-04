@@ -354,7 +354,14 @@ class Req:
         measured_iterations: int,
         target_iterations: int | None = None,
     ) -> None:
-        """Record a stage loop against its full default-request work."""
+        """Record a stage loop against its full default-request work.
+
+        Most stages declare the count as a formula of the step count
+        (``PipelineStage.default_workload_iterations``) and never call this.
+        It is for loops whose length is only known inside them (chunked or
+        block-wise schedules); ``target_iterations`` defaults to scaling the
+        measured count from the probe's steps to the default workload's.
+        """
         if not self.is_warmup or self.metrics is None:
             return
         measured = max(1, int(measured_iterations))
@@ -362,11 +369,7 @@ class Req:
             measured_request_steps = max(1, int(self.num_inference_steps))
             target_request_steps = int(
                 self.extra.get(
-                    "stage_target_num_inference_steps",
-                    self.extra.get(
-                        "warmup_target_num_inference_steps",
-                        measured_request_steps,
-                    ),
+                    "warmup_target_num_inference_steps", measured_request_steps
                 )
             )
             target_iterations = (
