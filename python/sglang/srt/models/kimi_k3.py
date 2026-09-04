@@ -137,6 +137,7 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_npu = is_npu()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 
 
@@ -1133,17 +1134,25 @@ class KimiK3MoE(nn.Module):
         takes both a strided row and an fp32 row. The SM90/SM120 cutlass mxfp4
         kernels return from apply() before that quant, and precision="bf16"
         skips it as well, so those keep the bf16 contract even though the
-        runner backend is the same."""
+        runner backend is the same. The aiter runner also takes the view as
+        is on K3's mxfp8-activation route, whose moe-sort quant indexes rows
+        by input.stride(-2); its other quant_types (generic per-token /
+        per-1x128, prequant bypass) were not checked for strided input, so
+        this opts the whole runner in rather than per quant_type."""
         from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
         method = self.experts.quant_method
+        runner = getattr(self.experts, "runner", None)
         return not (
-            isinstance(method, Mxfp4MoEMethod)
-            and method.use_flashinfer
-            and not method.use_marlin
-            and method._fi_kernel == "trtllm_sm100"
-            and method.flashinfer_mxfp4_moe_precision == "default"
-            and method.hidden_size == self.moe_hidden_size
+            (
+                isinstance(method, Mxfp4MoEMethod)
+                and method.use_flashinfer
+                and not method.use_marlin
+                and method._fi_kernel == "trtllm_sm100"
+                and method.flashinfer_mxfp4_moe_precision == "default"
+                and method.hidden_size == self.moe_hidden_size
+            )
+            or (runner is not None and runner.runner_backend.is_aiter())
         )
 
     @cached_property
@@ -3272,10 +3281,14 @@ class KimiK3LinearForCausalLM(nn.Module):
                 # The router consumes the correction bias in fp32; convert the
                 # bf16 checkpoint values once (exact) so the per-call
                 # .to(float32) in topk becomes a no-op instead of one upcast
-                # kernel per MoE layer per step.
+                # kernel per MoE layer per step. If aiter, the router takes the
+                # gate-logit dtype instead, so match that one to the same end.
                 bias = layer.mlp.gate.e_score_correction_bias
-                if bias.dtype != torch.float32:
-                    bias.data = bias.data.to(torch.float32)
+                _bias_dtype = (
+                    layer.mlp.gate.weight.dtype if _use_aiter else torch.float32
+                )
+                if bias.dtype != _bias_dtype:
+                    bias.data = bias.data.to(_bias_dtype)
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_fused_decode()
