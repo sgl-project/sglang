@@ -15,7 +15,6 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 
 if TYPE_CHECKING:
@@ -985,14 +984,6 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
 def _handle_ngram(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
-    if (
-        cfg.speculative_ngram_global_tree_mode != "disabled"
-        and not envs.SGLANG_ENABLE_NGRAM_GLOBAL_TREE.get()
-    ):
-        raise ValueError(
-            "--speculative-ngram-global-tree-mode requires "
-            "SGLANG_ENABLE_NGRAM_GLOBAL_TREE=1 when global tree allocation is enabled."
-        )
     if cfg.device not in ("cuda", "cpu"):
         raise ValueError(
             "Ngram speculative decoding only supports CUDA or CPU devices."
