@@ -19,6 +19,8 @@ from fastapi import Request
 from sglang.srt.entrypoints.openai.protocol import CompletionRequest
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -66,6 +68,9 @@ class ServingCompletionTestCase(unittest.TestCase):
 
     # ---------- shared test fixtures ----------
     def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
         # build the mock TokenizerManager once for every test
         tm = Mock(spec=TokenizerManager)
 

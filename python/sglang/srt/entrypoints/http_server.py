@@ -251,8 +251,8 @@ async def init_multi_tokenizer() -> ServerArgs:
     template_manager.initialize_templates(
         tokenizer_manager=tokenizer_manager,
         model_path=get_model().model_path,
-        chat_template=server_args.chat_template,
-        completion_template=server_args.completion_template,
+        chat_template=get_serving().chat_template,
+        completion_template=get_serving().completion_template,
     )
 
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
@@ -290,11 +290,11 @@ async def lifespan(fast_api_app: FastAPI):
         enable_func_timer()
 
     # Init tracing
-    if server_args.enable_trace:
+    if get_observability().enable_trace:
         process_tracing_init(
-            server_args.otlp_traces_endpoint,
+            get_observability().otlp_traces_endpoint,
             "sglang",
-            trace_modules=server_args.trace_modules,
+            trace_modules=get_observability().trace_modules,
         )
         if get_disagg().disaggregation_mode == "prefill":
             thread_label = "Prefill" + thread_label
@@ -343,15 +343,15 @@ async def lifespan(fast_api_app: FastAPI):
 
     # Launch tool server
     tool_server = None
-    if server_args.tool_server == "demo":
+    if get_serving().tool_server == "demo":
         from sglang.srt.entrypoints.openai.tool_server import DemoToolServer
 
         tool_server = DemoToolServer()
-    elif server_args.tool_server:
+    elif get_serving().tool_server:
         from sglang.srt.entrypoints.openai.tool_server import MCPToolServer
 
         tool_server = MCPToolServer()
-        await tool_server.add_tool_server(server_args.tool_server)
+        await tool_server.add_tool_server(get_serving().tool_server)
     elif envs.EXA_API_KEY.get():
         from sglang.srt.entrypoints.openai.tool_server import NativeToolServer
 
@@ -381,10 +381,10 @@ async def lifespan(fast_api_app: FastAPI):
         )
 
     # Execute custom warmups
-    if server_args.warmups is not None:
+    if get_serving().warmups is not None:
         await execute_warmups(
             get_disagg().disaggregation_mode,
-            server_args.warmups.split(","),
+            get_serving().warmups.split(","),
             _global_state.tokenizer_manager,
         )
         logger.info("Warmup ended")
@@ -397,7 +397,7 @@ async def lifespan(fast_api_app: FastAPI):
         if (
             getattr(fast_api_app, "is_single_tokenizer_mode", False)
             and get_serving().grpc_port is not None
-            and not (get_serving().smg_grpc_mode or server_args.grpc_mode)
+            and not (get_serving().smg_grpc_mode or get_serving().grpc_mode)
         ):
             grpc_handle = _start_native_grpc_server_for_runtime(
                 server_args=server_args,
@@ -406,7 +406,7 @@ async def lifespan(fast_api_app: FastAPI):
                 scheduler_info=_global_state.scheduler_info,
                 grpc_port=get_serving().grpc_port,
             )
-            if server_args.sidecar is not None:
+            if get_serving().sidecar is not None:
                 from sglang.srt.entrypoints.sidecar import start_sidecar
 
                 sidecar = start_sidecar()
@@ -1101,7 +1101,7 @@ async def attach_hicache_storage_backend(
 
     Only allowed when there are NO running / queued requests.
     """
-    if not _global_state.tokenizer_manager.server_args.admin_api_key:
+    if not get_serving().admin_api_key:
         return _admin_api_key_missing_response()
 
     ret = await _global_state.tokenizer_manager.attach_hicache_storage(
@@ -1133,7 +1133,7 @@ async def detach_hicache_storage_backend():
 
     Only allowed when there are NO running / queued requests.
     """
-    if not _global_state.tokenizer_manager.server_args.admin_api_key:
+    if not get_serving().admin_api_key:
         return _admin_api_key_missing_response()
 
     ret = await _global_state.tokenizer_manager.detach_hicache_storage()
@@ -1157,7 +1157,7 @@ async def detach_hicache_storage_backend():
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def hicache_storage_backend_status():
     """Get current HiCache storage backend status (tokenizer-side view)."""
-    if not _global_state.tokenizer_manager.server_args.admin_api_key:
+    if not get_serving().admin_api_key:
         return _admin_api_key_missing_response()
 
     return {
@@ -2203,8 +2203,8 @@ async def _send_disaggregation_warmup_requests(
 def _execute_server_warmup(server_args: ServerArgs):
     headers = {}
     url = server_args.url()
-    if server_args.api_key:
-        headers["Authorization"] = f"Bearer {server_args.api_key}"
+    if get_serving().api_key:
+        headers["Authorization"] = f"Bearer {get_serving().api_key}"
 
     ssl_verify = ssl_verify_of(server_args)
 
@@ -2235,12 +2235,12 @@ def _execute_server_warmup(server_args: ServerArgs):
     # disaggregation, but its local warmup must stay on the text path.
     is_vlm = (
         bool(model_info.get("has_image_understanding", False))
-        and not server_args.language_only
-        and not server_args.language_model_only
+        and not get_disagg().language_only
+        and not get_disagg().language_model_only
         and not is_mps()
     )
     if model_info["is_generation"]:
-        if is_vlm and not server_args.skip_tokenizer_init:
+        if is_vlm and not get_serving().skip_tokenizer_init:
             request_name = "/v1/chat/completions"
         else:
             request_name = "/generate"
@@ -2253,7 +2253,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             "max_new_tokens": max_new_tokens,
         },
     }
-    if server_args.skip_tokenizer_init:
+    if get_serving().skip_tokenizer_init:
         json_data["input_ids"] = [[10, 11, 12] for _ in range(get_parallel().dp_size)]
         # TODO Workaround the bug that embedding errors for list of size 1
         if get_parallel().dp_size == 1:
@@ -2306,10 +2306,10 @@ def _execute_server_warmup(server_args: ServerArgs):
             json_data["text"] = json_data["text"][0]
 
     # Config debug dumping
-    if server_args.debug_tensor_dump_input_file:
+    if get_observability().debug_tensor_dump_input_file:
         json_data.pop("text", None)
         json_data["input_ids"] = np.load(
-            server_args.debug_tensor_dump_input_file
+            get_observability().debug_tensor_dump_input_file
         ).tolist()
         json_data["sampling_params"]["max_new_tokens"] = 0
 
@@ -2373,7 +2373,7 @@ def _execute_server_warmup(server_args: ServerArgs):
 def _freeze_gc_after_server_warmup(server_args: ServerArgs):
     # Freeze GC after server warmup so static objects skip future GC gen2 collection.
     # Use /freeze_gc to freeze scheduler and detokenizer as well.
-    freeze_key = server_args.admin_api_key or server_args.api_key
+    freeze_key = get_serving().admin_api_key or get_serving().api_key
     freeze_headers = {}
     if freeze_key:
         freeze_headers["Authorization"] = f"Bearer {freeze_key}"
@@ -2394,7 +2394,7 @@ def _wait_and_warmup(
     launch_callback: Optional[Callable[[], None]] = None,
     execute_warmup_func: Callable = _execute_server_warmup,
 ):
-    if server_args.checkpoint_engine_wait_weights_before_ready:
+    if get_model().checkpoint_engine_wait_weights_before_ready:
         _wait_weights_ready()
 
     # Joiner schedulers are served through the primary after adoption.
@@ -2416,10 +2416,10 @@ def _wait_and_warmup(
     # The server is ready for requests
     logger.info("The server is fired up and ready to roll!")
 
-    if server_args.delete_ckpt_after_loading:
+    if get_model().delete_ckpt_after_loading:
         delete_directory(get_model().model_path)
 
-    if server_args.debug_tensor_dump_input_file:
+    if get_observability().debug_tensor_dump_input_file:
         kill_process_tree(os.getpid())
 
     if launch_callback is not None:
@@ -2559,7 +2559,7 @@ def _setup_and_run_http_server(
 
     # Pass additional arguments to the lifespan function.
     # They will be used for additional initialization setups.
-    if server_args.tokenizer_worker_num == 1:
+    if get_serving().tokenizer_worker_num == 1:
         # If it is single tokenizer mode, we can pass the arguments by attributes of the app object.
         app.is_single_tokenizer_mode = True
         app.server_args = server_args
@@ -2577,16 +2577,16 @@ def _setup_and_run_http_server(
         # - no keys: legacy had no restriction; ADMIN_FORCE endpoints must still be rejected when
         #   admin_api_key is not configured.
         if (
-            server_args.api_key
-            or server_args.admin_api_key
+            get_serving().api_key
+            or get_serving().admin_api_key
             or app_has_admin_force_endpoints(app)
         ):
             from sglang.srt.utils.auth import add_api_key_middleware
 
             add_api_key_middleware(
                 app,
-                api_key=server_args.api_key,
-                admin_api_key=server_args.admin_api_key,
+                api_key=get_serving().api_key,
+                admin_api_key=get_serving().admin_api_key,
             )
     else:
         # If it is multi-tokenizer mode, we need to write the arguments to shared memory
@@ -2605,15 +2605,15 @@ def _setup_and_run_http_server(
         # Update logging configs
         set_uvicorn_logging_configs(server_args)
 
-        if server_args.ssl_certfile:
+        if get_serving().ssl_certfile:
             logger.info(
-                f"SSL enabled: certfile={server_args.ssl_certfile}, "
-                f"keyfile={server_args.ssl_keyfile}"
+                f"SSL enabled: certfile={get_serving().ssl_certfile}, "
+                f"keyfile={get_serving().ssl_keyfile}"
             )
 
         # Listen for HTTP requests
-        if server_args.tokenizer_worker_num == 1:
-            if server_args.enable_http2:
+        if get_serving().tokenizer_worker_num == 1:
+            if get_serving().enable_http2:
                 logger.info(
                     f"Starting embedded Granian HTTP/2 server on "
                     f"{get_serving().host}:{get_serving().port}"
@@ -2624,32 +2624,32 @@ def _setup_and_run_http_server(
                     log_level=get_observability().log_level_http
                     or get_observability().log_level,
                     http2_max_concurrent_streams=(
-                        server_args.http2_max_concurrent_streams
+                        get_serving().http2_max_concurrent_streams
                     ),
                     http2_initial_connection_window_size=(
-                        server_args.http2_initial_connection_window_size
+                        get_serving().http2_initial_connection_window_size
                     ),
-                    ssl_certfile=server_args.ssl_certfile,
-                    ssl_keyfile=server_args.ssl_keyfile,
-                    ssl_ca_certs=server_args.ssl_ca_certs,
-                    ssl_keyfile_password=server_args.ssl_keyfile_password,
+                    ssl_certfile=get_serving().ssl_certfile,
+                    ssl_keyfile=get_serving().ssl_keyfile,
+                    ssl_ca_certs=get_serving().ssl_ca_certs,
+                    ssl_keyfile_password=get_serving().ssl_keyfile_password,
                     ssl_verify=False,  # No MTLS supported for now.
                 )
-            elif server_args.enable_ssl_refresh:
+            elif get_serving().enable_ssl_refresh:
                 # Use Config/Server API for access to the SSLContext.
                 config = uvicorn.Config(
                     app,
                     host=get_serving().host,
                     port=get_serving().port,
-                    root_path=server_args.fastapi_root_path,
+                    root_path=get_serving().fastapi_root_path,
                     log_level=get_observability().log_level_http
                     or get_observability().log_level,
                     timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
                     loop="uvloop",
-                    ssl_keyfile=server_args.ssl_keyfile,
-                    ssl_certfile=server_args.ssl_certfile,
-                    ssl_ca_certs=server_args.ssl_ca_certs,
-                    ssl_keyfile_password=server_args.ssl_keyfile_password,
+                    ssl_keyfile=get_serving().ssl_keyfile,
+                    ssl_certfile=get_serving().ssl_certfile,
+                    ssl_ca_certs=get_serving().ssl_ca_certs,
+                    ssl_keyfile_password=get_serving().ssl_keyfile_password,
                 )
                 config.load()  # Creates the SSLContext
 
@@ -2660,9 +2660,9 @@ def _setup_and_run_http_server(
                 async def _run_with_ssl_refresh():
                     refresher = SSLCertRefresher(
                         config.ssl,
-                        server_args.ssl_keyfile,
-                        server_args.ssl_certfile,
-                        server_args.ssl_ca_certs,
+                        get_serving().ssl_keyfile,
+                        get_serving().ssl_certfile,
+                        get_serving().ssl_ca_certs,
                     )
                     logger.info("SSL certificate auto-refresh enabled.")
                     try:
@@ -2679,15 +2679,15 @@ def _setup_and_run_http_server(
                     app,
                     host=get_serving().host,
                     port=get_serving().port,
-                    root_path=server_args.fastapi_root_path,
+                    root_path=get_serving().fastapi_root_path,
                     log_level=get_observability().log_level_http
                     or get_observability().log_level,
                     timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
                     loop="uvloop",
-                    ssl_keyfile=server_args.ssl_keyfile,
-                    ssl_certfile=server_args.ssl_certfile,
-                    ssl_ca_certs=server_args.ssl_ca_certs,
-                    ssl_keyfile_password=server_args.ssl_keyfile_password,
+                    ssl_keyfile=get_serving().ssl_keyfile,
+                    ssl_certfile=get_serving().ssl_certfile,
+                    ssl_ca_certs=get_serving().ssl_ca_certs,
+                    ssl_keyfile_password=get_serving().ssl_keyfile_password,
                 )
         else:
             # Multiple tokenizer and http processes
@@ -2699,14 +2699,14 @@ def _setup_and_run_http_server(
                 "propagate": False,
             }
 
-            if server_args.enable_ssl_refresh:
+            if get_serving().enable_ssl_refresh:
                 logger.warning(
                     "--enable-ssl-refresh is not supported with multiple "
                     "tokenizer workers (--tokenizer-worker-num > 1). "
                     "SSL refresh will be disabled."
                 )
 
-            if server_args.enable_http2:
+            if get_serving().enable_http2:
                 logger.info(
                     f"Starting embedded Granian HTTP/2 server on "
                     f"{get_serving().host}:{get_serving().port}"
@@ -2717,36 +2717,36 @@ def _setup_and_run_http_server(
                     log_level=get_observability().log_level_http
                     or get_observability().log_level,
                     http2_max_concurrent_streams=(
-                        server_args.http2_max_concurrent_streams
+                        get_serving().http2_max_concurrent_streams
                     ),
                     http2_initial_connection_window_size=(
-                        server_args.http2_initial_connection_window_size
+                        get_serving().http2_initial_connection_window_size
                     ),
-                    tokenizer_worker_num=server_args.tokenizer_worker_num,
-                    ssl_certfile=server_args.ssl_certfile,
-                    ssl_keyfile=server_args.ssl_keyfile,
-                    ssl_ca_certs=server_args.ssl_ca_certs,
-                    ssl_keyfile_password=server_args.ssl_keyfile_password,
+                    tokenizer_worker_num=get_serving().tokenizer_worker_num,
+                    ssl_certfile=get_serving().ssl_certfile,
+                    ssl_keyfile=get_serving().ssl_keyfile,
+                    ssl_ca_certs=get_serving().ssl_ca_certs,
+                    ssl_keyfile_password=get_serving().ssl_keyfile_password,
                 )
             else:
                 uvicorn.run(
                     "sglang.srt.entrypoints.http_server:app",
                     host=get_serving().host,
                     port=get_serving().port,
-                    root_path=server_args.fastapi_root_path,
+                    root_path=get_serving().fastapi_root_path,
                     log_level=get_observability().log_level_http
                     or get_observability().log_level,
                     timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
                     timeout_worker_healthcheck=envs.SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT.get(),
                     loop="uvloop",
-                    workers=server_args.tokenizer_worker_num,
-                    ssl_keyfile=server_args.ssl_keyfile,
-                    ssl_certfile=server_args.ssl_certfile,
-                    ssl_ca_certs=server_args.ssl_ca_certs,
-                    ssl_keyfile_password=server_args.ssl_keyfile_password,
+                    workers=get_serving().tokenizer_worker_num,
+                    ssl_keyfile=get_serving().ssl_keyfile,
+                    ssl_certfile=get_serving().ssl_certfile,
+                    ssl_ca_certs=get_serving().ssl_ca_certs,
+                    ssl_keyfile_password=get_serving().ssl_keyfile_password,
                 )
     finally:
-        if server_args.tokenizer_worker_num > 1:
+        if get_serving().tokenizer_worker_num > 1:
             if multi_tokenizer_args_shm is not None:
                 multi_tokenizer_args_shm.unlink()
             if _global_state is not None:

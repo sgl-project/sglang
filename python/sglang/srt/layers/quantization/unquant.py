@@ -161,7 +161,7 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
     global _flashinfer_pr4266_run_direct_dense
     global _enable_bf16_splitk_gemm
 
-    backend_str = server_args.bf16_gemm_backend
+    backend_str = get_exec().kernel.bf16_gemm_backend
     if backend_str == "auto" and get_platform().is_sm100:
         backend_str = (
             "torch"

@@ -20,7 +20,9 @@ from sglang.srt.managers.multimodal_processor import (  # noqa: E402
     get_mm_processor_cls,
     import_processors,
 )
+from sglang.srt.runtime_context import publish
 from sglang.srt.rust_server.multimodal import rust_mm_family_for  # noqa: E402
+from sglang.srt.server_args import ServerArgs
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -28,7 +30,10 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 def processor_cls_for(architecture, model_type):
     """Through the production selection, as `resolve_spec` calls it."""
     hf_config = SimpleNamespace(architectures=[architecture], model_type=model_type)
-    return get_mm_processor_cls(hf_config, SimpleNamespace(model_impl="sglang"))
+    # `model_impl` is read from the bags now, so it has to be published rather
+    # than handed over on a stand-in.
+    publish(ServerArgs(model_path="dummy", model_impl="sglang"), role="tokenizer")
+    return get_mm_processor_cls(hf_config, None)
 
 
 class TestRustMmGate(CustomTestCase):

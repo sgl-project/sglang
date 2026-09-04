@@ -317,7 +317,7 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Initialize ZMQ sockets
         context = zmq.Context(2)
-        if self.server_args.node_rank == 0:
+        if get_parallel().node_rank == 0:
             self.send_to_rpc = get_zmq_socket(
                 context, zmq.DEALER, self.port_args.rpc_ipc_name, True
             )
@@ -1538,7 +1538,7 @@ class Engine(EngineScoreMixin, EngineBase):
         else:
             return [
                 MultiprocessingSerializer.serialize(tensors)
-                for _ in range(self.server_args.tp_size)
+                for _ in range(get_parallel().tp_size)
             ]
 
     def load_lora_adapter_from_tensors(

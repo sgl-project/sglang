@@ -8,6 +8,7 @@ import torch
 from sglang.srt.arg_groups.serving_hook import ssl_verify_of
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.entrypoints.http_server import launch_server
+from sglang.srt.runtime_context import get_parallel, get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
 
@@ -32,7 +33,7 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
             try:
                 headers = {
                     "Content-Type": "application/json; charset=utf-8",
-                    "Authorization": f"Bearer {server_args.api_key}",
+                    "Authorization": f"Bearer {get_serving().api_key}",
                 }
                 response = session.get(
                     f"{base_url}/health_generate", headers=headers, verify=ssl_verify
@@ -61,7 +62,7 @@ class HttpServerEngineAdapter(EngineBase):
     def __init__(self, **kwargs):
         self.server_args = ServerArgs(**kwargs)
         print(
-            f"Launch HttpServerEngineAdapter at: {self.server_args.host}:{self.server_args.port}"
+            f"Launch HttpServerEngineAdapter at: {get_serving().host}:{get_serving().port}"
         )
         self.process = launch_server_process(self.server_args)
 
@@ -97,7 +98,7 @@ class HttpServerEngineAdapter(EngineBase):
             {
                 "serialized_named_tensors": [
                     MultiprocessingSerializer.serialize(named_tensors, output_str=True)
-                    for _ in range(self.server_args.tp_size)
+                    for _ in range(get_parallel().tp_size)
                 ],
                 "load_format": load_format,
                 "flush_cache": flush_cache,

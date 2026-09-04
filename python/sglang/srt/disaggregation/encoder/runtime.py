@@ -50,6 +50,7 @@ from sglang.srt.observability.trace import (
     trace_set_thread_info,
 )
 from sglang.srt.runtime_context import (
+    get_device,
     get_observability,
     get_parallel,
     get_serving,
@@ -1616,7 +1617,7 @@ def launch_dp_runtime(server_args: ServerArgs) -> DPDispatcher:
     atexit.register(_kill_workers)
 
     for dp_rank in range(dp_size):
-        gpu_id = server_args.base_gpu_id + dp_rank
+        gpu_id = get_device().base_gpu_id + dp_rank
         # Pin the device parent-side around spawn (same convention as the
         # scheduler launcher and DP controller) so the child inherits
         # CUDA_VISIBLE_DEVICES from its first instruction, before any import
@@ -1638,8 +1639,8 @@ def launch_dp_runtime(server_args: ServerArgs) -> DPDispatcher:
         worker_processes.append(process)
 
     labels = {"model_name": get_serving().served_model_name}
-    if server_args.extra_metric_labels:
-        labels.update(server_args.extra_metric_labels)
+    if get_observability().extra_metric_labels:
+        labels.update(get_observability().extra_metric_labels)
     return DPDispatcher(
         dp_size,
         dispatch_sockets,
