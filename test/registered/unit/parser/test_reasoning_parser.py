@@ -16,6 +16,7 @@ from sglang.srt.parser.reasoning_parser import (
     KimiK2Detector,
     Ling3Detector,
     Nemotron3Detector,
+    Plamo3Detector,
     Qwen3Detector,
     ReasoningParser,
 )
@@ -751,6 +752,9 @@ class TestReasoningParser(CustomTestCase):
         parser = ReasoningParser("gemma4")
         self.assertIsInstance(parser.detector, Gemma4Detector)
 
+        parser = ReasoningParser("plamo3")
+        self.assertIsInstance(parser.detector, Plamo3Detector)
+
     def test_init_invalid_model(self):
         """Test initialization with invalid model type."""
         with self.assertRaises(ValueError) as context:
@@ -896,6 +900,103 @@ class TestReasoningParser(CustomTestCase):
 
         self.assertEqual(all_reasoning, "reasoning")
         self.assertEqual(all_normal, "<|tool_calls_section_begin|><|tool_call_begin|>")
+
+    def test_plamo3_reasoning_and_tool_interruption(self):
+        """Test PLaMo3 reasoning tokens and tool interruption."""
+        parser = ReasoningParser("plamo3")
+        reasoning, normal = parser.parse_non_stream(
+            "<|plamo:begin_think:plamo|>thinking<|plamo:end_think:plamo|>answer"
+        )
+        self.assertEqual(reasoning, "thinking")
+        self.assertEqual(normal, "answer")
+
+        parser = ReasoningParser("plamo3")
+        reasoning, normal = parser.parse_non_stream(
+            "<|plamo:begin_think:plamo|>thinking"
+            "<|plamo:begin_tool_requests:plamo|>{}"
+        )
+        self.assertEqual(reasoning, "thinking")
+        self.assertEqual(normal, "<|plamo:begin_tool_requests:plamo|>{}")
+
+        parser = ReasoningParser("plamo3")
+        chunks = [
+            "<|plamo:begin_think:plamo|>",
+            "reasoning",
+            "<|plamo:end_think:plamo|>",
+            "answer",
+        ]
+        all_reasoning = ""
+        all_normal = ""
+        for chunk in chunks:
+            reasoning, normal = parser.parse_stream_chunk(chunk)
+            all_reasoning += reasoning
+            all_normal += normal
+
+        self.assertEqual(all_reasoning, "reasoning")
+        self.assertEqual(all_normal, "answer")
+
+    def test_plamo3_reasoning_markers_split_across_chunks(self):
+        parser = ReasoningParser("plamo3")
+        chunks = [
+            "<|plamo:begin_",
+            "think",
+            ":plamo|>",
+            "reasoning",
+            "<|plamo:end_",
+            "think",
+            ":plamo|>",
+            "answer",
+        ]
+        all_reasoning = ""
+        all_normal = ""
+        for chunk in chunks:
+            reasoning, normal = parser.parse_stream_chunk(chunk)
+            all_reasoning += reasoning
+            all_normal += normal
+
+        self.assertEqual(all_reasoning, "reasoning")
+        self.assertEqual(all_normal, "answer")
+
+    def test_plamo3_tool_interruption_marker_split_across_chunks(self):
+        parser = ReasoningParser("plamo3")
+        chunks = [
+            "<|plamo:begin_think:plamo|>",
+            "reasoning",
+            "<|plamo:begin_tool_",
+            "requests",
+            ":plamo|>",
+            "tool_requests",
+        ]
+        all_reasoning = ""
+        all_normal = ""
+        for chunk in chunks:
+            reasoning, normal = parser.parse_stream_chunk(chunk)
+            all_reasoning += reasoning
+            all_normal += normal
+
+        self.assertEqual(all_reasoning, "reasoning")
+        self.assertEqual(
+            all_normal,
+            "<|plamo:begin_tool_requests:plamo|>tool_requests",
+        )
+
+    def test_plamo3_force_nonempty_content_via_chat_template_kwargs(self):
+        from sglang.srt.entrypoints.openai.protocol import (
+            ChatCompletionMessageUserParam,
+            ChatCompletionRequest,
+        )
+
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[ChatCompletionMessageUserParam(role="user", content="Hi")],
+            chat_template_kwargs={"force_nonempty_content": True},
+        )
+        parser = ReasoningParser("plamo3", request=request)
+        reasoning, normal = parser.parse_non_stream(
+            "<|plamo:begin_think:plamo|>only reasoning<|plamo:end_think:plamo|>"
+        )
+        self.assertEqual(reasoning, "")
+        self.assertEqual(normal, "only reasoning")
 
 
 class TestIntegrationScenarios(CustomTestCase):
