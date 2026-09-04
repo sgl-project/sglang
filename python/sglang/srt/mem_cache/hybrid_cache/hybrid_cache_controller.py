@@ -1054,9 +1054,7 @@ class HybridCacheController(BaseHiCacheController):
             return hash_value, kv_hit_pages * self.page_size
 
         extra_info = HiCacheStorageExtraInfo(
-            prefix_keys=operation.prefix_keys.copy()
-            if operation.prefix_keys
-            else None,
+            prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None,
             extra_info={
                 "request_id": operation.request_id,
                 **({"pp_rank": pp_rank} if pp_rank is not None else {}),
