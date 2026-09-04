@@ -16,6 +16,7 @@ import unittest
 from array import array
 from types import SimpleNamespace
 
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session
 from sglang.test.test_utils import CustomTestCase
@@ -123,6 +124,29 @@ class TestSessionTokenShare(CustomTestCase):
         r4 = self._create("r4", [70])
         self.assertEqual(list(r4.origin_input_ids), in1 + out1 + [70])
         self.assertEqual(list(r4.full_untruncated_fill_ids), list(r4.origin_input_ids))
+
+    def test_overlapping_turn_does_not_release_active_request(self):
+        in1, out1 = list(range(400, 410)), [1, 2, 3]
+        r1 = self._create("r1", in1)
+        self._decode_and_finish(r1, out1)
+
+        # Turn 2 owns the session until it finishes or is explicitly aborted.
+        self._create("r2", [50, 51])
+        self.assertTrue(self.session._inflight)
+
+        # Rejecting an overlapping turn must not let scheduler-side pre-abort
+        # cleanup clear turn 2's ownership of the session.
+        with get_parallel().override(tp_size=1, tp_rank=0):
+            r3 = self._create("r3", [60])
+        self.assertIsNotNone(r3.to_finish)
+        self.assertIsNone(r3.session)
+        self.assertTrue(self.session._inflight)
+
+        # Once turn 2 is aborted, the next request resumes from the last
+        # committed turn; neither rejected attempt is retained.
+        self.session.abort_req()
+        r4 = self._create("r4", [70])
+        self.assertEqual(list(r4.origin_input_ids), in1 + out1 + [70])
 
     def test_first_turn_abort(self):
         self._create("r1", [1, 2, 3])
