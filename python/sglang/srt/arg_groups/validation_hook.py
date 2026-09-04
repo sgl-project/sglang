@@ -18,10 +18,40 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
     parse_ib_device_config,
 )
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.sampling.watermark_config import parse_watermark_key
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
+
+
+def check_watermark_server_args(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if (cfg.watermark_key is not None or cfg.watermark_config is not None) and not (
+        cfg.enable_watermark
+    ):
+        raise ValueError(
+            "--watermark-key and --watermark-config require --enable-watermark"
+        )
+
+    if not cfg.enable_watermark:
+        return
+
+    if cfg.device != "cuda":
+        raise ValueError(
+            f"--enable-watermark requires --device cuda, got {cfg.device!r}"
+        )
+    if cfg.watermark_key is not None:
+        parse_watermark_key(cfg.watermark_key)
+    if cfg.watermark_context_window < 1:
+        raise ValueError(
+            "--watermark-context-window must be at least 1, "
+            f"got {cfg.watermark_context_window!r}"
+        )
+    if cfg.enable_custom_logit_processor:
+        raise ValueError(
+            "--enable-watermark is incompatible with --enable-custom-logit-processor"
+        )
 
 
 def check_server_args(server_args: Any):
@@ -228,32 +258,7 @@ def check_server_args(server_args: Any):
             "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
         )
 
-    if (cfg.watermark_key is not None or cfg.watermark_config is not None) and not (
-        cfg.enable_watermark
-    ):
-        raise ValueError(
-            "--watermark-key and --watermark-config require --enable-watermark"
-        )
-
-    if cfg.enable_watermark:
-        from sglang.srt.sampling.watermark_config import parse_watermark_key
-
-        if cfg.device != "cuda":
-            raise ValueError(
-                f"--enable-watermark requires --device cuda, got {cfg.device!r}"
-            )
-        if cfg.watermark_key is not None:
-            parse_watermark_key(cfg.watermark_key)
-        if cfg.watermark_context_window < 1:
-            raise ValueError(
-                "--watermark-context-window must be at least 1, "
-                f"got {cfg.watermark_context_window!r}"
-            )
-        if cfg.enable_custom_logit_processor:
-            raise ValueError(
-                "--enable-watermark is incompatible with "
-                "--enable-custom-logit-processor"
-            )
+    check_watermark_server_args(server_args)
 
     check_load_publish_args(server_args)
 

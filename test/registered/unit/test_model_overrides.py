@@ -104,6 +104,8 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "enable_symm_mem",
                     "speculative_attention_mode",
                     "speculative_draft_attention_backend",
+                    "watermark_context_window",
+                    "watermark_key",
                 }
             ),
         )
