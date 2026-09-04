@@ -343,6 +343,7 @@ class TestTopologyAwarePlacement(CustomTestCase):
                     ep_size=2,
                     tp_size=2,
                     ep_dispatch_algorithm="dynamic",
+                    ep_join_mode=None,
                     moe_a2a_backend="flashinfer",
                     deepep_mode="auto",
                 )
