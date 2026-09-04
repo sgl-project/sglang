@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import random
 from collections import deque
 from contextlib import nullcontext
@@ -48,6 +49,7 @@ if is_npu():
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 _IS_HIP = is_hip()
+logger = logging.getLogger(__name__)
 
 
 def poll_and_all_reduce_pp(
@@ -173,13 +175,21 @@ def unified_memory_disagg_move_gate(scheduler):
 
 
 def should_bypass_dsa_cp_prefix_cache() -> bool:
-    """Bypass prefix cache under DSA Prefill CP until CP-aware radix resharding
-    exists; without it, cache hits let attention read non-local page rows."""
-    return (
+    """Default to bypassing DSA Prefill CP prefix cache without radix resharding."""
+    needs_resharding = (
         get_disagg().disaggregation_mode == DisaggregationMode.PREFILL.value
         and get_parallel().attn_cp_size > 1
         and get_parallel().enable_dsa_prefill_context_parallel
     )
+    if needs_resharding and envs.SGLANG_ENABLE_EXPERIMENTAL_DSA_CP_RADIX_CACHE.get():
+        logger.warning(
+            "Experimental DSA CP prefix caching: the automatic PD Prefill cache "
+            "bypass is disabled. CP-aware radix resharding is not implemented; "
+            "cache hits may read non-local KV rows and produce incorrect outputs. "
+            "Explicit --disable-radix-cache still takes precedence."
+        )
+        return False
+    return needs_resharding
 
 
 #########################
