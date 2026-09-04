@@ -2802,6 +2802,15 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        # Re-validate requests that bypass the tokenizer manager.
+        try:
+            req.sampling_params.verify(self.model_config.vocab_size)
+        except (TypeError, ValueError, OverflowError) as exc:
+            req.set_finish_with_abort(f"Invalid sampling parameters: {exc}")
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
         self._maybe_namespace_elastic_radix_cache(req)
 
         if mm_input_error is not None:
