@@ -129,7 +129,9 @@ class TestNorm:
         torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
 
         ref_x = x.clone()
-        residual = torch.randn([batch_size, hidden_size], dtype=dtype)
+        residual = make_non_contiguous(
+            torch.randn([batch_size, hidden_size], dtype=dtype)
+        )
         ref_residual = residual.clone()
 
         torch.ops.sgl_kernel.gemma_fused_add_rmsnorm_cpu(x, residual, weight, eps)

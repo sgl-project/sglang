@@ -1,9 +1,14 @@
 import unittest
+from unittest import mock
 
 import sgl_kernel  # noqa: F401
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
+from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+    fused_mamba_state_scatter_with_mask,
+)
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, organize_draft_results
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.cpu_test_utils import precision
@@ -143,6 +148,32 @@ def _run_build_tree_kernel(
         retrieve_next_token,
         retrieve_next_sibling,
     )
+
+
+def _ref_parents_from_mask(tree_mask, bs, draft_token_num):
+    """Reference parent table from the QLEN_ONLY tree mask: a token's mask row
+    marks its whole ancestor chain, whose deepest member (BFS numbering: the
+    largest index) is the parent. Independent of the retrieve_* link walk the
+    kernels use."""
+    mask = tree_mask.view(bs, draft_token_num, draft_token_num)
+    parents = torch.zeros(bs, draft_token_num, dtype=torch.int64)
+    for b in range(bs):
+        for t in range(1, draft_token_num):
+            ancestors = [j for j in range(t) if mask[b, t, j]]
+            parents[b, t] = max(ancestors)
+    return parents
+
+
+def _ref_state_scatter_with_mask(dst, src, dst_indices_raw, step_indices_raw):
+    """Advanced-indexing reference: commit one step per request, skipping the
+    padded requests, which carry a negative step or a negative slot."""
+    valid = (step_indices_raw >= 0) & (dst_indices_raw >= 0)
+    if not valid.any():
+        return
+    requests = valid.nonzero(as_tuple=True)[0]
+    dst[:, dst_indices_raw[requests].long()] = src[
+        :, requests, step_indices_raw[requests].long()
+    ]
 
 
 def _ref_verify_tree_greedy(
@@ -1496,6 +1527,792 @@ class TestBuildDraftDecodeMetadata(CustomTestCase):
         for num_steps in [1, 2, 3]:
             with self.subTest(num_steps=num_steps):
                 self._run_and_check(seq_lens, 4, num_steps, pool_len=64, num_reqs=6)
+
+
+class TestFusedSigmoidGatingDeltaRuleVerify(CustomTestCase):
+    def setUp(self):
+        torch.manual_seed(1234)
+
+    def test_target_verify_multi_token(self):
+        # varlen multi-token verify: B=2 sequences of T=4 draft tokens each
+        B, T = 2, 4
+        HK, HV, K, V = 2, 4, 32, 32
+        total_tokens = B * T
+        num_slots, cache_size = 6, 4
+        dtype = torch.bfloat16
+
+        q = torch.rand(1, total_tokens, HK, K, dtype=dtype) * 0.1
+        k = torch.rand(1, total_tokens, HK, K, dtype=dtype) * 0.1
+        v = torch.rand(1, total_tokens, HV, V, dtype=dtype) * 0.1
+        # a/b are 2-D [tokens, HV] in verify mode (per-token gating)
+        a = torch.rand(total_tokens, HV, dtype=dtype) * 0.1
+        b = torch.rand(total_tokens, HV, dtype=dtype) * 0.1
+        dt_bias = torch.rand(HV, dtype=dtype) * 0.1
+        cu_seqlens = torch.tensor([0, T, 2 * T], dtype=torch.int32)
+        ssm_states_init = torch.rand(num_slots, HV, K, V, dtype=torch.float32) * 0.05
+        cache_indices = torch.tensor([5, 1], dtype=torch.int32)
+        # Index tensors may be longer than the sequence count (the GDN backend
+        # passes an arange over the whole state pool); only the first B entries
+        # are read -- the out-of-range tail values are canaries.
+        intermediate_state_indices = torch.tensor([2, 0, 7, 9], dtype=torch.int32)
+
+        for A_log_dtype in [torch.float32, torch.bfloat16]:
+            with self.subTest(A_log_dtype=A_log_dtype):
+                A_log = (torch.rand(HV, dtype=torch.float32) * 0.1).to(A_log_dtype)
+                ssm_states = ssm_states_init.clone()
+                intermediate_states_buffer = torch.zeros(
+                    cache_size, T, HV, K, V, dtype=torch.float32
+                )
+                core_attn_out = (
+                    torch.ops.sgl_kernel.fused_sigmoid_gating_delta_rule_update_cpu(
+                        A_log=A_log,
+                        dt_bias=dt_bias,
+                        q=q,
+                        k=k,
+                        v=v,
+                        a=a,
+                        b=b,
+                        initial_state_source=ssm_states,
+                        initial_state_indices=cache_indices,
+                        cu_seqlens=cu_seqlens,
+                        use_qk_l2norm_in_kernel=True,
+                        softplus_beta=1.0,
+                        softplus_threshold=20.0,
+                        is_kda=False,
+                        disable_state_update=True,
+                        intermediate_states_buffer=intermediate_states_buffer,
+                        intermediate_state_indices=intermediate_state_indices,
+                        cache_steps=T,
+                    )
+                )
+
+                # disable_state_update must leave the ssm state pool untouched
+                self.assertTrue(torch.equal(ssm_states, ssm_states_init))
+
+                out_ref, buffer_ref = self._ref_delta_rule_verify(
+                    q,
+                    k,
+                    v,
+                    a,
+                    b,
+                    A_log,
+                    dt_bias,
+                    ssm_states_init,
+                    cache_indices,
+                    cu_seqlens,
+                    intermediate_state_indices,
+                    cache_size,
+                )
+                atol = rtol = precision[torch.bfloat16]
+                torch.testing.assert_close(
+                    core_attn_out.float(), out_ref, atol=atol, rtol=rtol
+                )
+                torch.testing.assert_close(
+                    intermediate_states_buffer, buffer_ref, atol=1e-3, rtol=1e-3
+                )
+
+    def _ref_delta_rule_verify(
+        self,
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        ssm_states,
+        cache_indices,
+        cu_seqlens,
+        intermediate_state_indices,
+        cache_size,
+        parents=None,
+    ):
+        # Sequential pure-python delta rule with sigmoid gating, fp32 math.
+        # With `parents` (tree verify), each step starts from its parent's
+        # cached state instead of the running one.
+        _, total_tokens, HK, K = q.shape
+        HV, V = v.shape[2], v.shape[3]
+        T = int(cu_seqlens[1])
+        group_size = HV // HK
+        scale = 1.0 / (K**0.5)
+        eps = 1e-5  # kernel l2norm epsilon
+
+        qf = q[0].float()
+        kf = k[0].float()
+        qn = qf * (qf.pow(2).sum(-1, keepdim=True) + eps).rsqrt()
+        kn = kf * (kf.pow(2).sum(-1, keepdim=True) + eps).rsqrt()
+        g = -A_log.float().exp() * F.softplus(
+            a.float() + dt_bias.float()
+        )  # [tokens, HV]
+        beta = b.float().sigmoid()
+
+        out = torch.zeros(1, total_tokens, HV, V, dtype=torch.float32)
+        buffer_ref = torch.zeros(cache_size, T, HV, K, V, dtype=torch.float32)
+        num_sequences = cu_seqlens.numel() - 1
+        for n in range(num_sequences):
+            bos = int(cu_seqlens[n])
+            seq_len = int(cu_seqlens[n + 1]) - bos
+            buf_idx = int(intermediate_state_indices[n])
+            for hv in range(HV):
+                h = ssm_states[int(cache_indices[n]), hv].clone()  # [K, V]
+                hk = hv // group_size
+                for t in range(seq_len):
+                    pos = bos + t
+                    if parents is not None and t > 0:
+                        h = buffer_ref[buf_idx, int(parents[n, t]), hv].clone()
+                    h = h * g[pos, hv].exp()
+                    kv_mem = (h * kn[pos, hk].unsqueeze(-1)).sum(dim=0)  # [V]
+                    delta = (v[0, pos, hv].float() - kv_mem) * beta[pos, hv]
+                    h = h + kn[pos, hk].unsqueeze(-1) * delta.unsqueeze(0)
+                    out[0, pos, hv] = (h * qn[pos, hk].unsqueeze(-1)).sum(0) * scale
+                    buffer_ref[buf_idx, t, hv] = h
+        return out, buffer_ref
+
+    def test_target_verify_tree_topk4(self):
+        # EAGLE tree verify: B=2 random topk=4 trees of T=8 draft tokens; each
+        # draft's initial state is its parent's cached state, not the previous
+        # draft's.
+        topk, num_steps = 4, 3
+        B, T = 2, 8
+        HK, HV, K, V = 2, 4, 32, 32
+        total_tokens = B * T
+        num_slots, cache_size = 6, 4
+        dtype = torch.bfloat16
+
+        parent_list, selected_index = _gen_draft_tree(B, topk, num_steps, T)
+        seq_lens = torch.randint(4, 32, (B,), dtype=torch.int64)
+        tree_mask, _, _, _, _ = _run_build_tree_kernel(
+            parent_list,
+            selected_index,
+            seq_lens,
+            topk,
+            num_steps,
+            T,
+            TreeMaskMode.QLEN_ONLY,
+        )
+        parents = _ref_parents_from_mask(tree_mask, B, T)
+        self.assertGreater(int((parents[:, 1:] != torch.arange(1, T) - 1).sum()), 0)
+
+        q = torch.rand(1, total_tokens, HK, K, dtype=dtype) * 0.1
+        k = torch.rand(1, total_tokens, HK, K, dtype=dtype) * 0.1
+        v = torch.rand(1, total_tokens, HV, V, dtype=dtype) * 0.1
+        a = torch.rand(total_tokens, HV, dtype=dtype) * 0.1
+        b = torch.rand(total_tokens, HV, dtype=dtype) * 0.1
+        A_log = torch.rand(HV, dtype=torch.float32) * 0.1
+        dt_bias = torch.rand(HV, dtype=dtype) * 0.1
+        cu_seqlens = torch.tensor([0, T, 2 * T], dtype=torch.int32)
+        ssm_states_init = torch.rand(num_slots, HV, K, V, dtype=torch.float32) * 0.05
+        cache_indices = torch.tensor([5, 1], dtype=torch.int32)
+        intermediate_state_indices = torch.tensor([2, 0, 7, 9], dtype=torch.int32)
+
+        ssm_states = ssm_states_init.clone()
+        intermediate_states_buffer = torch.zeros(
+            cache_size, T, HV, K, V, dtype=torch.float32
+        )
+        core_attn_out = torch.ops.sgl_kernel.fused_sigmoid_gating_delta_rule_update_cpu(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            initial_state_source=ssm_states,
+            initial_state_indices=cache_indices,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=True,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            is_kda=False,
+            disable_state_update=True,
+            intermediate_states_buffer=intermediate_states_buffer,
+            intermediate_state_indices=intermediate_state_indices,
+            cache_steps=T,
+            retrieve_parent_token=parents,
+        )
+
+        self.assertTrue(torch.equal(ssm_states, ssm_states_init))
+
+        out_ref, buffer_ref = self._ref_delta_rule_verify(
+            q,
+            k,
+            v,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            ssm_states_init,
+            cache_indices,
+            cu_seqlens,
+            intermediate_state_indices,
+            cache_size,
+            parents=parents,
+        )
+        atol = rtol = precision[torch.bfloat16]
+        torch.testing.assert_close(core_attn_out.float(), out_ref, atol=atol, rtol=rtol)
+        torch.testing.assert_close(
+            intermediate_states_buffer, buffer_ref, atol=1e-3, rtol=1e-3
+        )
+
+    def test_pad_slot_starts_from_zero_and_commits_nothing(self):
+        # A padded row carries state slot -1 while its intermediate index still
+        # points at the pool's discard row. The row owns no state: it starts
+        # from zeros and writes none back, as the CUDA kernel does.
+        B, T = 2, 3
+        HK, HV, K, V = 2, 4, 32, 32
+        total_tokens = B * T
+        num_slots, cache_size = 4, 3
+        dtype = torch.bfloat16
+
+        q = torch.rand(1, total_tokens, HK, K, dtype=dtype) * 0.1
+        k = torch.rand(1, total_tokens, HK, K, dtype=dtype) * 0.1
+        v = torch.rand(1, total_tokens, HV, V, dtype=dtype) * 0.1
+        a = torch.rand(total_tokens, HV, dtype=dtype) * 0.1
+        b = torch.rand(total_tokens, HV, dtype=dtype) * 0.1
+        A_log = torch.rand(HV, dtype=torch.float32) * 0.1
+        dt_bias = torch.rand(HV, dtype=dtype) * 0.1
+        cu_seqlens = torch.tensor([0, T, 2 * T], dtype=torch.int32)
+        cache_indices = torch.tensor([2, -1], dtype=torch.int32)
+        intermediate_state_indices = torch.tensor([1, 2], dtype=torch.int32)
+
+        # The pool sits behind a guard slot, so a write through slot -1 lands
+        # in the guard instead of in memory this test does not own.
+        pool_init = torch.rand(num_slots + 1, HV, K, V, dtype=torch.float32) * 0.05
+
+        # the padded row's reference state is zeros, not the guard slot
+        ref_states = torch.cat(
+            [pool_init[1:], torch.zeros(1, HV, K, V, dtype=torch.float32)]
+        )
+        ref_indices = torch.tensor([2, num_slots], dtype=torch.int32)
+        out_ref, buffer_ref = self._ref_delta_rule_verify(
+            q,
+            k,
+            v,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            ref_states,
+            ref_indices,
+            cu_seqlens,
+            intermediate_state_indices,
+            cache_size,
+        )
+
+        atol = rtol = precision[dtype]
+        for disable_state_update in [True, False]:
+            with self.subTest(disable_state_update=disable_state_update):
+                pool = pool_init.clone()
+                ssm_states = pool[1:]
+                intermediate_states_buffer = torch.zeros(
+                    cache_size, T, HV, K, V, dtype=torch.float32
+                )
+                core_attn_out = (
+                    torch.ops.sgl_kernel.fused_sigmoid_gating_delta_rule_update_cpu(
+                        A_log=A_log,
+                        dt_bias=dt_bias,
+                        q=q,
+                        k=k,
+                        v=v,
+                        a=a,
+                        b=b,
+                        initial_state_source=ssm_states,
+                        initial_state_indices=cache_indices,
+                        cu_seqlens=cu_seqlens,
+                        use_qk_l2norm_in_kernel=True,
+                        disable_state_update=disable_state_update,
+                        intermediate_states_buffer=intermediate_states_buffer,
+                        intermediate_state_indices=intermediate_state_indices,
+                        cache_steps=T,
+                    )
+                )
+
+                torch.testing.assert_close(
+                    core_attn_out.float(), out_ref, atol=atol, rtol=rtol
+                )
+                torch.testing.assert_close(
+                    intermediate_states_buffer, buffer_ref, atol=1e-3, rtol=1e-3
+                )
+                # nothing may reach the guard slot, and only the one real
+                # sequence may update the pool
+                torch.testing.assert_close(pool[0], pool_init[0], atol=0, rtol=0)
+                for slot in range(1, num_slots + 1):
+                    updated = slot == 3 and not disable_state_update
+                    self.assertEqual(
+                        torch.equal(pool[slot], pool_init[slot]), not updated
+                    )
+
+
+class TestCausalConv1dUpdateMultiToken(CustomTestCase):
+    def setUp(self):
+        torch.manual_seed(1234)
+
+    def _ref_tree_conv(
+        self,
+        x,
+        conv_states,
+        weight,
+        bias,
+        parents,
+        conv_state_indices,
+        intermediate_state_indices,
+        cache_size,
+    ):
+        # Per-token convolution over the ancestor chain, fp32 math; walking
+        # past the root reads the committed history (newest column last).
+        batch, dim, seqlen = x.shape
+        width = weight.shape[1]
+        state_len = width - 1
+        out_ref = torch.empty_like(x)
+        window_ref = torch.zeros(cache_size, seqlen, dim, state_len, dtype=x.dtype)
+        for b in range(batch):
+            hist = conv_states[int(conv_state_indices[b])].float()  # [dim, state_len]
+            for t in range(seqlen):
+                cols = []
+                idx = t
+                for _ in range(width):
+                    if idx >= 0:
+                        cols.append(x[b, :, idx].float())
+                    else:
+                        cols.append(hist[:, state_len + idx])
+                    idx = int(parents[b, idx]) if idx > 0 else idx - 1
+                acc = bias.float().clone()
+                for j, col in enumerate(cols):
+                    acc = acc + weight[:, width - 1 - j].float() * col
+                out_ref[b, :, t] = F.silu(acc).to(x.dtype)
+                window = torch.stack(
+                    [cols[state_len - 1 - w] for w in range(state_len)], dim=-1
+                )
+                window_ref[int(intermediate_state_indices[b]), t] = window.to(x.dtype)
+        return out_ref, window_ref
+
+    def test_multi_token_tree_topk4(self):
+        # EAGLE tree verify: each draft token convolves over its ancestor
+        # chain; the committed conv states are shared read-only history and
+        # must come out untouched. The kernel also derives the parent table.
+        topk, num_steps = 4, 3
+        batch, dim, width, seqlen = 3, 32, 4, 8
+        num_entries, cache_size = 6, 5
+        dtype = torch.bfloat16
+        state_len = width - 1
+
+        parent_list, selected_index = _gen_draft_tree(batch, topk, num_steps, seqlen)
+        seq_lens = torch.randint(4, 32, (batch,), dtype=torch.int64)
+        tree_mask, _, _, retrieve_next_token, retrieve_next_sibling = (
+            _run_build_tree_kernel(
+                parent_list,
+                selected_index,
+                seq_lens,
+                topk,
+                num_steps,
+                seqlen,
+                TreeMaskMode.QLEN_ONLY,
+            )
+        )
+        parents_ref = _ref_parents_from_mask(tree_mask, batch, seqlen)
+        self.assertGreater(
+            int((parents_ref[:, 1:] != torch.arange(1, seqlen) - 1).sum()), 0
+        )
+
+        x = torch.randn(batch, dim, seqlen, dtype=dtype)
+        conv_states_init = torch.randn(num_entries, dim, state_len, dtype=dtype)
+        weight = torch.randn(dim, width, dtype=dtype)
+        bias = torch.randn(dim, dtype=dtype)
+        conv_state_indices = torch.tensor([4, 0, 2], dtype=torch.int32)
+        intermediate_state_indices = torch.tensor([1, 3, 0], dtype=torch.int32)
+        packed_weight = torch.ops.sgl_kernel.causal_conv1d_weight_pack(weight)
+
+        out_ref, window_ref = self._ref_tree_conv(
+            x,
+            conv_states_init,
+            weight,
+            bias,
+            parents_ref,
+            conv_state_indices,
+            intermediate_state_indices,
+            cache_size,
+        )
+
+        for layout in ["contiguous", "transpose_view"]:
+            with self.subTest(layout=layout):
+                if layout == "contiguous":
+                    x_in = x.clone()
+                else:
+                    x_in = x.transpose(1, 2).contiguous().transpose(1, 2)
+                conv_states = conv_states_init.clone()
+                intermediate_conv_window = torch.zeros(
+                    cache_size, seqlen, dim, state_len, dtype=dtype
+                )
+                retrieve_parent_token = torch.full(
+                    (batch, seqlen), -7, dtype=torch.int64
+                )
+                out = torch.ops.sgl_kernel.causal_conv1d_update_cpu(
+                    x_in,
+                    conv_states,
+                    packed_weight,
+                    bias,
+                    True,  # silu_activation
+                    None,  # cache_seqlens
+                    conv_state_indices,
+                    PAD_SLOT_ID,
+                    True,  # is_vnni
+                    intermediate_conv_window,
+                    intermediate_state_indices,
+                    retrieve_next_token,
+                    retrieve_next_sibling,
+                    retrieve_parent_token,
+                )
+
+                out.transpose(1, 2).view(batch * seqlen, dim)
+
+                atol = rtol = precision[dtype]
+                torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
+                torch.testing.assert_close(
+                    retrieve_parent_token, parents_ref, atol=0, rtol=0
+                )
+                self.assertTrue(torch.equal(conv_states, conv_states_init))
+                torch.testing.assert_close(
+                    intermediate_conv_window, window_ref, atol=atol, rtol=rtol
+                )
+
+    def test_multi_token_with_intermediate_conv_window(self):
+        batch, dim, width, seqlen = 3, 32, 4, 4
+        num_entries, cache_size = 6, 5
+        dtype = torch.bfloat16
+        state_len = width - 1
+
+        x = torch.randn(batch, dim, seqlen, dtype=dtype)
+        conv_states_init = torch.randn(num_entries, dim, state_len, dtype=dtype)
+        weight = torch.randn(dim, width, dtype=dtype)
+        bias = torch.randn(dim, dtype=dtype)
+        conv_state_indices = torch.tensor([4, 0, 2], dtype=torch.int32)
+        intermediate_state_indices = torch.tensor([1, 3, 0], dtype=torch.int32)
+        packed_weight = torch.ops.sgl_kernel.causal_conv1d_weight_pack(weight)
+
+        # reference: sequential single-token updates with state caching
+        conv_state_ref = conv_states_init[conv_state_indices.to(torch.int64)].clone()
+        window_ref = torch.zeros(cache_size, seqlen, dim, state_len, dtype=dtype)
+        out_ref = torch.empty_like(x)
+        for t in range(seqlen):
+            x_t = x[:, :, t]
+            x_cat = torch.cat([conv_state_ref, x_t.unsqueeze(-1)], dim=-1)
+            conv_state_ref = x_cat[:, :, -state_len:].clone()
+            out_t = F.conv1d(
+                x_cat.float(),
+                weight.float().unsqueeze(1),
+                bias.float(),
+                padding=0,
+                groups=dim,
+            )[:, :, -1]
+            out_ref[:, :, t] = F.silu(out_t).to(dtype)
+            for i in range(batch):
+                window_ref[int(intermediate_state_indices[i]), t] = conv_state_ref[i]
+
+        # The GDN verify call site passes a [batch, dim, seqlen] transpose view
+        # of a token-major buffer; a plain contiguous tensor must work too.
+        for layout in ["contiguous", "transpose_view"]:
+            with self.subTest(layout=layout):
+                if layout == "contiguous":
+                    x_in = x.clone()
+                else:
+                    x_in = x.transpose(1, 2).contiguous().transpose(1, 2)
+                conv_states = conv_states_init.clone()
+                intermediate_conv_window = torch.zeros(
+                    cache_size, seqlen, dim, state_len, dtype=dtype
+                )
+                out = torch.ops.sgl_kernel.causal_conv1d_update_cpu(
+                    x_in,
+                    conv_states,
+                    packed_weight,
+                    bias,
+                    True,  # silu_activation
+                    None,  # cache_seqlens
+                    conv_state_indices,
+                    PAD_SLOT_ID,
+                    True,  # is_vnni
+                    intermediate_conv_window,
+                    intermediate_state_indices,
+                )
+
+                # The output must stay a zero-copy transpose view of a
+                # token-major buffer: the caller reshapes it per token.
+                out.transpose(1, 2).view(batch * seqlen, dim)
+
+                atol = rtol = precision[dtype]
+                torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
+                torch.testing.assert_close(
+                    conv_states[conv_state_indices.to(torch.int64)],
+                    conv_state_ref,
+                    atol=atol,
+                    rtol=rtol,
+                )
+                torch.testing.assert_close(
+                    intermediate_conv_window, window_ref, atol=atol, rtol=rtol
+                )
+
+    def test_multi_token_skips_pad_slots(self):
+        # A padded row carries conv slot -1 while its intermediate index still
+        # points at the discard window row. The row owns no conv state, so the
+        # kernel neither updates one nor caches a window; its output is left
+        # alone, as the CUDA kernel does, because the caller discards it.
+        batch, dim, width, seqlen = 3, 32, 4, 3
+        num_entries, cache_size = 5, 4
+        dtype = torch.bfloat16
+        state_len = width - 1
+        padded_row = 1
+
+        x = torch.randn(batch, dim, seqlen, dtype=dtype)
+        weight = torch.randn(dim, width, dtype=dtype)
+        bias = torch.randn(dim, dtype=dtype)
+        conv_state_indices = torch.tensor([3, -1, 0], dtype=torch.int32)
+        intermediate_state_indices = torch.tensor([1, 3, 0], dtype=torch.int32)
+        packed_weight = torch.ops.sgl_kernel.causal_conv1d_weight_pack(weight)
+
+        # The pool sits behind a guard entry, so a write through slot -1 lands
+        # in the guard instead of in memory this test does not own.
+        pool_init = torch.randn(num_entries + 1, dim, state_len, dtype=dtype)
+        pool = pool_init.clone()
+        conv_states = pool[1:]
+
+        # reference: sequential single-token updates over the real rows only
+        real_rows = [i for i in range(batch) if i != padded_row]
+        conv_state_ref = conv_states[
+            conv_state_indices[real_rows].to(torch.int64)
+        ].clone()
+        window_ref = torch.zeros(cache_size, seqlen, dim, state_len, dtype=dtype)
+        out_ref = torch.empty(len(real_rows), dim, seqlen, dtype=dtype)
+        for t in range(seqlen):
+            x_cat = torch.cat(
+                [conv_state_ref, x[real_rows, :, t].unsqueeze(-1)], dim=-1
+            )
+            conv_state_ref = x_cat[:, :, -state_len:].clone()
+            out_t = F.conv1d(
+                x_cat.float(),
+                weight.float().unsqueeze(1),
+                bias.float(),
+                padding=0,
+                groups=dim,
+            )[:, :, -1]
+            out_ref[:, :, t] = F.silu(out_t).to(dtype)
+            for i, row in enumerate(real_rows):
+                window_ref[int(intermediate_state_indices[row]), t] = conv_state_ref[i]
+
+        intermediate_conv_window = torch.zeros(
+            cache_size, seqlen, dim, state_len, dtype=dtype
+        )
+        out = torch.ops.sgl_kernel.causal_conv1d_update_cpu(
+            x,
+            conv_states,
+            packed_weight,
+            bias,
+            True,  # silu_activation
+            None,  # cache_seqlens
+            conv_state_indices,
+            PAD_SLOT_ID,
+            True,  # is_vnni
+            intermediate_conv_window,
+            intermediate_state_indices,
+        )
+
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(out[real_rows], out_ref, atol=atol, rtol=rtol)
+        torch.testing.assert_close(
+            conv_states[conv_state_indices[real_rows].to(torch.int64)],
+            conv_state_ref,
+            atol=atol,
+            rtol=rtol,
+        )
+        torch.testing.assert_close(
+            intermediate_conv_window, window_ref, atol=atol, rtol=rtol
+        )
+        # nothing may reach the guard entry, and the untouched pool entries
+        # must keep their contents
+        torch.testing.assert_close(pool[0], pool_init[0], atol=0, rtol=0)
+        for entry in (2, 5):
+            torch.testing.assert_close(
+                conv_states[entry - 1], pool_init[entry], atol=0, rtol=0
+            )
+
+
+class TestMambaStateScatterWithMask(CustomTestCase):
+    def setUp(self):
+        torch.manual_seed(1234)
+
+    def _run_and_check(self, dst, src, dst_indices, step_indices):
+        dst_ref = dst.clone()
+        _ref_state_scatter_with_mask(dst_ref, src, dst_indices, step_indices)
+
+        out = dst.clone()
+        torch.ops.sgl_kernel.mamba_state_scatter_with_mask_cpu(
+            out, src, dst_indices.to(torch.int32), step_indices.to(torch.int32)
+        )
+        torch.testing.assert_close(out, dst_ref, atol=0, rtol=0)
+
+    def test_ssm_state_scatter(self):
+        # dense per-step SSM states: [layers, cache, HV, K, V]
+        layers, cache_size, requests, steps = 2, 6, 3, 4
+        HV, K, V = 4, 8, 8
+        dst = torch.randn(layers, cache_size, HV, K, V, dtype=torch.float32)
+        src = torch.randn(layers, requests, steps, HV, K, V, dtype=torch.float32)
+        dst_indices = torch.tensor([4, 0, 2], dtype=torch.int32)
+        step_indices = torch.tensor([3, 0, 2], dtype=torch.int32)
+
+        self._run_and_check(dst, src, dst_indices, step_indices)
+
+    def test_skips_negative_steps_and_slots(self):
+        # padded requests carry -1 and must leave the cache untouched. Requests
+        # 1 and 2 are padded on one index each, so only 0 and 3 commit.
+        layers, cache_size, requests, steps = 2, 5, 4, 3
+        dst = torch.randn(layers, cache_size, 4, 4, dtype=torch.bfloat16)
+        src = torch.randn(layers, requests, steps, 4, 4, dtype=torch.bfloat16)
+        dst_indices = torch.tensor([1, 3, -1, 0], dtype=torch.int32)
+        step_indices = torch.tensor([2, -1, 1, 0], dtype=torch.int32)
+
+        self._run_and_check(dst, src, dst_indices, step_indices)
+
+    def test_conv_window_scatter_strided_source(self):
+        # the deduplicated conv-window source overlaps its per-step windows, so
+        # its entries are non-contiguous
+        layers, cache_size, requests, steps = 2, 5, 3, 4
+        dim, win = 16, 3
+        dst = torch.randn(layers, cache_size, dim, win, dtype=torch.bfloat16)
+        shared = torch.randn(
+            layers, requests, dim, steps + win - 1, dtype=torch.bfloat16
+        )
+        src = shared.as_strided(
+            (layers, requests, steps, dim, win),
+            (
+                shared.stride(0),
+                shared.stride(1),
+                shared.stride(3),
+                shared.stride(2),
+                shared.stride(3),
+            ),
+        )
+        self.assertFalse(src[0, 0, 0].is_contiguous())
+        dst_indices = torch.tensor([2, 4, 0], dtype=torch.int32)
+        step_indices = torch.tensor([1, 3, -1], dtype=torch.int32)
+
+        self._run_and_check(dst, src, dst_indices, step_indices)
+
+    def test_dispatch_follows_tensor_device(self):
+        # The CPU kernel is picked from the tensors' device, not from the
+        # process-wide engine flag: with the flag off, a request whose slot is
+        # negative must still be skipped rather than committed to the last slot.
+        layers, cache_size, requests, steps = 2, 4, 2, 3
+        dst = torch.randn(layers, cache_size, 4, 4, dtype=torch.float32)
+        src = torch.randn(layers, requests, steps, 4, 4, dtype=torch.float32)
+        dst_indices = torch.tensor([3, -1], dtype=torch.int32)
+        step_indices = torch.tensor([2, 0], dtype=torch.int32)
+
+        dst_ref = dst.clone()
+        _ref_state_scatter_with_mask(dst_ref, src, dst_indices, step_indices)
+
+        out = dst.clone()
+        with mock.patch(
+            "sglang.kernels.ops.mamba.mamba_state_scatter_triton._is_cpu", False
+        ):
+            fused_mamba_state_scatter_with_mask(out, src, dst_indices, step_indices)
+        torch.testing.assert_close(out, dst_ref, atol=0, rtol=0)
+
+    def test_dim_contiguous_conv_state_destination(self):
+        # causal_conv1d_update_cpu re-strides conv_states to be dim-contiguous,
+        # so the destination entry is transposed and the copy is a transpose
+        layers, cache_size, requests, steps = 2, 5, 3, 4
+        dim, win = 16, 3
+        dst = torch.randn(layers, cache_size, win, dim, dtype=torch.bfloat16).transpose(
+            2, 3
+        )
+        self.assertEqual(dst.shape[-2:], (dim, win))
+        self.assertFalse(dst[0, 0].is_contiguous())
+        src = torch.randn(layers, requests, steps, dim, win, dtype=torch.bfloat16)
+        dst_indices = torch.tensor([2, 4, 0], dtype=torch.int32)
+        step_indices = torch.tensor([1, 3, 2], dtype=torch.int32)
+
+        self._run_and_check(dst, src, dst_indices, step_indices)
+
+    def test_dense_conv_window_scatter(self):
+        layers, cache_size, requests, steps = 3, 4, 3, 5
+        dim, win = 32, 3
+        dst = torch.randn(layers, cache_size, dim, win, dtype=torch.bfloat16)
+        src = torch.randn(layers, requests, steps, dim, win, dtype=torch.bfloat16)
+        dst_indices = torch.tensor([3, 1, 2], dtype=torch.int32)
+        step_indices = torch.tensor([4, 0, -1], dtype=torch.int32)
+
+        self._run_and_check(dst, src, dst_indices, step_indices)
+
+    def test_both_sides_strided(self):
+        # the odometer path with two independent stride sets
+        layers, cache_size, requests, steps = 2, 5, 3, 4
+        dim, win = 16, 3
+        dst = torch.randn(layers, cache_size, win, dim, dtype=torch.bfloat16).transpose(
+            2, 3
+        )
+        shared = torch.randn(
+            layers, requests, dim, steps + win - 1, dtype=torch.bfloat16
+        )
+        src = shared.as_strided(
+            (layers, requests, steps, dim, win),
+            (
+                shared.stride(0),
+                shared.stride(1),
+                shared.stride(3),
+                shared.stride(2),
+                shared.stride(3),
+            ),
+        )
+        self.assertFalse(dst[0, 0].is_contiguous())
+        self.assertFalse(src[0, 0, 0].is_contiguous())
+        dst_indices = torch.tensor([2, 4, 0], dtype=torch.int32)
+        step_indices = torch.tensor([1, 3, 2], dtype=torch.int32)
+
+        self._run_and_check(dst, src, dst_indices, step_indices)
+
+    def test_envelope_strided_destination(self):
+        # a unified-pool view spaces its slots out, so the slot stride is wider
+        # than one entry
+        layers, cache_size, requests, steps = 2, 4, 2, 3
+        HV, K, V = 2, 4, 4
+        envelope = torch.zeros(layers, cache_size, 2, HV, K, V, dtype=torch.float32)
+        dst = envelope[:, :, 0]
+        self.assertGreater(dst.stride(1), HV * K * V)
+        src = torch.randn(layers, requests, steps, HV, K, V, dtype=torch.float32)
+        dst_indices = torch.tensor([3, 1], dtype=torch.int32)
+        step_indices = torch.tensor([2, 0], dtype=torch.int32)
+
+        self._run_and_check(dst, src, dst_indices, step_indices)
+        # the neighbouring half of each envelope slot must be untouched
+        torch.testing.assert_close(
+            envelope[:, :, 1], torch.zeros_like(envelope[:, :, 1]), atol=0, rtol=0
+        )
+
+    def test_out_of_range_indices_are_skipped(self):
+        # the torch reference raises on these, so the kernel is checked directly
+        layers, cache_size, requests, steps = 2, 3, 3, 2
+        dst = torch.randn(layers, cache_size, 4, dtype=torch.float32)
+        src = torch.randn(layers, requests, steps, 4, dtype=torch.float32)
+        dst_indices = torch.tensor([cache_size, 0, 1], dtype=torch.int32)
+        step_indices = torch.tensor([0, steps, 1], dtype=torch.int32)
+
+        out = dst.clone()
+        torch.ops.sgl_kernel.mamba_state_scatter_with_mask_cpu(
+            out, src, dst_indices, step_indices
+        )
+        # only request 2 is in range
+        torch.testing.assert_close(out[:, 1], src[:, 2, 1], atol=0, rtol=0)
+        for untouched in (0, 2):
+            torch.testing.assert_close(
+                out[:, untouched], dst[:, untouched], atol=0, rtol=0
+            )
+
+    def test_empty_request_list(self):
+        dst = torch.randn(2, 3, 4, dtype=torch.float32)
+        src = torch.randn(2, 0, 2, 4, dtype=torch.float32)
+        empty = torch.empty(0, dtype=torch.int32)
+
+        out = dst.clone()
+        torch.ops.sgl_kernel.mamba_state_scatter_with_mask_cpu(out, src, empty, empty)
+        torch.testing.assert_close(out, dst, atol=0, rtol=0)
 
 
 if __name__ == "__main__":

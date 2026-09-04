@@ -10,6 +10,13 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_cpu
+
+_is_cpu = is_cpu()
+
+if _is_cpu:
+    import sgl_kernel  # noqa: F401
+
 
 def _require_entry_contiguous_dst(
     dst: torch.Tensor, entry_start_dim: int, fn_name: str
@@ -144,6 +151,31 @@ def track_mamba_states_if_needed(
     )
 
 
+def _state_scatter_with_mask(
+    dst: torch.Tensor,
+    src: torch.Tensor,
+    dst_indices_raw: torch.Tensor,
+    step_indices_raw: torch.Tensor,
+):
+    """Masked state scatter off CUDA, which only the CPU kernel implements.
+
+    It indexes both entries through their own strides, so it serves the dense
+    SSM/conv layouts and the overlapping conv-window view alike.
+    """
+    if dst.device.type != "cpu":
+        raise ValueError(
+            "masked mamba state scatter is implemented for CUDA and CPU tensors "
+            f"only. {dst.device=}"
+        )
+
+    torch.ops.sgl_kernel.mamba_state_scatter_with_mask_cpu(
+        dst,
+        src,
+        dst_indices_raw.to(torch.int32).contiguous(),
+        step_indices_raw.to(torch.int32).contiguous(),
+    )
+
+
 @triton.jit
 def _fused_mamba_state_scatter_with_mask_kernel(
     src_ptr,
@@ -249,9 +281,8 @@ def fused_mamba_state_scatter_with_mask(
             f"dst and src must be on the same device. {dst.device=} {src.device=}"
         )
     if not dst.is_cuda or not src.is_cuda:
-        raise ValueError(
-            "fused_mamba_state_scatter_with_mask only supports CUDA tensors."
-        )
+        _state_scatter_with_mask(dst, src, dst_indices_raw, step_indices_raw)
+        return
     if dst.ndim < 2 or src.ndim < 3:
         raise ValueError(f"Unexpected tensor ranks: {dst.ndim=} {src.ndim=}")
     if dst.shape[0] != src.shape[0]:
@@ -408,11 +439,13 @@ def fused_conv_window_scatter_with_mask(
     if total_requests == 0:
         return
 
-    if not (dst.is_cuda and src.is_cuda and dst.device == src.device):
+    if dst.device != src.device:
         raise ValueError(
-            "fused_conv_window_scatter_with_mask requires dst and src to be CUDA "
-            f"tensors on the same device ({dst.device=}, {src.device=})."
+            f"dst and src must be on the same device. {dst.device=} {src.device=}"
         )
+    if not dst.is_cuda or not src.is_cuda:
+        _state_scatter_with_mask(dst, src, dst_indices_raw, step_indices_raw)
+        return
     if dst.ndim != 4 or src.ndim != 5:
         raise ValueError(f"Unexpected ranks: {dst.ndim=} (want 4) {src.ndim=} (want 5)")
     if dst.shape[0] != src.shape[0]:
@@ -587,6 +620,9 @@ def _conv_multi_eligible(pairs) -> bool:
         return False
     layers = pairs[0][0].shape[0]
     for dst, src in pairs:
+        # Triton-only fast path; off CUDA every pair takes the per-pair scatter
+        if not dst.is_cuda or not src.is_cuda:
+            return False
         if dst.dtype != torch.bfloat16 or src.dtype != torch.bfloat16:
             return False
         if dst.ndim != 4 or src.ndim != 5:
