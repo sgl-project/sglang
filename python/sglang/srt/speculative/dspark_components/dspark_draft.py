@@ -217,6 +217,12 @@ class DraftBlockProposer:
         self.gamma = gamma
         self.sample_from_anchor = bool(draft_model.sample_from_anchor)
         self.query_token_num = self.gamma if self.sample_from_anchor else self.gamma + 1
+        # Mask-filling heads emit gamma-1 drafts per gamma-row block.
+        self.num_drafts = (
+            gamma - 1
+            if getattr(draft_model.markov_head, "mask_filling", False)
+            else gamma
+        )
         self._mask_token_id = mask_token_id
         self._draft_block_spec_info = draft_block_spec_info
         self._tp_sync = tp_sync
@@ -271,7 +277,7 @@ class DraftBlockProposer:
             envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
             and draft_sampler is not None
             and fwd.can_run_graph
-            and (all_greedy or draft_sampler.folded_sampling)
+            and (all_greedy or draft_sampler.samples_any_temperature)
         ):
             folded = True
             if draft_sampler.folded_sampling:
@@ -282,8 +288,8 @@ class DraftBlockProposer:
                 corrected_logits = (
                     None
                     if all_greedy
-                    else draft_sampler.corrected_out[: bs * self.gamma].view(
-                        bs, self.gamma, -1
+                    else draft_sampler.corrected_out[: bs * self.num_drafts].view(
+                        bs, self.num_drafts, -1
                     )
                 )
             else:
@@ -302,7 +308,9 @@ class DraftBlockProposer:
                     )
                 corrected_logits = None
             draft_block = DraftBlockResult(
-                draft_tokens=draft_sampler.out[: bs * self.gamma].view(bs, self.gamma),
+                draft_tokens=draft_sampler.out[: bs * self.num_drafts].view(
+                    bs, self.num_drafts
+                ),
                 corrected_logits=corrected_logits,
                 greedy_mask=greedy_mask,
                 temperatures=temperatures,

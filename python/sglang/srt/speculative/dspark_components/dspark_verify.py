@@ -79,11 +79,18 @@ class TargetVerifyResult(msgspec.Struct, frozen=True):
 
 
 class TargetVerifyExecutor:
+    # Verify pre-inits attention metadata in prepare_for_verify; runners whose
+    # eager prep re-pads the batch afterwards must re-init post-pad instead of
+    # trusting the pre-init.
+    verify_skip_attn_backend_init: bool = True
+    # Subclasses that restore per-request state post-accept opt in to keep a
+    # reference to the verify forward batch (rebound every round).
+    _retain_verify_forward_batch: bool = False
+
     def __init__(
         self,
         *,
         target_worker,
-        gamma: int,
         verify_num_draft_tokens: int,
         model_runner,
         kv_injector: TargetHiddenKvInjector,
@@ -92,7 +99,8 @@ class TargetVerifyExecutor:
         simulate_acc_len: float = 0.0,
     ) -> None:
         self.target_worker = target_worker
-        self.gamma = int(gamma)
+        # Drafts per request (verify width - 1).
+        self.num_drafts = int(verify_num_draft_tokens) - 1
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self.model_runner = model_runner
         self.kv_injector = kv_injector
@@ -126,15 +134,15 @@ class TargetVerifyExecutor:
         if folded_accept:
             return self.verify_epilogue.read_accept(bs)
 
-        correct_len, bonus, cap_trim_lens = accept_draft_tokens(
-            candidates=verify_ids_2d,
+        correct_len, bonus, cap_trim_lens = self._accept_draft_tokens(
+            bs=bs,
+            verify_ids_2d=verify_ids_2d,
             target_logits=target_logits,
             draft_block=draft_block,
             sampling_info=sampling_info,
             draft_input=draft_input,
-            gamma=self.gamma,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            cutoff_layout=layout,
+            layout=layout,
+            prefix_lens=prefix_lens,
         )
         if self._simulate_acc_len > 0:
             correct_len = self._simulated_correct_len(
@@ -160,7 +168,7 @@ class TargetVerifyExecutor:
             correct_len=correct_len,
             bonus=bonus,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
-            gamma=self.gamma,
+            gamma=self.num_drafts,
         )
         return AcceptOuts(
             correct_len=correct_len,
@@ -169,6 +177,30 @@ class TargetVerifyExecutor:
             commit_lens=finalized.commit_lens,
             new_seq_lens=finalized.new_seq_lens,
             out_tokens=out_tokens,
+        )
+
+    def _accept_draft_tokens(
+        self,
+        *,
+        bs: int,
+        verify_ids_2d: torch.Tensor,
+        target_logits: Optional[torch.Tensor],
+        draft_block: DraftBlockResult,
+        sampling_info,
+        draft_input: DFlashDraftInputV2,
+        layout: Optional[RaggedVerifyLayout],
+        prefix_lens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Accept primitive; returns cutoff-capped (correct_len, bonus, cap_trim_lens)."""
+        return accept_draft_tokens(
+            candidates=verify_ids_2d,
+            target_logits=target_logits,
+            draft_block=draft_block,
+            sampling_info=sampling_info,
+            draft_input=draft_input,
+            gamma=self.num_drafts,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            cutoff_layout=layout,
         )
 
     def _simulated_correct_len(
@@ -185,7 +217,7 @@ class TargetVerifyExecutor:
             self._simulated_correct_drafts_buf = buf
 
         simulated_acc_len = sample_simulated_acc_len(
-            self._simulate_acc_len, SIMULATE_ACC_METHOD, self.gamma + 1
+            self._simulate_acc_len, SIMULATE_ACC_METHOD, self.num_drafts + 1
         )
         return buf[:bs].fill_(simulated_acc_len - 1)
 
@@ -299,6 +331,8 @@ class TargetVerifyExecutor:
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
+        if self._retain_verify_forward_batch:
+            self._last_verify_forward_batch = verify_forward_batch
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
@@ -306,7 +340,9 @@ class TargetVerifyExecutor:
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True if not _is_npu else None,
+            skip_attn_backend_init=(
+                self.verify_skip_attn_backend_init if not _is_npu else None
+            ),
         )
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
