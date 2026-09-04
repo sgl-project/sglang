@@ -1,13 +1,19 @@
 import asyncio
 import sys
+from http import HTTPStatus
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from sglang.srt.disaggregation.encoder.runtime import (
+    DPDispatcher,
     EncoderScheduler,
     PendingRequest,
     _resolve_encoder_batch_policy,
+    execute_encode_pipeline,
 )
+from sglang.srt.disaggregation.encoder.server import MMError
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -119,6 +125,84 @@ def test_scheduler_coalesces_concurrent_submissions():
 )
 def test_resolve_encoder_batch_policy(model_type, configured, explicit, expected):
     assert _resolve_encoder_batch_policy(model_type, configured, explicit) == expected
+
+
+def test_scheduler_rejects_when_pending_limit_is_full():
+    async def run_test():
+        with envs.SGLANG_ENCODER_MAX_PENDING_REQUESTS.override(1):
+            scheduler = EncoderScheduler(
+                AsyncMock(), [], max_batch_size=1, request_timeout=1.0
+            )
+        scheduler.pending_queue.put_nowait(_pending())
+
+        with pytest.raises(MMError, match="pending request limit") as exc_info:
+            await asyncio.wait_for(
+                scheduler.submit({"req_id": "overflow", "modality": "image"}),
+                timeout=5,
+            )
+
+        assert exc_info.value.code == HTTPStatus.SERVICE_UNAVAILABLE
+        assert scheduler.pending_queue.qsize() == 1
+
+    asyncio.run(run_test())
+
+
+def test_video_pipeline_uses_bounded_scheduler():
+    async def run_test():
+        encoder = AsyncMock()
+        encoder.transfer_backend = "mooncake"
+        scheduler = AsyncMock()
+        scheduler.submit.side_effect = asyncio.CancelledError
+        request = {"req_id": "pipeline-video", "modality": "video"}
+        with pytest.raises(asyncio.CancelledError):
+            await execute_encode_pipeline(encoder, scheduler, request)
+        scheduler.submit.assert_awaited_once_with(request)
+        encoder.encode.assert_not_awaited()
+
+    asyncio.run(run_test())
+
+
+def test_dp_dispatcher_enforces_capacity_and_skips_full_ranks():
+    async def run_test():
+        with envs.SGLANG_ENCODER_MAX_PENDING_REQUESTS.override(1):
+            dispatcher = DPDispatcher(2, [object(), object()], None, [])
+        loop = asyncio.get_running_loop()
+        dispatcher.pending_futures[0]["rank-0"] = loop.create_future()
+        dispatcher.pending_futures[1]["rank-1"] = loop.create_future()
+
+        with pytest.raises(MMError, match="pending request limit") as exc_info:
+            await dispatcher.dispatch({"req_id": "overflow", "modality": "image"})
+
+        assert exc_info.value.code == HTTPStatus.SERVICE_UNAVAILABLE
+        assert dispatcher.pending_counts == [1, 1]
+
+        original = dispatcher.pending_futures[0]["rank-0"]
+        with pytest.raises(MMError) as exc_info:
+            await dispatcher.dispatch({"req_id": "rank-0"})
+        assert exc_info.value.code == HTTPStatus.CONFLICT
+        assert dispatcher.pending_futures[0]["rank-0"] is original
+
+        dispatcher.pending_futures[1].pop("rank-1")
+
+        with patch(
+            "sglang.srt.disaggregation.encoder.runtime.async_sock_send",
+            new_callable=AsyncMock,
+        ):
+            task = asyncio.create_task(
+                dispatcher.dispatch({"req_id": "new", "modality": "image"})
+            )
+            await asyncio.sleep(0)
+            assert dispatcher.req_id_to_rank["new"] == 1
+            future = dispatcher.pending_futures[1].pop("new")
+            future.set_result({"content": "ok"})
+            assert await task == {"content": "ok"}
+
+        with pytest.raises(MMError) as exc_info:
+            await dispatcher.dispatch({"req_id": "new"})
+        assert exc_info.value.code == HTTPStatus.CONFLICT
+        assert dispatcher.pending_counts == [1, 0]
+
+    asyncio.run(run_test())
 
 
 if __name__ == "__main__":

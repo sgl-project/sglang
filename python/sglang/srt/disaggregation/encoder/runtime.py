@@ -114,7 +114,8 @@ class EncoderScheduler:
         self.max_batch_size = max(1, int(max_batch_size))
         self.coalesce_same_turn = bool(coalesce_same_turn)
         self.request_timeout = max(1.0, float(request_timeout))
-        self.pending_queue: asyncio.Queue[PendingRequest] = asyncio.Queue()
+        max_pending = max(1, envs.SGLANG_ENCODER_MAX_PENDING_REQUESTS.get())
+        self.pending_queue: asyncio.Queue[PendingRequest] = asyncio.Queue(max_pending)
         self._worker_task: Optional[asyncio.Task] = None
 
     def start(self) -> None:
@@ -143,7 +144,13 @@ class EncoderScheduler:
 
     async def submit(self, request: dict) -> Tuple:
         pending = PendingRequest(request, asyncio.get_running_loop())
-        await self.pending_queue.put(pending)
+        try:
+            self.pending_queue.put_nowait(pending)
+        except asyncio.QueueFull as exc:
+            raise MMError(
+                "Encoder pending request limit reached. Retry later.",
+                code=HTTPStatus.SERVICE_UNAVAILABLE,
+            ) from exc
         try:
             return await asyncio.wait_for(pending.future, timeout=self.request_timeout)
         except asyncio.TimeoutError:
@@ -407,6 +414,9 @@ class DPDispatcher:
         # The event loop only keeps weak references to tasks, so the long-lived
         # loops started in `start()` need a strong reference to survive GC.
         self.background_tasks: Set[asyncio.Task] = set()
+        self.max_pending_per_rank = max(
+            1, envs.SGLANG_ENCODER_MAX_PENDING_REQUESTS.get()
+        )
 
         # Prometheus gauge: pending requests per DP rank. Lives in the main
         # process (the dispatcher), unlike the per-worker EncoderMetricsCollector.
@@ -530,6 +540,14 @@ class DPDispatcher:
         }
 
     async def dispatch(self, request: dict) -> dict:
+        req_id = request["req_id"]
+        if req_id in self.req_id_to_rank or any(
+            req_id in pending for pending in self.pending_futures
+        ):
+            raise server_module.MMError(
+                f"Encoder request req_id={req_id!r} is already active.",
+                code=HTTPStatus.CONFLICT,
+            )
         counts = self.pending_counts
         # Skip ranks whose worker process has died.
         alive_ranks = self.alive_ranks
@@ -538,11 +556,16 @@ class DPDispatcher:
                 "All encoder DP workers are dead.",
                 code=HTTPStatus.SERVICE_UNAVAILABLE,
             )
+        alive_ranks = [r for r in alive_ranks if counts[r] < self.max_pending_per_rank]
+        if not alive_ranks:
+            raise server_module.MMError(
+                "Encoder pending request limit reached on every DP rank. Retry later.",
+                code=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
         min_p = min(counts[r] for r in alive_ranks)
         candidates = [r for r in alive_ranks if counts[r] == min_p]
         rank = candidates[self._rr_counter % len(candidates)]
         self._rr_counter += 1
-        req_id = request["req_id"]
         future = asyncio.get_running_loop().create_future()
         self.pending_futures[rank][req_id] = future
         self._update_pending_gauge()
@@ -1103,7 +1126,7 @@ async def execute_encode_pipeline(
 
     time_stats.set_mm_encode_start_time()
     try:
-        if sched is not None and modality in _BATCHABLE_MODALITIES:
+        if sched is not None:
             result = await sched.submit(request)
         elif send_sockets is not None:
             # Non-batched requests still own their collective dispatch order
