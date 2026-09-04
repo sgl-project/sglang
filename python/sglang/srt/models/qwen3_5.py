@@ -82,6 +82,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
+    kv_cache_scales_loader,
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import (
@@ -1814,6 +1815,30 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         return hidden_states, aux_hidden_states
 
+    # If this function is called, it should always initialize KV cache scale
+    # factors (or else raise an exception). Qwen3.5 mixes full-attention and
+    # GatedDeltaNet layers, so only full-attention layers own KV cache scales.
+    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        tp_size = get_parallel().tp_size
+        tp_rank = get_parallel().tp_rank
+        for layer_idx, scaling_factor in kv_cache_scales_loader(
+            quantization_param_path,
+            tp_rank,
+            tp_size,
+            self.config.num_hidden_layers,
+            None,
+        ):
+            layer = self.layers[layer_idx]
+            if not isinstance(layer, Qwen3_5AttentionDecoderLayer):
+                continue
+
+            # AITER and FlashMLA consume the tensor forms, while Triton and
+            # FlashInfer use the scalar fields to avoid device-to-host copies.
+            layer.attn.k_scale = torch.tensor(scaling_factor)
+            layer.attn.v_scale = torch.tensor(scaling_factor)
+            layer.attn.k_scale_float = float(scaling_factor)
+            layer.attn.v_scale_float = float(scaling_factor)
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
@@ -2155,6 +2180,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         head = self.lm_head.weight if self.pp_group.is_last_rank else None
         return embed, head
 
+    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        self.model.load_kv_cache_scales(quantization_param_path)
+
     def set_embed_and_head(self, embed, head):
         if self.pp_group.is_first_rank and embed is not None:
             del self.model.embed_tokens.weight
@@ -2324,6 +2352,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
         head = self.lm_head.weight if self.pp_group.is_last_rank else None
         return embed, head
+
+    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        self.model.load_kv_cache_scales(quantization_param_path)
 
     def set_embed_and_head(self, embed, head):
         if self.pp_group.is_first_rank and embed is not None:
