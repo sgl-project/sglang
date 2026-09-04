@@ -30,10 +30,9 @@ pub const X_ROUTER_UPSTREAM_STATUS: HeaderName =
 /// contradicts the precise code — it only generalizes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ErrorClass {
-    /// 400 — request rejected at ingress as malformed / invalid.
+    /// 400 — request rejected at ingress as malformed / invalid, including
+    /// asking for a model this router does not serve.
     BadRequest,
-    /// 404 — requested model / resource not found.
-    NotFound,
     /// 502 — a selected worker failed to return a usable response (unreachable,
     /// or started a response then dropped the body).
     Upstream,
@@ -49,7 +48,6 @@ impl ErrorClass {
     fn status(self) -> StatusCode {
         match self {
             ErrorClass::BadRequest => StatusCode::BAD_REQUEST,
-            ErrorClass::NotFound => StatusCode::NOT_FOUND,
             ErrorClass::Upstream => StatusCode::BAD_GATEWAY,
             ErrorClass::NoTarget => StatusCode::SERVICE_UNAVAILABLE,
             ErrorClass::Timeout => StatusCode::GATEWAY_TIMEOUT,
@@ -86,6 +84,14 @@ pub enum ApiError {
     #[error("bad request: {0}")]
     BadRequest(String),
 
+    /// The request named a model this router does not serve — 400, with the
+    /// distinct `model_not_found` code.
+    ///
+    /// Deliberately NOT a 503: the router is single-model, so an unserved
+    /// model id is a permanent client error, and answering `no_healthy_workers`
+    /// both told the client to retry something that can never succeed and was
+    /// indistinguishable from every worker being down. The two now separate —
+    /// unserved model is 400, a real outage stays 503.
     #[error("model not found: {0}")]
     ModelNotFound(String),
 
@@ -274,7 +280,7 @@ impl ApiError {
     fn class(&self) -> ErrorClass {
         match self {
             ApiError::BadRequest(_) => ErrorClass::BadRequest,
-            ApiError::ModelNotFound(_) => ErrorClass::NotFound,
+            ApiError::ModelNotFound(_) => ErrorClass::BadRequest,
             ApiError::UpstreamUnreachable { .. } => ErrorClass::Upstream,
             ApiError::UpstreamStatus { .. } => ErrorClass::Upstream,
             ApiError::UpstreamTimeout { .. } => ErrorClass::Timeout,
@@ -1015,7 +1021,7 @@ mod tests {
         let resp = err.into_response();
         let (status, code_header, env) = parse_envelope(resp);
 
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(code_header.as_deref(), Some("model_not_found"));
         assert_eq!(env.error.code, "model_not_found");
         assert_eq!(env.error.typ, "invalid_request_error");
@@ -1175,7 +1181,7 @@ mod tests {
             (
                 "model not found",
                 ApiError::ModelNotFound("ghost".into()),
-                StatusCode::NOT_FOUND,
+                StatusCode::BAD_REQUEST,
                 "model_not_found",
                 None,
                 "ingress",

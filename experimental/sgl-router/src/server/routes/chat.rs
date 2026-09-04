@@ -263,6 +263,33 @@ async fn chat_completions_inner(
         .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?
         .to_owned();
     let model_id = ModelId(model_str.clone());
+    // The router serves exactly one model (`--model-id`, the same id
+    // `/v1/models` advertises), so an id it does not recognise is decidable
+    // here — before worker selection, at no queue or engine cost. Without
+    // this the name fell through to `prefill_candidates`, where an unknown
+    // model looks identical to a known one whose workers are all down: both
+    // came back 503 `no_healthy_workers`, which tells the client to retry a
+    // request that can never succeed and leaves an operator unable to tell a
+    // client typo from an outage.
+    //
+    // Compared against the CONFIG rather than the worker registry on purpose:
+    // the registry is populated asynchronously from worker `served_model_name`
+    // reports, so a registry check would 400 legitimate requests during the
+    // startup window before any worker registers, and during a full outage.
+    // The config is known at boot and never races.
+    if model_str != ctx.config.model.id {
+        // Log the mismatch with BOTH ids: returning here is before the point
+        // where the access log learns the model, so without this the rejected
+        // id appears in no server-side line at all and a spike of 400s cannot
+        // be traced back to the client sending the wrong alias. The 503 path
+        // this replaces did log the id.
+        tracing::warn!(
+            requested_model = %model_str,
+            served_model = %ctx.config.model.id,
+            "rejecting request for a model this router does not serve",
+        );
+        return Err(ApiError::ModelNotFound(model_str));
+    }
 
     // Enforce the per-model output-token contract (`--max-output-tokens`)
     // before admission: an explicit ask above the cap is a client error
@@ -4051,6 +4078,45 @@ mod tests {
     /// accounting moved to the middleware, pre-routing rejections were invisible
     /// to `requests_total` (so `sum by (outcome)` undercounted) and absent from
     /// the access log.
+    /// An id this router does not serve is a client error decided at ingress:
+    /// 400 with the distinct `model_not_found` code, before any worker is
+    /// selected. The second row is why the check reads the CONFIG and not the
+    /// worker registry — the configured model with no registered workers must
+    /// stay 503 `no_healthy_workers`, so a client typo and a real outage
+    /// remain tellable apart (they were both 503 before).
+    #[tokio::test]
+    async fn unserved_model_is_400_while_outage_stays_503() {
+        use tower::ServiceExt;
+
+        for (model, want_status, want_code) in [
+            ("ghost-model", StatusCode::BAD_REQUEST, "model_not_found"),
+            (
+                "stub-model",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_healthy_workers",
+            ),
+        ] {
+            let app = crate::server::app::build_router(Arc::new(AppContext::stub()));
+            let body = serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}],
+            });
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            assert_eq!(res.status(), want_status, "model={model}");
+            assert_eq!(
+                res.headers().get("x-router-error-code").unwrap(),
+                want_code,
+                "model={model}",
+            );
+        }
+    }
+
     #[tokio::test]
     async fn pre_routing_400_is_logged_and_counted() {
         use std::sync::Mutex;

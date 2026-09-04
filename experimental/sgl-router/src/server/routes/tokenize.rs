@@ -349,8 +349,12 @@ mod tests {
         );
     }
 
+    /// On this route `ModelNotFound` covers two conditions — an id the router
+    /// does not serve, and a served id whose tokenizer was never loaded
+    /// (`--tokenizer-path none`). Both are 400 `model_not_found`; separating
+    /// them would need a distinct variant and is left alone here.
     #[tokio::test]
-    async fn unknown_model_404() {
+    async fn unknown_model_400() {
         let app = crate::server::app::build_router(ctx_with_tiny());
         let body = serde_json::to_vec(&serde_json::json!({
             "model": "nope", "prompt": "x"
@@ -367,7 +371,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
             res.headers().get("x-router-error-code").unwrap(),
             "model_not_found"
