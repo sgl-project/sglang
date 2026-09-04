@@ -1889,6 +1889,25 @@ class ServerArgs:
         "Explicit list of batch sizes to capture for the prefill cuda graph.",
         NS("exec.graph"),
     ] = None
+    cuda_graph_context_bucket_prefill: A[
+        Optional[List[int]],
+        Arg(
+            help=(
+                "Maximum final-context lengths captured by the breakable/full "
+                "prefill CUDA graph. The largest seq_len in a replay batch is "
+                "rounded up to the nearest bucket; context-shaped attention "
+                "metadata and C4 indexer logits use that bucket instead of the "
+                "model maximum. Values are page-aligned by the runner; replay "
+                "falls back to eager when no bucket fits or padding would "
+                "exceed 2x the live maximum context. "
+                f"\n\n{human_readable_int.__doc__}"
+            ),
+            type_parser=human_readable_int,
+            nargs="+",
+            aliases=["--context-bucket"],
+        ),
+        NS("exec.graph"),
+    ] = None
     cuda_graph_tc_compiler: A[
         Optional[Literal["eager", "inductor"]],
         "Compiler used by the tc_piecewise backend (currently only the prefill phase consumes it).",

@@ -537,6 +537,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Preallocated piecewise-graph attention output, set by RadixAttention.
     _attn_output: Optional[torch.Tensor] = None
 
+    # Prefill body-CUDA-graph context bucket. Attention backends that allocate
+    # context-shaped metadata use this fixed maximum instead of deriving a
+    # shape from the live batch. None preserves eager/default graph behavior.
+    max_seq_len_override: Optional[int] = None
+
     # For logits and logprobs post processing
     next_token_logits_buffer: torch.Tensor = None
     temperature: torch.Tensor = None

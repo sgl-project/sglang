@@ -308,6 +308,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- runner bounds --------------------------------------------
         self.max_num_tokens = max(self.capture_num_tokens)
         self.max_bs = model_runner.req_to_token_pool.size
+        self.capture_context_sizes = self._resolve_context_buckets(
+            model_runner, prefill_config.context_buckets
+        )
 
         # --- capture modes --------------------------------------------
         self.capture_forward_mode = ForwardMode.EXTEND
@@ -546,7 +549,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.use_captured_attn_metadata = model_runner.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
         else:
             self.use_captured_attn_metadata = False
-        self.attn_metadata_buffers: Optional[Dict[int, object]] = (
+        self.attn_metadata_buffers: Optional[Dict[ShapeKey, object]] = (
             {} if self.use_captured_attn_metadata else None
         )
 
@@ -874,6 +877,68 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     @staticmethod
+    def _resolve_context_buckets(
+        model_runner, requested_buckets: Optional[list[int]]
+    ) -> tuple[int, ...]:
+        """Page-align and validate captured final-context buckets."""
+        if not requested_buckets:
+            return ()
+
+        page_size = int(model_runner.page_size)
+        max_context_len = PrefillCudaGraphRunner._max_addressable_prefix_len(
+            model_runner
+        )
+        if max(requested_buckets) > max_context_len:
+            raise ValueError(
+                "--cuda-graph-context-bucket-prefill exceeds the maximum "
+                "addressable context: "
+                f"bucket {max(requested_buckets)} > {max_context_len}"
+            )
+        aligned = tuple(
+            sorted(
+                {
+                    _ceil_div(int(value), page_size) * page_size
+                    for value in requested_buckets
+                }
+            )
+        )
+        if tuple(requested_buckets) != aligned:
+            logger.info(
+                "Page-aligning prefill CUDA graph context buckets %s -> %s "
+                "(page_size=%d).",
+                requested_buckets,
+                aligned,
+                page_size,
+            )
+        logger.info(
+            "Prefill CUDA graph context buckets: %s; capture keys use "
+            "(num_tokens, max_context_len).",
+            aligned,
+        )
+        return aligned
+
+    @staticmethod
+    def _max_context_len(forward_batch: ForwardBatch) -> Optional[int]:
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if seq_lens_cpu is not None:
+            if torch.is_tensor(seq_lens_cpu):
+                return int(seq_lens_cpu.max().item()) if seq_lens_cpu.numel() > 0 else 0
+            return max((int(value) for value in seq_lens_cpu), default=0)
+        seq_lens = getattr(forward_batch, "seq_lens", None)
+        if seq_lens is None or seq_lens.numel() == 0:
+            return None
+        # Prefill normally has seq_lens_cpu. This fallback is for hand-built
+        # batches and intentionally synchronizes rather than guessing a bucket.
+        return int(seq_lens.max().item())
+
+    def _select_context_bucket(self, max_context_len: int) -> Optional[int]:
+        if not self.capture_context_sizes:
+            return None
+        if max_context_len > self.capture_context_sizes[-1]:
+            return None
+        return self._pad_to_bucket(max_context_len, self.capture_context_sizes)
+
+    @staticmethod
     def _resolve_prefix_chunk_shape(
         model_runner, capture_req_slots: int
     ) -> tuple[int, int]:
@@ -914,7 +979,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and self._select_prefix_capture_chunks(prefix_lens) is None
         )
 
-    def _shape_key(self, num_tokens: int, forward_batch: ForwardBatch) -> ShapeKey:
+    def _shape_key(
+        self,
+        num_tokens: int,
+        forward_batch: ForwardBatch,
+        *,
+        context_size: Optional[int] = None,
+    ) -> ShapeKey:
         variant = None
         if self._capture_chunked_prefix and self._has_prefix_hit(forward_batch):
             captured_n = self._select_prefix_capture_chunks(
@@ -922,7 +993,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
             assert captured_n is not None, "prefix batch has no captured FullCG variant"
             variant = _chunked_prefix_variant(captured_n)
-        return ShapeKey(size=num_tokens, variant_label=variant)
+        if self.capture_context_sizes and context_size is None:
+            max_context_len = self._max_context_len(forward_batch)
+            assert max_context_len is not None, "batch has no final context length"
+            context_size = self._select_context_bucket(max_context_len)
+            assert context_size is not None, "batch has no captured context bucket"
+        return ShapeKey(
+            size=num_tokens,
+            variant_label=variant,
+            context_size=context_size,
+        )
 
     def _create_chunked_prefix_buffers(self) -> _ChunkedPrefixCaptureBuffers:
         """Allocate the stable chunk-metadata tensors shared by all variants."""
@@ -1058,7 +1138,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def _init_forward_metadata_for_capture(
-        self, forward_batch: ForwardBatch, num_tokens: int
+        self, forward_batch: ForwardBatch, shape_key: ShapeKey
     ) -> None:
         """Capture-time metadata init for the BCG-with-captured-metadata
         contract. For opt-in backends (DSV4), call the BCG-specific entry
@@ -1072,13 +1152,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch
         )
         assert self.attn_metadata_buffers is not None
-        self.attn_metadata_buffers[num_tokens] = metadata
+        self.attn_metadata_buffers[shape_key] = metadata
 
     def _prepare_forward_metadata_for_replay(
         self,
         forward_batch: ForwardBatch,
         static_forward_batch: ForwardBatch,
-        num_tokens: int,
+        shape_key: ShapeKey,
     ) -> None:
         """Replay-time metadata refresh for the BCG-with-captured-metadata
         contract. For opt-in backends, refresh the stashed per-bucket
@@ -1104,16 +1184,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             padded_view.req_pool_indices = s["req_pool_indices"][:r]
             padded_view.extend_seq_lens = s["extend_seq_lens"][:r]
             padded_view.extend_prefix_lens = s["extend_prefix_lens"][:r]
+            padded_view.max_seq_len_override = static_forward_batch.max_seq_len_override
             attn_backend.init_forward_metadata_out_graph(padded_view)
             return
         if not self.use_captured_attn_metadata:
             attn_backend.init_forward_metadata(forward_batch)
             attn_backend.prepare_prefill_shared_read_snapshot(
-                forward_batch, num_qo_tokens=num_tokens
+                forward_batch, num_qo_tokens=shape_key.size
             )
             return
         assert self.attn_metadata_buffers is not None
-        metadata = self.attn_metadata_buffers[num_tokens]
+        metadata = self.attn_metadata_buffers[shape_key]
         attn_backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
             metadata,
             forward_batch,
@@ -1139,6 +1220,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         capture_hidden_mode,
         return_logprob: bool,
         lora_ineligible: bool = False,
+        max_context_len: Optional[int] = None,
     ) -> bool:
         """Rank-local replay eligibility: the single source of truth for
         ``can_run_graph`` (ForwardBatch, forward time) and the dp mlp-sync
@@ -1181,6 +1263,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         if return_logprob and not self._uses_eager_prefill_tail():
             return False
+        if self.capture_context_sizes:
+            if max_context_len is None:
+                return False
+            context_bucket = self._select_context_bucket(max_context_len)
+            if context_bucket is None:
+                return False
+            if (
+                max_context_len > 0
+                and context_bucket
+                > max_context_len * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR
+            ):
+                return False
         if num_tokens is None:
             return True
         if num_tokens > self.max_num_tokens:
@@ -1223,6 +1317,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     forward_batch
                 )
             ),
+            max_context_len=self._max_context_len(forward_batch),
         ):
             return False
         if getattr(self, "enable_cp_v2_bcg_capture", False) and is_cp_v2_active(
@@ -1254,7 +1349,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_states=self.static_draft_hidden_states[:num_tokens],
         )
 
-    def capture_prepare(self, num_tokens: int) -> tuple[ForwardBatch, AttentionBackend]:
+    def capture_prepare(
+        self, num_tokens: int, context_size: Optional[int] = None
+    ) -> tuple[ForwardBatch, AttentionBackend]:
         """Build a dummy prefill ForwardBatch for capture/warmup at this shape.
 
         Default tensor inputs are fresh literals; under a Breakable
@@ -1264,7 +1361,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         Returns ``(forward_batch, attn_backend)`` to mirror decode's
         capture_prepare signature.
         """
-        context_length = self.model_runner.model_config.context_len
+        model_context_length = self.model_runner.model_config.context_len
+        context_length = min(context_size or model_context_length, model_context_length)
         # A prefill bucket is an aggregate token count. Capture it as the
         # fewest synthetic requests, with every request containing no more
         # than context_length tokens.
@@ -1396,6 +1494,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 # refreshes the static batch info with live values.
                 lora_ids=([None] * bs if self._capture_lora else None),
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
+                max_seq_len_override=context_size,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
         return forward_batch, self.model_runner.attn_backend
@@ -1418,12 +1517,28 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.gpu_id,
             empty_cache=False,
         )
-        capture_range = (
-            tqdm.tqdm(list(reversed(self.capture_num_tokens)))
-            if get_parallel().tp_rank == 0
-            else reversed(self.capture_num_tokens)
+        context_sizes: tuple[Optional[int], ...] = (
+            tuple(reversed(self.capture_context_sizes))
+            if self.capture_context_sizes
+            else (None,)
         )
-        for num_tokens in capture_range:
+        capture_shapes = [
+            (num_tokens, context_size)
+            for num_tokens in reversed(self.capture_num_tokens)
+            for context_size in context_sizes
+        ]
+        if self.capture_context_sizes:
+            logger.info(
+                "Capturing %d prefill CUDA graph shapes: %d token buckets x "
+                "%d context buckets (before execution variants).",
+                len(capture_shapes),
+                len(self.capture_num_tokens),
+                len(self.capture_context_sizes),
+            )
+        capture_range = (
+            tqdm.tqdm(capture_shapes) if get_parallel().tp_rank == 0 else capture_shapes
+        )
+        for num_tokens, context_size in capture_range:
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
                     self.model_runner.device,
@@ -1431,19 +1546,30 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     empty_cache=False,
                 )
                 capture_range.set_description(
-                    f"Capturing num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
+                    "Capturing prefill shape "
+                    f"({num_tokens=} {context_size=} {avail_mem=:.2f} GB)"
                 )
-            self.capture_one_shape(num_tokens)
+            self.capture_one_shape(num_tokens, context_size=context_size)
             if self._capture_chunked_prefix:
                 for captured_n in self._prefix_capture_variants:
-                    self.capture_one_shape(num_tokens, prefix_num_chunks=captured_n)
+                    self.capture_one_shape(
+                        num_tokens,
+                        context_size=context_size,
+                        prefix_num_chunks=captured_n,
+                    )
 
-    def capture_one_shape(self, size: int, *, prefix_num_chunks: int = 0) -> None:
+    def capture_one_shape(
+        self,
+        size: int,
+        *,
+        context_size: Optional[int] = None,
+        prefix_num_chunks: int = 0,
+    ) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
         """
         num_tokens = size
-        forward_batch, attn_backend = self.capture_prepare(num_tokens)
+        forward_batch, attn_backend = self.capture_prepare(num_tokens, context_size)
         if self.enable_cp_v2_bcg_capture:
             assert self.prefill_cp_bcg_input is not None
             self.prefill_cp_bcg_input.prepare(
@@ -1464,6 +1590,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             lora_manager.prepare_lora_batch(forward_batch)
         shape_key = ShapeKey(
             size=num_tokens,
+            context_size=context_size,
             variant_label=(
                 _chunked_prefix_variant(prefix_num_chunks)
                 if prefix_num_chunks
@@ -1484,7 +1611,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # Reaching into a backend-specific metadata cache here would make
             # this path incompatible with the OSS FlashAttention backend.
         else:
-            self._init_forward_metadata_for_capture(forward_batch, num_tokens)
+            self._init_forward_metadata_for_capture(forward_batch, shape_key)
 
         def run_once():
             return self._run_forward(forward_batch, num_tokens)
@@ -1539,6 +1666,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     "Prefill CUDA graph replay was admitted without a fitting bucket"
                 )
         self.raw_num_tokens = num_tokens
+
+        raw_context_size = self._max_context_len(forward_batch)
+        static_context_size = (
+            self._select_context_bucket(raw_context_size)
+            if self.capture_context_sizes and raw_context_size is not None
+            else None
+        )
+        if self.capture_context_sizes and static_context_size is None:
+            raise RuntimeError(
+                "Prefill CUDA graph replay was admitted without a fitting "
+                "context bucket"
+            )
 
         bs = forward_batch.batch_size
         self.raw_bs = bs
@@ -1675,6 +1814,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.capture_return_pooled_hidden_states
                 or forward_batch.return_pooled_hidden_states
             ),
+            max_seq_len_override=static_context_size,
         )
         if self._is_full_backend:
             forward_batch.next_token_logits_buffer = (
@@ -1743,8 +1883,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
             metadata_forward_batch = static_forward_batch
 
+        shape_key = self._shape_key(
+            static_num_tokens,
+            forward_batch,
+            context_size=static_context_size,
+        )
         self._prepare_forward_metadata_for_replay(
-            metadata_forward_batch, static_forward_batch, static_num_tokens
+            metadata_forward_batch, static_forward_batch, shape_key
         )
 
         return static_forward_batch

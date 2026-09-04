@@ -109,6 +109,11 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
             self.actions_by_option["--prefill-delayer-forward-passes-buckets"].nargs,
             "+",
         )
+        self.assertIs(
+            self.actions_by_option["--cuda-graph-context-bucket-prefill"].type,
+            human_readable_int,
+        )
+        self.assertEqual(self.actions_by_option["--context-bucket"].nargs, "+")
         self.assertEqual(
             self.actions_by_option["--schedule-policy"].choices,
             ["lpm", "random", "fcfs", "dfs-weight", "lof", "priority", "routing-key"],
@@ -130,6 +135,21 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
                 args = self.parser.parse_args(["--model", "dummy", option, "3"])
                 self.assertEqual(args.dp_size, 3)
                 self.assertEqual(ServerArgs.from_cli_args(args).dp_size, 3)
+
+    def test_context_bucket_accepts_human_readable_values(self):
+        for option in (
+            "--cuda-graph-context-bucket-prefill",
+            "--context-bucket",
+        ):
+            with self.subTest(option=option):
+                args = self.parser.parse_args(
+                    ["--model", "dummy", option, "60k", "200k"]
+                )
+
+                self.assertEqual(
+                    ServerArgs.from_cli_args(args).cuda_graph_context_bucket_prefill,
+                    [60_000, 200_000],
+                )
 
     def test_migrated_and_manual_options_parse_together(self):
         args = self.parser.parse_args(

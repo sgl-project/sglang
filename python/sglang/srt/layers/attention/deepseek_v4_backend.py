@@ -1442,6 +1442,13 @@ class DeepseekV4AttnBackend(
             max_seq_len_override = getattr(forward_batch, "max_seq_len_override", None)
         if max_seq_len_override is not None:
             max_seq_len = max_seq_len_override
+            if seq_lens_cpu is not None and len(seq_lens_cpu) > 0:
+                actual_max_seq_len = int(seq_lens_cpu.max().item())
+                if actual_max_seq_len > max_seq_len:
+                    raise ValueError(
+                        "Prefill CUDA graph context bucket is smaller than the "
+                        f"live context: {max_seq_len=} < {actual_max_seq_len=}"
+                    )
         elif seq_lens_cpu is not None:
             max_seq_len = int(seq_lens_cpu.max().item())
         else:
@@ -1532,9 +1539,13 @@ class DeepseekV4AttnBackend(
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self, forward_batch: ForwardBatch
     ):
+        max_seq_len = (
+            getattr(forward_batch, "max_seq_len_override", None)
+            or self.MAX_SEQ_LEN_FOR_CAPTURE
+        )
         self.forward_metadata = self._build_forward_metadata(
             forward_batch,
-            max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            max_seq_len_override=max_seq_len,
             use_prefill_cuda_graph=True,
         )
         return self.forward_metadata
@@ -1549,9 +1560,16 @@ class DeepseekV4AttnBackend(
         # Build graph-compatible metadata against the padded static batch. The
         # batch still carries live seq/extend lens, so the online c128 prefill
         # plan remains batch-specific without constructing a second metadata set.
+        metadata_batch = (
+            static_forward_batch if static_forward_batch is not None else forward_batch
+        )
+        max_seq_len = (
+            getattr(metadata_batch, "max_seq_len_override", None)
+            or self.MAX_SEQ_LEN_FOR_CAPTURE
+        )
         static_metadata = self._build_forward_metadata(
-            static_forward_batch if static_forward_batch is not None else forward_batch,
-            max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            metadata_batch,
+            max_seq_len_override=max_seq_len,
             use_prefill_cuda_graph=True,
         )
         assert isinstance(capture_metadata, DSV4Metadata)
