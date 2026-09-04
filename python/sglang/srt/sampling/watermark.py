@@ -210,6 +210,26 @@ def force_watermark_tokens(
     min_ps: torch.Tensor,
     keys: torch.Tensor,
 ) -> None:
+    if logits.is_cuda:
+        try:
+            from sglang.kernels.ops.sampling.textseal_selector import (
+                force_watermark_tokens_triton,
+            )
+        except ImportError:
+            pass
+        else:
+            force_watermark_tokens_triton(
+                logits,
+                context_hashes,
+                eligible,
+                temperatures,
+                top_ks,
+                top_ps,
+                min_ps,
+                keys,
+            )
+            return
+
     probabilities = _truncate_probabilities(
         logits, temperatures, top_ks, top_ps, min_ps
     )
@@ -273,6 +293,12 @@ class WatermarkState:
         )
         self.context_history_positions = torch.arange(
             max_contexts_per_req, dtype=torch.int32, device=device
+        )
+        self.context_hash_buffer = torch.empty(
+            max_num_reqs, dtype=torch.int64, device=device
+        )
+        self.eligible_buffer = torch.empty(
+            max_num_reqs, dtype=torch.bool, device=device
         )
 
     @classmethod
@@ -619,6 +645,42 @@ class WatermarkState:
         keys, context_windows, watermark_enabled = self._watermark_batch_config(
             sampling_info
         )
+        if logits.is_cuda:
+            try:
+                from sglang.kernels.ops.sampling.textseal_selector import (
+                    prepare_watermark_contexts_triton,
+                )
+            except ImportError:
+                pass
+            else:
+                batch_size = req_pool_indices.shape[0]
+                context_hashes = self.context_hash_buffer[:batch_size]
+                eligible = self.eligible_buffer[:batch_size]
+                prepare_watermark_contexts_triton(
+                    self.token_ids,
+                    self.lengths,
+                    self.write_positions,
+                    self.watermarked_context_hashes,
+                    self.num_watermarked_contexts,
+                    req_pool_indices,
+                    context_windows,
+                    watermark_enabled,
+                    sampling_info.top_ks,
+                    context_hashes,
+                    eligible,
+                )
+                force_watermark_tokens(
+                    logits=logits,
+                    context_hashes=context_hashes,
+                    eligible=eligible,
+                    temperatures=sampling_info.temperatures,
+                    top_ks=sampling_info.top_ks,
+                    top_ps=sampling_info.top_ps,
+                    min_ps=sampling_info.min_ps,
+                    keys=keys,
+                )
+                return
+
         contexts, context_lengths = self.contexts_tail(
             req_pool_indices, context_windows
         )
