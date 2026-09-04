@@ -180,6 +180,52 @@ class TestPrepareServerArgs(CustomTestCase):
         with self.assertRaises(SystemExit):
             parser.parse_args(base_args + ["--dsv4-prefill-backend", "flashmla_kv"])
 
+    def test_multimodal_preprocessing_admission_cli_and_default(self):
+        self.assertIsNone(
+            ServerArgs(
+                model_path="dummy"
+            ).max_mm_preprocessing_inflight_items_per_worker
+        )
+        args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--max-mm-preprocessing-inflight-items-per-worker",
+                "7",
+            ]
+        )
+        self.assertEqual(args.max_mm_preprocessing_inflight_items_per_worker, 7)
+
+    def test_multimodal_preprocessing_admission_rejects_rust_server(self):
+        with (
+            envs.SGLANG_RUST_SERVER.override(True),
+            self.assertRaisesRegex(AssertionError, "Rust frontend"),
+        ):
+            args = prepare_server_args(
+                [
+                    "--model-path",
+                    "dummy",
+                    "--max-mm-preprocessing-inflight-items-per-worker",
+                    "7",
+                ]
+            )
+            args.resolve_once()
+            args.check_server_args()
+
+    def test_multimodal_preprocessing_admission_rejects_epd(self):
+        with self.assertRaisesRegex(AssertionError, "EPD language-only"):
+            args = prepare_server_args(
+                [
+                    "--model-path",
+                    "dummy",
+                    "--language-only",
+                    "--max-mm-preprocessing-inflight-items-per-worker",
+                    "7",
+                ]
+            )
+            args.resolve_once()
+            args.check_server_args()
+
     def test_return_hidden_states_mode_configuration(self):
         def _resolved(**kwargs):
             server_args = ServerArgs(**kwargs)

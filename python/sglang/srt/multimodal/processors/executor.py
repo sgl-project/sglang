@@ -4,6 +4,10 @@ import copy
 import threading
 from typing import Any, Callable, TypeVar
 
+from sglang.srt.managers.multimodal_preprocessing_admission import (
+    track_mm_preprocessing_future,
+)
+
 T = TypeVar("T")
 
 
@@ -31,9 +35,11 @@ class MultimodalProcessorExecutor:
         self._clone_lock = threading.Lock()
 
     async def run(self, function: Callable[..., T], *args: Any, **kwargs: Any) -> T:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self._executor, self._run, function, args, kwargs
+        future = self._executor.submit(self._run, function, args, kwargs)
+        track_mm_preprocessing_future(future)
+        return await asyncio.wrap_future(
+            future,
+            loop=asyncio.get_running_loop(),
         )
 
     def _run(

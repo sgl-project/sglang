@@ -17,6 +17,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
@@ -28,6 +29,22 @@ def check_server_args(server_args: Any):
     from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 
     cfg = resolving_view(server_args)
+
+    assert (
+        cfg.max_mm_preprocessing_inflight_items_per_worker is None
+        or cfg.max_mm_preprocessing_inflight_items_per_worker > 0
+    ), "Multimodal preprocessing inflight item limit must be positive or None"
+    if cfg.max_mm_preprocessing_inflight_items_per_worker is not None:
+        assert not envs.SGLANG_RUST_SERVER.get(), (
+            "--max-mm-preprocessing-inflight-items-per-worker is not supported "
+            "with SGLANG_RUST_SERVER because the Rust frontend owns a separate "
+            "multimodal preprocessing pipeline"
+        )
+        assert not cfg.language_only, (
+            "--max-mm-preprocessing-inflight-items-per-worker is not supported "
+            "with EPD language-only mode because preprocessing may be dispatched "
+            "to a remote encoder"
+        )
 
     # Check parallel size constraints
     if cfg.ep_join_mode != "scale":

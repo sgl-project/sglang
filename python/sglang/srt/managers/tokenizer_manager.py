@@ -94,6 +94,11 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import wrap_shm_features
+from sglang.srt.managers.multimodal_preprocessing_admission import (
+    MultimodalPreprocessingAdmission,
+    MultimodalPreprocessingAdmissionLease,
+    count_preprocessed_multimodal_items,
+)
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
@@ -430,6 +435,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
         self.preferred_sampling_params = get_serving().preferred_sampling_params
         self.crash_dump_folder = get_observability().crash_dump_folder
+        max_mm_preprocessing_items = (
+            get_mm().max_mm_preprocessing_inflight_items_per_worker
+        )
+        self.mm_preprocessing_admission = (
+            MultimodalPreprocessingAdmission(max_mm_preprocessing_items)
+            if max_mm_preprocessing_items is not None
+            else None
+        )
 
         # Init model config
         self.init_model_config()
@@ -801,7 +814,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
                 )
 
-        self._init_req_state(obj, request)
+        preprocessing_lease = self._try_acquire_mm_preprocessing_admission(obj)
+        try:
+            self._init_req_state(obj, request)
+        except BaseException:
+            if preprocessing_lease is not None:
+                preprocessing_lease.release()
+            raise
         request_rids = {obj.rid} if obj.is_single else set(obj.rid)
         try:
             if get_disagg().language_only:
@@ -818,16 +837,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 # Tokenize the request and send it to the scheduler
                 if obj.is_single:
-                    tokenized_obj = await self._tokenize_one_request(obj)
+                    tokenized_obj = await self._await_mm_preprocessing(
+                        self._tokenize_one_request(obj),
+                        preprocessing_lease,
+                    )
                     state = self.rid_to_state[obj.rid]
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
                     await self._send_one_request(tokenized_obj)
+                    if preprocessing_lease is not None:
+                        preprocessing_lease.release()
                     async for response in self._wait_one_response(obj, request):
                         yield response
                 else:
                     async for response in self._handle_batch_request(
-                        obj, request, request_rids
+                        obj, request, request_rids, preprocessing_lease
                     ):
                         yield response
         except BaseException:
@@ -840,6 +864,58 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # cleanup.
             self._release_req_states_on_failure(request_rids)
             raise
+        finally:
+            if preprocessing_lease is not None:
+                preprocessing_lease.release()
+
+    def _try_acquire_mm_preprocessing_admission(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> Optional[MultimodalPreprocessingAdmissionLease]:
+        admission = getattr(self, "mm_preprocessing_admission", None)
+        if admission is None:
+            return None
+        item_count = count_preprocessed_multimodal_items(obj)
+        if item_count == 0:
+            return None
+        if item_count > admission.max_inflight_items:
+            raise fastapi.HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail=(
+                    f"The request needs {item_count} multimodal preprocessing "
+                    f"item slots, which exceeds the configured per-worker maximum "
+                    f"of {admission.max_inflight_items}. Reduce the request's media "
+                    "items or increase "
+                    "--max-mm-preprocessing-inflight-items-per-worker."
+                ),
+            )
+
+        lease = admission.try_acquire(item_count)
+        if lease is None:
+            raise fastapi.HTTPException(
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                detail=(
+                    "Multimodal preprocessing is at capacity: "
+                    f"the request needs {item_count} item slot(s), "
+                    f"with {admission.inflight_items}/"
+                    f"{admission.max_inflight_items} currently reserved."
+                ),
+            )
+        return lease
+
+    async def _await_mm_preprocessing(
+        self,
+        awaitable: Awaitable[Any],
+        lease: Optional[MultimodalPreprocessingAdmissionLease],
+    ) -> Any:
+        if lease is None:
+            return await awaitable
+
+        # Executor work submitted in this context attaches itself to the lease.
+        # Cancellation can therefore unwind the request immediately: the owner
+        # releases its reference, while any thread/process work that cannot be
+        # cancelled keeps the reservation until its done callback fires.
+        with lease.activate():
+            return await awaitable
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
@@ -1839,6 +1915,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
         request_rids: Optional[set[str]] = None,
+        preprocessing_lease: Optional[MultimodalPreprocessingAdmissionLease] = None,
     ):
         if request_rids is None:
             request_rids = set(obj.rid)
@@ -1848,7 +1925,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         rids = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
             if self._should_use_batch_tokenization(batch_size, obj):
-                tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
+                tokenized_objs = await self._await_mm_preprocessing(
+                    self._batch_tokenize_and_process(batch_size, obj),
+                    preprocessing_lease,
+                )
                 await self._send_batch_request(tokenized_objs)
 
                 # Set up generators for each request in the batch
@@ -1861,16 +1941,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     rids.append(tmp_obj.rid)
             else:
                 # Sequential tokenization and processing
-                with (
+                guard = (
                     input_blocker_guard_region(
                         dispatch_to_scheduler=self._dispatch_to_scheduler,
                     )
                     if get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
                     else nullcontext()
-                ):
+                )
+                with guard:
                     for i in range(batch_size):
                         tmp_obj = obj[i]
-                        tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                        tokenized_obj = await self._await_mm_preprocessing(
+                            self._tokenize_one_request(tmp_obj),
+                            preprocessing_lease,
+                        )
                         state = self.rid_to_state[tmp_obj.rid]
                         if tmp_obj.return_prompt_token_ids:
                             state.prompt_token_ids = list(tokenized_obj.input_ids)
@@ -1888,9 +1972,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Tokenize all requests
             objs = [obj[i] for i in range(batch_size)]
-            tokenized_objs = await asyncio.gather(
-                *(self._tokenize_one_request(obj) for obj in objs)
-            )
+            if preprocessing_lease is None:
+                tokenized_objs = await asyncio.gather(
+                    *(self._tokenize_one_request(obj) for obj in objs)
+                )
+            else:
+                tokenized_objs = await self._await_mm_preprocessing(
+                    self._tokenize_parallel_sampling_requests(objs),
+                    preprocessing_lease,
+                )
 
             # Cache the common prefix for parallel sampling
             for i in range(batch_size):
@@ -1936,6 +2026,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self.rid_to_state[objs[i].rid].time_stats.set_finished_time()
                 del self.rid_to_state[objs[i].rid]
 
+        if preprocessing_lease is not None:
+            # CPU processor output remains reserved through CUDA-VMM/shared-memory
+            # preparation and the final scheduler handoff.
+            preprocessing_lease.release()
+
         # Wait for all requests
         is_stream = hasattr(obj, "stream") and obj.stream
         if not is_stream:
@@ -1944,6 +2039,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             async for response in self._stream_batch_responses(generators, rids):
                 yield response
+
+    async def _tokenize_parallel_sampling_requests(
+        self, objs: List[Union[GenerateReqInput, EmbeddingReqInput]]
+    ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]]:
+        results = await asyncio.gather(
+            *(self._tokenize_one_request(obj) for obj in objs),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        return results
 
     async def _collect_batch_responses(self, generators):
         tasks = [asyncio.create_task(gen.__anext__()) for gen in generators]

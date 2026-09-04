@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import io
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -8,6 +9,9 @@ from typing import Optional
 
 from PIL import Image
 
+from sglang.srt.managers.multimodal_preprocessing_admission import (
+    MultimodalPreprocessingAdmission,
+)
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.cache import MultimodalPreprocessCache, snapshot_media
 from sglang.srt.multimodal.media_artifacts import (
@@ -89,6 +93,47 @@ class _Processor(MediaArtifactCacheMixin):
 
 
 class TestMediaArtifactProcessor(unittest.TestCase):
+    def test_kimi_artifact_hash_error_keeps_sibling_io_reserved(self):
+        """The Kimi artifact mixin submits all snapshot I/O before hash checks."""
+        sibling_started = threading.Event()
+        release_sibling = threading.Event()
+
+        class _BlockingProcessor(_Processor):
+            def snapshot_media_source(self, source, modality):
+                if source == b"mismatched":
+                    sibling_started.wait()
+                    return snapshot_media(b"actual")
+                sibling_started.set()
+                release_sibling.wait()
+                return snapshot_media(source)
+
+        processor = _BlockingProcessor()
+        admission = MultimodalPreprocessingAdmission(2)
+        lease = admission.try_acquire(2)
+        expected = snapshot_media(b"expected").content_digest
+
+        async def drive():
+            with lease.activate():
+                with self.assertRaisesRegex(ValueError, "content hash mismatch"):
+                    await processor.prepare_media_artifacts(
+                        [b"mismatched", b"blocked"],
+                        content_hashes=[expected, None],
+                    )
+            lease.release()
+            self.assertEqual(admission.inflight_items, 2)
+            release_sibling.set()
+            for _ in range(100):
+                if admission.inflight_items == 0:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(admission.inflight_items, 0)
+
+        try:
+            asyncio.run(drive())
+        finally:
+            release_sibling.set()
+            processor.close()
+
     def test_default_image_decoder_rejects_lazy_pil_failure(self):
         malformed_png = base64.b64decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLJSwAAAABJRU5ErkJggg=="
