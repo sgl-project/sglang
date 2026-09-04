@@ -6,7 +6,10 @@ import torch
 from sgl_kernel.scalar_type import scalar_types
 
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
+from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+    _select_moe_block_size,
+    fused_marlin_moe,
+)
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import awq_marlin_quantize, marlin_quantize
@@ -140,6 +143,66 @@ def marlin_moe_generate_valid_test_cases():
         if is_valid(*case):
             cases.append(case)
     return cases
+
+
+class TestMarlinMoeBlockSizeSelection(unittest.TestCase):
+    def test_kimi_k3_h200_tp16_ep16(self):
+        expected = {
+            128: 8,
+            256: 16,
+            512: 16,
+            1024: 32,
+            2048: 48,
+            4096: 48,
+            8192: 64,
+        }
+        for num_tokens, block_size in expected.items():
+            with self.subTest(num_tokens=num_tokens):
+                self.assertEqual(
+                    _select_moe_block_size(
+                        num_tokens,
+                        num_experts=56,
+                        top_k=16,
+                        global_num_experts=896,
+                        device_name="NVIDIA H200",
+                    ),
+                    block_size,
+                )
+
+    def test_kimi_k3_h200_tp32_ep32(self):
+        expected = {
+            64: 8,
+            128: 16,
+            256: 16,
+            512: 32,
+            1024: 48,
+            2048: 48,
+            4096: 64,
+        }
+        for num_tokens, block_size in expected.items():
+            with self.subTest(num_tokens=num_tokens):
+                self.assertEqual(
+                    _select_moe_block_size(
+                        num_tokens,
+                        num_experts=28,
+                        top_k=16,
+                        global_num_experts=896,
+                        device_name="NVIDIA H200",
+                    ),
+                    block_size,
+                )
+
+    def test_other_devices_keep_default_heuristic(self):
+        self.assertEqual(
+            _select_moe_block_size(
+                64,
+                num_experts=56,
+                top_k=16,
+                global_num_experts=896,
+                device_name="NVIDIA H100 80GB HBM3",
+            ),
+            32,
+        )
 
 
 class TestFusedMarlinMoe(CustomTestCase):
