@@ -39,16 +39,11 @@ _AUTOTUNE_CONFIGS = [
     for bn in (32, 64, 128)
     for w in (1, 2, 4)
     for ns in (1, 2)
+    # The torch 2.11 HIP Triton/LLVM stack aborts on this candidate for gfx950's
+    # padded-head path. Autotune cannot recover from a compiler process abort,
+    # so omit it only from the HIP grid; other backends retain the full grid.
+    if torch.version.hip is None or not (bn == 128 and w == 1 and ns == 2)
 ]
-if torch.version.hip is not None:
-    # waves_per_eu is a ROCm launch attribute, so only offer it on HIP builds;
-    # a CUDA compile must never see an unknown Config key. Autotune picks it on
-    # merit at the gfx950 sparse-MLA prefill shapes rather than it being pinned
-    # to one head count.
-    _AUTOTUNE_CONFIGS.insert(
-        0,
-        triton.Config({"BLOCK_N": 32, "waves_per_eu": 2}, num_warps=2, num_stages=2),
-    )
 
 
 @triton.autotune(

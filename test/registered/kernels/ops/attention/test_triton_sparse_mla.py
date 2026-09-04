@@ -31,31 +31,44 @@ def _require_gfx950() -> None:
         pytest.skip(f"the sparse-MLA Triton prefill path requires gfx950, got {arch}")
 
 
-def _make_indices(pattern: str) -> torch.Tensor:
+def _make_indices(
+    pattern: str,
+    *,
+    seq: int = SEQ,
+    pool_size: int = POOL_SIZE,
+    topk: int = TOPK,
+) -> torch.Tensor:
     if pattern == "trailing":
-        base = torch.arange(POOL_SIZE - TOPK, POOL_SIZE)
+        base = torch.arange(pool_size - topk, pool_size)
     elif pattern == "strided":
-        base = torch.arange(0, POOL_SIZE, 2)
+        base = torch.arange(0, pool_size, pool_size // topk)
     elif pattern == "head_tail":
         base = torch.cat(
             [
-                torch.arange(0, TOPK // 2),
-                torch.arange(POOL_SIZE - TOPK // 2, POOL_SIZE),
+                torch.arange(0, topk // 2),
+                torch.arange(pool_size - topk // 2, pool_size),
             ]
         )
     else:
         raise ValueError(f"unknown index pattern: {pattern}")
 
-    rows = [torch.roll(base, shifts=row) for row in range(SEQ)]
+    rows = [torch.roll(base, shifts=row) for row in range(seq)]
     return torch.stack(rows).to(device="cuda", dtype=torch.int32).unsqueeze(1)
 
 
-def _make_inputs(num_heads: int, pattern: str):
+def _make_inputs(
+    num_heads: int,
+    pattern: str,
+    *,
+    seq: int = SEQ,
+    pool_size: int = POOL_SIZE,
+    topk: int = TOPK,
+):
     generator = torch.Generator(device="cuda")
     generator.manual_seed(20260901 + num_heads)
     q_nope = (
         torch.randn(
-            SEQ,
+            seq,
             num_heads,
             VALUE_DIM,
             device="cuda",
@@ -65,7 +78,7 @@ def _make_inputs(num_heads: int, pattern: str):
     ).to(torch.float8_e4m3fn)
     q_rope = (
         torch.randn(
-            SEQ,
+            seq,
             num_heads,
             ROPE_DIM,
             device="cuda",
@@ -75,7 +88,7 @@ def _make_inputs(num_heads: int, pattern: str):
     ).to(torch.float8_e4m3fn)
     kv = (
         torch.randn(
-            POOL_SIZE,
+            pool_size,
             1,
             HEAD_DIM,
             device="cuda",
@@ -83,7 +96,12 @@ def _make_inputs(num_heads: int, pattern: str):
         )
         * 0.25
     ).to(torch.float8_e4m3fn)
-    return q_nope, q_rope, kv, _make_indices(pattern)
+    return (
+        q_nope,
+        q_rope,
+        kv,
+        _make_indices(pattern, seq=seq, pool_size=pool_size, topk=topk),
+    )
 
 
 def _reference(
@@ -116,6 +134,28 @@ def test_triton_sparse_mla_raw_fp8(num_heads: int, pattern: str) -> None:
     """
     _require_gfx950()
     q_nope, q_rope, kv, indices = _make_inputs(num_heads, pattern)
+    actual = triton_sparse_mla_fwd(
+        q_nope,
+        q_rope,
+        kv,
+        indices,
+        sm_scale=1.0 / math.sqrt(HEAD_DIM),
+        d_v=VALUE_DIM,
+    ).squeeze(0)
+    expected = _reference(q_nope, q_rope, kv, indices)
+    torch.testing.assert_close(actual.float(), expected, atol=0.2, rtol=0.2)
+
+
+def test_triton_sparse_mla_gfx950_full_topk() -> None:
+    """Compile every candidate in the gfx950 padded-head dispatch grid."""
+    _require_gfx950()
+    q_nope, q_rope, kv, indices = _make_inputs(
+        8,
+        "trailing",
+        seq=1,
+        pool_size=2048,
+        topk=2048,
+    )
     actual = triton_sparse_mla_fwd(
         q_nope,
         q_rope,
