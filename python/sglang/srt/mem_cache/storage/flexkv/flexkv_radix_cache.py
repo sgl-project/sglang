@@ -632,20 +632,6 @@ class FlexKVRadixCache(RadixCache):
                     page_ids = page_reps // self.page_size
                     unique_pages = torch.unique(page_ids)
                     aligned = bool((page_reps % self.page_size == 0).all())
-                logger.info(
-                    "[FlexKV] D2H slot mapping rid=%s tokens=%d pages=%d "
-                    "slot_first=%d slot_last=%d block_min=%d block_max=%d "
-                    "unique_blocks=%d aligned=%s",
-                    rid,
-                    kv_indices.numel(),
-                    page_reps.numel(),
-                    int(page_reps[0]),
-                    int(page_reps[-1]),
-                    int(page_ids.min()),
-                    int(page_ids.max()),
-                    unique_pages.numel(),
-                    aligned,
-                )
                 if not aligned or unique_pages.numel() != page_ids.numel():
                     raise RuntimeError(
                         "FlexKV D2H received an invalid GPU slot mapping: "

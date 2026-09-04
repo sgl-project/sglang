@@ -63,7 +63,7 @@ docker exec flexkv-sglang bash -c '
   python3 -c "
 import sglang, flexkv
 from flexkv.kvmanager import KVManager
-from sglang.srt.mem_cache.storage.flexkv import flexkv_comm
+from flexkv.integration.sglang.connector import FlexKVConnector
 from sglang.srt.mem_cache.registry import registered_radix_cache_backends
 import sglang.srt.mem_cache.storage.flexkv  # registers
 print(\"flexkv ok\", flexkv.__file__)
@@ -258,9 +258,6 @@ This is the path you'll use under any non-trivial deployment topology
   `register_layer_transfer_counter`; the per-layer hook blocks each
   forward layer on its own eventfd until the FlexKV transfer worker
   signals the layer is staged.
-* For a detailed explanation of CP rank synchronization, failure modes,
-  diagnostics, and validation, see
-  [`LAYERWISE_CP_RESTORE_HANG.md`](LAYERWISE_CP_RESTORE_HANG.md).
 * Layerwise mode requires the FlexKV transfer worker's UDS socket
   (`/tmp/flexkv_layerwise_eventfd.sock` by default) to be reachable —
   the connector handshakes with it at startup. The socket path is
@@ -277,18 +274,19 @@ This is the path you'll use under any non-trivial deployment topology
   `check_hicache_events`, `reset`.
 * `flexkv_hybrid_radix_cache.py` — composes FlexKV I/O with
   `UnifiedRadixCache` for hybrid SWA models such as DeepSeek V4.
-* `flexkv_connector.py` — `FlexKVConnector`. Owns the `KVManager`,
-  `KVTPClient`, and the cross-rank sync context. Public methods:
-  `lookup_kv`, `retrieve_kv`, `start_load_kv_layerwise`, `store_kv`,
-  `check_completed_stores`, `prefetch_async`, …
-* `flexkv_comm.py` — `FlexKVComm` (3-axis PP × CP × TP sync built on
-  torch.distributed) + the eventfd / `SCM_RIGHTS` shims used by the
-  layerwise transfer UDS handshake. **`FlexKVLayerLoadingEvent` here
-  carries the layerwise correctness fix** (drain stale eventfd
-  signals on reset, switch `wait` to `select.select` to keep blocking
-  semantics on a NONBLOCK fd).
 * `__init__.py` — registers the `"flexkv"` factory with
   `sglang.srt.mem_cache.registry`.
+
+The connector and the cross-rank sync layer are **not** vendored here.
+They are imported from the FlexKV package itself:
+
+* `flexkv.integration.sglang.connector` — `FlexKVConnector`. Owns the
+  `KVManager`, `KVTPClient`, and the cross-rank sync context. Public
+  methods: `lookup_kv`, `retrieve_kv`, `start_load_kv_layerwise`,
+  `store_kv`, `check_completed_stores`, `prefetch_async`, …
+* the same package provides `FlexKVComm` (3-axis PP × CP × TP sync built
+  on torch.distributed) plus the eventfd / `SCM_RIGHTS` shims used by the
+  layerwise transfer UDS handshake.
 
 ---
 
@@ -380,8 +378,11 @@ Supported:
   output byte-equal to no-FlexKV baseline across short / medium / long
   prompts. ~30–46 GB/s observed for D2H stores and ~37 GB/s for H2D
   loads.
-* IP (layerwise) path — verified end-to-end with the fix in
-  `flexkv_comm.py`. ~7–12 GB/s per-layer (smaller per-call payload).
+* IP (layerwise) path — verified end-to-end with the layerwise eventfd
+  fix in the FlexKV package's `FlexKVLayerLoadingEvent` (drain stale
+  eventfd signals on reset, and use `select.select` in `wait` to keep
+  blocking semantics on a NONBLOCK fd). ~7–12 GB/s per-layer (smaller
+  per-call payload).
 * PP / CP / DP / multi-node — code paths driven by `FlexKVComm`,
   carried over from the production-validated `BaseKVConnector`
   integration. Not exercised in single-GPU smoke tests; needs a

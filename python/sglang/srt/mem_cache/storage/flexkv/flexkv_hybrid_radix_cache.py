@@ -42,7 +42,6 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class _LoadMarker:
-    key: RadixKey
     device_length: int
 
 
@@ -205,9 +204,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         if hit_length <= 0:
             return result
 
-        snapshot = token_ids[:] if token_ids is key.token_ids else token_ids
         self._load_markers[params.req.rid] = _LoadMarker(
-            key=RadixKey(snapshot, key.extra_key, key.is_bigram),
             device_length=device_length,
         )
         return result._replace(
@@ -759,11 +756,6 @@ class FlexKVHybridRadixCache(BasePrefixCache):
 
     def ready_to_load_host_cache(self) -> Any:
         return self._inner_cache.ready_to_load_host_cache()
-
-    def flush_write_through_acks(self) -> None:
-        self._launch_pending_stores()
-        self._drain_completed_stores()
-        self._inner_cache.flush_write_through_acks()
 
     def take_events(self) -> list[Any]:
         return self._inner_cache.take_events()

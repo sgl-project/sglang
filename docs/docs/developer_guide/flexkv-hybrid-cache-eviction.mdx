@@ -17,8 +17,9 @@ An allocation succeeds only when both pools have enough free capacity for their 
 ```text
 _alloc_restore_slots()
   -> evict_from_tree_cache()
-  -> tree_cache.evict(EvictParams(...))
-  -> retry the allocation once
+  -> tree_cache.evict(EvictParams(...))   # loops until the demand is met
+                                          # or eviction stops making progress
+  -> retry the allocation
 ```
 
 Small tests may never enter `evict_from_tree_cache()` because the device pools still have free slots. Always include a memory-pressure test when you change this path.
