@@ -306,6 +306,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
     ):
         """Dispatch generation requests, merging compatible requests when allowed."""
         reqs = self._normalize_generation_reqs(reqs)
+        if self._async_output_save:
+            # Reserve capacity before any forward allocates another output.
+            # The single finalize worker completes futures in FIFO order.
+            while len(self._inflight_finalizes) >= _MAX_INFLIGHT_FINALIZES:
+                self._inflight_finalizes.popleft().result()
+            self._flush_ready_replies()
         if self.worker.is_sleeping():
             raise RuntimeError(
                 "Server is sleeping. Call resume_memory_occupation first."
@@ -820,10 +826,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         deferred: _DeferredOutput,
     ) -> None:
         assert self._finalize_executor is not None
-        # Single finalize worker completes FIFO, so waiting on the oldest
-        # future is enough to keep the bound.
-        while len(self._inflight_finalizes) >= _MAX_INFLIGHT_FINALIZES:
-            self._inflight_finalizes.popleft().result()
         future = self._finalize_executor.submit(
             self._finalize_and_stage_reply, item=item, deferred=deferred
         )

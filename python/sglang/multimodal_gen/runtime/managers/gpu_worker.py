@@ -689,19 +689,23 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         # A dedicated stream, ordered after the producing forward via done_event,
         # keeps the D2H copies and uint8 conversions off the next request's
         # compute stream.
-        if self._deferred_save_stream is None:
-            self._deferred_save_stream = torch.get_device_module().Stream()
-        stream = self._deferred_save_stream
-        stream.wait_event(done_event)
-        with torch.get_device_module().stream(stream):
-            self._finalize_output_batch(
-                output_batch=output_batch,
-                req=req,
-                save_output_paths=save_output_paths,
-                output_metrics=output_metrics,
-                deferred=True,
-            )
-        stream.synchronize()
+        device_module = torch.get_device_module()
+        # CUDA's current device is thread-local; executor threads do not inherit
+        # the worker's device selection.
+        with device_module.device(self.local_rank):
+            if self._deferred_save_stream is None:
+                self._deferred_save_stream = device_module.Stream()
+            stream = self._deferred_save_stream
+            stream.wait_event(done_event)
+            with device_module.stream(stream):
+                self._finalize_output_batch(
+                    output_batch=output_batch,
+                    req=req,
+                    save_output_paths=save_output_paths,
+                    output_metrics=output_metrics,
+                    deferred=True,
+                )
+            stream.synchronize()
 
     def take_deferred_finalize(self) -> Callable[[], None] | None:
         deferred = self._deferred_finalize
