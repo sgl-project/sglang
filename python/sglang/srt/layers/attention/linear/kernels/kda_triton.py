@@ -232,7 +232,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         beta_is_raw: bool = False,
         return_intermediate_states: bool = False,
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
         return chunk_kda(
             q=q,
             k=k,

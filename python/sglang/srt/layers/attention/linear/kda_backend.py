@@ -331,7 +331,7 @@ class KDAKernelDispatcher:
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
         kernel = self.extend_kernel
         if kwargs.get("lower_bound") is not None and not getattr(
             kernel, "supports_safe_gate", True

@@ -23,10 +23,6 @@ pattern (the code under test) executes.
     python -m pytest test/registered/unit/mem_cache/test_flashkda_strided_state_access.py -v
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
-
 import sys
 import types
 import unittest
@@ -38,6 +34,10 @@ from sglang.srt.mem_cache.layout.page_major import (
     build_page_major_mamba_views,
     mamba_entry_bytes,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 _DEV = "cpu"
 
@@ -45,8 +45,8 @@ _DEV = "cpu"
 _LAYERS = 3
 _LAYER_UNDER_TEST = 1
 _H = 2
-_K = 4
-_V = 4
+_K = 128
+_V = 128
 _SLOTS = 8
 _CONV_SHAPES = (
     (3, 8),
@@ -114,7 +114,7 @@ class _FakeFlashKDA:
         out_buf.fill_(0.25)
 
 
-class TestFlashKDAStridedStateAccess(unittest.TestCase):
+class TestFlashKDAStridedStateAccess(CustomTestCase):
     def setUp(self):
         self._saved_module = sys.modules.get("flash_kda")
         self.fake = _FakeFlashKDA()
@@ -149,7 +149,7 @@ class TestFlashKDAStridedStateAccess(unittest.TestCase):
             query_start_loc=query_start_loc,
             A_log=torch.randn(1, 1, _H, 1),
             dt_bias=torch.randn(_H * _K),
-            lower_bound=-10.0,  # safe gate => fused path (no triton fallback)
+            lower_bound=-5.0,  # GLM safe gate => fused path (no Triton fallback)
             extend_seq_lens_cpu=[_SEQ_LEN] * num_seqs,
         )
 
@@ -178,12 +178,11 @@ class TestFlashKDAStridedStateAccess(unittest.TestCase):
         conv_before = [cv.clone() for cv in conv_views]
 
         cache_indices = torch.tensor([5, 2], dtype=torch.int32)
-        out, intermediate_states = self._run_extend(ssm_states, cache_indices)
+        out = self._run_extend(ssm_states, cache_indices)
 
         # Routing: the fused path ran exactly once (a silent re-route to the
         # triton fallback would make every assertion below vacuous).
         self.assertEqual(self.fake.calls, 1)
-        self.assertIsNone(intermediate_states)
         self.assertEqual(tuple(out.shape), (1, 2 * _SEQ_LEN, _H, _V))
 
         # Gather: the external kernel must receive a CONTIGUOUS copy whose rows
