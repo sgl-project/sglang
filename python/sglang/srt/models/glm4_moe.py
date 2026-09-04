@@ -1452,22 +1452,19 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
     # _resolve_nextn_quant_config below instead.
     hf_to_sglang_mapper = WeightsMapper()
 
-    _NEXTN_SPEC_WEIGHT_NAMES = ("shared_head.norm", "eh_proj", "enorm", "hnorm")
-
-    @classmethod
-    def _map_mtp_ckpt_name(cls, name: str, layer_prefix: str) -> str:
-        # Keep this mapping in sync with DeepseekV2WeightLoaderMixin's
-        # NextN rule: MTP-specific weights live under model.*, while the
-        # decoder block weights live under model.decoder.*.
-        if any(part in name for part in cls._NEXTN_SPEC_WEIGHT_NAMES):
-            return name.replace(layer_prefix, "model", 1)
-        return name.replace(layer_prefix, "model.decoder", 1)
-
     def _resolve_nextn_quant_config(self, config, quant_config):
-        if quant_config is None or quant_config.get_name() != "quark":
-            return quant_config
+        if quant_config is None:
+            return None
+        quant_name = (
+            quant_config.get_name() if hasattr(quant_config, "get_name") else None
+        )
+        if quant_name != "quark":
+            return super()._resolve_nextn_quant_config(config, quant_config)
 
-        layer_prefix = f"model.layers.{config.num_hidden_layers}"
+        nextn_layer_id = (
+            0 if config.num_hidden_layers == 1 else config.num_hidden_layers
+        )
+        layer_prefix = f"model.layers.{nextn_layer_id}"
 
         # Quark's per-module scheme selection (e.g. MTP self_attn in PTPC-FP8
         # while MTP MoE is MXFP4) is keyed by "layer_quant_config" patterns
@@ -1476,7 +1473,19 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
         # keys need the same remap as exclude_layers below, or they silently
         # fall back to the wrong (layer-type/global) scheme.
         layer_quant_config = quant_config.quant_config.get("layer_quant_config")
+        mtp_excluded = [
+            name
+            for name in quant_config.exclude_layers
+            if name.startswith(layer_prefix + ".")
+        ]
+        if not layer_quant_config and not mtp_excluded:
+            return quant_config
+
+        import copy
+
+        quant_config = copy.copy(quant_config)
         if layer_quant_config:
+            quant_config.quant_config = copy.copy(quant_config.quant_config)
             quant_config.quant_config["layer_quant_config"] = {
                 (
                     self._map_mtp_ckpt_name(pattern, layer_prefix)
@@ -1486,30 +1495,21 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
                 for pattern, pattern_config in layer_quant_config.items()
             }
 
-        mtp_excluded = [
-            name
-            for name in quant_config.exclude_layers
-            if name.startswith(layer_prefix + ".")
-        ]
-        if not mtp_excluded:
-            return quant_config
+        if mtp_excluded:
+            names = set(quant_config.exclude_layers)
+            for name in mtp_excluded:
+                names.add(self._map_mtp_ckpt_name(name, layer_prefix))
 
-        names = set(quant_config.exclude_layers)
-        for name in mtp_excluded:
-            names.add(self._map_mtp_ckpt_name(name, layer_prefix))
+            # Fused routed experts are queried by the coarse module prefix
+            # "model.decoder.mlp.experts". Expanded per-expert leaf excludes do not
+            # match that prefix, so add the coarse prefix when any routed expert in
+            # the MTP layer is excluded. This keeps only that fused MoE module bf16
+            # while allowing the remaining draft modules to use their quant config.
+            if any(".mlp.experts." in name for name in mtp_excluded):
+                names.add("model.decoder.mlp.experts")
 
-        # Fused routed experts are queried by the coarse module prefix
-        # "model.decoder.mlp.experts". Expanded per-expert leaf excludes do not
-        # match that prefix, so add the coarse prefix when any routed expert in
-        # the MTP layer is excluded. This keeps only that fused MoE module bf16
-        # while allowing the remaining draft modules to use their quant config.
-        if any(".mlp.experts." in name for name in mtp_excluded):
-            names.add("model.decoder.mlp.experts")
+            quant_config.exclude_layers = list(names)
 
-        import copy
-
-        quant_config = copy.copy(quant_config)
-        quant_config.exclude_layers = list(names)
         return quant_config
 
 

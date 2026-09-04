@@ -303,7 +303,7 @@ class ModelOptQuantConfig(QuantizationConfig):
         packed_modules_mapping: Optional[Dict[str, List[str]]],
     ):
         super().__init__()
-        self.packed_modules_mapping = packed_modules_mapping
+        self.packed_modules_mapping = packed_modules_mapping or {}
         self.exclude_modules = exclude_modules or []
         self.kv_cache_quant_algo = kv_cache_quant_algo
         self.use_per_token_activation = False
