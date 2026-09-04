@@ -171,7 +171,10 @@ def matmul_kernel_persistent(
 
 
 def _matmul_persistent_triton(
-    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
 ):
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
@@ -183,8 +186,10 @@ def _matmul_persistent_triton(
     M, K = a.shape
     K, N = b.shape
     dtype = a.dtype
-    # Allocates output.
-    c = torch.empty((M, N), device=a.device, dtype=dtype)
+    # Allocates output; out_dtype only moves the store, tiling stays input-keyed.
+    c = torch.empty(
+        (M, N), device=a.device, dtype=dtype if out_dtype is None else out_dtype
+    )
 
     # 1D launch kernel where each block gets its own program.
     def grid(META):
@@ -248,14 +253,18 @@ def _matmul_persistent_triton(
 
 
 def _matmul_persistent_deepgemm(
-    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
 ):
     M, K = a.shape
     K, N = b.shape
-    dtype = a.dtype
-    out = torch.empty((M, N), device=a.device, dtype=dtype)
+    out_dtype = a.dtype if out_dtype is None else out_dtype
+    out = torch.empty((M, N), device=a.device, dtype=out_dtype)
 
     try:
+        # NN forwards to bf16_gemm_nt, whose store is bf16 or fp32 either way.
         deep_gemm.bf16_gemm_nn(a, b, out)
     except RuntimeError as e:
         raise RuntimeError(
@@ -273,7 +282,10 @@ def _matmul_persistent_deepgemm(
 
 
 def matmul_persistent(
-    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
 ):
     K, N = b.shape
 
@@ -285,13 +297,19 @@ def matmul_persistent(
         and ENABLE_JIT_DEEPGEMM
         and (a.dtype == torch.bfloat16)
         and (b.dtype == torch.bfloat16)
+        # DeepGEMM's bf16 GEMM stores bf16 or fp32; anything else belongs on Triton.
+        and out_dtype in (None, torch.bfloat16, torch.float32)
         and a.is_contiguous()
         and b.transpose(0, 1).is_contiguous()
         and N >= MIN_DEEPGEMM_DIM
     ):
         if _ENABLE_MM_COMPARISON_TEST:
-            out_triton = _matmul_persistent_triton(a=a, b=b, bias=bias)
-            out_deepgemm = _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
+            out_triton = _matmul_persistent_triton(
+                a=a, b=b, bias=bias, out_dtype=out_dtype
+            )
+            out_deepgemm = _matmul_persistent_deepgemm(
+                a=a, b=b, bias=bias, out_dtype=out_dtype
+            )
             diff = calc_diff(out_triton, out_deepgemm)
             assert diff < 0.0001, f"{diff=} {out_triton=} {out_deepgemm=}"
             # can be enabled for debugging
@@ -304,15 +322,17 @@ def matmul_persistent(
             # print(f"{a=} {b=} {bias=} {out_triton=} {out_deepgemm=}")
             return out_deepgemm
 
-        return _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
+        return _matmul_persistent_deepgemm(a=a, b=b, bias=bias, out_dtype=out_dtype)
 
-    if _ENABLE_MM_FALLBACK_VARIANT:
+    # The variant GEMM stores a.dtype, so a wider out_dtype has to go to Triton
+    # rather than round trip through a narrower store.
+    if _ENABLE_MM_FALLBACK_VARIANT and out_dtype in (None, a.dtype):
         out = torch.einsum("ik,kj->ij", a, b)
         if bias is not None:
             out += bias
         return out
 
-    return _matmul_persistent_triton(a=a, b=b, bias=bias)
+    return _matmul_persistent_triton(a=a, b=b, bias=bias, out_dtype=out_dtype)
 
 
 @triton.jit
@@ -965,7 +985,9 @@ def _rms_norm_aten_compat(input, normalized_shape, weight=None, eps=None):
 
 
 def _mm_dtype_compat(self, mat2, out_dtype):
-    return matmul_persistent(self.contiguous(), mat2.contiguous()).to(out_dtype)
+    # Casting the result would round through the input dtype instead of storing
+    # out_dtype; matmul_persistent takes strided operands, so no .contiguous().
+    return matmul_persistent(self, mat2, out_dtype=out_dtype)
 
 
 _batch_invariant_MODE = False
@@ -1011,9 +1033,13 @@ def enable_batch_invariant_mode(enable_bmm: bool = True):
             npu_matmul_batch_invariant,
             npu_mean_batch_invariant,
             npu_mm_batch_invariant,
+            npu_mm_dtype_batch_invariant,
         )
 
         _batch_invariant_LIB.impl("aten::mm", npu_mm_batch_invariant, dispatch_key)
+        _batch_invariant_LIB.impl(
+            "aten::mm.dtype", npu_mm_dtype_batch_invariant, dispatch_key
+        )
         _batch_invariant_LIB.impl(
             "aten::matmul", npu_matmul_batch_invariant, dispatch_key
         )
