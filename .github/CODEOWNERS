@@ -96,4 +96,4 @@
 /python/sglang/kernels/jit/csrc/ngram_corpus @hnyls2002 @Qiaolin-Yu @kpham-sgl
 /python/sglang/srt/models/laguna.py @Jiminator
 /python/sglang/srt/configs/laguna.py @Jiminator
-/tools/sglang-simulator/ ma_ruiyan@foxmail.com hzh0425@apache.org hz-zhou@qq.com m15811920139@163.com
+/tools/sglang-simulator ma_ruiyan@foxmail.com hzh0425@apache.org hz-zhou@qq.com m15811920139@163.com
