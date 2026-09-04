@@ -1,6 +1,6 @@
 """
 Usage:
-python3 offline_batch_inference.py
+python3 offline_batch_inference_qwen_1m.py
 """
 
 from urllib.request import urlopen
