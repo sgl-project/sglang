@@ -135,6 +135,7 @@ def check_server_args(server_args: Any):
     assert cfg.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"
     assert cfg.mm_processor_worker_num >= 0, "Multimodal processor worker num must >= 0"
     assert cfg.mm_io_worker_num >= 0, "Multimodal I/O worker num must >= 0"
+    validate_mm_preprocessing_device(cfg)
     validate_buckets_rule("--prompt-tokens-buckets", cfg.prompt_tokens_buckets)
     validate_buckets_rule("--generation-tokens-buckets", cfg.generation_tokens_buckets)
 
@@ -229,6 +230,21 @@ def check_server_args(server_args: Any):
         )
 
     check_load_publish_args(server_args)
+
+
+def validate_mm_preprocessing_device(cfg: Any) -> None:
+    """The CLI restricts the value through its choices; programmatic
+    construction reaches this check directly."""
+    if cfg.mm_preprocessing_device not in ("auto", "cpu", "cuda"):
+        raise ValueError(
+            "--mm-preprocessing-device must be one of auto, cpu, cuda; got "
+            f"{cfg.mm_preprocessing_device!r}."
+        )
+    if cfg.mm_preprocessing_device == "cuda" and cfg.device != "cuda":
+        raise ValueError(
+            "--mm-preprocessing-device=cuda requires --device=cuda; "
+            f"the server device is {cfg.device!r}."
+        )
 
 
 def validate_buckets_rule(arg_name: str, buckets_rule: List[str]):
