@@ -33,8 +33,8 @@ shims over this slot).
 ``get_model()`` / ``get_spec()`` / ``get_lora()`` / ``get_mm()`` /
 ``get_disagg()`` / ``get_serving()`` / ``get_observability()`` return the
 resolved **config namespace bags** — the single source of truth for config,
-snapshotted from ``server_args`` at publish and driven by the ``NS(...)``
-metadata on each field (multi-level under ``exec.*``). Reads are attribute
+snapshotted from ``server_args`` at publish, one bag per namespace class in
+``arg_groups/fields/`` (multi-level under ``exec.*``). Reads are attribute
 chains (``get_exec().moe.moe_runner_backend``); bags are read-only by bare
 assignment (written via ``override``).
 
@@ -796,14 +796,16 @@ class _ConfigBag:
 
 
 def _build_config_bags(server_args: Any) -> dict:
-    """Snapshot the resolution result into the namespace bag tree, driven by
-    the ``NS(...)`` metadata on the dataclass fields. Each leaf comes from
+    """Snapshot the resolution result into the namespace bag tree.
+
+    The tree is ``namespace_of``: each field is placed by the namespace class
+    that declares it (``arg_groups/fields/``). Each leaf comes from
     ``resolution_result`` -- the declaration if resolution made one, else what
-    the caller supplied. Returns
-    ``{top_level_name: _ConfigBag}``, arbitrarily nested (``exec.moe.eplb.…``).
-    Only dataclass fields carry ``NS`` markers, so derived properties/methods are
-    naturally excluded (they stay on the bag). A name used as both a leaf and a
-    subgroup at the same level is a hard error — no silent shadowing."""
+    the caller supplied. Returns ``{top_level_name: _ConfigBag}``, arbitrarily
+    nested (``exec.moe.eplb.…``). Only dataclass fields are placed, so derived
+    properties and methods are naturally excluded (they stay on the bag). A
+    name used as both a leaf and a subgroup at the same level is a hard error
+    — no silent shadowing."""
     from sglang.srt.arg_groups.arg_utils import namespace_of
     from sglang.srt.arg_groups.overrides import resolution_result
 
@@ -812,12 +814,12 @@ def _build_config_bags(server_args: Any) -> dict:
     for field, path in namespace_of(type(server_args)).items():
         value = resolution_result(server_args, field, _MISSING)
         if value is _MISSING:
-            # Every NS-declared field is a dataclass field, so a resolved config
+            # Every placed field is a dataclass field, so a resolved config
             # always carries it; a miss means a malformed/partial config object
             # was published. Fail loud here rather than silently omitting the
             # leaf (which surfaces later as a confusing "not a published leaf").
             raise AttributeError(
-                f"config field {field!r} is declared NS({path!r}) but absent from "
+                f"config field {field!r} belongs to namespace {path!r} but is absent from "
                 f"the published {type(server_args).__name__}; cannot project its bag leaf"
             )
         parts = path.split(".")
@@ -953,8 +955,8 @@ class RuntimeContext:
         )
         self._server_args = server_args
         # Snapshot resolved config into the namespace bags (the single source of
-        # truth for config reads). Driven by NS(...) metadata; a mock/partial
-        # config with no NS markers yields an empty tree (no bags projected).
+        # truth for config reads). Placed by `namespace_of`; a mock/partial
+        # config that declares no namespace yields an empty tree (no bags).
         self._config_bags = _build_config_bags(server_args)
         spec = self._config_bags.get("spec")
         if spec is not None:
@@ -1024,7 +1026,7 @@ class RuntimeContext:
         no write-through, so the old "wrote one store, read another" desync class
         cannot occur.
 
-        Each flat field name is routed to its bag by the ``NS`` metadata (flat
+        Each flat field name is routed to its bag by ``namespace_of`` (flat
         names are unique across namespaces). Validation is all-or-nothing: an
         unknown / unprojected field aborts before any write. ``source`` is
         recorded for provenance / reproduction.
@@ -1042,7 +1044,7 @@ class RuntimeContext:
             path = nsmap.get(name)
             if path is None:
                 raise ValueError(
-                    f"override: unknown config field {name!r} (no NS namespace) — "
+                    f"override: unknown config field {name!r} (no namespace) — "
                     "not a resolved config leaf"
                 )
             parts = path.split(".")
@@ -1076,7 +1078,7 @@ class RuntimeContext:
 
         path = namespace_of(type(self._server_args)).get(name)
         if path is None:
-            raise ValueError(f"{name!r} is not a config leaf (no NS namespace)")
+            raise ValueError(f"{name!r} is not a config leaf (no namespace)")
         parts = path.split(".")
         bag = self.config_bag(parts[0])
         for seg in parts[1:]:
