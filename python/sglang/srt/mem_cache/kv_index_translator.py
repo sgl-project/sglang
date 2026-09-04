@@ -428,21 +428,51 @@ class KVIndexTranslator:
 
     # -- write loc (phase 1; phase 2 lives in build_index_table) ----------------
 
-    def rebind_write_loc(self, forward_batch) -> None:
-        """Phase 1 of the WRITE contract: translate the batch's write loc to
-        FULL-side kernel-facing ids exactly once, at ForwardBatch
-        construction. No-op on non-unified pools.
+    def rebind_write_loc(
+        self,
+        forward_batch,
+        backend=None,
+        *,
+        for_capture: bool = False,
+    ) -> None:
+        """The WRITE contract's one translate: virtual `out_cache_loc` ->
+        FULL-side kernel-facing ids, once per forward.
 
-        REBIND, never mutate: the translate returns a FRESH tensor, so the
-        ScheduleBatch's aliased tensor stays VIRTUAL for the radix / accept /
-        in-flight machinery that reads it.
+        Must run at attention-metadata init and no earlier. A capture-stable
+        destination can only be asked of a backend in scope here; padding runs
+        before this point and `torch.cat`s a new tensor, stranding a pointer
+        taken sooner; and a buffer filled sooner races a still-pending step
+        under overlap scheduling.
+
+        REBIND, never mutate: the ScheduleBatch's aliased tensor stays VIRTUAL
+        for the radix / accept / in-flight machinery that reads it.
+
+        NOT idempotent, so exactly one call site per forward path: a second
+        call would re-translate its own output and write outside the pool,
+        which the write doors' `maybe_detect_kernel_facing_loc` reports.
         """
         self._index_table_memo = None
-        if not self.is_translating or forward_batch.out_cache_loc is None:
+        if not self.is_translating:
             return
-        forward_batch.out_cache_loc = self._translate_write_full(
-            forward_batch.out_cache_loc
+        virtual = forward_batch.out_cache_loc
+        if virtual is None:
+            return
+        dest = (
+            backend.capture_write_loc_dest(forward_batch)
+            if for_capture and backend is not None
+            else None
         )
+        if dest is None:
+            forward_batch.out_cache_loc = self._translate_write_full(virtual)
+            return
+        out, width = dest
+        n = int(virtual.numel())
+        assert width >= n, (
+            f"capture_write_loc_dest gave width {width} for {n} locs; the "
+            f"captured buffer cannot hold this batch"
+        )
+        self._translate_write_full(virtual, out=out[:width], out_width=width)
+        forward_batch.out_cache_loc = out[:n]
 
     def sliding_window_write_loc_for(
         self, out_cache_loc: Optional[torch.Tensor]

@@ -57,7 +57,14 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         runner = self._make_runner()
         runner.use_captured_attn_metadata = False
         attn_backend = mock.Mock()
-        runner.model_runner = SimpleNamespace(attn_backend=attn_backend)
+        # Replay-prep translates the write loc before metadata init; a static
+        # pool makes that a no-op, which is what this padding test wants.
+        runner.model_runner = SimpleNamespace(
+            attn_backend=attn_backend,
+            kv_index_translator=SimpleNamespace(
+                rebind_write_loc=lambda *args, **kwargs: None
+            ),
+        )
         forward_batch = self._make_forward_batch(8)
         static_forward_batch = self._make_forward_batch(16)
 

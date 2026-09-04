@@ -1403,6 +1403,38 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
         return self.req_index_to_mamba_index_mapping[req_indices]
 
+    @property
+    def mamba_v2p_table(self) -> Optional[torch.Tensor]:
+        """The mamba virtual->physical slot table, or None when the ids this
+        pool hands out are already physical.
+
+        Exists so the replay fast path can fold the translate into its own
+        launch instead of excluding any pool that overrides
+        `translate_mamba_indices`.
+        """
+        return None
+
+    @property
+    def mamba_translate_is_fusable(self) -> bool:
+        """Whether `fused_replay_state_indices` can reproduce this pool's
+        `translate_mamba_indices` inside its own launch.
+
+        It can express exactly two shapes: the identity, and one gather through
+        `mamba_v2p_table`. Anything else has to run the unfused reference
+        chain, so the default answers for the identity by checking that the
+        method is still this class's -- a subclass that replaces it with
+        something the kernel cannot express is then excluded automatically,
+        rather than silently mis-served. A subclass whose translate IS one of
+        the two shapes says so by publishing `mamba_v2p_table` or by
+        overriding this.
+        """
+        if self.mamba_v2p_table is not None:
+            return True
+        return (
+            type(self).translate_mamba_indices
+            is HybridReqToTokenPool.translate_mamba_indices
+        )
+
     def translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
         """Virtual->physical mamba-slot translate. Identity for a static pool
         (slots are physical); UnifiedHybridReqToTokenPool overrides it for the
@@ -1596,13 +1628,13 @@ class KVWriteLoc:
     All location info lives here (in the attention metadata), NOT in the pool:
     - ``loc``: the generic per-token write location (``out_cache_loc``).
       KERNEL-FACING on every pool: physical by allocation on non-unified
-      pools, rebound at ForwardBatch construction (``rebind_write_loc``) on
-      the unified pool.
+      pools, rebound at attention-metadata init (``rebind_write_loc``) on the
+      unified pool.
     - ``swa_loc``: the SWA-sub-pool location for hybrid SWA pools (``None``
       otherwise); under the unified pool the translator derives it from the
       same rebound loc (``sliding_window_write_loc_for``).
-    - ``full_loc``: OPTIONAL full-attention-sub-pool location. Since the
-      construction-time rebind it is the SAME id space as ``loc``, so pools
+    - ``full_loc``: OPTIONAL full-attention-sub-pool location. It is the SAME
+      id space as ``loc`` once the rebind has run, so pools
       fall back to ``loc`` when it is ``None`` -- only triton's captured path
       still passes its capture-stable
       ``ForwardMetadata.out_cache_loc_full_physical`` buffer here (a

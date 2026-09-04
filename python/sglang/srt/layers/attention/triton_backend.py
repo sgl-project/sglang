@@ -334,6 +334,9 @@ class TritonAttnBackend(AttentionBackend):
         else:
             self.kv_indptr = kv_indptr_buf
 
+        # Created in `init_cuda_graph_state`, and only for a translating pool;
+        # `capture_write_loc_dest` reads it before that on an eager-only run.
+        self.cuda_graph_out_cache_loc_full_physical: Optional[torch.Tensor] = None
         # Sliding window may need a second buffer for interleaved attention types
         self.window_kv_indptr = None
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
@@ -722,25 +725,34 @@ class TritonAttnBackend(AttentionBackend):
             )
         return self.cuda_graph_swa_out_cache_loc[:n]
 
+    def capture_write_loc_dest(self, forward_batch: ForwardBatch):
+        """The captured WRITE-loc buffer; see the base class.
+
+        The full width is requested so the translate clears what a smaller
+        replay left behind: the captured store consumes the whole buffer, and
+        stale ids past the batch would be written as live rows. Zeroing sends
+        them to slot 0, the reserved sink in every id space.
+        """
+        buf = self.cuda_graph_out_cache_loc_full_physical
+        if buf is None:
+            return None
+        # Sized by the DECODE runner's `init_cuda_graph_state`, so only the
+        # decode-shaped graphs may claim it; a prefill capture asking for it
+        # would alias two graphs onto one buffer.
+        mode = forward_batch.forward_mode
+        if not (mode.is_decode_or_idle() or mode.is_target_verify()):
+            return None
+        return buf, buf.numel()
+
     def _fill_cuda_graph_write_locs(
         self, forward_batch: ForwardBatch, bs: int
     ) -> Optional[torch.Tensor]:
-        """Copy the cuda-graph WRITE loc into the capture-stable buffer and
-        return the ``[:n]`` view; no-op for non-unified pools.
-
-        Runs BEFORE graph.replay() so it reads the live post-compaction v2p.
-        The capture batch is runner-built with zeros, which is safe because
-        slot 0 is the reserved sink in every id space.
-        """
+        """The capture-stable WRITE loc, or None for a non-unified pool:
+        `out_cache_loc` is already the live view of the buffer this backend
+        named, so there is nothing to copy."""
         if not self.kv_index_translator.is_translating:
             return None
-        out_cache_loc = forward_batch.out_cache_loc
-        n = out_cache_loc.shape[0]
-        # Zero the padded tail first: a smaller replay batch leaves [n:] holding
-        # stale ids that the captured store would write; send them to slot 0 (sink).
-        self.cuda_graph_out_cache_loc_full_physical[n:].zero_()
-        self.cuda_graph_out_cache_loc_full_physical[:n].copy_(out_cache_loc)
-        return self.cuda_graph_out_cache_loc_full_physical[:n]
+        return forward_batch.out_cache_loc
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""

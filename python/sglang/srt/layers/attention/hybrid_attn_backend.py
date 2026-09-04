@@ -86,6 +86,12 @@ class HybridAttnBackend(AttentionBackend):
         else:
             return self.prefill_backend
 
+    def capture_write_loc_dest(self, forward_batch: ForwardBatch):
+        """Forward to whichever half owns the KV write for this mode."""
+        return self._select_backend(forward_batch.forward_mode).capture_write_loc_dest(
+            forward_batch
+        )
+
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         return self._select_backend(fm).shared_read_ends(fm)
 
