@@ -146,15 +146,28 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 pass
         self.clear()
 
+    def available_size(self):
+        return (len(self.free_pages) + self.num_staged_pages) * self.page_size
+
+    def get_all_free_pages(self):
+        return torch.cat((self.free_pages, *self.staged_pages))
+
+    def merge_and_sort_free(self):
+        if not self.staged_pages:
+            return
+        self.free_pages, _ = torch.sort(self.get_all_free_pages())
+        self.staged_pages = []
+        self.num_staged_pages = 0
+
     def alloc(self, need_size: int):
         # page-aligned allocation, returning contiguous indices of pages
         if self.debug_mode:
-            assert (
-                need_size % self.page_size == 0
-            ), "The allocation size should be page-aligned"
+            assert need_size % self.page_size == 0, (
+                "The allocation size should be page-aligned"
+            )
 
         num_pages = need_size // self.page_size
-        if self.need_sort and num_pages > len(self.free_pages):
+        if num_pages > len(self.free_pages):
             self.merge_and_sort_free()
         if num_pages > len(self.free_pages):
             return None
@@ -185,9 +198,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
 
         bs = len(prefix_lens)
-        if self.need_sort and extend_num_tokens // self.page_size + bs + 1 > len(
-            self.free_pages
-        ):
+        if extend_num_tokens // self.page_size + bs + 1 > len(self.free_pages):
             self.merge_and_sort_free()
 
         out_indices = torch.empty(
@@ -231,7 +242,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
 
         bs = len(seq_lens)
-        if self.need_sort and bs > len(self.free_pages):
+        if bs > len(self.free_pages):
             self.merge_and_sort_free()
 
         out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
@@ -271,45 +282,42 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self._debug_check_no_duplicate_pages()
 
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
-        """Fixed-shape counterpart of free(): a page's tokens sit consecutively
-        in the kv row, so page representatives are stride slices -- no
-        torch.unique, whose data-dependent output shape forces a device sync.
-        Contract: see base; a page must be freed by only one call per group."""
+        """Fixed-shape counterpart of free().
+
+        The segment starts on a page boundary and a page's tokens sit
+        consecutively in the kv row, so ``free_index[::page_size]`` is one
+        token from each page the segment covers -- including a partial last
+        page. No torch.unique, whose data-dependent output shape forces a
+        device sync. Contract: see base."""
         if free_index.numel() == 0:
             return
 
         ps = self.page_size
-        offset = start_pos % ps
-        if offset == 0:
-            pieces = (free_index[::ps],)
-        else:
-            pieces = (free_index[:1], free_index[ps - offset :: ps])
+        assert start_pos % ps == 0, f"segment start {start_pos} is not page-aligned"
+        reps = free_index[::ps]
 
         if self.debug_mode:
             # reference unique on CPU: the NPU subclass deliberately avoids device unique
-            page_ids = torch.cat([p // ps for p in pieces])
             assert torch.equal(
-                torch.sort(page_ids.cpu())[0],
+                torch.sort(reps.cpu() // ps)[0],
                 torch.unique(free_index.cpu() // ps),
             )
 
         if self.free_group is None:
-            self._release_page_ids(*(p // ps for p in pieces))
+            self._release_page_ids(reps // ps)
             if self.debug_mode:
                 self._debug_check_no_duplicate_pages()
         else:
-            self.free_page_reps_group.extend(
-                self._copy_for_free_group(piece) for piece in pieces
-            )
+            self.free_page_reps_group.append(self._copy_for_free_group(reps))
 
     def _debug_check_no_duplicate_pages(self):
-        # span both containers: need_sort (PD disagg) routes frees into release_pages
-        pages = torch.cat((self.free_pages, self.release_pages))
+        pages = self.get_all_free_pages()
         assert len(torch.unique(pages)) == len(pages)
 
     def _release_page_ids(self, *page_ids: torch.Tensor):
         if self.need_sort:
-            self.release_pages = torch.cat((*page_ids, self.release_pages))
+            self.staged_pages.extend(page_ids)
+            self.num_staged_pages += sum(ids.numel() for ids in page_ids)
         else:
             self.free_pages = torch.cat((*page_ids, self.free_pages))
 
@@ -335,7 +343,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         self.free_group = None
         self.free_page_reps_group = []
-        self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+        # need_sort only: freed pages wait here, unsorted, until an alloc runs short.
+        self.staged_pages: list[torch.Tensor] = []
+        self.num_staged_pages = 0
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)

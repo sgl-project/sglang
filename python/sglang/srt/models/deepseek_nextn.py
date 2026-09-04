@@ -99,7 +99,6 @@ _is_npu = is_npu()
 
 
 class DeepseekModelNextN(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,

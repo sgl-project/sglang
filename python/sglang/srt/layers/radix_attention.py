@@ -323,7 +323,7 @@ def _unified_attention_with_output_impl(
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
-    real_query_num_tokens = forward_batch.num_token_non_padded_cpu
+    real_query_num_tokens = forward_batch.global_num_token_non_padded_cpu
     # Ordinary PCG attention pads Q/K/V to the same token bucket. Prefix MHA
     # instead supplies a fixed-capacity K/V chunk whose extent is independent
     # of the suffix queries, so its caller must preserve that separate extent.
@@ -531,7 +531,7 @@ def unified_sparse_attention_with_output(
     context = get_tc_piecewise_forward_context()
     forward_batch = context.forward_batch
     attention_layer = context.attention_layers[layer_id]
-    real_num_tokens = forward_batch.num_token_non_padded_cpu
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
 
     if real_num_tokens == 0:
         _zero_skipped_attn_outputs(attn_out, idx_out)
@@ -602,7 +602,7 @@ def attention_with_output_extra_kwargs(
     context = get_tc_piecewise_forward_context()
     forward_batch = context.forward_batch
     attention_layer = context.attention_layers[layer_id]
-    real_num_tokens = forward_batch.num_token_non_padded_cpu
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
 
     if real_num_tokens == 0:
         _zero_skipped_attn_outputs(output)

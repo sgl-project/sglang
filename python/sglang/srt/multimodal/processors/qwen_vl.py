@@ -98,9 +98,7 @@ if _is_cpu and _is_cpu_amx_available:
 
         from sglang.srt.layers.amx_utils import fast_preprocess_cpu
 
-        transformers.models.qwen2_vl.image_processing_qwen2_vl_fast.Qwen2VLImageProcessorFast._preprocess = (
-            fast_preprocess_cpu
-        )
+        transformers.models.qwen2_vl.image_processing_qwen2_vl_fast.Qwen2VLImageProcessorFast._preprocess = fast_preprocess_cpu
     except Exception as e:
         logger.warning(
             f"Failed to hack Qwen2VLImageProcessorFast with AMX optimization: {e}"
@@ -178,9 +176,9 @@ def smart_nframes(
     Returns:
         int: the number of frames for video used for model inputs.
     """
-    assert not (
-        "fps" in ele and "nframes" in ele
-    ), "Only accept either `fps` or `nframes`"
+    assert not ("fps" in ele and "nframes" in ele), (
+        "Only accept either `fps` or `nframes`"
+    )
     if "nframes" in ele:
         nframes = round_by_factor(ele["nframes"], FRAME_FACTOR)
     else:

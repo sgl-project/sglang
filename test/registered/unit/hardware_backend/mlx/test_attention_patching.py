@@ -1181,10 +1181,8 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             spec_algorithm=SpeculativeAlgorithm.NONE,
             device="cpu",
         )
-        scheduler.get_next_batch_to_run = (
-            lambda running_batch, last_batch: SimpleNamespace(
-                batch_to_run=batch, running_batch=running_batch
-            )
+        scheduler.get_next_batch_to_run = lambda running_batch, last_batch: (
+            SimpleNamespace(batch_to_run=batch, running_batch=running_batch)
         )
 
         with self.assertRaises(_StopLoop):
@@ -1520,6 +1518,7 @@ if _HAS_MLX:
     class FakeRequest:
         def __init__(self):
             self.kv = ReqKvInfo()
+            self.mamba_branching_seqlen = None
             self.inflight_middle_chunks = 0
 
     class FakeTpWorker:

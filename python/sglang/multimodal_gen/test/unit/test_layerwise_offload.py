@@ -1375,15 +1375,15 @@ def test_mapped_layers_ship_through_the_courier(tmp_path, monkeypatch):
 
     manager.prefetch_layer(0, non_blocking=True)
     assert 0 in manager._courier_inflight, "an async prefetch hands the layer over"
-    assert (
-        0 not in manager._gpu_layers
-    ), "the layer is not ready until its tensors are bound on this thread"
+    assert 0 not in manager._gpu_layers, (
+        "the layer is not ready until its tensors are bound on this thread"
+    )
 
     manager.prefetch_layer(0, non_blocking=False)
     assert 0 in manager._gpu_layers and not manager._courier_inflight
-    assert torch.equal(
-        model.blocks[0].weight.detach().cpu(), expected
-    ), "the bytes that went through the courier's slot must be the checkpoint's"
+    assert torch.equal(model.blocks[0].weight.detach().cpu(), expected), (
+        "the bytes that went through the courier's slot must be the checkpoint's"
+    )
 
 
 def test_the_courier_kill_switch_forces_the_synchronous_path(tmp_path, monkeypatch):
@@ -1397,9 +1397,9 @@ def test_the_courier_kill_switch_forces_the_synchronous_path(tmp_path, monkeypat
     manager.release_all()
     manager.prefetch_layer(0, non_blocking=True)
     assert not manager._courier_inflight and manager._mapped_courier is None
-    assert (
-        0 in manager._gpu_layers
-    ), "with the courier disabled the direct synchronous path serves the layer"
+    assert 0 in manager._gpu_layers, (
+        "with the courier disabled the direct synchronous path serves the layer"
+    )
 
 
 def test_release_all_drains_the_courier(tmp_path, monkeypatch):

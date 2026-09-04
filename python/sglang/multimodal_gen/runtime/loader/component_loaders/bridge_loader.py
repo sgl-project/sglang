@@ -27,12 +27,14 @@ class BridgeLoader(PlainStateDictComponentLoader):
 
     component_names = ["dual_tower_bridge"]
     expected_library = "diffusers"
-    supports_fsdp_inference = True
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
         config = self.load_component_config(component_model_path, component_name)
+        component_weights_path = self.resolve_component_weights_path(
+            component_model_path, server_args, component_name
+        )
         hf_config = deepcopy(config)
         class_name = config.pop("_class_name", None)
         if class_name is None:
@@ -60,9 +62,9 @@ class BridgeLoader(PlainStateDictComponentLoader):
         model_cls, _ = ModelRegistry.resolve_model_cls(class_name)
 
         # Find all safetensors files
-        safetensors_list = _list_safetensors_files(component_model_path)
+        safetensors_list = _list_safetensors_files(component_weights_path)
         if not safetensors_list:
-            raise ValueError(f"No safetensors files found in {component_model_path}")
+            raise ValueError(f"No safetensors files found in {component_weights_path}")
 
         default_dtype = resolve_precision(
             server_args, component_name, precision_attr="dit_precision"
@@ -82,10 +84,14 @@ class BridgeLoader(PlainStateDictComponentLoader):
 
         # Use the FSDP loader when FSDP is requested or shard rules are declared.
         fsdp_shard_conditions = getattr(model_cls, "_fsdp_shard_conditions", None)
-        if use_fsdp or (
-            server_args.residency_mode(component_name) == RESIDENT
-            and server_args.hsdp_shard_dim is not None
-            and fsdp_shard_conditions
+        if (
+            component_weights_path != component_model_path
+            or use_fsdp
+            or (
+                server_args.residency_mode(component_name) == RESIDENT
+                and server_args.hsdp_shard_dim is not None
+                and fsdp_shard_conditions
+            )
         ):
             local_torch_device = get_local_torch_device()
             # Load with FSDP support

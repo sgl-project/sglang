@@ -178,7 +178,7 @@ class PetitNvFp4LinearMethod(LinearMethodBase):
         layer.output_size_per_partition = output_size_per_partition
         if input_size_per_partition % 16 != 0:
             raise ValueError(
-                "Unsupported model when in features size is " "not multiple of 16"
+                "Unsupported model when in features size is not multiple of 16"
             )
 
         weight_dtype = (

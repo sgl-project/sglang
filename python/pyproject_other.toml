@@ -197,6 +197,7 @@ test = [
   "peft>=0.18.0,<0.19.0", # Pin to <0.19.0 due to torchao incompatibility
   "pytest",
   "sentence_transformers",
+  "sgl-eval==0.1.0",
   "tabulate",
 ]
 

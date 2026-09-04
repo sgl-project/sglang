@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -10,9 +11,26 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
-class _FakeAllocator:
-    def __init__(self):
+class _FakeAllocator(BaseTokenToKVPoolAllocator):
+    """Single-pool double. Subclassing the base routes free_full / free_segment /
+    free_segments into free(), so a new free API cannot slip past the recorder."""
+
+    def __init__(self, page_size: int = 1):
+        super().__init__(
+            size=1024,
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
         self.freed = []
+
+    def clear(self):
+        self.freed = []
+
+    def alloc(self, need_size: int):
+        raise NotImplementedError
 
     def free(self, free_index: torch.Tensor):
         self.freed.append(free_index.clone())
@@ -114,7 +132,7 @@ def test_preabort_detaches_session_and_preserves_slot():
     the session: session=None, abort_req() called. Slot stays intact."""
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
     req_to_token_pool = _FakeReqToTokenPool(req_to_token)
-    allocator = _FakeAllocator()
+    allocator = _FakeAllocator(page_size=16)
     inner = _FakeInnerCache(
         req_to_token_pool,
         allocator,
@@ -283,9 +301,41 @@ def test_trim_overshoot_postcondition():
     assert req.kv.kv_allocated_len == target
     assert req.kv.swa_evicted_seqlen == target
     assert len(req.output_ids) == 12
-    # Tail [38, 44) freed by _free_kv_aligned.
-    assert len(allocator.freed) == 1
-    assert allocator.freed[0].tolist() == list(range(38, 44))
+    # Tail [38, 44) freed by _free_kv_aligned, split at the pre-trim eviction
+    # floor 42: [38, 42) gave its SWA peers back already, so it goes back full-only.
+    assert [t.tolist() for t in allocator.freed] == [[38, 39, 40, 41], [42, 43]]
+
+
+def test_trim_overshoot_keeps_cursor_page_aligned_on_paged():
+    """A mid-page trim target must not become the SWA eviction cursor (the
+    dead/alive split there frees the shared page twice); rewind to the boundary."""
+    page_size = 16
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator(page_size=page_size)
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size)
+    )
+
+    # origin=26, finished=12 -> raw target 38 (mid-page); cursor 48 > target.
+    req = _FakeReq("session-a", req_pool_idx=0, committed=52, allocated=64)
+    req.origin_input_ids = list(range(26))
+    req.output_ids = list(range(14))
+    req.kv.swa_evicted_seqlen = 48
+
+    tree_cache._trim_overshoot(req, finished_len=12)
+
+    # Rewound to floor_align(38) = 32; every cursor lands page-aligned.
+    assert req.kv.kv_allocated_len == 32
+    assert req.kv.kv_committed_len == 32
+    assert req.kv.swa_evicted_seqlen == 32
+    assert len(req.output_ids) == 12
+    # Freed [32, 64): [32, 48) below the old cursor goes back full-only,
+    # [48, 64) both halves.
+    assert [t.tolist() for t in allocator.freed] == [
+        list(range(32, 48)),
+        list(range(48, 64)),
+    ]
 
 
 if __name__ == "__main__":

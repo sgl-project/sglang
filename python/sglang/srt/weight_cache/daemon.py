@@ -501,7 +501,7 @@ class WeightCacheDaemon:
             f.write(f"config={self.config.to_dict()}\n")
 
         logger.info(
-            f"[WeightCacheDaemon gpu={self.gpu_id}] " f"Listening on {self.socket_path}"
+            f"[WeightCacheDaemon gpu={self.gpu_id}] Listening on {self.socket_path}"
         )
 
         self._running = True

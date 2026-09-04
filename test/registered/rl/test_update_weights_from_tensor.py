@@ -52,9 +52,9 @@ def test_update_weights_from_tensor(tp_size):
     torch.cuda.ipc_collect()
     torch.cuda.empty_cache()
     memory_after = torch.cuda.memory_allocated()
-    assert (
-        memory_after <= memory_before + 1024
-    ), f"Memory leak detected: {memory_after - memory_before} bytes"
+    assert memory_after <= memory_before + 1024, (
+        f"Memory leak detected: {memory_after - memory_before} bytes"
+    )
 
 
 class TestUpdateWeightsFromTensor(CustomTestCase):
@@ -283,9 +283,9 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
 
 def _check_param(engine, param_name, expect_values):
     actual_values = torch.tensor(engine.get_weights_by_name(param_name))[0, :5]
-    assert torch.allclose(
-        actual_values, torch.tensor(expect_values), atol=0.002
-    ), f"{actual_values=}"
+    assert torch.allclose(actual_values, torch.tensor(expect_values), atol=0.002), (
+        f"{actual_values=}"
+    )
 
 
 if __name__ == "__main__":

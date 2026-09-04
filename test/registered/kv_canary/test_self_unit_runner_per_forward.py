@@ -28,21 +28,25 @@ class TestManagerPerForward(CanaryManagerTestCase):
     def test_per_forward_orchestrates_plan_head_tail(self) -> None:
         """Verify per-forward execution launches plan, head/tail verify kernels, and write kernels in order."""
         calls: list[object] = []
-        with patch.object(
-            kernel_launcher_module,
-            "launch_canary_plan_kernels",
-            lambda **kwargs: calls.append("plan"),
-        ), patch.object(
-            endpoint_module,
-            "launch_canary_verify_kernel",
-            lambda **kwargs: calls.append(
-                ("verify", kwargs["context"].kernel_kind.name)
+        with (
+            patch.object(
+                kernel_launcher_module,
+                "launch_canary_plan_kernels",
+                lambda **kwargs: calls.append("plan"),
             ),
-        ), patch.object(
-            endpoint_module,
-            "launch_canary_write_kernel",
-            lambda **kwargs: calls.append(
-                ("write", kwargs["context"].kernel_kind.name)
+            patch.object(
+                endpoint_module,
+                "launch_canary_verify_kernel",
+                lambda **kwargs: calls.append(
+                    ("verify", kwargs["context"].kernel_kind.name)
+                ),
+            ),
+            patch.object(
+                endpoint_module,
+                "launch_canary_write_kernel",
+                lambda **kwargs: calls.append(
+                    ("write", kwargs["context"].kernel_kind.name)
+                ),
             ),
         ):
             manager = make_manager(device=self.device)
@@ -87,7 +91,7 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
         forward_batch.out_cache_loc = torch.tensor(
             [7, 0, 0], dtype=torch.int64, device=self.device
         )
-        forward_batch.num_token_non_padded_cpu = 1
+        forward_batch.global_num_token_non_padded_cpu = 1
 
         kernel_launcher_module.launch_endpoints_per_forward(
             endpoints=(endpoint,),
@@ -140,7 +144,7 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
         forward_batch.out_cache_loc = torch.tensor(
             [7], dtype=torch.int32, device=self.device
         )
-        forward_batch.num_token_non_padded_cpu = 1
+        forward_batch.global_num_token_non_padded_cpu = 1
 
         kernel_launcher_module.launch_endpoints_per_forward(
             endpoints=(endpoint,),
@@ -178,7 +182,7 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
         forward_batch.out_cache_loc = torch.tensor(
             [7, 0, 0], dtype=torch.int64, device=self.device
         )
-        forward_batch.num_token_non_padded_cpu = 1
+        forward_batch.global_num_token_non_padded_cpu = 1
 
         kernel_launcher_module.launch_endpoints_per_forward(
             endpoints=(endpoint,),
@@ -214,7 +218,7 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
         forward_batch.out_cache_loc = torch.tensor(
             [[7, 8]], dtype=torch.int64, device=self.device
         )[:, 0]
-        forward_batch.num_token_non_padded_cpu = 1
+        forward_batch.global_num_token_non_padded_cpu = 1
 
         kernel_launcher_module.launch_endpoints_per_forward(
             endpoints=(endpoint,),

@@ -7,7 +7,6 @@ hits return another rank's KV. The KL cases catch that as a large divergence.
 Blackwell-only: the MLA DCP decode path needs ``tokenspeed_mla`` (SM100/12x).
 """
 
-import subprocess
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -99,11 +98,6 @@ class TestUnifiedKimiLinearDcpHiCache(UnifiedRadixTreeTestMixin, CustomTestCase)
 
     @classmethod
     def tearDownClass(cls):
-        cls.process.terminate()
-        try:
-            cls.process.wait(timeout=60)
-        except subprocess.TimeoutExpired:
-            pass
         terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
 

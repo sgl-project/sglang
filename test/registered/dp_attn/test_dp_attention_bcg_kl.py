@@ -138,9 +138,9 @@ def test_prefill_cache_hit(base_url, input_ids, max_new_tokens, is_hicache=False
 
     hit_label = "L1 hits" if is_hicache else "cache hits"
     print(f"  {hit_label}: {len(new_input_ids)}/{len(input_ids)}")
-    assert (
-        len(new_input_ids) > len(input_ids) // 2
-    ), f"too few {hit_label}: {len(new_input_ids)}/{len(input_ids)}"
+    assert len(new_input_ids) > len(input_ids) // 2, (
+        f"too few {hit_label}: {len(new_input_ids)}/{len(input_ids)}"
+    )
 
     input_logprobs = _get_input_logprobs(base_url, new_input_ids, output_logprobs)
     return _compute_kl(input_logprobs, output_logprobs)
@@ -170,9 +170,9 @@ def test_decode_cache_hit(base_url, input_ids, max_new_tokens, is_hicache=False)
 
     hit_label = "L1 decode hits" if is_hicache else "cache hits"
     print(f"  {hit_label}: {len(new_input_ids)}/{len(turn2_ids)}")
-    assert (
-        len(new_input_ids) > len(turn2_ids) // 2
-    ), f"too few {hit_label}: {len(new_input_ids)}/{len(turn2_ids)}"
+    assert len(new_input_ids) > len(turn2_ids) // 2, (
+        f"too few {hit_label}: {len(new_input_ids)}/{len(turn2_ids)}"
+    )
 
     input_logprobs = _get_input_logprobs(base_url, new_input_ids, output_logprobs)
     return _compute_kl(input_logprobs, output_logprobs)
@@ -281,8 +281,7 @@ class _DPAttentionPrefillCudaGraphKLMixin:
                 return
             time.sleep(0.5)
         self.fail(
-            f"No {self.prefill_backend} prefill CUDA graph replay was logged "
-            f"for {case}"
+            f"No {self.prefill_backend} prefill CUDA graph replay was logged for {case}"
         )
 
     def test_prefill_and_decode_cache_hit_kl_is_zero(self):

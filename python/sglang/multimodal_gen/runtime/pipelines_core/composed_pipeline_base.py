@@ -480,9 +480,9 @@ class ComposedPipelineBase(ABC):
         self._validate_direct_gpu_component_selection(model_index, server_args)
 
         # some sanity checks
-        assert (
-            len(model_index) > 1
-        ), "model_index.json must contain at least one pipeline module"
+        assert len(model_index) > 1, (
+            "model_index.json must contain at least one pipeline module"
+        )
 
         # In disagg mode, read HF config for skipped components (e.g., VAE)
         # so that update_model_arch + post_init can derive pipeline_config.

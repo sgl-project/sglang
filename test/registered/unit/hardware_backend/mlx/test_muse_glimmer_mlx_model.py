@@ -98,14 +98,13 @@ def _raw_weights(args):
                 p + "post_attn_norm.weight": mx.full((hid,), 0.20),
                 p + "post_attention_layernorm.weight": mx.full((hid,), 0.30),
                 p + "post_ffn_norm.weight": mx.full((hid,), 0.40),
-                p
-                + "mlp.gate_proj.weight": mx.random.normal(
+                p + "mlp.gate_proj.weight": mx.random.normal(
                     (args.intermediate_size, hid)
                 ),
-                p
-                + "mlp.up_proj.weight": mx.random.normal((args.intermediate_size, hid)),
-                p
-                + "mlp.down_proj.weight": mx.random.normal(
+                p + "mlp.up_proj.weight": mx.random.normal(
+                    (args.intermediate_size, hid)
+                ),
+                p + "mlp.down_proj.weight": mx.random.normal(
                     (hid, args.intermediate_size)
                 ),
             }

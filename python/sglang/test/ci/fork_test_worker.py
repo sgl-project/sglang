@@ -33,6 +33,10 @@ def _normalize_exit_code(code) -> int:
 
 def _run_file(filename: str) -> int:
     sys.argv = [filename, "-f"]
+    # Match ``python /path/to/test.py``: tests may import helper modules that
+    # live next to the executed file. runpy.run_path() does not update
+    # sys.path[0] for us, and this child exits after the file finishes.
+    sys.path[0] = os.path.dirname(os.path.abspath(filename))
     try:
         runpy.run_path(filename, run_name="__main__")
         return 0

@@ -20,6 +20,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.moe.moe_runner import deep_gemm_sm120
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -259,9 +260,9 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
                 1,
                 32,
             ], f"MXFP8 requires block_shape [1, 32], got {self.block_shape}"
-            assert (
-                deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-            ), "MXFP8 requires DEEPGEMM_SCALE_UE8M0=True"
+            assert deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0, (
+                "MXFP8 requires DEEPGEMM_SCALE_UE8M0=True"
+            )
 
 
 class DeepGemmRunnerCore(MoeRunnerCore):
@@ -272,7 +273,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         assert self.config.activation in ("silu", "situ")
         assert self.config.is_gated
         self.swiglu_limit = self.config.swiglu_limit
-        self.use_swizzle = get_moe_a2a_backend().is_megamoe()
+        # SM120's contiguous GEMM only consumes standard-layout activations, so
+        # it opts out of swizzle regardless of the a2a backend.
+        self.use_swizzle = (
+            get_moe_a2a_backend().is_megamoe() and deep_gemm_sm120.use_swizzle()
+        )
 
     def run(
         self,
@@ -652,9 +657,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
             if hidden_states_scale.dtype != torch.int:
                 b, s_mn, s_k = hidden_states_scale.shape
-                assert (
-                    s_mn % 4 == 0 and s_k % 4 == 0
-                ), f"scales must be aligned to 4, but got ({b}, {s_mn}, {s_k})"
+                assert s_mn % 4 == 0 and s_k % 4 == 0, (
+                    f"scales must be aligned to 4, but got ({b}, {s_mn}, {s_k})"
+                )
                 hidden_states_scale = _cast_to_e8m0_with_rounding_up(
                     hidden_states_scale
                 )
@@ -896,6 +901,19 @@ def pre_permute_standard_to_deep_gemm(
         dispatch_output.topk_output,
     )
     topk_weights, topk_ids, _ = topk_output
+    # SM120's DeepGEMM grouped GEMM consumes standard-layout activations only.
+    # Feeding it the shared masked/swizzled layout does not raise -- it silently
+    # returns wrong results (GSM8K 0.96 -> 0.06, measured on 4x RTX 6000D), so
+    # refuse the combination rather than corrupt output.
+    assert deep_gemm_sm120.is_supported(), (
+        "--moe-runner-backend deep_gemm on consumer Blackwell (SM120) requires "
+        "the standard-layout MoE path, which is unavailable in this build."
+    )
+    sm120_input = deep_gemm_sm120.maybe_pre_permute(
+        hidden_states, topk_ids, topk_weights, quant_info, runner_config, running_state
+    )
+    if sm120_input is not None:
+        return sm120_input
 
     hidden_states_shape = hidden_states.shape
     hidden_states_dtype = hidden_states.dtype
@@ -904,7 +922,10 @@ def pre_permute_standard_to_deep_gemm(
 
     topk_weights, topk_ids = topk_weights, topk_ids
 
-    if _should_use_masked_standard_layout(runner_config, quant_info, hidden_states):
+    if (
+        deep_gemm_sm120.allows_masked_standard_layout()
+        and _should_use_masked_standard_layout(runner_config, quant_info, hidden_states)
+    ):
         output_dtype = (
             torch.bfloat16
             if quant_info.w13_weight.dtype == torch.bfloat16
@@ -1122,6 +1143,12 @@ def post_permute_deep_gemm_to_standard(
 ) -> StandardCombineInput:
     from sglang.kernels.ops.moe.ep_moe_kernels import post_reorder_deepgemm
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+
+    sm120_output = deep_gemm_sm120.maybe_post_permute(
+        runner_output, runner_config, running_state
+    )
+    if sm120_output is not None:
+        return sm120_output
 
     hidden_states_shape = running_state["hidden_states_shape"]
     hidden_states_dtype = running_state["hidden_states_dtype"]
@@ -1426,9 +1453,9 @@ def _varlen_deep_gemm_silu_mul_quant(
     # int32 UE8M0 (no follow-up transform; needs G % 4 == 0 and the
     # num_real_tokens grid bound) when eligible, row-major fp32 otherwise.
     if gemm1_alpha is not None:
-        assert (
-            swiglu_limit is None
-        ), "swiglu_limit and gemm1_alpha are mutually exclusive"
+        assert swiglu_limit is None, (
+            "swiglu_limit and gemm1_alpha are mutually exclusive"
+        )
         assert not swizzle, "swizzle is not supported with gemm1_alpha"
         from sglang.kernels.ops.moe.ep_moe_kernels import (
             silu_and_mul_masked_post_quant_fwd,

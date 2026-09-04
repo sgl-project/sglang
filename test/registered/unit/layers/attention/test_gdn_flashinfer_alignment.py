@@ -151,6 +151,8 @@ class TestFlashInferGDNAlignment(unittest.TestCase):
         v = torch.empty(1, 1, 8, 128, dtype=torch.bfloat16)
         a = _view_with_pointer_mod((1, 1, 8), torch.bfloat16, 16)
         b = _view_with_pointer_mod((1, 1, 8), torch.bfloat16, 16)
+        a.copy_(torch.arange(a.numel(), dtype=a.dtype).view_as(a))
+        b.copy_(torch.arange(b.numel(), dtype=b.dtype).add_(8).view_as(b))
         A_log = _view_with_pointer_mod((8,), torch.float32, 4)
         dt_bias = _view_with_pointer_mod((8,), torch.bfloat16, 2)
         state = torch.zeros(2, 8, 128, 128, dtype=torch.bfloat16)

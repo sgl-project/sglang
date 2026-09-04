@@ -221,7 +221,6 @@ class DeepseekV4ModelNextN(nn.Module):
 
 
 class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
-
     def __init__(
         self,
         config: PretrainedConfig,

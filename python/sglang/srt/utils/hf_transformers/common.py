@@ -42,6 +42,7 @@ from sglang.srt.configs import (
     InternS2PreviewConfig,
     JetNemotronConfig,
     JetVLMConfig,
+    K2HorizonConfig,
     KimiK3Config,
     KimiK25Config,
     KimiLinearConfig,
@@ -70,6 +71,7 @@ from sglang.srt.configs import (
     Step3p5Config,
     Step3p7Config,
     Step3VLConfig,
+    XllmConfig,
 )
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.internvl import InternVLChatConfig
@@ -100,6 +102,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         DeepseekVL2Config,
         MultiModalityConfig,
         KimiVLConfig,
+        K2HorizonConfig,
         LocateAnythingConfig,
         InternVLChatConfig,
         LagunaConfig,
@@ -142,6 +145,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         InklingVisionConfig,
         InklingMMConfig,
         MiniMaxM3VLConfig,
+        XllmConfig,
     ]
 }
 
@@ -654,9 +658,15 @@ def get_tokenizer_from_processor(processor):
 
 
 # Turn-final markers that some checkpoints ship without EOS metadata:
-# <|eom_id|> (Llama-3 tool use) and <|content_model_end_sampling|> (Inkling,
-# whose bundled tokenizer config leaves eos_token unset).
-_ADDITIONAL_STOP_TOKEN_TEXTS = ("<|eom_id|>", "<|content_model_end_sampling|>")
+# <|eom_id|> (Llama-3 tool use), <|content_model_end_sampling|> (Inkling,
+# whose bundled tokenizer config leaves eos_token unset), and
+# <|ifm|im_end|> (some K2 Horizon checkpoints, notably 0.9B, name only
+# <|endoftext|> as EOS).
+_ADDITIONAL_STOP_TOKEN_TEXTS = (
+    "<|eom_id|>",
+    "<|content_model_end_sampling|>",
+    "<|ifm|im_end|>",
+)
 
 
 def attach_additional_stop_token_ids(tokenizer):

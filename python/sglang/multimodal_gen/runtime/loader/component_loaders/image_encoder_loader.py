@@ -30,7 +30,7 @@ class ImageEncoderLoader(TextEncoderLoader):
         component_name: str = "image_encoder",
     ):
         """Load the text encoders based on the model path, and inference args."""
-        component_weights_path = self.resolve_model_weights_path(
+        component_weights_path = self.resolve_component_weights_path(
             component_model_path,
             server_args,
             component_name,

@@ -37,6 +37,7 @@ def test_split_full_attention_applies_model_wrapper_once():
             kv_cache_dtype=None,
             token_to_kv_pool=object(),
             req_to_token_pool=object(),
+            kv_index_translator=None,
             init_new_workspace=None,
         )
         wrapper_inputs = []

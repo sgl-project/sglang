@@ -486,7 +486,7 @@ return {
       title: "Quality",
       scope: "request",
       docsHref: "/docs/sglang-diffusion/cache_dit",
-      description: "Reference execution or the audited Cache-DiT acceleration preset.",
+      description: "Cumulative reference, fusion-only, or audited Cache-DiT execution.",
       quality: "Sampling policy",
       learnMore: "#choose-the-quality-level",
       default: "lossless",
@@ -496,6 +496,11 @@ return {
           label: "Lossless",
           recommended: true,
           description: "Reference-exact denoising without Cache-DiT approximation.",
+        },
+        {
+          id: "extra-high",
+          label: "Extra high",
+          description: "Includes fusion-only request paths but not Cache-DiT; MiniMax-H3 currently follows its lossless denoise path at this tier.",
         },
         {
           id: "high",
@@ -669,7 +674,7 @@ return {
         || (s.execution === "bcg" && ["b200", "h200"].includes(s.hw) && s.weights === "ref2va");
       const serveVerified = topologyVerified && encoderVerified && attentionVerified
         && precisionVerified && executionVerified;
-      const requestVerified = topologyVerified && (s.quality === "lossless"
+      const requestVerified = topologyVerified && (["lossless", "extra-high"].includes(s.quality)
         || (s.quality === "high" && highAudited && s.execution === "eager"));
 
       const topologyParts = [];

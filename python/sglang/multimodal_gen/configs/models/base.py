@@ -83,9 +83,9 @@ class ModelConfig:
             arch_config.__post_init__()
 
     def update_model_config(self, source_model_dict: dict[str, Any]) -> None:
-        assert (
-            "arch_config" not in source_model_dict
-        ), "Source model config shouldn't contain arch_config."
+        assert "arch_config" not in source_model_dict, (
+            "Source model config shouldn't contain arch_config."
+        )
 
         valid_fields = {f.name for f in fields(self)}
 

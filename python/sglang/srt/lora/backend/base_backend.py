@@ -23,6 +23,9 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         device: the device where the backend runs.
     """
 
+    supports_lora_a_overlap = False
+    skip_inactive_lora_batches = False
+
     # Supporting backends implement init_prefill_cuda_graph_batch_info() and
     # honor use_prefill_cuda_graph in prepare_lora_batch().
     supports_prefill_cuda_graph: bool = False
@@ -51,6 +54,14 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         self.lm_head_batch_info = None
         self.lm_head_pass_batch_infos = None
         self._lm_head_pass_idx = None
+
+    def validate_lora_targets(
+        self,
+        base_model: torch.nn.Module,
+        target_modules: set[str],
+    ) -> None:
+        """Raise before wrapping when this backend cannot execute its targets."""
+        pass
 
     def run_lora_a_embedding(
         self,
@@ -351,6 +362,20 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         """
         pass
 
+    def prepare_lora_token_segments(
+        self,
+        *,
+        segment_lens: list[int],
+        weight_indices: list[int],
+        lora_ranks: list[int],
+        scalings: list[float],
+    ) -> None:
+        """Prepare explicit eager token-row LoRA segments."""
+        raise NotImplementedError(
+            f"LoRA backend {type(self).__name__} does not support explicit "
+            "token segments."
+        )
+
 
 @triton.jit
 def _compute_moe_lora_info_kernel(
@@ -394,9 +419,9 @@ def _compute_moe_lora_info(
     max_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if token_lora_mapping is not None:
-        assert (
-            num_tokens <= token_lora_mapping.shape[0]
-        ), "num_tokens must be less than or equal to the shape of token_lora_mapping"
+        assert num_tokens <= token_lora_mapping.shape[0], (
+            "num_tokens must be less than or equal to the shape of token_lora_mapping"
+        )
         token_lora_mapping = token_lora_mapping[:num_tokens]
     else:
         token_lora_mapping = torch.empty(
@@ -404,9 +429,9 @@ def _compute_moe_lora_info(
         )
 
     if adapter_enabled is not None:
-        assert (
-            len(lora_ranks) <= adapter_enabled.shape[0]
-        ), "lora_ranks must be less than or equal to the shape of adapter_enabled"
+        assert len(lora_ranks) <= adapter_enabled.shape[0], (
+            "lora_ranks must be less than or equal to the shape of adapter_enabled"
+        )
     else:
         adapter_enabled = torch.empty(
             len(lora_ranks), dtype=torch.int32, device=lora_ranks.device

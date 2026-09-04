@@ -94,9 +94,9 @@ def test_quant_scatter_matches_quant_plus_fill(num_tokens, topk, hidden, group):
             assert torch.equal(
                 gi_new[e, m].view(torch.uint8), gi_ref[e, m].view(torch.uint8)
             ), f"fp8 mismatch token={t} slot={j} expert={e}"
-            assert torch.equal(
-                gs_new[e, :, m], gs_ref[e, :, m]
-            ), f"scale mismatch token={t} slot={j} expert={e}"
+            assert torch.equal(gs_new[e, :, m], gs_ref[e, :, m]), (
+                f"scale mismatch token={t} slot={j} expert={e}"
+            )
 
 
 def test_standard_deepgemm_preprocess_quantizes_with_ue8m0_scale():

@@ -10,7 +10,6 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestResolveMinFreeSlots(unittest.TestCase):
-
     def test_unset_non_dflash_disables(self):
         self.assertIsNone(resolve_min_free_slots(None, 512, is_dflash_family=False))
 
@@ -50,7 +49,6 @@ class TestResolveMinFreeSlots(unittest.TestCase):
 
 
 class TestMinFreeSlotsDelayer(unittest.TestCase):
-
     def test_delays_below_threshold(self):
         delayer = MinFreeSlotsDelayer(min_free_slots=4)
         self.assertTrue(delayer.should_delay(running_bs=100, num_allocatable_reqs=2))

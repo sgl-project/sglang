@@ -51,10 +51,17 @@ def generate_request_id() -> str:
     return str(uuid.uuid4())
 
 
-# Validated request-level quality levels. "lossless" is the exact reference
-# path (bit-exact against the CI golden outputs); "high" opts into validated
-# accelerated paths whose quality is guaranteed but not bit-exact.
-QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
+# Validated request-level quality levels, ordered from the strictest numerical
+# contract to the broadest optimization set. "lossless" keeps the exact
+# reference path; "extra-high" adds only request-gated kernel fusions; "high"
+# is cumulative and may also enable model-owned approximate optimizations.
+QUALITY_LEVELS: tuple[str, ...] = ("lossless", "extra-high", "high")
+KERNEL_FUSION_QUALITY_LEVELS = frozenset({"extra-high", "high"})
+
+
+def quality_allows_kernel_fusions(quality: str) -> bool:
+    """Return whether a quality level includes request-gated kernel fusions."""
+    return quality in KERNEL_FUSION_QUALITY_LEVELS
 
 
 def _sanitize_filename(name: str, replacement: str = "_", max_length: int = 150) -> str:
@@ -126,9 +133,7 @@ class SamplingParams:
     prompt: str | list[str] | None = field(
         default=None, metadata={"batch_sig_exclude": True}
     )
-    negative_prompt: str = (
-        "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
-    )
+    negative_prompt: str = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
     prompt_path: str | None = field(default=None, metadata={"batch_sig_exclude": True})
     output_path: str | None = field(default=None, metadata={"batch_sig_exclude": True})
     output_file_name: str | None = field(
@@ -141,15 +146,15 @@ class SamplingParams:
     # - "lossless" (default): the exact reference path. Output is expected to
     #   be bit-identical to the HF reference implementation and to pass the
     #   CI golden/ground-truth comparisons.
-    # - "high": opt into validated accelerated paths. Quality stays
-    #   guaranteed (the intent is to back every such path with mathematical
-    #   acceptance thresholds, e.g. PSNR > 25 against the reference), but
-    #   the output is no longer bit-exact versus the HF reference or the CI
-    #   ground truth.
+    # - "extra-high": add only validated kernel fusions. These may change
+    #   half-precision rounding order, so output is not bit-exact versus the
+    #   reference, but this tier does not itself enable sparse or approximate
+    #   optimizations.
+    # - "high": include every "extra-high" fusion and allow model-owned
+    #   approximate optimizations such as sparse computation or feature
+    #   caching. These paths require model-specific quality validation.
     #
-    # Models that support "high" must validate the deployment and workload
-    # explicitly. It intentionally participates in the dynamic-batch
-    # signature.
+    # It intentionally participates in the dynamic-batch signature.
     quality: str = "lossless"
 
     # Frame interpolation
@@ -256,12 +261,8 @@ class SamplingParams:
     )
     return_trajectory_latents: bool = False  # returns all latents for each timestep
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
-    rollout_return_denoising_env: bool = (
-        False  # populate ``denoising_env`` (image/pos/neg kwargs, guidance) for RL replay
-    )
-    rollout_return_dit_trajectory: bool = (
-        False  # per-step noisy latents + final latent + timesteps (RolloutDitTrajectory)
-    )
+    rollout_return_denoising_env: bool = False  # populate ``denoising_env`` (image/pos/neg kwargs, guidance) for RL replay
+    rollout_return_dit_trajectory: bool = False  # per-step noisy latents + final latent + timesteps (RolloutDitTrajectory)
     # 0-indexed denoising-loop step filters; None = all steps.
     rollout_sde_step_indices: list[int] | None = None
     rollout_return_step_indices: list[int] | None = None
@@ -481,8 +482,7 @@ class SamplingParams:
 
         if self.quality not in QUALITY_LEVELS:
             raise ValueError(
-                f"quality must be one of {list(QUALITY_LEVELS)}, "
-                f"got {self.quality!r}"
+                f"quality must be one of {list(QUALITY_LEVELS)}, got {self.quality!r}"
             )
 
         # These are always required to be sane regardless of pipeline.
@@ -1120,10 +1120,12 @@ class SamplingParams:
             help=(
                 "Request-level quality: 'lossless' (default) keeps the exact "
                 "reference path, bit-exact against the reference "
-                "implementation; 'high' opts into the model-owned validated "
-                "accelerated path, whose quality stays guaranteed but is not "
-                "bit-exact. Support and validated deployment constraints are "
-                "model-specific."
+                "implementation; 'extra-high' adds only request-gated kernel "
+                "fusions and does not itself enable sparse or approximate "
+                "optimization; 'high' includes every extra-high fusion and "
+                "may also enable "
+                "model-owned approximate paths. Support and validated "
+                "deployment constraints are model-specific."
             ),
         )
         add_argument(

@@ -433,9 +433,9 @@ def get_rope_cpu(
 
     assert rope_scaling is not None
     scaling_type = rope_scaling["rope_type"]
-    assert (
-        scaling_type == "deepseek_yarn"
-    ), "Only deepseek_yarn is supported for CPU for now"
+    assert scaling_type == "deepseek_yarn", (
+        "Only deepseek_yarn is supported for CPU for now"
+    )
 
     scaling_factor = _get_rope_param(rope_scaling, "factor", 1.0, scaling_type)
     original_max_position = _get_rope_param(

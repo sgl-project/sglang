@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.test.ci.ci_register import register_xpu_ci
 
 # Must be set before lmcache imports. Save prior values so tearDownModule can
@@ -71,7 +72,7 @@ def _make_req(rid, req_pool_idx, token_ids, tree):
         extra_key=None,
         cache_salt=None,
         last_node=tree.root_node,
-        kv=SimpleNamespace(
+        kv=ReqKvInfo(
             req_pool_idx=req_pool_idx,
             cache_protected_len=0,
             kv_committed_len=len(token_ids),
@@ -167,7 +168,7 @@ class TestLMCRadixCacheXPU(unittest.TestCase):
             req_pool_idx = req_to_token_pool.alloc(
                 [
                     SimpleNamespace(
-                        inflight_middle_chunks=0, kv=SimpleNamespace(req_pool_idx=None)
+                        inflight_middle_chunks=0, kv=ReqKvInfo(req_pool_idx=None)
                     )
                 ]
             )[0]

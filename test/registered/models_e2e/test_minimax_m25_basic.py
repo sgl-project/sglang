@@ -64,7 +64,7 @@ class TestMiniMaxM25Basic(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (minimax-m25)\n" f'{metrics["accuracy"]=:.3f}\n'
+                f'### test_gsm8k (minimax-m25)\n{metrics["accuracy"]=:.3f}\n'
             )
         self.assertGreater(metrics["accuracy"], 0.900)
 
@@ -76,7 +76,7 @@ class TestMiniMaxM25Basic(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (minimax-m25)\n" f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (minimax-m25)\n{speed=:.2f} token/s\n"
             )
             self.assertGreater(speed, 90)
 

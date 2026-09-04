@@ -254,3 +254,366 @@ jobs:
             --hours ${{ inputs.hours || '24' }} \
             --input-data-file ci-data/actions-job-snapshot.json \
             --summary
+
+  # Colorful nightly XPU status dashboard, rendered into the workflow summary.
+  # Success-rate thresholds: >=90% healthy, >=70% degraded, else critical.
+  nightly-xpu-status-dashboard:
+    name: Nightly XPU Status Dashboard
+    if: ${{ !inputs.job_filter }}
+    needs: [fetch-actions-data, nightly-reports]
+    runs-on: ubuntu-latest
+    env:
+      HEALTHY_THRESHOLD: '90'
+      DEGRADED_THRESHOLD: '70'
+      WINDOW_HOURS: ${{ inputs.hours || '24' }}
+    steps:
+      - name: Download Actions data snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: actions-job-snapshot
+          path: ci-data
+
+      - name: Render colorful nightly status dashboard
+        run: |
+          python - <<'PY'
+          import json, os, sys
+          from datetime import datetime, timezone
+
+          snap_path = "ci-data/actions-job-snapshot.json"
+          out = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stdout")
+          healthy = float(os.environ["HEALTHY_THRESHOLD"])
+          degraded = float(os.environ["DEGRADED_THRESHOLD"])
+          window_hours = os.environ.get("WINDOW_HOURS", "24")
+
+          with open(snap_path) as f:
+              snapshot = json.load(f)
+
+          # Only look at nightly-test-intel jobs
+          nightly = [
+              j for j in snapshot.get("jobs", [])
+              if j.get("workflow_path", "").endswith("nightly-test-intel.yml")
+          ]
+
+          # status_summary style counts, per job name
+          per_job = {}
+          for j in nightly:
+              name = j.get("job_name") or j.get("name", "unknown")
+              d = per_job.setdefault(name, {"success": 0, "failure": 0, "cancelled": 0, "skipped": 0, "in_progress": 0, "other": 0})
+              status = j.get("status", "")
+              conclusion = j.get("conclusion", "")
+              if status == "completed":
+                  if conclusion == "success":
+                      d["success"] += 1
+                  elif conclusion == "failure":
+                      d["failure"] += 1
+                  elif conclusion == "skipped":
+                      d["skipped"] += 1
+                  elif conclusion == "cancelled":
+                      d["cancelled"] += 1
+                  else:
+                      d["other"] += 1
+              elif status in ("in_progress", "queued", "waiting"):
+                  d["in_progress"] += 1
+              else:
+                  d["other"] += 1
+
+          def badge(label, value, color):
+              # shields.io renders inline in GitHub markdown summaries.
+              label = label.replace("-", "--").replace(" ", "_")
+              value = str(value).replace("-", "--").replace(" ", "_")
+              return f"![{label}](https://img.shields.io/badge/{label}-{value}-{color})"
+
+          def health(rate):
+              if rate is None:
+                  return ("gray", "UNKNOWN", "⚪")   # white circle
+              if rate >= healthy:
+                  return ("brightgreen", "HEALTHY", "\U0001F7E2")   # green circle
+              if rate >= degraded:
+                  return ("yellow", "DEGRADED", "\U0001F7E1")       # yellow circle
+              return ("red", "CRITICAL", "\U0001F534")              # red circle
+
+          totals = {"success": 0, "failure": 0, "cancelled": 0, "skipped": 0, "in_progress": 0, "other": 0}
+          for counts in per_job.values():
+              for k, v in counts.items():
+                  totals[k] += v
+          finished = totals["success"] + totals["failure"]
+          overall_rate = (totals["success"] / finished * 100.0) if finished else None
+          fleet_color, fleet_label, fleet_dot = health(overall_rate)
+
+          now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+          lines = []
+          lines.append("## Nightly XPU Status Dashboard")
+          lines.append("")
+          lines.append(f"_Window: last **{window_hours}h** · Snapshot rendered at **{now}**_")
+          lines.append("")
+          lines.append("### Fleet health")
+          lines.append("")
+          lines.append(
+              " ".join([
+                  badge("fleet", fleet_label, fleet_color),
+                  badge("success_rate", f"{overall_rate:.1f}%25" if overall_rate is not None else "n%2Fa", fleet_color),
+                  badge("healthy_threshold", f"{int(healthy)}%25", "brightgreen"),
+                  badge("degraded_threshold", f"{int(degraded)}%25", "yellow"),
+              ])
+          )
+          lines.append("")
+          lines.append(
+              f"**{fleet_dot} Overall:** "
+              f"{totals['success']} passed · {totals['failure']} failed · "
+              f"{totals['cancelled']} cancelled · {totals['skipped']} skipped · "
+              f"{totals['in_progress']} in flight"
+          )
+          lines.append("")
+          lines.append("### Per-model / per-job breakdown")
+          lines.append("")
+          lines.append("| Status | Job | Success rate | Passed | Failed | Skipped | Cancelled | In-flight |")
+          lines.append("|:------:|:----|-------------:|-------:|-------:|--------:|----------:|----------:|")
+
+          def sort_key(item):
+              name, c = item
+              finished = c["success"] + c["failure"]
+              rate = (c["success"] / finished) if finished else 2.0  # untested last
+              return (rate, name)
+
+          for name, c in sorted(per_job.items(), key=sort_key):
+              finished = c["success"] + c["failure"]
+              rate = (c["success"] / finished * 100.0) if finished else None
+              color, label, dot = health(rate)
+              rate_txt = f"{rate:.1f}%" if rate is not None else "n/a"
+              rate_badge = badge("rate", f"{rate:.1f}%25" if rate is not None else "n%2Fa", color)
+              lines.append(
+                  f"| {dot} `{label}` | `{name}` | {rate_badge} <sub>{rate_txt}</sub> | "
+                  f"{c['success']} | {c['failure']} | {c['skipped']} | {c['cancelled']} | {c['in_progress']} |"
+              )
+
+          lines.append("")
+          lines.append("<sub>Thresholds: "
+                       f"\U0001F7E2 healthy ≥ {int(healthy)}% · "
+                       f"\U0001F7E1 degraded ≥ {int(degraded)}% · "
+                       f"\U0001F534 critical below</sub>")
+          lines.append("")
+
+          with open(out, "a") as f:
+              f.write("\n".join(lines) + "\n")
+
+          # Fail the step if fleet is CRITICAL so oncall sees a red X on the run.
+          if overall_rate is not None and overall_rate < degraded:
+              print(f"::error::Nightly XPU fleet is CRITICAL: success rate {overall_rate:.1f}% < {int(degraded)}%")
+              sys.exit(1)
+          PY
+
+  # -------------------------------------------------------------------
+  # Intel(XPU) Nightly report — per-model 1x/2x/4x/8x tables.
+  # Downloads the per-model metrics jsonl artifacts uploaded by
+  # nightly-test-intel.yml (SGLANG_TEST_METRICS_FILE side-writer) and renders
+  # one Markdown table per GPU-count suite. 8x is future-ready: it renders
+  # "No metrics recorded" until an 8-GPU suite is enabled upstream.
+  # -------------------------------------------------------------------
+  nightly-xpu-per-model-report:
+    name: Intel(XPU) Nightly report
+    # Fork PRs don't get secrets and can't read cross-workflow artifacts;
+    # rest is same gating as the fetch-actions-data job above.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Resolve latest Nightly Test (Intel) run id
+        id: source-run
+        run: |
+          # Pick the most recent completed run of nightly-test-intel.yml on the
+          # default branch. workflow_dispatch reruns are included; skipped or
+          # in-progress runs are not.
+          RUN_ID=$(gh run list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --workflow nightly-test-intel.yml \
+            --branch main \
+            --status completed \
+            --limit 1 \
+            --json databaseId --jq '.[0].databaseId // empty')
+          if [ -z "$RUN_ID" ]; then
+            echo "No completed Nightly Test (Intel) run found on main."
+            echo "run_id=" >> "$GITHUB_OUTPUT"
+          else
+            echo "Latest completed nightly run: $RUN_ID"
+            echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download per-model metrics artifacts
+        if: steps.source-run.outputs.run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          pattern: nightly-xpu-*-metrics
+          path: metrics/
+          run-id: ${{ steps.source-run.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          # Keep artifact names as subdirs so we can split by GPU-count suite.
+          merge-multiple: false
+        continue-on-error: true
+
+      - name: Render per-model 1x / 2x / 4x / 8x tables
+        env:
+          SOURCE_RUN_ID: ${{ steps.source-run.outputs.run_id }}
+        run: |
+          python - <<'PY'
+          import glob
+          import json
+          import os
+
+          SUITES = [
+              ("1x", "nightly-xpu-1-gpu-metrics"),
+              ("2x", "nightly-xpu-2-gpu-metrics"),
+              ("4x", "nightly-xpu-4-gpu-metrics"),
+              # 8x is here for future readiness. Until nightly-test-intel.yml
+              # adds an 8-GPU suite + upload step, its artifact directory is
+              # missing and the section renders "No metrics recorded".
+              ("8x", "nightly-xpu-8-gpu-metrics"),
+          ]
+
+          def load(subdir: str):
+              path = os.path.join("metrics", subdir)
+              records = []
+              for f in sorted(glob.glob(os.path.join(path, "*.jsonl"))):
+                  with open(f) as fh:
+                      for line in fh:
+                          line = line.strip()
+                          if not line:
+                              continue
+                          try:
+                              records.append(json.loads(line))
+                          except json.JSONDecodeError:
+                              # Skip malformed rows so one bad line doesn't
+                              # blank the whole table.
+                              continue
+              return records
+
+          def fmt(value, precision: int = 2) -> str:
+              if value is None or value == "" or value == "N/A":
+                  return "N/A"
+              try:
+                  return f"{float(value):.{precision}f}"
+              except (TypeError, ValueError):
+                  return str(value)
+
+          out = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stdout")
+          source_run = os.environ.get("SOURCE_RUN_ID", "")
+          repo = os.environ.get("GITHUB_REPOSITORY", "")
+
+          lines = ["", "## Intel(XPU) Nightly report", ""]
+          if source_run and repo:
+              lines.append(
+                  f"Source: [Intel(XPU) Nightly report - run #{source_run}]"
+                  f"(https://github.com/{repo}/actions/runs/{source_run})"
+              )
+              lines.append("")
+          elif not source_run:
+              lines.append("_No completed Nightly Test (Intel) run found; nothing to render._")
+              lines.append("")
+
+          def rows_for(records):
+              # Group records by test_file. Two record shapes:
+              #   kind=="model": rich per-model row emitted by tests that call
+              #                  write_results_to_github_step_summary.
+              #   kind=="file":  file-level fallback emitted by run_unittest_files
+              #                  for every test file in the suite.
+              # If a test_file has any model rows, we show those and drop the
+              # matching file row so a test does not double-count. Test files
+              # that never emit a model row fall back to the file row - that
+              # is what makes newly-added tests appear automatically.
+              by_file_model = {}
+              by_file_file = {}
+              orphans_model = []
+              for r in records:
+                  kind = r.get("kind")
+                  tf = r.get("test_file", "") or ""
+                  if kind == "model":
+                      if tf:
+                          by_file_model.setdefault(tf, []).append(r)
+                      else:
+                          orphans_model.append(r)
+                  else:
+                      # "file" or legacy records without kind
+                      if tf and "model" not in r:
+                          by_file_file[tf] = r
+                      else:
+                          orphans_model.append(r)
+
+              rendered = []
+              for tf in sorted(set(by_file_model) | set(by_file_file)):
+                  if tf in by_file_model:
+                      for r in by_file_model[tf]:
+                          rendered.append(("model", r))
+                  else:
+                      rendered.append(("file", by_file_file[tf]))
+              for r in orphans_model:
+                  rendered.append(("model", r))
+              return rendered
+
+          any_fail = 0
+          for label, subdir in SUITES:
+              records = load(subdir)
+              lines.append(f"### {label} ({subdir[:-len('-metrics')]})")
+              lines.append("")
+              if not records:
+                  lines.append("_No metrics recorded for this suite._")
+                  lines.append("")
+                  continue
+
+              lines.append(
+                  "| Model / Test file | Prompts | Ref accuracy | Actual accuracy "
+                  "| Ref throughput | Actual throughput | Duration | Status |"
+              )
+              lines.append(
+                  "|-------------------|--------:|-------------:|----------------:"
+                  "|---------------:|------------------:|---------:|:------:|"
+              )
+              for row_kind, r in rows_for(records):
+                  status = str(r.get("status", "")).lower()
+                  is_pass = status == "pass"
+                  if not is_pass:
+                      any_fail += 1
+                  status_cell = "PASS" if is_pass else (status.upper() or "N/A")
+                  if row_kind == "model":
+                      duration = r.get("latency")
+                      lines.append(
+                          f"| `{r.get('model','?')}` "
+                          f"| {r.get('num_prompts','N/A')} "
+                          f"| {fmt(r.get('accuracy_threshold'), 3)} "
+                          f"| {fmt(r.get('accuracy'), 3)} "
+                          f"| {fmt(r.get('output_throughput_threshold'), 2)} "
+                          f"| {fmt(r.get('output_throughput'), 2)} "
+                          f"| {fmt(duration, 2)} "
+                          f"| {status_cell} |"
+                      )
+                  else:
+                      tf = r.get("test_file", "?")
+                      lines.append(
+                          f"| {tf} "
+                          f"| N/A | N/A | N/A | N/A | N/A "
+                          f"| {fmt(r.get('duration'), 2)} "
+                          f"| {status_cell} |"
+                      )
+              lines.append("")
+
+          lines.append(
+              "<sub>Rows with a model name are per-model records emitted by "
+              "`write_results_to_github_step_summary`; rows with just a test "
+              "file name are auto-recorded by `run_unittest_files`. Ref columns "
+              "are the accuracy / throughput thresholds declared by each test; "
+              "Actual is what nightly measured. Any new test added to "
+              "run_suite.py shows up here on the next nightly.</sub>"
+          )
+          lines.append("")
+
+          with open(out, "a") as f:
+              f.write("\n".join(lines) + "\n")
+
+          # Surface — but don't hard-fail — the report step: nightly-test-intel
+          # already flags model failures. This job is a rendering step.
+          if any_fail:
+              print(f"::warning::{any_fail} nightly XPU model row(s) marked FAIL in the per-model tables")
+          PY

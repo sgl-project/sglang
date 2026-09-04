@@ -51,10 +51,40 @@ def _req(
 def _scheduler(waiting_queue):
     s = Scheduler.__new__(Scheduler)
     s.waiting_queue = waiting_queue
+    s.enable_hierarchical_cache = False
     s.enable_hicache_storage = False
+    s.enable_unified_cache_external_linker = False
     s.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
     s.beam_coordinator = MagicMock()
     return s
+
+
+class TestQueuedLimitAbort(CustomTestCase):
+    def setUp(self):
+        patcher = patch(
+            "sglang.srt.managers.scheduler.get_serving",
+            return_value=SimpleNamespace(weight_version="v0"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_hicache_without_storage_uses_common_abort_cleanup(self):
+        candidate = _req("candidate", wait_entry=1.0)
+        candidate.priority = 0
+        incoming = _req("incoming", wait_entry=2.0)
+        incoming.priority = 1
+
+        s = _scheduler([candidate])
+        s.max_queued_requests = 1
+        s.enable_priority_scheduling = True
+        s.schedule_low_priority_values_first = False
+        s.enable_hierarchical_cache = True
+        s.tree_cache = MagicMock(spec=["release_aborted_request"])
+
+        self.assertFalse(s._abort_on_queued_limit(incoming))
+
+        s.tree_cache.release_aborted_request.assert_called_once_with("candidate")
+        self.assertEqual(s.waiting_queue, [])
 
 
 class TestWaitingTimeout(CustomTestCase):

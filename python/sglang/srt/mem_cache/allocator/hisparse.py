@@ -158,9 +158,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             extra_indices = self.hisparse_attn_allocator.alloc(
                 need_size - len(hisparse_indices)
             )
-            assert (
-                extra_indices is not None
-            ), "Hisparse allocation failed in alloc_device_buffer"
+            assert extra_indices is not None, (
+                "Hisparse allocation failed in alloc_device_buffer"
+            )
             buffer_indices = torch.cat([hisparse_indices, extra_indices])
         return buffer_indices
 
@@ -216,9 +216,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             len(logical_indices),
             num_new_pages=num_new_pages,
         )
-        assert (
-            hisparse_indices is not None
-        ), "Hisparse allocation failed in alloc_extend"
+        assert hisparse_indices is not None, (
+            "Hisparse allocation failed in alloc_extend"
+        )
         self.full_to_hisparse_device_index_mapping[logical_indices] = hisparse_indices
         return logical_indices
 
@@ -268,7 +268,6 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
 
 class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
-
     def __init__(
         self,
         logical_attn_allocator: BaseTokenToKVPoolAllocator,
@@ -469,9 +468,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             extra_indices = self.hisparse_attn_allocator.alloc(
                 need_size - len(hisparse_indices)
             )
-            assert (
-                extra_indices is not None
-            ), "Hisparse allocation failed in alloc_device_buffer"
+            assert extra_indices is not None, (
+                "Hisparse allocation failed in alloc_device_buffer"
+            )
             buffer_indices = torch.cat([hisparse_indices, extra_indices])
         return buffer_indices
 
@@ -538,9 +537,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             hisparse_last_loc,
             len(compressed_logical_indices),
         )
-        assert (
-            hisparse_indices is not None
-        ), "Hisparse allocation failed in alloc_extend"
+        assert hisparse_indices is not None, (
+            "Hisparse allocation failed in alloc_extend"
+        )
 
         self.full_to_hisparse_device_index_mapping[compressed_logical_indices] = (
             hisparse_indices.to(torch.int64)

@@ -125,7 +125,6 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
 
 
 class AttentionLayer(Protocol):
-
     _k_scale: torch.Tensor
     _v_scale: torch.Tensor
     _k_scale_float: float
@@ -142,7 +141,6 @@ class AttentionLayer(Protocol):
 
 
 class AttentionImpl(ABC, Generic[T]):
-
     @abstractmethod
     def __init__(
         self,

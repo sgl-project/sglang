@@ -243,9 +243,7 @@ def run(task, fi, tri, device, dtype, args):
                     )  # noqa: E731
                 else:
                     inp = make_decode_inputs(B, H, HV, K, V, pool, device, dtype)
-                    corr = lambda kern: call_decode(
-                        kern, inp, inp["ssm"].clone()
-                    )  # noqa: E731
+                    corr = lambda kern: call_decode(kern, inp, inp["ssm"].clone())  # noqa: E731
                     ssm_t = inp["ssm"].clone()
                     timed = lambda kern: call_decode(kern, inp, ssm_t)  # noqa: E731
 

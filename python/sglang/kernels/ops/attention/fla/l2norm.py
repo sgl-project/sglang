@@ -120,7 +120,6 @@ def l2norm_fwd(
 
 
 class L2NormFunction(torch.autograd.Function):
-
     @staticmethod
     @input_guard
     def forward(ctx, x, eps=1e-6, output_dtype=None):
@@ -137,7 +136,6 @@ l2_norm = l2norm
 
 
 class L2Norm(nn.Module):
-
     def __init__(self, eps: float = 1e-6, output_dtype: Optional[torch.dtype] = None):
         super().__init__()
         self.eps = eps

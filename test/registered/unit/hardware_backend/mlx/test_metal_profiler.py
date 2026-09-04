@@ -96,8 +96,9 @@ class TestMetalCaptureProfilerMLX(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "test.gputrace"
-            with patch.object(mx.metal, "start_capture"), patch.object(
-                mx.metal, "stop_capture"
+            with (
+                patch.object(mx.metal, "start_capture"),
+                patch.object(mx.metal, "stop_capture"),
             ):
                 profiler, result = MetalCaptureProfiler.start_mlx(trace_path)
 
@@ -131,9 +132,10 @@ class TestMetalCaptureProfilerMLX(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "test.gputrace"
-            with patch.object(mx.metal, "start_capture"), patch.object(
-                mx.metal, "stop_capture"
-            ) as mock_stop:
+            with (
+                patch.object(mx.metal, "start_capture"),
+                patch.object(mx.metal, "stop_capture") as mock_stop,
+            ):
                 profiler, _ = MetalCaptureProfiler.start_mlx(trace_path)
                 profiler.stop()
                 mock_stop.assert_called_once()
@@ -261,9 +263,12 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             mgr = self._make_manager(tmp)
             capture_ctx = MagicMock()
-            with mock_patch.object(
-                torch.mps.profiler, "metal_capture", return_value=capture_ctx
-            ), mock_patch("torch.distributed.barrier"):
+            with (
+                mock_patch.object(
+                    torch.mps.profiler, "metal_capture", return_value=capture_ctx
+                ),
+                mock_patch("torch.distributed.barrier"),
+            ):
                 result = mgr._start_profile()
                 self.assertTrue(result.success, result.message)
                 self.assertTrue(mgr.profile_in_progress)

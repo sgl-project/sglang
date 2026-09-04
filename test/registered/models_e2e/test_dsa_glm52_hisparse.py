@@ -1,11 +1,10 @@
-import subprocess
 import time
 import unittest
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
+from sglang.test.test_utils import terminate_and_kill_process_tree
 
 register_cuda_ci(est_time=720, stage="extra-b", runner_config="8-gpu-h200")
 
@@ -54,14 +53,10 @@ class TestGLM52HiSparse(DefaultServerBase, GSM8KMixin):
 
     @classmethod
     def tearDownClass(cls):
-        # HiSparse's large pinned host buffer stalls an external SIGKILL teardown
-        # (kernel unpin). Drive the server's own graceful shutdown so each rank
-        # unregisters in userspace; hard-kill as a fallback.
-        cls.process.terminate()
-        try:
-            cls.process.wait(timeout=90)
-        except subprocess.TimeoutExpired:
-            kill_process_tree(cls.process.pid, wait_timeout=60)
+        # HiSparse's pinned host buffer needs longer than the base class's 60s.
+        terminate_and_kill_process_tree(
+            cls.process, terminate_timeout=90, wait_timeout=60
+        )
         time.sleep(2)
 
 

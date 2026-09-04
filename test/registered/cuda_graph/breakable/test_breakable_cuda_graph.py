@@ -222,7 +222,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         num_tokens = 3
         padded_num_tokens = 5
         forward_batch = SimpleNamespace(
-            num_token_non_padded_cpu=num_tokens,
+            global_num_token_non_padded_cpu=num_tokens,
             out_cache_loc=torch.arange(padded_num_tokens, device=self.device),
             positions=torch.arange(padded_num_tokens, device=self.device),
         )

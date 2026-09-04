@@ -11,6 +11,7 @@ To plug in a custom backend, register it under a string name via
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -112,13 +113,14 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         # FlexKV supplies its own host-tier path and composes with the unified
         # radix cache for SWA models. Select it before the built-in hybrid
         # cache branches so --enable-flexkv works for DeepSeek V4 as well.
-        import os
-
         from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
 
         if get_memory().flexkv_config_file and not os.environ.get("FLEXKV_CONFIG_PATH"):
             os.environ["FLEXKV_CONFIG_PATH"] = get_memory().flexkv_config_file
         return _flexkv_factory(ctx)
+
+    if server_args.enable_unified_cache_external_linker:
+        return _create_unified_radix_cache(ctx, server_args, params)
 
     if ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0:
         from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
@@ -191,6 +193,26 @@ def _create_unified_radix_cache(
         ctx.tp_worker.register_hicache_layer_transfer_counter(
             cache.cache_controller.layer_done_counter
         )
+    elif server_args.enable_unified_cache_external_linker:
+        backend = server_args.unified_cache_external_linker_backend
+        if backend == "mooncake":
+            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+                MooncakeDirectLinker,
+            )
+
+            linker_cls = MooncakeDirectLinker
+        else:
+            raise ValueError(
+                f"Unknown unified cache external linker backend: {backend!r}"
+            )
+
+        cache.init_cache_linker(
+            linker_cls(server_args, params, components=set(cache.components))
+        )
+        counter = cache.linker.layer_done_counter
+        kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+        kvcache.register_layer_transfer_counter(counter)
+        ctx.tp_worker.register_hicache_layer_transfer_counter(counter)
     return cache
 
 

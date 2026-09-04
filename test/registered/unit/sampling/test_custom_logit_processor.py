@@ -3,7 +3,7 @@
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="base-c-test-cpu")
+register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 
 import json
 import unittest
@@ -39,7 +39,6 @@ def _make_req(origin_input_ids=None, output_ids=None):
 
 # Serialization round-trip
 class TestCustomLogitProcessorSerialization(CustomTestCase):
-
     def test_to_str_produces_valid_json(self):
         """Test that to_str() produces valid JSON with a 'callable' field."""
         s = DisallowedTokensLogitsProcessor.to_str()

@@ -61,7 +61,9 @@ def _holders(fn):
             else (
                 annotation.id
                 if isinstance(annotation, ast.Name)
-                else annotation.attr if isinstance(annotation, ast.Attribute) else None
+                else annotation.attr
+                if isinstance(annotation, ast.Attribute)
+                else None
             )
         )
         if text == "ServerArgs":

@@ -855,9 +855,9 @@ def _install_framework(fw_name: str, dry_run: bool = False) -> bool:
     if dry_run:
         print(f"  [DRY-RUN] Would install: bash {INSTALL_SCRIPT} {fw_name}")
         return True
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Installing framework: {fw_name}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     ret = subprocess.run(
         ["bash", str(INSTALL_SCRIPT), fw_name],
         timeout=600,
@@ -943,9 +943,9 @@ def run_comparison(
             installed_fws.add(fw_name)
 
         for case, fw_cfg in pairs:
-            print(f"\n{'='*60}")
+            print(f"\n{'=' * 60}")
             print(f"Case: {case['id']} | Model: {case['model']} | Framework: {fw_name}")
-            print(f"{'='*60}")
+            print(f"{'=' * 60}")
 
             if dry_run:
                 cmd = build_server_cmd(fw_name, case, fw_cfg, port)
@@ -982,9 +982,9 @@ def run_comparison(
     print(f"\nResults written to {output}")
 
     # Print summary table
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("SUMMARY")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     for r in results:
         lat = f"{r['latency_s']:.2f}s" if r["latency_s"] else r.get("error", "N/A")
         print(f"  {r['case_id']:30s} | {r['framework']:12s} | {lat}")

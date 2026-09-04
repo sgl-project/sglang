@@ -27,6 +27,11 @@ _MULTIMODAL_ROOT = (
     / "srt"
     / "multimodal"
 )
+if not _MULTIMODAL_ROOT.is_dir():
+    raise RuntimeError(
+        f"multimodal processor tree not found at {_MULTIMODAL_ROOT}; "
+        "these tests must run from a full source checkout"
+    )
 # The async helper and the sync body live side by side here by design.
 _EXEMPT = {"base_processor.py"}
 

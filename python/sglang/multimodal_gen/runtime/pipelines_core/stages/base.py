@@ -215,8 +215,7 @@ class PipelineStage(StageDedupMixin, ABC):
                 return replace(use, target_dtype=target_dtype)
             return use
         raise ValueError(
-            f"{self.__class__.__name__} did not declare component use: "
-            f"{component_name}"
+            f"{self.__class__.__name__} did not declare component use: {component_name}"
         )
 
     @contextmanager

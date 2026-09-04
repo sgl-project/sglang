@@ -77,7 +77,6 @@ temp_dir = tempfile.gettempdir()
 
 
 class DisabledTqdm(tqdm):
-
     def __init__(self, *args, **kwargs):
         kwargs["disable"] = True
         super().__init__(*args, **kwargs)

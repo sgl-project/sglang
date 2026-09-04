@@ -72,7 +72,6 @@ def grouped_gemm_nt_f8f8bf16_masked(
         with configure_deep_gemm_num_sms(
             overlap_args.num_sms if overlap_args is not None else None
         ):
-
             fp4_kwargs = {}
             if recipe_a is not None:
                 fp4_kwargs["recipe_a"] = recipe_a

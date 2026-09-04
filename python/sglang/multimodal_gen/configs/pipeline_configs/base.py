@@ -1180,9 +1180,9 @@ class PipelineConfig:
                 elif isinstance(current_value, tuple) and all(
                     isinstance(v, ModelConfig) for v in current_value
                 ):
-                    assert len(current_value) == len(
-                        new_value
-                    ), "Users shouldn't delete or add text encoder config objects in your json"
+                    assert len(current_value) == len(new_value), (
+                        "Users shouldn't delete or add text encoder config objects in your json"
+                    )
                     for target_config, source_config in zip(
                         current_value, new_value, strict=True
                     ):

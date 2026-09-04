@@ -53,6 +53,7 @@ def _make_ctx(
         enable_streaming_session=enable_streaming,
         enable_lmcache=enable_lmcache,
         enable_flexkv=enable_flexkv,
+        enable_unified_cache_external_linker=False,
     )
     return TreeCacheBuildContext(
         server_args=server_args,

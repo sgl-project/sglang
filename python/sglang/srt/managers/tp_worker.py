@@ -614,9 +614,9 @@ class TpModelWorker(BaseTpWorker):
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
-            assert (
-                capture_hidden_mode is None
-            ), "capture_hidden_mode override requires a ScheduleBatch input"
+            assert capture_hidden_mode is None, (
+                "capture_hidden_mode override requires a ScheduleBatch input"
+            )
 
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)

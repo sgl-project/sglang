@@ -201,9 +201,9 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         layer_shard_size: int,
         **kwargs,
     ):
-        assert (
-            layer_shard_rank is not None and layer_shard_size > 1
-        ), "LayerSplitDSATokenToKVPool requires layer_shard_size > 1"
+        assert layer_shard_rank is not None and layer_shard_size > 1, (
+            "LayerSplitDSATokenToKVPool requires layer_shard_size > 1"
+        )
         self.layer_shard_rank = layer_shard_rank
         self.layer_shard_size = layer_shard_size
         self.layer_shard_enabled = True

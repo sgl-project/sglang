@@ -1,7 +1,7 @@
 """End-to-end parity at the scheduler-input boundary.
 
 `test_preprocess.py` pins the `preprocess` binding; this drives the whole native
-path — the `process_native_mm` driver, then `NativeMmHost.build_native_mm` — and
+path — the `process_mm` driver, then `RustMmProcessor.build_output` — and
 compares every field the scheduler reads against the Python `mm_processor`.
 Bitwise, for both HF backends: the Rust resize clones PIL's fixed-point bicubic
 and ATen's uint8 antialias kernel, so whichever one a server is configured with
@@ -23,7 +23,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.rust_server import NativeMmHost  # noqa: E402
+from sglang.srt.rust_server.multimodal import RustMmProcessor  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -33,7 +33,7 @@ from _mm_rust_utils import PROCESSOR_CONFIGS, image_bytes, load_core  # noqa: E4
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
 CORE = load_core()
-DRIVER = getattr(getattr(CORE, "qwen_vl", None), "process_native_mm", None)
+DRIVER = getattr(getattr(CORE, "qwen_vl", None), "process_mm", None)
 
 # The fixture tokenizer's vocab (see `_fixtures.make_processor`):
 # 1 = <|vision_start|>, 2 = <|image_pad|>, 3 = <|vision_end|>, 4 = "hello".
@@ -68,21 +68,21 @@ class TestQwenE2eParity(CustomTestCase):
 
         import_processors("sglang.srt.multimodal.processors")
         # Skip __init__: it would build a processor; reuse the fixture's.
-        host = NativeMmHost.__new__(NativeMmHost)
+        host = RustMmProcessor.__new__(RustMmProcessor)
         host.model_config = SimpleNamespace(hf_config=self.processor.hf_config)
         host._processor = self.processor._processor
         host.server_args = self.processor.server_args
-        spec = host.resolve_native_spec()
+        spec = host.resolve_spec()
         self.assertIsNotNone(spec, f"gate rejected {self.image_processor}")
         return spec
 
     def run_native(self, spec, sources):
-        """The Rust path: the `process_native_mm` driver, then the drain
+        """The Rust path: the `process_mm` driver, then the drain
         adapter — the same two steps `RustServer.drain` performs."""
         ids, features, grids, hashes, offsets, mrope, delta = DRIVER(
             PROMPT_PER_IMAGE * len(sources), sources, spec.rust_json()
         )
-        # The shape of Rust's MmEncodeResult, inline transport (test_build_native_mm
+        # The shape of Rust's MmEncodeResult, inline transport (test_build_output
         # pins the shm shape).
         handoff = SimpleNamespace(
             features=features,
@@ -93,7 +93,7 @@ class TestQwenE2eParity(CustomTestCase):
             mrope=mrope,
             mrope_delta=delta,
         )
-        return snapshot(ids, NativeMmHost.build_native_mm(spec, handoff))
+        return snapshot(ids, RustMmProcessor.build_output(spec, handoff))
 
     def run_python(self, sources):
         """The reference path: the Python `mm_processor` the scheduler would use."""

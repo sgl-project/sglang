@@ -134,7 +134,6 @@ def _make_batch(tree, allocator, pool):
 
 
 class TestSWAEvictionBoundary(unittest.TestCase):
-
     # -- Eviction formula: page_size > window --
 
     def test_formula_page_gt_window_sweep(self):

@@ -589,8 +589,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
             pending_copy = self._pending_store_copies.pop(store_key, None)
             if pending_copy is None:
                 raise RuntimeError(
-                    "FlexKV async store-ready key is not locally pending: "
-                    f"{store_key}"
+                    f"FlexKV async store-ready key is not locally pending: {store_key}"
                 )
             pending = pending_copy.launch
             indices = (

@@ -73,9 +73,9 @@ class KVAndScore:
         assert len(tensors) > 0, "At least one tensor is required for concatenation."
         item_size = tensors[0]._item_size
         for v in tensors:
-            assert (
-                v._item_size == item_size
-            ), "All tensors must have the same item size."
+            assert v._item_size == item_size, (
+                "All tensors must have the same item size."
+            )
 
         return KVAndScore(torch.cat([v.kv_score for v in tensors], dim=dim))
 

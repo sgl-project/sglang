@@ -102,8 +102,7 @@ class TestLoadPublisherGating(CustomTestCase):
         by default (the feature is off without it). dp_size lives on the ps,
         which the publisher reads (no separate param to disagree with it)."""
         with patch(
-            "sglang.srt.managers.scheduler_components.load_publisher."
-            "_open_pub_socket"
+            "sglang.srt.managers.scheduler_components.load_publisher._open_pub_socket"
         ) as open_sock:
             pub = SchedulerLoadPublisher(
                 kv_events_config=config,
@@ -284,8 +283,7 @@ class TestLoadPublisherGating(CustomTestCase):
         import zmq
 
         with patch(
-            "sglang.srt.managers.scheduler_components.load_publisher."
-            "_open_pub_socket",
+            "sglang.srt.managers.scheduler_components.load_publisher._open_pub_socket",
             side_effect=zmq.ZMQError,
         ) as open_sock:
             pub = SchedulerLoadPublisher(

@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
     cfg = resolving_view(server_args)
+
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
     # so mooncake installs TcpTransport instead of RDMA, rewrite the backend to
     # mooncake, and skip RDMA HCA selection. Must run before backend-name checks.
@@ -128,9 +129,9 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             )
 
     elif cfg.disaggregation_mode == "prefill":
-        assert (
-            cfg.disaggregation_transfer_backend != "fake"
-        ), "Prefill server does not support 'fake' as the transfer backend"
+        assert cfg.disaggregation_transfer_backend != "fake", (
+            "Prefill server does not support 'fake' as the transfer backend"
+        )
 
         if envs.SGLANG_RUST_SERVER.get():
             _alias_bootstrap_port_to_api_port(server_args)

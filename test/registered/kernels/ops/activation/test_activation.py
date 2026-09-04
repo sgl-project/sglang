@@ -133,9 +133,9 @@ def test_activation_filter_expert(
     if kept.any():
         torch.testing.assert_close(out[kept], expected[kept], atol=atol, rtol=rtol)
     if token_skip.any():
-        assert torch.isnan(
-            out[token_skip]
-        ).all(), "filter_expert kernel touched rows whose expert_id is -1"
+        assert torch.isnan(out[token_skip]).all(), (
+            "filter_expert kernel touched rows whose expert_id is -1"
+        )
 
 
 @pytest.mark.parametrize("op_name", OPS)

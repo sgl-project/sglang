@@ -1,7 +1,7 @@
-"""MMMU accuracy gate for the Rust tokenizer manager's native multimodal path.
+"""MMMU accuracy gate for the Rust tokenizer manager's multimodal path.
 
 ``test_rust_native_mm_e2e.py`` checks that the output is *valid*; this checks that
-native Rust preprocessing yields *equally good* model inputs. A systematic skew
+Rust preprocessing yields *equally good* model inputs. A systematic skew
 (wrong resample filter, channel order, normalization, patch layout) still reads as
 fluent text and passes a keyword smoke check, but drops MMMU below the gate.
 
@@ -36,7 +36,7 @@ MODEL = "Qwen/Qwen3.5-0.8B"
 VISION_BLOCK = "<|vision_start|><|image_pad|><|vision_end|>"
 
 NUM_EXAMPLES = 100
-# Calibrated 2026-07-24 on H200: the native path scores 0.37 on this fixed subset
+# Calibrated 2026-07-24 on H200: the Rust path scores 0.37 on this fixed subset
 # at temperature 0 (two runs), matching the Python reference (0.37, same sampler
 # and samples). The gate leaves headroom for batching nondeterminism.
 MMMU_ACCURACY_THRESHOLD = 0.30
@@ -101,10 +101,10 @@ class QwenGenerateVisionSampler(SamplerBase):
     importlib.util.find_spec("sglang.srt.rust_extensions._server") is None,
     "sglang-server rust extension not installed (e.g. AMD suite)",
 )
-class TestRustNativeMmMMMU(CustomTestCase):
+class TestRustMmMMMU(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        # Capture the server log so the test can pin that the native MM
+        # Capture the server log so the test can pin that the Rust MM
         # pipeline is active.
         cls.log_dir = tempfile.TemporaryDirectory()
         cls.server_logs = tuple(
@@ -139,12 +139,12 @@ class TestRustNativeMmMMMU(CustomTestCase):
 
     def test_mmmu_accuracy(self):
         # Guard the path under test: if the model ever drops off
-        # NATIVE_MM_FAMILIES, launch fails and this names why.
+        # RUST_MM_FAMILIES, launch fails and this names why.
         self.assertIn(
-            "native MM pipeline enabled",
+            "Rust MM pipeline enabled",
             self._read_server_log(),
-            "rust server did not enable the native MM pipeline for "
-            f"{MODEL}; this test must exercise the native path",
+            "rust server did not enable the Rust MM pipeline for "
+            f"{MODEL}; this test must exercise the Rust path",
         )
 
         eval_obj = MMMUVLMEval(num_examples=NUM_EXAMPLES, num_threads=32)
@@ -154,12 +154,12 @@ class TestRustNativeMmMMMU(CustomTestCase):
         dump_metric(
             "mmmu_score",
             result.score,
-            labels={"model": MODEL, "eval": "mmmu", "api": "generate-rust-native-mm"},
+            labels={"model": MODEL, "eval": "mmmu", "api": "generate-rust-mm"},
         )
         self.assertGreaterEqual(
             result.score,
             MMMU_ACCURACY_THRESHOLD,
-            f"Rust native MM path scored {result.score:.4f} on MMMU, below the "
+            f"Rust MM path scored {result.score:.4f} on MMMU, below the "
             f"{MMMU_ACCURACY_THRESHOLD:.2f} gate",
         )
 
