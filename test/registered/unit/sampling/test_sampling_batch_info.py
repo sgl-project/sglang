@@ -3,7 +3,7 @@
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="base-c-test-cpu")
+register_cpu_ci(est_time=6, suite="base-c-test-cpu")
 
 import unittest
 from types import SimpleNamespace
@@ -50,7 +50,6 @@ def _serial_batched_fill(entries, vocab_mask):
 
 
 class TestMergeBiasTensor(CustomTestCase):
-
     def test_both_none_returns_none(self):
         """Test that merging two None tensors returns None."""
         result = merge_bias_tensor(None, None, 2, 3, DEVICE, 0.0)
@@ -95,7 +94,6 @@ class TestMergeBiasTensor(CustomTestCase):
 
 # SamplingBatchInfo.__len__
 class TestSamplingBatchInfoLen(CustomTestCase):
-
     def test_len_matches_batch_size(self):
         """Test that __len__ returns batch size (number of temperature rows)."""
         info = _make_info(batch_size=5)
@@ -103,7 +101,6 @@ class TestSamplingBatchInfoLen(CustomTestCase):
 
 
 class TestMergeCustomLogitProcessor(CustomTestCase):
-
     def test_both_none_returns_none(self):
         """Test that merging two None processor dicts returns None."""
         result = SamplingBatchInfo.merge_custom_logit_processor(
@@ -150,7 +147,6 @@ class TestMergeCustomLogitProcessor(CustomTestCase):
 
 # apply_logits_bias
 class TestApplyLogitsBias(CustomTestCase):
-
     def test_applies_additive_penalties(self):
         """Test that pre-accumulated additive penalties are added to logits."""
         info = _make_info(batch_size=1)
@@ -198,10 +194,80 @@ class TestApplyLogitsBias(CustomTestCase):
         info.apply_logits_bias(logits)
         self.assertTrue(torch.equal(logits, original))
 
+    def test_apply_logits_bias_without_penalizer_orchestrator(self):
+        info = _make_info(batch_size=1, penalizer_orchestrator=None)
+        logits = torch.zeros(1, VOCAB_SIZE)
+
+        info.apply_logits_bias(logits)
+
+        self.assertTrue(torch.equal(logits, torch.zeros_like(logits)))
+
+    def test_observer_sees_production_constraint_boundary(self):
+        events = []
+
+        class Observer:
+            def before_grammar(self, logits, sampling_info):
+                events.append(("before", logits.clone()))
+                return object()
+
+        grammar = MagicMock()
+        grammar.apply_vocab_mask.side_effect = lambda logits, vocab_mask: logits.fill_(
+            -4.0
+        )
+        info = _make_info(batch_size=1)
+        info.acc_additive_penalties = torch.ones(1, VOCAB_SIZE)
+        info.grammar_mask = GrammarMask(grammar, torch.ones(1, VOCAB_SIZE))
+        info.logit_bias = torch.full((1, VOCAB_SIZE), 2.0)
+        logits = torch.zeros(1, VOCAB_SIZE)
+
+        state = info.apply_logits_bias_with_observer(logits, observer=Observer())
+
+        self.assertIsNotNone(state)
+        self.assertTrue(torch.equal(events[0][1], torch.ones_like(logits)))
+        self.assertEqual(len(events), 1)
+        self.assertTrue(torch.equal(logits, torch.full_like(logits, -2.0)))
+        grammar.apply_vocab_mask.assert_called_once()
+
+    def test_observer_path_preserves_production_logit_transforms(self):
+        class Observer:
+            def before_grammar(self, logits, sampling_info):
+                return object()
+
+        def make_info():
+            grammar = MagicMock()
+            grammar.apply_vocab_mask.side_effect = lambda logits, vocab_mask: (
+                logits.add_(vocab_mask)
+            )
+            info = _make_info(batch_size=1)
+            info.acc_additive_penalties = torch.linspace(
+                -0.5, 0.5, VOCAB_SIZE
+            ).unsqueeze(0)
+            info.acc_scaling_penalties = torch.linspace(1.0, 1.5, VOCAB_SIZE).unsqueeze(
+                0
+            )
+            info.grammar_mask = GrammarMask(
+                grammar,
+                torch.linspace(-2.0, 0.0, VOCAB_SIZE).unsqueeze(0),
+            )
+            info.logit_bias = torch.linspace(0.0, 1.0, VOCAB_SIZE).unsqueeze(0)
+            return info
+
+        ordinary = make_info()
+        observed = make_info()
+        ordinary_logits = torch.linspace(-3.0, 3.0, VOCAB_SIZE).unsqueeze(0)
+        observed_logits = ordinary_logits.clone()
+
+        ordinary.apply_logits_bias(ordinary_logits)
+        observed.apply_logits_bias_with_observer(
+            observed_logits,
+            observer=Observer(),
+        )
+
+        self.assertTrue(torch.equal(observed_logits, ordinary_logits))
+
 
 # update_penalties
 class TestUpdatePenalties(CustomTestCase):
-
     def test_required_creates_penalties_tensor(self):
         """Test that update_penalties allocates a zero tensor and calls orchestrator methods."""
         orch = MagicMock(is_required=True)
@@ -225,7 +291,6 @@ class TestUpdatePenalties(CustomTestCase):
 
 # update_regex_vocab_mask
 class TestUpdateRegexVocabMask(CustomTestCase):
-
     def test_no_grammars_clears_mask(self):
         """Test that None grammars clears the grammar_mask."""
         info = _make_info(batch_size=1)
@@ -308,7 +373,6 @@ class TestUpdateRegexVocabMask(CustomTestCase):
 
 # filter_batch
 class TestFilterBatch(CustomTestCase):
-
     def test_filter_keeps_correct_indices(self):
         """Test that filter retains rows at indices 0 and 2, dropping index 1."""
         info = _make_info(batch_size=3)
@@ -363,7 +427,6 @@ class TestFilterBatch(CustomTestCase):
 
 # merge_batch
 class TestMergeBatch(CustomTestCase):
-
     def test_merge_concatenates_tensors(self):
         """Test that merge concatenates temperature tensors from both batches."""
         info1 = _make_info(batch_size=2)
@@ -442,7 +505,6 @@ class TestMergeBatch(CustomTestCase):
 
 # copy_for_forward
 class TestCopyForForward(CustomTestCase):
-
     def test_returns_copy_without_orchestrator(self):
         """Test that copy_for_forward returns a copy with orchestrator set to None."""
         orch = MagicMock(is_required=False)
@@ -455,7 +517,6 @@ class TestCopyForForward(CustomTestCase):
 
 # from_schedule_batch
 class TestFromScheduleBatch(CustomTestCase):
-
     def setUp(self):
         super().setUp()
         # from_schedule_batch reads these two flags from the exec bag; give

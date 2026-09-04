@@ -21,7 +21,8 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
-    from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.sampling.sampling_observer import HostAuxiliaryOutput
+    from sglang.srt.speculative.spec_info import SpecInput
 
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,12 @@ class GenerationBatchResult:
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
+    # Padded row width in flattened speculative output. Existing algorithms
+    # default to speculative_num_draft_tokens; linear UNO emits F + 1 columns.
+    speculative_output_stride: Optional[int] = None
+    # Valid output tokens that are not accepted draft proposals. Existing
+    # algorithms have one bonus token; UNO also emits its clean root.
+    num_non_draft_tokens_per_req: int = 1
 
     # Grammar FSM advance memoization (spec-v2 overlap). advance_grammar_fsm sets
     # these once — eagerly via the scheduler's grammar barrier inside verify(), or
@@ -90,7 +97,7 @@ class GenerationBatchResult:
     new_seq_lens: Optional[torch.Tensor] = None
 
     # relay path: forward stream -> next step forward
-    next_draft_input: Optional[EagleDraftInput] = None
+    next_draft_input: Optional[SpecInput] = None
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
@@ -108,11 +115,16 @@ class GenerationBatchResult:
     fpm_start_event: Optional[torch.cuda.Event] = None
     fpm_end_event: Optional[torch.cuda.Event] = None
 
+    auxiliary_host_output: Optional[HostAuxiliaryOutput] = None
+
     @property
     def has_sampled_token_ids(self) -> bool:
         """True when this iter sampled token ids; False when none were produced
         this rank/split (a non-last PP rank or a non-final prefill split)."""
         return isinstance(self.next_token_ids, torch.Tensor)
+
+    def get_num_generated_tokens(self, batch_size: int) -> int:
+        return self.num_correct_drafts + batch_size * self.num_non_draft_tokens_per_req
 
     @torch.profiler.record_function("copy_result_to_cpu")
     def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
@@ -170,7 +182,17 @@ class GenerationBatchResult:
             if holder is not None:
                 holder.map_device_tensors(_async_d2h)
 
+        self.copy_auxiliary_output_to_cpu()
+
         self.copy_done.record()
+
+    def copy_auxiliary_output_to_cpu(self) -> None:
+        if self.logits_output is None or self.auxiliary_host_output is not None:
+            return
+        device_output = self.logits_output.auxiliary_device_output
+        if device_output is not None:
+            self.auxiliary_host_output = device_output.copy_to_host(_async_d2h)
+            self.logits_output.auxiliary_device_output = None
 
     @classmethod
     def from_pp_proxy(
@@ -373,7 +395,7 @@ def msgpack_decode_explained(data: bytes) -> Any:
             if m is not None:
                 idx = int(m.group(1))
                 if 1 <= idx <= len(fields):
-                    msg = f"{msg[:m.start()]}$.{fields[idx - 1]}{msg[m.end():]}"
+                    msg = f"{msg[: m.start()]}$.{fields[idx - 1]}{msg[m.end() :]}"
         raise MsgpackDecodeError(rid, msg) from e
 
 
@@ -383,11 +405,8 @@ def compute_num_reserved_tokens() -> int:
     The current eagle implementation stores draft tokens in the output token
     slots, so the context budget has to account for them; every other algorithm
     reserves nothing. Shared by `TokenizerManager` and the rust server's
-    `server_args` blob (`RustServer._build_server_args`), which needs the same
-    number to run the total-token check in Rust. Both stamp the number once at
-    launch, so it has to cover every step an adaptive-spec run may switch to:
-    it reads the bags for the candidate-table ceiling and the current
-    `topk * steps`, not the untouched startup record.
+    `server_args` handoff (`RustServer._build_server_args`), which needs the same
+    number to run the total-token check in Rust.
     """
     spec = get_spec()
     algorithm = SpeculativeAlgorithm.from_string(spec.speculative_algorithm)
