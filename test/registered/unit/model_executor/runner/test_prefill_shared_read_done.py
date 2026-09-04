@@ -45,10 +45,9 @@ def _batch(mode=ForwardMode.EXTEND):
     return SimpleNamespace(forward_mode=mode)
 
 
-def test_publishes_recorded_event_when_enabled():
+def test_publishes_recorded_event_by_default():
     runner = _model_runner()
-    with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True):
-        maybe_publish_prefill_shared_read_done(runner, _batch(), _DEVICE_MODULE)
+    maybe_publish_prefill_shared_read_done(runner, _batch(), _DEVICE_MODULE)
     published = runner.shared_read_done_event
     assert isinstance(published, _Event) and published.recorded
 
