@@ -1065,6 +1065,10 @@ class ServerArgs:
     dsa_prefill_cp_mode: A[str, Arg(no_cli=True), NS("parallel")] = "round-robin-split"
     enable_prefill_context_parallel: A[bool, Arg(no_cli=True), NS("parallel")] = False
     prefill_cp_mode: A[str, Arg(no_cli=True), NS("parallel")] = "in-seq-split"
+    # Temporary runtime compatibility switch for configurations that still
+    # require the legacy prefill-CP implementation. This is intentionally not
+    # exposed as a CLI option.
+    use_legacy_prefill_cp: A[bool, Arg(no_cli=True), NS("parallel")] = False
     enable_cp_decode_attn_tp: A[
         bool,
         "Enable attention tensor-parallel weight slicing during decode under context parallel (cp_size>1). Slices the replicated attention linears to the local CP partition, eliminating redundant decode GEMMs.",

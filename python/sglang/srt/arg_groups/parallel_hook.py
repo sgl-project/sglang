@@ -63,6 +63,26 @@ def handle_context_parallelism(server_args: Any):
                     "--language-only."
                 )
 
+        # CP-v2 currently fails to make progress when dense Qwen3 runs with
+        # HiCache under KV-cache pressure. Keep this configuration on the
+        # working legacy implementation until the CP-v2 interaction is fixed
+        # (https://github.com/sgl-project/sglang/issues/38019).
+        if (
+            cfg.enable_prefill_cp
+            and cfg.enable_hierarchical_cache
+            and model_arch == "Qwen3ForCausalLM"
+            and not (platform.is_hip or platform.is_npu)
+        ):
+            declare_resolution(
+                server_args,
+                "_handle_context_parallelism",
+                use_legacy_prefill_cp=True,
+            )
+            logger.warning(
+                "Falling back to legacy prefill CP for Qwen3ForCausalLM with "
+                "HiCache due to https://github.com/sgl-project/sglang/issues/38019."
+            )
+
     if cfg.enable_prefill_cp and cfg.cp_strategy is None:
         raise ValueError(
             "--cp-strategy must be set when --enable-prefill-cp is enabled."

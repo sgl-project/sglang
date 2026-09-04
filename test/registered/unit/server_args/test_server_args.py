@@ -1038,6 +1038,8 @@ class TestContextParallelServerArgs(CustomTestCase):
             ep_size=1,
             pp_size=1,
             enable_aiter_allreduce_fusion=False,
+            enable_hierarchical_cache=False,
+            use_legacy_prefill_cp=False,
         )
         defaults.update(overrides)
         for key, value in defaults.items():
@@ -1181,6 +1183,43 @@ class TestContextParallelServerArgs(CustomTestCase):
 
         self.assertTrue(is_cp_enabled())
         self.assertTrue(is_interleave())
+
+    @override_platform(is_hip=False, is_npu=False)
+    def test_qwen3_hicache_prefill_cp_uses_legacy_runtime(self):
+        server_args = self._new_cp_args(
+            model_path="Qwen/Qwen3-32B",
+            enable_prefill_cp=True,
+            cp_strategy="zigzag",
+            attn_cp_size=2,
+            tp_size=2,
+            enable_hierarchical_cache=True,
+        )
+        server_args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
+            is_multimodal=False,
+        )
+
+        handle_context_parallelism(server_args)
+
+        self.assertTrue(resolution_result(server_args, "use_legacy_prefill_cp"))
+
+    @override_platform(is_hip=False, is_npu=False)
+    def test_qwen3_without_hicache_keeps_cp_v2_runtime(self):
+        server_args = self._new_cp_args(
+            model_path="Qwen/Qwen3-32B",
+            enable_prefill_cp=True,
+            cp_strategy="zigzag",
+            attn_cp_size=2,
+            tp_size=2,
+        )
+        server_args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
+            is_multimodal=False,
+        )
+
+        handle_context_parallelism(server_args)
+
+        self.assertFalse(resolution_result(server_args, "use_legacy_prefill_cp"))
 
 
 class TestPortArgs(unittest.TestCase):

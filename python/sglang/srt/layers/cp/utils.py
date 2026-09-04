@@ -121,7 +121,15 @@ def enable_cp_v2() -> bool:
     """Return whether the strategy-based generic prefill CP path is available."""
     from sglang.srt.utils import is_hip, is_npu
 
-    return not (is_hip() or is_npu())
+    if is_hip() or is_npu():
+        return False
+
+    try:
+        use_legacy_prefill_cp = get_parallel().use_legacy_prefill_cp
+    except (AttributeError, ValueError):
+        # Unit helpers may query platform support before publishing ServerArgs.
+        use_legacy_prefill_cp = False
+    return not use_legacy_prefill_cp
 
 
 def is_cp_v2_active(forward_batch) -> bool:

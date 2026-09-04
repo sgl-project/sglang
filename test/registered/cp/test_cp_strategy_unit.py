@@ -133,6 +133,17 @@ class TestCPStrategyUnit(CustomTestCase):
     def test_npu_keeps_strategy_cp_disabled(self, _mock_is_hip, _mock_is_npu):
         self.assertFalse(enable_cp_v2())
 
+    @patch("sglang.srt.utils.is_npu", return_value=False)
+    @patch("sglang.srt.utils.is_hip", return_value=False)
+    @patch(
+        "sglang.srt.layers.cp.utils.get_parallel",
+        return_value=SimpleNamespace(use_legacy_prefill_cp=True),
+    )
+    def test_runtime_compatibility_switch_disables_cp_v2(
+        self, _mock_get_parallel, _mock_is_hip, _mock_is_npu
+    ):
+        self.assertFalse(enable_cp_v2())
+
 
 class TestPrefillCPBCGReplay(CustomTestCase):
     def tearDown(self):
