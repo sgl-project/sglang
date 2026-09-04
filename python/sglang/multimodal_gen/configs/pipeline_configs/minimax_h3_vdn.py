@@ -23,10 +23,6 @@ class VDNH3PipelineConfig(MiniMaxH3PipelineConfig):
     no breakable CUDA graph yet.
     """
 
-    def __post_init__(self) -> None:
-        # measured 0.98 vs 1.06 s/NFE on 8x B200 at the same block-level error
-        self.online_fp8_per_tensor = True
-
     def validate_quality_deployment(self, server_args) -> None:
         raise ValueError(
             'quality="high" is audited only for the base MiniMax-H3 50-step '
@@ -42,6 +38,9 @@ class VDNH3PipelineConfig(MiniMaxH3PipelineConfig):
                 "MiniMaxAI/MiniMax-H3 for those."
             )
         # an unset backend would resolve to the platform default (dense FA)
+        if server_args.quantization == "fp8":
+            # one scale per tensor: 0.97 vs 1.05 s/NFE on 8x B200, same block error
+            server_args.quantization = "fp8_per_tensor"
         if server_args.attention_backend is None and not (
             server_args.component_attention_backends or {}
         ).get("transformer"):

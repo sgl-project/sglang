@@ -101,7 +101,6 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
                 "fastwan21-t2v-1.3b",
                 "fasth3-t2va-vsa",
                 "vdn-h3",
-                "vdn-h3-fp8",
                 "wan22-t2v-nvfp4",
                 "krea2-turbo",
                 "krea2-raw",

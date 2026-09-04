@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping
 import torch
 from torch import nn
 
-from sglang.kernels.ops.diffusion import fused_qknorm_rope_out_of_place, usp_merge_heads
+from sglang.kernels.ops.diffusion import fused_inplace_qknorm_rope, usp_merge_heads
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTArchConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
@@ -266,15 +266,12 @@ def _vdn_window_softmax(
     cu_seqlens_host: tuple[int, ...] | None,
     max_seqlen: int,
 ) -> torch.Tensor:
-    """Gated window softmax on out-of-place QK-normed + RoPE'd copies of the
-    raw q/k [S, h, d] (the branch keeps reading the raw tensors)."""
+    """Gated window softmax on QK-normed + RoPE'd copies of the raw q/k
+    [S, h, d] (the branch keeps reading the raw tensors)."""
     cos_sin_cache, positions = rope_cache
+    q_sm, k_sm = q.clone(), k.clone()
     if attention._use_fused_qknorm_rope and not torch.compiler.is_compiling():
-        q_sm = torch.empty(q.shape, dtype=q.dtype, device=q.device)
-        k_sm = torch.empty(k.shape, dtype=k.dtype, device=k.device)
-        fused_qknorm_rope_out_of_place(
-            q,
-            k,
+        fused_inplace_qknorm_rope(
             q_sm,
             k_sm,
             attention.q_norm.weight,
@@ -294,7 +291,7 @@ def _vdn_window_softmax(
         )
 
         q_sm, k_sm = _apply_qk_norm(
-            q.clone(), k.clone(), attention.q_norm, attention.k_norm, attention.head_dim
+            q_sm, k_sm, attention.q_norm, attention.k_norm, attention.head_dim
         )
         q_sm, k_sm = _apply_rope_qk(q_sm, k_sm, cos_sin_cache, positions)
     return attention._attention_impl.forward_varlen(

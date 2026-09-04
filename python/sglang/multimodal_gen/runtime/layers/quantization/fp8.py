@@ -79,16 +79,7 @@ class Fp8Config(SRTFp8Config, QuantizationConfig):
 
     No-arg ``Fp8Config()`` selects online (post-load) weight quantization:
     ``is_checkpoint_fp8_serialized=False`` with ``activation_scheme="dynamic"``.
-    ``per_tensor_online`` quantizes those weights with one scale per tensor and
-    runs a dynamic per-tensor activation scale into cuBLASLt instead of the
-    per-channel CUTLASS GEMM (about 20% faster DiT GEMMs on SM100 at the same
-    block-level error; a different fp8 sample). Pipeline configs opt in through
-    ``PipelineConfig.online_fp8_per_tensor``.
     """
-
-    def __init__(self, *args, per_tensor_online: bool = False, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.per_tensor_online = per_tensor_online
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -139,14 +130,6 @@ class Fp8LinearMethod(LinearMethodBase):
             self.use_marlin = force_marlin or auto_enable
 
         self.block_quant = self.quant_config.weight_block_size is not None
-        self.per_tensor_online = bool(
-            isinstance(self.quant_config, Fp8Config)
-            and self.quant_config.per_tensor_online
-            and not self.block_quant
-            and not self.quant_config.is_checkpoint_fp8_serialized
-            and not self.use_marlin
-            and current_platform.is_cuda()
-        )
 
         self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
 
@@ -260,7 +243,6 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.register_parameter("input_scale", None)
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        layer.fp8_per_tensor = False
         if self.block_quant:
             # If ROCm, normalize the weights and scales to e4m3fnuz
             if _is_fp8_fnuz:
@@ -316,18 +298,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
             # If checkpoint not serialized fp8, quantize the weights.
             if not self.quant_config.is_checkpoint_fp8_serialized:
-                # torch._scaled_mm wants 16-aligned K and N and a bf16/fp16
-                # activation; other layers keep the per-channel path
-                layer.fp8_per_tensor = (
-                    self.per_tensor_online
-                    and layer.weight.dtype in (torch.bfloat16, torch.float16)
-                    and layer.weight.shape[0] % 16 == 0
-                    and layer.weight.shape[1] % 16 == 0
-                )
-                if layer.fp8_per_tensor:
-                    qweight, weight_scale = input_to_float8(layer.weight)
-                    weight_scale = weight_scale.reshape(1)
-                elif self.cutlass_fp8_supported or self.use_marlin:
+                if self.cutlass_fp8_supported or self.use_marlin:
                     # apply per-channel quantization default as
                     # cutlass sgl-kernel and marlin only support per-channel scale
                     qweight, weight_scale = per_token_group_quant_fp8(
@@ -421,25 +392,6 @@ class Fp8LinearMethod(LinearMethodBase):
         # diffusion backbones routinely pass a permuted view. Normalising at the
         # producer instead would also move the unquantized path's output, by
         # changing which GEMM kernel it picks. No-op when already contiguous.
-        if isinstance(x, tuple):
-            # (fp8 input, per-tensor scale) from a fused activation + quant
-            # kernel; only the per-tensor layers accept it
-            if not self.accepts_fp8_per_tensor_input(layer):
-                raise ValueError(
-                    f"{layer.__class__.__name__} is not an fp8 per-tensor layer; "
-                    "it cannot take a prequantized input"
-                )
-            qinput, x_scale = x
-            return apply_fp8_linear(
-                input=qinput,
-                weight=layer.weight,
-                weight_scale=layer.weight_scale,
-                input_scale=x_scale,
-                bias=bias,
-                cutlass_fp8_supported=False,
-                pad_output=False,
-                pre_quant_output_dtype=torch.bfloat16,
-            )
         if not x.is_contiguous():
             x = x.contiguous()
 
@@ -485,20 +437,6 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
-        if self.accepts_fp8_per_tensor_input(layer):
-            # dynamic per-tensor activation scale, scalar weight scale,
-            # torch._scaled_mm
-            return apply_fp8_linear(
-                input=x,
-                weight=layer.weight,
-                weight_scale=layer.weight_scale,
-                bias=bias,
-                cutlass_fp8_supported=False,
-                use_per_token_if_dynamic=False,
-                pad_output=False,
-                compressed_tensor_quant=True,
-            )
-
         return apply_fp8_linear(
             input=x,
             weight=layer.weight,
@@ -508,6 +446,3 @@ class Fp8LinearMethod(LinearMethodBase):
             cutlass_fp8_supported=self.cutlass_fp8_supported,
             use_per_token_if_dynamic=False,
         )
-
-    def accepts_fp8_per_tensor_input(self, layer: Module) -> bool:
-        return bool(layer.fp8_per_tensor)

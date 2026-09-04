@@ -119,7 +119,7 @@ backend.
       <td><code>--component-quantizations.&lt;component&gt; &#123;fp8,mxfp4&#125;</code></td>
       <td>Z-Image-Turbo (validated), others likely work. More support coming soon.</td>
       <td>MXFP4: <code>aiter</code> on ROCm</td>
-      <td>MXFP4 requires ROCm and MI350+ (gfx95x). Weights quantized at load time, activations quantized to <code>fp8</code> / <code>mxfp4</code> dynamically. Online <code>fp8</code> uses per-channel weight scales and the CUTLASS GEMM; a pipeline config can set <code>online_fp8_per_tensor</code> (VDN-H3 does) to quantize the transformer with one scale per tensor into cuBLASLt (<code>torch._scaled_mm</code>) with a fused SwiGLU + activation quant for <code>fc2</code>, about 20% faster DiT GEMMs on SM100 at the same block-level error as per-channel (a different fp8 sample, as with any fp8 path).</td>
+      <td>MXFP4 requires ROCm and MI350+ (gfx95x). Weights quantized at load time, activations quantized to <code>fp8</code> / <code>mxfp4</code> dynamically. Online <code>fp8</code> uses per-channel weight scales and the CUTLASS GEMM; <code>fp8_per_tensor</code> quantizes with one scale per tensor into cuBLASLt (<code>torch._scaled_mm</code>) with a fused SwiGLU + activation quant for <code>fc2</code>, about 20% faster DiT GEMMs on SM100 at the same block-level error (a different fp8 sample, as with any fp8 path). VDN-H3 maps <code>--quantization fp8</code> to it.</td>
     </tr>
     <tr>
       <td><code>kitchen_int8</code> (online quantization)</td>

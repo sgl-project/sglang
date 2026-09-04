@@ -87,6 +87,7 @@ def _server_args(**overrides) -> SimpleNamespace:
         ring_degree=1,
         enable_torch_compile=False,
         enable_breakable_cuda_graph=False,
+        quantization=None,
     )
     args.update(overrides)
     ns = SimpleNamespace(**args)
@@ -117,10 +118,11 @@ def test_vdn_h3_pipeline_config_rejections() -> None:
         config.validate_server_args(_server_args(enable_breakable_cuda_graph=True))
     with pytest.raises(ValueError, match="no.*audited high-quality deployment"):
         config.validate_quality_deployment(server_args=None)
-    # an unset backend must become the hybrid one, not the platform default
-    args = _server_args()
+    # defaults: the hybrid backend, and per-tensor scales for online fp8
+    args = _server_args(quantization="fp8")
     config.validate_server_args(args)
     assert args.attention_backend == "hybrid_window_attn_h3"
+    assert args.quantization == "fp8_per_tensor"
 
 
 def test_hybrid_arch_config_from_transform_config_and_mapping() -> None:
@@ -642,41 +644,6 @@ def test_branch_matches_eager_reference_algorithm() -> None:
     assert diff < 3e-2 * max(scale, 1.0), (
         f"branch vs reference max diff {diff} (scale {scale})"
     )
-
-
-@requires_cuda
-def test_out_of_place_qknorm_rope_matches_inplace_and_keeps_inputs() -> None:
-    from sglang.kernels.ops.diffusion import (
-        can_use_fused_inplace_qknorm_rope,
-        fused_inplace_qknorm_rope,
-        fused_qknorm_rope_out_of_place,
-    )
-
-    T, H, D, R = 512, 4, 128, 96
-    if not can_use_fused_inplace_qknorm_rope(
-        D, R, True, torch.bfloat16, torch.bfloat16, True
-    ):
-        pytest.skip("fused qknorm+rope JIT kernel unavailable")
-    g = torch.Generator(device="cpu").manual_seed(0)
-    qkv = torch.randn(T, 3 * H * D, generator=g).to("cuda", torch.bfloat16)
-    q = qkv[:, : H * D].view(T, H, D)  # strided views of the fused projection
-    k = qkv[:, H * D : 2 * H * D].view(T, H, D)
-    qw = (torch.rand(D, generator=g) + 0.5).to("cuda", torch.bfloat16)
-    kw = (torch.rand(D, generator=g) + 0.5).to("cuda", torch.bfloat16)
-    freqs = torch.randn(T, R // 2, generator=g).to("cuda")
-    cache = torch.cat((freqs.cos(), freqs.sin()), -1).to(torch.bfloat16).contiguous()
-    pos = torch.arange(T, device="cuda")
-    kwargs = dict(
-        is_neox=True, eps=1e-5, head_dim=D, rope_dim=R, round_norm_before_rope=True
-    )
-    q_ref, k_ref = q.clone(), k.clone()
-    fused_inplace_qknorm_rope(q_ref, k_ref, qw, kw, cache, pos, **kwargs)
-    q_out = torch.empty(T, H, D, device="cuda", dtype=torch.bfloat16)
-    k_out = torch.empty_like(q_out)
-    q_before = qkv.clone()
-    fused_qknorm_rope_out_of_place(q, k, q_out, k_out, qw, kw, cache, pos, **kwargs)
-    assert torch.equal(qkv, q_before)
-    assert torch.equal(q_out, q_ref) and torch.equal(k_out, k_ref)
 
 
 # --------------------------------------------------------------------------

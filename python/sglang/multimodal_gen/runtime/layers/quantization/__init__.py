@@ -15,6 +15,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_conf
     KitchenInt8Config,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
+from sglang.multimodal_gen.runtime.layers.quantization.fp8_per_tensor import (
+    Fp8PerTensorConfig,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8 import (
     ModelOptFp8Config as ModelOptFp8DiffusionConfig,
 )
@@ -32,6 +35,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
 QuantizationMethods = Literal[
     "auto-round",
     "fp8",
+    "fp8_per_tensor",
     "modelopt",
     "modelopt_fp8",
     "modelopt_fp4",
@@ -54,6 +58,7 @@ _CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {
     "bitsandbytes": BitsAndBytesConfig,
     "modelslim": ModelSlimConfig,
     "fp8": Fp8Config,
+    "fp8_per_tensor": Fp8PerTensorConfig,
     "mxfp4": Mxfp4Config,
     "mxfp8": MXFP8Config,
     "mxfp4_npu": NPUMXFP4Config,

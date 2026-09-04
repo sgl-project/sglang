@@ -837,13 +837,6 @@ class MiniMaxH3Attention(nn.Module):
             arch, quant_config, prefix=prefix, local_heads=self.num_heads
         )
 
-    def hybrid_active(self) -> bool:
-        return (
-            self.hybrid is not None
-            and self._attention_backend_enum
-            is AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3
-        )
-
     def _set_attention_backend(self, backend) -> None:
         if (
             backend.get_enum() is AttentionBackendEnum.CUBE_SPARSE_ATTN
@@ -1091,17 +1084,6 @@ class MiniMaxH3Attention(nn.Module):
                 max_seqlen=max_seqlen,
                 ulysses_active=ulysses_active,
                 ring_active=ring_active,
-            )
-            return self._forward_hybrid(
-                x,
-                q,
-                k,
-                v,
-                rope_cache=rope_cache,
-                cu_seqlens=cu_seqlens,
-                cu_seqlens_host=cu_seqlens_host,
-                max_seqlen=max_seqlen,
-                ulysses_active=ulysses_active,
             )
         if rope_cache is None:
             q, k = _apply_qk_norm(

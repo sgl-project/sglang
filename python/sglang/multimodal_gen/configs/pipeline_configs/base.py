@@ -210,9 +210,6 @@ class PipelineConfig:
 
     # precision and autocast
     enable_autocast: bool = True
-    # Online --quantization fp8 for the transformer: one scale per tensor and
-    # cuBLASLt instead of per-channel CUTLASS (see quantization.Fp8Config).
-    online_fp8_per_tensor: bool = False
 
     # generation parameters
     # controls the timestep embedding generation

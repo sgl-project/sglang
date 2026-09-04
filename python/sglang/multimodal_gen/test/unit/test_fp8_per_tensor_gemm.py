@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Online fp8 per-tensor GEMM path (``Fp8Config(per_tensor_online=True)``):
+"""Online fp8 per-tensor GEMM path (``Fp8PerTensorConfig()``):
 load-time scalar weight scale, dynamic scalar activation scale into
 torch._scaled_mm, the prequantized (fp8, scale) input from the fused SwiGLU +
 quant kernel, and the per-layer fallback to the per-channel path."""
@@ -28,7 +28,9 @@ def test_per_tensor_linear_matches_bf16_and_accepts_prequantized() -> None:
     _init_parallel()
     from sglang.kernels.ops.diffusion import silu_mul_per_tensor_fp8
     from sglang.multimodal_gen.runtime.layers.linear import RowParallelLinear
-    from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
+    from sglang.multimodal_gen.runtime.layers.quantization.fp8_per_tensor import (
+        Fp8PerTensorConfig,
+    )
 
     in_f, out_f, rows = 512, 384, 200
     layer = RowParallelLinear(
@@ -36,10 +38,9 @@ def test_per_tensor_linear_matches_bf16_and_accepts_prequantized() -> None:
         out_f,
         bias=False,
         params_dtype=torch.bfloat16,
-        quant_config=Fp8Config(per_tensor_online=True),
+        quant_config=Fp8PerTensorConfig(),
         prefix="mlp.fc2",
     ).to("cuda")
-    assert layer.quant_method.per_tensor_online
     g = torch.Generator(device="cpu").manual_seed(1)
     weight = (torch.randn(out_f, in_f, generator=g) * 0.02).to("cuda", torch.bfloat16)
     with torch.no_grad():
@@ -76,9 +77,8 @@ def test_default_config_keeps_channelwise() -> None:
         quant_config=Fp8Config(),
         prefix="mlp.fc2",
     ).to("cuda")
-    assert not layer.quant_method.per_tensor_online
     layer.quant_method.process_weights_after_loading(layer)
-    assert not layer.fp8_per_tensor
+    assert not layer.quant_method.accepts_fp8_per_tensor_input(layer)
     assert layer.weight_scale.numel() == 128
 
 
@@ -87,14 +87,16 @@ def test_unaligned_layer_falls_back_to_channelwise() -> None:
     per-channel path even when the config asks for per-tensor."""
     _init_parallel()
     from sglang.multimodal_gen.runtime.layers.linear import RowParallelLinear
-    from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
+    from sglang.multimodal_gen.runtime.layers.quantization.fp8_per_tensor import (
+        Fp8PerTensorConfig,
+    )
 
     layer = RowParallelLinear(
         8,
         128,
         bias=True,
         params_dtype=torch.bfloat16,
-        quant_config=Fp8Config(per_tensor_online=True),
+        quant_config=Fp8PerTensorConfig(),
         prefix="adaln.linear",
     ).to("cuda")
     layer.quant_method.process_weights_after_loading(layer)

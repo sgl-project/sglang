@@ -455,6 +455,7 @@ MODELS = {
     # VDN-H3 (hybrid window-softmax + Video Delta linear attention, 8 NFE).
     # The paper workload: 1344x768, 345 frames = 14.375 s at 24 fps
     # (17n+5 aligned -> latent_t 102), t2va, 8 NFE = 9 sigma grid points.
+    # OpenVDN/vdn-minimax-h3 paper workload: 1344x768, 14.375 s, 8 DiT forwards
     "vdn-h3": {
         "path": "OpenVDN/vdn-minimax-h3",
         "prompt": (
@@ -473,72 +474,11 @@ MODELS = {
             "num_inference_steps": 9,
         },
         "extra_args": [
-            "--num-gpus=4",
-            "--attention-backend=hybrid_window_attn_h3",
-            "--enable-torch-compile=false",
-            "--warmup-steps=2",
-            # warm up at the served clip shape: H3's first forward at a new
-            # length otherwise pays allocator growth in every block
-            "--warmup-num-frames=345",
-            "--warmup-resolutions=1344x768",
-        ],
-        "force_eager": True,
-    },
-    "vdn-h3-fp8": {
-        "path": "OpenVDN/vdn-minimax-h3",
-        "prompt": (
-            "A curious raccoon peers through a vibrant field of yellow "
-            "sunflowers, its eyes wide with interest."
-        ),
-        "seed": 1000,
-        "config_overrides": {
-            "task": "t2va",
-            "conditions": [],
-            "target": {
-                "short_edge": 768,
-                "aspect_ratio": "16:9",
-                "duration_seconds": 14.375,
-            },
-            "num_inference_steps": 9,
-        },
-        "extra_args": [
-            "--num-gpus=4",
-            "--attention-backend=hybrid_window_attn_h3",
-            "--quantization=fp8",
-            "--enable-torch-compile=false",
-            "--warmup-steps=2",
-            "--warmup-num-frames=345",
-            "--warmup-resolutions=1344x768",
-        ],
-        "force_eager": True,
-    },
-    # 8x B200 paper workload.
-    "vdn-h3-fp8-8gpu": {
-        "path": "OpenVDN/vdn-minimax-h3",
-        "prompt": (
-            "A curious raccoon peers through a vibrant field of yellow "
-            "sunflowers, its eyes wide with interest."
-        ),
-        "seed": 1000,
-        "config_overrides": {
-            "task": "t2va",
-            "conditions": [],
-            "target": {
-                "short_edge": 768,
-                "aspect_ratio": "16:9",
-                "duration_seconds": 14.375,
-            },
-            "num_inference_steps": 9,
-        },
-        "extra_args": [
             "--num-gpus=8",
-            "--attention-backend=hybrid_window_attn_h3",
             "--quantization=fp8",
             "--performance-mode=speed",
             "--enable-torch-compile=false",
             "--warmup-steps=2",
-            "--warmup-num-frames=345",
-            "--warmup-resolutions=1344x768",
         ],
         "force_eager": True,
     },
