@@ -553,6 +553,11 @@ def handle_eplb_and_dispatch(server_args: Any):
             raise ValueError(
                 "topology-aware EPLB currently requires ep_size == tp_size"
             )
+        if getattr(cfg, "ep_dispatch_algorithm", None) not in (None, "static"):
+            raise ValueError(
+                "topology-aware EPLB currently requires "
+                "--ep-dispatch-algorithm static"
+            )
         if cfg.expert_distribution_recorder_mode not in ("stat", "stat_approx"):
             raise ValueError(
                 "topology-aware EPLB requires expert distribution recorder mode "
