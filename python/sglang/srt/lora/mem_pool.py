@@ -149,6 +149,7 @@ class LoRAMemoryPool:
         enable_lora_overlap_loading: bool = False,
     ):
         self.base_hf_config: AutoConfig = base_hf_config
+        self.base_model = base_model
         self.num_layer: int = base_hf_config.num_hidden_layers
         self.max_loras_per_batch: int = max_loras_per_batch
         self.dtype: torch.dtype = dtype
@@ -248,7 +249,9 @@ class LoRAMemoryPool:
                 return False
             if config.lora_added_tokens_size > self.lora_added_tokens_size:
                 return False
-            target_module_names = get_normalized_target_modules(config.target_modules)
+            target_module_names = get_normalized_target_modules(
+                config.target_modules, base_model=self.base_model
+            )
             if "all" in target_module_names:
                 return True
             return target_module_names.issubset(self.target_modules)
@@ -939,6 +942,41 @@ class LoRAMemoryPool:
                 target_module: None for target_module in self.B_buffer
             }
 
+            def add_per_expert_weight(
+                buffer: Dict[
+                    str, Optional[Union[torch.Tensor, Dict[int, torch.Tensor]]]
+                ],
+                cache_keys: Dict[str, Optional[Union[str, Dict[int, str]]]],
+                target_module: str,
+                expert_id: int,
+                name: str,
+                weights: torch.Tensor,
+            ) -> None:
+                """Stage one factor without disturbing the opposite factor.
+
+                Shared-outer MoE adapters intentionally mix layouts: one LoRA
+                factor is a packed 3D tensor while the opposite factor is a
+                dictionary of per-expert 2D tensors. Therefore A and B must be
+                initialized independently.
+                """
+                factor_weights = buffer[target_module]
+                factor_cache_keys = cache_keys[target_module]
+                if factor_weights is None:
+                    factor_weights = {}
+                    buffer[target_module] = factor_weights
+                if factor_cache_keys is None:
+                    factor_cache_keys = {}
+                    cache_keys[target_module] = factor_cache_keys
+                if not isinstance(factor_weights, dict) or not isinstance(
+                    factor_cache_keys, dict
+                ):
+                    raise ValueError(
+                        f"LoRA target '{target_module}' mixes packed and "
+                        f"per-expert weights for the same factor: '{name}'."
+                    )
+                factor_weights[expert_id] = weights
+                factor_cache_keys[expert_id] = name
+
             for name, weights in layer_weights.items():
                 target_module = get_target_module_name(name, self.target_modules)
 
@@ -955,18 +993,25 @@ class LoRAMemoryPool:
                     # packed 3D weights and named per-expert 2D weights.
                     target_module = shared_moe_target
                     if expert_match:
-                        if temp_A_buffer[target_module] is None:
-                            temp_A_buffer[target_module] = {}
-                            temp_B_buffer[target_module] = {}
-                            temp_A_cache_keys[target_module] = {}
-                            temp_B_cache_keys[target_module] = {}
                         expert_id = int(expert_match.group(1))
                         if "lora_A" in name:
-                            temp_A_buffer[target_module][expert_id] = weights
-                            temp_A_cache_keys[target_module][expert_id] = name
+                            add_per_expert_weight(
+                                temp_A_buffer,
+                                temp_A_cache_keys,
+                                target_module,
+                                expert_id,
+                                name,
+                                weights,
+                            )
                         else:
-                            temp_B_buffer[target_module][expert_id] = weights
-                            temp_B_cache_keys[target_module][expert_id] = name
+                            add_per_expert_weight(
+                                temp_B_buffer,
+                                temp_B_cache_keys,
+                                target_module,
+                                expert_id,
+                                name,
+                                weights,
+                            )
                     elif "lora_A" in name:
                         temp_A_buffer[target_module] = weights
                         temp_A_cache_keys[target_module] = name
@@ -976,19 +1021,25 @@ class LoRAMemoryPool:
                 elif expert_match:
                     # Per-expert MoE weight — 2D tensors, one per expert
                     target_module = target_module + "_moe"
-                    if temp_A_buffer[target_module] is None:
-                        temp_A_buffer[target_module] = {}
-                        temp_B_buffer[target_module] = {}
-                        temp_A_cache_keys[target_module] = {}
-                        temp_B_cache_keys[target_module] = {}
-
                     expert_id = int(expert_match.group(1))
                     if "lora_A" in name:
-                        temp_A_buffer[target_module][expert_id] = weights
-                        temp_A_cache_keys[target_module][expert_id] = name
+                        add_per_expert_weight(
+                            temp_A_buffer,
+                            temp_A_cache_keys,
+                            target_module,
+                            expert_id,
+                            name,
+                            weights,
+                        )
                     else:
-                        temp_B_buffer[target_module][expert_id] = weights
-                        temp_B_cache_keys[target_module][expert_id] = name
+                        add_per_expert_weight(
+                            temp_B_buffer,
+                            temp_B_cache_keys,
+                            target_module,
+                            expert_id,
+                            name,
+                            weights,
+                        )
                 elif "experts" in name and weights.dim() == 3:
                     # Shared outer MoE weight — 3D tensor [expert_dim, rank, hidden]
                     target_module = target_module + "_moe"

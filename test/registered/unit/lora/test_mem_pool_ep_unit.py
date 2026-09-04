@@ -882,6 +882,95 @@ class TestSharedMoeProductionLoad(unittest.TestCase):
                     torch.count_nonzero(pool.B_buffer[f"gate_up_proj{suffix}"][0]), 0
                 )
 
+    def test_mixed_packed_outer_and_per_expert_factors_load_independently(self):
+        for suffix, expert_path in (
+            ("_shared_moe", "shared_experts"),
+            ("_moe", "experts"),
+        ):
+            with self.subTest(suffix=suffix):
+                pool = _make_pool(
+                    num_experts_global=2,
+                    moe_ep_size=1,
+                    moe_ep_rank=0,
+                    moe_use_local_expert_ids=False,
+                )
+                pool.num_layer = 1
+                pool.max_lora_rank = 2
+                pool.target_modules = {"gate_up_proj", "down_proj"}
+                pool.experts_shared_outer_loras = True
+                pool.strict_loading = True
+                pool.lora_added_tokens_size = 0
+                pool.pin_memory_available = False
+                pool.enable_lora_overlap_loading = False
+                pool.base_model = object()
+                pool.A_buffer = {
+                    f"gate_up_proj{suffix}": [torch.zeros(1, 1, 4, 5)],
+                    f"down_proj{suffix}": [torch.zeros(1, 2, 2, 3)],
+                }
+                pool.B_buffer = {
+                    f"gate_up_proj{suffix}": [torch.zeros(1, 2, 6, 2)],
+                    f"down_proj{suffix}": [torch.zeros(1, 1, 5, 2)],
+                }
+                pool.embedding_A_buffer = {}
+                pool.embedding_B_buffer = {}
+                pool.lm_head_A_buffer = {}
+                pool.lm_head_B_buffer = {}
+                pool.new_embeddings_buffer = {}
+
+                gate_a = torch.arange(20, dtype=torch.float32).reshape(1, 4, 5)
+                gate_b = torch.arange(24, dtype=torch.float32).reshape(2, 6, 2)
+                down_a = torch.arange(12, dtype=torch.float32).reshape(2, 2, 3)
+                down_b = torch.arange(10, dtype=torch.float32).reshape(1, 5, 2)
+                weights = {
+                    f"model.layers.0.mlp.{expert_path}.gate_up_proj.lora_A.weight": gate_a,
+                    f"model.layers.0.mlp.{expert_path}.down_proj.lora_B.weight": down_b,
+                }
+                for expert_id in range(2):
+                    weights[
+                        f"model.layers.0.mlp.{expert_path}.{expert_id}.gate_up_proj.lora_B.weight"
+                    ] = gate_b[expert_id]
+                    weights[
+                        f"model.layers.0.mlp.{expert_path}.{expert_id}.down_proj.lora_A.weight"
+                    ] = down_a[expert_id]
+
+                adapter = types.SimpleNamespace(
+                    config=types.SimpleNamespace(r=2),
+                    scaling=2.5,
+                    layers=[types.SimpleNamespace(weights=weights, pinned_weights={})],
+                    embedding_layers={},
+                    added_tokens_embeddings={},
+                )
+                module = (
+                    _FakeSharedMoeLayer()
+                    if suffix == "_shared_moe"
+                    else _FakeRoutedMoeLayer()
+                )
+
+                _load_lora_weight_to_buffer(
+                    pool,
+                    uid="mixed-layout",
+                    buffer_id=0,
+                    lora_adapter=adapter,
+                    lora_modules=[{"experts": module}],
+                    lora_embed_tokens_module=None,
+                    lora_lm_head_module=None,
+                )
+
+                torch.testing.assert_close(
+                    pool.A_buffer[f"gate_up_proj{suffix}"][0][0, 0], gate_a[0]
+                )
+                torch.testing.assert_close(
+                    pool.B_buffer[f"gate_up_proj{suffix}"][0][0],
+                    gate_b * adapter.scaling,
+                )
+                torch.testing.assert_close(
+                    pool.A_buffer[f"down_proj{suffix}"][0][0], down_a
+                )
+                torch.testing.assert_close(
+                    pool.B_buffer[f"down_proj{suffix}"][0][0, 0],
+                    down_b[0] * adapter.scaling,
+                )
+
 
 class TestModuleLevelHelpers(unittest.TestCase):
     """`_get_moe_ep_context` / `_moe_runner_keeps_global_expert_ids`

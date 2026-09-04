@@ -43,6 +43,7 @@ from sglang.srt.lora.utils import (
     auto_detect_lora_target_modules,
     get_normalized_target_modules,
     get_target_module_name,
+    matches_lora_target,
     warn_if_adapter_targets_embeddings,
 )
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
@@ -715,7 +716,9 @@ class LoRAManager:
             )
             target_modules = self.target_modules
         elif target_modules:
-            self.target_modules = get_normalized_target_modules(target_modules)
+            self.target_modules = get_normalized_target_modules(
+                target_modules, base_model=self.base_model
+            )
         else:
             self.target_modules = set()
 
@@ -759,7 +762,7 @@ class LoRAManager:
                 )
 
             adapter_target_modules = get_normalized_target_modules(
-                config.target_modules
+                config.target_modules, base_model=self.base_model
             )
 
             if target_modules is not None:
@@ -1029,11 +1032,7 @@ class LoRAManager:
                 continue
 
             # The module should be converted if it is included in target_names
-            parts = module_name.split(".")
-            if (
-                parts[-1] in self.target_modules
-                or ".".join(parts[-2:]) in self.target_modules
-            ):
+            if matches_lora_target(module_name, self.target_modules):
                 layer_id = get_layer_id(module_name)
                 if layer_id is None:
                     continue
