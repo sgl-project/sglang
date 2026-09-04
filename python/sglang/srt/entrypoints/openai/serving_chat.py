@@ -929,7 +929,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     ).model_dump()
 
                 yield build_sse_content(
-                    chunk_id=content["meta_info"]["id"],
+                    chunk_id=self._wire_id(content["meta_info"]["id"]),
                     created=int(time.time()),
                     model=request.model,
                     index=index,
@@ -976,7 +976,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     ).model_dump()
 
                 yield build_sse_content(
-                    chunk_id=content["meta_info"]["id"],
+                    chunk_id=self._wire_id(content["meta_info"]["id"]),
                     created=int(time.time()),
                     model=request.model,
                     index=index,
@@ -1004,7 +1004,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 ).model_dump()
 
             yield build_sse_content(
-                chunk_id=content["meta_info"]["id"],
+                chunk_id=self._wire_id(content["meta_info"]["id"]),
                 created=int(time.time()),
                 model=request.model,
                 index=index,
@@ -2051,7 +2051,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 if is_firsts.get(index, True):
                     is_firsts[index] = False
                     yield build_sse_content(
-                        chunk_id=content["meta_info"]["id"],
+                        chunk_id=self._wire_id(content["meta_info"]["id"]),
                         created=int(time.time()),
                         model=request.model,
                         index=index,
@@ -2089,7 +2089,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 matched_stop = finish_reason_data.get("matched")
                 yield build_sse_content(
-                    chunk_id=content["meta_info"]["id"],
+                    chunk_id=self._wire_id(content["meta_info"]["id"]),
                     created=int(time.time()),
                     model=request.model,
                     index=idx,
@@ -2105,7 +2105,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             choice_hidden_states, request.return_hidden_states
                         )
                         hidden_states_chunk = ChatCompletionStreamResponse(
-                            id=content["meta_info"]["id"],
+                            id=self._wire_id(content["meta_info"]["id"]),
                             created=int(time.time()),
                             choices=[
                                 ChatCompletionResponseStreamChoice(
@@ -2173,7 +2173,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 # the other sglext fields keep the plain data-chunk shape.
                 if sglext_non_ids is not None:
                     sglext_chunk = ChatCompletionStreamResponse(
-                        id=content["meta_info"]["id"],
+                        id=self._wire_id(content["meta_info"]["id"]),
                         created=int(time.time()),
                         choices=[],
                         model=request.model,
@@ -2182,7 +2182,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     yield f"data: {sglext_chunk.model_dump_json()}\n\n"
                 if sglext_ids is not None:
                     sglext_ids_chunk = ChatCompletionStreamResponse(
-                        id=content["meta_info"]["id"],
+                        id=self._wire_id(content["meta_info"]["id"]),
                         created=int(time.time()),
                         choices=[],
                         model=request.model,
@@ -2191,7 +2191,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     yield f"event: sglext_ids\ndata: {sglext_ids_chunk.model_dump_json()}\n\n"
             elif sglext_non_ids is not None or sglext_ids is not None:
                 sglext_chunk = ChatCompletionStreamResponse(
-                    id=content["meta_info"]["id"],
+                    id=self._wire_id(content["meta_info"]["id"]),
                     created=int(time.time()),
                     choices=[],  # sglext is at response level
                     model=request.model,
@@ -2224,7 +2224,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     video_tokens=total_video_tokens,
                 )
                 usage_chunk = ChatCompletionStreamResponse(
-                    id=content["meta_info"]["id"],
+                    id=self._wire_id(content["meta_info"]["id"]),
                     created=int(time.time()),
                     choices=[],  # Empty choices array as per OpenAI spec
                     model=request.model,
@@ -2449,7 +2449,7 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         return ChatCompletionResponse(
-            id=ret[0]["meta_info"]["id"],
+            id=self._wire_id(ret[0]["meta_info"]["id"]),
             created=created,
             model=request.model,
             choices=choices,
@@ -2538,6 +2538,19 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
         return token_logprobs
+
+    def _wire_id(self, meta_id: str) -> str:
+        """API 层响应 id(P2.1):kimi_k3 口径下发 chatcmpl-<24hex>。
+
+        由调度器 rid 确定性派生,保证同一请求所有帧恒等(P1.3);其它编码
+        口径保留 rid 原样,运维日志按 rid 关联不受影响。rid 中非 hex 字符
+        (客户端自带前缀等)被剔除,不足 24 位右补零,只求格式稳定。
+        """
+        if self.chat_encoding_spec != "kimi_k3":
+            return meta_id
+        hexpart = "".join(c for c in meta_id.lower() if c in "0123456789abcdef")
+        return "chatcmpl-" + (hexpart + "0" * 24)[:24]
+
 
     def _process_tool_call_id(
         self,
@@ -3062,7 +3075,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 finish_reason=None,
             )
             chunk = ChatCompletionStreamResponse(
-                id=content["meta_info"]["id"],
+                id=self._wire_id(content["meta_info"]["id"]),
                 created=int(time.time()),
                 choices=[choice_data],
                 model=request.model,
@@ -3135,7 +3148,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     finish_reason=None,
                 )
                 chunk = ChatCompletionStreamResponse(
-                    id=content["meta_info"]["id"],
+                    id=self._wire_id(content["meta_info"]["id"]),
                     created=int(time.time()),
                     choices=[choice_data],
                     model=request.model,
@@ -3223,7 +3236,7 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
             chunk = ChatCompletionStreamResponse(
-                id=content["meta_info"]["id"],
+                id=self._wire_id(content["meta_info"]["id"]),
                 created=int(time.time()),
                 choices=[choice_data],
                 model=request.model,
