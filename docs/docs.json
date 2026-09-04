@@ -542,6 +542,14 @@
       "destination": "/docs/hardware-platforms/ascend-npus/optimization/ring_sp_performance"
     },
     {
+      "source": "/docs/hardware-platforms/ascend-npus/ascend_npu_graph_mode",
+      "destination": "/docs/hardware-platforms/ascend-npus/optimization/npu_graph_mode"
+    },
+    {
+      "source": "/docs/hardware-platforms/ascend-npus/ascend_npu_deployment_knowledge_base",
+      "destination": "/docs/hardware-platforms/ascend-npus/model-deployment/knowledge_base"
+    },
+    {
       "source": "/docs/hardware-platforms/ascend-npus/ascend_npu_profiling",
       "destination": "/docs/hardware-platforms/ascend-npus/optimization/profiling"
     },
@@ -1164,6 +1172,7 @@
                     "group": "Optimization",
                     "pages": [
                       "docs/hardware-platforms/ascend-npus/optimization/parameter_tuning",
+                      "docs/hardware-platforms/ascend-npus/optimization/npu_graph_mode",
                       "docs/hardware-platforms/ascend-npus/optimization/profiling",
                       "docs/hardware-platforms/ascend-npus/optimization/quantization",
                       "docs/hardware-platforms/ascend-npus/optimization/ring_sp_performance"
