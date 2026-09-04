@@ -558,6 +558,9 @@ class Envs:
     # plane; off, or no such plane, keeps the NCCL all-gather.
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
+    # Broadcast the compact ragged-verify token budget from TP rank0 so every
+    # rank (incl. attention-CP ranks) picks the same cuda-graph tier.
+    SGLANG_DSPARK_SYNC_VERIFY_BUDGET = EnvBool(False)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
 
     # ===================================================================
