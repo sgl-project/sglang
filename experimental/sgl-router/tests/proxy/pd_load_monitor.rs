@@ -19,7 +19,8 @@ use sgl_router::config::{
     StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::load_monitor::{Freshness, LoadMonitor, LoadMonitorConfig};
+use sgl_router::load_monitor::{LoadMonitor, LoadMonitorConfig};
+use sgl_router::policies::engine_load::{EngineLoadTable, Freshness};
 use sgl_router::policies::factory::build_registry_with_defaults;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
@@ -77,11 +78,14 @@ fn build_ctx(
     let cfg = config(policy, decode_policy);
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
-    let lm = LoadMonitor::new(LoadMonitorConfig {
-        report_interval: Duration::from_millis(50),
-        stale_after: Duration::from_millis(2000),
-        request_timeout: Duration::from_millis(500),
-    });
+    let lm = LoadMonitor::new(
+        LoadMonitorConfig {
+            report_interval: Duration::from_millis(50),
+            stale_after: Duration::from_millis(2000),
+            request_timeout: Duration::from_millis(500),
+        },
+        EngineLoadTable::new(),
+    );
     for s in specs {
         lm.track(&s.url);
         let _ = registry.add(s);

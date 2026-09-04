@@ -229,11 +229,20 @@ async fn main() -> Result<()> {
     // Pull-mode Load Monitor (opt-in). Built before the manager so newly
     // registered workers are tracked from their first `/server_info`.
     let load_monitor = cfg.load_monitor.enabled.then(|| {
-        sgl_router::load_monitor::LoadMonitor::new(sgl_router::load_monitor::LoadMonitorConfig {
-            report_interval: std::time::Duration::from_millis(cfg.load_monitor.report_interval_ms),
-            stale_after: std::time::Duration::from_millis(cfg.load_monitor.stale_after_ms),
-            request_timeout: std::time::Duration::from_millis(cfg.load_monitor.request_timeout_ms),
-        })
+        sgl_router::load_monitor::LoadMonitor::new(
+            sgl_router::load_monitor::LoadMonitorConfig {
+                report_interval: std::time::Duration::from_millis(
+                    cfg.load_monitor.report_interval_ms,
+                ),
+                stale_after: std::time::Duration::from_millis(cfg.load_monitor.stale_after_ms),
+                request_timeout: std::time::Duration::from_millis(
+                    cfg.load_monitor.request_timeout_ms,
+                ),
+            },
+            // One store for push (ZMQ LoadStat) and pull (GET /v1/loads):
+            // every load-aware policy reads the same table.
+            kv_index.engine_load(),
+        )
     });
     if load_monitor.is_some() {
         tracing::info!(

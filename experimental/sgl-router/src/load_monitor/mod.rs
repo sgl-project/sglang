@@ -1,12 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Load Monitor — pull-mode engine load snapshots for routing.
+//! Load Monitor — the pull-mode feeder of [`EngineLoadTable`].
 //!
-//! Ported from AIgate's `internal/loadmonitor` pull path. One background
-//! task per physical worker URL polls `GET /v1/loads?include=core`,
-//! aggregates the DP-rank rows into one endpoint-level [`LoadAggregate`],
-//! and publishes it behind a freshness gate:
+//! Engine-reported load lives in ONE store, [`EngineLoadTable`], with two
+//! feeders: the KV-events subscriber (engines that publish `LoadStat` on
+//! their load socket) and this module, which polls `GET
+//! /v1/loads?include=core` for engines that don't, or as a belt-and-braces
+//! second source. Both write per-`(worker_url, dp_rank)` rows stamped with
+//! the router-local receive time, so they mix freely (last write wins) and
+//! age under the same freshness window, which this module aligns with
+//! `--load-monitor-stale-after-ms`. Every load-aware policy then reads the
+//! same [`crate::policies::engine_load::WorkerLoads`] view: engine depth
+//! plus the slots this router acquired since that report.
+//!
+//! Pull mechanics (ported from AIgate's `internal/loadmonitor`):
 //!
 //! * **Trigger coalescing.** Every routed request calls [`LoadMonitor::trigger`]
 //!   for the model's workers. The wake channel has capacity one, so under
@@ -15,23 +23,18 @@
 //! * **Periodic fallback.** After each pull completes the task re-arms a
 //!   `report_interval` timer, so an idle worker keeps a fresh snapshot and
 //!   never gets stuck `stale` (which would make it permanently unroutable).
-//! * **Freshness.** A worker is [`Freshness::Fresh`] only when its latest
-//!   successful pull is younger than `stale_after`. `missing` (never
-//!   pulled), `stale` (too old, or the engine reported zero capacity while
-//!   still booting) and `unreachable` (HTTP / transport / parse failure)
-//!   workers are excluded from routing by the caller.
-//! * **Local pre-deduction.** [`LoadMonitor::note_dispatch`] bumps a
-//!   per-endpoint pending counter that [`LoadMonitor::load_score`] adds on
-//!   top of the engine-reported request count; the counter resets on the
-//!   next successful pull. This closes the blind window between a routing
-//!   decision and the engine reflecting that request in `/v1/loads`, so a
-//!   burst does not herd onto whichever worker looked lightest last pull.
+//! * **Freshness.** [`EngineLoadTable::worker_freshness`]: a worker is
+//!   routable under the freshness gate only when every rank's latest gauge
+//!   is younger than `stale_after`; a failed pull reads `unreachable`, an
+//!   early-boot zero-capacity snapshot reads `stale`.
 
+use crate::policies::engine_load::{
+    EngineLoadTable, Freshness, LoadStat, PullStatus, WorkerAggregate,
+};
 use crate::server::metrics::{LoadPullOutcome, MetricsRegistry, ReportedLoadKind};
 use dashmap::DashMap;
-use parking_lot::RwLock;
 use serde::Deserialize;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -47,8 +50,9 @@ pub struct LoadMonitorConfig {
     /// Periodic fallback pull interval, measured from the completion of the
     /// previous pull.
     pub report_interval: Duration,
-    /// A successful report older than this is `stale`. Must exceed
-    /// `report_interval` or idle workers flap between fresh and stale.
+    /// A report older than this is `stale`; also becomes the shared
+    /// [`EngineLoadTable`] freshness window. Must exceed `report_interval`
+    /// or idle workers flap between fresh and stale.
     pub stale_after: Duration,
     /// Per-pull HTTP timeout.
     pub request_timeout: Duration,
@@ -64,88 +68,23 @@ impl Default for LoadMonitorConfig {
     }
 }
 
-/// Endpoint-level aggregate over all DP ranks of one worker.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LoadAggregate {
-    pub num_running_requests: i64,
-    pub num_waiting_requests: i64,
-    /// `running + waiting` — the request-count load signal.
-    pub num_total_requests: i64,
-    pub num_used_tokens: i64,
-    /// Tokens held by running + queued requests — the prefill load signal.
-    pub num_total_tokens: i64,
-    pub max_total_tokens: i64,
-    pub max_running_requests: i64,
-    /// `max(0, max_total_tokens - num_used_tokens)`.
-    pub free_tokens: i64,
-    /// `max(0, max_running_requests - num_running_requests)`.
-    pub available_request_slots: i64,
-    pub dp_ranks: usize,
-}
-
-/// Routing-visible state of one worker's load report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Freshness {
-    /// No pull has completed yet.
-    Missing,
-    /// Latest pull succeeded within `stale_after`.
-    Fresh,
-    /// Latest pull is too old, or the engine reported zero capacity
-    /// (still initialising).
-    Stale,
-    /// Latest pull failed (HTTP status, transport, or payload error).
-    Unreachable,
-}
-
-impl Freshness {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Missing => "missing",
-            Self::Fresh => "fresh",
-            Self::Stale => "stale",
-            Self::Unreachable => "unreachable",
-        }
-    }
-}
-
-/// Read-only view of one endpoint at a point in time.
+/// Read-only diagnostic view of one worker's load as the table holds it.
 #[derive(Debug, Clone)]
 pub struct EndpointLoad {
     pub freshness: Freshness,
-    /// Present for `Fresh` and `Stale`; `None` for `Missing` / `Unreachable`.
-    pub aggregate: Option<LoadAggregate>,
-    /// Router-local pull sequence (only pulls that actually ran count).
+    /// Present once any rank has reported.
+    pub aggregate: Option<WorkerAggregate>,
+    /// Router-local pull sequence for this worker (pulls that actually ran).
     pub sequence: u64,
+    /// Oldest rank timestamp of the latest report.
     pub received_at: Option<Instant>,
     pub last_error: Option<String>,
-    /// Requests routed here since the last successful pull.
-    pub pending_dispatches: i64,
-}
-
-#[derive(Debug, Clone)]
-enum ReportStatus {
-    Healthy,
-    /// Engine answered but every rank reported zero token or request
-    /// capacity — SGLang's early-boot snapshot. Kept for diagnostics but
-    /// demoted to `Stale` so the worker is not routable yet.
-    ZeroCapacity,
-    Unreachable(String),
-}
-
-#[derive(Debug, Clone)]
-struct Report {
-    status: ReportStatus,
-    aggregate: Option<LoadAggregate>,
-    received_at: Instant,
-    sequence: u64,
 }
 
 struct Endpoint {
     url: String,
     /// Capacity-one wake channel: at most one pending refresh request.
     wake_tx: mpsc::Sender<()>,
-    latest: RwLock<Option<Report>>,
-    pending: AtomicI64,
     sequence: AtomicU64,
     cancel: CancellationToken,
 }
@@ -164,6 +103,7 @@ pub struct LoadMonitor {
     endpoints: DashMap<String, Arc<Endpoint>>,
     metrics: OnceLock<Arc<MetricsRegistry>>,
     drained: CancellationToken,
+    table: Arc<EngineLoadTable>,
 }
 
 impl std::fmt::Debug for LoadMonitor {
@@ -176,7 +116,11 @@ impl std::fmt::Debug for LoadMonitor {
 }
 
 impl LoadMonitor {
-    pub fn new(cfg: LoadMonitorConfig) -> Arc<Self> {
+    /// Build a monitor that writes into `table`. The table's freshness
+    /// window is set to `cfg.stale_after` so pushed and pulled reports age
+    /// under one rule.
+    pub fn new(cfg: LoadMonitorConfig, table: Arc<EngineLoadTable>) -> Arc<Self> {
+        table.set_freshness(cfg.stale_after);
         // One connection per worker is plenty: pulls to the same worker are
         // serialised by the per-endpoint task.
         let client = reqwest::Client::builder()
@@ -191,11 +135,17 @@ impl LoadMonitor {
             endpoints: DashMap::new(),
             metrics: OnceLock::new(),
             drained: CancellationToken::new(),
+            table,
         })
     }
 
     pub fn config(&self) -> &LoadMonitorConfig {
         &self.cfg
+    }
+
+    /// The shared store this monitor feeds.
+    pub fn table(&self) -> &Arc<EngineLoadTable> {
+        &self.table
     }
 
     /// Attach the process metrics registry (built after the monitor).
@@ -213,12 +163,9 @@ impl LoadMonitor {
         let ep = Arc::new(Endpoint {
             url: url.to_string(),
             wake_tx,
-            latest: RwLock::new(None),
-            pending: AtomicI64::new(0),
             sequence: AtomicU64::new(0),
             cancel: self.drained.child_token(),
         });
-        // Insert first so a concurrent `track` for the same URL is a no-op.
         if self
             .endpoints
             .insert(url.to_string(), Arc::clone(&ep))
@@ -232,11 +179,12 @@ impl LoadMonitor {
         tokio::spawn(async move { this.run_endpoint(ep, wake_rx).await });
     }
 
-    /// Stop polling `url` and forget its snapshot.
+    /// Stop polling `url` and drop its rows from the table.
     pub fn untrack(&self, url: &str) {
         if let Some((_, ep)) = self.endpoints.remove(url) {
             ep.cancel.cancel();
         }
+        self.table.forget_worker(url);
     }
 
     /// Cancel every pull task. Called on router shutdown.
@@ -259,101 +207,37 @@ impl LoadMonitor {
         }
     }
 
-    /// Record that one request was just routed to `url`. Adds to the
-    /// pre-deduction pending count until the next successful pull.
-    pub fn note_dispatch(&self, url: &str) {
-        if let Some(ep) = self.endpoints.get(url) {
-            ep.pending.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    fn freshness_of(&self, report: Option<&Report>, now: Instant) -> Freshness {
-        match report {
-            None => Freshness::Missing,
-            Some(r) => match &r.status {
-                ReportStatus::Unreachable(_) => Freshness::Unreachable,
-                ReportStatus::ZeroCapacity => Freshness::Stale,
-                ReportStatus::Healthy => {
-                    if now.saturating_duration_since(r.received_at) >= self.cfg.stale_after {
-                        Freshness::Stale
-                    } else {
-                        Freshness::Fresh
-                    }
-                }
-            },
-        }
-    }
-
-    /// Point-in-time view of `url`. Untracked URLs read as `Missing`.
+    /// Point-in-time diagnostic view of `url`.
     pub fn snapshot(&self, url: &str) -> EndpointLoad {
         let now = Instant::now();
-        let Some(ep) = self.endpoints.get(url) else {
-            return EndpointLoad {
-                freshness: Freshness::Missing,
-                aggregate: None,
-                sequence: 0,
-                received_at: None,
-                last_error: None,
-                pending_dispatches: 0,
-            };
+        let sequence = self
+            .endpoints
+            .get(url)
+            .map(|ep| ep.sequence.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        let (aggregate, received_at) = match self.table.worker_aggregate(url) {
+            Some((agg, at)) => (Some(agg), Some(at)),
+            None => (None, None),
         };
-        let latest = ep.latest.read().clone();
-        let freshness = self.freshness_of(latest.as_ref(), now);
-        let (aggregate, sequence, received_at, last_error) = match latest {
-            None => (None, 0, None, None),
-            Some(r) => {
-                let err = match &r.status {
-                    ReportStatus::Unreachable(e) => Some(e.clone()),
-                    ReportStatus::ZeroCapacity => {
-                        Some("engine reported zero token or request capacity".to_string())
-                    }
-                    ReportStatus::Healthy => None,
-                };
-                (r.aggregate, r.sequence, Some(r.received_at), err)
+        let last_error = match self.table.pull_status(url) {
+            Some(PullStatus::Unreachable(e)) => Some(e),
+            Some(PullStatus::ZeroCapacity) => {
+                Some("engine reported zero token or request capacity".to_string())
             }
+            None => None,
         };
         EndpointLoad {
-            freshness,
+            freshness: self.table.worker_freshness(url, now),
             aggregate,
             sequence,
             received_at,
             last_error,
-            pending_dispatches: ep.pending.load(Ordering::Relaxed),
         }
     }
 
+    /// Whether `url` currently passes the freshness gate.
     pub fn is_fresh(&self, url: &str) -> bool {
-        let now = Instant::now();
-        match self.endpoints.get(url) {
-            Some(ep) => self.freshness_of(ep.latest.read().as_ref(), now) == Freshness::Fresh,
-            None => false,
-        }
-    }
-
-    /// Request-count load score for a fresh worker: engine-reported
-    /// `running + waiting` plus requests this router dispatched since that
-    /// report. `None` when the worker is not fresh — callers fall back to
-    /// their local counter.
-    pub fn load_score(&self, url: &str) -> Option<i64> {
-        let now = Instant::now();
-        let ep = self.endpoints.get(url)?;
-        let latest = ep.latest.read();
-        if self.freshness_of(latest.as_ref(), now) != Freshness::Fresh {
-            return None;
-        }
-        let reported = latest.as_ref()?.aggregate?.num_total_requests;
-        Some(reported + ep.pending.load(Ordering::Relaxed).max(0))
-    }
-
-    /// Token load score for a fresh worker (prefill-side signal).
-    pub fn token_score(&self, url: &str) -> Option<i64> {
-        let now = Instant::now();
-        let ep = self.endpoints.get(url)?;
-        let latest = ep.latest.read();
-        if self.freshness_of(latest.as_ref(), now) != Freshness::Fresh {
-            return None;
-        }
-        Some(latest.as_ref()?.aggregate?.num_total_tokens)
+        self.table.worker_freshness(url, Instant::now()) == Freshness::Fresh
     }
 
     /// One endpoint's pull loop — mirrors AIgate's `runPull`: sample
@@ -387,49 +271,52 @@ impl LoadMonitor {
     }
 
     async fn pull_and_store(&self, ep: &Endpoint) {
-        let sequence = ep.sequence.fetch_add(1, Ordering::Relaxed) + 1;
-        let (status, aggregate) = match self.pull_once(&ep.url).await {
-            Ok(agg) if has_positive_capacity(&agg) => (ReportStatus::Healthy, Some(agg)),
-            Ok(agg) => (ReportStatus::ZeroCapacity, Some(agg)),
-            Err(e) => (ReportStatus::Unreachable(e), None),
-        };
-        let outcome = match &status {
-            ReportStatus::Healthy => LoadPullOutcome::Ok,
-            ReportStatus::ZeroCapacity => LoadPullOutcome::ZeroCapacity,
-            ReportStatus::Unreachable(e) => {
+        ep.sequence.fetch_add(1, Ordering::Relaxed);
+        let outcome = match self.pull_once(&ep.url).await {
+            Ok(report) => {
+                let now = Instant::now();
+                for (rank, stat) in &report.ranks {
+                    self.table.set(&ep.url, *rank, stat.clone(), now);
+                }
+                if report.positive_capacity {
+                    self.table.set_pull_status(&ep.url, None);
+                    LoadPullOutcome::Ok
+                } else {
+                    self.table
+                        .set_pull_status(&ep.url, Some(PullStatus::ZeroCapacity));
+                    LoadPullOutcome::ZeroCapacity
+                }
+            }
+            Err(e) => {
                 tracing::debug!(worker_url = %ep.url, error = %e, "load pull failed");
+                self.table
+                    .set_pull_status(&ep.url, Some(PullStatus::Unreachable(e)));
                 LoadPullOutcome::Unreachable
             }
         };
-        if matches!(status, ReportStatus::Healthy) {
-            // Authoritative report supersedes the local pre-deduction.
-            ep.pending.store(0, Ordering::Relaxed);
-        }
-        *ep.latest.write() = Some(Report {
-            status,
-            aggregate,
-            received_at: Instant::now(),
-            sequence,
-        });
         if let Some(m) = self.metrics.get() {
             m.record_load_pull(&ep.url, outcome);
-            if let Some(agg) = aggregate {
+            if let Some((agg, _)) = self.table.worker_aggregate(&ep.url) {
                 m.set_reported_load(
                     &ep.url,
                     ReportedLoadKind::RunningRequests,
-                    agg.num_running_requests,
+                    i64::try_from(agg.num_running_requests).unwrap_or(i64::MAX),
                 );
                 m.set_reported_load(
                     &ep.url,
                     ReportedLoadKind::WaitingRequests,
-                    agg.num_waiting_requests,
+                    i64::try_from(agg.num_waiting_requests).unwrap_or(i64::MAX),
                 );
-                m.set_reported_load(&ep.url, ReportedLoadKind::FreeTokens, agg.free_tokens);
+                m.set_reported_load(
+                    &ep.url,
+                    ReportedLoadKind::FreeTokens,
+                    i64::try_from(agg.free_tokens()).unwrap_or(i64::MAX),
+                );
             }
         }
     }
 
-    async fn pull_once(&self, worker_url: &str) -> Result<LoadAggregate, String> {
+    async fn pull_once(&self, worker_url: &str) -> Result<PulledReport, String> {
         let base = reqwest::Url::parse(worker_url).map_err(|e| format!("parse worker URL: {e}"))?;
         let mut url = base
             .join("/v1/loads")
@@ -456,6 +343,16 @@ impl LoadMonitor {
     }
 }
 
+/// One validated `/v1/loads` body: per-rank gauges in [`LoadStat`] shape.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PulledReport {
+    pub ranks: Vec<(u32, LoadStat)>,
+    /// False when every rank reports zero token or request capacity
+    /// (SGLang's early-boot snapshot) — the report is stored but the worker
+    /// reads as `stale`.
+    pub positive_capacity: bool,
+}
+
 /// JSON envelope returned by the engine's `GET /v1/loads`.
 #[derive(Debug, Deserialize)]
 struct LoadsResponse {
@@ -464,11 +361,13 @@ struct LoadsResponse {
 }
 
 /// One `/v1/loads` DP-rank object (the `core` section). Numeric fields
-/// default to zero when an older engine omits them.
+/// default to zero when an older engine omits them. `num_used_tokens` maps
+/// to `LoadStat::num_tokens` (KV tokens in use) — the same quantity the
+/// push socket publishes.
 #[derive(Debug, Deserialize)]
 struct LoadsRankJson {
     #[serde(default)]
-    dp_rank: i32,
+    dp_rank: i64,
     #[serde(default)]
     num_running_reqs: i64,
     #[serde(default)]
@@ -476,37 +375,27 @@ struct LoadsRankJson {
     #[serde(default)]
     num_used_tokens: i64,
     #[serde(default)]
-    num_total_tokens: i64,
-    #[serde(default)]
     max_total_num_tokens: i64,
     #[serde(default)]
     max_running_requests: i64,
 }
 
-/// Validate one `/v1/loads` body and aggregate its DP ranks.
-pub fn parse_loads_response(body: &[u8]) -> Result<LoadAggregate, String> {
+/// Validate one `/v1/loads` body and convert its DP ranks to [`LoadStat`]s.
+pub fn parse_loads_response(body: &[u8]) -> Result<PulledReport, String> {
     let parsed: LoadsResponse =
         serde_json::from_slice(body).map_err(|e| format!("parse /v1/loads response: {e}"))?;
     if parsed.loads.is_empty() {
         return Err("GET /v1/loads returned no DP ranks".to_string());
     }
     let mut seen = std::collections::HashSet::with_capacity(parsed.loads.len());
-    let mut agg = LoadAggregate::default();
+    let mut ranks = Vec::with_capacity(parsed.loads.len());
+    let mut positive_capacity = true;
     for rank in &parsed.loads {
-        if rank.dp_rank < 0 {
-            return Err(format!(
-                "dp_rank must be non-negative, got {}",
-                rank.dp_rank
-            ));
-        }
-        if !seen.insert(rank.dp_rank) {
-            return Err(format!("duplicate dp_rank {}", rank.dp_rank));
-        }
         for (name, v) in [
+            ("dp_rank", rank.dp_rank),
             ("num_running_reqs", rank.num_running_reqs),
             ("num_waiting_reqs", rank.num_waiting_reqs),
             ("num_used_tokens", rank.num_used_tokens),
-            ("num_total_tokens", rank.num_total_tokens),
             ("max_total_num_tokens", rank.max_total_num_tokens),
             ("max_running_requests", rank.max_running_requests),
         ] {
@@ -514,22 +403,28 @@ pub fn parse_loads_response(body: &[u8]) -> Result<LoadAggregate, String> {
                 return Err(format!("{name} must be non-negative, got {v}"));
             }
         }
-        agg.num_running_requests += rank.num_running_reqs;
-        agg.num_waiting_requests += rank.num_waiting_reqs;
-        agg.num_used_tokens += rank.num_used_tokens;
-        agg.num_total_tokens += rank.num_total_tokens;
-        agg.max_total_tokens += rank.max_total_num_tokens;
-        agg.max_running_requests += rank.max_running_requests;
-        agg.dp_ranks += 1;
+        let dp_rank = u32::try_from(rank.dp_rank)
+            .map_err(|_| format!("dp_rank {} out of range", rank.dp_rank))?;
+        if !seen.insert(dp_rank) {
+            return Err(format!("duplicate dp_rank {dp_rank}"));
+        }
+        if rank.max_total_num_tokens == 0 || rank.max_running_requests == 0 {
+            positive_capacity = false;
+        }
+        ranks.push((
+            dp_rank,
+            LoadStat {
+                num_running_reqs: rank.num_running_reqs as u64,
+                num_waiting_reqs: rank.num_waiting_reqs as u64,
+                num_tokens: rank.num_used_tokens as u64,
+                max_total_num_tokens: rank.max_total_num_tokens as u64,
+            },
+        ));
     }
-    agg.num_total_requests = agg.num_running_requests + agg.num_waiting_requests;
-    agg.free_tokens = (agg.max_total_tokens - agg.num_used_tokens).max(0);
-    agg.available_request_slots = (agg.max_running_requests - agg.num_running_requests).max(0);
-    Ok(agg)
-}
-
-fn has_positive_capacity(agg: &LoadAggregate) -> bool {
-    agg.max_total_tokens > 0 && agg.max_running_requests > 0
+    Ok(PulledReport {
+        ranks,
+        positive_capacity,
+    })
 }
 
 #[cfg(test)]
@@ -553,17 +448,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_aggregates_ranks_and_derives_fields() {
+    fn parse_maps_ranks_onto_load_stat() {
         let body = json!({"timestamp": "x", "loads": [rank(0, 2, 1), rank(1, 3, 0)]});
-        let agg = parse_loads_response(body.to_string().as_bytes()).unwrap();
-        assert_eq!(agg.dp_ranks, 2);
-        assert_eq!(agg.num_running_requests, 5);
-        assert_eq!(agg.num_waiting_requests, 1);
-        assert_eq!(agg.num_total_requests, 6);
-        assert_eq!(agg.num_total_tokens, 300);
-        assert_eq!(agg.max_total_tokens, 2000);
-        assert_eq!(agg.free_tokens, 1800);
-        assert_eq!(agg.available_request_slots, 32 - 5);
+        let r = parse_loads_response(body.to_string().as_bytes()).unwrap();
+        assert!(r.positive_capacity);
+        assert_eq!(r.ranks.len(), 2);
+        assert_eq!(r.ranks[0].0, 0);
+        assert_eq!(r.ranks[0].1.num_running_reqs, 2);
+        assert_eq!(r.ranks[0].1.num_waiting_reqs, 1);
+        assert_eq!(r.ranks[0].1.num_tokens, 100);
+        assert_eq!(r.ranks[0].1.max_total_num_tokens, 1000);
+        assert_eq!(r.ranks[1].1.num_running_reqs, 3);
     }
 
     #[test]
@@ -579,10 +474,10 @@ mod tests {
     }
 
     #[test]
-    fn missing_fields_default_to_zero_and_zero_capacity_is_detected() {
-        let agg = parse_loads_response(br#"{"loads": [{"dp_rank": 0}]}"#).unwrap();
-        assert_eq!(agg.num_total_requests, 0);
-        assert!(!has_positive_capacity(&agg));
+    fn missing_fields_default_to_zero_and_zero_capacity_is_flagged() {
+        let r = parse_loads_response(br#"{"loads": [{"dp_rank": 0}]}"#).unwrap();
+        assert_eq!(r.ranks[0].1.num_running_reqs, 0);
+        assert!(!r.positive_capacity);
     }
 
     /// Mock engine: `/v1/loads` counts hits and serves a fixed rank set.
@@ -597,7 +492,7 @@ mod tests {
                 let hits = Arc::clone(&hits_c);
                 async move {
                     hits.fetch_add(1, Ordering::Relaxed);
-                    Json(json!({"loads": [rank(0, running, 0)]}))
+                    Json(json!({"loads": [rank(0, running, 0), rank(1, running, 1)]}))
                 }
             }),
         );
@@ -635,53 +530,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn track_pulls_immediately_and_becomes_fresh() {
+    async fn track_pulls_immediately_and_populates_the_shared_table() {
         let (url, hits, _srv) = mock_engine(4).await;
-        let m = LoadMonitor::new(cfg(10_000, 30_000));
+        let table = EngineLoadTable::new();
+        let m = LoadMonitor::new(cfg(10_000, 30_000), Arc::clone(&table));
+        // `new` aligns the shared window with stale_after.
+        assert_eq!(table.freshness(), Duration::from_millis(30_000));
         assert_eq!(m.snapshot(&url).freshness, Freshness::Missing);
         m.track(&url);
         wait_until(|| m.is_fresh(&url), "initial pull").await;
         let snap = m.snapshot(&url);
         assert_eq!(snap.sequence, 1);
-        assert_eq!(snap.aggregate.unwrap().num_total_requests, 4);
-        assert_eq!(m.load_score(&url), Some(4));
+        let agg = snap.aggregate.unwrap();
+        assert_eq!(agg.ranks, 2);
+        assert_eq!(agg.num_total_requests(), 4 + 4 + 1);
+        // Per-rank rows landed in the table the policies read.
+        let fresh = table.snapshot_fresh(Instant::now());
+        assert_eq!(fresh.get(&url).copied(), Some(9));
         assert_eq!(hits.load(Ordering::Relaxed), 1);
-        // Long interval: no periodic pull sneaks in.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(hits.load(Ordering::Relaxed), 1);
         m.drain();
     }
 
     #[tokio::test]
-    async fn trigger_coalesces_and_resets_pending_dispatches() {
+    async fn trigger_coalesces_to_at_most_one_pending_pull() {
         let (url, hits, _srv) = mock_engine(1).await;
-        let m = LoadMonitor::new(cfg(10_000, 30_000));
+        let m = LoadMonitor::new(cfg(10_000, 30_000), EngineLoadTable::new());
         m.track(&url);
         wait_until(|| m.is_fresh(&url), "initial pull").await;
-        m.note_dispatch(&url);
-        m.note_dispatch(&url);
-        assert_eq!(m.load_score(&url), Some(3), "reported 1 + 2 pending");
-        // Many triggers while idle → exactly one extra pull, which resets
-        // the pre-deduction to the authoritative value.
         for _ in 0..20 {
             m.trigger([url.as_str()]);
         }
         wait_until(|| hits.load(Ordering::Relaxed) >= 2, "triggered pull").await;
-        wait_until(|| m.snapshot(&url).pending_dispatches == 0, "pending reset").await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
             hits.load(Ordering::Relaxed) <= 3,
             "20 triggers must coalesce into at most one in-flight plus one pending pull, got {}",
             hits.load(Ordering::Relaxed)
         );
-        assert_eq!(m.load_score(&url), Some(1));
         m.drain();
     }
 
     #[tokio::test]
     async fn periodic_fallback_keeps_idle_worker_fresh() {
         let (url, hits, _srv) = mock_engine(0).await;
-        let m = LoadMonitor::new(cfg(20, 200));
+        let m = LoadMonitor::new(cfg(20, 200), EngineLoadTable::new());
         m.track(&url);
         wait_until(|| hits.load(Ordering::Relaxed) >= 4, "periodic pulls").await;
         assert!(m.is_fresh(&url));
@@ -691,14 +585,13 @@ mod tests {
     #[tokio::test]
     async fn stale_when_reports_stop_and_unreachable_when_engine_dies() {
         let (url, _hits, srv) = mock_engine(0).await;
-        // Interval far longer than stale_after so no refresh lands.
-        let m = LoadMonitor::new(cfg(10_000, 40));
+        let m = LoadMonitor::new(cfg(10_000, 40), EngineLoadTable::new());
         m.track(&url);
         wait_until(|| m.is_fresh(&url), "initial pull").await;
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert_eq!(m.snapshot(&url).freshness, Freshness::Stale);
-        assert_eq!(m.load_score(&url), None);
-        // Kill the engine, trigger a pull → unreachable with an error.
+        // The policy view drops a stale worker (falls back to the local counter).
+        assert!(m.table().snapshot_fresh(Instant::now()).is_empty());
         drop(srv);
         tokio::time::sleep(Duration::from_millis(20)).await;
         m.trigger([url.as_str()]);
@@ -720,7 +613,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let m = LoadMonitor::new(cfg(10_000, 30_000));
+        let m = LoadMonitor::new(cfg(10_000, 30_000), EngineLoadTable::new());
         m.track(&url);
         wait_until(|| m.snapshot(&url).sequence >= 1, "pull").await;
         assert_eq!(m.snapshot(&url).freshness, Freshness::Stale);
@@ -729,9 +622,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn untrack_stops_polling_and_forgets_snapshot() {
+    async fn untrack_stops_polling_and_forgets_rows() {
         let (url, hits, _srv) = mock_engine(0).await;
-        let m = LoadMonitor::new(cfg(10, 1000));
+        let table = EngineLoadTable::new();
+        let m = LoadMonitor::new(cfg(10, 1000), Arc::clone(&table));
         m.track(&url);
         wait_until(|| hits.load(Ordering::Relaxed) >= 2, "pulls").await;
         m.untrack(&url);
@@ -739,6 +633,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert!(hits.load(Ordering::Relaxed) <= at_untrack + 1);
         assert_eq!(m.snapshot(&url).freshness, Freshness::Missing);
+        assert!(table.worker_aggregate(&url).is_none());
         m.drain();
     }
 }

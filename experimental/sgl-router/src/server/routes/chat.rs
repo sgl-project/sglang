@@ -554,16 +554,10 @@ async fn chat_completions_inner(
         &decode_pool,
         &selection_ctx,
     )?;
-    // Local pre-deduction: count this dispatch against the chosen
-    // worker(s) until the engine's next report reflects it, so a burst of
-    // requests inside one pull interval does not all herd onto the worker
-    // that looked lightest at the last report.
-    if let Some(lm) = &ctx.load_monitor {
-        lm.note_dispatch(&worker.url);
-        if let Some(d) = &decode_peer {
-            lm.note_dispatch(&d.url);
-        }
-    }
+    // Pre-deduction of this dispatch is implicit: every `load_guard` /
+    // admission slot records its acquisition time in the worker's
+    // `SlotRegistry`, and `WorkerLoads::load_of` adds the slots acquired
+    // since the engine's last report on top of the reported depth.
     let decode_hint_url: Option<String> = decode_peer.as_ref().map(|d| d.url.clone());
     let mut request_headers = headers;
     if let Some(url) = &decode_hint_url {

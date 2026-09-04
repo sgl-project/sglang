@@ -90,7 +90,7 @@
 
 use crate::config::{CacheAwareConfig, LoadGate};
 
-use crate::policies::engine_load::{EngineLoadTable, WorkerDepth};
+use crate::policies::engine_load::EngineLoadTable;
 use crate::policies::kv_events::{
     compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree, Tiers,
 };
@@ -189,86 +189,7 @@ struct BalanceCheck {
     imbalanced: bool,
 }
 
-/// Per-selection load lookup. Built once per `select` from a single
-/// [`EngineLoadTable::fresh_worker_state`] pass: a worker with a fresh
-/// engine-reported snapshot uses its queue depth (`num_running +
-/// num_waiting`) plus its own dispatches acquired since that snapshot's
-/// timestamp (see [`Self::load_of`]); otherwise it falls back to the
-/// router-side in-flight counter (`Worker::active_load`). Holding the
-/// snapshot keeps every per-worker `load_of` an O(1) map lookup.
-struct WorkerLoads {
-    /// url -> (engine-reported depth + queue, that snapshot's oldest-rank
-    /// timestamp).
-    fresh: HashMap<String, (WorkerDepth, Instant)>,
-}
-
-impl WorkerLoads {
-    /// Build the per-selection snapshot from one `fresh_worker_state` pass.
-    /// The single construction chokepoint guarantees every comparison in a
-    /// given `select` sees one consistent view of load.
-    fn from_engine(table: &EngineLoadTable, now: Instant) -> Self {
-        Self {
-            fresh: table.fresh_worker_state(now),
-        }
-    }
-
-    /// A worker's current load: the engine-reported queue depth as of the
-    /// last fresh snapshot, plus this worker's own dispatches made *since*
-    /// that snapshot's timestamp — i.e. exactly the requests the engine
-    /// hasn't had a chance to report back on yet. This is deliberately not
-    /// the worker's full `active_load()`: that counter also includes
-    /// long-held slots from slow-draining streaming responses (see
-    /// `crate::proxy::Proxy::forward_streaming_to`'s `stream_guards` doc)
-    /// that the engine's own last report has likely already accounted for —
-    /// adding the full counter on top would bias selection away from workers
-    /// that are idle on the engine side but still slowly draining a finished
-    /// stream to a client.
-    ///
-    /// This correction is per-router-process: it only sees dispatches THIS
-    /// router pod made. It closes the single-pod stale-gauge herd, but does
-    /// not coordinate with other router replicas — two pods can still both
-    /// read the same stale engine number and independently pile onto the
-    /// same worker within one gauge-refresh window. Closing that would need
-    /// cross-replica state sharing, which this fix does not attempt.
-    fn load_of(&self, w: &Worker) -> usize {
-        match self.fresh.get(w.url.as_str()) {
-            // `saturating_add`, not an assertable invariant: both operands
-            // are bounded by real admission/concurrency limits (a worker's
-            // in-flight count is capped well below `usize::MAX` by
-            // `SlotRegistry::try_claim`'s admission cap), so overflow here
-            // is unreachable from real traffic — reaching it would mean a
-            // problem (memory exhaustion, a corrupt engine payload) that is
-            // already symptomatic elsewhere, not something worth a panic on
-            // this per-request hot path.
-            Some(&(d, at)) => d.depth().saturating_add(w.slots_acquired_since(at)),
-            None => w.active_load(),
-        }
-    }
-
-    /// How many requests are queued on this worker's engine, or `None` when no
-    /// fresh snapshot says.
-    ///
-    /// Deliberately not defaulted to 0 or to any router-side value. The
-    /// router-side counter has no queue component at all — it cannot tell a
-    /// dispatched-and-running request from a dispatched-and-waiting one — so
-    /// there is no honest substitute, and inventing one would silently turn a
-    /// queue gate into a comparison against a different quantity. `None` means
-    /// "unknown", and callers gate open on it.
-    ///
-    /// Unlike [`Self::load_of`] this carries no since-snapshot correction: a
-    /// dispatch this router just made is not known to be *queued* — the engine
-    /// may well be running it — so adding it here would manufacture queue
-    /// depth that may not exist.
-    fn waiting_of(&self, w: &Worker) -> Option<usize> {
-        self.fresh.get(w.url.as_str()).map(|(d, _)| d.waiting())
-    }
-
-    /// Number of workers whose load came from the engine (vs the router-side
-    /// fallback). Used only to annotate the rebalance log.
-    fn engine_worker_count(&self) -> usize {
-        self.fresh.len()
-    }
-}
+use crate::policies::engine_load::WorkerLoads;
 
 /// Outcome of [`CacheAwareZmqPolicy::match_request`] — the matched cache
 /// owners plus the best-mode stats the caller logs and meters. In a uniform

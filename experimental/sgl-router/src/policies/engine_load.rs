@@ -17,8 +17,11 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use crate::workers::Worker;
 
 use dashmap::{DashMap, DashSet};
 use serde::de::{self, Deserializer, IgnoredAny, SeqAccess, Visitor};
@@ -167,25 +170,167 @@ pub struct EngineLoadTable {
     /// from "silently degraded to the in-flight counter" (expected but no
     /// fresh snapshot) — see [`Self::expected_count`].
     expected: DashSet<String>,
-    freshness: Duration,
+    /// Freshness window in milliseconds. Atomic so the Load Monitor can
+    /// align it with `--load-monitor-stale-after-ms` after construction.
+    freshness_ms: AtomicU64,
+    /// Latest pull-mode status per worker URL; absent == last pull OK (or
+    /// the worker is fed by the push socket only).
+    pull_status: DashMap<String, PullStatus>,
+}
+
+/// Outcome of the latest pull-mode sample for a worker (the Load Monitor's
+/// `GET /v1/loads`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PullStatus {
+    /// HTTP / transport / payload failure; the previous rows are kept for
+    /// diagnostics but the worker reads as `Unreachable`.
+    Unreachable(String),
+    /// The engine answered but every rank reported zero token or request
+    /// capacity (SGLang's early-boot snapshot); reads as `Stale`.
+    ZeroCapacity,
+}
+
+/// Routing-visible freshness of a worker's load report, combining the
+/// per-rank gauge age with the pull status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    /// No rank has ever reported.
+    Missing,
+    /// Every rank's latest gauge is younger than the freshness window.
+    Fresh,
+    /// Some rank's gauge is older than the window, or the engine reported
+    /// zero capacity.
+    Stale,
+    /// The latest pull failed.
+    Unreachable,
+}
+
+impl Freshness {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Fresh => "fresh",
+            Self::Stale => "stale",
+            Self::Unreachable => "unreachable",
+        }
+    }
+}
+
+/// Endpoint-level aggregate over a worker's ranks (for diagnostics and
+/// metrics; routing reads [`WorkerLoads`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkerAggregate {
+    pub num_running_requests: u64,
+    pub num_waiting_requests: u64,
+    pub num_used_tokens: u64,
+    pub max_total_tokens: u64,
+    pub ranks: usize,
+}
+
+impl WorkerAggregate {
+    pub fn num_total_requests(&self) -> u64 {
+        self.num_running_requests
+            .saturating_add(self.num_waiting_requests)
+    }
+
+    pub fn free_tokens(&self) -> u64 {
+        self.max_total_tokens.saturating_sub(self.num_used_tokens)
+    }
+}
+
+fn duration_ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 impl EngineLoadTable {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            by_rank: DashMap::new(),
-            expected: DashSet::new(),
-            freshness: DEFAULT_FRESHNESS,
-        })
+        Self::with_freshness(DEFAULT_FRESHNESS)
     }
 
-    #[cfg(test)]
     pub fn with_freshness(freshness: Duration) -> Arc<Self> {
         Arc::new(Self {
             by_rank: DashMap::new(),
             expected: DashSet::new(),
-            freshness,
+            freshness_ms: AtomicU64::new(duration_ms(freshness)),
+            pull_status: DashMap::new(),
         })
+    }
+
+    /// Current freshness window.
+    pub fn freshness(&self) -> Duration {
+        Duration::from_millis(self.freshness_ms.load(Ordering::Relaxed))
+    }
+
+    /// Replace the freshness window (the Load Monitor aligns it with its
+    /// `stale_after`, so push and pull reports age under one rule).
+    pub fn set_freshness(&self, freshness: Duration) {
+        self.freshness_ms
+            .store(duration_ms(freshness), Ordering::Relaxed);
+    }
+
+    /// Record the outcome of a pull-mode sample. `None` clears a previous
+    /// failure (the pull succeeded).
+    pub fn set_pull_status(&self, url: &str, status: Option<PullStatus>) {
+        match status {
+            Some(s) => {
+                self.pull_status.insert(url.to_string(), s);
+            }
+            None => {
+                self.pull_status.remove(url);
+            }
+        }
+    }
+
+    pub fn pull_status(&self, url: &str) -> Option<PullStatus> {
+        self.pull_status.get(url).map(|s| s.clone())
+    }
+
+    /// Freshness of one worker as routing sees it: a failed pull wins over
+    /// the gauge age, zero capacity reads as stale, and a worker is fresh
+    /// only when EVERY rank's latest gauge is inside the window.
+    pub fn worker_freshness(&self, url: &str, now: Instant) -> Freshness {
+        match self.pull_status.get(url).map(|s| s.clone()) {
+            Some(PullStatus::Unreachable(_)) => return Freshness::Unreachable,
+            Some(PullStatus::ZeroCapacity) => return Freshness::Stale,
+            None => {}
+        }
+        let window = self.freshness();
+        let mut seen = false;
+        let mut all_fresh = true;
+        for entry in self.by_rank.iter() {
+            if entry.key().0 != url {
+                continue;
+            }
+            seen = true;
+            if now.saturating_duration_since(entry.value().at) > window {
+                all_fresh = false;
+            }
+        }
+        match (seen, all_fresh) {
+            (false, _) => Freshness::Missing,
+            (true, true) => Freshness::Fresh,
+            (true, false) => Freshness::Stale,
+        }
+    }
+
+    /// Sum of the latest gauges over a worker's ranks, with the oldest rank
+    /// timestamp. `None` when no rank has reported.
+    pub fn worker_aggregate(&self, url: &str) -> Option<(WorkerAggregate, Instant)> {
+        let mut agg = WorkerAggregate::default();
+        let mut oldest: Option<Instant> = None;
+        for entry in self.by_rank.iter() {
+            if entry.key().0 != url {
+                continue;
+            }
+            let l = &entry.value().load;
+            agg.num_running_requests = agg.num_running_requests.saturating_add(l.num_running_reqs);
+            agg.num_waiting_requests = agg.num_waiting_requests.saturating_add(l.num_waiting_reqs);
+            agg.num_used_tokens = agg.num_used_tokens.saturating_add(l.num_tokens);
+            agg.max_total_tokens = agg.max_total_tokens.saturating_add(l.max_total_num_tokens);
+            agg.ranks += 1;
+            oldest = Some(oldest.map_or(entry.value().at, |o| o.min(entry.value().at)));
+        }
+        oldest.map(|at| (agg, at))
     }
 
     /// Record the latest load for one `(worker_url, dp_rank)`.
@@ -255,7 +400,7 @@ impl EngineLoadTable {
         let mut acc: HashMap<String, Acc> = HashMap::new();
         for entry in self.by_rank.iter() {
             let at = entry.value().at;
-            let fresh = now.duration_since(at) <= self.freshness;
+            let fresh = now.saturating_duration_since(at) <= self.freshness();
             let l = &entry.value().load;
             // `try_from`, not `as`: the counts are engine-supplied and the
             // deserializer defaults missing fields, so they are not trusted
@@ -298,11 +443,85 @@ impl EngineLoadTable {
     pub fn forget_worker(&self, url: &str) {
         self.by_rank.retain(|k, _| k.0 != url);
         self.expected.remove(url);
+        self.pull_status.remove(url);
     }
 
     #[cfg(test)]
     pub fn entry_count(&self) -> usize {
         self.by_rank.len()
+    }
+}
+
+/// One consistent per-selection view of engine-reported load: every
+/// worker's fresh (`running + num_waiting`) plus its own dispatches acquired
+/// since that snapshot's timestamp (see [`Self::load_of`]); a worker without
+/// a fresh snapshot falls back to the router-side in-flight counter
+/// (`Worker::active_load`). Holding the snapshot keeps every per-worker
+/// `load_of` an O(1) map lookup. Shared by every load-aware policy
+/// (cache-aware-zmq, power_of_two, load_based, the PD decode pick) so they
+/// all score a worker the same way.
+#[derive(Debug)]
+pub struct WorkerLoads {
+    /// url -> (engine-reported depth + queue, that snapshot's oldest-rank
+    /// timestamp).
+    fresh: HashMap<String, (WorkerDepth, Instant)>,
+}
+
+impl WorkerLoads {
+    /// Build the per-selection snapshot from one `fresh_worker_state` pass.
+    /// The single construction chokepoint guarantees every comparison in a
+    /// given `select` sees one consistent view of load.
+    pub fn from_engine(table: &EngineLoadTable, now: Instant) -> Self {
+        Self {
+            fresh: table.fresh_worker_state(now),
+        }
+    }
+
+    /// A worker's current load: the engine-reported queue depth as of the
+    /// last fresh snapshot, plus this worker's own dispatches made *since*
+    /// that snapshot's timestamp — i.e. exactly the requests the engine
+    /// hasn't had a chance to report back on yet. This is deliberately not
+    /// the worker's full `active_load()`: that counter also includes
+    /// long-held slots from slow-draining streaming responses that the
+    /// engine's own last report has likely already accounted for.
+    ///
+    /// This correction is per-router-process: it only sees dispatches THIS
+    /// router pod made. It closes the single-pod stale-gauge herd, but does
+    /// not coordinate with other router replicas.
+    pub fn load_of(&self, w: &Worker) -> usize {
+        match self.fresh.get(w.url.as_str()) {
+            Some(&(d, at)) => d.depth().saturating_add(w.slots_acquired_since(at)),
+            None => w.active_load(),
+        }
+    }
+
+    /// Whether `w` has a fresh engine snapshot in this view.
+    pub fn is_fresh(&self, w: &Worker) -> bool {
+        self.fresh.contains_key(w.url.as_str())
+    }
+
+    /// How many requests are queued on this worker's engine, or `None` when no
+    /// fresh snapshot says.
+    ///
+    /// Deliberately not defaulted to 0 or to any router-side value. The
+    /// router-side counter has no queue component at all — it cannot tell a
+    /// dispatched-and-running request from a dispatched-and-waiting one — so
+    /// there is no honest substitute, and inventing one would silently turn a
+    /// queue gate into a comparison against a different quantity. `None` means
+    /// "unknown", and callers gate open on it.
+    ///
+    /// Unlike [`Self::load_of`] this carries no since-snapshot correction: a
+    /// dispatch this router just made is not known to be *queued* — the engine
+    /// may well be running it — so adding it here would manufacture queue
+    /// depth that may not exist.
+    pub fn waiting_of(&self, w: &Worker) -> Option<usize> {
+        self.fresh.get(w.url.as_str()).map(|(d, _)| d.waiting())
+    }
+
+    /// Number of workers whose load came from the engine (vs the router-side
+    /// fallback). Used only to annotate the rebalance log.
+    pub fn engine_worker_count(&self) -> usize {
+        self.fresh.len()
     }
 }
 

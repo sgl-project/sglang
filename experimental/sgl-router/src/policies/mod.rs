@@ -220,6 +220,9 @@ pub struct SelectionContext<'a> {
     /// Engine-reported load source (Load Monitor). `None` when disabled —
     /// load-aware policies then fall back to the local in-flight counter.
     load_monitor: Option<&'a LoadMonitor>,
+    /// Lazily built, per-selection view of engine-reported load (one
+    /// `fresh_worker_state` pass shared by every `worker_load` call).
+    engine_loads: std::sync::OnceLock<engine_load::WorkerLoads>,
 }
 
 impl<'a> SelectionContext<'a> {
@@ -231,6 +234,7 @@ impl<'a> SelectionContext<'a> {
             request_tokens: None,
             mm_affinity_key: None,
             load_monitor: None,
+            engine_loads: std::sync::OnceLock::new(),
         }
     }
 
@@ -246,6 +250,7 @@ impl<'a> SelectionContext<'a> {
             request_tokens: None,
             mm_affinity_key: None,
             load_monitor: None,
+            engine_loads: std::sync::OnceLock::new(),
         }
     }
 
@@ -291,10 +296,15 @@ impl<'a> SelectionContext<'a> {
     /// workers from the candidate set when the monitor is enabled, so
     /// the fallback only fires when the monitor is off.
     pub fn worker_load(&self, worker: &Worker) -> usize {
-        self.load_monitor
-            .and_then(|lm| lm.load_score(&worker.url))
-            .map(|score| usize::try_from(score.max(0)).unwrap_or(usize::MAX))
-            .unwrap_or_else(|| worker.active_load())
+        match self.load_monitor {
+            Some(lm) => self
+                .engine_loads
+                .get_or_init(|| {
+                    engine_load::WorkerLoads::from_engine(lm.table(), std::time::Instant::now())
+                })
+                .load_of(worker),
+            None => worker.active_load(),
+        }
     }
 
     pub fn model(&self) -> &ModelId {
