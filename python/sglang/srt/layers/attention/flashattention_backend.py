@@ -224,6 +224,17 @@ class FlashAttentionBackend(AttentionBackend):
                 is_draft_worker=True,
                 num_draft_tokens=int(self.speculative_num_draft_tokens),
             )
+        # Spec decode (draft_extend / target_verify) sets cache_seqlens to
+        # seq_lens + num_draft_tokens. page_table / strided_indices are sized
+        # from max_context_len; without this headroom FA indexes past the
+        # page_table near the context wall (CUDA illegal memory access).
+        if self.speculative_num_draft_tokens:
+            self.max_context_len = int(model_runner.model_config.context_len) + int(
+                self.speculative_num_draft_tokens
+            )
+            self.max_num_pages = (
+                self.max_context_len + self.page_size - 1
+            ) // self.page_size
         self.speculative_step_id = speculative_step_id
 
         # Local attention settings
