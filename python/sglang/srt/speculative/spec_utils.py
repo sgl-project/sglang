@@ -49,7 +49,6 @@ from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
 from sglang.srt.runtime_context import (
-    get_exec,
     get_spec,
     mamba_extra_buffer_enabled,
     mamba_extra_buffer_lazy_enabled,
@@ -812,17 +811,17 @@ def _verify_commit_step_indices(
             fused_commit_track_indices,
         )
 
-        track_interval = (
-            get_exec().mamba.mamba_track_interval
+        track_grid = (
+            mamba_track_grid(batch.tree_cache.page_size)
             if batch.mamba_track_indices is not None
             else 0
         )
         return fused_commit_track_indices(
             accept_index.contiguous(),
             accept_lens,
-            batch.seq_lens if track_interval > 0 else None,
+            batch.seq_lens if track_grid > 0 else None,
             draft_token_num,
-            track_interval,
+            track_grid,
         )
     accept_indices_offset = torch.arange(
         0,
