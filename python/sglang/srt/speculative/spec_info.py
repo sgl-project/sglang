@@ -38,6 +38,7 @@ class SpeculativeAlgorithm(Enum):
     """
 
     DFLASH = auto()
+    UNO = auto()
     DSPARK = auto()
     EAGLE = auto()
     EAGLE3 = auto()
@@ -116,6 +117,9 @@ class SpeculativeAlgorithm(Enum):
 
     def is_dflash(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH
+
+    def is_uno(self) -> bool:
+        return self == SpeculativeAlgorithm.UNO
 
     def is_dspark(self) -> bool:
         return self == SpeculativeAlgorithm.DSPARK
@@ -223,6 +227,7 @@ class SpeculativeAlgorithm(Enum):
             _handle_eagle_family,
             _handle_frozen_kv_mtp,
             _handle_ngram,
+            _handle_uno,
         )
 
         # Validate for every algorithm at startup: the metrics paths read the
@@ -233,6 +238,8 @@ class SpeculativeAlgorithm(Enum):
 
         if self.is_dflash():
             _handle_dflash(server_args)
+        elif self.is_uno():
+            _handle_uno(server_args)
         elif self.is_dspark():
             _handle_dspark(server_args)
         elif self.is_frozen_kv_mtp():
@@ -307,6 +314,11 @@ class SpeculativeAlgorithm(Enum):
 
             return DFlashWorkerV2
 
+        if self.is_uno():
+            from sglang.srt.speculative.uno_worker_v2 import UnoWorkerV2
+
+            return UnoWorkerV2
+
         if self.is_dspark():
             from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
                 DSparkWorkerV2,
@@ -359,6 +371,9 @@ class SpecInputType(IntEnum):
     DFLASH_DRAFT = auto()
     DFLASH_VERIFY = auto()
     NGRAM_VERIFY = auto()
+    UNO_STATE = auto()
+    UNO_DRAFT = auto()
+    UNO_VERIFY = auto()
 
 
 class SpecInput(ABC):
@@ -396,6 +411,7 @@ class SpecInput(ABC):
             SpecInputType.EAGLE_DRAFT_EXTEND,
             SpecInputType.FROZEN_KV_MTP_DRAFT,
             SpecInputType.DFLASH_DRAFT,
+            SpecInputType.UNO_DRAFT,
         }
 
     def is_verify_input(self) -> bool:
@@ -404,6 +420,7 @@ class SpecInput(ABC):
             SpecInputType.FROZEN_KV_MTP_VERIFY,
             SpecInputType.DFLASH_VERIFY,
             SpecInputType.NGRAM_VERIFY,
+            SpecInputType.UNO_VERIFY,
         }
 
 

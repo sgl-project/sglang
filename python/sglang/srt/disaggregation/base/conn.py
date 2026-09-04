@@ -104,6 +104,8 @@ class KVPoll:
 class BaseKVManager(ABC):
     """Base class for managing transfer states"""
 
+    enable_deferred_decode_kv_release: bool = False
+
     @abstractmethod
     def __init__(
         self,

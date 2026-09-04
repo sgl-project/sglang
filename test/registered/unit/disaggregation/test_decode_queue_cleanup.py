@@ -9,6 +9,7 @@ from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.fake.conn import FakeKVManager, FakeKVReceiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
@@ -382,7 +383,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
     @patch("sglang.srt.disaggregation.decode.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")
     @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
-    def test_transfer_failure_clears_receiver_before_removing_request(
+    def test_transfer_failure_cleanup_respects_deferred_release_gates(
         self, mock_poll, mock_prepare_abort, mock_release_kv_cache
     ):
         receiver = FakeReceiver()
@@ -434,6 +435,32 @@ class TestDecodeQueueCleanup(CustomTestCase):
         mock_release_kv_cache.assert_called_once_with(
             req, queue.tree_cache, is_insert=False
         )
+
+        receiver = FakeReceiver()
+        receiver.kv_mgr = FakeKVManager.__new__(FakeKVManager)
+        decode_req.kv_receiver = receiver
+        queue.queue = [decode_req]
+        queue.enable_deferred_kv_release = True
+        queue.req_to_metadata_buffer_idx_allocator.reset_mock()
+        mock_release_kv_cache.reset_mock()
+
+        transferred = queue.pop_transferred()
+
+        self.assertEqual(transferred, [])
+        self.assertEqual(queue.queue, [])
+        self.assertTrue(receiver.clear_called)
+        self.assertIsNone(decode_req.kv_receiver)
+        queue.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
+        mock_release_kv_cache.assert_called_once_with(
+            req, queue.tree_cache, is_insert=False
+        )
+
+    def test_fake_receiver_initializes_deferred_release_state(self):
+        manager = MagicMock()
+        receiver = FakeKVReceiver(manager, "")
+
+        self.assertIs(receiver.kv_mgr, manager)
+        self.assertFalse(receiver.abort_notified)
 
     def test_retracted_decode_requests_keep_scheduler_non_idle(self):
         scheduler = Scheduler.__new__(Scheduler)

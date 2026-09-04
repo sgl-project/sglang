@@ -326,6 +326,8 @@ def build_kv_cache(
         enable_mamba_extra_buffer_lazy=server_args.enable_mamba_extra_buffer_lazy(),
         pp_rank=ps.pp_rank,
         pp_size=ps.pp_size,
+        attn_cp_rank=ps.attn_cp_rank,
+        attn_cp_size=ps.attn_cp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
