@@ -20,11 +20,10 @@ More details can be found in https://docs.flashinfer.ai/api/mla.html
 
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Callable, List, Optional, Union
+from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 
-from sglang.kernels.ops.attention.dsa.quant_k_cache import gather_dsa_kv_scales
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -70,48 +69,6 @@ if is_flashinfer_available():
         BatchMLAPagedAttentionWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
     )
-
-
-_MLA_BF16_DEQUANT_SCRATCH = {}
-
-
-def _referenced_kv_to_bf16(k_fp8, kv_indices):
-    """Dequantize only referenced KV rows instead of the entire pool.
-    Allocate the persistent CUDA graph buffer outside inference mode.
-    """
-    key = (k_fp8.device, tuple(k_fp8.shape))
-    scratch = _MLA_BF16_DEQUANT_SCRATCH.get(key)
-    if scratch is None:
-        with torch.inference_mode(False):
-            scratch = torch.empty(
-                k_fp8.shape, dtype=torch.bfloat16, device=k_fp8.device
-            )
-        _MLA_BF16_DEQUANT_SCRATCH[key] = scratch
-    idx = kv_indices.long()
-    scratch[idx] = k_fp8[idx].to(torch.bfloat16)
-    return scratch
-
-
-def _verify_plan_indptr_cpu(bs, draft_token_num, seq_lens_cpu):
-    """Build verify indptr on CPU to avoid FlashInfer plan's blocking GPU-to-host synchronization."""
-    n = draft_token_num
-    qo_indptr = torch.arange(0, (bs + 1) * n, step=n, dtype=torch.int32)
-    kv_len_arr = seq_lens_cpu[:bs].to(torch.int32) + n
-    kv_indptr = torch.zeros(bs + 1, dtype=torch.int32)
-    kv_indptr[1:] = torch.cumsum(kv_len_arr, dim=0)
-    return qo_indptr, kv_indptr, kv_len_arr
-
-
-def _extend_plan_indptr_cpu(bs, seq_lens_cpu, extend_seq_lens_cpu):
-    """Build extend indptr on CPU to avoid FlashInfer plan's blocking GPU-to-host synchronization."""
-    kv_len_arr = seq_lens_cpu[:bs].to(torch.int32)
-    kv_indptr = torch.zeros(bs + 1, dtype=torch.int32)
-    kv_indptr[1:] = torch.cumsum(kv_len_arr, dim=0)
-    qo_indptr = torch.zeros(bs + 1, dtype=torch.int32)
-    qo_indptr[1:] = torch.cumsum(
-        torch.tensor(extend_seq_lens_cpu[:bs], dtype=torch.int32), dim=0
-    )
-    return qo_indptr, kv_indptr, kv_len_arr
 
 
 @dataclass
@@ -285,24 +242,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             and not get_exec().kernel.flashinfer_mla_disable_ragged
         )
         self.page_size = model_runner.page_size
-        self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
-        self.kv_lora_rank = model_runner.model_config.kv_lora_rank
-        self.dsa_scaled_kv_layout = self.token_to_kv_pool.dsa_kv_cache_store_fp8
-        self.use_dsa_scaled_kv = (
-            self.dsa_scaled_kv_layout and self.qk_rope_head_dim == 0
-        )
-        self._dsa_num_tiles = self.kv_lora_rank // 128
-        self._dsa_ckv_scale_buf = None
-        if self.use_dsa_scaled_kv:
-            kv_pool = self.token_to_kv_pool
-            self._dsa_ckv_scale_buf = torch.empty(
-                (kv_pool.size + kv_pool.page_size, 1, self._dsa_num_tiles),
-                dtype=torch.float32,
-                device=model_runner.device,
-            )
-        self.extend_scale_kv_indices = None
-        self.extend_scale_kv_indptr = None
-        self.extend_scale_kv_indptr_idx = 0
 
         # Allocate buffers
         # different from flashinfer zero_init_global_workspace_buffer
@@ -343,10 +282,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=self.fmha_backend
         )
-
-        self.decode_bf16_kv_indices = None
-        self.extend_bf16_kv_indices = None
-        self.decode_fp8_native = get_platform().is_sm90
 
         if not self.skip_prefill:
             self.prefill_wrapper_paged = BatchMLAPagedAttentionWrapper(
@@ -495,19 +430,13 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 prefill_wrapper_paged=self.prefill_wrapper_verify,
                 use_ragged=False,
                 spec_info=forward_batch.spec_info,
-                is_verify=True,
-                seq_lens_cpu=forward_batch.seq_lens_cpu,
             )
             self.forward_metadata = PrefillMetadata(self.prefill_wrapper_verify, False)
-            self.extend_scale_kv_indices = self.extend_bf16_kv_indices
-            self.extend_scale_kv_indptr = None
-            self.extend_scale_kv_indptr_idx = 0
         else:
             prefix_lens = forward_batch.extend_prefix_lens
             extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             use_ragged = (
                 not get_exec().kernel.flashinfer_mla_disable_ragged
-                and self.qk_rope_head_dim > 0
                 and extend_no_prefix
                 # Captured prefill (tc_piecewise or breakable) must use paged
                 # prefill: it stays compatible with prefix cache, and the ragged
@@ -549,8 +478,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 qo_indptr_cpu=qo_indptr_cpu,
                 kv_indptr_cpu=kv_indptr_cpu,
                 kv_len_arr_cpu=kv_len_arr_cpu,
-                seq_lens_cpu=forward_batch.seq_lens_cpu,
-                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrapper_paged, use_ragged
@@ -683,12 +610,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     if use_generic_fast_plan
                     else None
                 ),
-                is_verify=True,
-                seq_lens_cpu=seq_lens_cpu,
             )
-            self.extend_scale_kv_indices = self.cuda_graph_kv_indices
-            self.extend_scale_kv_indptr = self.cuda_graph_kv_indptr
-            self.extend_scale_kv_indptr_idx = bs
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
@@ -789,8 +711,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     self.token_to_kv_pool.set_mla_kv_buffer(layer, cache_loc, k, k_rope)
                 else:
                     self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
-        if self.qk_rope_head_dim == 0:
-            q_rope = None
         if q_rope is not None:
             q = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
@@ -818,9 +738,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 forward_batch.attn_dcp_metadata is not None
                 and forward_batch.attn_dcp_metadata.dcp_kv_buffer is not None
             ):
-                k_buf = forward_batch.attn_dcp_metadata.dcp_kv_buffer
+                k_buf = forward_batch.attn_dcp_metadata.dcp_kv_buffer.to(q.dtype)
             else:
-                k_buf = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                k_buf = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
             if q_rope is None:
                 qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                 q, q_rope = (
@@ -828,83 +748,15 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     qall[:, :, layer.v_head_dim :],
                 )
             o = q.new_empty(q.shape)
-            fp8_run_kwargs = {}
-            if k_buf.dtype == torch.float8_e4m3fn:
-                if self.use_dsa_scaled_kv:
-                    k_buf, fp8_run_kwargs = self._scaled_fp8_kv_kwargs(
-                        k_buf,
-                        (
-                            self.extend_scale_kv_indices
-                            if forward_batch.forward_mode.is_target_verify()
-                            else self.extend_bf16_kv_indices
-                        ),
-                        (
-                            self.extend_scale_kv_indptr
-                            if forward_batch.forward_mode.is_target_verify()
-                            else None
-                        ),
-                        self.extend_scale_kv_indptr_idx,
-                    )
-                elif (
-                    forward_batch.forward_mode.is_target_verify()
-                    and self.decode_fp8_native
-                ):
-                    kv_scale = (
-                        layer.k_scale_float if layer.k_scale_float is not None else 1.0
-                    )
-                    fp8_run_kwargs = {"ckv_scale": kv_scale, "kpe_scale": kv_scale}
-                else:
-                    k_buf = self._dequant_referenced_kv_extend(k_buf)
-            elif k_buf.dtype != q.dtype:
-                k_buf = k_buf.to(q.dtype)
             o = prefill_wrapper_paged.run(
                 q,
                 q_rope,
                 k_buf[:, :, : layer.v_head_dim],
                 k_buf[:, :, layer.v_head_dim :],
                 out=o,
-                **fp8_run_kwargs,
             )
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-
-    def _dequant_referenced_kv(self, k_fp8):
-        idx = self.decode_bf16_kv_indices
-        if idx is None:
-            return k_fp8.to(torch.bfloat16)
-        return _referenced_kv_to_bf16(k_fp8, idx)
-
-    def _dequant_referenced_kv_extend(self, k_fp8):
-        idx = self.extend_bf16_kv_indices
-        if idx is None:
-            return k_fp8.to(torch.bfloat16)
-        return _referenced_kv_to_bf16(k_fp8, idx)
-
-    def _scaled_fp8_kv_kwargs(self, k_fp8, kv_indices, kv_indptr=None, kv_indptr_idx=0):
-        """Gather referenced per-group FP8 scales into an index-compatible persistent buffer."""
-        assert self.use_dsa_scaled_kv
-        assert self._dsa_ckv_scale_buf is not None
-        scale_src = k_fp8[
-            :, :, self.kv_lora_rank : self.kv_lora_rank + self._dsa_num_tiles * 4
-        ].view(torch.float32)
-        if kv_indptr is not None:
-            gather_dsa_kv_scales(
-                scale_src,
-                self._dsa_ckv_scale_buf,
-                kv_indices,
-                kv_indptr,
-                kv_indptr_idx,
-            )
-        elif kv_indices is None:
-            self._dsa_ckv_scale_buf.copy_(scale_src)
-        else:
-            idx = kv_indices.long()
-            self._dsa_ckv_scale_buf[idx] = scale_src[idx]
-        return k_fp8[:, :, : self.kv_lora_rank], {
-            "ckv_scale": 1.0,
-            "kpe_scale": 1.0,
-            "ckv_scale_arr": self._dsa_ckv_scale_buf,
-        }
 
     def forward_decode(
         self,
@@ -940,8 +792,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     )
 
         # Reshape inputs
-        if self.qk_rope_head_dim == 0:
-            q_rope = None
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
@@ -952,22 +802,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             q_nope = reshaped_q[:, :, : layer.v_head_dim]
             q_rope = reshaped_q[:, :, layer.v_head_dim :]
 
-        k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        fp8_run_kwargs = {}
-        if k_buffer.dtype == torch.float8_e4m3fn:
-            if self.use_dsa_scaled_kv:
-                k_buffer, fp8_run_kwargs = self._scaled_fp8_kv_kwargs(
-                    k_buffer, self.decode_bf16_kv_indices
-                )
-            elif self.decode_fp8_native:
-                kv_scale = (
-                    layer.k_scale_float if layer.k_scale_float is not None else 1.0
-                )
-                fp8_run_kwargs = {"ckv_scale": kv_scale, "kpe_scale": kv_scale}
-            else:
-                k_buffer = self._dequant_referenced_kv(k_buffer)
-        elif k_buffer.dtype != q.dtype:
-            k_buffer = k_buffer.to(q.dtype)
+        k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
 
         o = q_nope.new_empty(q_nope.shape)
         # for decode and dcp_world_size > 1, lse should be returned to compute final attn_out
@@ -982,7 +817,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             return_lse=(
                 forward_batch.forward_mode.is_decode() and get_parallel().dcp_enabled
             ),
-            **fp8_run_kwargs,
         )
         if isinstance(o, tuple):
             out, lse = o
@@ -1004,11 +838,6 @@ class FlashInferMLAIndicesUpdaterDecode:
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
         self.scaling = model_runner.model_config.scaling
         self.data_type = model_runner.dtype
-        self.kv_data_type = (
-            model_runner.kv_cache_dtype
-            if model_runner.kv_cache_dtype == torch.float8_e4m3fn
-            else model_runner.dtype
-        )
         self.attn_backend = attn_backend
 
         # Buffers and wrappers
@@ -1101,11 +930,6 @@ class FlashInferMLAIndicesUpdaterDecode:
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
-        self.attn_backend.decode_bf16_kv_indices = kv_indices
-        plan_kv_data_type = (
-            self.kv_data_type if self.attn_backend.decode_fp8_native else self.data_type
-        )
-
         if not init_metadata_replay:
             wrapper.plan(
                 q_indptr,
@@ -1119,7 +943,7 @@ class FlashInferMLAIndicesUpdaterDecode:
                 False,
                 sm_scale,
                 self.data_type,
-                plan_kv_data_type,
+                self.data_type,
             )
         else:
             wrapper.plan(
@@ -1134,7 +958,7 @@ class FlashInferMLAIndicesUpdaterDecode:
                 False,
                 sm_scale,
                 self.data_type,
-                plan_kv_data_type,
+                self.data_type,
             )
 
 
@@ -1151,11 +975,6 @@ class FlashInferMLAIndicesUpdaterPrefill:
         self.scaling = model_runner.model_config.scaling
         self.data_type = model_runner.dtype
         self.q_data_type = model_runner.dtype
-        self.kv_data_type = (
-            model_runner.kv_cache_dtype
-            if model_runner.kv_cache_dtype == torch.float8_e4m3fn
-            else model_runner.dtype
-        )
         self.attn_backend = attn_backend
 
         # Buffers and wrappers
@@ -1182,9 +1001,6 @@ class FlashInferMLAIndicesUpdaterPrefill:
         qo_indptr_cpu: Optional[torch.Tensor] = None,
         kv_indptr_cpu: Optional[torch.Tensor] = None,
         kv_len_arr_cpu: Optional[torch.Tensor] = None,
-        is_verify: bool = False,
-        seq_lens_cpu: Optional[torch.Tensor] = None,
-        extend_seq_lens_cpu: Optional[List[int]] = None,
     ):
         if use_ragged:
             paged_kernel_lens = prefix_lens
@@ -1210,9 +1026,6 @@ class FlashInferMLAIndicesUpdaterPrefill:
             qo_indptr_cpu=qo_indptr_cpu,
             kv_indptr_cpu=kv_indptr_cpu,
             kv_len_arr_cpu=kv_len_arr_cpu,
-            is_verify=is_verify,
-            seq_lens_cpu=seq_lens_cpu,
-            extend_seq_lens_cpu=extend_seq_lens_cpu,
         )
 
     def call_begin_forward(
@@ -1234,9 +1047,6 @@ class FlashInferMLAIndicesUpdaterPrefill:
         qo_indptr_cpu: Optional[torch.Tensor] = None,
         kv_indptr_cpu: Optional[torch.Tensor] = None,
         kv_len_arr_cpu: Optional[torch.Tensor] = None,
-        is_verify: bool = False,
-        seq_lens_cpu: Optional[torch.Tensor] = None,
-        extend_seq_lens_cpu: Optional[List[int]] = None,
     ):
         bs = len(seq_lens)
         sm_scale = self.scaling
@@ -1282,7 +1092,6 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 )
             )
 
-        self.attn_backend.extend_bf16_kv_indices = kv_indices
         if use_ragged:
             # ragged prefill
             wrapper_ragged.begin_forward(
@@ -1322,38 +1131,14 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 # built from full seq_lens and don't match, so fall back to GPU.
                 qo_indptr_cpu = kv_indptr_cpu = kv_len_arr_cpu = None
 
-            if qo_indptr_cpu is not None:
-                plan_qo_indptr = qo_indptr_cpu
-                plan_kv_indptr = kv_indptr_cpu
-                plan_kv_len_arr = kv_len_arr_cpu
-            elif (
-                is_verify
-                and seq_lens_cpu is not None
-                and attn_dcp_metadata is None
-                and spec_info is not None
-            ):
-                plan_qo_indptr, plan_kv_indptr, plan_kv_len_arr = (
-                    _verify_plan_indptr_cpu(bs, spec_info.draft_token_num, seq_lens_cpu)
-                )
-            elif (
-                spec_info is None
-                and seq_lens_cpu is not None
-                and extend_seq_lens_cpu is not None
-                and attn_dcp_metadata is None
-            ):
-                plan_qo_indptr, plan_kv_indptr, plan_kv_len_arr = (
-                    _extend_plan_indptr_cpu(bs, seq_lens_cpu, extend_seq_lens_cpu)
-                )
-            else:
-                plan_qo_indptr = qo_indptr
-                plan_kv_indptr = kv_indptr
-                plan_kv_len_arr = kv_indptr[1:] - kv_indptr[:-1]
-            plan_kv_data_type = (
-                self.kv_data_type
-                if (is_verify and self.attn_backend.decode_fp8_native)
-                or self.attn_backend.use_dsa_scaled_kv
-                else self.data_type
+            plan_qo_indptr = qo_indptr if qo_indptr_cpu is None else qo_indptr_cpu
+            plan_kv_indptr = kv_indptr if kv_indptr_cpu is None else kv_indptr_cpu
+            plan_kv_len_arr = (
+                kv_indptr[1:] - kv_indptr[:-1]
+                if kv_len_arr_cpu is None
+                else kv_len_arr_cpu
             )
+
             wrapper_paged.plan(
                 plan_qo_indptr,
                 plan_kv_indptr,
@@ -1366,7 +1151,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 True,
                 sm_scale,
                 self.q_data_type,
-                plan_kv_data_type,
+                self.data_type,
             )
 
 
