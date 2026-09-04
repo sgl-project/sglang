@@ -10,7 +10,7 @@ import sys
 from abc import abstractmethod
 from collections import defaultdict
 from multiprocessing import shared_memory
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -36,8 +36,13 @@ from sglang.srt.managers.schedule_batch import (
     CudaIpcTensorTransportProxy,
     Modality,
     MultimodalInputs,
+    MultimodalProcessorOutput,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.multimodal.transport import (
+    TensorTransportMode,
+    determine_tensor_transport_mode,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_server_args,
@@ -51,11 +56,6 @@ from sglang.utils import logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log
 # propagation that can cause some log messages (like 'server is fired up') to not appear
 # in the console when multimodal support is enabled.
-
-# TODO(mick): nccl
-# cuda_ipc: for intranode tensor sharing
-TensorTransportMode = Literal["cuda_ipc", "auto", "default"]
-
 
 _GPU_FEATURE_BUFFER: Optional[torch.Tensor] = None
 _BUFFER_OFFSET = 0
@@ -365,6 +365,27 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
         return ret_input_ids
 
 
+# masked_scatter_ materializes the expanded [num_tokens, hidden] bool mask plus
+# an int64 prefix-sum over it (~9 B per num_tokens x hidden element); the
+# cumsum-derived row indices keep the transients O(num_tokens) and sync-free.
+def _scatter_mm_embedding(
+    dest: torch.Tensor, mask: torch.Tensor, src: torch.Tensor
+) -> None:
+    # mask: [num_tokens, 1] bool; src: [num_mm_tokens, width] in sequence order.
+    src = src.to(dest.device, dest.dtype)
+    num_src_rows = src.size(0)
+    flat_mask = mask.view(-1)
+    ranks = torch.cumsum(flat_mask, dim=0) - 1
+    # False rows collapse into the discard slot num_src_rows; a mask/src
+    # row-count mismatch device-asserts in scatter_/index_copy_ (poison init).
+    ranks = ranks.masked_fill(~flat_mask, num_src_rows)
+    rows = torch.full(
+        (num_src_rows + 1,), dest.size(0), dtype=torch.long, device=dest.device
+    )
+    rows.scatter_(0, ranks, torch.arange(flat_mask.numel(), device=dest.device))
+    dest.index_copy_(0, rows[:num_src_rows], src)
+
+
 def embed_mm_inputs(
     mm_inputs_list: List[MultimodalInputs],
     extend_prefix_lens: List[int],
@@ -486,18 +507,16 @@ def embed_mm_inputs(
         other_info["input_deepstack_embeds"] = input_deepstack_embeds
 
     # 4. scatter embeddings into input embedding
-    # masked_scatter_ avoids the cudaStreamSynchronize that torch.where triggers.
-    def _scatter(dest, mask, src):
-        dest.masked_scatter_(mask.expand_as(dest), src.to(dest.device, dest.dtype))
-
     for i, modality, embedding, mask in zip(
         range(len(embeddings)), modalities, embeddings, masks
     ):
         if embedding is None or mask is None:
             continue
-        _scatter(input_embeds, mask, embedding)
+        _scatter_mm_embedding(dest=input_embeds, mask=mask, src=embedding)
         if use_deepstack.get(modality, None):
-            _scatter(input_deepstack_embeds, mask, deepstack_embeddings[i])
+            _scatter_mm_embedding(
+                dest=input_deepstack_embeds, mask=mask, src=deepstack_embeddings[i]
+            )
 
     return input_embeds, other_info
 
@@ -709,6 +728,7 @@ def general_mm_embed_routine(
                                 if (
                                     isinstance(precomputed_embeddings, torch.Tensor)
                                     and precomputed_embeddings.is_cuda
+                                    and not mm_item.keep_device_embedding
                                 ):
                                     mm_item.precomputed_embeddings = (
                                         precomputed_embeddings.to(
@@ -1266,6 +1286,9 @@ class ShmPointerMMData:
     """
 
     def __init__(self, tensor: torch.Tensor, precomputed_hash: Optional[int] = None):
+        self._shm_handle = None
+        self.tensor = None
+        self._materialization_error = None
         if not tensor.is_cpu:
             tensor = tensor.cpu()
         if not tensor.is_contiguous():
@@ -1292,7 +1315,6 @@ class ShmPointerMMData:
             raise
         self.shm_name = shm.name
         shm.close()
-        self._shm_handle = None
 
     def __getstate__(self):
         return {
@@ -1307,27 +1329,78 @@ class ShmPointerMMData:
         self.shape = state["shape"]
         self.dtype = state["dtype"]
         self.precomputed_hash = state.get("precomputed_hash")
-        self._shm_handle = shared_memory.SharedMemory(name=self.shm_name)
-        # Zero-copy view into shared memory (no clone, no unlink)
-        self.tensor = torch.frombuffer(self._shm_handle.buf, dtype=self.dtype).reshape(
-            self.shape
-        )
+        self._shm_handle = None
+        self.tensor = None
+        self._materialization_error = None
+
+        # keep deserialization infallible so all TP ranks finish the broadcast
+        handle = None
+        tensor = None
+        try:
+            handle = shared_memory.SharedMemory(name=self.shm_name)
+            tensor = torch.frombuffer(handle.buf, dtype=self.dtype)
+            self.tensor = tensor.reshape(self.shape)
+            self._shm_handle = handle
+        except Exception as error:
+            tensor = None
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception:
+                    logger.warning(
+                        "Failed to close a malformed multimodal SHM handle",
+                        exc_info=True,
+                    )
+            self._materialization_error = f"{type(error).__name__}: {error}"
 
     def materialize(self) -> torch.Tensor:
         """Clone tensor from shm to owned memory, then release shm handle."""
-        tensor = self.tensor.clone()
-        if self._shm_handle is not None:
-            self._shm_handle.close()
+        try:
+            if self._materialization_error is not None:
+                raise RuntimeError(self._materialization_error)
+            return self.tensor.clone()
+        finally:
+            self.close_and_unlink()
+
+    def close_and_unlink(self) -> None:
+        """Release this rank's view and unlink the shared feature segment."""
+        handle = self._shm_handle
+        self._shm_handle = None
+        self.tensor = None
+        if handle is None:
             try:
-                self._shm_handle.unlink()
+                handle = shared_memory.SharedMemory(name=self.shm_name)
             except FileNotFoundError:
-                pass  # Another rank already unlinked
-            self._shm_handle = None
-        return tensor
+                return
+            except OSError:
+                logger.warning(
+                    "Failed to reopen a multimodal SHM segment for cleanup",
+                    exc_info=True,
+                )
+                return
+        try:
+            try:
+                handle.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.warning(
+                    "Failed to unlink a multimodal SHM segment",
+                    exc_info=True,
+                )
+        finally:
+            try:
+                handle.close()
+            except Exception:
+                logger.warning(
+                    "Failed to close a multimodal SHM handle",
+                    exc_info=True,
+                )
 
     def __del__(self):
         # Only close; never unlink. Unlinking is materialize()'s job.
-        if getattr(self, "_shm_handle", None) is not None:
+        if self._shm_handle is not None:
+            self.tensor = None
             self._shm_handle.close()
             self._shm_handle = None
 
@@ -1335,13 +1408,7 @@ class ShmPointerMMData:
 def _get_is_default_transport():
     global _is_default_tensor_transport
     if _is_default_tensor_transport is None:
-        from sglang.srt.managers.tokenizer_manager import (
-            determine_tensor_transport_mode,
-        )
-
-        _is_default_tensor_transport = (
-            determine_tensor_transport_mode(get_server_args()) == "default"
-        )
+        _is_default_tensor_transport = determine_tensor_transport_mode() == "default"
     return _is_default_tensor_transport
 
 
@@ -1414,16 +1481,39 @@ def has_shm_features(recv_reqs):
         if isinstance(req, BaseBatchReq):
             if has_shm_features(req.batch):
                 return True
-        elif (
-            isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput))
-            and req.mm_inputs
-        ):
+        elif isinstance(
+            req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+        ) and isinstance(req.mm_inputs, (MultimodalProcessorOutput, MultimodalInputs)):
             for item in req.mm_inputs.mm_items:
                 if _feature_has_shm(item.feature):
                     return True
                 if _feature_has_shm(item.precomputed_embeddings):
                     return True
     return False
+
+
+def _discard_tensor_or_list(value) -> None:
+    if isinstance(value, ShmPointerMMData):
+        value.close_and_unlink()
+    elif isinstance(value, (list, tuple)):
+        for tensor in value:
+            if isinstance(tensor, ShmPointerMMData):
+                tensor.close_and_unlink()
+
+
+def discard_shm_features(obj) -> None:
+    """Release SHM features that will not be consumed by this request."""
+    if isinstance(obj, BaseBatchReq):
+        for sub_obj in obj.batch:
+            discard_shm_features(sub_obj)
+        return
+    if not isinstance(obj, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
+        return
+    if not isinstance(obj.mm_inputs, (MultimodalProcessorOutput, MultimodalInputs)):
+        return
+    for item in obj.mm_inputs.mm_items:
+        _discard_tensor_or_list(item.feature)
+        _discard_tensor_or_list(item.precomputed_embeddings)
 
 
 def _unwrap_tensor_or_list(value):
@@ -1451,10 +1541,9 @@ def unwrap_shm_features(obj):
             unwrap_shm_features(sub_obj)
         return obj
     # Handle single requests
-    if (
-        isinstance(obj, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput))
-        and obj.mm_inputs
-    ):
+    if isinstance(
+        obj, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+    ) and isinstance(obj.mm_inputs, (MultimodalProcessorOutput, MultimodalInputs)):
         for item in obj.mm_inputs.mm_items:
             if item.feature is not None:
                 item.feature = _unwrap_tensor_or_list(item.feature)

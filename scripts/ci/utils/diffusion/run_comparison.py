@@ -362,6 +362,16 @@ def _build_sglang_payload(case: dict) -> dict:
     ):
         if key in case:
             payload[key] = case[key]
+
+    # Model-specific request fields outside the common schema -- MiniMax-H3
+    # derives its shape from `target` and rejects an explicit num_frames, so a
+    # case needs to both add keys and drop common ones. A null value removes
+    # the key rather than sending null.
+    for key, value in (case.get("sglang_request_extra") or {}).items():
+        if value is None:
+            payload.pop(key, None)
+        else:
+            payload[key] = value
     return payload
 
 
@@ -845,9 +855,9 @@ def _install_framework(fw_name: str, dry_run: bool = False) -> bool:
     if dry_run:
         print(f"  [DRY-RUN] Would install: bash {INSTALL_SCRIPT} {fw_name}")
         return True
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Installing framework: {fw_name}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     ret = subprocess.run(
         ["bash", str(INSTALL_SCRIPT), fw_name],
         timeout=600,
@@ -856,6 +866,20 @@ def _install_framework(fw_name: str, dry_run: bool = False) -> bool:
         print(f"  WARNING: {fw_name} installation failed (exit {ret.returncode})")
         return False
     return True
+
+
+def _get_checkout_commit_sha() -> str:
+    fallback = os.environ.get("GITHUB_SHA", "unknown")
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return fallback
+    return result.stdout.strip() or fallback
 
 
 def run_comparison(
@@ -872,7 +896,7 @@ def run_comparison(
     Each non-sglang framework is installed right before its cases run.
     """
     timestamp = datetime.now(timezone.utc).isoformat()
-    commit_sha = os.environ.get("GITHUB_SHA", "unknown")
+    commit_sha = _get_checkout_commit_sha()
     run_id = os.environ.get("GITHUB_RUN_ID", "local")
 
     log_dir = Path("comparison-logs")
@@ -919,9 +943,9 @@ def run_comparison(
             installed_fws.add(fw_name)
 
         for case, fw_cfg in pairs:
-            print(f"\n{'='*60}")
+            print(f"\n{'=' * 60}")
             print(f"Case: {case['id']} | Model: {case['model']} | Framework: {fw_name}")
-            print(f"{'='*60}")
+            print(f"{'=' * 60}")
 
             if dry_run:
                 cmd = build_server_cmd(fw_name, case, fw_cfg, port)
@@ -958,9 +982,9 @@ def run_comparison(
     print(f"\nResults written to {output}")
 
     # Print summary table
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("SUMMARY")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     for r in results:
         lat = f"{r['latency_s']:.2f}s" if r["latency_s"] else r.get("error", "N/A")
         print(f"  {r['case_id']:30s} | {r['framework']:12s} | {lat}")

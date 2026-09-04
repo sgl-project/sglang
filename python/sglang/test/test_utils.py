@@ -33,7 +33,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from sglang.benchmark.serving import run_benchmark
-from sglang.global_config import global_config
+from sglang.lang.global_config import global_config
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -147,12 +147,13 @@ DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST = "Barrrrry/DeepSeek-R1-W4AFP8"
 DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
 
 # Nightly tests
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = (
-    "meta-llama/Llama-3.1-8B-Instruct,Qwen/Qwen3-8B,Qwen/Qwen3-4B"
+# Deliberate omission: a model another registered suite already uses as its base
+# model is left out, since a regression there surfaces in that suite instead.
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = (
+    "meta-llama/Llama-3.1-70B-Instruct,Qwen/Qwen2-57B-A14B-Instruct"
 )
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = "meta-llama/Llama-3.1-70B-Instruct,mistralai/Mixtral-8x7B-Instruct-v0.1,Qwen/Qwen2-57B-A14B-Instruct"
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8,neuralmagic/Mistral-7B-Instruct-v0.3-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,neuralmagic/gemma-2-2b-it-FP8"
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,zai-org/GLM-4.5-Air-FP8"
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = "neuralmagic/Mistral-7B-Instruct-v0.3-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,neuralmagic/gemma-2-2b-it-FP8"
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4,hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4,hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN = "Qwen/Qwen2.5-1.5B-Instruct"
 DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST = "Qwen/Qwen2.5-VL-3B-Instruct"
@@ -219,17 +220,10 @@ def is_rust_server_built():
     """Return whether the embedded Rust server extension (``SGLANG_RUST_SERVER``)
     is importable.
 
-    ``sglang/srt/server/`` is not in the source tree — it is produced by
-    ``setup.py build_rust --inplace``, so on a build without it ``find_spec``
-    raises ``ModuleNotFoundError`` for the missing *parent* package rather than
-    returning ``None`` for the missing leaf. Suites gate a rust-server subclass on
-    this at class-definition time, so letting that escape would fail the whole
-    module import instead of skipping the one class.
+    The ``sglang.srt.rust_extensions`` Python package is always present; the
+    private ``_server`` module exists only when the PyO3 extension was built.
     """
-    try:
-        return importlib.util.find_spec("sglang.srt.server._core") is not None
-    except ModuleNotFoundError:
-        return False
+    return importlib.util.find_spec("sglang.srt.rust_extensions._server") is not None
 
 
 def _use_cached_default_models(model_repo: str):
@@ -663,6 +657,17 @@ def _wait_for_server_health(
             time.sleep(10)
 
     return False, "Server failed to start within the timeout period"
+
+
+def unified_radix_tree_server_env(
+    tree_core_backend: str, **extra_env: str
+) -> dict[str, str]:
+    return {
+        **os.environ,
+        **extra_env,
+        "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+        "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND": tree_core_backend,
+    }
 
 
 def popen_launch_server(
@@ -2095,30 +2100,50 @@ def _wait_for_gpu_idle_in_ci(
             pass
 
 
+# Names the runner kits stamp onto a record that are not members of it.
+# `ModelRunner` computes `use_mla_backend` on itself; the kits copy that bool
+# onto the record they hand the runner, and `hasattr` cannot see it.
+_RUNNER_WRITTEN_NAMES = frozenset({"use_mla_backend"})
+
+
 def server_args_variant(server_args, **fields):
     """A modified deep copy of a config, for a test double whose fixture
     differs from the (possibly published, read-only) config it starts from.
     The receiver is untouched; the copy keeps its read-only guard.
 
-    A name may also shadow a method with a fixture value (the runner kits set
-    ``use_mla_backend``, a method ModelRunner itself overwrites at init);
-    names that exist nowhere on the class fail loudly."""
+    A name may also be one the kits stamp on rather than a field (see
+    ``_RUNNER_WRITTEN_NAMES``); names that exist nowhere fail loudly."""
     variant = copy.deepcopy(server_args)
     cls = type(variant)
     unknown = {
         name
         for name in fields
-        if name not in cls.__dataclass_fields__ and not hasattr(cls, name)
+        if name not in cls.__dataclass_fields__
+        and not hasattr(cls, name)
+        and name not in _RUNNER_WRITTEN_NAMES
     }
     if unknown:
         raise ValueError(f"unknown ServerArgs field(s): {sorted(unknown)}")
+    # Reach the stash as well as the fields (the bags project from raw input
+    # + declarations); through `object` because the copy keeps its read-only
+    # guard.
+    stash = getattr(variant, "_resolved_overrides", None)
+    if stash is None:
+        stash = []
+        object.__setattr__(variant, "_resolved_overrides", stash)
+    declared = {
+        name: value
+        for name, value in fields.items()
+        if name in cls.__dataclass_fields__
+    }
+    if declared:
+        stash.append(("server_args_variant", dict(declared)))
     for name, value in fields.items():
         object.__setattr__(variant, name, value)
     return variant
 
 
 class CustomTestCase(unittest.TestCase):
-
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
 
@@ -2221,12 +2246,6 @@ class ModelLaunchSettings:
         for fixed_arg in fixed_args:
             if fixed_arg not in self.extra_args:
                 self.extra_args.append(fixed_arg)
-
-
-class ModelEvalMetrics:
-    def __init__(self, accuracy: float, eval_time: float):
-        self.accuracy = accuracy
-        self.eval_time = eval_time
 
 
 def extract_trace_link_from_bench_one_batch_server_output(output: str) -> str:

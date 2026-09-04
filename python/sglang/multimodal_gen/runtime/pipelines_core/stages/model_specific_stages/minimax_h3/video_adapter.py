@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import math
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
@@ -69,8 +70,7 @@ class MiniMaxH3VideoModelAdapter:
     def validate_task_gate(self, task: Any, *, provided: bool) -> None:
         if not provided or task is None:
             raise ValueError(
-                "task is required for MiniMax H3; supported tasks: "
-                "fl2va, ref2va, t2va"
+                "task is required for MiniMax H3; supported tasks: fl2va, ref2va, t2va"
             )
         if not isinstance(task, str):
             raise ValueError("task must be a non-empty string for MiniMax H3")
@@ -329,16 +329,22 @@ class MiniMaxH3VideoModelAdapter:
             if shape.get("width") is not None and shape.get("height") is not None:
                 expected_size = (int(shape["width"]), int(shape["height"]))
 
-        final_media_fields: dict[str, str] = {}
-        for output_index, output_path in enumerate(output_paths):
-            media_fields = _probe_minimax_h3_output_fields(
+        def probe_output(output_path: str) -> dict[str, str]:
+            return _probe_minimax_h3_output_fields(
                 output_path,
                 expected_frame_count=expected_frame_count,
                 expected_size=expected_size,
             )
-            if output_index == 0:
-                final_media_fields = media_fields
-            elif media_fields != final_media_fields:
+
+        if len(output_paths) > 1:
+            with ThreadPoolExecutor(max_workers=min(4, len(output_paths))) as pool:
+                media_fields_by_output = list(pool.map(probe_output, output_paths))
+        else:
+            media_fields_by_output = [probe_output(output_paths[0])]
+
+        final_media_fields = media_fields_by_output[0]
+        for output_index, media_fields in enumerate(media_fields_by_output[1:], 1):
+            if media_fields != final_media_fields:
                 raise RuntimeError(
                     "generated MiniMax H3 outputs have inconsistent media metadata: "
                     f"output 0={final_media_fields}, output "
