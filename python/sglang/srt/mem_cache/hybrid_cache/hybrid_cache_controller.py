@@ -1054,8 +1054,14 @@ class HybridCacheController(BaseHiCacheController):
             return hash_value, kv_hit_pages * self.page_size
 
         extra_info = HiCacheStorageExtraInfo(
-            prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None,
-            extra_info={"pp_rank": pp_rank} if pp_rank is not None else None,
+            prefix_keys=operation.prefix_keys.copy()
+            if operation.prefix_keys
+            else None,
+            extra_info={
+                "request_id": operation.request_id,
+                **({"pp_rank": pp_rank} if pp_rank is not None else {}),
+            },
+
         )
         if operation.pool_transfers:
             hit_result = self.storage_backend.batch_exists_v2(
@@ -1138,7 +1144,10 @@ class HybridCacheController(BaseHiCacheController):
             )
             self._sync_trailing_keys(transfers_nonkv, sidecar_hashes, sidecar_hit_pages)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=operation.prefix_keys)
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=operation.prefix_keys,
+                extra_info={"request_id": operation.request_id},
+            )
             results = self.storage_backend.batch_get_v2(
                 transfers_nonkv, extra_info=extra_info
             )
