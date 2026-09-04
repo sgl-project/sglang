@@ -179,11 +179,11 @@ def can_dsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
 def cp_zigzag_full_plan_rows(
     forward_batch: "ForwardBatch", device: torch.device
 ) -> torch.Tensor | None:
-    cp_meta = getattr(forward_batch, "attn_cp_metadata", None)
+    cp_meta = forward_batch.attn_cp_metadata
     if cp_meta is None or getattr(cp_meta, "zigzag_index", None) is None:
         return None
     if (
-        getattr(forward_batch, "extend_seq_lens_cpu", None) is None
+        forward_batch.extend_seq_lens_cpu is None
         or getattr(cp_meta, "split_list", None) is None
     ):
         return None
