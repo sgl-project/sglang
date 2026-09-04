@@ -316,7 +316,7 @@ class ModelRunner:
 
     def supports_sampling_observer(self) -> bool:
         """Whether this runner's sampling path publishes observer output."""
-        return self.server_args.dllm_algorithm is None and self.spec_algorithm.is_none()
+        return get_exec().dllm.dllm_algorithm is None and self.spec_algorithm.is_none()
 
     def __init__(
         self,
