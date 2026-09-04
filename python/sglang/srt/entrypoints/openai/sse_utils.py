@@ -13,28 +13,28 @@ _SSE_NL_B = b"\n\n"
 class StreamDelta(msgspec.Struct, omit_defaults=True):
     """Delta content for streaming responses.
 
-    None 字段一律不下发(omit_defaults):Kimi 流式规范要求 reasoning_content
-    出现即必须是字符串(P0.12)、结束帧 delta 为空对象(P1.10)、增量帧不混入
-    无关 null 键(P0.10)—— OpenAI 官方流式输出同样不发 null 字段。此前为让
-    OpenAI Python SDK 的 `data.reasoning_content` 属性恒存在而强制序列化
-    null;但键缺失本就是流式契约的状态信号,客户端应按键存在与否分支,为单一
-    SDK 的取值便利违反 wire 契约会被严格客户端(KVV stream-spec)判协议违规。
+    Null fields are never emitted (omit_defaults): the Kimi stream spec requires
+    reasoning_content to be a string whenever present (P0.12), the end frame to
+    be an empty object (P1.10), and increment frames not to mix in unrelated
+    null keys (P0.10) — matching OpenAI's own streaming output. Key absence is
+    the wire contract's state signal; always serializing null for one SDK's
+    attribute convenience fails strict conformance clients.
     """
 
     reasoning_content: Optional[str] = None
     role: Optional[str] = None
     content: Optional[str] = None
-    # Moonshot 扩展(P0.5):{"token_ids": [int, ...]},仅请求
-    # stream_options.include_internal_content=true 时携带。
+    # Moonshot extension (P0.5): {"token_ids": [int, ...]}; only carried when
+    # the request sets stream_options.include_internal_content=true.
     internal_content: Optional[dict] = None
 
 
 class StreamChoice(msgspec.Struct):
     """A single choice in a streaming response.
 
-    注意不能开 omit_defaults:finish_reason 键必须每帧出现(null 或字符串,
-    P0.8)。usage 仅结束帧填充(P0.4,Moonshot 扩展),中间帧序列化为
-    null —— P1.15 允许中间帧 usage 为 null 或缺失。
+    Must NOT use omit_defaults: the finish_reason key has to appear on every
+    frame (null or string, P0.8). usage is only filled on the end frame (P0.4,
+    Moonshot extension); middle frames serialize it as null, which P1.15 allows.
     """
 
     index: int
