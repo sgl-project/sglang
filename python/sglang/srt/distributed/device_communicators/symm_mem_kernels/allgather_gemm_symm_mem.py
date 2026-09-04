@@ -97,8 +97,9 @@ class AllGatherGemmContextSymmMem(msgspec.Struct):
     NUM_GEMM_SMS: int
     ag_stream: torch.cuda.Stream
 
-    symm_input_buf: torch.Tensor  # [world_size, M, K]
-    symm_ag_a_buf: torch.Tensor  # [M * world_size, K]
+    max_M: int
+    symm_input_buf: torch.Tensor  # [world_size, max_M, K]
+    symm_ag_a_buf: torch.Tensor  # [max_M * world_size, K]
     ag_signal_buf: torch.Tensor  # [world_size] uint32
 
     # symm_mem rendezvous handles
@@ -209,6 +210,7 @@ def create_allgather_gemm_context_symm_mem(
         NUM_COMM_SMS=NUM_COMM_SMS,
         NUM_GEMM_SMS=num_gemm_sms,
         ag_stream=ag_stream,
+        max_M=max_M,
         symm_input_buf=symm_input_buf,
         symm_ag_a_buf=symm_ag_a_buf,
         ag_signal_buf=ag_signal_buf,
@@ -396,9 +398,9 @@ def allgather_gemm_op_symm_mem(
     assert a_bf16.shape[1] == b_fp8.shape[1], "K dimension mismatch"
     assert a_bf16.is_contiguous()
     # Slice-based view() would silently truncate an oversized M_local.
-    assert M_local <= ctx.symm_input_buf.shape[1], (
+    assert M_local <= ctx.max_M, (
         f"M_local={M_local} exceeds symm-mem AG buffer capacity "
-        f"{ctx.symm_input_buf.shape[1]}; prefill buffer grew past the size the "
+        f"{ctx.max_M}; prefill buffer grew past the size the "
         "context was created with"
     )
 
