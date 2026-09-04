@@ -94,7 +94,7 @@ def test_situ_routed_moe_returns_published_output_buffer():
         patch.object(
             mxfp4_module,
             "_prepare_flashinfer_mxfp8_activations",
-            return_value=(packed_topk, x_quant, x_scale),
+            return_value=(x, packed_topk, x_quant, x_scale),
         ),
         patch.dict(
             "sys.modules",
