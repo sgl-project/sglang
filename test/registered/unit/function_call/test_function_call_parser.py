@@ -47,6 +47,44 @@ def _shared_tokenizer(path: str):
     return get_tokenizer(path)
 
 
+class TestFunctionCallParser(unittest.TestCase):
+    def test_incomplete_tool_call_marker_is_preserved(self):
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    parameters={"type": "object", "properties": {}},
+                ),
+            )
+        ]
+        cases = {
+            "mistral": "[TOOL_CALLS",
+            "cohere_command4": "<|START_ACTION|>",
+            "deepseekv3": "<｜tool▁calls▁begin｜>",
+            "deepseekv31": "<｜tool▁calls▁begin｜>",
+            "glm": "<tool_call>",
+            "glm45": "<tool_call>",
+            "hermes": "<tool_call>",
+            "hunyuan": "<tool_calls>",
+            "lfm2": "<|tool_call_start|>",
+            "mimo": "<tool_call>",
+            "poolside_v1": "<tool_call>",
+            "qwen3_coder": "<tool_call>",
+            "step3p5": "<tool_call>",
+        }
+
+        for parser_name, text in cases.items():
+            with self.subTest(parser_name=parser_name):
+                normal_text, calls = FunctionCallParser(
+                    tools, parser_name
+                ).parse_non_stream(text)
+                self.assertEqual(normal_text, text)
+                self.assertEqual(calls, [])
+
+
 class TestInklingDetector(unittest.TestCase):
     def setUp(self):
         self.tools = [
