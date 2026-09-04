@@ -1233,7 +1233,9 @@ class _DeepSeekV4Strategy(StackStrategy):
             _build_deepseek_v4_device_pool_group,
         )
 
-        return _build_deepseek_v4_device_pool_group(kvcache, page_size)
+        return _build_deepseek_v4_device_pool_group(
+            kvcache, page_size, params.mtp_draft_device_pools
+        )
 
     def build(
         self,
@@ -1504,7 +1506,9 @@ class _DsaStrategy(StackStrategy):
             _build_dsa_device_pool_group,
         )
 
-        return _build_dsa_device_pool_group(kvcache, page_size)
+        return _build_dsa_device_pool_group(
+            kvcache, page_size, params.mtp_draft_device_pools
+        )
 
     def build(
         self,

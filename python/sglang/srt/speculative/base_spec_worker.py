@@ -31,6 +31,8 @@ class HiCacheDraftMode(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class HiCacheDraftPlan:
+    """Draft-cache layout shared by HiCache and the direct external linker."""
+
     mode: HiCacheDraftMode = HiCacheDraftMode.NONE
     device_pools: tuple[object, ...] = ()
 
@@ -247,6 +249,7 @@ class BaseSpecWorker(ABC):
         spec_algorithm = target_model_runner.spec_algorithm
         if not (
             get_memory().enable_hierarchical_cache
+            or get_memory().enable_unified_cache_external_linker
             or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
         ):
             return HiCacheDraftPlan()
