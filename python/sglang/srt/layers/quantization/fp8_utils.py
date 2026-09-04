@@ -1605,10 +1605,6 @@ def quant_weight_ue8m0(
     return out_w, out_s
 
 
-def transform_scale_ue8m0_inplace(param, mn):
-    param.data = transform_scale_ue8m0(param.data, mn=mn)
-
-
 # NOTE copy and modified from DeepGEMM
 def transform_scale_ue8m0(sf, mn, use_torch_impl: bool = False):
     import deep_gemm.utils.layout
