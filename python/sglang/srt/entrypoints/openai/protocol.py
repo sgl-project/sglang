@@ -1249,6 +1249,8 @@ class DeltaMessage(BaseModel):
 class ChatCompletionResponseStreamChoice(BaseModel):
     index: int
     delta: DeltaMessage
+    token_ids: Optional[List[int]] = None
+    prompt_token_ids: Optional[List[int]] = None
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[
         Literal[
@@ -1256,6 +1258,15 @@ class ChatCompletionResponseStreamChoice(BaseModel):
         ]
     ] = None
     matched_stop: Union[None, int, str] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.token_ids is None:
+            data.pop("token_ids", None)
+        if self.prompt_token_ids is None:
+            data.pop("prompt_token_ids", None)
+        return data
 
 
 class ChatCompletionStreamResponse(BaseModel):

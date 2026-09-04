@@ -25,8 +25,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
+    ChatCompletionResponseStreamChoice,
     ChatMessage,
     CompletionRequest,
+    DeltaMessage,
     Function,
     ModelCard,
     ModelList,
@@ -691,6 +693,28 @@ class TestModelSerialization(unittest.TestCase):
         self.assertNotIn("token_ids", data)
         self.assertEqual(data["response_token_ids"], [4, 5])
         self.assertEqual(data["meta_info"], {"prompt_tokens": 3})
+
+    def test_stream_choice_token_ids_serialization(self):
+        """Test that stream token ID fields serialize only when set."""
+        default_choice = ChatCompletionResponseStreamChoice(
+            index=0,
+            delta=DeltaMessage(role="assistant", content="Hello"),
+            finish_reason=None,
+        )
+        default_data = default_choice.model_dump()
+        self.assertNotIn("token_ids", default_data)
+        self.assertNotIn("prompt_token_ids", default_data)
+
+        choice = ChatCompletionResponseStreamChoice(
+            index=0,
+            delta=DeltaMessage(role="assistant", content="Hello"),
+            finish_reason=None,
+            token_ids=[4, 5],
+            prompt_token_ids=[1, 2, 3],
+        )
+        data = choice.model_dump()
+        self.assertEqual(data["token_ids"], [4, 5])
+        self.assertEqual(data["prompt_token_ids"], [1, 2, 3])
 
 
 class TestFunctionDeferLoading(unittest.TestCase):

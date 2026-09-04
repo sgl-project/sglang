@@ -789,6 +789,7 @@ class OpenAIServingChat(OpenAIServingBase):
         index: int,
         request: ChatCompletionRequest,
         stream_offsets: Dict[int, int],
+        token_id_offsets: Dict[int, int],
         reasoning_parser_dict: Dict,
         parser_dict: Dict,
         has_tool_calls: Dict[int, bool],
@@ -801,16 +802,28 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> AsyncGenerator[str, None]:
         """Generate SSE chunks for streaming content."""
         offset = stream_offsets.get(index, 0)
+        text = content.get("text") or ""
         if self.tokenizer_manager.server_args.incremental_streaming_output:
-            delta = content["text"]
+            delta = text
         else:
-            delta = content["text"][offset:]
-            stream_offsets[index] = len(content["text"])
+            delta = text[offset:]
+            stream_offsets[index] = len(text)
+
+        chunk_token_ids = None
+        if request.return_token_ids:
+            output_ids = content.get("output_ids") or []
+            if self.tokenizer_manager.server_args.incremental_streaming_output:
+                chunk_token_ids = output_ids
+            else:
+                n_prev_token_id = token_id_offsets.get(index, 0)
+                chunk_token_ids = output_ids[n_prev_token_id:]
+                token_id_offsets[index] = len(output_ids)
 
         # Attach logprobs to the first chunk emitted this step (reasoning,
         # tool-call, or content) so they aren't dropped when a parser is active
         # nor duplicated across chunks; flush any leftover at the end.
         remaining_logprobs = choice_logprobs
+        remaining_token_ids = chunk_token_ids
 
         # Handle reasoning content
         if self.reasoning_parser and request.separate_reasoning:
@@ -838,10 +851,12 @@ class OpenAIServingChat(OpenAIServingBase):
                     model=request.model,
                     index=index,
                     reasoning_content=reasoning_text,
+                    token_ids=remaining_token_ids,
                     logprobs=remaining_logprobs,
                     usage=usage,
                 )
                 remaining_logprobs = None
+                remaining_token_ids = None
 
         # Handle tool calls
         if self._tool_call_parsing_active(request):
@@ -869,7 +884,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         else:
             # Regular content
-            if delta:
+            if delta or remaining_token_ids:
                 usage = None
                 if continuous_usage_stats:
                     usage = UsageProcessor.calculate_token_usage(
@@ -885,19 +900,24 @@ class OpenAIServingChat(OpenAIServingBase):
                     model=request.model,
                     index=index,
                     content=delta,
+                    token_ids=remaining_token_ids,
                     logprobs=remaining_logprobs,
                     usage=usage,
                 )
                 remaining_logprobs = None
+                remaining_token_ids = None
 
         # Flush logprobs still unattached this step — only when a parser is
-        # active, since _process_tool_call_stream may consume the delta and emit
-        # no content chunk. On the plain path an empty-delta step has no chunk
-        # to attach to either way, and a standalone empty-delta logprobs chunk
-        # is not a shape clients expect.
-        if remaining_logprobs is not None and (
+        # active, since _process_tool_call_stream may consume the delta and
+        # emit no content chunk. Token IDs use the same fallback, preserving
+        # the raw token stream independently from parsed deltas.
+        should_flush_logprobs = remaining_logprobs is not None and (
             self.reasoning_parser or self.tool_call_parser
-        ):
+        )
+        should_flush_token_ids = bool(remaining_token_ids) and (
+            self.reasoning_parser or self._tool_call_parsing_active(request)
+        )
+        if should_flush_logprobs or should_flush_token_ids:
             usage = None
             if continuous_usage_stats:
                 usage = UsageProcessor.calculate_token_usage(
@@ -912,6 +932,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 created=int(time.time()),
                 model=request.model,
                 index=index,
+                token_ids=remaining_token_ids,
                 logprobs=remaining_logprobs,
                 usage=usage,
             )
@@ -1048,17 +1069,6 @@ class OpenAIServingChat(OpenAIServingBase):
             request.reasoning_effort = reasoning_effort
 
         if request.stream:
-            if request.return_prompt_token_ids:
-                raise ValueError(
-                    "return_prompt_token_ids is not supported with streaming. "
-                    "Please set stream=false when using return_prompt_token_ids=true."
-                )
-            if request.return_token_ids:
-                raise ValueError(
-                    "return_token_ids is not supported with streaming on "
-                    "/v1/chat/completions. Please set stream=false when using "
-                    "return_token_ids=true."
-                )
             if request.return_meta_info:
                 raise ValueError(
                     "return_meta_info is not supported with streaming. "
@@ -1650,6 +1660,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # State tracking for streaming
         is_firsts = {}
         stream_offsets = {}
+        token_id_offsets = {}
         n_prev_tokens = {}
         has_tool_calls = {}
         finish_reasons = {}
@@ -1749,6 +1760,12 @@ class OpenAIServingChat(OpenAIServingBase):
                         index=index,
                         role="assistant",
                         content="",
+                        prompt_token_ids=(
+                            content.get("prompt_token_ids")
+                            if request.return_prompt_token_ids
+                            or request.return_token_ids
+                            else None
+                        ),
                     )
                     stream_started = True
 
@@ -1758,6 +1775,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     index=index,
                     request=request,
                     stream_offsets=stream_offsets,
+                    token_id_offsets=token_id_offsets,
                     reasoning_parser_dict=reasoning_parser_dict,
                     parser_dict=parser_dict,
                     has_tool_calls=has_tool_calls,
