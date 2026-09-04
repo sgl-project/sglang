@@ -3320,12 +3320,13 @@ class ServerArgs:
     # Model weight update and weight loading
     # -------------------------------------------------------------------------
     startup_weight_load_mode: A[
-        Literal["serial", "overlap"],
+        Literal["serial", "overlap", "auto"],
         (
             "Control startup weight loading relative to CUDA graph capture. "
             "'serial' preserves the existing startup order; 'overlap' stages "
             "checkpoint files while CUDA graphs are captured and commits the "
-            "real weights afterward."
+            "real weights afterward; 'auto' uses overlap for supported "
+            "configurations and otherwise preserves the serial path."
         ),
         NS("model"),
     ] = "serial"
@@ -4110,6 +4111,12 @@ class ServerArgs:
         cfg = resolving_view(self)
 
         return cfg.startup_weight_load_mode == "overlap"
+
+    @property
+    def should_attempt_startup_weight_load_overlap(self) -> bool:
+        cfg = resolving_view(self)
+
+        return cfg.startup_weight_load_mode in ("overlap", "auto")
 
     def __setattr__(self, name, value):
         # Once resolution has finished the record is the READ-ONLY raw input

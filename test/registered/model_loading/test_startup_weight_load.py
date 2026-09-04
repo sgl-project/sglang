@@ -4,10 +4,7 @@ import unittest
 
 import sglang as sgl
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-    CustomTestCase,
-)
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
 register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-small")
 
@@ -37,32 +34,34 @@ class TestStartupWeightLoad(CustomTestCase):
                 logprob_start_len=0,
             )
 
-    def test_overlap_matches_default_serial_startup(self):
+    def test_overlap_and_auto_match_default_serial_startup(self):
         # Omitting the flag is intentional: it pins the merge-safe default path.
         serial = self._generate()
-        overlap = self._generate("overlap")
+        for mode in ("overlap", "auto"):
+            with self.subTest(mode=mode):
+                candidate = self._generate(mode)
 
-        self.assertEqual(serial["output_ids"], overlap["output_ids"])
-        self.assertEqual(serial["text"], overlap["text"])
+                self.assertEqual(serial["output_ids"], candidate["output_ids"])
+                self.assertEqual(serial["text"], candidate["text"])
 
-        serial_logprobs = serial["meta_info"]["output_token_logprobs"]
-        overlap_logprobs = overlap["meta_info"]["output_token_logprobs"]
-        self.assertEqual(len(serial_logprobs), len(overlap_logprobs))
-        self.assertGreater(len(serial_logprobs), 0)
-        for index, (serial_item, overlap_item) in enumerate(
-            zip(serial_logprobs, overlap_logprobs)
-        ):
-            self.assertEqual(
-                serial_item[1],
-                overlap_item[1],
-                f"token id differs at output position {index}",
-            )
-            self.assertAlmostEqual(
-                serial_item[0],
-                overlap_item[0],
-                delta=1e-5,
-                msg=f"logprob differs at output position {index}",
-            )
+                serial_logprobs = serial["meta_info"]["output_token_logprobs"]
+                candidate_logprobs = candidate["meta_info"]["output_token_logprobs"]
+                self.assertEqual(len(serial_logprobs), len(candidate_logprobs))
+                self.assertGreater(len(serial_logprobs), 0)
+                for index, (serial_item, candidate_item) in enumerate(
+                    zip(serial_logprobs, candidate_logprobs)
+                ):
+                    self.assertEqual(
+                        serial_item[1],
+                        candidate_item[1],
+                        f"token id differs at output position {index}",
+                    )
+                    self.assertAlmostEqual(
+                        serial_item[0],
+                        candidate_item[0],
+                        delta=1e-5,
+                        msg=f"logprob differs at output position {index}",
+                    )
 
 
 if __name__ == "__main__":

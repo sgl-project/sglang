@@ -80,13 +80,9 @@ from sglang.srt.connector import (
     get_connector_type,
 )
 from sglang.srt.connector.utils import parse_model_name
-from sglang.srt.distributed import (
-    model_parallel_is_initialized,
-)
+from sglang.srt.distributed import model_parallel_is_initialized
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
-from sglang.srt.layers.moe.utils import (
-    install_shared_experts_fusion_decision,
-)
+from sglang.srt.layers.moe.utils import install_shared_experts_fusion_decision
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
@@ -120,6 +116,7 @@ from sglang.srt.model_loader.weight_utils import (
     multi_thread_pt_weights_iterator,
     np_cache_weights_iterator,
     pt_weights_iterator,
+    restore_optional_checkpoint_parameter_values,
     safetensors_weights_iterator,
     set_runai_streamer_env,
 )
@@ -414,6 +411,7 @@ class DefaultModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
+        self._startup_optional_parameter_values = None
         _validate_default_loader_extra_config(
             extra_config=load_config.model_loader_extra_config,
             load_format=load_config.load_format,
@@ -621,16 +619,9 @@ class DefaultModelLoader(BaseModelLoader):
                 get_model().weight_loader_drop_cache_after_load
             )
 
-            # Prefetch and multi-threaded loading both read the same shards,
-            # competing for I/O on shared/network storage. When prefetch is
-            # active (mmap path, not FASTSAFETENSORS) and the user didn't
-            # explicitly request multi-threaded loading, fall back to the
-            # single-threaded loader and let prefetch feed the page cache.
-            # Setting enable_multithread_load or num_threads in
-            # --model-loader-extra-config opts out (the latter is consumed
-            # only by the multi-threaded iterator, so it signals intent);
-            # e.g. local NVMe, where prefetch is a no-op and multi-threading
-            # helps.
+            # Active prefetch and multithreaded loading reread the same shards.
+            # Unless explicitly requested, use one commit reader to avoid I/O
+            # oversubscription. Explicit multithreading may help local storage.
             if (
                 concurrent_prefetch_active
                 and not weight_loader_disable_mmap
@@ -777,7 +768,7 @@ class DefaultModelLoader(BaseModelLoader):
         *,
         num_threads: int,
     ) -> CheckpointFilePrefetchHandle:
-        """Start CPU-only page-cache staging for already-resolved sources."""
+        """Start CPU-only page-cache prefetching for already-resolved sources."""
         if not all(source.use_safetensors for source in resolved_sources):
             raise ValueError(
                 "Startup weight-loading overlap requires safetensors checkpoints"
@@ -811,24 +802,15 @@ class DefaultModelLoader(BaseModelLoader):
         model: nn.Module,
         model_config: ModelConfig,
     ) -> nn.Module:
-        """Initialize final storage with values safe for graph warmup.
+        """Prepare final storage for graph capture with sentinel weights.
 
-        Mirrors the post-initialization sequence of ``DummyModelLoader``, except
-        that parameters are filled with a detectable sentinel instead of random
-        values so ``commit_model_weights`` can prove every one of them was
-        replaced.
-
-        Note that this runs ``process_weights_after_loading`` on the sentinel
-        values, and ``commit_model_weights`` runs it again on the real weights,
-        so overlap invokes it once more than the serial path. That is safe for
-        the currently supported matrix, where the CUDA unquantized path is a
-        no-op, and it is not covered by the storage manifest, which proves
-        tensor identity rather than idempotence. Any quantization method that
-        mutates weights in place therefore has to be evaluated here before its
-        configuration is added to the supported set.
+        Post-load processing runs once for capture and again for real weights.
+        Each admitted profile must refresh graph-visible storage in place.
         """
         with set_default_torch_dtype(model_config.dtype):
-            initialize_capture_safe_weights(model)
+            self._startup_optional_parameter_values = initialize_capture_safe_weights(
+                model
+            )
             _post_load_weights(model)
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
@@ -853,6 +835,12 @@ class DefaultModelLoader(BaseModelLoader):
     ) -> None:
         """Load real checkpoint values into a capture-ready model."""
 
+        assert self._startup_optional_parameter_values is not None
+        restore_optional_checkpoint_parameter_values(
+            self._startup_optional_parameter_values
+        )
+        self._startup_optional_parameter_values = None
+
         def weights_iterator():
             for resolved_source in resolved_sources:
                 yield from self._get_weights_iterator(
@@ -869,6 +857,36 @@ class DefaultModelLoader(BaseModelLoader):
                 target_device,
             )
         self.counter_after_loading_weights = time.perf_counter()
+
+    def load_initialized_model_from_resolved_sources(
+        self,
+        *,
+        model: nn.Module,
+        model_config: ModelConfig,
+        resolved_sources: Tuple[ResolvedSource, ...],
+        target_device: torch.device,
+    ) -> nn.Module:
+        """Load resolved sources serially into an initialized model.
+
+        Auto uses this path for source-based fallback before sentinel mutation,
+        avoiding a second model allocation.
+        """
+
+        def weights_iterator():
+            for resolved_source in resolved_sources:
+                yield from self._get_weights_iterator(
+                    resolved_source.source,
+                    resolved_source=resolved_source,
+                )
+
+        with set_default_torch_dtype(model_config.dtype):
+            self.load_weights_and_postprocess(
+                model,
+                weights_iterator(),
+                target_device,
+            )
+        self.counter_after_loading_weights = time.perf_counter()
+        return model.eval()
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(
