@@ -1075,6 +1075,20 @@ TWO_GPU_CASES = [
         ),
     ),
     DiffusionTestCase(
+        "qwen_image_t2i_2_gpus_extra_high",
+        DiffusionServerArgs(
+            model_path=DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
+            # Cover the request-gated fused added-QKV path with the same ring setup.
+            ulysses_degree=1,
+            ring_degree=2,
+        ),
+        DiffusionSamplingParams(extras={"quality": "extra-high"}),
+        run_perf_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
         "zimage_image_t2i_2_gpus",
         DiffusionServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
