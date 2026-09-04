@@ -171,7 +171,9 @@ def test_create_moe_runner_handles_flashinfer_for_megamoe(monkeypatch, use_mega_
 
     assert method.moe_runner_config is runner_config
     if use_mega_moe:
-        assert not hasattr(method, "runner")
+        # FusedMoEMethodBase declares ``runner: MoeRunner | None = None``, so the
+        # early return leaves the class default rather than no attribute at all.
+        assert method.runner is None
     else:
         assert method.runner is runner
 

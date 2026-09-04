@@ -38,9 +38,9 @@ def cutlass_mla_decode(
 ) -> torch.Tensor:
     assert q_nope.ndim == 3, f"q_nope must be a 3D tensor, but got {q_nope.ndim}"
     assert q_pe.ndim == 3, f"q_pe must be a 3D tensor, but got {q_pe.ndim}"
-    assert (
-        kv_c_and_k_pe_cache.ndim == 3
-    ), f"kv_c_and_k_pe_cache must be a 3D tensor, but got {kv_c_and_k_pe_cache.ndim}"
+    assert kv_c_and_k_pe_cache.ndim == 3, (
+        f"kv_c_and_k_pe_cache must be a 3D tensor, but got {kv_c_and_k_pe_cache.ndim}"
+    )
 
     B_q, H, D_q_nope = q_nope.shape
     B_q_2, H_2, D_q_pe = q_pe.shape
@@ -77,12 +77,12 @@ def cutlass_mla_decode(
         torch.bfloat16,
     ), f"q_nope.dtype needs to be fp16 or bf16 but got {q_nope.dtype}."
     assert q_nope.dtype == q_pe.dtype == kv_c_and_k_pe_cache.dtype
-    assert (
-        seq_lens.dtype == torch.int32
-    ), f"seq_lens.dtype needs to be int32 but got {seq_lens.dtype}."
-    assert (
-        page_table.dtype == torch.int32
-    ), f"page_table.dtype needs to be int32 but got {page_table.dtype}."
+    assert seq_lens.dtype == torch.int32, (
+        f"seq_lens.dtype needs to be int32 but got {seq_lens.dtype}."
+    )
+    assert page_table.dtype == torch.int32, (
+        f"page_table.dtype needs to be int32 but got {page_table.dtype}."
+    )
 
     out = q_nope.new_empty((B_q, MAX_HEADS, D_latent))
 
