@@ -20,6 +20,8 @@ if _is_cuda or _is_musa:
     )
 
 import triton.language as tl
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
 
 
 def _get_launch_config_1d(device, numel):
@@ -141,6 +143,51 @@ def deepep_post_reorder_triton_kernel(
                 in_data = tl.load(load_ptr + offset, mask=mask)
                 sum_vec += in_data * weigh_scale
         tl.store(store_ptr + offset, sum_vec, mask=mask)
+
+
+@lru_cache(maxsize=None)
+def gluon_post_reorder_layout(block_size: int, num_warps: int):
+    return gl.BlockedLayout([block_size // (32 * num_warps)], [32], [num_warps], [0])
+
+
+@gluon.jit
+def deepep_post_reorder_gluon_kernel(
+    down_output_ptr,
+    output_ptr,
+    src2dst_ptr,
+    topk_weights_ptr,
+    topk,
+    hidden_size,
+    routed_scaling_factor: gl.constexpr,
+    BLOCK_SIZE: gl.constexpr,
+    TOPK: gl.constexpr,
+    layout: gl.constexpr,
+):
+    InDtype = down_output_ptr.dtype.element_ty
+
+    src_idx = gl.program_id(0)
+    chunk = gl.program_id(1)
+    s2d = src2dst_ptr + src_idx * topk
+    tw = topk_weights_ptr + src_idx * topk
+    store_ptr = output_ptr + src_idx * hidden_size
+
+    offset = chunk * BLOCK_SIZE + gl.arange(0, BLOCK_SIZE, layout=layout)
+    mask = offset < hidden_size
+
+    acc = gl.zeros([BLOCK_SIZE], dtype=InDtype, layout=layout)
+    for k in range(TOPK):
+        dst_k = gl.load(s2d + k).to(gl.int64)
+        w_k = gl.load(tw + k).to(InDtype)
+        if routed_scaling_factor != 1.0:
+            w_k = w_k * routed_scaling_factor
+        d_k = gl.load(
+            down_output_ptr + dst_k * hidden_size + offset,
+            mask=mask & (dst_k >= 0),
+            other=0.0,
+        )
+        acc += d_k * w_k
+
+    gl.store(store_ptr + offset, acc, mask=mask)
 
 
 @triton.jit

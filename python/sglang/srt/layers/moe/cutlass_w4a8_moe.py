@@ -26,9 +26,11 @@ from sglang.kernels.ops.moe.ep_moe_kernels import (
     cutlass_w4_run_moe_ep_preproess,
     deepep_ll_get_cutlass_w4a8_moe_mm_data,
     deepep_permute_triton_kernel,
+    deepep_post_reorder_gluon_kernel,
     deepep_post_reorder_triton_kernel,
     deepep_run_moe_deep_preprocess,
     fp8_per_token_to_per_tensor_quant_triton,
+    gluon_post_reorder_layout,
     post_reorder_for_cutlass_moe,
     pre_reorder_for_cutlass_moe,
     silu_and_mul_masked_post_per_tensor_quant_fwd,
@@ -417,19 +419,38 @@ def cutlass_w4a8_moe_deepep_normal(
         device=c2.device,
         dtype=torch.bfloat16,
     )
-    deepep_post_reorder_triton_kernel[(num_tokens,)](
-        c2,
-        output,
-        src2dst,
-        topk_ids_,
-        topk_weights,
-        topk,
-        c2.shape[1],
-        # DeepEP models apply routed_scaling_factor after the cross-rank
-        # combine, so this rank-local reduction must remain unscaled.
-        1.0,
-        BLOCK_SIZE=512,
-    )
+    # DeepEP models apply routed_scaling_factor after the cross-rank
+    # combine, so this rank-local reduction must remain unscaled.
+    hidden_size = c2.shape[1]
+    if _is_cuda:
+        BLOCK_SIZE = 512 if (num_tokens <= 16 or hidden_size <= 4096) else 1024
+        NUM_WARPS = 4
+        grid = (num_tokens, (hidden_size + BLOCK_SIZE - 1) // BLOCK_SIZE)
+        deepep_post_reorder_gluon_kernel[grid](
+            c2,
+            output,
+            src2dst,
+            topk_weights,
+            topk,
+            hidden_size,
+            1.0,
+            BLOCK_SIZE=BLOCK_SIZE,
+            TOPK=topk,
+            layout=gluon_post_reorder_layout(BLOCK_SIZE, NUM_WARPS),
+            num_warps=NUM_WARPS,
+        )
+    else:
+        deepep_post_reorder_triton_kernel[(num_tokens,)](
+            c2,
+            output,
+            src2dst,
+            topk_ids_,
+            topk_weights,
+            topk,
+            hidden_size,
+            1.0,
+            BLOCK_SIZE=512,
+        )
 
     return output
 
