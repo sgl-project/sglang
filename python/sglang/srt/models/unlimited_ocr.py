@@ -181,7 +181,7 @@ class UnlimitedOCRForCausalLM(nn.Module):
         if pixel_values is not None:
             if not isinstance(pixel_values, (torch.Tensor, list)):
                 raise ValueError(
-                    "Incorrect type of pixel values. " f"Got type: {type(pixel_values)}"
+                    f"Incorrect type of pixel values. Got type: {type(pixel_values)}"
                 )
             if not isinstance(images_spatial_crop, (torch.Tensor, list)):
                 raise ValueError(
@@ -190,7 +190,7 @@ class UnlimitedOCRForCausalLM(nn.Module):
                 )
             if not isinstance(images_crop, (torch.Tensor, list)):
                 raise ValueError(
-                    "Incorrect type of image crop. " f"Got type: {type(images_crop)}"
+                    f"Incorrect type of image crop. Got type: {type(images_crop)}"
                 )
             return [pixel_values, images_crop, images_spatial_crop]
 

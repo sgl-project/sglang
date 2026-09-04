@@ -12,7 +12,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import NextBatchPlan, Req
+from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.utils.common import Range
@@ -34,11 +34,10 @@ def _make_req(
     req.output_ids = array("q")
     req.full_untruncated_fill_ids = array("q", fill_ids)
     req.prefix_indices = prefix_indices
-    req.req_pool_idx = req_pool_idx
     req.extend_range = Range(fill_len - extend_input_len, fill_len)
     req.inflight_middle_chunks = 0
     req.host_hit_length = 0
-    req.cache_protected_len = 0
+    req.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
     req.skip_radix_cache_insert = False
     req.last_node = None
     req.swa_uuid_for_lock = None
@@ -48,7 +47,7 @@ def _make_req(
     req.positional_embed_overrides = None
     req.extra_key = None
     req.cache_salt = None
-    req.mamba_pool_idx = None
+    req.kv.mamba_pool_idx = None
     req.sampling_params = SimpleNamespace(max_new_tokens=128, ignore_eos=False)
     return req
 
@@ -91,6 +90,8 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.running_batch.is_prefill_only = False
     s.running_batch.batch_is_full = False
     s.running_batch.reqs = []
+    s.prefill_decode_interval = 0
+    s._prefill_decode_interval_remaining = 0
     s.get_new_batch_prefill = MagicMock(
         return_value=NextBatchPlan(batch_to_run=None, running_batch=s.running_batch)
     )

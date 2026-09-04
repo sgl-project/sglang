@@ -23,6 +23,7 @@ class LoadFormat(str, enum.Enum):
     SHARDED_STATE = "sharded_state"
     PRESHARDED = "presharded"
     GGUF = "gguf"
+    EXPERT_PACK = "expert_pack"
     BITSANDBYTES = "bitsandbytes"
     MISTRAL = "mistral"
     LAYERED = "layered"
