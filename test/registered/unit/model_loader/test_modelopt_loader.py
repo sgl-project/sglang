@@ -40,6 +40,7 @@ from sglang.srt.model_loader.weight_utils import (
     get_quant_config,
 )
 from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
+from sglang.srt.models.nano_nemotron_vl import NemotronH_Omni_Reasoning_V3
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -700,6 +701,29 @@ class TestModelOptFp4LoaderSelection(CustomTestCase):
 
 
 class TestModelOptMixedPrecisionConfig(CustomTestCase):
+    def test_nemotron_h_omni_resolves_fused_qkv_from_split_layers(self):
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    f"language_model.model.layers.7.mixer.{projection}": {
+                        "quant_algo": "FP8"
+                    }
+                    for projection in ("q_proj", "k_proj", "v_proj")
+                },
+                "packed_modules_mapping": (
+                    NemotronH_Omni_Reasoning_V3.packed_modules_mapping
+                ),
+            }
+        )
+
+        self.assertEqual(
+            quant_config._resolve_quant_algo(
+                "language_model.model.layers.7.mixer.qkv_proj"
+            ),
+            "FP8",
+        )
+
     def test_fp8_pb_wo_dispatches_to_native_block_fp8(self):
         quant_config = ModelOptMixedPrecisionConfig.from_config(
             {

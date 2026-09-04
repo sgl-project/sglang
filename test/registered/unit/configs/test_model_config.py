@@ -7,6 +7,7 @@ from sglang.srt.configs.model_config import (
     ModelConfig,
     get_hybrid_layer_ids,
     is_embedding_gemma,
+    is_multimodal_model,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -54,6 +55,9 @@ class TestEmbeddingGemmaConfig(CustomTestCase):
 
 
 class TestDraftModelConfig(CustomTestCase):
+    def test_nemotron_h_omni_is_multimodal(self):
+        self.assertTrue(is_multimodal_model(["NemotronH_Omni_Reasoning_V3"]))
+
     def test_qwen35_mtp_depth_is_synced_to_text_config(self):
         config = object.__new__(ModelConfig)
         config.is_draft_model = True
@@ -68,6 +72,21 @@ class TestDraftModelConfig(CustomTestCase):
         self.assertEqual(config.hf_config.architectures, ["Qwen3_5ForCausalLMMTP"])
         self.assertEqual(config.hf_config.num_nextn_predict_layers, 1)
         self.assertEqual(config.hf_text_config.num_nextn_predict_layers, 1)
+
+    def test_nemotron_h_omni_mtp_uses_language_model_config(self):
+        config = object.__new__(ModelConfig)
+        config.is_draft_model = True
+        config.speculative_algorithm = "EAGLE"
+        config.hf_config = SimpleNamespace(
+            architectures=["NemotronH_Omni_Reasoning_V3"]
+        )
+        config.hf_text_config = SimpleNamespace(architectures=["NemotronHForCausalLM"])
+
+        config._config_draft_model()
+
+        self.assertIs(config.hf_config, config.hf_text_config)
+        self.assertEqual(config.hf_config.architectures, ["NemotronHForCausalLMMTP"])
+        self.assertEqual(config.hf_config.num_nextn_predict_layers, 1)
 
 
 if __name__ == "__main__":

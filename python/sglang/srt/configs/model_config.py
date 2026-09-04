@@ -783,6 +783,14 @@ class ModelConfig:
             self.hf_config.architectures[0] = "ExaoneMoEForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "NemotronH_Omni_Reasoning_V3"
+        ):
+            self.hf_config = self.hf_text_config
+            self.hf_config.architectures = ["NemotronHForCausalLMMTP"]
+            self.hf_config.num_nextn_predict_layers = 1
+
         if is_draft_model and self.hf_config.architectures[0] in [
             "NemotronHForCausalLM",
             "NemotronHPuzzleForCausalLM",
@@ -1940,6 +1948,7 @@ multimodal_model_archs = [
     "MossVLForConditionalGeneration",
     "NemotronH_Nano_VL_V2",
     "NemotronH_Nano_Omni_Reasoning_V3",
+    "NemotronH_Omni_Reasoning_V3",
     "MuseGlimmerForConditionalGeneration",
     "PixtralForConditionalGeneration",
     "Qwen2AudioForConditionalGeneration",

@@ -1,13 +1,4 @@
-"""
-Unit tests for NemotronHForCausalLM.load_weights.
-
-Regression test for Nemotron-H expert scale checkpoint tensors that map to
-parameters absent from the current runtime model.
-"""
-
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=4, suite="base-a-test-cpu")
+"""Unit tests for Nemotron-H target and MTP checkpoint weight loading."""
 
 import unittest
 from types import SimpleNamespace
@@ -15,6 +6,11 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.models.nemotron_h import NemotronHForCausalLM
+from sglang.srt.models.nemotron_h_mtp import NemotronHForCausalLMMTP
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 class _FakePPGroup:
@@ -43,9 +39,19 @@ class _RecordingParam:
         self.loaded_weight = loaded_weight
 
 
-class TestNemotronHWeightLoading(unittest.TestCase):
-    def _make_minimal_model(self, named_parameters=()):
-        model = object.__new__(NemotronHForCausalLM)
+class _RecordingStackedParam:
+    def __init__(self):
+        self.loads = []
+
+    def weight_loader(self, param, loaded_weight, shard_id):
+        self.loads.append((param, loaded_weight, shard_id))
+
+
+class TestNemotronHWeightLoading(CustomTestCase):
+    def _make_minimal_model(
+        self, named_parameters=(), model_class=NemotronHForCausalLM
+    ):
+        model = object.__new__(model_class)
         model.config = SimpleNamespace(n_routed_experts=2, max_n_routed_experts=2)
         model.model = SimpleNamespace()
         model.pp_group = _FakePPGroup()
@@ -132,6 +138,59 @@ class TestNemotronHWeightLoading(unittest.TestCase):
         )
         self.assertIsNone(
             skipped.loaded_weight, "non-MTP target weight should be skipped"
+        )
+
+    def test_mtp_strips_multimodal_language_model_prefix(self):
+        embed = _RecordingParam()
+        head = _RecordingParam()
+        mtp_layer = _RecordingParam()
+        model = self._make_minimal_model(
+            [
+                ("model.embed_tokens.weight", embed),
+                ("lm_head.weight", head),
+                ("model.layers.0.norm.weight", mtp_layer),
+            ],
+            model_class=NemotronHForCausalLMMTP,
+        )
+        model.remap_prefix = {"backbone": "model"}
+        model.remap_substr = {"embeddings": "embed_tokens"}
+
+        w_embed, w_head, w_mtp = (torch.ones(1) for _ in range(3))
+        model.load_weights(
+            [
+                ("language_model.backbone.embeddings.weight", w_embed),
+                ("language_model.lm_head.weight", w_head),
+                ("language_model.mtp.layers.0.norm.weight", w_mtp),
+            ]
+        )
+
+        self.assertIs(embed.loaded_weight, w_embed)
+        self.assertIs(head.loaded_weight, w_head)
+        self.assertIs(mtp_layer.loaded_weight, w_mtp)
+
+    def test_split_qkv_fp8_scales_load_into_fused_parameter(self):
+        input_scale = _RecordingStackedParam()
+        model = self._make_minimal_model(
+            [("model.layers.7.mixer.qkv_proj.input_scale", input_scale)]
+        )
+        model.stacked_params_mapping = NemotronHForCausalLM.stacked_params_mapping
+
+        q_scale, k_scale, v_scale = (torch.tensor(value) for value in (1, 2, 3))
+        model.load_weights(
+            [
+                ("model.layers.7.mixer.q_proj.input_scale", q_scale),
+                ("model.layers.7.mixer.k_proj.input_scale", k_scale),
+                ("model.layers.7.mixer.v_proj.input_scale", v_scale),
+            ]
+        )
+
+        self.assertEqual(
+            input_scale.loads,
+            [
+                (input_scale, q_scale, "q"),
+                (input_scale, k_scale, "k"),
+                (input_scale, v_scale, "v"),
+            ],
         )
 
 

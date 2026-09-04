@@ -38,6 +38,7 @@ from sglang.srt.models.nemotron_h import (
     NemotronHMoEDecoderLayer,
 )
 from sglang.srt.models.nemotron_h_utils import is_attn_layer
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
@@ -293,7 +294,21 @@ class NemotronHMultiTokenPredictor(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if inputs_embeds is None:
-            inputs_embeds = self.get_input_embeddings(input_ids)
+            inputs_embeds = forward_batch.mm_input_embeds
+            if (
+                forward_batch.forward_mode.is_extend()
+                and forward_batch.contains_mm_inputs()
+                and not forward_batch.forward_mode.is_draft_extend_v2()
+            ):
+                assert inputs_embeds is not None
+                last_indices = (
+                    forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+                ).long()
+                inputs_embeds[last_indices] = self.get_input_embeddings(
+                    input_ids[last_indices]
+                )
+            if inputs_embeds is None:
+                inputs_embeds = self.get_input_embeddings(input_ids)
 
         hidden_states = forward_batch.spec_info.hidden_states
         residual = None
@@ -309,6 +324,10 @@ class NemotronHMultiTokenPredictor(nn.Module):
 
 
 class NemotronHForCausalLMMTP(NemotronHForCausalLM):
+    hf_to_sglang_mapper = NemotronHForCausalLM.hf_to_sglang_mapper | WeightsMapper(
+        orig_to_new_prefix={"language_model.mtp.": "mtp."}
+    )
+
     def __init__(
         self,
         config: NemotronHConfig,
@@ -366,6 +385,9 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
+        weights = (
+            (name.removeprefix("language_model."), weight) for name, weight in weights
+        )
         super().load_weights(weights, is_mtp=True)
 
     def set_lm_head_from_target(self, target_lm_head: nn.Module) -> None:

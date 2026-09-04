@@ -1,6 +1,7 @@
 """Config-time override declarations for nemotron_h.
 
-Architectures: NemotronHForCausalLM, NemotronHPuzzleForCausalLM.
+Architectures: NemotronHForCausalLM, NemotronHPuzzleForCausalLM,
+NemotronH_Omni_Reasoning_V3.
 """
 
 import logging
@@ -17,7 +18,11 @@ from sglang.srt.runtime_context import get_platform
 logger = logging.getLogger(__name__)
 
 
-@_register_for("NemotronHForCausalLM", "NemotronHPuzzleForCausalLM")
+@_register_for(
+    "NemotronHForCausalLM",
+    "NemotronHPuzzleForCausalLM",
+    "NemotronH_Omni_Reasoning_V3",
+)
 def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     """NemotronH quantization / MoE runner / attention backend defaults
     (absorbed from the retired arg_groups/nemotron_h_hook.py; the mamba radix
@@ -35,7 +40,12 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     ]
     quantization = cfg.quantization
     if is_modelopt:
-        assert model_config.hf_config.mlp_hidden_act == "relu2"
+        language_config = (
+            model_config.hf_text_config
+            if model_arch == "NemotronH_Omni_Reasoning_V3"
+            else hf_config
+        )
+        assert language_config.mlp_hidden_act == "relu2"
         if model_config.quantization == "modelopt":
             quant_algo = model_config.hf_config.quantization_config["quant_algo"]
             if quant_algo == "MIXED_PRECISION":

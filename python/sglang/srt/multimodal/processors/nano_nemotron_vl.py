@@ -22,6 +22,7 @@ from PIL import Image
 from sglang.srt.configs.nano_nemotron_vl import (
     NemotronH_Nano_Omni_Reasoning_V3_Config,
     NemotronH_Nano_VL_V2_Config,
+    NemotronH_Omni_Reasoning_V3_Config,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -31,6 +32,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.models.nano_nemotron_vl import (
     NemotronH_Nano_Omni_Reasoning_V3,
     NemotronH_Nano_VL_V2,
+    NemotronH_Omni_Reasoning_V3,
 )
 from sglang.srt.models.parakeet import ParakeetExtractor
 from sglang.srt.multimodal.audio_from_video import extract_audio_from_video_bytes
@@ -57,7 +59,11 @@ MAX_FRAMES = 128
 
 
 class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
-    models = [NemotronH_Nano_VL_V2, NemotronH_Nano_Omni_Reasoning_V3]
+    models = [
+        NemotronH_Nano_VL_V2,
+        NemotronH_Nano_Omni_Reasoning_V3,
+        NemotronH_Omni_Reasoning_V3,
+    ]
     gpu_image_decode = (
         False  # NanoNemotronVL processes loaded image as PIL image explicitly
     )
@@ -69,6 +75,7 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
             {
                 NemotronH_Nano_VL_V2_Config: NemotronH_Nano_VL_V2,
                 NemotronH_Nano_Omni_Reasoning_V3_Config: NemotronH_Nano_Omni_Reasoning_V3,
+                NemotronH_Omni_Reasoning_V3_Config: NemotronH_Omni_Reasoning_V3,
             },
         )
         Image.MAX_IMAGE_PIXELS = None
