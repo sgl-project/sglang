@@ -516,15 +516,18 @@ def build_fixture(
             full_attention_layer_ids=cfg.full_attention_layer_ids,
             device=device,
         )
-        allocator = SWATokenToKVPoolAllocator(
-            size=cfg.kv_size,
-            size_swa=cfg.kv_size,
-            page_size=cfg.page_size,
-            dtype=cfg.dtype,
-            device=device,
-            kvcache=kv_pool,
-            need_sort=False,
-        )
+        # Tree values reach the allocator as start_pos=0 segments, so only the
+        # debug cross-check against torch.unique catches a mis-aligned value.
+        with envs.SGLANG_DEBUG_MEMORY_POOL.override(True):
+            allocator = SWATokenToKVPoolAllocator(
+                size=cfg.kv_size,
+                size_swa=cfg.kv_size,
+                page_size=cfg.page_size,
+                dtype=cfg.dtype,
+                device=device,
+                kvcache=kv_pool,
+                need_sort=False,
+            )
     elif cfg.has_mamba:
         kv_pool = HybridLinearKVPool(
             size=cfg.kv_size,
@@ -4070,11 +4073,8 @@ class UnifiedRadixCacheSuite:
         # for an un-charged gate to accept.
         extend_need = 2 * ps + 1
         max_new = 8
-        self.assertIsNotNone(
-            cons_alloc.swa_attn_allocator.alloc(
-                cons_alloc.swa_available_size() - (window + extend_need - 1)
-            )
-        )
+        hold = cons_alloc.swa_available_size() - (window + extend_need - 1)
+        self.assertIsNotNone(cons_alloc.swa_attn_allocator.alloc(hold // ps * ps))
 
         # The adder's SWA gate for this request (_swa_budget_for_req).
         surfaced_swa_hit = cons.staged_prefetch_swa_tokens(req_id)
@@ -7559,8 +7559,8 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         _component_with_cache(ComponentType.FULL, cache).apply_component_action(
             FreeComponentDeviceSlot([indices], component_type=ComponentType.FULL)
         )
-        cache.token_to_kv_pool_allocator.full_attn_allocator.free.assert_called_once_with(
-            indices
+        cache.token_to_kv_pool_allocator.full_attn_allocator.free_segment.assert_called_once_with(
+            indices, start_pos=0
         )
 
     def test_apply_component_action_device_kv_swa_uses_free_swa(self):
@@ -7681,7 +7681,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         alloc.set_full_to_swa_mapping.assert_called_once_with(kept_full, swa_value)
         # the incoming full's stale mapping is cleared, then its slot freed (full-only)
         alloc.clear_full_to_swa_mapping.assert_called_once_with(incoming_full)
-        alloc.free_full.assert_called_once_with(incoming_full)
+        alloc.free_full_segment.assert_called_once_with(incoming_full, start_pos=0)
         # Never by indexing the tensor: the unified composite has no
         # `full_to_swa_index_mapping` to index into.
         alloc.full_to_swa_index_mapping.__setitem__.assert_not_called()
