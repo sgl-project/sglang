@@ -1,3 +1,4 @@
+import asyncio
 import os
 import threading
 import unittest
@@ -604,6 +605,49 @@ class TestMultimodalProcessorConcurrency(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             processor.process_and_combine_mm_data.call_args.kwargs["marker"]
         )
+
+    async def test_cancelled_request_holds_admission_until_executor_stops(self):
+        from sglang.srt.managers.multimodal_preprocessing_admission import (
+            MultimodalPreprocessingAdmission,
+        )
+        from sglang.srt.multimodal.processors.executor import (
+            MultimodalProcessorExecutor,
+        )
+
+        admission = MultimodalPreprocessingAdmission(max_inflight_items=1)
+        lease = admission.acquire(1)
+        entered = threading.Event()
+        release_worker = threading.Event()
+        executor = MultimodalProcessorExecutor(
+            lambda: SimpleNamespace(tokenizer=object()), max_workers=1
+        )
+        self.addCleanup(executor.shutdown)
+
+        def blocking_work(*, processor):
+            entered.set()
+            release_worker.wait()
+
+        async def request():
+            with lease.activate():
+                await executor.run(blocking_work)
+
+        task = asyncio.create_task(request())
+        try:
+            self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            lease.release()
+            self.assertEqual(admission.inflight_items, 1)
+        finally:
+            release_worker.set()
+
+        async def wait_for_release():
+            while admission.inflight_items:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_release(), timeout=1)
+        self.assertEqual(admission.inflight_items, 0)
 
     async def test_single_worker_preserves_synchronous_path(self):
         from sglang.srt.multimodal.processors.base_processor import (

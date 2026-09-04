@@ -2890,6 +2890,16 @@ class ServerArgs:
         "environment override when this argument is 0.",
         NS("mm"),
     ] = 0
+    max_mm_preprocessing_inflight_items_per_worker: A[
+        Optional[int],
+        "Maximum number of image, video, and audio items admitted concurrently "
+        "to tokenizer-owned multimodal preprocessing in each tokenizer worker. "
+        "Requests that would exceed the available item budget are rejected "
+        "without waiting. EPD language-only mode and the Rust HTTP server reject "
+        "this option because they use different preprocessing ownership. This does "
+        "not limit HTTP request-body parsing or the scheduler request queue.",
+        NS("mm"),
+    ] = None
     allowed_media_domains: A[
         List[str],
         "Restrict client-supplied HTTP(S) image, video, and audio URLs to these "

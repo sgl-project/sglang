@@ -11,13 +11,17 @@ Covers:
   - _init_req_state rejects duplicate rids
   - Resubmission succeeds after cleanup
   - Handler failures clean up pending and dispatched requests
+  - Multimodal preprocessing admission is released on failures and cancellation
 """
 
 import asyncio
+import concurrent.futures
+import threading
 import unittest
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
+from fastapi import HTTPException
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -28,6 +32,10 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
     BatchStrOutput,
     GenerateReqInput,
+)
+from sglang.srt.managers.multimodal_preprocessing_admission import (  # noqa: E402
+    MultimodalPreprocessingAdmission,
+    track_mm_preprocessing_future,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
@@ -680,6 +688,168 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
             asyncio.run(drive())
 
         self.assertFalse(tm.rid_to_state)
+
+
+class TestGenerateRequestMultimodalAdmissionCleanup(CustomTestCase):
+    def _make_multimodal_obj(self, rid="mm-request"):
+        obj = _make_generate_obj(rid, is_single=True)
+        obj.image_data = ["image-0", "image-1"]
+        obj.video_data = None
+        obj.audio_data = None
+        return obj
+
+    def test_request_larger_than_capacity_is_non_retryable_bad_request(self):
+        tm = _make_tm_for_generate(self)
+        tm.mm_preprocessing_admission = MultimodalPreprocessingAdmission(1)
+        tm._tokenize_one_request = AsyncMock()
+        obj = self._make_multimodal_obj()
+
+        async def drive():
+            await tm.generate_request(obj).__anext__()
+
+        with self.assertRaises(HTTPException) as raised:
+            asyncio.run(drive())
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(tm.mm_preprocessing_admission.inflight_items, 0)
+        tm._tokenize_one_request.assert_not_awaited()
+        self.assertNotIn(obj.rid, tm.rid_to_state)
+
+    def test_transient_capacity_exhaustion_is_retryable_service_unavailable(self):
+        tm = _make_tm_for_generate(self)
+        tm.mm_preprocessing_admission = MultimodalPreprocessingAdmission(2)
+        existing = tm.mm_preprocessing_admission.try_acquire(1)
+        tm._tokenize_one_request = AsyncMock()
+        obj = self._make_multimodal_obj()
+
+        async def drive():
+            await tm.generate_request(obj).__anext__()
+
+        try:
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(drive())
+            self.assertEqual(raised.exception.status_code, 503)
+            self.assertEqual(tm.mm_preprocessing_admission.inflight_items, 1)
+            tm._tokenize_one_request.assert_not_awaited()
+        finally:
+            existing.release()
+
+    def test_tokenization_exception_releases_reservation(self):
+        tm = _make_tm_for_generate(self)
+        tm.mm_preprocessing_admission = MultimodalPreprocessingAdmission(2)
+        tm._tokenize_one_request = AsyncMock(side_effect=RuntimeError("decode failed"))
+        obj = self._make_multimodal_obj()
+
+        async def drive():
+            await tm.generate_request(obj).__anext__()
+
+        with self.assertRaisesRegex(RuntimeError, "decode failed"):
+            asyncio.run(drive())
+
+        self.assertEqual(tm.mm_preprocessing_admission.inflight_items, 0)
+
+    def test_tokenization_cancellation_releases_reservation(self):
+        tm = _make_tm_for_generate(self)
+        tm.mm_preprocessing_admission = MultimodalPreprocessingAdmission(2)
+        entered_worker = threading.Event()
+        release_worker = threading.Event()
+
+        async def block_in_tokenization(_obj):
+            def background_work():
+                entered_worker.set()
+                release_worker.wait()
+
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(background_work)
+            track_mm_preprocessing_future(future)
+            try:
+                await asyncio.wrap_future(future)
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
+
+        tm._tokenize_one_request = block_in_tokenization
+        obj = self._make_multimodal_obj()
+
+        async def drive():
+            task = asyncio.create_task(tm.generate_request(obj).__anext__())
+            while not entered_worker.is_set():
+                await asyncio.sleep(0)
+            self.assertEqual(tm.mm_preprocessing_admission.inflight_items, 2)
+            task.cancel()
+            await asyncio.sleep(0)
+            try:
+                self.assertTrue(task.done())
+                self.assertEqual(tm.mm_preprocessing_admission.inflight_items, 2)
+            finally:
+                release_worker.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(drive())
+        self.assertEqual(tm.mm_preprocessing_admission.inflight_items, 0)
+
+    def test_parallel_tokenization_error_drains_sibling_background_work(self):
+        tm = _make_tm_for_generate(self)
+        admission = MultimodalPreprocessingAdmission(2)
+        lease = admission.try_acquire(2)
+        entered_worker = threading.Event()
+        release_worker = threading.Event()
+        failed = object()
+        blocked = object()
+
+        async def tokenize(obj):
+            if obj is failed:
+                while not entered_worker.is_set():
+                    await asyncio.sleep(0)
+                raise ValueError("first item failed")
+
+            loop = asyncio.get_running_loop()
+
+            def background_work():
+                entered_worker.set()
+                release_worker.wait()
+
+            await loop.run_in_executor(None, background_work)
+            return "finished"
+
+        tm._tokenize_one_request = tokenize
+
+        async def drive():
+            task = asyncio.create_task(
+                tm._await_mm_preprocessing(
+                    tm._tokenize_parallel_sampling_requests([failed, blocked]), lease
+                )
+            )
+            while not entered_worker.is_set():
+                await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            try:
+                self.assertFalse(task.done())
+                self.assertEqual(admission.inflight_items, 2)
+            finally:
+                release_worker.set()
+            with self.assertRaisesRegex(ValueError, "first item failed"):
+                await task
+            lease.release()
+
+        asyncio.run(drive())
+        self.assertEqual(admission.inflight_items, 0)
+
+    def test_request_state_initialization_error_releases_reservation(self):
+        tm = _make_tm_for_generate(self)
+        tm.mm_preprocessing_admission = MultimodalPreprocessingAdmission(2)
+        obj = self._make_multimodal_obj(rid="duplicate")
+        existing_state = _make_req_state("duplicate")
+        tm.rid_to_state["duplicate"] = existing_state
+
+        async def drive():
+            await tm.generate_request(obj).__anext__()
+
+        with self.assertRaisesRegex(ValueError, "Duplicate request ID"):
+            asyncio.run(drive())
+
+        self.assertEqual(tm.mm_preprocessing_admission.inflight_items, 0)
+        self.assertIs(tm.rid_to_state["duplicate"], existing_state)
 
 
 class TestWaitOneResponseAfterStateFreed(CustomTestCase):

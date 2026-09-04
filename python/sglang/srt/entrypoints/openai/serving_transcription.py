@@ -23,13 +23,14 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import math
 import time
 import uuid
 from typing import TYPE_CHECKING, AsyncGenerator, List, Optional, Union
 
-from fastapi import Request, WebSocket
+from fastapi import HTTPException, Request, WebSocket
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 from sglang.srt.entrypoints.openai.audio_chunking import split_audio_energy_aware
@@ -79,6 +80,21 @@ class OpenAIServingTranscription(OpenAIServingBase):
 
     def _request_id_prefix(self) -> str:
         return "trsc-"
+
+    def _streaming_http_error(self, error: HTTPException) -> str:
+        payload = json.loads(
+            self.create_streaming_error_response(
+                str(error.detail),
+                err_type=(
+                    "server_error"
+                    if error.status_code >= 500
+                    else "invalid_request_error"
+                ),
+                status_code=error.status_code,
+            )
+        )
+        payload["error"]["retryable"] = error.status_code == 503
+        return json.dumps(payload)
 
     def _validate_request(self, request: TranscriptionRequest) -> Optional[str]:
         """Validate transcription request."""
@@ -583,6 +599,8 @@ class OpenAIServingTranscription(OpenAIServingBase):
                     )
                     yield f"data: {chunk.model_dump_json()}\n\n"
 
+        except HTTPException as e:
+            yield f"data: {self._streaming_http_error(e)}\n\n"
         except ValueError as e:
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
@@ -707,6 +725,8 @@ class OpenAIServingTranscription(OpenAIServingBase):
                     finish_reason_type = chunk_finish_reason
 
             yield _frame(None, finish_reason=finish_reason_type or "stop")
+        except HTTPException as e:
+            yield f"data: {self._streaming_http_error(e)}\n\n"
         except ValueError as e:
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
@@ -799,6 +819,8 @@ class OpenAIServingTranscription(OpenAIServingBase):
 
         except asyncio.CancelledError:
             raise
+        except HTTPException as e:
+            yield f"data: {self._streaming_http_error(e)}\n\n"
         except Exception as e:
             logger.exception("[streaming_asr] unrecoverable error")
             error = self.create_streaming_error_response(str(e))

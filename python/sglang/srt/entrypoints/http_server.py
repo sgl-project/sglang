@@ -935,6 +935,25 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                 }
                 logger.error(f"[http_server] Error: {e}")
                 yield b"data: " + dumps_json(out) + b"\n\n"
+            except HTTPException as e:
+                # The response has already started, so an admission failure can
+                # no longer change the HTTP status. Preserve the 503 and retry
+                # signal in the SSE error payload instead of tearing down the
+                # stream with an unhandled exception.
+                out = {
+                    "error": {
+                        "message": str(e.detail),
+                        "type": (
+                            "server_error"
+                            if e.status_code >= HTTPStatus.INTERNAL_SERVER_ERROR
+                            else "invalid_request_error"
+                        ),
+                        "code": e.status_code,
+                        "retryable": e.status_code == HTTPStatus.SERVICE_UNAVAILABLE,
+                    }
+                }
+                logger.warning(f"[http_server] Error: {e.detail}")
+                yield b"data: " + dumps_json(out) + b"\n\n"
             yield b"data: [DONE]\n\n"
 
         return StreamingResponse(

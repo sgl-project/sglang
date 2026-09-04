@@ -32,6 +32,9 @@ import numpy as np
 import torch
 from PIL import Image
 
+from sglang.srt.managers.multimodal_preprocessing_admission import (
+    track_mm_preprocessing_future,
+)
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.cache import (
     CacheLookup,
@@ -323,12 +326,13 @@ class MediaArtifactCacheMixin:
             load_indices.append(index)
 
         # 2. read cache: build artifact key from media snapshot then try reading cache
-        snapshot_futures = {
-            index: self.io_executor.submit(
+        snapshot_futures = {}
+        for index in load_indices:
+            future = self.io_executor.submit(
                 self.snapshot_media_source, media_data[index], modality
             )
-            for index in load_indices
-        }
+            track_mm_preprocessing_future(future)
+            snapshot_futures[index] = future
         for index, future in snapshot_futures.items():
             snapshot = await asyncio.wrap_future(future)
             caller_hash = content_hashes[index]
@@ -392,6 +396,7 @@ class MediaArtifactCacheMixin:
                     modality,
                 )
             )
+            track_mm_preprocessing_future(missed_task)
             # shared work outlives cancellation of this request
             await asyncio.shield(missed_task)
 
@@ -434,11 +439,11 @@ class MediaArtifactCacheMixin:
                 index = first_index_by_key[missed.key]
                 snapshot = snapshots[index]
                 assert snapshot is not None
-                media = await asyncio.wrap_future(
-                    self.io_executor.submit(
-                        self.decode_media_snapshot, snapshot, modality
-                    )
+                future = self.io_executor.submit(
+                    self.decode_media_snapshot, snapshot, modality
                 )
+                track_mm_preprocessing_future(future)
+                media = await asyncio.wrap_future(future)
                 missed_media.append(
                     MediaArtifactInput(
                         content_digest=snapshot.content_digest,

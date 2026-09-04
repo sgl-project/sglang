@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
 import soundfile as sf
+from fastapi import HTTPException
 
 from sglang.srt.entrypoints.openai.protocol import (
     TranscriptionRequest,
@@ -129,6 +130,104 @@ class TestStreamingFusedAutodetect(CustomTestCase):
         loop = get_or_create_event_loop()
         frames = loop.run_until_complete(drive())
         return request, frames
+
+    def test_regular_stream_preserves_retryable_admission_error(self):
+        tm = _MockTokenizerManager([])
+
+        def generate_request(*_args):
+            async def failed():
+                raise HTTPException(status_code=503, detail="at capacity")
+                yield
+
+            return failed()
+
+        tm.generate_request = generate_request
+        serving = OpenAIServingTranscription(tm)
+        request = TranscriptionRequest(model="whisper", stream=True)
+        adapted = GenerateReqInput(text="", modalities=["audio"])
+
+        async def drive():
+            return [
+                frame
+                async for frame in serving._generate_transcription_stream(
+                    adapted, request, Mock()
+                )
+            ]
+
+        frames = asyncio.run(drive())
+        error = json.loads(frames[0].removeprefix("data: "))["error"]
+        self.assertEqual(error["code"], 503)
+        self.assertTrue(error["retryable"])
+
+    def test_long_audio_stream_preserves_bad_request(self):
+        tm = _MockTokenizerManager([])
+
+        def generate_request(*_args):
+            async def failed():
+                raise HTTPException(status_code=400, detail="too many audio items")
+                yield
+
+            return failed()
+
+        tm.generate_request = generate_request
+        tm.abort_request = Mock()
+        serving = OpenAIServingTranscription(tm)
+        request = TranscriptionRequest(model="whisper", stream=True)
+        request._audio_chunks = [b"chunk"]
+        adapted = GenerateReqInput(text="", modalities=["audio"], sampling_params={})
+        raw_request = Mock()
+        raw_request.is_disconnected = AsyncMock(return_value=False)
+
+        async def drive():
+            return [
+                frame
+                async for frame in serving._generate_long_audio_stream(
+                    adapted, request, raw_request
+                )
+            ]
+
+        frames = asyncio.run(drive())
+        error = json.loads(frames[0].removeprefix("data: "))["error"]
+        self.assertEqual(error["code"], 400)
+        self.assertFalse(error["retryable"])
+
+    @patch(
+        "sglang.srt.entrypoints.openai.serving_transcription.process_asr_chunk",
+        new_callable=AsyncMock,
+        side_effect=HTTPException(status_code=503, detail="at capacity"),
+    )
+    @patch(
+        "sglang.srt.entrypoints.openai.serving_transcription.split_audio_chunks",
+        return_value=[b"chunk"],
+    )
+    def test_chunked_stream_preserves_retryable_admission_error(self, _split, _process):
+        tm = _MockTokenizerManager([])
+        serving = OpenAIServingTranscription(tm)
+        serving._adapter = Mock(
+            chunked_streaming_config={
+                "chunk_size_sec": 1,
+                "unfixed_chunk_num": 1,
+                "unfixed_token_num": 1,
+            }
+        )
+        request = TranscriptionRequest(model="whisper", stream=True)
+        request.audio_data = b"audio"
+        adapted = GenerateReqInput(text="", modalities=["audio"])
+        raw_request = Mock()
+        raw_request.is_disconnected = AsyncMock(return_value=False)
+
+        async def drive():
+            return [
+                frame
+                async for frame in serving._generate_chunked_asr_stream(
+                    adapted, request, raw_request
+                )
+            ]
+
+        frames = asyncio.run(drive())
+        error = json.loads(frames[0].removeprefix("data: "))["error"]
+        self.assertEqual(error["code"], 503)
+        self.assertTrue(error["retryable"])
 
     def test_prefix_stripped_and_language_extracted(self):
         chunks = [

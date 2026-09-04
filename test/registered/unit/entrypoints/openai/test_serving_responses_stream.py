@@ -1,8 +1,11 @@
+import asyncio
 import unittest
 from unittest.mock import patch
 
+from fastapi import HTTPException
 from utils import (
     StreamFixture,
+    collect_stream_events,
     engine_chunk,
     event_payloads,
     event_types,
@@ -10,7 +13,7 @@ from utils import (
     make_serving,
 )
 
-from sglang.srt.entrypoints.openai.protocol import ResponsesRequest
+from sglang.srt.entrypoints.openai.protocol import ResponsesRequest, ResponsesResponse
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -18,6 +21,80 @@ register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 class NonHarmonyStreamTestCase(CustomTestCase):
+    def test_background_admission_failure_is_stored(self):
+        for status_code, expected_code, retryable in (
+            (400, "invalid_prompt", False),
+            (503, "rate_limit_exceeded", True),
+        ):
+            with self.subTest(status_code=status_code):
+                serving = make_serving()
+                request = ResponsesRequest(
+                    model="x", input="hi", background=True, store=True
+                )
+                serving.response_store[request.request_id] = (
+                    ResponsesResponse.from_request(
+                        request,
+                        {},
+                        model_name="x",
+                        created_time=1,
+                        output=[],
+                        status="queued",
+                        usage=None,
+                    )
+                )
+
+                async def failed():
+                    raise HTTPException(status_code=status_code, detail="at capacity")
+                    yield
+
+                asyncio.run(
+                    serving._run_background_request(
+                        request,
+                        {},
+                        failed(),
+                        object(),
+                        "x",
+                        None,
+                        None,
+                        1,
+                        require_reasoning=False,
+                    )
+                )
+
+                stored = serving.response_store[request.request_id]
+                self.assertEqual(stored.status, "failed")
+                self.assertEqual(stored.error["code"], expected_code)
+                self.assertEqual(stored.error["status_code"], status_code)
+                self.assertEqual(stored.error["retryable"], retryable)
+
+    def test_admission_503_is_preserved_in_failed_event(self):
+        serving = make_serving()
+        request = ResponsesRequest(model="x", input="hi", stream=True, store=False)
+
+        async def failed():
+            raise HTTPException(status_code=503, detail="at capacity")
+            yield
+
+        async def collect():
+            return await collect_stream_events(
+                serving.responses_stream_generator_non_harmony(
+                    request,
+                    sampling_params={},
+                    result_generator=failed(),
+                    model_name="x",
+                    tokenizer=None,
+                    request_metadata=None,
+                    require_reasoning=False,
+                )
+            )
+
+        events = asyncio.run(collect())
+        payload = event_payloads(events)[-1]
+        self.assertEqual(payload["type"], "response.failed")
+        self.assertEqual(payload["response"]["error"]["code"], "rate_limit_exceeded")
+        self.assertEqual(payload["response"]["error"]["status_code"], 503)
+        self.assertTrue(payload["response"]["error"]["retryable"])
+
     def test_reasoning_parser_uses_processed_reasoning_state(self):
         serving = make_serving()
         serving.reasoning_parser = "deepseek-r1"
