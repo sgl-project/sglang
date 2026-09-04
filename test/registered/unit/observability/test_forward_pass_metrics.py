@@ -418,8 +418,8 @@ class TestSchedulerTimeAccounting(CustomTestCase):
         self.reporter.metrics_collector = types.SimpleNamespace(
             increment_scheduler_idle_seconds=self.idle_seconds.append,
             increment_scheduler_process_cpu_seconds=self.process_cpu_seconds.append,
-            increment_scheduler_stage_seconds=lambda **kwargs: self.stage_seconds.append(
-                kwargs
+            increment_scheduler_stage_seconds=lambda **kwargs: (
+                self.stage_seconds.append(kwargs)
             ),
         )
 
