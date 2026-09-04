@@ -566,8 +566,8 @@ def handle_platform_cp_compatibility(server_args: Any):
     is_protected_platform = platform.is_hip or platform.is_npu
     if not is_protected_platform:
         if (
-            server_args.enable_prefill_context_parallel
-            or server_args.enable_dsa_prefill_context_parallel
+            cfg.enable_prefill_context_parallel
+            or cfg.enable_dsa_prefill_context_parallel
         ):
             raise ValueError(
                 "Legacy prefill context-parallel options are supported only "
