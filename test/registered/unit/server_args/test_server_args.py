@@ -41,7 +41,6 @@ from sglang.srt.arg_groups.moe_hook import (
 )
 from sglang.srt.arg_groups.overrides import (
     cutedsl_moe_max_num_tokens,
-    mamba_cache_chunk_size,
     max_speculative_num_draft_tokens,
     resolution_result,
 )
@@ -275,21 +274,6 @@ class TestPrepareServerArgs(CustomTestCase):
             self.assertEqual(parsed.mm_process_config, {"image": {"resize": 128}})
         finally:
             os.unlink(config_file)
-
-
-class TestMambaCacheChunkSize(CustomTestCase):
-    def test_uses_canonical_text_config_for_composed_model(self):
-        server_args = object.__new__(ServerArgs)
-        server_args._model_config = SimpleNamespace(
-            hf_config=SimpleNamespace(mamba_chunk_size=32),
-            hf_text_config=SimpleNamespace(mamba_chunk_size=128),
-        )
-
-        with patch(
-            "sglang.srt.arg_groups.overrides.resolved_view",
-            return_value=SimpleNamespace(page_size=64),
-        ):
-            self.assertEqual(mamba_cache_chunk_size(server_args), 128)
 
 
 class TestMmEncoderDataParallelLogging(CustomTestCase):

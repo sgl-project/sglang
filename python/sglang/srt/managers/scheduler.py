@@ -926,7 +926,11 @@ class Scheduler(
             initialize_mamba_selective_state_update_backend(self.server_args)
 
     def init_moe_gemm_config(self):
-        config_to_check = self.model_config.hf_text_config
+        config_to_check = self.model_config.hf_config
+        if hasattr(self.model_config.hf_config, "text_config"):
+            config_to_check = self.model_config.hf_config.text_config
+        elif hasattr(self.model_config, "hf_text_config"):
+            config_to_check = self.model_config.hf_text_config
 
         # Different MoE architectures expose the per-token expert count under
         # different attribute names (e.g. Gemma4 uses ``top_k_experts``,

@@ -1857,7 +1857,7 @@ def mamba_cache_chunk_size(server_args: Any) -> int:
             # Must match sglang.kernels.ops.attention.fla.chunk_delta_h.CHUNK_SIZE
             FLA_CHUNK_SIZE = 64
 
-        hf_config = model_config_of(server_args).hf_text_config
+        hf_config = model_config_of(server_args).hf_config
         chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
         page_size = resolved_view(server_args).page_size
         assert (
