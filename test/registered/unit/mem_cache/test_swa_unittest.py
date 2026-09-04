@@ -2,6 +2,7 @@ import unittest
 from array import array
 from types import SimpleNamespace
 from unittest import mock
+from unittest.mock import patch
 
 import torch
 
@@ -830,13 +831,13 @@ class TestSWA(unittest.TestCase):
         req2.prefix_indices = torch.tensor([21, 22, 23, 24, 25], device=tree.device)
 
         freed_lens = []
-        original_free = allocator.free
+        original_free_segment = allocator.free_segment
 
-        def wrapped_free(indices):
+        def wrapped_free_segment(indices, *, start_pos):
             freed_lens.append(int(indices.numel()))
-            return original_free(indices)
+            return original_free_segment(indices, start_pos=start_pos)
 
-        allocator.free = wrapped_free
+        allocator.free_segment = wrapped_free_segment
         tree.cache_finished_req(
             req2, is_insert=False, kv_len_to_handle=req2._kv_committed_len
         )
@@ -1070,20 +1071,44 @@ class TestFreeKvRow(CustomTestCase):
                 )
                 self.assertEqual(self._sizes(), (self.full_baseline, self.swa_baseline))
 
-    def test_adjacent_below_floor_pieces_release_their_shared_page_once(self):
+    def test_below_floor_pieces_go_back_through_the_full_side(self):
         _, allocator, _ = _build_swa_tree(is_eagle=False, page_size=4)
         indices = _swa_alloc(allocator, 8)
         allocator.free_swa(indices)
         after_alloc = allocator.full_available_size()
 
-        # Rows [0, 6) and [6, 8) both sit below the floor and share page 1.
-        free_kv_row_segments(
-            allocator,
-            [(indices[:6], 0), (indices[6:], 6)],
-            swa_evicted_seqlen=8,
-        )
+        # Both rows [0, 4) and [4, 8) sit below the floor: full side only.
+        with patch.object(
+            allocator.full_attn_allocator,
+            "free",
+            side_effect=AssertionError("full side took the unique path"),
+        ):
+            free_kv_row_segments(
+                allocator,
+                [(indices[:4], 0), (indices[4:], 4)],
+                swa_evicted_seqlen=8,
+            )
 
         self.assertEqual(allocator.full_available_size(), after_alloc + 8)
+
+    def test_grouped_full_side_frees_defer_and_skip_the_unique_path(self):
+        _, allocator, _ = _build_swa_tree(is_eagle=False, page_size=4)
+        indices = _swa_alloc(allocator, 12)
+        allocator.free_swa(indices[:8])
+        after_alloc = allocator.full_available_size()
+
+        with patch.object(
+            allocator.full_attn_allocator,
+            "free",
+            side_effect=AssertionError("full side took the unique path"),
+        ):
+            allocator.free_group_begin()
+            # dead rows [0, 8) and the alive row [8, 12) from one request
+            free_kv_row_segments(allocator, [(indices, 0)], swa_evicted_seqlen=8)
+            self.assertEqual(allocator.full_available_size(), after_alloc)
+            allocator.free_group_end()
+
+        self.assertEqual(allocator.full_available_size(), after_alloc + 12)
 
     def test_free_kv_row_reads_the_record_row_and_its_floor(self):
         indices = _swa_alloc(self.allocator, 8)
