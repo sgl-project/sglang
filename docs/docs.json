@@ -953,6 +953,7 @@
                   "docs/advanced_features/hicache_storage_runtime_attach_detach"
                 ]
               },
+              "docs/advanced_features/sglang_simulator",
               "docs/advanced_features/vlm_query",
               "docs/advanced_features/dp_for_multi_modal_encoder",
               "docs/advanced_features/cuda_graph_for_multi_modal_encoder",

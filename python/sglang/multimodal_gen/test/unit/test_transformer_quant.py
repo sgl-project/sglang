@@ -93,6 +93,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader i
 from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
     inspect_minimax_h3_safetensors,
     resolve_minimax_h3_checkpoint_quantization,
+    validate_minimax_h3_checkpoint_variant,
 )
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     TransformerQuantLoadSpec,
@@ -690,6 +691,18 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                         for call in download.call_args_list
                     )
                 )
+
+    def test_minimax_h3_hybrid_checkpoint_accepts_selected_partition(self):
+        checkpoint = "/cache/minimax_h3_hybrid_fl2va_ref2va_b25-49.safetensors"
+
+        validate_minimax_h3_checkpoint_variant([checkpoint], "fl2va")
+        validate_minimax_h3_checkpoint_variant([checkpoint], "ref2va")
+
+    def test_minimax_h3_single_partition_checkpoint_rejects_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            validate_minimax_h3_checkpoint_variant(
+                ["/cache/minimax_h3_fl2va.safetensors"], "ref2va"
+            )
 
     def test_inspect_minimax_h3_safetensors_detects_curve_and_comfy_format(self):
         marker = json.dumps(
