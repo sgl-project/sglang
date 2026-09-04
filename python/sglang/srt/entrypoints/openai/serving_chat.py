@@ -1810,6 +1810,24 @@ class OpenAIServingChat(OpenAIServingBase):
                     final_finish_reason = "tool_calls"
 
                 matched_stop = finish_reason_data.get("matched")
+                # P0.4(Moonshot 扩展):结束帧必须携带 choices[0].usage ——
+                # per-候选的精确计费,与 stream_options.include_usage 无关;
+                # 明细字段(reasoning_tokens/cached_tokens)必须为整数,没有也回 0。
+                choice_usage = None
+                if self.chat_encoding_spec == "kimi_k3":
+                    pt = prompt_tokens.get(idx, 0)
+                    ct = completion_tokens.get(idx, 0)
+                    choice_usage = {
+                        "prompt_tokens": pt,
+                        "completion_tokens": ct,
+                        "total_tokens": pt + ct,
+                        "completion_tokens_details": {
+                            "reasoning_tokens": reasoning_tokens.get(idx, 0) or 0,
+                        },
+                        "prompt_tokens_details": {
+                            "cached_tokens": cached_tokens.get(idx, 0) or 0,
+                        },
+                    }
                 yield build_sse_content(
                     chunk_id=self._wire_id(content["meta_info"]["id"]),
                     created=int(time.time()),
@@ -1817,6 +1835,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     index=idx,
                     finish_reason=final_finish_reason,
                     matched_stop=matched_stop,
+                    choice_usage=choice_usage,
                 )
 
             # Send hidden states if requested
