@@ -49,6 +49,8 @@ class TestQwenRustMmHashes(CustomTestCase):
     def setUp(self):
         from sglang.srt.managers.multimodal_processor import import_processors
 
+        # The hash helper builds RustMmProcessor via __new__ (no __init__),
+        # so processors must be registered here for resolve_spec's lookup.
         import_processors("sglang.srt.multimodal.processors")
         self.processor = make_processor(self, PROCESSOR_CONFIGS["qwen2_5_vl"])
 
