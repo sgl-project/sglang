@@ -285,11 +285,6 @@ def build_hybrid_swa_group(
     transfer_layer_num = len(full_layer_mapping | swa_layer_mapping)
     if _uses_unified_page_envelope_host(full_kv_pool, swa_kv_pool, use_mla):
         memory = get_memory()
-        if memory.hicache_host_memory_mode == "buffer_only":
-            raise ValueError(
-                "--hicache-host-memory-mode buffer_only does not support a "
-                "shared FULL/SWA unified host arena."
-            )
         kv_host_pool, swa_host_pool = (
             UnifiedPageEnvelopeHostPool.build_hybrid_swa_pool_pair(
                 device_pools=(full_kv_pool, swa_kv_pool),

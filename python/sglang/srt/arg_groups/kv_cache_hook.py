@@ -292,6 +292,10 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         not cfg.enable_lmcache
     ), "--enable-unified-memory is not yet compatible with --enable-lmcache."
     if cfg.enable_hierarchical_cache:
+        assert cfg.pp_size == 1, (
+            "--enable-unified-memory with hierarchical cache does not support "
+            "pipeline parallelism (--pp-size > 1)."
+        )
         if cfg.hicache_storage_backend in {"mooncake", "nixl"}:
             raise ValueError(
                 "--enable-unified-memory with hierarchical cache does not "
