@@ -19,13 +19,20 @@ from sglang.srt.managers.schedule_batch import (  # noqa: E402
     ReqKvInfo,
 )
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
-from sglang.srt.runtime_context import get_context  # noqa: E402
+from sglang.srt.runtime_context import get_context, publish, reset_context  # noqa: E402
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestDisaggregationPriorityQueueing(unittest.TestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def _new_scheduler(self, disaggregation_mode: DisaggregationMode) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.disaggregation_mode = disaggregation_mode
@@ -91,6 +98,12 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
 
 
 class TestDecodePreallocQueuePriority(unittest.TestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def _new_decode_req(self, rid: str, priority: int, *, failed: bool = False):
         req = SimpleNamespace(
             rid=rid,
@@ -227,6 +240,12 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
     dispatch itself now lives on the kv manager (see
     ``TestCommonKVManagerPrefillRecompute``)."""
 
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def _sampling_params(self):
         return SimpleNamespace(
             temperature=0.0,
@@ -285,6 +304,12 @@ class TestCommonKVManagerPrefillRecompute(unittest.TestCase):
     rebootstrap ``/generate`` failure through ``kv_receiver.abort()`` ->
     ``KVPoll.Failed`` so the scheduler's normal transfer-failure streaming runs.
     """
+
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
     def _new_manager(self):
         from sglang.srt.disaggregation.common.conn import CommonKVManager
@@ -423,6 +448,12 @@ class TestCommonKVManagerPrefillRecompute(unittest.TestCase):
 
 
 class TestDecodePrebuilt(unittest.TestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def _new_scheduler(self, *, enable_overlap: bool) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.grammar_manager = MagicMock()

@@ -167,7 +167,7 @@ class RustMmProcessor:
 
         hf_config = self.model_config.hf_config
         mm_processor_cls = get_mm_processor_cls(
-            hf_config, self.server_args, model_config=self.model_config
+            hf_config, model_config=self.model_config
         )
         family = rust_mm_family_for(
             mm_processor_cls, getattr(hf_config, "model_type", None)

@@ -281,10 +281,7 @@ def _init_parallel_groups(
         server_args=server_args,
         model_config=model_config,
     )
-    initialize_layernorm_sp(
-        server_args=server_args,
-        model_config=model_config,
-    )
+    initialize_layernorm_sp(model_config=model_config)
     if is_npu():
         register_sgl_tp_rank(gpu_id)
 

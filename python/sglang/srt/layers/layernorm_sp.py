@@ -54,7 +54,7 @@ from sglang.srt.utils.common import ceil_align
 SP_SUPPORTED_ARCHITECTURES = frozenset({"Qwen3ForCausalLM"})
 
 
-def initialize_layernorm_sp(*, server_args, model_config) -> None:
+def initialize_layernorm_sp(*, model_config) -> None:
     """Materialize ``flags.sp.enabled``; runs once per worker after distributed
     setup, alongside ``initialize_dp_attention``."""
     architectures = model_config.hf_config.architectures

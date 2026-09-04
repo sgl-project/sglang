@@ -1,5 +1,4 @@
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -9,6 +8,9 @@ from sglang.srt.layers.quantization.fp8_utils import (
     quant_weight_ue8m0,
     transform_scale_ue8m0,
 )
+from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
+from sglang.srt.runtime_context import override_platform, publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -51,6 +53,18 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
         torch.set_default_device("cuda")
+        # `apply_fp8_linear` reads `get_exec().graph.cuda_graph_config`, so
+        # this needs a published context. A real record carrying the real
+        # config type rather than a stand-in namespace: the branch this test
+        # wants is "prefill is not compiled with inductor", which is what a
+        # default `CudaGraphConfig` says (tc_compiler="eager"). The dummy model
+        # path returns before cuda-graph resolution, so the object is passed in
+        # rather than resolved.
+        publish(
+            ServerArgs(model_path="dummy", cuda_graph_config=CudaGraphConfig()),
+            role="test",
+        )
+        cls.addClassCleanup(reset_context)
 
     @staticmethod
     def _make_inputs(dtype=torch.bfloat16):
@@ -65,18 +79,7 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
     def test_native_scalar_a_static_prequant_and_dynamic_scale_shapes(self):
         import sglang.srt.layers.quantization.fp8_utils as fp8_utils
 
-        exec_config = SimpleNamespace(
-            graph=SimpleNamespace(
-                cuda_graph_config=SimpleNamespace(
-                    prefill=SimpleNamespace(tc_compiler="none")
-                )
-            )
-        )
-        for capability in (
-            "is_sm90",
-            "is_sm100",
-            "is_sm120",
-        ):
+        for capability in ("is_sm90", "is_sm100", "is_sm120"):
             with self.subTest(capability=capability):
                 input, qinput, weight, input_scale, weight_scale = self._make_inputs()
                 seen_scales = []
@@ -91,22 +94,15 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
                         device=mat_a.device,
                     )
 
-                capabilities = {
-                    "is_sm90": False,
-                    "is_sm100": False,
-                    "is_sm120": False,
-                }
+                capabilities = {"is_sm90": False, "is_sm100": False, "is_sm120": False}
                 capabilities[capability] = True
+                # Said once, to every reader: `apply_fp8_linear` asks the
+                # platform directly, so there is no module-level copy to patch.
                 with (
-                    patch.object(
-                        fp8_utils,
-                        "get_platform",
-                        return_value=SimpleNamespace(**capabilities),
-                    ),
+                    override_platform(**capabilities),
                     patch.object(
                         fp8_utils, "fp8_scaled_mm", side_effect=fake_fp8_scaled_mm
                     ),
-                    patch.object(fp8_utils, "get_exec", return_value=exec_config),
                 ):
                     fp8_utils.apply_fp8_linear(
                         input,
@@ -160,15 +156,7 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
             )
 
         with (
-            patch.object(
-                fp8_utils,
-                "get_platform",
-                return_value=SimpleNamespace(
-                    is_sm90=False,
-                    is_sm100=False,
-                    is_sm120=False,
-                ),
-            ),
+            override_platform(is_sm90=False, is_sm100=False, is_sm120=False),
             patch.object(fp8_utils, "fp8_scaled_mm", side_effect=fake_fp8_scaled_mm),
         ):
             fp8_utils.apply_fp8_linear(

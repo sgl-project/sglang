@@ -644,7 +644,6 @@ class ModelRunner:
                 world_size=self.ps.tp_size * self.ps.pp_size,
                 rank=self.ps.tp_size * self.ps.pp_rank + self.ps.tp_rank,
                 local_rank=self.gpu_id,
-                server_args=self.server_args,
                 port=self.dist_port,
             )
 

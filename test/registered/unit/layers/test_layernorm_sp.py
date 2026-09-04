@@ -11,7 +11,13 @@ from types import SimpleNamespace
 from sglang.srt.arg_groups.layernorm_sp_hook import validate_layernorm_sp
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_flags, get_forward, reset_context
+from sglang.srt.runtime_context import (
+    get_flags,
+    get_forward,
+    publish,
+    reset_context,
+)
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -19,8 +25,10 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _initialize(*, enable=True, arch="Qwen3ForCausalLM"):
+    publish(
+        ServerArgs(model_path="dummy", enable_layernorm_sp=enable), role="tokenizer"
+    )
     layernorm_sp.initialize_layernorm_sp(
-        server_args=SimpleNamespace(enable_layernorm_sp=enable),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(architectures=[arch] if arch else [])
         ),
