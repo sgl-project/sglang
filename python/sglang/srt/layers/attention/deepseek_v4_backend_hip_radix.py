@@ -689,6 +689,16 @@ class DeepseekV4HipRadixBackend(
             extend_seq_lens,
             num_tokens,
             need_compress=need_compress,
+            repeat_output_size=(
+                num_tokens
+                if (
+                    need_compress
+                    and not attach_decode_streams
+                    and extend_seq_lens_cpu is not None
+                    and sum(extend_seq_lens_cpu) == num_tokens
+                )
+                else None
+            ),
         )
         if attach_decode_streams:
             # Target-verify runs through the unified_kv DECODE kernel, so build
@@ -1447,6 +1457,7 @@ class DeepseekV4HipRadixBackend(
         extend_seq_lens: torch.Tensor,
         num_tokens: int,
         need_compress: bool = True,
+        repeat_output_size: Optional[int] = None,
     ) -> None:
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -1458,10 +1469,10 @@ class DeepseekV4HipRadixBackend(
         bs = req_pool_indices.shape[0]
         seq_lens = seq_lens.to(torch.int64)
         extend_seq_lens = extend_seq_lens.to(torch.int64)
-        # token -> req index (length L = sum(extend_seq_lens)).
-        # output_size skips the implicit sum() D2H on draft-extend. dropping it on the
-        # target-extend path triggers a GPU memory access fault.
-        if need_compress:
+        # Draft extend already supplies an exact output size. Target prefill may
+        # opt in when its CPU length mirror proves the actual query count;
+        # GPU-only/ragged paths retain the established fallback.
+        if need_compress and repeat_output_size is None:
             bid = torch.repeat_interleave(
                 torch.arange(bs, device=device, dtype=torch.int64),
                 extend_seq_lens,
@@ -1470,7 +1481,11 @@ class DeepseekV4HipRadixBackend(
             bid = torch.repeat_interleave(
                 torch.arange(bs, device=device, dtype=torch.int64),
                 extend_seq_lens,
-                output_size=num_tokens,
+                output_size=(
+                    num_tokens
+                    if repeat_output_size is None
+                    else repeat_output_size
+                ),
             )
         if core.unified is None:
             core.unified = UnifiedKvMetadata()

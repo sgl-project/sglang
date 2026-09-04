@@ -70,10 +70,17 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         core.positions_casual = torch.tensor([0, 1, 2, 0], dtype=torch.int32)
         core.unified = None
 
-        with mock.patch(
-            "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate."
-            "is_unified_kv_triton",
-            return_value=True,
+        with (
+            mock.patch(
+                "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate."
+                "is_unified_kv_triton",
+                return_value=True,
+            ),
+            mock.patch(
+                "sglang.srt.layers.attention.deepseek_v4_backend_hip_radix."
+                "torch.repeat_interleave",
+                wraps=torch.repeat_interleave,
+            ) as repeat_interleave,
         ):
             backend._attach_unified_kv_prefill_meta(
                 core,
@@ -82,12 +89,54 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
                 seq_lens=torch.tensor([1, 3], dtype=torch.int32),
                 extend_seq_lens=torch.tensor([1, 2], dtype=torch.int32),
                 num_tokens=3,
+                repeat_output_size=3,
             )
 
+        repeat_interleave.assert_called_once()
+        self.assertEqual(repeat_interleave.call_args.kwargs["output_size"], 3)
         self.assertEqual(core.unified.pf_state_slot.tolist(), [7, 9, 9, 9])
         self.assertEqual(core.unified.pf_chunk_start.tolist(), [0, 1, 1, 0])
         self.assertEqual(core.unified.pf_cu_q.tolist(), [0, 1, 1, 0])
         self.assertEqual(core.unified.pf_final_pos.tolist(), [0, 2, 2, 128])
+
+    def test_eager_prefill_uses_host_proven_repeat_output_size(self):
+        backend = object.__new__(DeepseekV4HipRadixBackend)
+        backend.req_to_token = torch.zeros((2, 8), dtype=torch.int32)
+        backend.token_to_kv_pool = object()
+        core = self._make_core_metadata(0)
+        backend.expand_prefill_casually = mock.Mock(
+            return_value=(
+                core.seq_lens_casual,
+                torch.tensor([7, 9, 9], dtype=torch.int32),
+            )
+        )
+        backend.make_core_attn_metadata = mock.Mock(return_value=core)
+        backend._attach_unified_kv_prefill_meta = mock.Mock()
+        backend.init_forward_metadata_indexer = mock.Mock(return_value=None)
+
+        with mock.patch(
+            "sglang.srt.layers.attention.deepseek_v4_backend_hip_radix."
+            "create_paged_compressor_data",
+            return_value=None,
+        ):
+            backend.init_forward_metadata_prefill(
+                max_seq_len=4096,
+                req_pool_indices=torch.tensor([7, 9], dtype=torch.int32),
+                seq_lens=torch.tensor([1, 3], dtype=torch.int32),
+                seq_lens_cpu=[1, 3],
+                out_cache_loc=torch.zeros(3, dtype=torch.int64),
+                num_tokens=3,
+                extend_seq_lens=torch.tensor([1, 2], dtype=torch.int32),
+                extend_seq_lens_cpu=[1, 2],
+                use_prefill_cuda_graph=False,
+            )
+
+        self.assertEqual(
+            backend._attach_unified_kv_prefill_meta.call_args.kwargs[
+                "repeat_output_size"
+            ],
+            3,
+        )
 
     def test_prefill_bcg_uses_bucket_sized_gpu_compressor_plans(self):
         backend = object.__new__(DeepseekV4HipRadixBackend)
