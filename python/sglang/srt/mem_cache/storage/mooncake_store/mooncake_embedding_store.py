@@ -1,5 +1,5 @@
 import logging
-from typing import Any, List, Optional
+from typing import Any, List
 
 from sglang.srt.mem_cache.embedding_store import EmbeddingStore
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
@@ -51,42 +51,37 @@ class MooncakeEmbeddingStore(MooncakeBaseStore, EmbeddingStore):
         return f"emb_{mm_hash}"
 
     def batch_get(
-        self, hashes: List[str], ptrs: List[int], sizes: List[int],
-        request_id: Optional[str] = None,
+        self, hashes: List[str], ptrs: List[int], sizes: List[int]
     ) -> List[bool]:
         keys = [self.get_key(h) for h in hashes]
-        with self.request_context(request_id=request_id):
-            results = self.store.batch_get_into(keys, ptrs, sizes)
+        results = self.store.batch_get_into(keys, ptrs, sizes)
         return [res > 0 for res in results]
 
     def batch_put(
-        self, hashes: List[str], ptrs: List[int], sizes: List[int],
-        request_id: Optional[str] = None,
+        self, hashes: List[str], ptrs: List[int], sizes: List[int]
     ) -> List[bool]:
         keys = [self.get_key(h) for h in hashes]
-        with self.request_context(request_id=request_id):
-            exists = self.store.batch_is_exist(keys)
+        exists = self.store.batch_is_exist(keys)
 
-            put_keys, put_ptrs, put_sizes, indices = [], [], [], []
-            success_map = [True] * len(hashes)
+        put_keys, put_ptrs, put_sizes, indices = [], [], [], []
+        success_map = [True] * len(hashes)
 
-            for i, status in enumerate(exists):
-                if status != 1:
-                    put_keys.append(keys[i])
-                    put_ptrs.append(ptrs[i])
-                    put_sizes.append(sizes[i])
-                    indices.append(i)
+        for i, status in enumerate(exists):
+            if status != 1:
+                put_keys.append(keys[i])
+                put_ptrs.append(ptrs[i])
+                put_sizes.append(sizes[i])
+                indices.append(i)
 
-            if put_keys:
-                results = self.store.batch_put_from(put_keys, put_ptrs, put_sizes)
-                for i, res in enumerate(results):
-                    success_map[indices[i]] = res == 0
+        if put_keys:
+            results = self.store.batch_put_from(put_keys, put_ptrs, put_sizes)
+            for i, res in enumerate(results):
+                success_map[indices[i]] = res == 0
         return success_map
 
-    def batch_is_exist(self, hashes: List[str], request_id: Optional[str] = None) -> List[bool]:
+    def batch_is_exist(self, hashes: List[str]) -> List[bool]:
         keys = [self.get_key(h) for h in hashes]
-        with self.request_context(request_id=request_id):
-            results = self.store.batch_is_exist(keys)
+        results = self.store.batch_is_exist(keys)
         return [res == 1 for res in results]
 
     def batch_get_into_multi_buffers(
@@ -94,11 +89,9 @@ class MooncakeEmbeddingStore(MooncakeBaseStore, EmbeddingStore):
         hashes: List[str],
         ptrs: List[List[int]],
         sizes: List[List[int]],
-        request_id: Optional[str] = None,
     ) -> List[bool]:
         keys = [self.get_key(h) for h in hashes]
-        with self.request_context(request_id=request_id):
-            results = self.store.batch_get_into_multi_buffers(keys, ptrs, sizes)
+        results = self.store.batch_get_into_multi_buffers(keys, ptrs, sizes)
         return [res > 0 for res in results]
 
     def batch_put_from_multi_buffers(
@@ -106,31 +99,29 @@ class MooncakeEmbeddingStore(MooncakeBaseStore, EmbeddingStore):
         hashes: List[str],
         ptrs: List[List[int]],
         sizes: List[List[int]],
-        request_id: Optional[str] = None,
     ) -> List[bool]:
         keys = [self.get_key(h) for h in hashes]
 
         # Skip keys that already exist in Mooncake
-        with self.request_context(request_id=request_id):
-            exists = self.store.batch_is_exist(keys)
-            put_keys = []
-            put_ptrs = []
-            put_sizes = []
-            put_indices = []
-            success_map = [True] * len(hashes)
+        exists = self.store.batch_is_exist(keys)
+        put_keys = []
+        put_ptrs = []
+        put_sizes = []
+        put_indices = []
+        success_map = [True] * len(hashes)
 
-            for i, status in enumerate(exists):
-                if status != 1:
-                    put_keys.append(keys[i])
-                    put_ptrs.append(ptrs[i])
-                    put_sizes.append(sizes[i])
-                    put_indices.append(i)
+        for i, status in enumerate(exists):
+            if status != 1:
+                put_keys.append(keys[i])
+                put_ptrs.append(ptrs[i])
+                put_sizes.append(sizes[i])
+                put_indices.append(i)
 
-            if not put_keys:
-                return success_map
+        if not put_keys:
+            return success_map
 
-            results = self.store.batch_put_from_multi_buffers(put_keys, put_ptrs, put_sizes)
-            for i, res in enumerate(results):
-                success_map[put_indices[i]] = res == 0
+        results = self.store.batch_put_from_multi_buffers(put_keys, put_ptrs, put_sizes)
+        for i, res in enumerate(results):
+            success_map[put_indices[i]] = res == 0
 
         return success_map

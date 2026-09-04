@@ -905,6 +905,24 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         ]
         return component_keys, key_multiplier
 
+    @staticmethod
+    def _request_context_from_extra_info(
+        extra_info: Optional[HiCacheStorageExtraInfo],
+    ) -> dict:
+        """Pull request-context fields out of HiCacheStorageExtraInfo.extra_info.
+
+        The controller carries per-request metadata (request_id, trace_id, ...)
+        in the ``extra_info`` dict of :class:`HiCacheStorageExtraInfo`; this
+        returns them as a kwargs dict for :meth:`request_context`.
+        """
+        if extra_info is None:
+            return {}
+        ed = getattr(extra_info, "extra_info", None)
+        if not isinstance(ed, dict):
+            return {}
+        keys = ("request_id", "trace_id", "span_id", "parent_span_id")
+        return {k: ed[k] for k in keys if ed.get(k) is not None}
+
     def batch_exists_v2(
         self,
         keys: List[str],
@@ -932,7 +950,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 keys, transfer
             )
             component_keys = self._tag_keys(component_keys)
-            ex = self._batch_exist(component_keys, request_id=self._extra_info_request_id(extra_info))
+            with self.request_context(**self._request_context_from_extra_info(extra_info)):
+                ex = self._batch_exist(component_keys)
             if key_multiplier > 0:
                 page_exists = [
                     all(
@@ -973,11 +992,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         final_pages = restorable[-1] if restorable else 0
         return PoolTransferResult(final_pages, hit_count, restorable)
 
-    def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool,
-                     extra_info: Optional[HiCacheStorageExtraInfo] = None):
+    def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
         # Unified v2 I/O path: each PoolTransfer can expand to one or more
         # storage objects per logical page, but API still reports page-level result.
-        request_id = self._extra_info_request_id(extra_info)
         results: dict = {}
         for transfer in transfers:
             host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
@@ -1004,7 +1021,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     if self._can_use_group_semantics()
                     else None
                 )
-                exist_result = self._batch_exist(key_strs, request_id=request_id)
+                exist_result = self._batch_exist(key_strs)
                 io_results = [0 if state == 1 else -1 for state in exist_result]
                 missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
                 if missing_idx:
@@ -1013,14 +1030,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         [ptr_list[i] for i in missing_idx],
                         [element_size_list[i] for i in missing_idx],
                         self._filter_group_ids(group_ids, missing_idx),
-                        request_id=request_id,
                     )
                     for i, res in zip(missing_idx, put_results):
                         io_results[i] = res
             else:
                 io_results = self._get_batch_zero_copy_impl(
-                    key_strs, ptr_list, element_size_list,
-                    request_id=request_id,
+                    key_strs, ptr_list, element_size_list
                 )
             results[transfer.name] = self._batch_postprocess(
                 io_results, is_set_operate=is_set, key_multiplier=key_multiplier
@@ -1032,14 +1047,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict:
-        return self._batch_io_v2(transfers, is_set=False, extra_info=extra_info)
+        with self.request_context(**self._request_context_from_extra_info(extra_info)):
+            return self._batch_io_v2(transfers, is_set=False)
 
     def batch_set_v2(
         self,
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict:
-        return self._batch_io_v2(transfers, is_set=True, extra_info=extra_info)
+        return self._batch_io_v2(transfers, is_set=True)
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = (
@@ -1160,10 +1176,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
 
         start_time = time.perf_counter()
-        get_results = self._get_batch_zero_copy_impl(
-            key_strs, buffer_ptrs, buffer_sizes,
-            request_id=self._extra_info_request_id(extra_info),
-        )
+        with self.request_context(**self._request_context_from_extra_info(extra_info)):
+            get_results = self._get_batch_zero_copy_impl(
+                key_strs, buffer_ptrs, buffer_sizes
+            )
         end_time = time.perf_counter()
 
         if self.enable_storage_metrics:
@@ -1194,7 +1210,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             if self._can_use_group_semantics()
             else None
         )
-        exist_result = self._batch_exist(key_strs, request_id=self._extra_info_request_id(extra_info))
+        exist_result = self._batch_exist(key_strs)
 
         set_keys = []
         set_buffer_ptrs = []
@@ -1218,7 +1234,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 set_buffer_ptrs,
                 set_buffer_sizes,
                 self._filter_group_ids(group_ids, set_indices),
-                request_id=self._extra_info_request_id(extra_info),
             )
             end_time = time.perf_counter()
 
@@ -1239,15 +1254,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         value: Optional[Any] = None,
         target_location: Optional[List[int]] = None,
         target_sizes: Optional[List[int]] = None,
-        request_id: Optional[str] = None,
     ) -> bool:
         # Only support zero copy set for now
         assert target_location is not None and target_sizes is not None
-        exist_result = self._batch_exist([key], request_id=request_id)
+        exist_result = self._batch_exist([key])
         if exist_result[0] == 1:
             return True
         put_result = self._put_batch_zero_copy_impl(
-            [key], [target_location], [target_sizes], request_id=request_id,
+            [key], [target_location], [target_sizes]
         )
         return put_result[0] == 0
 
@@ -1257,7 +1271,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         values: Optional[List[torch.Tensor]] = None,
         target_locations: Optional[List[int]] = None,
         target_sizes: Optional[List[int]] = None,
-        request_id: Optional[str] = None,
     ) -> bool:
         # Only support zero copy set for now
         assert target_locations is not None and target_sizes is not None
@@ -1274,7 +1287,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             ):
                 return False
 
-        exist_result = self._batch_exist(keys, request_id=request_id)
+        exist_result = self._batch_exist(keys)
         set_keys = []
         set_target_locations = []
         set_target_sizes = []
@@ -1288,8 +1301,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Only set non-existing keys to storage
         start_time = time.perf_counter()
         put_result = self._put_batch_zero_copy_impl(
-            set_keys, set_target_locations, set_target_sizes,
-            request_id=request_id,
+            set_keys, set_target_locations, set_target_sizes
         )
         end_time = time.perf_counter()
 
@@ -1316,11 +1328,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         key,
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
-        request_id: Optional[str] = None,
     ) -> bool:
         assert target_location is not None and target_sizes is not None
         get_result = self._get_batch_zero_copy_impl(
-            [key], [target_location], [target_sizes], request_id=request_id,
+            [key], [target_location], [target_sizes]
         )
         return get_result[0] >= 0
 
@@ -1329,7 +1340,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         keys: List[str],
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
-        request_id: Optional[str] = None,
     ) -> int:
         assert len(keys) == len(target_locations) == len(target_sizes)
         if len(keys) == 0:
@@ -1337,7 +1347,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         start_time = time.perf_counter()
         get_result = self._get_batch_zero_copy_impl(
-            keys, target_locations, target_sizes, request_id=request_id,
+            keys, target_locations, target_sizes
         )
         end_time = time.perf_counter()
 
@@ -1357,13 +1367,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 return i // key_multiplier
         return len(keys) // key_multiplier
 
-    def exists(self, key, request_id: Optional[str] = None) -> bool:
-        exist_result = self._batch_exist([key], request_id=request_id)
+    def exists(self, key) -> bool:
+        exist_result = self._batch_exist([key])
         return exist_result[0] == 1
 
     def batch_exists(
-        self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None,
-        request_id: Optional[str] = None,
+        self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
@@ -1385,7 +1394,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     query_keys.append(f"{key}_{self.mha_suffix}_v")
                 key_multiplier = 2
 
-        exist_result = self._batch_exist(query_keys, request_id=request_id)
+        with self.request_context(**self._request_context_from_extra_info(extra_info)):
+            exist_result = self._batch_exist(query_keys)
         for i in range(len(query_keys)):
             if exist_result[i] != 1:
                 return i // key_multiplier
@@ -1399,21 +1409,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def clear(self) -> None:
         self.store.remove_all()
 
-    @staticmethod
-    def _extra_info_request_id(extra_info) -> Optional[str]:
-        """Extract request_id from HiCacheStorageExtraInfo, if available."""
-        if extra_info is None:
-            return None
-        ed = getattr(extra_info, "extra_info", None) or {}
-        return ed.get("request_id") if isinstance(ed, dict) else None
-
     def _put_batch_zero_copy_impl(
         self,
         key_strs: List[str],
         buffer_ptrs: List[Any],
         buffer_sizes: List[Any],
         group_ids: Optional[List[str]] = None,
-        request_id: Optional[str] = None,
     ) -> List[int]:
         config = None
         if self._can_use_group_semantics() and group_ids is not None:
@@ -1425,33 +1426,29 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             config = self._replicate_config_cls()
             config.group_ids = group_ids
 
-        with self.request_context(request_id=request_id):
-            if self._uses_multi_buffer(buffer_ptrs):
-                config = config or self._replicate_config_cls()
-                return self.store.batch_put_from_multi_buffers(
-                    key_strs, buffer_ptrs, buffer_sizes, config
-                )
-            elif config is not None:
-                return self.store.batch_put_from(
-                    key_strs, buffer_ptrs, buffer_sizes, config
-                )
-            else:
-                return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+        if self._uses_multi_buffer(buffer_ptrs):
+            config = config or self._replicate_config_cls()
+            return self.store.batch_put_from_multi_buffers(
+                key_strs, buffer_ptrs, buffer_sizes, config
+            )
+        elif config is not None:
+            return self.store.batch_put_from(
+                key_strs, buffer_ptrs, buffer_sizes, config
+            )
+        else:
+            return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
 
     def _get_batch_zero_copy_impl(
-        self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any],
-        request_id: Optional[str] = None,
+        self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
     ) -> List[int]:
-        with self.request_context(request_id=request_id):
-            if self._uses_multi_buffer(buffer_ptrs):
-                return self.store.batch_get_into_multi_buffers(
-                    key_strs, buffer_ptrs, buffer_sizes
-                )
-            return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        if self._uses_multi_buffer(buffer_ptrs):
+            return self.store.batch_get_into_multi_buffers(
+                key_strs, buffer_ptrs, buffer_sizes
+            )
+        return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
 
-    def _batch_exist(self, key_strs: List[str], request_id: Optional[str] = None) -> List[int]:
-        with self.request_context(request_id=request_id):
-            return self.store.batch_is_exist(key_strs)
+    def _batch_exist(self, key_strs: List[str]) -> List[int]:
+        return self.store.batch_is_exist(key_strs)
 
     def get_stats(self):
         storage_metrics = StorageMetrics()
