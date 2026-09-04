@@ -1488,6 +1488,8 @@ class Envs:
     )
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
+    # Opt-in PTPC FP8 GEMM for GLM-5.2 attention projections on gfx950.
+    SGLANG_DSA_FP8_PROJ_GEMM = EnvBool(False)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
         2048, deprecated_name="SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"
     )

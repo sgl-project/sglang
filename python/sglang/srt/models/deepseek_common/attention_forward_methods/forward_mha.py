@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
 
@@ -14,6 +14,7 @@ from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_extend,
     filter_dcp_local_kv_indices,
 )
+from sglang.srt.layers.quantization.unquant import fp8_proj_gemm_active
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -42,12 +43,29 @@ if _is_cuda:
 elif _is_musa:
     from sgl_kernel import concat_mla_k
 
+if _use_aiter_gfx95:
+    from sglang.srt.models.deepseek_common.utils import (
+        flatten_fp8_per_token_quant,
+        fused_rms_fp8_per_token_quant,
+    )
+
 
 def resolve_attn_backend(forward_batch: ForwardBatch):
     backend = get_attn_backend()
     if isinstance(backend, TboAttnBackend):
         backend = backend.primary
     return backend
+
+
+def _maybe_quant_o_proj_input(
+    self: DeepseekV2AttentionMLA, attn_output: torch.Tensor
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    if not fp8_proj_gemm_active(self.o_proj):
+        return attn_output
+    return flatten_fp8_per_token_quant(
+        attn_output.contiguous(),
+        dtype_quant=torch.float8_e4m3fn,
+    )
 
 
 def forward_dsa_indexer_for_mha(
@@ -158,10 +176,22 @@ class DeepseekMHAForwardMixin:
             # DSA Indexer: cache quantized keys, auto-skip topk for sequences <= dsa_index_topk
 
             if self.use_dsa:
-                q_lora = self.q_a_layernorm(q)
-                q = self.q_b_proj(q_lora)[0].view(
-                    -1, self.num_local_heads, self.qk_head_dim
-                )
+                if _use_aiter_gfx95 and fp8_proj_gemm_active(self.q_b_proj):
+                    q_quanted, q_lora, _, _ = fused_rms_fp8_per_token_quant(
+                        q,
+                        self.q_a_layernorm.weight,
+                        self.q_a_layernorm.variance_epsilon,
+                        dtype_quant=torch.float8_e4m3fn,
+                        output_unquantized_inp1=True,
+                    )
+                    q = self.q_b_proj(q_quanted)[0].view(
+                        -1, self.num_local_heads, self.qk_head_dim
+                    )
+                else:
+                    q_lora = self.q_a_layernorm(q)
+                    q = self.q_b_proj(q_lora)[0].view(
+                        -1, self.num_local_heads, self.qk_head_dim
+                    )
                 if self.should_run_indexer():
                     forward_dsa_indexer_for_mha(
                         self.indexer,
@@ -171,6 +201,17 @@ class DeepseekMHAForwardMixin:
                         forward_batch=forward_batch,
                         layer_id=self.layer_id,
                     )
+            elif _use_aiter_gfx95 and fp8_proj_gemm_active(self.q_b_proj):
+                q_quanted, _, _, _ = fused_rms_fp8_per_token_quant(
+                    q,
+                    self.q_a_layernorm.weight,
+                    self.q_a_layernorm.variance_epsilon,
+                    dtype_quant=torch.float8_e4m3fn,
+                    output_unquantized_inp1=False,
+                )
+                q = self.q_b_proj(q_quanted)[0].view(
+                    -1, self.num_local_heads, self.qk_head_dim
+                )
             else:
                 q = self.q_a_layernorm(q)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
@@ -265,6 +306,7 @@ class DeepseekMHAForwardMixin:
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         if gate is not None:
             attn_output = self._apply_gated(attn_output, gate)
+        attn_output = _maybe_quant_o_proj_input(self, attn_output)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -322,6 +364,7 @@ class DeepseekMHAForwardMixin:
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         if gate is not None:
             attn_output = self._apply_gated(attn_output, gate)
+        attn_output = _maybe_quant_o_proj_input(self, attn_output)
         output, _ = self.o_proj(attn_output)
         return output
 

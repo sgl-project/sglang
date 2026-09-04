@@ -27,6 +27,7 @@ from sglang.srt.layers.dcp import (
     dcp_a2a_lse_reduce,
 )
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
+from sglang.srt.layers.quantization.unquant import fp8_proj_gemm_active
 from sglang.srt.layers.radix_attention import unified_attention_with_output
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.lora.deepseek_mla_correction import (
@@ -60,6 +61,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_hip,
     _is_musa,
+    _use_aiter_gfx95,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import (
@@ -108,6 +110,12 @@ def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
 
 if _is_cuda:
     from sglang.kernels.ops.gemm import bmm_fp8
+
+if _use_aiter_gfx95:
+    from sglang.srt.models.deepseek_common.utils import (
+        flatten_fp8_per_token_quant,
+        fused_rms_fp8_per_token_quant,
+    )
 
 
 def should_defer_dsa_cp_kv_gather(
@@ -334,8 +342,21 @@ class DeepseekMLAForwardMixin:
                     k_nope = self.kv_a_layernorm(k_nope)
                 current_stream.wait_stream(self.alt_stream)
             else:
-                q = self.q_a_layernorm(q)
-                k_nope = self.kv_a_layernorm(k_nope)
+                if _use_aiter_gfx95 and fp8_proj_gemm_active(self.q_b_proj):
+                    q_quanted, q_lora, k_nope, _ = fused_rms_fp8_per_token_quant(
+                        q,
+                        self.q_a_layernorm.weight,
+                        self.q_a_layernorm.variance_epsilon,
+                        k_nope,
+                        self.kv_a_layernorm.weight,
+                        self.kv_a_layernorm.variance_epsilon,
+                        dtype_quant=torch.float8_e4m3fn,
+                        output_unquantized_inp1=self.use_dsa,
+                    )
+                    q = q_quanted
+                else:
+                    q = self.q_a_layernorm(q)
+                    k_nope = self.kv_a_layernorm(k_nope)
 
             # q_lora needed by indexer
             if self.use_dsa:
@@ -913,6 +934,11 @@ class DeepseekMLAForwardMixin:
             )
         if gate is not None:
             attn_bmm_output = self._apply_gated(attn_bmm_output, gate)
+        if fp8_proj_gemm_active(self.o_proj):
+            attn_bmm_output = flatten_fp8_per_token_quant(
+                attn_bmm_output.contiguous(),
+                dtype_quant=torch.float8_e4m3fn,
+            )
         output, _ = self.o_proj(attn_bmm_output)
 
         if self.next_skip_topk is None:
