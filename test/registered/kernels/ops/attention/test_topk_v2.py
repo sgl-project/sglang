@@ -270,6 +270,56 @@ def test_topk_v2_output_indices(batch: int, seq: int, k: int) -> None:
     _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k)
 
 
+@pytest.mark.parametrize("k", [512, 1024, 2048])
+@pytest.mark.parametrize(
+    "batch,seq",
+    [
+        (4, 256),  # trivial
+        (8, 4096),  # register
+        (4, 16385),  # streaming
+        (2, 65537),  # CUDA cluster / ROCm streaming
+    ],
+)
+@torch.inference_mode()
+def test_topk_v2_paged_and_raw_outputs(batch: int, seq: int, k: int) -> None:
+    """One selection produces aligned raw and page-transformed outputs."""
+    torch.manual_seed(batch * 100003 + seq * 7 + k + 2)
+    device = "cuda"
+    width = (seq + 3) & ~3
+    scores = torch.randn(batch, width, dtype=torch.float32, device=device)[:, :seq]
+    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
+    seq_lens[0] = 0  # DP-idle row: both outputs must be fully padded
+    if batch > 1:
+        scores[1].zero_()  # outputs must stay aligned even at a tie boundary
+        seq_lens[-1] = max(1, seq - 17)
+    num_pages = (seq + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, inv_cpu = _make_page_table(
+        batch, num_pages, "perm", device, per_row=True
+    )
+    page_out = torch.full((batch, k), -2, dtype=torch.int32, device=device)
+    raw_out = torch.full_like(page_out, -2)
+    metadata = _plan(seq_lens)
+
+    topk_transform_paged_v2(
+        scores,
+        seq_lens,
+        page_table,
+        page_out,
+        PAGE_SIZE,
+        metadata,
+        raw_out,
+    )
+    torch.cuda.synchronize()
+
+    page_cpu = page_out.cpu().tolist()
+    page_as_raw = [_invert(page_cpu[i], inv_cpu[i]) for i in range(batch)]
+    raw = [[v for v in row if v != -1] for row in raw_out.cpu().tolist()]
+    assert page_as_raw == raw
+
+    ref_raw = _reference(scores, seq_lens, k)
+    _assert_topk_close(scores.cpu(), ref_raw, raw, batch, seq_lens.cpu(), k)
+
+
 # --- ragged entry point ------------------------------------------------------
 # Rows select inside `[row_start, row_start + seq_len)` of their score row and
 # emit `position + offset`. The window start is an arbitrary token offset, so
