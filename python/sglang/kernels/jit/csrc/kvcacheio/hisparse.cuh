@@ -8,6 +8,7 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
+#include "../hisparse_mtp_demand.cuh"
 #include <stdexcept>
 #include <stdint.h>
 #include <string>

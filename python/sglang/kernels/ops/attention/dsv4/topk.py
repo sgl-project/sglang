@@ -136,6 +136,9 @@ def topk_transform_paged_v2(
     out_page_indices: torch.Tensor,
     page_size: int,
     metadata: torch.Tensor,
+    out_raw_indices: Optional[torch.Tensor] = None,
+    direct_transform_table: Optional[torch.Tensor] = None,
+    direct_transform_rows: Optional[torch.Tensor] = None,
 ) -> None:
     """Fused top-k + optional page-table transform (DeepSeek-V4 top-k v2 kernel).
 
@@ -175,4 +178,7 @@ def topk_transform_paged_v2(
         out_page_indices,
         page_size,
         metadata,
+        out_raw_indices,
+        direct_transform_table,
+        direct_transform_rows,
     )

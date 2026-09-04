@@ -1,5 +1,6 @@
 import unittest
 from itertools import product
+from types import SimpleNamespace
 from typing import List, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
@@ -20,6 +21,7 @@ from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
+    TopKOutputBuffers,
     TopkTransformMethod,
 )
 from sglang.srt.layers.attention.dsa_backend import (
@@ -1272,6 +1274,82 @@ class TestDSAIndexer(CustomTestCase):
                     backend.decode_cuda_graph_metadata["page_table"] is None,
                     should_use_topk_v2,
                 )
+
+    def test_topk_v2_can_return_logical_and_direct_host_rows(self):
+        batch_size = 2
+        max_score_len = 4096
+        topk = 2048
+        seq_lens = torch.tensor(
+            [max_score_len, max_score_len - 64],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        logits = self._make_tie_free_logits(batch_size, max_score_len)
+        page_size = 64
+        real_page_table = (
+            torch.arange(
+                max_score_len // page_size,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            .unsqueeze(0)
+            .expand(batch_size, -1)
+            .contiguous()
+        )
+        from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
+
+        attn_metadata = SimpleNamespace(
+            page_size=page_size,
+            page_table_1=torch.empty(
+                batch_size, 0, dtype=torch.int32, device=self.device
+            ),
+            real_page_table=real_page_table,
+            topk_v2_plan=plan_topk_v2(seq_lens),
+        )
+        raw_indices = torch.full(
+            (batch_size, topk), -1, dtype=torch.int32, device=self.device
+        )
+        host_table = (
+            torch.arange(max_score_len, dtype=torch.int64, device=self.device)
+            .unsqueeze(0)
+            .expand(batch_size, -1)
+            .contiguous()
+            + 10_000
+        )
+        host_rows = torch.arange(batch_size, dtype=torch.int64, device=self.device)
+        physical_indices = torch.full_like(raw_indices, -1)
+
+        with envs.SGLANG_DSA_FUSE_TOPK.override(True):
+            actual = DSATopKBackend.SGL_KERNEL.topk_transform(
+                logits,
+                seq_lens,
+                topk,
+                TopkTransformMethod.PAGED,
+                attn_metadata,
+                output_buffers=TopKOutputBuffers(
+                    raw_indices=raw_indices,
+                    physical_indices=physical_indices,
+                    direct_transform_table=host_table,
+                    direct_transform_rows=host_rows,
+                ),
+            )
+
+        self.assertEqual(actual.data_ptr(), raw_indices.data_ptr())
+        for row, seq_len in enumerate(seq_lens.tolist()):
+            expected = torch.topk(logits[row, :seq_len], topk, sorted=False).indices
+            self.assertTrue(
+                torch.equal(
+                    torch.sort(actual[row]).values,
+                    torch.sort(expected.to(torch.int32)).values,
+                )
+            )
+            expected_host_rows = host_table[row, expected].to(torch.int32)
+            self.assertTrue(
+                torch.equal(
+                    torch.sort(physical_indices[row]).values,
+                    torch.sort(expected_host_rows).values,
+                )
+            )
 
     # TODO: enable this test after indexer accuracy aligned
     # @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")

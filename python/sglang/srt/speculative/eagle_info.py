@@ -178,6 +178,25 @@ class EagleDraftInput(SpecInput):
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
 
+    def slice_single(self, batch_index: int) -> "EagleDraftInput":
+        """Snapshot one request while HiSparse stages its prefill KV."""
+        sli = slice(batch_index, batch_index + 1)
+
+        def sliced(value):
+            return None if value is None else value[sli]
+
+        return EagleDraftInput(
+            topk_p=sliced(self.topk_p),
+            topk_index=sliced(self.topk_index),
+            draft_probs=sliced(self.draft_probs),
+            hidden_states=sliced(self.hidden_states),
+            capture_hidden_mode=self.capture_hidden_mode,
+            dsa_topk_indices=sliced(self.dsa_topk_indices),
+            bonus_tokens=sliced(self.bonus_tokens),
+            future_indices=sliced(self.future_indices),
+            future_dsa_topk_indices_available=(self.future_dsa_topk_indices_available),
+        )
+
     @classmethod
     def create_idle_input(
         cls,

@@ -1,0 +1,852 @@
+diff -ruN base/csrc/api/hisparse_demand.h final/csrc/api/hisparse_demand.h
+--- base/csrc/api/hisparse_demand.h	1970-01-01 08:00:00
++++ final/csrc/api/hisparse_demand.h	2026-08-23 21:59:33
+@@ -0,0 +1,151 @@
++#pragma once
++
++#include <optional>
++
++#include "../sm90/decode/sparse_fp8/components/hisparse_demand_params.h"
++
++struct HisparseDemandArgs {
++    std::optional<at::Tensor> host_kv;
++    std::optional<at::Tensor> host_locs;
++    std::optional<at::Tensor> device_locs;
++    std::optional<at::Tensor> cache_tags;
++    std::optional<at::Tensor> decode_calls;
++    std::optional<at::Tensor> num_real_reqs;
++    std::optional<at::Tensor> req_pool_indices;
++    std::optional<at::Tensor> seq_lens;
++    std::optional<at::Tensor> mtp_committed_lens;
++    int64_t cache_rows = 0;
++
++    bool enabled() const {
++        return host_kv.has_value();
++    }
++
++    void validate(
++        const Arch& arch,
++        const at::Tensor& kv,
++        int batch_size,
++        int query_length,
++        int head_dim,
++        int topk,
++        bool have_extra_kcache,
++        bool have_topk_length,
++        bool have_attn_sink
++    ) const {
++        const bool have_all =
++            host_kv.has_value() && host_locs.has_value() &&
++            device_locs.has_value() && cache_tags.has_value() &&
++            decode_calls.has_value() && num_real_reqs.has_value() &&
++            req_pool_indices.has_value() && seq_lens.has_value() &&
++            mtp_committed_lens.has_value();
++        const bool have_any =
++            host_kv.has_value() || host_locs.has_value() ||
++            device_locs.has_value() || cache_tags.has_value() ||
++            decode_calls.has_value() || num_real_reqs.has_value() ||
++            req_pool_indices.has_value() || seq_lens.has_value() ||
++            mtp_committed_lens.has_value();
++        TORCH_CHECK(
++            have_all || !have_any,
++            "all HiSparse Demand tensors must be provided together"
++        );
++        if (!have_all) {
++            TORCH_CHECK(
++                cache_rows == 0,
++                "cache_rows requires the HiSparse Demand tensor bundle"
++            );
++            return;
++        }
++
++        KU_CHECK_DEVICE(host_locs);
++        KU_CHECK_DEVICE(device_locs);
++        KU_CHECK_DEVICE(cache_tags);
++        KU_CHECK_DEVICE(decode_calls);
++        KU_CHECK_DEVICE(num_real_reqs);
++        KU_CHECK_DEVICE(req_pool_indices);
++        KU_CHECK_DEVICE(seq_lens);
++        KU_CHECK_DEVICE(mtp_committed_lens);
++
++        KU_CHECK_DTYPE(host_locs, torch::kInt32);
++        KU_CHECK_DTYPE(device_locs, torch::kInt64);
++        KU_CHECK_DTYPE(cache_tags, torch::kInt64);
++        KU_CHECK_DTYPE(decode_calls, torch::kInt32);
++        KU_CHECK_DTYPE(num_real_reqs, torch::kInt32);
++        KU_CHECK_DTYPE(req_pool_indices, torch::kInt64);
++        KU_CHECK_DTYPE(seq_lens, torch::kInt32);
++        KU_CHECK_DTYPE(mtp_committed_lens, torch::kInt32);
++
++        KU_CHECK_CONTIGUOUS(host_locs);
++        KU_CHECK_CONTIGUOUS(device_locs);
++        KU_CHECK_CONTIGUOUS(cache_tags);
++        KU_CHECK_CONTIGUOUS(decode_calls);
++        KU_CHECK_CONTIGUOUS(num_real_reqs);
++        KU_CHECK_CONTIGUOUS(req_pool_indices);
++        KU_CHECK_CONTIGUOUS(seq_lens);
++        KU_CHECK_CONTIGUOUS(mtp_committed_lens);
++
++        TORCH_CHECK(arch.is_sm90a(), "HiSparse Demand only supports SM90");
++        TORCH_CHECK(head_dim == 576, "HiSparse Demand only supports V32 KV rows");
++        TORCH_CHECK(query_length == 1, "HiSparse Demand requires s_q == 1");
++        TORCH_CHECK(topk == 2048, "HiSparse Demand requires topk == 2048");
++        TORCH_CHECK(cache_rows == 4096, "HiSparse Demand requires cache_rows == 4096");
++        TORCH_CHECK(!have_extra_kcache, "HiSparse Demand does not support extra KV");
++        TORCH_CHECK(!have_topk_length, "HiSparse Demand does not support topk_length");
++        TORCH_CHECK(!have_attn_sink, "HiSparse Demand does not support attn_sink");
++        TORCH_CHECK(host_kv->device().is_cpu(), "HiSparse Demand host KV must be on CPU");
++        TORCH_CHECK(host_kv->is_pinned(), "HiSparse Demand host KV must be pinned");
++        TORCH_CHECK(host_kv->is_contiguous(), "HiSparse Demand host KV must be contiguous");
++        TORCH_CHECK(
++            host_kv->scalar_type() == kv.scalar_type(),
++            "HiSparse Demand host KV dtype must match device KV"
++        );
++        TORCH_CHECK(
++            host_kv->element_size() == 1 && host_kv->size(-1) == 656,
++            "HiSparse Demand host KV must contain contiguous 656-byte rows"
++        );
++        TORCH_CHECK(
++            host_locs->dim() == 2 && host_locs->size(0) == batch_size &&
++                host_locs->size(1) == topk,
++            "HiSparse Demand host locations must have shape [batch, topk]"
++        );
++        TORCH_CHECK(
++            device_locs->dim() == 2 &&
++                device_locs->size(1) == cache_rows + 6,
++            "HiSparse MTP Demand device locations must have shape [request, cache_rows + 6]"
++        );
++        TORCH_CHECK(
++            cache_tags->dim() == 2 &&
++                cache_tags->size(0) == device_locs->size(0) &&
++                cache_tags->size(1) == cache_rows,
++            "HiSparse Demand cache tags must have shape [request, cache_rows]"
++        );
++        TORCH_CHECK(
++            decode_calls->dim() == 1 &&
++                decode_calls->size(0) == device_locs->size(0),
++            "HiSparse Demand decode calls must have shape [request]"
++        );
++        KU_CHECK_SHAPE(num_real_reqs, 1);
++        KU_CHECK_SHAPE(req_pool_indices, batch_size);
++        KU_CHECK_SHAPE(seq_lens, batch_size);
++        KU_CHECK_SHAPE(mtp_committed_lens, batch_size);
++    }
++
++    sm90::decode::sparse_fp8::hisparse_demand::Params kernel_params() const {
++        if (!enabled()) return {};
++        return {
++            reinterpret_cast<const uint8_t*>(host_kv->data_ptr()),
++            host_locs->data_ptr<int32_t>(),
++            device_locs->data_ptr<int64_t>(),
++            reinterpret_cast<uint64_t*>(cache_tags->data_ptr<int64_t>()),
++            decode_calls->data_ptr<int32_t>(),
++            num_real_reqs->data_ptr<int32_t>(),
++            req_pool_indices->data_ptr<int64_t>(),
++            seq_lens->data_ptr<int32_t>(),
++            mtp_committed_lens->data_ptr<int32_t>(),
++            static_cast<int>(cache_rows),
++            int64_stride_to_int(host_locs->stride(0)),
++            int64_stride_to_int(device_locs->stride(0)),
++            static_cast<int>(host_locs->size(1)),
++            int64_stride_to_int(cache_tags->stride(0)),
++            int64_stride_to_int(cache_tags->stride(1)),
++        };
++    }
++};
+diff -ruN base/csrc/api/sparse_decode.h final/csrc/api/sparse_decode.h
+--- base/csrc/api/sparse_decode.h	2026-06-24 14:52:45
++++ final/csrc/api/sparse_decode.h	2026-08-23 22:00:27
+@@ -2,6 +2,7 @@
+
+ #include "common.h"
+
++#include "hisparse_demand.h"
+ #include "params.h"
+
+ #include "sm90/decode/sparse_fp8/splitkv_mla.h"
+@@ -193,7 +194,8 @@
+     const std::optional<at::Tensor> &extra_indices,
+     const std::optional<at::Tensor> &extra_topk_length,
+     int d_v,
+-    float sm_scale
++    float sm_scale,
++    const HisparseDemandArgs &hisparse_demand = {}
+ ) {
+     using bf16 = cutlass::bfloat16_t;
+
+@@ -309,6 +311,18 @@
+     KU_CHECK_SHAPE(extra_indices, b, s_q, extra_topk);
+     KU_CHECK_SHAPE(extra_topk_length, b);
+
++    hisparse_demand.validate(
++        arch,
++        kv,
++        b,
++        s_q,
++        d_qk,
++        topk,
++        have_extra_kcache,
++        have_topk_length,
++        have_attn_sink
++    );
++
+     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+     auto opts = q.options();
+
+@@ -411,6 +425,8 @@
+         have_extra_kcache ? int64_stride_to_int(extra_kv->stride(1)) : 0,
+         have_extra_kcache ? int64_stride_to_int(extra_indices->stride(0)) : 0,
+         have_extra_kcache ? int64_stride_to_int(extra_indices->stride(1)) : 0,
++
++        hisparse_demand.kernel_params(),
+         at::cuda::getCurrentCUDAStream().stream()
+     };
+
+diff -ruN base/csrc/params.h final/csrc/params.h
+--- base/csrc/params.h	2026-06-24 14:52:45
++++ final/csrc/params.h	2026-08-23 21:59:33
+@@ -1,6 +1,9 @@
+ #pragma once
+
++#include <cstdint>
++
+ #include "cutlass/bfloat16.h"
++#include "sm90/decode/sparse_fp8/components/hisparse_demand_params.h"
+
+ enum class ModelType {
+     V32,
+@@ -90,6 +93,8 @@
+     int stride_extra_kv_block, stride_extra_kv_row;
+     int stride_extra_indices_b, stride_extra_indices_s_q;
+
++    sm90::decode::sparse_fp8::hisparse_demand::Params hisparse_demand;
++
+     cudaStream_t stream;
+
+     // SplitKV-related parameters
+diff -ruN base/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_params.h final/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_params.h
+--- base/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_params.h	1970-01-01 08:00:00
++++ final/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_params.h	2026-08-23 22:08:19
+@@ -0,0 +1,26 @@
++#pragma once
++
++#include <cstdint>
++
++namespace sm90::decode::sparse_fp8::hisparse_demand {
++
++struct Params {
++    const uint8_t* __restrict__ host_kv = nullptr;
++    const int32_t* __restrict__ host_locs = nullptr;
++    const int64_t* __restrict__ device_locs = nullptr;
++    uint64_t* __restrict__ cache_tags = nullptr;
++    const int32_t* __restrict__ decode_calls = nullptr;
++    const int32_t* __restrict__ num_real_reqs = nullptr;
++    const int64_t* __restrict__ req_pool_indices = nullptr;
++    const int32_t* __restrict__ seq_lens = nullptr;
++    const int32_t* __restrict__ mtp_committed_lens = nullptr;
++    int cache_rows = 0;
++    int host_locs_req_stride = 0;
++    int device_locs_req_stride = 0;
++    int token_capacity = 0;
++    int cache_tags_req_stride = 0;
++    int cache_tags_slot_stride = 0;
++
++};
++
++}  // namespace sm90::decode::sparse_fp8::hisparse_demand
+diff -ruN base/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_producer.h final/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_producer.h
+--- base/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_producer.h	1970-01-01 08:00:00
++++ final/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_producer.h	2026-08-23 22:08:19
+@@ -0,0 +1,358 @@
++#pragma once
++
++#include <cstdint>
++
++#include "hisparse_demand_source.h"
++
++namespace sm90::decode::sparse_fp8::hisparse_demand_producer {
++
++namespace source = hisparse_demand_source;
++
++enum class Kind : int { INVALID = 0, DEVICE = 1, HOST = 2, FILL = 3 };
++
++struct Resolution {
++    Kind kind = Kind::INVALID;
++    int physical_row = -1;
++    int cache_slot = -1;
++    uint64_t* fill_tag = nullptr;
++    uint64_t fill_ready_tag = 0;
++};
++
++template <typename FP8>
++struct ThreadState {
++    FP8* source_row = nullptr;
++    uint8_t* fill_row = nullptr;
++    uint64_t* fill_tag = nullptr;
++    uint64_t fill_ready_tag = 0;
++};
++
++static __forceinline__ __device__ uint32_t primary_slot(
++    uint32_t row,
++    uint32_t mask
++) {
++    return ((row ^ (row >> 11)) * 0x9e3779b1u) & mask;
++}
++
++static __forceinline__ __device__ uint32_t secondary_slot(
++    uint32_t row,
++    uint32_t first,
++    uint32_t mask
++) {
++    uint32_t second = ((row ^ (row >> 16)) * 0x85ebca6bu) & mask;
++    return (second + static_cast<uint32_t>(second == first)) & mask;
++}
++
++static __forceinline__ __device__ bool promote_ready(
++    uint64_t* tag,
++    uint64_t observed,
++    uint32_t generation,
++    uint64_t row
++) {
++    if (!source::is_ready_row(observed, row)) return false;
++    if (source::tag_generation(observed) == generation) return true;
++    const uint64_t ready = source::pack_tag(
++        generation, source::State::READY, row
++    );
++    const uint64_t old = source::compare_exchange_acq_rel(
++        tag, observed, ready
++    );
++    return old == observed ||
++        (source::observe_ready(tag, generation, row));
++}
++
++static __forceinline__ __device__ Resolution resolve(
++    int logical_token,
++    int host_row,
++    int seq_len,
++    int committed_len,
++    int64_t request_slot,
++    uint64_t* cache_tags,
++    int64_t tag_request_stride,
++    int cache_rows,
++    const int64_t* device_locs,
++    int64_t device_request_stride,
++    const int32_t* decode_calls
++) {
++    Resolution result;
++    if (logical_token < 0 || logical_token >= seq_len) return result;
++
++    if (
++        logical_token >= committed_len &&
++        logical_token < committed_len + 4
++    ) {
++        result.kind = Kind::DEVICE;
++        result.physical_row = static_cast<int>(__ldg(
++            device_locs + request_slot * device_request_stride + cache_rows +
++            2 + logical_token - committed_len
++        ));
++        return result;
++    }
++    if (logical_token >= committed_len || host_row < 0) return result;
++
++    const int calls = __ldg(decode_calls + request_slot);
++    const uint32_t generation = static_cast<uint32_t>(
++        calls > 0 ? calls - 1 : 0
++    ) & source::GENERATION_MASK;
++    const uint64_t row = static_cast<uint32_t>(host_row);
++    const uint32_t mask = static_cast<uint32_t>(cache_rows - 1);
++    uint32_t slots[2] = {
++        primary_slot(static_cast<uint32_t>(row), mask), 0
++    };
++    slots[1] = secondary_slot(
++        static_cast<uint32_t>(row), slots[0], mask
++    );
++    const int64_t tag_base = request_slot * tag_request_stride;
++    uint64_t* tags[2] = {
++        cache_tags + tag_base + slots[0],
++        cache_tags + tag_base + slots[1]
++    };
++    uint64_t observed[2];
++
++    #pragma unroll
++    for (int i = 0; i < 2; ++i) {
++        observed[i] = source::load_acquire(tags[i]);
++        if (promote_ready(tags[i], observed[i], generation, row)) {
++            result.kind = Kind::DEVICE;
++            result.cache_slot = static_cast<int>(slots[i]);
++            result.physical_row = static_cast<int>(__ldg(
++                device_locs + request_slot * device_request_stride + slots[i]
++            ));
++            return result;
++        }
++        observed[i] = source::load_acquire(tags[i]);
++        if (source::is_filling_row(observed[i], generation, row)) {
++            result.kind = source::observe_ready(tags[i], generation, row)
++                ? Kind::DEVICE
++                : Kind::HOST;
++            result.cache_slot = static_cast<int>(slots[i]);
++            if (result.kind == Kind::DEVICE) {
++                result.physical_row = static_cast<int>(__ldg(
++                    device_locs + request_slot * device_request_stride + slots[i]
++                ));
++            }
++            return result;
++        }
++    }
++
++    int target = -1;
++    #pragma unroll
++    for (int i = 0; i < 2; ++i) {
++        if (observed[i] == 0 && target < 0) target = i;
++    }
++    if (target < 0) {
++        uint32_t oldest_age = 0;
++        #pragma unroll
++        for (int i = 0; i < 2; ++i) {
++            if (!source::is_replaceable(observed[i], generation)) continue;
++            const uint32_t age =
++                (generation - source::tag_generation(observed[i])) &
++                source::GENERATION_MASK;
++            if (target < 0 || age > oldest_age) {
++                target = i;
++                oldest_age = age;
++            }
++        }
++    }
++
++    if (target >= 0) {
++        const uint64_t filling = source::pack_tag(
++            generation, source::State::FILLING, row
++        );
++        const uint64_t old = source::compare_exchange_acq_rel(
++            tags[target], observed[target], filling
++        );
++        if (old == observed[target]) {
++            result.kind = Kind::FILL;
++            result.cache_slot = static_cast<int>(slots[target]);
++            result.physical_row = static_cast<int>(__ldg(
++                device_locs + request_slot * device_request_stride +
++                slots[target]
++            ));
++            result.fill_tag = tags[target];
++            result.fill_ready_tag = source::pack_tag(
++                generation, source::State::READY, row
++            );
++            return result;
++        }
++    }
++
++    #pragma unroll
++    for (int i = 0; i < 2; ++i) {
++        observed[i] = source::load_acquire(tags[i]);
++        if (promote_ready(tags[i], observed[i], generation, row) ||
++            source::observe_ready(tags[i], generation, row)) {
++            result.kind = Kind::DEVICE;
++            result.cache_slot = static_cast<int>(slots[i]);
++            result.physical_row = static_cast<int>(__ldg(
++                device_locs + request_slot * device_request_stride + slots[i]
++            ));
++            return result;
++        }
++    }
++    result.kind = Kind::HOST;
++    return result;
++}
++
++static __forceinline__ __device__ bool is_valid(
++    int logical_token,
++    int host_row,
++    int seq_len,
++    int committed_len
++) {
++    if (logical_token < 0 || logical_token >= seq_len) return false;
++    if (
++        logical_token >= committed_len &&
++        logical_token < committed_len + 4
++    ) {
++        return true;
++    }
++    return logical_token < committed_len && host_row >= 0;
++}
++
++template <typename Params, typename FP8>
++static __forceinline__ __device__ ThreadState<FP8> resolve_source(
++    const Params& params,
++    int batch_idx,
++    int topk_ordinal,
++    int lane_idx,
++    int page_block_size,
++    int64_t k_block_stride,
++    int64_t k_row_stride,
++    FP8* k_ptr,
++    int& token_index,
++    int& block_index,
++    int& rel_idx_in_block
++) {
++    ThreadState<FP8> state;
++    const auto& demand = params.hisparse_demand;
++    if (demand.host_kv == nullptr) {
++        state.source_row = k_ptr + block_index * k_block_stride +
++            rel_idx_in_block * k_row_stride;
++        return state;
++    }
++
++    const unsigned row_group_mask = 0x01010101u << (lane_idx % 8);
++    int source_kind = static_cast<int>(Kind::INVALID);
++    int host_row = -1;
++    int physical_row = -1;
++    if (
++        lane_idx < 8 && topk_ordinal >= 0 &&
++        topk_ordinal < demand.token_capacity &&
++        batch_idx < __ldg(demand.num_real_reqs)
++    ) {
++        host_row = __ldg(
++            demand.host_locs +
++            batch_idx * demand.host_locs_req_stride + topk_ordinal
++        );
++        const int64_t request_slot = __ldg(
++            demand.req_pool_indices + batch_idx
++        );
++        const auto resolution = resolve(
++            token_index,
++            host_row,
++            __ldg(demand.seq_lens + batch_idx),
++            __ldg(demand.mtp_committed_lens + batch_idx),
++            request_slot,
++            demand.cache_tags,
++            demand.cache_tags_req_stride,
++            demand.cache_rows,
++            demand.device_locs,
++            demand.device_locs_req_stride,
++            demand.decode_calls
++        );
++        source_kind = static_cast<int>(resolution.kind);
++        physical_row = resolution.physical_row;
++        if (resolution.kind == Kind::FILL) {
++            state.fill_tag = resolution.fill_tag;
++            state.fill_ready_tag = resolution.fill_ready_tag;
++        }
++    }
++    source_kind = __shfl_sync(
++        row_group_mask, source_kind, lane_idx % 8
++    );
++    host_row = __shfl_sync(row_group_mask, host_row, lane_idx % 8);
++    physical_row = __shfl_sync(
++        row_group_mask, physical_row, lane_idx % 8
++    );
++
++    auto get_device_row = [&](int row) {
++        const int physical_block = static_cast<uint32_t>(row) /
++            static_cast<uint32_t>(page_block_size);
++        const int physical_offset = static_cast<uint32_t>(row) %
++            static_cast<uint32_t>(page_block_size);
++        return k_ptr + physical_block * k_block_stride +
++            physical_offset * k_row_stride;
++    };
++
++    const auto kind = static_cast<Kind>(source_kind);
++    if (kind == Kind::DEVICE) {
++        token_index = physical_row;
++        block_index = static_cast<uint32_t>(token_index) /
++            static_cast<uint32_t>(page_block_size);
++        rel_idx_in_block = static_cast<uint32_t>(token_index) %
++            static_cast<uint32_t>(page_block_size);
++        state.source_row = get_device_row(physical_row);
++    } else if (kind == Kind::HOST || kind == Kind::FILL) {
++        state.source_row = reinterpret_cast<FP8*>(
++            const_cast<uint8_t*>(
++                demand.host_kv + host_row * source::ROW_BYTES
++            )
++        );
++        if (kind == Kind::FILL) {
++            state.fill_row = reinterpret_cast<uint8_t*>(
++                get_device_row(physical_row)
++            );
++        }
++    } else {
++        token_index = -1;
++        state.source_row = k_ptr;
++    }
++    return state;
++}
++
++template <typename Params>
++static __forceinline__ __device__ bool is_index_valid(
++    const Params& params,
++    int batch_idx,
++    int ordinal,
++    int logical_token
++) {
++    const auto& demand = params.hisparse_demand;
++    if (demand.host_kv == nullptr) return logical_token != -1;
++    if (batch_idx >= __ldg(demand.num_real_reqs)) return false;
++    const int host_row = __ldg(
++        demand.host_locs +
++        batch_idx * demand.host_locs_req_stride + ordinal
++    );
++    return is_valid(
++        logical_token,
++        host_row,
++        __ldg(demand.seq_lens + batch_idx),
++        __ldg(demand.mtp_committed_lens + batch_idx)
++    );
++}
++
++template <typename T>
++static __forceinline__ __device__ void maybe_fill(
++    uint8_t* fill_row,
++    int byte_offset,
++    const T& value
++) {
++    if (fill_row != nullptr) {
++        *reinterpret_cast<T*>(fill_row + byte_offset) = value;
++    }
++}
++
++static __forceinline__ __device__ void publish_fill(
++    uint8_t* fill_row,
++    uint64_t* fill_tag,
++    uint64_t fill_ready_tag,
++    int lane_idx
++) {
++    if (fill_row == nullptr) return;
++    const unsigned row_group_mask = 0x01010101u << (lane_idx % 8);
++    __syncwarp(row_group_mask);
++    if (lane_idx < 8) source::store_release(fill_tag, fill_ready_tag);
++}
++
++}  // namespace sm90::decode::sparse_fp8::hisparse_demand_producer
+diff -ruN base/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_source.h final/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_source.h
+--- base/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_source.h	1970-01-01 08:00:00
++++ final/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_source.h	2026-08-23 21:58:23
+@@ -0,0 +1,117 @@
++#pragma once
++
++#include <cstdint>
++
++namespace sm90::decode::sparse_fp8::hisparse_demand_source {
++
++static constexpr int ROW_BYTES = 656;
++static constexpr uint32_t GENERATION_MASK = (1u << 24) - 1;
++static constexpr uint32_t TAG_GENERATION_SHIFT = 2;
++static constexpr uint32_t TAG_ROW_SHIFT = 26;
++static constexpr uint32_t RETENTION_STEPS = 2;
++
++enum class State : uint32_t { FILLING = 1, READY = 2 };
++
++static __forceinline__ __device__ uint64_t pack_tag(
++    uint32_t generation,
++    State state,
++    uint64_t host_row
++) {
++    return (host_row << TAG_ROW_SHIFT) |
++        (static_cast<uint64_t>(generation & GENERATION_MASK)
++         << TAG_GENERATION_SHIFT) |
++        static_cast<uint64_t>(state);
++}
++
++static __forceinline__ __device__ uint32_t tag_generation(uint64_t value) {
++    return static_cast<uint32_t>(
++        (value >> TAG_GENERATION_SHIFT) & GENERATION_MASK
++    );
++}
++
++static __forceinline__ __device__ uint64_t tag_row(uint64_t value) {
++    return value >> TAG_ROW_SHIFT;
++}
++
++static __forceinline__ __device__ State tag_state(uint64_t value) {
++    return static_cast<State>(value & 0x3ull);
++}
++
++static __forceinline__ __device__ bool is_ready_row(
++    uint64_t value,
++    uint64_t host_row
++) {
++    return tag_state(value) == State::READY && tag_row(value) == host_row;
++}
++
++static __forceinline__ __device__ bool is_filling_row(
++    uint64_t value,
++    uint32_t generation,
++    uint64_t host_row
++) {
++    return tag_state(value) == State::FILLING &&
++        tag_generation(value) == generation && tag_row(value) == host_row;
++}
++
++static __forceinline__ __device__ bool is_replaceable(
++    uint64_t value,
++    uint32_t generation
++) {
++    const uint32_t age =
++        (generation - tag_generation(value)) & GENERATION_MASK;
++    return value == 0 ||
++        (tag_state(value) == State::READY && age >= RETENTION_STEPS);
++}
++
++static __forceinline__ __device__ uint64_t load_acquire(
++    const uint64_t* ptr
++) {
++    uint64_t value;
++    asm volatile(
++        "ld.global.acquire.gpu.u64 %0, [%1];"
++        : "=l"(value)
++        : "l"(ptr)
++        : "memory"
++    );
++    return value;
++}
++
++static __forceinline__ __device__ uint64_t compare_exchange_acq_rel(
++    uint64_t* ptr,
++    uint64_t expected,
++    uint64_t desired
++) {
++    uint64_t old;
++    asm volatile(
++        "atom.global.acq_rel.gpu.cas.b64 %0, [%1], %2, %3;"
++        : "=l"(old)
++        : "l"(ptr), "l"(expected), "l"(desired)
++        : "memory"
++    );
++    return old;
++}
++
++static __forceinline__ __device__ void store_release(
++    uint64_t* ptr,
++    uint64_t value
++) {
++    asm volatile(
++        "st.global.release.gpu.u64 [%0], %1;"
++        :
++        : "l"(ptr), "l"(value)
++        : "memory"
++    );
++}
++
++static __forceinline__ __device__ bool observe_ready(
++    const uint64_t* ptr,
++    uint32_t generation,
++    uint64_t host_row
++) {
++    const uint64_t observed = load_acquire(ptr);
++    return tag_state(observed) == State::READY &&
++        tag_generation(observed) == generation &&
++        tag_row(observed) == host_row;
++}
++
++}  // namespace sm90::decode::sparse_fp8::hisparse_demand_source
+diff -ruN base/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh final/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh
+--- base/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh	2026-06-24 14:52:45
++++ final/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh	2026-08-23 21:58:23
+@@ -14,6 +14,7 @@
+ #include "flashmla_utils.h"
+ #include "components/dequant.h"
+ #include "components/helpers.h"
++#include "components/hisparse_demand_producer.h"
+ #include "config.h"
+ using namespace cute;
+
+@@ -537,14 +538,44 @@
+
+                     int block_index = token_index == -1 ? 0 : (int)((uint32_t)token_index/(uint32_t)page_block_size);   // Use uint32_t division and mod to improve performance
+                     int rel_idx_in_block = (uint32_t)token_index % (uint32_t)page_block_size;   // NOTE When token_index is -1 (UINT_MAX), UINT_MAX%page_block_size < page_block_size, so there will be no illegal-memory-access error
++                    const int topk_ordinal = block_idx * TOPK_BLOCK_SIZE +
++                        idx_in_cluster * (TOPK_BLOCK_SIZE / 2) + my_token_idx;
+
+                     fp8* gK_base;
++                    uint8_t* fill_row = nullptr;
++                    uint64_t* fill_tag = nullptr;
++                    uint64_t fill_ready_tag = 0;
+                     bf16 scales[NUM_SCALES];
+                     if constexpr (MODEL_TYPE == ModelType::V32) {
+                         static_assert(NUM_SCALES == 4);
+-                        gK_base = k_ptr + block_index*k_block_stride + rel_idx_in_block*k_row_stride;
++                        static_assert(TOPK_BLOCK_SIZE == 64);
++                        const auto demand =
++                            hisparse_demand_producer::resolve_source(
++                                params,
++                                batch_idx,
++                                topk_ordinal,
++                                lane_idx,
++                                page_block_size,
++                                k_block_stride,
++                                k_row_stride,
++                                k_ptr,
++                                token_index,
++                                block_index,
++                                rel_idx_in_block
++                            );
++                        gK_base = demand.source_row;
++                        fill_row = demand.fill_row;
++                        fill_tag = demand.fill_tag;
++                        fill_ready_tag = demand.fill_ready_tag;
+                         float scales_float[NUM_SCALES];
+                         *(float4*)(scales_float) = load_128b_from_gmem<float4, L1CacheHint::EVICT_LAST, L2PrefetchHint::B128>((float*)(gK_base+HEAD_DIM_NOPE));
++                        if (lane_idx < 8) {
++                            hisparse_demand_producer::maybe_fill(
++                                fill_row,
++                                HEAD_DIM_NOPE,
++                                *reinterpret_cast<float4*>(scales_float)
++                            );
++                        }
+                         CUTE_UNROLL
+                         for (int i = 0; i < NUM_SCALES; ++i) {
+                             scales[i] = (bf16)scales_float[i];
+@@ -582,6 +613,13 @@
+                     CUTE_UNROLL
+                     for (int dim_idx = 0; dim_idx < HEAD_DIM_NOPE/64; dim_idx += 1) {
+                         fp8x16 cur_fp8x16 = load_128b_from_gmem<fp8x16, L1CacheHint::EVICT_LAST, L2PrefetchHint::B256>(gK_nope + dim_idx*64);   // We use EVICT_LAST here since gK_base may not be aligned to 32B (for V3.2) and the performance is the best among all cache hints (for MODEL1)
++                        if constexpr (MODEL_TYPE == ModelType::V32) {
++                            hisparse_demand_producer::maybe_fill(
++                                fill_row,
++                                (lane_idx / 8) * 16 + dim_idx * 64,
++                                *reinterpret_cast<uint128_t*>(&cur_fp8x16)
++                            );
++                        }
+                         bf16 scale = scales[MODEL_TYPE == ModelType::V32 ? dim_idx/2 : dim_idx];
+                         auto dequant_and_save_bf16x8 = [&](const fp8x8 &data, int offset) {
+                             int smem_offset = (dim_idx*64 + offset) * TOPK_BLOCK_SIZE;
+@@ -610,6 +648,14 @@
+                     for (int dim_idx = 0; dim_idx < HEAD_DIM_ROPE/32; dim_idx += 1) {
+                         bf16x8 cur_bf16x8 = load_128b_from_gmem<bf16x8, L1CacheHint::EVICT_LAST, L2PrefetchHint::B128>(gK_rope + dim_idx*32);
+                         if constexpr (MODEL_TYPE == ModelType::V32) {
++                            hisparse_demand_producer::maybe_fill(
++                                fill_row,
++                                HEAD_DIM_NOPE + NUM_SCALES * sizeof(float) +
++                                    (lane_idx / 8) * 16 + dim_idx * 64,
++                                cur_bf16x8
++                            );
++                        }
++                        if constexpr (MODEL_TYPE == ModelType::V32) {
+                             // NOTE We do not need to mask the RoPE part for V3.2 since it isn't involved in the SV gemm
+                         } else {
+                             if (token_index == -1)
+@@ -621,6 +667,11 @@
+                             st_async_128b(sK_rope_peer_base + smem_offset, cur_bf16x8, peer_bar_k_remote_ready);
+                         }
+                     }
++                    if constexpr (MODEL_TYPE == ModelType::V32) {
++                        hisparse_demand_producer::publish_fill(
++                            fill_row, fill_tag, fill_ready_tag, lane_idx
++                        );
++                    }
+                 }
+
+                 fence_view_async_shared();
+@@ -629,7 +680,13 @@
+                     // We put this after fence_view_async_shared() since this won't be read by async proxy
+                     auto is_index_valid = [&](int index, int offset_within_thread) -> bool {
+                         if constexpr (MODEL_TYPE == ModelType::V32) {
+-                            return index != -1;
++                            return hisparse_demand_producer::is_index_valid(
++                                params,
++                                batch_idx,
++                                block_idx * TOPK_BLOCK_SIZE + lane_idx * 2 +
++                                    offset_within_thread,
++                                index
++                            );
+                         } else {
+                             return index != -1 && rel_block_idx*TOPK_BLOCK_SIZE + lane_idx*2 + offset_within_thread < topk_length;
+                         }

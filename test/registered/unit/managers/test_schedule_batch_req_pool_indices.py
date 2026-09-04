@@ -12,6 +12,8 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode  # noqa: E402
+from sglang.srt.speculative.eagle_info import EagleDraftInput  # noqa: E402
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -30,6 +32,46 @@ def _make_req(req_pool_idx, origin_input_ids, output_ids):
 
 
 class TestHisparseDecodeBatchReqPoolCpu(unittest.TestCase):
+    def test_staged_spec_batch_reuses_complete_relay_without_partial_stash(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.device = "cpu"
+        scheduler.req_to_token_pool = types.SimpleNamespace(device="cpu")
+        scheduler.token_to_kv_pool_allocator = None
+        scheduler.tree_cache = None
+        scheduler.model_config = types.SimpleNamespace(
+            is_encoder_decoder=False, vocab_size=32
+        )
+        scheduler.enable_overlap = True
+        scheduler.spec_algorithm = SpeculativeAlgorithm.EAGLE
+        scheduler.future_map = MagicMock()
+
+        reqs = [
+            _make_req(req_pool_idx=4, origin_input_ids=[1, 2, 3], output_ids=[7]),
+            _make_req(req_pool_idx=9, origin_input_ids=[1, 2], output_ids=[8]),
+        ]
+        for req, probability, token in zip(reqs, (0.25, 0.75), (17, 23)):
+            req.hisparse_spec_info = EagleDraftInput(
+                topk_p=torch.tensor([[probability]]),
+                topk_index=torch.tensor([[token]]),
+                hidden_states=torch.tensor([[probability]]),
+                bonus_tokens=torch.tensor([req.output_ids[-1]]),
+                future_indices=torch.tensor([req.kv.req_pool_idx]),
+            )
+
+        with patch(
+            "sglang.srt.managers.scheduler.SamplingBatchInfo.from_schedule_batch",
+            return_value=MagicMock(),
+        ):
+            batch = scheduler._build_hisparse_decode_batch(reqs)
+
+        self.assertTrue(
+            torch.equal(batch.spec_info.future_indices, batch.req_pool_indices)
+        )
+        # The FutureMap owns the complete top-k/hidden payload while staging;
+        # this object only carries the request-slot keys used to gather it.
+        scheduler.future_map.stash.assert_not_called()
+        self.assertTrue(all(req.hisparse_spec_info is None for req in reqs))
+
     def test_build_hisparse_decode_batch_populates_req_pool_indices_cpu(self):
         # _build_hisparse_decode_batch builds a ScheduleBatch off the normal
         # extend path, so it must populate the req_pool_indices_cpu host mirror

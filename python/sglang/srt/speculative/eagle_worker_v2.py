@@ -1273,6 +1273,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
+            hisparse_coordinator = batch.hisparse_coordinator
+            if (
+                hisparse_coordinator is not None
+                and hisparse_coordinator.mtp_demand_buffer_enabled
+            ):
+                hisparse_coordinator.finish_pending_mtp_demand_commit()
+            elif hisparse_coordinator is not None:
+                hisparse_coordinator.finish_pending_draft_extend_backup()
+
             return batch_output
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:

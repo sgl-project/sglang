@@ -143,7 +143,6 @@ def load_cache_to_device_buffer_spec_mla(
         num_steps,
         record_miss_plan,
     )
-
     module.load_cache_to_device_buffer_spec(
         top_k_tokens,
         device_buffer_tokens,
@@ -163,6 +162,37 @@ def load_cache_to_device_buffer_spec_mla(
         miss_src,
         miss_dst,
         miss_count,
+    )
+
+
+@functools.cache
+def _jit_native_mtp_sparse_module(
+    item_size_bytes: int,
+    block_size: int,
+    num_top_k: int,
+    hot_buffer_size: int,
+) -> Module:
+    """Build the correctness-first MTP materialization kernel."""
+    template_args = make_cpp_args(
+        block_size,
+        num_top_k,
+        hot_buffer_size,
+        True,
+        False,
+    )
+    return load_jit(
+        "native_mtp_sparse_cache",
+        item_size_bytes,
+        block_size,
+        num_top_k,
+        hot_buffer_size,
+        cuda_files=["hisparse_mtp_native.cuh"],
+        cuda_wrappers=[
+            (
+                "load_cache_to_device_buffer",
+                f"load_cache_to_device_buffer<{template_args}>",
+            )
+        ],
     )
 
 
@@ -248,6 +278,44 @@ def _jit_dsv4_transfer_module(block_size: int) -> Module:
                 f"transfer_cache_dsv4_mla<{template_args}>",
             )
         ],
+    )
+
+
+@functools.cache
+def _jit_mtp_demand_writeback_module() -> Module:
+    return load_jit(
+        "mtp_demand_writeback",
+        cuda_files=["kvcacheio/hisparse.cuh"],
+        cuda_wrappers=[
+            ("backup_mtp_demand_window_mla", "backup_mtp_demand_window_mla"),
+        ],
+    )
+
+
+def backup_mtp_demand_window_mla(
+    *,
+    src_layers: torch.Tensor,
+    dst_layers: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    accept_index: torch.Tensor,
+    item_size: int,
+    num_layers: int,
+) -> None:
+    """Write accepted fixed-width MTP rows with layer-parallel GPU workers."""
+    assert src_layers.dtype == dst_layers.dtype
+    assert src_layers.dtype in (torch.int64, torch.uint64)
+    assert src_indices.dtype == dst_indices.dtype == torch.int64
+    assert accept_index.dtype == torch.int32
+    assert src_indices.numel() == dst_indices.numel() == accept_index.numel()
+    _jit_mtp_demand_writeback_module().backup_mtp_demand_window_mla(
+        src_layers,
+        dst_layers,
+        src_indices,
+        dst_indices,
+        accept_index,
+        item_size,
+        num_layers,
     )
 
 
@@ -396,6 +464,67 @@ def load_cache_to_device_buffer_mla(
         miss_dst=miss_dst,
         miss_count=miss_count,
         skip_io=skip_io,
+    )
+
+
+def load_cache_to_device_buffer_mtp_mla(
+    *,
+    top_k_tokens: torch.Tensor,
+    device_buffer_tokens: torch.Tensor,
+    host_cache_locs: torch.Tensor,
+    device_buffer_locs: torch.Tensor,
+    host_cache: torch.Tensor,
+    device_buffer: torch.Tensor,
+    top_k_device_locs: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    mtp_staging_locs: torch.Tensor,
+    item_size_bytes: int,
+    num_top_k: int,
+    hot_buffer_size: int,
+    page_size: int,
+    block_size: int,
+    num_real_reqs: torch.Tensor,
+    num_steps: int,
+) -> None:
+    """Materialize each historical MTP occurrence into stable device rows."""
+    if top_k_tokens.dim() != 3:
+        raise ValueError("native MTP TopK must have shape [request, step, topk]")
+    num_reqs, actual_steps, actual_top_k = top_k_tokens.shape
+    if actual_steps != num_steps or actual_top_k != num_top_k:
+        raise ValueError("native MTP TopK shape does not match num_steps/num_top_k")
+    if top_k_device_locs.shape != top_k_tokens.shape:
+        raise ValueError("native MTP output must match the TopK shape")
+    if seq_lens.numel() != num_reqs * num_steps:
+        raise ValueError("native MTP sequence lengths must be request-major")
+    if mtp_staging_locs.ndim != 2 or mtp_staging_locs.shape[1] < (
+        num_steps * num_top_k
+    ):
+        raise ValueError("native MTP staging capacity is smaller than steps * topk")
+
+    empty = torch.empty(0)
+    _jit_native_mtp_sparse_module(
+        item_size_bytes,
+        block_size,
+        num_top_k,
+        hot_buffer_size,
+    ).load_cache_to_device_buffer(
+        top_k_tokens,
+        device_buffer_tokens,
+        host_cache_locs,
+        device_buffer_locs,
+        host_cache,
+        empty,
+        device_buffer,
+        empty,
+        top_k_device_locs,
+        req_pool_indices,
+        seq_lens,
+        mtp_staging_locs,
+        num_real_reqs,
+        page_size,
+        item_size_bytes,
+        num_steps,
     )
 
 

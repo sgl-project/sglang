@@ -1023,6 +1023,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
         if forward_batch.hisparse_coordinator is not None:
             forward_batch.hisparse_coordinator.num_real_reqs.fill_(bs)
+            if (
+                self.capture_forward_mode.is_target_verify()
+                and forward_batch.hisparse_coordinator.mtp_demand_buffer_enabled
+            ):
+                forward_batch.hisparse_coordinator.set_mtp_demand_num_query_rows(
+                    bs * self.captured_req_width
+                )
 
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
@@ -1438,6 +1445,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                and self.model_runner.hisparse_coordinator.mtp_demand_buffer_enabled
+            ):
+                self.model_runner.hisparse_coordinator.set_mtp_demand_num_query_rows(
+                    raw_num_token
+                )
 
         variant_label = self._resolve_lora_variant(forward_batch)
         dsa_variant = self._resolve_dsa_variant(forward_batch)

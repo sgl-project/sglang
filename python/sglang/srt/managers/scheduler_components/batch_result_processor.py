@@ -109,6 +109,18 @@ class SchedulerBatchResultProcessor:
     beam_coordinator: BeamCoordinator
     abort_request: Callable
 
+    def _stash_hisparse_spec_info(
+        self, batch: ScheduleBatch, batch_index: int, req: Req
+    ) -> None:
+        if batch.spec_info is None:
+            return
+        if not hasattr(batch.spec_info, "slice_single"):
+            raise RuntimeError(
+                "HiSparse cannot stage speculative state for "
+                f"{type(batch.spec_info).__name__}"
+            )
+        req.hisparse_spec_info = batch.spec_info.slice_single(batch_index)
+
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         use_free_group = get_disagg().disaggregation_decode_enable_radix_cache
@@ -358,6 +370,7 @@ class SchedulerBatchResultProcessor:
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                         if get_memory().enable_hisparse:
+                            self._stash_hisparse_spec_info(batch, i, req)
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
                     self._maybe_collect_customized_info(i, req, logits_output)

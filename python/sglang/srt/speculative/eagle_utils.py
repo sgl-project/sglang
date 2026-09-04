@@ -546,6 +546,8 @@ def eagle_prepare_for_verify(
             device=device,
         )
 
+        _prepare_hisparse_mtp_verify_slots(batch, verify_input.draft_token_num)
+
         batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
             batch, verify_input.draft_token_num
         )
@@ -591,6 +593,27 @@ def eagle_prepare_for_verify(
     # here would use pre-pad shapes and trip DSv4 indexer shape match.
 
     return verify_forward_batch, can_run_cuda_graph
+
+
+def _prepare_hisparse_mtp_verify_slots(
+    batch: ScheduleBatch, draft_token_num: int
+) -> None:
+    """Bind target-verify logical rows to HiSparse hot/extra-page storage."""
+    coordinator = batch.hisparse_coordinator
+    if coordinator is None or batch.forward_mode.is_idle():
+        return
+    coordinator.prepare_verify_slots_spec_v2(
+        req_pool_indices=batch.req_pool_indices,
+        req_pool_indices_cpu=batch.req_pool_indices_cpu,
+        verify_cache_locs=batch.out_cache_loc,
+        num_tokens_per_req=draft_token_num,
+        start_positions=batch.seq_lens,
+        # Under overlap, seq_lens_cpu is intentionally absent. Req metadata can
+        # lag one in-flight verify, so reserve two verify windows without a D2H.
+        host_reserve_end_positions_cpu=[
+            req.kv.kv_committed_len + 2 * draft_token_num for req in batch.reqs
+        ],
+    )
 
 
 def _seeded_verify_coins(

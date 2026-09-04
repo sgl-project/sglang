@@ -76,9 +76,13 @@ struct TopKPagedParams {
   const int32_t* __restrict__ seq_lens;
   const int32_t* __restrict__ page_table;
   int32_t* __restrict__ page_indices;
+  int32_t* __restrict__ raw_indices;  // optional raw (pre-transform) indices output; nullptr if unused
+  const int64_t* __restrict__ direct_table;
+  const int64_t* __restrict__ direct_rows;
   const PlanItem* __restrict__ metadata;  // [0]=GlobalMetadata, [1+i]=PlanItem
   int64_t score_stride;
   int64_t page_table_stride;
+  int64_t direct_table_stride;
   uint32_t topk;
   uint32_t page_bits;
   uint32_t cluster_floor;  // seq_len > this routes to the cluster path (batch-aware, host-set)
@@ -97,10 +101,13 @@ struct TopKPagedParams {
   }
   SGL_DEVICE TopKProblem problem(uint32_t batch_id, uint32_t seq_len) const {
     const auto k = static_cast<int64_t>(topk);
+    const int64_t direct_row = direct_rows != nullptr ? direct_rows[batch_id] : 0;
     return TopKProblem{
         .in = scores + batch_id * score_stride,
         .out = page_indices + batch_id * k,
+        .raw_out = raw_indices != nullptr ? raw_indices + batch_id * k : nullptr,
         .page_table = page_table + batch_id * page_table_stride,
+        .direct_table = direct_table != nullptr ? direct_table + direct_row * direct_table_stride : nullptr,
         .topk = topk,
         .seq_len = seq_len,
         .page_bits = page_bits,
@@ -240,7 +247,9 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
   const auto problem = TopKProblem{
       .in = score + (row_start - rem),
       .out = out,
+      .raw_out = nullptr,
       .page_table = nullptr,  // unused
+      .direct_table = nullptr,
       .topk = topk,
       .seq_len = seq_len + rem,
       .page_bits = 1,  // unused
@@ -490,7 +499,10 @@ struct TopKKernel {
       const tvm::ffi::Optional<tvm::ffi::TensorView> page_table,
       const tvm::ffi::TensorView page_indices,
       const uint32_t page_size,
-      const tvm::ffi::TensorView metadata) {
+      const tvm::ffi::TensorView metadata,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> direct_table,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> direct_rows) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto Bp1 = SymbolicSize{"batch_size_plus_1"};
@@ -532,6 +544,28 @@ struct TopKKernel {
         .with_device(device_)
         .verify(metadata);
 
+    int32_t* raw_indices_ptr = nullptr;
+    if (raw_indices.has_value()) {
+      TensorMatcher({B, K}).with_dtype<int32_t>().with_device(device_).verify(raw_indices.value());
+      raw_indices_ptr = static_cast<int32_t*>(raw_indices.value().data_ptr());
+    }
+
+    const int64_t* direct_table_ptr = nullptr;
+    const int64_t* direct_rows_ptr = nullptr;
+    int64_t direct_table_stride = 0;
+    RuntimeCheck(
+        direct_table.has_value() == direct_rows.has_value(), "direct_table and direct_rows must be provided together");
+    if (direct_table.has_value()) {
+      auto R = SymbolicSize{"direct_table_rows"};
+      auto T = SymbolicSize{"direct_table_width"};
+      auto TS = SymbolicSize{"direct_table_stride"};
+      TensorMatcher({R, T}).with_strides({TS, 1}).with_dtype<int64_t>().with_device(device_).verify(
+          direct_table.value());
+      TensorMatcher({B}).with_dtype<int64_t>().with_device(device_).verify(direct_rows.value());
+      direct_table_ptr = static_cast<const int64_t*>(direct_table.value().data_ptr());
+      direct_rows_ptr = static_cast<const int64_t*>(direct_rows.value().data_ptr());
+      direct_table_stride = TS.unwrap();
+    }
     RuntimeCheck(std::has_single_bit(page_size), "page_size must be power of 2");
     RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 (16-byte vectorized load)");
     RuntimeCheck(Bp1.unwrap() == B.unwrap() + 1, "invalid metadata shape");
@@ -555,9 +589,13 @@ struct TopKKernel {
         .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
         .page_table = page_table_ptr,
         .page_indices = static_cast<int32_t*>(page_indices.data_ptr()),
+        .raw_indices = raw_indices_ptr,
+        .direct_table = direct_table_ptr,
+        .direct_rows = direct_rows_ptr,
         .metadata = static_cast<const PlanItem*>(metadata.data_ptr()),
         .score_stride = S.unwrap(),
         .page_table_stride = page_table_stride,
+        .direct_table_stride = direct_table_stride,
         .topk = topk,
         .page_bits = page_bits,
         .cluster_floor = (batch_size <= kSmallBatchLowFloor) ? kClusterFloorSmall : kClusterFloor,

@@ -20,7 +20,7 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -177,7 +177,6 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_global_dwdp_manager,
     get_lora,
-    get_memory,
     get_model,
     get_observability,
     get_parallel,
@@ -271,6 +270,68 @@ def _prefill_cuda_graph_allows_context_parallel(
         bool(getattr(prefill_runner, "enable_cp_v2_bcg_capture", False))
         and is_cp_v2_active(forward_batch)
     )
+
+
+def _supports_glm52_hisparse_mtp(server_args: ServerArgs) -> bool:
+    return bool(
+        server_args.enable_hisparse
+        and server_args.device in (None, "cuda")
+        and server_args.kv_cache_dtype == "fp8_e4m3"
+        and server_args.dsa_decode_backend == "flashmla_kv"
+        and server_args.speculative_algorithm == "EAGLE"
+        and server_args.speculative_num_steps == 3
+        and server_args.speculative_eagle_topk == 1
+        and server_args.speculative_num_draft_tokens == 4
+        and server_args.speculative_attention_mode == "prefill"
+        and server_args.pp_size == 1
+        and server_args.attn_cp_size == 1
+        and not server_args.enable_pdmux
+        and server_args.disaggregation_mode in ("null", "decode")
+    )
+
+
+def resolve_hisparse_for_runner(
+    server_args: ServerArgs, *, is_draft_worker: bool
+) -> bool:
+    """Keep speculative draft KV resident; HiSparse belongs to the target."""
+    return bool(server_args.enable_hisparse and not is_draft_worker)
+
+
+def should_enable_hisparse_mtp_demand_buffer(
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    device_capability: Tuple[int, int],
+    mtp_demand_buffer: bool,
+) -> bool:
+    """Return whether this target worker supports the requested Demand path."""
+    architectures = model_config.hf_config.architectures or []
+    iteration_share = bool(
+        getattr(model_config.hf_config, "index_share_for_mtp_iteration", True)
+    )
+    supports_topk_source = server_args.disaggregation_mode == "null" or (
+        server_args.disaggregation_mode == "decode" and not iteration_share
+    )
+    return bool(
+        mtp_demand_buffer
+        and _supports_glm52_hisparse_mtp(server_args)
+        and server_args.tp_size == 8
+        and server_args.dp_size == 8
+        and server_args.enable_dp_attention
+        and server_args.dsa_topk_backend == "sgl-kernel"
+        and supports_topk_source
+        and envs.SGLANG_DSA_FUSE_TOPK.get()
+        and envs.SGLANG_OPT_USE_TOPK_V2.get()
+        and device_capability == (9, 0)
+        and architectures == ["GlmMoeDsaForCausalLM"]
+    )
+
+
+def _bind_hisparse_mapping_to_active_pool(token_to_kv_pool, allocator) -> None:
+    """Bind the allocator's logical mapping to the pool used by this runner."""
+    register_mapping = getattr(token_to_kv_pool, "register_mapping", None)
+    mapping = getattr(allocator, "full_to_hisparse_device_index_mapping", None)
+    if register_mapping is not None and mapping is not None:
+        register_mapping(mapping)
 
 
 @dataclass
@@ -384,7 +445,9 @@ class ModelRunner:
         self._pending_elastic_scale_update = None
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
-        self.enable_hisparse = get_memory().enable_hisparse
+        self.enable_hisparse = resolve_hisparse_for_runner(
+            server_args, is_draft_worker=is_draft_worker
+        )
         self._sampling_observer: Optional[SamplingObserver] = None
         self.sampling_prewarm_result = SamplingPrewarmResult()
 
@@ -619,6 +682,7 @@ class ModelRunner:
             sliding_window_size=self.sliding_window_size,
             spec_algorithm=self.spec_algorithm,
             is_draft_worker=self.is_draft_worker,
+            enable_hisparse=self.enable_hisparse,
             post_capture_kv_active=is_post_capture_kv_active(
                 server_args=self.server_args, is_draft_worker=self.is_draft_worker
             ),
@@ -906,6 +970,10 @@ class ModelRunner:
         # Keep a reference so the shared byte buffer is not GC'd.
         self._unified_memory_pool = result.unified_memory_pool
 
+        _bind_hisparse_mapping_to_active_pool(
+            self.token_to_kv_pool, self.token_to_kv_pool_allocator
+        )
+
         self._init_post_memory_pool_components()
 
     def _init_post_memory_pool_components(self):
@@ -962,6 +1030,17 @@ class ModelRunner:
                 hf_text_config=self.model_config.hf_text_config,
                 pp_size=self.ps.pp_size,
                 is_speculative=self.spec_algorithm.is_speculative(),
+            ),
+            mtp_num_rows=(
+                self.server_args.speculative_num_draft_tokens
+                if self.spec_algorithm.is_speculative()
+                else 0
+            ),
+            enable_mtp_demand_buffer=should_enable_hisparse_mtp_demand_buffer(
+                self.server_args,
+                self.model_config,
+                torch.cuda.get_device_capability(self.device),
+                hisparse_cfg.mtp_demand_buffer,
             ),
         )
 
@@ -1772,13 +1851,22 @@ class ModelRunner:
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
             )
 
-            if (
+            if self.hisparse_coordinator is not None and (
                 forward_batch.forward_mode.is_decode()
-                and self.hisparse_coordinator is not None
+                or forward_batch.forward_mode.is_target_verify()
             ):
                 forward_batch.hisparse_coordinator = self.hisparse_coordinator
                 self.hisparse_coordinator.wait_for_pending_backup()
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
+                if (
+                    forward_batch.forward_mode.is_target_verify()
+                    and self.hisparse_coordinator.mtp_demand_buffer_enabled
+                ):
+                    self.hisparse_coordinator.prepare_mtp_demand_verify(
+                        req_pool_indices=forward_batch.req_pool_indices,
+                        committed_lens=forward_batch.seq_lens,
+                        num_query_rows=forward_batch.input_ids.numel(),
+                    )
 
             # Replay cuda graph if applicable
             if can_run_graph:
