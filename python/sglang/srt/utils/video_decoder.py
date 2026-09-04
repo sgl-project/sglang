@@ -48,6 +48,7 @@ class VideoDecoderWrapper:
             multiple decoders in parallel threads.
         """
         self._source = source
+        self._device = device
         self._num_decode_threads = num_decode_threads
         self._source_bytes = source if isinstance(source, bytes) else None
         self._source_path = source if isinstance(source, str) else None
@@ -127,10 +128,15 @@ class VideoDecoderWrapper:
 
         if _BACKEND == "torchcodec":
             batch = self._decoder.get_frames_at(indices)
-            return batch.data.pin_memory()
+            return self._pin_memory_if_needed(batch.data)
         else:
             arr = self._decoder.get_batch(indices).asnumpy()
-            return torch.from_numpy(arr).pin_memory()
+            return self._pin_memory_if_needed(torch.from_numpy(arr))
+
+    def _pin_memory_if_needed(self, tensor):
+        if self._device == "cpu":
+            return tensor
+        return tensor.pin_memory()
 
     def _parallel_decode(self, indices, num_threads):
         """Decode frames using multiple VideoDecoder instances in parallel threads."""
@@ -156,7 +162,7 @@ class VideoDecoderWrapper:
                 idx = future_to_idx[future]
                 results[idx] = future.result()
 
-        return torch.cat(results, dim=0).pin_memory()
+        return self._pin_memory_if_needed(torch.cat(results, dim=0))
 
     @property
     def source_bytes(self) -> bytes | None:
