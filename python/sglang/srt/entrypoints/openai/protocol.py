@@ -671,6 +671,18 @@ class FunctionResponse(BaseModel):
     name: Optional[str] = None
     arguments: Optional[str | Dict[str, Any]] = None
 
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        # 流式工具调用契约(Kimi 流式规范 §5.4):续块不得携带 name 键(连 null
+        # 也不行,P0.3);arguments 键必须始终出现且为字符串,首块为 ""(P1.8)。
+        # 非流式路径 name 恒非 None,不受影响。
+        data = handler(self)
+        if data.get("name") is None:
+            data.pop("name", None)
+        if data.get("arguments") is None:
+            data["arguments"] = ""
+        return data
+
 
 class ToolCall(BaseModel):
     """Tool call response."""
@@ -679,6 +691,18 @@ class ToolCall(BaseModel):
     index: Optional[int] = None
     type: Literal["function"] = "function"
     function: FunctionResponse
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        # 流式续块(id 为 None)只能携带 index + function.arguments,不得出现
+        # id / type 键(包括 null,P0.3);首块与非流式响应(id 非 None)保留全部。
+        data = handler(self)
+        if data.get("id") is None:
+            data.pop("id", None)
+            data.pop("type", None)
+        if data.get("index") is None:
+            data.pop("index", None)
+        return data
 
 
 _GenericMessageRole = Literal[

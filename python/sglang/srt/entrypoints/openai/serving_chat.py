@@ -2103,7 +2103,11 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> str:
         """Process for generating a new and unique `tool_call_id`"""
         if self.tool_call_parser == "kimi_k3":
-            return f"{call_item.name}:{history_tool_calls_cnt + call_item.tool_index}"
+            # 官方 wire 形态是 `<name>_<global_index>`(P2.2,detokenize 时把底层
+            # `functions.<name>:<idx>` 的分隔符 `:` 替换为 `_`);冒号形态是底层
+            # token 格式,不应出现在 API 层。global_index 跨函数名全局计数,
+            # 保证与 history 中已有 id 不冲突(P0.14)。
+            return f"{call_item.name}_{history_tool_calls_cnt + call_item.tool_index}"
         if self.tool_call_parser != "kimi_k2":
             # A simple uuid is sufficient for all models except for Kimi-K2.
             tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
@@ -2647,40 +2651,62 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_call_id = None
                 function_name = None
 
-            tool_call = ToolCall(
-                id=tool_call_id,
-                index=call_item.tool_index,
-                function=FunctionResponse(
-                    name=function_name,
-                    arguments=call_item.parameters,
-                ),
-            )
-
-            choice_data = ChatCompletionResponseStreamChoice(
-                index=index,
-                delta=DeltaMessage(tool_calls=[tool_call]),
-                finish_reason=None,
-            )
-            chunk = ChatCompletionStreamResponse(
-                id=content["meta_info"]["id"],
-                created=int(time.time()),
-                choices=[choice_data],
-                model=request.model,
-            )
-
-            # Add usage stats if continuous_usage_stats is enabled
-            if continuous_usage_stats:
-                prompt_tokens = self._reported_prompt_tokens(content["meta_info"])
-                completion_tokens = content["meta_info"].get("completion_tokens", 0)
-                reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
-                chunk.usage = UsageProcessor.calculate_token_usage(
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    reasoning_tokens=reasoning_tokens,
-                    cached_tokens=self._continuous_usage_cached_details(content),
+            # 流式工具调用契约(Kimi 流式规范 §5.4):首块只立"槽位"
+            # (index+id+type+name+arguments=""),parser 已解出的初始参数拆到
+            # 紧随的续块(仅 index + function.arguments)下发 —— 首块直接带数据
+            # 是规范里点名的反例,客户端需要特判。
+            tool_call_deltas = []
+            if function_name is not None:
+                tool_call_deltas.append(
+                    ToolCall(
+                        id=tool_call_id,
+                        index=call_item.tool_index,
+                        function=FunctionResponse(name=function_name, arguments=""),
+                    )
+                )
+                if call_item.parameters:
+                    tool_call_deltas.append(
+                        ToolCall(
+                            index=call_item.tool_index,
+                            function=FunctionResponse(arguments=call_item.parameters),
+                        )
+                    )
+            else:
+                tool_call_deltas.append(
+                    ToolCall(
+                        index=call_item.tool_index,
+                        function=FunctionResponse(arguments=call_item.parameters),
+                    )
                 )
 
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            for tool_call in tool_call_deltas:
+                choice_data = ChatCompletionResponseStreamChoice(
+                    index=index,
+                    delta=DeltaMessage(tool_calls=[tool_call]),
+                    finish_reason=None,
+                )
+                chunk = ChatCompletionStreamResponse(
+                    id=content["meta_info"]["id"],
+                    created=int(time.time()),
+                    choices=[choice_data],
+                    model=request.model,
+                )
+
+                # Add usage stats if continuous_usage_stats is enabled
+                if continuous_usage_stats:
+                    prompt_tokens = self._reported_prompt_tokens(content["meta_info"])
+                    completion_tokens = content["meta_info"].get(
+                        "completion_tokens", 0
+                    )
+                    reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
+                    chunk.usage = UsageProcessor.calculate_token_usage(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        reasoning_tokens=reasoning_tokens,
+                        cached_tokens=self._continuous_usage_cached_details(content),
+                    )
+
+                yield f"data: {chunk.model_dump_json()}\n\n"
 
     def _check_for_unstreamed_tool_args(
         self,
