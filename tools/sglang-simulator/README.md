@@ -21,7 +21,7 @@ checks instead of branching on version numbers.
   same monorepo checkout.
 - A local model directory containing model configuration files. Tokenizer files
   are also required unless tokenizer initialization is disabled.
-- Predictor data for AIConfigurator, ML, or replay mode.
+- Predictor data for the selected AIConfigurator, ML, replay, or InferCast mode.
 
 Use an official SGLang image matching the checkout when validating GPU and
 runtime compatibility.
@@ -217,9 +217,21 @@ Supported predictors:
 | `aiconfigurator` | Operator and module performance-database estimation. |
 | `ml` | A trained sklearn-compatible 18-feature latency model. |
 | `replay` | Exact or nearest-neighbor batch-composition replay. |
+| `infercast` | AMD model-forward estimates from an InferCast FIDB slice. |
 
 Relative predictor paths are resolved from the simulator configuration location.
 Environment variables in paths use `${NAME}` syntax.
+
+### InferCast predictor
+
+Install the exact InferCast revision paired with the selected FIDB slice, then
+start from [`examples/sim_configs/infercast_silicon.json`](examples/sim_configs/infercast_silicon.json).
+The adapter makes one UMD per-forward call for each `EXTEND`, `MIXED`, or
+`DECODE` iteration and records the provider revision and FIDB stack digest.
+
+Prefix-hit, later chunk, and mixed shapes retain their prepared `(E, P)` values.
+InferCast currently predicts only reduced `P == 0`; non-zero `P` reaches the
+extend API and fails explicitly without fallback latency or time advancement.
 
 ## Workload formats
 
