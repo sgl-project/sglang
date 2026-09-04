@@ -486,7 +486,7 @@ def _warmup_cache(
         return
 
     print(
-        f"Warming up cache with {cache_hit_rate*100:.1f}% hit rate "
+        f"Warming up cache with {cache_hit_rate * 100:.1f}% hit rate "
         f"({cached_token_len} tokens per request)"
     )
     # Create prefix input_ids for cache warming
@@ -1024,7 +1024,7 @@ def get_report_summary(
         f"\nInput lens: {bench_args.input_len}. Output lens: {bench_args.output_len}."
     )
     if bench_args.cache_hit_rate > 0.0:
-        summary += f" Cache hit rate: {bench_args.cache_hit_rate*100:.1f}%."
+        summary += f" Cache hit rate: {bench_args.cache_hit_rate * 100:.1f}%."
     summary += "\n"
 
     if is_blackwell():
@@ -1241,9 +1241,9 @@ def run_benchmark_internal(
             skip_max_running_requests_threshold = float("inf")
             skip_token_capacity_threshold = float("inf")
         else:
-            assert (
-                max_running_requests_per_dp > 0
-            ), f"effective_max_running_requests_per_dp is not set, {max_running_requests_per_dp=}"
+            assert max_running_requests_per_dp > 0, (
+                f"effective_max_running_requests_per_dp is not set, {max_running_requests_per_dp=}"
+            )
             skip_max_running_requests_threshold = max_running_requests_per_dp * dp_size
 
         print(f"{max_running_requests_per_dp=}")
@@ -1288,9 +1288,9 @@ def run_benchmark_internal(
             "--lora-request-distribution=distinct/skewed requires more than "
             "one adapter via --lora-name."
         )
-    assert (
-        bench_args.lora_zipf_alpha > 1
-    ), f"--lora-zipf-alpha must be > 1, got {bench_args.lora_zipf_alpha}"
+    assert bench_args.lora_zipf_alpha > 1, (
+        f"--lora-zipf-alpha must be > 1, got {bench_args.lora_zipf_alpha}"
+    )
 
     if bench_args.apply_chat_template and not (
         bench_args.fixed_prompt_file or bench_args.dataset_name in REPLAY_TEXT_DATASETS

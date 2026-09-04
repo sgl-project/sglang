@@ -163,9 +163,9 @@ def _mamba_chunk_scan_combined_fwd(
     if cu_seqlens is None:
         return out_x, dt, dA_cumsum, states, final_states
     else:
-        assert (
-            batch == 1
-        ), "passing cu_seqlens to get the varlen states is only supported if batch dimension is 1"
+        assert batch == 1, (
+            "passing cu_seqlens to get the varlen states is only supported if batch dimension is 1"
+        )
         varlen_states = chunk_state_varlen(
             B.squeeze(0),
             x.squeeze(0),
@@ -223,9 +223,9 @@ def mamba_chunk_scan_combined(
     if not return_varlen_states:
         cu_seqlens = None
     else:
-        assert (
-            cu_seqlens is not None
-        ), "cu_seqlens must be provided if return_varlen_states is True"
+        assert cu_seqlens is not None, (
+            "cu_seqlens must be provided if return_varlen_states is True"
+        )
     out_x, dt_out, dA_cumsum, states, final_states, *rest = (
         _mamba_chunk_scan_combined_fwd(
             x,
