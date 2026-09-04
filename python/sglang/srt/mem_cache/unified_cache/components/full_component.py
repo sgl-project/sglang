@@ -487,7 +487,10 @@ class FullComponent(TreeComponent):
         if phase == ExternalLinkerLoadPhase.ABORT:
             self._full_allocator().free(transfer.device_indices)
             return None
+        if phase == ExternalLinkerLoadPhase.PREPARE:
+            return transfer
 
+        assert phase == ExternalLinkerLoadPhase.COMMIT
         return transfer
 
     def free_host_values(self, host_values: list[torch.Tensor]) -> None:
