@@ -116,6 +116,7 @@ from sglang.srt.models.deepseek_common.utils import tiny_router_gemm_max_tokens
 from sglang.srt.models.dots3_common.fp8 import per_token_group_quant_einsum_fp8
 from sglang.srt.runtime_context import (
     get_device,
+    get_disagg,
     get_exec,
     get_parallel,
 )
@@ -2612,8 +2613,13 @@ class DotsNoteOmniThinkerForConditionalGeneration(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
         )
-        # Load multimodal towers only where embeddings are produced.
-        if self.pp_group.is_first_rank and not config.language_only:
+        # Adaptive encoder dispatch deliberately keeps small media requests on
+        # the language worker. Retain local towers for that fallback even when
+        # the worker otherwise runs in language-only mode.
+        load_local_towers = (
+            not config.language_only or get_disagg().enable_adaptive_dispatch_to_encoder
+        )
+        if self.pp_group.is_first_rank and load_local_towers:
             self.audio_tower = DotsNoteOmniAudioEncoder(str(model_dir))
             self.visual = DotsNoteOmniVisionEncoder(str(model_dir))
         else:
