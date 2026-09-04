@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 
@@ -40,3 +42,7 @@ def test_out_of_place_qknorm_rope_matches_inplace_and_keeps_inputs() -> None:
     fused_qknorm_rope_out_of_place(q, k, q_out, k_out, qw, kw, cache, pos, **kwargs)
     assert torch.equal(qkv, before)
     assert torch.equal(q_out, q_ref) and torch.equal(k_out, k_ref)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
