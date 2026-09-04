@@ -324,6 +324,17 @@ class HybridCacheController(BaseHiCacheController):
         if pool_transfers is None and extra_pools:
             self.mem_pool_host.free(host_indices)
             return None
+        # resolve_host_transfers assigns raw anchor indices to KV-derived pools
+        # without ratio conversion; fix them up now.
+        if pool_transfers:
+            for pool in pool_transfers:
+                if pool.indices_from_pool == PoolName.KV:
+                    pool.device_indices = self._map_kv_derived_indices(
+                        pool.name, pool.device_indices
+                    )
+                    pool.host_indices = self._map_kv_derived_indices(
+                        pool.name, pool.host_indices
+                    )
 
         self.write_queue.append(
             CacheOperation(
@@ -827,6 +838,22 @@ class HybridCacheController(BaseHiCacheController):
                 )
                 transfer.host_indices = transfer.host_indices[:needed]
 
+    def _map_kv_derived_indices(
+        self, pool_name: PoolName, indices: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        if indices is None:
+            return None
+        entry = self.mem_pool_host.entry_map.get(pool_name)
+        slot_page_size = getattr(
+            getattr(entry, "host_pool", None), "slot_page_size", self.page_size
+        )
+        ratio = 1
+        if slot_page_size > 0 and self.page_size % slot_page_size == 0:
+            ratio = self.page_size // slot_page_size
+        if ratio > 1:
+            return indices.reshape(-1, ratio)[:, 0] // ratio
+        return indices
+
     def _resolve_device_transfers(
         self,
         extra_pools: Optional[list[PoolTransfer]],
@@ -874,8 +901,12 @@ class HybridCacheController(BaseHiCacheController):
         # Assign indices to deferred pools from their source.
         for pool in derived_transfers:
             if pool.indices_from_pool == PoolName.KV:
-                pool.host_indices = kv_host_indices
-                pool.device_indices = kv_device_indices
+                pool.host_indices = self._map_kv_derived_indices(
+                    pool.name, kv_host_indices
+                )
+                pool.device_indices = self._map_kv_derived_indices(
+                    pool.name, kv_device_indices
+                )
                 continue
 
             source = next(

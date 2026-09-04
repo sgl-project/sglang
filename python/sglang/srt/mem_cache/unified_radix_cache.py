@@ -34,11 +34,7 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
 )
 from sglang.srt.mem_cache.common import RetractionBackup
-from sglang.srt.mem_cache.hicache_storage import (
-    PoolName,
-    PoolTransfer,
-    SidecarPoolSpec,
-)
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer, SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
@@ -86,11 +82,7 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
 )
-from sglang.srt.runtime_context import (
-    get_memory,
-    get_model,
-    get_observability,
-)
+from sglang.srt.runtime_context import get_memory, get_model, get_observability
 from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.utils.common import ceil_align
 
@@ -107,6 +99,21 @@ if TYPE_CHECKING:
 from sglang.srt.utils.rank_consensus_checker import rank_consensus
 
 T = TypeVar("T")
+
+
+def _c128_transfer_num_pages(transfers: Sequence[PoolTransfer], page_size: int) -> int:
+    num_pages = 0
+    for transfer in transfers:
+        if transfer.host_indices is None:
+            continue
+        num_slots = len(transfer.host_indices)
+        assert num_slots % page_size == 0, (
+            f"C128 load-back transfers must contain complete physical pages: "
+            f"{num_slots=}, {page_size=}"
+        )
+        num_pages += num_slots // page_size
+    return num_pages
+
 
 COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
     ComponentType.FULL: FullComponent,
@@ -1513,6 +1520,21 @@ class UnifiedRadixCache(BasePrefixCache):
             self.dec_lock_ref(node_id, ancestor_lock_params)
             self.dec_host_lock_ref(node_id, host_anchor_params)
             return False
+
+        c128_allocator = getattr(
+            self.token_to_kv_pool_allocator, "c128_attn_allocator", None
+        )
+        if c128_allocator is not None:
+            c128_num_pages = _c128_transfer_num_pages(
+                comp_xfers.get(ComponentType.C128, ()),
+                c128_allocator.page_size,
+            )
+            if not self.token_to_kv_pool_allocator.ensure_c128_capacity(
+                self, c128_num_pages
+            ):
+                self.dec_lock_ref(node_id, ancestor_lock_params)
+                self.dec_host_lock_ref(node_id, host_anchor_params)
+                return False
 
         avail = self._component_available_size(ComponentType.FULL)
         if avail < kv_tokens:

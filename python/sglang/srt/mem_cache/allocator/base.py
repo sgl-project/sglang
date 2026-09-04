@@ -66,13 +66,22 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
         evict_from_tree_cache(tree_cache, num_tokens)
 
-    def check_decode_capacity(self, *, num_tokens: int, tree_cache) -> bool:
+    def check_decode_capacity(
+        self,
+        *,
+        num_tokens: int,
+        tree_cache,
+        requests=None,
+        spec_algorithm=None,
+    ) -> bool:
         """Whether the NEXT decode step's ``num_tokens`` allocation fits,
         evicting reclaimable cache first. The retract loop converges on this
         same check, so allocator-side shortfalls retract gracefully instead of
         tripping fail-loud alloc errors. Default reproduces the historical
         ``ScheduleBatch.check_decode_mem`` body; unified composites override
-        with byte gates + per-step reservations of their own.
+        with byte gates + per-step reservations of their own. ``requests`` and
+        ``spec_algorithm`` provide optional request-level context for allocators
+        whose demand cannot be represented by a single token count.
         """
         self.evict_to_free_tokens(tree_cache, num_tokens)
         return self.available_size() >= num_tokens

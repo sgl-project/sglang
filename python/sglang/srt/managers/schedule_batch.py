@@ -100,10 +100,7 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
-from sglang.srt.mem_cache.allocation import (
-    alloc_for_decode,
-    alloc_for_extend,
-)
+from sglang.srt.mem_cache.allocation import alloc_for_decode, alloc_for_extend
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -3069,8 +3066,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         shortfalls retract gracefully instead of tripping fail-loud alloc
         errors."""
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
+        requests = (
+            self.reqs
+            if selected_indices is None
+            else [self.reqs[i] for i in selected_indices]
+        )
         return self.token_to_kv_pool_allocator.check_decode_capacity(
-            num_tokens=num_tokens, tree_cache=self.tree_cache
+            num_tokens=num_tokens,
+            tree_cache=self.tree_cache,
+            requests=requests,
+            spec_algorithm=self.spec_algorithm,
         )
 
     def retract_decode(self) -> Tuple[List[Req], float, List[Req]]:
