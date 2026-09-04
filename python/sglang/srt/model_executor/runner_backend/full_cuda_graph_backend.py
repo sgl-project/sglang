@@ -123,13 +123,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
-        if self._reuse_output_buffer and self._output_buffer is None:
-            if torch.is_tensor(warmup_output) and warmup_output.ndim > 0:
-                # Prefill replays one shape at a time, so all captured graphs can
-                # write their eager-tail input into the largest shape's buffer.
-                self._output_buffer = torch.empty_like(warmup_output)
-            else:
-                self._reuse_output_buffer = False
+        self._initialize_output_buffer(warmup_output)
         del warmup_output
 
         graph = torch.cuda.CUDAGraph()
@@ -151,29 +145,46 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream),
         ):
             self._precarve.mint()
-            out = forward_fn()
-            if self._reuse_output_buffer:
-                output_buffer = self._output_buffer
-                assert output_buffer is not None
-                if (
-                    torch.is_tensor(out)
-                    and out.ndim == output_buffer.ndim
-                    and out.shape[1:] == output_buffer.shape[1:]
-                    and out.shape[0] <= output_buffer.shape[0]
-                    and out.dtype == output_buffer.dtype
-                    and out.device == output_buffer.device
-                ):
-                    shared_out = output_buffer[: out.shape[0]]
-                    shared_out.copy_(out)
-                    out = shared_out
-                else:
-                    self._reuse_output_buffer = False
+            out = self._copy_output_to_buffer(forward_fn())
 
         if profiler is not None:
             profiler.step()
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
+
+    def _initialize_output_buffer(self, output: Any) -> None:
+        if not self._reuse_output_buffer or self._output_buffer is not None:
+            return
+        if not torch.is_tensor(output) or output.ndim == 0:
+            self._reuse_output_buffer = False
+            return
+        # Prefill captures the largest shape first and replays one shape at a
+        # time, so all graphs can share this eager-tail input buffer.
+        self._output_buffer = torch.empty_like(output)
+
+    def _copy_output_to_buffer(self, output: Any) -> Any:
+        if not self._reuse_output_buffer:
+            return output
+        output_buffer = self._output_buffer
+        assert output_buffer is not None
+        if not self._output_fits_buffer(output, output_buffer):
+            self._reuse_output_buffer = False
+            return output
+        shared_output = output_buffer[: output.shape[0]]
+        shared_output.copy_(output)
+        return shared_output
+
+    @staticmethod
+    def _output_fits_buffer(output: Any, output_buffer: torch.Tensor) -> bool:
+        return (
+            torch.is_tensor(output)
+            and output.ndim == output_buffer.ndim
+            and output.shape[1:] == output_buffer.shape[1:]
+            and output.shape[0] <= output_buffer.shape[0]
+            and output.dtype == output_buffer.dtype
+            and output.device == output_buffer.device
+        )
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
