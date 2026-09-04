@@ -7,7 +7,7 @@ pub mod sse;
 
 use crate::health::circuit_breaker::CircuitBreaker;
 use crate::server::error::ApiError;
-use crate::server::header_utils::should_forward_request_header;
+use crate::server::header_utils::{should_forward_request_header, should_forward_response_header};
 use crate::server::metrics::MetricsRegistry;
 use crate::workers::WireProtocol;
 use anyhow::Context;
@@ -17,6 +17,19 @@ use bytes::Bytes;
 use reqwest::{Client, Url};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
+
+/// Clone the upstream response headers that are forwarded to the client
+/// (see `should_forward_response_header`) before the upstream response is
+/// consumed. The proxy otherwise builds downstream responses from scratch
+/// (synthesizing content-type), which would silently drop the engine's
+/// `X-Msh-Usage-*` accounting headers (Kimi stream spec P0.18).
+fn forwardable_response_headers(headers: &HeaderMap) -> Vec<(HeaderName, HeaderValue)> {
+    headers
+        .iter()
+        .filter(|(name, _)| should_forward_response_header(name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
+}
 use std::time::Duration;
 
 /// Total number of [`AbortReason`] variants. Referenced by
@@ -783,6 +796,7 @@ impl Proxy {
         // a misbehaving worker stay eligible. For 5xx the early bail is
         // safe (no body to consume meaningfully), but we still wait
         // until after the read attempt to record exactly once.
+        let forwarded = forwardable_response_headers(resp.headers());
         let bytes = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
@@ -815,6 +829,9 @@ impl Proxy {
         }
         let mut out = Response::new(Body::from(bytes.clone()));
         *out.status_mut() = status;
+        for (name, value) in forwarded {
+            out.headers_mut().append(name, value);
+        }
         out.headers_mut().insert(
             HeaderName::from_static("content-type"),
             HeaderValue::from_static("application/json"),
@@ -962,6 +979,8 @@ impl Proxy {
         } else {
             upstream_ct
         };
+        // Cloned here, before `resp` is consumed into the SSE byte pump below.
+        let forwarded = forwardable_response_headers(resp.headers());
         // Breaker recording is deferred to the pump's completion hook so
         // an upstream that returns 2xx headers and then drops mid-stream
         // is recorded as a failure. For a genuine 5xx fault we record_failure
@@ -1089,6 +1108,9 @@ impl Proxy {
         );
         let mut out = Response::new(body);
         *out.status_mut() = status;
+        for (name, value) in forwarded {
+            out.headers_mut().append(name, value);
+        }
         out.headers_mut().insert(
             HeaderName::from_static("content-type"),
             HeaderValue::from_str(&content_type)

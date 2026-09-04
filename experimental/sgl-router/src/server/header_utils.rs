@@ -22,10 +22,48 @@ pub fn should_forward_request_header(name: &HeaderName) -> bool {
         || n.starts_with("x-sgl-")
 }
 
+/// True if an upstream worker's RESPONSE header should be forwarded to the
+/// client. The proxy builds downstream responses from scratch (synthesizing
+/// content-type), so anything not whitelisted here is silently dropped.
+/// Needed for the Kimi accounting headers (`X-Msh-Usage-*`, stream spec
+/// P0.18), which the engine sets so clients can account prompt tokens even
+/// when a stream drops before the final usage frame; `server-timing` lets the
+/// engine's own metrics survive next to the router's appended ones.
+/// Hop-by-hop headers and anything the proxy synthesizes itself
+/// (content-type/length, transfer-encoding, connection) stay excluded.
+pub fn should_forward_response_header(name: &HeaderName) -> bool {
+    let n = name.as_str();
+    n.starts_with("x-msh-") || n == "server-timing" || n == "x-request-id"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::HeaderName;
+
+    #[test]
+    fn response_whitelist_basics() {
+        // Forwarded: Kimi accounting headers, engine timing, request id.
+        for n in [
+            "x-msh-usage-prompt-tokens",
+            "x-msh-usage-cached-tokens",
+            "server-timing",
+            "x-request-id",
+        ] {
+            assert!(should_forward_response_header(&HeaderName::from_static(n)), "{n}");
+        }
+        // Dropped: hop-by-hop and proxy-synthesized headers.
+        for n in [
+            "content-type",
+            "content-length",
+            "transfer-encoding",
+            "connection",
+            "x-sgl-decode-url",
+            "set-cookie",
+        ] {
+            assert!(!should_forward_response_header(&HeaderName::from_static(n)), "{n}");
+        }
+    }
 
     #[test]
     fn whitelist_basics() {
