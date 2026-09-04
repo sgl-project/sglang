@@ -1103,6 +1103,10 @@ class Req(ReqDllmMixin):
         # match, it will be the tracked seqlen in the ping pong buffer for the
         # right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
+        # Full-KV tokens that could not be reused because the matching Mamba
+        # checkpoint was unavailable. Reported once on the first prefill pass.
+        self.mamba_cache_miss_tokens = 0
+        self._mamba_cache_miss_reported = False
         # Total cached prefix length (on-device prefix_indices + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule
         # time and used to estimate uncached tokens / sort by longest prefix for
@@ -1834,6 +1838,8 @@ class Req(ReqDllmMixin):
         self.kv.mamba_last_track_idx = None
         self.kv.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
+        self.mamba_cache_miss_tokens = 0
+        self._mamba_cache_miss_reported = False
         self.kv.mamba_cow_src_index = None
         self.kv.mamba_needs_clear = False
         self.already_computed = 0
