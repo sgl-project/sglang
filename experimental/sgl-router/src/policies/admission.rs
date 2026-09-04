@@ -392,12 +392,18 @@ impl<'a> FreshLoadLookup<'a> {
         self.compare_prefill_keys(&self.pressure_key(left), &self.pressure_key(right))
     }
 
-    /// Returns engine queue depth for a complete fresh set, otherwise local load.
+    /// Returns corrected engine queue depth for a complete fresh set, otherwise
+    /// local load.
     pub(crate) fn score_load(&self, worker: &Arc<Worker>) -> usize {
         self.comparable_get(&worker.id)
             .map(|load| {
+                let recent_dispatches = worker
+                    .slots_acquired_since(load.captured_at)
+                    .try_into()
+                    .unwrap_or(u64::MAX);
                 load.num_waiting_reqs
                     .saturating_add(load.num_running_reqs)
+                    .saturating_add(recent_dispatches)
                     .try_into()
                     .unwrap_or(usize::MAX)
             })

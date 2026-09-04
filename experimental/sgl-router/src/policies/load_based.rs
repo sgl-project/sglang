@@ -133,4 +133,118 @@ mod tests {
             "load-based scoring must use the request snapshot before local active-load"
         );
     }
+
+    #[test]
+    fn recent_dispatches_after_snapshot_change_load_based_choice() {
+        let model = ModelId("tiny".into());
+        let w0 = worker("w0");
+        let w1 = worker("w1");
+        let captured_at = Instant::now();
+        let snapshot = EngineLoadSnapshot::from_workers(
+            37,
+            HashMap::from([
+                (
+                    w0.url.clone(),
+                    EngineWorkerLoad {
+                        num_running_reqs: 0,
+                        num_waiting_reqs: 0,
+                        num_tokens: 0,
+                        max_total_num_tokens: 0,
+                        captured_at,
+                    },
+                ),
+                (
+                    w1.url.clone(),
+                    EngineWorkerLoad {
+                        num_running_reqs: 1,
+                        num_waiting_reqs: 0,
+                        num_tokens: 0,
+                        max_total_num_tokens: 0,
+                        captured_at,
+                    },
+                ),
+            ]),
+        );
+        let _after_snapshot = [w0.load_guard(), w0.load_guard()];
+        let ctx = SelectionContext::new(&model, None).with_load_snapshot(&snapshot);
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+
+        assert_eq!(
+            LoadBasedPolicy::new().select(&workers, &ctx).unwrap().id,
+            w1.id,
+            "dispatches newer than Engine Load must correct its queue depth"
+        );
+    }
+
+    #[test]
+    fn dispatches_before_snapshot_are_not_double_counted() {
+        let model = ModelId("tiny".into());
+        let w0 = worker("w0");
+        let w1 = worker("w1");
+        let _before_snapshot = [w0.load_guard(), w0.load_guard()];
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let captured_at = Instant::now();
+        let snapshot = EngineLoadSnapshot::from_workers(
+            41,
+            HashMap::from([
+                (
+                    w0.url.clone(),
+                    EngineWorkerLoad {
+                        num_running_reqs: 0,
+                        num_waiting_reqs: 0,
+                        num_tokens: 0,
+                        max_total_num_tokens: 0,
+                        captured_at,
+                    },
+                ),
+                (
+                    w1.url.clone(),
+                    EngineWorkerLoad {
+                        num_running_reqs: 1,
+                        num_waiting_reqs: 0,
+                        num_tokens: 0,
+                        max_total_num_tokens: 0,
+                        captured_at,
+                    },
+                ),
+            ]),
+        );
+        let ctx = SelectionContext::new(&model, None).with_load_snapshot(&snapshot);
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+
+        assert_eq!(
+            LoadBasedPolicy::new().select(&workers, &ctx).unwrap().id,
+            w0.id,
+            "slots already covered by the snapshot must not be added again"
+        );
+    }
+
+    #[test]
+    fn incomplete_snapshot_uses_frozen_local_active_fallback() {
+        let model = ModelId("tiny".into());
+        let w0 = worker("w0");
+        let w1 = worker("w1");
+        let _local_load = [w0.load_guard(), w0.load_guard()];
+        let snapshot = EngineLoadSnapshot::from_workers(
+            43,
+            HashMap::from([(
+                w0.url.clone(),
+                EngineWorkerLoad {
+                    num_running_reqs: 0,
+                    num_waiting_reqs: 0,
+                    num_tokens: 0,
+                    max_total_num_tokens: 0,
+                    captured_at: Instant::now(),
+                },
+            )]),
+        );
+        let ctx = SelectionContext::new(&model, None).with_load_snapshot(&snapshot);
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+
+        assert_eq!(
+            LoadBasedPolicy::new().select(&workers, &ctx).unwrap().id,
+            w1.id,
+            "a partial Engine Load set must not mix engine and local gauges"
+        );
+    }
 }
