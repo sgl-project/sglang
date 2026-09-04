@@ -147,6 +147,34 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
     return BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps
 
 
+def _num_stages_for_extend_attention(Lq: int) -> int:
+    """Pipeline depth for the extend-attention KV loop.
+
+    The loop body is a straight-line global -> shared load of the K and V tiles
+    followed by two dots, which is the shape Triton can software pipeline. This
+    has been hardcoded to 1 since the kernel was written.
+
+    Measured on H200 (sm_90): 3 is best up to Lq=256. At Lq=512 the block config
+    (BLOCK_M=32, BLOCK_N=64, BLOCK_DMODEL=BLOCK_DV=512) needs 299008 bytes of
+    shared memory at 3 stages against a 232448 byte limit, so 2 is the ceiling.
+
+    Anything not measured stays at 1, which is every architecture other than
+    Hopper. That exclusion is deliberate rather than conservative boilerplate:
+
+    - sm120 (workstation Blackwell) picks BLOCK_N=128 for Lq<=128 precisely
+      because it only has 100 KiB of shared memory. Three stages of 128x128 K
+      and V tiles is 192 KiB, so the kernel would fail to compile there.
+    - sm100 (data-center Blackwell) uses its own block sizes to avoid PTX
+      register exhaustion, and deeper pipelining has not been measured against
+      that constraint.
+    - HIP keeps 1: the gfx950 specialization already fights register spills
+      (#34741), and raising the pipeline depth there is untested.
+    """
+    if not _is_cuda or CUDA_CAPABILITY[0] != 9:
+        return 1
+    return 3 if Lq <= 256 else 2
+
+
 def _compact_extend_q_tiles_per_head(
     *,
     batch_size: int,
@@ -877,7 +905,7 @@ def extend_attention_fwd(
         grid = (compact_q_tiles, head_num)
     else:
         grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
-    num_stages = 1
+    num_stages = _num_stages_for_extend_attention(Lq)
 
     extra_kargs = {}
     if _is_hip:
