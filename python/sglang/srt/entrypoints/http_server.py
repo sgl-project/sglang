@@ -980,7 +980,7 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
 @app.api_route("/flush_cache", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
-    """Flush the radix cache."""
+    """Flush runtime caches, including multimodal embeddings."""
     ret = await _global_state.tokenizer_manager.flush_cache(timeout_s=timeout)
     if ret.success:
         content = (

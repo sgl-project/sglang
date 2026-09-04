@@ -110,6 +110,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
@@ -4833,7 +4834,7 @@ class Scheduler(
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
     def flush_cache(self, empty_cache: bool = True):
-        """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
+        """Flush runtime caches and optionally empty the device allocator cache."""
         if self.is_fully_idle():
             self.cur_batch_for_debug = None
             self.last_batch = None
@@ -4846,6 +4847,12 @@ class Scheduler(
 
             if self.draft_worker:
                 self.draft_worker.clear_cache_pool()
+
+            # Drop cached embeddings so weight updates cannot reuse stale encoder
+            # outputs. Do this before trimming the allocator so colocated workloads
+            # can reclaim the memory.
+            if mm_schedule.embedding_cache is not None:
+                mm_schedule.embedding_cache.clear()
 
             if empty_cache:
                 current_platform.empty_cache()
