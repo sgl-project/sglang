@@ -3227,6 +3227,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
         self.free_group = None
         self.free_page_reps_group: Optional[List[torch.Tensor]] = None
+        self.full_free_group: List[torch.Tensor] = []
         # Empty (not None) for the leak checker.
         self.free_pages = torch.empty(0, dtype=torch.int64, device=device)
         self.release_pages = torch.empty(0, dtype=torch.int64, device=device)
@@ -3661,6 +3662,17 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.full_attn_allocator.free(free_index.detach().to(torch.int64))
         self.full_attn_allocator.clear_inverse_history()
 
+    def free_full_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
+        if free_index is None or free_index.numel() == 0:
+            return
+        if self.page_size == 1:
+            # token == page: free_full already frees by exact ids, no dedup.
+            self.free_full(free_index)
+            return
+        # The swa v2p is the mapping, so a tombstoned swa page drops out of the
+        # two-sided segment path by itself; full-only is the same call.
+        self.free_segment(free_index, start_pos=start_pos)
+
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:
@@ -3676,13 +3688,20 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     # -- free-group --
 
+    # Not the SWA parent's hooks: those open the parent's paged full allocator
+    # as a free group, and this composite's sub-pools defer on their own.
     def free_group_begin(self) -> None:
-        super().free_group_begin()
+        BaseTokenToKVPoolAllocator.free_group_begin(self)
         self.free_page_reps_group = []
+        self.full_free_group = []
 
     def free_group_end(self) -> None:
         pending, self.free_page_reps_group = self.free_page_reps_group, None
-        super().free_group_end()
+        full_free_group, self.full_free_group = self.full_free_group, []
+        BaseTokenToKVPoolAllocator.free_group_end(self)
+        if full_free_group:
+            self.full_attn_allocator.free(torch.cat(full_free_group))
+            self.full_attn_allocator.clear_inverse_history()
         if pending:
             self._release_page_reps(pending)
 
@@ -3746,6 +3765,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.swa_attn_allocator.clear()
         self.free_group = None
         self.free_page_reps_group = None
+        self.full_free_group = []
 
     # -- Lazy compaction hooks --
 
