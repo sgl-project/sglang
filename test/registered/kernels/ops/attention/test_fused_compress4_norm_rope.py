@@ -312,12 +312,12 @@ def test_fused_matches_chain_decode(scenario: str, mode: str, prefix_len: int) -
             next_slot += 1
         else:
             # A non-compress decode step must not touch either cache.
-            assert torch.equal(
-                cache_chain, before_chain
-            ), f"chain wrote cache on non-compress step (pos={pos})"
-            assert torch.equal(
-                cache_fused, before_fused
-            ), f"fused wrote cache on non-compress step (pos={pos})"
+            assert torch.equal(cache_chain, before_chain), (
+                f"chain wrote cache on non-compress step (pos={pos})"
+            )
+            assert torch.equal(cache_fused, before_fused), (
+                f"fused wrote cache on non-compress step (pos={pos})"
+            )
 
         _assert_cache_close(
             cfg["store"], cache_chain, cache_fused, head_dim, cfg["page_size"]
