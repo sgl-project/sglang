@@ -24,6 +24,7 @@ from typing import Callable, List, Optional
 
 import psutil
 import setproctitle
+import xxhash
 import zmq
 
 from sglang.srt.environ import envs
@@ -89,6 +90,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    ROUTING_KEY = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -166,6 +168,7 @@ class DataParallelController:
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.ROUTING_KEY: self.routing_key_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
@@ -787,6 +790,26 @@ class DataParallelController:
         )
         target_rank = req.bootstrap_room % len(self.workers)
         sock_send(self.workers[target_rank], req)
+
+    def routing_key_scheduler(self, req: Req):
+        """Pin all requests sharing a routing_key to one dp rank.
+
+        Multi-turn agentic clients (RL rollout loops, the rolling bench) send
+        one routing_key per rollout; hashing it keeps every turn's grown
+        context on the dp rank that holds its radix-cache prefix. Keyless
+        requests fall back to round robin.
+        """
+        if isinstance(req, TokenizedGenerateReqInput) and req.routing_key is not None:
+            if self.maybe_external_dp_rank_routing(req):
+                return
+            active = self._active_workers
+            if not active:
+                raise RuntimeError("No active DP workers are available for routing.")
+            target = active[xxhash.xxh3_64_intdigest(req.routing_key) % len(active)]
+            if self.status[target]:
+                sock_send(self.workers[target], req)
+                return
+        self.round_robin_scheduler(req)
 
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
