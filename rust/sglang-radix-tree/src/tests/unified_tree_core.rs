@@ -2323,6 +2323,7 @@ fn insert_coalesces_parent_linked_block_stores() {
             block_size: 2,
             medium: StorageMedium::Gpu,
             cache_salt: None,
+            session_id: None,
         }]
     );
     // Events hash lazily even though the storage tier is off.
@@ -2452,6 +2453,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         block_size: 2,
         medium: StorageMedium::Gpu,
         cache_salt: None,
+        session_id: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 1);
     // A different block size must not join the parent-linked store tail.
@@ -2462,6 +2464,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         block_size: 1,
         medium: StorageMedium::Gpu,
         cache_salt: None,
+        session_id: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 2);
     // Matching size and parent are still separated across media.
@@ -2472,6 +2475,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         block_size: 1,
         medium: StorageMedium::Cpu,
         cache_salt: None,
+        session_id: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 3);
     // Matching size and medium are still separated without the parent link.
@@ -2482,6 +2486,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         block_size: 1,
         medium: StorageMedium::Cpu,
         cache_salt: None,
+        session_id: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 4);
     tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
@@ -2524,6 +2529,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         block_size: 2,
         medium: StorageMedium::Gpu,
         cache_salt: Some(Arc::from("tenant-a")),
+        session_id: None,
     });
     tc.enqueue_kv_event_(KvCacheEvent::BlockStored {
         block_hashes: vec![2],
@@ -2532,6 +2538,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         block_size: 2,
         medium: StorageMedium::Gpu,
         cache_salt: Some(Arc::from("tenant-b")),
+        session_id: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 2);
 }
@@ -2599,6 +2606,7 @@ fn bigram_insert_events_carry_pair_token_payloads() {
             block_size: 1,
             medium: StorageMedium::Gpu,
             cache_salt: None,
+            session_id: None,
         }]
     );
 }
@@ -2621,6 +2629,7 @@ fn finish_write_through_emits_cpu_stored_events() {
             block_size: 1,
             medium: StorageMedium::Cpu,
             cache_salt: None,
+            session_id: None,
         }]
     );
 }
@@ -2672,6 +2681,7 @@ fn load_back_commit_emits_gpu_stored_events() {
             block_size: 1,
             medium: StorageMedium::Gpu,
             cache_salt: None,
+            session_id: None,
         }]
     );
 }
@@ -2691,6 +2701,7 @@ fn unevict_on_insert_emits_a_gpu_stored_event() {
             block_size: 1,
             medium: StorageMedium::Gpu,
             cache_salt: None,
+            session_id: None,
         }]
     );
 }
@@ -2779,6 +2790,7 @@ fn split_insert_stores_only_the_new_block_chained_to_the_split_parent() {
             block_size: 2,
             medium: StorageMedium::Gpu,
             cache_salt: None,
+            session_id: None,
         }]
     );
     // The split divided the page hashes between the two fragments.
@@ -2852,6 +2864,7 @@ fn finish_write_through_after_a_split_publishes_both_fragments() {
             block_size: 2,
             medium: StorageMedium::Cpu,
             cache_salt: None,
+            session_id: None,
         }]
     );
     // The matching ack cleared the pending mark on both fragments.
