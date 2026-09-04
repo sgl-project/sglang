@@ -227,6 +227,7 @@ from sglang.srt.utils import (
     slow_rank_detector,
 )
 from sglang.srt.utils.device_timer import device_timer_ctx
+from sglang.srt.utils.mem_forensics import maybe_start_memory_forensics
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.offloader import (
@@ -434,6 +435,10 @@ class ModelRunner:
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
         self.init_torch_distributed()
+
+        # Allocator-history recording must begin before any lazily created
+        # buffer that a captured CUDA graph may later reference.
+        maybe_start_memory_forensics()
 
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
