@@ -508,6 +508,7 @@ class MambaPool:
         speculative_num_draft_tokens: Optional[int] = None,
         speculative_eagle_topk: Optional[int] = None,
         enable_linear_replayssm: bool = False,
+        enable_kda_replayssm_predecay: bool = False,
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
@@ -527,6 +528,11 @@ class MambaPool:
         self.debug_memory_pool = envs.SGLANG_DEBUG_MEMORY_POOL.get()
         self.enable_linear_replayssm = enable_linear_replayssm
         self.linear_replayssm_cache_len = linear_replayssm_cache_len
+        self.replayssm_predecay_kda = bool(
+            enable_linear_replayssm
+            and enable_kda_replayssm_predecay
+            and cache_params.supports_kda_replayssm_predecay(linear_replayssm_cache_len)
+        )
         # ReplaySSM: the decode ring (--enable-linear-replayssm) allocates the
         # chunked (d, k) records + write_pos; the spec-verify flag
         # (--enable-linear-replayssm-spec) always uses fold-every-commit and
@@ -633,7 +639,12 @@ class MambaPool:
                 # in the conv/activation dtype instead of the (fp32-enforced)
                 # SSM dtype to halve the ring traffic. g stays fp32 everywhere
                 # (exact-fold input). The two flags are mutually exclusive.
-                ring_dtype = conv_dtype if enable_linear_replayssm_spec else ssm_dtype
+                ring_dtype = (
+                    conv_dtype
+                    if enable_linear_replayssm_spec
+                    or (self.replayssm_predecay_kda and conv_dtype != torch.float16)
+                    else ssm_dtype
+                )
                 # Fold-every-commit: one verify window, no chunked (d, k)
                 # records. KDA is the exception on both counts: its window
                 # stays L-sized (the fused verify ring-write drops
@@ -899,7 +910,8 @@ class MambaPool:
             # all GDN layers of one verify step; advanced by commit_gdn_replayssm_spec.
             self.replayssm_cache_base = (
                 torch.zeros((size + 1,), dtype=torch.int32, device=device)
-                if enable_linear_replayssm_spec and not self.replayssm_spec_fold
+                if self.replayssm_predecay_kda
+                or (enable_linear_replayssm_spec and not self.replayssm_spec_fold)
                 else None
             )
             self.replayssm_is_flush = (
@@ -959,8 +971,17 @@ class MambaPool:
     def _should_fuse_slot_ops(self) -> bool:
         return self._conv_fuse_ok and not envs.SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS.get()
 
+    def reset_replayssm_cursors(self, indices) -> None:
+        if self.replayssm_write_pos is not None:
+            self.replayssm_write_pos[indices] = 0
+        if self.replayssm_cache_base is not None:
+            self.replayssm_cache_base[indices] = 0
+        if self.replayssm_is_flush is not None:
+            self.replayssm_is_flush[indices] = 0
+
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
+        self.reset_replayssm_cursors(indices)
         if self._should_fuse_slot_ops():
             from sglang.srt.mem_cache.mamba_slot_fused import fused_clear_conv_slots
 
@@ -1008,6 +1029,13 @@ class MambaPool:
                 f"(write_pos==0), got {src_wp.tolist()} for src "
                 f"{src_indices.tolist()}"
             )
+            if self.replayssm_predecay_kda:
+                src_base = self.replayssm_cache_base[src_indices]
+                assert bool((src_base == 0).all().item()), (
+                    "copy_from requires a fully-flushed ReplaySSM source "
+                    f"(cache_base==0), got {src_base.tolist()} for src "
+                    f"{src_indices.tolist()}"
+                )
         if self._should_fuse_slot_ops():
             from sglang.srt.mem_cache.mamba_slot_fused import fused_copy_conv_slots
 
@@ -1029,14 +1057,9 @@ class MambaPool:
             self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
                 :, src_indices
             ]
-        if self.replayssm_write_pos is not None:
-            self.replayssm_write_pos[dst_indices] = 0
-        # ReplaySSM spec-verify ring: a copied checkpoint has no pending ring
-        # entries, so its rolling origin + flush flag reset alongside write_pos.
-        if self.replayssm_cache_base is not None:
-            self.replayssm_cache_base[dst_indices] = 0
-        if self.replayssm_is_flush is not None:
-            self.replayssm_is_flush[dst_indices] = 0
+        # A copied checkpoint has no pending ordinary-decode ring entries. The
+        # spec-verify ring also resets its rolling origin and flush flag.
+        self.reset_replayssm_cursors(dst_indices)
 
     def get_cpu_copy(self, indices):
         current_platform.synchronize()
@@ -1047,29 +1070,51 @@ class MambaPool:
         temporal_cpu = self.mamba_cache.temporal[:, indices].to(
             "cpu", non_blocking=True
         )
-        # ReplaySSM spec-verify ring: round-trip the per-slot cursors with the
-        # checkpoint so a restored slot reconstructs exactly. Only the spec ring
-        # adds the 3rd tuple element; every other config keeps the legacy 2-tuple
-        # so those paths stay byte-identical.
+        # Round-trip ReplaySSM per-slot cursors with the checkpoint so a restored
+        # slot reconstructs exactly. Configurations without a cache base keep the
+        # legacy 2-tuple.
         if self.replayssm_cache_base is not None:
             cursors_cpu = (
                 self.replayssm_write_pos[indices].to("cpu", non_blocking=True),
                 self.replayssm_cache_base[indices].to("cpu", non_blocking=True),
-                self.replayssm_is_flush[indices].to("cpu", non_blocking=True),
+                (
+                    self.replayssm_is_flush[indices].to("cpu", non_blocking=True)
+                    if self.replayssm_is_flush is not None
+                    else None
+                ),
             )
+            if self.replayssm_predecay_kda:
+                rings_cpu = tuple(
+                    tensor[:, indices].to("cpu", non_blocking=True)
+                    for tensor in (
+                        self.mamba_cache.replayssm_d,
+                        self.mamba_cache.replayssm_k,
+                        self.mamba_cache.replayssm_g,
+                    )
+                )
+                current_platform.synchronize()
+                return conv_cpu, temporal_cpu, cursors_cpu, rings_cpu
             current_platform.synchronize()
             return conv_cpu, temporal_cpu, cursors_cpu
         current_platform.synchronize()
         return conv_cpu, temporal_cpu
 
     def load_cpu_copy(self, mamba_cache_cpu, indices):
-        # Accept both the legacy 2-tuple (conv, temporal) and the 3-tuple that also
-        # carries the ReplaySSM spec-verify cursors.
-        if len(mamba_cache_cpu) == 3:
+        # Accept the legacy 2-tuple, the cursor-aware 3-tuple, and the bounded-KDA
+        # 4-tuple that also carries pending ReplaySSM ring records.
+        rings_cpu = None
+        if len(mamba_cache_cpu) == 4:
+            conv_cpu, temporal_cpu, cursors_cpu, rings_cpu = mamba_cache_cpu
+        elif len(mamba_cache_cpu) == 3:
             conv_cpu, temporal_cpu, cursors_cpu = mamba_cache_cpu
-        else:
+        elif len(mamba_cache_cpu) == 2:
             conv_cpu, temporal_cpu = mamba_cache_cpu
             cursors_cpu = None
+        else:
+            raise ValueError(
+                "Mamba CPU state must contain 2, 3, or 4 tuple elements, "
+                f"got {len(mamba_cache_cpu)}."
+            )
         current_platform.synchronize()
         for i, conv in enumerate(self.mamba_cache.conv):
             conv[:, indices] = conv_cpu[i].to(conv.device, non_blocking=True)
@@ -1084,9 +1129,25 @@ class MambaPool:
             self.replayssm_cache_base[indices] = cb_cpu.to(
                 self.replayssm_cache_base.device, non_blocking=True
             )
-            self.replayssm_is_flush[indices] = fl_cpu.to(
-                self.replayssm_is_flush.device, non_blocking=True
-            )
+            if fl_cpu is not None and self.replayssm_is_flush is not None:
+                self.replayssm_is_flush[indices] = fl_cpu.to(
+                    self.replayssm_is_flush.device, non_blocking=True
+                )
+            if rings_cpu is not None:
+                for tensor, tensor_cpu in zip(
+                    (
+                        self.mamba_cache.replayssm_d,
+                        self.mamba_cache.replayssm_k,
+                        self.mamba_cache.replayssm_g,
+                    ),
+                    rings_cpu,
+                    strict=True,
+                ):
+                    tensor[:, indices] = tensor_cpu.to(
+                        tensor.device, non_blocking=True
+                    )
+        elif self.replayssm_predecay_kda:
+            self.reset_replayssm_cursors(indices)
         current_platform.synchronize()
 
     _NON_TRANSFER_STATE_FIELDS = frozenset(
@@ -1213,6 +1274,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
         enable_linear_replayssm: bool = False,
+        enable_kda_replayssm_predecay: bool = False,
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
@@ -1240,6 +1302,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_eagle_topk=speculative_eagle_topk,
             enable_linear_replayssm=enable_linear_replayssm,
+            enable_kda_replayssm_predecay=enable_kda_replayssm_predecay,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
@@ -1256,6 +1319,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         speculative_num_draft_tokens: int = None,
         speculative_eagle_topk: Optional[int] = None,
         enable_linear_replayssm: bool = False,
+        enable_kda_replayssm_predecay: bool = False,
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
@@ -1270,6 +1334,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_eagle_topk=speculative_eagle_topk,
             enable_linear_replayssm=enable_linear_replayssm,
+            enable_kda_replayssm_predecay=enable_kda_replayssm_predecay,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
@@ -1369,14 +1434,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 # ring. write_pos=0 means "ring empty", so the decode kernel
                 # ignores ring contents and reads only the checkpoint state
                 # (the post-prefill state that prefill wrote into this slot).
-                if self.mamba_pool.replayssm_write_pos is not None:
-                    self.mamba_pool.replayssm_write_pos[req.kv.mamba_pool_idx] = 0
-                # ReplaySSM spec-verify ring: an empty ring also resets the
-                # circular origin + flush flag so the first verify step on this
-                # freshly-prefilled slot reconstructs from the checkpoint alone.
-                if self.mamba_pool.replayssm_cache_base is not None:
-                    self.mamba_pool.replayssm_cache_base[req.kv.mamba_pool_idx] = 0
-                    self.mamba_pool.replayssm_is_flush[req.kv.mamba_pool_idx] = 0
+                # ReplaySSM cursors are independent optional fields: ordinary
+                # pre-decay owns write_pos/base, while spec Replay also owns
+                # is_flush.
+                self.mamba_pool.reset_replayssm_cursors(req.kv.mamba_pool_idx)
             mamba_indices.append(req.kv.mamba_pool_idx)
             if self.enable_mamba_extra_buffer:
                 if req.kv.mamba_ping_pong_track_buffer is None:

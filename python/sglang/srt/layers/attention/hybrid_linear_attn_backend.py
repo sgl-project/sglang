@@ -4,6 +4,8 @@ import logging
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
@@ -50,6 +52,98 @@ _validate_mamba_replay_state_indices = (
 )
 
 
+@triton.jit
+def _advance_replayssm_decode_cursor_kernel(
+    persistent_write_pos,
+    persistent_cache_base,
+    static_write_pos,
+    static_cache_base,
+    state_indices,
+    force_flush,
+    n_rows,
+    stride_indices: tl.constexpr,
+    stride_force_flush: tl.constexpr,
+    CACHE_LEN: tl.constexpr,
+    CACHE_LEN_POWER_OF_TWO: tl.constexpr,
+    HAS_FORCE_FLUSH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    rows = tl.arange(0, BLOCK)
+    row_mask = rows < n_rows
+    slots = tl.load(state_indices + rows * stride_indices, mask=row_mask, other=-1).to(
+        tl.int64
+    )
+    valid = row_mask & (slots >= 0)
+    write_pos = tl.load(persistent_write_pos + slots, mask=valid, other=0).to(tl.int32)
+    cache_base = tl.load(persistent_cache_base + slots, mask=valid, other=0).to(
+        tl.int32
+    )
+    tl.store(static_write_pos + rows, write_pos, mask=row_mask)
+    tl.store(static_cache_base + rows, cache_base, mask=row_mask)
+
+    natural_flush = write_pos == CACHE_LEN - 1
+    forced_flush = False
+    if HAS_FORCE_FLUSH:
+        forced_flush = (
+            tl.load(
+                force_flush + rows * stride_force_flush,
+                mask=row_mask,
+                other=0,
+            )
+            != 0
+        )
+    history_flush = natural_flush & (not forced_flush) & (CACHE_LEN > 1)
+    full_flush = forced_flush | (natural_flush & (CACHE_LEN == 1))
+    next_pos = tl.where(full_flush, 0, tl.where(history_flush, 1, write_pos + 1))
+    if CACHE_LEN_POWER_OF_TWO:
+        flushed_base = (cache_base + write_pos) & (CACHE_LEN - 1)
+    else:
+        flushed_base = (cache_base + write_pos) % CACHE_LEN
+    next_base = tl.where(
+        full_flush, 0, tl.where(history_flush, flushed_base, cache_base)
+    )
+    tl.store(persistent_write_pos + slots, next_pos, mask=valid)
+    tl.store(persistent_cache_base + slots, next_base, mask=valid)
+
+
+def _advance_replayssm_predecay_cursor(
+    *,
+    persistent_write_pos: torch.Tensor,
+    persistent_cache_base: torch.Tensor,
+    static_write_pos: torch.Tensor,
+    static_cache_base: torch.Tensor,
+    state_indices: torch.Tensor,
+    cache_len: int,
+    force_flush: Optional[torch.Tensor] = None,
+) -> None:
+    n_rows = state_indices.numel()
+    if n_rows == 0:
+        return
+    if envs.SGLANG_DEBUG_MEMORY_POOL.get():
+        valid_slots = state_indices[state_indices >= 0]
+        if torch.unique(valid_slots).numel() != valid_slots.numel():
+            raise ValueError(
+                "KDA ReplaySSM requires unique non-padding state indices per step."
+            )
+    block = triton.next_power_of_2(n_rows)
+    force_flush_arg = state_indices if force_flush is None else force_flush
+    _advance_replayssm_decode_cursor_kernel[(1,)](
+        persistent_write_pos,
+        persistent_cache_base,
+        static_write_pos,
+        static_cache_base,
+        state_indices,
+        force_flush_arg,
+        n_rows,
+        stride_indices=state_indices.stride(0),
+        stride_force_flush=force_flush_arg.stride(0),
+        CACHE_LEN=cache_len,
+        CACHE_LEN_POWER_OF_TWO=cache_len & (cache_len - 1) == 0,
+        HAS_FORCE_FLUSH=force_flush is not None,
+        BLOCK=block,
+    )
+
+
 class MambaAttnBackendBase(AttentionBackend):
     # Per-slot accept lengths for the KDA fused-accept spec path; allocated only
     # by KDAAttnBackend where `_can_fuse_accept_state` holds. None everywhere
@@ -88,7 +182,14 @@ class MambaAttnBackendBase(AttentionBackend):
         # Per-bs static write-cursor / force-flush buffers for cuda-graph; None
         # unless --enable-linear-replayssm is set.
         self.replayssm_write_pos_list = None
+        self.replayssm_cache_base_list = None
         self.replayssm_force_flush_list = None
+        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        self.replayssm_predecay_kda = bool(
+            mamba_pool is not None
+            and getattr(mamba_pool, "replayssm_predecay_kda", False)
+        )
+        self.replayssm_force_flush_enabled = not get_memory().disable_radix_cache
         self.query_start_loc_list = []
         self.retrieve_next_token_list = []
         self.retrieve_next_sibling_list = []
@@ -147,6 +248,7 @@ class MambaAttnBackendBase(AttentionBackend):
             mamba_cache_indices[_real_bs:] = -1
 
         replayssm_write_pos = None
+        replayssm_cache_base = None
         replayssm_force_flush = None
         if forward_batch.forward_mode.is_decode_or_idle():
             query_start_loc = torch.arange(
@@ -168,17 +270,45 @@ class MambaAttnBackendBase(AttentionBackend):
             )
             if write_pos_buf is not None:
                 slots = mamba_cache_indices.to(torch.long)
+                L = mamba_pool.linear_replayssm_cache_len
+                if self.replayssm_predecay_kda:
+                    cache_base_buf = mamba_pool.replayssm_cache_base
+                    if cache_base_buf is None:
+                        raise RuntimeError(
+                            "KDA ReplaySSM pre-decay cache base was not allocated."
+                        )
+                    replayssm_write_pos = torch.empty_like(mamba_cache_indices)
+                    replayssm_cache_base = torch.empty_like(mamba_cache_indices)
+                    if self.replayssm_force_flush_enabled:
+                        force_flush_bool = self._replayssm_track_flush_mask(
+                            forward_batch.seq_lens_cpu, bs
+                        )
+                        replayssm_force_flush = force_flush_bool.to(
+                            device=self.device, dtype=torch.int32
+                        )
+                    _advance_replayssm_predecay_cursor(
+                        persistent_write_pos=write_pos_buf,
+                        persistent_cache_base=cache_base_buf,
+                        static_write_pos=replayssm_write_pos,
+                        static_cache_base=replayssm_cache_base,
+                        state_indices=mamba_cache_indices,
+                        cache_len=L,
+                        force_flush=replayssm_force_flush,
+                    )
+                    return_metadata_cursor = True
+                else:
+                    return_metadata_cursor = False
                 # Padded rows carry slot == -1; clamp the gather in-bounds (kernel
                 # zeroes padded rows via state_idx < 0).
                 safe_slots = slots.clamp(min=0)
-                replayssm_write_pos = write_pos_buf[safe_slots].clone()
-                L = mamba_pool.linear_replayssm_cache_len
+                if not return_metadata_cursor:
+                    replayssm_write_pos = write_pos_buf[safe_slots].clone()
                 # KDA has no radix coordination: flush only on the natural write_pos
                 # == L-1 wrap. GDN adds the radix-aligned force-flush below.
                 is_kda = getattr(mamba_pool, "replayssm_is_kda", False)
                 # Force-flush on the radix track's seq_lens % mamba_track_interval
                 # == 0 boundary so the ring folds into temporal[slot] when read.
-                if not is_kda:
+                if not is_kda and not return_metadata_cursor:
                     force_flush_bool = self._replayssm_track_flush_mask(
                         forward_batch.seq_lens_cpu, bs
                     )
@@ -187,7 +317,7 @@ class MambaAttnBackendBase(AttentionBackend):
                     )
                 # Advance only valid slots, scattered over unique slots (dup-index
                 # race; padded rows clamp to 0); a forced flush -> next write_pos 0.
-                valid_mask = slots >= 0
+                valid_mask = (slots >= 0) & (not return_metadata_cursor)
                 valid_slots = slots[valid_mask]
                 if valid_slots.numel() > 0:
                     flushed = replayssm_write_pos == (L - 1)
@@ -281,6 +411,7 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_recompute_dst=track_ssm_recompute_dst,
             has_mamba_track_mask=has_mamba_track_mask,
             replayssm_write_pos=replayssm_write_pos,
+            replayssm_cache_base=replayssm_cache_base,
             replayssm_force_flush=replayssm_force_flush,
         )
 
@@ -479,7 +610,13 @@ class MambaAttnBackendBase(AttentionBackend):
         # Per-bs static write-cursor / force-flush buffers, captured by pointer +
         # refreshed in-place each replay; sized like state_indices_list. None when off.
         self.replayssm_write_pos_list = [] if self._replayssm_enabled() else None
-        self.replayssm_force_flush_list = [] if self._replayssm_enabled() else None
+        self.replayssm_cache_base_list = [] if self.replayssm_predecay_kda else None
+        self.replayssm_force_flush_list = (
+            []
+            if self._replayssm_enabled()
+            and (not self.replayssm_predecay_kda or self.replayssm_force_flush_enabled)
+            else None
+        )
         # int64 to match DecodeInputBuffers.mamba_track_indices + the track-save
         # kernel's int64 index load. Refreshed in-place by _replay_metadata.
         self.mamba_track_indices_buf = torch.zeros(
@@ -493,6 +630,10 @@ class MambaAttnBackendBase(AttentionBackend):
             )
             if self.replayssm_write_pos_list is not None:
                 self.replayssm_write_pos_list.append(
+                    torch.zeros((i + 1,), dtype=torch.int32, device=self.device)
+                )
+            if self.replayssm_cache_base_list is not None:
+                self.replayssm_cache_base_list.append(
                     torch.zeros((i + 1,), dtype=torch.int32, device=self.device)
                 )
             if self.replayssm_force_flush_list is not None:
@@ -582,6 +723,11 @@ class MambaAttnBackendBase(AttentionBackend):
             if self.replayssm_write_pos_list is not None
             else None
         )
+        replayssm_cache_base = (
+            self.replayssm_cache_base_list[bs - 1]
+            if self.replayssm_cache_base_list is not None
+            else None
+        )
         replayssm_force_flush = (
             self.replayssm_force_flush_list[bs - 1]
             if self.replayssm_force_flush_list is not None
@@ -597,6 +743,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
                 replayssm_write_pos=replayssm_write_pos,
+                replayssm_cache_base=replayssm_cache_base,
                 replayssm_force_flush=replayssm_force_flush,
             )
         else:
@@ -604,6 +751,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 replayssm_write_pos=replayssm_write_pos,
+                replayssm_cache_base=replayssm_cache_base,
                 replayssm_force_flush=replayssm_force_flush,
             )
 
@@ -671,66 +819,95 @@ class MambaAttnBackendBase(AttentionBackend):
         # snapshot-then-advance). Skip the advance during capture: dummy slots
         # would corrupt real ring positions.
         replayssm_write_pos = None
+        replayssm_cache_base = None
         replayssm_force_flush = None
         if self.replayssm_write_pos_list is not None:
             mamba_pool = self.req_to_token_pool.mamba_pool
             write_pos_buf = mamba_pool.replayssm_write_pos
             static_wp = self.replayssm_write_pos_list[bs - 1]
-            static_ff = self.replayssm_force_flush_list[bs - 1]
+            static_cb = (
+                self.replayssm_cache_base_list[bs - 1]
+                if self.replayssm_cache_base_list is not None
+                else None
+            )
+            static_ff = (
+                self.replayssm_force_flush_list[bs - 1]
+                if self.replayssm_force_flush_list is not None
+                else None
+            )
             # Hand the full captured per-bs buffers to the kernel; it indexes per row.
             replayssm_write_pos = static_wp
+            replayssm_cache_base = static_cb
             replayssm_force_flush = static_ff
             if write_pos_buf is not None:
                 # this replay's per-row physical slots (padded rows == -1)
                 slots = mamba_indices.to(torch.long)
-                safe_slots = slots.clamp(min=0)
-                # Snapshot this step's cursor into the captured buffer in-place
-                # (copy_, never reassign the object).
-                static_wp[: len(mamba_indices)].copy_(write_pos_buf[safe_slots])
-                # Refresh the force-flush buffer in-place from this step's seq_lens
-                # (same condition as the radix track). Zeroed during capture.
-                force_flush_dev = None
-                # KDA: no radix coordination -> leave zeroed so the advance is a pure wrap.
-                is_kda = getattr(mamba_pool, "replayssm_is_kda", False)
-                if (
-                    not is_kda
-                    and forward_mode.is_decode_or_idle()
-                    and seq_lens_cpu is not None
-                ):
-                    ff_mask = self._replayssm_track_flush_mask(seq_lens_cpu, bs)
-                    force_flush_dev = ff_mask.to(device=self.device, dtype=torch.int32)
-                    static_ff.copy_(force_flush_dev)
+                if self.replayssm_predecay_kda:
+                    if static_cb is None or mamba_pool.replayssm_cache_base is None:
+                        raise RuntimeError(
+                            "KDA ReplaySSM pre-decay cache base was not initialized."
+                        )
+                    if static_ff is not None and (
+                        forward_mode.is_decode_or_idle() and seq_lens_cpu is not None
+                    ):
+                        ff_mask = self._replayssm_track_flush_mask(seq_lens_cpu, bs)
+                        static_ff.copy_(
+                            ff_mask.to(device=self.device, dtype=torch.int32)
+                        )
+                    elif static_ff is not None:
+                        static_ff.zero_()
+                    if not in_capture and forward_mode.is_decode_or_idle():
+                        _advance_replayssm_predecay_cursor(
+                            persistent_write_pos=write_pos_buf,
+                            persistent_cache_base=mamba_pool.replayssm_cache_base,
+                            static_write_pos=static_wp,
+                            static_cache_base=static_cb,
+                            state_indices=mamba_indices,
+                            cache_len=mamba_pool.linear_replayssm_cache_len,
+                            force_flush=static_ff,
+                        )
                 else:
-                    static_ff.zero_()
-                # Defense in depth: the decode-ring advance is only meaningful for
-                # decode/idle forwards (mirrors the eager path's gating). A
-                # TARGET_VERIFY replay must never advance the cursor.
-                if not in_capture and forward_mode.is_decode_or_idle():
-                    L = mamba_pool.linear_replayssm_cache_len
-                    # Advance only valid (non-padded) slots; a forced flush empties
-                    # the ring -> next write_pos 0, like the natural L-1 wrap.
-                    valid_mask = slots >= 0
-                    valid_slots = slots[valid_mask]
-                    if valid_slots.numel() > 0:
-                        cur_pos = write_pos_buf[safe_slots]
-                        flushed = cur_pos == (L - 1)
-                        if force_flush_dev is not None:
-                            flushed = flushed | (force_flush_dev != 0)
-                        next_pos = torch.where(
-                            flushed,
-                            torch.zeros_like(cur_pos),
-                            (cur_pos + 1) % L,
+                    safe_slots = slots.clamp(min=0)
+                    static_wp[: len(mamba_indices)].copy_(write_pos_buf[safe_slots])
+                    force_flush_dev = None
+                    is_kda = getattr(mamba_pool, "replayssm_is_kda", False)
+                    if (
+                        not is_kda
+                        and forward_mode.is_decode_or_idle()
+                        and seq_lens_cpu is not None
+                    ):
+                        ff_mask = self._replayssm_track_flush_mask(seq_lens_cpu, bs)
+                        force_flush_dev = ff_mask.to(
+                            device=self.device, dtype=torch.int32
                         )
-                        # Dedup; rows sharing a slot share write_pos+flush.
-                        uniq_slots, inv = torch.unique(valid_slots, return_inverse=True)
-                        next_for_valid = next_pos[valid_mask]
-                        new_vals = torch.empty(
-                            uniq_slots.shape[0],
-                            dtype=write_pos_buf.dtype,
-                            device=write_pos_buf.device,
-                        )
-                        new_vals[inv] = next_for_valid.to(write_pos_buf.dtype)
-                        write_pos_buf[uniq_slots] = new_vals
+                        static_ff.copy_(force_flush_dev)
+                    else:
+                        static_ff.zero_()
+                    if not in_capture and forward_mode.is_decode_or_idle():
+                        L = mamba_pool.linear_replayssm_cache_len
+                        valid_mask = slots >= 0
+                        valid_slots = slots[valid_mask]
+                        if valid_slots.numel() > 0:
+                            cur_pos = write_pos_buf[safe_slots]
+                            flushed = cur_pos == (L - 1)
+                            if force_flush_dev is not None:
+                                flushed = flushed | (force_flush_dev != 0)
+                            next_pos = torch.where(
+                                flushed,
+                                torch.zeros_like(cur_pos),
+                                (cur_pos + 1) % L,
+                            )
+                            uniq_slots, inv = torch.unique(
+                                valid_slots, return_inverse=True
+                            )
+                            next_for_valid = next_pos[valid_mask]
+                            new_vals = torch.empty(
+                                uniq_slots.shape[0],
+                                dtype=write_pos_buf.dtype,
+                                device=write_pos_buf.device,
+                            )
+                            new_vals[inv] = next_for_valid.to(write_pos_buf.dtype)
+                            write_pos_buf[uniq_slots] = new_vals
         if forward_mode.is_decode_or_idle():
             if num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
@@ -790,6 +967,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
                 replayssm_write_pos=replayssm_write_pos,
+                replayssm_cache_base=replayssm_cache_base,
                 replayssm_force_flush=replayssm_force_flush,
             )
         else:
@@ -798,6 +976,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 mamba_track_indices=track_buf,
                 replayssm_write_pos=replayssm_write_pos,
+                replayssm_cache_base=replayssm_cache_base,
                 replayssm_force_flush=replayssm_force_flush,
             )
 

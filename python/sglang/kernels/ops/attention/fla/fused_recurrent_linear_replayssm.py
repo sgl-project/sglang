@@ -7,9 +7,8 @@
 # ``IS_KDA`` constexpr selects the gate path and the GDN path is bit-for-bit
 # the original (no regression to the validated GDN kernel).
 #
-# This is a STANDALONE increment: kernel + wrapper only. It is NOT yet wired
-# into the memory pool / radix cache / scheduler / backend dispatch. The caller
-# (currently the correctness test and the microbenchmark) owns the ring tensors.
+# The memory pool owns the persistent ring tensors. The backend supplies a
+# per-row cursor snapshot and force-flush decision for eager or graph replay.
 #
 # Idea (vs. ``fused_recurrent_gated_delta_rule_packed_decode`` / ``..._kda_...``):
 #   The plain packed decode reads the full recurrent state S [HV, V, K] from
@@ -53,6 +52,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import triton
 import triton.language as tl
@@ -73,8 +74,10 @@ def fused_recurrent_linear_replayssm_decode_kernel(
     g_cache,  # GDN: [num_slots, HV, L] ; KDA: [num_slots, HV, L, K] log-decay gates (fp32)
     ssm_state_indices,  # [B] physical state slot per decode row
     write_pos,  # [B] int32 per-row ring cursor (0..L-1)
+    cache_base,  # [B] int32 circular-ring logical position zero
     force_flush,  # [B] int32: !=0 forces a flush this step (radix track boundary)
     scale,
+    lower_bound,
     stride_mixed_qkv_tok: tl.constexpr,
     stride_a_tok: tl.constexpr,
     stride_b_tok: tl.constexpr,
@@ -91,10 +94,15 @@ def fused_recurrent_linear_replayssm_decode_kernel(
     NK: tl.constexpr,
     BKT: tl.constexpr,
     MAX_CACHE_LEN: tl.constexpr,
+    CACHE_LEN_POWER_OF_TWO: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     HAS_FORCE_FLUSH: tl.constexpr,
+    CIRCULAR_REPLAY: tl.constexpr,
+    PREFIX_GATE_CACHE: tl.constexpr,
+    PREDECAYED_K_CACHE: tl.constexpr,
     IS_KDA: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
@@ -119,13 +127,36 @@ def fused_recurrent_linear_replayssm_decode_kernel(
     # Per-row buffer cursor and flush flag (device-side branch, no host branch),
     # plus the set of valid (already committed) cache positions.
     b_write_pos = tl.load(write_pos + i_n).to(tl.int64)
-    b_is_flush = b_write_pos == MAX_CACHE_LEN - 1
+    b_natural_flush = b_write_pos == MAX_CACHE_LEN - 1
+    b_force_flush = False
     if HAS_FORCE_FLUSH:
         # A radix track-boundary (or any caller-forced) flush folds the partial
         # ring (the real `write_pos` entries, NOT L-1) + current token into the
         # checkpoint so an external snapshot reads an up-to-date state. cache_valid
         # below still uses the true write_pos, so only committed entries are read.
-        b_is_flush = b_is_flush | (tl.load(force_flush + i_n) != 0)
+        b_force_flush = tl.load(force_flush + i_n) != 0
+    b_is_flush = b_natural_flush | b_force_flush
+    if CIRCULAR_REPLAY:
+        b_cache_base = tl.load(cache_base + i_n).to(tl.int32)
+        if CACHE_LEN_POWER_OF_TWO:
+            physical_c = (b_cache_base + o_c) & (MAX_CACHE_LEN - 1)
+            physical_write_pos = (b_cache_base + b_write_pos) & (MAX_CACHE_LEN - 1)
+            physical_last_pos = (b_cache_base + b_write_pos - 1) & (MAX_CACHE_LEN - 1)
+        else:
+            physical_c = (b_cache_base + o_c) % MAX_CACHE_LEN
+            physical_write_pos = (b_cache_base + b_write_pos) % MAX_CACHE_LEN
+            physical_last_pos = (b_cache_base + b_write_pos - 1) % MAX_CACHE_LEN
+        b_checkpoint_history = (
+            b_natural_flush & (not b_force_flush) & (MAX_CACHE_LEN > 1)
+        )
+        b_checkpoint_full = b_force_flush | (MAX_CACHE_LEN == 1)
+    else:
+        physical_c = o_c
+        physical_write_pos = b_write_pos
+        physical_last_pos = b_write_pos - 1
+        b_checkpoint_history = False
+        b_checkpoint_full = b_is_flush
+    b_store_record = not b_checkpoint_full
     cache_valid = o_c < b_write_pos
 
     # Gate for the current token.  beta is a per-head scalar for both gate
@@ -135,18 +166,26 @@ def fused_recurrent_linear_replayssm_decode_kernel(
     #   g = -exp(A_log) * softplus(a + dt_bias);  alpha = exp(g);  beta = sigmoid(b)
     A_log_val = tl.load(A_log + i_hv).to(tl.float32)
     b_val = tl.load(b + i_n * stride_b_tok + i_hv).to(tl.float32)
-    beta_val = tl.sigmoid(b_val).to(b.dtype.element_ty).to(tl.float32)
+    beta_val = tl.sigmoid(b_val)
+    if not PREDECAYED_K_CACHE:
+        # Preserve the upstream GDN/raw-KDA path bit for bit.  The bounded
+        # pre-decay specialization keeps beta in fp32 to match its prefix
+        # construction, but must not change existing ReplaySSM numerics.
+        beta_val = beta_val.to(b.dtype.element_ty).to(tl.float32)
     if not IS_KDA:
         a_val = tl.load(a + i_n * stride_a_tok + i_hv).to(tl.float32)
         dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
         x = a_val + dt_bias_val
-        softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
-        g_val = -tl.exp(A_log_val) * softplus_x
+        if USE_LOWER_BOUND:
+            g_val = lower_bound * tl.sigmoid(tl.exp(A_log_val) * x)
+        else:
+            softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
+            g_val = -tl.exp(A_log_val) * softplus_x
         alpha_val = tl.exp(g_val)
 
         # Replay decay over the committed cache, from the cached per-step gates.
         # b_replay_decay[j] = exp(sum_i g_i - cumsum_inclusive_j) = prod_{i>j} alpha_i
-        p_g_main = g_cache + (state_idx * HV + i_hv) * MAX_CACHE_LEN + o_c
+        p_g_main = g_cache + (state_idx * HV + i_hv) * MAX_CACHE_LEN + physical_c
         b_g_all = tl.load(p_g_main, mask=cache_valid, other=0.0).to(tl.float32)
         b_g_prefix = tl.cumsum(b_g_all, axis=0)
         b_g_total = tl.sum(b_g_all, axis=0)
@@ -156,7 +195,8 @@ def fused_recurrent_linear_replayssm_decode_kernel(
     # Cached corrected-delta vectors d (K-independent).  Layout
     # d_cache[slot, hv, L, V] -> index [V, BC] tile.
     p_d_main = d_cache + (
-        ((state_idx * HV + i_hv) * MAX_CACHE_LEN + o_c[None, :]) * V + o_v[:, None]
+        ((state_idx * HV + i_hv) * MAX_CACHE_LEN + physical_c[None, :]) * V
+        + o_v[:, None]
     )
     b_d_all = tl.load(
         p_d_main, mask=mask_v[:, None] & cache_valid[None, :], other=0
@@ -208,8 +248,8 @@ def fused_recurrent_linear_replayssm_decode_kernel(
     b_state_q = tl.zeros([BV], dtype=tl.float32)
     b_state_k = tl.zeros([BV], dtype=tl.float32)
     cur_kq = tl.zeros([1], dtype=tl.float32)
-    write_k = (not b_is_flush) and (i_v == 0) and (i_hv == i_h * (HV // H))
-    write_g_kda = IS_KDA and (not b_is_flush) and (i_v == 0)
+    write_k = b_store_record and (i_v == 0) and (i_hv == i_h * (HV // H))
+    write_g_kda = IS_KDA and b_store_record and (i_v == 0)
     for kk in range(NK):
         o_kt = kk * BKT + tl.arange(0, BKT)
         mask_kt = o_kt < K
@@ -241,7 +281,7 @@ def fused_recurrent_linear_replayssm_decode_kernel(
         )
         p_k_c = (
             k_cache
-            + ((state_idx * H + i_h) * MAX_CACHE_LEN + o_c[:, None]) * K
+            + ((state_idx * H + i_h) * MAX_CACHE_LEN + physical_c[:, None]) * K
             + o_kt[None, :]
         )
 
@@ -259,37 +299,73 @@ def fused_recurrent_linear_replayssm_decode_kernel(
             # keys and the total decay onto S0.
             p_g_c = (
                 g_cache
-                + ((state_idx * HV + i_hv) * MAX_CACHE_LEN + o_c[:, None]) * K
+                + ((state_idx * HV + i_hv) * MAX_CACHE_LEN + physical_c[:, None]) * K
                 + o_kt[None, :]
             )
-            b_g_all_c = tl.load(
-                p_g_c, mask=cache_valid[:, None] & mask_kt[None, :], other=0.0
-            ).to(tl.float32)
-            b_g_prefix_c = tl.cumsum(b_g_all_c, axis=0)  # [BC, BKT]
-            b_g_total_c = tl.sum(b_g_all_c, axis=0)  # [BKT]
-            b_replay_decay_c = tl.where(
-                cache_valid[:, None],
-                tl.exp(b_g_total_c[None, :] - b_g_prefix_c),
-                0.0,
-            )  # [BC, BKT]
+            if PREFIX_GATE_CACHE:
+                # Each ring row stores the cumulative log-gate within the current
+                # window. Reading the last valid row removes the per-token scan.
+                p_g_last_c = (
+                    g_cache
+                    + ((state_idx * HV + i_hv) * MAX_CACHE_LEN + physical_last_pos) * K
+                    + o_kt
+                )
+                b_g_total_c = tl.load(
+                    p_g_last_c,
+                    mask=(b_write_pos > 0) & mask_kt,
+                    other=0.0,
+                ).to(tl.float32)
+                if not PREDECAYED_K_CACHE:
+                    b_g_prefix_c = tl.load(
+                        p_g_c,
+                        mask=cache_valid[:, None] & mask_kt[None, :],
+                        other=0.0,
+                    ).to(tl.float32)
+            else:
+                b_g_all_c = tl.load(
+                    p_g_c,
+                    mask=cache_valid[:, None] & mask_kt[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                b_g_prefix_c = tl.cumsum(b_g_all_c, axis=0)  # [BC, BKT]
+                b_g_total_c = tl.sum(b_g_all_c, axis=0)  # [BKT]
             b_total_decay_c = tl.exp(b_g_total_c)  # [BKT]
             b_k_all_c = tl.load(
                 p_k_c, mask=cache_valid[:, None] & mask_kt[None, :], other=0.0
             ).to(tl.float32)
-            b_k_scaled = (b_k_all_c * b_replay_decay_c).to(p_o.dtype.element_ty)
+            if PREDECAYED_K_CACHE:
+                # K_ring[j] stores K_j * exp(-prefix_j), so reconstruction
+                # needs one K-wide exp(total) instead of an LxK suffix exp.
+                b_k_scaled = (b_k_all_c * b_total_decay_c[None, :]).to(
+                    p_o.dtype.element_ty
+                )
+            else:
+                b_replay_decay_c = tl.where(
+                    cache_valid[:, None],
+                    tl.exp(b_g_total_c[None, :] - b_g_prefix_c),
+                    0.0,
+                )  # [BC, BKT]
+                b_k_scaled = (b_k_all_c * b_replay_decay_c).to(p_o.dtype.element_ty)
+
             b_h_c = b_h0_c * b_total_decay_c[None, :] + tl.dot(b_d_tc, b_k_scaled).to(
                 tl.float32
             )
+
             # KDA: current-token per-K decay folds into q/k for the readout.
             p_a_c = a + i_n * stride_a_tok + i_hv * K + o_kt
             p_dt_c = dt_bias + i_hv * K + o_kt
             b_a_c = tl.load(p_a_c, mask=mask_kt, other=0.0).to(tl.float32)
             b_dt_c = tl.load(p_dt_c, mask=mask_kt, other=0.0).to(tl.float32)
             x_c = b_a_c + b_dt_c
-            softplus_c = tl.where(
-                x_c <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x_c)), x_c
-            )
-            g_cur_c = -tl.exp(A_log_val) * softplus_c  # [BKT]
+            if USE_LOWER_BOUND:
+                g_cur_c = lower_bound * tl.sigmoid(tl.exp(A_log_val) * x_c)
+            else:
+                softplus_c = tl.where(
+                    x_c <= SOFTPLUS_THRESHOLD,
+                    tl.log(1.0 + tl.exp(x_c)),
+                    x_c,
+                )
+                g_cur_c = -tl.exp(A_log_val) * softplus_c  # [BKT]
             alpha_cur_c = tl.exp(g_cur_c)
             q_eff = q_cs * alpha_cur_c
             k_eff = k_c * alpha_cur_c
@@ -298,10 +374,22 @@ def fused_recurrent_linear_replayssm_decode_kernel(
             if write_g_kda:
                 p_cur_g = (
                     g_cache
-                    + ((state_idx * HV + i_hv) * MAX_CACHE_LEN + b_write_pos) * K
+                    + ((state_idx * HV + i_hv) * MAX_CACHE_LEN + physical_write_pos) * K
                     + o_kt
                 )
-                tl.store(p_cur_g, g_cur_c, mask=mask_kt & (b_write_pos < MAX_CACHE_LEN))
+                if PREFIX_GATE_CACHE:
+                    g_store_c = tl.where(
+                        b_checkpoint_history,
+                        g_cur_c,
+                        b_g_total_c + g_cur_c,
+                    )
+                else:
+                    g_store_c = g_cur_c
+                tl.store(
+                    p_cur_g,
+                    g_store_c,
+                    mask=mask_kt & (b_write_pos < MAX_CACHE_LEN),
+                )
 
         # Read the state with the (gate-folded) q and k, accumulated across tiles.
         b_state_q += tl.sum(b_h_c * q_eff[None, :], axis=1)
@@ -310,13 +398,31 @@ def fused_recurrent_linear_replayssm_decode_kernel(
         if write_k:
             p_cur_k = (
                 k_cache
-                + ((state_idx * H + i_h) * MAX_CACHE_LEN + b_write_pos) * K
+                + ((state_idx * H + i_h) * MAX_CACHE_LEN + physical_write_pos) * K
                 + o_kt
             )
+            if PREDECAYED_K_CACHE:
+                new_total_decay_c = tl.where(
+                    b_checkpoint_history,
+                    alpha_cur_c,
+                    b_total_decay_c * alpha_cur_c,
+                )
+                k_store_c = (k_c / new_total_decay_c).to(p_cur_k.dtype.element_ty)
+            else:
+                # Preserve upstream raw KDA/GDN rounding even when the ring is
+                # wider than the activation/output dtype.
+                k_store_c = k_c.to(p_o.dtype.element_ty)
             tl.store(
                 p_cur_k,
-                k_c.to(p_o.dtype.element_ty),
+                k_store_c,
                 mask=mask_kt & (b_write_pos < MAX_CACHE_LEN),
+            )
+
+        if b_checkpoint_history:
+            tl.store(
+                p_h0_c,
+                b_h_c.to(p_h0_c.dtype.element_ty),
+                mask=mask_v[:, None] & mask_kt[None, :],
             )
 
     # Current-token output: (S . Diag(a)) q + d_cur*(k . q), with the new
@@ -330,7 +436,7 @@ def fused_recurrent_linear_replayssm_decode_kernel(
     b_o = b_state_q + b_d_cur * tl.sum(cur_kq)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
-    if b_is_flush:
+    if b_checkpoint_full:
         # Flush: fold the current token into the checkpoint, S_new = S.Diag(a) +
         # d_cur k^T, and persist it.  Re-walk K chunks to rebuild S, then apply
         # the update.  After this the ring is logically cleared (the caller
@@ -357,7 +463,7 @@ def fused_recurrent_linear_replayssm_decode_kernel(
             ).to(tl.float32)
             p_k_c = (
                 k_cache
-                + ((state_idx * H + i_h) * MAX_CACHE_LEN + o_c[:, None]) * K
+                + ((state_idx * H + i_h) * MAX_CACHE_LEN + physical_c[:, None]) * K
                 + o_kt[None, :]
             )
             if not IS_KDA:
@@ -371,24 +477,51 @@ def fused_recurrent_linear_replayssm_decode_kernel(
             else:
                 p_g_c = (
                     g_cache
-                    + ((state_idx * HV + i_hv) * MAX_CACHE_LEN + o_c[:, None]) * K
+                    + ((state_idx * HV + i_hv) * MAX_CACHE_LEN + physical_c[:, None])
+                    * K
                     + o_kt[None, :]
                 )
-                b_g_all_c = tl.load(
-                    p_g_c, mask=cache_valid[:, None] & mask_kt[None, :], other=0.0
-                ).to(tl.float32)
-                b_g_prefix_c = tl.cumsum(b_g_all_c, axis=0)
-                b_g_total_c = tl.sum(b_g_all_c, axis=0)
-                b_replay_decay_c = tl.where(
-                    cache_valid[:, None],
-                    tl.exp(b_g_total_c[None, :] - b_g_prefix_c),
-                    0.0,
-                )
+                if PREFIX_GATE_CACHE:
+                    p_g_last_c = (
+                        g_cache
+                        + ((state_idx * HV + i_hv) * MAX_CACHE_LEN + physical_last_pos)
+                        * K
+                        + o_kt
+                    )
+                    b_g_total_c = tl.load(
+                        p_g_last_c,
+                        mask=(b_write_pos > 0) & mask_kt,
+                        other=0.0,
+                    ).to(tl.float32)
+                    if not PREDECAYED_K_CACHE:
+                        b_g_prefix_c = tl.load(
+                            p_g_c,
+                            mask=cache_valid[:, None] & mask_kt[None, :],
+                            other=0.0,
+                        ).to(tl.float32)
+                else:
+                    b_g_all_c = tl.load(
+                        p_g_c,
+                        mask=cache_valid[:, None] & mask_kt[None, :],
+                        other=0.0,
+                    ).to(tl.float32)
+                    b_g_prefix_c = tl.cumsum(b_g_all_c, axis=0)
+                    b_g_total_c = tl.sum(b_g_all_c, axis=0)
                 b_total_decay_c = tl.exp(b_g_total_c)
                 b_k_all_c = tl.load(
                     p_k_c, mask=cache_valid[:, None] & mask_kt[None, :], other=0.0
                 ).to(tl.float32)
-                b_k_scaled = (b_k_all_c * b_replay_decay_c).to(p_o.dtype.element_ty)
+                if PREDECAYED_K_CACHE:
+                    b_k_scaled = (b_k_all_c * b_total_decay_c[None, :]).to(
+                        p_o.dtype.element_ty
+                    )
+                else:
+                    b_replay_decay_c = tl.where(
+                        cache_valid[:, None],
+                        tl.exp(b_g_total_c[None, :] - b_g_prefix_c),
+                        0.0,
+                    )
+                    b_k_scaled = (b_k_all_c * b_replay_decay_c).to(p_o.dtype.element_ty)
                 b_h_c = b_h0_c * b_total_decay_c[None, :] + tl.dot(
                     b_d_tc, b_k_scaled
                 ).to(tl.float32)
@@ -397,10 +530,16 @@ def fused_recurrent_linear_replayssm_decode_kernel(
                 b_a_c = tl.load(p_a_c, mask=mask_kt, other=0.0).to(tl.float32)
                 b_dt_c = tl.load(p_dt_c, mask=mask_kt, other=0.0).to(tl.float32)
                 x_c = b_a_c + b_dt_c
-                softplus_c = tl.where(
-                    x_c <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x_c)), x_c
-                )
-                alpha_cur_c = tl.exp(-tl.exp(A_log_val) * softplus_c)  # [BKT]
+                if USE_LOWER_BOUND:
+                    g_cur_c = lower_bound * tl.sigmoid(tl.exp(A_log_val) * x_c)
+                else:
+                    softplus_c = tl.where(
+                        x_c <= SOFTPLUS_THRESHOLD,
+                        tl.log(1.0 + tl.exp(x_c)),
+                        x_c,
+                    )
+                    g_cur_c = -tl.exp(A_log_val) * softplus_c
+                alpha_cur_c = tl.exp(g_cur_c)  # [BKT]
                 b_h_new_c = (
                     b_h_c * alpha_cur_c[None, :] + b_d_cur[:, None] * k_c[None, :]
                 )
@@ -421,7 +560,9 @@ def fused_recurrent_linear_replayssm_decode_kernel(
         # (k chunks were written inside the loop; KDA's g chunks too).  GDN's
         # scalar g is appended here.
         p_cur_d = (
-            d_cache + ((state_idx * HV + i_hv) * MAX_CACHE_LEN + b_write_pos) * V + o_v
+            d_cache
+            + ((state_idx * HV + i_hv) * MAX_CACHE_LEN + physical_write_pos) * V
+            + o_v
         )
         tl.store(
             p_cur_d,
@@ -429,7 +570,9 @@ def fused_recurrent_linear_replayssm_decode_kernel(
             mask=mask_v & (b_write_pos < MAX_CACHE_LEN),
         )
         if (not IS_KDA) and (i_v == 0):
-            p_cur_g = g_cache + (state_idx * HV + i_hv) * MAX_CACHE_LEN + b_write_pos
+            p_cur_g = (
+                g_cache + (state_idx * HV + i_hv) * MAX_CACHE_LEN + physical_write_pos
+            )
             tl.store(p_cur_g, g_val, mask=b_write_pos < MAX_CACHE_LEN)
 
 
@@ -448,12 +591,17 @@ def fused_recurrent_linear_replayssm_decode(
     ssm_state_indices: torch.Tensor,
     write_pos: torch.Tensor,
     force_flush: torch.Tensor | None = None,
+    lower_bound: float | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     is_kda: bool = False,
     block_v: int | None = None,
     num_warps: int = 1,
     num_stages: int = 3,
     nk: int = 2,
+    cache_base: torch.Tensor | None = None,
+    circular_replay: bool = False,
+    prefix_gate_cache: bool = False,
+    predecayed_k_cache: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Buffered output-only linear-attention autoregressive decode (1 token/seq).
 
@@ -471,8 +619,7 @@ def fused_recurrent_linear_replayssm_decode(
 
     Allocates nothing persistent: the caller owns the ring tensors and is
     responsible for advancing / resetting ``write_pos`` (e.g. ``(write_pos+1) %
-    L`` after each step).  This is a STANDALONE kernel; the memory-pool / cache
-    integration is a later phase.
+    L`` after each step).
     """
     if mixed_qkv.ndim != 2:
         raise ValueError(f"`mixed_qkv` must be 2D (got ndim={mixed_qkv.ndim}).")
@@ -486,16 +633,40 @@ def fused_recurrent_linear_replayssm_decode(
         raise ValueError(f"`initial_state` must be 4D (got ndim={initial_state.ndim}).")
     if not out.is_contiguous():
         raise ValueError("`out` must be contiguous.")
-    if write_pos.ndim != 1 or write_pos.dtype != torch.int32:
-        raise ValueError("`write_pos` must be a 1D int32 tensor.")
-    if force_flush is not None and (
-        force_flush.ndim != 1 or force_flush.dtype != torch.int32
+    if (
+        write_pos.ndim != 1
+        or write_pos.dtype != torch.int32
+        or not write_pos.is_contiguous()
     ):
-        raise ValueError("`force_flush` must be a 1D int32 tensor or None.")
+        raise ValueError("`write_pos` must be a contiguous 1D int32 tensor.")
+    if force_flush is not None and (
+        force_flush.ndim != 1
+        or force_flush.dtype != torch.int32
+        or not force_flush.is_contiguous()
+    ):
+        raise ValueError("`force_flush` must be a contiguous 1D int32 tensor or None.")
+    if circular_replay and (
+        cache_base is None
+        or cache_base.ndim != 1
+        or cache_base.dtype != torch.int32
+        or not cache_base.is_contiguous()
+    ):
+        raise ValueError(
+            "`cache_base` must be a contiguous 1D int32 tensor for circular replay."
+        )
 
     B = mixed_qkv.shape[0]
     num_state_slots, HV, V, K = initial_state.shape
+    if initial_state.stride()[1:] != (V * K, K, 1):
+        raise ValueError(
+            "`initial_state` must be contiguous in its [HV, V, K] inner "
+            "dimensions; an arbitrary slot stride is supported."
+        )
     qkv_dim = mixed_qkv.shape[1]
+    if qkv_dim <= HV * V or (qkv_dim - HV * V) % 2 != 0:
+        raise ValueError(
+            f"Invalid packed `mixed_qkv` last dim={qkv_dim} for HV={HV}, V={V}."
+        )
     q_dim = (qkv_dim - HV * V) // 2
     if q_dim <= 0 or q_dim % K != 0:
         raise ValueError(
@@ -506,7 +677,13 @@ def fused_recurrent_linear_replayssm_decode(
         raise ValueError(
             f"Invalid head config inferred from mixed_qkv: H={H}, HV={HV}."
         )
+    if tuple(b.shape) != (B, HV) or b.stride(-1) != 1:
+        raise ValueError(f"`b` must have contiguous shape {(B, HV)}.")
+    if A_log.shape[0] != HV or not A_log.is_contiguous():
+        raise ValueError(f"`A_log` must have contiguous shape {(HV,)}.")
     max_cache_len = d_cache.shape[2]
+    if max_cache_len < 1:
+        raise ValueError("ReplaySSM cache length must be at least 1.")
 
     # Gate-shape sanity: GDN scalar gate vs KDA per-K gate.
     if is_kda:
@@ -533,20 +710,28 @@ def fused_recurrent_linear_replayssm_decode(
         g_expect = (HV, max_cache_len)
 
     # Cache shape sanity (per state slot): d=(HV, L, V), k=(H, L, K).
-    if tuple(d_cache.shape[1:]) != (HV, max_cache_len, V):
+    if (
+        not d_cache.is_contiguous()
+        or not k_cache.is_contiguous()
+        or not g_cache.is_contiguous()
+    ):
+        raise ValueError("ReplaySSM ring caches must be contiguous.")
+    if tuple(d_cache.shape) != (num_state_slots, HV, max_cache_len, V):
         raise ValueError(
-            f"`d_cache` per-slot shape must be {(HV, max_cache_len, V)} "
-            f"(got {tuple(d_cache.shape[1:])})."
+            "`d_cache` shape must be "
+            f"{(num_state_slots, HV, max_cache_len, V)} "
+            f"(got {tuple(d_cache.shape)})."
         )
-    if tuple(k_cache.shape[1:]) != (H, max_cache_len, K):
+    if tuple(k_cache.shape) != (num_state_slots, H, max_cache_len, K):
         raise ValueError(
-            f"`k_cache` per-slot shape must be {(H, max_cache_len, K)} "
-            f"(got {tuple(k_cache.shape[1:])})."
+            "`k_cache` shape must be "
+            f"{(num_state_slots, H, max_cache_len, K)} "
+            f"(got {tuple(k_cache.shape)})."
         )
-    if tuple(g_cache.shape[1:]) != g_expect:
+    if tuple(g_cache.shape) != (num_state_slots, *g_expect):
         raise ValueError(
-            f"`g_cache` per-slot shape must be {g_expect} "
-            f"(got {tuple(g_cache.shape[1:])})."
+            f"`g_cache` shape must be {(num_state_slots, *g_expect)} "
+            f"(got {tuple(g_cache.shape)})."
         )
     if g_cache.dtype != torch.float32:
         raise ValueError(f"`g_cache` must be float32 (got {g_cache.dtype}).")
@@ -554,11 +739,49 @@ def fused_recurrent_linear_replayssm_decode(
         raise ValueError(
             f"`out` must have shape {(B, 1, HV, V)} (got {tuple(out.shape)})."
         )
+    if ssm_state_indices.ndim != 1 or ssm_state_indices.dtype != torch.int32:
+        raise ValueError("`ssm_state_indices` must be a 1D int32 tensor.")
     if write_pos.shape[0] != B or ssm_state_indices.shape[0] != B:
         raise ValueError(
             "`write_pos` and `ssm_state_indices` must both have length B="
             f"{B} (got {write_pos.shape[0]}, {ssm_state_indices.shape[0]})."
         )
+    if force_flush is not None and force_flush.shape[0] != B:
+        raise ValueError(f"`force_flush` must have length B={B}.")
+    if circular_replay and cache_base.shape != (B,):
+        raise ValueError(
+            f"`cache_base` must have shape {(B,)} " f"(got {tuple(cache_base.shape)})."
+        )
+    if predecayed_k_cache:
+        if not is_kda or not prefix_gate_cache or not circular_replay:
+            raise ValueError(
+                "Pre-decayed K requires KDA circular replay with prefix gates."
+            )
+        if H != HV:
+            raise ValueError("Pre-decayed K requires one K head per value head.")
+        if initial_state.dtype != torch.float32:
+            raise ValueError("Pre-decayed K requires a float32 checkpoint state.")
+        if d_cache.dtype != k_cache.dtype:
+            raise ValueError("Pre-decayed K requires matching d/k ring dtypes.")
+        if d_cache.dtype not in (mixed_qkv.dtype, torch.float32):
+            raise ValueError(
+                "Pre-decayed K d/k rings must use the activation dtype or float32."
+            )
+        if not 2 <= max_cache_len <= 16:
+            raise ValueError("Pre-decayed K requires a cache length between 2 and 16.")
+        if lower_bound is None or not math.isfinite(lower_bound) or lower_bound >= 0:
+            raise ValueError(
+                "Pre-decayed K requires a finite negative safe-gate lower bound."
+            )
+        if (max_cache_len - 1) * abs(lower_bound) > 80:
+            raise ValueError(
+                "Pre-decayed K inverse-prefix scaling is unsafe: "
+                "(cache_len - 1) * abs(lower_bound) must be <= 80."
+            )
+        if mixed_qkv.dtype == torch.float16 and k_cache.dtype != torch.float32:
+            raise ValueError(
+                "Pre-decayed K with FP16 activations requires an FP32 ring."
+            )
 
     BK = triton.next_power_of_2(K)
     if triton.cdiv(K, BK) != 1:
@@ -575,6 +798,7 @@ def fused_recurrent_linear_replayssm_decode(
     # cache / metadata loads.
     BV = block_v if block_v is not None else min(triton.next_power_of_2(V), 64)
     BC = max(16, triton.next_power_of_2(max_cache_len))
+    cache_base_arg = write_pos if cache_base is None else cache_base
 
     grid = (triton.cdiv(V, BV), B, HV)
     fused_recurrent_linear_replayssm_decode_kernel[grid](
@@ -591,8 +815,10 @@ def fused_recurrent_linear_replayssm_decode(
         g_cache=g_cache,
         ssm_state_indices=ssm_state_indices,
         write_pos=write_pos,
+        cache_base=cache_base_arg,
         force_flush=force_flush if force_flush is not None else write_pos,
         scale=scale,
+        lower_bound=0.0 if lower_bound is None else lower_bound,
         stride_mixed_qkv_tok=mixed_qkv.stride(0),
         stride_a_tok=a.stride(0),
         stride_b_tok=b.stride(0),
@@ -609,19 +835,22 @@ def fused_recurrent_linear_replayssm_decode(
         NK=nk,
         BKT=BKT,
         MAX_CACHE_LEN=max_cache_len,
+        CACHE_LEN_POWER_OF_TWO=max_cache_len & (max_cache_len - 1) == 0,
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         HAS_FORCE_FLUSH=force_flush is not None,
+        CIRCULAR_REPLAY=circular_replay,
+        PREFIX_GATE_CACHE=prefix_gate_cache,
+        PREDECAYED_K_CACHE=predecayed_k_cache,
         IS_KDA=is_kda,
+        USE_LOWER_BOUND=lower_bound is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )
     return out, initial_state
 
 
-# Backwards-compatible aliases: the original GDN-only names. Existing callers
-# (backend dispatch, tests, microbench) keep working; ``is_kda`` defaults to
-# False so these are the GDN path unchanged.
+# Backwards-compatible aliases for the original GDN-only names.
 fused_recurrent_gdn_replayssm_decode_kernel = (
     fused_recurrent_linear_replayssm_decode_kernel
 )
