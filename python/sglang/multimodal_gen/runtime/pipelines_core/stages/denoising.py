@@ -706,7 +706,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         self._quality_fusions_mounted = want
         for description in sorted(mounted_fusions):
-            logger.info("Mounted %s for quality=%s", description, quality)
+            logger.debug("Mounted %s for quality=%s", description, quality)
 
     def _cache_dit_dual_model_name(self) -> str:
         return "wan2.2"
