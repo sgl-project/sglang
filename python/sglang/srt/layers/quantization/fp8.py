@@ -917,16 +917,15 @@ class Fp8LinearMethod(LinearMethodBase):
                 # channelwise cutlass GemmUniversal by ~1.2-2.7x across the
                 # decode/prefill M range (matches vLLM's per-tensor SM120
                 # choice). Requantize per-channel -> per-tensor (max scale)
-                # there instead. Kill switch: SGLANG_SM120_FP8_PERTENSOR=0.
-                _sm120_fp8_pertensor = (
+                # there instead.
+                use_sm120_fp8_pertensor = (
                     self.cutlass_fp8_supported
                     and not self.use_marlin
-                    and get_bool_env_var("SGLANG_SM120_FP8_PERTENSOR", "true")
                     and get_device_capability()[0] == 12
                 )
                 # cutlass sgl-kernel and marlin only support per-channel scale; aiter supports per-channel scale
                 if (
-                    (self.cutlass_fp8_supported and not _sm120_fp8_pertensor)
+                    (self.cutlass_fp8_supported and not use_sm120_fp8_pertensor)
                     or self.use_marlin
                     or (_use_aiter and self.use_aiter_fp8_per_token)
                 ):
