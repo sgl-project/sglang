@@ -304,6 +304,8 @@ class TestAutoResidencyWarmup(unittest.TestCase):
             estimated_peak_bytes=1,
             estimated_request_duration_ns=10_000_000_000,
             measured_request_duration_ns=20_000_000_000,
+            reference_probe_duration_ns=10_000_000_000,
+            probe_duration_ns=20_000_000_000,
         )
         worker._build_auto_residency_report = mock.Mock(return_value=report)
         worker._auto_residency_all_gather = mock.Mock(side_effect=lambda value: [value])
@@ -353,6 +355,8 @@ class TestAutoResidencyWarmup(unittest.TestCase):
             estimated_peak_bytes=1,
             estimated_request_duration_ns=10_000_000_000,
             measured_request_duration_ns=20_000_000_000,
+            reference_probe_duration_ns=10_000_000_000,
+            probe_duration_ns=20_000_000_000,
         )
         worker._build_auto_residency_report = mock.Mock(return_value=report)
         worker._auto_residency_all_gather = mock.Mock(side_effect=lambda value: [value])
@@ -443,6 +447,8 @@ class TestAutoResidencyWarmup(unittest.TestCase):
             estimated_peak_bytes=1,
             estimated_request_duration_ns=10_000_000_000,
             measured_request_duration_ns=10_000_000_000,
+            reference_probe_duration_ns=10_000_000_000,
+            probe_duration_ns=10_000_000_000,
         )
         worker._build_auto_residency_report = mock.Mock(return_value=report)
         worker._auto_residency_all_gather = mock.Mock(side_effect=lambda value: [value])
