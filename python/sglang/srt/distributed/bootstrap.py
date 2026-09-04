@@ -81,14 +81,14 @@ def init_torch_distributed(
     tic = time.perf_counter()
     logger.info("Init torch distributed begin.")
 
-    backend = _resolve_backend(device=device, server_args=server_args)
+    backend = _resolve_backend(device=device)
 
     before_avail_memory = get_available_gpu_memory(device, ps.gpu_id)
     if not get_parallel().enable_p2p_check:
         monkey_patch_p2p_access_check()
 
     dist_init_method = _resolve_dist_init_method(dist_port=dist_port)
-    _set_all_reduce_flags(server_args=server_args)
+    _set_all_reduce_flags()
 
     if not is_draft_worker:
         if device == "cpu":
@@ -170,7 +170,7 @@ def init_torch_distributed(
     )
 
 
-def _resolve_backend(*, device: str, server_args: ServerArgs) -> str:
+def _resolve_backend(*, device: str) -> str:
     backend = get_default_distributed_backend(device)
     if device == "cuda" and get_exec().moe.elastic_ep_backend == "mooncake":
         backend = "mooncake"
@@ -195,7 +195,7 @@ def _resolve_dist_init_method(*, dist_port: int) -> str:
     return dist_init_method
 
 
-def _set_all_reduce_flags(*, server_args: ServerArgs) -> None:
+def _set_all_reduce_flags() -> None:
     set_custom_all_reduce(not get_exec().comm.disable_custom_all_reduce)
     set_mscclpp_all_reduce(get_exec().comm.enable_mscclpp)
     set_torch_symm_mem_all_reduce(get_exec().comm.enable_torch_symm_mem)

@@ -888,7 +888,7 @@ class Engine(EngineScoreMixin, EngineBase):
                         + (tp_rank % tp_size_per_node) * get_device().gpu_id_step
                     )
                     attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(
-                        server_args, tp_rank
+                        tp_rank
                     )
 
                     with maybe_reindex_device_id(gpu_id) as gpu_id:
@@ -1870,9 +1870,7 @@ def _calculate_rank_ranges(
     return pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node
 
 
-def _compute_parallelism_ranks(
-    server_args: ServerArgs, tp_rank: int
-) -> Tuple[int, int, int]:
+def _compute_parallelism_ranks(tp_rank: int) -> Tuple[int, int, int]:
     """Compute attention-CP, MoE-DP, and MoE-EP ranks for a TP rank.
 
     Called while the launcher is deciding what to spawn, so the sizes are the
