@@ -206,9 +206,13 @@ def _get_host_id() -> str:
     return "unknown"
 
 
+def _resolve_trace_service_name(server_name: Optional[str]) -> str:
+    return server_name or os.environ.get("OTEL_SERVICE_NAME") or "sglang"
+
+
 # Should be called by each tracked process.
 def process_tracing_init(
-    otlp_endpoint, server_name, trace_modules: Optional[str] = None
+    otlp_endpoint, server_name: Optional[str], trace_modules: Optional[str] = None
 ):
     global opentelemetry_initialized
     global get_cur_time_ns
@@ -226,10 +230,12 @@ def process_tracing_init(
             "opentelemetry package is not installed!!! Please not enable tracing or install opentelemetry"
         )
 
+    service_name = _resolve_trace_service_name(server_name)
+
     try:
         resource = Resource.create(
             attributes={
-                SERVICE_NAME: server_name,
+                SERVICE_NAME: service_name,
             }
         )
         tracer_provider = TracerProvider(
@@ -259,7 +265,7 @@ def process_tracing_init(
     if envs.SGLANG_TRACE_ASYNC.get():
         from sglang.srt.observability.trace_async import start_trace_exporter
 
-        start_trace_exporter(otlp_endpoint, server_name, trace_modules=trace_modules)
+        start_trace_exporter(otlp_endpoint, service_name, trace_modules=trace_modules)
 
 
 def get_global_tracing_enabled():

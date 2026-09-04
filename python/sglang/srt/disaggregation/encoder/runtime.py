@@ -1529,7 +1529,7 @@ def launch_local_runtime(server_args: ServerArgs) -> EncoderRuntime:
     if get_observability().enable_trace:
         process_tracing_init(
             get_observability().otlp_traces_endpoint,
-            "sglang",
+            get_observability().otlp_service_name,
             trace_modules=get_observability().trace_modules,
         )
         trace_set_thread_info("Encoder")

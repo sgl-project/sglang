@@ -8,9 +8,10 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import sglang.srt.observability.trace as mod
+from sglang.srt.environ import envs
 from sglang.srt.observability.trace import (
     SpanAttributes,
     TraceEvent,
@@ -25,6 +26,7 @@ from sglang.srt.observability.trace import (
     set_global_trace_level,
     trace_set_thread_info,
 )
+from sglang.test.test_utils import CustomTestCase
 
 try:
     from opentelemetry import trace as otel_trace
@@ -38,6 +40,7 @@ except ImportError:
 
 # Access the private module-level function (avoid name mangling inside classes).
 _get_host_id = getattr(mod, "_get_host_id")
+_resolve_trace_service_name = getattr(mod, "_resolve_trace_service_name")
 
 
 class TestTraceFunctions(unittest.TestCase):
@@ -164,7 +167,73 @@ class TestGetOtlpSpanExporter(unittest.TestCase):
                 get_otlp_span_exporter("localhost:4317")
 
 
-class TestProcessTracingInit(unittest.TestCase):
+class TestProcessTracingInit(CustomTestCase):
+    def test_explicit_service_name_takes_precedence(self):
+        with patch.dict(os.environ, {"OTEL_SERVICE_NAME": "from-environment"}):
+            self.assertEqual(
+                _resolve_trace_service_name("from-cli"),
+                "from-cli",
+            )
+
+    def test_service_name_uses_otel_environment_variable(self):
+        with patch.dict(os.environ, {"OTEL_SERVICE_NAME": "from-environment"}):
+            self.assertEqual(
+                _resolve_trace_service_name(None),
+                "from-environment",
+            )
+
+    def test_service_name_defaults_to_sglang(self):
+        for environment_value in (None, ""):
+            with self.subTest(environment_value=environment_value):
+                with patch.dict(os.environ, {}, clear=False):
+                    if environment_value is None:
+                        os.environ.pop("OTEL_SERVICE_NAME", None)
+                    else:
+                        os.environ["OTEL_SERVICE_NAME"] = environment_value
+                    self.assertEqual(_resolve_trace_service_name(None), "sglang")
+
+    def test_resolved_service_name_is_applied_to_resource(self):
+        original_initialized = mod.opentelemetry_initialized
+        original_tracer = mod.tracer
+        resource = MagicMock()
+        provider = MagicMock()
+
+        try:
+            with (
+                patch.object(mod, "opentelemetry_imported", True),
+                patch.object(mod, "SERVICE_NAME", "service.name", create=True),
+                patch.object(mod, "Resource", create=True) as resource_cls,
+                patch.object(
+                    mod, "TracerProvider", return_value=provider, create=True
+                ) as tracer_provider_cls,
+                patch.object(mod, "BatchSpanProcessor", create=True),
+                patch.object(mod, "get_otlp_span_exporter"),
+                patch.object(mod, "trace", create=True),
+                patch(
+                    "sglang.srt.observability.trace_async.start_trace_exporter"
+                ) as start_trace_exporter,
+                patch.dict(os.environ, {"OTEL_SERVICE_NAME": "from-environment"}),
+                envs.SGLANG_TRACE_ASYNC.override(True),
+            ):
+                resource_cls.create.return_value = resource
+                process_tracing_init("localhost:4317", None)
+
+            resource_cls.create.assert_called_once_with(
+                attributes={"service.name": "from-environment"}
+            )
+            tracer_provider_cls.assert_called_once_with(
+                resource=resource,
+                id_generator=unittest.mock.ANY,
+            )
+            start_trace_exporter.assert_called_once_with(
+                "localhost:4317",
+                "from-environment",
+                trace_modules=None,
+            )
+        finally:
+            mod.opentelemetry_initialized = original_initialized
+            mod.tracer = original_tracer
+
     def test_raises_without_otel(self):
 
         orig = mod.opentelemetry_imported

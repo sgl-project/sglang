@@ -153,6 +153,20 @@ class TestPrepareServerArgs(CustomTestCase):
             self.assertEqual(os.environ["DG_USE_FP4_ACTS"], "0")
             self.assertEqual(os.environ["DG_USE_MXF4_KIND"], "0")
 
+    def test_otlp_service_name(self):
+        default_args = prepare_server_args(["--model-path", "dummy"])
+        self.assertIsNone(default_args.otlp_service_name)
+
+        custom_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--otlp-service-name",
+                "sglang-production",
+            ]
+        )
+        self.assertEqual(custom_args.otlp_service_name, "sglang-production")
+
     def test_prefill_decode_interval(self):
         args = ServerArgs(model_path="dummy", prefill_decode_interval=16)
         args.resolve_once()

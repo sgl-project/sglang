@@ -1615,6 +1615,11 @@ class ServerArgs:
         "Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port>",
         NS("observability"),
     ] = "localhost:4317"
+    otlp_service_name: A[
+        Optional[str],
+        "Service name for OTLP traces. If unset, uses OTEL_SERVICE_NAME or defaults to 'sglang'.",
+        NS("observability"),
+    ] = None
     # RequestMetricsExporter configuration
     export_metrics_to_file: A[
         bool,
