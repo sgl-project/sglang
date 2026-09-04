@@ -63,7 +63,10 @@ class TestUnifiedQwen3HiCacheCP(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "--hicache-mem-layout",
                 cls.hicache_mem_layout,
             ],
-            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env={
+                "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
+                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+            },
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
 

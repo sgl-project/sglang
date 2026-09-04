@@ -63,6 +63,7 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
             "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir,
             # Make runs less flaky for CI/dev.
             "SGLANG_ENABLE_DETERMINISTIC_INFERENCE": "1",
+            "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
             **cls.extra_env,
         }
 
