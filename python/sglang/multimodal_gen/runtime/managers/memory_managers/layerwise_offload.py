@@ -180,9 +180,21 @@ def _install_host_gather_hooks(
     """Run this module's gather on the host, move only the result."""
 
     def _inputs_to_host(_module, args, kwargs):
+        # Move only integer (vocab-index) tensors to the host table; floating
+        # inputs (e.g. RoPE freqs a VL encoder feeds the same module) must stay
+        # on the compute device or the gather mixes cpu/cuda tensors.
         if not args or not torch.is_tensor(args[0]):
             return None
-        return (args[0].to("cpu"),) + args[1:], kwargs
+        if not (args[0].dtype in (torch.long, torch.int, torch.int32, torch.int64)):
+            return None
+        moved = tuple(
+            a.to("cpu")
+            if torch.is_tensor(a)
+            and a.dtype in (torch.long, torch.int, torch.int32, torch.int64)
+            else a
+            for a in args
+        )
+        return moved, kwargs
 
     def _output_to_device(_module, _args, output):
         if not torch.is_tensor(output):
