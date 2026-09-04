@@ -382,8 +382,6 @@ class XPUAttentionBackend(AttentionBackend):
                 (1, 0),
             )
             metadata.encoder_max_seq_len_k = metadata.encoder_lens_int32.max().item()
-            # Token-slot indices (page_size=1 semantics), capped per request by
-            # encoder_lens_int32; consumed by the varlen gather in forward_*.
             metadata.encoder_page_table = self.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.encoder_max_seq_len_k
             ]
@@ -594,13 +592,19 @@ class XPUAttentionBackend(AttentionBackend):
                 -1, self.page_size, layer.tp_v_head_num, layer.head_dim
             )
             if self.is_encoder_decoder and forward_batch.encoder_lens is not None:
+                page_table, cache_seqlens, causal = self._encoder_decoder_page_table(
+                    layer, metadata
+                )
                 o = self._forward_attn_flat_page_table(
                     q=q,
                     key_cache=key_cache,
                     value_cache=value_cache,
                     layer=layer,
-                    metadata=metadata,
-                    decode=False,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_q=metadata.cu_seqlens_q,
+                    max_seqlen_q=metadata.max_seq_len_q,
+                    causal=causal,
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if layer.is_cross_attention:
@@ -796,27 +800,37 @@ class XPUAttentionBackend(AttentionBackend):
         out = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         return out
 
-    def _forward_attn_flat_page_table(
-        self, *, q, key_cache, value_cache, layer, metadata, decode
-    ):
-        """MHA on XPU via flash_attn_with_kvcache page_size=1.
+    @staticmethod
+    def _encoder_decoder_page_table(layer, metadata):
+        """Pick (page_table, cache_seqlens, causal) for an encoder-decoder layer:
+        cross-attention reads the encoder KV region (non-causal), decoder
+        self-attention reads the decoder KV region (causal)."""
+        if layer.is_cross_attention:
+            return metadata.encoder_page_table, metadata.encoder_lens_int32, False
+        return metadata.page_table, metadata.cache_seqlens_int32, True
 
-        Whisper/Mllama/MossVL store encoder KV token-granularly in req_to_token
-        (page_size=1 semantics). sgl-kernel-xpu PR #454 makes the paged
-        flash_attn_with_kvcache detect a page_size==1 k_cache + page_table and
-        gather + run varlen internally, so the backend just calls it like the FA
-        (CUDA) path. Eager-only. The kernel returns NaN (not zeros) for an empty
-        KV, so the encoder_lens==0 warmup case is still guarded here.
+    def _forward_attn_flat_page_table(
+        self,
+        *,
+        q,
+        key_cache,
+        value_cache,
+        layer,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        max_seqlen_q,
+        causal,
+    ):
+        """MHA on XPU via flash_attn_with_kvcache with a page_size=1 (flat
+        token-slot) page table. sgl-kernel-xpu PR #454 detects a page_size==1
+        k_cache + page_table and gathers + runs varlen internally, so the backend
+        calls it like the FA (CUDA) path. Eager-only. A request with
+        cache_seqlens==0 attends to no keys and the kernel returns NaN for its
+        rows, so those rows are zeroed (an all-empty batch skips the launch).
         """
         q_rows = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-        if layer.is_cross_attention:
-            page_table = metadata.encoder_page_table
-            cache_seqlens = metadata.encoder_lens_int32
-            causal = False
-        else:
-            page_table = metadata.page_table
-            cache_seqlens = metadata.cache_seqlens_int32
-            causal = True
+        # If the maximum cache_seqlens is 0, there are no keys to attend to.
         if int(cache_seqlens.max().item()) == 0:
             return q_rows.new_zeros(
                 (q_rows.shape[0], q_rows.shape[1], value_cache.shape[-1])
@@ -825,18 +839,24 @@ class XPUAttentionBackend(AttentionBackend):
         # i.e. k_cache.shape[1] == 1 and routes flash_attn_with_kvcache to varlen gather.
         k_cache = key_cache.reshape(-1, 1, layer.tp_k_head_num, layer.head_dim)
         v_cache = value_cache.reshape(-1, 1, layer.tp_v_head_num, layer.head_dim)
-        return flash_attn_with_kvcache(
+        out = flash_attn_with_kvcache(
             q=q_rows,
             k_cache=k_cache,
             v_cache=v_cache,
             page_table=page_table,
             cache_seqlens=cache_seqlens,
-            cu_seqlens_q=metadata.cu_seqlens_q,
-            max_seqlen_q=1 if decode else metadata.max_seq_len_q,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
             softmax_scale=layer.scaling,
             causal=causal,
             softcap=layer.logit_cap,
         )
+        # Mixed batch: requests with cache_seqlens==0 attend to no keys and come
+        # back as NaN, so zero their query rows (mapped via cu_seqlens_q).
+        if int(cache_seqlens.min().item()) == 0:
+            seg = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+            out[(cache_seqlens == 0).repeat_interleave(seg)] = 0
+        return out
 
     def forward_decode(
         self,
@@ -944,13 +964,19 @@ class XPUAttentionBackend(AttentionBackend):
             )
 
             if self.is_encoder_decoder and forward_batch.encoder_lens is not None:
+                page_table, cache_seqlens, causal = self._encoder_decoder_page_table(
+                    layer, metadata
+                )
                 o = self._forward_attn_flat_page_table(
                     q=q,
                     key_cache=key_cache,
                     value_cache=value_cache,
                     layer=layer,
-                    metadata=metadata,
-                    decode=True,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_q=metadata.cu_seqlens_q,
+                    max_seqlen_q=1,
+                    causal=causal,
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 

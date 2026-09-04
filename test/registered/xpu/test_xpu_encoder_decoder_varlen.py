@@ -1,12 +1,10 @@
 """Real-device XPU tests for the encoder-decoder attention path.
 
 The backend calls flash_attn_with_kvcache with a page_size=1 view; sgl-kernel-xpu
-PR #454 detects that and gathers + runs varlen inside the kernel. These run on an
-actual XPU and guard two things a mocked CPU test cannot:
-  1. our _forward_encoder_decoder_mha + the real kernel produce correct attention
-     for a scattered (non-page-aligned) token-slot layout, and
-  2. encoder_lens == 0 short-circuits to zeros WITHOUT reaching the kernel (whose
-     page_size=1 path returns NaN for an empty KV).
+PR #454 detects that and gathers + runs varlen inside the kernel. This runs on an
+actual XPU and guards what a mocked CPU test cannot: _forward_attn_flat_page_table
+plus the real kernel produce correct attention for a scattered (non-page-aligned)
+token-slot layout, for both cross-attn (non-causal) and decoder self-attn (causal).
 """
 
 import unittest
@@ -87,17 +85,6 @@ class TestXPUEncoderDecoderVarlen(CustomTestCase):
             .to(self.dev)
         )
         q = torch.randn(num_rows, self.H, self.D, dtype=torch.bfloat16, device=self.dev)
-        # causal=True is decoder self-attn (page_table); causal=False is cross-attn
-        # (encoder_page_table). Point both metadata pairs at the same test tensors
-        # so _forward_encoder_decoder_mha's dispatch reads the intended one.
-        metadata = SimpleNamespace(
-            encoder_page_table=page_table,
-            encoder_lens_int32=cache_seqlens,
-            page_table=page_table,
-            cache_seqlens_int32=cache_seqlens,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seq_len_q=1,
-        )
         layer = SimpleNamespace(
             is_cross_attention=not causal,
             tp_q_head_num=self.H,
@@ -110,13 +97,19 @@ class TestXPUEncoderDecoderVarlen(CustomTestCase):
         key_cache = self.k_flat.view(-1, 1, self.H, self.D)
         value_cache = self.v_flat.view(-1, 1, self.H, self.D)
 
-        got = self.backend._forward_encoder_decoder_mha(
+        # causal=True mirrors decoder self-attn, causal=False cross-attn; the
+        # generic helper takes the (page_table, cache_seqlens, causal) that the
+        # caller's _encoder_decoder_page_table dispatch would have selected.
+        got = self.backend._forward_attn_flat_page_table(
             q=q,
             key_cache=key_cache,
             value_cache=value_cache,
             layer=layer,
-            metadata=metadata,
-            decode=True,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=1,
+            causal=causal,
         )
         torch.xpu.synchronize()
         want = _sdpa_ref(

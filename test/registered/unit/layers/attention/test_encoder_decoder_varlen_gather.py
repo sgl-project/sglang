@@ -53,11 +53,13 @@ class TestEncoderDecoderForward(unittest.TestCase):
             logit_cap=0.0,
         )
 
-    def test_forward_dispatch_selects_cross_vs_self(self):
-        # cross-attn must call flash_attn_with_kvcache with encoder_page_table +
-        # encoder_lens_int32 + causal=False; self-attn with page_table +
-        # cache_seqlens_int32 + causal=True. Both must pass a page_size=1 k_cache
-        # (shape[1]==1) so PR #454 routes to the internal varlen gather.
+    def test_dispatch_and_forward_cross_vs_self(self):
+        # The caller picks (page_table, cache_seqlens, causal) via
+        # _encoder_decoder_page_table -- cross-attn -> encoder_page_table +
+        # encoder_lens_int32 + causal=False; self-attn -> page_table +
+        # cache_seqlens_int32 + causal=True -- then hands them to the generic
+        # _forward_attn_flat_page_table, which must forward them unchanged with a
+        # page_size=1 k_cache (shape[1]==1) so PR #454 routes to the varlen gather.
         enc_pt = torch.arange(5, dtype=torch.int32).unsqueeze(0)
         dec_pt = (torch.arange(4, dtype=torch.int32) + 10).unsqueeze(0)
         metadata = SimpleNamespace(
@@ -65,17 +67,24 @@ class TestEncoderDecoderForward(unittest.TestCase):
             encoder_lens_int32=torch.tensor([5], dtype=torch.int32),
             page_table=dec_pt,
             cache_seqlens_int32=torch.tensor([4], dtype=torch.int32),
-            cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32),
-            max_seq_len_q=1,
         )
         key_cache = self.k_flat.view(-1, 1, self.HK, self.D)
         value_cache = self.v_flat.view(-1, 1, self.HK, self.D)
         q = torch.randn(1, self.HQ * self.D)
+        cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32)
 
         for is_cross, exp_pt, exp_seqlens, exp_causal in (
             (True, enc_pt, metadata.encoder_lens_int32, False),
             (False, dec_pt, metadata.cache_seqlens_int32, True),
         ):
+            layer = self._layer(is_cross)
+            page_table, cache_seqlens, causal = (
+                self.backend._encoder_decoder_page_table(layer, metadata)
+            )
+            self.assertTrue(torch.equal(page_table, exp_pt))
+            self.assertTrue(torch.equal(cache_seqlens, exp_seqlens))
+            self.assertEqual(causal, exp_causal)
+
             captured = {}
 
             def fake_kvcache(*_, **kw):
@@ -85,13 +94,16 @@ class TestEncoderDecoderForward(unittest.TestCase):
                 )
 
             with patch.object(xpu_backend, "flash_attn_with_kvcache", fake_kvcache):
-                self.backend._forward_encoder_decoder_mha(
+                self.backend._forward_attn_flat_page_table(
                     q=q,
                     key_cache=key_cache,
                     value_cache=value_cache,
-                    layer=self._layer(is_cross),
-                    metadata=metadata,
-                    decode=True,
+                    layer=layer,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=1,
+                    causal=causal,
                 )
             self.assertTrue(torch.equal(captured["page_table"], exp_pt))
             self.assertTrue(torch.equal(captured["cache_seqlens"], exp_seqlens))
@@ -99,33 +111,58 @@ class TestEncoderDecoderForward(unittest.TestCase):
             self.assertEqual(captured["k_cache"].shape[1], 1)  # page_size=1 view
             self.assertEqual(captured["max_seqlen_q"], 1)
 
-    def test_empty_encoder_lens_returns_zeros_without_kernel(self):
-        # Whisper text-only warmup: encoder_lens == 0. PR #454's page_size=1 path
-        # returns NaN for an empty KV, so the backend must short-circuit to zeros
-        # and never launch the kernel.
-        metadata = SimpleNamespace(
-            encoder_page_table=torch.zeros(1, 0, dtype=torch.int32),
-            encoder_lens_int32=torch.zeros(1, dtype=torch.int32),
-            page_table=torch.zeros(1, 0, dtype=torch.int32),
-            cache_seqlens_int32=torch.zeros(1, dtype=torch.int32),
-            cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32),
-            max_seq_len_q=1,
-        )
+    def test_all_empty_returns_zeros_without_kernel(self):
+        # Whisper text-only warmup: all cache_seqlens == 0. PR #454's page_size=1
+        # path returns NaN for an empty KV, so the backend must short-circuit to
+        # zeros and never launch the kernel.
         key_cache = self.k_flat.view(-1, 1, self.HK, self.D)
         value_cache = self.v_flat.view(-1, 1, self.HK, self.D)
         q = torch.randn(1, self.HQ * self.D)
         sentinel = MagicMock(side_effect=AssertionError("kernel must not run"))
         with patch.object(xpu_backend, "flash_attn_with_kvcache", sentinel):
-            out = self.backend._forward_encoder_decoder_mha(
+            out = self.backend._forward_attn_flat_page_table(
                 q=q,
                 key_cache=key_cache,
                 value_cache=value_cache,
                 layer=self._layer(True),
-                metadata=metadata,
-                decode=True,
+                page_table=torch.zeros(1, 0, dtype=torch.int32),
+                cache_seqlens=torch.zeros(1, dtype=torch.int32),
+                cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32),
+                max_seqlen_q=1,
+                causal=False,
             )
         sentinel.assert_not_called()
         self.assertTrue(torch.equal(out, torch.zeros(1, self.HQ, self.D)))
+
+    def test_mixed_empty_zeros_only_empty_request_rows(self):
+        # Mixed batch: request 0 has cache_seqlens==0 (no keys), request 1 has
+        # keys. PR #454 returns NaN for the empty request's rows, so the backend
+        # must zero exactly those rows and leave the rest untouched. Unequal query
+        # counts (2 and 3) exercise the cu_seqlens_q -> per-request row mapping.
+        key_cache = self.k_flat.view(-1, 1, self.HK, self.D)
+        value_cache = self.v_flat.view(-1, 1, self.HK, self.D)
+        q = torch.randn(5, self.HQ * self.D)
+
+        def fake_kvcache(*_, **kw):
+            # All-ones (never-NaN) sentinel so zeroed rows are distinguishable.
+            return kw["q"].new_ones(
+                (kw["q"].shape[0], kw["q"].shape[1], kw["v_cache"].shape[-1])
+            )
+
+        with patch.object(xpu_backend, "flash_attn_with_kvcache", fake_kvcache):
+            out = self.backend._forward_attn_flat_page_table(
+                q=q,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                layer=self._layer(True),
+                page_table=torch.zeros(2, 4, dtype=torch.int32),
+                cache_seqlens=torch.tensor([0, 4], dtype=torch.int32),
+                cu_seqlens_q=torch.tensor([0, 2, 5], dtype=torch.int32),
+                max_seqlen_q=3,
+                causal=False,
+            )
+        self.assertTrue(torch.equal(out[:2], torch.zeros(2, self.HQ, self.D)))
+        self.assertTrue(torch.equal(out[2:], torch.ones(3, self.HQ, self.D)))
 
     def test_init_forward_metadata_per_request_encoder_offset(self):
         # Guards the encoder_lens.numel()==1 removal: with UNEQUAL encoder lengths,
