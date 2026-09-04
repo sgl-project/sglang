@@ -9,13 +9,13 @@ from sglang.srt.layers.quantization.fp8 import (
     _is_cuda,
     _is_gfx95_supported,
     _is_hip,
-    is_sm100_supported,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     inverse_transform_scale_ue8m0,
     quant_weight_ue8m0,
     transform_scale_ue8m0,
 )
+from sglang.srt.runtime_context import get_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -26,7 +26,7 @@ class TestMxfp8MoeScaleLayout(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         if not (
-            (_is_cuda and is_sm100_supported()) or (_is_hip and _is_gfx95_supported)
+            (_is_cuda and get_platform().is_sm100) or (_is_hip and _is_gfx95_supported)
         ):
             raise unittest.SkipTest(
                 "MXFP8 MoE quantization requires SM100 or ROCm gfx95"
