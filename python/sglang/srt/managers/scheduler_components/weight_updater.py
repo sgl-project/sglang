@@ -503,9 +503,6 @@ class SchedulerWeightUpdaterManager:
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
 
-        for tag in tags:
-            self.offload_tags.add(tag)
-
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             if scheduler is not None:
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
@@ -520,8 +517,14 @@ class SchedulerWeightUpdaterManager:
                     queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                     if queue is not None:
                         queue.release_memory_occupation()
-            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
             self.flush_cache()
+
+            # torch_memory_saver.pause() unmaps the region without waiting for
+            # the device: any kernel still touching KV memory would fault. Drain
+            # the streams before releasing.
+            torch.get_device_module().synchronize()
+            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
+            self.offload_tags.add(GPU_MEMORY_TYPE_KV_CACHE)
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self._assert_weight_cache_inactive("release_memory_occupation")
@@ -529,12 +532,20 @@ class SchedulerWeightUpdaterManager:
                 self.tp_worker.model_runner.model
             )
             torch.distributed.barrier(self.tp_cpu_group)
+
+            # The static-state clones above are asynchronous D2D copies that read
+            # the weights region; they must complete before the region is unmapped.
+            torch.get_device_module().synchronize()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
+            self.offload_tags.add(GPU_MEMORY_TYPE_WEIGHTS)
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
+            if not (
+                GPU_MEMORY_TYPE_KV_CACHE in tags or GPU_MEMORY_TYPE_WEIGHTS in tags
+            ):
+                torch.get_device_module().synchronize()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
-
-        torch.get_device_module().synchronize()
+            self.offload_tags.add(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
         return ReleaseMemoryOccupationReqOutput()
 
