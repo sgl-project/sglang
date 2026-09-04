@@ -107,6 +107,19 @@ if _is_cuda:
 if _use_aiter:
     from aiter.ops.cache import indexer_k_quant_and_cache
 
+if _is_hip:
+    try:
+        from aiter.ops.triton._gluon_kernels.gfx950.attention.fp8_mqa_logits_blockq import (
+            fp8_mqa_logits_blockq,
+            get_blockq_config,
+        )
+    except ImportError:
+        fp8_mqa_logits_blockq = None
+        get_blockq_config = None
+else:
+    fp8_mqa_logits_blockq = None
+    get_blockq_config = None
+
 from sglang.srt.distributed import (
     get_attn_tp_group,
 )
@@ -200,6 +213,47 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
         "Hidden size must be a power of 2 for Hadamard transform."
     )
     return hadamard_transform(x, scale=hidden_size**-0.5)
+
+
+def _aiter_fp8_mqa_logits_with_optional_blockq(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    kv_scales: torch.Tensor,
+    weights: torch.Tensor,
+    cu_starts: torch.Tensor,
+    cu_ends: torch.Tensor,
+    fp8_mqa_logits,
+) -> torch.Tensor:
+    if (
+        get_blockq_config is None
+        or fp8_mqa_logits_blockq is None
+        or get_blockq_config(q.shape[1], q.shape[2]) is None
+    ):
+        return fp8_mqa_logits(
+            q,
+            kv,
+            kv_scales,
+            weights,
+            cu_starts,
+            cu_ends,
+            clean_logits=False,
+        )
+
+    seq_len_kv_aligned = ceil_align(kv.shape[0], 256)
+    logits = torch.empty(
+        (q.shape[0], seq_len_kv_aligned),
+        dtype=torch.float32,
+        device=q.device,
+    )[:, : kv.shape[0]]
+    return fp8_mqa_logits_blockq(
+        q,
+        kv,
+        kv_scales,
+        weights,
+        cu_starts,
+        cu_ends,
+        logits,
+    )
 
 
 class Indexer(DSANPUIndexerMixin, BaseFusedOp):
@@ -1124,14 +1178,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     # transform masks invalid positions via ks/ke/lengths, so the
                     # -inf pre-fill of the [tokens x seq_len_kv] logits buffer is
                     # redundant and grows quadratically with context length.
-                    logits = fp8_mqa_logits(
+                    logits = _aiter_fp8_mqa_logits_with_optional_blockq(
                         q_fp8[:q_offset],
                         kv,
                         scale,
                         weights[:q_offset],
                         ks,
                         ke,
-                        clean_logits=False,
+                        fp8_mqa_logits,
                     )
                 else:
                     q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
@@ -1180,14 +1234,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
                     kv, scale = kv_fp8
                     # clean_logits=False: topk transform handles masking (see above)
-                    logits_chunk = fp8_mqa_logits(
+                    logits_chunk = _aiter_fp8_mqa_logits_with_optional_blockq(
                         q_fp8[start:end],
                         kv,
                         scale,
                         weights[start:end],
                         ks[start:end],
                         ke[start:end],
-                        clean_logits=False,
+                        fp8_mqa_logits,
                     )
                 else:
                     q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
