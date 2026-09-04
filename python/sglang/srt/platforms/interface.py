@@ -12,8 +12,6 @@ Out-of-tree platforms register via setuptools entry_points under the
 
 from __future__ import annotations
 
-import functools
-import inspect
 from typing import TYPE_CHECKING, Literal, Optional, Type
 
 import msgspec
@@ -70,20 +68,12 @@ class SRTPlatform(DeviceMixin):
     lifecycle hooks.
 
     OOT platforms subclass SRTPlatform and override the methods relevant to
-    their hardware. Every public name a subclass defines must exist on this
-    base with a compatible signature; the check runs at class-definition
-    time so a renamed or removed hook fails loudly instead of silently
-    never being called. Vendor-private helpers go under a leading
-    underscore.
+    their hardware.
     """
 
     # SRT-specific class-level attributes
     supported_quantization: list[str] = []
     capabilities: PlatformCapabilities = PlatformCapabilities()
-
-    def __init_subclass__(cls, **kwargs) -> None:
-        super().__init_subclass__(**kwargs)
-        _check_platform_subclass(cls)
 
     # ------------------------------------------------------------------
     # Configuration lifecycle
@@ -188,83 +178,6 @@ class SRTPlatform(DeviceMixin):
         this key take precedence over the method lookup.
         """
         return "native"
-
-
-def _unwrap_callable(attr):
-    if isinstance(attr, (classmethod, staticmethod)):
-        return attr.__func__
-    if isinstance(attr, (property, functools.cached_property)):
-        return None
-    if inspect.isfunction(attr):
-        return attr
-    return None
-
-
-_NAMED = (
-    inspect.Parameter.POSITIONAL_OR_KEYWORD,
-    inspect.Parameter.KEYWORD_ONLY,
-)
-_VARIADIC = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
-
-
-def _signature_mismatch(*, base_attr, override) -> Optional[str]:
-    base_fn = _unwrap_callable(base_attr)
-    override_fn = _unwrap_callable(override)
-    if base_fn is None or override_fn is None:
-        return None
-    base_params = list(inspect.signature(base_fn).parameters.values())[1:]
-    override_params = list(inspect.signature(override_fn).parameters.values())[1:]
-    override_names = {p.name for p in override_params}
-    accepts_var_kw = any(
-        p.kind is inspect.Parameter.VAR_KEYWORD for p in override_params
-    )
-    for p in base_params:
-        if p.kind in _NAMED and p.name not in override_names and not accepts_var_kw:
-            return f"does not accept {p.name!r}"
-    base_names = {p.name for p in base_params}
-    for p in override_params:
-        if (
-            p.kind not in _VARIADIC
-            and p.default is inspect.Parameter.empty
-            and p.name not in base_names
-        ):
-            return f"requires {p.name!r}, which core never passes"
-    return None
-
-
-def _check_platform_subclass(cls: type) -> None:
-    contract = set(SRTPlatform.__mro__)
-    base_public = {n for n in dir(SRTPlatform) if not n.startswith("_")}
-    unknown: list[str] = []
-    incompatible: list[str] = []
-    for klass in cls.__mro__:
-        if klass in contract:
-            continue
-        for name, attr in vars(klass).items():
-            if name.startswith("_"):
-                continue
-            if name not in base_public:
-                unknown.append(f"{klass.__name__}.{name}")
-                continue
-            reason = _signature_mismatch(
-                base_attr=inspect.getattr_static(SRTPlatform, name), override=attr
-            )
-            if reason is not None:
-                incompatible.append(f"{klass.__name__}.{name} {reason}")
-    if not unknown and not incompatible:
-        return
-    lines = [f"{cls.__name__} does not match the SRTPlatform contract."]
-    if unknown:
-        lines.append(
-            "Public names that are not on SRTPlatform (core never calls them; "
-            "prefix vendor-private helpers with an underscore): "
-            + ", ".join(sorted(unknown))
-        )
-    if incompatible:
-        lines.append(
-            "Overrides with incompatible signatures: " + "; ".join(incompatible)
-        )
-    raise TypeError("\n".join(lines))
 
 
 def require_out_of_tree_impl(
