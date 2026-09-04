@@ -1746,9 +1746,9 @@ class ServerArgs:
     bf16_gemm_backend: A[
         str,
         Arg(
-            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs and the KDA CuTe DSL kernel 'cutedsl_sm120' on SM120 consumer Blackwell GPUs, except deterministic inference selects 'torch'; otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; dispatches between the allowlisted low-M Split-K kernel, the CuTe DSL kernel, and cuBLAS; set SGLANG_ENABLE_BF16_SPLITK_GEMM=0 to disable Split-K), 'cutedsl_sm120' (Kernel Design Agents CuTe DSL dense BF16 decode GEMM, M<=48, on SM120 consumer Blackwell), 'flashinfer_pr4266' (legacy compatibility alias for the optimized CuTe DSL path), 'gemv', 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
+            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x and SM120 GPUs, except deterministic inference selects 'torch'; otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (automatically dispatches to the SGLang JIT CuTe DSL TGV/Split-K kernels on SM10x or the shape-gated KDA CuTe DSL kernel on SM120, with cuBLAS fallback; set SGLANG_ENABLE_BF16_SPLITK_GEMM=0 to disable Split-K on SM10x), 'flashinfer_pr4266' (legacy compatibility alias for the SM10x optimized CuTe DSL path), 'gemv', 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
             cli_name="--bf16-gemm-backend",
-            choices=["auto", "cutedsl", "cutedsl_sm120", "flashinfer_pr4266", "gemv", "torch"],
+            choices=["auto", "cutedsl", "flashinfer_pr4266", "gemv", "torch"],
         ),
         NS("exec.kernel"),
     ] = "auto"
@@ -3804,7 +3804,6 @@ class ServerArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
-
         # Auto-derived from Annotated[..., Arg(...)] field metadata.
         add_cli_args_from_dataclass(parser, ServerArgs)
 

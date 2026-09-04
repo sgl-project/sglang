@@ -198,7 +198,7 @@ def _k3_bf16_gemm(
     if x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16:
         from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
 
-        if get_bf16_gemm_backend().is_cutedsl():
+        if get_bf16_gemm_backend().is_cutedsl() and get_platform().is_sm100:
             from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
                 cutedsl_bf16_gemm,
                 cutedsl_bf16_gemm_out,

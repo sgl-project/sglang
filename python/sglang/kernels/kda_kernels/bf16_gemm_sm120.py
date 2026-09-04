@@ -705,9 +705,13 @@ class _Bf16GemmSm120Kernel:
         sB = storage.sB.get_tensor(
             b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
         )
-        sC = storage.sC.get_tensor(
-            epi_smem_layout_staged.outer, swizzle=epi_smem_layout_staged.inner
-        ) if cutlass.const_expr(self.num_splits == 1) else None
+        sC = (
+            storage.sC.get_tensor(
+                epi_smem_layout_staged.outer, swizzle=epi_smem_layout_staged.inner
+            )
+            if cutlass.const_expr(self.num_splits == 1)
+            else None
+        )
 
         # Local_tile partition global tensors (2D (m, k) / (n, k) / (m, n))
         gA_mkl = cute.local_tile(
@@ -1059,10 +1063,9 @@ class _Bf16GemmSm120Kernel:
                                     n_local = tRS_cC[elem_idx][1] + Int32(
                                         epi_n * self.epi_tile[1]
                                     )
-                                    acc_vec[elem_idx] = (
-                                        acc_vec[elem_idx]
-                                        + mBias[n_local].to(self.acc_dtype)
-                                    )
+                                    acc_vec[elem_idx] = acc_vec[elem_idx] + mBias[
+                                        n_local
+                                    ].to(self.acc_dtype)
                             acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
                             tRS_rD_out.store(acc_vec)
 

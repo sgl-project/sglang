@@ -76,7 +76,6 @@ if _use_aiter:
 class Bf16GemmBackend(Enum):
     AUTO = "auto"
     CUTEDSL = "cutedsl"
-    CUTEDSL_SM120 = "cutedsl_sm120"
     FLASHINFER_PR4266 = "flashinfer_pr4266"
     GEMV = "gemv"
     TORCH = "torch"
@@ -87,9 +86,6 @@ class Bf16GemmBackend(Enum):
     def is_cutedsl(self) -> bool:
         return self == Bf16GemmBackend.CUTEDSL
 
-    def is_cutedsl_sm120(self) -> bool:
-        return self == Bf16GemmBackend.CUTEDSL_SM120
-
     def is_gemv(self) -> bool:
         return self == Bf16GemmBackend.GEMV
 
@@ -97,11 +93,7 @@ class Bf16GemmBackend(Enum):
         return self == Bf16GemmBackend.FLASHINFER_PR4266
 
     def is_optimized(self) -> bool:
-        return (
-            self.is_cutedsl()
-            or self.is_cutedsl_sm120()
-            or self.is_flashinfer_pr4266()
-        )
+        return self.is_cutedsl() or self.is_flashinfer_pr4266()
 
 
 _BF16_GEMM_BACKEND: Optional[Bf16GemmBackend] = None
@@ -173,17 +165,11 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
     global _enable_bf16_splitk_gemm
 
     backend_str = server_args.bf16_gemm_backend
-    if backend_str == "auto" and get_platform().is_sm100:
+    if backend_str == "auto" and (get_platform().is_sm100 or get_platform().is_sm120):
         backend_str = (
             "torch"
             if get_exec().deterministic.enable_deterministic_inference
             else "cutedsl"
-        )
-    elif backend_str == "auto" and get_platform().is_sm120:
-        backend_str = (
-            "torch"
-            if get_exec().deterministic.enable_deterministic_inference
-            else "cutedsl_sm120"
         )
 
     backend = Bf16GemmBackend(backend_str)
@@ -200,47 +186,42 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
 
         _hopper_bf16_gemv = hopper_bf16_gemv
         _use_hopper_bf16_gemv = use_hopper_bf16_gemv
-    elif backend.is_cutedsl_sm120():
-        if get_exec().deterministic.enable_deterministic_inference:
-            raise ValueError(
-                "--bf16-gemm-backend cutedsl_sm120 is batch-size dependent and "
-                "cannot be combined with --enable-deterministic-inference"
-            )
-        if not get_platform().is_sm120:
-            raise ValueError(
-                "--bf16-gemm-backend cutedsl_sm120 requires SM120 (consumer Blackwell)"
-            )
-
-        from sglang.kernels.kda_kernels.bf16_gemm_sm120 import (
-            run_bf16_gemm_sm120,
-            use_bf16_gemm_sm120,
-        )
-
-        _sm120_bf16_gemm = run_bf16_gemm_sm120
-        _use_sm120_bf16_gemm = use_bf16_gemm_sm120
     elif backend.is_optimized():
         if get_exec().deterministic.enable_deterministic_inference:
             raise ValueError(
-                "--bf16-gemm-backend cutedsl is batch-size dependent and cannot "
-                "be combined with --enable-deterministic-inference"
+                f"--bf16-gemm-backend {backend.value} is batch-size dependent and "
+                "cannot be combined with --enable-deterministic-inference"
             )
-        if not get_platform().is_sm100:
-            raise ValueError(
-                f"--bf16-gemm-backend {backend.value} requires SM100/SM103 (Blackwell)"
+        if backend.is_cutedsl() and get_platform().is_sm120:
+            from sglang.kernels.kda_kernels.bf16_gemm_sm120 import (
+                run_bf16_gemm_sm120,
+                use_bf16_gemm_sm120,
             )
 
-        from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
-            cutedsl_bf16_gemm,
-            use_cutedsl_bf16_gemm,
-        )
+            _sm120_bf16_gemm = run_bf16_gemm_sm120
+            _use_sm120_bf16_gemm = use_bf16_gemm_sm120
+        else:
+            if not get_platform().is_sm100:
+                supported_arches = (
+                    "SM100/SM103 or SM120" if backend.is_cutedsl() else "SM100/SM103"
+                )
+                raise ValueError(
+                    f"--bf16-gemm-backend {backend.value} requires "
+                    f"{supported_arches} (Blackwell)"
+                )
 
-        _cutedsl_bf16_gemm = cutedsl_bf16_gemm
-        _use_cutedsl_bf16_gemm = use_cutedsl_bf16_gemm
+            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
+                cutedsl_bf16_gemm,
+                use_cutedsl_bf16_gemm,
+            )
 
-    # Split-K is an SM100/SM103 fast path; the SM120 KDA backend has no
-    # Split-K tactics and its own dispatch covers all decode shapes.
+            _cutedsl_bf16_gemm = cutedsl_bf16_gemm
+            _use_cutedsl_bf16_gemm = use_cutedsl_bf16_gemm
+
+    # Split-K is an SM100/SM103 fast path; the SM120 KDA kernel has no
+    # Split-K tactics and uses the common dispatcher's shape-gated fallback.
     _enable_bf16_splitk_gemm = False
-    if should_enable_bf16_splitk_gemm(backend) and not backend.is_cutedsl_sm120():
+    if should_enable_bf16_splitk_gemm(backend) and get_platform().is_sm100:
         from sglang.kernels.ops.gemm.flashinfer_pr4266_dense_bf16_gemm_sm100_direct import (
             default_tactic,
             prefer_direct_bf16_gemm_sm100,
@@ -455,6 +436,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         """Run an inference-only BF16 linear into caller-owned storage."""
         if (
             get_bf16_gemm_backend().is_cutedsl()
+            and _use_cutedsl_bf16_gemm is not None
             and x.is_cuda
             and x.ndim == 2
             and x.dtype == torch.bfloat16
@@ -1135,7 +1117,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         layer: torch.nn.Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
-
         return self.runner.run(dispatch_output, layer)
 
     def forward_tpu(self, *args, **kwargs) -> CombineInput:
