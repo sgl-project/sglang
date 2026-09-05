@@ -197,6 +197,7 @@ class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     MARLIN = "marlin"
     HUMMING = "humming"
     EXPERIMENTAL_SGL_MARLIN = "experimental_sgl_marlin"
+    LORA = "lora"
     AITER = "aiter"
     HPC_OPS = "hpc_ops"
     INTEL_XPU = "intel_xpu"
@@ -208,6 +209,11 @@ class RegisteredMoeRunnerBackend(_MoeRunnerBackendPredicates):
 
     value: str
 
+    def is_lora(self):
+        return self == MoeRunnerBackend.LORA
+
+    def is_triton(self):
+        return self == MoeRunnerBackend.TRITON
 
 MoeRunnerBackendLike = MoeRunnerBackend | RegisteredMoeRunnerBackend
 _REGISTERED_MOE_RUNNER_BACKEND_NAMES: set[str] = set()
