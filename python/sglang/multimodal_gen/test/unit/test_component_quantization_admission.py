@@ -358,7 +358,7 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
             ),
             patch(
                 "sglang.multimodal_gen.runtime.loader.component_loaders."
-                "adapter_loader.ModelRegistry.resolve_model_cls"
+                "component_loader.ModelRegistry.resolve_model_cls"
             ) as resolve_model,
             self.assertRaises(ComponentCheckpointUnsupportedError),
         ):
