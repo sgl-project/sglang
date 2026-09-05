@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use sglang_radix_tree::{
     CacheInitParams, FULL, InsertParams, InsertResult, KeyNamespaceRef, MAMBA, MatchPrefixParams,
-    PageValue, UnifiedTreeCore,
+    PageValue, TreeCoreRuntimeError, UnifiedTreeCore,
 };
 
 type TestCore = UnifiedTreeCore<Vec<i64>, PageValue<u32>>;
@@ -100,6 +100,63 @@ fn page_value_core_supports_read_only_match_and_continuation_insert() {
         namespace: KeyNamespaceRef::default(),
     });
     assert_eq!(matched.device_indices.as_slice(), &[1, 2, 5, 6]);
+}
+
+#[test]
+fn continuation_insert_rejects_a_host_only_anchor() {
+    let mut tree = TestCore::new_with_empty(
+        CacheInitParams {
+            enable_hicache: true,
+            ..Default::default()
+        },
+        vec![FULL],
+        PageValue::default(),
+    );
+    insert(&mut tree, &[10, 20, 30, 40], &[1, 2, 3, 4]);
+    let anchor = tree
+        .match_prefix(&MatchPrefixParams {
+            key: &vec![10, 20],
+            namespace: KeyNamespaceRef::default(),
+        })
+        .last_device_node_id;
+    let leaf = tree
+        .match_prefix(&MatchPrefixParams {
+            key: &vec![10, 20, 30, 40],
+            namespace: KeyNamespaceRef::default(),
+        })
+        .last_device_node_id;
+    // Back both nodes up and drop their device copies: the anchor is now a
+    // host-only tombstone.
+    tree.commit_backup(anchor, PageValue::from_vec(vec![101, 102]), HashMap::new());
+    tree.commit_backup(leaf, PageValue::from_vec(vec![103, 104]), HashMap::new());
+    let _ = tree.demote(leaf);
+    let _ = tree.demote(anchor);
+
+    let key = vec![10, 20, 50, 60];
+    let error = tree
+        .try_insert_suffix_from_node(
+            anchor,
+            2,
+            &InsertParams {
+                key: &key,
+                namespace: KeyNamespaceRef::default(),
+                value: PageValue::from_vec(vec![5, 6]),
+                prev_prefix_len: 2,
+                swa_evicted_seqlen: 0,
+                mamba_value: None,
+                chunked: false,
+                priority: 0,
+                track_adopted_ranges: false,
+            },
+        )
+        .err()
+        .expect("a host-only anchor must be rejected");
+    assert!(matches!(
+        error,
+        TreeCoreRuntimeError::InsertAnchorNotDeviceResident { .. }
+    ));
+    tree.try_sanity_check(&[], &[])
+        .expect("the rejected insert leaves the tree consistent");
 }
 
 #[test]

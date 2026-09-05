@@ -1479,6 +1479,9 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 node_id: anchor.id,
             });
         }
+        if !anchor.is_root() && !anchor.has_device_value(FULL) {
+            return Err(TreeCoreRuntimeError::InsertAnchorNotDeviceResident { node_id: anchor.id });
+        }
 
         let mut path = Vec::new();
         let mut cursor = prefix_node_idx;

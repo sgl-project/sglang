@@ -764,6 +764,10 @@ pub enum TreeCoreRuntimeError {
     /// A non-root continuation stays inside the anchor's namespace.
     #[error("insert continuation namespace does not match non-root anchor {node_id}")]
     InsertContinuationNamespaceMismatch { node_id: NodeId },
+    /// A non-root anchor must still hold Full KV on device; growing below a
+    /// host-only tombstone would put device data under an evicted parent.
+    #[error("insert continuation anchor {node_id} has no device Full KV")]
+    InsertAnchorNotDeviceResident { node_id: NodeId },
     /// Device indices must cover the aligned key span consumed by the insert API.
     #[error(
         "insert value length {value_len} is shorter than required aligned span {aligned_key_len}"
