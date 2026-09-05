@@ -142,15 +142,18 @@ def get_token_ids_logprobs_raw(
     if stage == LogprobStage.DECODE:
         for i, token_ids in enumerate(token_ids_logprobs_list):
             if token_ids is None:
-                vals.append([])
-                idxs.append([])
+                # No token ids requested for this request: emit an empty row
+                # through the same append below, so every entry has the type
+                # consumers expect (move_logprobs_to_cpu calls .tolist() on
+                # each entry).
+                row = logprobs.new_empty((0,))
             else:
                 token_ids_tensor = torch.tensor(token_ids, dtype=torch.long).to(
                     logprobs.device, non_blocking=True
                 )
                 row = logprobs[i, token_ids_tensor]
-                vals.append(row if no_copy_to_cpu else row.tolist())
-                idxs.append(token_ids)
+            vals.append(row if no_copy_to_cpu else row.tolist())
+            idxs.append([] if token_ids is None else token_ids)
     else:  # prefill
         pt = 0
         for i, (token_ids, pruned_len) in enumerate(
