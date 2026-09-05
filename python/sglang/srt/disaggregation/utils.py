@@ -1112,6 +1112,69 @@ def append_state_component(
     kv_args.state_layer_ids.append(layer_ids or [])
 
 
+def extend_state_component(
+    kv_args: KVArgs,
+    state_type: StateType,
+    data_ptrs: List[int],
+    data_lens: List[int],
+    item_lens: List[int],
+    layer_ids: Optional[List[int]] = None,
+) -> None:
+    for i, existing_state_type in enumerate(kv_args.state_types):
+        if existing_state_type == state_type:
+            kv_args.state_data_ptrs[i].extend(data_ptrs)
+            kv_args.state_data_lens[i].extend(data_lens)
+            kv_args.state_item_lens[i].extend(item_lens)
+            kv_args.state_layer_ids[i].extend(layer_ids or [])
+            return
+    append_state_component(
+        kv_args,
+        state_type,
+        data_ptrs,
+        data_lens,
+        item_lens,
+        layer_ids=layer_ids,
+    )
+
+
+def _dsv4_stage_layer_ids(pool) -> List[int]:
+    return list(range(pool._stage_start, pool._stage_end))
+
+
+def _dsv4_c4_layer_ids(pool) -> List[int]:
+    return [
+        layer_id
+        for layer_id in _dsv4_stage_layer_ids(pool)
+        if pool.compression_ratios[layer_id] == 4
+    ]
+
+
+def _dsv4_swa_component_layer_ids(pool) -> List[int]:
+    c4_ids = _dsv4_c4_layer_ids(pool)
+    if pool._unified_kv:
+        return c4_ids + c4_ids
+    return _dsv4_stage_layer_ids(pool) + c4_ids + c4_ids
+
+
+def _dsv4_swa_ring_component_layer_ids(pool) -> List[int]:
+    return _dsv4_stage_layer_ids(pool)
+
+
+def _dsv4_c128_component_layer_ids(pool) -> List[int]:
+    return [
+        layer_id
+        for layer_id in _dsv4_stage_layer_ids(pool)
+        if pool.compression_ratios[layer_id] == 128
+    ]
+
+
+def _remap_draft_state_layer_ids(
+    layer_ids: List[int], num_hidden_layers: int
+) -> List[int]:
+    band_index = {lid: i for i, lid in enumerate(dict.fromkeys(layer_ids))}
+    return [num_hidden_layers + band_index[lid] for lid in layer_ids]
+
+
 def setup_state_kv_args(
     kv_args: KVArgs,
     token_to_kv_pool,
@@ -1167,8 +1230,18 @@ def setup_state_kv_args(
         # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
         # state list is described per-entry via get_state_buf_infos.
         if isinstance(token_to_kv_pool, BaseSWAKVPool):
+            layer_ids = (
+                _dsv4_swa_component_layer_ids(token_to_kv_pool)
+                if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                else None
+            )
             append_state_component(
-                kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
+                kv_args,
+                StateType.SWA,
+                data_ptrs,
+                data_lens,
+                item_lens,
+                layer_ids=layer_ids,
             )
             # MXFP8 KV: each sub-pool's block scales ride as their own component
             # so they inherit the index payload of the KV they describe.
@@ -1202,6 +1275,7 @@ def setup_state_kv_args(
                         ring_ptrs,
                         ring_lens,
                         ring_item_lens,
+                        layer_ids=_dsv4_swa_ring_component_layer_ids(token_to_kv_pool),
                     )
             if hasattr(token_to_kv_pool, "get_c128_state_buf_infos"):
                 c128_ptrs, c128_lens, c128_item_lens = (
@@ -1214,6 +1288,7 @@ def setup_state_kv_args(
                         c128_ptrs,
                         c128_lens,
                         c128_item_lens,
+                        layer_ids=_dsv4_c128_component_layer_ids(token_to_kv_pool),
                     )
         elif isinstance(token_to_kv_pool, HybridLinearKVPool):
             dim = (
@@ -1283,13 +1358,11 @@ def setup_state_kv_args(
                 c128_item_lens,
             )
 
-    # DSV4 NextN shares the target allocator, so target and draft use the same
-    # local SWA indices. Keep draft buffers in a separate positional component
-    # to avoid mixing them into the target's heterogeneous state layout, while
-    # reusing the existing SWA transport dispatch on both GPU and NPU.
     if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool) and isinstance(
         draft_token_to_kv_pool, DeepSeekV4TokenToKVPool
     ):
+        if total_kv_layers is None:
+            raise RuntimeError("DSV4 draft state transfer requires total_kv_layers")
         if not draft_token_to_kv_pool.compression_ratios or not all(
             ratio == 0 for ratio in draft_token_to_kv_pool.compression_ratios
         ):
@@ -1321,6 +1394,7 @@ def setup_state_kv_args(
                 draft_token_to_kv_pool.get_unified_swa_ring_buf_infos()
             )
             draft_state_type = StateType.SWA_RING
+            draft_layer_ids = _dsv4_swa_ring_component_layer_ids(draft_token_to_kv_pool)
         else:
             if (
                 token_to_kv_pool.full_to_swa_index_mapping
@@ -1346,14 +1420,16 @@ def setup_state_kv_args(
                 draft_token_to_kv_pool.get_state_buf_infos()
             )
             draft_state_type = StateType.SWA
+            draft_layer_ids = _dsv4_swa_component_layer_ids(draft_token_to_kv_pool)
 
         if draft_ptrs:
-            append_state_component(
+            extend_state_component(
                 kv_args,
                 draft_state_type,
                 draft_ptrs,
                 draft_lens,
                 draft_item_lens,
+                _remap_draft_state_layer_ids(draft_layer_ids, total_kv_layers),
             )
 
     if (

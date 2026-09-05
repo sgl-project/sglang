@@ -596,6 +596,9 @@ def _buf_infos(*ptrs):
 def _make_dsv4_target(*, unified, mapping=None):
     pool = object.__new__(DeepSeekV4TokenToKVPool)
     pool._unified_kv = unified
+    pool._stage_start = 0
+    pool._stage_end = 1
+    pool.compression_ratios = [0]
     pool.page_size = 256
     pool.sliding_window = 128
     pool.full_to_swa_index_mapping = mapping
@@ -613,6 +616,8 @@ def _make_dsv4_target(*, unified, mapping=None):
 def _make_dsv4_draft(*, unified, mapping=None):
     pool = object.__new__(DeepSeekV4TokenToKVPool)
     pool._unified_kv = unified
+    pool._stage_start = 0
+    pool._stage_end = 1
     pool.compression_ratios = [0]
     pool.page_size = 256
     pool.sliding_window = 128
@@ -635,26 +640,24 @@ def _make_dsv4_draft(*, unified, mapping=None):
 
 
 class TestDSV4DraftStateRegistration(unittest.TestCase):
-    def test_draft_state_is_a_separate_component(self):
+    def test_draft_state_is_packed_into_swa_component(self):
         mapping = torch.arange(16)
         cases = [
             (
                 "paged",
                 _make_dsv4_target(unified=False, mapping=mapping),
                 _make_dsv4_draft(unified=False, mapping=mapping),
-                [StateType.SWA, StateType.SWA],
-                [[11]],
+                StateType.SWA,
             ),
             (
                 "unified",
                 _make_dsv4_target(unified=True),
                 _make_dsv4_draft(unified=True),
-                [StateType.SWA, StateType.SWA_RING, StateType.SWA_RING],
-                [[11], [12]],
+                StateType.SWA_RING,
             ),
         ]
 
-        for name, target, draft, expected_types, target_ptrs in cases:
+        for name, target, draft, draft_state_type in cases:
             with self.subTest(name=name):
                 if draft._unified_kv:
                     expected_infos = draft.get_unified_swa_ring_buf_infos()
@@ -662,13 +665,23 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
                     expected_infos = draft.get_state_buf_infos()
                 kv_args = KVArgs()
 
-                setup_state_kv_args(kv_args, target, draft)
+                setup_state_kv_args(kv_args, target, draft, total_kv_layers=40)
 
-                self.assertEqual(kv_args.state_types, expected_types)
-                self.assertEqual(kv_args.state_data_ptrs[:-1], target_ptrs)
-                self.assertEqual(kv_args.state_data_ptrs[-1], expected_infos[0])
-                self.assertEqual(kv_args.state_data_lens[-1], expected_infos[1])
-                self.assertEqual(kv_args.state_item_lens[-1], expected_infos[2])
+                component_idx = kv_args.state_types.index(draft_state_type)
+                self.assertEqual(kv_args.state_types.count(draft_state_type), 1)
+                self.assertEqual(
+                    kv_args.state_data_ptrs[component_idx][-len(expected_infos[0]) :],
+                    expected_infos[0],
+                )
+                self.assertEqual(
+                    kv_args.state_data_lens[component_idx][-len(expected_infos[1]) :],
+                    expected_infos[1],
+                )
+                self.assertEqual(
+                    kv_args.state_item_lens[component_idx][-len(expected_infos[2]) :],
+                    expected_infos[2],
+                )
+                self.assertEqual(kv_args.state_layer_ids[component_idx][-1], 40)
 
 
 if __name__ == "__main__":
