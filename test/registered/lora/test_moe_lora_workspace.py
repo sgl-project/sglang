@@ -167,5 +167,22 @@ def test_parallel_region_state_fails_closed_when_first_used_during_capture(
         workspace.event("cuda:0", "missing:ready")
 
 
+def test_graph_mode_iota_keeps_its_address_when_eager_iota_grows():
+    workspace = MoeLoraWorkspace()
+    workspace.begin_forward(graph_mode=True)
+    captured = workspace.iota(8, "cpu")
+    address = captured.data_ptr()
+
+    workspace.begin_forward(graph_mode=False)
+    grown = workspace.iota(64, "cpu")
+    assert grown.numel() == 64 and int(grown[-1]) == 63
+
+    workspace.begin_forward(graph_mode=True)
+    replay = workspace.iota(8, "cpu")
+    assert replay.data_ptr() == address
+    torch.testing.assert_close(replay, torch.arange(8, dtype=torch.int32))
+    assert workspace.iota(16, "cpu").data_ptr() != address
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

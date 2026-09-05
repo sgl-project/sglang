@@ -12,7 +12,10 @@ Architectures:
 - `gb300.*` — every SM100-family device (B200, GB200/GB300)
 - `h200.*` — SM90
 - `default.*` — served when no file covers the architecture; routes
-  everything through the conservative serial fallback
+  everything through the conservative serial fallback. Prefill fallback
+  rows stay route-major: the masked slab domain scales as
+  `local_experts x chunk tokens x hidden` (tens of GiB at real chunk
+  sizes) where route-major scales with routed pairs.
 - `base_gemm/` — M-bucketed base-GEMM launch tables (separate key space:
   provider × geometry × device, not plan rows; see its README)
 
@@ -33,10 +36,13 @@ Plans file:
 `expert_major` for the padded `[E, m_max, K]` per-expert slabs, `route_major`
 for one flat buffer of aligned per-expert segments. It is a table value
 because the surrounding stages are built for it. WHICH VENDOR implements that
-row order is not: `--moe-lora-base-gemm` picks `cutedsl` (default) or
-`triton` (route-major only, the A/B arm) at serving time. A geometry a vendor
-cannot admit fails at attach; nothing falls back silently. Do not confuse
-`base_gemm_rows`
+row order is not: the `--moe-runner-backend lora_<vendor>` name picks
+`cutedsl` (the bf16/fp8 default), `triton` (the A/B arm), or `marlin` (the
+nvfp4 default) at serving time; a vendor serving no layers of a weight family
+resolves to that family's default, logged. Triton and Marlin gather rows by
+the sort metadata and have no masked slab domain, so they run a decode row's
+`expert_major` request on their route-major class. A geometry a vendor cannot
+admit fails at attach. Do not confuse `base_gemm_rows`
 with `layout` above: that one is the ADAPTER weight layout (per-expert or
 shared-outer).
 
@@ -412,7 +418,7 @@ eager measurement would have shipped it by mistake.
 off; turning it on wins 1.8-6.8% of MoE-LoRA layer time in every cell measured,
 on both SM100 architectures and all three models, at both prefill graph buckets,
 far outside the noise floor. H200's shared rank bands 9-64
-(`prefill.shared.rank_le16`/`rank_le64`) finalize through shared-rank-reduce,
+(`prefill.shared.rank_le16`/`rank_le64`) finalize through `shared_token_delta`,
 so they have no standalone down-B stage and no into-base axis -- those rows
 are untouched.
 
@@ -448,7 +454,7 @@ tolerance of 3e-2, and each one is a near-zero output where the base and the
 delta cancel. Use a tolerance that scales with the row size, not a fixed one.
 
 H200 shared prefill, rank bands other than 16 (2026-08-20). Every sweep above
-used rank 16, which selects a shared-rank-reduce row with no into-base axis.
+used rank 16, which selects a shared-finalize row with no into-base axis.
 Two other bands keep a standalone down-B: `prefill.shared.rank_le8` for rank 8
 and below, and the unbounded `prefill.shared` above rank 64. 12 captured
 cells, each config captured twice:
@@ -466,7 +472,7 @@ All 12 cells are faster, from +1.31% to +9.76%, median +3.39%, worst noise
 floor 1.04%. These are the largest gains the epilogue gives anywhere. The gain
 falls as the rank rises, which fits: the delta buffer this removes is one row
 for each pair whatever the rank, so its cost is a larger share of a small-rank
-forward. Both rows now use the epilogue. The shared-rank-reduce bands stay
+forward. Both rows now use the epilogue. The shared-finalize bands stay
 off, because they own no separate down-B stage.
 
 Also seen, not acted on: on PER-EXPERT rows at the 2048 bucket, removing
@@ -516,7 +522,7 @@ Route builder on the H200 prefill rows (2026-08-20, added after the flip). The
 48-cell sweep above reached one prefill row only, SM100's `prefill.shared`,
 where parallel against joint was a wash: 12 cells, median +0.10%, range -0.87%
 to +1.70%. It reached no H200 prefill row at all, because that sweep used rank
-16, and rank 16 on H200 selects a shared-rank-reduce row that never used the
+16, and rank 16 on H200 selects a shared-finalize row that never used the
 joint builder. So two H200 prefill rows changed builder with no measurement. This
 closes that gap. Joint is deleted, so the comparison is parallel against
 serial:
@@ -548,7 +554,140 @@ and point `SGLANG_LORA_MOE_CONFIG_DIR` at that directory; files there take
 precedence over the packaged ones, per architecture. The seed only reuses the
 existing plans for the wider geometry: validate provider admission and
 correctness on that geometry before serving it, then benchmark it with the
-campaign protocol below.
+campaign protocol below. `--check` reports rows for one `--quant-family`.
+
+The finalize family names in the evidence below are the current ones:
+`shared_token_delta` was called `shared_token_gemm` and `shared_one_pass` was
+called `shared_mapped_reduce` while these sweeps ran (renamed 2026-09-03).
+
+Shared prefill finalize, rank 16-32 (2026-09-03). Which finalize should the
+shared-outer prefill rows use? Four arms on the same servers: prefill of 4096
+tokens per request at batch 32/16/8/1, two rounds each with the arm order
+reversed. Decode throughput and the greedy probes did not change in any cell.
+Columns where one control round hit a one-off outlier are left out.
+
+H200, change in TTFT against the then-shipped `shared_rank_reduce` row
+(`prefill.shared.rank_le16`); negative is faster:
+
+| model | shared_token_delta | shared_one_pass | materialized + into_base |
+|---|---:|---:|---:|
+| Qwen3.5-35B bf16 | -2.2% .. -2.8% | -1.5% .. -1.8% | +3.7% .. +6.4% |
+| Qwen3.5-35B FP8 | -2.6% .. -2.9% | -1.6% .. -2.1% | +2.1% .. +6.4% |
+| Inkling-Small NVFP4 (marlin) | -2.8% .. -3.5% | -0.6% .. -1.7% | +1.8% .. +4.0% |
+| Qwen3.5-397B FP8, tp 8 | -3.1% .. -3.2% | -0.1% .. -0.4% | +4.9% .. +9.3% |
+
+GB300, change in TTFT against the shipped `shared_token_delta` row
+(`prefill.shared.rank_le32`):
+
+| model | shared_rank_reduce | shared_one_pass | materialized + into_base |
+|---|---:|---:|---:|
+| Qwen3.5-35B FP8, rank 16 | +0.6% .. +2.7% | +1.0% .. +3.4% | +1.5% .. +4.4% |
+| Inkling-Small NVFP4, rank 32 | +1.4% .. +1.6% | +2.2% .. +2.5% | +1.4% .. +2.7% |
+| Qwen3.5-397B NVFP4, rank 16 | +0.1% .. +1.4% | +0.3% .. +2.0% | +1.7% .. +3.6% |
+
+`shared_token_delta` wins every cell on both architectures. The H200 rank 9-16
+row moved to it and `shared_rank_reduce` was deleted: its tail re-read the
+shared down-B once per (token, tile), and nothing else selected it. The
+rank-reduce kernel stays as the first stage of `shared_token_delta`, and
+`shared_one_pass` stays for the gb300 NVFP4 decode row, which this sweep
+did not measure. Numerics: all three shared finalizes sit within 8e-4 of an
+fp32 reference on both tables' prefill rows with the cutedsl and triton row
+orders.
+
+Shared decode finalize (2026-09-03). The same four finalizes on the shared
+decode rows, decode-heavy requests of 128 input and 256 output tokens at batch
+64/32/8/1, two rounds each with the arm order reversed. Rounds reproduce to
+within 0.1%, so decode is a far cleaner measurement than prefill. Change in
+decode tokens per second; positive is faster.
+
+H200 `decode.shared`, against the then-shipped materialized finalize:
+
+| model | shared_rank_reduce | shared_token_delta | shared_one_pass |
+|---|---:|---:|---:|
+| Qwen3.5-35B bf16 | -0.5% .. +0.9% | -7.7% .. -15.7% | +1.5% .. +2.4% |
+| Qwen3.5-35B FP8 | -0.7% .. +0.4% | -8.0% .. -16.2% | +1.4% .. +2.2% |
+| Inkling-Small NVFP4 (marlin) | -0.7% .. +0.2% | -5.8% .. -10.6% | -0.1% .. +0.6% |
+| Qwen3.5-397B FP8, tp 8 | -0.2% .. +0.3% | -3.4% .. -13.4% | +0.5% .. +2.4% |
+
+GB300, against the shipped row of each cell:
+
+| model (row, shipped finalize) | shared_rank_reduce | shared_token_delta | shared_one_pass | materialized |
+|---|---:|---:|---:|---:|
+| Qwen3.5-35B FP8 (`decode.shared`, materialized) | -1.0% .. -1.5% | -6.0% .. -14.0% | +0.7% .. +2.3% | repeat, within 0.1% |
+| Inkling-Small NVFP4 (`decode.shared.nvfp4`, mapped) | -0.1% .. -1.3% | -3.5% .. -11.7% | repeat, within 1% | -1.7% .. -5.2% |
+| Qwen3.5-397B NVFP4 (`decode.shared.nvfp4`, mapped) | -0.5% .. -1.9% | -4.9% .. -17.8% | repeat, within 0.2% | -4.9% .. -8.0% |
+| Qwen3.5-397B FP8, tp 2 (`decode.shared.fp8.e_ge512`, materialized) | not run | not run | +0.0% .. +1.4% | repeat |
+
+Decode inverts the prefill result. `shared_token_delta` pays its extra GEMM
+and token-delta pass on every step and loses 3-18%. `shared_one_pass`
+is best or tied in all eight cells, so every shared decode row now uses it:
+`decode.shared` on both tables and `decode.shared.fp8.e_ge512` moved to it,
+and the NVFP4 decode row already had it (materialized would cost that row
+2-8%). The one-pass finalize owns down-B, which leaves only down-A to overlap,
+so those rows keep `down_a`. The 512-expert FP8 cell ran at tp 2, where the
+hybrid state buffers cap running requests at 43, so it has no batch-64 point.
+
+Shared prefill finalize, every rank band (2026-09-03). The rank 16-32 sweep
+above left the rank 8 band and the bands above 32 (GB300) and 64 (H200) on
+materialized + into_base. This sweep ran the same arms at ranks 8, 64, 128 and
+256 with synthetic shared-outer adapters (N(0, 0.01) factors, the same recipe
+as the rank 16 ones), prefill 4096 tokens per request at batch 32/16/8/1, two
+rounds each. Change in TTFT against the shipped row; negative is faster.
+
+| arch | model | rank | row (shipped finalize) | shared_token_delta | shared_one_pass | materialized + into_base |
+|---|---|---:|---|---:|---:|---:|
+| H200 | Qwen3.5-35B bf16 | 8 | `prefill.shared.rank_le8` (materialized) | -6.2% .. -6.5% (bs1 -2.7%) | +5.5% .. +9.6% | shipped |
+| H200 | Inkling-Small NVFP4 | 8 | `prefill.shared.rank_le8` (materialized) | -4.3% .. -4.6% (bs1 -3.1%) | +7.4% .. +11.0% | shipped |
+| H200 | Qwen3.5-397B FP8 | 8 | `prefill.shared.rank_le8` (materialized) | -9.0% .. -9.2% (bs1 -4.3%) | +4.4% .. +9.7% | shipped |
+| H200 | Qwen3.5-35B bf16 | 64 | `prefill.shared.rank_le64` (token_delta) | shipped | +6.5% .. +9.3% | +6.7% .. +11.8% |
+| H200 | Qwen3.5-397B FP8 | 64 | `prefill.shared.rank_le64` (token_delta) | shipped | +8.4% .. +9.5% | +11.3% .. +17.3% |
+| H200 | Qwen3.5-35B bf16 | 128 | `prefill.shared` (materialized) | -5.7% .. -6.1% (bs1 -4.0%) | +10.7% .. +14.8% | shipped |
+| H200 | Inkling-Small NVFP4 | 128 | `prefill.shared` (materialized) | -3.8% .. -4.1% (bs1 -2.7%) | +13.1% .. +18.2% | shipped |
+| H200 | Qwen3.5-397B FP8 | 128 | `prefill.shared` (materialized) | -8.1% .. -8.2% (bs1 -4.8%) | +12.0% .. +17.6% | shipped |
+| H200 | Qwen3.5-35B bf16 | 256 | `prefill.shared` (materialized) | -5.3% .. -5.6% (bs1 -3.3%) | +1321% .. +1591% | shipped |
+| GB300 | Qwen3.5-35B FP8 | 8 | `prefill.shared.rank_le32` (token_delta) | shipped | +9.2% .. +12.0% | +5.1% .. +6.2% (bs1 +0.9%) |
+| GB300 | Inkling-Small NVFP4 | 8 | `prefill.shared.rank_le32` (token_delta) | shipped | +6.9% .. +7.1% | +2.2% .. +2.4% (bs1 +0.7%) |
+| GB300 | Qwen3.5-35B FP8 | 64 | `prefill.shared` (materialized) | -3.3% .. -4.3% (bs1 -0.3%) | +0.4% .. +2.8% | shipped |
+| GB300 | Inkling-Small NVFP4 | 64 | `prefill.shared` (materialized) | -2.2% .. -2.7% (bs1 -1.2%) | +1.6% .. +3.8% | shipped |
+| GB300 | Qwen3.5-35B FP8 | 128 | `prefill.shared` (materialized) | -3.5% .. -5.7% (bs1 -2.6%) | +6.2% .. +11.0% | shipped |
+| GB300 | Qwen3.5-35B FP8 | 256 | `prefill.shared` (materialized) | -5.9% .. -6.1% (bs1 -3.5%) | +618% .. +788% | shipped |
+
+`shared_token_delta` wins every band on both architectures, so every in-domain
+shared prefill row now finalizes through it: `prefill.shared.rank_le8` and
+`prefill.shared` on H200 and `prefill.shared` on GB300 moved, and they lose
+their standalone down-B stage and into-base axis with it. The out-of-domain
+fallback rows follow the same evidence rather than the pre-sweep default:
+`fallback.prefill.shared` finalizes through `shared_token_delta` in all three
+tables, and a `fallback.decode.shared` row ahead of the layout-agnostic
+`fallback.decode` gives shared-outer decode `shared_one_pass` there too
+(the per-expert fallbacks keep materialized, the only finalize a per-expert
+adapter can use). The `fallback.decode.shared` tile rule copies
+`decode.shared` on H200 and GB300 (same plan, phase and layout; only the
+domain differs) and `fallback.decode` plus the built-in one-pass tile in the
+default table, so no shipped row runs on the built-in defaults unnoticed. The one-pass prefill numbers above rank 16 are confounded: the
+prefill rows' `shared_token_delta.tail` tile is 1024 wide with 8 warps, tuned
+for the token-delta tail, and at the time both families read one shared tile
+section, so the one-pass kernel ran under it (each family now has its own
+section, `shared_token_delta` and `shared_one_pass`); so at rank 256 it
+spills a 1024 x 256 B tile (the kernel alone runs at 1.5 ms for 8192 tokens
+with a 128-wide tile). No prefill row ships it, and the decode rows use the
+128-wide tile.
+
+Shared decode finalize at the rank extremes (2026-09-03). The decode sweep
+above ran at rank 16. Same protocol at ranks 8, 128 and 256 on Qwen3.5-35B;
+change in decode tokens/s of materialized against the shipped one-pass finalize:
+
+| arch | rank | materialized vs shipped `shared_one_pass` |
+|---|---:|---:|
+| H200 bf16 | 8 | -1.6% .. -3.0% |
+| H200 bf16 | 128 | -0.7% .. +0.1% |
+| H200 bf16 | 256 | -0.2% .. -0.7% (bs8 +0.9%) |
+| GB300 FP8 | 8 | -0.5% .. -2.5% |
+| GB300 FP8 | 128 | -0.2% .. -0.7% |
+| GB300 FP8 | 256 | -0.7% .. -1.4% (bs1 +0.1%) |
+
+The one-pass finalize keeps its lead at rank 8 and ties at 128 and 256, so the
+decode rows stay on it across the whole rank range.
 
 Token route from the request segments (2026-09-03). The shared-outer token
 route, one row per token grouped by adapter slot, used to be built like the
@@ -559,7 +698,7 @@ share one slot, and the batch carries the request boundaries (`seg_indptr`).
 One program now walks the requests and writes each one's tokens in place,
 padded to whole blocks, keyed by its slot; a request without an adapter adds
 no block. Same route contract, same consumers (`token_grouped` A and the
-`shared_token_gemm` finalize). Tokens whose experts all live on other ranks
+`shared_token_delta` finalize). Tokens whose experts all live on other ranks
 are no longer dropped from the route; their rows are computed and never read.
 
 TTFT with the segment route against the histogram route, prefill 4096 tokens
@@ -569,6 +708,21 @@ per request, bs 32/16/8/1, two rounds each, H200, rank 16:
 |---|---:|---:|---:|---:|
 | Qwen3.5-35B bf16 | -1.4% | -1.4% | -1.1% | -1.2% |
 | Inkling-Small NVFP4 | -0.7% | -1.1% | -2.1% | -0.5% |
+
+Per-pair inner product on the NVFP4 decode row (2026-09-03). The gb300 NVFP4
+decode row runs `token_dense` A, `per_pair` B over its slot planes, `per_pair`
+down-A and `shared_one_pass`. A variant of both per-pair kernels on
+`tl.dot`, a 16-row tile holding one live row, was measured against the shipped
+`tl.sum` kernels on that row (128 input, 256 output tokens, bs 64/32/8/1, two
+rounds):
+
+| model | tl.sum vs tl.dot variant, decode tok/s |
+|---|---:|
+| Inkling-Small NVFP4, rank 32 | +0.5% .. +1.7% |
+| Qwen3.5-397B NVFP4, rank 16 | -0.2% .. +0.3% |
+
+The `tl.sum` kernels win or tie, so no dot variant ships: one kernel per site
+serves every raw route.
 
 Base GEMM orientation (2026-09-04). The CuTeDSL grouped GEMMs run one
 orientation: the weight on the MMA M axis and the tokens on the N axis, which

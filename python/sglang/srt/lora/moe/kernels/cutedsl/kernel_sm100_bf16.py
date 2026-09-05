@@ -69,7 +69,6 @@ class GroupedGemmKernelSm100Bf16:
         cluster_shape_mn: Tuple[int, int],
         mma_inst_tile_k: int = 4,
         persistent_clusters: int | None = None,
-        produce_pdl: bool = False,
         swap_ab: bool = False,
         contiguous_segments: bool = False,
     ):
@@ -81,7 +80,6 @@ class GroupedGemmKernelSm100Bf16:
         self.mma_tiler = (*mma_tiler_mn, 1)
         self.mma_inst_tile_k = mma_inst_tile_k
         self.persistent_clusters = persistent_clusters
-        self.produce_pdl = produce_pdl
         self.swap_ab = swap_ab
         self.contiguous_segments = contiguous_segments
         if contiguous_segments and not swap_ab:
@@ -308,10 +306,6 @@ class GroupedGemmKernelSm100Bf16:
     ):
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
-        if cutlass.const_expr(self.produce_pdl):
-            # Start the next kernel's prologue now; its own wait still holds
-            # back the first read of this GEMM's output.
-            cute.arch.griddepcontrol_launch_dependents()
 
         if warp_idx == self.tma_warp_id:
             cpasync.prefetch_descriptor(tma_atom_a)

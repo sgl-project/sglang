@@ -17,6 +17,7 @@ class MoeLoraWorkspace:
         self._eager_buffers: dict[
             tuple[str, torch.dtype, torch.device], torch.Tensor
         ] = {}
+        self._iota: dict[torch.device, torch.Tensor] = {}
         self._streams: dict[torch.device, torch.cuda.Stream] = {}
         self._events: dict[tuple[torch.device, str], torch.cuda.Event] = {}
         self._graph_mode = False
@@ -69,6 +70,35 @@ class MoeLoraWorkspace:
                 self._eager_buffers[key] = storage
             tensor = storage[:elements].view(resolved_shape)
         return tensor
+
+    def iota(self, n: int, device: torch.device | str) -> torch.Tensor:
+        """Return an int32 identity map [0..n), filled outside capture.
+
+        Graph mode keys the map by length so a captured pointer is never
+        freed by later growth; eager mode grows one shared buffer.
+        """
+        resolved_device = torch.device(device)
+        if self._graph_mode:
+            key = ("iota", (n,), torch.int32, resolved_device)
+            tensor = self._graph_buffers.get(key)
+            if tensor is None:
+                if self._capturing(resolved_device):
+                    raise RuntimeError(
+                        "the MoE LoRA iota buffer was not warmed before CUDA capture"
+                    )
+                tensor = torch.arange(n, dtype=torch.int32, device=resolved_device)
+                self._graph_buffers[key] = tensor
+            return tensor
+        buffer = self._iota.get(resolved_device)
+        if buffer is None or buffer.numel() < n:
+            if self._capturing(resolved_device):
+                raise RuntimeError(
+                    "the MoE LoRA iota buffer cannot grow inside CUDA capture"
+                )
+            capacity = max(n, 2 * buffer.numel() if buffer is not None else n)
+            buffer = torch.arange(capacity, dtype=torch.int32, device=resolved_device)
+            self._iota[resolved_device] = buffer
+        return buffer[:n]
 
     def side_stream(self, device: torch.device | str) -> torch.cuda.Stream:
         # Calls on one device must fork from the same stream.

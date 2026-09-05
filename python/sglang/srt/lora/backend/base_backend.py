@@ -249,9 +249,12 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
 
         base = moe_layer.base_layer
         top_k = base.top_k
-        qinfo = moe_layer._quant_info
-        E, N, _ = qinfo.w13_weight.shape
-        hidden_dim = qinfo.w2_weight.shape[1]
+        # Packed Marlin tensor shapes do not expose the logical dimensions.
+        E = int(base.num_local_experts)
+        N = (2 if base.moe_runner_config.is_gated else 1) * int(
+            base.intermediate_size_per_partition
+        )
+        hidden_dim = int(base.hidden_size)
         dtype = compute_dtype
         num_experts = base.num_experts
 

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.lora.moe.base_gemm_provider import select_provider_cls
 from sglang.srt.lora.moe.execution_plan import (
     ActFamily,
     ActivationFn,
@@ -130,13 +131,6 @@ class TestDownBIntoBasePlan:
         assert reordered.down_b.family is LoraBFamily.GROUPED
         assert reordered.finalize.family is FinalizeFamily.MATERIALIZED
 
-    def test_flagged_plan_leaves_the_shape_keyed_conversions(self) -> None:
-        # With the scatter, down-B writes into the base down rows. The plan is
-        # then no longer the plain serial shape.
-        plan = _serial_plan()
-        assert plan.is_fully_serial_materialized()
-        assert not replace(plan, down_b_into_base=True).is_fully_serial_materialized()
-
     def test_flag_leaves_the_b_family_to_provider_capability(self) -> None:
         # The provider says which down-B kernel does the scatter. The plan
         # does not fix the down-B family.
@@ -173,12 +167,12 @@ class TestDownBIntoBasePlan:
         assert RouteRequirement.ALIGNED_PER_EXPERT in scattered.route_requirements()
 
     def test_flag_requires_a_standalone_down_b(self) -> None:
-        # The shared-rank reduce consumes down-B inside finalize. There is
-        # then no separate down-B stage to move. The H200 shared row uses
-        # this form.
+        # A shared finalize consumes down-B inside finalize. There is then
+        # no separate down-B stage to move. The shared prefill rows for rank
+        # 9-64 use this form.
         consumed = _build_plan(
             is_shared_outer=True,
-            finalize_family=FinalizeFamily.SHARED_RANK_REDUCE,
+            finalize_family=FinalizeFamily.SHARED_TOKEN_DELTA,
         )
         assert consumed.down_b is None
         with pytest.raises(ValueError, match="down-B into-base"):
@@ -209,15 +203,10 @@ def _into_base_expected(name: str, layout) -> bool:
     No separate down-B stage then remains to move.
     """
     if layout != False:
-        # gb300's rank_le32 shared row copies its parent and keeps the scatter;
-        # h200's rank_le16/le64 shared rows finalize through shared_rank_reduce
-        # and are excluded.
-        return name in (
-            "prefill.shared",
-            "prefill.shared.rank_le8",
-            "prefill.shared.rank_le32",
-            "fallback.prefill.shared",
-        )
+        # Every shared prefill row, the out-of-domain fallback included,
+        # finalizes through shared_token_delta, which consumes down-B in the
+        # finalize, so no shared row has a standalone down-B stage to move.
+        return False
     return name in (
         "prefill.per_expert",
         "prefill.per_expert.rank_le16",
@@ -667,14 +656,14 @@ def _bind_test_menu(runner, plan, launch_config):
     selected = SelectedPlan(key="test", name="test", base_gemm_rows="test", plan=plan)
     tiles = SimpleNamespace(config_for=lambda num_tokens: launch_config)
     runner.plans = {Phase.PREFILL: selected, Phase.DECODE: selected}
-    runner.tiles = {Phase.PREFILL: tiles, Phase.DECODE: tiles}
+    runner.tiles = {selected.key: tiles}
 
 
 def _build_runner(plan, launch_config, base_gemm_rows: str, gpu, num_experts: int):
     from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
     from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
 
-    provider = MoeLoraRunner.select_provider_cls(base_gemm_rows, "cutedsl")(
+    provider = select_provider_cls(base_gemm_rows, "bf16")(
         MoeLoraBf16QuantInfo(
             w13_weight=gpu["w13_weight"],
             w2_weight=gpu["w2_weight"],

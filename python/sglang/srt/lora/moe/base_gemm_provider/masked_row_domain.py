@@ -10,11 +10,11 @@ import torch
 
 from sglang.srt.lora.moe.base_gemm_provider.base import (
     MoeBaseProvider,
-    admit_bf16_weights,
+    admit_weight_layout,
     expected_rows_per_expert,
     prepare_buffer,
 )
-from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
+from sglang.srt.lora.moe.quant_info import StandardLayoutQuantInfo
 
 if TYPE_CHECKING:
     from sglang.srt.lora.moe.route_view import RouteView
@@ -40,9 +40,9 @@ class MaskedRowState(msgspec.Struct, kw_only=True):
 
 
 class MaskedRowDomainProvider(MoeBaseProvider):
-    def __init__(self, quant_info: MoeLoraBf16QuantInfo):
+    def __init__(self, quant_info: StandardLayoutQuantInfo):
         self.quant_info = quant_info
-        self._gate_up_slices = admit_bf16_weights(quant_info)
+        self._gate_up_slices = admit_weight_layout(quant_info)
 
         from sglang.srt.lora.moe.kernels.activation_delta import (
             act_delta_masked,
@@ -127,7 +127,6 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         activation_lora_input: torch.Tensor,
         *,
         activation: str = "silu",
-        consume_base_pdl: bool = False,
     ) -> None:
         self._act_kernel(
             gateup_out,
@@ -139,7 +138,6 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             gate_first=self.contract.gate_first,
             interleaved=self.contract.interleaved,
             activation=activation,
-            consume_base_pdl=consume_base_pdl,
         )
 
     def fused_act(
@@ -155,7 +153,6 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         bridge_gateup: torch.Tensor | None = None,
         b_gate_up: torch.Tensor | None = None,
         bridge_top_k: int = 1,
-        consume_base_pdl: bool = False,
     ) -> None:
         self._fused_act(
             activation=activation,
@@ -171,7 +168,6 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             bridge_gateup=bridge_gateup,
             b_gate_up=b_gate_up,
             bridge_top_k=bridge_top_k,
-            consume_base_pdl=consume_base_pdl,
         )
 
     def gateup_out_shape(self, row_state: MaskedRowState) -> tuple[int, ...]:

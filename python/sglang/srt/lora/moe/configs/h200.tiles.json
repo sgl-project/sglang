@@ -47,17 +47,17 @@
     "sites": {
      "b_activation": {
       "BLOCK_SIZE_K": 16,
-      "BLOCK_SIZE_W": 256,
+      "BLOCK_SIZE_W": 64,
       "GROUP_SIZE_M": 16,
-      "num_stages": 4,
-      "num_warps": 8
-     },
-     "down_a": {
-      "BLOCK_SIZE_K": 128,
-      "BLOCK_SIZE_N": 64,
-      "GROUP_SIZE_M": 8,
       "num_stages": 2,
       "num_warps": 4
+     },
+     "down_a": {
+      "BLOCK_SIZE_K": 64,
+      "BLOCK_SIZE_N": 16,
+      "GROUP_SIZE_M": 16,
+      "num_stages": 2,
+      "num_warps": 2
      },
      "down_b": {
       "BLOCK_SIZE_K": 16,
@@ -67,10 +67,10 @@
       "num_warps": 4
      },
      "gate_up_a": {
-      "BLOCK_SIZE_K": 64,
-      "BLOCK_SIZE_N": 16,
+      "BLOCK_SIZE_K": 128,
+      "BLOCK_SIZE_N": 32,
       "GROUP_SIZE_M": 8,
-      "num_stages": 3,
+      "num_stages": 2,
       "num_warps": 2
      },
      "gate_up_b": {
@@ -209,7 +209,12 @@
       "num_stages": 3,
       "num_warps": 8
      },
-     "routing_block_size": 16
+     "routing_block_size": 16,
+     "shared_one_pass": {
+      "BLOCK_SIZE_H": 128,
+      "num_stages": 3,
+      "num_warps": 4
+     }
     }
    }
   ],
@@ -254,17 +259,16 @@
       "num_warps": 4
      },
      "routing_block_size": 16,
-     "shared_finalize": {
+     "shared_token_delta": {
       "reduce": {
        "BLOCK_SIZE_T": 16,
        "num_stages": 2,
        "num_warps": 8
       },
       "tail": {
-       "BLOCK_SIZE_H": 512,
-       "BLOCK_SIZE_K": 16,
+       "BLOCK_SIZE_H": 1024,
        "num_stages": 2,
-       "num_warps": 2
+       "num_warps": 8
       }
      }
     }
@@ -310,7 +314,19 @@
       "num_stages": 2,
       "num_warps": 4
      },
-     "routing_block_size": 32
+     "routing_block_size": 32,
+     "shared_token_delta": {
+      "reduce": {
+       "BLOCK_SIZE_T": 16,
+       "num_stages": 2,
+       "num_warps": 8
+      },
+      "tail": {
+       "BLOCK_SIZE_H": 1024,
+       "num_stages": 2,
+       "num_warps": 8
+      }
+     }
     }
    }
   ],
@@ -355,17 +371,16 @@
       "num_warps": 4
      },
      "routing_block_size": 16,
-     "shared_finalize": {
+     "shared_token_delta": {
       "reduce": {
        "BLOCK_SIZE_T": 16,
        "num_stages": 2,
        "num_warps": 8
       },
       "tail": {
-       "BLOCK_SIZE_H": 256,
-       "BLOCK_SIZE_K": 32,
+       "BLOCK_SIZE_H": 1024,
        "num_stages": 2,
-       "num_warps": 4
+       "num_warps": 8
       }
      }
     }
@@ -411,7 +426,66 @@
       "num_stages": 2,
       "num_warps": 4
      },
-     "routing_block_size": 64
+     "routing_block_size": 64,
+     "shared_token_delta": {
+      "reduce": {
+       "BLOCK_SIZE_T": 16,
+       "num_stages": 2,
+       "num_warps": 8
+      },
+      "tail": {
+       "BLOCK_SIZE_H": 1024,
+       "num_stages": 2,
+       "num_warps": 8
+      }
+     }
+    }
+   }
+  ],
+  "fallback.decode.shared": [
+   {
+    "sites": {
+     "b_activation": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_W": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "down_a": {
+      "BLOCK_SIZE_K": 128,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 4,
+      "num_warps": 4
+     },
+     "down_b": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_N": 128,
+      "GROUP_SIZE_M": 1,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "gate_up_a": {
+      "BLOCK_SIZE_K": 128,
+      "BLOCK_SIZE_N": 32,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 3,
+      "num_warps": 4
+     },
+     "gate_up_b": {
+      "BLOCK_SIZE_K": 64,
+      "BLOCK_SIZE_N": 256,
+      "GROUP_SIZE_M": 4,
+      "num_stages": 3,
+      "num_warps": 8
+     },
+     "routing_block_size": 16,
+     "shared_one_pass": {
+      "BLOCK_SIZE_H": 128,
+      "num_stages": 3,
+      "num_warps": 4
+     }
     }
    }
   ],
@@ -543,7 +617,19 @@
       "num_stages": 2,
       "num_warps": 4
      },
-     "routing_block_size": 32
+     "routing_block_size": 32,
+     "shared_token_delta": {
+      "reduce": {
+       "BLOCK_SIZE_T": 32,
+       "num_stages": 2,
+       "num_warps": 4
+      },
+      "tail": {
+       "BLOCK_SIZE_H": 1024,
+       "num_stages": 2,
+       "num_warps": 8
+      }
+     }
     }
    }
   ]

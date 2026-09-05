@@ -1,7 +1,7 @@
 """Check a model's MoE LoRA plan coverage, or emit a seed table for it.
 
---check reports which shipped row serves each (layout, phase), or that the
-model falls to the serial fallback (exit code 1).
+--check reports which shipped row serves each (layout, phase) for the given
+--quant-family, or that the model falls to the serial fallback (exit code 1).
 --emit-seed writes <out>/<arch>.plans.json with the domain widened to the
 model. The seed only reuses the existing plans for the wider geometry:
 validate provider admission and correctness on that geometry before serving
@@ -59,6 +59,7 @@ def resolve_report(args, geometry) -> int:
     fell_through = 0
     for is_shared_outer in (False, True):
         selected = resolve_plans(
+            quant_family=args.quant_family,
             architecture=architecture_for_capability(args.capability_major, 0),
             is_shared_outer=is_shared_outer,
             physical_rank=args.max_rank,
@@ -116,6 +117,12 @@ def main() -> None:
         help="whether gate/up is 2x intermediate; not in any config.json",
     )
     ap.add_argument("--max-rank", type=int, default=32)
+    ap.add_argument(
+        "--quant-family",
+        choices=("bf16", "fp8", "nvfp4"),
+        default="bf16",
+        help="weight family whose rows --check reports",
+    )
     ap.add_argument("--config-dir", default=None)
     ap.add_argument("--out", default="./tuned_config")
     ap.add_argument("--check", action="store_true")

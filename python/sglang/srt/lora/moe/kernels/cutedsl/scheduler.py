@@ -106,10 +106,6 @@ class MoESchedulerParams:
         return self.cta_tile_shape_mnk[0] * self.cluster_shape_mn[0]
 
     @property
-    def cluster_tile_n(self) -> int:
-        return self.cta_tile_shape_mnk[1] * self.cluster_shape_mn[1]
-
-    @property
     def cta_tile_k(self) -> int:
         return self.cta_tile_shape_mnk[2]
 

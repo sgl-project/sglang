@@ -20,9 +20,10 @@ Four things pick what a layer executes, and they run at two different times.
    row matches, the `fallback` rows are walked the same way instead.
 2. **Provider.** Joined from two places: the matched row's `base_gemm_rows`
    (`expert_major` / `route_major`) says which row order the plan needs, and
-   `--moe-lora-base-gemm` says which vendor implements it (`cutedsl` default
-   or route-major-only `triton`). A geometry a vendor cannot admit fails at
-   attach.
+   `--moe-runner-backend lora_<vendor>` says which vendor implements it
+   (`cutedsl`, the bf16/fp8 default; `triton`; `marlin`, the nvfp4 default).
+   Triton and Marlin have no masked slab domain and run an `expert_major` row
+   on their route-major class. A geometry a vendor cannot admit fails at attach.
 3. **Tile rules.** `resolve_tiles` takes that row's rule list and drops every
    rule whose `max_rank` is below the bound rank. What survives is a ladder.
 
@@ -109,7 +110,8 @@ size instead of arguing about the fourth digit.
 
 ## Scripts here
 
-- `tune_lora_config.py` — report which shipped rows serve a model (`--check`) and emit a seed plan table whose `domain`
+- `tune_lora_config.py` — report which shipped rows serve a model for one
+  `--quant-family` (`--check`) and emit a seed plan table whose `domain`
   covers it (`--emit-seed`) into an output directory that
   `SGLANG_LORA_MOE_CONFIG_DIR` can point at directly. The seed reuses existing
   plans: validate admission and correctness on the new geometry, then tune it

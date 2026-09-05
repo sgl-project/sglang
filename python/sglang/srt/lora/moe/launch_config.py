@@ -13,7 +13,8 @@ from sglang.srt.lora.moe.execution_plan import (
     Site,
 )
 from sglang.srt.lora.moe.kernels.finalize import (
-    SHARED_RANK_DEFAULT_CONFIG,
+    SHARED_ONE_PASS_DEFAULT_CONFIG,
+    SHARED_TOKEN_DELTA_DEFAULT_CONFIG,
 )
 from sglang.srt.lora.moe.kernels.fused_act import (
     FUSED_B_ACT_DEFAULT_CONFIG,
@@ -66,11 +67,14 @@ class MoeLoraLaunchConfig:
     b_activation: dict[str, int] = field(
         default_factory=lambda: dict(FUSED_B_ACT_DEFAULT_CONFIG)
     )
-    shared_finalize: dict[str, dict[str, int]] = field(
+    shared_token_delta: dict[str, dict[str, int]] = field(
         default_factory=lambda: {
             name: dict(values)
-            for name, values in SHARED_RANK_DEFAULT_CONFIG.items()
+            for name, values in SHARED_TOKEN_DELTA_DEFAULT_CONFIG.items()
         }
+    )
+    shared_one_pass: dict[str, int] = field(
+        default_factory=lambda: dict(SHARED_ONE_PASS_DEFAULT_CONFIG)
     )
 
     def __post_init__(self) -> None:
@@ -96,10 +100,13 @@ class MoeLoraLaunchConfig:
                     f"{name} declares BLOCK_SIZE_M={declared}, but the aligned "
                     f"route uses routing_block_size={self.routing_block_size}"
                 )
-        if set(self.shared_finalize) != {"reduce", "tail"}:
-            raise ValueError("shared_finalize must contain exactly 'reduce' and 'tail'")
-        for name, config in self.shared_finalize.items():
-            _validate_flat_config(f"shared_finalize.{name}", config)
+        if set(self.shared_token_delta) != {"reduce", "tail"}:
+            raise ValueError(
+                "shared_token_delta must contain exactly 'reduce' and 'tail'"
+            )
+        for name, config in self.shared_token_delta.items():
+            _validate_flat_config(f"shared_token_delta.{name}", config)
+        _validate_flat_config("shared_one_pass", self.shared_one_pass)
 
     def for_a(self, site: Site) -> Mapping[str, int]:
         return self.gate_up_a if site is Site.GATE_UP else self.down_a

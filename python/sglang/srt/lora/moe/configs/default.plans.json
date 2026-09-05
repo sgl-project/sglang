@@ -1,51 +1,63 @@
 {
- "arch": "default",
- "domain": {
-  "max_hidden": 0,
-  "max_local_experts": 0
- },
- "scenarios": [],
- "fallback": [
-  {
-   "name": "fallback.decode",
-   "phase": "decode",
-   "base_gemm_rows": "expert_major",
-   "plan": {
-    "gate_up_a_family": "grouped",
-    "down_a_family": "grouped",
-    "gate_up_b_family": "grouped",
-    "down_b_family": "grouped",
-    "act_family": "materialized",
-    "finalize_family": "materialized"
-   }
+  "arch": "default",
+  "domain": {
+    "max_hidden": 0,
+    "max_local_experts": 0
   },
-  {
-   "name": "fallback.prefill.per_expert",
-   "layout": "per_expert",
-   "phase": "prefill",
-   "base_gemm_rows": "route_major",
-   "plan": {
-    "gate_up_a_family": "grouped",
-    "down_a_family": "grouped",
-    "down_b_family": "grouped",
-    "act_family": "b_activation",
-    "finalize_family": "materialized",
-    "down_b_into_base": true
-   }
-  },
-  {
-   "name": "fallback.prefill.shared",
-   "layout": "shared",
-   "phase": "prefill",
-   "base_gemm_rows": "expert_major",
-   "plan": {
-    "gate_up_a_family": "grouped",
-    "down_a_family": "grouped",
-    "down_b_family": "grouped",
-    "act_family": "b_activation",
-    "finalize_family": "materialized",
-    "down_b_into_base": true
-   }
-  }
- ]
+  "scenarios": [],
+  "fallback": [
+    {
+      "name": "fallback.decode.shared",
+      "layout": "shared",
+      "phase": "decode",
+      "base_gemm_rows": "expert_major",
+      "plan": {
+        "gate_up_a_family": "grouped",
+        "down_a_family": "grouped",
+        "gate_up_b_family": "grouped",
+        "act_family": "materialized",
+        "finalize_family": "shared_one_pass"
+      }
+    },
+    {
+      "name": "fallback.decode",
+      "phase": "decode",
+      "base_gemm_rows": "expert_major",
+      "plan": {
+        "gate_up_a_family": "grouped",
+        "down_a_family": "grouped",
+        "gate_up_b_family": "grouped",
+        "down_b_family": "grouped",
+        "act_family": "materialized",
+        "finalize_family": "materialized"
+      }
+    },
+    {
+      "name": "fallback.prefill.per_expert",
+      "layout": "per_expert",
+      "phase": "prefill",
+      "base_gemm_rows": "route_major",
+      "plan": {
+        "gate_up_a_family": "grouped",
+        "down_a_family": "grouped",
+        "down_b_family": "grouped",
+        "act_family": "b_activation",
+        "finalize_family": "materialized",
+        "down_b_into_base": true
+      }
+    },
+    {
+      "name": "fallback.prefill.shared",
+      "layout": "shared",
+      "phase": "prefill",
+      "base_gemm_rows": "route_major",
+      "plan": {
+        "gate_up_a_family": "token_grouped",
+        "down_a_family": "grouped",
+        "act_family": "b_activation",
+        "finalize_family": "shared_token_delta",
+        "route_builder": "parallel_shared_outer"
+      }
+    }
+  ]
 }

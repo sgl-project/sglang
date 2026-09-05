@@ -1,190 +1,200 @@
 {
- "arch": "h200",
- "domain": {
-  "max_hidden": 4096,
-  "max_local_experts": 512
- },
- "scenarios": [
-  {
-   "name": "decode.per_expert",
-   "layout": "per_expert",
-   "phase": "decode",
-   "base_gemm_rows": "expert_major",
-   "plan": {
-    "gate_up_a_family": "grouped",
-    "down_a_family": "per_pair",
-    "gate_up_b_family": "grouped",
-    "down_b_family": "grouped",
-    "act_family": "materialized",
-    "finalize_family": "materialized",
-    "gate_up_overlap": "gate_up_a_b",
-    "down_overlap": "down_a_b"
-   }
+  "arch": "h200",
+  "domain": {
+    "max_hidden": 4096,
+    "max_local_experts": 512
   },
-  {
-   "name": "prefill.per_expert.rank_le16",
-   "layout": "per_expert",
-   "phase": "prefill",
-   "base_gemm_rows": "route_major",
-   "plan": {
-    "gate_up_a_family": "grouped",
-    "down_a_family": "grouped",
-    "down_b_family": "grouped",
-    "act_family": "b_activation",
-    "finalize_family": "materialized",
-    "down_b_into_base": true,
-    "gate_up_overlap": "gate_up_a"
-   },
-   "max_rank": 16
-  },
-  {
-   "name": "prefill.per_expert.rank_le32",
-   "layout": "per_expert",
-   "phase": "prefill",
-   "base_gemm_rows": "route_major",
-   "plan": {
-    "gate_up_a_family": "grouped",
-    "down_a_family": "grouped",
-    "down_b_family": "grouped",
-    "act_family": "b_activation",
-    "finalize_family": "materialized",
-    "down_b_into_base": true
-   },
-   "max_rank": 32
-  },
-  {
-   "name": "prefill.per_expert",
-   "layout": "per_expert",
-   "phase": "prefill",
-   "base_gemm_rows": "route_major",
-   "plan": {
-    "gate_up_a_family": "grouped",
-    "down_a_family": "grouped",
-    "down_b_family": "grouped",
-    "act_family": "b_activation",
-    "finalize_family": "materialized",
-    "down_b_into_base": true
-   }
-  },
-  {
-   "name": "decode.shared",
-   "layout": "shared",
-   "phase": "decode",
-   "base_gemm_rows": "expert_major",
-   "plan": {
-    "gate_up_a_family": "grouped",
-    "down_a_family": "grouped",
-    "gate_up_b_family": "grouped",
-    "down_b_family": "grouped",
-    "act_family": "materialized",
-    "finalize_family": "materialized",
-    "gate_up_overlap": "gate_up_a_b",
-    "down_overlap": "down_a_b",
-    "route_builder": "parallel_shared_outer"
-   }
-  },
-  {
-   "name": "prefill.shared.rank_le8",
-   "layout": "shared",
-   "phase": "prefill",
-   "max_rank": 8,
-   "base_gemm_rows": "route_major",
-   "plan": {
-    "gate_up_a_family": "token_grouped",
-    "down_a_family": "grouped",
-    "down_b_family": "grouped",
-    "act_family": "b_activation",
-    "finalize_family": "materialized",
-    "route_builder": "parallel_shared_outer",
-    "down_b_into_base": true
-   }
-  },
-  {
-   "name": "prefill.shared.rank_le16",
-   "layout": "shared",
-   "phase": "prefill",
-   "max_rank": 16,
-   "base_gemm_rows": "route_major",
-   "plan": {
-    "gate_up_a_family": "token_grouped",
-    "down_a_family": "grouped",
-    "act_family": "b_activation",
-    "finalize_family": "shared_rank_reduce",
-    "gate_up_overlap": "gate_up_a"
-   }
-  },
-  {
-   "name": "prefill.shared.rank_le64",
-   "layout": "shared",
-   "phase": "prefill",
-   "max_rank": 64,
-   "base_gemm_rows": "route_major",
-   "plan": {
-    "gate_up_a_family": "token_grouped",
-    "down_a_family": "grouped",
-    "act_family": "b_activation",
-    "finalize_family": "shared_rank_reduce"
-   }
-  },
-  {
-   "name": "prefill.shared",
-   "layout": "shared",
-   "phase": "prefill",
-   "base_gemm_rows": "route_major",
-   "plan": {
-    "gate_up_a_family": "token_grouped",
-    "down_a_family": "grouped",
-    "down_b_family": "grouped",
-    "act_family": "b_activation",
-    "finalize_family": "materialized",
-    "route_builder": "parallel_shared_outer",
-    "down_b_into_base": true
-   }
-  }
- ],
- "fallback": [
-  {
-   "name": "fallback.decode",
-   "phase": "decode",
-   "base_gemm_rows": "expert_major",
-   "plan": {
-    "gate_up_a_family": "grouped",
-    "down_a_family": "grouped",
-    "gate_up_b_family": "grouped",
-    "down_b_family": "grouped",
-    "act_family": "materialized",
-    "finalize_family": "materialized",
-    "down_overlap": "down_a_b",
-    "gate_up_overlap": "gate_up_a_b"
-   }
-  },
-  {
-   "name": "fallback.prefill.per_expert",
-   "layout": "per_expert",
-   "phase": "prefill",
-   "base_gemm_rows": "route_major",
-   "plan": {
-    "gate_up_a_family": "grouped",
-    "down_a_family": "grouped",
-    "down_b_family": "grouped",
-    "act_family": "b_activation",
-    "finalize_family": "materialized",
-    "down_b_into_base": true
-   }
-  },
-  {
-   "name": "fallback.prefill.shared",
-   "layout": "shared",
-   "phase": "prefill",
-   "base_gemm_rows": "expert_major",
-   "plan": {
-    "gate_up_a_family": "grouped",
-    "down_a_family": "grouped",
-    "down_b_family": "grouped",
-    "act_family": "b_activation",
-    "finalize_family": "materialized",
-    "down_b_into_base": true
-   }
-  }
- ]
+  "scenarios": [
+    {
+      "name": "decode.per_expert",
+      "layout": "per_expert",
+      "phase": "decode",
+      "base_gemm_rows": "expert_major",
+      "plan": {
+        "gate_up_a_family": "grouped",
+        "down_a_family": "per_pair",
+        "gate_up_b_family": "grouped",
+        "down_b_family": "grouped",
+        "act_family": "materialized",
+        "finalize_family": "materialized",
+        "gate_up_overlap": "gate_up_a_b",
+        "down_overlap": "down_a_b"
+      }
+    },
+    {
+      "name": "prefill.per_expert.rank_le16",
+      "layout": "per_expert",
+      "phase": "prefill",
+      "base_gemm_rows": "route_major",
+      "plan": {
+        "gate_up_a_family": "grouped",
+        "down_a_family": "grouped",
+        "down_b_family": "grouped",
+        "act_family": "b_activation",
+        "finalize_family": "materialized",
+        "down_b_into_base": true,
+        "gate_up_overlap": "gate_up_a"
+      },
+      "max_rank": 16
+    },
+    {
+      "name": "prefill.per_expert.rank_le32",
+      "layout": "per_expert",
+      "phase": "prefill",
+      "base_gemm_rows": "route_major",
+      "plan": {
+        "gate_up_a_family": "grouped",
+        "down_a_family": "grouped",
+        "down_b_family": "grouped",
+        "act_family": "b_activation",
+        "finalize_family": "materialized",
+        "down_b_into_base": true
+      },
+      "max_rank": 32
+    },
+    {
+      "name": "prefill.per_expert",
+      "layout": "per_expert",
+      "phase": "prefill",
+      "base_gemm_rows": "route_major",
+      "plan": {
+        "gate_up_a_family": "grouped",
+        "down_a_family": "grouped",
+        "down_b_family": "grouped",
+        "act_family": "b_activation",
+        "finalize_family": "materialized",
+        "down_b_into_base": true
+      }
+    },
+    {
+      "name": "decode.shared",
+      "layout": "shared",
+      "phase": "decode",
+      "base_gemm_rows": "expert_major",
+      "plan": {
+        "gate_up_a_family": "grouped",
+        "down_a_family": "grouped",
+        "gate_up_b_family": "grouped",
+        "act_family": "materialized",
+        "finalize_family": "shared_one_pass",
+        "gate_up_overlap": "gate_up_a_b",
+        "down_overlap": "down_a",
+        "route_builder": "parallel_shared_outer"
+      }
+    },
+    {
+      "name": "prefill.shared.rank_le8",
+      "layout": "shared",
+      "phase": "prefill",
+      "max_rank": 8,
+      "base_gemm_rows": "route_major",
+      "plan": {
+        "gate_up_a_family": "token_grouped",
+        "down_a_family": "grouped",
+        "act_family": "b_activation",
+        "finalize_family": "shared_token_delta",
+        "route_builder": "parallel_shared_outer"
+      }
+    },
+    {
+      "name": "prefill.shared.rank_le16",
+      "layout": "shared",
+      "phase": "prefill",
+      "max_rank": 16,
+      "base_gemm_rows": "route_major",
+      "plan": {
+        "gate_up_a_family": "token_grouped",
+        "down_a_family": "grouped",
+        "act_family": "b_activation",
+        "finalize_family": "shared_token_delta",
+        "gate_up_overlap": "gate_up_a"
+      }
+    },
+    {
+      "name": "prefill.shared.rank_le64",
+      "layout": "shared",
+      "phase": "prefill",
+      "max_rank": 64,
+      "base_gemm_rows": "route_major",
+      "plan": {
+        "gate_up_a_family": "token_grouped",
+        "down_a_family": "grouped",
+        "act_family": "b_activation",
+        "finalize_family": "shared_token_delta"
+      }
+    },
+    {
+      "name": "prefill.shared",
+      "layout": "shared",
+      "phase": "prefill",
+      "base_gemm_rows": "route_major",
+      "plan": {
+        "gate_up_a_family": "token_grouped",
+        "down_a_family": "grouped",
+        "act_family": "b_activation",
+        "finalize_family": "shared_token_delta",
+        "route_builder": "parallel_shared_outer"
+      }
+    }
+  ],
+  "fallback": [
+    {
+      "name": "fallback.decode.shared",
+      "layout": "shared",
+      "phase": "decode",
+      "base_gemm_rows": "expert_major",
+      "plan": {
+        "gate_up_a_family": "grouped",
+        "down_a_family": "grouped",
+        "gate_up_b_family": "grouped",
+        "act_family": "materialized",
+        "finalize_family": "shared_one_pass",
+        "gate_up_overlap": "gate_up_a_b",
+        "down_overlap": "down_a",
+        "route_builder": "parallel_shared_outer"
+      }
+    },
+    {
+      "name": "fallback.decode",
+      "phase": "decode",
+      "base_gemm_rows": "expert_major",
+      "plan": {
+        "gate_up_a_family": "grouped",
+        "down_a_family": "grouped",
+        "gate_up_b_family": "grouped",
+        "down_b_family": "grouped",
+        "act_family": "materialized",
+        "finalize_family": "materialized",
+        "down_overlap": "down_a_b",
+        "gate_up_overlap": "gate_up_a_b"
+      }
+    },
+    {
+      "name": "fallback.prefill.per_expert",
+      "layout": "per_expert",
+      "phase": "prefill",
+      "base_gemm_rows": "route_major",
+      "plan": {
+        "gate_up_a_family": "grouped",
+        "down_a_family": "grouped",
+        "down_b_family": "grouped",
+        "act_family": "b_activation",
+        "finalize_family": "materialized",
+        "down_b_into_base": true
+      }
+    },
+    {
+      "name": "fallback.prefill.shared",
+      "layout": "shared",
+      "phase": "prefill",
+      "base_gemm_rows": "route_major",
+      "plan": {
+        "gate_up_a_family": "token_grouped",
+        "down_a_family": "grouped",
+        "act_family": "b_activation",
+        "finalize_family": "shared_token_delta",
+        "route_builder": "parallel_shared_outer"
+      }
+    }
+  ]
 }

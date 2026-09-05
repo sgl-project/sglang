@@ -23,11 +23,14 @@ class TritonRowState(msgspec.Struct, kw_only=True):
     top_k: int
     config: dict
     down_config: dict | None
+    # Quantized activation and scales for the down GEMM.
+    act_quant: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 class TritonBf16ContiguousProvider(ContiguousRowDomainProvider):
     contract = MoeBaseProviderContract(
         key="triton_bf16_contiguous",
+        quant_info_cls=MoeLoraBf16QuantInfo,
         gate_first=True,
         interleaved=False,
         gate_up_output_dtype=torch.bfloat16,
@@ -44,6 +47,9 @@ class TritonBf16ContiguousProvider(ContiguousRowDomainProvider):
         )
         self._configs: dict[int, tuple[dict, dict | None]] = {}
 
+    _config_dtype_tag: str | None = None
+    _config_block_shape: list[int] | None = None
+
     def _config_for(self, num_tokens: int, top_k: int) -> tuple[dict, dict | None]:
         cached = self._configs.get(num_tokens)
         if cached is not None:
@@ -56,12 +62,17 @@ class TritonBf16ContiguousProvider(ContiguousRowDomainProvider):
             tuple(self.quant_info.w13_weight.shape),
             tuple(self.quant_info.w2_weight.shape),
             top_k,
-            None,  # bf16 configs carry no dtype suffix
+            self._config_dtype_tag,
             num_tokens,
             return_down_config=True,
+            block_shape=self._config_block_shape,
         )
         # Both GEMMs share a sort; upstream makes their BLOCK_SIZE_M equal.
         resolved = (dict(config), dict(down_config) if down_config else None)
+        # Classic Triton kernels do not accept the TMA launcher's flag.
+        resolved[0].pop("USE_TMA", None)
+        if resolved[1]:
+            resolved[1].pop("USE_TMA", None)
         self._configs[num_tokens] = resolved
         return resolved
 
@@ -72,26 +83,19 @@ class TritonBf16ContiguousProvider(ContiguousRowDomainProvider):
         top_k: int,
         workspace=None,
     ) -> TritonRowState:
-        from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
-            moe_align_block_size,
-        )
+        from sglang.srt.lora.moe.kernels.align_rows import align_rows
 
         config, down_config = self._config_for(hidden_states.shape[0], top_k)
-        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids,
-            int(config["BLOCK_SIZE_M"]),
-            self.quant_info.num_local_experts,
-            ignore_invalid_expert=True,
+        sorted_token_ids, expert_ids, num_tokens_post_padded = align_rows(
+            topk_ids, int(config["BLOCK_SIZE_M"]), self.quant_info.num_local_experts
         )
         num_pairs = topk_ids.numel()
         device = hidden_states.device
         if workspace is not None:
-            pair_to_row = workspace.tensor(
-                "triton:pair_to_row", (num_pairs,), dtype=torch.int32, device=device
-            )
+            # Reuse the identity map to avoid an arange launch per layer.
+            pair_to_row = workspace.iota(num_pairs, device)
         else:
-            pair_to_row = torch.empty(num_pairs, dtype=torch.int32, device=device)
-        torch.arange(num_pairs, dtype=torch.int32, device=device, out=pair_to_row)
+            pair_to_row = torch.arange(num_pairs, dtype=torch.int32, device=device)
         return TritonRowState(
             hidden_states=hidden_states,
             topk_ids=topk_ids,
