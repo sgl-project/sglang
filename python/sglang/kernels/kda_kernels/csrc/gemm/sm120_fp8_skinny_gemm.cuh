@@ -4,8 +4,6 @@
 // KDA provenance: this kernel was automatically optimized by the Humanize2
 // workflow (https://github.com/PolyArch/humanize) and Kernel Design Agents
 // (https://github.com/mit-han-lab/kernel-design-agents).
-// Source: https://github.com/BBuf/KDA-Pilot/pull/199 @
-// 3c0294ba40e00b23138cd2e256b22a9519298da0.
 
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are met:
@@ -33,8 +31,8 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
-// This file integrates the KDA-Pilot SM120 FP8 skinny GEMM with SGLang's JIT
-// kernel and KDA backend interfaces.
+// This file integrates the SM120 FP8 skinny GEMM with SGLang's JIT kernel and
+// KDA backend interfaces.
 
 #pragma once
 
@@ -420,7 +418,7 @@ void launch_gemm(
 namespace sglang {
 
 /**
- * \brief KDA-Pilot SM120 per-tensor FP8 skinny GEMM.
+ * \brief SM120 per-tensor FP8 skinny GEMM for the KDA backend.
  *
  * SGLang performs its reference static quantization before this entry so the
  * full path remains within BF16 tolerance of the FlashInfer fallback.
