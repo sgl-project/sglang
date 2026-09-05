@@ -21,7 +21,7 @@ freed TOKEN ids, has a data-dependent output shape and so must D2H the count;
 page's tokens sitting consecutively in the kv row.
 
 Mirrors `test_paged_free_segment.py`, which pins the same properties for
-`PagedKVAllocator`.
+`PagedKVPool`.
 """
 
 import ast
@@ -31,7 +31,7 @@ import unittest
 from unittest import mock
 
 import torch
-from test_multi_ended_allocator import TestPagedMultiEndedKVAllocator as _PagedFixture
+from test_multi_ended_allocator import TestPagedMultiEndedKVPool as _PagedFixture
 
 from sglang.srt.mem_cache.allocator import (
     unified_hybrid_swa,
@@ -39,7 +39,11 @@ from sglang.srt.mem_cache.allocator import (
     unified_side,
 )
 from sglang.srt.mem_cache.allocator import unified_sub_pool as mea
-from sglang.srt.mem_cache.allocator.base import BaseKVPool, BaseKVPoolSide
+from sglang.srt.mem_cache.allocator.base import (
+    BaseKVAllocator,
+    BaseKVPool,
+    BaseKVPoolSide,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
@@ -48,7 +52,7 @@ PAGE_SIZE = _PagedFixture.PAGE_SIZE
 
 
 def _paged_allocator(lazy: bool):
-    """A real paged `MultiEndedKVAllocator` from the sibling fixture."""
+    """A real paged `MultiEndedKVPool` from the sibling fixture."""
     inst = _PagedFixture([m for m in dir(_PagedFixture) if m.startswith("test_")][0])
     _pool, full, _swa, _fkv, _skv = inst._build()
     full.lazy_compaction = lazy
@@ -65,12 +69,12 @@ _TABLES = {"virtual_to_physical", "physical_to_virtual"}
 # a tombstone" is a per-method design fact a scan cannot infer. Completeness is
 # guarded by `test_every_allocator_free_path_is_listed` below.
 _TOMBSTONE_METHODS = [
-    (mea.MultiEndedKVAllocator, "_free_lazy"),
-    (mea.MultiEndedKVAllocator, "free"),
-    (mea.MultiEndedKVAllocator, "_commit_move_batch"),
-    (mea.FloatMultiEndedKVAllocator, "free"),
-    (mea.FloatMultiEndedKVAllocator, "make_room"),
-    (mea.FloatMultiEndedKVAllocator, "_relocate_to_positions"),
+    (mea.MultiEndedKVPool, "_free_lazy"),
+    (mea.MultiEndedKVPool, "free"),
+    (mea.MultiEndedKVPool, "_commit_move_batch"),
+    (mea.FloatMultiEndedKVPool, "free"),
+    (mea.FloatMultiEndedKVPool, "make_room"),
+    (mea.FloatMultiEndedKVPool, "_relocate_to_positions"),
 ]
 
 
@@ -83,7 +87,7 @@ _UNIFIED_MODULES = (mea, unified_mamba, unified_hybrid_swa)
 
 
 def _allocators_in_module():
-    """Every allocator class DEFINED in the unified allocator modules (not imported)."""
+    """Every pool / allocator class DEFINED in the unified modules (not imported)."""
     return sorted(
         (
             c
@@ -91,7 +95,7 @@ def _allocators_in_module():
             for c in vars(mod).values()
             if isinstance(c, type)
             and c.__module__ == mod.__name__
-            and "Allocator" in c.__name__
+            and issubclass(c, (BaseKVPool, BaseKVAllocator))
         ),
         key=lambda c: c.__name__,
     )
@@ -328,7 +332,7 @@ class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
 
     def test_all_overridden(self):
         for cls, base in (
-            (mea.MultiEndedKVAllocator, BaseKVPool),
+            (mea.MultiEndedKVPool, BaseKVPool),
             (unified_side.VirtualFullKVPoolSide, BaseKVPoolSide),
             (unified_side.VirtualSWAKVPoolSide, BaseKVPoolSide),
         ):
@@ -348,7 +352,7 @@ class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
         buffer, or `free_segment` raises inside a group. The composites fan
         out to their sides, so the buffer is checked on the side that owns it."""
         for cls, buffer in (
-            (mea.MultiEndedKVAllocator, "free_page_reps_group"),
+            (mea.MultiEndedKVPool, "free_page_reps_group"),
             (unified_side.VirtualSWAKVPoolSide, "_pending_reps"),
         ):
             with self.subTest(cls=cls.__name__):

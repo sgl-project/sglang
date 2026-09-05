@@ -29,8 +29,8 @@ from sglang.srt.mem_cache.allocator.unified_side import (
     VirtualSWAKVPoolSide,
 )
 from sglang.srt.mem_cache.allocator.unified_sub_pool import (
-    FloatMultiEndedKVAllocator,
-    MultiEndedKVAllocator,
+    FloatMultiEndedKVPool,
+    MultiEndedKVPool,
     _chain_byte_accounting_violations,
     _end_pair_chain,
     _float_open_short_side,
@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 class UnifiedHybridSWAKVAllocator(BaseHybridSWAKVAllocator):
     """Composite allocator for the hybrid SWA pair (full + swa MHA sub-pools).
 
-    The two sides are MultiEndedKVAllocator sub-pools sharing one virtual id
+    The two sides are MultiEndedKVPool sub-pools sharing one virtual id
     space; the swa side's v2p table is the pairing, so there is no full -> swa
     mapping tensor. One alloc(N) binds N pages on BOTH sides under the same
     virtual id, so `available_size()` (joint bytes, in TOKENS) is the only safe
@@ -93,7 +93,7 @@ class UnifiedHybridSWAKVAllocator(BaseHybridSWAKVAllocator):
         self._kvcache = kvcache
         self.lazy_compaction = lazy_compaction
 
-        full_pool = MultiEndedKVAllocator(
+        full_pool = MultiEndedKVPool(
             kvcache=kvcache.full_kv_pool,
             unified_buffer=unified_buffer,
             sub_pool_name="full",
@@ -128,7 +128,7 @@ class UnifiedHybridSWAKVAllocator(BaseHybridSWAKVAllocator):
         self._wire_peers()
 
         # Epoch-keyed memo for the joint capacity view (any chain member's
-        # mutation invalidates -- see `MultiEndedKVAllocator._chain_capacity_epoch`).
+        # mutation invalidates -- see `MultiEndedKVPool._chain_capacity_epoch`).
         self._joint_avail_memo_epoch: Optional[int] = None
         self._joint_avail_memo_tokens: int = 0
 
@@ -157,9 +157,9 @@ class UnifiedHybridSWAKVAllocator(BaseHybridSWAKVAllocator):
 
     # -- construction hooks (the tri-pool subclass overrides both) --
 
-    def _build_swa_pool(self, **kwargs) -> MultiEndedKVAllocator:
+    def _build_swa_pool(self, **kwargs) -> MultiEndedKVPool:
         """The swa sub-allocator: an END pool in the 2-pool pair."""
-        return MultiEndedKVAllocator(
+        return MultiEndedKVPool(
             sub_pool_name="swa",
             is_id_owner=False,  # non-owner; consumes virtuals minted by full
             **kwargs,
@@ -417,7 +417,7 @@ class UnifiedHybridSWAKVAllocator(BaseHybridSWAKVAllocator):
         )
 
     def _joint_capacity_memo_violations(self) -> List[str]:
-        """Idle-time twin of `MultiEndedKVAllocator._capacity_memo_violations`
+        """Idle-time twin of `MultiEndedKVPool._capacity_memo_violations`
         for the composite joint view. Empty == healthy."""
         if self._joint_avail_memo_epoch != self.full.pool._chain_capacity_epoch():
             return []
@@ -509,7 +509,7 @@ class UnifiedMambaHybridSWAKVAllocator(UnifiedHybridSWAKVAllocator):
         )
         # Per-request state END pool (grow-up; page_size=1 -- state is
         # per-request, orthogonal to KV paging).
-        self.mamba_allocator = MultiEndedKVAllocator(
+        self.mamba_allocator = MultiEndedKVPool(
             kvcache=mamba_kvcache,
             unified_buffer=unified_buffer,
             sub_pool_name="mamba",
@@ -537,11 +537,11 @@ class UnifiedMambaHybridSWAKVAllocator(UnifiedHybridSWAKVAllocator):
 
     # -- construction hooks --
 
-    def _build_swa_pool(self, **kwargs) -> MultiEndedKVAllocator:
+    def _build_swa_pool(self, **kwargs) -> MultiEndedKVPool:
         # The swa side is the FLOAT middle: it never runs the lazy event pipeline
         # regardless of the composite's flag (frees mark holes, allocs reuse them).
         kwargs["lazy_compaction"] = False
-        return FloatMultiEndedKVAllocator(
+        return FloatMultiEndedKVPool(
             sub_pool_name="swa",
             is_id_owner=False,  # non-owner; consumes virtuals minted by full
             **kwargs,
@@ -635,7 +635,7 @@ class UnifiedMambaHybridSWAKVAllocator(UnifiedHybridSWAKVAllocator):
         demand = self._alloc_demand(need_tokens)
         flt = None
         for b in demand:
-            if isinstance(b, FloatMultiEndedKVAllocator):
+            if isinstance(b, FloatMultiEndedKVPool):
                 flt = b
         _float_open_short_side(flt, demand)
 

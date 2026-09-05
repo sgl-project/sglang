@@ -36,8 +36,8 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
 from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
 from sglang.srt.mem_cache.allocator import (
     BaseKVAllocator,
-    PagedKVAllocator,
-    TokenedKVAllocator,
+    PagedKVPool,
+    TokenedKVPool,
 )
 from sglang.srt.mem_cache.allocator.base import SinglePoolKVAllocator
 from sglang.srt.mem_cache.allocator.hisparse import (
@@ -644,7 +644,7 @@ class KVCacheConfigurator:
 
         config = self.mambaish_config
         assert config is not None
-        # The full sub-pool is page-aware (via `MultiEndedKVAllocator(page_size=...)`);
+        # The full sub-pool is page-aware (via `MultiEndedKVPool(page_size=...)`);
         # the mamba sub-pool stays page=1.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
         # Mirror the non-shared path's extra_max_context_len computation.
@@ -1916,11 +1916,11 @@ class KVCacheConfigurator:
                     )
                 else:
                     from sglang.srt.hardware_backend.npu.allocator_npu import (
-                        NPUPagedKVAllocator,
+                        NPUPagedKVPool,
                     )
 
                     token_to_kv_pool_allocator = SinglePoolKVAllocator(
-                        NPUPagedKVAllocator(
+                        NPUPagedKVPool(
                             sizes.max_total_num_tokens,
                             page_size=get_schedule().page_size,
                             dtype=self.kv_cache_dtype,
@@ -1973,7 +1973,7 @@ class KVCacheConfigurator:
                         get_schedule().page_size == 1 and not get_parallel().dcp_enabled
                     ):
                         token_to_kv_pool_allocator = SinglePoolKVAllocator(
-                            TokenedKVAllocator(
+                            TokenedKVPool(
                                 sizes.max_total_num_tokens,
                                 dtype=self.kv_cache_dtype,
                                 device=self.device,
@@ -1983,7 +1983,7 @@ class KVCacheConfigurator:
                         )
                     else:
                         token_to_kv_pool_allocator = SinglePoolKVAllocator(
-                            PagedKVAllocator(
+                            PagedKVPool(
                                 sizes.max_total_num_tokens
                                 * get_parallel().attn_dcp_size,
                                 page_size=get_schedule().page_size

@@ -113,8 +113,8 @@ def alloc_extend_naive(
     out_indices.copy_(out)
 
 
-class PagedKVAllocator(BaseFreeListKVPool):
-    """Same interface as `TokenedKVAllocator`, but the indices handed to one
+class PagedKVPool(BaseFreeListKVPool):
+    """Same interface as `TokenedKVPool`, but the indices handed to one
     request are always page-aligned.
 
     TODO: fuse last_loc into the kernel.

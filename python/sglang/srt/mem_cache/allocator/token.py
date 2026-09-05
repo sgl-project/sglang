@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 
-class TokenedKVAllocator(BaseFreeListKVPool):
+class TokenedKVPool(BaseFreeListKVPool):
     """An allocator managing the indices to kv cache data."""
 
     def __init__(

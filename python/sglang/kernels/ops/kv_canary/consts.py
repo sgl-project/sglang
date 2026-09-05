@@ -9,7 +9,7 @@ CANARY_CHAIN_ANCHOR: Final[int] = 0xC0FFEE1234567890
 # request rows start at 1.
 REQ_POOL_IDX_PADDING: Final[int] = 0
 
-# Mirrors SGLang's TokenedKVAllocator contract: token-to-KV slot 0 is reserved for padded-token dummy
+# Mirrors SGLang's TokenedKVPool contract: token-to-KV slot 0 is reserved for padded-token dummy
 # writes. Since req_to_token stores token-to-KV slot ids and is zero-initialized, canary slot 0 is skipped
 # instead of treating unfilled entries as real KV slots.
 TOKEN_TO_KV_SLOT_PADDING: Final[int] = 0

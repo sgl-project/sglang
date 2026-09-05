@@ -3,7 +3,7 @@ XPU integration tests for LMCRadixCache (IP mode).
 
 Unlike test_lmcache_connector.py, which drives LMCacheLayerwiseConnector
 directly, this test builds a real ReqToTokenPool + MHATokenToKVPool +
-TokenedKVAllocator and drives LMCRadixCache itself through the request
+TokenedKVPool and drives LMCRadixCache itself through the request
 lifecycle (match_prefix -> cache_finished_req, then evict a fresh cache to
 force a real LMCache load-back through match_prefix again). This exercises
 LayerTransferCounter.wait_until, _load_back's slot/offset math, and the
@@ -50,7 +50,7 @@ except ImportError:
     raise RuntimeError("LMCache is not installed. Install with: pip install lmcache")
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.mem_cache.allocator.token import TokenedKVAllocator
+from sglang.srt.mem_cache.allocator.token import TokenedKVPool
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
@@ -122,7 +122,7 @@ class TestLMCRadixCacheXPU(unittest.TestCase):
             enable_memory_saver=False,
         )
         allocator = SinglePoolKVAllocator(
-            TokenedKVAllocator(
+            TokenedKVPool(
                 size=self.BUFFER_SIZE,
                 dtype=torch.bfloat16,
                 device=self.DEVICE,

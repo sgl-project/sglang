@@ -8,9 +8,9 @@ from sglang.srt.mem_cache.allocator.base import (
     invariant_checks_enabled,
 )
 from sglang.srt.mem_cache.allocator.hybrid import BaseHybridSWAKVAllocator
-from sglang.srt.mem_cache.allocator.paged import PagedKVAllocator
+from sglang.srt.mem_cache.allocator.paged import PagedKVPool
 from sglang.srt.mem_cache.allocator.pairing import MappingTensorPairing
-from sglang.srt.mem_cache.allocator.token import TokenedKVAllocator
+from sglang.srt.mem_cache.allocator.token import TokenedKVPool
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.utils import is_npu
@@ -21,7 +21,7 @@ _is_npu = is_npu()
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.allocator_npu import (
-        NPUPagedKVAllocator,
+        NPUPagedKVPool,
     )
 
 
@@ -175,19 +175,17 @@ class HybridSWAKVAllocator(BaseHybridSWAKVAllocator):
         swa_kv_pool = getattr(kvcache, "swa_kv_pool", None)
 
         if page_size == 1:
-            full_pool = TokenedKVAllocator(size, dtype, device, full_kv_pool, need_sort)
-            swa_pool = TokenedKVAllocator(
-                size_swa, dtype, device, swa_kv_pool, need_sort
-            )
+            full_pool = TokenedKVPool(size, dtype, device, full_kv_pool, need_sort)
+            swa_pool = TokenedKVPool(size_swa, dtype, device, swa_kv_pool, need_sort)
         else:
             if _is_npu:
-                PagedKVAllocatorClass = NPUPagedKVAllocator
+                PagedKVPoolClass = NPUPagedKVPool
             else:
-                PagedKVAllocatorClass = PagedKVAllocator
-            full_pool = PagedKVAllocatorClass(
+                PagedKVPoolClass = PagedKVPool
+            full_pool = PagedKVPoolClass(
                 size, page_size, dtype, device, full_kv_pool, need_sort
             )
-            swa_pool = PagedKVAllocatorClass(
+            swa_pool = PagedKVPoolClass(
                 size_swa, page_size, dtype, device, swa_kv_pool, need_sort
             )
 
@@ -412,7 +410,7 @@ class PureSWAKVAllocator(SinglePoolKVAllocator):
         assert page_size == 1
         assert isinstance(kvcache, BaseSWAKVPool)
         super().__init__(
-            TokenedKVAllocator(size_swa, dtype, device, kvcache.swa_kv_pool, need_sort),
+            TokenedKVPool(size_swa, dtype, device, kvcache.swa_kv_pool, need_sort),
             component=ComponentType.SWA,
         )
         self._kvcache = kvcache

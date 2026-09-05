@@ -25,7 +25,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.configs.model_config import is_deepseek_v4
-from sglang.srt.hardware_backend.npu.allocator_npu import NPUPagedKVAllocator
+from sglang.srt.hardware_backend.npu.allocator_npu import NPUPagedKVPool
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_extend,
 )
@@ -122,7 +122,7 @@ class NPUDSV4HybridSWAKVAllocator(HybridSWAKVAllocator):
         def mk(pool_size, pool):
             # C128 KV sub-pool implements KVCache, so it drops into the standard
             # paged allocator. pool_size is in compressed-token units.
-            return NPUPagedKVAllocator(
+            return NPUPagedKVPool(
                 pool_size,
                 page_size=pool.kernel_page_size,
                 dtype=dtype,
@@ -215,7 +215,7 @@ class NPUDSV4HybridSWAKVAllocator(HybridSWAKVAllocator):
 
     def _alloc_c_extend(
         self,
-        allocator: NPUPagedKVAllocator,
+        allocator: NPUPagedKVPool,
         prefix_lens: torch.Tensor,
         prefix_lens_cpu: torch.Tensor,
         seq_lens: torch.Tensor,

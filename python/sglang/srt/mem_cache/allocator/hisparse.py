@@ -3,7 +3,7 @@ import weakref
 import torch
 
 from sglang.srt.mem_cache.allocator.base import BaseKVAllocator, BaseKVPoolSide
-from sglang.srt.mem_cache.allocator.paged import PagedKVAllocator
+from sglang.srt.mem_cache.allocator.paged import PagedKVPool
 from sglang.srt.mem_cache.allocator.swa import HybridSWAKVAllocator
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
@@ -70,7 +70,7 @@ class HiSparseKVAllocator(BaseKVAllocator):
         self.page_size = page_size
         self.need_sort = need_sort
 
-        self.logical_attn_allocator = PagedKVAllocator(
+        self.logical_attn_allocator = PagedKVPool(
             self._size_full,
             self.page_size,
             self.dtype,
@@ -78,7 +78,7 @@ class HiSparseKVAllocator(BaseKVAllocator):
             kvcache,
             need_sort,
         )
-        self.hisparse_attn_allocator = PagedKVAllocator(
+        self.hisparse_attn_allocator = PagedKVPool(
             self._size_hisparse,
             self.page_size,
             self.dtype,
@@ -344,7 +344,7 @@ class HiSparseHybridSWAKVAllocator(HybridSWAKVAllocator):
         # The public page_size stays the logical DSV4 full/SWA page size; the C4
         # pool allocates in its own compressed page size.
         self.hisparse_page_size = self.hisparse_kvcache.page_size
-        self.hisparse_attn_allocator = PagedKVAllocator(
+        self.hisparse_attn_allocator = PagedKVPool(
             self._size_hisparse,
             self.hisparse_page_size,
             self.hisparse_kvcache.dtype,

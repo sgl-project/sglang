@@ -3,7 +3,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.mem_cache.allocator import (
-    PagedKVAllocator,
+    PagedKVPool,
     alloc_extend_naive,
 )
 from sglang.srt.utils import get_num_new_pages, next_power_of_2
@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 
-class NPUPagedKVAllocator(PagedKVAllocator):
+class NPUPagedKVPool(PagedKVPool):
     def __init__(
         self,
         size: int,

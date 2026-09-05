@@ -157,10 +157,10 @@ class TestCapacityMemoCoherence(unittest.TestCase):
         (the span flips transparency, walling off their gaps) keep serving
         pre-move values. Exercised on a hand-wired end+float+end chain so no
         end-pool descriptor write can mask a missing span bump."""
-        from test_multi_ended_allocator import TestFloatMultiEndedKVAllocator
+        from test_multi_ended_allocator import TestFloatMultiEndedKVPool
 
-        inst = TestFloatMultiEndedKVAllocator(
-            [m for m in dir(TestFloatMultiEndedKVAllocator) if m.startswith("test_")][0]
+        inst = TestFloatMultiEndedKVPool(
+            [m for m in dir(TestFloatMultiEndedKVPool) if m.startswith("test_")][0]
         )
         _pool, sa, fla, da, _kv = inst._build_tri()
         self.assertEqual(fla._hole_pages(), 0)  # hole-free extension path

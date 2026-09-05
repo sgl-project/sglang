@@ -10,10 +10,10 @@ from sglang.srt.mem_cache.allocator.base import (
 )
 from sglang.srt.mem_cache.allocator.hybrid import BaseHybridSWAKVAllocator
 from sglang.srt.mem_cache.allocator.paged import (
-    PagedKVAllocator,
+    PagedKVPool,
     alloc_extend_naive,
 )
-from sglang.srt.mem_cache.allocator.token import TokenedKVAllocator
+from sglang.srt.mem_cache.allocator.token import TokenedKVPool
 
 __all__ = [
     "BaseFreeListKVPool",
@@ -22,8 +22,8 @@ __all__ = [
     "BaseKVPool",
     "BaseKVPoolSide",
     "KVPoolSide",
-    "PagedKVAllocator",
+    "PagedKVPool",
     "SinglePoolKVAllocator",
-    "TokenedKVAllocator",
+    "TokenedKVPool",
     "alloc_extend_naive",
 ]

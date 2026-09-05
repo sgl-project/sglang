@@ -25,7 +25,7 @@ from torch.profiler import record_function
 from sglang.srt.mem_cache.allocator import BaseKVAllocator
 from sglang.srt.mem_cache.allocator.unified_side import VirtualFullKVPoolSide
 from sglang.srt.mem_cache.allocator.unified_sub_pool import (
-    MultiEndedKVAllocator,
+    MultiEndedKVPool,
     _chain_byte_accounting_violations,
     _end_pair_chain,
 )
@@ -67,7 +67,7 @@ class UnifiedMambaKVAllocator(BaseKVAllocator):
 
         # Only FULL shards under DCP; the mamba state is replicated on every rank
         # and stays page_size=1, orthogonal to the full side's per-token paging.
-        full_pool = MultiEndedKVAllocator(
+        full_pool = MultiEndedKVPool(
             kvcache=kvcache.full_kv_pool,
             unified_buffer=unified_buffer,
             sub_pool_name="full",
@@ -84,7 +84,7 @@ class UnifiedMambaKVAllocator(BaseKVAllocator):
                 full_pool, conserve_cap=(full_pool.max_slots - 1) * dcp_size
             )
         }
-        self.mamba_allocator = MultiEndedKVAllocator(
+        self.mamba_allocator = MultiEndedKVPool(
             kvcache=kvcache.mamba_pool,
             unified_buffer=unified_buffer,
             sub_pool_name="mamba",

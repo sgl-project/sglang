@@ -1,4 +1,4 @@
-"""Pool sides of the unified-memory composites: one `MultiEndedKVAllocator`
+"""Pool sides of the unified-memory composites: one `MultiEndedKVPool`
 each, sharing a virtual id space with their peers."""
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from sglang.srt.mem_cache.allocator.base import (
     KVPoolSide,
     invariant_checks_enabled,
 )
-from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedKVAllocator
+from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedKVPool
 from sglang.srt.utils.invariants import Bucket, Invariant, IsTrue, expect
 
 # A tombstoned (-1) or sink (0) page handed to the swa free would join the free
@@ -24,9 +24,9 @@ class VirtualFullKVPoolSide(KVPoolSide):
     """The id-owning full sub-pool. `conserve_cap` is the static partition cap
     the leak invariant measures against."""
 
-    pool: MultiEndedKVAllocator
+    pool: MultiEndedKVPool
 
-    def __init__(self, pool: MultiEndedKVAllocator, *, conserve_cap: int):
+    def __init__(self, pool: MultiEndedKVPool, *, conserve_cap: int):
         super().__init__(pool)
         self.conserve_cap = conserve_cap
 
@@ -63,7 +63,7 @@ class VirtualSWAKVPoolSide(BaseKVPoolSide):
     freed here is live on the swa side (the release contract), so the pool's
     v2p table is never consulted before a free."""
 
-    def __init__(self, pool: MultiEndedKVAllocator, *, conserve_cap: int):
+    def __init__(self, pool: MultiEndedKVPool, *, conserve_cap: int):
         self.pool = pool
         self.page_size = pool.page_size
         self.conserve_cap = conserve_cap

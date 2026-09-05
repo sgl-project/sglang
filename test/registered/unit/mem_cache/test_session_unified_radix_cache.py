@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.mem_cache.allocator import TokenedKVAllocator
+from sglang.srt.mem_cache.allocator import TokenedKVPool
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
@@ -111,7 +111,7 @@ def make_params(enable_session: bool) -> CacheInitParams:
         enable_memory_saver=False,
     )
     allocator = SinglePoolKVAllocator(
-        TokenedKVAllocator(
+        TokenedKVPool(
             size=64,
             dtype=dtype,
             device="cpu",

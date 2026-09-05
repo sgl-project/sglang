@@ -1,6 +1,6 @@
 """free_segment / free_segments vs the torch.unique reference: page-aligned
 starts over every tail alignment, the page-disjoint contract, and free-group
-deferral. See PagedKVAllocator.free_segment for why unique is avoided.
+deferral. See PagedKVPool.free_segment for why unique is avoided.
 
     python -m pytest test/registered/unit/mem_cache/test_paged_free_segment.py -v
 """
@@ -13,7 +13,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.base import BaseKVPool
-from sglang.srt.mem_cache.allocator.paged import PagedKVAllocator
+from sglang.srt.mem_cache.allocator.paged import PagedKVPool
 from sglang.srt.mem_cache.common import _release_overallocated_kv_indices
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -24,7 +24,7 @@ NUM_PAGES = 64
 
 
 def _make_allocator(need_sort=False):
-    return PagedKVAllocator(
+    return PagedKVPool(
         size=NUM_PAGES * PAGE_SIZE,
         page_size=PAGE_SIZE,
         dtype=torch.float16,

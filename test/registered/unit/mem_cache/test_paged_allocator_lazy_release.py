@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.mem_cache.allocator.paged import PagedKVAllocator
+from sglang.srt.mem_cache.allocator.paged import PagedKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -15,8 +15,8 @@ PAGE_SIZE = 2
 NUM_PAGES = 16
 
 
-def _make_allocator(*, need_sort: bool) -> PagedKVAllocator:
-    return PagedKVAllocator(
+def _make_allocator(*, need_sort: bool) -> PagedKVPool:
+    return PagedKVPool(
         size=NUM_PAGES * PAGE_SIZE,
         page_size=PAGE_SIZE,
         dtype=torch.float16,

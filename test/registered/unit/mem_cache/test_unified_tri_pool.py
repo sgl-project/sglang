@@ -27,8 +27,8 @@ from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaHybridSWAKVAllocator,
 )
 from sglang.srt.mem_cache.allocator.unified_sub_pool import (
-    FloatMultiEndedKVAllocator,
-    MultiEndedKVAllocator,
+    FloatMultiEndedKVPool,
+    MultiEndedKVPool,
 )
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
@@ -155,7 +155,7 @@ class TestUnifiedTriPool(unittest.TestCase):
         fa = allocator.full.pool
         sa = allocator.swa.pool
         ma = allocator.mamba_allocator
-        self.assertIsInstance(sa, FloatMultiEndedKVAllocator)
+        self.assertIsInstance(sa, FloatMultiEndedKVPool)
         self.assertIs(ma.high_peer, sa)
         self.assertIs(sa.low_peer, ma)
         self.assertIs(sa.high_peer, fa)
@@ -447,10 +447,10 @@ class TestGeneralizedRebalance(unittest.TestCase):
         """Raw end+float+end chain, BOTH orientations in one fixture: the
         up-growing end opens the float's LOW side, the down-growing end its
         HIGH side."""
-        from test_multi_ended_allocator import TestFloatMultiEndedKVAllocator
+        from test_multi_ended_allocator import TestFloatMultiEndedKVPool
 
-        inst = TestFloatMultiEndedKVAllocator(
-            [m for m in dir(TestFloatMultiEndedKVAllocator) if m.startswith("test_")][0]
+        inst = TestFloatMultiEndedKVPool(
+            [m for m in dir(TestFloatMultiEndedKVPool) if m.startswith("test_")][0]
         )
         _pool, up_end, fla, down_end, _kv = inst._build_tri()
         v = fla.alloc(8)  # opaque float mid-region
@@ -476,7 +476,7 @@ class TestGeneralizedRebalance(unittest.TestCase):
 
     def test_two_pool_chain_rebalance_is_a_noop(self):
         from test_multi_ended_allocator import (
-            TestPagedMultiEndedKVAllocator as _PagedFixture,
+            TestPagedMultiEndedKVPool as _PagedFixture,
         )
 
         inst = _PagedFixture(
@@ -1188,7 +1188,7 @@ class TestFloatRelocationIsOrderedAgainstTheForward(unittest.TestCase):
     def test_the_settle_is_a_stream_wait_not_a_host_sync(self):
         """The settle before a float move must be a stream wait: a host sync
         there would land on the alloc-shortfall path every time the float moves."""
-        src = inspect.getsource(MultiEndedKVAllocator._settle_inflight_forward)
+        src = inspect.getsource(MultiEndedKVPool._settle_inflight_forward)
         self.assertIn("wait_event", src)
         self.assertNotIn(".item()", src)
         self.assertNotIn("synchronize()", src)

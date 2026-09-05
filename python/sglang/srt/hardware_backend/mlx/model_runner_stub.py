@@ -13,7 +13,7 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
     MlxAuxiliaryStateReqToTokenPool,
 )
-from sglang.srt.mem_cache.allocator import SinglePoolKVAllocator, TokenedKVAllocator
+from sglang.srt.mem_cache.allocator import SinglePoolKVAllocator, TokenedKVPool
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
@@ -36,7 +36,7 @@ MLX_AUX_STATE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 4
 class _DummyKVCache(KVCache):
     """Scheduler-facing KV cache that allocates no GPU memory.
 
-    Satisfies the KVCache interface so that TokenedKVAllocator can be
+    Satisfies the KVCache interface so that TokenedKVPool can be
     constructed, but every buffer access raises. The MLX backend manages
     attention KV and auxiliary state internally.
     """
@@ -303,7 +303,7 @@ class MlxModelRunnerStub(ModelRunner):
         )
         self.token_to_kv_pool = dummy_kv
         self.token_to_kv_pool_allocator = SinglePoolKVAllocator(
-            TokenedKVAllocator(
+            TokenedKVPool(
                 size=self.max_total_num_tokens,
                 dtype=self.kv_cache_dtype,
                 device="cpu",

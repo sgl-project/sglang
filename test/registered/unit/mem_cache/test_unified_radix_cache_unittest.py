@@ -26,7 +26,7 @@ from sglang.srt.disaggregation.kv_events import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.mem_cache.allocator import SinglePoolKVAllocator, TokenedKVAllocator
+from sglang.srt.mem_cache.allocator import SinglePoolKVAllocator, TokenedKVPool
 from sglang.srt.mem_cache.allocator.swa import HybridSWAKVAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -541,7 +541,7 @@ def build_fixture(
             mamba_pool=req_to_token_pool.mamba_pool,
         )
         allocator = SinglePoolKVAllocator(
-            TokenedKVAllocator(
+            TokenedKVPool(
                 size=cfg.kv_size,
                 dtype=cfg.dtype,
                 device=device,
@@ -561,7 +561,7 @@ def build_fixture(
             enable_memory_saver=False,
         )
         allocator = SinglePoolKVAllocator(
-            TokenedKVAllocator(
+            TokenedKVPool(
                 size=cfg.kv_size,
                 dtype=cfg.dtype,
                 device=device,

@@ -26,7 +26,7 @@ live + holes + pending pages at EVERY point of a lifecycle, not just at rest.
 
 import unittest
 
-from test_multi_ended_allocator import TestPagedMultiEndedKVAllocator as _PagedFixture
+from test_multi_ended_allocator import TestPagedMultiEndedKVPool as _PagedFixture
 from test_multi_ended_allocator import TestUnifiedHybridSWAKVAllocator as _SwaFixture
 
 from sglang.srt.mem_cache.allocator import unified_sub_pool as mea

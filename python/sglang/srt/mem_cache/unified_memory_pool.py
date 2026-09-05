@@ -13,7 +13,7 @@
 # ==============================================================================
 """UnifiedKVPool -- one physical `uint8` byte buffer shared by N sub-pools.
 
-Two END `MultiEndedKVAllocator`s grow inward from opposite ends; optional
+Two END `MultiEndedKVPool`s grow inward from opposite ends; optional
 "float" MIDDLE pools live between their frontiers (chain order
 `[up end, floats..., down end]`). Eager- or lazy-compacting `free` keeps each
 pool's byte range reclaimable. Layout is envelope-major (a slot's data for all
@@ -115,7 +115,7 @@ class SubPoolSpec(ABC):
 
         The page envelope is a uniform array of equally wide row-blocks, so a
         kernel-facing id is the physical page scaled by this count (see
-        `MultiEndedKVAllocator.translate_kv_loc_for_kernel`). 1 means the kernel-facing ids are the physical ones.
+        `MultiEndedKVPool.translate_kv_loc_for_kernel`). 1 means the kernel-facing ids are the physical ones.
         """
         return 1
 
@@ -876,7 +876,7 @@ class UnifiedMambaPool(MambaPool):
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         # Cross-pool physical-move contract, implemented by every pool the
-        # MultiEndedKVAllocator wraps. Ids are PHYSICAL slots; `MambaPool.copy_from`
+        # MultiEndedKVPool wraps. Ids are PHYSICAL slots; `MambaPool.copy_from`
         # takes (src, dst), hence the swap.
         MambaPool.copy_from(self, src_loc, tgt_loc)
 
@@ -962,7 +962,7 @@ class UnifiedMambaSlotAllocator:
             return torch.empty((0,), dtype=torch.int64, device=self._device)
         return torch.arange(start, end, dtype=torch.int64, device=self._device)
 
-    # -- slot management (delegates to the MultiEndedKVAllocator) --
+    # -- slot management (delegates to the MultiEndedKVPool) --
 
     def alloc(self, need_size: int):
         # alloc_group fast path: single-slot draws from the prefetched batch.
@@ -1330,7 +1330,7 @@ def init_unified_mamba_pools(
         lazy_compaction=lazy_compaction,
     )
 
-    # Wrap the composite's mamba MultiEndedKVAllocator in a slot allocator (PHYSICAL view).
+    # Wrap the composite's mamba MultiEndedKVPool in a slot allocator (PHYSICAL view).
     mamba_slot_allocator = UnifiedMambaSlotAllocator(
         allocator.mamba_allocator,
         max_size=req_to_token_pool._shared_mamba_size,
@@ -1500,7 +1500,7 @@ class UnifiedSWAKVPool(SWAKVPool):
     # -- allocator wiring --
 
     def attach_allocators(self, *, full_allocator, swa_allocator) -> None:
-        """Wire the two `MultiEndedKVAllocator`s whose v2p tables translate slot ids."""
+        """Wire the two `MultiEndedKVPool`s whose v2p tables translate slot ids."""
         self._full_allocator = full_allocator
         self._swa_allocator = swa_allocator
 

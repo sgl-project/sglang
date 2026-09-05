@@ -29,7 +29,7 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedKVAllocator
+from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedKVPool
 from sglang.srt.mem_cache.layout.page_major import build_mla_views
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
@@ -267,7 +267,7 @@ class _FakeKVCache:
 class TestTranslateKvLocForKernel(unittest.TestCase):
     def _build(self, ps=1, n_full_tokens=64, multiplier=_L):
         pool, full, mamba = _make_unified(page_size=ps, n_full_tokens=n_full_tokens)
-        full_alloc = MultiEndedKVAllocator(
+        full_alloc = MultiEndedKVPool(
             kvcache=_FakeKVCache(pool.max_slots("full")),
             unified_buffer=pool,
             sub_pool_name="full",
@@ -276,7 +276,7 @@ class TestTranslateKvLocForKernel(unittest.TestCase):
             page_size=ps,
             kernel_page_multiplier=multiplier,
         )
-        mamba_alloc = MultiEndedKVAllocator(
+        mamba_alloc = MultiEndedKVPool(
             kvcache=_FakeKVCache(pool.max_slots("mamba")),
             unified_buffer=pool,
             sub_pool_name="mamba",

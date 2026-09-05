@@ -23,7 +23,7 @@ import torch
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocator import SinglePoolKVAllocator, TokenedKVAllocator
+from sglang.srt.mem_cache.allocator import SinglePoolKVAllocator, TokenedKVPool
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -218,7 +218,7 @@ def create_bench_cache(
             mamba_pool=req_to_token_pool.mamba_pool if has_mamba else None,
         )
         allocator = SinglePoolKVAllocator(
-            TokenedKVAllocator(
+            TokenedKVPool(
                 size=kv_size,
                 dtype=_DTYPE,
                 device=device,
