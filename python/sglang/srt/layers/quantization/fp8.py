@@ -55,6 +55,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
+    apply_fp8_ptpc_linear,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
@@ -1063,6 +1064,21 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_scale=layer.weight_scale_inv,
                 input_scale=None,
                 bias=bias,
+            )
+
+        # (fp8, per_token_scale) from the aiter silu+mul quant kernel. A scale with
+        # one row per token can only be consumed by the aiter PTPC GEMM, which wants
+        # the weight as (N, K) while Fp8LinearMethod stores it as (K, N), so undo
+        # that with .T
+        if self.use_per_token_if_dynamic and isinstance(x, tuple) and x[1].dim() >= 2:
+            return apply_fp8_ptpc_linear(
+                input=(x[0], x[1]),
+                weight=layer.weight.T,
+                weight_scale=layer.weight_scale,
+                input_scale=layer.input_scale,
+                bias=bias,
+                cutlass_fp8_supported=self.cutlass_fp8_supported,
+                use_per_token_if_dynamic=self.use_per_token_if_dynamic,
             )
 
         if isinstance(x, tuple):
