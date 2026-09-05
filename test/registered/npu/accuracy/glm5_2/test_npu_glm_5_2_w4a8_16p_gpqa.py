@@ -59,7 +59,7 @@ GLM_5_2_W4A8_16P_TWO_NODE_OTHER_ARGS = [
     "--cuda-graph-max-bs",
     4,
     "--max-running-requests",
-    32,
+    64,
     "--quantization",
     "modelslim",
     "--moe-a2a-backend",
