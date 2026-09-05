@@ -1,7 +1,9 @@
 import ast
 import inspect
+import sys
 import textwrap
 
+import pytest
 import torch
 
 from sglang.srt.layers.attention.dsa import dsa_indexer, litetopk
@@ -131,3 +133,7 @@ def test_rank_major_source_mapping_inverts_interleave_gather():
             for row in logical
         ]
         assert restored == logical
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
