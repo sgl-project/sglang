@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
+from sglang.srt.layers.rotary_embedding.bailing_mrope import BailingMRotaryEmbedding
 from sglang.srt.layers.rotary_embedding.base import (
     LinearScalingRotaryEmbedding,
     RotaryEmbedding,
@@ -209,7 +210,20 @@ def get_rope(
                 original_max_position,
             )
         elif scaling_type == "default":
-            if "mrope_section" in rope_scaling:
+            if "mrope_section" in rope_scaling and rope_scaling.get(
+                "video_rope", False
+            ):
+                rotary_emb = BailingMRotaryEmbedding(
+                    head_size,
+                    rotary_dim,
+                    max_position,
+                    base,
+                    is_neox_style,
+                    dtype,
+                    mrope_section=rope_scaling["mrope_section"],
+                    video_rope=True,
+                )
+            elif "mrope_section" in rope_scaling:
                 rotary_emb = MRotaryEmbedding(
                     head_size,
                     rotary_dim,

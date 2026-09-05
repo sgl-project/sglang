@@ -83,6 +83,55 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 
 
+def _build_forward_token_modalities(
+    mm_inputs: Optional[List[MultimodalInputs]],
+    extend_prefix_lens: Optional[List[int]],
+    extend_seq_lens: Optional[List[int]],
+    num_tokens: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if not mm_inputs or extend_prefix_lens is None or extend_seq_lens is None:
+        return None
+    if not (len(mm_inputs) == len(extend_prefix_lens) == len(extend_seq_lens)):
+        raise ValueError(
+            "Multimodal metadata batch dimensions do not match: "
+            f"mm_inputs={len(mm_inputs)}, prefixes={len(extend_prefix_lens)}, "
+            f"extend_lens={len(extend_seq_lens)}"
+        )
+
+    modalities = []
+    has_multimodal_tokens = False
+    for mm_input, prefix_len, extend_len in zip(
+        mm_inputs, extend_prefix_lens, extend_seq_lens
+    ):
+        if mm_input is None or mm_input.token_modalities is None:
+            modalities.extend([0] * extend_len)
+            continue
+        end = prefix_len + extend_len
+        request_modalities = mm_input.token_modalities[prefix_len:end]
+        if len(request_modalities) != extend_len:
+            raise ValueError(
+                "Multimodal token metadata is shorter than the active forward span: "
+                f"prefix_len={prefix_len}, extend_len={extend_len}, "
+                f"metadata_len={len(mm_input.token_modalities)}"
+            )
+        has_multimodal_tokens |= any(request_modalities)
+        modalities.extend(request_modalities)
+
+    if len(modalities) != num_tokens:
+        raise ValueError(
+            "Multimodal token metadata does not match the forward batch: "
+            f"metadata_tokens={len(modalities)}, forward_tokens={num_tokens}"
+        )
+    if not has_multimodal_tokens:
+        return None
+    return torch.tensor(
+        modalities,
+        dtype=torch.int8,
+        pin_memory=is_pin_memory_available(device),
+    ).to(device, non_blocking=True)
+
+
 def _elastic_should_preserve_local_token_counts(
     *,
     model_runner: ModelRunner,
@@ -475,6 +524,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
+    mm_token_modalities: Optional[torch.Tensor] = None
+    multi_gate_indices: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     # Encoder-decoder host fields
     encoder_cached: Optional[List[bool]] = None
@@ -855,6 +906,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ret._maybe_init_non_generation_fields(batch)
 
         device = model_runner.device
+
+        ret.mm_token_modalities = _build_forward_token_modalities(
+            ret.mm_inputs,
+            extend_prefix_lens if isinstance(extend_prefix_lens, list) else None,
+            extend_seq_lens if isinstance(extend_seq_lens, list) else None,
+            len(batch.input_ids) if batch.input_ids is not None else 0,
+            device,
+        )
 
         model_runner.kv_index_translator.rebind_write_loc(ret)
 

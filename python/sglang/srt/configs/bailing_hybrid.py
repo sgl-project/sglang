@@ -77,7 +77,7 @@ class BailingHybridConfig(PretrainedConfig):
         use_qk_norm=True,
         num_nextn_predict_layers=0,
         mtp_loss_scaling_factor=0,
-        moe_router_enable_expert_bias=True,
+        moe_router_enable_expert_bias=False,
         routed_scaling_factor=1.0,
         layer_group_size=1,
         group_norm_size=1,

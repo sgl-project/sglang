@@ -289,43 +289,46 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         use_data_parallel: bool = False,
         tp_size: Optional[int] = None,
         tp_rank: Optional[int] = None,
+        disable_merger_proj: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
         self.padded_context_dim = padded_context_dim * (spatial_merge_size**2)
 
         self.use_postshuffle_norm = use_postshuffle_norm
+        self.disable_merger_proj = disable_merger_proj
 
         if norm_layer is None:
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
         self.norm = norm_layer(
             self.hidden_size if use_postshuffle_norm else context_dim
         )
-        self.tp_size, self.tp_rank = _resolve_vision_tp(
-            use_data_parallel=use_data_parallel,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-        )
-        self.linear_fc1 = ColumnParallelLinear(
-            self.hidden_size,
-            self.padded_context_dim,
-            bias=True,
-            quant_config=quant_config,
-            prefix=add_prefix("linear_fc1", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-        )
-        self.act_fn = nn.GELU()
-        self.linear_fc2 = RowParallelLinear(
-            self.padded_context_dim,
-            dim,
-            bias=True,
-            quant_config=quant_config,
-            prefix=add_prefix("linear_fc2", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            use_dp_attention_reduce=is_dp_attention_enabled(),
-        )
+        if not disable_merger_proj:
+            self.tp_size, self.tp_rank = _resolve_vision_tp(
+                use_data_parallel=use_data_parallel,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+            )
+            self.linear_fc1 = ColumnParallelLinear(
+                self.hidden_size,
+                self.padded_context_dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=add_prefix("linear_fc1", prefix),
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+            )
+            self.act_fn = nn.GELU()
+            self.linear_fc2 = RowParallelLinear(
+                self.padded_context_dim,
+                dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=add_prefix("linear_fc2", prefix),
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+                use_dp_attention_reduce=is_dp_attention_enabled(),
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_postshuffle_norm:
@@ -333,10 +336,11 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         else:
             x = self.norm(x).view(-1, self.hidden_size)
 
-        x_parallel, _ = self.linear_fc1(x)
-        x_parallel = self.act_fn(x_parallel)
-        out, _ = self.linear_fc2(x_parallel)
-        return out
+        if not self.disable_merger_proj:
+            x_parallel, _ = self.linear_fc1(x)
+            x_parallel = self.act_fn(x_parallel)
+            x, _ = self.linear_fc2(x_parallel)
+        return x
 
 
 class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
@@ -363,9 +367,13 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         self.use_data_parallel = use_data_parallel
         # layer indexes of which layer's output should be deep-stacked
         self.deepstack_visual_indexes = vision_config.deepstack_visual_indexes
-        self.out_hidden_size = vision_config.out_hidden_size * (
-            1 + len(self.deepstack_visual_indexes)
+        self.disable_merger_proj = getattr(vision_config, "disable_merger_proj", False)
+        merger_out_dim = (
+            self.hidden_size * self.spatial_merge_unit
+            if self.disable_merger_proj
+            else vision_config.out_hidden_size
         )
+        self.out_hidden_size = merger_out_dim * (1 + len(self.deepstack_visual_indexes))
         self.patch_embed = Qwen3VLVisionPatchEmbed(config=vision_config)
         if self.pp_group.is_first_rank:
             self.pos_embed = VocabParallelEmbedding(
@@ -435,6 +443,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             quant_config=quant_config,
             prefix=add_prefix("merger", prefix),
             use_data_parallel=use_data_parallel,
+            disable_merger_proj=self.disable_merger_proj,
         )
 
         self.deepstack_merger_list = nn.ModuleList(
@@ -449,6 +458,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                     quant_config=quant_config,
                     prefix=add_prefix(f"deepstack_merger_list.{layer_idx}", prefix),
                     use_data_parallel=use_data_parallel,
+                    disable_merger_proj=self.disable_merger_proj,
                 )
                 for layer_idx in range(len(self.deepstack_visual_indexes))
             ]

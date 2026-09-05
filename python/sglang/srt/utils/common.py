@@ -3712,6 +3712,9 @@ def is_fa3_default_architecture(hf_config):
         "Step3p7ForConditionalGeneration",
         "MiMoV2ForCausalLM",
         "MiMoV2FlashForCausalLM",
+        "BailingMMNativeForConditionalGeneration",
+        "BailingMM2NativeForConditionalGeneration",
+        "BailingMoeV3VLForConditionalGeneration",
     }
     return architectures[0] in default_archs
 
