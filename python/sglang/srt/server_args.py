@@ -2464,8 +2464,8 @@ class ServerArgs:
         NS("exec.moe"),
     ] = "auto"
     fuseep_mode: A[
-        Literal[1, 2],
-        "Select the mode when enable Ascend FuseEP MoE, 1 -> dispatch_gmm_combine_decode is executed；2 -> dispatch_ffn_combine is executed (support hybrid deployment when 2).",
+        Literal[1, 2, 3],
+        "Select the mode when enabling Ascend FuseEP MoE: 1 runs dispatch_gmm_combine_decode; 2 runs dispatch_ffn_combine (and supports hybrid deployment); 3 runs the MegaMoE fused operator for ModelSlim W4A8 Kimi-K3.",
         NS("exec.moe"),
     ] = 2
     deepep_dispatcher_output_dtype: A[
