@@ -316,6 +316,7 @@ class SamplingParams:
         False  # return rollout debug tensors (intermediate states)
     )
     return_trajectory_latents: bool = False  # returns all latents for each timestep
+    record_decision_trace: bool = False  # records per-step cache skip/compute decisions
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
     rollout_return_denoising_env: bool = False  # populate ``denoising_env`` (image/pos/neg kwargs, guidance) for RL replay
     rollout_return_dit_trajectory: bool = False  # per-step noisy latents + final latent + timesteps (RolloutDitTrajectory)

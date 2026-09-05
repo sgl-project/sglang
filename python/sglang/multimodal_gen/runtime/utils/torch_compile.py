@@ -61,34 +61,66 @@ def resolve_torch_compile_mode(
     return default
 
 
+def matching_submodule_names(module: nn.Module) -> tuple[str, ...]:
+    """Names of the submodules regional compile would target, in traversal order."""
+    conditions = getattr(module, "_compile_conditions", ())
+    return tuple(
+        name
+        for name, submodule in module.named_modules()
+        if name and any(condition(name, submodule) for condition in conditions)
+    )
+
+
 def compile_matching_submodules(
     module: nn.Module,
     *,
     compile_kwargs: dict[str, object],
 ) -> int:
-    conditions = getattr(module, "_compile_conditions", ())
-    matches = [
-        submodule
-        for name, submodule in module.named_modules()
-        if name and any(condition(name, submodule) for condition in conditions)
-    ]
-    if not matches:
+    names = matching_submodule_names(module)
+    if not names:
         raise ValueError(
             "regional compile found no matching submodules; "
             f"check {type(module).__name__}._compile_conditions"
         )
 
-    for submodule in matches:
-        submodule.compile(**compile_kwargs)
-    return len(matches)
+    named_modules = dict(module.named_modules())
+    for name in names:
+        named_modules[name].compile(**compile_kwargs)
+    return len(names)
 
 
 @dataclass
 class CompiledModuleRegistry:
     module_ids: set[int] = field(default_factory=set)
+    region_names: dict[int, tuple[str, ...]] = field(default_factory=dict)
 
     def is_compiled(self, module: nn.Module) -> bool:
         return id(module) in self.module_ids
+
+    def regions_for(self, module: nn.Module) -> tuple[str, ...]:
+        """Names of the submodules regionally compiled onto ``module``, if any.
+
+        Empty when ``module`` was compiled whole (via :meth:`compile_once`)
+        or not compiled at all.
+        """
+        return self.region_names.get(id(module), ())
+
+    def region_digest(self, module: nn.Module) -> str | None:
+        """Stable sha256 over the compiled region inventory, or None if
+        ``module`` has no regional compile recorded (see :meth:`regions_for`).
+
+        Feeds :attr:`CompiledPlanManifest.regions` so a promoted manifest is
+        tied to the exact submodule set that was compiled, not just a
+        caller-supplied label.
+        """
+        names = self.regions_for(module)
+        if not names:
+            return None
+        import hashlib
+
+        return hashlib.sha256(
+            "\n".join(sorted(names)).encode("utf-8")
+        ).hexdigest()
 
     def compile_once(
         self,
@@ -112,11 +144,13 @@ class CompiledModuleRegistry:
         module_id = id(module)
         if module_id in self.module_ids:
             return 0
+        names = matching_submodule_names(module)
         compiled_count = compile_matching_submodules(
             module,
             compile_kwargs=compile_kwargs,
         )
         self.module_ids.add(module_id)
+        self.region_names[module_id] = names
         return compiled_count
 
 

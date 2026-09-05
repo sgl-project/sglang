@@ -908,6 +908,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             rollout_trajectory_data=getattr(result, "rollout_trajectory_data", None),
             noise_pred=getattr(result, "noise_pred", None),
             trajectory_decoded=getattr(result, "trajectory_decoded", None),
+            decision_trace=getattr(result, "decision_trace", None) or None,
         )
 
     @staticmethod

@@ -422,6 +422,15 @@ class ServerArgs(DisaggServerArgsMixin):
     # Compilation
     enable_torch_compile: bool = False
     regional_compile: bool = False
+    # Path to a JSON file of CompiledPlanManifest records (see
+    # runtime.utils.compile_trajectory_gate), each declaring the exact
+    # workload signature a compiled plan was validated for offline/in CI.
+    # When set, _maybe_torch_compile only compiles a transformer if the
+    # current request's workload signature is covered by a validated
+    # manifest entry, falling back to eager otherwise. When unset (the
+    # default), compilation behavior is unchanged from before this option
+    # existed -- this never blocks compilation on its own.
+    compile_trajectory_gate_manifest: str | None = None
 
     # Breakable CUDA graph (BCG): capture the DiT forward as CUDA-graph
     # segments split at attention modules (SP all-to-all / dynamic attention
@@ -2302,6 +2311,18 @@ class ServerArgs(DisaggServerArgsMixin):
                 "Compile repeated DiT submodules selected by the model's "
                 "_compile_conditions instead of compiling the whole transformer. "
                 "Requires --enable-torch-compile."
+            ),
+        )
+        parser.add_argument(
+            "--compile-trajectory-gate-manifest",
+            type=str,
+            default=ServerArgs.compile_trajectory_gate_manifest,
+            help=(
+                "Path to a JSON file of CompiledPlanManifest records (see "
+                "runtime.utils.compile_trajectory_gate). When set, a transformer "
+                "is only compiled if the current request's workload signature is "
+                "covered by a validated manifest entry; otherwise it falls back "
+                "to eager. Unset by default, which never blocks compilation."
             ),
         )
         parser.add_argument(
