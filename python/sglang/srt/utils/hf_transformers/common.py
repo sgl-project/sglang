@@ -25,6 +25,11 @@ from sglang.srt.configs import (
     AfmoeConfig,
     BailingHybridConfig,
     ChatGLMConfig,
+    Cosmos3Config,
+    Cosmos3EdgeConfig,
+    Cosmos3EdgeProjectorConfig,
+    Cosmos3EdgeTextConfig,
+    Cosmos3EdgeVisionConfig,
     DbrxConfig,
     DeepseekVL2Config,
     Dots3Config,
@@ -222,6 +227,42 @@ for name, cls in _CONFIG_REGISTRY.items():
         err = str(e).lower()
         if "already registered" not in err and "already used" not in err:
             logger.warning("Failed to register config %s: %s", name, e)
+
+# Cosmos3 (understanding tower) reuses the Qwen3-VL config schema. Register it
+# with AutoConfig only (not `_CONFIG_REGISTRY`), so the nested `text_config` is
+# flattened onto the top-level config in `get_config` — the same path the base
+# Qwen3-VL config relies on. Adding it to `_CONFIG_REGISTRY` would trigger a
+# `from_pretrained` reload that drops that flattening.
+try:
+    AutoConfig.register(Cosmos3Config.model_type, Cosmos3Config)
+except ValueError as e:
+    err = str(e).lower()
+    if "already registered" not in err and "already used" not in err:
+        logger.warning("Failed to register config %s: %s", Cosmos3Config.model_type, e)
+
+# Cosmos3-Edge native text support starts from the checkpoint root config, then
+# consumes ``text_config`` in ``sglang.srt.models.cosmos3_edge``. Keep it out of
+# `_CONFIG_REGISTRY` so the generic parser can flatten text attributes onto the
+# root config after `AutoConfig.from_pretrained`, matching other multimodal
+# configs that use a text sub-config.
+for _cosmos3_edge_config_cls in (
+    Cosmos3EdgeTextConfig,
+    Cosmos3EdgeVisionConfig,
+    Cosmos3EdgeProjectorConfig,
+    Cosmos3EdgeConfig,
+):
+    try:
+        AutoConfig.register(
+            _cosmos3_edge_config_cls.model_type, _cosmos3_edge_config_cls
+        )
+    except ValueError as e:
+        err = str(e).lower()
+        if "already registered" not in err and "already used" not in err:
+            logger.warning(
+                "Failed to register config %s: %s",
+                _cosmos3_edge_config_cls.model_type,
+                e,
+            )
 
 
 # ---------------------------------------------------------------------------

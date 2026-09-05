@@ -175,6 +175,14 @@
             "runtime_peak_vram_mb": 58542.0,
             "estimated_full_test_time_s": 133.2
         },
+        "qwen_image_t2i_2_gpus_extra_high": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 57.9
+        },
         "ideogram4_fp8_t2i": {
             "stages_ms": {
                 "InputValidationStage": 0.06,
@@ -1510,6 +1518,7 @@
             "expected_median_denoise_ms": 1010.9,
             "load_peak_vram_mb": 27320.0,
             "runtime_peak_vram_mb": 50112.0,
+            "warmup_peak_vram_mb": 56748.0,
             "estimated_full_test_time_s": 77.0
         },
         "wan2_2_i2v_a14b_2gpu": {
@@ -1639,6 +1648,7 @@
             "expected_median_denoise_ms": 656.68,
             "load_peak_vram_mb": 35350.0,
             "runtime_peak_vram_mb": 52830.0,
+            "warmup_peak_vram_mb": 45782.0,
             "estimated_full_test_time_s": 243.0
         },
         "wan2_1_i2v_14b_720P_2gpu": {
@@ -1767,6 +1777,7 @@
             "expected_median_denoise_ms": 2020.71,
             "load_peak_vram_mb": 60038.0,
             "runtime_peak_vram_mb": 72524.0,
+            "warmup_peak_vram_mb": 26902.0,
             "estimated_full_test_time_s": 204.3
         },
         "wan2_1_t2v_14b_2gpu": {
