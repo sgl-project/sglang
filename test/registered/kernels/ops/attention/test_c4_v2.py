@@ -7,7 +7,11 @@ import pytest
 import torch
 import triton
 
-from sglang.kernels.ops.attention.dsv4 import compress_forward
+from sglang.kernels.ops.attention.dsv4 import (
+    CompressorDecodePlan,
+    CompressorPrefillPlan,
+    compress_forward,
+)
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.deepseek_v4.common import (
@@ -120,6 +124,91 @@ def _make_inputs(
 # -----------------------------------------------------------------------------
 # Tests
 # -----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("ring_size", [8, 16])
+@pytest.mark.parametrize(
+    ("gpu_inputs", "use_cuda_graph"),
+    [(False, False), (True, False), (True, True)],
+)
+def test_unified_request_ring_plans_ignore_full_to_state(
+    ring_size: int, gpu_inputs: bool, use_cuda_graph: bool
+) -> None:
+    """C4 plans must address state by request slot, not the full-cache map."""
+    device = torch.device(get_device())
+    req_pool_indices = torch.tensor([2, 5], dtype=torch.int64, device=device)
+    req_to_token = torch.zeros((6, 16), dtype=torch.int32, device=device)
+    full_to_state = torch.zeros(1, dtype=torch.int64, device=device)
+    seq_lens = torch.tensor([8, 12], dtype=torch.int64)
+    extend_lens = torch.tensor([4, 4], dtype=torch.int64)
+    if gpu_inputs:
+        seq_lens = seq_lens.to(device)
+        extend_lens = extend_lens.to(device)
+
+    prefill = CompressorPrefillPlan.generate(
+        compress_ratio=RATIO,
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        extend_lens=extend_lens,
+        req_to_token=req_to_token,
+        full_to_state=full_to_state,
+        swa_page_size=256,
+        ring_size=ring_size,
+        num_q_tokens=8,
+        use_cuda_graph=use_cuda_graph,
+        use_req_ring=True,
+    )
+    plan_c = prefill.plan_c.view(torch.int32).reshape(-1, 4).cpu()
+    plan_w = prefill.plan_w.view(torch.int32).reshape(-1, 2).cpu()
+
+    valid_c = plan_c[plan_c[:, 2] >= 0]
+    got_reads = {
+        int(row[1].item()) & 0xFFFF: (int(row[2].item()), int(row[3].item()))
+        for row in valid_c
+    }
+    expected_reads = {
+        3: (
+            (2 * ring_size + 3 % ring_size) // RATIO,
+            (2 * ring_size + 7 % ring_size) // RATIO,
+        ),
+        7: (
+            (5 * ring_size + 7 % ring_size) // RATIO,
+            (5 * ring_size + 11 % ring_size) // RATIO,
+        ),
+    }
+    assert got_reads == expected_reads
+
+    valid_w = plan_w[plan_w[:, 1] >= 0]
+    got_writes = {int(row[0].item()): int(row[1].item()) for row in valid_w}
+    expected_writes = {
+        **{j: 2 * ring_size + (4 + j) % ring_size for j in range(4)},
+        **{4 + j: 5 * ring_size + (8 + j) % ring_size for j in range(4)},
+    }
+    assert got_writes == expected_writes
+    assert {got_writes[j] for j in range(4)}.isdisjoint(
+        {got_writes[j] for j in range(4, 8)}
+    )
+
+    decode = CompressorDecodePlan.generate(
+        compress_ratio=RATIO,
+        req_pool_indices=req_pool_indices,
+        req_to_token=req_to_token,
+        full_to_state=full_to_state,
+        seq_lens=torch.tensor([8, 12], dtype=torch.int64, device=device),
+        swa_page_size=256,
+        ring_size=ring_size,
+        use_req_ring=True,
+    )
+    got_decode = decode.plan_d.view(torch.int32).reshape(-1, 4).cpu()
+    expected_decode = torch.tensor(
+        [
+            [8, 2 * ring_size + 7 % ring_size, *expected_reads[3]],
+            [12, 5 * ring_size + 11 % ring_size, *expected_reads[7]],
+        ],
+        dtype=torch.int32,
+    )
+    assert torch.equal(got_decode, expected_decode)
+    assert got_decode[0, 1] != got_decode[1, 1]
 
 
 @pytest.mark.parametrize("mode", ["legacy", "paged"])

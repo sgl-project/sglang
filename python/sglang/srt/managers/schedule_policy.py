@@ -5,10 +5,7 @@ from array import array
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
-from sglang.srt.runtime_context import (
-    get_disagg,
-    get_schedule,
-)
+from sglang.srt.runtime_context import get_disagg, get_schedule
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
@@ -659,8 +656,16 @@ class PrefillAdder:
 
     @property
     def rem_swa_tokens(self):
+        allocator = self.token_to_kv_pool_allocator
+        if getattr(allocator.get_kvcache(), "_unified_kv", False):
+            # Unified-KV: SWA is a per-request ring, not a tree-reusable token
+            # pool. swa_available_size() already reports ring capacity
+            # (free_slots * ring_cost). tree swa_evictable is in the old linear
+            # token unit and freeing it does not release ring space, so exclude
+            # it here to keep a single consistent accounting unit.
+            return allocator.swa_available_size() - self.rem_swa_token_offset
         return (
-            self.token_to_kv_pool_allocator.swa_available_size()
+            allocator.swa_available_size()
             + self.tree_cache.swa_evictable_size()
             - self.rem_swa_token_offset
         )
@@ -707,6 +712,13 @@ class PrefillAdder:
         where alloc = min(extend, rem_chunk); the min() cap keeps the two terms
         from double-counting extend, so budget <= extend + max_new_tokens + page.
         """
+        allocator = self.token_to_kv_pool_allocator
+        if getattr(allocator.get_kvcache(), "_unified_kv", False):
+            # Unified-KV: each request occupies exactly one fixed SWA ring slot,
+            # independent of context / chunk length; a host-hit prefix reuses the
+            # same ring. Budget the fixed per-slot ring cost (paired with the
+            # ring-based swa_available_size on the allocator).
+            return allocator.swa_ring_cost_tokens
         if self.rem_chunk_tokens is not None:
             alloc = min(extend_input_len, self.rem_chunk_tokens)
         else:
@@ -834,6 +846,9 @@ class PrefillAdder:
         max_new_tokens: int,
         retracted_stain: bool,
         mamba_gap_reserve: int = 0,
+        host_hit_len: int = 0,
+        storage_hit_len: int = 0,
+        is_chunked_continuation: bool = False,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
@@ -857,9 +872,17 @@ class PrefillAdder:
         self.rem_input_tokens -= extend_input_len
 
         if self.is_hybrid_swa:
-            self.rem_swa_token_offset += self._swa_budget_for_req(
-                extend_input_len, max_new_tokens
+            # Unified-KV: SWA is a fixed per-request ring slot reserved once at
+            # first admission and already reflected in swa_available_size() on
+            # later rounds. Charging it again on a chunked continuation would
+            # double-count the slot and over-throttle admission, so skip it.
+            _unified = getattr(
+                self.token_to_kv_pool_allocator.get_kvcache(), "_unified_kv", False
             )
+            if not (_unified and is_chunked_continuation):
+                self.rem_swa_token_offset += self._swa_budget_for_req(
+                    extend_input_len, max_new_tokens
+                )
 
         if self.dllm_config is not None:
             self.rem_dllm_tokens -= extend_input_len
@@ -994,9 +1017,15 @@ class PrefillAdder:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
-            if self.is_hybrid_swa:
+            if self.is_hybrid_swa and not getattr(
+                self.token_to_kv_pool_allocator.get_kvcache(), "_unified_kv", False
+            ):
                 # alloc_extend needs extend_num_tokens + page_size per request,
-                # so reserve one page here to avoid OOM
+                # so reserve one page here to avoid OOM.
+                # Unified-KV: rem_swa_tokens is ring capacity (free_slots * ring
+                # cost), not a linear per-chunk token budget, and this request's
+                # ring slot is already reserved -- mixing units here would wrongly
+                # truncate the chunk, so skip the SWA clamp.
                 _rem_tokens = min(
                     _rem_tokens, int(self.rem_swa_tokens) - self.page_size
                 )
@@ -1035,6 +1064,7 @@ class PrefillAdder:
             ),
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+            is_chunked_continuation=True,
         )
 
         # Return if chunked prefill not finished
@@ -1238,7 +1268,7 @@ class PrefillAdder:
                 self._swa_new_tokens(req),
                 swa_host_hit_length=req.swa_host_hit_length,
             )
-            if swa_needed >= self.rem_swa_tokens:
+            if swa_needed > self.rem_swa_tokens:
                 if not self._swa_req_never_fits(
                     real_input_tokens,
                     self._swa_new_tokens(req),
@@ -1274,7 +1304,7 @@ class PrefillAdder:
                     self._swa_new_tokens(req),
                     swa_host_hit_length=req.swa_host_hit_length,
                 )
-                if swa_needed >= self.rem_swa_tokens:
+                if swa_needed > self.rem_swa_tokens:
                     if not self._swa_req_never_fits(
                         real_input_tokens,
                         self._swa_new_tokens(req),

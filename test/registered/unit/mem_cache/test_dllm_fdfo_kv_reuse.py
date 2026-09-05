@@ -23,6 +23,9 @@ class _FakeAllocator:
         self.alloc_calls = []
         self.extend_calls = []
 
+    def get_kvcache(self):
+        return None
+
     def available_size(self):
         return 1 << 30
 
