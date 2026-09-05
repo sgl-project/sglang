@@ -1428,6 +1428,7 @@ def get_generate_fn(
                 "reference_url": sampling_params.image_path,
                 "fps": sampling_params.fps,
                 "num_frames": sampling_params.num_frames,
+                **extra_body,
             },
         )
 

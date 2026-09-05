@@ -49,24 +49,30 @@ IMAGE_GEN_KEEP_RESIDENT_MIN_AVAILABLE_GB = 45.0
 DEFAULT_KEEP_RESIDENT_MIN_AVAILABLE_GB = 120.0
 
 
-def auto_residency_args_skip_reason(server_args: ServerArgs) -> str | None:
-    """Return why args cannot use warmup-calibrated residency."""
+def resolve_keep_resident_min_available_gb(
+    server_args: ServerArgs,
+    deployment_config: ModelDeploymentConfig | None = None,
+) -> float:
+    """Resolve the established device-memory admission threshold for residency."""
+    deployment_config = (
+        deployment_config or server_args.pipeline_config.get_model_deployment_config()
+    )
+    explicit = deployment_config.keep_resident_min_available_gb
+    if explicit is not None:
+        return explicit
+    if server_args.pipeline_config.task_type.is_image_gen():
+        return IMAGE_GEN_KEEP_RESIDENT_MIN_AVAILABLE_GB
+    return DEFAULT_KEEP_RESIDENT_MIN_AVAILABLE_GB
+
+
+def auto_residency_static_skip_reason(server_args: ServerArgs) -> str | None:
+    """Return why args cannot use pre-warmup static residency planning."""
     if envs.SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY:
         return "disabled via SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY"
     if server_args.performance_mode != "auto":
         return f"performance_mode={server_args.performance_mode}"
-    if (
-        server_args.pipeline_class_name == "LTX2TwoStagePipeline"
-        and server_args.ltx2_two_stage_device_mode is None
-    ):
-        return "legacy LTX-2 two-stage placement"
-    if server_args.ltx2_two_stage_device_mode == "original":
-        return "LTX-2 original two-stage placement"
-    if (
-        server_args.warmup_mode != "server"
-        or server_args.disagg_role != RoleType.MONOLITHIC
-    ):
-        return "no synthetic server warmup to calibrate from"
+    if server_args.disagg_role != RoleType.MONOLITHIC:
+        return "disaggregated role"
     task_type = server_args.pipeline_config.task_type
     if not (task_type.is_visual_gen() or task_type.is_mesh_gen()):
         return "no synthetic server warmup to calibrate from"
@@ -88,6 +94,23 @@ def auto_residency_args_skip_reason(server_args: ServerArgs) -> str | None:
         return "dynamic batching enabled"
     if not current_platform.is_cuda():
         return "requires CUDA"
+    return None
+
+
+def auto_residency_args_skip_reason(server_args: ServerArgs) -> str | None:
+    """Return why args cannot use warmup-calibrated residency refinement."""
+    reason = auto_residency_static_skip_reason(server_args)
+    if reason is not None:
+        return reason
+    if (
+        server_args.pipeline_class_name == "LTX2TwoStagePipeline"
+        and server_args.ltx2_two_stage_device_mode is None
+    ):
+        return "legacy LTX-2 two-stage placement"
+    if server_args.ltx2_two_stage_device_mode == "original":
+        return "LTX-2 original two-stage placement"
+    if server_args.warmup_mode != "server":
+        return "no synthetic server warmup to calibrate from"
     return None
 
 
@@ -130,20 +153,16 @@ class ServerArgsAutoTuner:
     def _deployment_config(self) -> ModelDeploymentConfig:
         return self.server_args.pipeline_config.get_model_deployment_config()
 
-    def _uses_warmup_calibrated_residency(self) -> bool:
-        """Whether warmup will replace coarse pre-load residency defaults."""
-        return auto_residency_args_skip_reason(self.server_args) is None
+    def _uses_auto_residency_planner(self) -> bool:
+        """Whether the static planner replaces coarse deployment defaults."""
+        return auto_residency_static_skip_reason(self.server_args) is None
 
     def _resolve_keep_resident_min_available_gb(
         self, deployment_config: ModelDeploymentConfig
-    ) -> float | None:
-        # explicit per-model > task-type default > global default
-        explicit = deployment_config.keep_resident_min_available_gb
-        if explicit is not None:
-            return explicit
-        if self.server_args.pipeline_config.task_type.is_image_gen():
-            return IMAGE_GEN_KEEP_RESIDENT_MIN_AVAILABLE_GB
-        return DEFAULT_KEEP_RESIDENT_MIN_AVAILABLE_GB
+    ) -> float:
+        return resolve_keep_resident_min_available_gb(
+            self.server_args, deployment_config
+        )
 
     def adjust_based_on_performance_mode(self) -> None:
         """Adjust the server args based on the performance mode"""
@@ -206,10 +225,10 @@ class ServerArgsAutoTuner:
         args = self.server_args
         if args.performance_mode != "auto" or current_platform.is_cpu():
             return
-        if self._uses_warmup_calibrated_residency():
-            # Keep the load-safe placement until warmup has measured the real
-            # workload. The post-warmup planner replaces model/card thresholds
-            # with component sizes and per-phase headroom.
+        if self._uses_auto_residency_planner():
+            # Keep the load-safe placement until the post-load static planner
+            # replaces model/card thresholds with component sizes and the
+            # default workload. A server warmup may refine that estimate.
             return
 
         # Explicit placement is component-scoped; unmatched components still
@@ -338,7 +357,19 @@ class ServerArgsAutoTuner:
     def maybe_adjust_auto_fsdp_with_offload_enabled(self) -> None:
         args = self.server_args
         if (
+            args.use_fsdp_inference
+            and args.is_arg_explicitly_set("use_fsdp_inference")
+            and args.explicit_residency_mode("transformer") is None
+        ):
+            # An explicit FSDP request must manage the DiT unless the user also
+            # supplied a component-scoped placement. Auto's load-safe default
+            # otherwise leaves the transformer offloaded and silently turns
+            # --use-fsdp-inference into a no-op.
+            args.dit_cpu_offload = False
+
+        if (
             args.performance_mode == "auto"
+            and not self._uses_auto_residency_planner()
             and args.num_gpus >= 2
             and not self._explicit_dit_residency
             and self._auto_uses_dit_offload()
@@ -375,20 +406,28 @@ class ServerArgsAutoTuner:
             return
 
         min_available_gb = self._get_min_available_device_memory_gb()
-        logger.info(
-            "Auto memory policy for %s: %s of free device memory selects "
-            "layerwise offload for %s. Explicit placement flags always win, "
-            "and the per-component lines below say where each one's weights "
-            "landed -- see the model's cookbook page for what to expect from "
-            "your memory budget.",
-            args.pipeline_config.__class__.__name__,
-            (
-                f"{min_available_gb:.1f} GiB"
-                if min_available_gb is not None
-                else "an unknown amount"
-            ),
-            ", ".join(layerwise_components),
+        uses_planner = self._uses_auto_residency_planner()
+        model_name = args.pipeline_config.__class__.__name__
+        available = (
+            f"{min_available_gb:.1f} GiB" if min_available_gb is not None else "unknown"
         )
+        if uses_planner:
+            logger.info(
+                "Auto memory planner for %s: layerwise candidates=%s, "
+                "free VRAM=%s. Final placement follows component sizing and "
+                "warmup calibration; explicit placement flags always win.",
+                model_name,
+                ", ".join(layerwise_components),
+                available,
+            )
+        else:
+            logger.info(
+                "Auto memory policy for %s: free VRAM=%s selects layerwise "
+                "offload for %s. Explicit placement flags always win.",
+                model_name,
+                available,
+                ", ".join(layerwise_components),
+            )
         args.layerwise_offload_components = layerwise_components
         self._warn_if_resident_dit_contradicts_its_own_threshold(layerwise_components)
 
@@ -605,7 +644,7 @@ class ServerArgsAutoTuner:
         args = self.server_args
         if args.performance_mode != "auto" or current_platform.is_cpu():
             return components
-        if self._uses_warmup_calibrated_residency():
+        if self._uses_auto_residency_planner():
             return components
 
         deployment_config = self._deployment_config()

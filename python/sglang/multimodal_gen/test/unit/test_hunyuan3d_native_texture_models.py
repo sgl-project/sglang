@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -204,6 +205,76 @@ class TestHunyuan3DComponentResidency(unittest.TestCase):
             Hunyuan3D2Pipeline._component_device(server_args, "paint_transformer"),
             torch.device("cpu"),
         )
+
+
+def test_hunyuan3d_shape_inventory_splits_bundled_checkpoint(tmp_path):
+    checkpoint = tmp_path / "model.safetensors"
+    header = {
+        "conditioner.encoder.weight": {
+            "dtype": "F16",
+            "shape": [3],
+            "data_offsets": [0, 6],
+        },
+        "model.block.weight": {
+            "dtype": "F16",
+            "shape": [5],
+            "data_offsets": [6, 16],
+        },
+        "vae.decoder.weight": {
+            "dtype": "F16",
+            "shape": [2],
+            "data_offsets": [16, 20],
+        },
+    }
+    encoded_header = json.dumps(header).encode()
+    checkpoint.write_bytes(
+        len(encoded_header).to_bytes(8, "little") + encoded_header + b"\0" * 20
+    )
+
+    sources = Hunyuan3D2Pipeline._shape_component_weight_sources(
+        str(checkpoint), True, 2
+    )
+
+    assert [
+        (source.component_name, source.checkpoint_bytes, source.parameter_count)
+        for source in sources
+    ] == [
+        ("hy3dshape_conditioner", 6, 3),
+        ("hy3dshape_model", 10, 5),
+        ("hy3dshape_vae", 4, 2),
+    ]
+
+
+def test_hunyuan3d_texture_inventory_includes_every_weighted_component(tmp_path):
+    config = Hunyuan3D2PipelineConfig(
+        paint_subfolder="paint",
+        delight_subfolder="delight",
+    )
+    for relative_path in (
+        "paint/vae/config.json",
+        "paint/unet/config.json",
+        "paint/scheduler/scheduler_config.json",
+        "delight/vae/config.json",
+        "delight/unet/config.json",
+        "delight/scheduler/scheduler_config.json",
+        "delight/text_encoder/config.json",
+        "delight/tokenizer/tokenizer_config.json",
+    ):
+        path = tmp_path / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}")
+
+    sources = Hunyuan3D2Pipeline._texture_component_weight_sources(
+        SimpleNamespace(model_path=str(tmp_path)), config
+    )
+
+    assert [source.component_name for source in sources] == [
+        "paint_vae",
+        "paint_transformer",
+        "delight_vae",
+        "delight_transformer",
+        "delight_text_encoder",
+    ]
 
 
 class TestHunyuan3DPaintTurboSchedule(unittest.TestCase):

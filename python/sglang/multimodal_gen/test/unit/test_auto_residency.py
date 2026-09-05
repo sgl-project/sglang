@@ -9,10 +9,17 @@ import torch.nn as nn
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import LongLive2T2VConfig
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImageEditPlus_2511_PipelineConfig,
+    QwenImageEditPlusPipelineConfig,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
     ACTIVATION_EXTRAPOLATION_MARGIN,
     GIB_BYTES,
+    MAX_LAYERWISE_POLICY_TARGETS,
+    MAX_LAYERWISE_RESIDENT_TARGETS,
     MIN_VRAM_RESERVE_BYTES,
+    PAGEABLE_H2D_COST_MULTIPLIER,
     AppliedResidencyChange,
     AutoResidencyPlan,
     AutoResidencyRollbackError,
@@ -21,6 +28,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     ResidencyTarget,
     WarmupMemoryRecord,
     _layerwise_pin_targets,
+    _layerwise_policy_targets,
     _layerwise_resident_targets,
     apply_residency_changes,
     collect_residency_targets,
@@ -28,13 +36,16 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     component_resident_size_bytes,
     component_runtime_weight_bytes,
     current_placement_reserve_shortfall_bytes,
+    estimate_allocator_headroom_bytes,
     estimate_candidate_latency_savings_ns,
     estimate_default_workload_peak_bytes,
     estimate_default_workload_timing,
     estimate_layerwise_layer_uses,
     estimate_workload_phase_peaks,
     format_applied_changes,
+    measured_failed_workload_phase_peaks,
     plan_auto_residency,
+    pre_warmup_residency_targets,
     rank_candidates_by_h2d_savings,
     resolve_measured_default_workload,
     rollback_residency_changes,
@@ -44,8 +55,15 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
     LAYERWISE_OFFLOAD,
     RESIDENT,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    HostPinBudget,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    RESIDENCY_POLICY_LEADING,
+    RESIDENCY_POLICY_STRIDED,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
@@ -62,7 +80,7 @@ def _record(
     num_frames=17,
     baseline_gib=10,
     peak_gib=12,
-    peak_reserved_gib=0,
+    peak_reserved_gib=None,
     succeeded=True,
     num_inference_steps=1,
     total_duration_ms=0.0,
@@ -83,7 +101,7 @@ def _record(
         baseline_allocated_bytes=baseline_gib * GIB_BYTES,
         peak_allocated_bytes=peak_gib * GIB_BYTES,
         succeeded=succeeded,
-        peak_reserved_bytes=peak_reserved_gib * GIB_BYTES,
+        peak_reserved_bytes=int((peak_reserved_gib or peak_gib) * GIB_BYTES),
         num_inference_steps=num_inference_steps,
         total_duration_ms=total_duration_ms,
         stage_duration_ms=stage_duration_ms or {},
@@ -98,6 +116,56 @@ def _record(
         layerwise_layer_uses=layerwise_layer_uses or {},
         layerwise_layer_uses_by_stage=layerwise_layer_uses_by_stage or {},
     )
+
+
+def test_qwen_image_2511_excludes_transformer_only_during_preload():
+    from sglang.multimodal_gen.runtime.pipelines.qwen_image import (
+        QwenImageEditPlusPipeline,
+    )
+
+    pipeline = QwenImageEditPlusPipeline.__new__(QwenImageEditPlusPipeline)
+
+    pipeline.server_args = SimpleNamespace(
+        pipeline_config=QwenImageEditPlus_2511_PipelineConfig()
+    )
+    assert pipeline.preload_residency_excluded_components == frozenset(("transformer",))
+
+    pipeline.server_args = SimpleNamespace(
+        pipeline_config=QwenImageEditPlusPipelineConfig()
+    )
+    assert pipeline.preload_residency_excluded_components == frozenset()
+
+
+class TestEstimateAllocatorHeadroom:
+    def test_uses_covering_workload_allocator_gap(self):
+        small = _record(
+            num_frames=9,
+            peak_gib=10,
+            peak_reserved_gib=11,
+        )
+        target = _record(
+            num_frames=17,
+            peak_gib=20,
+            peak_reserved_gib=26,
+        )
+
+        assert (
+            estimate_allocator_headroom_bytes(
+                records=[small, target], target_units=target.workload_units()
+            )
+            == 6 * GIB_BYTES
+        )
+
+    def test_keeps_largest_observed_gap_without_covering_workload(self):
+        first = _record(peak_gib=10, peak_reserved_gib=12)
+        second = _record(peak_gib=15, peak_reserved_gib=19)
+
+        assert (
+            estimate_allocator_headroom_bytes(
+                records=[first, second], target_units=second.workload_units() * 2
+            )
+            == 4 * GIB_BYTES
+        )
 
 
 class TestEstimateDefaultWorkloadTiming:
@@ -130,6 +198,25 @@ class TestEstimateDefaultWorkloadTiming:
             "text_encoder": ("TextEncodingStage",),
             "transformer": ("DenoisingStage",),
         }
+
+    def test_prefetch_phase_does_not_claim_stage_latency(self):
+        record = _record(
+            num_inference_steps=2,
+            total_duration_ms=1_000,
+            stage_duration_ms={"encode": 100, "denoise": 900},
+            phase_active_components={
+                "0:encode:prefetch:transformer": ("transformer",),
+                "1:denoise:use:transformer": ("transformer",),
+            },
+        )
+
+        _, _, component_stages = estimate_default_workload_timing(
+            records=[record],
+            target_units=record.workload_units(),
+            target_num_inference_steps=2,
+        )
+
+        assert component_stages == {"transformer": ("denoise",)}
 
     def test_uses_steady_step_instead_of_scaling_first_step_setup(self):
         record = _record(
@@ -217,7 +304,7 @@ class TestEstimateDefaultWorkloadTiming:
         }
         assert request_ns == 9_500_000_000
 
-    def test_transfer_savings_is_capped_by_request_not_component_stage(self):
+    def test_transfer_savings_uses_component_stage_as_cross_component_cap(self):
         candidates = [
             _candidate("text_encoder", weight_gib=10, h2d_gib=10),
             _candidate("transformer", weight_gib=10, h2d_gib=10),
@@ -227,13 +314,133 @@ class TestEstimateDefaultWorkloadTiming:
         savings = estimate_candidate_latency_savings_ns(
             candidates=candidates,
             request_duration_ns=10_000_000_000,
+            stage_duration_ns={"encode": 100_000_000, "denoise": 4_000_000_000},
+            component_stages={
+                "text_encoder": ("encode",),
+                "transformer": ("denoise",),
+            },
         )
 
-        assert savings[candidates[0].option_key()] > 400_000_000
+        assert savings[candidates[0].option_key()] == 100_000_000
         assert savings[candidates[1].option_key()] > 400_000_000
         assert savings[candidates[2].option_key()] < 0
 
-    def test_measured_placement_keeps_full_cost_of_slower_dit_target(self):
+    def test_stage_cap_preserves_order_inside_one_shot_component_frontier(self):
+        partial = ResidencyTarget(
+            component_name="text_encoder",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=10 * GIB_BYTES,
+            h2d_bytes_per_request=5 * GIB_BYTES,
+            target_layerwise_resident_layers=(5,),
+            target_layerwise_pinned_layers=((),),
+        )
+        resident = ResidencyTarget(
+            component_name="text_encoder",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=20 * GIB_BYTES,
+            h2d_bytes_per_request=10 * GIB_BYTES,
+            target_layerwise_resident_layers=(10,),
+            target_layerwise_pinned_layers=((),),
+        )
+
+        savings = estimate_candidate_latency_savings_ns(
+            candidates=[partial, resident],
+            request_duration_ns=10_000_000_000,
+            stage_duration_ns={"encode": 100_000_000},
+            component_stages={"text_encoder": ("encode",)},
+        )
+
+        assert savings[partial.option_key()] == 50_000_000
+        assert savings[resident.option_key()] == 100_000_000
+
+    def test_async_stage_time_does_not_cap_repeated_dit_transfers(self):
+        partial = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=10 * GIB_BYTES,
+            h2d_bytes_per_request=5 * GIB_BYTES,
+            target_layerwise_resident_layers=(5,),
+            target_layerwise_pinned_layers=((),),
+        )
+        resident = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=20 * GIB_BYTES,
+            h2d_bytes_per_request=10 * GIB_BYTES,
+            target_layerwise_resident_layers=(10,),
+            target_layerwise_pinned_layers=((),),
+        )
+
+        savings = estimate_candidate_latency_savings_ns(
+            candidates=[partial, resident],
+            request_duration_ns=10_000_000_000,
+            stage_duration_ns={"denoise": 100_000_000},
+            component_stages={"transformer": ("denoise",)},
+        )
+
+        assert savings[partial.option_key()] > 100_000_000
+        assert savings[resident.option_key()] > savings[partial.option_key()]
+
+    def test_repeated_nonstandard_component_uses_request_latency_cap(self):
+        partial = ResidencyTarget(
+            component_name="custom_refiner",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=10 * GIB_BYTES,
+            h2d_bytes_per_request=5 * GIB_BYTES,
+            target_layerwise_resident_layers=(5,),
+            target_layerwise_pinned_layers=((),),
+        )
+        resident = ResidencyTarget(
+            component_name="custom_refiner",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=20 * GIB_BYTES,
+            h2d_bytes_per_request=10 * GIB_BYTES,
+            target_layerwise_resident_layers=(10,),
+            target_layerwise_pinned_layers=((),),
+        )
+
+        savings = estimate_candidate_latency_savings_ns(
+            candidates=[partial, resident],
+            request_duration_ns=10_000_000_000,
+            stage_duration_ns={"denoise": 100_000_000},
+            component_stages={"custom_refiner": ("denoise",)},
+            repeated_components={"custom_refiner"},
+        )
+
+        assert savings[partial.option_key()] > 100_000_000
+        assert savings[resident.option_key()] > savings[partial.option_key()]
+
+    def test_dit_request_cap_does_not_compress_marginal_transfer_savings(self):
+        partial = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=95 * GIB_BYTES,
+            h2d_bytes_per_request=95 * GIB_BYTES,
+            target_layerwise_resident_layers=(95,),
+            target_layerwise_pinned_layers=((),),
+        )
+        resident = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=100 * GIB_BYTES,
+            h2d_bytes_per_request=100 * GIB_BYTES,
+            target_layerwise_resident_layers=(100,),
+            target_layerwise_pinned_layers=((),),
+        )
+
+        savings = estimate_candidate_latency_savings_ns(
+            candidates=[partial, resident],
+            request_duration_ns=1_000_000_000,
+            stage_duration_ns={"denoise": 100_000_000},
+            component_stages={"transformer": ("denoise",)},
+        )
+
+        assert savings[resident.option_key()] == 1_000_000_000
+        assert (
+            savings[resident.option_key()] - savings[partial.option_key()] > 200_000_000
+        )
+
+    def test_measured_placement_keeps_the_full_cost_of_a_slower_dit_target(self):
         coarse = ResidencyTarget(
             component_name="transformer",
             residency_mode=COMPONENT_OFFLOAD,
@@ -263,6 +470,8 @@ class TestEstimateDefaultWorkloadTiming:
         savings = estimate_candidate_latency_savings_ns(
             candidates=[coarse, virtual_layerwise, resident],
             request_duration_ns=1_000_000_000,
+            stage_duration_ns={"denoise": 1_000_000_000},
+            component_stages={"transformer": ("denoise",)},
         )
 
         assert savings[coarse.option_key()] == 0
@@ -536,7 +745,7 @@ class TestEstimateDefaultWorkloadPeak:
             phase_active_components={"denoise": ("transformer",)},
         )
 
-        peaks, active, used, _ = estimate_workload_phase_peaks(
+        peaks, active, used, _, _ = estimate_workload_phase_peaks(
             records=[small, large],
             target_units=832 * 480 * 81,
             component_weight_bytes={"transformer": 28 * GIB_BYTES},
@@ -544,6 +753,43 @@ class TestEstimateDefaultWorkloadPeak:
 
         assert peaks["denoise"] >= 32 * GIB_BYTES
         assert active == {"denoise": ("transformer",)}
+        assert used == active
+
+    def test_failed_probe_preserves_phase_layouts_for_recovery(self):
+        first = WarmupMemoryRecord(
+            width=512,
+            height=512,
+            num_frames=1,
+            baseline_allocated_bytes=20 * GIB_BYTES,
+            peak_allocated_bytes=30 * GIB_BYTES,
+            succeeded=False,
+            phase_peak_allocated_bytes={"denoise": 29 * GIB_BYTES},
+            phase_active_components={"denoise": ("transformer",)},
+            phase_used_components={"denoise": ("transformer",)},
+        )
+        second = WarmupMemoryRecord(
+            width=512,
+            height=512,
+            num_frames=1,
+            baseline_allocated_bytes=20 * GIB_BYTES,
+            peak_allocated_bytes=31 * GIB_BYTES,
+            succeeded=False,
+            phase_peak_allocated_bytes={"denoise": 31 * GIB_BYTES},
+            phase_active_components={"denoise": ("transformer_2",)},
+            phase_used_components={"denoise": ("transformer_2",)},
+        )
+
+        peak, phases, active, used, _, _ = measured_failed_workload_phase_peaks(
+            records=[first, second],
+            target_units=first.workload_units(),
+        )
+
+        assert peak == 31 * GIB_BYTES
+        assert phases == {
+            "denoise:layout:0": 29 * GIB_BYTES,
+            "denoise:layout:1": 31 * GIB_BYTES,
+        }
+        assert set(active.values()) == {("transformer",), ("transformer_2",)}
         assert used == active
 
     def test_phase_estimation_uses_allocated_peak(self):
@@ -558,7 +804,7 @@ class TestEstimateDefaultWorkloadPeak:
             phase_active_components={"denoise": ("transformer",)},
         )
 
-        peaks, _, _, _ = estimate_workload_phase_peaks(
+        peaks, _, _, _, _ = estimate_workload_phase_peaks(
             records=[record],
             target_units=record.workload_units(),
             component_weight_bytes={"transformer": 10 * GIB_BYTES},
@@ -578,7 +824,7 @@ class TestEstimateDefaultWorkloadPeak:
             phase_full_weight_transition_components={"lora_switch": ("transformer",)},
         )
 
-        peaks, _, _, transitions = estimate_workload_phase_peaks(
+        peaks, _, _, _, transitions = estimate_workload_phase_peaks(
             records=[record],
             target_units=record.workload_units(),
             component_weight_bytes={"transformer": 2 * GIB_BYTES},
@@ -609,7 +855,7 @@ class TestEstimateDefaultWorkloadPeak:
             phase_active_components={"denoise": ("transformer",)},
         )
 
-        peaks, active, used, _ = estimate_workload_phase_peaks(
+        peaks, active, used, _, _ = estimate_workload_phase_peaks(
             records=[small, target],
             target_units=target.workload_units(),
             component_weight_bytes={"transformer": 40 * GIB_BYTES},
@@ -641,7 +887,7 @@ class TestEstimateDefaultWorkloadPeak:
             phase_active_components={"denoise": ("text_encoder",)},
         )
 
-        peaks, active, used, _ = estimate_workload_phase_peaks(
+        peaks, active, used, _, _ = estimate_workload_phase_peaks(
             records=[transformer_phase, encoder_phase],
             target_units=transformer_phase.workload_units(),
             component_weight_bytes={
@@ -659,6 +905,53 @@ class TestEstimateDefaultWorkloadPeak:
             "denoise:layout:1": ("transformer",),
         }
         assert used == active
+
+    def test_phase_estimation_keeps_distinct_prefetch_layouts_separate(self):
+        without_prefetch = WarmupMemoryRecord(
+            width=768,
+            height=512,
+            num_frames=25,
+            baseline_allocated_bytes=2 * GIB_BYTES,
+            peak_allocated_bytes=20 * GIB_BYTES,
+            succeeded=True,
+            phase_peak_allocated_bytes={"encode": 20 * GIB_BYTES},
+            phase_active_components={"encode": ("text_encoder",)},
+            phase_used_components={"encode": ("text_encoder",)},
+        )
+        with_prefetch = WarmupMemoryRecord(
+            width=768,
+            height=512,
+            num_frames=25,
+            baseline_allocated_bytes=2 * GIB_BYTES,
+            peak_allocated_bytes=30 * GIB_BYTES,
+            succeeded=True,
+            phase_peak_allocated_bytes={"encode": 30 * GIB_BYTES},
+            phase_active_components={
+                "encode": ("text_encoder", "transformer"),
+            },
+            phase_used_components={"encode": ("text_encoder",)},
+            phase_prefetched_components={"encode": ("transformer",)},
+        )
+
+        peaks, active, used, prefetched, _ = estimate_workload_phase_peaks(
+            records=[without_prefetch, with_prefetch],
+            target_units=without_prefetch.workload_units(),
+            component_weight_bytes={
+                "transformer": 10 * GIB_BYTES,
+                "text_encoder": 8 * GIB_BYTES,
+            },
+        )
+
+        assert peaks == {
+            "encode:layout:0": 20 * GIB_BYTES,
+            "encode:layout:1": 30 * GIB_BYTES,
+        }
+        assert set(active.values()) == {
+            ("text_encoder",),
+            ("text_encoder", "transformer"),
+        }
+        assert set(used.values()) == {("text_encoder",)}
+        assert set(prefetched.values()) == {(), ("transformer",)}
 
 
 def _candidate(
@@ -686,16 +979,19 @@ def _candidate(
 def _report(
     *,
     rank: int = 0,
-    budget_gib: int = 100,
-    estimated_gib: int | None = 50,
-    observed_reserved_gib: int = 0,
+    budget_gib: float = 100,
+    estimated_gib: float | None = 50,
+    planning_headroom_correction_gib: int = 0,
+    observed_reserved_gib: float = 0,
     candidates: list[ResidencyTarget] | None = None,
     skip_reason: str | None = None,
-    phase_peaks_gib: dict[str, int] | None = None,
+    phase_peaks_gib: dict[str, float] | None = None,
     phase_components: dict[str, tuple[str, ...]] | None = None,
     phase_present_components: dict[str, tuple[str, ...]] | None = None,
+    phase_prefetched_components: dict[str, tuple[str, ...]] | None = None,
     phase_full_weight_transition_components: dict[str, tuple[str, ...]] | None = None,
     component_weight_gib: dict[str, int] | None = None,
+    component_active_weight_gib: dict[str, int] | None = None,
     node_rank: int = 0,
     pinned_host_gib: int = 0,
     host_pin_capacity_gib: int = 0,
@@ -705,17 +1001,23 @@ def _report(
     estimated_request_duration_ns: int = 0,
     measured_request_duration_ns: int = 0,
     candidate_latency_savings_ns: dict[str, int] | None = None,
+    warmup_oom: bool = False,
+    require_feasible_placement: bool = False,
 ) -> RankResidencyReport:
     return RankResidencyReport(
         rank=rank,
-        budget_bytes=budget_gib * GIB_BYTES,
+        budget_bytes=int(budget_gib * GIB_BYTES),
         estimated_peak_bytes=(
-            None if estimated_gib is None else estimated_gib * GIB_BYTES
+            None if estimated_gib is None else int(estimated_gib * GIB_BYTES)
+        ),
+        planning_headroom_correction_bytes=(
+            planning_headroom_correction_gib * GIB_BYTES
         ),
         target_workload_measured=target_workload_measured,
         observed_reserved_bytes=observed_reserved_gib * GIB_BYTES,
         estimated_peak_bytes_by_phase={
-            name: value * GIB_BYTES for name, value in (phase_peaks_gib or {}).items()
+            name: int(value * GIB_BYTES)
+            for name, value in (phase_peaks_gib or {}).items()
         },
         active_components_by_phase=(
             phase_present_components
@@ -723,12 +1025,17 @@ def _report(
             else phase_components or {}
         ),
         used_components_by_phase=phase_components or {},
+        prefetched_components_by_phase=phase_prefetched_components or {},
         full_weight_transition_components_by_phase=(
             phase_full_weight_transition_components or {}
         ),
         current_device_weight_bytes_by_component={
             name: value * GIB_BYTES
             for name, value in (component_weight_gib or {}).items()
+        },
+        current_active_weight_bytes_by_component={
+            name: value * GIB_BYTES
+            for name, value in (component_active_weight_gib or {}).items()
         },
         node_rank=node_rank,
         pinned_host_bytes=pinned_host_gib * GIB_BYTES,
@@ -739,6 +1046,8 @@ def _report(
         measured_request_duration_ns=measured_request_duration_ns,
         candidate_latency_savings_ns=candidate_latency_savings_ns or {},
         candidates=candidates if candidates is not None else [_candidate("vae")],
+        warmup_oom=warmup_oom,
+        require_feasible_placement=require_feasible_placement,
         skip_reason=skip_reason,
     )
 
@@ -798,11 +1107,231 @@ class TestResolveMeasuredDefaultWorkload:
 
 
 class TestPlanAutoResidency:
+    def test_latency_equivalent_partial_dit_prefers_strided_schedule(self):
+        common = dict(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=4 * GIB_BYTES,
+            h2d_bytes_per_request=10 * GIB_BYTES,
+            target_layerwise_resident_layers=(8,),
+            target_layerwise_pinned_layers=((),),
+            target_device_weight_bytes=4 * GIB_BYTES,
+        )
+        leading = ResidencyTarget(
+            **common,
+            target_layerwise_residency_policies=(RESIDENCY_POLICY_LEADING,),
+            current_placement=True,
+        )
+        strided = ResidencyTarget(
+            **common,
+            target_layerwise_residency_policies=(RESIDENCY_POLICY_STRIDED,),
+        )
+
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    estimated_gib=30,
+                    candidates=[leading, strided],
+                    target_workload_measured=True,
+                )
+            ]
+        )
+
+        assert len(plan.changes) == 1
+        assert plan.changes[0].target_layerwise_residency_policies == (
+            RESIDENCY_POLICY_STRIDED,
+        )
+
+    def test_lower_latency_utility_keeps_the_measured_placement(self):
+        resident = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=RESIDENT,
+            target_residency_mode=RESIDENT,
+            target_resident_weight_bytes=20 * GIB_BYTES,
+            h2d_bytes_per_request=20 * GIB_BYTES,
+            permanent_residency=True,
+            target_device_weight_bytes=20 * GIB_BYTES,
+            current_placement=True,
+        )
+        offloaded = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=RESIDENT,
+            target_residency_mode=COMPONENT_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=19 * GIB_BYTES,
+            device_transition_delta_bytes=-20 * GIB_BYTES,
+            inactive_device_delta_bytes=-20 * GIB_BYTES,
+            present_device_delta_bytes=-20 * GIB_BYTES,
+        )
+
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=100,
+                    estimated_gib=30,
+                    candidates=[resident, offloaded],
+                    estimated_request_duration_ns=1_000_000_000,
+                    candidate_latency_savings_ns={
+                        resident.option_key(): 500_000_000,
+                        offloaded.option_key(): 475_000_000,
+                    },
+                )
+            ]
+        )
+
+        assert plan.changes == []
+
+    def test_material_latency_gain_can_replace_the_measured_placement(self):
+        resident = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=RESIDENT,
+            target_residency_mode=RESIDENT,
+            target_resident_weight_bytes=20 * GIB_BYTES,
+            h2d_bytes_per_request=20 * GIB_BYTES,
+            permanent_residency=True,
+            target_device_weight_bytes=20 * GIB_BYTES,
+            current_placement=True,
+        )
+        offloaded = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=RESIDENT,
+            target_residency_mode=COMPONENT_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=19 * GIB_BYTES,
+            device_transition_delta_bytes=-20 * GIB_BYTES,
+            inactive_device_delta_bytes=-20 * GIB_BYTES,
+            present_device_delta_bytes=-20 * GIB_BYTES,
+        )
+
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=100,
+                    estimated_gib=30,
+                    candidates=[resident, offloaded],
+                    estimated_request_duration_ns=1_000_000_000,
+                    candidate_latency_savings_ns={
+                        resident.option_key(): 460_000_000,
+                        offloaded.option_key(): 500_000_000,
+                    },
+                )
+            ]
+        )
+
+        assert plan.changes == [offloaded]
+
+    def test_free_host_pin_gain_is_selected(self):
+        pageable = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=5 * GIB_BYTES,
+            h2d_bytes_per_request=10 * GIB_BYTES,
+            target_layerwise_resident_layers=(5,),
+            target_layerwise_pinned_layers=((),),
+            target_device_weight_bytes=5 * GIB_BYTES,
+            current_placement=True,
+        )
+        pinned = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=5 * GIB_BYTES,
+            h2d_bytes_per_request=11 * GIB_BYTES,
+            target_layerwise_resident_layers=(5,),
+            target_layerwise_pinned_layers=((0,),),
+            pinned_host_delta_bytes=GIB_BYTES,
+            target_device_weight_bytes=5 * GIB_BYTES,
+            target_pinned_host_bytes=GIB_BYTES,
+        )
+
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=100,
+                    estimated_gib=30,
+                    candidates=[pageable, pinned],
+                    host_pin_capacity_gib=10,
+                    estimated_request_duration_ns=1_000_000_000,
+                    candidate_latency_savings_ns={
+                        pageable.option_key(): 100_000_000,
+                        pinned.option_key(): 110_000_000,
+                    },
+                )
+            ]
+        )
+
+        assert plan.changes == [pinned]
+
+    def test_oom_phase_forces_a_lower_memory_complete_target(self):
+        resident = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=RESIDENT,
+            target_resident_weight_bytes=20 * GIB_BYTES,
+            h2d_bytes_per_request=20 * GIB_BYTES,
+            permanent_residency=True,
+            target_device_weight_bytes=20 * GIB_BYTES,
+            current_placement=True,
+        )
+        layerwise = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=2 * GIB_BYTES,
+            h2d_bytes_per_request=10 * GIB_BYTES,
+            target_layerwise_resident_layers=(2,),
+            target_layerwise_pinned_layers=((),),
+            device_transition_delta_bytes=-15 * GIB_BYTES,
+            active_device_delta_bytes=-15 * GIB_BYTES,
+            present_device_delta_bytes=-15 * GIB_BYTES,
+            inactive_device_delta_bytes=-20 * GIB_BYTES,
+            target_device_weight_bytes=2 * GIB_BYTES,
+        )
+
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=30,
+                    estimated_gib=29,
+                    warmup_oom=True,
+                    phase_peaks_gib={"denoise": 29},
+                    phase_components={"denoise": ("transformer",)},
+                    phase_present_components={"denoise": ("transformer",)},
+                    component_weight_gib={"transformer": 20},
+                    candidates=[resident, layerwise],
+                )
+            ]
+        )
+
+        assert plan.recovering_from_oom
+        assert plan.resource_budget_bytes["gpu:rank0:denoise"] == -3 * GIB_BYTES
+        assert [candidate.option_key() for candidate in plan.changes] == [
+            layerwise.option_key()
+        ]
+
     def test_rank_skip_reason_propagates(self):
         plan = plan_auto_residency(
             reports=[_report(), _report(rank=1, skip_reason="no measurements")]
         )
         assert plan.skip_reason == "rank 1: no measurements"
+
+    def test_oom_recovery_state_survives_an_infeasible_plan(self):
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=30,
+                    estimated_gib=29,
+                    warmup_oom=True,
+                    phase_peaks_gib={"denoise": 29},
+                    candidates=[_candidate("vae")],
+                )
+            ]
+        )
+
+        assert plan.recovering_from_oom
+        assert plan.skip_reason == "no placement satisfies all resource budgets"
         assert not plan.changes
 
     def test_missing_estimate_skips(self):
@@ -824,11 +1353,315 @@ class TestPlanAutoResidency:
         plan = plan_auto_residency(reports=[_report(budget_gib=20, estimated_gib=10)])
         assert plan.reserve_bytes == MIN_VRAM_RESERVE_BYTES
 
+    def test_uncalibrated_small_card_reserve_has_three_gib_floor(self):
+        plan = plan_auto_residency(reports=[_report(budget_gib=12, estimated_gib=5)])
+        assert plan.reserve_bytes == 3 * GIB_BYTES
+
+    def test_pre_warmup_report_enforces_weight_feasibility_without_oom(self):
+        resident = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=RESIDENT,
+            target_resident_weight_bytes=11 * GIB_BYTES,
+            h2d_bytes_per_request=11 * GIB_BYTES,
+            permanent_residency=True,
+            target_device_weight_bytes=11 * GIB_BYTES,
+            current_placement=True,
+        )
+        layerwise = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=GIB_BYTES,
+            h2d_bytes_per_request=5 * GIB_BYTES,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((),),
+            active_device_delta_bytes=-9 * GIB_BYTES,
+            inactive_device_delta_bytes=-10 * GIB_BYTES,
+            target_device_weight_bytes=GIB_BYTES,
+        )
+
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=12,
+                    estimated_gib=11,
+                    phase_peaks_gib={"static:transformer": 11},
+                    phase_components={"static:transformer": ("transformer",)},
+                    candidates=[resident, layerwise],
+                    require_feasible_placement=True,
+                )
+            ]
+        )
+
+        assert not plan.recovering_from_oom
+        assert [candidate.target_mode() for candidate in plan.changes] == [
+            LAYERWISE_OFFLOAD
+        ]
+
+    def test_pre_warmup_plan_keeps_feasible_current_placement(self):
+        current = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=GIB_BYTES,
+            h2d_bytes_per_request=5 * GIB_BYTES,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((),),
+            target_device_weight_bytes=GIB_BYTES,
+            current_placement=True,
+        )
+        component_offload = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=COMPONENT_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=11 * GIB_BYTES,
+            target_device_weight_bytes=0,
+        )
+        less_layerwise = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=7 * GIB_BYTES,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((),),
+            target_device_weight_bytes=0,
+        )
+        candidates = [current, less_layerwise, component_offload]
+
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=12,
+                    estimated_gib=2,
+                    phase_peaks_gib={"static:transformer": 2},
+                    phase_components={"static:transformer": ("transformer",)},
+                    candidates=candidates,
+                    require_feasible_placement=True,
+                    estimated_request_duration_ns=1,
+                    candidate_latency_savings_ns={
+                        candidate.option_key(): int(candidate.current_placement)
+                        for candidate in candidates
+                    },
+                )
+            ]
+        )
+
+        assert plan.changes == []
+
+    def test_pre_warmup_targets_defer_device_weight_promotion(self):
+        current = ResidencyTarget(
+            component_name="text_encoder",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=COMPONENT_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=8 * GIB_BYTES,
+            target_device_weight_bytes=0,
+            current_placement=True,
+        )
+        resident = ResidencyTarget(
+            component_name="text_encoder",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=RESIDENT,
+            target_resident_weight_bytes=8 * GIB_BYTES,
+            h2d_bytes_per_request=0,
+            target_device_weight_bytes=8 * GIB_BYTES,
+        )
+
+        assert pre_warmup_residency_targets([current, resident]) == [current]
+
+    def test_pre_warmup_targets_keep_active_working_set_demotion(self):
+        current = ResidencyTarget(
+            component_name="text_encoder",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=COMPONENT_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=0,
+            target_device_weight_bytes=0,
+            current_placement=True,
+        )
+        layerwise = ResidencyTarget(
+            component_name="text_encoder",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=0,
+            target_device_weight_bytes=GIB_BYTES,
+            active_device_delta_bytes=-16 * GIB_BYTES,
+            inactive_device_delta_bytes=GIB_BYTES,
+            device_transition_delta_bytes=GIB_BYTES,
+        )
+
+        assert pre_warmup_residency_targets([current, layerwise]) == [
+            current,
+            layerwise,
+        ]
+
+    def test_pre_warmup_report_uses_weight_model_below_legacy_threshold(
+        self, monkeypatch
+    ):
+        from sglang.multimodal_gen.runtime.managers import gpu_worker
+
+        current = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=COMPONENT_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=8 * GIB_BYTES,
+            target_device_weight_bytes=0,
+            current_placement=True,
+        )
+        modules = {"transformer": object()}
+        collect_calls = []
+
+        def collect_targets(_workload, *, allow_host_pin_reallocation=True):
+            collect_calls.append(allow_host_pin_reallocation)
+            return [current]
+
+        worker = SimpleNamespace(
+            rank=0,
+            pipeline=SimpleNamespace(preload_residency_excluded_components=frozenset()),
+            server_args=SimpleNamespace(
+                num_gpus=1,
+                nnodes=1,
+                node_rank=0,
+                host_pin_budget=lambda: None,
+            ),
+            _auto_residency_budget_bytes=lambda: 30 * GIB_BYTES,
+            _collect_auto_residency_targets=collect_targets,
+            _auto_residency_modules=lambda: modules,
+        )
+        monkeypatch.setattr(
+            gpu_worker,
+            "component_runtime_weight_bytes",
+            lambda _modules: {"transformer": 8 * GIB_BYTES},
+        )
+        monkeypatch.setattr(
+            gpu_worker,
+            "component_current_device_weight_bytes",
+            lambda _modules: {"transformer": 0},
+        )
+        monkeypatch.setattr(
+            gpu_worker, "layerwise_pinned_host_bytes", lambda *a, **k: 0
+        )
+        monkeypatch.setattr(
+            gpu_worker, "layerwise_host_pin_capacity_bytes", lambda *a, **k: 0
+        )
+        monkeypatch.setattr(
+            gpu_worker, "host_memory_available_bytes", lambda: 100 * GIB_BYTES
+        )
+        monkeypatch.setattr(
+            gpu_worker.torch,
+            "get_device_module",
+            lambda: SimpleNamespace(memory_allocated=lambda: 2 * GIB_BYTES),
+        )
+
+        report = gpu_worker.GPUWorker._build_pre_warmup_auto_residency_report(
+            worker,
+            workload=DefaultWorkload(
+                width=832,
+                height=480,
+                num_frames=24,
+                num_inference_steps=50,
+            ),
+        )
+
+        assert report.budget_bytes == 30 * GIB_BYTES
+        assert report.estimated_peak_bytes == 10 * GIB_BYTES
+        assert report.candidates == [current]
+        assert report.skip_reason is None
+        assert report.estimated_request_duration_ns == 1
+        assert report.candidate_latency_savings_ns == {current.option_key(): 1}
+        assert collect_calls == [False]
+
+    def test_pre_warmup_report_keeps_excluded_components_fixed(self, monkeypatch):
+        from sglang.multimodal_gen.runtime.managers import gpu_worker
+
+        transformer = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=RESIDENT,
+            target_resident_weight_bytes=20 * GIB_BYTES,
+            h2d_bytes_per_request=20 * GIB_BYTES,
+            permanent_residency=True,
+        )
+        vae = ResidencyTarget(
+            component_name="vae",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=RESIDENT,
+            target_resident_weight_bytes=GIB_BYTES,
+            h2d_bytes_per_request=GIB_BYTES,
+            permanent_residency=True,
+            target_device_weight_bytes=GIB_BYTES,
+            current_placement=True,
+        )
+        modules = {"transformer": object(), "vae": object()}
+        worker = SimpleNamespace(
+            rank=0,
+            pipeline=SimpleNamespace(
+                preload_residency_excluded_components=frozenset(("transformer",))
+            ),
+            server_args=SimpleNamespace(
+                num_gpus=1,
+                nnodes=1,
+                node_rank=0,
+                host_pin_budget=lambda: None,
+            ),
+            _auto_residency_budget_bytes=lambda: 80 * GIB_BYTES,
+            _collect_auto_residency_targets=lambda _workload, **_kwargs: [
+                transformer,
+                vae,
+            ],
+            _auto_residency_modules=lambda: modules,
+        )
+        monkeypatch.setattr(
+            gpu_worker,
+            "component_runtime_weight_bytes",
+            lambda _modules: {"transformer": 20 * GIB_BYTES, "vae": GIB_BYTES},
+        )
+        monkeypatch.setattr(
+            gpu_worker,
+            "component_current_device_weight_bytes",
+            lambda _modules: {"transformer": 0, "vae": 0},
+        )
+        monkeypatch.setattr(
+            gpu_worker, "layerwise_pinned_host_bytes", lambda *a, **k: 0
+        )
+        monkeypatch.setattr(
+            gpu_worker, "layerwise_host_pin_capacity_bytes", lambda *a, **k: 0
+        )
+        monkeypatch.setattr(
+            gpu_worker, "host_memory_available_bytes", lambda: 100 * GIB_BYTES
+        )
+        monkeypatch.setattr(
+            gpu_worker.torch,
+            "get_device_module",
+            lambda: SimpleNamespace(memory_allocated=lambda: 2 * GIB_BYTES),
+        )
+
+        report = gpu_worker.GPUWorker._build_pre_warmup_auto_residency_report(
+            worker,
+            workload=DefaultWorkload(
+                width=1920,
+                height=1088,
+                num_frames=24,
+                num_inference_steps=15,
+            ),
+        )
+
+        assert [candidate.component_name for candidate in report.candidates] == ["vae"]
+        assert report.estimated_peak_bytes_by_phase["static:transformer"] == (
+            22 * GIB_BYTES
+        )
+        assert report.used_components_by_phase["static:transformer"] == ("transformer",)
+
     def test_reserve_floor_is_capped_on_a_small_card(self):
-        # A flat 4 GiB would fence off a third of a 12 GiB card; the cap keeps
-        # the floor at a fifth of what is actually there.
+        # Keep enough room for unmeasured activations without applying the
+        # datacenter-card 4 GiB floor verbatim.
         plan = plan_auto_residency(reports=[_report(budget_gib=10, estimated_gib=4)])
-        assert plan.reserve_bytes == 2 * GIB_BYTES
+        assert plan.reserve_bytes == 3 * GIB_BYTES
 
     def test_target_workload_measurement_uses_tighter_reserve(self):
         plan = plan_auto_residency(
@@ -841,6 +1674,18 @@ class TestPlanAutoResidency:
             ]
         )
         assert plan.reserve_bytes == 5 * GIB_BYTES
+
+    def test_measured_small_card_reserve_drops_to_ten_percent(self):
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=12,
+                    estimated_gib=10,
+                    target_workload_measured=True,
+                )
+            ]
+        )
+        assert plan.reserve_bytes == int(1.2 * GIB_BYTES)
 
     def test_target_workload_measurement_is_replica_wide(self):
         candidate = _candidate("vae", weight_gib=1)
@@ -879,7 +1724,7 @@ class TestPlanAutoResidency:
         )
         assert [c.component_name for c in plan.changes] == ["dit"]
 
-    def test_long_request_does_not_spend_vram_on_tiny_encoder_gain(self):
+    def test_long_request_uses_available_vram_for_encoder_gain(self):
         transformer = _candidate(
             "transformer",
             mode=LAYERWISE_OFFLOAD,
@@ -904,10 +1749,11 @@ class TestPlanAutoResidency:
         )
 
         assert [candidate.component_name for candidate in plan.changes] == [
-            "transformer"
+            "transformer",
+            "text_encoder",
         ]
 
-    def test_latency_equivalent_plan_avoids_strategy_repacking(self):
+    def test_equal_latency_plan_avoids_strategy_repacking(self):
         current = ResidencyTarget(
             component_name="vae",
             residency_mode=LAYERWISE_OFFLOAD,
@@ -935,7 +1781,7 @@ class TestPlanAutoResidency:
                     estimated_request_duration_ns=1_000_000_000,
                     candidate_latency_savings_ns={
                         current.option_key(): 0,
-                        component_offload.option_key(): 10_000_000,
+                        component_offload.option_key(): 0,
                     },
                 )
             ]
@@ -977,7 +1823,8 @@ class TestPlanAutoResidency:
         )
 
         assert [candidate.component_name for candidate in plan.changes] == [
-            "transformer"
+            "transformer",
+            "text_encoder",
         ]
 
     def test_smaller_component_still_fits_after_skipping_a_big_one(self):
@@ -1067,6 +1914,9 @@ class TestPlanAutoResidency:
                         "text_and_prefetch": ("text_encoder", "transformer"),
                         "denoise": ("transformer",),
                     },
+                    phase_prefetched_components={
+                        "text_and_prefetch": ("transformer",),
+                    },
                     candidates=[offload, resident],
                 )
             ]
@@ -1074,6 +1924,56 @@ class TestPlanAutoResidency:
 
         assert [candidate.option_key() for candidate in plan.changes] == [
             "transformer:resident"
+        ]
+
+    def test_component_offload_can_release_an_overlapped_layerwise_prefetch(self):
+        layerwise = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=10 * GIB_BYTES,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((),),
+            current_placement=True,
+        )
+        component_offload = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=COMPONENT_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=0,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((),),
+            concurrent_prefetch_device_delta_bytes=-10 * GIB_BYTES,
+        )
+
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=18,
+                    estimated_gib=18,
+                    warmup_oom=True,
+                    candidates=[layerwise, component_offload],
+                    phase_peaks_gib={"encode_prefetch": 18},
+                    phase_components={"encode_prefetch": ("text_encoder",)},
+                    phase_present_components={
+                        "encode_prefetch": ("text_encoder", "transformer"),
+                    },
+                    phase_prefetched_components={
+                        "encode_prefetch": ("transformer",),
+                    },
+                    component_active_weight_gib={
+                        "text_encoder": 8,
+                        "transformer": 10,
+                    },
+                )
+            ]
+        )
+
+        assert plan.skip_reason is None
+        assert [candidate.target_mode() for candidate in plan.changes] == [
+            COMPONENT_OFFLOAD
         ]
 
     def test_request_end_residency_is_carried_into_the_next_request(self):
@@ -1341,6 +2241,44 @@ class TestPlanAutoResidency:
             LAYERWISE_OFFLOAD
         ]
 
+    def test_untracked_oom_peak_constrains_synthetic_component_phase(self):
+        component_offload = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=COMPONENT_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=0,
+            current_placement=True,
+        )
+        layerwise = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=GIB_BYTES,
+            h2d_bytes_per_request=10 * GIB_BYTES,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((),),
+            active_device_delta_bytes=-10 * GIB_BYTES,
+            inactive_device_delta_bytes=GIB_BYTES,
+        )
+
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=12,
+                    estimated_gib=11.75,
+                    phase_peaks_gib={"request:untracked": 11.75},
+                    phase_present_components={"request:untracked": ("vae",)},
+                    candidates=[component_offload, layerwise],
+                    warmup_oom=True,
+                )
+            ]
+        )
+
+        assert [candidate.target_mode() for candidate in plan.changes] == [
+            LAYERWISE_OFFLOAD
+        ]
+
     def test_reports_reserve_shortfall_for_a_newly_calibrated_placement(self):
         plan = plan_auto_residency(
             reports=[
@@ -1353,7 +2291,26 @@ class TestPlanAutoResidency:
             ]
         )
 
-        assert plan.current_placement_reserve_shortfall_bytes == 2 * GIB_BYTES
+        assert plan.current_placement_reserve_shortfall_bytes == GIB_BYTES
+
+    def test_failed_candidate_margin_only_constrains_future_growth(self):
+        candidate = _candidate("transformer", weight_gib=5, h2d_gib=5)
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=40,
+                    estimated_gib=30,
+                    planning_headroom_correction_gib=3,
+                    target_workload_measured=True,
+                    candidates=[candidate],
+                    phase_peaks_gib={"denoise": 30},
+                )
+            ]
+        )
+
+        assert plan.current_placement_reserve_shortfall_bytes == 0
+        assert plan.resource_budget_bytes["gpu:rank0:denoise"] == 3 * GIB_BYTES
+        assert plan.changes == []
 
     def test_validation_checks_measured_placement_without_candidate_frontier(self):
         report = _report(
@@ -1361,6 +2318,17 @@ class TestPlanAutoResidency:
             estimated_gib=20,
             target_workload_measured=True,
             phase_peaks_gib={"decode": 28},
+        )
+
+        assert current_placement_reserve_shortfall_bytes([report]) == GIB_BYTES
+
+    def test_validation_keeps_conservative_reserve_after_warmup_oom(self):
+        report = _report(
+            budget_gib=30,
+            estimated_gib=20,
+            target_workload_measured=True,
+            phase_peaks_gib={"decode": 28},
+            warmup_oom=True,
         )
 
         assert current_placement_reserve_shortfall_bytes([report]) == 2 * GIB_BYTES
@@ -1405,6 +2373,72 @@ class TestPlanAutoResidency:
             "first_transformer"
         ]
         assert "gpu:rank0:unobserved:second_transformer" in plan.resource_budget_bytes
+
+    def test_unobserved_phase_excludes_another_components_transient_weights(self):
+        transformer_component = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=COMPONENT_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=0,
+            current_placement=True,
+        )
+        transformer_layerwise = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=10 * GIB_BYTES,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((),),
+            active_device_delta_bytes=-10 * GIB_BYTES,
+            inactive_device_delta_bytes=GIB_BYTES,
+        )
+        vae = ResidencyTarget(
+            component_name="vae",
+            residency_mode=RESIDENT,
+            target_residency_mode=RESIDENT,
+            target_resident_weight_bytes=GIB_BYTES,
+            h2d_bytes_per_request=GIB_BYTES,
+            current_placement=True,
+            permanent_residency=True,
+            target_device_weight_bytes=GIB_BYTES,
+        )
+
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=12,
+                    estimated_gib=11.75,
+                    warmup_oom=True,
+                    candidates=[transformer_component, transformer_layerwise, vae],
+                    phase_peaks_gib={
+                        "setup": 5,
+                        "prefetch:transformer": 11.75,
+                    },
+                    phase_components={
+                        "prefetch:transformer": (),
+                    },
+                    phase_present_components={
+                        "setup": ("vae",),
+                        "prefetch:transformer": ("transformer", "vae"),
+                    },
+                    phase_prefetched_components={
+                        "prefetch:transformer": ("transformer",),
+                    },
+                    component_weight_gib={"vae": 1},
+                    component_active_weight_gib={"transformer": 11, "vae": 1},
+                )
+            ]
+        )
+
+        assert plan.skip_reason is None
+        assert [candidate.target_mode() for candidate in plan.changes] == [
+            LAYERWISE_OFFLOAD
+        ]
+        assert plan.resource_budget_bytes["gpu:rank0:unobserved:vae"] == (
+            12 * GIB_BYTES - 5 * GIB_BYTES - plan.reserve_bytes
+        )
 
     def test_redundant_phase_constraints_collapse_to_the_highest_peak(self):
         plan = plan_auto_residency(
@@ -1593,9 +2627,9 @@ class TestPlanAutoResidency:
             "hot_dit",
             "cold_encoder",
         ]
-        assert plan.resource_budget_bytes["hostpin:node0:rank0"] == 0
+        assert plan.resource_budget_bytes["hostpin:node0"] == 0
 
-    def test_dynamic_hostpin_is_constrained_for_every_worker(self):
+    def test_dynamic_hostpin_uses_one_node_budget_and_assigns_rank_quotas(self):
         pin_more = ResidencyTarget(
             component_name="transformer",
             residency_mode=LAYERWISE_OFFLOAD,
@@ -1623,8 +2657,86 @@ class TestPlanAutoResidency:
         assert [candidate.component_name for candidate in plan.changes] == [
             "transformer"
         ]
-        assert plan.resource_budget_bytes["hostpin:node0:rank0"] == 20 * GIB_BYTES
-        assert plan.resource_budget_bytes["hostpin:node0:rank1"] == 20 * GIB_BYTES
+        assert plan.resource_budget_bytes["hostpin:node0"] == 40 * GIB_BYTES
+        assert plan.host_pin_target_bytes_by_rank == {
+            0: 10 * GIB_BYTES,
+            1: 10 * GIB_BYTES,
+        }
+
+    def test_node_hostpin_can_assign_asymmetric_rank_quotas(self):
+        rank0 = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=100 * GIB_BYTES,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((0,),),
+            pinned_host_delta_bytes=30 * GIB_BYTES,
+        )
+        rank1 = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=100 * GIB_BYTES,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((0,),),
+            pinned_host_delta_bytes=5 * GIB_BYTES,
+        )
+
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    rank=0,
+                    host_pin_capacity_gib=20,
+                    candidates=[rank0],
+                ),
+                _report(
+                    rank=1,
+                    host_pin_capacity_gib=20,
+                    candidates=[rank1],
+                ),
+            ]
+        )
+
+        assert [candidate.component_name for candidate in plan.changes] == [
+            "transformer"
+        ]
+        assert plan.host_pin_target_bytes_by_rank == {
+            0: 30 * GIB_BYTES,
+            1: 5 * GIB_BYTES,
+        }
+
+    def test_hostpin_capacity_is_scoped_per_node(self):
+        pin_more = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=100 * GIB_BYTES,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((0,),),
+            pinned_host_delta_bytes=30 * GIB_BYTES,
+        )
+
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    rank=0,
+                    node_rank=0,
+                    host_pin_capacity_gib=20,
+                    candidates=[pin_more],
+                ),
+                _report(
+                    rank=1,
+                    node_rank=1,
+                    host_pin_capacity_gib=20,
+                    candidates=[pin_more],
+                ),
+            ]
+        )
+
+        assert plan.changes == []
+        assert plan.resource_budget_bytes["hostpin:node0"] == 20 * GIB_BYTES
+        assert plan.resource_budget_bytes["hostpin:node1"] == 20 * GIB_BYTES
 
     def test_hostpin_repack_must_fit_transition_headroom(self):
         pin_more = ResidencyTarget(
@@ -1648,7 +2760,7 @@ class TestPlanAutoResidency:
         )
 
         assert plan.changes == []
-        assert plan.resource_budget_bytes["hostram:node0:rank0:pin"] == 5 * GIB_BYTES
+        assert plan.resource_budget_bytes["hostram:node0:pin"] == 5 * GIB_BYTES
 
     def test_component_demotion_must_fit_host_materialization_headroom(self):
         demote = ResidencyTarget(
@@ -1670,10 +2782,7 @@ class TestPlanAutoResidency:
         )
 
         assert plan.changes == []
-        assert (
-            plan.resource_budget_bytes["hostram:node0:rank0:materialize"]
-            == 5 * GIB_BYTES
-        )
+        assert plan.resource_budget_bytes["hostram:node0:materialize"] == 5 * GIB_BYTES
 
     def test_layerwise_materialization_must_fit_transition_vram(self):
         resident = ResidencyTarget(
@@ -1819,13 +2928,14 @@ class _FakeLayerwiseManager:
         tensors: dict[str, torch.Tensor],
         *,
         resident_layers: int = 0,
+        layers_attr_str: str = "layers",
         event_log: list[str] | None = None,
         event_name: str = "manager",
-        layers_attr_str: str = "layers",
     ):
         self.enabled = True
         self._configured = True
         self._tensors = tensors
+        self.layers_attr_str = layers_attr_str
         self.num_layers = max(1, len(tensors))
         self.resident_layers = resident_layers
         self.residency_policy = "leading"
@@ -1833,7 +2943,6 @@ class _FakeLayerwiseManager:
         self._pinned_layers: tuple[int, ...] = ()
         self._event_log = event_log
         self._event_name = event_name
-        self.layers_attr_str = layers_attr_str
         self.fail_load = False
         self.load_all_layers_calls = 0
         self.remove_hooks_calls = 0
@@ -1850,7 +2959,8 @@ class _FakeLayerwiseManager:
             tensor.numel() * tensor.element_size() for tensor in self._tensors.values()
         )
 
-    def resident_weight_bytes(self, resident_layers=None):
+    def resident_weight_bytes(self, resident_layers=None, residency_policy=None):
+        del residency_policy
         count = self.resident_layers if resident_layers is None else resident_layers
         return (
             self.offloaded_weight_bytes()
@@ -1858,7 +2968,10 @@ class _FakeLayerwiseManager:
             // self.num_layers
         )
 
-    def peak_managed_device_weight_bytes(self, resident_layers=None):
+    def peak_managed_device_weight_bytes(
+        self, resident_layers=None, residency_policy=None
+    ):
+        del residency_policy
         count = self.resident_layers if resident_layers is None else resident_layers
         return (
             self.offloaded_weight_bytes()
@@ -1897,8 +3010,13 @@ class _FakeLayerwiseManager:
         return previous
 
     def set_resident_layers(self, resident_layers):
-        previous = self.resident_layers
+        previous, _ = self.set_residency_layout(resident_layers, self.residency_policy)
+        return previous
+
+    def set_residency_layout(self, resident_layers, residency_policy):
+        previous = (self.resident_layers, self.residency_policy)
         self.resident_layers = min(max(0, resident_layers), self.num_layers)
+        self.residency_policy = residency_policy
         return previous
 
     def load_all_layers(self):
@@ -1962,8 +3080,9 @@ class _FakeLazyLayerwiseDit(LayerwiseOffloadableModuleMixin, nn.Module):
 class _StubResidencyArgs:
     """Duck-typed stand-in for the two ServerArgs hooks adjustments use."""
 
-    def __init__(self):
+    def __init__(self, host_pin_budget=None):
         self.auto_modes: dict[str, str] = {}
+        self._host_pin_budget = host_pin_budget
 
     def auto_residency_mode(self, component_name):
         return self.auto_modes.get(component_name)
@@ -1978,7 +3097,7 @@ class _StubResidencyArgs:
         self.auto_modes.pop(component_name, None)
 
     def host_pin_budget(self):
-        return None
+        return self._host_pin_budget
 
 
 def _plan_for(candidates: list[ResidencyTarget]) -> AutoResidencyPlan:
@@ -2014,10 +3133,14 @@ class TestSizeAccounting:
             }
         )
         module = _FakeLayerwiseDit([manager])
+        module.register_parameter("unmanaged", nn.Parameter(torch.zeros(8)))
 
         runtime = component_runtime_weight_bytes({"transformer": module})
 
-        assert runtime["transformer"] == manager.peak_managed_device_weight_bytes()
+        assert runtime["transformer"] == (
+            module.unmanaged.numel() * module.unmanaged.element_size()
+            + manager.peak_managed_device_weight_bytes()
+        )
 
 
 class TestCollectResidencyTargets:
@@ -2074,6 +3197,63 @@ class TestCollectResidencyTargets:
 
         assert targets == [(0, 0)]
 
+    def test_measured_resident_frontier_keeps_current_one_shot_layout(self):
+        managers = [
+            _FakeLayerwiseManager(
+                {f"encoder.{index}.w": torch.zeros(16) for index in range(3)}
+            ),
+            _FakeLayerwiseManager(
+                {f"decoder.{index}.w": torch.zeros(16) for index in range(2)}
+            ),
+        ]
+
+        targets = _layerwise_resident_targets(
+            managers,
+            layer_uses=((0, 0, 0), (1, 1)),
+            current_resident_layers=(2, 1),
+        )
+
+        assert targets == [(0, 0), (2, 1)]
+
+    def test_large_measured_resident_frontier_is_bounded_and_keeps_anchors(self):
+        managers = [
+            _FakeLayerwiseManager(
+                {f"first.{index}.w": torch.zeros(16) for index in range(70)}
+            ),
+            _FakeLayerwiseManager(
+                {f"second.{index}.w": torch.zeros(16) for index in range(70)}
+            ),
+        ]
+
+        targets = _layerwise_resident_targets(
+            managers,
+            layer_uses=(tuple([8] * 70), tuple([8] * 70)),
+            current_resident_layers=(13, 17),
+        )
+
+        assert len(targets) <= MAX_LAYERWISE_RESIDENT_TARGETS
+        assert (0, 0) in targets
+        assert (70, 70) in targets
+        assert (70, 0) in targets
+        assert (0, 70) in targets
+        assert (13, 17) in targets
+
+    def test_large_policy_frontier_is_bounded_and_keeps_extremes(self):
+        managers = [
+            SimpleNamespace(num_layers=4, residency_policy=RESIDENCY_POLICY_LEADING)
+            for _ in range(80)
+        ]
+
+        targets = _layerwise_policy_targets(
+            managers=managers,
+            resident_layers=tuple(2 for _ in managers),
+            tune_policy=True,
+        )
+
+        assert len(targets) == MAX_LAYERWISE_POLICY_TARGETS
+        assert tuple(RESIDENCY_POLICY_LEADING for _ in managers) in targets
+        assert tuple(RESIDENCY_POLICY_STRIDED for _ in managers) in targets
+
     def test_host_pin_frontier_includes_non_prefix_packings(self):
         manager = SimpleNamespace(
             num_layers=3,
@@ -2113,6 +3293,29 @@ class TestCollectResidencyTargets:
         )
 
         assert len(targets) == 41
+
+    def test_large_host_pin_frontier_is_bounded_and_keeps_extremes(self):
+        layer_bytes = {index: 1 << index for index in range(24)}
+        manager = SimpleNamespace(
+            num_layers=24,
+            residency_policy="leading",
+            pin_cpu_memory=True,
+            layer_weight_bytes=lambda: layer_bytes,
+            layer_host_store_bytes=lambda: layer_bytes,
+            pinnable_layer_indices=lambda: tuple(layer_bytes),
+        )
+
+        targets = _layerwise_pin_targets(
+            managers=[manager],
+            resident_layers=(0,),
+            current_pinned_layers=((),),
+            uses_per_streamed_layer=1,
+            max_targets=16,
+        )
+
+        assert len(targets) <= 16
+        assert ((),) in targets
+        assert (tuple(layer_bytes),) in targets
 
     def test_nonbinding_host_resources_keep_only_maximum_pin_utility(self):
         manager = SimpleNamespace(
@@ -2160,6 +3363,31 @@ class TestCollectResidencyTargets:
         assert len(candidates) <= 8
         assert len(current) == 1
         assert current[0].target_layerwise_pinned_layers == ((0,),)
+
+    def test_component_latency_cap_keeps_the_full_pin_frontier(self):
+        manager = _FakeLayerwiseManager(
+            {f"layers.{index}.w": torch.zeros(16) for index in range(3)}
+        )
+        layer_bytes = {index: GIB_BYTES for index in range(3)}
+        manager.layer_weight_bytes = lambda: layer_bytes
+        manager.layer_host_store_bytes = lambda: layer_bytes
+        module = _FakeLayerwiseDit([manager])
+
+        candidates = collect_residency_targets(
+            modules={"transformer": module},
+            residency_mode_of=lambda _name: LAYERWISE_OFFLOAD,
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=3,
+            used_components={"transformer"},
+            layerwise_layer_uses={"transformer": {"layers": (3, 3, 3)}},
+            host_transition_headroom_bytes=16 * GIB_BYTES,
+            host_pin_headroom_bytes=16 * GIB_BYTES,
+            request_duration_ns=1_000_000_000,
+            latency_upper_bound_ns_by_component={"transformer": 1},
+        )
+
+        assert len(candidates) > 8
 
     def test_host_pin_frontier_drops_scratch_only_tradeoffs_when_nonbinding(self):
         manager = SimpleNamespace(
@@ -2227,14 +3455,18 @@ class TestCollectResidencyTargets:
             for candidate in candidates
             if candidate.permanent_residency
         }
-        # resident vae, explicit placement, custom strategy, non-module: out
-        assert set(permanent_candidates) == {"text_encoder", "transformer"}
+        # Unset resident components remain tunable. Explicit placement,
+        # custom strategy, and non-module objects stay outside the frontier.
+        assert set(permanent_candidates) == {"text_encoder", "transformer", "vae"}
+        assert permanent_candidates["vae"].current_placement
         assert permanent_candidates["text_encoder"].h2d_bytes_per_request == (
             permanent_candidates["text_encoder"].target_resident_weight_bytes
         )
-        # layerwise DiT re-streams its layers once per denoise step
+        # The all-pageable layerwise DiT re-streams its layers every step.
         assert permanent_candidates["transformer"].h2d_bytes_per_request == (
-            permanent_candidates["transformer"].target_resident_weight_bytes * 100
+            permanent_candidates["transformer"].target_resident_weight_bytes
+            * 50
+            * PAGEABLE_H2D_COST_MULTIPLIER
         )
         assert any(
             candidate.component_name == "transformer"
@@ -2287,6 +3519,107 @@ class TestCollectResidencyTargets:
         assert target.target_resident_weight_bytes > 0
         assert target.active_device_delta_bytes < 0
         assert target.h2d_bytes_per_request > 0
+
+    def test_auto_dit_frontier_tunes_policy_unless_explicit(self):
+        manager = _FakeLayerwiseManager(
+            {f"layers.{index}.w": torch.zeros(16) for index in range(4)},
+            resident_layers=2,
+        )
+        module = _FakeLayerwiseDit([manager])
+        common = dict(
+            modules={"transformer": module},
+            residency_mode_of=self._modes({"transformer": LAYERWISE_OFFLOAD}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=10,
+        )
+
+        candidates = collect_residency_targets(
+            **common,
+            layerwise_policy_is_explicit=lambda _name, _dit_group: False,
+        )
+        policies = {
+            candidate.target_layerwise_residency_policies
+            for candidate in candidates
+            if candidate.target_mode() == LAYERWISE_OFFLOAD
+            and candidate.target_layerwise_resident_layers == (2,)
+            and candidate.target_layerwise_pinned_layers == ((),)
+        }
+        assert policies == {
+            (RESIDENCY_POLICY_LEADING,),
+            (RESIDENCY_POLICY_STRIDED,),
+        }
+
+        explicit_candidates = collect_residency_targets(
+            **common,
+            layerwise_policy_is_explicit=lambda _name, _dit_group: True,
+        )
+        assert all(
+            candidate.target_layerwise_residency_policies is None
+            for candidate in explicit_candidates
+        )
+
+    def test_auto_dit_frontier_tunes_each_layer_group_policy(self):
+        managers = [
+            _FakeLayerwiseManager(
+                {f"layers.{index}.w": torch.zeros(16) for index in range(4)},
+                resident_layers=2,
+            )
+            for _ in range(2)
+        ]
+        module = _FakeLayerwiseDit(managers)
+
+        candidates = collect_residency_targets(
+            modules={"transformer": module},
+            residency_mode_of=self._modes({"transformer": LAYERWISE_OFFLOAD}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=10,
+            layerwise_policy_is_explicit=lambda _name, _dit_group: False,
+        )
+
+        policies = {
+            candidate.target_layerwise_residency_policies
+            for candidate in candidates
+            if candidate.target_mode() == LAYERWISE_OFFLOAD
+            and candidate.target_layerwise_resident_layers == (2, 2)
+            and candidate.target_layerwise_pinned_layers == ((), ())
+        }
+        assert policies == {
+            (RESIDENCY_POLICY_LEADING, RESIDENCY_POLICY_LEADING),
+            (RESIDENCY_POLICY_LEADING, RESIDENCY_POLICY_STRIDED),
+            (RESIDENCY_POLICY_STRIDED, RESIDENCY_POLICY_LEADING),
+            (RESIDENCY_POLICY_STRIDED, RESIDENCY_POLICY_STRIDED),
+        }
+
+    def test_repeated_non_dit_group_can_tune_policy(self):
+        manager = _FakeLayerwiseManager(
+            {f"layers.{index}.w": torch.zeros(16) for index in range(4)},
+            resident_layers=2,
+        )
+        module = _FakeLayerwiseDit([manager])
+
+        candidates = collect_residency_targets(
+            modules={"custom_refiner": module},
+            residency_mode_of=self._modes({"custom_refiner": LAYERWISE_OFFLOAD}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=10,
+            layerwise_policy_is_explicit=lambda _name, _dit_group: False,
+            layerwise_layer_uses={"custom_refiner": {"layers": (4, 4, 4, 4)}},
+        )
+
+        policies = {
+            candidate.target_layerwise_residency_policies
+            for candidate in candidates
+            if candidate.target_mode() == LAYERWISE_OFFLOAD
+            and candidate.target_layerwise_resident_layers == (2,)
+            and candidate.target_layerwise_pinned_layers == ((),)
+        }
+        assert policies == {
+            (RESIDENCY_POLICY_LEADING,),
+            (RESIDENCY_POLICY_STRIDED,),
+        }
 
     def test_fully_pinned_component_can_release_hostpin_for_a_hotter_component(self):
         manager = _FakeLayerwiseManager(
@@ -2356,7 +3689,32 @@ class TestCollectResidencyTargets:
             mixed_dtype_components={"vae"},
         )
 
-        assert not any(candidate.permanent_residency for candidate in candidates)
+        assert candidates
+        assert {candidate.target_mode() for candidate in candidates} == {
+            LAYERWISE_OFFLOAD
+        }
+
+    def test_mixed_dtype_coarse_component_does_not_add_virtual_layerwise(self):
+        module = _FakeLazyLayerwiseDit()
+
+        candidates = collect_residency_targets(
+            modules={"vae": module},
+            residency_mode_of=self._modes({"vae": COMPONENT_OFFLOAD}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=10,
+            mixed_dtype_components={"vae"},
+            layerwise_tuning_of=lambda _name, _dit_group: (
+                1.0,
+                0.0,
+                "leading",
+            ),
+        )
+
+        assert {candidate.target_mode() for candidate in candidates} == {
+            COMPONENT_OFFLOAD,
+            RESIDENT,
+        }
 
     def test_non_dit_layerwise_frontier_includes_partial_residency(self):
         manager = _FakeLayerwiseManager(
@@ -2424,6 +3782,70 @@ class TestCollectResidencyTargets:
             candidate.target_layerwise_pinned_layers[0] == () for candidate in layerwise
         )
 
+    @pytest.mark.parametrize(
+        "component_name",
+        (
+            "text_encoder",
+            "text_encoder_2",
+            "image_encoder",
+            "image_encoder_2",
+            "transformer",
+            "transformer_2",
+            "video_dit",
+            "video_dit_2",
+            "audio_dit",
+            "audio_dit_2",
+            "connectors",
+            "dual_tower_bridge",
+            "vae",
+            "vae_2",
+            "video_vae",
+            "audio_vae",
+            "condition_image_encoder",
+        ),
+    )
+    @pytest.mark.parametrize(
+        "startup_mode", (COMPONENT_OFFLOAD, LAYERWISE_OFFLOAD, RESIDENT)
+    )
+    def test_every_serving_component_group_gets_a_complete_frontier(
+        self, component_name, startup_mode
+    ):
+        module = (
+            _FakeLayerwiseDit(
+                [
+                    _FakeLayerwiseManager(
+                        {f"layers.{index}.w": torch.zeros(16) for index in range(4)}
+                    )
+                ]
+            )
+            if startup_mode == LAYERWISE_OFFLOAD
+            else _FakeLazyLayerwiseDit(num_layers=4)
+        )
+
+        candidates = collect_residency_targets(
+            modules={component_name: module},
+            residency_mode_of=self._modes({component_name: startup_mode}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=8,
+            layerwise_tuning_of=lambda _name, _dit_group: (
+                0.0,
+                0.0,
+                "leading",
+            ),
+        )
+
+        assert {candidate.target_mode() for candidate in candidates} == {
+            COMPONENT_OFFLOAD,
+            LAYERWISE_OFFLOAD,
+            RESIDENT,
+        }
+        assert any(
+            candidate.target_mode() == LAYERWISE_OFFLOAD
+            and candidate.target_layerwise_resident_layers == (2,)
+            for candidate in candidates
+        )
+
     def test_component_offload_frontier_can_expand_layerwise_lazily(self):
         module = _FakeLazyLayerwiseDit(num_layers=4)
 
@@ -2458,7 +3880,16 @@ class TestCollectResidencyTargets:
             candidate.target_layerwise_resident_layers == (2,)
             for candidate in candidates
         )
-        assert any(candidate.target_mode() == RESIDENT for candidate in candidates)
+        resident = next(
+            candidate for candidate in candidates if candidate.target_mode() == RESIDENT
+        )
+        assert (
+            resident.device_transition_delta_bytes
+            == resident.target_device_weight_bytes
+        )
+        assert (
+            resident.concurrent_prefetch_delta() == resident.active_device_delta_bytes
+        )
 
     def test_virtual_layerwise_prefetch_is_runtime_not_transition_memory(self):
         module = _FakeLazyLayerwiseDit(num_layers=3)
@@ -2479,6 +3910,9 @@ class TestCollectResidencyTargets:
         )
         assert streamed.device_transition_delta_bytes == 0
         assert streamed.active_device_delta_bytes < 0
+        assert (
+            streamed.concurrent_prefetch_delta() == streamed.active_device_delta_bytes
+        )
 
     def test_lazy_layerwise_frontier_keeps_buffers_out_of_managed_weights(self):
         module = _FakeLazyLayerwiseDit(num_layers=2)
@@ -2517,16 +3951,14 @@ class TestCollectResidencyTargets:
             "transformer": backing.untyped_storage().nbytes()
         }
 
-    def test_auto_resident_component_keeps_offload_as_a_target(self):
+    def test_default_resident_component_keeps_offload_as_a_target(self):
         module = nn.Linear(4, 4)
         candidates = collect_residency_targets(
             modules={"text_encoder": module},
             residency_mode_of=self._modes({"text_encoder": RESIDENT}),
-            baseline_residency_mode_of=self._modes({"text_encoder": COMPONENT_OFFLOAD}),
             explicit_residency_mode_of=lambda _name: None,
             custom_strategy_names=(),
             num_inference_steps=1,
-            auto_resident_components={"text_encoder"},
         )
 
         by_mode = {candidate.target_mode(): candidate for candidate in candidates}
@@ -2535,6 +3967,136 @@ class TestCollectResidencyTargets:
         assert by_mode[COMPONENT_OFFLOAD].inactive_device_delta_bytes < 0
         assert by_mode[COMPONENT_OFFLOAD].device_transition_delta_bytes < 0
         assert by_mode[COMPONENT_OFFLOAD].host_materialize_scratch_bytes > 0
+
+    def test_required_resident_component_has_no_tunable_frontier(self):
+        candidates = collect_residency_targets(
+            modules={"transformer_2": nn.Linear(4, 4)},
+            residency_mode_of=self._modes({"transformer_2": RESIDENT}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=1,
+            required_resident_components={"transformer_2"},
+        )
+
+        assert candidates == []
+
+    def test_default_resident_dit_exposes_complete_layerwise_frontier(self):
+        module = _FakeLazyLayerwiseDit(num_layers=3)
+        candidates = collect_residency_targets(
+            modules={"transformer_2": module},
+            residency_mode_of=self._modes({"transformer_2": RESIDENT}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=4,
+            layerwise_tuning_of=lambda _name, _dit_group: (1.0, 0.0, "leading"),
+        )
+
+        assert {candidate.target_mode() for candidate in candidates} == {
+            COMPONENT_OFFLOAD,
+            LAYERWISE_OFFLOAD,
+            RESIDENT,
+        }
+        assert {
+            candidate.target_layerwise_resident_layers
+            for candidate in candidates
+            if candidate.target_mode() == LAYERWISE_OFFLOAD
+        } == {(0,), (1,), (2,), (3,)}
+        assert all(
+            candidate.residency_mode == RESIDENT
+            for candidate in candidates
+            if candidate.target_mode() == LAYERWISE_OFFLOAD
+        )
+        resident = next(
+            candidate for candidate in candidates if candidate.target_mode() == RESIDENT
+        )
+        assert {
+            candidate.host_materialize_scratch_bytes
+            for candidate in candidates
+            if candidate.target_mode() == LAYERWISE_OFFLOAD
+        } == {resident.target_device_weight_bytes}
+
+    def test_resident_seed_preserves_unconfigured_layerwise_frontier(self):
+        module = _FakeLazyLayerwiseDit(num_layers=3)
+        candidates = collect_residency_targets(
+            modules={"text_encoder": module},
+            residency_mode_of=self._modes({"text_encoder": RESIDENT}),
+            baseline_residency_mode_of=self._modes({"text_encoder": LAYERWISE_OFFLOAD}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=1,
+            layerwise_tuning_of=lambda _name, _dit_group: (1.0, 0.0, "leading"),
+        )
+
+        assert {candidate.target_mode() for candidate in candidates} == {
+            COMPONENT_OFFLOAD,
+            LAYERWISE_OFFLOAD,
+            RESIDENT,
+        }
+        assert all(candidate.residency_mode == RESIDENT for candidate in candidates)
+        assert next(
+            candidate for candidate in candidates if candidate.target_mode() == RESIDENT
+        ).current_placement
+
+    def test_virtual_layerwise_reuses_component_offload_host_weights(self):
+        module = _FakeLazyLayerwiseDit(num_layers=3)
+        candidates = collect_residency_targets(
+            modules={"transformer": module},
+            residency_mode_of=self._modes({"transformer": COMPONENT_OFFLOAD}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=4,
+            layerwise_tuning_of=lambda _name, _dit_group: (1.0, 0.0, "leading"),
+        )
+
+        streamed = next(
+            candidate
+            for candidate in candidates
+            if candidate.target_mode() == LAYERWISE_OFFLOAD
+            and candidate.target_layerwise_resident_layers == (0,)
+        )
+        assert streamed.device_transition_delta_bytes == 0
+        assert streamed.active_device_delta_bytes < 0
+        resident = next(
+            candidate for candidate in candidates if candidate.target_mode() == RESIDENT
+        )
+        assert (
+            0
+            < streamed.host_materialize_scratch_bytes
+            < resident.target_device_weight_bytes
+        )
+
+    def test_virtual_layerwise_frontier_includes_host_pin_prefixes(self):
+        module = _FakeLazyLayerwiseDit(num_layers=3)
+        candidates = collect_residency_targets(
+            modules={"transformer": module},
+            residency_mode_of=self._modes({"transformer": COMPONENT_OFFLOAD}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=4,
+            layerwise_tuning_of=lambda _name, _dit_group: (1.0, 0.0, "leading"),
+        )
+
+        streamed = [
+            candidate
+            for candidate in candidates
+            if candidate.target_mode() == LAYERWISE_OFFLOAD
+            and candidate.target_layerwise_resident_layers == (0,)
+        ]
+        assert {candidate.target_layerwise_pinned_layers for candidate in streamed} == {
+            ((),),
+            ((0,),),
+            ((0, 1),),
+            ((0, 1, 2),),
+        }
+        fully_pinned = next(
+            candidate
+            for candidate in streamed
+            if candidate.target_layerwise_pinned_layers == ((0, 1, 2),)
+        )
+        assert fully_pinned.pinned_host_delta_bytes > 0
+        assert (
+            fully_pinned.host_pin_scratch_bytes == fully_pinned.pinned_host_delta_bytes
+        )
 
     def test_layerwise_frontier_accounts_for_immediate_materialization(self):
         manager = _FakeLayerwiseManager(
@@ -2555,8 +4117,17 @@ class TestCollectResidencyTargets:
         resident = next(
             candidate for candidate in candidates if candidate.permanent_residency
         )
+        component = next(
+            candidate
+            for candidate in candidates
+            if candidate.target_mode() == COMPONENT_OFFLOAD
+        )
         assert (
-            resident.device_transition_delta_bytes == manager.offloaded_weight_bytes()
+            component.concurrent_prefetch_delta() == component.active_device_delta_bytes
+        )
+        assert (
+            resident.device_transition_delta_bytes
+            == resident.target_device_weight_bytes
         )
         module.disable_offload()
         module.register_parameter(
@@ -2570,7 +4141,6 @@ class TestCollectResidencyTargets:
             explicit_residency_mode_of=lambda _name: None,
             custom_strategy_names=(),
             num_inference_steps=10,
-            auto_resident_components={"transformer"},
         )
         streamed = next(
             candidate
@@ -2580,9 +4150,85 @@ class TestCollectResidencyTargets:
         assert (
             streamed.device_transition_delta_bytes == -manager.offloaded_weight_bytes()
         )
+        component = next(
+            candidate
+            for candidate in candidates
+            if candidate.target_mode() == COMPONENT_OFFLOAD
+        )
+        assert (
+            component.device_transition_delta_bytes
+            == -resident.target_device_weight_bytes
+        )
 
 
 class TestApplyAndRollback:
+    def test_apply_and_rollback_restore_rank_hostpin_quota(self):
+        budget = HostPinBudget(
+            available_bytes=40 * GIB_BYTES,
+            reserve_bytes=2 * GIB_BYTES,
+        )
+        args = _StubResidencyArgs(host_pin_budget=budget)
+        target = ResidencyTarget(
+            component_name="text_encoder",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=RESIDENT,
+            target_resident_weight_bytes=GIB_BYTES,
+            h2d_bytes_per_request=GIB_BYTES,
+        )
+        plan = AutoResidencyPlan(
+            host_pin_target_bytes_by_rank={0: 12 * GIB_BYTES},
+            changes=[target],
+        )
+
+        applied = apply_residency_changes(
+            plan=plan,
+            modules={"text_encoder": nn.Linear(2, 2)},
+            server_args=args,
+            rank=0,
+        )
+        assert budget.available_bytes == 12 * GIB_BYTES
+        assert budget.reserve_bytes == 0
+
+        rollback_residency_changes(
+            applied=applied,
+            modules={"text_encoder": nn.Linear(2, 2)},
+            server_args=args,
+        )
+        assert budget.available_bytes == 40 * GIB_BYTES
+        assert budget.reserve_bytes == 2 * GIB_BYTES
+        assert budget.planning_capacity_bytes == 38 * GIB_BYTES
+
+    def test_apply_failure_restores_rank_hostpin_quota(self):
+        budget = HostPinBudget(
+            available_bytes=40 * GIB_BYTES,
+            reserve_bytes=2 * GIB_BYTES,
+        )
+        args = _StubResidencyArgs(host_pin_budget=budget)
+        plan = AutoResidencyPlan(
+            host_pin_target_bytes_by_rank={0: 12 * GIB_BYTES},
+            changes=[
+                ResidencyTarget(
+                    component_name="missing",
+                    residency_mode=COMPONENT_OFFLOAD,
+                    target_residency_mode=RESIDENT,
+                    target_resident_weight_bytes=GIB_BYTES,
+                    h2d_bytes_per_request=GIB_BYTES,
+                )
+            ],
+        )
+
+        with pytest.raises(RuntimeError, match="is missing"):
+            apply_residency_changes(
+                plan=plan,
+                modules={},
+                server_args=args,
+                rank=0,
+            )
+
+        assert budget.available_bytes == 40 * GIB_BYTES
+        assert budget.reserve_bytes == 2 * GIB_BYTES
+        assert budget.planning_capacity_bytes == 38 * GIB_BYTES
+
     def test_lazy_layerwise_configuration_rolls_back_to_component_offload(self):
         module = _FakeLazyLayerwiseDit(num_layers=4)
         args = _StubResidencyArgs()
@@ -2599,6 +4245,7 @@ class TestApplyAndRollback:
             for candidate in candidates
             if candidate.target_mode() == LAYERWISE_OFFLOAD
             and candidate.target_layerwise_resident_layers == (2,)
+            and candidate.target_layerwise_pinned_layers == ((0, 1, 2, 3),)
         )
 
         applied = apply_residency_changes(
@@ -2609,6 +4256,12 @@ class TestApplyAndRollback:
 
         assert len(module.layerwise_offload_managers) == 1
         assert module.layerwise_offload_managers[0].resident_layers == 2
+        assert module.layerwise_offload_managers[0].pinned_layer_indices() == (
+            0,
+            1,
+            2,
+            3,
+        )
         assert args.auto_modes == {"transformer": LAYERWISE_OFFLOAD}
         manager = module.layerwise_offload_managers[0]
 
@@ -2656,7 +4309,9 @@ class TestApplyAndRollback:
 
         rollback_residency_changes(
             applied=applied,
-            modules={"text_encoder": module},
+            # Lazy stage-owned components can disappear from the manager's
+            # per-request name index before validation rollback.
+            modules={},
             server_args=args,
         )
         assert len(module.layerwise_offload_managers) == 1
@@ -2751,8 +4406,10 @@ class TestApplyAndRollback:
             modules={"text_encoder": module},
             server_args=args,
         )
+
         assert manager.enabled is False
         assert manager.pinned_layer_indices() == (0,)
+        assert manager.release_host_stores_calls == 0
 
         commit_residency_changes(
             applied=applied,
@@ -2805,6 +4462,38 @@ class TestApplyAndRollback:
             server_args=args,
         )
         assert [manager.resident_layers for manager in managers] == [1, 0]
+
+    def test_partial_layerwise_policy_change_rolls_back_exact_layout(self):
+        manager = _FakeLayerwiseManager(
+            {f"layers.{index}.w": torch.zeros(16) for index in range(4)},
+            resident_layers=2,
+        )
+        module = _FakeLayerwiseDit([manager])
+        args = _StubResidencyArgs()
+        candidate = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=manager.resident_weight_bytes(2),
+            h2d_bytes_per_request=GIB_BYTES,
+            target_layerwise_resident_layers=(2,),
+            target_layerwise_residency_policies=(RESIDENCY_POLICY_STRIDED,),
+            target_layerwise_pinned_layers=((),),
+        )
+
+        applied = apply_residency_changes(
+            plan=_plan_for([candidate]),
+            modules={"transformer": module},
+            server_args=args,
+        )
+        assert manager.residency_policy == RESIDENCY_POLICY_STRIDED
+
+        rollback_residency_changes(
+            applied=applied,
+            modules={"transformer": module},
+            server_args=args,
+        )
+        assert manager.resident_layers == 2
+        assert manager.residency_policy == RESIDENCY_POLICY_LEADING
 
     def test_permanent_layerwise_can_be_demoted_and_rollback_restores_it(self):
         manager = _FakeLayerwiseManager(
@@ -3175,7 +4864,7 @@ class TestCandidateRanking:
 
 
 class TestAppliedChangesLog:
-    def test_reports_equivalent_server_args_and_kill_switch(self):
+    def test_reports_runtime_transition_and_kill_switch(self):
         plan = _plan_for(
             [
                 _candidate("text_encoder", mode=LAYERWISE_OFFLOAD, weight_gib=7),
@@ -3185,7 +4874,8 @@ class TestAppliedChangesLog:
         message = format_applied_changes(plan=plan)
         assert "text_encoder: layerwise-offload -> resident" in message
         assert "vae: component-offload -> resident" in message
-        assert "--component-residency text_encoder=resident vae=resident" in message
+        assert "Startup flags may use a different load path" in message
+        assert "--component-residency" not in message
         assert "SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY=1" in message
 
 
@@ -3384,6 +5074,19 @@ class TestAutoResidencySkipReason:
 
         return auto_residency_skip_reason(args)
 
+    def _static_skip_reason(self, args):
+        from sglang.multimodal_gen.runtime.server_args.auto_tune import (
+            auto_residency_static_skip_reason,
+        )
+
+        return auto_residency_static_skip_reason(args)
+
+    def test_static_planning_does_not_require_warmup(self, monkeypatch):
+        monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY", raising=False)
+        monkeypatch.delenv("SGLANG_CACHE_DIT_ENABLED", raising=False)
+        assert self._static_skip_reason(self._base_args(warmup_mode="off")) is None
+        assert "server warmup" in self._skip_reason(self._base_args(warmup_mode="off"))
+
     def test_env_kill_switch(self, monkeypatch):
         monkeypatch.setenv("SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY", "1")
         reason = self._skip_reason(self._base_args())
@@ -3400,7 +5103,7 @@ class TestAutoResidencySkipReason:
         "overrides, expected_fragment",
         [
             ({"warmup_mode": "request"}, "server warmup"),
-            ({"disagg_role": "denoiser"}, "server warmup"),
+            ({"disagg_role": "denoiser"}, "disaggregated role"),
             ({"backend": "diffusers"}, "diffusers"),
             (
                 {"ltx2_two_stage_device_mode": "original"},
@@ -3506,4 +5209,12 @@ class TestAutoResidencySkipReason:
         monkeypatch.delenv("SGLANG_CACHE_DIT_ENABLED", raising=False)
         reason = self._skip_reason(self._base_args())
         # on a CUDA host everything passes; CPU CI stops at the platform gate
+        assert reason is None or reason == "requires CUDA"
+
+    def test_transformer_weight_override_reaches_platform_gate(self, monkeypatch):
+        monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY", raising=False)
+        monkeypatch.delenv("SGLANG_CACHE_DIT_ENABLED", raising=False)
+        reason = self._skip_reason(
+            self._base_args(transformer_weights_path="/x.safetensors")
+        )
         assert reason is None or reason == "requires CUDA"

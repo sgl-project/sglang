@@ -16,7 +16,6 @@ import torch
 import torch.distributed.tensor as dist_tensor
 from torch import nn
 from torch.distributed import DeviceMesh, init_device_mesh
-from torch.distributed._tensor import distribute_tensor
 from torch.distributed.fsdp import (
     CPUOffloadPolicy,
     FSDPModule,
@@ -58,6 +57,75 @@ _is_npu = is_npu()
 logger = init_logger(__name__)
 
 _DTYPE_MISMATCH_EXAMPLE_LIMIT = 3
+
+
+def _local_dtensor_from_full_tensor(
+    full_tensor: torch.Tensor,
+    template: dist_tensor.DTensor,
+) -> dist_tensor.DTensor:
+    """Build this rank's DTensor shard without a load-time collective.
+
+    Every rank has already read the checkpoint tensor on this fallback path.
+    Slice the final local storage directly instead of asking rank 0 to
+    redistribute another copy through ``distribute_tensor``.
+    """
+    if tuple(full_tensor.shape) != tuple(template.shape):
+        raise ValueError(
+            "FSDP checkpoint tensor shape mismatch: "
+            f"loaded={tuple(full_tensor.shape)}, expected={tuple(template.shape)}"
+        )
+    local_shape, global_offset = (
+        dist_tensor._utils.compute_local_shape_and_global_offset(
+            template.shape,
+            template.device_mesh,
+            template.placements,
+        )
+    )
+    slices = tuple(
+        slice(offset, offset + size)
+        for offset, size in zip(global_offset, local_shape, strict=True)
+    )
+    local_tensor = full_tensor[slices]
+    if tuple(local_shape) != tuple(full_tensor.shape):
+        # Do not retain the full checkpoint storage through a shard view.
+        local_tensor = local_tensor.clone(memory_format=torch.contiguous_format)
+    return dist_tensor.DTensor.from_local(
+        local_tensor,
+        template.device_mesh,
+        template.placements,
+        run_check=False,
+        shape=template.shape,
+        stride=template.stride(),
+    )
+
+
+def _initialize_local_dtensor(
+    template: dist_tensor.DTensor,
+    *,
+    fill_value: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dist_tensor.DTensor:
+    """Initialize only this rank's final FSDP storage."""
+    local_shape, _ = dist_tensor._utils.compute_local_shape_and_global_offset(
+        template.shape,
+        template.device_mesh,
+        template.placements,
+    )
+    local_tensor = torch.full(
+        tuple(local_shape),
+        fill_value,
+        device=device,
+        dtype=dtype,
+    )
+    return dist_tensor.DTensor.from_local(
+        local_tensor,
+        template.device_mesh,
+        template.placements,
+        run_check=False,
+        shape=template.shape,
+        stride=template.stride(),
+    )
 
 
 def _is_bitsandbytes_quant_config(quant_config: Any | None) -> bool:
@@ -825,10 +893,9 @@ def load_model_from_full_model_state_dict(
                         f"param_cls={type(actual_param).__name__}"
                     ) from exc
                 full_tensor = temp_param.data
-            sharded_tensor = distribute_tensor(
+            sharded_tensor = _local_dtensor_from_full_tensor(
                 full_tensor,
-                meta_sharded_param.device_mesh,
-                meta_sharded_param.placements,
+                meta_sharded_param,
             )
             if cpu_offload:
                 sharded_tensor = sharded_tensor.to("cpu")
@@ -959,15 +1026,11 @@ def load_model_from_full_model_state_dict(
             if cpu_offload and not is_fsdp_model:
                 sharded_tensor = sharded_tensor.cpu()
         else:
-            full_tensor = init_like(
+            sharded_tensor = _initialize_local_dtensor(
                 meta_sharded_param,
+                fill_value=1 if init_like is torch.ones_like else 0,
                 device=checkpoint_load_device,
                 dtype=meta_sharded_param_dtype,
-            )
-            sharded_tensor = distribute_tensor(
-                full_tensor,
-                meta_sharded_param.device_mesh,
-                meta_sharded_param.placements,
             )
             if cpu_offload:
                 sharded_tensor = sharded_tensor.cpu()

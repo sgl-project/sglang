@@ -1506,7 +1506,7 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertEqual(args.residency_mode("vae"), COMPONENT_OFFLOAD)
-        self.assertEqual(args.residency_mode("transformer"), RESIDENT)
+        self.assertEqual(args.residency_mode("transformer"), COMPONENT_OFFLOAD)
         self.assertEqual(args.residency_mode("text_encoder"), LAYERWISE_OFFLOAD)
 
     def test_explicit_dit_layerwise_component_wins_over_auto_residency(self):
@@ -1532,15 +1532,15 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(args.residency_mode("transformer"), COMPONENT_OFFLOAD)
         self.assertEqual(args.residency_mode("vae"), LAYERWISE_OFFLOAD)
 
-    def test_no_warmup_keeps_model_residency_fallback(self):
+    def test_no_warmup_keeps_load_safe_static_planner_seed(self):
         args = self._from_dict_with_pipeline_config(
             Cosmos3Config(),
             memory_gb=140,
             kwargs={"performance_mode": "auto", "warmup_mode": "off"},
         )
 
-        self.assertEqual(args.residency_mode("transformer"), RESIDENT)
-        self.assertEqual(args.residency_mode("vae"), RESIDENT)
+        self.assertEqual(args.residency_mode("transformer"), COMPONENT_OFFLOAD)
+        self.assertEqual(args.residency_mode("vae"), LAYERWISE_OFFLOAD)
 
     def test_realtime_server_keeps_model_residency_fallback(self):
         args = self._from_dict_with_pipeline_config(
@@ -1653,15 +1653,15 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(qwen_deployment.keep_resident_components, ("vae",))
         self.assertIsNone(qwen_deployment.keep_resident_min_available_gb)
 
-    def test_longlive_residency_scales_with_available_memory(self):
+    def test_longlive_planner_candidates_do_not_use_a_coarse_vram_threshold(self):
         high_memory_args = self._from_dict_with_pipeline_config(
             LongLive2T2VConfig(),
             memory_gb=80,
             kwargs={"performance_mode": "auto"},
         )
         high_memory_offload = high_memory_args.layerwise_offload_components or []
-        self.assertNotIn("text_encoder", high_memory_offload)
-        self.assertNotIn("vae", high_memory_offload)
+        self.assertIn("text_encoder", high_memory_offload)
+        self.assertIn("vae", high_memory_offload)
 
         constrained_args = self._from_dict_with_pipeline_config(
             LongLive2T2VConfig(),
@@ -1691,31 +1691,25 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertIn("text_encoder", constrained_offload)
         self.assertIn("vae", constrained_offload)
 
-    def test_qwen_ar_generation_residency_scales_with_available_memory(self):
-        pipeline_configs = (
-            QwenImageLayeredPipelineConfig(),
+    def test_longcat_ar_planner_candidates_do_not_use_a_coarse_vram_threshold(self):
+        high_memory_args = self._from_dict_with_pipeline_config(
             LongCatImagePipelineConfig(),
+            memory_gb=80,
+            kwargs={"performance_mode": "auto"},
         )
+        self.assertIn(
+            "text_encoder", high_memory_args.layerwise_offload_components or []
+        )
+        self.assertFalse(high_memory_args.text_encoder_cpu_offload)
 
-        for pipeline_config in pipeline_configs:
-            high_memory_args = self._from_dict_with_pipeline_config(
-                pipeline_config,
-                memory_gb=80,
-                kwargs={"performance_mode": "auto"},
-            )
-            self.assertNotIn(
-                "text_encoder", high_memory_args.layerwise_offload_components or []
-            )
-            self.assertFalse(high_memory_args.text_encoder_cpu_offload)
-
-            constrained_args = self._from_dict_with_pipeline_config(
-                pipeline_config,
-                memory_gb=60,
-                kwargs={"performance_mode": "auto"},
-            )
-            self.assertIn(
-                "text_encoder", constrained_args.layerwise_offload_components or []
-            )
+        constrained_args = self._from_dict_with_pipeline_config(
+            LongCatImagePipelineConfig(),
+            memory_gb=60,
+            kwargs={"performance_mode": "auto"},
+        )
+        self.assertIn(
+            "text_encoder", constrained_args.layerwise_offload_components or []
+        )
 
     def test_auto_multi_gpu_sana_wm_prefers_fsdp_and_cfg_parallel(self):
         args = self._from_dict_with_pipeline_config(
@@ -1820,7 +1814,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertIsNone(args.image_encoder_cpu_offload)
         self.assertFalse(args.enable_cfg_parallel)
 
-    def test_default_auto_keeps_image_vae_resident_when_memory_allows(self):
+    def test_default_auto_exposes_all_implicit_image_placement_candidates(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
             kwargs={"model_path": "Qwen/Qwen-Image"},
@@ -1828,12 +1822,10 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertEqual(args.performance_mode, "auto")
         self.assertFalse(args.use_fsdp_inference)
-        # 80gb > image threshold (45gb): vae and dit stay resident, while the
-        # large encoders use layerwise offload.
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
-            ["text_encoder", "image_encoder"],
+            ["text_encoder", "image_encoder", "vae"],
         )
         self.assertFalse(args.vae_cpu_offload)
 
@@ -1852,7 +1844,7 @@ class TestOffloadDefaults(unittest.TestCase):
             ["text_encoder", "image_encoder", "vae"],
         )
 
-    def test_auto_zimage_keeps_dit_resident_on_5090(self):
+    def test_auto_zimage_defers_residency_until_weights_are_known(self):
         args = self._from_dict_with_pipeline_config(
             ZImagePipelineConfig(),
             memory_gb=32,
@@ -1863,10 +1855,10 @@ class TestOffloadDefaults(unittest.TestCase):
             },
         )
 
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
-            ["text_encoder", "image_encoder"],
+            ["text_encoder", "image_encoder", "vae"],
         )
 
     def test_auto_lingbot_keeps_dit_resident_on_h100(self):
@@ -1899,7 +1891,7 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertTrue(args.dit_cpu_offload)
 
-    def test_auto_ltx_original_replaces_component_cpu_offload(
+    def test_auto_ltx_original_defers_component_residency(
         self,
     ):
         args = self._from_dict_with_pipeline_config(
@@ -1913,7 +1905,7 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertEqual(args.ltx2_two_stage_device_mode, "original")
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
@@ -1922,7 +1914,7 @@ class TestOffloadDefaults(unittest.TestCase):
             ["text_encoder", "image_encoder", "vae"],
         )
 
-    def test_auto_wan_keeps_single_dit_resident_on_h100(self):
+    def test_auto_wan_defers_single_dit_residency(self):
         args = self._from_dict_with_pipeline_config(
             WanT2V480PConfig(),
             kwargs={"performance_mode": "auto"},
@@ -1930,7 +1922,7 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.use_fsdp_inference)
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(
@@ -1977,7 +1969,7 @@ class TestOffloadDefaults(unittest.TestCase):
                     ["dit", "text_encoder", "image_encoder", "vae"],
                 )
 
-    def test_auto_wan2_1_14b_keeps_dit_resident_on_h100(self):
+    def test_auto_wan2_1_14b_defers_dit_residency(self):
         for pipeline_config, model_path in (
             (WanT2V720PConfig(), "Wan-AI/Wan2.1-T2V-14B-Diffusers"),
             (WanI2V480PConfig(), "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"),
@@ -1993,7 +1985,7 @@ class TestOffloadDefaults(unittest.TestCase):
                 )
 
                 self.assertTrue(args.layerwise_offload_components)
-                self.assertFalse(args.dit_cpu_offload)
+                self.assertTrue(args.dit_cpu_offload)
                 self.assertEqual(args.dit_offload_prefetch_size, 0.0)
                 self.assertEqual(
                     args.layerwise_offload_components,
@@ -2044,6 +2036,23 @@ class TestOffloadDefaults(unittest.TestCase):
             ["text_encoder", "image_encoder", "vae"],
         )
         self.assertTrue(args.use_fsdp_inference)
+        self.assertEqual(args.residency_mode("transformer"), RESIDENT)
+        self.assertTrue(args.should_use_fsdp_for_component("transformer"))
+
+    def test_explicit_component_offload_still_scopes_explicit_fsdp(self):
+        args = self._from_dict_with_pipeline_config(
+            WanT2V480PConfig(),
+            kwargs={
+                "model_path": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+                "num_gpus": 2,
+                "performance_mode": "auto",
+                "use_fsdp_inference": True,
+                "component_residency": {"transformer": COMPONENT_OFFLOAD},
+            },
+        )
+
+        self.assertEqual(args.residency_mode("transformer"), COMPONENT_OFFLOAD)
+        self.assertFalse(args.should_use_fsdp_for_component("transformer"))
 
     def test_auto_wan_layerwise_offload_preserves_explicit_dit_cpu_offload(self):
         args = self._from_dict_with_pipeline_config(
@@ -2076,7 +2085,7 @@ class TestOffloadDefaults(unittest.TestCase):
             ["dit", "text_encoder", "image_encoder", "vae"],
         )
 
-    def test_auto_mova_keeps_dit_resident_at_memory_threshold(self):
+    def test_auto_mova_keeps_dit_layerwise_candidate_at_high_memory(self):
         args = self._from_dict_with_pipeline_config(
             MOVAPipelineConfig(),
             memory_gb=140,
@@ -2086,13 +2095,13 @@ class TestOffloadDefaults(unittest.TestCase):
             },
         )
 
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
-            ["text_encoder", "image_encoder"],
+            ["dit", "text_encoder", "image_encoder", "vae"],
         )
 
-    def test_auto_cosmos3_keeps_dit_resident_on_high_memory_gpu(self):
+    def test_auto_cosmos3_defers_high_memory_residency(self):
         args = self._from_dict_with_pipeline_config(
             Cosmos3Config(model_path="nvidia/Cosmos3-Nano"),
             available_memory_gb=95,
@@ -2102,11 +2111,11 @@ class TestOffloadDefaults(unittest.TestCase):
             },
         )
 
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.vae_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
-            ["text_encoder", "image_encoder"],
+            ["text_encoder", "image_encoder", "vae"],
         )
 
     def test_auto_cosmos3_offloads_dit_below_resident_threshold(self):
@@ -2122,9 +2131,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.vae_cpu_offload)
 
-    def test_auto_cosmos3_super_keeps_dit_resident_on_high_memory_gpu(self):
-        # Super is a single-DiT pipeline like Nano, so above the threshold the
-        # component-offload round trip is pure per-request copy cost.
+    def test_auto_cosmos3_super_defers_high_memory_residency(self):
         args = self._from_dict_with_pipeline_config(
             Cosmos3Config(model_path="nvidia/Cosmos3-Super"),
             available_memory_gb=139,
@@ -2134,7 +2141,7 @@ class TestOffloadDefaults(unittest.TestCase):
             },
         )
 
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.vae_cpu_offload)
 
     def test_auto_cosmos3_super_offloads_dit_below_resident_threshold(self):
@@ -2164,7 +2171,7 @@ class TestOffloadDefaults(unittest.TestCase):
             ["dit", "text_encoder", "image_encoder", "vae"],
         )
 
-    def test_auto_fastwan_keeps_dit_resident_on_h100(self):
+    def test_auto_fastwan_defers_dit_residency(self):
         args = self._from_dict_with_pipeline_config(
             FastWan2_2_TI2V_5B_Config(),
             available_memory_gb=72,
@@ -2174,7 +2181,7 @@ class TestOffloadDefaults(unittest.TestCase):
             },
         )
 
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
             ["text_encoder", "image_encoder", "vae"],
@@ -2192,7 +2199,7 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertTrue(args.dit_cpu_offload)
 
-    def test_auto_fast_hunyuan_keeps_dit_resident_on_h100(self):
+    def test_auto_fast_hunyuan_defers_residency(self):
         args = self._from_dict_with_pipeline_config(
             FastHunyuanConfig(),
             available_memory_gb=72,
@@ -2202,7 +2209,7 @@ class TestOffloadDefaults(unittest.TestCase):
             },
         )
 
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.vae_cpu_offload)
 
     def test_auto_fast_hunyuan_offloads_dit_below_resident_threshold(self):
@@ -2217,7 +2224,7 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertTrue(args.dit_cpu_offload)
 
-    def test_auto_turbo_wan_keeps_dit_resident_on_h100(self):
+    def test_auto_turbo_wan_defers_dit_residency(self):
         args = self._from_dict_with_pipeline_config(
             TurboWanT2V480PConfig(),
             kwargs={
@@ -2226,7 +2233,7 @@ class TestOffloadDefaults(unittest.TestCase):
             },
         )
 
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
             ["text_encoder", "image_encoder", "vae"],
@@ -2244,7 +2251,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertTrue(args.dit_cpu_offload)
         self.assertEqual(args.layerwise_offload_components, ["dit"])
 
-    def test_auto_multi_gpu_wan_uses_layerwise_offload_without_cfg(self):
+    def test_auto_multi_gpu_wan_defers_residency_without_cfg(self):
         with patch.object(ServerArgs, "_model_default_uses_cfg", return_value=False):
             args = self._from_dict_with_pipeline_config(
                 WanT2V480PConfig(),
@@ -2257,7 +2264,7 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertFalse(args.enable_cfg_parallel)
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
@@ -2283,7 +2290,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertTrue(args.image_encoder_cpu_offload)
         self.assertEqual(args.layerwise_offload_components, ["dit"])
 
-    def test_auto_multi_gpu_ltx_replaces_component_cpu_offload_with_resident_dit(self):
+    def test_auto_multi_gpu_ltx_defers_component_residency(self):
         args = self._from_dict_with_pipeline_config(
             LTX2PipelineConfig(),
             available_memory_gb=76,
@@ -2295,7 +2302,7 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertFalse(args.use_fsdp_inference)
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
@@ -2304,7 +2311,7 @@ class TestOffloadDefaults(unittest.TestCase):
             ["text_encoder", "image_encoder", "vae"],
         )
 
-    def test_auto_high_memory_ltx23_resident_keeps_aux_components_resident(self):
+    def test_auto_high_memory_ltx23_resident_defers_aux_placement(self):
         args = self._from_dict_with_pipeline_config(
             LTX2PipelineConfig(),
             memory_gb=140,
@@ -2319,10 +2326,15 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(args.ltx2_two_stage_device_mode, "resident")
         self.assertFalse(args.use_fsdp_inference)
         self.assertFalse(args.dit_cpu_offload)
+        self.assertEqual(args.residency_mode("transformer"), RESIDENT)
+        self.assertEqual(args.residency_mode("transformer_2"), RESIDENT)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertFalse(args.vae_cpu_offload)
-        self.assertIsNone(args.layerwise_offload_components)
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["text_encoder", "image_encoder", "vae"],
+        )
 
     def test_auto_high_memory_ltx23_original_keeps_default_layerwise_components(self):
         args = self._from_dict_with_pipeline_config(
@@ -2372,7 +2384,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(args.ltx2_two_stage_device_mode, "resident")
         self.assertEqual(args.layerwise_offload_components, ["text_encoder"])
 
-    def test_auto_multi_gpu_qwen_keeps_vae_resident_with_cfg(self):
+    def test_auto_multi_gpu_qwen_defers_residency_with_cfg(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
             kwargs={
@@ -2384,16 +2396,14 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
-        # 80gb > image threshold (45gb): vae and dit stay resident, while the
-        # large encoders use layerwise offload.
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
-            ["text_encoder", "image_encoder"],
+            ["text_encoder", "image_encoder", "vae"],
         )
         self.assertFalse(args.vae_cpu_offload)
 
-    def test_auto_multi_gpu_zimage_base_prefers_fsdp(self):
+    def test_auto_multi_gpu_zimage_defers_fsdp_to_weight_inventory(self):
         args = self._from_dict_with_pipeline_config(
             ZImagePipelineConfig(),
             kwargs={
@@ -2403,7 +2413,22 @@ class TestOffloadDefaults(unittest.TestCase):
             },
         )
 
-        self.assertTrue(args.use_fsdp_inference)
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertTrue(args.enable_cfg_parallel)
+
+    def test_server_warmup_keeps_zimage_dit_available_to_residency_planner(self):
+        args = self._from_dict_with_pipeline_config(
+            ZImagePipelineConfig(),
+            kwargs={
+                "model_path": "Tongyi-MAI/Z-Image",
+                "num_gpus": 2,
+                "performance_mode": "auto",
+                "warmup_mode": "server",
+            },
+        )
+
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertEqual(args.residency_mode("transformer"), COMPONENT_OFFLOAD)
         self.assertTrue(args.enable_cfg_parallel)
 
     def test_auto_multi_gpu_zimage_turbo_skips_fsdp(self):
@@ -2432,15 +2457,13 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
-        # Explicit FSDP selection must not freeze unrelated, implicit DiT
-        # residency decisions on a high-memory GPU.
-        self.assertFalse(args.dit_cpu_offload)
+        # Explicit FSDP selection must not freeze unrelated, implicit
+        # residency decisions before component weights are known.
+        self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.vae_cpu_offload)
-        # The layerwise filter still drops VAE (kept resident); encoders stay
-        # offloaded.
         self.assertEqual(
             args.layerwise_offload_components,
-            ["text_encoder", "image_encoder"],
+            ["text_encoder", "image_encoder", "vae"],
         )
 
     def test_auto_multi_gpu_qwen_skips_fsdp_when_available_memory_is_low(self):
@@ -2456,12 +2479,10 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
-        # 50gb still > image threshold (45gb): vae and dit stay resident, while
-        # the encoders remain offloaded; qwen does not opt into auto fsdp.
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
-            ["text_encoder", "image_encoder"],
+            ["text_encoder", "image_encoder", "vae"],
         )
         self.assertFalse(args.vae_cpu_offload)
 
@@ -2480,7 +2501,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
 
-    def test_auto_multi_gpu_qwen_keeps_vae_resident_with_headroom(self):
+    def test_auto_multi_gpu_qwen_defers_residency_with_headroom(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
             available_memory_gb={1: 72, 2: 80},
@@ -2494,16 +2515,14 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
-        # min available across selected gpus is 72gb > image threshold (45gb):
-        # vae and dit stay resident, while the encoders remain offloaded.
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
-            ["text_encoder", "image_encoder"],
+            ["text_encoder", "image_encoder", "vae"],
         )
         self.assertFalse(args.vae_cpu_offload)
 
-    def test_auto_minimax_h3_keeps_large_components_resident_with_headroom(self):
+    def test_auto_minimax_h3_defers_large_component_residency(self):
         args = self._from_dict_with_pipeline_config(
             MiniMaxH3PipelineConfig(),
             memory_gb=141,
@@ -2516,11 +2535,11 @@ class TestOffloadDefaults(unittest.TestCase):
             },
         )
 
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.vae_cpu_offload)
-        self.assertNotIn("text_encoder", args.layerwise_offload_components or [])
-        self.assertNotIn("vae", args.layerwise_offload_components or [])
+        self.assertIn("text_encoder", args.layerwise_offload_components or [])
+        self.assertIn("vae", args.layerwise_offload_components or [])
 
     def test_auto_minimax_h3_keeps_memory_policy_below_residency_threshold(self):
         args = self._from_dict_with_pipeline_config(

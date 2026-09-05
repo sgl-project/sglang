@@ -24,6 +24,7 @@ class BridgeLoader(PlainStateDictComponentLoader):
     """Loader for MOVA dual tower bridge with FSDP support."""
 
     pipeline_bridge_config_attr: str = "bridge_config"
+    supports_fsdp_loading = True
 
     component_names = ["dual_tower_bridge"]
     expected_library = "diffusers"

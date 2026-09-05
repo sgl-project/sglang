@@ -113,8 +113,9 @@ def compute_streamed_layers(
 ) -> tuple[int, ...]:
     """Which layer indices are streamed rather than held on the GPU.
 
-    Both policies stream the same *count* of layers, so they cost the same
-    memory and move the same bytes. They differ only in when those bytes move:
+    Both policies stream the same *count* of layers. Their byte footprints are
+    usually close, but can differ when layer sizes are nonuniform. Their main
+    difference is when those bytes move:
 
     ``leading``  keeps layers ``0..r-1`` and streams the tail. Every streamed
                  layer sits next to another streamed layer, so the transfers
@@ -122,8 +123,8 @@ def compute_streamed_layers(
                  step, and each has exactly one layer of compute to hide behind.
 
     ``strided``  spreads the streamed layers evenly across the whole step, so
-                 the same bytes move over ``n`` layers instead of ``n-r`` and
-                 the peak concurrent traffic drops by ``n/(n-r)``.
+                 traffic moves over ``n`` layers instead of ``n-r`` and the
+                 peak concurrent traffic drops by ``n/(n-r)``.
 
     What that buys is contention, not bandwidth and not stalls. Profiling the
     two policies on an 8-GPU run shows the same HtoD volume to within 0.1%, the
@@ -579,7 +580,10 @@ class LayerwiseOffloadManager:
     ) -> torch.Tensor:
         if isinstance(target, DTensor):
             return DTensor.from_local(
-                local_tensor, target.device_mesh, target.placements
+                local_tensor,
+                target.device_mesh,
+                target.placements,
+                run_check=False,
             )
         return local_tensor
 
@@ -1288,6 +1292,11 @@ class LayerwiseOffloadManager:
 
         for layer_idx in range(self.num_layers):
             if layer_idx not in self._gpu_layers:
+                # Anonymous host stores can fill the copy stream without a
+                # per-layer host wait. Checkpoint mappings still use the
+                # synchronous path: the mapped courier has a bounded slot ring
+                # intended to overlap one forward, not materialize a whole
+                # model at once.
                 self.prefetch_layer(
                     layer_idx,
                     non_blocking=not bool(self._mapped_cpu_weights.get(layer_idx)),
@@ -1296,7 +1305,12 @@ class LayerwiseOffloadManager:
             torch.get_device_module().current_stream().wait_stream(self.copy_stream)
 
     def release_host_stores(self) -> None:
-        """Drop rollback stores after a resident placement is validated."""
+        """Drop rollback stores after a resident placement is validated.
+
+        The real device tensors must already be materialized and the manager
+        disabled. Repacking pinned stores as pageable here would copy the full
+        checkpoint for data that will never be streamed again.
+        """
         if self.enabled:
             raise RuntimeError("cannot release host stores while offload is enabled")
         if self._mapped_courier is not None:
@@ -1635,20 +1649,27 @@ class LayerwiseOffloadManager:
     def pin_budget(self) -> HostPinBudget:
         return self._pin_budget
 
-    def resident_weight_bytes(self, resident_layers: int | None = None) -> int:
+    def resident_weight_bytes(
+        self,
+        resident_layers: int | None = None,
+        residency_policy: str | None = None,
+    ) -> int:
         """Managed bytes retained across denoise steps for a layer count."""
         count = self.resident_layers if resident_layers is None else resident_layers
+        policy = self.residency_policy if residency_policy is None else residency_policy
         streamed = compute_streamed_layers(
             num_layers=self.num_layers,
             resident_layers=count,
-            policy=self.residency_policy,
+            policy=policy,
         )
         resident = set(range(self.num_layers)) - set(streamed)
         layer_bytes = self.layer_weight_bytes()
         return sum(layer_bytes.get(layer_idx, 0) for layer_idx in resident)
 
     def peak_managed_device_weight_bytes(
-        self, resident_layers: int | None = None
+        self,
+        resident_layers: int | None = None,
+        residency_policy: str | None = None,
     ) -> int:
         """Conservative managed-weight working set during this component's use.
 
@@ -1659,10 +1680,11 @@ class LayerwiseOffloadManager:
         the measured peak already contains the current copy window.
         """
         count = self.resident_layers if resident_layers is None else resident_layers
+        policy = self.residency_policy if residency_policy is None else residency_policy
         streamed = compute_streamed_layers(
             num_layers=self.num_layers,
             resident_layers=count,
-            policy=self.residency_policy,
+            policy=policy,
         )
         layer_bytes = self.layer_weight_bytes()
         resident = set(range(self.num_layers)) - set(streamed)
@@ -1676,28 +1698,41 @@ class LayerwiseOffloadManager:
         return resident_bytes + streamed_window_bytes
 
     @torch.compiler.disable
-    def set_resident_layers(self, resident_layers: int) -> int:
-        """Change the stage-scoped resident-layer count between requests.
+    def set_residency_layout(
+        self, resident_layers: int, residency_policy: str
+    ) -> tuple[int, str]:
+        """Change the stage-scoped resident set between requests.
 
         CPU stores and hooks stay intact. The next component use loads the new
         resident set once and keeps it across denoise steps; request teardown
         still releases every layer, so other pipeline phases recover the VRAM.
         """
         target = min(max(0, int(resident_layers)), self.num_layers)
-        previous = self.resident_layers
-        if target == previous:
+        if residency_policy not in RESIDENCY_POLICIES:
+            raise ValueError(
+                f"unknown residency policy {residency_policy!r}; expected one of "
+                f"{RESIDENCY_POLICIES}"
+            )
+        previous = (self.resident_layers, self.residency_policy)
+        if (target, residency_policy) == previous:
             return previous
         self.release_all()
         self.resident_layers = target
+        self.residency_policy = residency_policy
         self._streamed_order = compute_streamed_layers(
             num_layers=self.num_layers,
             resident_layers=target,
-            policy=self.residency_policy,
+            policy=residency_policy,
         )
         self._resident_set = frozenset(range(self.num_layers)) - set(
             self._streamed_order
         )
         self._residency_active = False
+        return previous
+
+    def set_resident_layers(self, resident_layers: int) -> int:
+        """Change only the stage-scoped resident-layer count."""
+        previous, _ = self.set_residency_layout(resident_layers, self.residency_policy)
         return previous
 
     def iter_cpu_weights(self):
@@ -1735,60 +1770,67 @@ class LayerwiseOffloadManager:
                 cpu_buffer = self._consolidated_cpu_weights[layer_idx][dtype]
                 yield name, cpu_buffer[offset : offset + numel].reshape(shape)
 
+    def prepare_layer_for_forward(self, layer_idx: int) -> None:
+        """Materialize one managed layer and schedule its successors.
+
+        Forward hooks normally own this lifecycle. Model-specific forwards that
+        intentionally call a block's internals instead of ``block(...)`` must
+        invoke this method explicitly, because PyTorch cannot run that block's
+        hooks when its ``__call__`` is bypassed.
+        """
+        if layer_idx == 0:
+            self._activate_residency()
+            self.prepare_for_next_req(non_blocking=False)
+        elif (
+            self._last_forwarded_layer is not None
+            and layer_idx > self._last_forwarded_layer + 1
+        ):
+            self._release_skip_gap(
+                last_ran=self._last_forwarded_layer, next_ran=layer_idx
+            )
+        if layer_idx not in self._gpu_layers:
+            # LTX audio VAE traverses decoder.up in reverse order.
+            self.prefetch_layer(layer_idx, non_blocking=False)
+        if layer_idx in self._prefetch_events and self.copy_stream is not None:
+            torch.get_device_module().current_stream().wait_event(
+                self._prefetch_events[layer_idx]
+            )
+
+        if self.residency_policy == RESIDENCY_POLICY_STRIDED:
+            # Top up the stream at every layer rather than in bursts of
+            # prefetch_size. Under `strided` the next streamed layer can be
+            # several layers away, so index-based bursts would issue it late.
+            for layer_to_prefetch in self._next_streamed(
+                after=layer_idx, count=self.prefetch_size
+            ):
+                self.prefetch_layer(layer_to_prefetch, non_blocking=True)
+        elif self.prefetch_size and layer_idx % self.prefetch_size == 0:
+            for index in range(
+                layer_idx + self.prefetch_size,
+                layer_idx + 2 * self.prefetch_size,
+            ):
+                self.prefetch_layer(index % self.num_layers, non_blocking=True)
+
+    def finish_layer_forward(self, layer_idx: int) -> None:
+        """Release a streamed layer after its forward completes."""
+        self._last_forwarded_layer = layer_idx
+        self.release_layer(layer_idx)
+
     def register_forward_hooks(self) -> None:
         if not self.enabled:
             return
 
         layers = dict(self.model.named_modules())[self.layers_attr_str]
 
-        def make_pre_hook(i):
+        def make_pre_hook(layer_idx):
             def hook(module, input):
-                if i == 0:
-                    self._activate_residency()
-                    self.prepare_for_next_req(non_blocking=False)
-                elif (
-                    self._last_forwarded_layer is not None
-                    and i > self._last_forwarded_layer + 1
-                ):
-                    self._release_skip_gap(
-                        last_ran=self._last_forwarded_layer, next_ran=i
-                    )
-                if i not in self._gpu_layers:
-                    # LTX audio VAE traverses decoder.up in reverse order
-                    self.prefetch_layer(i, non_blocking=False)
-                if i in self._prefetch_events and self.copy_stream is not None:
-                    torch.get_device_module().current_stream().wait_event(
-                        self._prefetch_events[i]
-                    )
-
-                if self.residency_policy == RESIDENCY_POLICY_STRIDED:
-                    # Top up the stream at every layer rather than in bursts of
-                    # prefetch_size. Under `strided` the next streamed layer can
-                    # be several layers away, so a burst schedule keyed on index
-                    # arithmetic would either skip it or issue it late; asking
-                    # for "the next N streamed layers" is the same request every
-                    # layer and prefetch_layer is idempotent, so the repeats are
-                    # free. This is what buys the wider hiding window: the
-                    # transfer is issued as soon as the previous streamed layer
-                    # is done with, not one layer before it is needed.
-                    for layer_to_prefetch in self._next_streamed(
-                        after=i, count=self.prefetch_size
-                    ):
-                        self.prefetch_layer(layer_to_prefetch, non_blocking=True)
-                # trigger batch prefetch (i + prefetch_size ~ i + 2 * prefetch_size) if needed
-                elif self.prefetch_size and i % self.prefetch_size == 0:
-                    for j in range(i + self.prefetch_size, i + 2 * self.prefetch_size):
-                        layer_to_prefetch = j % self.num_layers
-                        self.prefetch_layer(layer_to_prefetch, non_blocking=True)
+                self.prepare_layer_for_forward(layer_idx)
 
             return hook
 
-        def make_post_hook(i):
+        def make_post_hook(layer_idx):
             def hook(module, input, output):
-                # previous, we wait here, until the copy stream for next layer is finished,
-                # now with any prefetch_size, only wait for the copy stream, when the copy stream is for the next layer
-                self._last_forwarded_layer = i
-                self.release_layer(i)
+                self.finish_layer_forward(layer_idx)
 
             return hook
 
@@ -2198,21 +2240,48 @@ class LayerwiseOffloadableModuleMixin:
         self, resident_layers: Sequence[int]
     ) -> tuple[int, ...]:
         """Apply an exact resident-layer count to every managed layer group."""
+        previous, _ = self.set_layerwise_residency_layout(
+            resident_layers,
+            self.layerwise_residency_policies(),
+        )
+        return previous
+
+    def layerwise_residency_policies(self) -> tuple[str, ...]:
+        return tuple(
+            manager.residency_policy for manager in self.layerwise_offload_managers
+        )
+
+    def set_layerwise_residency_layout(
+        self,
+        resident_layers: Sequence[int],
+        residency_policies: Sequence[str],
+    ) -> tuple[tuple[int, ...], tuple[str, ...]]:
+        """Apply exact resident counts and policies to every managed group."""
         if len(resident_layers) != len(self.layerwise_offload_managers):
             raise ValueError("layerwise resident-layer group count changed")
+        if len(residency_policies) != len(self.layerwise_offload_managers):
+            raise ValueError("layerwise residency-policy group count changed")
         previous = tuple(
-            manager.resident_layers for manager in self.layerwise_offload_managers
+            (manager.resident_layers, manager.residency_policy)
+            for manager in self.layerwise_offload_managers
         )
         updated: list[LayerwiseOffloadManager] = []
         try:
-            for manager, count in zip(self.layerwise_offload_managers, resident_layers):
-                manager.set_resident_layers(count)
+            for manager, count, policy in zip(
+                self.layerwise_offload_managers,
+                resident_layers,
+                residency_policies,
+            ):
+                manager.set_residency_layout(count, policy)
                 updated.append(manager)
         except Exception:
-            for manager, count in zip(updated, previous):
-                manager.set_resident_layers(count)
+            for manager, (count, policy) in zip(updated, previous):
+                manager.set_residency_layout(count, policy)
             raise
-        return previous
+        return (
+            tuple(count for count, _ in previous),
+            tuple(policy for _, policy in previous),
+        )
 
     def layerwise_pinned_host_bytes(self) -> int:
         return sum(
@@ -2273,6 +2342,14 @@ class LayerwiseOffloadableModuleMixin:
             raise ValueError("layerwise resident-layer group count changed")
         self.set_layerwise_resident_layer_counts(resident_layers)
 
+    def restore_layerwise_residency_layout(
+        self,
+        resident_layers: Sequence[int],
+        residency_policies: Sequence[str],
+    ) -> None:
+        """Restore exact per-group counts and policies after a failed adjustment."""
+        self.set_layerwise_residency_layout(resident_layers, residency_policies)
+
     def disable_offload(self) -> None:
         """Disable layerwise offload: load all layers to GPU and remove hooks.
 
@@ -2295,12 +2372,18 @@ class LayerwiseOffloadableModuleMixin:
                 try:
                     manager.load_all_layers()
                 except Exception:
+                    # Loading every layer is the step most likely to OOM. Re-arm
+                    # this manager before re-raising: leaving it hook-less with
+                    # enabled=True would let release_all() swap weights for (1,)
+                    # placeholders that nothing ever streams back in.
                     manager.release_all()
                     manager.register_forward_hooks()
                     raise
                 manager.enabled = False
                 disabled.append(manager)
         except Exception:
+            # A module may own multiple layer groups. Do not leave earlier
+            # groups resident and later groups streaming when one group fails.
             for manager in reversed(disabled):
                 manager.enabled = True
                 manager.release_all()
@@ -2628,6 +2711,16 @@ def configure_layerwise_offload_modules(
                 normalized_component_names,
             )
         )
+        # Startup auto residency may replace the configured layerwise baseline
+        # with a reversible resident seed before this post-load setup runs.
+        # Configure only components whose effective placement is still
+        # layerwise; warmup can create managers lazily if it later demotes one.
+        selected_pipeline_component_names = [
+            component_name
+            for component_name in selected_pipeline_component_names
+            if server_args.auto_residency_mode(component_name) is None
+            or server_args.residency_mode(component_name) == LAYERWISE_OFFLOAD
+        ]
 
     if (
         warn_missing

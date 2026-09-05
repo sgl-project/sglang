@@ -1517,7 +1517,7 @@
             "expected_avg_denoise_ms": 871.39,
             "expected_median_denoise_ms": 1010.9,
             "load_peak_vram_mb": 27320.0,
-            "runtime_peak_vram_mb": 48504.0,
+            "runtime_peak_vram_mb": 50112.0,
             "warmup_peak_vram_mb": 56748.0,
             "estimated_full_test_time_s": 77.0
         },
@@ -1647,7 +1647,7 @@
             "expected_avg_denoise_ms": 653.89,
             "expected_median_denoise_ms": 656.68,
             "load_peak_vram_mb": 35350.0,
-            "runtime_peak_vram_mb": 49998.0,
+            "runtime_peak_vram_mb": 52830.0,
             "warmup_peak_vram_mb": 45782.0,
             "estimated_full_test_time_s": 243.0
         },
@@ -1718,7 +1718,7 @@
             "expected_avg_denoise_ms": 1923.51,
             "expected_median_denoise_ms": 1933.7,
             "load_peak_vram_mb": 35350.0,
-            "runtime_peak_vram_mb": 58158.0,
+            "runtime_peak_vram_mb": 61652.0,
             "estimated_full_test_time_s": 248.9
         },
         "wan2_2_t2v_a14b_2gpu": {
@@ -1728,7 +1728,7 @@
                 "LatentPreparationStage": 0.14,
                 "TimestepPreparationStage": 1.36,
                 "DenoisingStage": 81747.14,
-                "DecodingStage": 784.99
+                "DecodingStage": 2146.55
             },
             "denoise_step_ms": {
                 "0": 1453.25,
@@ -1775,7 +1775,7 @@
             "expected_e2e_ms": 83297.78,
             "expected_avg_denoise_ms": 2029.88,
             "expected_median_denoise_ms": 2020.71,
-            "load_peak_vram_mb": 6440.0,
+            "load_peak_vram_mb": 60038.0,
             "runtime_peak_vram_mb": 72524.0,
             "warmup_peak_vram_mb": 26902.0,
             "estimated_full_test_time_s": 204.3
@@ -2264,7 +2264,7 @@
             "expected_e2e_ms": 237254.68,
             "expected_avg_denoise_ms": 32.68,
             "expected_median_denoise_ms": 30.2,
-            "load_peak_vram_mb": 876.0,
+            "load_peak_vram_mb": 8264.0,
             "runtime_peak_vram_mb": 15686.0,
             "estimated_full_test_time_s": 420.1
         },
@@ -2805,9 +2805,9 @@
             },
             "expected_e2e_ms": 15974.21,
             "expected_avg_denoise_ms": 802.06,
-            "expected_median_denoise_ms": 747.62,
+            "expected_median_denoise_ms": 946.4,
             "load_peak_vram_mb": 56048.0,
-            "runtime_peak_vram_mb": 79016.0,
+            "runtime_peak_vram_mb": 68712.0,
             "estimated_full_test_time_s": 363.2
         },
         "qwen_image_t2i_cache_dit_scm_config_diffusers_1gpu": {
