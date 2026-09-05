@@ -60,13 +60,14 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillWorkspace,
+    compute_interleave_cp_swa_ranges,
     use_dsv4_q8kv8_sparse_prefill,
 )
 from sglang.srt.layers.attention.verify_mask import (
     VerifyMask,
     maybe_create_verify_mask,
 )
-from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.cp.utils import get_cp_strategy, is_cp_v2_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
@@ -1758,12 +1759,31 @@ class DeepseekV4AttnBackend(
                     f"{extra_indices.shape=}'s last dimension is not aligned to 64"
                 )
 
-            # sparse_prefill_fwd does not support SM120.
+            prefill_cp_active = (
+                get_parallel().attn_cp_size > 1
+                and forward_batch.forward_mode.is_context_parallel_extend()
+            )
+            cp_strategy = get_cp_strategy() if prefill_cp_active else None
+            # Sparse prefill has an explicit global-position map for CP-v2
+            # interleave. Legacy CP and zigzag keep using regular FlashMLA.
+            cp_sparse_supported = not prefill_cp_active or (
+                is_cp_v2_active(forward_batch)
+                and cp_strategy is not None
+                and cp_strategy.name == "interleave"
+            )
+            force_kvcache_prefill = self.dsv4_prefill_backend == "flashmla_kvcache"
+            force_sparse_prefill = self.dsv4_prefill_backend in (
+                "flashmla_sparse",
+                "flashmla_sparse_q8",
+            )
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
                 and not get_platform().is_sm120
+                and cp_sparse_supported
+                and not force_kvcache_prefill
                 and (
-                    q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
+                    force_sparse_prefill
+                    or q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
                     or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
                 )
             ):
@@ -1844,6 +1864,129 @@ class DeepseekV4AttnBackend(
 
         raise NotImplementedError("ragged attention")
 
+    def _get_or_build_sparse_prefill_cache(
+        self,
+        q_flat: torch.Tensor,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        core_attn_metadata: DSV4AttnMetadata,
+    ) -> SparsePrefillChunkCache:
+        cache = self.forward_metadata.sparse_prefill_cache
+        if cache is not None:
+            return cache
+
+        seq_lens_cpu_tensor = forward_batch.seq_lens_cpu
+        assert seq_lens_cpu_tensor is not None
+        seq_lens_cpu = [int(x) for x in seq_lens_cpu_tensor.tolist()]
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        assert extend_seq_lens_cpu is not None
+        extend_seq_lens_cpu = [int(x) for x in extend_seq_lens_cpu]
+
+        seq_lens = forward_batch.seq_lens.to(torch.int32)
+        extend_seq_lens = forward_batch.extend_seq_lens.to(torch.int32)
+        req_pool_indices = forward_batch.req_pool_indices.to(torch.int32)
+        query_positions = core_attn_metadata.positions_casual.to(torch.int32)
+        num_qo_tokens = q_flat.shape[0]
+        swa_first_pos = None
+        swa_gather_lens = None
+
+        prefill_cp_active = (
+            get_parallel().attn_cp_size > 1
+            and forward_batch.forward_mode.is_context_parallel_extend()
+        )
+        if prefill_cp_active:
+            assert is_cp_v2_active(forward_batch)
+            strategy = get_cp_strategy()
+            assert strategy is not None and strategy.name == "interleave"
+            (
+                local_query_lens_cpu,
+                local_query_lens,
+                local_request_indices_cpu,
+                local_request_indices,
+            ) = strategy.shard_per_request(
+                extend_seq_lens_cpu,
+                forward_batch.extend_seq_lens,
+            )
+            num_qo_tokens = sum(local_query_lens_cpu)
+            assert num_qo_tokens <= q_flat.shape[0], (
+                f"CP sparse prefill has {num_qo_tokens} logical query rows, "
+                f"but Q only has {q_flat.shape[0]} physical rows"
+            )
+            assert query_positions.shape[0] >= num_qo_tokens
+            query_positions = query_positions[:num_qo_tokens]
+
+            local_index = local_request_indices.long()
+            seq_lens = seq_lens.index_select(0, local_index)
+            req_pool_indices = req_pool_indices.index_select(0, local_index)
+            extend_seq_lens = local_query_lens.to(torch.int32)
+
+            first_positions_cpu, gather_lens_cpu = compute_interleave_cp_swa_ranges(
+                seq_lens=seq_lens_cpu,
+                extend_seq_lens=extend_seq_lens_cpu,
+                local_query_lens=local_query_lens_cpu,
+                local_request_indices=local_request_indices_cpu,
+                cp_rank=get_parallel().attn_cp_rank,
+                cp_size=get_parallel().attn_cp_size,
+                swa_window=SWA_WINDOW,
+            )
+            device = seq_lens.device
+            # A direct ``torch.tensor(..., device=device)`` for each list uses
+            # pageable host memory and synchronizes the current CUDA stream.
+            # Pack both tiny arrays into one pinned allocation so their H2D
+            # transfer is a single asynchronous operation ordered before the
+            # cache-build kernels on the same stream.
+            swa_ranges_cpu = torch.tensor(
+                [first_positions_cpu, gather_lens_cpu],
+                dtype=torch.int32,
+                pin_memory=device.type == "cuda",
+            )
+            swa_ranges = swa_ranges_cpu.to(
+                device=device,
+                non_blocking=device.type == "cuda",
+            )
+            swa_first_pos, swa_gather_lens = swa_ranges.unbind(0)
+            total_swa = sum(gather_lens_cpu)
+            selected_seq_lens_cpu = [seq_lens_cpu[i] for i in local_request_indices_cpu]
+            max_seq_len = max(selected_seq_lens_cpu)
+        else:
+            assert query_positions.shape[0] >= num_qo_tokens
+            query_positions = query_positions[:num_qo_tokens]
+            total_swa = sum(
+                min(seq_len, extend_len + SWA_WINDOW - 1)
+                for seq_len, extend_len in zip(
+                    seq_lens_cpu, extend_seq_lens_cpu, strict=True
+                )
+            )
+            max_seq_len = max(seq_lens_cpu)
+
+        cache = SparsePrefillChunkCache.build(
+            seq_lens=seq_lens,
+            extend_seq_lens=extend_seq_lens,
+            query_positions=query_positions,
+            req_pool_indices=req_pool_indices,
+            req_to_token=self.req_to_token,
+            full_to_swa=token_to_kv_pool.full_to_swa_index_mapping,
+            swa_window_size=SWA_WINDOW,
+            swa_page_size=token_to_kv_pool.swa_window_size,
+            num_qo_tokens=num_qo_tokens,
+            max_seq_len=max_seq_len,
+            total_swa=total_swa,
+            swa_first_pos=swa_first_pos,
+            swa_gather_lens=swa_gather_lens,
+        )
+        self.forward_metadata.sparse_prefill_cache = cache
+        return cache
+
+    @staticmethod
+    def _restore_sparse_prefill_physical_rows(
+        output: torch.Tensor, physical_rows: int
+    ) -> torch.Tensor:
+        if output.shape[0] == physical_rows:
+            return output
+        assert output.shape[0] < physical_rows
+        padding = output.new_zeros((physical_rows - output.shape[0], *output.shape[1:]))
+        return torch.cat((output, padding), dim=0)
+
     def _forward_prefill_sparse(
         self,
         q: torch.Tensor,
@@ -1870,12 +2013,14 @@ class DeepseekV4AttnBackend(
         # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
         q_flat = q.squeeze(1)
 
-        cache = self.forward_metadata.sparse_prefill_cache
-        if cache is None:
-            cache = self._build_sparse_prefill_chunk_cache(
-                forward_batch, num_qo_tokens=q_flat.shape[0]
-            )
-            self.forward_metadata.sparse_prefill_cache = cache
+        cache = self._get_or_build_sparse_prefill_cache(
+            q_flat=q_flat,
+            forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool,
+            core_attn_metadata=core_attn_metadata,
+        )
+        physical_q_rows = q_flat.shape[0]
+        q_flat = q_flat[: cache.num_qo_tokens]
 
         # Resolve the workspace + indices for this ratio, then dequant
         # SWA + compressed regions directly into the workspace (no torch.cat).
@@ -1940,7 +2085,7 @@ class DeepseekV4AttnBackend(
             attn_sink=attn_sink,
             topk_length=combined_lens,
         )
-        return o
+        return self._restore_sparse_prefill_physical_rows(o, physical_q_rows)
 
     def _prepare_q8kv8_q_and_sink(
         self,
@@ -2029,6 +2174,14 @@ class DeepseekV4AttnBackend(
                 f"{q_flat.shape[1]} local heads"
             )
 
+        cache = self._get_or_build_sparse_prefill_cache(
+            q_flat=q_flat,
+            forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool,
+            core_attn_metadata=core_attn_metadata,
+        )
+        physical_q_rows = q_flat.shape[0]
+        q_flat = q_flat[: cache.num_qo_tokens]
         q_fp8, attn_sink_pad, identity_scale, active_heads = (
             self._prepare_q8kv8_q_and_sink(q_flat, attn_sink)
         )
@@ -2044,13 +2197,6 @@ class DeepseekV4AttnBackend(
                 self.head_dim_v,
             )
             self._q8kv8_sparse_prefill_log_emitted = True
-
-        cache = self.forward_metadata.sparse_prefill_cache
-        if cache is None:
-            cache = self._build_sparse_prefill_chunk_cache(
-                forward_batch, num_qo_tokens=q_flat.shape[0]
-            )
-            self.forward_metadata.sparse_prefill_cache = cache
 
         compressed_slice = None
         extra_k_cache = None
@@ -2131,7 +2277,8 @@ class DeepseekV4AttnBackend(
             topk_length=combined_lens,
         )
 
-        return o[:, :active_heads]
+        o = o[:, :active_heads]
+        return self._restore_sparse_prefill_physical_rows(o, physical_q_rows)
 
     def expand_prefill_casually(
         self,
