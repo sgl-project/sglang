@@ -1311,6 +1311,11 @@ class SchedulerDisaggregationPrefillMixin:
                         seq_len,
                         page_size,
                         prefix_len=req.disagg_decode_prefix_len,
+                        c4_ring_size=(
+                            self.token_to_kv_pool_allocator.get_kvcache().get_ring_size(
+                                4
+                            )
+                        ),
                     )
                 )
             state_indices = [

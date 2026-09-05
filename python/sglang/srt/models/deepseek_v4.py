@@ -45,7 +45,15 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
+    Dsv4NpuRoPE,
+    prime_rope_cos_sin,
+    rope_cos_sin,
+)
+from sglang.srt.hardware_backend.npu.utils import (
+    is_npu_arch35,
+    use_npu_arch35_mxfp8_wo_a,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
     dsa_use_prefill_cp,
@@ -703,12 +711,16 @@ class MqaAttentionBase(nn.Module):
             if wo_b_reduce_results is None
             else wo_b_reduce_results
         )
+        # NPU arch35 runs wo_a as a batched MXFP8 GEMM instead of deep_gemm's FP8 one,
+        # but it needs the same quantized weights.
+        self.use_npu_arch35_mxfp8_wo_a = use_npu_arch35_mxfp8_wo_a(quant_config)
+        quantize_wo_a = fp8 or self.use_npu_arch35_mxfp8_wo_a
         if wo_a_keeps_quant_config is None:
             keep_source_quant = (
                 quant_config is not None and quant_config.get_name() == "expert_pack"
             )
             wo_a_quant_config: Optional[QuantizationConfig] = (
-                quant_config if fp8 or keep_source_quant else None
+                quant_config if quantize_wo_a or keep_source_quant else None
             )
         elif wo_a_keeps_quant_config:
             wo_a_quant_config = quant_config
@@ -761,14 +773,21 @@ class MqaAttentionBase(nn.Module):
             prefix=add_prefix("wo_a", prefix),
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
-            **({} if fp8 else {"params_dtype": torch.bfloat16}),
+            **({} if quantize_wo_a else {"params_dtype": torch.bfloat16}),
         )
-        if fp8:
-            from sglang.srt.layers import deep_gemm_wrapper
-
+        if quantize_wo_a:
             assert hasattr(self.wo_a, "weight_scale_inv"), (
                 "FP8 quant_config must create weight_scale_inv"
             )
+        if self.use_npu_arch35_mxfp8_wo_a:
+            # Read by the NPU arch35 MXFP8 weight processor to batch the
+            # weight/scale per attention group for npu_transpose_quant_batchmatmul.
+            self.wo_a._dsv4_npu_arch35_mxfp8_wo_a = True
+            self.wo_a._dsv4_num_groups = self.n_local_groups
+            self.wo_a._dsv4_o_lora_rank = self.o_lora_rank
+        elif fp8:
+            from sglang.srt.layers import deep_gemm_wrapper
+
             self.wo_a.weight_scale_inv.format_ue8m0 = (
                 deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
             )
@@ -905,9 +924,22 @@ class MQALayer(MqaAttentionBase):
         )
 
         if _is_npu:
-            Dsv4NpuRoPE.for_freqs(
+            rope = Dsv4NpuRoPE.for_freqs(
                 self.freqs_cis, getattr(self, "rotary_emb", None)
-            ).ensure_tables(torch.float32)
+            )
+            # fp32 tables feed the compressor gather; bf16 tables make the
+            # activation-dtype gathers cast-free. Bit-identical values:
+            # rounding the table once equals rounding each gathered element.
+            rope.ensure_tables(torch.float32)
+            rope.ensure_tables(torch.bfloat16)
+            # npu_rms_norm has no weight-free overload; the per-head q norm
+            # reads this cached ones vector instead of paying a per-call
+            # alloc + fill.
+            self.register_buffer(
+                "q_rms_norm_ones",
+                torch.ones(self.head_dim, dtype=torch.bfloat16),
+                persistent=False,
+            )
 
         if _is_hip:
             cos_cache = (
@@ -990,22 +1022,25 @@ class MQALayer(MqaAttentionBase):
         return result
 
     def _get_npu_rope_position_cache(
-        self, positions: torch.Tensor, dtype: torch.dtype, inverse: bool = False
+        self,
+        forward_batch: ForwardBatch,
+        positions: torch.Tensor,
+        dtype: torch.dtype,
+        inverse: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # ``rotary_emb`` is shared by layers with the same RoPE configuration and
-        # can also be shared by the target and NextN models.  Only cache the
-        # immutable full table on it.  A position-gathered tensor is specific to
-        # this forward and reusing it based on shape alone gives MTP decode the
-        # previous step's RoPE values when positions change but batch size does not.
-        return Dsv4NpuRoPE.for_freqs(
-            self.freqs_cis, getattr(self, "rotary_emb", None)
-        ).get_cos_sin(
+        # can also be shared by the target and NextN models.  Only the immutable
+        # full table is cached on it; position-gathered tensors are memoized per
+        # forward (prime_rope_cos_sin / rope_cos_sin), never across forwards --
+        # reusing them based on shape alone gives MTP decode the previous step's
+        # RoPE values when positions change but batch size does not.
+        return rope_cos_sin(
+            self.freqs_cis,
+            getattr(self, "rotary_emb", None),
+            forward_batch,
             positions,
             dtype,
-            view_4d=True,
             inverse=inverse,
-            allow_build=False,
-            cache_dtype=torch.float32,
         )
 
     def _compute_q_a(
@@ -1200,7 +1235,7 @@ class MQALayer(MqaAttentionBase):
                 kv, _ = self.wkv(x)
             kv = self.kv_norm(kv)
             cos4_k, sin4_k = self._get_npu_rope_position_cache(
-                positions, kv.dtype, inverse=False
+                forward_batch, positions, kv.dtype, inverse=False
             )
             Dsv4NpuRoPE.apply_rotary_mul_inplace(
                 kv.unsqueeze(1),
@@ -1220,10 +1255,9 @@ class MQALayer(MqaAttentionBase):
             stream_q.wait_event(q_lora_ready)
             q, _ = self.wq_b(q_lora)
             q = q.view(-1, self.n_local_heads, self.head_dim)
-            _dummy = q.new_ones(q.shape[-1])
-            q = torch_npu.npu_rms_norm(q, _dummy, self.eps)[0]
+            q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
             cos4_q, sin4_q = self._get_npu_rope_position_cache(
-                positions, q.dtype, inverse=False
+                forward_batch, positions, q.dtype, inverse=False
             )
             Dsv4NpuRoPE.apply_rotary_mul_inplace(
                 q,
@@ -1515,8 +1549,7 @@ class MQALayer(MqaAttentionBase):
             q_lora = self.q_norm(q_lora)
             q, _ = self.wq_b(q_lora)
             q = q.view(-1, self.n_local_heads, self.head_dim)
-            _dummy = q.new_ones(q.shape[-1])
-            q = torch_npu.npu_rms_norm(q, _dummy, self.eps)[0]
+            q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
 
             if qkv_a is not None:
                 kv = qkv_a[..., self.q_lora_rank :]
@@ -1525,7 +1558,7 @@ class MQALayer(MqaAttentionBase):
             kv = self.kv_norm(kv)
 
             cos4, sin4 = self._get_npu_rope_position_cache(
-                positions, q.dtype, inverse=False
+                forward_batch, positions, q.dtype, inverse=False
             )
             Dsv4NpuRoPE.apply_rotary_mul_inplace(
                 q,
@@ -1790,7 +1823,7 @@ class MQALayer(MqaAttentionBase):
         else:
             if _is_npu:
                 cos4, sin4 = self._get_npu_rope_position_cache(
-                    positions, o.dtype, inverse=True
+                    forward_batch, positions, o.dtype, inverse=True
                 )
                 Dsv4NpuRoPE.apply_rotary_mul_inplace(
                     o,
@@ -1810,7 +1843,23 @@ class MQALayer(MqaAttentionBase):
 
             o = o.view(o.shape[0], self.n_local_groups, -1)
 
-            if _FP8_WO_A_GEMM and _wo_a_fp8_mxscale is not None:
+            if self.use_npu_arch35_mxfp8_wo_a:
+                o, o_scale = torch_npu.npu_dynamic_mx_quant(
+                    o, dst_type=torch.float8_e4m3fn
+                )
+                o = torch_npu.npu_transpose_quant_batchmatmul(
+                    o,
+                    self.wo_a.weight,
+                    dtype=torch.bfloat16,
+                    bias=None,
+                    group_sizes=(0, 0, 32),
+                    x1_scale=o_scale.view(torch.float8_e8m0fnu),
+                    x2_scale=self.wo_a.weight_scale_inv.view(torch.float8_e8m0fnu),
+                    perm_x1=(1, 0, 2),
+                    perm_x2=(0, 1, 2),
+                    perm_y=(1, 0, 2),
+                )
+            elif _FP8_WO_A_GEMM and _wo_a_fp8_mxscale is not None:
                 # ROCm gfx950: same fp8 absorb GEMM as the DeepGEMM path below,
                 # but through aiter's e8m0 block-scale batched GEMM. The
                 # activation is quantized per token-group inside the helper.
@@ -2162,7 +2211,16 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         if _is_npu:
-            return torch.ops.custom.npu_hc_post(x, residual, post, comb)
+            if not is_npu_arch35():
+                return torch.ops.custom.npu_hc_post(x, residual, post, comb)
+            # The A5 build of npu_hc_post is batched — it requires a leading
+            # batch axis on every operand.
+            return torch.ops.custom.npu_hc_post(
+                x.unsqueeze(0),
+                residual.unsqueeze(0),
+                post.unsqueeze(0),
+                comb.unsqueeze(0),
+            ).squeeze(0)
 
         if _is_xpu:
             return _get_mhc_ops().mhc_post(x, residual, post, comb)
@@ -3278,6 +3336,19 @@ class DeepseekV4Model(nn.Module):
         for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
+        if _is_npu and not run_tbo:
+            # Rope cos/sin for the whole forward: one bf16 gather per rope
+            # config on the current stream, before the layer loop forks the
+            # KV/Q side streams. TBO children carry their own positions and
+            # recompute per layer.
+            prime_rope_cos_sin(
+                (
+                    self.layers[i].self_attn
+                    for i in range(self.start_layer, self.end_layer)
+                ),
+                forward_batch,
+                positions,
+            )
         if run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
@@ -3756,7 +3827,10 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        if not _FP8_WO_A_GEMM:
+        # Must mirror MQALayer.__init__'s `quantize_wo_a`: dequantizing wo_a here
+        # while the layer allocated an FP8 parameter (or vice versa) fails the
+        # weight loader's dtype check.
+        if not (_FP8_WO_A_GEMM or use_npu_arch35_mxfp8_wo_a(self.quant_config)):
             weights = _prepare_deepseek_v4_weights(weights, self.quant_config)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING

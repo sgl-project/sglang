@@ -1461,6 +1461,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         seq_len,
                         self.token_to_kv_pool_allocator.page_size,
                         prefix_len=total_prefix_len,
+                        c4_ring_size=self.token_to_kv_pool.get_ring_size(4),
                     )
                 )
             state_indices: Optional[List] = [
