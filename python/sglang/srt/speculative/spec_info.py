@@ -208,6 +208,14 @@ class SpeculativeAlgorithm(Enum):
             return build_dspark_disagg_draft_input(
                 batch, last_tokens_tensor, future_map
             )
+        if self.is_dflash():
+            from sglang.srt.speculative.dflash_disaggregation import (
+                build_dflash_family_disagg_draft_input,
+            )
+
+            return build_dflash_family_disagg_draft_input(
+                batch, last_tokens_tensor, future_map
+            )
         return None
 
     def need_topk(self) -> bool:
