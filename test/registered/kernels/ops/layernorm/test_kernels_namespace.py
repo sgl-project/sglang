@@ -29,6 +29,7 @@ EXPECTED = {
     "moe.moe_align_block_size": {"aot", "jit"},
     "quantization.nvfp4_gemm_swiglu_nvfp4_quant": {"cute_dsl"},
     "kvcache.reshape_and_cache_flash": {"triton"},
+    "speculative.fused_draft_extend_prolog": {"triton"},
     "diffusion.apply_group_norm_silu": {"triton"},
     "diffusion.norm_scale_shift": {"KDA", "cute_dsl", "flydsl"},
     "diffusion.scale_residual_norm_scale_shift": {
