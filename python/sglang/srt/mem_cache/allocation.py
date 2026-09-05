@@ -230,6 +230,7 @@ def alloc_req_slots(
     req_to_token_pool: ReqToTokenPool,
     reqs: list[Req],
     tree_cache: BasePrefixCache | None,
+    token_to_kv_pool=None,
 ) -> list[int]:
     """Allocate request slots from the pool.
 
@@ -260,6 +261,7 @@ def alloc_req_slots(
                 tree_cache.evict_for_alloc(
                     EvictParams(num_tokens=0, mamba_num=mamba_num)
                 )
+    newly_allocated = [req.kv.req_pool_idx is None for req in reqs]
     req_pool_indices = req_to_token_pool.alloc(reqs)
     if req_pool_indices is None:
         raise RuntimeError(
@@ -267,6 +269,13 @@ def alloc_req_slots(
             "Please set a smaller number for `--max-running-requests`. "
             f"{req_to_token_pool.available_size()=}, {num_reqs=}, "
         )
+
+    new_req_pool_indices = [
+        idx for idx, is_new in zip(req_pool_indices, newly_allocated) if is_new
+    ]
+    clear_c4_req_states = getattr(token_to_kv_pool, "clear_c4_req_states", None)
+    if new_req_pool_indices and clear_c4_req_states is not None:
+        clear_c4_req_states(new_req_pool_indices)
     return req_pool_indices
 
 
@@ -311,7 +320,10 @@ def alloc_for_extend(
 
     # Allocate req slots (raises RuntimeError if the pool is exhausted)
     req_pool_indices = alloc_req_slots(
-        batch.req_to_token_pool, batch.reqs, batch.tree_cache
+        batch.req_to_token_pool,
+        batch.reqs,
+        batch.tree_cache,
+        token_to_kv_pool=batch.token_to_kv_pool_allocator.get_kvcache(),
     )
     req_pool_indices_cpu = torch.tensor(
         req_pool_indices, dtype=torch.int64, pin_memory=pin_memory
