@@ -42,13 +42,16 @@ logger = init_logger(__name__)
 SGL_TEST_FILES_CI_DATA_REPO = "sgl-project/ci-data-diffusion"
 SGL_TEST_FILES_CI_DATA_REVISION = "11783b3fbd8ebb1e3509cc4590c1fff476e65511"
 
+GITHUB_CONTENT_PROXY_URL = ""
+
 # The NPU pin is kept as a separate branch so ascend GT can be bumped independently
 # when it's regenerated on its own cadence.
 if current_platform.is_npu():
+    GITHUB_CONTENT_PROXY_URL = "https://gh-proxy.test.osinfra.cn/"
     SGL_TEST_FILES_CI_DATA_REVISION = "7df858ead07940ff4d9489230fa9f040dd186789"
 
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
-    "https://raw.githubusercontent.com/"
+    f"{GITHUB_CONTENT_PROXY_URL}https://raw.githubusercontent.com/"
     f"{SGL_TEST_FILES_CI_DATA_REPO}/{SGL_TEST_FILES_CI_DATA_REVISION}/"
     "diffusion-ci/consistency_gt"
 )
