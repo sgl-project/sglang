@@ -398,7 +398,13 @@ def prepare_mlp_sync_batch_raw(
     )
     breakable_prefill = check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
     full_prefill = check_cuda_graph_backend(Phase.PREFILL, Backend.FULL)
-    coordinated_prefill = breakable_prefill or full_prefill
+    # TC_PIECEWISE belongs here too: this verdict gates can_run_graph, so without it
+    # the prefill graph is captured at startup and then never replayed.
+    coordinated_prefill = (
+        breakable_prefill
+        or full_prefill
+        or check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+    )
     prefill_graph_runner = (
         model_runner.prefill_cuda_graph_runner if coordinated_prefill else None
     )
