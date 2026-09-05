@@ -3653,8 +3653,16 @@ class Scheduler(
             if self.enable_hicache_storage:
                 self._retry_missed_storage_prefetches()
 
-        if self.enable_priority_preemption or self.is_hybrid_swa:
-            # Reset batch_is_full to try preemption with a prefill adder.
+        if (
+            self.enable_priority_preemption
+            or self.is_hybrid_swa
+            or (self.is_hybrid_ssm and self.tree_cache.supports_mamba())
+        ):
+            # batch_is_full is otherwise cleared only when the running batch
+            # shrinks. Preemption, SWA eviction and mamba-aware radix
+            # eviction (cached recurrent states of finished requests become
+            # evictable while the batch is unchanged) can all admit a request
+            # before that, so re-run admission every round.
             running_batch.batch_is_full = False
 
         if (
