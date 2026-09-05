@@ -24,6 +24,7 @@ from sglang.kernels.ops.memory.allocator import (
     alloc_extend_kernel,
 )
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     get_bool_env_var,
     get_num_new_pages,
@@ -113,6 +114,25 @@ def alloc_extend_naive(
     out_indices.copy_(out)
 
 
+def alloc_decode_naive(
+    seq_lens,
+    last_loc,
+    free_pages,
+    out_indices,
+    page_size,
+    num_new_pages,
+):
+    if num_new_pages == 0:
+        out_indices.copy_(last_loc + 1)
+        return
+    need_new_page = ((seq_lens - 1) % page_size == 0).to(torch.int64)
+    new_page_rank = (torch.cumsum(need_new_page, 0) - need_new_page).clamp_(
+        max=num_new_pages - 1
+    )
+    new_page_start = free_pages[new_page_rank] * page_size
+    out_indices.copy_(torch.where(need_new_page.bool(), new_page_start, last_loc + 1))
+
+
 class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """Same interface as `TokenToKVPoolAllocator`, but the indices handed to one
     request are always page-aligned.
@@ -132,6 +152,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
+        self.use_triton_kernels = current_platform.capabilities.supports_triton
 
         # Pre-warm the torch.unique used by free(): on ROCm the first call
         # JIT-compiles rocPRIM sort/unique kernels and costs ~200ms.
@@ -203,15 +224,26 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
 
-        alloc_extend_kernel[(bs,)](
-            prefix_lens,
-            seq_lens,
-            last_loc,
-            self.free_pages,
-            out_indices,
-            next_power_of_2(bs),
-            self.page_size,
-        )
+        if self.use_triton_kernels:
+            alloc_extend_kernel[(bs,)](
+                prefix_lens,
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                next_power_of_2(bs),
+                self.page_size,
+            )
+        else:
+            alloc_extend_naive(
+                prefix_lens,
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.page_size,
+                self.device,
+            )
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
@@ -243,19 +275,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if bs > len(self.free_pages):
             self.merge_and_sort_free()
 
-        out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
-        alloc_decode_kernel[(bs,)](
-            seq_lens,
-            last_loc,
-            self.free_pages,
-            out_indices,
-            next_power_of_2(bs),
-            self.page_size,
-        )
-
-        if self.debug_mode:
-            assert len(torch.unique(out_indices)) == len(out_indices)
-
         num_new_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu,
             page_size=self.page_size,
@@ -263,6 +282,29 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         if num_new_pages > len(self.free_pages):
             return None
+
+        out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
+        if self.use_triton_kernels:
+            alloc_decode_kernel[(bs,)](
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                next_power_of_2(bs),
+                self.page_size,
+            )
+        else:
+            alloc_decode_naive(
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.page_size,
+                num_new_pages,
+            )
+
+        if self.debug_mode:
+            assert len(torch.unique(out_indices)) == len(out_indices)
 
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices

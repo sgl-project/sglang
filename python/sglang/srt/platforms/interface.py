@@ -3,8 +3,8 @@ SGLang SRT Hardware Platform Abstraction.
 
 Defines SRTPlatform — the base class for SRT (LLM inference) platform
 backends.  SRTPlatform inherits DeviceMixin for shared device operations
-and adds SRT-specific subsystem factory methods, capability flags, and
-configuration lifecycle hooks.
+and adds SRT-specific subsystem factory methods, a capability declaration,
+and configuration lifecycle hooks.
 
 Out-of-tree platforms register via setuptools entry_points under the
 "sglang.srt.platforms" group and should subclass SRTPlatform.
@@ -12,15 +12,51 @@ Out-of-tree platforms register via setuptools entry_points under the
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Type
+from typing import TYPE_CHECKING, Literal, Optional, Type
+
+import msgspec
 
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 
 if TYPE_CHECKING:
+    import torch
+
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 # Re-export for convenience
-__all__ = ["SRTPlatform", "PlatformEnum"]
+__all__ = [
+    "KVPoolKind",
+    "PlatformCapabilities",
+    "SRTPlatform",
+    "PlatformEnum",
+    "require_out_of_tree_impl",
+    "reject_out_of_tree_path",
+]
+
+KVPoolKind = Literal["mha", "mla", "dsa"]
+
+
+class PlatformCapabilities(msgspec.Struct, frozen=True, kw_only=True):
+    """What the platform can do.
+
+    Core reads these before it constructs anything and picks a code path
+    the platform can serve, instead of announcing a decision and asking the
+    platform to honor it. Every field defaults to the conservative answer.
+
+    ``supports_triton``: Triton kernels can launch on this device. When
+    False, core uses the torch-native allocator and req-to-token writers.
+    ``graph_capture``: the decode graph runner (``get_graph_runner_cls``)
+    runs. ``piecewise_graph``: the prefill piecewise compilation backend
+    runs.
+    ``hicache_device_kernels``: the sgl_kernel HiCache transfer / write-back
+    kernels are available; otherwise the host pools skip their staging
+    buffers.
+    """
+
+    supports_triton: bool = False
+    graph_capture: bool = False
+    piecewise_graph: bool = False
+    hicache_device_kernels: bool = False
 
 
 class SRTPlatform(DeviceMixin):
@@ -28,14 +64,16 @@ class SRTPlatform(DeviceMixin):
     Base class for SRT hardware platform backends.
 
     Inherits device identity queries and operations from DeviceMixin.
-    Adds SRT-specific factory methods, capability flags, and lifecycle hooks.
+    Adds SRT-specific factory methods, a capability declaration, and
+    lifecycle hooks.
 
-    OOT platforms should subclass SRTPlatform and override the methods
-    relevant to their hardware.
+    OOT platforms subclass SRTPlatform and override the methods relevant to
+    their hardware.
     """
 
-    # SRT-specific class-level attribute
+    # SRT-specific class-level attributes
     supported_quantization: list[str] = []
+    capabilities: PlatformCapabilities = PlatformCapabilities()
 
     # ------------------------------------------------------------------
     # Configuration lifecycle
@@ -56,25 +94,39 @@ class SRTPlatform(DeviceMixin):
         """Return the default attention backend name for this platform."""
         raise NotImplementedError
 
-    def get_graph_runner_cls(self) -> type:
-        """Return the graph runner class for this platform."""
-        raise NotImplementedError
+    def get_graph_runner_cls(self) -> Optional[type]:
+        """Return the graph runner class, or None for the in-tree default.
 
-    def get_mha_kv_pool_cls(self) -> type:
-        """Return the MHA KV pool class for this platform."""
-        raise NotImplementedError
+        ``None`` means "no platform opinion": the caller falls back to the
+        in-tree device-keyed selection.
+        """
+        return None
 
-    def get_mla_kv_pool_cls(self) -> type:
-        """Return the MLA KV pool class for this platform."""
-        raise NotImplementedError
+    def get_kv_pool_cls(self, *, kind: KVPoolKind) -> Optional[type]:
+        """Return this platform's KV pool class for ``kind``, or None.
 
-    def get_dsa_kv_pool_cls(self) -> type:
-        """Return the DSA KV pool class for this platform (DeepSeek V3.2)."""
-        raise NotImplementedError
+        The class must subclass the in-tree pool for that kind
+        (``MHATokenToKVPool`` / ``MLATokenToKVPool`` / ``DSATokenToKVPool``)
+        and is constructed by the configurator with exactly the keyword
+        arguments the in-tree class receives, at every site the in-tree
+        class is built (standalone, the SWA composite, the hybrid-linear
+        full-attention leaf). Override ``_create_buffers`` to change how the
+        backing storage is carved; the rest of the pool (addressing, index
+        translation, PD registration) stays core's. ``None`` (the default)
+        means the in-tree class, which allocates on ``device`` and is
+        correct for any torch device.
+        """
+        return None
 
-    def get_paged_allocator_cls(self) -> type:
-        """Return the paged allocator class for this platform."""
-        raise NotImplementedError
+    def get_paged_allocator_cls(self) -> Optional[type]:
+        """Return the paged allocator class, or None for the in-tree default.
+
+        Honored at every paged-allocator construction site, including
+        inside ``SWATokenToKVPoolAllocator``. The in-tree allocator already
+        falls back to torch-native kernels when ``capabilities.supports_triton``
+        is False, so most platforms need no override.
+        """
+        return None
 
     def get_compile_backend(self, mode: str | None = None) -> str:
         """Return the compilation backend identifier.
@@ -83,9 +135,10 @@ class SRTPlatform(DeviceMixin):
         """
         return "inductor"
 
-    def get_piecewise_backend_cls(self) -> type:
-        """Return the piecewise compilation backend class for this platform."""
-        raise NotImplementedError
+    def get_piecewise_backend_cls(self) -> Optional[type]:
+        """Return the piecewise compilation backend class, or None for the
+        in-tree device-keyed default."""
+        return None
 
     def get_quantization_config(
         self, quantization: str
@@ -96,34 +149,19 @@ class SRTPlatform(DeviceMixin):
         return None
 
     # ------------------------------------------------------------------
-    # Capability flags (safe conservative defaults)
-    # ------------------------------------------------------------------
-
-    def supports_fp8(self) -> bool:
-        """Whether this platform supports FP8 quantization."""
-        return False
-
-    def support_cuda_graph(self) -> bool:
-        """Whether this platform supports device graph capture and replay.
-        Controls CUDA graph (CudaGraphRunner) for the decode path.
-        OOT platforms that support graph-style capture should return True.
-        """
-        return False
-
-    def support_piecewise_cuda_graph(self) -> bool:
-        """Whether this platform supports piecewise CUDA graph.
-
-        Controls PiecewiseCudaGraphRunner for the prefill/extend path
-        (torch.compile backend).
-        """
-        return False
-
-    # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------
 
     def init_backend(self) -> None:
         """One-time backend initialization.  Called in each worker."""
+        pass
+
+    def post_load_model(self, model: torch.nn.Module) -> None:
+        """Called once after the model's weights are loaded, in the worker.
+
+        The place to relocate parameters, swap quant methods, or install
+        forward hooks on an in-tree model class; mutate ``model`` in place.
+        """
         pass
 
     # ------------------------------------------------------------------
@@ -140,3 +178,28 @@ class SRTPlatform(DeviceMixin):
         this key take precedence over the method lookup.
         """
         return "native"
+
+
+def require_out_of_tree_impl(
+    platform: SRTPlatform, *, hook: str, subsystem: str
+) -> None:
+    """Reject "no platform opinion" from an out-of-tree platform; no-op in-tree."""
+    if not platform.is_out_of_tree():
+        return
+    raise NotImplementedError(
+        f"Out-of-tree platform {type(platform).__name__} (device "
+        f"{platform.device_name!r}) provides no {subsystem}. Override "
+        f"{hook} on your SRTPlatform subclass: the in-tree fallback is "
+        f"device-keyed and would hand this device the CUDA implementation."
+    )
+
+
+def reject_out_of_tree_path(platform: SRTPlatform, *, subsystem: str) -> None:
+    """Reject an in-tree-only path that has no platform seam; no-op in-tree."""
+    if not platform.is_out_of_tree():
+        return
+    raise NotImplementedError(
+        f"Out-of-tree platform {type(platform).__name__} (device "
+        f"{platform.device_name!r}) reached {subsystem}, which has no platform "
+        f"seam yet and would otherwise build in-tree classes that assume CUDA."
+    )
