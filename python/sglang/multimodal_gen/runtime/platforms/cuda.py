@@ -504,6 +504,14 @@ class CudaPlatformBase(Platform):
         return torch.device(f"cuda:{envs.LOCAL_RANK}")
 
     @classmethod
+    def synchronize(cls) -> None:
+        torch.cuda.synchronize()
+
+    @classmethod
+    def empty_cache(cls) -> None:
+        torch.cuda.empty_cache()
+
+    @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
         raise NotImplementedError
 
