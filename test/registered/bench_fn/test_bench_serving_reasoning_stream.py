@@ -20,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from sglang.benchmark.serving import (
     RequestFuncInput,
     async_request_openai_chat_completions,
+    async_request_openai_completions,
     calculate_metrics,
     set_global_args,
 )
@@ -50,7 +51,10 @@ class _SSEHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         for chunk in self.chunks:
-            self.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
+            if isinstance(chunk, bytes):
+                self.wfile.write(chunk)
+            else:
+                self.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
             self.wfile.flush()
             time.sleep(self.chunk_delay_s)
         self.wfile.write(b"data: [DONE]\n\n")
@@ -121,10 +125,18 @@ class TestBenchServingReasoningStream(CustomTestCase):
                 print_requests=False,
                 tokenizer="",
                 header=None,
+                return_logprob=False,
+                top_logprobs_num=0,
+                cache_report=False,
             )
         )
 
-    def _run(self, chunks):
+    def _run(
+        self,
+        chunks,
+        request_func=async_request_openai_chat_completions,
+        endpoint="chat/completions",
+    ):
         port = _free_port()
 
         class Handler(_SSEHandler):
@@ -137,7 +149,7 @@ class TestBenchServingReasoningStream(CustomTestCase):
         try:
             req = RequestFuncInput(
                 prompt="hello",
-                api_url=f"http://127.0.0.1:{port}/v1/chat/completions",
+                api_url=f"http://127.0.0.1:{port}/v1/{endpoint}",
                 prompt_len=1,
                 output_len=64,
                 model="dummy-model",
@@ -145,7 +157,7 @@ class TestBenchServingReasoningStream(CustomTestCase):
                 image_data=None,
                 extra_request_body={},
             )
-            return asyncio.run(async_request_openai_chat_completions(req))
+            return asyncio.run(request_func(req))
         finally:
             server.shutdown()
             server.server_close()
@@ -223,6 +235,41 @@ class TestBenchServingReasoningStream(CustomTestCase):
         self.assertEqual(out.generated_text, "thinking")
         self.assertGreater(out.ttft, 0.0)
         self.assertEqual(out.output_len, 1)
+
+    def test_sse_comments_are_ignored_for_chat_completions(self):
+        chunks = [
+            b":\n\n",
+            _make_chunk(content="hello "),
+            b": keep-alive\n\n",
+            _make_chunk(content="world", completion_tokens=2),
+        ]
+        out = self._run(chunks)
+
+        self.assertTrue(out.success, msg=f"request failed: {out.error}")
+        self.assertEqual(out.generated_text, "hello world")
+        self.assertEqual(len(out.itl), 1)
+        self.assertEqual(out.output_len, 2)
+
+    def test_sse_comments_are_ignored_for_completions(self):
+        chunks = [
+            b":\n\n",
+            {"choices": [{"text": "hello "}]},
+            b": keep-alive\n\n",
+            {
+                "choices": [{"text": "world"}],
+                "usage": {"completion_tokens": 2},
+            },
+        ]
+        out = self._run(
+            chunks,
+            request_func=async_request_openai_completions,
+            endpoint="completions",
+        )
+
+        self.assertTrue(out.success, msg=f"request failed: {out.error}")
+        self.assertEqual(out.generated_text, "hello world")
+        self.assertEqual(len(out.itl), 1)
+        self.assertEqual(out.output_len, 2)
 
     def test_content_only_stream_unchanged(self):
         chunks = [
