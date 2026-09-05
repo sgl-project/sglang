@@ -52,10 +52,8 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     save_outputs,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
-    EXTRAPOLATED_VRAM_RESERVE_FRACTION,
     GIB_BYTES,
     MAX_LATENCY_EQUIVALENCE_NS,
-    MIN_VRAM_RESERVE_BYTES,
     PLACEMENT_STATUS_ADJUSTED,
     PLACEMENT_STATUS_ROLLBACK_FAILED,
     PLACEMENT_STATUS_ROLLED_BACK,
@@ -177,6 +175,9 @@ def _worker_cpu_intra_op_threads(num_gpus: int) -> int | None:
     return max(1, min(16, cpu_count // max(1, num_gpus)))
 
 
+PROBE_FIT_MIN_MARGIN_BYTES = 1 << 30
+
+
 def _shape_label(req: Req) -> str:
     return f"{req.width}x{req.height}x{req.num_frames or 1}f"
 
@@ -198,10 +199,10 @@ def fit_auto_residency_probe(
     reserve, frames go first and then area, the ladder the OOM retry walks.
     Returns the fitted request, its estimate and the number of shrink steps.
     """
-    reserve = max(
-        MIN_VRAM_RESERVE_BYTES, int(total_bytes * EXTRAPOLATED_VRAM_RESERVE_FRACTION)
-    )
-    budget = free_bytes - reserve
+    # Only the probe has to fit, so the margin is allocator slack, not the
+    # planner's placement reserve (which held back 4 GiB of a 32 GiB card and
+    # shrank a probe that had 10 GiB to spare).
+    budget = free_bytes - max(PROBE_FIT_MIN_MARGIN_BYTES, total_bytes // 50)
     fitted, steps = req, 0
     while True:
         units = (
@@ -1024,12 +1025,20 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             current_platform.get_available_gpu_memory(empty_cache=True) * (1 << 30)
         )
         total_bytes = int(torch.cuda.get_device_properties(device).total_memory)
-        _, estimate, steps = fit_auto_residency_probe(
+        _, _, steps = fit_auto_residency_probe(
             req,
             records=records,
             free_bytes=free_bytes,
             total_bytes=total_bytes,
             server_args=self.server_args,
+        )
+        requested_units = (
+            max(1, int(req.width or 1))
+            * max(1, int(req.height or 1))
+            * max(1, int(req.num_frames or 1))
+        )
+        estimate = estimate_default_workload_peak_bytes(
+            records=records, target_units=requested_units
         )
         # Ranks see different free memory and hold different records; the
         # forward must run one shape everywhere, so the most cautious rank wins.
