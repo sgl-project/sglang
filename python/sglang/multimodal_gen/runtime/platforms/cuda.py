@@ -745,8 +745,8 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
-        """Install the quality-gated FLUX.2 / AutoencoderKL / Wan VAE decoder
-        fast paths.
+        """Install the quality-gated FLUX.2 / AutoencoderKL / Wan / MiniMax-H3
+        VAE decoder fast paths.
 
         Requests with quality="extra-high" or "high" run the fast paths; the
         "lossless" default runs the original module path bit-for-bit. See
@@ -757,6 +757,9 @@ class CudaPlatformBase(Platform):
                 maybe_optimize_autoencoder_kl,
                 maybe_optimize_flux2_vae,
             )
+            from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_vae_cuda_opt import (
+                maybe_optimize_minimax_h3_vae,
+            )
             from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
                 maybe_optimize_wan_vae,
             )
@@ -764,6 +767,7 @@ class CudaPlatformBase(Platform):
             vae = maybe_optimize_flux2_vae(vae)
             vae = maybe_optimize_autoencoder_kl(vae)
             vae = maybe_optimize_wan_vae(vae)
+            vae = maybe_optimize_minimax_h3_vae(vae)
         except Exception:
             logger.warning(
                 "Failed to apply CUDA VAE optimizations; using the unmodified VAE.",

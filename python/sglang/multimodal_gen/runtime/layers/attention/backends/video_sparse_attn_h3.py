@@ -29,6 +29,7 @@ from typing import Any
 
 import torch
 
+from sglang.kernels.ops.diffusion import can_use_vsa_block_sparse_sm100
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
@@ -42,6 +43,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn i
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.vsa_h3_kernels import (
     vsa_h3_block_sparse_attn_forward,
+    vsa_h3_gate_add,
     vsa_h3_pack_tiles,
     vsa_h3_untile,
 )
@@ -277,6 +279,8 @@ class _Workspace:
     """Per-geometry scratch: tiled q/k/v(/gate) [3|4, H, S_pad, D], pooled fp32
     tile means [3, H, n_tiles, D], and the kernel index lists (prefix rows and
     prefix columns are static; only the top-k video columns change per layer).
+    The native kernel pairs query tiles, so the tile axis is padded to an even
+    count with one empty tile.
     """
 
     def __init__(
@@ -289,9 +293,12 @@ class _Workspace:
         device: torch.device,
     ) -> None:
         n_tiles = meta.num_tiles
-        seq_pad = n_tiles * VSA_H3_TILE_ELEMS
+        self.n_tiles = n_tiles
+        self.native = can_use_vsa_block_sparse_sm100(device.index, dtype, head_dim)
+        n_alloc = n_tiles + (n_tiles % 2 if self.native else 0)
+        seq_pad = n_alloc * VSA_H3_TILE_ELEMS
         self.key = _workspace_key(meta, heads, head_dim, has_gate, dtype, device)
-        self.tiled = torch.empty(
+        self.tiled = torch.zeros(
             (3 + int(has_gate), heads, seq_pad, head_dim), dtype=dtype, device=device
         )
         self.pooled = torch.empty(
@@ -300,11 +307,15 @@ class _Workspace:
         self.out_tiled = torch.empty(
             (heads, seq_pad, head_dim), dtype=dtype, device=device
         )
+        self.block_sizes = torch.zeros(n_alloc, dtype=torch.int32, device=device)
+        self.block_sizes[:n_tiles] = meta.variable_block_sizes
         all_tiles = torch.arange(n_tiles, dtype=torch.int32, device=device)
-        self.dense_index = all_tiles.repeat(heads, n_tiles, 1)
-        self.dense_num = torch.full(
-            (heads, n_tiles), n_tiles, dtype=torch.int32, device=device
+        self.dense_index = torch.zeros(
+            (heads, n_alloc, n_tiles), dtype=torch.int32, device=device
         )
+        self.dense_index[:, :n_tiles] = all_tiles
+        self.dense_num = torch.zeros((heads, n_alloc), dtype=torch.int32, device=device)
+        self.dense_num[:, :n_tiles] = n_tiles
         self.q2k_index = self.dense_index.clone()
         self.q2k_num = self.dense_num.clone()
 
@@ -312,9 +323,42 @@ class _Workspace:
         self, video_lists: torch.Tensor, num_prefix_tiles: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
         width = video_lists.shape[-1]
-        self.q2k_index[:, num_prefix_tiles:, :width] = video_lists
-        self.q2k_num[:, num_prefix_tiles:] = width
+        self.q2k_index[:, num_prefix_tiles : self.n_tiles, :width] = video_lists
+        self.q2k_num[:, num_prefix_tiles : self.n_tiles] = width
         return self.q2k_index, self.q2k_num
+
+
+def vsa_h3_gate_tile_index(
+    meta: VideoSparseAttentionH3Metadata, row_start: int, num_rows: int
+) -> torch.Tensor:
+    """Tile of each packed row in the shard, -1 for pad rows."""
+    key = ("gate_tile_index", row_start, num_rows)
+    tile_index = meta.workspace_cache.get(key)
+    if tile_index is None:
+        unpack_index = meta.unpack_index
+        rows = torch.arange(row_start, row_start + num_rows, device=unpack_index.device)
+        tile_index = torch.full_like(rows, -1, dtype=torch.int32)
+        in_used = rows < meta.total_seq_length
+        tile_index[in_used] = unpack_index[rows[in_used]] // VSA_H3_TILE_ELEMS
+        meta.workspace_cache[key] = tile_index
+    return tile_index
+
+
+def vsa_h3_fold_gate(
+    out: torch.Tensor,
+    gate_compress: torch.Tensor,
+    out_compress: torch.Tensor,
+    meta: VideoSparseAttentionH3Metadata,
+    row_start: int,
+) -> None:
+    """Fold the compression branch into ``out`` [rows, H, D], the row shard at
+    ``row_start``."""
+    vsa_h3_gate_add(
+        out,
+        gate_compress,
+        out_compress,
+        vsa_h3_gate_tile_index(meta, row_start, out.shape[0]),
+    )
 
 
 def _get_workspace(
@@ -393,7 +437,9 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         raise NotImplementedError(
-            "VSA-H3 serves MiniMax-H3's packed varlen attention; use forward_varlen."
+            "VSA-H3 serves MiniMax-H3's packed varlen attention only; select it "
+            "for the transformer with --component-attention-backends "
+            "transformer=video_sparse_attn_h3 so dense layers keep their backends."
         )
 
     def forward_varlen(
@@ -407,8 +453,16 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
         cu_seqlens_host: tuple[int, ...] | None = None,
         attn_metadata: VideoSparseAttentionH3Metadata | None = None,
         gate_compress: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """query/key/value: [T, H, D] packed rows (post-norm, post-RoPE)."""
+        return_compress: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """query/key/value: [T, H, D] packed rows (post-norm, post-RoPE).
+        ``return_compress`` returns the compression branch's ``[H, n_tiles, D]``
+        output instead of folding it, for ``vsa_h3_fold_gate`` after the
+        caller's collectives."""
+        if return_compress and (gate_compress is not None or attn_metadata is None):
+            raise ValueError(
+                "return_compress replaces gate_compress and needs VSA-H3 metadata"
+            )
         if self.layer_idx is None or attn_metadata is None:
             if attn_metadata is None and self.layer_idx is not None:
                 raise RuntimeError(
@@ -441,6 +495,7 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
 
         sparsity = 0.0 if self.layer_idx in meta.dense_layers else meta.VSA_sparsity
         has_gate = gate_compress is not None
+        want_compress = has_gate or return_compress
         ws = _get_workspace(meta, query, has_gate)
 
         vsa_h3_pack_tiles(
@@ -456,7 +511,7 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
         q_pooled, k_pooled, v_pooled = ws.pooled
 
         scores = None
-        if sparsity > 0.0 or has_gate:
+        if sparsity > 0.0 or want_compress:
             scores = torch.matmul(q_pooled, k_pooled.transpose(-2, -1)) * (
                 self.head_size**-0.5
             )
@@ -468,21 +523,24 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
             ws.tiled[2:3],
             q2k_index[None],
             q2k_num[None],
-            meta.variable_block_sizes,
+            ws.block_sizes,
             out=ws.out_tiled[None],
+            native=ws.native,
         )
 
         out_compress = None
-        if has_gate:
+        if want_compress:
             out_compress = torch.matmul(torch.softmax(scores, dim=-1), v_pooled)
 
         result = torch.empty(query.shape, dtype=query.dtype, device=query.device)
         vsa_h3_untile(
             ws.out_tiled,
             ws.tiled[3] if has_gate else None,
-            out_compress,
+            out_compress if has_gate else None,
             meta.unpack_index,
             used,
             result,
         )
+        if return_compress:
+            return result, out_compress
         return result

@@ -216,6 +216,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Fused in-place QK RMS-norm + RoPE.",
     ),
     (
+        "diffusion.vsa_block_sparse_sm100",
+        KernelBackend.JIT,
+        "attention.vsa_block_sparse_sm100_jit:vsa_block_sparse_sm100",
+        _CUDA_SM100_PLUS,
+        "FastVideo's warp-specialized tcgen05 block-sparse VSA forward (64-token tiles).",
+    ),
+    (
         "diffusion.flux2_layernorm_modulate_fp8_quant",
         KernelBackend.KDA,
         "sglang.kernels.kda_kernels.layernorm_modulate_triton:fused_layernorm_modulate_fp8_quant_raw",
@@ -514,6 +521,8 @@ _EXPORTS: dict[str, str] = {
     # Diffusion attention kernels
     "cam_scan_bidi_chunkwise": "attention.sana_wm_gdn_chunkwise_triton",
     "fused_bigdn_func": "attention.sana_wm_gdn_triton",
+    "can_use_vsa_block_sparse_sm100": "attention.vsa_block_sparse_sm100_jit",
+    "vsa_block_sparse_sm100": "attention.vsa_block_sparse_sm100_jit",
     "fused_qk_inv_rms": "attention.sana_wm_gdn_triton",
     "prepare_rope_tables": "attention.sana_wm_gdn_triton",
     "_attn_fwd": "attention.sparse_linear_attn_triton",

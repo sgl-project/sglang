@@ -90,10 +90,11 @@ These fusion families mount under both `quality="extra-high"` and
 | SANA-Video BF16-input linear attention | Keeps the first linear-attention GEMM's inputs in BF16 with FP32 accumulation/output; the second GEMM remains FP32 |
 | FLUX-family VAE fast paths | Channels-last decode, GroupNorm(+SiLU), upsample, and attention replacements for FLUX.2 and AutoencoderKL-based FLUX.1, Z-Image, and SD3 pipelines |
 | Wan VAE RMSNorm + SiLU | Replaces the channel-first RMSNorm/SiLU chain while keeping the decode in `channels_last_3d` |
+| MiniMax-H3 VAE decoder fast path | Per-head fp32 RMSNorm, rounded to the activation dtype, and NeoX RoPE in one launch over the strided Q/K views of the ViT decoder's QKV buffer; cuDNN SDPA for the block's attention |
 
 ## Kernel inventory
 
-43 operators are registered in the kernel registry across 47 implementations (some operators carry several backends). Backends are named by provenance, not device: `JIT` compiles under nvcc *and* hipcc, `TRITON` runs on CUDA and ROCm, `CUTE_DSL` needs CUTLASS, `FLYDSL` is ROCm gfx950 only, `AOT` comes from the `sgl_kernel` wheel.
+44 operators are registered in the kernel registry across 48 implementations (some operators carry several backends). Backends are named by provenance, not device: `JIT` compiles under nvcc *and* hipcc, `TRITON` runs on CUDA and ROCm, `CUTE_DSL` needs CUTLASS, `FLYDSL` is ROCm gfx950 only, `AOT` comes from the `sgl_kernel` wheel.
 
 ### Normalization
 
@@ -153,6 +154,7 @@ These fusion families mount under both `quality="extra-high"` and
 | --- | --- | --- |
 | `sparse_linear_attn_fwd` | Triton | block-map, compression, and forward for sparse linear attention |
 | `bigdn` | Triton | Sana-WM bidirectional gated delta-net; the chunkwise form splits phase A along the KV and Z streams so two blocks stay resident per SM, and stores `(I - P)` so phase B's MMA folds the identity-add in |
+| `vsa_block_sparse_sm100` | JIT CUDA | FastVideo's warp-specialized tcgen05 block-sparse VSA forward for 64-token tiles (sm_100a / sm_103a); a CTA owns two adjacent query tiles with their own key lists. VSA-H3 uses it on Blackwell and keeps the Triton tile-64 kernel elsewhere |
 
 ### Data movement
 
