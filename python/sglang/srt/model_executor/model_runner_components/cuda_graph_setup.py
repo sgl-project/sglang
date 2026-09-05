@@ -46,7 +46,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
-from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
+from sglang.srt.utils import get_available_gpu_memory
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -453,20 +453,6 @@ def capture_prefill_graph(
         model_runner.mha_companion_layers,
         layer_model,
     )
-
-    if not has_standard_gqa_for_all_local_layers(
-        attention_layer_count=sum(
-            layer is not None for layer in model_runner.attention_layers
-        ),
-        start_layer=model_runner.layer_info.start_layer,
-        end_layer=model_runner.layer_info.end_layer,
-    ):
-        # TODO(yuwei): support Non-Standard GQA
-        log_info_on_rank0(
-            logger,
-            "Disable prefill CUDA graph because some layers do not apply Standard GQA",
-        )
-        return result(None)
 
     tic = time.perf_counter()
     before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
