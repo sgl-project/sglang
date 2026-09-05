@@ -45,6 +45,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.utils import is_health_check_generate_req
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
 from sglang.srt.observability.startup_time import aggregate_scheduler_startup_times
@@ -161,6 +162,7 @@ class DataParallelController:
 
         # Dispatch method
         self.round_robin_counter = 0
+        self.health_round_robin_counter = 0
         dispatch_lookup = {
             LoadBalanceMethod.ROUND_ROBIN: self.round_robin_scheduler,
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
@@ -321,7 +323,12 @@ class DataParallelController:
         self.dp_budget.update_budget(self.load_snapshot_reader.read_all())
 
     def dispatching_with_trace(self, req: Req, refresh_load_budget: bool = True):
-        if refresh_load_budget and self.refresh_load_budget_on_dispatch:
+        is_health_check = is_health_check_generate_req(req)
+        if (
+            not is_health_check
+            and refresh_load_budget
+            and self.refresh_load_budget_on_dispatch
+        ):
             self.refresh_load_budget()
 
         time_stats = DPControllerReqTimeStats.new_from_obj(
@@ -330,12 +337,18 @@ class DataParallelController:
 
         time_stats.set_dp_dispatch_time()
         req.time_stats = wrap_as_pickle(time_stats)
-        self.dispatching(req)
+        if is_health_check:
+            self.dispatch_health_check(req)
+        else:
+            self.dispatching(req)
         req.time_stats = time_stats
         req.time_stats.set_dp_dispatch_finish_time()
 
     def dispatch_batch_generate(self, batch_req: BatchTokenizedGenerateReqInput):
-        if self.refresh_load_budget_on_dispatch:
+        has_user_request = any(
+            not is_health_check_generate_req(req) for req in batch_req
+        )
+        if has_user_request and self.refresh_load_budget_on_dispatch:
             self.refresh_load_budget()
         for req in batch_req:
             self.dispatching_with_trace(req, refresh_load_budget=False)
@@ -739,6 +752,36 @@ class DataParallelController:
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
         self.startup_time = aggregate_scheduler_startup_times(
             info.get("startup_time") for info in scheduler_info
+        )
+
+    def dispatch_health_check(self, req: Req):
+        # Preserve the existing PD/disaggregation routing contract; follow_bootstrap_room does not share
+        # mutable user load-balancing state.
+        if self.load_balance_method == LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM:
+            self.follow_bootstrap_room_scheduler(req)
+            return
+
+        if self.maybe_external_dp_rank_routing(req):
+            return
+
+        active = self._active_workers
+        if not active:
+            raise RuntimeError("No active DP workers are available for health checks.")
+
+        attempts = 0
+        while attempts < len(active):
+            slot = active[self.health_round_robin_counter % len(active)]
+            self.health_round_robin_counter = (
+                self.health_round_robin_counter + 1
+            ) % len(active)
+            if self.status[slot]:
+                logger.debug(f"Choose worker {slot} for health check")
+                sock_send(self.workers[slot], req)
+                return
+            attempts += 1
+        raise RuntimeError(
+            f"Cannot route health check: all {len(active)} active DP workers "
+            "are unavailable."
         )
 
     def maybe_external_dp_rank_routing(self, req: Req):
