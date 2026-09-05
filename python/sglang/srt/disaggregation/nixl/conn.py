@@ -43,10 +43,10 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
-    pack_state_types,
+    pack_state_component_types,
     resolve_dcp_dst_entry_indices,
-    resolve_state_component_dst_index,
-    unpack_state_types,
+    resolve_state_component_dst_index_by_type,
+    unpack_state_component_types,
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel, get_schedule
@@ -237,7 +237,7 @@ class KVArgsRegisterInfo:
     dst_state_item_lens: List[List[int]] = dataclasses.field(default_factory=list)
     dst_state_dim_per_tensor: List[List[int]] = dataclasses.field(default_factory=list)
     dst_state_layer_ids: List[List[int]] = dataclasses.field(default_factory=list)
-    dst_state_types: List[StateType] = dataclasses.field(default_factory=list)
+    dst_state_component_types: List[StateType] = dataclasses.field(default_factory=list)
     dst_homogeneous_mem_kind: Optional[str] = None
     kv_xfer_segments: Optional[List[_KVXferPreparedSegment]] = None
     staging_base_ptr: int = 0
@@ -282,7 +282,9 @@ class KVArgsRegisterInfo:
             if len(msg) > 20 and msg[20] != b""
             else []
         )
-        dst_state_types = unpack_state_types(msg[23]) if len(msg) > 23 else []
+        dst_state_component_types = (
+            unpack_state_component_types(msg[23]) if len(msg) > 23 else []
+        )
 
         return cls(
             room=str(msg[0].decode("ascii")),
@@ -311,7 +313,7 @@ class KVArgsRegisterInfo:
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
             dst_state_layer_ids=dst_state_layer_ids,
-            dst_state_types=dst_state_types,
+            dst_state_component_types=dst_state_component_types,
             staging_base_ptr=(
                 struct.unpack("Q", msg[14])[0]
                 if len(msg) > 14 and len(msg[14]) == 8
@@ -1326,7 +1328,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_state_item_lens=dst_info.dst_state_item_lens,
                                 dst_state_dim_per_tensor=dst_info.dst_state_dim_per_tensor,
                                 dst_state_layer_ids=dst_info.dst_state_layer_ids,
-                                dst_state_types=dst_info.dst_state_types,
+                                dst_state_component_types=(
+                                    dst_info.dst_state_component_types
+                                ),
                             )
                             handles.extend(
                                 h for h in state_xfer_handles if h is not None
@@ -2305,7 +2309,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_state_item_lens: List[List[int]] | None = None,
         dst_state_dim_per_tensor: List[List[int]] | None = None,
         dst_state_layer_ids: List[List[int]] | None = None,
-        dst_state_types: List[StateType] | None = None,
+        dst_state_component_types: List[StateType] | None = None,
     ):
         """Send state per hybrid component, dispatching by state_type[i]."""
         state_types = getattr(self.kv_args, "state_types", []) or []
@@ -2324,13 +2328,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_state_item_lens = dst_state_item_lens or []
         dst_state_dim_per_tensor = dst_state_dim_per_tensor or []
         dst_state_layer_ids = dst_state_layer_ids or []
-        dst_state_types = dst_state_types or []
+        dst_state_component_types = dst_state_component_types or []
 
         handles = []
         for i, st in enumerate(state_types):
-            dst_component_index = resolve_state_component_dst_index(
+            dst_component_index = resolve_state_component_dst_index_by_type(
                 state_types,
-                dst_state_types,
+                dst_state_component_types,
                 i,
             )
             src_indices = (
@@ -3100,7 +3104,9 @@ class NixlKVReceiver(CommonKVReceiver):
             packed_state_layer_ids = pack_int_lists(
                 self.kv_mgr.kv_args.state_layer_ids, "I"
             )
-            packed_state_types = pack_state_types(self.kv_mgr.kv_args.state_types)
+            packed_state_component_types = pack_state_component_types(
+                self.kv_mgr.kv_args.state_types
+            )
 
             # Include staging allocator metadata if available
             if (
@@ -3149,7 +3155,7 @@ class NixlKVReceiver(CommonKVReceiver):
                             packed_kv_layer_ids,
                             str(self.kv_mgr.dcp_size).encode("ascii"),
                             str(self.kv_mgr.dcp_rank).encode("ascii"),
-                            packed_state_types,
+                            packed_state_component_types,
                         ]
                     )
             except zmq.ZMQError:

@@ -35,10 +35,10 @@ from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_transfer_entry_pairs,
     get_dsv4_c128_state_indices,
-    pack_state_types,
-    resolve_state_component_dst_index,
+    pack_state_component_types,
+    resolve_state_component_dst_index_by_type,
     setup_state_kv_args,
-    unpack_state_types,
+    unpack_state_component_types,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
@@ -148,23 +148,47 @@ class TestDisaggregationWire(unittest.TestCase):
         bufs = [b"abc", b"", b"de", b"x" * 17]
         self.assertEqual(unpack_list_of_buffers(pack_list_of_buffers(bufs)), bufs)
 
-    def test_state_component_matching_uses_type_occurrence(self):
-        src_state_types = [StateType.SWA, StateType.SWA]
-        dst_state_types = [StateType.SWA, StateType.C128_STATE, StateType.SWA]
+    def test_state_component_matching_uses_unique_type(self):
+        src_state_component_types = [StateType.SWA, StateType.C128_STATE]
+        dst_state_component_types = [
+            StateType.SWA_RING,
+            StateType.C128_STATE,
+            StateType.SWA,
+        ]
 
         self.assertEqual(
-            resolve_state_component_dst_index(src_state_types, dst_state_types, 0),
-            0,
-        )
-        self.assertEqual(
-            resolve_state_component_dst_index(src_state_types, dst_state_types, 1),
+            resolve_state_component_dst_index_by_type(
+                src_state_component_types, dst_state_component_types, 0
+            ),
             2,
         )
+        self.assertEqual(
+            resolve_state_component_dst_index_by_type(
+                src_state_component_types, dst_state_component_types, 1
+            ),
+            1,
+        )
 
-    def test_state_types_roundtrip(self):
-        state_types = [StateType.SWA, StateType.C128_STATE, StateType.SWA_RING]
+        with self.assertRaisesRegex(RuntimeError, "is not unique"):
+            resolve_state_component_dst_index_by_type(
+                [StateType.SWA, StateType.SWA],
+                [StateType.SWA],
+                0,
+            )
 
-        self.assertEqual(unpack_state_types(pack_state_types(state_types)), state_types)
+    def test_state_component_types_roundtrip(self):
+        state_component_types = [
+            StateType.SWA,
+            StateType.C128_STATE,
+            StateType.SWA_RING,
+        ]
+
+        self.assertEqual(
+            unpack_state_component_types(
+                pack_state_component_types(state_component_types)
+            ),
+            state_component_types,
+        )
 
     def test_layer_shard_kv_layer_ids_use_shard_start(self):
         kv_pool = SimpleNamespace(

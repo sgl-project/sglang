@@ -1003,13 +1003,13 @@ def resolve_dcp_dst_entry_indices(
     ]
 
 
-def pack_state_types(state_types) -> bytes:
-    return ",".join(state_type.value for state_type in (state_types or [])).encode(
-        "ascii"
-    )
+def pack_state_component_types(state_component_types) -> bytes:
+    return ",".join(
+        state_type.value for state_type in (state_component_types or [])
+    ).encode("ascii")
 
 
-def unpack_state_types(data: bytes):
+def unpack_state_component_types(data: bytes):
     from sglang.srt.disaggregation.base.conn import StateType
 
     if not data:
@@ -1017,32 +1017,33 @@ def unpack_state_types(data: bytes):
     return [StateType(value) for value in data.decode("ascii").split(",") if value]
 
 
-def resolve_state_component_dst_index(src_state_types, dst_state_types, src_index: int):
-    if not dst_state_types:
+def resolve_state_component_dst_index_by_type(
+    src_state_component_types, dst_state_component_types, src_index: int
+):
+    if not dst_state_component_types:
         return src_index
-    if not src_state_types:
+    if not src_state_component_types:
         raise RuntimeError(
-            "Destination state_types are present but source state_types are empty."
+            "Destination state component types are present but source state "
+            "component types are empty."
         )
-    if src_index >= len(src_state_types):
+    if src_index >= len(src_state_component_types):
         raise RuntimeError(
             f"Source state component index {src_index} exceeds "
-            f"state_types length {len(src_state_types)}."
+            f"state component types length {len(src_state_component_types)}."
         )
-    state_type = src_state_types[src_index]
-    occurrence = sum(
-        1 for item in src_state_types[: src_index + 1] if item == state_type
-    )
-    seen = 0
-    for dst_index, dst_state_type in enumerate(dst_state_types):
+    state_type = src_state_component_types[src_index]
+    if src_state_component_types.count(state_type) != 1:
+        raise RuntimeError(f"Source state component {state_type!s} is not unique.")
+    dst_count = dst_state_component_types.count(state_type)
+    if dst_count == 0:
+        raise RuntimeError(f"Decode peer is missing state component {state_type!s}.")
+    if dst_count != 1:
+        raise RuntimeError(f"Decode peer state component {state_type!s} is not unique.")
+    for dst_index, dst_state_type in enumerate(dst_state_component_types):
         if dst_state_type == state_type:
-            seen += 1
-            if seen == occurrence:
-                return dst_index
-    raise RuntimeError(
-        f"Decode peer is missing state component {state_type!s} "
-        f"occurrence {occurrence}."
-    )
+            return dst_index
+    raise AssertionError("unreachable")
 
 
 def build_staging_slot_metadata(
