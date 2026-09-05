@@ -1285,7 +1285,9 @@ class ServingChatTestCase(unittest.TestCase):
 
         result = self.chat._process_messages(request, is_multimodal=True)
 
-        call = self.tm.tokenizer.apply_chat_template.call_args
+        # response_format triggers a second baseline render for billed-token
+        # accounting; the wire-relevant render is the first call.
+        call = self.tm.tokenizer.apply_chat_template.call_args_list[0]
         rendered_messages = call.args[0]
         self.assertEqual(rendered_messages[0]["role"], "system")
         self.assertEqual(
@@ -1317,6 +1319,57 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertNotIn("schema_", call.kwargs["response_format"]["json_schema"])
         self.assertEqual(result.prompt_ids, [7, 8, 9])
         self.assertEqual(result.image_data[0].url, "image-1")
+
+    def test_kimi_k3_response_format_tokens_not_billed(self):
+        self.template_manager.chat_template_name = None
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.tm.tokenizer.apply_chat_template.side_effect = [
+            list(range(186)),
+            list(range(119)),
+        ]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "hi"}],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "answer", "schema": {"type": "object"}},
+            },
+        )
+
+        self.chat._process_messages(request, is_multimodal=False)
+
+        self.assertEqual(request._response_format_prompt_tokens, 67)
+        baseline_call = self.tm.tokenizer.apply_chat_template.call_args_list[1]
+        self.assertNotIn("response_format", baseline_call.kwargs)
+        self.assertEqual(
+            self.chat._reported_prompt_tokens({"prompt_tokens": 186}, request),
+            186 - self.chat._KIMI_K3_GENERATION_STUB_TOKENS - 67,
+        )
+
+        plain = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "hi"}]
+        )
+        self.assertEqual(
+            self.chat._reported_prompt_tokens({"prompt_tokens": 122}, plain),
+            122 - self.chat._KIMI_K3_GENERATION_STUB_TOKENS,
+        )
+
+    def test_kimi_k3_response_format_via_template_kwargs_not_billed(self):
+        self.template_manager.chat_template_name = None
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.tm.tokenizer.apply_chat_template.side_effect = [
+            list(range(186)),
+            list(range(119)),
+        ]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "hi"}],
+            chat_template_kwargs={"response_format": {"type": "json_object"}},
+        )
+
+        self.chat._process_messages(request, is_multimodal=False)
+
+        self.assertEqual(request._response_format_prompt_tokens, 67)
 
     def test_kimi_k3_neutralizes_text_only_assistant_history(self):
         self.template_manager.chat_template_name = None
