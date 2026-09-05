@@ -2,9 +2,13 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
+
+import torch
 
 from sglang.srt.configs.model_config import (
     ModelConfig,
+    _get_and_verify_dtype,
     get_hybrid_layer_ids,
     is_embedding_gemma,
 )
@@ -12,6 +16,33 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class TestGetAndVerifyDtype(CustomTestCase):
+    def test_missing_config_dtype_warns_for_auto_downcast(self):
+        """An implicit float32-to-float16 choice warns when dtype is absent."""
+        with patch("sglang.srt.configs.model_config.logger.warning") as warning:
+            dtype = _get_and_verify_dtype({}, "auto")
+
+        self.assertIs(dtype, torch.float16)
+        warning.assert_called_once()
+        self.assertIn("declares no dtype/torch_dtype", warning.call_args.args[0])
+
+    def test_auto_downcast_warning_requires_missing_config_dtype(self):
+        """Declared or explicitly requested dtypes do not report a missing dtype."""
+        cases = (
+            ("declared-float32", {"dtype": "float32"}, "auto", torch.float16),
+            ("explicit-dtype", {}, "bfloat16", torch.bfloat16),
+            ("unknown-config-dtype", {"dtype": "unknown"}, "auto", torch.float16),
+        )
+
+        for name, config, requested_dtype, expected_dtype in cases:
+            with self.subTest(name=name):
+                with patch("sglang.srt.configs.model_config.logger.warning") as warning:
+                    dtype = _get_and_verify_dtype(config, requested_dtype)
+
+                self.assertIs(dtype, expected_dtype)
+                warning.assert_not_called()
 
 
 class TestHybridLayerIds(CustomTestCase):
