@@ -14,6 +14,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.attention.dsa import litetopk
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_graph_dsa_split_op_surface,
@@ -61,8 +62,9 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_hip,
     _is_musa,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.state_capturer.indexer_topk import (
+    get_global_indexer_capturer,
     maybe_capture_indexer_topk,
 )
 from sglang.srt.utils import BumpAllocator
@@ -72,6 +74,12 @@ logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 _ENABLE_DSA_Q8KV8_BORN_FP8_Q = envs.SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q.get()
 _ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get()
+_CP_ASYNC_INDEXER_ENABLED = (
+    litetopk.ENABLED
+    and litetopk.CP_ASYNC_PREP
+    and envs.SGLANG_LITETOPK_CP_ASYNC_INDEXER.get()
+)
+_CP_ASYNC_INDEXER_LOGGED = False
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -134,6 +142,18 @@ class DeepseekMLAForwardMixin:
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
             get_exec().kernel.flashinfer_mla_disable_ragged
+        )
+        # All producer layers share one indexer stream.  This preserves layer
+        # order, avoids per-layer driver allocations, and lets eager CP-v2
+        # overlap the indexer chain with MLA preparation.  The stream is
+        # leased at model construction, never during CUDA graph capture.
+        self.dsa_cp_async_indexer_stream = (
+            get_stream("dsa_cp_async_indexer")
+            if _is_cuda
+            and _CP_ASYNC_INDEXER_ENABLED
+            and self.use_dsa
+            and self.dsa_enable_prefill_cp
+            else None
         )
 
     def should_run_indexer(
@@ -299,6 +319,7 @@ class DeepseekMLAForwardMixin:
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
+        global _CP_ASYNC_INDEXER_LOGGED
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
         # Q8KV8 q-prep/indexer overlap handshake (see the fork site below):
@@ -310,6 +331,32 @@ class DeepseekMLAForwardMixin:
             if hasattr(self, "prepare_attention_output_gate")
             else None
         )
+        cp_async_indexer_pending = False
+        cp_async_indexer_armed = False
+        # A pending token belongs to exactly one layer invocation.  Clear any
+        # stale value before this invocation decides whether it can launch the
+        # async producer; the qualified path installs its layer id below.
+        attn_backend = None
+        cp_async_marker_supported = False
+        if _CP_ASYNC_INDEXER_ENABLED:
+            attn_backend = get_attn_backend()
+            # TBO installs per-child backends in ForwardContext, so checking
+            # the runtime object type is insufficient.  The marker protocol
+            # is single-invocation until explicit child forwarding exists.
+            cp_async_marker_supported = not get_exec().overlap.enable_two_batch_overlap
+            stale_async_layer = getattr(
+                attn_backend, "_litetopk_cp_async_indexer_layer", -1
+            )
+            if stale_async_layer != -1:
+                # This is only an exception-recovery guard.  Normal invocations
+                # are cleared by the exact consumer below; if a prior backend
+                # aborted after enqueue, drain its producer before any new CP
+                # collective can be launched on another stream.
+                if self.dsa_cp_async_indexer_stream is not None:
+                    torch.cuda.current_stream().wait_stream(
+                        self.dsa_cp_async_indexer_stream
+                    )
+            setattr(attn_backend, "_litetopk_cp_async_indexer_layer", -1)
 
         fuse_bmm_attention = (
             self.q_lora_rank is not None
@@ -361,6 +408,64 @@ class DeepseekMLAForwardMixin:
                 if q_lora is None:
                     q_lora = q
 
+            # Eager CP-v2: arm the complete indexer as soon as q_lora is
+            # available.  The stream dependency is captured here, before the
+            # main MLA q_b projection, but the indexer kernels are submitted
+            # immediately *after* q_b below.  Submitting q_b first gives the
+            # much larger main-path GEMM scheduling priority; submitting the
+            # indexer second still lets it overlap the remaining MLA prepare
+            # chain without allowing its persistent scan to occupy all SMs
+            # before q_b reaches the device scheduler.
+            cp_async_indexer = (
+                _CP_ASYNC_INDEXER_ENABLED
+                and q_lora is not None
+                and self.should_run_indexer(prev_topk_indices)
+                and cp_async_marker_supported
+                and getattr(attn_backend, "dsa_prefill_impl", None) == "trtllm"
+                and self.dsa_cp_async_indexer_stream is not None
+                and self.indexer.use_dsa_indexer_fusion
+                and self.indexer.alt_stream is not None
+                and self.indexer.cp_indexer_comm_stream is not None
+                and forward_batch.attn_cp_metadata is not None
+                and int(forward_batch.attn_cp_metadata.bs) == 1
+                and (
+                    int(forward_batch.attn_cp_metadata.total_seq_lens)
+                    % get_parallel().attn_cp_size
+                    == 0
+                )
+                and forward_batch.tbo_padded_len is None
+                and get_parallel().attn_tp_size == 1
+                # Layer-split cache reads add an owner broadcast on the same
+                # CP communicator after index-K AG.  Keep that topology on the
+                # serial path until it has its own completion event.
+                and not get_parallel().enable_dsa_cache_layer_split
+                and get_global_indexer_capturer() is None
+                and dsa_use_prefill_cp(forward_batch)
+                and is_cp_v2_active(forward_batch)
+                and forward_batch.forward_mode.is_extend_without_speculative()
+                and not get_is_capture_mode()
+                and not is_graph_dsa_split_op_surface(forward_batch)
+                and litetopk.supports_fused_query_len(
+                    int(q_lora.shape[0]), use_fp4=False
+                )
+                and litetopk.single_request_production_ready_cpu(
+                    forward_batch.seq_lens_cpu, use_fp4=False
+                )
+            )
+            if cp_async_indexer:
+                current_stream = torch.cuda.current_stream()
+                indexer_stream = self.dsa_cp_async_indexer_stream
+                indexer_stream.wait_stream(current_stream)
+                # The indexer reads these allocations after Python returns to
+                # the main stream.  Explicit ownership prevents allocator
+                # reuse while the independent producer is still running.
+                hidden_states.record_stream(indexer_stream)
+                q_lora.record_stream(indexer_stream)
+                positions.record_stream(indexer_stream)
+                if forward_batch.out_cache_loc is not None:
+                    forward_batch.out_cache_loc.record_stream(indexer_stream)
+                cp_async_indexer_armed = True
+
             # overlap q_b_proj and indexer during decode
             if (
                 self.alt_stream is not None
@@ -400,6 +505,55 @@ class DeepseekMLAForwardMixin:
                     )
                 else:
                     q = self.q_b_proj_forward(q)
+
+                # The dependency recorded above ends before q_b, while this
+                # host submission occurs immediately after q_b was enqueued on
+                # the main stream.  This preserves overlap but avoids giving
+                # the indexer's persistent scan an artificial head start over
+                # the 4x-larger attention projection.
+                if cp_async_indexer_armed:
+                    current_stream = torch.cuda.current_stream()
+                    indexer_stream = self.dsa_cp_async_indexer_stream
+                    try:
+                        with torch.cuda.stream(indexer_stream):
+                            topk_indices = self.indexer(
+                                x=hidden_states,
+                                q_lora=q_lora,
+                                positions=positions,
+                                forward_batch=forward_batch,
+                                layer_id=self.layer_id,
+                            )
+                    except Exception:
+                        # An exception may occur after index-K work was
+                        # submitted to C but before I installed its ordinary
+                        # tail wait.  Put both streams behind main before
+                        # unwinding so a recovered request cannot launch a CP
+                        # collective out of order.
+                        current_stream.wait_stream(self.indexer.cp_indexer_comm_stream)
+                        current_stream.wait_stream(indexer_stream)
+                        raise
+                    if topk_indices is None:
+                        current_stream.wait_stream(self.indexer.cp_indexer_comm_stream)
+                        current_stream.wait_stream(indexer_stream)
+                        raise RuntimeError(
+                            "CP LiteTopK async indexer returned no top-k tensor"
+                        )
+                    cp_async_indexer_pending = True
+                    # The marker is an invocation-specific commit token.  The
+                    # TRTLLM backend consumes exactly this layer after its own
+                    # KV gather/store has been enqueued.
+                    setattr(
+                        attn_backend,
+                        "_litetopk_cp_async_indexer_layer",
+                        self.layer_id,
+                    )
+                    if not _CP_ASYNC_INDEXER_LOGGED:
+                        print(
+                            "LITETOPK_CP_ASYNC_INDEXER_EXECUTED "
+                            "main-first indexer/MLA overlap active",
+                            flush=True,
+                        )
+                        _CP_ASYNC_INDEXER_LOGGED = True
 
                 # Hoist these above the DSA indexer split op so the indexer
                 # and the composite bmm+attention split op are adjacent in FX.
@@ -449,7 +603,9 @@ class DeepseekMLAForwardMixin:
                         self._q8kv8_qprep_overlap_pending = True
 
                 if q_lora is not None:
-                    if self.should_run_indexer(prev_topk_indices):
+                    if not cp_async_indexer_pending and self.should_run_indexer(
+                        prev_topk_indices
+                    ):
                         topk_indices = self.indexer(
                             x=hidden_states,
                             q_lora=q_lora,
@@ -457,7 +613,7 @@ class DeepseekMLAForwardMixin:
                             forward_batch=forward_batch,
                             layer_id=self.layer_id,
                         )
-                    else:
+                    elif not cp_async_indexer_pending:
                         topk_indices = maybe_capture_indexer_topk(
                             self.layer_id, prev_topk_indices
                         )
@@ -632,6 +788,13 @@ class DeepseekMLAForwardMixin:
         if dsa_prefill_cp and not defer_kv_gather_until_after_rope:
             from sglang.srt.layers.attention.dsa_backend import materialize_full_kv_cp
 
+            if cp_async_indexer_pending:
+                # Both gathers use the attention-CP group.  Keep their
+                # collective order deterministic while allowing MLA's gather
+                # to overlap the indexer stream's post-gather LiteTopK scan.
+                torch.cuda.current_stream().wait_stream(
+                    self.indexer.cp_indexer_comm_stream
+                )
             k_nope, k_pe = materialize_full_kv_cp(
                 self,
                 forward_batch,
@@ -674,6 +837,21 @@ class DeepseekMLAForwardMixin:
                 logger.warning(
                     f"not supported forward_mode {forward_batch.forward_mode}"
                 )
+
+        if cp_async_indexer_pending and not defer_kv_gather_until_after_rope:
+            # Attention is the first consumer of topk_indices.  Join only
+            # after all independent MLA Q/K preparation and CP communication
+            # has been enqueued on the main stream.  TRTLLM's fused-rope path
+            # defers its KV gather into the backend; that backend owns the
+            # later join so its collective can overlap LiteTopK as well.
+            torch.cuda.current_stream().wait_stream(self.dsa_cp_async_indexer_stream)
+            if topk_indices is not None:
+                topk_indices.record_stream(torch.cuda.current_stream())
+            setattr(
+                attn_backend,
+                "_litetopk_cp_async_indexer_layer",
+                -1,
+            )
 
         return (
             q_pe,

@@ -10,11 +10,15 @@ from einops import rearrange
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.ops.attention.fused_store_index_cache import (
     can_use_dsa_fused_store,
+    fused_quantize_index_k_packed,
     fused_store_index_k_cache,
+    store_packed_index_k_cache,
+    store_rank_major_packed_index_k_cache,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa import litetopk
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import DSANPUIndexerMixin
 from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
@@ -23,6 +27,7 @@ from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     bcg_dsa_indexer_prefill_split,
     pcg_dsa_indexer_prefill_split,
 )
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
@@ -44,6 +49,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_schedule,
+    get_stream,
 )
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
@@ -61,11 +67,145 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
+_litetopk_exec_logged = False
+# One process-wide index-K communication stream serializes every producer
+# layer, so its packed transport scratch can be shared safely across layers.
+_CP_PACKED_INDEX_K_LOCAL_BUFS: Dict[str, torch.Tensor] = {}
+_CP_PACKED_INDEX_K_AG_EXEC_LOGGED = False
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
+
+
+def _litetopk_single_request_cpu_range(
+    metadata: BaseIndexerMetadata,
+    forward_batch: ForwardBatch,
+    *,
+    dsa_cp_enabled: bool,
+) -> Optional[Tuple[int, int]]:
+    """Return ``(window_start, common_end)`` without synchronizing CUDA.
+
+    LiteTopK is currently restricted to one request.  For that layout the
+    flattened K window starts at zero, and the earliest causal endpoint is
+    known from scheduler CPU metadata.  CP-v2 interleave assigns query rows
+    ``rank, rank + cp_size, ...``, so rank contributes the only offset.
+
+    Unknown/uneven CP layouts return ``None`` and retain the conservative
+    device-tensor fallback at the call site.
+    """
+    seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
+    if len(seq_lens_cpu) != 1:
+        return None
+    sequence_length = int(seq_lens_cpu[0].item())
+
+    if dsa_cp_enabled:
+        cp_metadata = forward_batch.attn_cp_metadata
+        strategy = get_cp_strategy()
+        if (
+            cp_metadata is None
+            or strategy is None
+            or strategy.name != "interleave"
+            or int(cp_metadata.bs) != 1
+        ):
+            return None
+        global_query_length = int(cp_metadata.total_seq_lens)
+        # The experimental Q=1024/1016 shapes are evenly divided.  Avoid
+        # making assumptions about padded uneven tails until they are tested.
+        if global_query_length <= 0 or global_query_length % int(strategy.cp_size) != 0:
+            return None
+        common_end = sequence_length - global_query_length + 1 + int(strategy.cp_rank)
+    else:
+        extend_lens_cpu = metadata.get_dsa_extend_len_cpu()
+        if len(extend_lens_cpu) != 1:
+            return None
+        common_end = sequence_length - int(extend_lens_cpu[0]) + 1
+
+    if common_end < 0 or common_end > sequence_length:
+        return None
+    return 0, common_end
+
+
+def _litetopk_carry_recent_rows_hint(
+    forward_batch: ForwardBatch,
+    *,
+    dsa_cp_enabled: bool,
+) -> Optional[int]:
+    """Keep LiteTopK's recent-query carry window in global row units."""
+    if not dsa_cp_enabled or forward_batch.attn_cp_metadata is None:
+        return None
+    strategy = get_cp_strategy()
+    if strategy is None or strategy.name != "interleave":
+        return None
+    return litetopk.carry_recent_rows_for_cp(int(strategy.cp_size))
+
+
+def _transform_litetopk_single_request_indices(
+    metadata: BaseIndexerMetadata,
+    logical_indices: torch.Tensor,
+) -> None:
+    """Match the stock indexer's post-top-k ABI for one request.
+
+    LiteTopK emits request-logical token IDs.  RAGGED single-request prefill
+    consumes those IDs directly, while PAGED prefill consumes physical token
+    locations from the page-size-1 table.  The stock path performs this mapping
+    inside ``topk_transform``; the fused path must do the equivalent explicitly.
+    """
+    method = getattr(metadata, "topk_transform_method", None)
+    if method == TopkTransformMethod.RAGGED:
+        return
+    if method != TopkTransformMethod.PAGED:
+        raise RuntimeError(f"Unsupported LiteTopK top-k transform method: {method}")
+    # Match DSATopKBackend.topk_transform: when fused transform is disabled,
+    # the attention backend consumes logical IDs and performs PAGED mapping
+    # later.  Mapping here in that mode would transform twice.
+    if not envs.SGLANG_DSA_FUSE_TOPK.get() or bool(
+        getattr(metadata, "force_unfused_topk", False)
+    ):
+        return
+
+    page_table_1 = metadata.get_page_table_1()
+    if page_table_1 is None or page_table_1.dim() != 2 or page_table_1.shape[0] != 1:
+        raise RuntimeError(
+            "LiteTopK PAGED prefill requires a one-request page-size-1 table"
+        )
+    if (
+        logical_indices.device.type == "cuda"
+        and logical_indices.dtype == torch.int32
+        and logical_indices.dim() == 2
+        and logical_indices.shape[1] == 2048
+        and logical_indices.is_contiguous()
+        and page_table_1.dtype == torch.int32
+        and page_table_1.is_contiguous()
+        and page_table_1.stride(1) == 1
+        and page_table_1.device == logical_indices.device
+    ):
+        # One Triton launch replaces long/ge/clamp/take/where/copy and its
+        # roughly 50 MiB of temporary traffic for Q=1024,K=2048.  A stride-0
+        # row expansion presents the one-request table to the decode kernel;
+        # each CTA reads its complete input row before writing that same row,
+        # so result=input is a safe in-place transform.  The kernel preserves
+        # every negative sentinel as -1.
+        from sglang.kernels.ops.attention.dsa.transform_index import (
+            transform_index_page_table_decode_fast,
+        )
+
+        transform_index_page_table_decode_fast(
+            page_table_1.expand(logical_indices.shape[0], -1),
+            logical_indices,
+            result=logical_indices,
+            page_size=1,
+        )
+        return
+    logical_indices_i64 = logical_indices.long()
+    valid = logical_indices_i64 >= 0
+    # torch.take treats -1 as the final element.  Stock top-k preserves -1
+    # padding/sentinels, so gather through a non-negative scratch index and
+    # restore every invalid lane instead of turning underfill into a real slot.
+    mapped = torch.take(page_table_1[0], logical_indices_i64.clamp_min(0))
+    logical_indices.copy_(torch.where(valid, mapped, logical_indices))
+
 
 if not _is_npu:
     from sglang.kernels.ops.attention.dsa import (
@@ -253,6 +393,30 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self.cp_size = get_parallel().attn_cp_size
         else:
             self.cp_size = None
+        if litetopk.CP_GLOBAL_CARRY:
+            if not self.dsa_enable_prefill_cp:
+                raise RuntimeError(
+                    "SGLANG_LITETOPK_CP_GLOBAL_CARRY requires DSA prefill CP"
+                )
+            cp_strategy = get_cp_strategy()
+            if cp_strategy is None or cp_strategy.name != "interleave":
+                raise RuntimeError(
+                    "SGLANG_LITETOPK_CP_GLOBAL_CARRY currently requires "
+                    "CP-v2 interleave"
+                )
+            litetopk.configure_cp_global_carry(get_parallel().attn_cp_group)
+        # One process-wide stream preserves the order of every index-K CP
+        # collective.  Leasing it during model construction keeps the CUDA
+        # driver call outside graph capture.  The stream is used only by the
+        # opt-in eager LiteTopK pipeline below.
+        self.cp_indexer_comm_stream = (
+            get_stream("dsa_cp_index_k_comm")
+            if _is_cuda
+            and self.dsa_enable_prefill_cp
+            and litetopk.ENABLED
+            and litetopk.CP_ASYNC_PREP
+            else None
+        )
         if _is_cuda:
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
@@ -321,6 +485,23 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
             get_exec().kernel.dsa_paged_mqa_logits_backend
         )
+
+        # LiteTopk fused indexer top-k (SM100, prefill only, opt-in): scoring +
+        # top-k in one pass, never materializing the [num_q, seq_len] logits.
+        # GLM DSA shape only (H=32, D=128), and incompatible with forced
+        # init/local token inclusion (no logits buffer to mask).
+        if _is_cuda and envs.SGLANG_ENABLE_DSA_LITETOPK.get():
+            from sglang.kernels.ops.attention.dsa import dsa_litetopk_is_supported
+
+            self.use_dsa_litetopk = (
+                self.n_heads == 32
+                and self.head_dim == 128
+                and self.num_init_tokens == 0
+                and self.num_local_tokens == 0
+                and dsa_litetopk_is_supported()
+            )
+        else:
+            self.use_dsa_litetopk = False
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
@@ -730,6 +911,146 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         current_stream.wait_stream(self.alt_stream)
         return q_fp8, weights
 
+    def _fused_q_prepare_and_cp_store(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        act_quant,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Prepare a fused CP indexer on three ordered CUDA streams.
+
+        ``wq_b`` runs on the model's ordinary alternate stream while the
+        fused K/head-gate projection runs on the caller's main stream.  Once
+        the latter is ready, a dedicated process-wide communication stream
+        performs local K norm/RoPE, the CP-v2 all-gather/reorder, and the
+        global index-cache store.  The main stream prepares Q concurrently and
+        joins the communication stream exactly once before LiteTopK reads the
+        newly written tail.
+
+        Every DSA layer leases the same communication stream, which keeps the
+        collective order identical across ranks and avoids cross-layer NCCL
+        reordering.
+        """
+        global _CP_PACKED_INDEX_K_AG_EXEC_LOGGED
+
+        if self.alt_stream is None or self.cp_indexer_comm_stream is None:
+            raise RuntimeError(
+                "CP LiteTopK async preparation requires two side streams"
+            )
+        if not is_cp_v2_active(forward_batch):
+            raise RuntimeError("CP LiteTopK async preparation requires CP-v2")
+
+        current_stream = torch.cuda.current_stream()
+        q_stream = self.alt_stream
+        comm_stream = self.cp_indexer_comm_stream
+        q_scale_gate = self.softmax_scale * self.n_heads**-0.5
+
+        # Snapshot the caller's dependencies before either side stream starts.
+        q_stream.wait_stream(current_stream)
+        with torch.cuda.stream(q_stream):
+            q = self.wq_b(q_lora)[0].view(-1, self.n_heads, self.head_dim)
+
+        # Keep the larger fused K/head-gate projection on the main stream.
+        kw, _ = self.wk_weights_proj(x)
+        key_raw, weights_raw = kw.split([self.head_dim, self.n_heads], dim=-1)
+
+        # The communication stream consumes the main-stream projection, then
+        # owns all K work through the cache write.  record_stream protects the
+        # projection allocation if Python releases ``kw`` before that work is
+        # complete.
+        comm_stream.wait_stream(current_stream)
+        key_raw.record_stream(comm_stream)
+        positions.record_stream(comm_stream)
+        if forward_batch.out_cache_loc is not None:
+            forward_batch.out_cache_loc.record_stream(comm_stream)
+        with torch.cuda.stream(comm_stream):
+            key = fused_k_indexer_norm_rope(
+                key_raw,
+                self.k_norm.weight,
+                self.k_norm.bias,
+                self.k_norm.variance_epsilon,
+                self._indexer_cos_sin_cache,
+                positions,
+            )
+            if litetopk.CP_PACKED_INDEX_K_AG:
+                local_rows = int(key.shape[0])
+                packed_key = str(key.device)
+                packed_entry = _CP_PACKED_INDEX_K_LOCAL_BUFS.get(packed_key)
+                if packed_entry is None or packed_entry.shape[0] < local_rows:
+                    capacity = 1 << max(0, local_rows - 1).bit_length()
+                    packed_entry = torch.empty(
+                        (capacity, 132),
+                        dtype=torch.uint8,
+                        device=key.device,
+                    )
+                    _CP_PACKED_INDEX_K_LOCAL_BUFS[packed_key] = packed_entry
+                packed_local = packed_entry[:local_rows]
+                fused_quantize_index_k_packed(
+                    key,
+                    packed_local,
+                    page_size=get_token_to_kv_pool().page_size,
+                )
+                cp_strategy = get_cp_strategy()
+                rank_major = cp_strategy.try_materialize_rank_major_indexer_k_cache(
+                    packed_local, forward_batch
+                )
+                if rank_major is not None:
+                    packed_rank_major, packed_cp_size = rank_major
+                    self._store_rank_major_packed_index_k_cache(
+                        forward_batch=forward_batch,
+                        layer_id=layer_id,
+                        packed=packed_rank_major,
+                        cp_size=packed_cp_size,
+                    )
+                    packed_route = "rank_major_direct_store"
+                else:
+                    packed_full = cp_strategy.materialize_full_indexer_k_cache(
+                        packed_local, forward_batch
+                    )
+                    self._store_packed_index_k_cache(
+                        forward_batch=forward_batch,
+                        layer_id=layer_id,
+                        packed=packed_full,
+                    )
+                    packed_route = "reordered_fallback"
+                if not _CP_PACKED_INDEX_K_AG_EXEC_LOGGED:
+                    logger.info(
+                        "LITETOPK_CP_PACKED_INDEX_K_AG_EXECUTED "
+                        "local_fp8_pack_before_CP_allgather %s",
+                        packed_route,
+                    )
+                    _CP_PACKED_INDEX_K_AG_EXEC_LOGGED = True
+            else:
+                key = get_cp_strategy().materialize_full_indexer_k_cache(
+                    key, forward_batch
+                )
+                self._store_index_k_cache(
+                    forward_batch=forward_batch,
+                    layer_id=layer_id,
+                    key=key,
+                    act_quant=act_quant,
+                )
+
+        # Q preparation only depends on q_stream and weights_raw.  It overlaps
+        # the local-K transform, collective, reorder, quantization and store.
+        current_stream.wait_stream(q_stream)
+        q.record_stream(current_stream)
+        q_fp8, weights = fused_q_indexer_rope_first_quant(
+            q.contiguous(),
+            weights_raw,
+            q_scale_gate,
+            self._indexer_cos_sin_cache,
+            positions,
+        )
+
+        # LiteTopK immediately gathers the current index-cache tail, so this
+        # is the semantic join point.  No earlier main-stream wait is needed.
+        current_stream.wait_stream(comm_stream)
+        return q_fp8, weights
+
     @staticmethod
     def _update_rope_guarded(dst: torch.Tensor, src: torch.Tensor) -> None:
         # On AMD with in-place RoPE kernels, self-aliasing can occur;
@@ -1026,6 +1347,43 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         need_chunk = logits_bytes > logits_budget_bytes
         return need_chunk, logits_budget_bytes
 
+    def _get_topk_ragged_litetopk(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
+        ks: torch.Tensor,
+        ke: torch.Tensor,
+        indexer_seq_lens_cpu: torch.Tensor,
+    ) -> torch.Tensor:
+        """LiteTopk fused prefill top-k: scoring + gate + exact select in one
+        KV pass; no [num_q, seq_len] logits buffer and no chunk loop. Output
+        indices are gathered-KV absolute positions, -1 padded -- identical to
+        the dense RAGGED transform contract."""
+        from sglang.kernels.ops.attention.dsa import dsa_litetopk_indexer
+
+        assert forward_batch.extend_seq_lens_cpu is not None
+        kv_lens = indexer_seq_lens_cpu.tolist()
+        req_bounds = []
+        row0 = kv0 = 0
+        for rows, kv_len in zip(forward_batch.extend_seq_lens_cpu, kv_lens):
+            req_bounds.append((row0, row0 + rows, kv0, kv0 + int(kv_len)))
+            row0 += rows
+            kv0 += int(kv_len)
+        return dsa_litetopk_indexer(
+            q_fp8.contiguous(),
+            k_fp8,
+            k_scale,
+            weights.contiguous(),
+            ks,
+            ke,
+            self.index_topk,
+            req_bounds=req_bounds,
+        )
+
     def _get_topk_ragged(
         self,
         enable_dual_stream: bool,
@@ -1072,6 +1430,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         )
 
         batch_size = len(block_tables)
+        global _litetopk_exec_logged
+
         token_nums, _, _ = q_fp8.shape
         device = q_fp8.device
         device_index = device.index
@@ -1087,8 +1447,159 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         ks, ke = metadata.get_indexer_kvcache_range()
 
         indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
-        seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
-        max_seq_len = torch.max(indexer_seq_lens_cpu).item()
+        seq_len_sum = int(torch.sum(indexer_seq_lens_cpu).item())
+        max_seq_len = int(torch.max(indexer_seq_lens_cpu).item())
+
+        # Detect a new single-request epoch before the native dense prefix can
+        # allocate [Q,S] logits.  The first indexer layer that observes the
+        # sequence rollback retires all previous-request LiteTopK workspaces;
+        # later layers see no old carry and make this a no-op.  The boundary
+        # stock chunk still seeds a fresh carry normally before S reaches MIN.
+        if (
+            envs.SGLANG_LITETOPK.get()
+            and forward_batch.attn_cp_metadata is not None
+            and int(forward_batch.attn_cp_metadata.bs) == 1
+            and not get_is_capture_mode()
+        ):
+            litetopk.retire_if_carry_extent_rollback(device, seq_len_sum)
+
+        # LiteTopK performs its own pair-swapped paged gather.  Dispatch it
+        # before the stock contiguous gather so the full index K is not copied
+        # twice.  For supported single-request prefill shapes it scans the
+        # suffix without materializing [Q, S] logits and maps winners back to
+        # the exact ABI expected by the selected attention backend.
+        # REQUIRED is checked before eligibility so an unsupported scheduler
+        # shape cannot silently turn a qualification run into the stock path.
+        litetopk_enabled = envs.SGLANG_LITETOPK.get()
+        litetopk_required = envs.SGLANG_LITETOPK_REQUIRED.get()
+        litetopk_capturing = (
+            get_is_capture_mode() if litetopk_enabled or litetopk_required else False
+        )
+        cp_metadata = forward_batch.attn_cp_metadata
+        litetopk_num_reqs = (
+            int(cp_metadata.bs) if cp_metadata is not None else batch_size
+        )
+        cp_global_carry_layout_ok = True
+        cp_global_carry_layout_reasons: Tuple[str, ...] = ()
+        if litetopk.CP_GLOBAL_CARRY:
+            cp_strategy = get_cp_strategy()
+            global_query_length = (
+                -1 if cp_metadata is None else int(cp_metadata.total_seq_lens)
+            )
+            cp_size = -1 if cp_strategy is None else int(cp_strategy.cp_size)
+            cp_global_carry_layout_ok = (
+                cp_metadata is not None
+                and cp_strategy is not None
+                and cp_strategy.name == "interleave"
+                and cp_size > 1
+                and global_query_length > 0
+                and global_query_length % cp_size == 0
+            )
+            if not cp_global_carry_layout_ok:
+                cp_global_carry_layout_reasons = (
+                    "global carry requires an evenly divided CP-v2 interleave "
+                    f"chunk, got global_Q={global_query_length}, cp_size={cp_size}",
+                )
+        required_path_args = {
+            "enabled": litetopk_enabled,
+            "required": litetopk_required,
+            "use_fp4": False,
+            "query_length": token_nums,
+            "sequence_length": seq_len_sum,
+            "num_reqs": litetopk_num_reqs,
+            "capturing": litetopk_capturing,
+            "route": "SGLang FP8 fused indexer",
+            "extra_reasons": cp_global_carry_layout_reasons,
+        }
+        litetopk_production_ready = litetopk.enforce_required_path(**required_path_args)
+        litetopk_common_eligible = (
+            litetopk_enabled
+            and litetopk_num_reqs == 1
+            and not litetopk_capturing
+            and self.num_init_tokens == 0
+            and self.num_local_tokens == 0
+            and self.index_topk == 2048
+            and cp_global_carry_layout_ok
+            and litetopk.supports_fused_query_len(token_nums, use_fp4=False)
+        )
+        litetopk_eligible = litetopk_common_eligible and litetopk_production_ready
+        litetopk_carry_recent_rows = _litetopk_carry_recent_rows_hint(
+            forward_batch,
+            dsa_cp_enabled=self.dsa_enable_prefill_cp,
+        )
+        if litetopk_eligible:
+            cpu_range = _litetopk_single_request_cpu_range(
+                metadata,
+                forward_batch,
+                dsa_cp_enabled=self.dsa_enable_prefill_cp,
+            )
+            if cpu_range is None:
+                # Conservative fallback for an unqualified CP layout.  The
+                # normal CP8 interleave path never synchronizes here.
+                common_end = int(ke.min().item())
+                window_start = int(ks.min().item())
+            else:
+                window_start, common_end = cpu_range
+
+            k_fp8 = torch.empty(
+                (seq_len_sum, self.head_dim),
+                dtype=torch.float8_e4m3fn,
+                device=device,
+            )
+            k_scale_u8 = torch.empty((seq_len_sum, 4), dtype=torch.uint8, device=device)
+            cache_u8 = self._get_index_k_read_buffer(get_token_to_kv_pool(), layer_id)
+            cache_u8 = cache_u8.view(cache_u8.shape[0], page_size, 132)
+            plan = litetopk.prepare_permuted_gather(
+                cache_u8,
+                k_fp8,
+                k_scale_u8,
+                block_tables,
+                sequence_length=seq_len_sum,
+                query_length=token_nums,
+                num_reqs=1,
+                common_end=common_end,
+                window_start=window_start,
+                hot_key=layer_id,
+            )
+            if plan is not None:
+                q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
+                    q_fp8[:token_nums], weights[:token_nums]
+                )
+                k_scale = k_scale_u8.view(torch.float32).squeeze(-1)
+                if litetopk.try_large_exact_once_chunk(
+                    q_padded,
+                    k_fp8,
+                    k_scale,
+                    w_padded,
+                    ks,
+                    ke,
+                    topk_result[:token_nums],
+                    self.index_topk,
+                    permuted_plan=plan,
+                    num_reqs=1,
+                    ke_min_hint=common_end,
+                    hot_key=layer_id,
+                    ks_common_hint=window_start,
+                    carry_extent_hint=seq_len_sum,
+                    carry_recent_rows_hint=litetopk_carry_recent_rows,
+                ):
+                    _transform_litetopk_single_request_indices(
+                        metadata, topk_result[:token_nums]
+                    )
+                    if not _litetopk_exec_logged:
+                        print(
+                            "LITETOPK_KERNEL_EXECUTED SGLang FP8 fused indexer "
+                            f"dispatched device={q_fp8.device}",
+                            flush=True,
+                        )
+                        _litetopk_exec_logged = True
+                    return topk_result
+        if litetopk_required and litetopk_production_ready:
+            litetopk.enforce_required_path(
+                **required_path_args,
+                dispatched=False,
+            )
+
         k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
             layer_id,
             metadata.get_indexer_seq_len(),
@@ -1109,8 +1620,34 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
+        if self.use_dsa_litetopk:
+            raw_topk_result = self._get_topk_ragged_litetopk(
+                forward_batch=forward_batch,
+                q_fp8=q_fp8[:q_offset],
+                weights=weights[:q_offset],
+                k_fp8=k_fp8,
+                k_scale=k_scale,
+                ks=ks,
+                ke=ke,
+                indexer_seq_lens_cpu=indexer_seq_lens_cpu,
+            )
+            topk_result[:q_offset] = raw_topk_result
+            return topk_result
+
         need_chunk, logits_budget_bytes = self._should_chunk_mqa_logits(
             q_offset, k_offset, device_index
+        )
+
+        min_s = litetopk.production_min_s(False)
+        # q_offset is rank-local under CP interleave, while k_offset and the
+        # LiteTopK crossover live in the global sequence coordinate.  Use the
+        # current global scheduler chunk as the next-chunk hint so the final
+        # stock step seeds carry before a normal CP step crosses MIN_S.
+        next_query_span = q_offset
+        if self.dsa_enable_prefill_cp and cp_metadata is not None:
+            next_query_span = int(cp_metadata.total_seq_lens)
+        seed_litetopk_carry = (
+            litetopk_common_eligible and k_offset < min_s <= k_offset + next_query_span
         )
 
         if not need_chunk:
@@ -1149,8 +1686,29 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             assert logits.shape[1] == k_offset
 
             self._mask_init_and_local_tokens(logits, seq_lens_expanded, ks)
-            raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
-            topk_result[:q_offset] = raw_topk_result
+            if seed_litetopk_carry:
+                # The backend transform may turn logical winners into physical
+                # cache slots (PAGED).  Carry planning must stay in logical
+                # sequence coordinates, so select logical IDs first, map only
+                # the attention-facing copy, and seed from the unmapped IDs.
+                logical_topk_result = metadata.logical_topk(
+                    logits, self.index_topk, ks=ks
+                )
+                topk_result[:q_offset].copy_(logical_topk_result)
+                _transform_litetopk_single_request_indices(
+                    metadata, topk_result[:q_offset]
+                )
+                litetopk.stash_carry(
+                    layer_id,
+                    logical_topk_result,
+                    k_offset,
+                    recent_rows_hint=litetopk_carry_recent_rows,
+                )
+            else:
+                transformed_topk_result = metadata.topk_transform(
+                    logits, self.index_topk, ks=ks
+                )
+                topk_result[:q_offset] = transformed_topk_result
             return topk_result
 
         bytes_per_row = k_offset * self._MQA_LOGITS_BYTES_PER_ELEM
@@ -1161,6 +1719,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         cu_seqlens_q_full = None
         if global_topk_offset is None:
             cu_seqlens_q_full = torch.ones(q_offset, dtype=torch.int32, device=device)
+
+        # The stock dense path may itself split Q to stay inside the logits
+        # budget.  Preserve the same official->LiteTopK boundary contract by
+        # retaining only the most recent logical winner rows across those
+        # internal chunks, then publishing one carry after every output row is
+        # finalized.  Attention-facing rows are transformed independently.
+        logical_carry_tail = None
+        carry_recent_budget = (
+            litetopk.CARRY_RECENT_ROWS
+            if litetopk_carry_recent_rows is None
+            else int(litetopk_carry_recent_rows)
+        )
 
         assert seq_lens_expanded.shape[0] == q_offset, (
             f"seq_lens_expanded length mismatch: {seq_lens_expanded.shape[0]} != {q_offset}"
@@ -1217,17 +1787,48 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 cu_seqlens_q_chunk = cu_seqlens_q_full[start:end]
                 batch_idx_chunk = token_to_batch_idx[start:end]
 
-            raw_topk_chunk = metadata.topk_transform(
-                logits_chunk,
-                self.index_topk,
-                ks=ks[start:end],
-                cu_seqlens_q=cu_seqlens_q_chunk,
-                ke_offset=lengths_chunk,
-                batch_idx_list=batch_idx_chunk,
-                topk_indices_offset_override=topk_offset_chunk,
-            )
-            topk_result[start:end] = raw_topk_chunk
+            if seed_litetopk_carry:
+                logical_topk_chunk = metadata.logical_topk(
+                    logits_chunk,
+                    self.index_topk,
+                    ks=ks[start:end],
+                    lengths=lengths_chunk,
+                )
+                topk_result[start:end].copy_(logical_topk_chunk)
+                _transform_litetopk_single_request_indices(
+                    metadata, topk_result[start:end]
+                )
+                chunk_tail = logical_topk_chunk[-carry_recent_budget:]
+                if (
+                    logical_carry_tail is None
+                    or chunk_tail.shape[0] >= carry_recent_budget
+                ):
+                    logical_carry_tail = chunk_tail
+                else:
+                    logical_carry_tail = torch.cat(
+                        (logical_carry_tail, chunk_tail), dim=0
+                    )[-carry_recent_budget:]
+            else:
+                raw_topk_chunk = metadata.topk_transform(
+                    logits_chunk,
+                    self.index_topk,
+                    ks=ks[start:end],
+                    cu_seqlens_q=cu_seqlens_q_chunk,
+                    ke_offset=lengths_chunk,
+                    batch_idx_list=batch_idx_chunk,
+                    topk_indices_offset_override=topk_offset_chunk,
+                )
+                topk_result[start:end] = raw_topk_chunk
             start = end
+
+        if seed_litetopk_carry:
+            assert logical_carry_tail is not None
+            litetopk.stash_carry(
+                layer_id,
+                logical_carry_tail,
+                k_offset,
+                recent_rows_hint=litetopk_carry_recent_rows,
+            )
 
         return topk_result
 
@@ -1553,6 +2154,62 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             index_k_scale=k_scale,
         )
 
+    def _store_packed_index_k_cache(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        packed: torch.Tensor,
+    ) -> None:
+        """Store one gathered ``[global_Q, 132]`` fp8+scale transport slab."""
+        pool = get_token_to_kv_pool()
+        if hasattr(pool, "invalidate_index_buffer_for_layer"):
+            pool.invalidate_index_buffer_for_layer(layer_id)
+        if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
+            return
+        out_cache_loc = forward_batch.out_cache_loc
+        if out_cache_loc is None:
+            raise RuntimeError("packed index-K CP store requires out_cache_loc")
+        if packed.shape[0] != out_cache_loc.shape[0]:
+            raise RuntimeError(
+                "packed index-K CP gather/store row mismatch: "
+                f"packed={packed.shape[0]}, locations={out_cache_loc.shape[0]}"
+            )
+        store_packed_index_k_cache(
+            packed,
+            pool.get_index_k_with_scale_buffer(layer_id=layer_id),
+            out_cache_loc,
+            pool.page_size,
+        )
+
+    def _store_rank_major_packed_index_k_cache(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        packed: torch.Tensor,
+        cp_size: int,
+    ) -> None:
+        """Store equal-shard interleave AG rows without a global reorder."""
+        pool = get_token_to_kv_pool()
+        if hasattr(pool, "invalidate_index_buffer_for_layer"):
+            pool.invalidate_index_buffer_for_layer(layer_id)
+        if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
+            return
+        out_cache_loc = forward_batch.out_cache_loc
+        if out_cache_loc is None:
+            raise RuntimeError("rank-major packed index-K store requires out_cache_loc")
+        if packed.shape[0] != out_cache_loc.shape[0]:
+            raise RuntimeError(
+                "rank-major packed index-K gather/store row mismatch: "
+                f"packed={packed.shape[0]}, locations={out_cache_loc.shape[0]}"
+            )
+        store_rank_major_packed_index_k_cache(
+            packed,
+            pool.get_index_k_with_scale_buffer(layer_id=layer_id),
+            out_cache_loc,
+            int(cp_size),
+            pool.page_size,
+        )
+
     def forward_native(self, *args, **kwargs):
         # The indexer has no pure-torch reference path; it only runs on
         # platforms with a dedicated forward below.
@@ -1644,7 +2301,40 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self.weights_proj, "set_lora", False
         )
 
-        if (
+        litetopk_production_ready_cpu = (
+            metadata is not None
+            and forward_batch.attn_cp_metadata is not None
+            and int(forward_batch.attn_cp_metadata.bs) == 1
+            and litetopk.single_request_production_ready_cpu(
+                forward_batch.seq_lens_cpu, use_fp4=False
+            )
+        )
+
+        cp_litetopk_async_prep = (
+            litetopk.ENABLED
+            and litetopk.CP_ASYNC_PREP
+            and litetopk_production_ready_cpu
+            and self.use_dsa_indexer_fusion
+            and not in_piecewise_or_breakable_cuda_graph
+            and self.dsa_enable_prefill_cp
+            and forward_batch.attn_cp_metadata is not None
+            and is_cp_v2_active(forward_batch)
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and self.alt_stream is not None
+            and self.cp_indexer_comm_stream is not None
+            and litetopk.supports_fused_query_len(int(q_lora.shape[0]), use_fp4=False)
+        )
+
+        if cp_litetopk_async_prep:
+            q_fp8, weights = self._fused_q_prepare_and_cp_store(
+                x,
+                q_lora,
+                positions,
+                forward_batch,
+                layer_id,
+                act_quant,
+            )
+        elif (
             self.use_dsa_indexer_fusion
             and not in_piecewise_or_breakable_cuda_graph
             and forward_batch.attn_cp_metadata is None

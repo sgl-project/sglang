@@ -29,7 +29,7 @@ After all-gather, tokens are restored to the original order:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 import torch
 
@@ -55,6 +55,11 @@ class InterleaveContextParallelMetadata(BaseContextParallelMetadata):
     per_rank_actual_token: Optional[List[int]] = None
     max_rank_len: Optional[List[int]] = None
     per_rank_logical_token: Optional[List[int]] = None
+    # Rank-major all-gather output is restored with the same permutation for
+    # every layer in one forward.  Build it during input sharding instead of
+    # launching arange/mod/mul/add again in every index-K and MLA-KV gather.
+    gather_indices: Optional[Any] = None
+    gather_indices_rank_len: int = 0
 
 
 class InterleaveCPStrategy(ContextParallelStrategy):
@@ -97,13 +102,36 @@ class InterleaveCPStrategy(ContextParallelStrategy):
 
     def shard_hidden_states(self, x: Any, forward_batch) -> Any:
         metadata = forward_batch.attn_cp_metadata
+        if isinstance(x, torch.Tensor):
+            self._get_gather_indices(metadata, x.device)
         local_x = self._interleave_shard(x[: metadata.total_seq_lens])
         return pad_local_rows(local_x, metadata, dim=0)
 
     def shard_position_ids(self, positions: Any, forward_batch) -> Any:
         metadata = forward_batch.attn_cp_metadata
+        if isinstance(positions, torch.Tensor):
+            self._get_gather_indices(metadata, positions.device)
         local_positions = self._interleave_shard(positions[: metadata.total_seq_lens])
         return pad_local_rows(local_positions, metadata, dim=0)
+
+    def _get_gather_indices(self, metadata: Any, device: Any) -> Any:
+        """Return the per-forward rank-major-to-token-major gather plan."""
+        total_tokens = int(metadata.total_seq_lens)
+        physical_rank_len = max(metadata.per_rank_actual_token, default=0)
+        gather_indices = metadata.gather_indices
+        if (
+            gather_indices is None
+            or gather_indices.device != torch.device(device)
+            or gather_indices.numel() != total_tokens
+            or metadata.gather_indices_rank_len != physical_rank_len
+        ):
+            flat_indices = torch.arange(total_tokens, device=device)
+            gather_indices = (
+                flat_indices % self.cp_size
+            ) * physical_rank_len + flat_indices // self.cp_size
+            metadata.gather_indices = gather_indices
+            metadata.gather_indices_rank_len = physical_rank_len
+        return gather_indices
 
     def _interleave_shard(self, input_: Any) -> Any:
         cp_size = self.cp_size
@@ -196,19 +224,27 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         if physical_rank_len == 0:
             return x.new_empty((0, *x.shape[1:]))
 
-        padded_x = x.new_zeros((physical_rank_len, *x.shape[1:]))
-        padded_x[:local_logical_len] = x[:local_logical_len]
+        if local_logical_len == physical_rank_len and x.shape[0] == physical_rank_len:
+            # CP8 scheduler chunks 8,192 and 16,384 both take this path.  The
+            # input already has the collective shape, so allocating, clearing,
+            # and copying an equal-sized padding tensor is redundant.
+            padded_x = x.contiguous()
+        else:
+            padded_x = x.new_zeros((physical_rank_len, *x.shape[1:]))
+            padded_x[:local_logical_len] = x[:local_logical_len]
 
         with use_symmetric_memory(
             get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
         ):
             gathered = x.new_empty((self.cp_size * physical_rank_len, *x.shape[1:]))
-        attn_cp_all_gather_into_tensor(gathered, padded_x.contiguous())
+        if padded_x.is_cuda:
+            # The equal-split fast path may hand a main-stream allocation
+            # directly to a collective running on a side stream.  Keep its
+            # storage alive until that stream has finished reading it.
+            padded_x.record_stream(torch.cuda.current_stream(padded_x.device))
+        attn_cp_all_gather_into_tensor(gathered, padded_x)
 
-        flat_indices = torch.arange(total_tokens, device=x.device)
-        gather_indices = (
-            flat_indices % self.cp_size
-        ) * physical_rank_len + flat_indices // self.cp_size
+        gather_indices = self._get_gather_indices(metadata, x.device)
         return gathered.index_select(0, gather_indices)
 
     def get_supported_attention_backend(self):
@@ -218,6 +254,52 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         return self.gather_kv_cache(
             key.contiguous(), forward_batch, torch.cuda.current_stream()
         )
+
+    def try_materialize_rank_major_indexer_k_cache(
+        self, key: Any, forward_batch
+    ) -> Optional[Tuple[Any, int]]:
+        """Gather packed index-K rows in rank-major order when mapping is exact.
+
+        Eligibility is decided before the collective.  Uneven/padded shards,
+        non-power-of-two CP, and malformed metadata return ``None`` so the
+        caller can issue the ordinary gather+reorder exactly once.
+        """
+        metadata = getattr(forward_batch, "attn_cp_metadata", None)
+        cp_size = int(self.cp_size)
+        if (
+            metadata is None
+            or cp_size <= 1
+            or cp_size & (cp_size - 1)
+            or metadata.per_rank_actual_token is None
+            or len(metadata.per_rank_actual_token) != cp_size
+        ):
+            return None
+        actual_rank_lens = [int(v) for v in metadata.per_rank_actual_token]
+        logical_rank_lens = (
+            metadata.per_rank_logical_token or metadata.per_rank_actual_token
+        )
+        if logical_rank_lens is None or len(logical_rank_lens) != cp_size:
+            return None
+        logical_rank_lens = [int(v) for v in logical_rank_lens]
+        rows_per_rank = actual_rank_lens[0]
+        if (
+            rows_per_rank <= 0
+            or any(v != rows_per_rank for v in actual_rank_lens)
+            or any(v != rows_per_rank for v in logical_rank_lens)
+            or int(metadata.total_seq_lens) != cp_size * rows_per_rank
+            or int(key.shape[0]) != rows_per_rank
+        ):
+            return None
+
+        packed_local = key.contiguous()
+        with use_symmetric_memory(
+            get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
+        ):
+            gathered = key.new_empty((cp_size * rows_per_rank, *key.shape[1:]))
+        if packed_local.is_cuda:
+            packed_local.record_stream(torch.cuda.current_stream(packed_local.device))
+        attn_cp_all_gather_into_tensor(gathered, packed_local)
+        return gathered, cp_size
 
     def run_attention(
         self,
