@@ -47,6 +47,8 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         self.prefill_cuda_graph_max_tokens: int | None = None
         # Separate scratch sized for the largest prefill token bucket.
         self.prefill_moe_cg_buffers: dict | None = None
+        # Sequential MoE layers share one workspace, including graph scratch.
+        self.lora_workspace = None
 
     def reset_batch_state(self):
         """Idle-forward counterpart of prepare_lora_batch(): clears all
@@ -231,6 +233,16 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
 
         max_bs counts tokens. Layers reuse these buffers sequentially.
         """
+        device = moe_layer.base_layer.w13_weight.device
+        self.moe_cg_buffers = {
+            "adapter_enabled": torch.zeros(max_loras, dtype=torch.int32, device=device),
+            "token_lora_mapping": torch.full(
+                (max_bs,), -1, dtype=torch.int32, device=device
+            ),
+        }
+        if not include_legacy_kernel_buffers:
+            return
+
         base = moe_layer.base_layer
         top_k = base.top_k
         device = moe_layer._quant_info.w13_weight.device
@@ -273,6 +285,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
                 (max_bs,), -1, dtype=torch.int32, device=device
             ),
         }
+        self.moe_cg_buffers.update(legacy_buffers)
 
         if prefill:
             self.prefill_moe_cg_buffers = buffers
@@ -396,12 +409,17 @@ def _compute_moe_lora_info_kernel(
     valid = offs < seg_len
     lora_id = tl.load(weight_indices_ptr + pid_seg)
     lora_rank = tl.load(lora_ranks_ptr + lora_id)
+    adapter_is_enabled = lora_rank > 0
     tl.store(
         adapter_enabled_ptr + lora_id,
-        (lora_rank > 0).to(tl.int32),
+        adapter_is_enabled.to(tl.int32),
         mask=pid_m == 0,
     )
-    tl.store(token_lora_mapping_ptr + seg_start + offs, lora_id, mask=valid)
+    tl.store(
+        token_lora_mapping_ptr + seg_start + offs,
+        tl.where(adapter_is_enabled, lora_id, -1),
+        mask=valid,
+    )
 
 
 def _compute_moe_lora_info(
@@ -484,8 +502,12 @@ def _compute_moe_lora_info(
         torch.searchsorted(seg_indptr.to(torch.int32), token_positions, right=True) - 1
     )
 
-    token_lora_mapping = torch.index_select(
+    torch.index_select(
         weight_indices.to(torch.int32), 0, req_indices, out=token_lora_mapping
     )
+    token_lora_ranks = torch.index_select(
+        lora_ranks, 0, token_lora_mapping.to(torch.int64)
+    )
+    token_lora_mapping.masked_fill_(token_lora_ranks <= 0, -1)
 
     return adapter_enabled, token_lora_mapping
