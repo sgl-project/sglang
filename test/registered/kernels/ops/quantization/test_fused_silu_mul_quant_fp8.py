@@ -17,13 +17,20 @@ import sys
 import pytest
 import torch
 
+import sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe as fused_moe_module
 from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
     fused_silu_mul_quant_fp8,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
 )
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+    _can_use_fused_silu_mul_quant_fp8,
+    fused_experts_impl,
+)
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.layer_ut_utils import init_single_process_dist
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
@@ -80,6 +87,134 @@ SIZES = [
 ]
 
 DTYPES = [torch.bfloat16, torch.float16]
+
+
+def test_fused_silu_mul_quant_fp8_auto_dispatch():
+    """The fast path is automatic only when all caller contracts are satisfied."""
+    compatible = dict(
+        hidden_size=4096,
+        hidden_dtype=torch.bfloat16,
+        use_fp8_w8a8=True,
+        block_shape=[128, 128],
+        filter_expert=False,
+        activation="silu",
+        is_gated=True,
+        gemm1_alpha=None,
+        gemm1_limit=None,
+        hooks=None,
+        fuse_swiglu_interleaved=False,
+    )
+    assert _can_use_fused_silu_mul_quant_fp8(**compatible)
+
+    incompatible_overrides = (
+        {"hidden_size": 4100},
+        {"hidden_dtype": torch.float32},
+        {"use_fp8_w8a8": False},
+        {"block_shape": None},
+        {"block_shape": [128, 0]},
+        {"filter_expert": True},
+        {"activation": "gelu"},
+        {"is_gated": False},
+        {"gemm1_alpha": 1.0},
+        {"gemm1_limit": 7.0},
+        {"hooks": object()},
+        {"fuse_swiglu_interleaved": True},
+    )
+    for override in incompatible_overrides:
+        inputs = compatible | override
+        assert not _can_use_fused_silu_mul_quant_fp8(**inputs), override
+
+
+def test_fused_silu_mul_quant_fp8_auto_dispatch_moe_path(monkeypatch):
+    """The compatible MoE path invokes the fusion and matches its fallback."""
+    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+    init_single_process_dist(master_port=29676)
+
+    torch.manual_seed(42)
+    num_tokens, hidden_size, intermediate_size = 8, 256, 256
+    num_experts, topk, group_size = 4, 2, 128
+    block_shape = [group_size, group_size]
+
+    hidden_states = torch.randn(
+        num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16
+    )
+    w1 = (
+        torch.randn(
+            num_experts,
+            2 * intermediate_size,
+            hidden_size,
+            device="cuda",
+            dtype=torch.float32,
+        )
+        .mul_(0.02)
+        .to(torch.float8_e4m3fn)
+    )
+    w2 = (
+        torch.randn(
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            device="cuda",
+            dtype=torch.float32,
+        )
+        .mul_(0.02)
+        .to(torch.float8_e4m3fn)
+    )
+    w1_scale = torch.ones(
+        num_experts,
+        2 * intermediate_size // group_size,
+        hidden_size // group_size,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    w2_scale = torch.ones(
+        num_experts,
+        hidden_size // group_size,
+        intermediate_size // group_size,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    topk_ids = torch.tensor(
+        [[0, 1], [1, 2], [2, 3], [3, 0]] * 2, device="cuda", dtype=torch.int32
+    )
+    topk_weights = torch.full(
+        (num_tokens, topk), 1.0 / topk, device="cuda", dtype=torch.float32
+    )
+
+    def run_moe():
+        return fused_experts_impl(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            use_fp8_w8a8=True,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            block_shape=block_shape,
+            filter_expert=False,
+        )
+
+    original_fused_kernel = fused_moe_module.fused_silu_mul_quant_fp8
+    fused_kernel_calls = 0
+
+    def record_fused_kernel(*args, **kwargs):
+        nonlocal fused_kernel_calls
+        fused_kernel_calls += 1
+        return original_fused_kernel(*args, **kwargs)
+
+    monkeypatch.setattr(
+        fused_moe_module, "fused_silu_mul_quant_fp8", record_fused_kernel
+    )
+    fused_output = run_moe()
+    assert fused_kernel_calls == 1
+
+    monkeypatch.setattr(
+        fused_moe_module, "_can_use_fused_silu_mul_quant_fp8", lambda **_: False
+    )
+    fallback_output = run_moe()
+    assert fused_kernel_calls == 1
+    torch.testing.assert_close(fused_output, fallback_output, rtol=0.02, atol=0.02)
 
 
 @pytest.mark.parametrize("num_tokens, hidden_dim, group_size", SIZES)
