@@ -21,6 +21,10 @@ static constexpr int kInklingTopK = 6;
 static constexpr int kInklingTopPow2 = 8;
 static constexpr int kInklingWarpSize = 32;
 static constexpr int kInklingValuesPerLane = kInklingRoutedExperts / kInklingWarpSize;
+// Match the DeepSeek reference and SGLang's generic MoE top-k paths. With
+// sigmoid+bias selection, every selected raw sigmoid can underflow to zero;
+// the epsilon prevents 0/0 (and a subsequent NaN routing weight).
+static constexpr float kInklingRenormEpsilon = 1e-20f;
 
 __device__ __forceinline__ float inkling_sigmoid(float x) {
   return 1.0f / (1.0f + __expf(-x));
@@ -123,7 +127,7 @@ __launch_bounds__(kInklingWarpSize* WarpsPerBlock) __global__ void inkling_gate_
   for (int i = 0; i < kInklingTopPow2; ++i) {
     sum += active[i];
   }
-  const float scale = route_scale * global_scale[0] / sum;
+  const float scale = route_scale * global_scale[0] / (sum + kInklingRenormEpsilon);
 
 #pragma unroll
   for (int i = 0; i < kInklingTopK; ++i) {
@@ -338,7 +342,7 @@ __device__ __forceinline__ void inkling_gate_row(
   for (int i = 0; i < kInklingTopK + kInklingSharedExperts; ++i) {
     sum += active[i];
   }
-  const float scale = st.scale / sum;
+  const float scale = st.scale / (sum + kInklingRenormEpsilon);
 
   // Lane a < 8 owns active slot a (static-index select, then one store each).
   float my_active = 0.0f;

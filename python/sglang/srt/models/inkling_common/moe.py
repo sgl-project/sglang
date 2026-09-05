@@ -381,7 +381,7 @@ class InklingGate(nn.Module):
             logits = inkling_gate_gemv(x, self.weight, enable_pdl=is_arch_support_pdl())
         else:
             logits = inkling_fused_gate_linear_with_fp32_out(x, self.weight)
-        # Fused sigmoid[+bias] select-top-k + logsigmoid-renorm in one launch.
+        # Fused sigmoid[+bias] select-top-k + guarded sigmoid renorm in one launch.
         # Pre-packed topk is consumed only by the SRT MoeRunner apply path (quantized
         # experts). Unquantized experts use forward_moe, which needs standard topk
         # tensors; packed mode returns None for routed_weights/topk_indices and would

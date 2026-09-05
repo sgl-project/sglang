@@ -1,8 +1,9 @@
-"""Fused MoE gate: sigmoid + bias + top-k selection + logsigmoid renorm.
+"""Fused MoE gate: sigmoid + bias + top-k selection + guarded sigmoid renorm.
 
     sel  = sigmoid(logits)[:, :N] + bias        # selection score (bias optional)
     idx  = topk(sel, k)                         # top-k routed experts
-    w    = logsigmoid_norm(logits[idx] ++ shared) * route_scale * global_scale
+    w    = sigmoid(logits[idx] ++ shared) / (sum + 1e-20)
+           * route_scale * global_scale
 
 The renorm runs on the RAW logits gathered at the selected indices, so the sort
 key (sigmoid+bias) is not the renorm value -> we re-gather the raw logits.
@@ -116,7 +117,10 @@ def _sigmoid_gate_topk_renorm_kernel(
     probs = tl.sigmoid(active)
     mask_a = offs_a < A
     probs = tl.where(mask_a[None, :], probs, 0.0)
-    weights = probs / tl.sum(probs, axis=1, keep_dims=True)
+    # Selection bias can choose experts whose raw sigmoid weights all underflow
+    # to zero. Match the generic MoE top-k paths and the DeepSeek reference by
+    # guarding the fp32 sum, avoiding 0/0 -> NaN for the whole token row.
+    weights = probs / (tl.sum(probs, axis=1, keep_dims=True) + 1e-20)
     weights *= (route_scale * tl.load(global_scale_ptr)).to(weights.dtype)
 
     mask_rk = mask_m[:, None] & mask_k[None, :]
@@ -154,7 +158,7 @@ def sigmoid_gate_topk_renorm(
     *,
     return_packed_topk: bool = False,
 ):
-    """Fused top-k + logsigmoid renorm (production sigmoid+bias gate path).
+    """Fused top-k + guarded sigmoid renorm (production sigmoid+bias gate path).
 
     `logits` is [tokens, n_routed + n_shared]; the last `n_shared_experts`
     columns are the shared experts. Selection score is sigmoid(routed logit)
