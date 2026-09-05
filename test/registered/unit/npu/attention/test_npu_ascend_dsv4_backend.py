@@ -669,12 +669,15 @@ class TestArch35SparseAttentionDispatch(unittest.TestCase):
 
     @patch(_ARCH35_PATCH_TARGET, return_value=False)
     def test_pre_arch35_keeps_legacy_ops_without_quant_kwargs(self, _):
-        with patch("torch.ops.custom", MagicMock(), create=True) as custom_ops:
+        with (
+            patch("torch.ops.custom", MagicMock(), create=True) as custom_ops,
+            patch("torch.ops.npu", MagicMock(), create=True) as npu_ops,
+        ):
             metadata_op, attention_op = _sparse_attn_ops()
             kwargs = _sparse_attn_kv_quant_kwargs()
 
         self.assertIs(metadata_op, custom_ops.npu_sparse_attn_sharedkv_metadata)
-        self.assertIs(attention_op, custom_ops.npu_sparse_attn_sharedkv)
+        self.assertIs(attention_op, npu_ops.sparse_attn_sharedkv)
         self.assertEqual(kwargs, {})
 
 
