@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! 根据请求形状、SLO profile 和 rank 生成有序 CandidateDomain。
+//! Builds ordered candidate domains from request shape, SLO profile, and rank.
 
 use crate::config::{BucketConfig, BucketSpec, BucketStage, SloBucketPolicy};
 use crate::policies::admission::CandidateDomain;
@@ -10,7 +10,7 @@ use crate::workers::Worker;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// Bucket 选择使用的请求字段。
+/// Request fields used for bucket selection.
 #[derive(Debug, Clone, Copy)]
 pub struct BucketRequest {
     pub input_tokens: u64,
@@ -90,7 +90,7 @@ impl BucketSelector {
         let Some(config) = &self.config else {
             return vec![CandidateDomain::global_decode(workers)];
         };
-        // 未配置 Decode Bucket 时保持全局 Decode domain。
+        // Keep a global decode domain when no decode bucket is configured.
         if !config
             .buckets
             .iter()
@@ -118,7 +118,7 @@ impl BucketSelector {
         .collect()
     }
 
-    /// 将全局 Indexer 候选绑定到其 Prefill Bucket，使用 `E` 检查工作量。
+    /// Maps global Indexer candidates to prefill buckets using `E` as the workload.
     pub fn bind_prefill_cache_candidate(
         &self,
         mut candidate: CacheCandidate,
@@ -148,7 +148,7 @@ impl BucketSelector {
         Some(candidate)
     }
 
-    /// 查找全局 Session primary 自己所属的 Prefill Bucket。
+    /// Finds the prefill bucket containing a global session primary.
     pub fn prefill_affinity_domain(
         &self,
         workers: &[Arc<Worker>],
@@ -246,7 +246,7 @@ impl BucketSelector {
                 eligible
             }
             SloBucketPolicy::BestEffort => {
-                // Best effort 优先使用不占用 SLO tier 的 bucket。
+                // Best effort prefers a bucket without an SLO tier.
                 degraded.extend(eligible);
                 degraded
             }
@@ -255,7 +255,7 @@ impl BucketSelector {
 }
 
 fn prefill_compatible(spec: &BucketSpec, input_tokens: u64) -> bool {
-    // No-hit 时 E=L。
+    // With no cache hit, E equals L.
     within(input_tokens, spec.min_extend_tokens, spec.max_extend_tokens)
         && spec
             .max_context_tokens
@@ -268,7 +268,7 @@ fn decode_compatible(
     expected_peak_sequence_tokens: Option<u64>,
 ) -> bool {
     let Some(expected_peak_sequence_tokens) = expected_peak_sequence_tokens else {
-        // 未知输出长度时只允许 catch-all Decode Bucket。
+        // Unknown output length can only use a catch-all decode bucket.
         return spec.min_sequence_tokens.is_none()
             && spec.max_sequence_tokens.is_none()
             && spec

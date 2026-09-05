@@ -53,10 +53,10 @@ pub struct Cli {
     /// Routing policy.
     #[arg(long, value_enum, default_value = "round_robin")]
     pub policy: PolicyKind,
-    /// PD 请求的 Decode worker 选择策略。
+    /// Policy used to select decode workers for PD requests.
     #[arg(long, value_enum, default_value = "power_of_two")]
     pub decode_policy: DecodePolicyKind,
-    /// 静态 P/D Bucket JSON 配置；省略时使用全局候选域。
+    /// Static P/D bucket configuration. Omit to use the global candidate domain.
     #[arg(long)]
     pub bucket_config: Option<String>,
 

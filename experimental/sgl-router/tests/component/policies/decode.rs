@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Decode policy 的最小可观察契约。
+//! Observable contract for decode policies.
 //!
-//! Decode admission/guard 读取 complete fresh ZMQ native-monitor 样本；短帧
-//! 会回退本地负载，不能伪造成 monitor-backed 压力选择。
+//! Decode guards require complete, fresh native monitor samples. Short frames
+//! fall back to local load and must not appear as monitor-backed decisions.
 
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::admission::{resolve_decode, CandidateDomain, DecisionReason};

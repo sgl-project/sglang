@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! 静态 Bucket 仅决定候选域和 fallback 顺序；不在这里做 worker 评分或动态
-//! admission。最终选择仍由 P/D policy、Admission 与 Guard 完成。
+//! Static buckets define candidate domains and fallback order. Worker scoring,
+//! admission, and guards remain the responsibility of the P/D policies.
 
 use sgl_router::config::{BucketConfig, BucketSpec, BucketStage, SloBucketPolicy};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};

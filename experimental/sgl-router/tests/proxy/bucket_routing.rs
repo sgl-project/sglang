@@ -1,11 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! 静态 P/D Bucket 的 HTTP 功能契约。
+//! HTTP contract for static P/D buckets.
 //!
-//! 这里验证 Bucket 在进入 policy 之前缩小候选域：P 的离线 TTFT profile 可以
-//! 覆盖 rank，D 使用 `input_tokens + max_tokens` 的 peak sequence length。测试
-//! 不依赖不存在的 transfer、retraction 或实时 queue 指标。
+//! Buckets narrow the candidate domain before policy selection. Prefill SLO
+//! profiles may override rank, while decode uses `input_tokens + max_tokens`.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};

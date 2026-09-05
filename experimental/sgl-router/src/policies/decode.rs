@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Decode policy 的独立扩展点，不复用 Prefill affinity。
+//! Decode policy extension point, independent of prefill affinity.
 
 use crate::config::DecodePolicyKind;
 use crate::policies::admission::{compare_decode_pressure, CandidateDomain};
@@ -25,7 +25,7 @@ impl<'a> DecodeSelectionContext<'a> {
         }
     }
 
-    /// 使用请求入口捕获的 Engine load snapshot。
+    /// Engine load snapshot captured at request ingress.
     pub fn with_load_snapshot(mut self, load_snapshot: &'a EngineLoadSnapshot) -> Self {
         self.load_snapshot = Some(load_snapshot);
         self
@@ -35,7 +35,7 @@ impl<'a> DecodeSelectionContext<'a> {
         self.load_snapshot
     }
 
-    /// `legacy_host_affinity` 的 Prefill URL 输入。
+    /// Prefill URL used by `legacy_host_affinity`.
     pub fn with_prefill_url(mut self, prefill_url: &'a str) -> Self {
         self.prefill_url = Some(prefill_url);
         self
@@ -54,7 +54,7 @@ pub trait DecodePolicy: Send + Sync + std::fmt::Debug {
     ) -> Option<SelectionProposal>;
 }
 
-/// 在 Decode domain 内随机采样两个 worker，并按 D 压力排序。
+/// Samples two workers from a decode domain and orders them by decode pressure.
 #[derive(Debug, Default)]
 pub struct DecodePowerOfTwoPolicy;
 
@@ -100,7 +100,7 @@ impl DecodePolicy for DecodePowerOfTwoPolicy {
     }
 }
 
-/// 旧 PD same-host Decode 选择的兼容 policy。
+/// Compatibility policy for legacy same-host PD decode selection.
 #[derive(Debug, Default)]
 pub struct LegacyHostAffinityDecodePolicy;
 
@@ -115,7 +115,7 @@ impl DecodePolicy for LegacyHostAffinityDecodePolicy {
     }
 }
 
-/// 构造 role-local Decode policy。
+/// Builds a decode policy scoped to one role.
 pub fn build_decode_policy(kind: DecodePolicyKind) -> Box<dyn DecodePolicy> {
     match kind {
         DecodePolicyKind::PowerOfTwo => Box::new(DecodePowerOfTwoPolicy::new()),

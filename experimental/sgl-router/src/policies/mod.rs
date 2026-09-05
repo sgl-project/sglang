@@ -207,19 +207,19 @@ impl<'a> SelectionContext<'a> {
         self
     }
 
-    /// 附加 Session-Aware session id。
+    /// Attaches a Session-Aware session ID.
     pub fn with_session_id(mut self, session_id: Option<&'a str>) -> Self {
         self.session_id = session_id;
         self
     }
 
-    /// 标识本次 policy 的候选域。
+    /// Identifies the candidate domain for this policy call.
     pub fn with_candidate_range_id(mut self, candidate_range_id: &'a str) -> Self {
         self.candidate_range_id = candidate_range_id;
         self
     }
 
-    /// 附加请求 input token 数。
+    /// Attaches the request input token count.
     pub fn with_input_tokens(mut self, input_tokens: u64) -> Self {
         self.input_tokens = Some(input_tokens);
         self
@@ -233,7 +233,7 @@ impl<'a> SelectionContext<'a> {
         self
     }
 
-    /// 附加请求开始时捕获的 Engine Load snapshot。
+    /// Attaches the engine load snapshot captured at request ingress.
     pub fn with_load_snapshot(mut self, load_snapshot: &'a EngineLoadSnapshot) -> Self {
         self.load_snapshot = Some(load_snapshot);
         self
@@ -250,14 +250,14 @@ impl<'a> SelectionContext<'a> {
         self
     }
 
-    /// 禁用 affinity lookup 和 assignment。
+    /// Disables affinity lookup and assignment.
     pub fn without_affinity_lookup(mut self) -> Self {
         self.affinity_lookup_enabled = false;
         self.affinity_assignment_enabled = false;
         self
     }
 
-    /// 保留 affinity lookup，但禁用 assignment 写入。
+    /// Enables affinity lookup without recording new assignments.
     pub fn without_affinity_assignment(mut self) -> Self {
         self.affinity_assignment_enabled = false;
         self
@@ -312,32 +312,32 @@ impl<'a> SelectionContext<'a> {
     }
 }
 
-/// Policy 产生的 primary/backup 提案。
+/// Primary and backup workers proposed by a policy.
 #[derive(Clone)]
 pub struct SelectionProposal {
     pub primary: Arc<Worker>,
     pub backup: Option<Arc<Worker>>,
     pub kind: ProposalKind,
-    /// Pair proposal 的可选 pressure-guard 参数。仅在 complete fresh native
-    /// monitor 覆盖 primary/backup 时生效；否则 admission 统一回退本地负载。
+    /// Optional pressure guard settings for this pair.
+    /// Applied only when both workers have complete, fresh native monitor data.
     pub guard_hints: GuardHints,
-    /// EligibilityFilter 之后可用于 fallback 的 worker。
+    /// Workers available for fallback after eligibility filtering.
     pub eligible_workers: Option<Vec<Arc<Worker>>>,
 }
 
-/// 一个 Cache-Aware Prefill 候选，`E = L - H`。
+/// Cache-Aware prefill candidate where `E = L - H`.
 #[derive(Clone)]
 pub struct CacheCandidate {
     pub worker: Arc<Worker>,
     pub matched_prefix_tokens: u64,
     pub uncached_tokens: u64,
-    /// 候选所属 domain。
+    /// Domain containing this candidate.
     pub candidate_range_id: String,
-    /// 使用 `E` 检查的可选 pending Prefill 上限。
+    /// Optional pending prefill limit checked against `E`.
     pub max_pending_prefill_tokens: Option<u64>,
 }
 
-/// 有界 Cache-Aware 候选集。
+/// Bounded set of Cache-Aware candidates.
 #[derive(Clone, Default)]
 pub struct CacheCandidateProposal {
     pub candidates: Vec<CacheCandidate>,
@@ -348,7 +348,7 @@ pub struct CacheCandidateProposal {
     pub pressure_rel_threshold: f64,
 }
 
-/// Prefill policy 返回 pair 或 Cache-Aware 候选集。
+/// Prefill proposal returned as either a pair or a Cache-Aware candidate set.
 #[derive(Clone)]
 pub enum PrefillProposal {
     Pair(SelectionProposal),
@@ -356,7 +356,7 @@ pub enum PrefillProposal {
 }
 
 impl PrefillProposal {
-    /// 将 EligibilityFilter 结果应用到两种 proposal。
+    /// Applies eligibility filtering to either proposal form.
     pub fn with_eligible_workers(self, workers: Vec<Arc<Worker>>) -> Self {
         match self {
             Self::Pair(proposal) => Self::Pair(proposal.with_eligible_workers(workers)),
@@ -373,7 +373,7 @@ impl PrefillProposal {
 }
 
 impl SelectionProposal {
-    /// 创建无 backup 的提案。
+    /// Creates a proposal without a backup.
     pub fn primary(primary: Arc<Worker>) -> Self {
         Self {
             primary,
@@ -384,7 +384,7 @@ impl SelectionProposal {
         }
     }
 
-    /// 创建 primary/backup 提案。
+    /// Creates a primary/backup proposal.
     pub fn with_backup(primary: Arc<Worker>, backup: Arc<Worker>) -> Self {
         Self {
             primary,
@@ -411,7 +411,7 @@ impl SelectionProposal {
     }
 }
 
-/// primary/backup 的来源。
+/// Source of a primary/backup proposal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProposalKind {
     Generic,
@@ -421,7 +421,7 @@ pub enum ProposalKind {
     Score,
 }
 
-/// Pair proposal 的可选 Guard 参数。
+/// Optional guard settings for a pair proposal.
 #[derive(Debug, Clone)]
 pub struct GuardHints {
     pub enable_pressure_guard: bool,
@@ -566,7 +566,7 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Instant;
 
-    /// 仅用于策略测试的 #34608 `LoadStat` 聚合值。
+    /// #34608 `LoadStat` aggregate used by policy tests.
     #[derive(Clone, Default)]
     struct TestEngineLoad {
         num_running_reqs: u64,

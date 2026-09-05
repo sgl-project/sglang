@@ -129,8 +129,8 @@ impl InMemoryKvIndexerBackend {
         let mut dirty_roots = Vec::new();
         let mut reported_chains = Vec::new();
         let mut revoked_hashes = Vec::new();
-        // 只有 worker 的 fast-path 身份变更才需要从所有根重算；REPORT、
-        // REVOKE 与 CLEAR 都会把受影响 hash 加入局部传播队列。
+        // Only a fast-path worker identity change requires a full recompute.
+        // REPORT, REVOKE, and CLEAR enqueue their affected hashes directly.
         let mut recompute_from_graph_roots = false;
         for action in req.actions {
             match ExternalKvActionType::try_from(action.r#type) {
@@ -709,8 +709,7 @@ fn recompute_worker_subtrees(
     }
 }
 
-/// 找到当前 REPORT 链以外、但仍由当前 worker 持有的直接 child。只有这些
-/// 节点会在父节点完整性改变后继承新的前缀状态。
+/// Returns direct children held by this worker but outside the current REPORT chain.
 fn external_children_held_by_worker(
     state: &State,
     worker_id: &str,
@@ -734,8 +733,9 @@ fn external_children_held_by_worker(
         .collect()
 }
 
-/// 仅刷新闭合线性 REPORT 链上的派生前缀状态，避免每个大批上报都遍历
-/// 已知的整棵后代子树。调用方已确认该链没有链外子节点。
+/// Refreshes derived prefix state along a closed linear REPORT chain.
+///
+/// The caller has verified that no node in the chain has an external child.
 fn refresh_linear_report_chain_prefix_completeness(
     state: &mut State,
     worker_id: &str,

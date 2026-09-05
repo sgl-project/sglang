@@ -529,19 +529,19 @@ impl MetricsRegistry {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// 记录 Cache-Aware hard admission 实际检查的候选数。
+    /// Cache-Aware candidates evaluated by hard admission.
     pub fn record_cache_admission_evaluations(&self, count: u64) {
         self.cache_admission_evaluated_total
             .fetch_add(count, Ordering::Relaxed);
     }
 
-    /// 记录 Cache-Aware hard admission 实际拒绝的候选数。
+    /// Cache-Aware candidates rejected by hard admission.
     pub fn record_cache_admission_rejections(&self, count: u64) {
         self.cache_admission_rejected_total
             .fetch_add(count, Ordering::Relaxed);
     }
 
-    /// 记录 complete fresh monitor 覆盖下真正比较/覆盖的 pressure guard 对数。
+    /// Pressure-guard pairs compared and overridden with complete monitor data.
     pub fn record_cache_pressure_guard(&self, compared: u64, overrides: u64) {
         self.cache_pressure_guard_compared_total
             .fetch_add(compared, Ordering::Relaxed);
@@ -549,8 +549,8 @@ impl MetricsRegistry {
             .fetch_add(overrides, Ordering::Relaxed);
     }
 
-    /// 记录一次 Cache-Aware 候选解析实际使用的负载来源。性能 runner 用它拒绝
-    /// `router_local` 结果，保证 monitor 已真实参与而非仅完成订阅。
+    /// Load source used for a Cache-Aware decision. Benchmarks reject
+    /// `router_local` results to verify that monitor data affected selection.
     pub fn record_cache_monitor_decision(&self, source: &'static str) {
         let mut guard = self.cache_monitor_decisions_total.lock();
         let counter = guard

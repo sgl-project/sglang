@@ -106,7 +106,7 @@ pub enum PolicyKind {
     Sticky,
 }
 
-/// PD 请求的 Decode worker 选择策略。
+/// Policy used to select decode workers for PD requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum DecodePolicyKind {
     #[default]
@@ -116,7 +116,7 @@ pub enum DecodePolicyKind {
     LegacyHostAffinity,
 }
 
-/// 静态 Bucket 的角色。
+/// Role served by a static bucket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BucketStage {
@@ -124,7 +124,7 @@ pub enum BucketStage {
     Decode,
 }
 
-/// Bucket 的 SLO 选择语义。
+/// SLO matching rules for a bucket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SloBucketPolicy {
@@ -134,7 +134,7 @@ pub enum SloBucketPolicy {
     SloFirst,
 }
 
-/// Router 启动时加载的静态 Bucket 配置。
+/// Static bucket configuration loaded at Router startup.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BucketConfig {
@@ -145,7 +145,7 @@ pub struct BucketConfig {
     pub tps_slo_policy: SloBucketPolicy,
 }
 
-/// 一个角色化 Runtime 能力池；`rank` 越小优先级越高。
+/// Runtime capacity assigned to one role. Lower ranks have higher priority.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BucketSpec {
@@ -291,9 +291,9 @@ pub struct ModelConfig {
     /// is omitted. Resolved by [`crate::tokenizer::adapter::load`].
     pub tokenizer_path: String,
     pub policy: PolicyKind,
-    /// Decode pool 的独立选择策略。
+    /// Selection policy for the decode pool.
     pub decode_policy: DecodePolicyKind,
-    /// 可选静态 Bucket 配置；`None` 使用全局 domain。
+    /// Optional static bucket configuration. `None` uses the global domain.
     pub bucket_config: Option<BucketConfig>,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     /// Cache-Aware prefix configuration.

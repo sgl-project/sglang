@@ -156,9 +156,9 @@ async fn shutdown_drains_100_inflight_streaming_chat_completions() {
         .collect::<Result<_, _>>()
         .expect("every client received response headers before shutdown");
 
-    // 4. 每个响应头都证明对应请求已进入 Axum 的 in-flight 集合。完整 cohort
-    //    连接后才触发 shutdown，避免把尚未连接的 accept 时序误测成 drain 行为。
-    //    Axum 此时停止接收新连接，但必须 drain 这 100 条既有 stream。
+    // 4. Each response header confirms that its request is in flight. Trigger
+    //    shutdown only after the full cohort connects, then verify that Axum
+    //    drains all 100 existing streams.
     let started = Instant::now();
     shutdown_tx.send(()).unwrap();
 

@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Prefill / Decode 共享 capacity admission 与 pressure guard。
+//! Shared capacity admission and pressure guards for prefill and decode.
 //!
-//! native Cache-Aware 只在完整、fresh 且 DP-rank 完整的 #34608 ZMQ monitor
-//! snapshot 上执行 capacity admission 与 pressure guard；短帧、缺 rank 或 stale
-//! 样本统一退化为 router-local load。
+//! Native Cache-Aware uses monitor-backed admission only when every expected
+//! DP rank has a fresh, complete #34608 ZMQ sample. Otherwise it falls back to
+//! Router-local load.
 
 use crate::policies::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
 use crate::policies::power_of_two::select_with_snapshot;
@@ -15,11 +15,10 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Prefill policy 的候选域及其配置化排队预算。
+/// A prefill candidate domain and its optional queue budget.
 ///
-/// `max_pending_prefill_tokens` 用完整 native monitor 的
-/// `num_waiting_uncached_tokens` 执行；缺完整 monitor 时保持可用，避免
-/// 将缺失观测误判成容量耗尽。
+/// `max_pending_prefill_tokens` is enforced only when the native monitor
+/// provides `num_waiting_uncached_tokens`.
 pub struct CandidateRange<'a> {
     pub id: &'a str,
     pub workers: &'a [Arc<Worker>],
@@ -36,7 +35,7 @@ impl<'a> CandidateRange<'a> {
     }
 }
 
-/// Router 在 policy 前解析出的角色化候选域。
+/// Role-specific candidate domains resolved before policy selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutingStage {
     Prefill,
@@ -121,7 +120,7 @@ pub struct FinalDecision {
     pub load_snapshot_version: u64,
 }
 
-/// Cache-Aware 解析审计。字段只用于 metrics/log/manifest，不参与选择。
+/// Cache-Aware selection audit data. These fields do not affect selection.
 pub struct CacheCandidateResolution {
     pub decision: Option<FinalDecision>,
     pub prefill_pressure_source: &'static str,
@@ -131,7 +130,7 @@ pub struct CacheCandidateResolution {
     pub pressure_guard_overrides: u64,
 }
 
-/// 从有界 Cache 候选中选择最终 Worker，并暴露 admission/guard 实际覆盖。
+/// Selects a worker from bounded cache candidates and records guard coverage.
 pub fn resolve_cache_candidates(
     proposal: &CacheCandidateProposal,
     request_input_tokens: u64,
@@ -321,9 +320,8 @@ fn is_proposal_worker_eligible(proposal: &SelectionProposal, candidate: &Arc<Wor
         .is_none_or(|workers| workers.iter().any(|worker| worker.id == candidate.id))
 }
 
-/// 完整 native monitor 才参与基于 snapshot 的 capacity admission。
-/// 缺 monitor 的 worker 保持可用，
-/// 由 router-local fallback 排序；这与 V3 的「不凭空拒绝」语义一致。
+/// Applies snapshot-backed capacity admission when native monitor data is complete.
+/// Workers without monitor data remain eligible and use Router-local ordering.
 fn has_kv_capacity(load: Option<&NativeCacheWorkerLoad>, requested_tokens: u64) -> bool {
     let Some(load) = load else {
         return true;
@@ -463,8 +461,10 @@ fn materially_more_pressured(
             > other_load.num_waiting_uncached_tokens as f64 * relative_threshold
 }
 
-/// 请求内 O(1) 视图。仅在候选集合的所有 Worker 都拥有同一次捕获的外部
-/// 快照时比较外部数值；混合集保持本地 active-load 排序，从而保证传递性。
+/// Constant-time request view over one captured load snapshot.
+///
+/// External values are compared only when every candidate is present. Mixed
+/// candidate sets use Router-local active load to preserve ordering.
 pub(crate) struct FreshLoadLookup<'a> {
     by_worker_id: HashMap<String, &'a NativeCacheWorkerLoad>,
     basic_by_worker_id: HashMap<String, &'a crate::policies::engine_load::EngineWorkerLoad>,
@@ -580,10 +580,11 @@ impl<'a> FreshLoadLookup<'a> {
         }
     }
 
-    /// 为纯评分项提供与同一请求 admission 一致的队列深度：当候选集合完整
-    /// 覆盖在入口冻结的 Engine Load 快照中时，使用 `waiting + running`；否则
-    /// 整个集合一致回退到 Router 本地 active-load。快照之后的新 dispatch 会
-    /// 叠加到 engine 值上，避免 stale gauge 低估当前负载。
+    /// Returns a queue depth consistent with admission for this request.
+    ///
+    /// A fully covered candidate set uses `waiting + running`; otherwise the
+    /// whole set uses Router-local active load. Dispatches after the snapshot
+    /// are added to the reported value.
     pub(crate) fn score_load(&self, worker: &Arc<Worker>) -> usize {
         self.compare_basic_engine
             .then(|| self.basic_by_worker_id.get(worker.id.0.as_str()).copied())
@@ -679,8 +680,7 @@ fn decode_domain_fallback(
         .map(|worker| (worker, DecisionReason::RangeFallback))
 }
 
-/// Prefill 比较优先使用完整 monitor 推导出的 queue-time；首帧/reset 时退回
-/// V3 的 waiting-uncached / waiting-request / running-request 次序。
+/// Compares prefill pressure by queue time when available, then by the V3 load tuple.
 pub(crate) fn compare_prefill_pressure(
     left: &Arc<Worker>,
     right: &Arc<Worker>,
@@ -718,7 +718,7 @@ fn compare_prefill_load(left: &NativeCacheWorkerLoad, right: &NativeCacheWorkerL
     }
 }
 
-/// Decode 比较也只使用 LoadStat。容量未知时不把 0 当作真实容量。
+/// Compares decode pressure from LoadStat without treating unknown capacity as zero.
 pub(crate) fn compare_decode_pressure(
     left: &Arc<Worker>,
     right: &Arc<Worker>,

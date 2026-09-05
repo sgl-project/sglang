@@ -760,7 +760,7 @@ mod tests {
             msg
         }
 
-        /// 为本地 PUB→SUB 握手留出并发测试所需的调度窗口。
+        /// Allows the local PUB/SUB handshake to complete in concurrent tests.
         pub async fn settle() {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }

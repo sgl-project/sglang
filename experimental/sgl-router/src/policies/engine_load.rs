@@ -22,10 +22,10 @@ use dashmap::{DashMap, DashSet};
 use serde::de::{self, Deserializer, IgnoredAny, SeqAccess, Visitor};
 use serde::Deserialize;
 
-/// Native Cache-Aware 实际消费的每个 rank 负载字段。
+/// Per-rank load fields consumed by native Cache-Aware.
 ///
-/// 短帧没有这些值，不能用于 admission 或 pressure guard；native
-/// `cache_aware` 会回退到 Router 本地负载。
+/// Short frames cannot drive admission or pressure guards, so native
+/// `cache_aware` falls back to Router-local load.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeCacheRankLoad {
     pub num_waiting_uncached_tokens: u64,
@@ -58,10 +58,10 @@ pub struct LoadStat {
     pub native_cache: Option<NativeCacheRankLoad>,
 }
 
-/// 一个 Worker 在一次固定时刻采集到的可用 Engine 负载。
+/// Engine load for one worker captured at a fixed point in time.
 ///
-/// 只包含 #34608 实际发布的四个字段的跨 DP-rank 求和结果。`captured_at`
-/// 保留最老 rank 的接收时刻，供 Router 把该时刻之后的本地派发叠加到队列深度。
+/// The four #34608 fields are summed across DP ranks. `captured_at` retains
+/// the oldest rank timestamp so later local dispatches can be added.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineWorkerLoad {
     pub num_running_reqs: u64,
@@ -71,11 +71,10 @@ pub struct EngineWorkerLoad {
     pub captured_at: Instant,
 }
 
-/// Native Cache-Aware 使用的完整 ZMQ monitor 聚合值。
+/// Complete ZMQ monitor aggregate used by native Cache-Aware.
 ///
-/// `prefill_throughput_tokens_per_s` 和 `estimated_prefill_queue_ms` 只在
-/// 每个 DP rank 都有两个相邻且单调递增的累计样本时出现；counter reset 或首帧
-/// 不会伪造吞吐/queue-time。
+/// Prefill throughput and queue time require two monotonic samples from every
+/// DP rank. Initial samples and counter resets leave both values unavailable.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NativeCacheWorkerLoad {
     pub num_running_reqs: u64,
@@ -90,10 +89,10 @@ pub struct NativeCacheWorkerLoad {
     pub captured_at: Instant,
 }
 
-/// 请求入口一次性捕获的不可变 Engine 负载视图。
+/// Immutable engine load view captured once at request ingress.
 ///
-/// key 为 Router 实际派发使用的 Worker URL。缺少、过期或 DP rank 不完整的
-/// Worker 不会出现在该映射中，消费者必须回退到 Router 本地 active-load。
+/// Keys are worker URLs used for dispatch. Missing, stale, or rank-incomplete
+/// workers are omitted and must use Router-local active load.
 #[derive(Debug, Clone, Default)]
 pub struct EngineLoadSnapshot {
     pub version: u64,
@@ -106,7 +105,7 @@ impl EngineLoadSnapshot {
         self.workers.get(worker_url)
     }
 
-    /// 仅返回 complete + fresh 的 V3-equivalent native Cache-Aware monitor。
+    /// Returns only complete, fresh native Cache-Aware monitor data.
     pub fn fresh_native_cache_load_for_url(
         &self,
         worker_url: &str,
@@ -114,8 +113,8 @@ impl EngineLoadSnapshot {
         self.native_cache_workers.get(worker_url)
     }
 
-    /// 用已经完成 freshness/rank 校验的 Worker 数据构造视图。主要供组件测试和
-    /// 离线策略验证复用；生产请求应通过 [`EngineLoadTable::capture_snapshot`] 获取。
+    /// Builds a view from worker data that already passed freshness and rank checks.
+    /// Production requests should use [`EngineLoadTable::capture_snapshot`].
     pub fn from_workers(version: u64, workers: HashMap<String, EngineWorkerLoad>) -> Self {
         Self {
             version,
@@ -124,9 +123,8 @@ impl EngineLoadSnapshot {
         }
     }
 
-    /// 用完整语义 monitor 构造测试/离线快照。生产入口必须使用
-    /// [`EngineLoadTable::capture_snapshot`]，让 freshness、expected rank 与
-    /// publisher compatibility 都在同一边界内判定。
+    /// Builds a test snapshot from complete native monitor data.
+    /// Production requests must use [`EngineLoadTable::capture_snapshot`].
     pub fn from_native_cache_workers(
         version: u64,
         workers: HashMap<String, NativeCacheWorkerLoad>,
@@ -400,10 +398,10 @@ impl EngineLoadTable {
             .collect()
     }
 
-    /// 完整 native Cache-Aware monitor 的聚合。与 basic gauge 的 freshness
-    /// boundary 完全一致，额外要求每个 rank 都带 #34608 扩展字段且容量有效。
-    /// 任何缺失、短帧、stale 或不完整 rank 都让该 worker 从 monitor-backed
-    /// admission/guard 中消失，调用方只能使用 router-local fallback。
+    /// Aggregates complete native Cache-Aware monitor data.
+    ///
+    /// Every rank must be fresh, capacity-valid, and include the #34608
+    /// extension. Otherwise the worker is omitted from monitor-backed guards.
     fn fresh_native_cache_worker_loads(
         &self,
         now: Instant,
@@ -514,8 +512,7 @@ impl EngineLoadTable {
             .collect()
     }
 
-    /// 当前时间点的不可变视图。请求入口只应调用一次，再把这个值传给全部
-    /// Prefill/Cache/Session/Decode 决策，避免一次请求内部观察到不同负载。
+    /// Captures one immutable view for all routing decisions in a request.
     pub fn capture_snapshot(&self, now: Instant) -> EngineLoadSnapshot {
         EngineLoadSnapshot {
             version: self.version.load(Ordering::Acquire),
