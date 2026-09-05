@@ -101,6 +101,10 @@ class MRotaryEmbedding(RotaryEmbedding):
                 )
 
         self.register_buffer("axis_map", self._build_axis_map(), persistent=False)
+        if self.axis_map is not None:
+            # A lane-to-axis lookup derived from mrope_section, not a weight: the RL
+            # weight checker must neither poison nor compare it.
+            self.axis_map._skip_weight_check = True
         if self._force_native:
             self._forward_method = self.forward_native
 
