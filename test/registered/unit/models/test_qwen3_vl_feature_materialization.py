@@ -46,7 +46,9 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
             with self.subTest(transport=transport):
                 processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
                 processor.mm_feature_transport = transport
-                processor.server_args = SimpleNamespace(mm_enable_dp_encoder=True)
+                processor.server_args = SimpleNamespace(
+                    mm_enable_dp_encoder=True, tp_size=2
+                )
                 processor.model_type = "qwen3_vl"
                 items = [
                     MultimodalDataItem(modality=Modality.IMAGE),
@@ -54,7 +56,7 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
                     MultimodalDataItem(modality=Modality.AUDIO),
                 ]
 
-                processor._mark_dp_encoder_features_for_deferred_reconstruction(items)
+                processor._mark_cuda_ipc_features_for_deferred_reconstruction(items)
 
                 self.assertTrue(
                     items[0].model_specific_data[
@@ -74,15 +76,28 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
     def test_processor_does_not_defer_cpu_transport(self):
         processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
         processor.mm_feature_transport = "cpu"
-        processor.server_args = SimpleNamespace(mm_enable_dp_encoder=True)
+        processor.server_args = SimpleNamespace(mm_enable_dp_encoder=True, tp_size=2)
         processor.model_type = "qwen3_vl"
         item = MultimodalDataItem(modality=Modality.IMAGE)
 
-        processor._mark_dp_encoder_features_for_deferred_reconstruction([item])
+        processor._mark_cuda_ipc_features_for_deferred_reconstruction([item])
 
         self.assertNotIn(
             DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
             item.model_specific_data,
+        )
+
+    def test_processor_defers_cuda_ipc_for_single_tp_qwen3_vl(self):
+        processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
+        processor.mm_feature_transport = "cuda_ipc"
+        processor.server_args = SimpleNamespace(mm_enable_dp_encoder=False, tp_size=1)
+        processor.model_type = "qwen3_vl"
+        item = MultimodalDataItem(modality=Modality.IMAGE)
+
+        processor._mark_cuda_ipc_features_for_deferred_reconstruction([item])
+
+        self.assertTrue(
+            item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY]
         )
 
     def test_image_features_are_packed_on_the_visual_device(self):
