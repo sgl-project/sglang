@@ -14,6 +14,7 @@ bugs in tensor shape handling (e.g., 2D tensors [num_delimiters, num_label_token
 """
 
 import asyncio
+import math
 import os
 import unittest
 
@@ -27,14 +28,26 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=210, stage="base-b", runner_config="1-gpu-small")
 
 TEST_MODEL_NAME = os.environ.get("TEST_MODEL_NAME", DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 TEST_CLASSIFICATION_BASE_MODEL = os.environ.get(
     "TEST_CLASSIFICATION_BASE_MODEL",
     "tomaarsen/Qwen3-Reranker-0.6B-seq-cls",
 )
+TEST_LLAMA_CLASSIFICATION_MODEL = os.environ.get(
+    "TEST_LLAMA_CLASSIFICATION_MODEL",
+    "trl-internal-testing/tiny-LlamaForSequenceClassification-3.2",
+)
+TEST_LLAMA_CLASSIFICATION_REVISION = os.environ.get(
+    "TEST_LLAMA_CLASSIFICATION_REVISION",
+    "769052e57a412de8772065109aeb4d646985f5e6",
+)
 _CLS_NUM_LABELS = AutoConfig.from_pretrained(TEST_CLASSIFICATION_BASE_MODEL).num_labels
+_LLAMA_CLS_NUM_LABELS = AutoConfig.from_pretrained(
+    TEST_LLAMA_CLASSIFICATION_MODEL,
+    revision=TEST_LLAMA_CLASSIFICATION_REVISION,
+).num_labels
 
 
 def _collect_scores(engine_kwargs, calls):
@@ -240,33 +253,14 @@ class TestMultiItemScoringClassification(CustomTestCase):
 
     def _compare_scores(self, query, items, apply_softmax=True, test_name=""):
         """Compare MIS batched vs MIS single-item scoring results."""
-        single_scores = []
-        for item in items:
-            result = self.engine.score(
-                query=query,
-                items=[item],
-                apply_softmax=apply_softmax,
-            ).scores
-            single_scores.append(result[0])
-
-        batched_scores = self.engine.score(
-            query=query,
-            items=items,
+        return _assert_batched_mis_matches_single_items(
+            self,
+            self.engine,
+            query,
+            items,
             apply_softmax=apply_softmax,
-        ).scores
-
-        self.assertEqual(
-            len(batched_scores), len(single_scores), f"{test_name}: count mismatch"
+            test_name=test_name,
         )
-        for i, (bs, ss) in enumerate(zip(batched_scores, single_scores)):
-            self.assertEqual(len(bs), len(ss), f"{test_name}: item {i} length mismatch")
-            for j, (b, s) in enumerate(zip(bs, ss)):
-                self.assertAlmostEqual(
-                    b,
-                    s,
-                    places=1,
-                    msg=f"{test_name}: item {i} label {j}: batched={b} vs single={s}",
-                )
 
     def test_parity_basic(self):
         query = "Rate this option:"
@@ -424,6 +418,75 @@ class TestMultiItemScoringClassification(CustomTestCase):
                 )
 
 
+class TestMultiItemScoringLlamaClassificationParity(CustomTestCase):
+    """Test Llama MIS batching with tokenized query and document embeddings."""
+
+    NUM_LABELS = _LLAMA_CLS_NUM_LABELS
+    PLACEHOLDER_ID = 0
+
+    @classmethod
+    def setUpClass(cls):
+        config = AutoConfig.from_pretrained(
+            TEST_LLAMA_CLASSIFICATION_MODEL,
+            revision=TEST_LLAMA_CLASSIFICATION_REVISION,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            TEST_LLAMA_CLASSIFICATION_MODEL,
+            revision=TEST_LLAMA_CLASSIFICATION_REVISION,
+        )
+        cls.query_ids = tokenizer.encode(
+            "Rate whether each document is relevant:",
+            add_special_tokens=False,
+        )
+        generator = torch.Generator().manual_seed(42)
+        scale = getattr(config, "initializer_range", 0.02)
+        cls.item_embed_overrides = [
+            [torch.randn(config.hidden_size, generator=generator) * scale]
+            for _ in range(3)
+        ]
+        cls.items = [[cls.PLACEHOLDER_ID] for _ in cls.item_embed_overrides]
+        cls.engine = Engine(
+            model_path=TEST_LLAMA_CLASSIFICATION_MODEL,
+            revision=TEST_LLAMA_CLASSIFICATION_REVISION,
+            disable_radix_cache=True,
+            chunked_prefill_size=-1,
+            enable_mis=True,
+            attention_backend="flashinfer",
+            mem_fraction_static=0.15,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "engine") and cls.engine is not None:
+            cls.engine.shutdown()
+        torch.cuda.empty_cache()
+
+    def test_parity_tokenized_query_with_item_embed_overrides(self):
+        """Packed MIS agrees with scoring each document separately."""
+        batched_scores = _assert_batched_mis_matches_single_items(
+            self,
+            self.engine,
+            self.query_ids,
+            self.items,
+            apply_softmax=False,
+            test_name="llama_embed_overrides",
+            embed_override_token_id=self.PLACEHOLDER_ID,
+            item_embed_overrides=self.item_embed_overrides,
+        )
+
+        self.assertEqual(len(batched_scores), len(self.items))
+        self.assertTrue(
+            all(math.isfinite(value) for score in batched_scores for value in score)
+        )
+        self.assertGreater(
+            len({tuple(score) for score in batched_scores}),
+            1,
+            "Different document embeddings returned identical scores",
+        )
+        for batched in batched_scores:
+            self.assertEqual(len(batched), self.NUM_LABELS)
+
+
 class TestMultiItemScoringParity(CustomTestCase):
     """Test that MIS produces the same results as single-item scoring."""
 
@@ -520,6 +583,72 @@ class TestMultiItemScoringParity(CustomTestCase):
 
     def test_parity_many_items(self):
         self._compare_scores("many_items")
+
+
+def _assert_batched_mis_matches_single_items(
+    test_case,
+    engine,
+    query,
+    items,
+    *,
+    apply_softmax=True,
+    test_name="",
+    embed_override_token_id=None,
+    item_embed_overrides=None,
+):
+    """Compare packed MIS scores with separate single-item MIS calls."""
+    if item_embed_overrides is not None:
+        test_case.assertEqual(len(item_embed_overrides), len(items))
+
+    single_scores = []
+    for item_idx, item in enumerate(items):
+        score_kwargs = {}
+        if item_embed_overrides is not None:
+            score_kwargs = {
+                "embed_override_token_id": embed_override_token_id,
+                "item_embed_overrides": [item_embed_overrides[item_idx]],
+            }
+        result = engine.score(
+            query=query,
+            items=[item],
+            apply_softmax=apply_softmax,
+            **score_kwargs,
+        ).scores
+        single_scores.append(result[0])
+
+    score_kwargs = {}
+    if item_embed_overrides is not None:
+        score_kwargs = {
+            "embed_override_token_id": embed_override_token_id,
+            "item_embed_overrides": item_embed_overrides,
+        }
+    batched_scores = engine.score(
+        query=query,
+        items=items,
+        apply_softmax=apply_softmax,
+        **score_kwargs,
+    ).scores
+
+    test_case.assertEqual(
+        len(batched_scores), len(single_scores), f"{test_name}: count mismatch"
+    )
+    for item_idx, (batched, single) in enumerate(zip(batched_scores, single_scores)):
+        test_case.assertEqual(
+            len(batched),
+            len(single),
+            f"{test_name}: item {item_idx} length mismatch",
+        )
+        for label_idx, (batched_value, single_value) in enumerate(zip(batched, single)):
+            test_case.assertAlmostEqual(
+                batched_value,
+                single_value,
+                places=1,
+                msg=(
+                    f"{test_name}: item {item_idx} label {label_idx}: "
+                    f"batched={batched_value} vs single={single_value}"
+                ),
+            )
+    return batched_scores
 
 
 if __name__ == "__main__":
