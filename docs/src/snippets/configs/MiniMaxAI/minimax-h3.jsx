@@ -691,7 +691,11 @@ return {
       const world = Number(s.nodes) * Number(s.gpus_per_node);
       const flags = ["--model-path {{MODEL_NAME}}"];
       if (world > 1) flags.push(`--num-gpus ${world}`);
-      if (topology.ring_degree > 1) flags.push(`--sp-degree ${world}`);
+      // The server requires sp_degree === ulysses * ring; validateTopology holds
+      // world === tp * ulysses * ring, so `world` is only correct at tp 1.
+      if (topology.ring_degree > 1) {
+        flags.push(`--sp-degree ${topology.ulysses_degree * topology.ring_degree}`);
+      }
       if (topology.tp_size > 1) flags.push(`--tp-size ${topology.tp_size}`);
       if (topology.ulysses_degree > 1) flags.push(`--ulysses-degree ${topology.ulysses_degree}`);
       if (topology.ring_degree > 1) flags.push(`--ring-degree ${topology.ring_degree}`);
