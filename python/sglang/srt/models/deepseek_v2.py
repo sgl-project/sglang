@@ -75,6 +75,7 @@ from sglang.srt.layers.aux_hidden_states import (
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
+    ScatterMode,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
@@ -115,6 +116,7 @@ from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
     has_per_rank_fused_shared_slots,
+    has_replicated_shared_expert,
     is_deepep_class_backend,
     is_sbo_enabled,
     is_shared_experts_fusion_disabled,
@@ -926,7 +928,7 @@ class DeepseekV2MoE(nn.Module):
             )
 
         if not self._enable_a2a_moe:
-            if self._can_dual_stream_graph(hidden_states):
+            if self._can_dual_stream_graph(hidden_states) and not skip_shared_experts:
                 fwd = get_forward()
                 return dsv2_flashinfer_moe_dual_stream_graph(
                     hidden_states,
@@ -945,6 +947,7 @@ class DeepseekV2MoE(nn.Module):
                     gemm_output_zero_allocator,
                     input_ids,
                     input_ids_global=input_ids_global,
+                    skip_shared_experts=skip_shared_experts,
                 )
             else:
                 return self.forward_normal(
@@ -965,6 +968,7 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
+        skip_shared_experts: bool = False,
     ) -> torch.Tensor:
         # Note(kpham-sgl): issue order satisfies 3 constraints:
         # - no stream explosion: main (routed) issued before alt block -> capture reuses 1 alt stream;
@@ -982,7 +986,9 @@ class DeepseekV2MoE(nn.Module):
         )
         self.alt_stream.wait_stream(current_stream)
         has_shared_output = (
-            hidden_states.shape[0] > 0 and self.num_fused_shared_experts == 0
+            hidden_states.shape[0] > 0
+            and self.num_fused_shared_experts == 0
+            and not skip_shared_experts
         )
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
@@ -1036,12 +1042,15 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
 
         # Shared expert on alt stream, issued AFTER the main (routed) branch. See note above.
-        with torch.cuda.stream(self.alt_stream):
-            shared_output = self._forward_shared_experts(
-                hidden_states,
-                gemm_output_zero_allocator,
-                pre_quant_input=pre_quant_input,
-            )
+        if skip_shared_experts:
+            shared_output = None
+        else:
+            with torch.cuda.stream(self.alt_stream):
+                shared_output = self._forward_shared_experts(
+                    hidden_states,
+                    gemm_output_zero_allocator,
+                    pre_quant_input=pre_quant_input,
+                )
 
         current_stream.wait_stream(self.alt_stream)
 
@@ -1068,7 +1077,7 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
-        if self._shared_expert_tp1:
+        if self._shared_expert_tp1 and shared_output is not None:
             final_hidden_states += shared_output
         return final_hidden_states
 
@@ -2527,10 +2536,35 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
+        _has_tp1_shared = has_replicated_shared_expert(self.mlp)
+        _cp_hoist_shared = (
+            _has_tp1_shared
+            and self.layer_scatter_modes.mlp_mode == ScatterMode.FULL
+            and (dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch))
+        )
+        _dp_hoist_shared = (
+            _has_tp1_shared
+            and self.layer_communicator.should_use_dp_reduce_scatter(forward_batch)
+        )
+        _hoist_shared = _cp_hoist_shared or _dp_hoist_shared
+        _shared_local = None
+        _local_rows = None
+        if _cp_hoist_shared:
+            cp_size = get_parallel().attn_cp_size
+            cp_rank = get_parallel().attn_cp_rank
+            _local_rows = hidden_states.tensor_split(cp_size)[cp_rank]
+        elif _dp_hoist_shared:
+            _local_rows = self.layer_communicator.get_dp_local_hidden_states(
+                hidden_states
+            )
+        if _local_rows is not None and _local_rows.shape[0] > 0:
+            _shared_local = self.mlp._forward_shared_experts(_local_rows)
+
         fuse_mlp_allreduce = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
             )
+            and not has_replicated_shared_expert(self.mlp)
         )
 
         # For DP with padding, reduce scatter can be used instead of all-reduce.
@@ -2557,11 +2591,19 @@ class DeepseekV2DecoderLayer(nn.Module):
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
             with _mlp_ctx:
-                hidden_states = self.mlp(
-                    hidden_states,
-                    forward_batch,
-                    gemm_output_zero_allocator,
-                )
+                if _hoist_shared:
+                    hidden_states = self.mlp(
+                        hidden_states,
+                        forward_batch,
+                        gemm_output_zero_allocator,
+                        skip_shared_experts=True,
+                    )
+                else:
+                    hidden_states = self.mlp(
+                        hidden_states,
+                        forward_batch,
+                        gemm_output_zero_allocator,
+                    )
 
         if (
             not (self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp)
@@ -2573,6 +2615,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+
+        if _shared_local is not None:
+            hidden_states = hidden_states + _shared_local[: hidden_states.shape[0]]
 
         return hidden_states, residual, topk_indices
 

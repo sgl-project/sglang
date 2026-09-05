@@ -880,17 +880,33 @@ class LayerCommunicator:
             allow_reduce_scatter=self.allow_reduce_scatter,
         )
 
+    def should_use_dp_reduce_scatter(self, forward_batch: ForwardBatch) -> bool:
+        return (
+            self.allow_reduce_scatter
+            and self._communicate_summable_tensor_pair_fn
+            is CommunicateSummableTensorPairFn._scatter_hidden_states
+            and (
+                should_use_dp_reduce_scatterv()
+                or (
+                    forward_batch.dp_padding_mode is not None
+                    and forward_batch.dp_padding_mode.is_max_len()
+                )
+            )
+        )
+
+    @staticmethod
+    def get_dp_local_hidden_states(hidden_states: torch.Tensor) -> torch.Tensor:
+        sizes = get_dp_global_num_tokens()
+        rank = get_parallel().attn_dp_rank
+        assert sizes is not None and rank < len(sizes)
+        assert sum(sizes) == hidden_states.shape[0]
+        return hidden_states.narrow(0, sum(sizes[:rank]), sizes[rank])
+
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         if not self.allow_reduce_scatter:
             return False
-        if (
-            self._communicate_summable_tensor_pair_fn
-            is CommunicateSummableTensorPairFn._scatter_hidden_states
-        ):
-            if should_use_dp_reduce_scatterv():
-                return True
-            if forward_batch.dp_padding_mode.is_max_len():
-                return True
+        if self.should_use_dp_reduce_scatter(forward_batch):
+            return True
         if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
             return True
         if get_attn_tp_context().input_scattered and not self.is_last_layer:
