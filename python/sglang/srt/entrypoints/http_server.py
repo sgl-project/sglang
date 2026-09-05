@@ -735,6 +735,9 @@ async def health_generate(request: Request) -> Response:
         f"{HEALTH_CHECK_TIMEOUT} seconds. tic start time: {tic_time}. "
         f"last_heartbeat time: {last_receive_time}"
     )
+    # Cancelling the local task does not retract the probe from the scheduler,
+    # so abort it there before the pop: abort_request skips untracked rids.
+    _global_state.tokenizer_manager.abort_request(rid=rid)
     _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
     _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
     return Response(status_code=503)

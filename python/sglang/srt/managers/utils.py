@@ -347,6 +347,15 @@ def is_health_check_generate_req(recv_req):
     return rid is not None and rid.startswith(HEALTH_CHECK_RID_PREFIX)
 
 
+def is_health_check_probe(recv_req) -> bool:
+    # Only a probe may be dropped while the scheduler is busy; the AbortReq that
+    # retracts one carries the same rid, so the prefix alone cannot separate them.
+    return isinstance(
+        recv_req,
+        (io_struct.TokenizedGenerateReqInput, io_struct.TokenizedEmbeddingReqInput),
+    ) and is_health_check_generate_req(recv_req)
+
+
 class MsgpackDecodeError(ValueError):
     """A msgpack frame the typed decoder rejected, with the failure explained:
     ``rid`` (when recoverable from the raw tagged array) and a human-readable
