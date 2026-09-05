@@ -6,6 +6,7 @@ from typing import Mapping, MutableMapping, Protocol, Sequence
 import torch
 import torch.nn as nn
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
     LAYERWISE_OFFLOAD,
@@ -722,6 +723,23 @@ class ComponentResidencyManager:
             )
             self._completed_warmup_phase_peaks = dict(self._warmup_phase_peaks)
         self._track_warmup_memory = False
+        if (
+            current_platform.device_shares_host_memory()
+            and torch.get_device_module().is_available()
+        ):
+            # One pool: every byte the caching allocator keeps reserved between
+            # requests is page cache the next request's streamed encoder cannot use.
+            torch.get_device_module().empty_cache()
+            if envs.SGLANG_DIFFUSION_DEBUG_HOST_MEMORY:
+                from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_breakdown import (
+                    log_host_memory_breakdown,
+                )
+
+                self._debug_requests_seen = getattr(self, "_debug_requests_seen", 0) + 1
+                log_host_memory_breakdown(
+                    self.placement_modules(),
+                    label=f"after request {self._debug_requests_seen}",
+                )
 
     def _begin_warmup_phase(
         self,

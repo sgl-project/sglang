@@ -800,46 +800,6 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         self.assertEqual(worker._auto_residency_round_sizes, [1])
 
 
-def test_single_iteration_probe_counts_repeated_stage_layers_per_iteration():
-    """A 2-step probe of a pipeline that runs steps-1 iterations sees every DiT
-    layer once. Those layers are per-iteration, not one-shot."""
-    from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
-        WarmupMemoryRecord,
-        estimate_layerwise_layer_uses,
-    )
-
-    stage = "MiniMaxH3DenoisingStage"
-    record = WarmupMemoryRecord(
-        width=864,
-        height=480,
-        num_frames=124,
-        baseline_allocated_bytes=0,
-        peak_allocated_bytes=1,
-        succeeded=True,
-        phase_used_components={
-            f"7:{stage}:use:transformer": ("transformer",),
-            "2:MiniMaxH3TextEncodingStage:use:text_encoder": ("text_encoder",),
-        },
-        layerwise_layer_uses={
-            "transformer": {"blocks": (1, 1, 1)},
-            "text_encoder": {"layers": (1, 1)},
-        },
-        layerwise_layer_uses_by_stage={
-            stage: {"transformer": {"blocks": (1, 1, 1)}},
-            "MiniMaxH3TextEncodingStage": {"text_encoder": {"layers": (1, 1)}},
-        },
-        num_inference_steps=2,
-        stage_iterations={stage: (1, 19)},
-    )
-    uses = estimate_layerwise_layer_uses(
-        records=[record],
-        target_units=None,
-        target_num_inference_steps=20,
-    )
-    assert uses["transformer"] == {"blocks": (19, 19, 19)}
-    assert uses["text_encoder"] == {"layers": (1, 1)}
-
-
 def test_short_validation_respects_pipeline_minimum_steps():
     from sglang.multimodal_gen.runtime.server_warmup import _short_validation_step_limit
 

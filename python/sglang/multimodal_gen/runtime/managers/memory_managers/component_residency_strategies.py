@@ -9,10 +9,20 @@ import torch.nn as nn
 from torch.distributed.fsdp import FSDPModule
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    shared_pool_available_bytes,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+# Device growth between a component's stages on a shared pool: activations and
+# the allocator's reserve (9.4 GiB measured for H3 at 1344x768x124f) plus margin.
+SHARED_POOL_NEXT_STAGE_HEADROOM_BYTES = 12 * 1024**3
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -267,6 +277,35 @@ class LayerwiseOffloadStrategy(ComponentResidencyStrategy):
             torch.mps.synchronize()
             module.restore_mps_cpu_non_layer_weights()
             torch.mps.empty_cache()
+        elif (
+            current_platform.is_cuda() and current_platform.device_shares_host_memory()
+        ):
+            # The stage's streamed layer windows are freed but still reserved
+            # by the caching allocator. On a shared pool that reserve is host
+            # memory the next stage's mapping needs as page cache; hand it back.
+            empty_cache = getattr(torch.get_device_module(), "empty_cache", None)
+            if empty_cache is not None:
+                empty_cache()
+            # And this component's own pages are now the least valuable in the
+            # cache until its next stage; say so before the next phase evicts.
+            # The room the cache will have for this component's next stream is
+            # what is available now less what the stages in between need.
+            room_bytes = max(
+                0, shared_pool_available_bytes() - SHARED_POOL_NEXT_STAGE_HEADROOM_BYTES
+            )
+            paged_out = 0
+            for manager in module.layerwise_offload_managers:
+                advise_cold = getattr(manager, "advise_mapped_pages_cold", None)
+                if advise_cold is not None:
+                    paged_out += int(advise_cold(room_bytes=room_bytes) or 0)
+            if paged_out:
+                logger.info(
+                    "Layerwise offload: paged out the first %.1f GiB of %s so the "
+                    "next request's stream fits the %.1f GiB the cache can give it.",
+                    paged_out / 1024**3,
+                    use.component_name,
+                    room_bytes / 1024**3,
+                )
 
     def finish_request(
         self,
