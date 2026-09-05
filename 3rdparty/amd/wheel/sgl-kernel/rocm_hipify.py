@@ -18,7 +18,8 @@ sources = [
     "csrc/common_extension_rocm.cc",
     "csrc/elementwise/activation.cu",
     "csrc/elementwise/pos_enc.cu",
-    "csrc/elementwise/topk.cu",
+    # csrc/elementwise/topk.cu is not hipified: ROCm builds csrc/elementwise/topk_rocm.hip
+    # instead, which is written for CDNA and needs no translation.
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu",
     "csrc/kvcacheio/transfer.cu",
     "csrc/memory/weak_ref_tensor.cpp",

@@ -292,5 +292,79 @@ def test_deepseek_v4_topk_transform(bs: int, c4_len: int) -> None:
     )
 
 
+def _make_scores(kind: str, bs: int, width: int, seed: int) -> torch.Tensor:
+    """Score distributions that stress the coarse stage of a histogram top-k.
+
+    Everything above uses ``torch.randn``, which spreads over enough exponents that
+    even a narrow coarse key separates it -- 127 populated buckets out of 256 on an
+    8-bit key. Real DSA indexer logits are far more concentrated than that. Captured
+    from a GLM-5.2 decode at 134,849 tokens of context, six consecutive indexer calls
+    populate 4 to 126 buckets, with the largest holding 6% to 88% of the row.
+
+    The three below bracket that regime, and each is calibrated to what it provokes on
+    an 8-bit fp16 coarse key: `banded` populates 4 buckets with 47% in the largest,
+    `narrow` collapses to a single bucket, and `subnormal` to two.
+    """
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    if kind == "diffuse":
+        return torch.randn(bs, width, generator=g, device="cuda", dtype=torch.float32)
+    if kind == "banded":
+        # The value range of the worst real capture, [54, 88].
+        return 54.0 + 34.0 * torch.rand(
+            bs, width, generator=g, device="cuda", dtype=torch.float32
+        )
+    if kind == "narrow":
+        # A row whose spread is small next to its magnitude, which is what makes a
+        # truncating coarse key run out of buckets.
+        return 70.0 + torch.randn(
+            bs, width, generator=g, device="cuda", dtype=torch.float32
+        )
+    if kind == "subnormal":
+        # Same shape as diffuse, scaled below fp16's smallest normal: a coarse key that
+        # rounds through fp16 cannot separate this row at all, an fp32 one is unaffected.
+        return 1e-16 * torch.randn(
+            bs, width, generator=g, device="cuda", dtype=torch.float32
+        )
+    raise ValueError(kind)
+
+
+def assert_exact(
+    score: torch.Tensor, indices: torch.Tensor, seq_len: int, k: int
+) -> None:
+    """The selected scores must be the top-k scores, as a multiset.
+
+    Stricter than ``assert_equal`` on purpose. Comparing index sets has to forgive
+    tie-breaking, and that forgiveness is what lets a kernel selecting from a silently
+    truncated candidate set pass: the indices it returns are all in range and all
+    distinct, they are simply not the largest.
+    """
+    for i in range(score.shape[0]):
+        want = torch.sort(
+            torch.topk(score[i, :seq_len], k).values, descending=True
+        ).values
+        got = torch.sort(score[i, :seq_len][indices[i].long()], descending=True).values
+        assert torch.equal(
+            got, want
+        ), f"row {i}: {int((got != want).sum())}/{k} selected scores are not the top-{k}"
+
+
+@pytest.mark.skipif(
+    torch.version.hip is None,
+    reason="the CUDA kernel in csrc/elementwise/topk.cu shares this limitation; only "
+    "the ROCm one (csrc/elementwise/topk_rocm.hip) is exact on these distributions",
+)
+@pytest.mark.parametrize("kind", ["diffuse", "banded", "narrow", "subnormal"])
+@pytest.mark.parametrize("bs", [1, 4, 64])
+@pytest.mark.parametrize("seq_len", [16384, 65536, 100500])
+@torch.inference_mode()
+def test_topk_is_exact_for_indexer_distributions(
+    kind: str, bs: int, seq_len: int
+) -> None:
+    k = 2048
+    score = _make_scores(kind, bs, MAX_SEQ_LEN, seed=seq_len + bs)
+    lengths = torch.full((bs,), seq_len, dtype=torch.int32, device="cuda")
+    assert_exact(score, fast_topk_v2(score, lengths, k), seq_len, k)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
