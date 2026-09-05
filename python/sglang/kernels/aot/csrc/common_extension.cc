@@ -191,6 +191,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "()");
   m.impl("prepare_moe_input", torch::kCUDA, &prepare_moe_input);
 
+  m.def(
+      "compact_cutlass_w4a8_moe_mm_data(Tensor expert_offsets, Tensor problem_sizes1, Tensor problem_sizes2, "
+      "Tensor compact_expert_offsets, Tensor compact_problem_sizes1, Tensor compact_problem_sizes2, "
+      "Tensor compact_expert_ids, int num_experts, int max_groups) -> ()");
+  m.impl("compact_cutlass_w4a8_moe_mm_data", torch::kCUDA, &compact_cutlass_w4a8_moe_mm_data);
+
   m.def("shuffle_rows(Tensor input, Tensor dst2src_map, Tensor output) -> ()");
   m.impl("shuffle_rows", torch::kCUDA, &shuffle_rows);
 
@@ -232,12 +238,46 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("get_cutlass_w4a8_moe_mm_data", torch::kCUDA, &get_cutlass_w4a8_moe_mm_data);
 
   m.def(
+      "get_cutlass_w4a8_moe_mm_data_with_permutation(Tensor topk_ids, Tensor! expert_offsets, "
+      "                        Tensor! problem_sizes1, Tensor! problem_sizes2, "
+      "                        Tensor! input_permutation, "
+      "                        Tensor! output_permutation, int num_experts, "
+      "                        int n, int k) -> ()");
+  m.impl("get_cutlass_w4a8_moe_mm_data_with_permutation", torch::kCUDA, &get_cutlass_w4a8_moe_mm_data_with_permutation);
+
+  m.def(
       "cutlass_w4a8_moe_mm(Tensor! d, Tensor a, Tensor b, "
       "               Tensor a_scales, Tensor b_scales, Tensor expert_offsets, "
       "               Tensor problem_sizes, Tensor a_strides, "
       "               Tensor b_strides, Tensor d_strides, Tensor s_strides,"
       "               int chunk_size, int topk) -> ()");
   m.impl("cutlass_w4a8_moe_mm", torch::kCUDA, &cutlass_w4a8_moe_mm);
+
+  m.def(
+      "cutlass_mxfp4a8_moe_mm(Tensor! d, Tensor a, Tensor b, "
+      "               Tensor a_scales, Tensor b_scales, Tensor expert_offsets, "
+      "               Tensor problem_sizes, Tensor a_strides, "
+      "               Tensor b_strides, Tensor d_strides, Tensor s_strides,"
+      "               int chunk_size, int topk,"
+      "               Tensor? act_block_scales=None, Tensor? as_strides=None,"
+      "               int act_scale_group=0, Tensor? expert_ids=None) -> ()");
+  m.impl("cutlass_mxfp4a8_moe_mm", torch::kCUDA, &cutlass_mxfp4a8_moe_mm);
+
+  m.def(
+      "cutlass_mxfp4a8_fused_moe_core("
+      "Tensor! c1, Tensor! c2, Tensor input, Tensor topk_ids, "
+      "Tensor! a_map, Tensor! c_map, Tensor! gateup_input_bf16, Tensor! gateup_input, "
+      "Tensor! a1_scale, Tensor! intermediate_q, Tensor! a2_scale, "
+      "Tensor w1, Tensor w1_scale, Tensor w1_residual, "
+      "Tensor w2, Tensor w2_scale, Tensor w2_residual, "
+      "Tensor! expert_offsets, Tensor gemm_expert_offsets, "
+      "Tensor! problem_sizes1, Tensor! problem_sizes2, "
+      "Tensor a_strides1, Tensor b_strides1, Tensor c_strides1, Tensor s_strides1, "
+      "Tensor a_strides2, Tensor b_strides2, Tensor c_strides2, Tensor s_strides2, "
+      "int topk, int gemm1_config, int gemm2_config, int num_experts, "
+      "int intermediate_size, int hidden_size, float swiglu_limit, "
+      "bool has_swiglu_limit, bool prepare_inputs, Tensor? expert_ids=None) -> ()");
+  m.impl("cutlass_mxfp4a8_fused_moe_core", torch::kCUDA, &cutlass_mxfp4a8_fused_moe_core);
 
   /*
    * From csrc/speculative
