@@ -549,6 +549,7 @@ class KVCacheConfigurator:
         if req_to_token_pool is None:
             req_to_token_pool = self._build_req_to_token_pool(
                 max_num_reqs=sizes.max_running_requests
+                + self._prefill_transfer_slots(sizes.max_running_requests)
             )
         else:
             # Draft worker shares req_to_token_pool with the target worker.
@@ -968,6 +969,12 @@ class KVCacheConfigurator:
                 "--chunked-prefill-size=-1, --disable-radix-cache, no context-parallel "
                 "attention, no HiSparse, and --kv-cache-dtype not in {nvfp4, fp4_mx_block16}."
             )
+
+    def _prefill_transfer_slots(self, max_running_requests: int) -> int:
+        """Reserve request slots for completed prefills whose KV is in flight."""
+        if get_disagg().disaggregation_mode != "prefill":
+            return 0
+        return max_running_requests
 
     def _build_req_to_token_pool(self, *, max_num_reqs: int) -> ReqToTokenPool:
         extra_max_context_len = get_req_to_token_extra_context_len()
@@ -2333,18 +2340,19 @@ class KVCacheConfigurator:
             get_memory().disable_radix_cache
             and get_schedule().max_running_requests is not None
         ):
-            # Use explicitly set max_running_requests when radix cache is disabled
+            reqs_per_worker = (
+                get_schedule().max_running_requests // self.ps.attn_dp_size
+            )
             get_context().override(
                 "mamba_pool.from_max_running_requests",
-                max_mamba_cache_size=get_schedule().max_running_requests
-                // self.ps.attn_dp_size,
+                max_mamba_cache_size=reqs_per_worker
+                + self._prefill_transfer_slots(reqs_per_worker),
             )
-            # Reserve intermediate memory based on capped max_num_reqs (+1: the
-            # pool's padding slot). Skipped under replayssm.
+            # In-flight transfers do not need speculative draft states.
             if has_spec_dec and not replayssm_active:
                 intermediate_size = (
                     stage_per_req
-                    * (get_schedule().max_mamba_cache_size + 1)
+                    * (reqs_per_worker + 1)
                     * get_spec().speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))

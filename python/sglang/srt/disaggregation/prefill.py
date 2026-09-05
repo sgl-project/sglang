@@ -886,7 +886,11 @@ class SchedulerDisaggregationPrefillMixin:
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_disagg_prefill_inflight_queue(
-        self: Scheduler, rids_to_check: Optional[List[str]] = None
+        self: Scheduler,
+        rids_to_check: Optional[List[str]] = None,
+        *,
+        polls: Optional[List[Optional[int]]] = None,
+        release_pools: bool = True,
     ) -> List[Req]:
         """
         Poll the requests in the middle of transfer. If done, return the request.
@@ -897,15 +901,19 @@ class SchedulerDisaggregationPrefillMixin:
 
         done_reqs = []
 
-        polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
-        )
+        if polls is None:
+            polls = poll_and_all_reduce_attn_cp_tp_group(
+                [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
+                self.attn_cp_cpu_group,
+                self.attn_tp_cpu_group,
+            )
 
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+            if poll is None:
+                undone_reqs.append(req)
+                continue
             if rids_to_check is not None:
                 if req.rid not in rids_to_check:
                     undone_reqs.append(req)
@@ -941,13 +949,14 @@ class SchedulerDisaggregationPrefillMixin:
             elif poll == KVPoll.Success:  # transfer done
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
-                release_kv_cache(req, self.tree_cache)  # unlock the tree
+                if release_pools:
+                    release_kv_cache(req, self.tree_cache)  # unlock the tree
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
-                self.handle_inflight_transfer_failure(req)
+                self.handle_inflight_transfer_failure(req, release_pools=release_pools)
                 done_reqs.append(req)
             else:
                 raise RuntimeError(
@@ -981,19 +990,18 @@ class SchedulerDisaggregationPrefillMixin:
             any(req.return_logprob for req in done_reqs),
             None,
         )
-        for req in done_reqs:
-            req: Req
-
-            maybe_release_metadata_buffer(
-                req, self.req_to_metadata_buffer_idx_allocator
-            )
+        if release_pools:
+            for req in done_reqs:
+                maybe_release_metadata_buffer(
+                    req, self.req_to_metadata_buffer_idx_allocator
+                )
 
         self.disagg_prefill_inflight_queue = undone_reqs
 
         return done_reqs
 
     def handle_inflight_transfer_failure(
-        self: Scheduler, req: Req
+        self: Scheduler, req: Req, *, release_pools: bool = True
     ) -> Optional[Exception]:
         """Conclude an inflight request whose KV transfer failed."""
         error_message = (
@@ -1012,7 +1020,8 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        release_kv_cache(req, self.tree_cache)  # unlock the tree
+        if release_pools:
+            release_kv_cache(req, self.tree_cache)  # unlock the tree
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
@@ -1020,6 +1029,16 @@ class SchedulerDisaggregationPrefillMixin:
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc
+
+    def release_prefill_transfer_pools(self: Scheduler, req: Req) -> None:
+        """Release pools retained by an early PP transfer conclusion."""
+        if (
+            req.req_pool_idx is not None
+            or req.kv is not None
+            or req.mamba_pool_idx is not None
+        ):
+            release_kv_cache(req, self.tree_cache)
+        maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
 
     def clear_pending_chunk_send(self: Scheduler, req: Req) -> None:
         """Drop `req` from the sent-but-unconcluded chunk set.
