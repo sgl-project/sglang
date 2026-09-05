@@ -103,6 +103,8 @@ class PrefillStats:
     log_host_hit_tokens: int = 0
     log_storage_hit_tokens: int = 0
     num_pending_tokens: int = 0
+    mamba_cache_miss_requests: int = 0
+    mamba_cache_miss_tokens: int = 0
 
     @classmethod
     def from_adder(
@@ -112,6 +114,17 @@ class PrefillStats:
         enable_priority_scheduling: bool = False,
         num_pending_tokens: int = 0,
     ):
+        mamba_cache_miss_requests = 0
+        mamba_cache_miss_tokens = 0
+        for req in adder.can_run_list:
+            if getattr(req, "_mamba_cache_miss_reported", False):
+                continue
+            miss_tokens = getattr(req, "mamba_cache_miss_tokens", 0)
+            if miss_tokens > 0:
+                mamba_cache_miss_requests += 1
+                mamba_cache_miss_tokens += miss_tokens
+                req._mamba_cache_miss_reported = True
+
         return cls(
             log_input_tokens=adder.log_input_tokens,
             log_hit_tokens=adder.log_hit_tokens,
@@ -126,6 +139,8 @@ class PrefillStats:
             ),
             num_new_seqs=len(adder.can_run_list),
             num_pending_tokens=num_pending_tokens,
+            mamba_cache_miss_requests=mamba_cache_miss_requests,
+            mamba_cache_miss_tokens=mamba_cache_miss_tokens,
         )
 
 
@@ -731,6 +746,10 @@ class SchedulerMetricsReporter:
                 prefill_compute_tokens=prefill_stats.log_input_tokens,
                 prefill_cache_tokens=prefill_stats.log_hit_tokens,
                 dp_cooperation_info=dp_cooperation_info,
+            )
+            self.metrics_collector.increment_mamba_cache_miss(
+                num_requests=prefill_stats.mamba_cache_miss_requests,
+                num_tokens=prefill_stats.mamba_cache_miss_tokens,
             )
             if self.enable_mfu_metrics:
                 flops, read_bytes, write_bytes = self._estimate_prefill_perf(batch)

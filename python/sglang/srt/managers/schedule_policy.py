@@ -64,6 +64,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
+    MatchResult,
     zero_match_result,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
@@ -140,6 +141,22 @@ def estimate_prefill_extend_tile_metrics(
     }
 
 
+def get_mamba_cache_miss_tokens(match_result: MatchResult) -> int:
+    """Return Full-KV tokens blocked by a missing reusable Mamba checkpoint."""
+    if match_result.mamba_branching_seqlen is None:
+        return 0
+
+    mamba_boundary_len = len(match_result.device_indices) + match_result.host_hit_length
+    if match_result.full_kv_hit_length <= mamba_boundary_len:
+        return 0
+
+    return max(
+        min(match_result.mamba_branching_seqlen, match_result.full_kv_hit_length)
+        - mamba_boundary_len,
+        0,
+    )
+
+
 def match_prefix_for_req(
     tree_cache: BasePrefixCache,
     req: Req,
@@ -195,6 +212,7 @@ def match_prefix_for_req(
     req.num_matched_prefix_tokens = min(
         len(req.prefix_indices) + req.host_hit_length, max_len
     )
+    req.mamba_cache_miss_tokens = get_mamba_cache_miss_tokens(match_result)
     if match_result.mamba_branching_seqlen is not None:
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
     if match_result.cache_protected_len is not None:
