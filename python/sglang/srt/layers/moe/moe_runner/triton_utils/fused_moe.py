@@ -95,6 +95,12 @@ padding_size = get_moe_padding_size(_use_aiter)
 logger = logging.getLogger(__name__)
 
 
+def _clamp_swiglu_inputs_(x: torch.Tensor, limit: float) -> None:
+    half = x.shape[-1] // 2
+    x[..., :half].clamp_(max=limit)
+    x[..., half:].clamp_(min=-limit, max=limit)
+
+
 def _validate_fused_swiglu_interleaved(
     *,
     activation: str,
@@ -708,6 +714,10 @@ def _fused_moe_kernel_sequence(
 
             if filter_expert:
                 swiglu_limit_for_triton = swiglu_limit
+            elif _is_hip:
+                # The fused clamp kernel is CUDA/XPU-only; apply its gate/up
+                # contract before the regular HIP silu_and_mul kernel.
+                _clamp_swiglu_inputs_(intermediate_cache1, swiglu_limit)
             else:
                 assert _is_cuda or _is_xpu, (
                     "fused silu_and_mul_clamp kernel is CUDA/XPU only; HIP must disable SWIGLU_CLAMP_FUSION"
