@@ -581,7 +581,7 @@ async fn start_recording_deadlines(
 /// the only thing letting the indexer shed a query whose caller gave up.
 #[tokio::test]
 async fn router_client_publishes_its_deadline_on_the_wire() {
-    let (index, seen) = start_recording_deadlines(Duration::from_millis(250)).await;
+    let (index, seen) = start_recording_deadlines(Duration::from_secs(2)).await;
 
     index
         .match_prefix(vec![1, 2, 3])
