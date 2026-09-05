@@ -103,7 +103,13 @@ class DeepEPMoE(FusedMoE):
             and quant_config is not None
             and quant_config.get_name() == "humming"
         )
-        if get_moe_a2a_backend().is_deepep_v2():
+        if (
+            get_moe_a2a_backend().is_deepep()
+            and self.moe_runner_config.runner_backend is not None
+            and self.moe_runner_config.runner_backend.is_marlin()
+        ):
+            self.deprecate_flag = True
+        elif get_moe_a2a_backend().is_deepep_v2():
             self.deprecate_flag = True
         elif is_humming:
             self.deprecate_flag = True

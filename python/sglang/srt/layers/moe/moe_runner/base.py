@@ -47,6 +47,9 @@ class MoeRunnerConfig:
     params_dtype: Optional[torch.dtype] = None
     routing_method_type: Optional[RoutingMethodType] = None
 
+    # Set by MoeRunner after the quantization method resolves the backend.
+    runner_backend: Optional[MoeRunnerBackendLike] = None
+
     # Runner configuration
     activation: str = "silu"
     is_gated: bool = True
