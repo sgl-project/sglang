@@ -163,9 +163,12 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
     # respect config file by overriding args with args parsed from it
     if config_file:
         config_args = ServerArgs.load_config_file(config_file) or {}
-        sampling_param_fields = {
-            field.name for field in dataclasses.fields(sampling_params_cls)
-        }
+        if hasattr(sampling_params_cls, "supported_override_fields"):
+            sampling_param_fields = sampling_params_cls.supported_override_fields()
+        else:
+            sampling_param_fields = {
+                field.name for field in dataclasses.fields(sampling_params_cls)
+            }
         sampling_params_kwargs.update(
             {
                 key: value

@@ -5,6 +5,8 @@
 Input validation stage for diffusion pipelines.
 """
 
+from typing import Iterator
+
 import numpy as np
 import torch
 import torchvision.transforms.functional as TF
@@ -13,6 +15,9 @@ from PIL import Image
 from sglang.multimodal_gen.configs.pipeline_configs import WanI2V480PConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
+    expand_request_outputs,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -47,6 +52,24 @@ class InputValidationStage(PipelineStage):
     def __init__(self, vae_image_processor=None):
         super().__init__()
         self.vae_image_processor = vae_image_processor
+
+    def iter_sequential_requests(
+        self, batch: Req, server_args: ServerArgs
+    ) -> Iterator[Req]:
+        if not server_args.pipeline_config.supports_sequential_multi_output_inference():
+            return iter((batch,))
+
+        num_outputs = max(1, int(batch.num_outputs_per_prompt or 1))
+        if num_outputs == 1:
+            return iter((batch,))
+
+        return iter(
+            expand_request_outputs(
+                batch,
+                reuse_parent_trace_ctx=True,
+                preserve_parent_metrics=True,
+            )
+        )
 
     @staticmethod
     def _calculate_dimensions_from_area(

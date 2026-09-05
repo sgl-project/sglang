@@ -1,0 +1,140 @@
+---
+title: SenseNova-U1.5-8B-MoT
+metatags:
+    description: "Run SenseNova-U1.5-8B-MoT text-to-image generation with SGLang's native multimodal generation runtime."
+---
+
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+
+<DiffusionModelTags tags={["image", "text-to-image", "Chinese typography", "poster layouts", "native pipeline"]} />
+
+## 1. Model Introduction
+
+[SenseNova-U1.5-8B-MoT](https://huggingface.co/sensenova/SenseNova-U1.5-8B-MoT) is a text-to-image model in the SenseNova-U1 family. It is useful for high-resolution poster, infographic, and enterprise visual-generation workloads where prompt following, layout structure, and Chinese text rendering are important.
+
+Built on [NEO-Unify](https://huggingface.co/blog/sensenova/neo-unify), this release improves composition, color harmony, material rendering, and local visual detail for native high-resolution generation. It also focuses on clearer Chinese and English text rendering, stronger infographic layout structure, and more reliable execution of complex prompts with object counts, spatial relationships, styles, and multiple constraints.
+
+## 2. SGLang-diffusion Installation
+
+SGLang-diffusion offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+Please refer to the [official SGLang-diffusion installation guide](../../../docs/sglang-diffusion/installation) for installation instructions.
+
+## 3. Model Deployment
+
+### 3.1 Offline Image Generation
+
+SenseNova-U1.5-8B-MoT is a text-to-image model. You can run a single offline generation job with `sglang generate`:
+
+```bash Command
+sglang generate \
+  --model-path sensenova/SenseNova-U1.5-8B-MoT \
+  --prompt "A cinematic mountain lake at sunrise, realistic photography." \
+  --width 2048 \
+  --height 2048 \
+  --guidance-scale 4.0 \
+  --num-inference-steps 50 \
+  --seed 42 \
+  --output-file-path output_sensenova_u15.png
+```
+
+### 3.2 Recommended Resolutions
+
+SenseNova-U1 was trained around the 2K-pixel resolution tier. Although the pipeline supports arbitrary `--width` and `--height` values, generation quality may degrade for untrained size combinations.
+
+Recommended resolution tiers:
+
+| Aspect ratio | Resolution |
+| --- | --- |
+| 1:1 | `2048 x 2048` |
+| 16:9 / 9:16 | `2720 x 1536` / `1536 x 2720` |
+| 3:2 / 2:3 | `2496 x 1664` / `1664 x 2496` |
+| 4:3 / 3:4 | `2368 x 1760` / `1760 x 2368` |
+| 2:1 / 1:2 | `2880 x 1440` / `1440 x 2880` |
+| 3:1 / 1:3 | `3456 x 1152` / `1152 x 3456` |
+| 9:16 4K | `2304 x 4096` |
+
+## 4. API Usage
+
+For complete API documentation, please refer to the [official API usage guide](../../../docs/sglang-diffusion/api/openai_api).
+
+### 4.1 Generate an Image
+
+```python Example
+import base64
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:30000/v1")
+
+response = client.images.generate(
+    model="sensenova/SenseNova-U1.5-8B-MoT",
+    prompt="A clean technology poster with structured layout and clear typography.",
+    n=1,
+    response_format="b64_json",
+)
+
+image_bytes = base64.b64decode(response.data[0].b64_json)
+with open("output_sensenova_u15.png", "wb") as f:
+    f.write(image_bytes)
+```
+
+## 5. Benchmark
+
+### 5.1 Speedup Benchmark
+
+#### 5.1.1 Single-run Profile
+
+<Tabs>
+  <Tab title="NVIDIA A800">
+
+    This is a single-run profile for smoke validation rather than a formal benchmark. Environment: NVIDIA A800; workload: vbench text-to-image, 1 prompt, concurrency 1, 1 output per prompt; warmup: none; repetitions: 1; dispersion: not reported; baseline: none; revisions: PR checkout and resolved model snapshot at run time; output validation: request completed and returned one image.
+
+    **Server Command**:
+
+    ```shell Command
+    sglang serve \
+      --model-path sensenova/SenseNova-U1.5-8B-MoT \
+      --port 30000
+    ```
+
+    **Benchmark Command**:
+
+    ```shell Command
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+      --dataset vbench \
+      --task text-to-image \
+      --num-prompts 1 \
+      --max-concurrency 1 \
+      --port 30000
+    ```
+
+    **Result**:
+
+    ```text Output
+    ================= Serving Benchmark Result =================
+    Task:                                         text-to-image
+    Model:                                        /workspace/models/ModelScope/SenseNova/SenseNova-U1.5-8B-MoT
+    Dataset:                                      vbench
+    --------------------------------------------------
+    Benchmark duration (s):                       13.10
+    Request rate:                                 inf
+    Max request concurrency:                      1
+    Successful requests:                          1/1
+    Completed outputs:                            1
+    Outputs per prompt:                           1
+    --------------------------------------------------
+    Request throughput (req/s):                   0.08
+    Output throughput (outputs/s):                0.08
+    Latency Mean (s):                             13.10
+    Latency Median (s):                           13.10
+    Latency P90 (s):                              13.10
+    Latency P95 (s):                              13.10
+    Latency P99 (s):                              13.10
+    --------------------------------------------------
+    Peak Memory Max (MB):                         34326.00
+    Peak Memory Mean (MB):                        34326.00
+    Peak Memory Median (MB):                      34326.00
+    ------------------------------------------------------------
+    ```
+  </Tab>
+</Tabs>
