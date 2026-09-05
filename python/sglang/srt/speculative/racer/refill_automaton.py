@@ -52,7 +52,7 @@ class BinaryRefillRacerAutomaton(RacerAutomaton):
                 continue
 
             row = self._token_bin_row(token)
-            next_breadth = breadth if depth == 1 else (breadth >> 1)
+            next_breadth = breadth if depth == 0 else (breadth >> 1)
             next_depth = depth + 1
             for i in range(min(breadth, self.topk)):
                 if remaining <= 0:

@@ -239,10 +239,7 @@ class RacerAutomaton:
 
             if remaining > 0 and breadth > 0:
                 row = self._token_bin_row(token)
-                # Exact C++ rule:
-                #   depth == 1 -> preserve current breadth for first child
-                #   otherwise  -> halve before the first child
-                next_breadth = breadth if depth == 1 else (breadth >> 1)
+                next_breadth = breadth if depth == 0 else (breadth >> 1)
                 next_depth = depth + 1
                 added = 0
                 for i in range(min(breadth, self.topk)):
