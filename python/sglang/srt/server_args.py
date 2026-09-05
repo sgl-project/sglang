@@ -3457,6 +3457,15 @@ class ServerArgs:
         "Enable prefill delayer for DP attention to reduce idle time.",
         NS("schedule"),
     ] = False
+    enable_dp_phase_lockstep: A[
+        bool,
+        (
+            "Keep all DP-attention ranks in the same phase (extend or decode) "
+            "each pass so mixed passes stop vetoing cuda graphs. Requires the "
+            "prefill delayer."
+        ),
+        NS("schedule"),
+    ] = False
     prefill_delayer_max_delay_passes: A[
         int, "Maximum forward passes to delay prefill.", NS("schedule")
     ] = 30

@@ -1382,6 +1382,18 @@ class Scheduler(
                     debug_log_enabled=self.ps.attn_tp_rank == 0,
                 )
 
+        self.dp_phase_lockstep = (
+            get_schedule().enable_dp_phase_lockstep
+            and self.prefill_delayer is not None
+            and self.spec_algorithm.is_none()
+            and not envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+        )
+        if get_schedule().enable_dp_phase_lockstep and not self.dp_phase_lockstep:
+            logger.info(
+                "--enable-dp-phase-lockstep is inert: it requires the prefill "
+                "delayer, no speculative decoding, and the scheduler all-gather."
+            )
+
         # NOTE: preemption is enabled by default for priority scheduling.
         self.enable_priority_preemption = (
             self.enable_priority_scheduling
@@ -3526,6 +3538,7 @@ class Scheduler(
             if running_batch.is_empty():
                 running_batch.batch_is_full = False
 
+        delayer_phase_prefill = False
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
         elif self._should_defer_prefill():
@@ -3534,6 +3547,15 @@ class Scheduler(
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
             running_batch = prefill_plan.running_batch
+            delayer_phase_prefill = prefill_plan.delayer_phase_prefill
+
+        if (
+            self.dp_phase_lockstep
+            and self.require_mlp_sync
+            and new_batch is None
+            and delayer_phase_prefill
+        ):
+            new_batch = self.dp_attn_adapter.get_idle_batch()
 
         need_mlp_sync = self.require_mlp_sync
         if (
@@ -3622,6 +3644,7 @@ class Scheduler(
             running_batch=running_batch,
         )
 
+        delayer_phase_prefill = False
         if self.prefill_delayer:
             observed_prefill_bs = prefill_delayer_single_pass.finalize(
                 actual_prefill_bs=ret.batch_size() if ret is not None else 0
@@ -3630,8 +3653,13 @@ class Scheduler(
                 self.max_prefill_bs = self.prefill_bs_tracker.observe_attempt(
                     observed_prefill_bs
                 )
+            delayer_phase_prefill = prefill_delayer_single_pass.is_phase_prefill
 
-        return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+        return NextBatchPlan(
+            batch_to_run=ret,
+            running_batch=running_batch,
+            delayer_phase_prefill=delayer_phase_prefill,
+        )
 
     def _get_new_batch_prefill_raw(
         self,

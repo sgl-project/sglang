@@ -3,6 +3,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import sglang.srt.managers.schedule_policy as schedule_policy
+from sglang.srt.managers.prefill_delayer import (
+    PrefillDelayerSinglePassExecutor,
+    _NegotiateOutput,
+)
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -30,10 +34,34 @@ class _RecordingDelayer:
     def __init__(self, allow: bool):
         self.allow = allow
         self.calls = []
+        self.call_kwargs = []
 
     def negotiate_should_allow_prefill(self, local_prefillable, **kwargs):
         self.calls.append(local_prefillable)
+        self.call_kwargs.append(kwargs)
         return self.allow
+
+
+def _single_rank_delaying_executor() -> PrefillDelayerSinglePassExecutor:
+    """Real executor over a stub delayer that always delays and echoes the
+    local in-flight bit back as the gathered any-rank bit (dp=1)."""
+    delayer = MagicMock()
+    delayer.enable_dp_attention = True
+    delayer.dp_size = 1
+    delayer._metrics_collector = None
+    delayer._debug_log_enabled = False
+    delayer._negotiate_should_allow_prefill.side_effect = (
+        lambda prefill_in_flight=False, **kwargs: _NegotiateOutput(
+            next_state=None,
+            input_estimation="all",
+            output_allow=False,
+            output_reason="delay",
+            num_prefillable=1,
+            num_token_watermark_force_allow=0,
+            any_prefill_in_flight=prefill_in_flight,
+        )
+    )
+    return PrefillDelayerSinglePassExecutor(delayer, token_usage=0.9)
 
 
 class TestPrefillAdder(CustomTestCase):
@@ -570,6 +598,58 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIs(result, req)
         req.set_extend_range.assert_not_called()
         self.assertEqual(len(adder.can_run_list), 0)
+
+    def test_add_chunked_req_parked_does_not_claim_prefill_in_flight(self):
+        # A parked chunk (hybrid-SWA early return) is not admitted this pass,
+        # so it must not negotiate as in-flight: under DP phase lockstep that
+        # bit would turn every rank's decode into an idle pass, and decode is
+        # what frees the SWA capacity the park is waiting on.
+        PAGE_SIZE = 64
+        adder, req = self._build_hybrid_swa_chunked_req(
+            page_size=PAGE_SIZE, rem_swa=PAGE_SIZE
+        )
+        recorder = _RecordingDelayer(allow=False)
+        adder.prefill_delayer_single_pass = recorder
+
+        self.assertIs(adder.add_chunked_req(req), req)
+
+        self.assertEqual(len(adder.can_run_list), 0)
+        self.assertTrue(
+            all(not kw.get("prefill_in_flight", False) for kw in recorder.call_kwargs)
+        )
+
+    def test_parked_chunk_leaves_pass_in_decode_phase(self):
+        PAGE_SIZE = 64
+        adder, req = self._build_hybrid_swa_chunked_req(
+            page_size=PAGE_SIZE, rem_swa=PAGE_SIZE
+        )
+        executor = _single_rank_delaying_executor()
+        adder.prefill_delayer_single_pass = executor
+        adder.running_batch.batch_size.return_value = 0
+        adder.max_running_requests = 64
+
+        self.assertIs(adder.add_chunked_req(req), req)
+        executor.finalize(actual_prefill_bs=0)
+
+        self.assertEqual(len(adder.can_run_list), 0)
+        self.assertFalse(executor.is_phase_prefill)
+
+    def test_admitted_chunk_forces_prefill_phase_even_when_delayed(self):
+        PAGE_SIZE = 64
+        adder, req = self._build_hybrid_swa_chunked_req(
+            page_size=PAGE_SIZE, rem_swa=100
+        )
+        executor = _single_rank_delaying_executor()
+        adder.prefill_delayer_single_pass = executor
+        adder.running_batch.batch_size.return_value = 0
+        adder.max_running_requests = 64
+
+        adder.add_chunked_req(req)
+        executor.finalize(actual_prefill_bs=1)
+
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertFalse(executor._result.output_allow)
+        self.assertTrue(executor.is_phase_prefill)
 
     def test_swa_budget_for_req(self):
         # budget = max(alloc - window, 0) + min(extend + max_new, window) + page,
