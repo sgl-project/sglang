@@ -7,11 +7,12 @@ use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use crate::components::{ComponentType, FULL, NUM_COMPONENT_TYPES};
-use crate::value::RadixValue;
 use hashbrown::hash_map::Entry;
 use hashbrown::{Equivalent, HashMap as HashBrownMap};
 use sha2::{Digest, Sha256};
+
+use crate::components::{ComponentType, FULL, NUM_COMPONENT_TYPES};
+use crate::value::RadixValue;
 
 /// The two independent dimensions that partition a radix tree.
 #[derive(Debug)]
