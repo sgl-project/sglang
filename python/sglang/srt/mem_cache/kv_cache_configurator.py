@@ -47,6 +47,12 @@ from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+    UnifiedSWATokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.allocator.unified_mamba import (
+    UnifiedMambaTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
@@ -101,6 +107,7 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
         not memory_config.enable_hisparse
         and not is_draft_worker
         and not memory_config.enable_hierarchical_cache
+        and not memory_config.enable_unified_cache_external_linker
         and get_disagg().disaggregation_mode == "null"
     )
 
@@ -500,35 +507,43 @@ class KVCacheConfigurator:
         # pool must be sized by that space.
         draft_virtual_id_space: Optional[int] = None
         if self.is_draft_worker and token_to_kv_pool_allocator is not None:
-            from sglang.srt.mem_cache.multi_ended_allocator import (
-                UnifiedMambaTokenToKVPoolAllocator,
-                UnifiedSWATokenToKVPoolAllocator,
-            )
-
-            if isinstance(token_to_kv_pool_allocator, UnifiedSWATokenToKVPoolAllocator):
-                raise ValueError(
-                    "Speculative decoding with --enable-unified-memory is only "
-                    "supported for hybrid-Mamba targets; the unified hybrid-SWA "
-                    "pool's draft sizing (virtual-id space) is not wired yet."
-                )
             if isinstance(
-                token_to_kv_pool_allocator, UnifiedMambaTokenToKVPoolAllocator
+                token_to_kv_pool_allocator,
+                (
+                    UnifiedMambaTokenToKVPoolAllocator,
+                    UnifiedSWATokenToKVPoolAllocator,
+                ),
             ):
-                draft_virtual_id_space = token_to_kv_pool_allocator.size_full
+                draft_virtual_id_space = (
+                    token_to_kv_pool_allocator.draft_virtual_id_space
+                )
                 assert draft_virtual_id_space >= sizes.max_total_num_tokens, (
                     "unified allocator virtual space smaller than the token "
-                    f"budget: size_full={draft_virtual_id_space} < "
+                    f"budget: virtual_id_space={draft_virtual_id_space} < "
                     f"max_total_num_tokens={sizes.max_total_num_tokens}"
                 )
                 # Round UP to page alignment (paged draft backends view the
-                # pool as (-1, page_size, H, D); size_full is not aligned).
+                # pool as (-1, page_size, H, D); the virtual space is not aligned).
                 page = max(int(self.pool_page_size or 1), 1)
                 draft_virtual_id_space = (
                     (draft_virtual_id_space + page - 1) // page * page
                 )
-                sizes = msgspec.structs.replace(
-                    sizes, max_total_num_tokens=draft_virtual_id_space
-                )
+                size_overrides = {
+                    "max_total_num_tokens": draft_virtual_id_space,
+                }
+                if (
+                    isinstance(
+                        token_to_kv_pool_allocator,
+                        UnifiedSWATokenToKVPoolAllocator,
+                    )
+                    and self.is_hybrid_swa
+                ):
+                    size_overrides["full_max_total_num_tokens"] = draft_virtual_id_space
+                    if not self.is_hybrid_swa_mtp_draft or self.draft_swa_full_capacity:
+                        size_overrides["swa_max_total_num_tokens"] = (
+                            draft_virtual_id_space
+                        )
+                sizes = msgspec.structs.replace(sizes, **size_overrides)
 
         # Initialize req_to_token_pool
         if req_to_token_pool is None:
@@ -576,7 +591,8 @@ class KVCacheConfigurator:
             assert token_to_kv_pool.size >= draft_virtual_id_space, (
                 "draft token_to_kv_pool smaller than the shared unified "
                 f"allocator's virtual-id space: pool size="
-                f"{token_to_kv_pool.size} < size_full={draft_virtual_id_space}; "
+                f"{token_to_kv_pool.size} < "
+                f"virtual_id_space={draft_virtual_id_space}; "
                 "verify-window writes at high virtual ids would go out of "
                 "bounds."
             )
@@ -1979,27 +1995,33 @@ class KVCacheConfigurator:
         else:
             assert self.is_draft_worker
             if self.is_hybrid_swa:
-                if self.draft_swa_full_capacity:
-                    # Banded depth: the SWA ring is full draft capacity, so use
-                    # an IDENTITY full->swa mapping — store and read locs both
-                    # equal out_cache_loc, and a slot is never evicted before
-                    # the request frees it. The window itself is enforced by the
-                    # FA sliding-window kernel, not by the ring. Layout mirrors
-                    # SWATokenToKVPoolAllocator's mapping (size + page_size
-                    # entries + trailing -1 sentinel so a -1 last_loc maps
-                    # to -1).
+                if isinstance(
+                    token_to_kv_pool_allocator,
+                    DeepSeekV4HiSparseTokenToKVPoolAllocator,
+                ):
+                    swa_allocator = token_to_kv_pool_allocator.logical_attn_allocator
+                else:
+                    swa_allocator = token_to_kv_pool_allocator
+                uses_unified_virtual_ids = isinstance(
+                    swa_allocator, UnifiedSWATokenToKVPoolAllocator
+                )
+                has_draft_swa_layers = (
+                    not self.is_hybrid_swa_mtp_draft or self.draft_swa_full_capacity
+                )
+                if self.draft_swa_full_capacity or (
+                    uses_unified_virtual_ids and has_draft_swa_layers
+                ):
+                    # The draft pool owns independent KV but consumes the target
+                    # allocator's virtual ids directly. Size its SWA side for that
+                    # whole space and use an identity mapping. The trailing -1
+                    # sentinel keeps a -1 last_loc mapped to -1.
                     n = sizes.full_max_total_num_tokens + self.page_size
                     identity_mapping = torch.arange(
                         n + 1, dtype=torch.int64, device=self.device
                     )
                     identity_mapping[-1] = -1
                     token_to_kv_pool.register_mapping(identity_mapping)
-                else:
-                    swa_allocator = getattr(
-                        token_to_kv_pool_allocator,
-                        "logical_attn_allocator",
-                        token_to_kv_pool_allocator,
-                    )
+                elif not uses_unified_virtual_ids:
                     assert isinstance(swa_allocator, SWATokenToKVPoolAllocator)
                     token_to_kv_pool.register_mapping(
                         swa_allocator.full_to_swa_index_mapping
@@ -2256,22 +2278,14 @@ class KVCacheConfigurator:
         # no longer reserves the (1 + D/ratio) intermediate factor -- the whole
         # budget goes to persistent slots (K sized like non-spec), which is how the
         # freed ~9GB turns into higher max_running.
-        # The ring is allocated per slot but is not part of mamba_cache_per_req;
-        # the solve must charge it too or num_slots is over-provisioned.
+        # The ring is not part of mamba_cache_per_req. GDN replay is fixed-size
+        # request scratch; KDA replay remains attached to each mamba slot.
         replayssm_active = get_exec().mamba.enable_linear_replayssm_spec and (
             self.hybrid_gdn_config is not None
             or kimi_linear_config(self.model_config) is not None
         )
         if replayssm_active:
-            # GDN sizes the fold window to the draft maximum; the KDA ring
-            # stays --linear-replayssm-cache-len long (mirrors MambaPool).
-            max_draft_tokens = max_speculative_num_draft_tokens()
-            if kimi_linear_config(self.model_config) is not None:
-                record_len = get_exec().mamba.linear_replayssm_cache_len
-            elif max_draft_tokens is not None:
-                record_len = max_draft_tokens
-            else:
-                record_len = get_exec().mamba.linear_replayssm_cache_len
+            record_len = get_exec().mamba.linear_replayssm_cache_len
             replayssm_ring_per_req = (
                 config.mamba2_cache_params.replayssm_ring_bytes_per_req(
                     record_len=record_len
@@ -2280,6 +2294,15 @@ class KVCacheConfigurator:
         else:
             replayssm_ring_per_req = 0
         replayssm_ring_per_req = int(replayssm_ring_per_req * pp_layer_scale)
+        if replayssm_active and kimi_linear_config(self.model_config) is None:
+            replay_req_slots = (
+                get_schedule().max_running_requests // self.ps.attn_dp_size + 1
+            )
+            replayssm_fixed_bytes = replayssm_ring_per_req * replay_req_slots
+            replayssm_ring_per_slot = 0
+        else:
+            replayssm_fixed_bytes = 0
+            replayssm_ring_per_slot = replayssm_ring_per_req
         if has_spec_dec:
             assert get_spec().speculative_num_draft_tokens is not None
             assert get_schedule().max_running_requests is not None
@@ -2360,11 +2383,12 @@ class KVCacheConfigurator:
                 intermediate_size = per_req * (capped_reqs + 1) * D
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
-                per_slot = per_req + replayssm_ring_per_req
+                per_slot = per_req + replayssm_ring_per_slot
                 get_context().override(
                     "mamba_pool.memory_budget",
                     max_mamba_cache_size=int(
-                        (mamba_budget_bytes - per_slot) // per_slot
+                        (mamba_budget_bytes - replayssm_fixed_bytes - per_slot)
+                        // per_slot
                     ),
                 )
 
@@ -2384,14 +2408,12 @@ class KVCacheConfigurator:
                 f"(4) use GPUs with more memory."
             )
 
-        # +1: the pool's padding slot is allocated alongside the request slots.
-        # ReplaySSM ring rides on every slot too (replayssm_ring_per_req is 0 when
-        # the ring is not allocated).
+        # +1 accounts for each pool's padding slot.
         mamba_state_memory = (
             (get_schedule().max_mamba_cache_size + 1)
-            * (stage_per_req + replayssm_ring_per_req)
-            / (1 << 30)
-        )
+            * (stage_per_req + replayssm_ring_per_slot)
+            + replayssm_fixed_bytes
+        ) / (1 << 30)
         return total_rest_memory - mamba_state_memory
 
 

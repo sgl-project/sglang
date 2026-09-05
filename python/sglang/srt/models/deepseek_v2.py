@@ -478,7 +478,14 @@ class MoEGate(nn.Module):
         self.is_nextn = is_nextn
         self.is_deepseek_v4 = is_deepseek_v4
         self.weight = nn.Parameter(
-            torch.empty((config.n_routed_experts, config.hidden_size))
+            torch.empty(
+                (config.n_routed_experts, config.hidden_size),
+                dtype=(
+                    torch.float32
+                    if getattr(config, "router_fp32", False)
+                    else torch.get_default_dtype()
+                ),
+            )
         )
 
         if config.topk_method == "noaux_tc" and not is_hash_moe:
@@ -515,6 +522,9 @@ class MoEGate(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         forward_batch: ForwardBatch = None,
     ):
+        if self.weight.dtype == torch.float32:
+            return F.linear(hidden_states.float(), self.weight)
+
         if use_intel_amx_backend(self):
             return torch.ops.sgl_kernel.weight_packed_linear(
                 hidden_states,
