@@ -51,7 +51,9 @@ from sglang.srt.layers.moe.topk import (
     TopKOutputChecker,
 )
 from sglang.srt.layers.moe.utils import (
+    DispatcherOutputDtype,
     RoutingMethodType,
+    get_deepep_v2_dispatcher_output_dtype,
     has_per_rank_fused_shared_slots,
     uses_per_rank_fused_shared_slots,
 )
@@ -157,7 +159,10 @@ def _get_deepep_comm_group(a2a_backend):
     return group
 
 
-def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
+def create_moe_dispatcher(
+    moe_runner_config: MoeRunnerConfig,
+    quant_method: Optional[FusedMoEMethodBase] = None,
+) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_none() and is_npu():
         return AscendTPDispatcher(moe_runner_config)
@@ -190,6 +195,9 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             return_recv_hook=True,
         )
     elif a2a_backend.is_deepep_v2():
+        output_dtype = get_deepep_v2_dispatcher_output_dtype(
+            _deepep_v2_experts_are_fp8(quant_method)
+        )
         return DeepEPv2Dispatcher(
             group=get_tp_group().device_group,
             router_topk=moe_runner_config.top_k,
@@ -197,6 +205,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
             params_dtype=moe_runner_config.params_dtype,
+            use_fp8_dispatch=output_dtype is DispatcherOutputDtype.FP8,
         )
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(
@@ -236,9 +245,19 @@ def _validate_hpc_ops_quant_method(quant_method) -> None:
         )
 
 
+def _deepep_v2_experts_are_fp8(quant_method) -> bool:
+    # Unquantized experts run the DeepGEMM BF16 grouped GEMM; every other
+    # method deepep_v2 accepts is FP8 blockwise.
+    return not isinstance(quant_method, UnquantizedFusedMoEMethod)
+
+
 def _validate_deepep_v2_quant_method(quant_method) -> None:
-    """Validate the FP8 contract consumed by the DeepEP v2 adapter."""
+    """Validate the expert formats the DeepEP v2 adapter can feed."""
     if not get_moe_a2a_backend().is_deepep_v2():
+        return
+
+    if isinstance(quant_method, UnquantizedFusedMoEMethod):
+        # BF16 experts: dispatch stays unquantized end to end.
         return
 
     config = (
@@ -258,9 +277,10 @@ def _validate_deepep_v2_quant_method(quant_method) -> None:
 
     if reason is not None:
         raise ValueError(
-            "--moe-a2a-backend deepep_v2 requires 128x128 blockwise FP8 "
-            f"experts with dynamic activation scaling, but this layer {reason}. "
-            "Use a compatible checkpoint or --moe-a2a-backend deepep."
+            "--moe-a2a-backend deepep_v2 requires either 128x128 blockwise FP8 "
+            "experts with dynamic activation scaling or unquantized BF16 "
+            f"experts, but this layer {reason}. Use a compatible checkpoint or "
+            "--moe-a2a-backend deepep."
         )
 
 
@@ -496,7 +516,9 @@ class FusedMoE(torch.nn.Module):
         )
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
-        self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
+        self.dispatcher = create_moe_dispatcher(
+            self.moe_runner_config, quant_method=self.quant_method
+        )
         # Dispatchers are not nn.Modules, so they cannot register their own
         # buffers; the AITER expert mask would not survive a memory-saver resume.
         expert_mask = getattr(self.dispatcher, "expert_mask_gpu", None)

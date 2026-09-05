@@ -1691,10 +1691,14 @@ def pre_permute_deepep_v2_to_deep_gemm(
     deepep_v2_masked_max_m = dispatch_output.masked_max_m
     deepep_v2_total_expanded = dispatch_output.total_expanded
     deepep_v2_expert_alignment = dispatch_output.expert_alignment
-    if hidden_states_scale is None:
+    # BF16 dispatch carries no activation scales; the BF16 grouped GEMM below
+    # consumes the rows as they arrive.
+    is_fp8 = hidden_states_scale is not None
+    if not is_fp8 and hidden_states.dtype != torch.bfloat16:
         raise RuntimeError(
-            "DeepEP v2 -> DeepGEMM requires FP8 dispatch output with activation "
-            "scales, but the dispatch output carried none."
+            "DeepEP v2 -> DeepGEMM requires either FP8 dispatch output with "
+            "activation scales or BF16 dispatch output, but the dispatch "
+            f"output carried {hidden_states.dtype} without scales."
         )
     assert runner_config.activation == "silu"
 
@@ -1763,7 +1767,9 @@ def pre_permute_deepep_v2_to_deep_gemm(
     input_tensor = torch.empty(
         (all_tokens, K), device=hidden_states.device, dtype=hidden_states.dtype
     )
-    if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+    if not is_fp8:
+        input_tensor_scale = None
+    elif deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
         # Packed UE8M0 scales require zero padding lanes.
         input_tensor_scale = torch.zeros(
             (ceil_div(K // 128, 4), all_tokens),
@@ -1791,7 +1797,8 @@ def pre_permute_deepep_v2_to_deep_gemm(
         scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
     )
     dispose_tensor(hidden_states)
-    dispose_tensor(hidden_states_scale)
+    if hidden_states_scale is not None:
+        dispose_tensor(hidden_states_scale)
     running_state["output_index"] = output_index
 
     return DeepGemmRunnerInput(
