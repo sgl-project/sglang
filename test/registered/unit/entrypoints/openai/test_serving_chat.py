@@ -3318,8 +3318,11 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertIsNone(response.sglext)
 
     def test_non_streaming_ids_server_default_enables_flag(self):
-        self.tm.server_args.return_input_ids = True
-        self.tm.server_args.return_output_ids = True
+        self.enterContext(
+            get_context().override_server_args(
+                return_input_ids=True, return_output_ids=True
+            )
+        )
         req = ChatCompletionRequest(
             model="x", messages=[{"role": "user", "content": "Hi?"}]
         )
@@ -3371,7 +3374,9 @@ class ServingChatTestCase(unittest.TestCase):
     ):
         """Stream chunks with incremental or cumulative output_ids;
         return parsed sglext chunks, or raw SSE strings when return_raw."""
-        self.tm.server_args.incremental_streaming_output = incremental
+        self.enterContext(
+            get_context().override_server_args(incremental_streaming_output=incremental)
+        )
         if framed:
             self.fastapi_request.headers["x-sglext-ids-framed"] = "1"
 
@@ -3495,7 +3500,9 @@ class ServingChatTestCase(unittest.TestCase):
         self, normal_chunks, abort_output_ids, incremental, abort_completion_tokens
     ):
         """Stream normal chunks then a graceful-abort chunk; return parsed sglext chunks."""
-        self.tm.server_args.incremental_streaming_output = incremental
+        self.enterContext(
+            get_context().override_server_args(incremental_streaming_output=incremental)
+        )
 
         async def _mock_generate():
             generated = 0
