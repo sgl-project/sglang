@@ -106,7 +106,7 @@ def test_vit_fast_path_is_gated_and_matches_reference():
     qk-norm+RoPE kernel and cuDNN SDPA run and match to rounding level."""
     from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_vae_cuda_opt import (
         _attn_fast_compatible,
-        install_qknorm_rope,
+        install_fast_attention,
     )
 
     device = torch.device("cuda")
@@ -132,7 +132,7 @@ def test_vit_fast_path_is_gated_and_matches_reference():
     ):
         reference = attention(hidden, rotary)
         gate = VaeFastPathGate()
-        install_qknorm_rope([attention], gate)
+        install_fast_attention([attention], gate)
         assert torch.equal(attention(hidden, rotary), reference)
         gate.enabled = True
         fused = attention(hidden, rotary)

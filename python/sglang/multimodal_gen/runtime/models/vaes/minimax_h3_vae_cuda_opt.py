@@ -118,21 +118,23 @@ def _plain_rms_norm(module) -> bool:
     return isinstance(module, nn.RMSNorm) and module.weight is None
 
 
-def _attn_fast_compatible(m) -> bool:
+def _attn_fast_compatible(attn: nn.Module) -> bool:
     return (
-        type(m) is Attention
-        and _plain_rms_norm(m.norm_q)
-        and _plain_rms_norm(m.norm_k)
-        and m.norm_q.eps == m.norm_k.eps
+        type(attn) is Attention
+        and _plain_rms_norm(attn.norm_q)
+        and _plain_rms_norm(attn.norm_k)
+        and attn.norm_q.eps == attn.norm_k.eps
     )
 
 
-def install_qknorm_rope(attn_modules: list[nn.Module], gate: VaeFastPathGate) -> None:
-    for m in attn_modules:
-        m._sgl_gate = gate
-        m._sgl_unit_weight = None
-        m._sgl_cudnn_failed = False
-        m.forward = MethodType(_attn_fast_forward, m)
+def install_fast_attention(
+    attn_modules: list[nn.Module], gate: VaeFastPathGate
+) -> None:
+    for attn in attn_modules:
+        attn._sgl_gate = gate
+        attn._sgl_unit_weight = None
+        attn._sgl_cudnn_failed = False
+        attn.forward = MethodType(_attn_fast_forward, attn)
 
 
 def maybe_optimize_minimax_h3_vae(vae: nn.Module) -> nn.Module:
@@ -144,7 +146,7 @@ def maybe_optimize_minimax_h3_vae(vae: nn.Module) -> nn.Module:
 
     if not isinstance(vae, MiniMaxH3VideoVAE):
         return vae
-    decoder = getattr(vae, "decoder", None)
+    decoder = vae.decoder
     if type(decoder) is not ViT3DDecoder:
         return vae
     if not _env_flag("MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM", "1"):
@@ -152,7 +154,7 @@ def maybe_optimize_minimax_h3_vae(vae: nn.Module) -> nn.Module:
         return vae
 
     attn_modules = [block.attn for block in decoder.transformer_blocks]
-    eligible = [m for m in attn_modules if _attn_fast_compatible(m)]
+    eligible = [attn for attn in attn_modules if _attn_fast_compatible(attn)]
     if len(eligible) != len(attn_modules):
         logger.warning(
             "MiniMax-H3 VAE: %d/%d decoder attention blocks non-standard; "
@@ -163,7 +165,7 @@ def maybe_optimize_minimax_h3_vae(vae: nn.Module) -> nn.Module:
         return vae
 
     gate = VaeFastPathGate()
-    install_qknorm_rope(eligible, gate)
+    install_fast_attention(eligible, gate)
     register_vae_fast_path_gate(vae, gate)
     logger.info(
         "MiniMax-H3 VAE: installed quality-gated fast path (%d QK RMSNorm+RoPE "
