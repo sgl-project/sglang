@@ -43,7 +43,7 @@ def _reference(topk_ids, block_size, num_experts):
     offsets = torch.cumsum(padded, 0) - padded
     total = int(padded.sum())
 
-    non_empty = torch.nonzero(padded, as_tuple=True)[0]
+    non_empty = padded.nonzero(as_tuple=True)[0]
     expert_ids = torch.repeat_interleave(
         non_empty - 1, padded[non_empty] // block_size
     ).to(torch.int32)

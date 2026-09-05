@@ -551,7 +551,7 @@ class InputLogprobProcessor:
             chunk_indices = global_indices - start_idx
             # Get the positions in the original array where chunk_mask is True
             # This is needed to correctly index into extend_input_logprob_token_ids_gpu
-            mask_indices = torch.nonzero(chunk_mask, as_tuple=True)[0]
+            mask_indices = chunk_mask.nonzero(as_tuple=True)[0]
 
             # Get the logits for this chunk. Each chunk must own its output:
             # writing through the shared graph logits buffer would alias
