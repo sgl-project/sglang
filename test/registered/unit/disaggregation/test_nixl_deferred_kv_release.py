@@ -1,187 +1,144 @@
 """Deferred decode-side KV release on the NIXL backend.
 
-When a decode request is aborted while its prefill->decode transfer may still be
-in flight, the decode holds its KV pages until every prefill rank acks that its
-transfer drained. NIXL transfers are asynchronous (agent.transfer() posts, the
-worker polls check_xfer_state), so the ack must come from the transfer worker
-after its DONE barrier -- never from the bootstrap thread for an active room.
+NIXL posts transfers asynchronously and the worker polls their handles. The
+bootstrap thread records the ACK target while a transfer is outstanding; only
+the worker can send that ACK after every handle reaches DONE.
 """
 
 import unittest
-from unittest.mock import MagicMock
+from collections import defaultdict
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import numpy as np
+from test_deferred_decode_kv_release import (
+    ABORT_GENERATION,
+    DeferredAbortNotificationScenarios,
+    TaggedAbortNotificationScenarios,
+    WorkerFailureAbortScenarios,
+)
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.common.conn import (
+    ABORT_TAG,
+    AckTarget,
+)
+from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-
-def _prefill_mgr(cls=CommonKVManager, enabled=True):
-    """Bare manager carrying only the prefill-side deferred-ack state."""
-    mgr = cls.__new__(cls)
-    mgr.enable_deferred_decode_kv_release = enabled
-    mgr._deferred_ack_targets = {}
-    mgr._staging_outstanding = {}
-    mgr.request_status = {}
-    mgr._sent = []
-    # Capture acks instead of opening a socket.
-    mgr._send_abort_ack = lambda ip, port, room: mgr._sent.append((ip, port, room))
-    return mgr
+ROOM = 11
+DECODE_IP = "10.0.0.3"
+DECODE_PORT = 6000
 
 
-class TestDeferredAckTargets(CustomTestCase):
-    def test_ack_held_until_outstanding_drains(self):
-        mgr = _prefill_mgr()
-        mgr.register_deferred_ack_target(7, "10.0.0.1", 5000)
-
-        mgr._staging_outstanding[7] = 1
-        mgr._maybe_ack_drained_abort(7)
-        self.assertEqual(mgr._sent, [])  # still writing -> no ack
-
-        mgr._staging_outstanding[7] = 0
-        mgr._maybe_ack_drained_abort(7)
-        self.assertEqual(mgr._sent, [("10.0.0.1", 5000, 7)])
-
-    def test_ack_fires_at_most_once(self):
-        mgr = _prefill_mgr()
-        mgr.register_deferred_ack_target(8, "10.0.0.2", 5001)
-        mgr._maybe_ack_drained_abort(8)
-        mgr._maybe_ack_drained_abort(8)
-        self.assertEqual(len(mgr._sent), 1)
-        self.assertNotIn(8, mgr._deferred_ack_targets)
-
-    def test_unregistered_room_is_noop(self):
-        mgr = _prefill_mgr()
-        mgr._maybe_ack_drained_abort(999)
-        self.assertEqual(mgr._sent, [])
-
-    def test_prefill_unique_rank_matches_success_sync_formula(self):
-        mgr = CommonKVManager.__new__(CommonKVManager)
-        mgr.attn_tp_rank, mgr.pp_size, mgr.attn_cp_size = 2, 3, 4
-        mgr.pp_rank, mgr.attn_cp_rank = 1, 3
-        self.assertEqual(mgr._prefill_unique_rank(), 2 * (3 * 4) + 1 * 4 + 3)
+def _manager(
+    *, enabled: bool = True, status: KVPoll | None = KVPoll.WaitingForInput
+) -> NixlKVManager:
+    manager = NixlKVManager.__new__(NixlKVManager)
+    manager.enable_deferred_decode_kv_release = enabled
+    manager._deferred_ack_targets = {}
+    manager._deferred_ack_poisoned_rooms = set()
+    manager._staging_outstanding = {}
+    manager.request_status = {} if status is None else {ROOM: status}
+    manager._sent = []
+    manager._send_abort_ack = lambda *args: manager._sent.append(args)
+    manager.record_failure = MagicMock()
+    manager.update_status = MagicMock(
+        side_effect=lambda room, value: manager.request_status.__setitem__(room, value)
+    )
+    manager.check_status = lambda room: manager.request_status[room]
+    return manager
 
 
-class TestNixlAbortNotification(CustomTestCase):
-    """_handle_abort_notification is the prefill bootstrap-thread entry point."""
+def _chunk() -> TransferKVChunk:
+    return TransferKVChunk(
+        room=ROOM,
+        prefill_kv_indices=np.array([1], dtype=np.int32),
+        index_slice=slice(0, 1),
+        is_last_chunk=False,
+        chunk_id=0,
+        prefill_aux_index=None,
+        state_indices=None,
+    )
 
-    @staticmethod
-    def _abort_msg(room=11, ip="10.0.0.3", port=6000):
-        return [
-            b"ABORT",
-            str(room).encode("ascii"),
-            ip.encode("ascii"),
-            str(port).encode("ascii"),
-        ]
 
-    def _mgr(self, enabled=True, room=11, status=KVPoll.WaitingForInput):
-        mgr = _prefill_mgr(NixlKVManager, enabled=enabled)
-        if status is not None:
-            mgr.request_status[room] = status
-        mgr.record_failure = MagicMock()
-        mgr.update_status = MagicMock(
-            side_effect=lambda r, s: mgr.request_status.__setitem__(r, s)
+class TestNixlAbortNotification(
+    DeferredAbortNotificationScenarios,
+    TaggedAbortNotificationScenarios,
+    WorkerFailureAbortScenarios,
+    CustomTestCase,
+):
+    room = ROOM
+    decode_ip = DECODE_IP
+    decode_port = DECODE_PORT
+
+    def _make_abort_manager(self, status: KVPoll | None):
+        return _manager(status=status)
+
+    def _provoke_worker_failure(self, manager) -> None:
+        manager.enable_staging = False
+        manager._staging_ctx = None
+        manager._staging_outstanding = defaultdict(int)
+        manager.transfer_infos = {ROOM: {}}
+        manager.exceptions = {}
+        manager.check_status = MagicMock(side_effect=RuntimeError("worker error"))
+        queue = SimpleNamespace(
+            get=MagicMock(side_effect=(_chunk(), KeyboardInterrupt()))
         )
-        mgr.check_status = lambda r: mgr.request_status[r]
-        return mgr
 
-    def test_in_flight_room_registers_target_and_does_not_ack_yet(self):
-        # A counted chunk holds the ack: only the worker knows when it landed.
-        mgr = self._mgr()
-        mgr._staging_outstanding[11] = 1
-        self.assertTrue(mgr._handle_abort_notification(self._abort_msg()))
+        with patch("sglang.srt.disaggregation.nixl.conn.logger.exception"):
+            with self.assertRaises(KeyboardInterrupt):
+                manager.transfer_worker(queue)
+        manager.check_status = lambda room: manager.request_status[room]
 
-        self.assertEqual(mgr._deferred_ack_targets[11], ("10.0.0.3", 6000))
-        self.assertEqual(mgr._sent, [])
-        # Marked Failed first, so no new chunk can be enqueued for the room.
-        self.assertEqual(mgr.request_status[11], KVPoll.Failed)
+    def test_worker_skip_between_failure_and_target_registration_still_acks(self):
+        manager = _manager()
+        manager._staging_outstanding[ROOM] = 1
+        update_status = manager.update_status.side_effect
 
-    def test_quiescent_active_room_acks_without_waiting_for_a_worker_visit(self):
-        # Window 2: chunks already drained with none left to come, so the worker
-        # never revisits the room -- acking here keeps it off the timeout path.
-        mgr = self._mgr()
-        self.assertTrue(mgr._handle_abort_notification(self._abort_msg()))
+        def fail_then_skip(room, status):
+            update_status(room, status)
+            # Window 1: the worker skips after Failed but before target
+            # registration, so the bootstrap thread must observe zero and ACK.
+            manager._staging_outstanding.pop(room, None)
+            manager._maybe_ack_drained_abort(room)
 
-        self.assertEqual(mgr._sent, [("10.0.0.3", 6000, 11)])
-        self.assertEqual(mgr._deferred_ack_targets, {})
+        manager.update_status = MagicMock(side_effect=fail_then_skip)
 
-    def test_worker_skip_before_registration_still_acks(self):
-        # Window 1: the worker can pass its skip point between the Failed flip
-        # and registration; the ack attempt at registration covers that.
-        mgr = self._mgr()
-        mgr._staging_outstanding[11] = 1
+        claimed = manager._handle_abort_notification(self._abort_message())
 
-        real_update = mgr.update_status.side_effect
+        self.assertTrue(claimed)
+        self.assertEqual(
+            manager._sent,
+            [(ROOM, AckTarget(DECODE_IP, DECODE_PORT, ABORT_GENERATION))],
+        )
+        self.assertEqual(manager._deferred_ack_targets, {})
 
-        def failed_then_worker_skips(room, status):
-            real_update(room, status)
-            # Worker dequeues, sees Failed, uncounts, and finds no target yet.
-            mgr._staging_outstanding.pop(room, None)
-            mgr._maybe_ack_drained_abort(room)
+    def test_feature_off_marks_failed_without_ack(self):
+        manager = _manager(enabled=False)
 
-        mgr.update_status = MagicMock(side_effect=failed_then_worker_skips)
-        self.assertTrue(mgr._handle_abort_notification(self._abort_msg()))
+        claimed = manager._handle_abort_notification(self._abort_message())
 
-        self.assertEqual(mgr._sent, [("10.0.0.3", 6000, 11)])
-        self.assertEqual(mgr._deferred_ack_targets, {})
+        self.assertTrue(claimed)
+        self.assertEqual(manager.request_status[ROOM], KVPoll.Failed)
+        self.assertEqual(manager._deferred_ack_targets, {})
+        self.assertEqual(manager._sent, [])
 
-    def test_concluded_room_acks_immediately(self):
-        # Concluded and quiescent: ack straight away.
-        mgr = self._mgr(status=None)
-        mgr.check_status = lambda r: KVPoll.Success
-        self.assertTrue(mgr._handle_abort_notification(self._abort_msg()))
+    def test_legacy_abort_without_return_address_is_tolerated(self):
+        manager = _manager()
 
-        self.assertEqual(mgr._sent, [("10.0.0.3", 6000, 11)])
-        self.assertEqual(mgr._deferred_ack_targets, {})
+        claimed = manager._handle_abort_notification(
+            [ABORT_TAG, str(ROOM).encode("ascii")]
+        )
 
-    def test_cleared_room_with_outstanding_chunk_does_not_ack(self):
-        # The ERR path abandons sibling handles that may still be writing and
-        # leaves the chunk counted; clear() then drops the room. Acking on
-        # "unknown room" alone would release decode pages under those writes.
-        mgr = self._mgr(status=None)  # room absent == cleared/unknown
-        mgr._staging_outstanding[11] = 1
-        self.assertTrue(mgr._handle_abort_notification(self._abort_msg()))
-
-        self.assertEqual(mgr._sent, [])
-        self.assertEqual(mgr._deferred_ack_targets, {})
-
-    def test_feature_off_registers_nothing_and_acks_nothing(self):
-        mgr = self._mgr(enabled=False)
-        self.assertTrue(mgr._handle_abort_notification(self._abort_msg()))
-
-        self.assertEqual(mgr._deferred_ack_targets, {})
-        self.assertEqual(mgr._sent, [])
-        # Legacy behavior preserved: the room is still failed.
-        self.assertEqual(mgr.request_status[11], KVPoll.Failed)
-
-    def test_legacy_two_frame_abort_is_tolerated(self):
-        # Older peers send [ABORT, room] with no return address.
-        mgr = self._mgr()
-        self.assertTrue(mgr._handle_abort_notification([b"ABORT", b"11"]))
-        self.assertEqual(mgr._deferred_ack_targets, {})
-        self.assertEqual(mgr._sent, [])
-
-    def test_non_abort_message_is_not_claimed(self):
-        mgr = self._mgr()
-        self.assertFalse(mgr._handle_abort_notification([b"STAGING_REQ", b"11"]))
-
-
-class TestNixlDecodeAckIngest(CustomTestCase):
-    def test_abort_ack_is_aggregated_per_rank(self):
-        # Mirrors the decode listener thread's ABORT_ACK branch.
-        mgr = CommonKVManager.__new__(CommonKVManager)
-        mgr._deferred_abort_ack_tracker = {}
-        mgr.register_deferred_abort_room(21)
-
-        for rank in (b"0", b"1", b"1"):
-            msg = [b"ABORT_ACK", b"21", rank]
-            mgr.note_abort_ack(int(msg[1].decode()), int(msg[2].decode()))
-
-        self.assertFalse(mgr.is_abort_release_safe(21, required_acks=3))
-        self.assertTrue(mgr.is_abort_release_safe(21, required_acks=2))
+        self.assertTrue(claimed)
+        self.assertEqual(manager.request_status[ROOM], KVPoll.Failed)
+        self.assertEqual(manager._deferred_ack_targets, {})
+        self.assertEqual(manager._sent, [])
 
 
 if __name__ == "__main__":

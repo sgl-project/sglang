@@ -10,15 +10,78 @@ fires. See DecodeTransferQueue.resolve_deferred_releases.
 
 import unittest
 from types import SimpleNamespace
+from typing import NamedTuple
 from unittest.mock import patch
 
 from sglang.srt.disaggregation import decode as decode_mod
-from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.common.conn import (
+    ABORT_ACK_TAG,
+    ABORT_TAG,
+    AbortAck,
+    AbortNotification,
+    AckTarget,
+    CommonKVManager,
+    CommonKVReceiver,
+    CommonKVSender,
+)
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
+from sglang.srt.disaggregation.fake.conn import FakeKVReceiver
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+ABORT_GENERATION = 7
+
+
+class AbortScenario(NamedTuple):
+    name: str
+    status: KVPoll | None
+    outstanding: int
+    expected_status: KVPoll | None
+
+
+ABORT_SCENARIOS = (
+    AbortScenario(
+        name="active transfer",
+        status=KVPoll.Transferring,
+        outstanding=1,
+        expected_status=KVPoll.Failed,
+    ),
+    # Window 2: no worker will revisit a room that is already quiescent.
+    AbortScenario(
+        name="active quiescent room",
+        status=KVPoll.WaitingForInput,
+        outstanding=0,
+        expected_status=KVPoll.Failed,
+    ),
+    AbortScenario(
+        name="completed transfer",
+        status=KVPoll.Success,
+        outstanding=1,
+        expected_status=KVPoll.Success,
+    ),
+    AbortScenario(
+        name="completed quiescent room",
+        status=KVPoll.Success,
+        outstanding=0,
+        expected_status=KVPoll.Success,
+    ),
+    # clear() can remove request_status before a counted write drains.
+    AbortScenario(
+        name="untracked transfer",
+        status=None,
+        outstanding=1,
+        expected_status=None,
+    ),
+    AbortScenario(
+        name="untracked quiescent room",
+        status=None,
+        outstanding=0,
+        expected_status=None,
+    ),
+)
 
 
 def _make_manager():
@@ -26,43 +89,356 @@ def _make_manager():
     touch (avoids the heavy real __init__)."""
     mgr = CommonKVManager.__new__(CommonKVManager)
     mgr._deferred_abort_ack_tracker = {}
+    mgr._deferred_abort_generation = 0
+    mgr.enable_deferred_decode_kv_release = True
     return mgr
+
+
+def _make_prefill_manager():
+    mgr = CommonKVManager.__new__(CommonKVManager)
+    mgr.enable_deferred_decode_kv_release = True
+    mgr.request_status = {}
+    mgr.req_to_decode_prefix_len = {}
+    mgr.transfer_infos = {}
+    mgr._deferred_ack_targets = {}
+    mgr._deferred_ack_poisoned_rooms = set()
+    mgr._staging_outstanding = {}
+    mgr._sent = []
+    mgr._send_abort_ack = lambda *args: mgr._sent.append(args)
+    return mgr
+
+
+class _TestReceiver(CommonKVReceiver):
+    def poll(self):
+        raise NotImplementedError
+
+    def failure_exception(self):
+        raise NotImplementedError
+
+
+class _TestSender(CommonKVSender):
+    def poll(self):
+        raise NotImplementedError
+
+    def failure_exception(self):
+        raise NotImplementedError
+
+
+class DeferredAbortNotificationScenarios:
+    room: int
+    decode_ip: str
+    decode_port: int
+
+    def _make_abort_manager(self, status: KVPoll | None):
+        raise NotImplementedError
+
+    def _dispatch_abort(self, manager) -> None:
+        claimed = manager._handle_abort_notification(self._abort_message())
+        self.assertTrue(claimed)
+
+    def _start_test_transfer(self, manager) -> None:
+        manager._staging_outstanding[self.room] = 1
+
+    def _drain_test_transfer(self, manager) -> None:
+        manager._staging_outstanding[self.room] -= 1
+        manager._maybe_ack_drained_abort(self.room)
+
+    def _abort_message(self) -> list[bytes]:
+        return AbortNotification(
+            self.room,
+            self.decode_ip,
+            self.decode_port,
+            ABORT_GENERATION,
+        ).to_zmq()
+
+    def test_deferred_ack_follows_room_status_and_outstanding_transfers(self):
+        target = AckTarget(
+            self.decode_ip,
+            self.decode_port,
+            ABORT_GENERATION,
+        )
+        for case in ABORT_SCENARIOS:
+            with self.subTest(name=case.name):
+                manager = self._make_abort_manager(case.status)
+                if case.outstanding:
+                    self._start_test_transfer(manager)
+
+                self._dispatch_abort(manager)
+
+                self.assertEqual(
+                    manager.request_status.get(self.room), case.expected_status
+                )
+                if case.outstanding:
+                    self.assertEqual(manager._deferred_ack_targets[self.room], target)
+                    self.assertEqual(manager._sent, [])
+                    self._drain_test_transfer(manager)
+                self.assertNotIn(self.room, manager._deferred_ack_targets)
+                self.assertEqual(manager._sent, [(self.room, target)])
+
+
+class TaggedAbortNotificationScenarios:
+    room: int
+
+    def test_non_abort_message_is_not_claimed(self):
+        manager = self._make_abort_manager(KVPoll.WaitingForInput)
+
+        self.assertFalse(
+            manager._handle_abort_notification(
+                [b"STAGING_REQ", str(self.room).encode()]
+            )
+        )
+
+
+class WorkerFailureAbortScenarios:
+    room: int
+    decode_ip: str
+    decode_port: int
+
+    def _provoke_worker_failure(self, manager) -> None:
+        raise NotImplementedError
+
+    def test_worker_exception_poison_is_reset_for_reused_room(self):
+        target = AckTarget(
+            self.decode_ip,
+            self.decode_port,
+            ABORT_GENERATION,
+        )
+        manager = self._make_abort_manager(KVPoll.WaitingForInput)
+        manager._deferred_ack_targets[self.room] = target
+
+        self._provoke_worker_failure(manager)
+
+        self.assertEqual(manager._staging_outstanding[self.room], 1)
+        self.assertNotIn(self.room, manager._deferred_ack_targets)
+
+        self._dispatch_abort(manager)
+        self.assertNotIn(self.room, manager._deferred_ack_targets)
+        self.assertEqual(manager._sent, [])
+
+        manager.request_status.pop(self.room, None)
+        CommonKVManager.update_status(manager, self.room, KVPoll.Bootstrapping)
+        self._dispatch_abort(manager)
+        self.assertNotIn(self.room, manager._deferred_ack_targets)
+        self.assertEqual(manager._sent, [(self.room, target)])
+
+
+class TestAbortWireFormat(CustomTestCase):
+    def test_abort_notification_round_trip(self):
+        notification = AbortNotification(100, "10.0.0.1", 5000, 7)
+
+        self.assertEqual(
+            AbortNotification.from_zmq(notification.to_zmq()), notification
+        )
+
+    def test_legacy_abort_without_return_address(self):
+        self.assertEqual(
+            AbortNotification.from_zmq([ABORT_TAG, b"101"]),
+            AbortNotification(room=101),
+        )
+
+    def test_malformed_abort_is_rejected(self):
+        self.assertIsNone(AbortNotification.from_zmq([ABORT_TAG, b"bad-room"]))
+
+    def test_malformed_abort_generation_is_dropped(self):
+        notification = AbortNotification.from_zmq(
+            [ABORT_TAG, b"101", b"10.0.0.1", b"5000", b"bad-generation"]
+        )
+
+        self.assertEqual(
+            notification,
+            AbortNotification(room=101, decode_ip="10.0.0.1", decode_port=5000),
+        )
+
+    def test_abort_ack_round_trip(self):
+        ack = AbortAck(room=102, prefill_rank=3, generation=7)
+
+        self.assertEqual(AbortAck.from_zmq(ack.to_zmq()), ack)
+
+
+class TestCommonAbortAckDispatch(CustomTestCase):
+    def test_abort_ack_message_is_aggregated(self):
+        mgr = _make_manager()
+        generation = mgr.register_deferred_abort_room(103)
+
+        claimed = mgr.handle_abort_ack_message(AbortAck(103, 4, generation).to_zmq())
+
+        self.assertTrue(claimed)
+        self.assertEqual(mgr._deferred_abort_ack_tracker[103].prefill_ranks, {4})
+
+    def test_non_ack_message_is_not_claimed(self):
+        mgr = _make_manager()
+
+        self.assertFalse(mgr.handle_abort_ack_message([b"STATUS", b"103", b"4"]))
+
+    def test_malformed_abort_ack_is_ignored(self):
+        mgr = _make_manager()
+        mgr.register_deferred_abort_room(103)
+
+        self.assertTrue(
+            mgr.handle_abort_ack_message([ABORT_ACK_TAG, b"bad-room", b"4", b"1"])
+        )
+        self.assertFalse(mgr.is_abort_release_safe(103, required_acks=1))
+
+    def test_generationless_abort_ack_warns_and_is_ignored(self):
+        mgr = _make_manager()
+        mgr.register_deferred_abort_room(103)
+
+        with patch(
+            "sglang.srt.disaggregation.common.conn.logger.warning_once"
+        ) as warning:
+            claimed = mgr.handle_abort_ack_message([ABORT_ACK_TAG, b"103", b"4"])
+
+        self.assertTrue(claimed)
+        self.assertFalse(mgr.is_abort_release_safe(103, required_acks=1))
+        warning.assert_called_once()
+
+    def test_stale_generation_ack_is_ignored_after_room_reuse(self):
+        mgr = _make_manager()
+        mgr.register_deferred_abort_room(103)
+        mgr.clear_deferred_abort_state(103)
+        mgr.register_deferred_abort_room(103)
+
+        claimed = mgr.handle_abort_ack_message([ABORT_ACK_TAG, b"103", b"4", b"1"])
+
+        self.assertTrue(claimed)
+        self.assertFalse(mgr.is_abort_release_safe(103, required_acks=1))
+
+        claimed = mgr.handle_abort_ack_message([ABORT_ACK_TAG, b"103", b"4", b"2"])
+
+        self.assertTrue(claimed)
+        self.assertTrue(mgr.is_abort_release_safe(103, required_acks=1))
+
+    def test_abort_for_deferred_release_arms_before_abort(self):
+        mgr = _make_manager()
+        receiver = _TestReceiver.__new__(_TestReceiver)
+        receiver.kv_mgr = mgr
+        receiver.bootstrap_room = 104
+        receiver.abort_notified = False
+        observed = []
+        receiver.abort = lambda: observed.append(104 in mgr._deferred_abort_ack_tracker)
+
+        receiver.abort_for_deferred_release()
+
+        self.assertEqual(observed, [True])
+
+    def test_abort_for_deferred_release_skips_tracker_when_disabled(self):
+        mgr = _make_manager()
+        mgr.enable_deferred_decode_kv_release = False
+        receiver = _TestReceiver.__new__(_TestReceiver)
+        receiver.kv_mgr = mgr
+        receiver.bootstrap_room = 105
+        receiver.abort_notified = False
+        receiver.abort = lambda: None
+
+        receiver.abort_for_deferred_release()
+
+        self.assertNotIn(105, mgr._deferred_abort_ack_tracker)
+
+    def test_base_receiver_falls_back_to_plain_abort(self):
+        receiver = FakeKVReceiver.__new__(FakeKVReceiver)
+        receiver.conclude_state = None
+
+        receiver.abort_for_deferred_release()
+
+        self.assertEqual(receiver.conclude_state, KVPoll.Failed)
+
+
+class TestDeferredAckTargets(CustomTestCase):
+    def test_ack_held_until_outstanding_drains(self):
+        mgr = _make_prefill_manager()
+        target = AckTarget("10.0.0.1", 5000, 9)
+        mgr.register_deferred_ack_target(7, target)
+
+        mgr._staging_outstanding[7] = 1
+        mgr._maybe_ack_drained_abort(7)
+        self.assertEqual(mgr._sent, [])
+
+        mgr._staging_outstanding[7] = 0
+        mgr._maybe_ack_drained_abort(7)
+        self.assertEqual(mgr._sent, [(7, target)])
+
+    def test_ack_fires_at_most_once(self):
+        mgr = _make_prefill_manager()
+        target = AckTarget("10.0.0.2", 5001, 10)
+        mgr.register_deferred_ack_target(8, target)
+
+        mgr._maybe_ack_drained_abort(8)
+        mgr._maybe_ack_drained_abort(8)
+
+        self.assertEqual(mgr._sent, [(8, target)])
+        self.assertNotIn(8, mgr._deferred_ack_targets)
+
+    def test_unregistered_room_is_noop(self):
+        mgr = _make_prefill_manager()
+
+        mgr._maybe_ack_drained_abort(999)
+
+        self.assertEqual(mgr._sent, [])
+
+    def test_sender_clear_keeps_target_until_outstanding_transfer_drains(self):
+        mgr = _make_prefill_manager()
+        mgr.request_status = {7: KVPoll.Failed}
+        target = AckTarget("10.0.0.1", 5000, 9)
+        mgr.register_deferred_ack_target(7, target)
+        mgr._staging_outstanding[7] = 1
+        sender = _TestSender.__new__(_TestSender)
+        sender.kv_mgr = mgr
+        sender.bootstrap_room = 7
+
+        sender.clear()
+
+        self.assertEqual(mgr._deferred_ack_targets[7], target)
+        mgr._staging_outstanding[7] = 0
+        mgr._maybe_ack_drained_abort(7)
+        self.assertEqual(mgr._sent, [(7, target)])
+
+    def test_sender_clear_discards_target_without_outstanding_transfer(self):
+        mgr = _make_prefill_manager()
+        mgr.request_status = {7: KVPoll.Failed}
+        mgr.register_deferred_ack_target(7, AckTarget("10.0.0.1", 5000, 9))
+        sender = _TestSender.__new__(_TestSender)
+        sender.kv_mgr = mgr
+        sender.bootstrap_room = 7
+
+        sender.clear()
+
+        self.assertNotIn(7, mgr._deferred_ack_targets)
+
+    def test_prefill_unique_rank_formula(self):
+        mgr = CommonKVManager.__new__(CommonKVManager)
+        mgr.attn_tp_rank, mgr.pp_size, mgr.attn_cp_size = 2, 3, 4
+        mgr.pp_rank, mgr.attn_cp_rank = 1, 3
+
+        self.assertEqual(mgr._prefill_unique_rank(), 31)
 
 
 class TestAbortAckAggregation(CustomTestCase):
     def test_release_safe_only_after_all_required_ranks_ack(self):
         mgr = _make_manager()
         room = 100
-        mgr.register_deferred_abort_room(room)
+        generation = mgr.register_deferred_abort_room(room)
         self.assertFalse(mgr.is_abort_release_safe(room, required_acks=2))
 
-        mgr.note_abort_ack(room, 0)
+        mgr.note_abort_ack(room, 0, generation)
         self.assertFalse(mgr.is_abort_release_safe(room, required_acks=2))
 
-        mgr.note_abort_ack(room, 1)
+        mgr.note_abort_ack(room, 1, generation)
         self.assertTrue(mgr.is_abort_release_safe(room, required_acks=2))
 
     def test_duplicate_rank_ack_does_not_over_count(self):
         mgr = _make_manager()
         room = 101
-        mgr.register_deferred_abort_room(room)
-        mgr.note_abort_ack(room, 0)
-        mgr.note_abort_ack(room, 0)  # same rank twice
+        generation = mgr.register_deferred_abort_room(room)
+        mgr.note_abort_ack(room, 0, generation)
+        mgr.note_abort_ack(room, 0, generation)  # same rank twice
         # Two acks arrived but from one rank: not safe for a 2-rank prefill.
         self.assertFalse(mgr.is_abort_release_safe(room, required_acks=2))
-
-    def test_single_rank_fast_path(self):
-        mgr = _make_manager()
-        room = 102
-        mgr.register_deferred_abort_room(room)
-        mgr.note_abort_ack(room, 0)
-        self.assertTrue(mgr.is_abort_release_safe(room, required_acks=1))
 
     def test_clear_deferred_abort_state(self):
         mgr = _make_manager()
         room = 103
-        mgr.register_deferred_abort_room(room)
-        mgr.note_abort_ack(room, 0)
+        generation = mgr.register_deferred_abort_room(room)
+        mgr.note_abort_ack(room, 0, generation)
         mgr.clear_deferred_abort_state(room)
         self.assertNotIn(room, mgr._deferred_abort_ack_tracker)
         self.assertFalse(mgr.is_abort_release_safe(room, required_acks=1))
@@ -72,41 +448,16 @@ class TestAbortAckAggregation(CustomTestCase):
         # would otherwise pollute a later request reusing the same room).
         mgr = _make_manager()
         room = 104
-        mgr.note_abort_ack(room, 0)  # no register yet
+        mgr.note_abort_ack(room, 0, 1)  # no register yet
         self.assertNotIn(room, mgr._deferred_abort_ack_tracker)
         self.assertFalse(mgr.is_abort_release_safe(room, required_acks=1))
-
-    def test_late_ack_after_release_does_not_pollute_reused_room(self):
-        # Regression for bootstrap_room reuse: req A (room R) releases, then a
-        # late ack from A arrives, then req B reuses room R. B must start from a
-        # clean slate and not inherit A's ack (which would release B early while
-        # its transfer is still in flight -> KV corruption).
-        mgr = _make_manager()
-        room = 105
-
-        # Req A: held, one of two ranks acks, then released (e.g. timed out).
-        mgr.register_deferred_abort_room(room)
-        mgr.note_abort_ack(room, 0)
-        mgr.clear_deferred_abort_state(room)
-
-        # Late ack from A's other rank arrives after release -> dropped.
-        mgr.note_abort_ack(room, 1)
-        self.assertNotIn(room, mgr._deferred_abort_ack_tracker)
-
-        # Req B reuses room R.
-        mgr.register_deferred_abort_room(room)
-        # Only B's rank-0 has acked so far; a 2-rank prefill is NOT safe yet.
-        mgr.note_abort_ack(room, 0)
-        self.assertFalse(mgr.is_abort_release_safe(room, required_acks=2))
-        mgr.note_abort_ack(room, 1)
-        self.assertTrue(mgr.is_abort_release_safe(room, required_acks=2))
 
     def test_register_resets_stale_acks(self):
         mgr = _make_manager()
         room = 106
-        mgr.register_deferred_abort_room(room)
-        mgr.note_abort_ack(room, 0)
-        mgr.note_abort_ack(room, 1)
+        generation = mgr.register_deferred_abort_room(room)
+        mgr.note_abort_ack(room, 0, generation)
+        mgr.note_abort_ack(room, 1, generation)
         self.assertTrue(mgr.is_abort_release_safe(room, required_acks=2))
         # Re-registering (a later reuse) wipes the prior acks.
         mgr.register_deferred_abort_room(room)
@@ -162,7 +513,7 @@ class TestResolveDeferredReleases(CustomTestCase):
         dreq = _make_decode_req(room, idx, mgr, n_prefill_ranks=2)
         # In production the room is armed in abort_request when the ABORT is
         # sent, before the scheduler defers here.
-        mgr.register_deferred_abort_room(room)
+        generation = mgr.register_deferred_abort_room(room)
         q._defer_release(dreq)
 
         with patch.object(decode_mod, "release_kv_cache") as rel:
@@ -172,13 +523,13 @@ class TestResolveDeferredReleases(CustomTestCase):
             self.assertEqual(len(q._deferred_releases), 1)
 
             # One of two ranks acked -> still held.
-            mgr.note_abort_ack(room, 0)
+            mgr.note_abort_ack(room, 0, generation)
             q.resolve_deferred_releases()
             rel.assert_not_called()
             self.assertEqual(len(q._deferred_releases), 1)
 
             # Both ranks acked -> released exactly once.
-            mgr.note_abort_ack(room, 1)
+            mgr.note_abort_ack(room, 1, generation)
             q.resolve_deferred_releases()
             rel.assert_called_once_with(dreq.req, q.tree_cache, is_insert=False)
 

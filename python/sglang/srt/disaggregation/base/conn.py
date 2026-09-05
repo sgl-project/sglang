@@ -245,6 +245,10 @@ class BaseKVReceiver(ABC):
         """
         pass
 
+    def abort_for_deferred_release(self) -> None:
+        """Abort using the backend's native behavior."""
+        self.abort()
+
 
 class BaseKVBootstrapServer(ABC):
     @abstractmethod

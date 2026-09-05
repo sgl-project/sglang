@@ -17,6 +17,9 @@ from prometheus_client import Counter
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
+    ABORT_ACK_TAG,
+    ABORT_TAG,
+    AbortNotification,
     CommonKVBootstrapServer,
     CommonKVManager,
     CommonKVReceiver,
@@ -223,9 +226,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
             self.start_prefill_thread()
-            # Per-room count of chunks not yet transferred; teardown waits for
-            # zero so a deferred chunk is not dropped by an early conclude.
-            self._staging_outstanding = defaultdict(int)
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = (
@@ -1658,8 +1658,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
         while True:
+            kv_chunk: Optional[TransferKVChunk] = None
             try:
-                kv_chunk: TransferKVChunk = queue.get()
+                kv_chunk = queue.get()
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -1999,9 +2000,83 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
+                if kv_chunk is not None:
+                    self.poison_deferred_ack_room(kv_chunk.room)
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
+
+    def _handle_abort_notification(self, msg: List[bytes]) -> bool:
+        if not msg or msg[0] != ABORT_TAG:
+            return False
+
+        notification = AbortNotification.from_zmq(msg)
+        if notification is None:
+            return True
+        room = notification.room
+        room_active = (
+            room in self.request_status and self.check_status(room) != KVPoll.Success
+        )
+
+        if self.enable_deferred_decode_kv_release:
+            self._handle_deferred_abort_notification(notification, room_active)
+        else:
+            self._handle_legacy_abort_notification(notification, room_active)
+        return True
+
+    def _handle_deferred_abort_notification(
+        self, notification: AbortNotification, room_active: bool
+    ) -> None:
+        room = notification.room
+        if room_active:
+            self.update_status(room, KVPoll.Failed)
+
+        ack_target = notification.deferred_ack_target()
+        if ack_target is None:
+            return
+        self.register_deferred_ack_target(room, ack_target)
+        self._maybe_ack_drained_abort(room)
+        if room_active:
+            logger.debug(
+                "Received abort notification for room %s, marked as Failed; "
+                "ACK deferred until transfer drains",
+                room,
+            )
+
+    def _handle_legacy_abort_notification(
+        self, notification: AbortNotification, room_active: bool
+    ) -> None:
+        room = notification.room
+        if room_active:
+            self.update_status(room, KVPoll.Failed)
+            logger.debug(
+                "Received abort notification for room %s, marked as Failed", room
+            )
+        else:
+            logger.debug(
+                "Received abort notification for room %s, ignoring "
+                "(already completed or unknown)",
+                room,
+            )
+
+        if notification.decode_ip is None or notification.decode_port is None:
+            return
+        try:
+            na = NetworkAddress(notification.decode_ip, notification.decode_port)
+            # Deferred ACKs carry a rank; the feature-off wire format does not.
+            self._send_multipart_locked(
+                na.to_tcp(),
+                [ABORT_ACK_TAG, str(room).encode("ascii")],
+                is_ipv6=na.is_ipv6,
+            )
+            logger.debug(
+                "Sent ABORT_ACK for room %s to %s:%s",
+                room,
+                notification.decode_ip,
+                notification.decode_port,
+            )
+        except Exception as exc:
+            logger.debug("Failed to send ABORT_ACK for room %s: %s", room, exc)
 
     def start_prefill_thread(self):
         def bootstrap_thread():
@@ -2018,74 +2093,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if room == "STAGING_RSP":
                     handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
                     continue
-                # Decode-side abort notification: mark room as failed and ACK
-                if room == "ABORT":
-                    room_to_be_aborted = int(waiting_req_bytes[1].decode("ascii"))
-                    decode_ip = waiting_req_bytes[2].decode("ascii")
-                    decode_port = int(waiting_req_bytes[3].decode("ascii"))
-                    room_active = (
-                        room_to_be_aborted in self.request_status
-                        and self.check_status(room_to_be_aborted) != KVPoll.Success
-                    )
-                    if self.enable_deferred_decode_kv_release:
-                        # Mark Failed FIRST (stops add_transfer_request enqueuing
-                        # new chunks), THEN register the ack target: registering
-                        # first would let the worker drain+ack while the room is
-                        # not yet Failed, so a newly enqueued chunk could still
-                        # write to the freed pages. The worker (not this thread)
-                        # acks once its in-flight write drains; if nothing is in
-                        # flight, decode falls back to the release timeout.
-                        if room_active:
-                            self.update_status(room_to_be_aborted, KVPoll.Failed)
-                            self.register_deferred_ack_target(
-                                room_to_be_aborted, decode_ip, decode_port
-                            )
-                            # Try once: the room may already be quiescent and
-                            # never revisited by the worker.
-                            self._maybe_ack_drained_abort(room_to_be_aborted)
-                            logger.debug(
-                                f"Received abort notification for room {room_to_be_aborted}, "
-                                f"marked as Failed; ACK deferred until transfer drains"
-                            )
-                        elif self._staging_outstanding.get(room_to_be_aborted, 0) == 0:
-                            # Concluded/unknown AND quiescent: ack now. A cleared
-                            # room is not automatically quiescent -- clear() can
-                            # drop a room whose chunk is still transferring.
-                            self._send_abort_ack(
-                                decode_ip, decode_port, room_to_be_aborted
-                            )
-                        continue
-                    # No need to abort the room if it has already succeeded
-                    if room_active:
-                        self.update_status(room_to_be_aborted, KVPoll.Failed)
-                        logger.debug(
-                            f"Received abort notification for room {room_to_be_aborted}, "
-                            f"marked as Failed"
-                        )
-                    else:
-                        logger.debug(
-                            f"Received abort notification for room {room_to_be_aborted}, "
-                            f"ignoring (already completed or unknown)"
-                        )
-                    # Send ACK back to decode endpoint
-                    try:
-                        na = NetworkAddress(decode_ip, decode_port)
-                        self._send_multipart_locked(
-                            na.to_tcp(),
-                            [
-                                b"ABORT_ACK",
-                                str(room_to_be_aborted).encode("ascii"),
-                            ],
-                            is_ipv6=na.is_ipv6,
-                        )
-                        logger.debug(
-                            f"Sent ABORT_ACK for room {room_to_be_aborted} to "
-                            f"{decode_ip}:{decode_port}"
-                        )
-                    except Exception as e:
-                        logger.debug(
-                            f"Failed to send ABORT_ACK for room {room_to_be_aborted}: {e}"
-                        )
+                if self._handle_abort_notification(waiting_req_bytes):
                     continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
@@ -2169,16 +2177,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     self._handle_staging_req(msg)
                     continue
 
-                # Prefill acknowledges abort notification
-                if msg[0] == b"ABORT_ACK":
-                    ack_aborted_room = int(msg[1].decode("ascii"))
-                    logger.debug(f"Received ABORT_ACK for room {ack_aborted_room}")
-                    # Deferred release: the 3-frame ack carries the prefill rank
-                    # and means its transfer drained; aggregate for is_abort_release_safe.
-                    if self.enable_deferred_decode_kv_release and len(msg) >= 3:
-                        self.note_abort_ack(
-                            ack_aborted_room, int(msg[2].decode("ascii"))
-                        )
+                if self.handle_abort_ack_message(msg):
                     continue
 
                 bootstrap_room, status, prefill_rank = msg

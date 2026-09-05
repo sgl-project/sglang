@@ -1,0 +1,367 @@
+"""Deferred decode-side KV release on the Mori backend."""
+
+import importlib
+import sys
+import threading
+import types
+import unittest
+from collections import defaultdict
+from enum import IntEnum
+from queue import Queue
+from unittest.mock import MagicMock, patch
+
+import numpy as np
+
+
+def _install_mori_stubs() -> None:
+    try:
+        importlib.import_module("mori.cpp")
+        importlib.import_module("mori.io")
+        return
+    except (ImportError, OSError):
+        pass
+
+    mori = types.ModuleType("mori")
+    mori.__path__ = []
+    mori_cpp = types.ModuleType("mori.cpp")
+    mori_io = types.ModuleType("mori.io")
+
+    class FakeStatusCode(IntEnum):
+        SUCCESS = 0
+        IN_PROGRESS = 1
+        FAILED = 2
+
+    mori_cpp.TransferStatus = object
+    for name in (
+        "BackendType",
+        "EngineDesc",
+        "IOEngine",
+        "IOEngineConfig",
+        "MemoryDesc",
+        "MemoryLocationType",
+        "PollCqMode",
+        "RdmaBackendConfig",
+    ):
+        setattr(mori_io, name, object)
+    mori_io.StatusCode = FakeStatusCode
+    mori.cpp = mori_cpp
+    mori.io = mori_io
+    sys.modules["mori"] = mori
+    sys.modules["mori.cpp"] = mori_cpp
+    sys.modules["mori.io"] = mori_io
+
+
+_install_mori_stubs()
+
+from test_deferred_decode_kv_release import (
+    ABORT_GENERATION,
+    DeferredAbortNotificationScenarios,
+)
+
+from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.common.conn import (
+    ABORT_TAG,
+    AbortNotification,
+    AckTarget,
+)
+from sglang.srt.disaggregation.common.utils import TransferKVChunk
+from sglang.srt.disaggregation.mori.conn import (
+    MoriKVManager,
+    StatusCode,
+    _MoriTransferSubmissionError,
+)
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+def _manager(enabled: bool = True) -> MoriKVManager:
+    manager = MoriKVManager.__new__(MoriKVManager)
+    manager.enable_deferred_decode_kv_release = enabled
+    manager.request_status = {}
+    manager.transfer_lock = threading.Lock()
+    manager._abort_ack_lock = threading.Lock()
+    manager._deferred_ack_targets = {}
+    manager._deferred_ack_poisoned_rooms = set()
+    manager._deferred_abort_ack_tracker = {}
+    manager._staging_outstanding = defaultdict(int)
+    manager._drain_queue = Queue(maxsize=1)
+    manager._submission_local = threading.local()
+    manager.req_to_decode_prefix_len = {}
+    manager.transfer_infos = {}
+    manager._room_notify_lock = threading.Lock()
+    manager._room_status_notified = {}
+    manager.failure_lock = threading.Lock()
+    manager.failure_records = {}
+    manager._sent = []
+    manager._send_abort_ack = lambda *args: manager._sent.append(args)
+    manager._wait_poll_ms = 0
+    manager._transfer_timeout_ms = 0
+    return manager
+
+
+def _abort_message(room: int = 11) -> list[bytes]:
+    return AbortNotification(room, "10.0.0.3", 6000, ABORT_GENERATION).to_zmq()
+
+
+def _chunk(room: int = 11) -> TransferKVChunk:
+    return TransferKVChunk(
+        room=room,
+        prefill_kv_indices=np.array([1], dtype=np.int32),
+        index_slice=slice(0, 1),
+        is_last_chunk=False,
+        prefill_aux_index=None,
+        state_indices=None,
+    )
+
+
+class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
+    room = 11
+    decode_ip = "10.0.0.3"
+    decode_port = 6000
+
+    def _make_abort_manager(self, status: KVPoll | None):
+        manager = _manager()
+        if status is not None:
+            manager.request_status[self.room] = status
+        return manager
+
+    def _dispatch_abort(self, manager) -> None:
+        manager._handle_abort_message(self._abort_message())
+
+    def _start_test_transfer(self, manager) -> None:
+        manager._mark_transfer_started(_chunk(self.room))
+
+    def _drain_test_transfer(self, manager) -> None:
+        manager._mark_transfer_quiescent(_chunk(self.room))
+
+    def test_abort_without_valid_return_address_marks_failed_without_ack(self):
+        messages = (
+            ("missing", [ABORT_TAG, b"11"]),
+            ("malformed port", [ABORT_TAG, b"11", b"10.0.0.3", b"bad"]),
+        )
+
+        for name, message in messages:
+            with self.subTest(name=name):
+                manager = _manager()
+                manager.request_status[11] = KVPoll.WaitingForInput
+
+                manager._handle_abort_message(message)
+
+                self.assertEqual(manager.request_status[11], KVPoll.Failed)
+                self.assertEqual(manager._sent, [])
+                self.assertEqual(manager._deferred_ack_targets, {})
+
+    def test_feature_off_preserves_abort_without_ack(self):
+        manager = _manager(enabled=False)
+        manager.request_status[11] = KVPoll.WaitingForInput
+
+        manager._handle_abort_message(_abort_message())
+
+        self.assertEqual(manager.request_status[11], KVPoll.Failed)
+        self.assertEqual(manager._sent, [])
+        self.assertEqual(manager._deferred_ack_targets, {})
+
+    def test_abort_after_submit_waits_for_terminal_status(self):
+        manager = _manager()
+        manager.request_status[11] = KVPoll.Transferring
+        status = MagicMock()
+        status.InProgress.return_value = False
+        manager._submit_kv_transfer = MagicMock(return_value=([status], None))
+        wait_results = iter((StatusCode.IN_PROGRESS, StatusCode.SUCCESS))
+
+        def wait_all(*args, **kwargs):
+            result = next(wait_results)
+            if result == StatusCode.IN_PROGRESS:
+                manager._handle_abort_message(_abort_message())
+                self.assertEqual(manager._sent, [])
+            return result
+
+        manager.engine = MagicMock()
+        manager.engine.wait_all.side_effect = wait_all
+        chunk = _chunk()
+        manager._mark_transfer_started(chunk)
+
+        is_quiescent = manager._process_transfer_chunk(chunk)
+
+        self.assertTrue(is_quiescent)
+        self.assertEqual(manager.engine.wait_all.call_count, 2)
+        self.assertEqual(manager._sent, [])
+        manager._mark_transfer_quiescent(chunk)
+        self.assertEqual(
+            manager._sent,
+            [(11, AckTarget("10.0.0.3", 6000, ABORT_GENERATION))],
+        )
+
+    def test_sla_failure_acks_after_status_drains(self):
+        manager = _manager()
+        manager.request_status[11] = KVPoll.Transferring
+        manager._transfer_timeout_ms = 1
+        manager.engine = MagicMock()
+        manager.engine.wait_all.return_value = StatusCode.IN_PROGRESS
+        status = MagicMock()
+        status.InProgress.return_value = True
+        manager._submit_kv_transfer = MagicMock(return_value=([status], None))
+        manager._conclude_room_failure = MagicMock()
+        chunk = _chunk()
+        manager._mark_transfer_started(chunk)
+
+        with patch(
+            "sglang.srt.disaggregation.mori.conn.time.perf_counter",
+            side_effect=(0.0, 0.002),
+        ):
+            is_quiescent = manager._process_transfer_chunk(chunk)
+
+        self.assertFalse(is_quiescent)
+        manager.engine.wait_all.assert_called_once()
+        self.assertEqual(manager._sent, [])
+        self.assertEqual(manager._staging_outstanding[11], 1)
+        manager._conclude_room_failure.assert_not_called()
+        manager._handle_abort_message(_abort_message())
+        queued_chunk, queued_statuses, failure_reason = (
+            manager._drain_queue.get_nowait()
+        )
+        manager._drain_transfer_statuses(queued_chunk, queued_statuses, failure_reason)
+
+        status.Wait.assert_called_once_with()
+        self.assertEqual(
+            manager._sent,
+            [(11, AckTarget("10.0.0.3", 6000, ABORT_GENERATION))],
+        )
+        self.assertNotIn(11, manager._staging_outstanding)
+        manager._conclude_room_failure.assert_called_once_with(
+            11, "KV transfer exceeded SLA 1ms"
+        )
+
+    def test_sla_failure_keeps_legacy_early_return_when_disabled(self):
+        manager = _manager(enabled=False)
+        manager._transfer_timeout_ms = 1
+        manager.engine = MagicMock()
+        manager.engine.wait_all.side_effect = (
+            StatusCode.IN_PROGRESS,
+            StatusCode.SUCCESS,
+        )
+
+        with patch(
+            "sglang.srt.disaggregation.mori.conn.time.perf_counter",
+            side_effect=(0.0, 0.002),
+        ):
+            failure = manager._wait_transfer_completion([object()])
+
+        self.assertEqual(failure, "KV transfer exceeded SLA 1ms")
+        self.assertEqual(manager.engine.wait_all.call_count, 1)
+
+    def test_wait_event_failure_releases_outstanding_count(self):
+        manager = _manager()
+        manager.request_status[11] = KVPoll.Transferring
+        manager._conclude_room_failure = MagicMock()
+        chunk = _chunk()
+        chunk.wait_event = MagicMock()
+        chunk.wait_event.synchronize.side_effect = RuntimeError("event failed")
+        queue = MagicMock()
+        queue.get.side_effect = (chunk, KeyboardInterrupt())
+
+        with patch("sglang.srt.disaggregation.mori.conn.logger.exception"):
+            with self.assertRaises(KeyboardInterrupt):
+                manager._transfer_worker(queue)
+
+        self.assertNotIn(11, manager._staging_outstanding)
+        manager._conclude_room_failure.assert_called_once()
+
+    def test_wait_all_exception_keeps_status_for_draining(self):
+        manager = _manager()
+        manager.request_status[11] = KVPoll.Transferring
+        status = MagicMock()
+        manager._submit_kv_transfer = MagicMock(return_value=([status], None))
+        manager.engine = MagicMock()
+        manager.engine.wait_all.side_effect = RuntimeError("wait failed")
+        manager._conclude_room_failure = MagicMock()
+
+        is_quiescent = manager._process_transfer_chunk(_chunk())
+
+        self.assertFalse(is_quiescent)
+        queued_chunk, queued_statuses, failure_reason = (
+            manager._drain_queue.get_nowait()
+        )
+        self.assertEqual(queued_chunk.room, 11)
+        self.assertEqual(queued_statuses, [status])
+        self.assertEqual(
+            failure_reason, "Transfer completion failed: RuntimeError('wait failed')"
+        )
+        manager._conclude_room_failure.assert_not_called()
+
+    def test_partial_submission_failure_transfers_ownership_to_drainer(self):
+        manager = _manager()
+        manager.request_status[11] = KVPoll.Transferring
+        status = MagicMock()
+
+        def submit(*args, **kwargs):
+            manager._record_submitted_statuses([status])
+            raise RuntimeError("later target failed")
+
+        manager._submit_kv_transfer = submit
+        manager._conclude_room_failure = MagicMock()
+        chunk = _chunk()
+        manager._mark_transfer_started(chunk)
+
+        with self.assertRaises(_MoriTransferSubmissionError) as raised:
+            manager._process_transfer_chunk(chunk)
+        manager._handle_submission_failure(chunk, raised.exception)
+
+        queued_chunk, queued_statuses, failure_reason = (
+            manager._drain_queue.get_nowait()
+        )
+        self.assertIs(queued_chunk, chunk)
+        self.assertEqual(queued_statuses, [status])
+        self.assertEqual(
+            failure_reason,
+            "Transfer submission failed: later target failed",
+        )
+        self.assertEqual(manager._staging_outstanding[11], 1)
+        manager._conclude_room_failure.assert_not_called()
+
+    def test_drain_worker_retries_same_item_after_exception(self):
+        manager = _manager()
+        manager._wait_poll_ms = 0
+        chunk = _chunk()
+        status = MagicMock()
+        manager._drain_queue = MagicMock()
+        manager._drain_queue.get.side_effect = (
+            (chunk, [status], None),
+            KeyboardInterrupt(),
+        )
+        manager._drain_transfer_statuses = MagicMock(
+            side_effect=(RuntimeError("transient wait failure"), None)
+        )
+
+        with patch("sglang.srt.disaggregation.mori.conn.logger.exception") as log:
+            with patch("sglang.srt.disaggregation.mori.conn.time.sleep"):
+                with self.assertRaises(KeyboardInterrupt):
+                    manager._drain_worker()
+
+        self.assertEqual(manager._drain_transfer_statuses.call_count, 2)
+        log.assert_called_once()
+
+    def test_failure_notification_precedes_ownership_release(self):
+        manager = _manager()
+        chunk = _chunk()
+        status = MagicMock()
+        status.InProgress.return_value = False
+        manager._conclude_room_failure = MagicMock(
+            side_effect=(RuntimeError("notification failed"), None)
+        )
+        manager._mark_transfer_quiescent = MagicMock()
+
+        with self.assertRaises(RuntimeError):
+            manager._drain_transfer_statuses(chunk, [status], "transfer failed")
+        manager._mark_transfer_quiescent.assert_not_called()
+
+        manager._drain_transfer_statuses(chunk, [status], "transfer failed")
+
+        self.assertEqual(manager._conclude_room_failure.call_count, 2)
+        manager._mark_transfer_quiescent.assert_called_once_with(chunk)
+
+
+if __name__ == "__main__":
+    unittest.main()
