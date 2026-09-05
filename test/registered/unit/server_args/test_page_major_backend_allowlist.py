@@ -24,12 +24,19 @@ exposes per-layer views and nothing else:
   * plain `--enable-page-major-kv-layout` without the unified pool keeps the
     envelope-strided 4-D views only the stride-aware Triton kernels read.
 
-The same handler screens the pool itself: the MHA/SWA per-layer views need
-uniform K/V rows, so an asymmetric-K/V model (MiMoV2: head_dim 192 !=
-v_head_dim 128) is rejected on EVERY backend, Triton included. MLA models are
-exempt -- their sub-pool keeps one latent row per layer, and real MLA configs
-(Kimi-Linear: head_dim 72, v_head_dim 128) report asymmetric dims while running
-the unified pool today.
+The same handler also screens the pool itself: asymmetric K/V rows are not
+admitted yet, so an asymmetric-K/V model (MiMoV2: head_dim 192 != v_head_dim
+128) cannot run `--enable-unified-memory` at all and is rejected on EVERY
+backend, Triton included. MLA models are exempt -- their sub-pool keeps
+one latent row per layer, and several MLA configs (Kimi-Linear: head_dim 72,
+v_head_dim 128) report asymmetric dims while running the unified pool today.
+
+Pinned here so no arm silently widens to an unwired backend (`cutlass_mla`,
+`aiter`) and no arm silently narrows: `fa3` is the resolved default on
+pre-Blackwell hosts, so its absence from an arm makes `--enable-unified-memory`
+fail to boot under its own default configuration.
+
+    python -m pytest test/registered/unit/server_args/test_page_major_backend_allowlist.py -v
 """
 
 import unittest
@@ -98,7 +105,7 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
         "tokenspeed_mla",
         "flashmla",
     )
-    # Wired for the per-layer MHA/SWA views (uniform-row models).
+    # Wired for the per-layer MHA/SWA views.
     PER_LAYER_VIEW_MHA_BACKENDS = ("fa3", "fa4", "flashinfer", "trtllm_mha")
     # MLA-family kernels that must never leak into the MHA arm.
     MLA_ONLY_BACKENDS = ("trtllm_mla", "cutedsl_mla", "tokenspeed_mla", "flashmla")
@@ -110,8 +117,8 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
         the MLA nor the MHA arm can narrow away."""
         for use_mla in (True, False):
             self.assertTrue(_accepts("triton", use_mla=use_mla))
-        # The uniform-row screen is a property of the model, not of the
-        # backend, so it rejects even Triton.
+        # Asymmetric K/V rows are not admitted yet; that is a property of the
+        # model, not of the backend, so the screen rejects even Triton.
         self.assertFalse(_accepts("triton", use_mla=False, has_asymmetric_kv=True))
 
     def test_per_layer_view_mla_backends_allowed_under_unified_mla(self):
@@ -121,11 +128,11 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                 f"{backend} should be allowed with the unified-memory MLA pool",
             )
 
-    def test_per_layer_view_mha_backends_allowed_for_uniform_row_models(self):
+    def test_per_layer_view_mha_backends_allowed_under_unified_mha(self):
         for backend in self.PER_LAYER_VIEW_MHA_BACKENDS:
             self.assertTrue(
                 _accepts(backend, use_mla=False),
-                f"{backend} should be allowed for a uniform-row MHA model",
+                f"{backend} should be allowed with the unified-memory MHA pool",
             )
 
     def test_mla_only_backends_rejected_for_mha(self):
@@ -136,7 +143,8 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
             )
 
     def test_asymmetric_kv_mha_model_cannot_use_unified_memory(self):
-        """The rejection is the POOL's, not a backend's, so it must fire on
+        """head_dim != v_head_dim (MiMoV2): not admitted under the unified pool
+        yet. The rejection is the POOL's, not a backend's, so it must fire on
         every backend -- Triton included."""
         for backend in ("triton",) + self.PER_LAYER_VIEW_MHA_BACKENDS:
             self.assertFalse(
