@@ -199,6 +199,7 @@ def _assert_pp_mtp_compat(
     assert (
         (not model_has_mtp_layers)
         or (spec_algorithm.is_none())
+        or spec_algorithm.is_dspark()
         or (
             (not spec_algorithm.is_none())
             and (num_effective_layers == model_num_layers)
