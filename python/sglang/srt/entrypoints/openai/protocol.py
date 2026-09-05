@@ -1651,6 +1651,12 @@ class ResponsesRequest(BaseModel):
     cache_salt: Optional[str] = Field(
         default=None, description="Cache salt for request caching"
     )
+    prompt_cache_key: Optional[str] = Field(
+        default=None,
+        description=(
+            "OpenAI prompt cache key. Applied as cache_salt when cache_salt is unset."
+        ),
+    )
 
     # SGLang sampling extras. ``None`` defers to ``--preferred-sampling-params``.
     frequency_penalty: float = 0.0

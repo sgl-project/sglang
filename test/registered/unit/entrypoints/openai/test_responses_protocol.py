@@ -406,5 +406,21 @@ class ToolChoiceObjectFormTestCase(CustomTestCase):
             )
 
 
+class PromptCacheKeyTestCase(CustomTestCase):
+    def test_prompt_cache_key_is_accepted(self):
+        request = ResponsesRequest(input="hello", prompt_cache_key="task-a")
+        self.assertEqual(request.prompt_cache_key, "task-a")
+        self.assertIsNone(request.cache_salt)
+
+    def test_cache_salt_wins_when_both_set(self):
+        request = ResponsesRequest(
+            input="hello",
+            cache_salt="native",
+            prompt_cache_key="task-a",
+        )
+        self.assertEqual(request.cache_salt, "native")
+        self.assertEqual(request.prompt_cache_key, "task-a")
+
+
 if __name__ == "__main__":
     unittest.main()

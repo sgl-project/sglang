@@ -1031,5 +1031,76 @@ class StreamingLogprobsRejectionTestCase(CustomTestCase):
         self.assertIn("streaming mode", body["error"]["message"])
 
 
+class PromptCacheKeyForwardingTestCase(CustomTestCase):
+    def _capture_adapted(self, request):
+        serving = make_serving()
+        rendered = MessageProcessingResult(
+            prompt="prompt",
+            prompt_ids=[1, 2, 3],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+        )
+        captured = {}
+
+        async def fake_generate(
+            request_id,
+            request_prompt,
+            adapted_request,
+            sampling_params,
+            context,
+            **kwargs,
+        ):
+            captured["adapted_request"] = adapted_request
+            context.append_output(
+                {
+                    "text": "done",
+                    "meta_info": {
+                        "prompt_tokens": 3,
+                        "completion_tokens": 1,
+                        "cached_tokens": 0,
+                    },
+                }
+            )
+            yield context
+
+        serving._generate_with_builtin_tools = fake_generate
+        with (
+            patch.object(
+                serving, "_apply_conversation_template", return_value=rendered
+            ),
+            patch(
+                "sglang.srt.entrypoints.openai.serving_responses.ReasoningParser"
+            ) as parser_cls,
+        ):
+            parser_cls.return_value.parse_non_stream.return_value = (None, "done")
+            response = asyncio.run(serving.create_responses(request))
+        self.assertEqual(response.status, "completed")
+        return captured["adapted_request"]
+
+    def test_prompt_cache_key_maps_to_cache_salt(self):
+        request = ResponsesRequest(
+            model="x",
+            input="hello",
+            prompt_cache_key="task-a",
+            store=False,
+        )
+        adapted = self._capture_adapted(request)
+        self.assertEqual(adapted.cache_salt, "task-a")
+
+    def test_native_cache_salt_wins_over_prompt_cache_key(self):
+        request = ResponsesRequest(
+            model="x",
+            input="hello",
+            cache_salt="native",
+            prompt_cache_key="task-a",
+            store=False,
+        )
+        adapted = self._capture_adapted(request)
+        self.assertEqual(adapted.cache_salt, "native")
+
+
 if __name__ == "__main__":
     unittest.main()
