@@ -1,9 +1,11 @@
+import argparse
 import unittest
 
 from sglang.benchmark.dspark_sps_profiler import (
     LoadInfo,
     ServerContext,
     SpsRow,
+    add_fit_args,
     build_request_count_sweep,
     build_table_from_summaries,
     count_aligned_steps,
@@ -199,6 +201,13 @@ class TestPostprocessRoundCrossRank(CustomTestCase):
 
 
 class TestTableAssembly(CustomTestCase):
+    def test_mbin_width_cli_default_and_override(self):
+        parser = argparse.ArgumentParser()
+        add_fit_args(parser)
+
+        self.assertEqual(parser.parse_args([]).mbin_w, 64)
+        self.assertEqual(parser.parse_args(["--mbin-w", "6"]).mbin_w, 6)
+
     def test_repeats_take_the_median_per_batch_tokens(self):
         rounds = [
             postprocess_round(
@@ -221,6 +230,53 @@ class TestTableAssembly(CustomTestCase):
         )
         self.assertEqual(table.sample_batch_tokens, [32])
         self.assertAlmostEqual(table.sample_steps_per_sec[0], 50.0)
+
+    def test_offdiag_mbin_width_controls_m_probes(self):
+        summaries = [
+            {
+                "batch_size_per_rank": bs,
+                "batch_tokens": m,
+                "steps_per_sec": 1.0 / (0.1 + 0.01 * bs + 0.001 * m),
+                "frac": 0.5,
+            }
+            for bs in (1, 2)
+            for m in (0, 6, 12)
+        ]
+
+        coarse = build_table_from_summaries(
+            summaries=summaries,
+            max_batch_tokens=None,
+            offdiag=True,
+        )
+        fine = build_table_from_summaries(
+            summaries=summaries,
+            max_batch_tokens=None,
+            offdiag=True,
+            mbin_w=6,
+        )
+
+        self.assertEqual(coarse.m_probes, [0])
+        self.assertEqual(fine.m_probes, [0, 6, 12])
+
+    def test_offdiag_mbin_width_must_be_positive(self):
+        summaries = [
+            {
+                "batch_size_per_rank": bs,
+                "batch_tokens": m,
+                "steps_per_sec": 10.0,
+                "frac": 0.5,
+            }
+            for bs in (1, 2)
+            for m in (0, 6)
+        ]
+
+        with self.assertRaisesRegex(ValueError, "mbin_w must be positive"):
+            build_table_from_summaries(
+                summaries=summaries,
+                max_batch_tokens=None,
+                offdiag=True,
+                mbin_w=0,
+            )
 
 
 class TestSweepHelpers(CustomTestCase):
