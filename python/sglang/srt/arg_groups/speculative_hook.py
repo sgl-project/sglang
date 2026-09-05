@@ -183,6 +183,31 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             algo.handle_server_args,
         )
 
+    _validate_dcp_spec(server_args)
+
+
+def _validate_dcp_spec(server_args: ServerArgs) -> None:
+    if (
+        server_args.speculative_algorithm is None
+        or getattr(server_args, "dcp_size", 1) <= 1
+    ):
+        return
+
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+    if not (algo.is_eagle() or algo.is_standalone() or algo.is_dflash()):
+        return
+
+    topk = getattr(server_args, "speculative_eagle_topk", None)
+    if topk is not None and int(topk) > 1:
+        raise ValueError(
+            "Decode context parallel (--dcp-size > 1) supports only chain "
+            "speculative drafts: the DCP verify path folds the draft tokens as "
+            "a linear causal chain. Set --speculative-eagle-topk 1, or run "
+            "without --dcp-size."
+        )
+
 
 def _handle_dflash(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
