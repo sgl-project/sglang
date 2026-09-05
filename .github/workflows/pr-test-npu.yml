@@ -297,7 +297,7 @@ jobs:
     if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
-      runner: linux-aarch64-a3-800t-2
+      runner: linux-aarch64-a3-2-
       test_type: 'accuracy'
       test_suite: base-c-test-acc-2-npu-a3
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
@@ -311,7 +311,7 @@ jobs:
     if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
-      runner: linux-aarch64-a3-800t-16
+      runner: linux-aarch64-a3-16-
       test_type: 'accuracy'
       test_suite: base-c-test-acc-16-npu-a3
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
