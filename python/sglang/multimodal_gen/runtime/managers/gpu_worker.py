@@ -301,6 +301,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         # Warmup probes run the default workload's full shape and may exceed any
         # serving request; keep their peak out of the runtime figure.
         self._warmup_peak_reserved_mb = 0.0
+        self._release_warmup_pool_before_serving = False
         self.sp_group = get_sp_group()
         self.sp_cpu_group = self.sp_group.cpu_group
         self.tp_group = get_tp_group()
@@ -720,6 +721,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 # starts from the same placement and can return released
                 # component storage before its allocated peak is measured.
                 torch.get_device_module().empty_cache()
+            self._release_warmup_pool(req)
             if not current_platform.is_cpu() and not current_platform.is_mps():
                 torch.get_device_module().reset_peak_memory_stats()
             if measure_server_warmup:
@@ -1141,6 +1143,22 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 _shape_label(fitted),
             )
         req.sampling_params = fitted.sampling_params
+
+    def _release_warmup_pool(self, req: Req) -> None:
+        """Drop the allocator pool warmup left behind before the first real request.
+
+        Warmup probes run shapes serving never sees; their cached blocks would
+        otherwise become the floor of every runtime peak measurement.
+        """
+        if req.is_warmup:
+            self._release_warmup_pool_before_serving = True
+            return
+        if not self._release_warmup_pool_before_serving:
+            return
+        self._release_warmup_pool_before_serving = False
+        if current_platform.is_cpu() or current_platform.is_mps():
+            return
+        torch.get_device_module().empty_cache()
 
     def _record_output_peak_memory(
         self, output_batch: OutputBatch, *, is_warmup: bool = False
