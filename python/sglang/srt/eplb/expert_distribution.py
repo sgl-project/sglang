@@ -557,6 +557,7 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
 class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._source_objects_of_layer = {}
         if torch.distributed.get_rank() == 0:
             logger.info(
                 "DeepepNormalSinglePassGatherer gathers approximate statistics. "
@@ -573,6 +574,30 @@ class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
     ):
         assert isinstance(local_physical_count_of_layer, list)
         self._on_layer_data(layer_idx, local_physical_count_of_layer)
+        if get_exec().moe.eplb_algorithm == "topology_aware":
+            # ``local_physical_count_of_layer`` is the post-A2A receive count.
+            # The topology planner needs the pre-A2A source traffic instead,
+            # which DeepEP exposes as ``num_tokens_per_expert``.
+            if isinstance(num_tokens_per_expert, torch.Tensor):
+                source_count = num_tokens_per_expert.detach().cpu().tolist()
+            else:
+                source_count = list(num_tokens_per_expert)
+            if len(source_count) != self._expert_location_metadata.num_physical_experts:
+                raise ValueError(
+                    "DeepEP source expert counts must cover all physical experts "
+                    f"(got {len(source_count)}, expected "
+                    f"{self._expert_location_metadata.num_physical_experts})"
+                )
+            if layer_idx in self._source_objects_of_layer:
+                self._source_objects_of_layer[layer_idx] = _list_sum(
+                    self._source_objects_of_layer[layer_idx], source_count
+                )
+            else:
+                self._source_objects_of_layer[layer_idx] = source_count
+
+    def reset(self):
+        super().reset()
+        self._source_objects_of_layer.clear()
 
     def collect(self) -> Dict:
         local_physical_count = super()._collect_objects(
@@ -581,10 +606,20 @@ class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
         global_physical_count = _convert_local_to_global_physical_count(
             local_physical_count,
             rank=self._rank,
-            num_local_physical_experts=self._expert_location_metadata.num_local_physical_experts,
+            num_local_physical_experts=(
+                self._expert_location_metadata.num_local_physical_experts
+            ),
             num_physical_experts=self._expert_location_metadata.num_physical_experts,
         )
-        return dict(global_physical_count=global_physical_count)
+        output = dict(global_physical_count=global_physical_count)
+        if get_exec().moe.eplb_algorithm == "topology_aware":
+            source_physical_count = [
+                self._source_objects_of_layer.get(layer_index)
+                or ([0] * self._expert_location_metadata.num_physical_experts)
+                for layer_index in range(self._expert_location_metadata.num_layers)
+            ]
+            output["source_physical_count"] = torch.tensor(source_physical_count)
+        return output
 
 
 class _DeepepLowLatencySinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
@@ -888,6 +923,17 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             dtype=torch.int32,
             device=get_device_namespace().device,
         )
+        self._logical_count_by_source_of_buffered_step = None
+        if get_exec().moe.eplb_algorithm == "topology_aware":
+            self._logical_count_by_source_of_buffered_step = _Buffer.init_new(
+                item_shape=(
+                    self._expert_location_metadata.num_layers,
+                    self._expert_location_metadata.num_logical_experts,
+                ),
+                buffer_size=get_exec().moe.expert_distribution_recorder_buffer_size,
+                dtype=torch.int32,
+                device=get_device_namespace().device,
+            )
         self._first_dump = True
 
     def append(
@@ -902,10 +948,35 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         self._global_physical_count_of_buffered_step.append(
             single_pass_data["global_physical_count"]
         )
+        if self._logical_count_by_source_of_buffered_step is not None:
+            source_physical_count = single_pass_data.get(
+                "source_physical_count",
+                single_pass_data["global_physical_count"],
+            ).to(get_device_namespace().device)
+            expected_shape = (
+                self._expert_location_metadata.num_layers,
+                self._expert_location_metadata.num_physical_experts,
+            )
+            if tuple(source_physical_count.shape) != expected_shape:
+                raise ValueError(
+                    "topology-aware EPLB source counts must have shape "
+                    f"{expected_shape}, got {tuple(source_physical_count.shape)}"
+                )
+            source_logical_count = _convert_global_physical_count_to_logical_count(
+                source_physical_count.unsqueeze(0),
+                num_layers=self._expert_location_metadata.num_layers,
+                num_logical_experts=self._expert_location_metadata.num_logical_experts,
+                physical_to_logical_map=(
+                    self._expert_location_metadata.physical_to_logical_map
+                ),
+            )[0]
+            self._logical_count_by_source_of_buffered_step.append(source_logical_count)
 
     def reset(self):
         super().reset()
         self._global_physical_count_of_buffered_step.reset()
+        if self._logical_count_by_source_of_buffered_step is not None:
+            self._logical_count_by_source_of_buffered_step.reset()
 
     def dump(self, output_mode: _OutputMode):
         logical_count_of_buffered_step = _convert_global_physical_count_to_logical_count(
@@ -914,6 +985,30 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             num_logical_experts=self._expert_location_metadata.num_logical_experts,
             physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
         )
+
+        logical_count_by_rank = None
+        if self._logical_count_by_source_of_buffered_step is not None:
+            # Keep the sender dimension for the topology-aware planner.  The
+            # regular EPLB path still uses the cheaper all-reduce below.
+            local_logical_count = (
+                self._logical_count_by_source_of_buffered_step.get_all().sum(dim=0)
+            )
+            from sglang.srt.distributed import get_moe_ep_group
+
+            ep_group = get_moe_ep_group()
+            if ep_group.world_size != self._expert_location_metadata.ep_size:
+                raise RuntimeError(
+                    "topology-aware EPLB source-count gather group does not "
+                    "match the configured EP size "
+                    f"(group={ep_group.world_size}, "
+                    f"metadata={self._expert_location_metadata.ep_size})"
+                )
+            gathered = ep_group.all_gather(local_logical_count, dim=0)
+            logical_count_by_rank = gathered.reshape(
+                ep_group.world_size,
+                self._expert_location_metadata.num_layers,
+                self._expert_location_metadata.num_logical_experts,
+            )
 
         if self._first_dump:
             self._first_dump = False
@@ -928,6 +1023,8 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             logical_count=logical_count_of_buffered_step,
             average_utilization_rate_over_window=self._get_global_average_utilization_rate(),
         )
+        if logical_count_by_rank is not None:
+            output["logical_count_by_rank"] = logical_count_by_rank
 
         if output_mode == "file":
             if self._rank == 0:

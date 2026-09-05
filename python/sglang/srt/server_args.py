@@ -2488,6 +2488,12 @@ class ServerArgs:
     )
     enable_eplb: A[bool, "Enable EPLB algorithm", NS("exec.moe")] = False
     eplb_algorithm: A[str, "Chosen EPLB algorithm", NS("exec.moe")] = "auto"
+    eplb_topology: A[
+        Optional[str],
+        "JSON file containing the EP rank-to-rank communication cost matrix for "
+        "topology-aware EPLB.",
+        NS("exec.moe"),
+    ] = None
     eplb_rebalance_num_iterations: A[
         int,
         "Number of iterations to automatically trigger a EPLB re-balance.",
