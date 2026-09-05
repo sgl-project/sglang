@@ -1,6 +1,6 @@
 """
 Usage:
-python offline_batch_inference_vlm.py --model-path Qwen/Qwen2-VL-7B-Instruct
+python offline_batch_inference_vlm.py --model-path Qwen/Qwen2-VL-7B-Instruct --chat-template qwen2-vl
 """
 
 import argparse
@@ -16,7 +16,7 @@ def main(
 ):
     vlm = sgl.Engine(**dataclasses.asdict(server_args))
 
-    conv = chat_templates[server_args.chat_template].copy()
+    conv = chat_templates[server_args.chat_template or "qwen2-vl"].copy()
     image_token = conv.image_token
 
     image_url = "https://github.com/sgl-project/sglang/blob/main/examples/assets/example_image.png?raw=true"
