@@ -41,16 +41,17 @@ import logging
 import tempfile
 import uuid
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
-from sglang.srt.arg_groups.arg_utils import NS, A, Arg, add_cli_args_from_dataclass
+from sglang.srt.arg_groups.arg_utils import (
+    add_cli_args_from_dataclass,
+)
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
     DeprecatedAliasStoreAction,
     DeprecatedStoreConstAction,
     DeprecatedStoreTrueAction,
-    LoRAPathAction,
 )
 from sglang.srt.arg_groups.model_override_base import ep_joiner_of, ep_scale_joiner_of
 from sglang.srt.arg_groups.overrides import (
@@ -60,12 +61,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
-    CudaGraphConfig,
-    parse_cuda_graph_config_arg,
-)
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.runtime_context import (
     get_context,
@@ -73,13 +69,6 @@ from sglang.srt.runtime_context import (
     publish,
 )
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
-from sglang.srt.utils.common import (
-    LORA_TARGET_ALL_MODULES,
-    SUPPORTED_LORA_TARGET_MODULES,
-    human_readable_int,
-    json_list_type,
-    nullable_str,
-)
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
 
 logger = logging.getLogger(__name__)
@@ -288,7 +277,7 @@ class ServerArgs:
         self._resolution_finished = True
 
     @property
-    def launch_command(self) -> Optional[str]:
+    def launch_command(self) -> str | None:
         """How this record was created, verbatim.
 
         `resolved_dict` answers with what resolution decided; this answers with
@@ -304,7 +293,7 @@ class ServerArgs:
         """
         return getattr(self, "_launch_command", None)
 
-    def resolved_dict(self) -> Dict[str, Any]:
+    def resolved_dict(self) -> dict[str, Any]:
         """This configuration as a plain dict of resolved field values.
 
         What the whole-object readbacks report (`/server_info` and its gRPC and
@@ -659,7 +648,7 @@ class ServerArgs:
 
         return TokenizerWorker
 
-    def url(self, port: Optional[int] = None):
+    def url(self, port: int | None = None):
         scheme = "https" if self.ssl_certfile else "http"
         # When binding to all interfaces, use loopback for internal requests.
         host = self.host
@@ -877,7 +866,7 @@ def record_writable(server_args: Any):
             object.__setattr__(server_args, "_input_frozen", True)
 
 
-def prepare_server_args(argv: List[str]) -> ServerArgs:
+def prepare_server_args(argv: list[str]) -> ServerArgs:
     """
     Prepare the server arguments from the command line arguments.
 
@@ -947,10 +936,10 @@ class PortArgs:
     metrics_ipc_name: str
 
     # The ipc filename for MultiTokenizerRouter to receive inputs from TokenizerWorker processes (zmq)
-    tokenizer_worker_ipc_name: Optional[str]
+    tokenizer_worker_ipc_name: str | None
 
     # The ipc endpoints between verifier scheduler and drafter scheduler
-    decoupled_spec_ipc_config: Optional[DecoupledSpecIpcConfig]
+    decoupled_spec_ipc_config: DecoupledSpecIpcConfig | None
 
     # zmq address for load snapshot PUSH/PULL (dp-attention TCP mode only;
     # empty when IPC mode derives the address from instance_id).
@@ -963,8 +952,8 @@ class PortArgs:
     @staticmethod
     def init_new(
         server_args: ServerArgs,
-        dp_rank: Optional[int] = None,
-        worker_ports: Optional[List[int]] = None,
+        dp_rank: int | None = None,
+        worker_ports: list[int] | None = None,
     ) -> PortArgs:
         cfg = resolving_view(server_args)
         if server_args.nccl_port is None:
