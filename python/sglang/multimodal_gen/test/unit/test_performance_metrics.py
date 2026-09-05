@@ -437,7 +437,12 @@ def test_warmup_peak_stays_out_of_the_runtime_peak():
     assert worker._runtime_peak_reserved_mb == 20000.0
 
 
-def test_worker_releases_the_warmup_pool_once_before_serving(monkeypatch):
+def _warmup_req(*, probe: bool = False) -> SimpleNamespace:
+    extra = {"auto_residency_full_shape_probe": True} if probe else {}
+    return SimpleNamespace(is_warmup=True, extra=extra)
+
+
+def test_worker_releases_the_probe_pool_before_the_next_request(monkeypatch):
     calls = []
     fake_device = SimpleNamespace(empty_cache=lambda: calls.append("empty_cache"))
     monkeypatch.setattr(
@@ -448,16 +453,19 @@ def test_worker_releases_the_warmup_pool_once_before_serving(monkeypatch):
     worker = GPUWorker.__new__(GPUWorker)
     worker._release_warmup_pool_before_serving = False
 
-    worker._release_warmup_pool(SimpleNamespace(is_warmup=True))
-    worker._release_warmup_pool(SimpleNamespace(is_warmup=True))
+    worker._release_warmup_pool(_warmup_req())
+    worker._release_warmup_pool(_warmup_req(probe=True))
     assert calls == []
 
-    worker._release_warmup_pool(SimpleNamespace(is_warmup=False))
-    worker._release_warmup_pool(SimpleNamespace(is_warmup=False))
+    # the bounded re-warm after the probe regrows the pool from empty
+    worker._release_warmup_pool(_warmup_req())
+    assert calls == ["empty_cache"]
+
+    worker._release_warmup_pool(SimpleNamespace(is_warmup=False, extra={}))
     assert calls == ["empty_cache"]
 
 
-def test_worker_does_not_release_a_pool_without_warmup(monkeypatch):
+def test_worker_keeps_the_pool_when_no_probe_ran(monkeypatch):
     calls = []
     fake_device = SimpleNamespace(empty_cache=lambda: calls.append("empty_cache"))
     monkeypatch.setattr(
@@ -466,5 +474,6 @@ def test_worker_does_not_release_a_pool_without_warmup(monkeypatch):
     worker = GPUWorker.__new__(GPUWorker)
     worker._release_warmup_pool_before_serving = False
 
-    worker._release_warmup_pool(SimpleNamespace(is_warmup=False))
+    worker._release_warmup_pool(_warmup_req())
+    worker._release_warmup_pool(SimpleNamespace(is_warmup=False, extra={}))
     assert calls == []
