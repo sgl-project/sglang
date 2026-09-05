@@ -41,7 +41,6 @@ class RACERWorker(NGRAMWorker):
         self.racer_prompt_warmup_chunk = max(
             1, int(os.getenv("SGLANG_RACER_PROMPT_WARMUP_CHUNK", "64"))
         )
-        self._warned_prompt_warmup_tp = False
 
         self.racer_stats_enabled = os.getenv("SGLANG_RACER_STATS", "0").lower() in (
             "1",
@@ -165,6 +164,29 @@ class RACERWorker(NGRAMWorker):
             return (time.perf_counter() - start) * 1000.0
         return 0.0
 
+    @staticmethod
+    def _gather_prompt_logits(logits_processor, local_logits: torch.Tensor) -> torch.Tensor:
+        """Gather vocabulary-sharded prompt logits on every TP rank.
+
+        ``_compute_lm_head`` returns only the local vocabulary shard when the LM
+        head is tensor-parallel. RACER needs global token ids for its TokenBin,
+        so prompt warm-up must mirror SGLang's normal logits gather before
+        applying top-k. We deliberately use the full-logits gather here as the
+        correctness-first implementation; prompt chunks keep the temporary
+        [Tc, V] tensor bounded.
+
+        For standard TP this is the same ``_logits_gatherer`` used by
+        ``LogitsProcessor._get_logits``. DP-attention LM-head configurations use
+        their dedicated attention-TP gather path. Every TP rank performs the
+        gather so every RACER request-local TokenBin remains identical.
+        """
+
+        if not logits_processor.do_tensor_parallel_all_gather:
+            return local_logits
+        if logits_processor.use_attn_tp_group:
+            return logits_processor._gather_attn_tp_logits(local_logits)
+        return logits_processor._logits_gatherer(local_logits)
+
     def _warm_prompt_tokenbin(self, batch, hidden_states: torch.Tensor) -> None:
         """Seed RACER's copy-logit adjacency from prompt positions.
 
@@ -175,26 +197,19 @@ class RACERWorker(NGRAMWorker):
 
         SGLang adaptation: EXTEND already computed the prompt hidden states, so
         this path applies only the LM head in small chunks instead of rerunning
-        the transformer. For a chunk of ``Tc`` prompt positions:
+        the transformer. For a chunk of ``Tc`` prompt positions under TP:
 
             hidden_states : [Tc, H]
-            logits        : [Tc, V]
+            local logits  : [Tc, V / TP]
+            global logits : [Tc, V]
             top-k ids     : [Tc, racer_topk]
 
-        Softmax is omitted because it preserves the logits ranking. This first
-        implementation is intentionally TP=1 only.
+        The vocabulary gather happens before top-k, so the resulting ids are
+        global vocabulary ids and are identical across TP ranks. Softmax is
+        omitted because it preserves the logits ranking.
         """
 
         if not self.racer_prompt_warmup:
-            return
-        if self.tp_rank != 0 or self.model_runner.server_args.tp_size != 1:
-            if not self._warned_prompt_warmup_tp:
-                logger.warning(
-                    "RACER prompt TokenBin warm-up currently supports TP=1 only; "
-                    "skipping warm-up for tp_size=%d.",
-                    self.model_runner.server_args.tp_size,
-                )
-                self._warned_prompt_warmup_tp = True
             return
         if hidden_states is None or hidden_states.ndim != 2:
             logger.warning(
@@ -224,15 +239,19 @@ class RACERWorker(NGRAMWorker):
         lm_head = model.lm_head
         topk = min(self.racer_topk, self.model_runner.model_config.vocab_size)
 
+        warmup_start = time.perf_counter() if self.racer_stats_enabled else 0.0
         topk_chunks: list[torch.Tensor] = []
+        num_chunks = 0
         for start in range(0, total, self.racer_prompt_warmup_chunk):
             end = min(total, start + self.racer_prompt_warmup_chunk)
-            logits = logits_processor._compute_lm_head(
+            local_logits = logits_processor._compute_lm_head(
                 hidden_states[start:end], lm_head
             )
+            logits = self._gather_prompt_logits(logits_processor, local_logits)
             ids = torch.topk(logits, k=topk, dim=-1).indices
             topk_chunks.append(ids.cpu())
-            del logits
+            num_chunks += 1
+            del local_logits, logits
 
         topk_ids = torch.cat(topk_chunks, dim=0)
         self.ngram_corpus.seed_prompt_logits(
@@ -241,6 +260,17 @@ class RACERWorker(NGRAMWorker):
             topk_ids.numpy(),
             prompt_lens,
         )
+
+        if self.racer_stats_enabled:
+            elapsed_ms = (time.perf_counter() - warmup_start) * 1000.0
+            logger.info(
+                "[RACER_PROMPT_WARMUP] tp=%d rows=%d chunks=%d topk=%d ms=%.3f",
+                self.model_runner.server_args.tp_size,
+                total,
+                num_chunks,
+                topk,
+                elapsed_ms,
+            )
 
     def forward_batch_generation(self, batch, on_publish=None) -> GenerationBatchResult:
         fwd_stream = torch.get_device_module(self.device).current_stream()
