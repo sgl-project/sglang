@@ -60,6 +60,11 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5LinearDecoderLayer,
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.models.qwen4_exp_ple_table import (
+    allocate_ple_host_table,
+    make_ple_file_prefetcher,
+    make_ple_file_rss_trimmer,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import logger
 
@@ -748,7 +753,7 @@ def _gather_ple_embedding_from_pinned_kernel(
 
 
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
-    """PLE table read directly from pinned host memory.
+    """PLE table read directly from host memory (pinned, or a file-backed mmap).
 
     The table stays in its checkpoint storage dtype (fp8 with a per-tensor
     weight_scale for fp8 checkpoints, bf16 otherwise); gathers emit bf16.
@@ -773,7 +778,13 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         "num_added_embeddings_per_partition",
     )
 
-    def __init__(self, embedding: VocabParallelEmbedding) -> None:
+    def __init__(
+        self,
+        embedding: VocabParallelEmbedding,
+        *,
+        backend: str = "pinned",
+        table_dir: Optional[str] = None,
+    ) -> None:
         nn.Module.__init__(self)
         if not isinstance(embedding.quant_method, UnquantizedEmbeddingMethod):
             raise NotImplementedError(
@@ -795,15 +806,23 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.quant_method = None
 
         source_weight = embedding.weight
-        cpu_weight = nn.Parameter(
-            torch.empty(
-                source_weight.shape,
-                dtype=source_weight.dtype,
-                device="cpu",
-                pin_memory=True,
+        host_table = allocate_ple_host_table(
+            shape=source_weight.shape,
+            dtype=source_weight.dtype,
+            backend=backend,
+            table_dir=table_dir,
+            # Each TP rank holds a different vocabulary shard of the same shape.
+            tag=(
+                f"rows{self.shard_indices.org_vocab_start_index}"
+                f"-{self.shard_indices.org_vocab_end_index}"
             ),
-            requires_grad=False,
         )
+        # Only the file backend has anything to prefetch (rows live on storage).
+        self._file_prefetcher = make_ple_file_prefetcher(host_table)
+        # ... and only it needs its resident set bounded: a fault maps a whole
+        # folio, so the mapping would otherwise creep towards the full table.
+        self._file_rss_trimmer = make_ple_file_rss_trimmer(host_table)
+        cpu_weight = nn.Parameter(host_table, requires_grad=False)
         for name, value in vars(source_weight).items():
             setattr(cpu_weight, name, value)
         cpu_weight.weight_loader = self.weight_loader
@@ -846,6 +865,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
         flat_ids = input_ids.reshape(-1).long()
         if flat_ids.numel():
+            if self._file_prefetcher is not None:
+                self._file_prefetcher.enqueue(flat_ids)
             _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
                 self.weight.data_ptr(),
                 flat_ids,
@@ -893,7 +914,9 @@ class Qwen4ExpPLELayer(nn.Module):
         )
         if config.ple_offload_embedding:
             self.ple_embedding.ngram_embedding = Qwen4ExpPinnedHostEmbedding(
-                self.ple_embedding.ngram_embedding
+                self.ple_embedding.ngram_embedding,
+                backend=getattr(config, "ple_offload_backend", "pinned"),
+                table_dir=getattr(config, "ple_offload_dir", None),
             )
         self.short_conv_dilation = self.ple_embedding.ngram_size
         self.short_conv_state_len = (

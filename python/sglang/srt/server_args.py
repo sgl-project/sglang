@@ -2620,6 +2620,31 @@ class ServerArgs:
         ),
         NS("exec.offload"),
     ] = None
+    ple_offload_backend: A[
+        str,
+        Arg(
+            help="Host storage for the offloaded Qwen4 PLE n-gram table. "
+            "'pinned' (default) uses CPU pinned memory. 'file' maps a sparse "
+            "file under --ple-offload-dir and lets the gather kernel read it "
+            "directly; use it on unified-memory devices (e.g. GB10 / DGX Spark) "
+            "where pinned host memory comes out of the same pool as the model "
+            "weights. Requires a device that reports "
+            "cudaDevAttrPageableMemoryAccessUsesHostPageTables.",
+            choices=["pinned", "file"],
+        ),
+        NS("exec.offload"),
+    ] = "pinned"
+    ple_offload_dir: A[
+        Optional[str],
+        Arg(
+            help="Directory for the file-backed PLE table when "
+            "--ple-offload-backend is 'file'. Defaults to "
+            "$SGLANG_CACHE_DIR/ple/<model path>, one directory per checkpoint. "
+            "The file is sparse and reused across restarts; put it on fast "
+            "local storage (NVMe).",
+        ),
+        NS("exec.offload"),
+    ] = None
     linear_attn_verify_backend: A[
         Optional[str],
         Arg(
@@ -3793,6 +3818,11 @@ class ServerArgs:
                 "--ple-offload-embedding cannot be combined with "
                 "--cpu-offload-gb or --offload-group-size: generic layer offload "
                 "would stage the pinned PLE embedding back to the device."
+            )
+        if self.ple_offload_backend == "file" and self.ple_offload_embedding is False:
+            raise ValueError(
+                "--ple-offload-backend file requires --ple-offload-embedding: "
+                "the file-backed table is the offloaded table."
             )
 
     def _handle_moe_runner_backend_alias(self):
