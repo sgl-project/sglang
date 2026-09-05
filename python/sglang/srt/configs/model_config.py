@@ -1160,7 +1160,9 @@ class ModelConfig:
             )
             self.num_attention_layers = encoder_layers + 2 * decoder_layers
         self.num_nextn_predict_layers = getattr(
-            self.hf_text_config, "num_nextn_predict_layers", None
+            self.hf_text_config,
+            "num_nextn_predict_layers",
+            getattr(self.hf_config, "num_nextn_predict_layers", None),
         )
         self.vocab_size = self.hf_text_config.vocab_size
         # GLM-Image is the only model here whose output head predicts vision tokens.
