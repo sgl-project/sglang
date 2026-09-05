@@ -575,12 +575,6 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "fused inside the full-attention page envelope (or falls back "
             "to a private pool over the unified virtual id space)."
         )
-        assert cfg.speculative_eagle_topk in (None, 1), (
-            "--enable-unified-memory + EAGLE/EAGLE3 supports a linear "
-            "draft chain only (--speculative-eagle-topk in {None, 1}); "
-            "tree verify is not audited for the unified pool. Got "
-            f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
-        )
         eagle_allowed = (
             _SPEC_VERIFY_AUDITED_BACKENDS
             if use_mla_backend(server_args)
@@ -608,12 +602,6 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "to inherit the target's."
         )
     if cfg.speculative_algorithm == "DSPARK":
-        assert cfg.speculative_eagle_topk in (None, 1), (
-            "--enable-unified-memory + DSPARK supports a linear draft "
-            "chain only (--speculative-eagle-topk in {None, 1}); tree "
-            "verify is not audited for the unified pool. Got "
-            f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
-        )
         _assert_spec_verify_backends(server_args, algorithm="DSPARK")
     if cfg.speculative_algorithm == "DFLASH":
         _assert_spec_verify_backends(
