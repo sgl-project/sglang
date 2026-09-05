@@ -788,11 +788,12 @@ export const config = {
     // request's prefix state is no longer pinned in the radix tree during
     // decode, a cache-retention trade, not a numerics change),
     // --mamba-ssm-dtype bfloat16 (halves the slot to 0.055 GiB), and pin
-    // --max-mamba-cache-size = requests x 3. --linear-attn-decode-backend
-    // triton keeps the GDN decode kernel the fp32 runs and the DGX Spark cells
-    // use; the FlashInfer GDN decode also runs on SM120 and measured the same
-    // TPOT and accuracy, so the pin is there to keep the bf16-state auto-default
-    // from switching kernels silently.
+    // --max-mamba-cache-size = requests x 3. The linear-attention kernels are
+    // left on auto: on SM120 that resolves to triton for decode, prefill and
+    // verify (the bf16-state FlashInfer GDN auto-default is SM100-only), the
+    // same kernel the fp32 runs and the DGX Spark cells use. An explicit
+    // --linear-attn-decode-backend flashinfer also runs on SM120 and measured
+    // the same TPOT and accuracy.
     //
     // With the state pool pinned, the KV pool takes whatever is left of the
     // static budget, so --mem-fraction-static is what sets the activation
@@ -837,7 +838,6 @@ export const config = {
         "--max-running-requests 16",
         "--max-mamba-cache-size 48",
         "--mamba-ssm-dtype bfloat16",
-        "--linear-attn-decode-backend triton",
         "--reasoning-parser qwen3",
         "--mem-fraction-static 0.96",
         "--host {{HOST_IP}}",
@@ -870,7 +870,6 @@ export const config = {
         "--max-running-requests 64",
         "--max-mamba-cache-size 192",
         "--mamba-ssm-dtype bfloat16",
-        "--linear-attn-decode-backend triton",
         "--reasoning-parser qwen3",
         "--mem-fraction-static 0.93",
         "--host {{HOST_IP}}",
