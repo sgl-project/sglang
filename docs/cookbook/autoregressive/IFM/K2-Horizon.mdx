@@ -41,7 +41,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 1. Model introduction
 
-**K2 Horizon** is an IFM model family spanning six checkpoints from **0.9B** to **375B** parameters. The family includes dense models, Mixture-of-Experts models, and the 36B checkpoint's routed Mixture-of-Value-Attention path. This page provides native SGLang serving recipes for the family.
+**K2 Horizon** is an IFM model family spanning six checkpoints from **0.9B** to **375B** parameters. The family includes dense models, Mixture-of-Experts models, and the MoVA-36B-A4B checkpoint's routed Mixture-of-Value-Attention path. This page provides native SGLang serving recipes for the family.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -84,13 +84,13 @@ import { Playground } from "/src/snippets/_playground.jsx";
       <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>BF16 · TP2</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/IFM/K2-Horizon-36B">36B</a></strong></td>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/IFM/K2-Horizon-MoVA-36B-A4B">MoVA-36B-A4B</a></strong></td>
       <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>MoE + MoVA</td>
       <td style={{padding: "9px 12px", textAlign: "right"}}>524,288</td>
       <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>BF16 · TP2</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/IFM/K2-Horizon-375B">375B</a></strong></td>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/IFM/K2-Horizon-375B-A23B">375B-A23B</a></strong></td>
       <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>MoE</td>
       <td style={{padding: "9px 12px", textAlign: "right"}}>524,288</td>
       <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>BF16 · TP8</td>
@@ -102,21 +102,21 @@ import { Playground } from "/src/snippets/_playground.jsx";
   All six checkpoints use the Apache License 2.0.
 </Note>
 
-**Resources:** [K2 Horizon collection](https://huggingface.co/collections/IFM/k2-horizon) · [K2 Horizon 375B model card](https://huggingface.co/IFM/K2-Horizon-375B).
+**Resources:** [K2 Horizon collection](https://huggingface.co/collections/IFM/k2-horizon) · [K2 Horizon 375B-A23B model card](https://huggingface.co/IFM/K2-Horizon-375B-A23B).
 
 ## 2. Configuration tips
 
 - **Hardware and precision:** The current matrix covers NVIDIA H200 GPUs and BF16 checkpoints only.
-- **Parallelism:** Use TP1 for 0.9B, 3.7B, and 7B; TP2 for 32B and 36B; and TP8 for 375B. Each recipe stays within one node.
+- **Parallelism:** Use TP1 for 0.9B, 3.7B, and 7B; TP2 for 32B and MoVA-36B-A4B; and TP8 for 375B-A23B. Each recipe stays within one node.
 - **Attention:** The verified base recipes select FlashAttention-3 with `--attention-backend fa3`.
-- **Revisions:** The recipes pin revisions `9b9ec1f7e17f62ed218df542687a144116219d84` (0.9B), `c177771836a4c460743c00002c22483f6f18d1eb` (3.7B), `69ada542b68fe13d767479db2ab9421baff88681` (7B), `e1fd0277713e4eefcd3416348fd6fedacf7f2392` (32B), `16d20c739c687c08423422d1a2fbba6c529014cd` (36B), and `12812264242a14dce44aa7ae27f931ff4584bcbf` (375B).
+- **Revisions:** The recipes pin revisions `9b9ec1f7e17f62ed218df542687a144116219d84` (0.9B), `c177771836a4c460743c00002c22483f6f18d1eb` (3.7B), `69ada542b68fe13d767479db2ab9421baff88681` (7B), `e1fd0277713e4eefcd3416348fd6fedacf7f2392` (32B), `16d20c739c687c08423422d1a2fbba6c529014cd` (MoVA-36B-A4B), and `12812264242a14dce44aa7ae27f931ff4584bcbf` (375B-A23B).
 - **Parsers:** The base recipes enable reasoning with `--reasoning-parser k2_horizon`. Enable `--tool-call-parser k2_horizon` from the **Parsers** card in the [Playground](#playground) when you need tool calling.
-- **36B router provenance:** The 36B checkpoint's source xLLM router used two GEMM partitions. `--json-model-override-args '{"xllm_source_router_gemm_partitions":2}'` preserves its BF16 partial-GEMM rounding and FP32 reduction order; SGLang does not infer this source topology from runtime TP.
-- **375B loading:** The 375B recipe disables multithreaded weight loading with `--model-loader-extra-config '{"enable_multithread_load":false}'`.
+- **MoVA-36B-A4B router provenance:** The MoVA-36B-A4B checkpoint's source xLLM router used two GEMM partitions. `--json-model-override-args '{"xllm_source_router_gemm_partitions":2}'` preserves its BF16 partial-GEMM rounding and FP32 reduction order; SGLang does not infer this source topology from runtime TP.
+- **375B-A23B loading:** The 375B-A23B recipe disables multithreaded weight loading with `--model-loader-extra-config '{"enable_multithread_load":false}'`.
 - **Playground features:** TP, EP, NGRAM, PD disaggregation, and HiCache are optional, unverified command overrides. The tool-call parser was functionally exercised separately.
 - **Deliberate omissions:** Context parallelism is unsupported or unvalidated for xLLM. DP-attention and alternate MoE backend selectors are not exposed until they are validated.
 - **Validation:** All six recipes completed native speed and full GSM8K evaluation on H200 using the K2 Horizon runtime support in [PR #37654](https://github.com/sgl-project/sglang/pull/37654).
-- **375B provenance:** The 375B benchmark launched a directly mounted checkpoint and passed revision `12812264242a14dce44aa7ae27f931ff4584bcbf` to the server. The other five launches used materialized Hugging Face snapshots at their pinned revisions.
+- **375B-A23B provenance:** The 375B-A23B benchmark launched a directly mounted checkpoint and passed revision `12812264242a14dce44aa7ae27f931ff4584bcbf` to the server. The other five launches used materialized Hugging Face snapshots at their pinned revisions.
 
 ## 3. Benchmark results
 
@@ -130,8 +130,8 @@ GSM8K used the full 1,319-example test split with `sgl-eval`, 32 client threads,
 | 3.7B | 92.12% | 91.89% | 92.00% |
 | 7B | 95.30% | 94.47% | 94.88% |
 | 32B | 95.75% | 96.21% | 95.98% |
-| 36B | 95.45% | 94.84% | 95.15% |
-| 375B | 95.53% | 95.60% | 95.56% |
+| MoVA-36B-A4B | 95.45% | 94.84% | 95.15% |
+| 375B-A23B | 95.53% | 95.60% | 95.56% |
 
 ## 4. Advanced usage
 

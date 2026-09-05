@@ -17,7 +17,7 @@
 
 import logging
 import re
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Sequence
 
 import torch
 
@@ -431,6 +431,16 @@ class LoRAManager:
         self.lora_backend.reset_batch_state()
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
+        # Some internal-only backends (currently UNO) use explicit token-row
+        # routing for their adapted forwards and want all-base batches to run
+        # through the plain model path.  Clear any routing retained by the
+        # preceding adapted forward before inspecting CUDA-graph metadata.
+        if self.lora_backend.skip_inactive_lora_batches and not any(
+            uid is not None for uid in forward_batch.lora_ids
+        ):
+            self.reset_lora_batch()
+            return
+
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
 
@@ -468,6 +478,39 @@ class LoRAManager:
         )
         self.lora_backend.batch_info.has_active_lora = any(
             lora_ranks[wi] > 0 for wi in weight_indices
+        )
+
+    def prepare_lora_token_segments(
+        self,
+        *,
+        lora_ids: Sequence[Optional[str]],
+        segment_lens: Sequence[int],
+    ) -> None:
+        """Prepare eager LoRA routing independently of request batching."""
+        lora_ids = list(lora_ids)
+        segment_lens = list(segment_lens)
+        if len(lora_ids) != len(segment_lens):
+            raise ValueError("LoRA ids and segment lengths must have equal length.")
+
+        weight_indices = []
+        lora_ranks = [0] * self.max_loras_per_batch
+        scalings = [0.0] * self.max_loras_per_batch
+        for lora_id in lora_ids:
+            weight_index = self.memory_pool.get_buffer_id(lora_id)
+            weight_indices.append(weight_index)
+            if lora_id is not None:
+                lora = self.loras[lora_id]
+                lora_ranks[weight_index] = lora.config.r
+                scalings[weight_index] = lora.scaling
+
+        self.lora_backend.prepare_lora_token_segments(
+            segment_lens=segment_lens,
+            weight_indices=weight_indices,
+            lora_ranks=lora_ranks,
+            scalings=scalings,
+        )
+        self.lora_backend.batch_info.has_active_lora = any(
+            lora_ranks[index] > 0 for index in weight_indices
         )
 
     def update_lora_info(self):
@@ -578,6 +621,10 @@ class LoRAManager:
         self.init_lora_shapes(
             max_lora_rank=max_lora_rank,
             target_modules=target_modules,
+        )
+        self.lora_backend.validate_lora_targets(
+            base_model=self.base_model,
+            target_modules=self.target_modules,
         )
 
         if self._experts_shared_outer_override is not None:

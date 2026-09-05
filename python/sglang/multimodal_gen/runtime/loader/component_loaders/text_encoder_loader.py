@@ -67,12 +67,13 @@ from sglang.multimodal_gen.runtime.loader.gguf_weights import (
     remap_gguf_tensor_meta,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
+    _list_safetensors_files,
+    checkpoint_bytes,
     get_param_names_mapping,
     set_default_torch_dtype,
     skip_init_modules,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
-    filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
     pt_weights_iterator,
     safetensors_weights_iterator,
@@ -462,31 +463,16 @@ def _require_quantized_encoder_layers(
             )
 
 
-def _checkpoint_bytes(model_path: str) -> int:
-    """On-disk size of a checkpoint, readable before any weight of it is."""
-    if os.path.isfile(model_path):
-        return os.path.getsize(model_path)
-    total = 0
-    for path in glob.glob(
-        os.path.join(str(model_path), "**", "*.safetensors"), recursive=True
-    ):
-        try:
-            total += os.path.getsize(path)
-        except OSError:
-            continue
-    return total
-
-
 def _keep_this_checkpoint_mapped(model_path: str) -> bool:
     """Whether this encoder's weights should stay on their file mapping."""
-    checkpoint_bytes = _checkpoint_bytes(model_path)
-    if not host_copies_would_not_fit(checkpoint_bytes):
+    weight_bytes = checkpoint_bytes(model_path)
+    if not host_copies_would_not_fit(weight_bytes):
         return False
     logger.info(
         "Text encoder checkpoint is %.2f GiB against %.2f GiB of host memory, "
         "so its compatible weights stay on the checkpoint mapping instead of "
         "being copied in.",
-        checkpoint_bytes / 1024**3,
+        weight_bytes / 1024**3,
         host_memory_available_bytes() / 1024**3,
     )
     return True
@@ -598,20 +584,20 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
 
         hf_weights_files: list[str] = []
         for pattern in allow_patterns:
-            hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
+            if pattern == "*.safetensors":
+                hf_weights_files = _list_safetensors_files(
+                    hf_folder,
+                    index_file=index_file,
+                    key_filter=key_filter,
+                )
+            else:
+                hf_weights_files = glob.glob(os.path.join(hf_folder, pattern))
             if len(hf_weights_files) > 0:
                 if pattern == "*.safetensors":
                     use_safetensors = True
                 break
 
-        if use_safetensors:
-            hf_weights_files = filter_duplicate_safetensors_files(
-                hf_weights_files,
-                hf_folder,
-                index_file,
-                key_filter=key_filter,
-            )
-        else:
+        if not use_safetensors:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
 
         if len(hf_weights_files) == 0:

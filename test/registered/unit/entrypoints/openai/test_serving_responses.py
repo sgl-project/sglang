@@ -23,6 +23,9 @@ from sglang.srt.entrypoints.openai.serving_responses import (
 )
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
+from sglang.srt.sampling.sampling_params import (
+    REQUEST_REASONING_END_TOKEN_IDS_KEY,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -246,6 +249,38 @@ class ChatToolForwardingTestCase(CustomTestCase):
         self.assertEqual(request_prompts, [[4, 5, 6]])
         self.assertEqual(engine_prompts, [[4, 5, 6]])
 
+    def test_k2_output_parser_reuses_effective_template_default(self):
+        serving = make_serving()
+        serving.reasoning_parser = "k2_horizon"
+        serving.default_chat_template_kwargs = {"reasoning_effort": "low"}
+        serving.template_manager.chat_template_name = None
+        serving.tokenizer_manager.tokenizer.apply_chat_template.return_value = [4, 5, 6]
+        request = ResponsesRequest(
+            model="IFM/K2-Horizon-7B",
+            input="hi",
+            # Template kwargs are the final render inputs, so the server default
+            # below takes precedence over this API convenience field.
+            reasoning={"effort": "medium"},
+            store=False,
+        )
+
+        asyncio.run(
+            serving._make_request(request, None, serving.tokenizer_manager.tokenizer)
+        )
+
+        render_call = serving.tokenizer_manager.tokenizer.apply_chat_template.call_args
+        self.assertEqual(render_call.kwargs["reasoning_effort"], "low")
+        self.assertEqual(request.chat_template_kwargs["reasoning_effort"], "low")
+
+        output_items = serving._make_response_output_items(
+            request,
+            "work</ifm|think_faster>\nanswer",
+            tokenizer=Mock(),
+            require_reasoning=True,
+        )
+        self.assertEqual(output_items[0].content[0].text, "work")
+        self.assertEqual(output_items[1].content[0].text, "\nanswer")
+
 
 class ReasoningRequestForwardingTestCase(unittest.TestCase):
     def test_create_responses_uses_processed_reasoning_state(self):
@@ -263,6 +298,7 @@ class ReasoningRequestForwardingTestCase(unittest.TestCase):
             video_data=None,
             modalities=[],
             stop=[],
+            reasoning_end_token_ids=[41, 42],
         )
         captured = {}
 
@@ -308,6 +344,12 @@ class ReasoningRequestForwardingTestCase(unittest.TestCase):
 
         self.assertEqual(response.status, "completed")
         self.assertFalse(captured["adapted_request"].require_reasoning)
+        self.assertEqual(
+            captured["adapted_request"].sampling_params["custom_params"][
+                REQUEST_REASONING_END_TOKEN_IDS_KEY
+            ],
+            [41, 42],
+        )
         self.assertFalse(parser_cls.call_args.kwargs["force_reasoning"])
 
 
