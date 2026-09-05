@@ -1547,6 +1547,32 @@ def test_mamba_path_cap_evicts_excess_states_through_the_adapter():
     assert core.mamba_evictable_size() == 1
 
 
+def test_mamba_eviction_walk_thins_the_cold_chain_through_the_adapter():
+    """Second round frees the slot at depth 3, not the LRU-oldest at depth 2:
+    the walk thins the cold chain by coverage instead of shallow-first."""
+    core = _mamba_tree_core()
+    for depth, slot in enumerate([7, 8, 9, 10], start=1):
+        _mamba_insert(
+            core, list(range(1, depth + 1)), list(range(10, 10 + depth)), slot
+        )
+
+    def evict_one():
+        tracker = {ComponentType.MAMBA: 0}
+        device_frees: dict = {}
+        host_frees: dict = {}
+        core.evict_device_start(ComponentType.MAMBA, 1)
+        step = core.evict_device_next_node(ComponentType.MAMBA, tracker)
+        _accumulate_step(step, tracker, device_frees, host_frees)
+        core.evict_device_end(ComponentType.MAMBA)
+        assert step.node_id is None
+        return torch.cat(device_frees[ComponentType.MAMBA]).tolist()
+
+    assert evict_one() == [7]
+    assert evict_one() == [9]
+    assert core.mamba_evictable_size() == 2
+    core.sanity_check([], [])
+
+
 def test_eagle_with_mamba_falls_back_to_the_unigram_binding():
     core = _mamba_tree_core(is_eagle=True)
     assert core.is_eagle is False

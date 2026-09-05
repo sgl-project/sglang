@@ -312,6 +312,12 @@ class UnifiedLRUList:
     def in_list(self, node: Optional[UnifiedTreeNode]):
         return node is not None and node.id in self.cache
 
+    def is_mru(self, node: UnifiedTreeNode) -> bool:
+        """Whether a member node is the most-recently-used of its partition."""
+        assert node.id in self.cache
+        prev = node.lru_prev[self._pt]
+        return prev is self.head or prev is self.mid
+
     def get_prev_no_lock(self, node: UnifiedTreeNode, check_id: bool = True):
         if check_id:
             assert node.id in self.cache

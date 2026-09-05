@@ -57,6 +57,82 @@ fn least_common_multiple(lhs: usize, rhs: usize) -> usize {
 }
 
 impl MambaComponent {
+    /// Pick which state of the LRU-oldest node's chain to drop.
+    ///
+    /// The states below `x` on its single-child chain belong to the same cold
+    /// path and are the next to age out, so dropping the one whose removal
+    /// leaves the smallest gap between its neighbours keeps that path's
+    /// checkpoint coverage spread out; a plain tail eviction strips it
+    /// shallow-first, which is the inverse of what a branch match needs.
+    /// Forks, locked, load-back-pinned, reused (matched by another request)
+    /// and leaf holders are boundaries, never victims. Returns `x` when there
+    /// is nothing better to thin.
+    fn thinning_victim<K: ChildKeyType>(tree_core: &UnifiedTreeCore<K>, x: NodeIdx_) -> NodeIdx_ {
+        let arena = &tree_core.arena;
+        if arena.node(x).children.len() != 1 {
+            return x;
+        }
+        let mut depth = 0;
+        let mut cur = x;
+        while let Some(parent) = arena.node(cur).parent {
+            depth += arena.node(cur).key.atom_len();
+            cur = parent;
+        }
+        // Nearest state holder above x (else the root) bounds its gap.
+        let mut prev_depth = 0;
+        let mut d = depth;
+        cur = x;
+        while let Some(parent) = arena.node(cur).parent {
+            if arena.node(parent).is_root() {
+                break;
+            }
+            d -= arena.node(cur).key.atom_len();
+            if arena.has_device_value(parent, MAMBA) {
+                prev_depth = d;
+                break;
+            }
+            cur = parent;
+        }
+        // (depth, node) for every state holder on the chain, x first.
+        let mut holders: Vec<(usize, NodeIdx_)> = vec![(depth, x)];
+        cur = x;
+        while arena.node(cur).children.len() == 1 {
+            let child = *arena.node(cur).children.values().next().unwrap();
+            depth += arena.node(child).key.atom_len();
+            if arena.has_device_value(child, MAMBA) {
+                holders.push((depth, child));
+            }
+            cur = child;
+        }
+        let chain_end = depth;
+        let mut victim = x;
+        let mut best_gap: Option<usize> = None;
+        for (i, &(_, node_id)) in holders.iter().enumerate() {
+            let node = arena.node(node_id);
+            if node_id != x
+                && (node.children.len() != 1
+                    || node.device_lock_ref(MAMBA) > 0
+                    || node.is_load_back_pending()
+                    || node.mamba_reused)
+            {
+                continue;
+            }
+            let lo = if i > 0 { holders[i - 1].0 } else { prev_depth };
+            let hi = if i + 1 < holders.len() {
+                holders[i + 1].0
+            } else {
+                chain_end
+            };
+            if best_gap.is_none_or(|best| hi - lo < best) {
+                best_gap = Some(hi - lo);
+                victim = node_id;
+            }
+        }
+        victim
+    }
+}
+
+impl MambaComponent {
     // Tier-selected mamba slot read for the lock paths; `host` picks the host slot.
     fn has_value<K: ChildKeyType>(node: &Node<K>, host: bool) -> bool {
         if host {
@@ -102,6 +178,11 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             LRURefreshPhase::Walkdown => {}
             LRURefreshPhase::MatchEnd => {
                 if tree_core.arena.has_device_value(node_id, MAMBA) {
+                    // The inserter's own re-match after a chunk insert lands on
+                    // the MRU node; any other match proves the state is reused.
+                    if !tree_core.device_lru_list(MAMBA).is_mru(node_id) {
+                        tree_core.arena.node_mut(node_id).mamba_reused = true;
+                    }
                     tree_core.device_lru_list_mut(MAMBA).reset_node_mru(node_id);
                 }
             }
@@ -391,16 +472,28 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             if tree_core.evictable_device_leaves.contains(x) {
                 break Some(x);
             }
-            // Internal nodes are tombstoned inline (no IO).
+            // Internal nodes are tombstoned inline (no IO). A thinned victim
+            // keeps x at the LRU tail so the next step re-evaluates its chain.
+            let victim = Self::thinning_victim(tree_core, x);
+            if victim != x {
+                cursor = Some(x);
+            }
             tree_core.evict_component_and_detach_lru_(
-                x,
+                victim,
                 ct,
                 device_frees,
                 host_frees,
                 EvictLayer::Device,
                 Some(tracker),
             );
-            tree_core.cascade_evict_(x, ct, tracker, device_frees, host_frees, EvictLayer::Device);
+            tree_core.cascade_evict_(
+                victim,
+                ct,
+                tracker,
+                device_frees,
+                host_frees,
+                EvictLayer::Device,
+            );
             break None;
         };
         tree_core.component_state_mut(MAMBA).evict_device_cursor = cursor;
