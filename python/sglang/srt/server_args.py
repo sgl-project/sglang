@@ -225,6 +225,7 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "cutlass_mla",
     "trtllm_mla",
     "tokenspeed_mla",
+    "aiter",
 ]
 add_chunked_prefix_cache_attention_backend = (
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append

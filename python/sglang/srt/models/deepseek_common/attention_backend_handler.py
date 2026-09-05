@@ -198,6 +198,13 @@ def handle_attention_aiter(attn, forward_batch):
     if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return AttnForwardMethod.MHA
     if forward_batch.forward_mode.is_extend_without_speculative():
+        sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
+        if (
+            sum_extend_prefix_lens > 0
+            and not attn.disable_chunked_prefix_cache
+            and sum_extend_prefix_lens >= attn.chunked_prefix_cache_threshold
+        ):
+            return AttnForwardMethod.MHA_CHUNKED_KV
         return AttnForwardMethod.MHA
     else:
         return AttnForwardMethod.MLA
