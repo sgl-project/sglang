@@ -18,12 +18,16 @@ from array import array
 import torch
 
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 PAGE_SIZE = 32
 
@@ -35,8 +39,7 @@ class _MockDllmReq(ReqDllmMixin):
         self.full_untruncated_fill_ids = array("q", fill_ids)
         self.extend_range = Range(0, len(self.full_untruncated_fill_ids))
         self.dllm_incomplete_ids = array("q", incomplete_ids)
-        self.req_pool_idx = req_pool_idx
-        self.cache_protected_len = 0
+        self.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
         self.last_node = None
         self.extra_key = None
         self.cache_salt = None
@@ -94,7 +97,7 @@ def _tree_pages(cache, page_size=PAGE_SIZE):
     return pages
 
 
-class TestDllmVolatileBlockNotCached(unittest.TestCase):
+class TestDllmVolatileBlockNotCached(CustomTestCase):
     def test_in_flight_block_is_excluded_from_cacheable_ids(self):
         stable, block = list(range(64)), list(range(900, 932))
         req = _MockDllmReq(stable + block, incomplete_ids=block)
@@ -130,8 +133,6 @@ class TestDllmVolatileBlockNotCached(unittest.TestCase):
             f"tree actually owns -- the same pages are counted under two nodes",
         )
 
-
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 if __name__ == "__main__":
     unittest.main()
