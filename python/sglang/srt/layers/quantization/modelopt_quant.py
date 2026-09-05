@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import regex as re
@@ -536,15 +535,11 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             self.use_marlin = (
                 envs.SGLANG_FORCE_FP8_MARLIN.get() or can_auto_enable_marlin_fp8()
             )
-        # SM120 decode fast path: cuBLAS serves M=1 fp8 GEMMs with SM89 tiles
+        # SM120 decode fast path: cuBLAS serves M=1 FP8 GEMMs with SM89 tiles
         # at 50-70% DRAM bandwidth for mid-sized N; a streaming GEMV recovers
-        # the gap. Kill switch: SGLANG_DISABLE_SM120_FP8_GEMV=1.
+        # the gap.
         cuda_capability = torch.cuda.get_device_capability() if is_cuda() else None
-        self.use_sm120_gemv = (
-            cuda_capability is not None
-            and cuda_capability[0] == 12
-            and os.environ.get("SGLANG_DISABLE_SM120_FP8_GEMV", "0") != "1"
-        )
+        self.use_sm120_gemv = cuda_capability is not None and cuda_capability[0] == 12
         self.use_kda_fp8_skinny = cuda_capability == (12, 0)
 
     def create_weights(
@@ -671,8 +666,8 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         if self.use_kda_fp8_skinny:
             # The existing SM120 GEMV stays first for M=1 shapes that it
             # accepts; cold-L2 CUDA Graph benchmarks show it is faster there.
-            # KDA handles the qualified M>=2 shapes, oversized M=1 projections,
-            # and M=1 when the native GEMV is explicitly disabled.
+            # KDA handles the qualified M>=2 shapes and oversized M=1
+            # projections.
             from sglang.kernels.ops.gemm import try_sm120_fp8_skinny_gemm
 
             output = try_sm120_fp8_skinny_gemm(

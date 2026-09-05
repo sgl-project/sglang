@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import sys
-from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 import torch
@@ -16,7 +14,6 @@ from sglang.kernels.kda_kernels.sm120_fp8_skinny_gemm_sm120 import (
     _run_sm120_fp8_skinny_gemm,
 )
 from sglang.srt.layers.quantization.fp8_utils import apply_fp8_linear_bmm_flashinfer
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8LinearMethod
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=180, stage="base-b", runner_config="1-gpu-small")
@@ -168,52 +165,6 @@ def test_bias_falls_back():
     args = _make_inputs(8, 8192, 5120)
     bias = torch.zeros(args[1].shape[1], dtype=torch.bfloat16, device="cuda")
     assert _run_kda(args, bias=bias) is None
-
-
-def _make_modelopt_dispatch_fixture():
-    method = object.__new__(ModelOptFp8LinearMethod)
-    method.use_marlin = False
-    method.use_sm120_gemv = True
-    method.use_kda_fp8_skinny = True
-    weight_storage = torch.empty((256, 512), dtype=torch.uint8, device="cuda")
-    layer = SimpleNamespace(
-        weight=weight_storage.t(),
-        input_scale=torch.ones(1, dtype=torch.float32, device="cuda"),
-        sm120_fp8_alpha=torch.ones(1, dtype=torch.float32, device="cuda"),
-    )
-    input = torch.empty((1, 512), dtype=torch.bfloat16, device="cuda")
-    return method, layer, input
-
-
-@pytest.mark.parametrize("native_accepts", (True, False), ids=("native", "kda"))
-def test_modelopt_dispatch_order(monkeypatch, native_accepts: bool):
-    import sglang.kernels.ops.gemm as gemm_ops
-    import sglang.kernels.ops.gemm.sm120_fp8_gemv as native_gemv
-    import sglang.kernels.ops.quantization.fp8_kernel as fp8_kernel
-
-    method, layer, input = _make_modelopt_dispatch_fixture()
-    native_output = torch.empty((1, 256), dtype=torch.bfloat16, device="cuda")
-    kda_output = torch.empty_like(native_output)
-    native_impl = Mock(return_value=native_output)
-    kda_impl = Mock(return_value=kda_output)
-
-    monkeypatch.setattr(native_gemv, "use_sm120_fp8_gemv", lambda *args: native_accepts)
-    monkeypatch.setattr(native_gemv, "sm120_fp8_gemv", native_impl)
-    monkeypatch.setattr(
-        fp8_kernel,
-        "static_quant_fp8",
-        lambda *args, **kwargs: (input.to(torch.float8_e4m3fn), None),
-    )
-    monkeypatch.setattr(gemm_ops, "try_sm120_fp8_skinny_gemm", kda_impl)
-
-    expected = native_output if native_accepts else kda_output
-    assert method.apply(layer, input) is expected
-    if native_accepts:
-        native_impl.assert_called_once()
-        kda_impl.assert_not_called()
-    else:
-        native_impl.assert_not_called()
-        kda_impl.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -102,8 +102,8 @@ NATIVE_M1_CASES = [
 ]
 
 
-# The full sweep covers the decode/verify M values requested for PR #199 and
-# representative per-tensor FP8 projections from other model families.
+# The full sweep covers decode/verify M values and representative per-tensor
+# FP8 projections from several model families.
 @marker.parametrize(
     "model,m,n,k",
     MODEL_FP8_CASES,
