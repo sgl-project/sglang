@@ -1160,6 +1160,59 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
 RUN case "${GPU_ARCH}" in *-rocm724) python3 -c "import pathlib,re,importlib.metadata as m; p=pathlib.Path(m.distribution('torch')._path)/'METADATA'; v=m.version('triton'); t,n=re.subn(r'^Requires-Dist: (?:triton|triton-rocm)==[^ ;]+', 'Requires-Dist: triton=='+v, p.read_text(), count=1, flags=re.M); assert n==1, n; p.write_text(t)" ;; esac
 
 # -----------------------
+# Point torch at the image's ROCm runtime.
+#
+# The wheels vendor their own HIP and roctracer under torch/lib, and
+# libtorch_hip.so carries RPATH $ORIGIN, so those copies win over /opt/rocm
+# whatever LD_LIBRARY_PATH says. A ROCm 7.2.4 image consequently profiles
+# through 7.2.0 libraries and loses kernel events under hipGraphLaunch
+# (ROCm/ROCm#6102, fixed in 7.2.2): 448 of 512 graph-replay kernels reached the
+# trace on both MI300X and MI355X, against 512 of 512 with the ROCm copies
+# preloaded, and 87% of decode kernels went missing in a real server trace.
+#
+# Replacing the vendored files makes the working configuration the default
+# instead of something every user has to know to preload. Keyed on whether the
+# wheel vendors them at all, so flavors whose torch already links /opt/rocm are
+# left alone. Replaced by rename: the running interpreter has the old files
+# mapped, and writing through them would corrupt it.
+RUN python3 - <<'PY'
+import os
+import pathlib
+import shutil
+import sys
+
+import torch
+
+torch_lib = pathlib.Path(torch.__file__).resolve().parent / "lib"
+rocm_lib = pathlib.Path("/opt/rocm/lib")
+replaced = []
+
+for name in ("libamdhip64", "libroctracer64"):
+    vendored = torch_lib / f"{name}.so"
+    if not vendored.exists():
+        print(f"{name}: not vendored by the wheel, nothing to replace")
+        continue
+    versioned = sorted(p for p in rocm_lib.glob(f"{name}.so.*") if not p.is_symlink())
+    if not versioned:
+        sys.exit(f"FATAL: {name} is vendored but {rocm_lib} has no copy to use")
+    source = versioned[-1]
+    staged = vendored.with_name(f"{vendored.name}.rocm")
+    shutil.copy2(source, staged)
+    staged.chmod(vendored.stat().st_mode & 0o7777)
+    os.replace(staged, vendored)
+    replaced.append((vendored, source))
+    print(f"{name}: {vendored} <- {source} ({source.stat().st_size} bytes)")
+
+for vendored, source in replaced:
+    if vendored.stat().st_size != source.stat().st_size:
+        sys.exit(f"FATAL: {vendored} does not match {source}")
+PY
+
+# A fresh interpreter, so this loads the libraries just swapped in: an ABI or
+# soname mismatch fails the build here rather than at a user's first profile.
+RUN python3 -c "import torch; assert torch.version.hip is not None, torch.__version__; print(f'[ROCm runtime] torch {torch.__version__}, hip {torch.version.hip}')"
+
+# -----------------------
 # Performance environment variable.
 
 # Skip CuDNN compatibility check - not applicable for ROCm (uses MIOpen instead)

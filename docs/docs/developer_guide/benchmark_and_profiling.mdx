@@ -379,6 +379,36 @@ export SGLANG_PROFILE_WITH_STACK=False
 python -m sglang.bench_offline_throughput --model-path meta-llama/Llama-3.1-8B-Instruct --dataset-name random --num-prompts 10 --profile --mem-frac=0.8
 ```
 
+### Missing GPU kernels on ROCm 7.2.0 images
+
+On ROCm 7.2.0, the roctracer backend behind PyTorch Profiler drops kernel-dispatch events for work submitted through `hipGraphLaunch`. Traces then under-report the decode steps, which run from replayed graphs: prefill kernels and the host-side graph launches are there, but kernels are missing underneath. The loss is partial rather than total, so a trace can look plausible and still be wrong. The same combination can also deadlock the HIP runtime inside the replay. ROCm resolved the reporting failure in 7.2.2 ([ROCm/ROCm#6102](https://github.com/ROCm/ROCm/issues/6102)).
+
+To check whether an image traces graph-launched kernels, run this inside it on a GPU host:
+
+```bash Command
+python3 scripts/ci/amd/check_hip_graph_profiling.py
+```
+
+Use a `rocm724` image (`lmsysorg/sglang-rocm:*-rocm724-*` daily, `lmsysorg/sglang:*-rocm724-*` per release). Those install ROCm 7.2.4 and point torch at it, so graph-launched kernels are traced with CUDA graphs left on.
+
+Installing 7.2.4 is not by itself enough, which matters for images built before that was addressed: the torch wheel vendors its own HIP and roctracer under `torch/lib`, and `libtorch_hip.so` has `RPATH $ORIGIN`, so the profiler runs through those 7.2.0 copies and `LD_LIBRARY_PATH` cannot override an `RPATH`. On such an image, overwrite the two files the wheel vendors:
+
+```bash Command
+TORCH_LIB=$(python3 -c 'import pathlib, torch; print(pathlib.Path(torch.__file__).resolve().parent / "lib")')
+cp -a /opt/rocm/lib/libamdhip64.so.7.2.70204 "$TORCH_LIB/libamdhip64.so"
+cp -a /opt/rocm/lib/libroctracer64.so.4.1.70204 "$TORCH_LIB/libroctracer64.so"
+```
+
+Prefer that over `LD_PRELOAD`ing the same libraries. A preload leaves both copies mapped in the process, which is harmless for a quick check but has been seen to abort server startup during CUDA-graph capture, inside Triton's AMD launcher.
+
+The probe above prints which libraries torch actually mapped, so use it to tell the two situations apart rather than assuming.
+
+On a `rocm720` image, or wherever preloading is not an option, profile with CUDA graphs disabled so that every kernel is launched eagerly and reaches the trace. Decode numbers collected this way exclude the graph-replay path, so use them to attribute kernel time rather than to measure decode latency.
+
+```bash Command
+python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --disable-cuda-graph
+```
+
 ### View traces
 
 Trace files can be loaded and visualized from:
