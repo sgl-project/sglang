@@ -437,6 +437,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.tree_core.has_swa_host_pool = swa._swa_kv_pool_host is not None
 
         if self.host_memory_mode == "buffer_only":
+            self.tree_core.set_host_memory_buffer_only()
             swa = self.components.get(ComponentType.SWA)
             validate_buffer_only_stack(
                 sidecar_pool_specs=self.sidecar_pool_specs,

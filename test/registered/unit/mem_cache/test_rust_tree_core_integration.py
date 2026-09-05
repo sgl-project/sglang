@@ -99,6 +99,7 @@ def _pump_insert(core: RustUnifiedTreeCore, params: InsertParams) -> InsertResul
         prefix_len=step.result.prefix_len,
         last_device_node=step.result.last_device_node,
         mamba_exist=step.result.mamba_exist,
+        swa_branch_inserted=step.result.swa_branch_inserted,
         cache_actions=actions,
     )
 
@@ -1994,6 +1995,80 @@ def test_bigram_insert_value_shorter_than_the_bigram_count_raises():
                 value=torch.tensor([10, 11], dtype=torch.int64),
             ),
         )
+
+
+# ---- SWA branching-point caching ----
+
+
+def _swa_hicache_core(window: int = 8) -> RustUnifiedTreeCore:
+    core = _swa_tree_core(window=window)
+    core.set_hicache_enabled()
+    core.has_swa_host_pool = True
+    return core
+
+
+def _swa_insert(core: RustUnifiedTreeCore, token_ids: list[int], indices: list[int]):
+    """Insert and settle the SWA rebuilds the tree core asks the cache to apply."""
+    result = _insert(core, token_ids, indices)
+    for action in result.cache_actions:
+        if isinstance(action, SWARebuild):
+            core.set_component_device_value(
+                action.node_id, ComponentType.SWA, action.source_value
+            )
+    return result
+
+
+def _swa_backup_transfer(core: RustUnifiedTreeCore, node_id):
+    _, comp_xfers = core.build_backup_spec(node_id)
+    transfers = comp_xfers[ComponentType.SWA]
+    assert len(transfers) == 1
+    return transfers[0]
+
+
+def test_swa_backup_spec_covers_the_whole_dirty_window():
+    core = _swa_hicache_core()
+    _swa_insert(core, [1], [10])
+    _swa_insert(core, [1, 2], [10, 11])
+    parent = core.match_prefix(MatchPrefixParams(key=_key([1]))).best_match_node
+    leaf = core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).best_match_node
+
+    # One backup at the leaf carries both device-only nodes, ancestors first.
+    transfer = _swa_backup_transfer(core, leaf)
+    assert transfer.nodes_to_load == [parent, leaf]
+    assert transfer.device_indices.tolist() == [10, 11]
+
+
+def test_swa_backup_commit_scatters_the_host_span_across_the_window():
+    core = _swa_hicache_core()
+    _swa_insert(core, [1], [10])
+    _swa_insert(core, [1, 2], [10, 11])
+    parent = core.match_prefix(MatchPrefixParams(key=_key([1]))).best_match_node
+    leaf = core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).best_match_node
+
+    transfer = _swa_backup_transfer(core, leaf)
+    transfer.host_indices = torch.tensor([200, 201], dtype=torch.int64)
+    core.commit_backup(
+        leaf, torch.empty(0, dtype=torch.int64), {ComponentType.SWA: [transfer]}
+    )
+
+    # Both nodes now hold their own slice, so the window has nothing left to send.
+    assert ComponentType.SWA not in core.build_backup_spec(leaf)[1]
+    for node in (parent, leaf):
+        assert core.component_has_host_value_only(node, ComponentType.SWA) is False
+
+
+def test_insert_reports_whether_it_reached_the_swa_branch_boundary():
+    for branching_seqlen, expected in [(2, True), (3, False), (None, False)]:
+        core = _swa_hicache_core()
+        result = _pump_insert(
+            core,
+            InsertParams(
+                key=_key([1, 2]),
+                value=torch.tensor([10, 11], dtype=torch.int64),
+                swa_branching_seqlen=branching_seqlen,
+            ),
+        )
+        assert result.swa_branch_inserted is expected, branching_seqlen
 
 
 if __name__ == "__main__":

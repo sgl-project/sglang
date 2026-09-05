@@ -147,6 +147,43 @@ impl SwaComponent {
         }
     }
 
+    /// Nodes within one sliding window of `node_id` whose SWA data sits on
+    /// device with no host copy, deepest first. The walk stops at a node an
+    /// in-flight backup already covers: that ack owns everything above it, so
+    /// two acks can never claim the same node.
+    fn dirty_backup_window_<K: ChildKeyType>(
+        &self,
+        tree_core: &UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+    ) -> Vec<NodeIdx_> {
+        if !tree_core.has_swa_host_pool {
+            return Vec::new();
+        }
+        let mut covered = 0;
+        let mut dirty: Vec<NodeIdx_> = Vec::new();
+        let mut cur_id = node_id;
+        while covered < self.sliding_window_size {
+            let cur = tree_core.arena.node(cur_id);
+            if cur.is_root() || cur.write_through_pending_id.is_some() {
+                break;
+            }
+            let on_device = cur.has_device_value(SWA);
+            let covered_len = if on_device {
+                cur.device_value_len(SWA)
+            } else if cur.has_host_value(SWA) {
+                cur.host_value_len(SWA)
+            } else {
+                break;
+            };
+            covered += covered_len;
+            if on_device && !cur.has_host_value(SWA) {
+                dirty.push(cur_id);
+            }
+            cur_id = cur.parent();
+        }
+        dirty
+    }
+
     fn next_host_unlocked_device_lru_node<K: ChildKeyType>(
         tree_core: &UnifiedTreeCore<K>,
         from: Option<NodeIdx_>,
@@ -286,6 +323,10 @@ impl SwaComponent {
 }
 
 impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
+    fn needs_incremental_backup(&self, tree_core: &UnifiedTreeCore<K>, node_id: NodeIdx_) -> bool {
+        !self.dirty_backup_window_(tree_core, node_id).is_empty()
+    }
+
     fn component_type(&self) -> ComponentType {
         SWA
     }
@@ -342,6 +383,14 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         value_chunks: &[Tensor],
         best_value_len: usize,
     ) -> MatchResult {
+        let swa_boundary_len = result.device_indices.size()[0] as usize + result.host_hit_length;
+
+        // Full KV may extend beyond the latest reusable SWA window. The branching
+        // point is the last page-aligned position within the Full-KV hit that lies
+        // beyond the current SWA boundary.
+        let aligned_seqlen = result.full_kv_hit_length / tree_core.page_size * tree_core.page_size;
+        result.swa_branching_seqlen = (aligned_seqlen > swa_boundary_len).then_some(aligned_seqlen);
+
         // Sum the SWA tokens backing the match, walking up from the best match
         // until one sliding window is covered; host-resident chunks count
         // toward the SWA host hit.
@@ -524,6 +573,10 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         result: &mut InsertResult,
         cache_actions: &mut Vec<CacheAction>,
     ) {
+        if let Some(branching_seqlen) = params.swa_branching_seqlen {
+            result.swa_branch_inserted = params.key.atom_len() >= branching_seqlen;
+        }
+
         if !is_new_leaf {
             return;
         }
@@ -841,19 +894,41 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         }
         Ok(match phase {
             CacheTransferPhase::BackupHost => {
-                let node = tree_core.arena.node(node_id);
-                if node.has_host_value(SWA) {
+                let dirty = if tree_core.host_memory_is_buffer_only {
+                    // Buffer mode stages one node per FIFO backup intent and sizes
+                    // its storage keys off that node alone.
+                    let node = tree_core.arena.node(node_id);
+                    if node.has_device_value(SWA) {
+                        vec![node_id]
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    self.dirty_backup_window_(tree_core, node_id)
+                };
+                if dirty.is_empty() {
                     return Ok(None);
                 }
-                // cd.value already holds SWA-pool indices (translated at insert time).
-                // Host pool indexing wants int64.
-                node.try_device_value(SWA).map(|value| {
-                    vec![PoolTransfer {
-                        name: PoolName::Swa,
-                        device_indices: Some(value.to_kind(Kind::Int64)),
-                        ..Default::default()
-                    }]
-                })
+                // Ancestors first: the host span is contiguous and the commit
+                // scatters it back in this order.
+                let device_indices: Vec<Tensor> = dirty
+                    .iter()
+                    .rev()
+                    // Device values already hold SWA-pool indices (translated at
+                    // insert time). Host pool indexing wants int64.
+                    .map(|&idx| tree_core.arena.device_value(idx, SWA).to_kind(Kind::Int64))
+                    .collect();
+                let nodes_to_load: Vec<NodeId> = dirty
+                    .iter()
+                    .rev()
+                    .map(|&idx| tree_core.arena.node(idx).id)
+                    .collect();
+                Some(vec![PoolTransfer {
+                    name: PoolName::Swa,
+                    device_indices: Some(Tensor::cat(&device_indices, 0)),
+                    nodes_to_load: Some(nodes_to_load),
+                    ..Default::default()
+                }])
             }
             CacheTransferPhase::LoadBack => {
                 // `node` is best_match_node; the SWA validator guarantees every
@@ -944,14 +1019,42 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
     ) {
         match phase {
             CacheTransferPhase::BackupHost => {
-                if let Some(transfer) = transfers.first()
-                    && let Some(host_indices) = &transfer.host_indices
-                {
+                let Some(transfer) = transfers.first() else {
+                    return;
+                };
+                let Some(host_indices) = &transfer.host_indices else {
+                    return;
+                };
+                // A transfer this component did not build covers one node and
+                // carries no offsets to scatter by: attach the whole span, as the
+                // single-node backup always did.
+                let Some(target_ids) = transfer.nodes_to_load.clone() else {
                     let node = tree_core.arena.node_mut(node_id);
                     if !node.has_host_value(SWA) {
                         node.set_host_value(SWA, host_indices.copy());
                     }
+                    return;
+                };
+                let mut offset = 0i64;
+                for target_id in target_ids {
+                    let target_idx = tree_core.arena.resolve(target_id);
+                    let size = {
+                        let target = tree_core.arena.node(target_idx);
+                        assert!(
+                            target.has_device_value(SWA) && !target.has_host_value(SWA),
+                            "SWA backup target {} is not device-only",
+                            target.id
+                        );
+                        target.device_value_len(SWA) as i64
+                    };
+                    tree_core.arena.set_host_value(
+                        target_idx,
+                        SWA,
+                        host_indices.narrow(0, offset, size).copy(),
+                    );
+                    offset += size;
                 }
+                assert_eq!(offset, host_indices.size()[0]);
             }
             CacheTransferPhase::LoadBack => {
                 let transfer = transfers

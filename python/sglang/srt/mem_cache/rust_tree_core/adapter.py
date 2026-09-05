@@ -214,6 +214,7 @@ def _insert_step_from_binding(step) -> InsertStepResult:
             prefix_len=step.result.prefix_len,
             last_device_node=step.result.last_device_node,
             mamba_exist=step.result.mamba_exist,
+            swa_branch_inserted=step.result.swa_branch_inserted,
             host_insert_dropped=step.result.host_insert_dropped,
             adopted_ranges=(
                 {
@@ -238,6 +239,7 @@ def _match_result_from_binding(result) -> MatchResult:
         best_match_node=result.best_match_node_id,
         host_hit_length=result.host_hit_length,
         swa_host_hit_length=result.swa_host_hit_length,
+        swa_branching_seqlen=result.swa_branching_seqlen,
         mamba_host_hit_length=result.mamba_host_hit_length,
         mamba_branching_seqlen=result.mamba_branching_seqlen,
         full_kv_hit_length=result.full_kv_hit_length,
@@ -621,6 +623,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 mamba_value=params.mamba_value,
                 prev_prefix_len=params.prev_prefix_len,
                 swa_evicted_seqlen=params.swa_evicted_seqlen,
+                swa_branching_seqlen=params.swa_branching_seqlen,
                 chunked=params.chunked,
                 priority=0 if params.priority is None else params.priority,
                 track_adopted_ranges=params.track_adopted_ranges,
@@ -661,6 +664,13 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def set_hicache_enabled(self) -> None:
         self._binding.set_hicache_enabled()
+
+    def set_host_memory_buffer_only(self) -> None:
+        self._binding.set_host_memory_buffer_only()
+
+    @property
+    def host_memory_is_buffer_only(self) -> bool:
+        return self._binding.host_memory_is_buffer_only()
 
     @property
     def page_size(self) -> int:
