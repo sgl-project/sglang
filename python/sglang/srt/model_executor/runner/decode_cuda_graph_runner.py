@@ -260,10 +260,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # --- DSA dense-decode dual-graph -------------------------------
         # Capture a "dense" (k-only, skip-indexer) and a "sparse" (full indexer)
         # decode graph per bs bucket, and dispatch on max_kv_len vs index_topk at
-        # replay. Auto-enabled for DSA models (index_topk present in the HF
-        # config) — correct for mixed lengths since any request with
-        # kv_len > index_topk falls back to the sparse graph. Adds ~52 graphs and
-        # ~2x capture time.
+        # replay. Auto-enabled for DSA models without DP attention (index_topk
+        # present in the HF config) — correct for mixed lengths since any request
+        # with kv_len > index_topk falls back to the sparse graph. Adds ~52 graphs
+        # and ~2x capture time.
         #
         # Scoped to HIP (AMD): the k-only dense-decode fast path has only been
         # validated on MI355X. This is common (non-hardware-gated) code, so on
@@ -278,7 +278,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         hf_config = model_runner.model_config.hf_config
-        if is_hip() and is_deepseek_dsa(hf_config):
+        if (
+            is_hip()
+            and is_deepseek_dsa(hf_config)
+            and not get_parallel().enable_dp_attention
+        ):
             self.dsa_index_topk = get_dsa_index_topk(hf_config)
             self.dsa_dual_graph = True
             logger.info(
