@@ -552,6 +552,21 @@ class TestParseQuantHfConfig(CustomTestCase):
                 self.assertIn("lm_head", quant_config.ignored_layers)
                 self.assertEqual(quant_config.kv_cache_quant_algo, "FP8")
 
+        nested_result = model_config._parse_modelopt_quant_config(
+            {
+                "quantization": {
+                    "quantization": {
+                        "quant_algo": "MXFP8",
+                        "group_size": 32,
+                        "exclude_modules": ["lm_head"],
+                    }
+                }
+            }
+        )
+        self.assertEqual(nested_result["quant_method"], "mxfp8")
+        self.assertEqual(nested_result["scale_fmt"], "ue8m0")
+        self.assertIn("lm_head", nested_result["modules_to_not_convert"])
+
     def test_modelopt_mxfp8_override(self):
         """Generic ModelOpt selection must not route MXFP8 to scalar FP8."""
         self.assertEqual(
