@@ -6,6 +6,7 @@ the canonical specs — read their headers first:
 
 - [`_deployment.jsx`](../../../../docs/src/snippets/_deployment.jsx) — the matrix widget; its header lists every config field. Dimensions are the legacy fixed five by default, or config-declared via `matchDims` / `overlayDims` (§2.1b).
 - [`_playground.jsx`](../../../../docs/src/snippets/_playground.jsx) — the diff-based override widget; lists the `playgroundFeatures` axes + the `AXIS_HANDLERS` interface.
+- [`_community.jsx`](../../../../docs/src/snippets/_community.jsx) — the community-contributions carousel at the page bottom (§2.5). Reads its own `<model>-community.jsx`, never `config.cells`.
 
 Engine extension (adding a new playground axis) lives in [engine-axis.md](engine-axis.md).
 
@@ -300,6 +301,149 @@ Speed (with concurrency chips that rewrite `--max-concurrency`) plus an
 Accuracy command with a chip per eval. No separate benchmark section needed.
 
 ---
+
+## 2.5 Community Configs (optional, page bottom)
+
+Landing a contributed recipe for hardware SGLang has no CI for. It does **not** go in
+`config.cells`: a new `supportedHardware` id multiplies every quant x strategy x nodes
+and leaves a row of greyed-out combinations, a new `quantizations` entry leaks that
+quant onto every other GPU, and the cell inherits the green **Verified** badge that
+means *the team reproduced this*.
+
+### Workflow
+
+**1. Generate the block** from the contributing PR:
+
+```bash
+node docs/scripts/gen_community_entry.mjs --pr 31006     # --repo defaults to sgl-project/sglang
+```
+
+Needs an authenticated `gh`. Prints to stdout, writes nothing; warnings go to stderr,
+so `> block.js` captures clean JS. It exits non-zero if the PR adds no new cells —
+a PR that only fills benchmarks for existing cells belongs in the matrix, not here.
+
+**2. Paste it into `configs/<org>/<model>-community.jsx`**, creating the file if this
+is the model's first contribution:
+
+```js
+export const community = [
+  // <-- paste the generated block here; one block per contributing PR
+];
+```
+
+**3. Replace `org: "TODO"`** with the contributor's affiliation — the one field the
+generator cannot know. Change nothing else: `flags`, `env`, `modelName`,
+`dockerImage`, `hardware` and `sglangVersion` are byte-faithful to what the
+contributor ran, and hand-editing them is how a config silently stops matching the
+PR it credits.
+
+**4. Wire the section into the MDX**, if the page does not have it yet. Last section
+on the page, one-sentence intro — do not restate the trust framing per page:
+
+```mdx
+## Community Configs
+
+Deployment configs contributed by the community. See the linked PR for benchmarks and discussion.
+
+import { CommunityConfigs } from "/src/snippets/_community.jsx";
+import { community }        from "/src/snippets/configs/<org>/<model>-community.jsx";
+
+<CommunityConfigs community={community} config={config} />
+```
+
+`config` is optional — read only for placeholder defaults, so `HOST_IP` / `PORT`
+match the Deploy panel's Env dialog.
+
+**5. Check and preview:**
+
+```bash
+node docs/scripts/check_cookbook_configs.mjs     # schema + retired-field guard
+cd docs && mint validate && mint dev
+```
+
+**6. Open the PR** against `sgl-project/sglang:main`, titled
+`docs(cookbook): add <hw> <quant> community config for <Model>`. Link the source PR
+in the body and credit the contributor by handle. Add both `run-ci` and
+`run-ci-extra` labels or pr-gate fails:
+
+```bash
+gh api -X POST repos/sgl-project/sglang/issues/<n>/labels \
+  -f "labels[]=run-ci" -f "labels[]=run-ci-extra"
+```
+
+### Worked example
+
+`--pr 31006` prints:
+
+```js
+  // GENERATED from PR #31006 — yiminghub2024/sglang@87f9dc2
+  {
+    source: {
+      label: "PR #31006", url: "https://github.com/sgl-project/sglang/pull/31006",
+      author: "yiminghub2024", org: "TODO",
+      authorUrl: "https://github.com/yiminghub2024",
+    },
+    reportedAt: "2026-07-24",
+    configs: [
+      {
+        id: "h20-w4afp8-low-latency",
+        title: "H20 · W4AFP8 · low-latency",
+        hardware: "NVIDIA H20 (96GB)",   // from config.hardware (added by this PR)
+        modelName: "PhalaCloud/GLM-5.2-W4AFP8",
+        sglangVersion: "0.5.14",
+        dockerImage: "lmsysorg/sglang:v0.5.14",
+        env: [],
+        flags: [
+          "--model-path {{MODEL_NAME}}", "--tp 8",
+          "--speculative-algorithm EAGLE", "--speculative-num-steps 5",
+          /* … 8 more, verbatim from the cell … */
+          "--host {{HOST_IP}}", "--port {{PORT}}",
+        ],
+      },
+    ],
+  },
+```
+
+plus, on stderr:
+
+```
+1 thing(s) needing a human:
+  - cell h20-w4afp8-low-latency carries verified:true — dropped, community configs are not team-verified
+```
+
+That card renders as `8× NVIDIA H20 (96GB)` — count from `--tp 8 × --nnodes 1` — with
+the knob line `W4AFP8 · EAGLE 5-1-6 · prefill CP8 · mem-fraction 0.8`. Both are
+computed from `flags` at render time.
+
+### Schema
+
+The unit is a **contribution (one PR)** holding every config that PR added. Several
+PRs stack as carousel slides; several configs in one PR become chips inside its slide.
+
+| field | |
+|---|---|
+| `source` | `{label, url, author, org?, authorUrl?}` |
+| `reportedAt` | ISO date, the PR's last-updated day |
+| `configs[].id` | `#community-<id>` anchor, unique per file |
+| `configs[].title` | short — doubles as the chip label |
+| `configs[].hardware` | GPU **model only**, e.g. `"NVIDIA H20 (96GB)"`. Free text, not a `HARDWARE_CATALOG` id, and never with a count baked in |
+| `configs[].modelName` | HF slug, substituted for `{{MODEL_NAME}}` |
+| `configs[].sglangVersion` | what the contributor tested |
+| `configs[].dockerImage` | optional; enables the Docker tab |
+| `configs[].env`, `.flags` | verbatim, `{{PLACEHOLDER}}` substitution only |
+
+`check_cookbook_configs.mjs` **rejects** these by name, so an entry written against an
+older draft fails loudly instead of rendering nothing:
+
+- **`benchmark`** — measurements stay in the PR. A community number is taken in the
+  contributor's own workload (#31006 used concurrency 10, not the house 1/16), so
+  rendering it beside the matrix cards invites an invalid comparison.
+- **`summary`** — the knob line is computed from `flags` by `describeFlags()`, and the
+  GPU count from `--tp × --nnodes` (absent `--tp` means **tp=1**, sglang's real
+  default). Prose drifts from the command; derived text cannot.
+- **`status` / `caveats` / `editorNotes`** — no trust taxonomy, no editorial layer.
+  Caveats and review live in the linked PR.
+
 
 ## Pitfalls (authoring)
 

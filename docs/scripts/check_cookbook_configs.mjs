@@ -124,8 +124,15 @@ const walk = (dir) => readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
   e.isDirectory() ? walk(join(dir, e.name))
     : (e.name.endsWith(".jsx")
       && !e.name.includes("benchmark")
+      && !e.name.endsWith("-community.jsx")
       && e.name !== "popular-models.jsx"
       ? [join(dir, e.name)] : []));
+
+// `*-community.jsx` files export `community` instead of `config`; they get their
+// own guard below rather than being run through the matrix checks.
+const walkCommunity = (dir) => readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
+  e.isDirectory() ? walkCommunity(join(dir, e.name))
+    : (e.name.endsWith("-community.jsx") ? [join(dir, e.name)] : []));
 
 for (const path of walk(CONFIGS)) {
   const where = relative(join(SNIPPETS, ".."), path);
@@ -468,6 +475,101 @@ for (const path of walkMdx(DIFFUSION_COOKBOOK)) {
   const words = prose.match(/[A-Za-z0-9][A-Za-z0-9+./@–—-]*/g) || [];
   if (words.length < 45 || words.length > 180) {
     fail(where, `lead introduction has ${words.length} words; expected 45–180`);
+  }
+}
+
+// ----------------------------------------------------------- 5. Community configs
+// Community entries never enter the cell matrix. The unit is a contribution (one PR)
+// holding that PR's configs; every config must be attributable (PR link, author,
+// hardware, version). Retired fields are rejected by name so an entry written against
+// an older draft fails loudly instead of rendering nothing.
+const RETIRED_ENTRY = {
+  status: "the status taxonomy was dropped — the section intro states these are not team-reproduced",
+  caveats: "dropped — discussion of a config's caveats lives in the linked PR",
+  warn: "dropped — discussion of a config's caveats lives in the linked PR",
+  notes: "dropped — discussion of a config's caveats lives in the linked PR",
+  editorNotes: "dropped — the section shows the config and links the PR; discussion lives in the PR thread",
+  summary: "the knob line is derived from `flags` by describeFlags() — a hand-written summary drifts from the command",
+  contributor: "moved to `source.author` / `source.org` / `source.authorUrl` on the contribution",
+  flags: "configs moved into the contribution's `configs: []` array",
+  benchmark: "dropped — measurements stay in the linked PR; a community workload was never comparable to the matrix cards beside it",
+};
+const loadCommunity = async (path) => {
+  const src = readFileSync(path, "utf8");
+  const mod = await import("data:text/javascript," + encodeURIComponent(src));
+  return mod.community;
+};
+
+for (const path of walkCommunity(CONFIGS)) {
+  const where = relative(join(SNIPPETS, ".."), path);
+  let community;
+  try {
+    community = await loadCommunity(path);
+  } catch (e) {
+    fail(where, `does not parse as a module: ${e.message}`);
+    continue;
+  }
+  if (!Array.isArray(community)) {
+    fail(where, "no `export const community` array");
+    continue;
+  }
+  const seenIds = new Set();
+  const seenSources = new Set();
+  for (const [i, group] of community.entries()) {
+    const src = group && group.source;
+    const gtag = `${where}[${(src && src.label) || i}]`;
+    if (!group || typeof group !== "object") { fail(gtag, "contribution is not an object"); continue; }
+    for (const [field, why] of Object.entries(RETIRED_ENTRY)) {
+      if (group[field] !== undefined) fail(gtag, `\`${field}\` is retired on a contribution — ${why}`);
+    }
+    if (!src || !src.url) {
+      fail(gtag, "missing `source.url` — the PR link is the point of the section");
+    } else if (seenSources.has(src.url)) {
+      fail(gtag, `duplicate contribution for ${src.url} — merge its configs into one group`);
+    } else {
+      seenSources.add(src.url);
+    }
+    if (!src || !src.label) fail(gtag, "missing `source.label` (e.g. \"PR #31006\")");
+    if (!src || !src.author) fail(gtag, "missing `source.author` — an unattributed config must not render");
+    if (src && src.org === "TODO") fail(gtag, "`source.org` is still the generator's TODO placeholder");
+
+    if (!Array.isArray(group.configs) || group.configs.length === 0) {
+      fail(gtag, "`configs` must be a non-empty array");
+      continue;
+    }
+    for (const [j, cfg] of group.configs.entries()) {
+      const tag = `${gtag}.configs[${(cfg && cfg.id) || j}]`;
+      if (!cfg || typeof cfg !== "object") { fail(tag, "config is not an object"); continue; }
+      for (const [field, why] of Object.entries(RETIRED_ENTRY)) {
+        if (field === "flags" || field === "contributor") continue;   // valid on a config
+        if (cfg[field] !== undefined) fail(tag, `\`${field}\` is retired — ${why}`);
+      }
+      for (const key of ["id", "title", "hardware", "modelName", "sglangVersion"]) {
+        if (!cfg[key]) fail(tag, `missing \`${key}\``);
+      }
+      // The id becomes the #community-<id> anchor, so a duplicate makes one config
+      // unreachable by deep link — and ids must be unique across the whole file, not
+      // just within a contribution.
+      if (cfg.id) {
+        if (seenIds.has(cfg.id)) fail(tag, `duplicate \`id\` "${cfg.id}" in this file`);
+        seenIds.add(cfg.id);
+      }
+      // The card renders "<count>× <hardware>", the count derived from --tp × --nnodes.
+      // A count typed into `hardware` both double-prints and goes stale.
+      if (typeof cfg.hardware === "string" && /^\s*\d+\s*[×x*]/.test(cfg.hardware)) {
+        fail(tag, `\`hardware\` must name the GPU model only ("NVIDIA H20 (96GB)") — the count is derived from --tp × --nnodes, got "${cfg.hardware}"`);
+      }
+      if (!Array.isArray(cfg.flags) || cfg.flags.length === 0) {
+        fail(tag, "`flags` must be a non-empty array of literal strings");
+      } else {
+        for (const f of cfg.flags) {
+          if (typeof f !== "string") fail(tag, "`flags` contains a non-string entry");
+        }
+      }
+      if (cfg.env !== undefined && !Array.isArray(cfg.env)) {
+        fail(tag, "`env` must be an array when present");
+      }
+    }
   }
 }
 
