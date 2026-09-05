@@ -290,7 +290,7 @@ class Gemma4Detector(BaseFormatDetector):
                 arguments = _parse_gemma4_args(args_str)
                 calls.append(
                     ToolCallItem(
-                        tool_index=tool_indices.get(func_name, -1),
+                        tool_index=(len(calls) if func_name in tool_indices else -1),
                         name=func_name,
                         parameters=json.dumps(arguments, ensure_ascii=False),
                     )
@@ -377,8 +377,10 @@ class Gemma4Detector(BaseFormatDetector):
 
                                 calls.append(
                                     ToolCallItem(
-                                        tool_index=self._tool_indices.get(
-                                            func_name, -1
+                                        tool_index=(
+                                            self.current_tool_id
+                                            if func_name in self._tool_indices
+                                            else -1
                                         ),
                                         name=func_name,
                                         parameters="",
@@ -408,8 +410,10 @@ class Gemma4Detector(BaseFormatDetector):
 
                             calls.append(
                                 ToolCallItem(
-                                    tool_index=self._tool_indices.get(
-                                        self.current_func_name, -1
+                                    tool_index=(
+                                        self.current_tool_id
+                                        if self.current_func_name in self._tool_indices
+                                        else -1
                                     ),
                                     parameters=json.dumps(
                                         arguments, ensure_ascii=False
