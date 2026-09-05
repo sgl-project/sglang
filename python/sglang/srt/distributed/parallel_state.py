@@ -1175,6 +1175,36 @@ class GroupCoordinator:
         sizes: Optional[List[int]] = None,
     ) -> torch.Tensor:
         world_size = self.world_size
+
+        def _resolve_output(simplify_sizes: bool):
+            # Shared shape/alloc. `simplify_sizes=True` (XPU) collapses
+            # all-equal sizes to None so xccl can use reduce_scatter_tensor.
+            local_sizes = sizes
+            if local_sizes is not None:
+                assert len(local_sizes) == world_size
+                assert input_.shape[0] == sum(local_sizes)
+                chunk_size = local_sizes[self.rank_in_group]
+                if simplify_sizes and all(s == local_sizes[0] for s in local_sizes):
+                    local_sizes = None
+            else:
+                assert input_.shape[0] % world_size == 0
+                chunk_size = input_.shape[0] // world_size
+            output_shape = (chunk_size,) + input_.shape[1:]
+            out = output
+            if out is None:
+                out = torch.empty(
+                    output_shape, dtype=input_.dtype, device=input_.device
+                )
+            else:
+                assert out.shape == output_shape
+            return out, local_sizes
+
+        # XPU has no pynccl_comm — delegate to XpuCommunicator.
+        if self.xpu_communicator is not None and not self.xpu_communicator.disabled:
+            out, s = _resolve_output(simplify_sizes=True)
+            self.xpu_communicator.reduce_scatterv(out, input_, sizes=s)
+            return out
+
         pynccl_comm = self.pynccl_comm
 
         with pynccl_comm.change_state(enable=True):
@@ -1182,22 +1212,7 @@ class GroupCoordinator:
                 "pynccl is required for reduce_scatterv"
             )
 
-            if sizes is not None:
-                assert len(sizes) == world_size
-                assert input_.shape[0] == sum(sizes)
-                chunk_size = sizes[self.rank_in_group]
-            else:
-                assert input_.shape[0] % world_size == 0
-                chunk_size = input_.shape[0] // world_size
-            output_shape = (chunk_size,) + input_.shape[1:]
-
-            if output is None:
-                output = torch.empty(
-                    output_shape, dtype=input_.dtype, device=input_.device
-                )
-            else:
-                assert output.shape == output_shape
-
+            output, _ = _resolve_output(simplify_sizes=False)
             pynccl_comm.reduce_scatter(output, input_, sizes=sizes)
             return output
 
@@ -1352,6 +1367,42 @@ class GroupCoordinator:
         )
         return output_tensor
 
+    def _all_gatherv_allocate_output(
+        self,
+        input_: torch.Tensor,
+        sizes: Optional[List[int]] = None,
+        output: Optional[torch.Tensor] = None,
+    ):
+        """Resolve the all_gatherv output buffer and simplify `sizes`.
+
+        Shared by the pynccl (CUDA) and xccl (XPU) paths so the shape asserts,
+        equal-size `sizes -> None` collapse, symmetric-memory allocation, and the
+        pre-allocated `output` buffer contract stay identical across backends.
+        """
+        world_size = self.world_size
+        input_size = input_.size()
+        if sizes is not None:
+            assert len(sizes) == world_size
+            assert input_.shape[0] == sizes[self.rank_in_group]
+            output_size = (sum(sizes),) + input_size[1:]
+            # 'sizes' is not needed if all inputs in the same group have the same shape
+            if all(s == sizes[0] for s in sizes):
+                sizes = None
+        else:
+            output_size = (input_size[0] * world_size,) + input_size[1:]
+        if output is not None:
+            assert tuple(output.shape) == tuple(output_size), (
+                f"all_gatherv output buffer shape {tuple(output.shape)} "
+                f"!= expected {tuple(output_size)}"
+            )
+            return output, sizes
+        # Allocate output tensor.
+        with self.use_symmetric_memory(self, disabled=sizes is not None):
+            output_tensor = torch.empty(
+                output_size, dtype=input_.dtype, device=input_.device
+            )
+        return output_tensor, sizes
+
     def all_gatherv(
         self,
         input_: Union[torch.Tensor, List[torch.Tensor]],
@@ -1362,44 +1413,28 @@ class GroupCoordinator:
         Supports varying sizes per rank and input tensor list.
         `sizes`: a list of len(world_size) with the number of items per rank to gather.
         `output`: optional pre-allocated destination buffer (single-tensor input only).
-            When given, NCCL writes the gathered result directly into it, avoiding an
-            extra output allocation + caller-side copy.
         """
         world_size = self.world_size
+
+        if self.xpu_communicator is not None and not self.xpu_communicator.disabled:
+            if not isinstance(input_, torch.Tensor):
+                # List input is the flashinfer-cutlass FP4 CUDA path only.
+                raise NotImplementedError(
+                    "all_gatherv list input is not supported on XPU"
+                )
+            out, s = self._all_gatherv_allocate_output(
+                input_, sizes=sizes, output=output
+            )
+            self.xpu_communicator.all_gatherv(out, input_, sizes=s)
+            # Wrap in a list to match the pynccl return contract.
+            return [out]
+
         pynccl_comm = self.pynccl_comm
 
         with pynccl_comm.change_state(enable=True):
             assert pynccl_comm is not None and not pynccl_comm.disabled, (
                 "pynccl is required for all_gatherv"
             )
-
-            def _all_gather_allocate_output(
-                input_: torch.Tensor,
-                sizes: Optional[List[int]] = None,
-                output: Optional[torch.Tensor] = None,
-            ):
-                input_size = input_.size()
-                if sizes is not None:
-                    assert len(sizes) == world_size
-                    assert input_.shape[0] == sizes[self.rank_in_group]
-                    output_size = (sum(sizes),) + input_size[1:]
-                    # 'sizes' is not needed if all inputs in the same group have the same shape
-                    if all(s == sizes[0] for s in sizes):
-                        sizes = None
-                else:
-                    output_size = (input_size[0] * world_size,) + input_size[1:]
-                if output is not None:
-                    assert tuple(output.shape) == tuple(output_size), (
-                        f"all_gatherv output buffer shape {tuple(output.shape)} "
-                        f"!= expected {tuple(output_size)}"
-                    )
-                    return output, sizes
-                # Allocate output tensor.
-                with self.use_symmetric_memory(self, disabled=sizes is not None):
-                    output_tensor = torch.empty(
-                        output_size, dtype=input_.dtype, device=input_.device
-                    )
-                return output_tensor, sizes
 
             single_input = isinstance(input_, torch.Tensor)
             if single_input:
@@ -1410,7 +1445,7 @@ class GroupCoordinator:
             output_list = []
             size_list = []
             for inp in input_:
-                output_tensor, s = _all_gather_allocate_output(
+                output_tensor, s = self._all_gatherv_allocate_output(
                     inp, sizes=sizes, output=output
                 )
                 output_list.append(output_tensor)
