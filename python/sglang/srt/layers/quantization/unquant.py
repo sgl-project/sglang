@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from sglang.kernels.fused_op import BaseFusedOp
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
@@ -255,28 +256,39 @@ def _flashinfer_pr4266_bf16_gemm(
 
 
 def _bf16_gemm_dispatch_impl(
-    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    addend: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     m = x.numel() // x.shape[-1]
     if _enable_bf16_splitk_gemm and use_flashinfer_pr4266_bf16_gemm(
         m, weight.shape[0], weight.shape[1]
     ):
-        return _flashinfer_pr4266_bf16_gemm(x, weight, bias)
-    if (
+        output = _flashinfer_pr4266_bf16_gemm(x, weight, bias)
+    elif (
         _use_hopper_bf16_gemv is not None
         and bias is None
         and _use_hopper_bf16_gemv(m, weight.shape[0], weight.shape[1])
     ):
-        return _hopper_bf16_gemv(x.view(-1, x.shape[-1]), weight).view(
+        output = _hopper_bf16_gemv(x.view(-1, x.shape[-1]), weight).view(
             *x.shape[:-1], -1
         )
-    if _use_cutedsl_bf16_gemm is not None and _use_cutedsl_bf16_gemm(
+    elif _use_cutedsl_bf16_gemm is not None and _use_cutedsl_bf16_gemm(
         m, weight.shape[0], weight.shape[1]
     ):
-        return _cutedsl_bf16_gemm(x.view(-1, x.shape[-1]), weight, bias).view(
+        output = _cutedsl_bf16_gemm(x.view(-1, x.shape[-1]), weight, bias).view(
             *x.shape[:-1], -1
         )
-    return F.linear(x, weight, bias)
+    else:
+        if addend is not None:
+            assert bias is None
+            return torch.addmm(addend, x, weight.t(), out=addend)
+        return F.linear(x, weight, bias)
+
+    if addend is not None:
+        output.add_(addend)
+    return output
 
 
 @register_custom_op(fake_impl=_bf16_gemm_dispatch_fake)
@@ -401,6 +413,49 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
 
         return F.linear(x, layer.weight, bias)
+
+    def apply_with_addend(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        addend: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return ``linear(x) + addend``, reusing ``addend`` when supported.
+
+        The addmm path overwrites ``addend``; custom-kernel and fallback paths
+        leave it unchanged. Callers must treat it as consumed in either case.
+        """
+        if (
+            torch.compiler.is_compiling()
+            or _use_aiter
+            or not _is_cuda
+            or is_batch_invariant_mode_enabled()
+            or not x.is_cuda
+            or x.ndim != 2
+            or x.dtype != torch.bfloat16
+            or layer.weight.dtype != torch.bfloat16
+            or addend.dtype != torch.bfloat16
+            or not addend.is_contiguous()
+            or addend.shape != (x.shape[0], layer.weight.shape[0])
+            or bias is not None
+            or x.requires_grad
+            or addend.requires_grad
+            or layer.weight.requires_grad
+        ):
+            output = self.apply(layer, x, bias)
+            output.add_(addend)
+            return output
+
+        backend = get_bf16_gemm_backend()
+        if backend in (Bf16GemmBackend.AUTO, Bf16GemmBackend.TORCH):
+            return torch.addmm(addend, x, layer.weight.t(), out=addend)
+        if backend.is_optimized():
+            return _bf16_gemm_dispatch_impl(x, layer.weight, bias, addend=addend)
+
+        output = self.apply(layer, x, bias)
+        output.add_(addend)
+        return output
 
     def apply_into(
         self,

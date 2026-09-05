@@ -293,10 +293,25 @@ class ReplicatedLinear(LinearBase):
         )
         param.data.copy_(loaded_weight)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        addend: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
-        output = self.quant_method.apply(self, x, bias)
+        apply_with_addend = (
+            getattr(self.quant_method, "apply_with_addend", None)
+            if addend is not None
+            else None
+        )
+        if apply_with_addend is not None:
+            output = apply_with_addend(self, x, addend, bias)
+        else:
+            output = self.quant_method.apply(self, x, bias)
+            if addend is not None:
+                output.add_(addend)
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 

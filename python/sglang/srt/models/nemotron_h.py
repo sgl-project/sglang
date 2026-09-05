@@ -331,6 +331,24 @@ class NemotronHMoE(nn.Module):
 
         return final_hidden_states, shared_output
 
+    def _apply_latent_projection(
+        self,
+        final_hidden_states: torch.Tensor,
+        shared_output: torch.Tensor | None,
+    ) -> torch.Tensor:
+        projection = self.fc2_latent_proj
+        if shared_output is not None and type(projection) is ReplicatedLinear:
+            final_hidden_states, _ = projection(
+                final_hidden_states,
+                addend=shared_output,
+            )
+            return final_hidden_states
+
+        final_hidden_states, _ = projection(final_hidden_states)
+        if shared_output is not None:
+            final_hidden_states += shared_output
+        return final_hidden_states
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -341,9 +359,10 @@ class NemotronHMoE(nn.Module):
         final_hidden_states, shared_output = self._forward_core(hidden_states)
 
         if self.use_latent_moe:
-            final_hidden_states, _ = self.fc2_latent_proj(final_hidden_states)
-
-        if shared_output is not None:
+            final_hidden_states = self._apply_latent_projection(
+                final_hidden_states, shared_output
+            )
+        elif shared_output is not None:
             final_hidden_states += shared_output
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
