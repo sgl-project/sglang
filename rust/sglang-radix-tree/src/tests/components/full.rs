@@ -1,6 +1,7 @@
 use super::*;
 use crate::components::FULL;
 use crate::test_utils::accumulate_step;
+use crate::test_utils::{MatchResult, PoolTransfer, UnifiedTreeCore};
 use crate::unified_tree_core::CacheInitParams;
 use tch::{Kind, Tensor};
 
@@ -23,11 +24,11 @@ fn set_value_no_check<K: ChildKeyType>(
 fn eviction_priority_is_lower_for_leaf_than_internal() {
     let full = FullComponent;
     assert_eq!(
-        <FullComponent as TreeComponent<Vec<i64>>>::eviction_priority(&full, true),
+        <FullComponent as TreeComponent<Vec<i64>, Tensor>>::eviction_priority(&full, true),
         0
     );
     assert_eq!(
-        <FullComponent as TreeComponent<Vec<i64>>>::eviction_priority(&full, false),
+        <FullComponent as TreeComponent<Vec<i64>, Tensor>>::eviction_priority(&full, false),
         2
     );
 }
@@ -1378,7 +1379,7 @@ fn match_validator_device_only_accepts_device_backed_only() {
         .set_device_value(dev, FULL, Tensor::from_slice(&[0i64]));
     tc.arena
         .set_host_value(host, FULL, Tensor::from_slice(&[0i64]));
-    let mut validator = <FullComponent as TreeComponent<Vec<i64>>>::create_match_validator(
+    let mut validator = <FullComponent as TreeComponent<Vec<i64>, Tensor>>::create_match_validator(
         &FullComponent,
         &tc,
         true,
@@ -1423,7 +1424,7 @@ fn match_validator_hicache_accepts_device_or_host_backed() {
         .set_device_value(dev, FULL, Tensor::from_slice(&[0i64]));
     tc.arena
         .set_host_value(host, FULL, Tensor::from_slice(&[0i64]));
-    let mut validator = <FullComponent as TreeComponent<Vec<i64>>>::create_match_validator(
+    let mut validator = <FullComponent as TreeComponent<Vec<i64>, Tensor>>::create_match_validator(
         &FullComponent,
         &tc,
         false,
@@ -1450,12 +1451,13 @@ fn match_validator_accepts_node_with_both_device_and_host() {
         .set_device_value(both, FULL, Tensor::from_slice(&[0i64]));
     tc.arena
         .set_host_value(both, FULL, Tensor::from_slice(&[0i64]));
-    let mut device_only = <FullComponent as TreeComponent<Vec<i64>>>::create_match_validator(
-        &FullComponent,
-        &tc,
-        true,
-    );
-    let mut hicache = <FullComponent as TreeComponent<Vec<i64>>>::create_match_validator(
+    let mut device_only =
+        <FullComponent as TreeComponent<Vec<i64>, Tensor>>::create_match_validator(
+            &FullComponent,
+            &tc,
+            true,
+        );
+    let mut hicache = <FullComponent as TreeComponent<Vec<i64>, Tensor>>::create_match_validator(
         &FullComponent,
         &tc,
         false,
@@ -1489,7 +1491,7 @@ fn match_validator_verdict_is_per_node_not_stateful() {
     tc.arena
         .set_device_value(dev, FULL, Tensor::from_slice(&[0i64]));
     // One validator reused across nodes returns each node's own verdict (FULL is stateless).
-    let mut validator = <FullComponent as TreeComponent<Vec<i64>>>::create_match_validator(
+    let mut validator = <FullComponent as TreeComponent<Vec<i64>, Tensor>>::create_match_validator(
         &FullComponent,
         &tc,
         true,
@@ -1531,11 +1533,12 @@ fn match_validator_accepts_present_but_empty_device_value() {
     );
     // A present-but-empty device value is a boundary (Python `value is not None`); a
     // truly value-less node is not.
-    let mut device_only = <FullComponent as TreeComponent<Vec<i64>>>::create_match_validator(
-        &FullComponent,
-        &tc,
-        true,
-    );
+    let mut device_only =
+        <FullComponent as TreeComponent<Vec<i64>, Tensor>>::create_match_validator(
+            &FullComponent,
+            &tc,
+            true,
+        );
     assert!(device_only(&tc, empty_dev));
     assert!(!device_only(&tc, no_value));
 }
@@ -1765,16 +1768,17 @@ fn match_validator_hicache_accepts_present_but_empty_host_value() {
         Tensor::from_slice(&empty),
     );
     // A present-but-empty host value is backuped (Python `host_value is not None`).
-    let mut hicache = <FullComponent as TreeComponent<Vec<i64>>>::create_match_validator(
+    let mut hicache = <FullComponent as TreeComponent<Vec<i64>, Tensor>>::create_match_validator(
         &FullComponent,
         &tc,
         false,
     );
-    let mut device_only = <FullComponent as TreeComponent<Vec<i64>>>::create_match_validator(
-        &FullComponent,
-        &tc,
-        true,
-    );
+    let mut device_only =
+        <FullComponent as TreeComponent<Vec<i64>, Tensor>>::create_match_validator(
+            &FullComponent,
+            &tc,
+            true,
+        );
     assert!(hicache(&tc, host));
     assert!(!device_only(&tc, host));
 }
@@ -1783,7 +1787,7 @@ fn match_validator_hicache_accepts_present_but_empty_host_value() {
 #[should_panic(expected = "out of bounds")]
 fn match_validator_panics_on_missing_node() {
     let tc = core();
-    let mut validator = <FullComponent as TreeComponent<Vec<i64>>>::create_match_validator(
+    let mut validator = <FullComponent as TreeComponent<Vec<i64>, Tensor>>::create_match_validator(
         &FullComponent,
         &tc,
         true,

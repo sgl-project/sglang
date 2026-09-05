@@ -9,7 +9,7 @@ use crate::unified_tree_core::{
     InsertResult, LRURefreshPhase, MatchPrefixParams, MatchResult, PoolTransfer,
     PoolTransferResult, UnifiedTreeCore,
 };
-use crate::value::{DefaultRadixValue, RadixValue};
+use crate::value::RadixValue;
 
 mod full;
 mod mamba;
@@ -55,7 +55,7 @@ pub(crate) fn all_values_flatten<K: ChildKeyType, V: RadixValue>(
 }
 
 /// A per-component lock/value/eviction driver over the shared `UnifiedTreeCore`.
-pub trait TreeComponent<K: ChildKeyType, V: RadixValue = DefaultRadixValue> {
+pub trait TreeComponent<K: ChildKeyType, V: RadixValue> {
     /// The component this driver serves.
     fn component_type(&self) -> ComponentType;
 

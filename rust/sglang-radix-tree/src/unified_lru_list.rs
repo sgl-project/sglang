@@ -8,7 +8,7 @@ use crate::node::ChildKeyType;
 use crate::node::Node;
 use crate::node::NodeArena;
 use crate::node::{NodeIdx_, ValueSlotIdx};
-use crate::value::{DefaultRadixValue, RadixValue};
+use crate::value::RadixValue;
 
 /// Index into the cell table; distinct from `NodeIdx_` so shifted and unshifted
 /// ids cannot be mixed.
@@ -408,7 +408,7 @@ impl UnifiedLRUList {
 pub struct PriorityKey(pub i64, pub i64);
 
 /// Ranks nodes for eviction; lower priority evicts first.
-pub trait EvictionStrategy<K: ChildKeyType, V: RadixValue = DefaultRadixValue> {
+pub trait EvictionStrategy<K: ChildKeyType, V: RadixValue> {
     /// The node's eviction priority.
     fn get_priority(&self, node: &Node<K, V>) -> PriorityKey;
 }

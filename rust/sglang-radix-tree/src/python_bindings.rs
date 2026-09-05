@@ -15,11 +15,20 @@ use crate::node::ChildKeyType;
 use crate::node::{KeyNamespaceRef, NodeId, TreeCoreRuntimeError};
 use crate::unified_tree_core::KvCacheEvent;
 use crate::unified_tree_core::{
-    BufferBackupSnapshot, BufferBackupState, CacheAction, CacheInitParams, CacheTransferPhase,
-    DecLockRefParams, EvictLayer, EvictionStepResult, InsertParams, InsertResult, InsertStepResult,
-    MatchPrefixParams, MatchResult, PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, Req,
-    UnifiedTreeCore,
+    BufferBackupSnapshot, BufferBackupState, CacheInitParams, CacheTransferPhase, DecLockRefParams,
+    EvictLayer, MatchPrefixParams, PoolHitPolicy, PoolName, PoolTransferResult,
 };
+
+// The binding is Tensor-only; name the generic tree types once.
+type CacheAction = crate::unified_tree_core::CacheAction<Tensor>;
+type EvictionStepResult = crate::unified_tree_core::EvictionStepResult<Tensor>;
+type InsertParams<'k, K> = crate::unified_tree_core::InsertParams<'k, K, Tensor>;
+type InsertResult = crate::unified_tree_core::InsertResult<Tensor>;
+type InsertStepResult = crate::unified_tree_core::InsertStepResult<Tensor>;
+type MatchResult = crate::unified_tree_core::MatchResult<Tensor>;
+type PoolTransfer = crate::unified_tree_core::PoolTransfer<Tensor>;
+type Req = crate::unified_tree_core::Req<Tensor>;
+type UnifiedTreeCore<K> = crate::unified_tree_core::UnifiedTreeCore<K, Tensor>;
 
 /// Parse a torch-style device string (e.g. "cpu", "cuda", "cuda:1"); a bare
 /// "cuda" means index 0, so callers must resolve the index themselves.
@@ -847,7 +856,7 @@ pub struct HostEvictionResultBinding {
 }
 
 impl HostEvictionResultBinding {
-    fn from_eviction_step(py: Python<'_>, result: EvictionStepResult<Tensor>) -> PyResult<Self> {
+    fn from_eviction_step(py: Python<'_>, result: EvictionStepResult) -> PyResult<Self> {
         Ok(Self {
             tracker: tracker_to_py(result.tracker),
             new_device_frees: frees_to_py(py, result.device_frees)?,
@@ -859,7 +868,7 @@ impl HostEvictionResultBinding {
 /// The generic UnifiedTreeCore adapter the per-key-type pyclasses delegate to;
 /// the Mutex makes the Send-only core satisfy pyclass's Sync bound.
 struct TreeCoreBinding<K: ChildKeyType> {
-    core: Mutex<UnifiedTreeCore<K, Tensor>>,
+    core: Mutex<UnifiedTreeCore<K>>,
     /// The core's construction device, kept outside the Mutex for pre-lock validation.
     device: Device,
     /// The core's page size, kept outside the Mutex for pre-lock validation.
@@ -923,7 +932,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
 
     /// Lock the core for one adapter call. A panic can leave a mutation half-applied,
     /// so a poisoned core is never reused.
-    fn core(&self) -> std::sync::MutexGuard<'_, UnifiedTreeCore<K, Tensor>> {
+    fn core(&self) -> std::sync::MutexGuard<'_, UnifiedTreeCore<K>> {
         self.core.lock().unwrap_or_else(|_| {
             panic!("Rust TreeCore mutex poisoned; refusing to reuse state after an earlier panic")
         })

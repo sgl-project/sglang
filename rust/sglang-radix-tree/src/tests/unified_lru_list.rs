@@ -1,6 +1,7 @@
 use super::*;
 use crate::components::FULL;
-use crate::node::{NodeArena, NodeIdx_, ValueSlotIdx};
+use crate::node::{NodeIdx_, ValueSlotIdx};
+use crate::test_utils::NodeArena;
 use tch::Tensor;
 
 fn order(list: &UnifiedLRUList) -> Vec<NodeIdx_> {

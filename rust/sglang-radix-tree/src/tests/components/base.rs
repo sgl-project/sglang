@@ -1,12 +1,13 @@
 use super::*;
 use crate::components::FULL;
+use crate::test_utils::{InsertParams, InsertResult, MatchResult, UnifiedTreeCore};
 use crate::unified_tree_core::CacheInitParams;
 use tch::Tensor;
 
 // Test-only component exercising the trait defaults; abstract hooks stay unimplemented.
 struct DefaultComponentForTest;
 
-impl TreeComponent<Vec<i64>> for DefaultComponentForTest {
+impl TreeComponent<Vec<i64>, Tensor> for DefaultComponentForTest {
     fn component_type(&self) -> ComponentType {
         FULL
     }

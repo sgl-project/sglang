@@ -18,7 +18,7 @@ use crate::node::{ChildKeyType, HashDigest, KeyNamespace, KeyNamespaceRef};
 use crate::node::{NUM_VALUE_SLOTS, NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
 use crate::unified_lru_list::UnifiedLRUList;
 use crate::unified_lru_list::{EvictionStrategy, PriorityKey, get_eviction_strategy};
-use crate::value::{DefaultRadixValue, RadixValue};
+use crate::value::RadixValue;
 
 // A 42-bit mask keeps digest multiplication by 1_000_003 within i64.
 const COEXIST_RECLAIM_DIGEST_MULTIPLIER: i64 = 1_000_003;
@@ -61,7 +61,7 @@ pub struct DecLockRefParams {
 pub struct DecLockRefResult {}
 
 /// Result of a prefix match.
-pub struct MatchResult<V: RadixValue = DefaultRadixValue> {
+pub struct MatchResult<V: RadixValue> {
     /// Device KV indices matched by the common prefix.
     pub device_indices: V,
     /// Last matched node still resident on device.
@@ -95,7 +95,7 @@ pub struct MatchPrefixParams<'k, K: ChildKeyType> {
 }
 
 /// Params for an insert; the key is borrowed from the caller.
-pub struct InsertParams<'k, K: ChildKeyType, V: RadixValue = DefaultRadixValue> {
+pub struct InsertParams<'k, K: ChildKeyType, V: RadixValue> {
     /// The insert key (already page-typed; bigram conversion happens at the boundary).
     pub key: &'k K,
     /// Namespace of the insert; picks the matching subtree root.
@@ -120,7 +120,7 @@ pub struct InsertParams<'k, K: ChildKeyType, V: RadixValue = DefaultRadixValue> 
 }
 
 /// Result of an insert.
-pub struct InsertResult<V: RadixValue = DefaultRadixValue> {
+pub struct InsertResult<V: RadixValue> {
     /// Tokens of the insert key that overlapped existing nodes.
     pub prefix_len: usize,
     /// The inserted key's full (page-aligned) length.
@@ -182,7 +182,7 @@ impl<V: RadixValue> InsertResult<V> {
 
 /// One step of a resumable insert: the Controller executes `actions`, then
 /// resumes while `result` is None; `result` is set on the final step.
-pub struct InsertStepResult<V: RadixValue = DefaultRadixValue> {
+pub struct InsertStepResult<V: RadixValue> {
     pub actions: Vec<CacheAction<V>>,
     pub result: Option<InsertResult<V>>,
 }
@@ -196,7 +196,7 @@ pub enum InsertPhase {
 
 /// In-flight resumable-insert state persisted across step barriers; owns its
 /// key/value/params snapshot so the walk survives across boundary calls.
-pub struct InsertWalkState<K: ChildKeyType, V: RadixValue = DefaultRadixValue> {
+pub struct InsertWalkState<K: ChildKeyType, V: RadixValue> {
     phase: InsertPhase,
     node_id: NodeIdx_,
     /// Page-aligned key suffix beginning at `key_offset`.
@@ -233,7 +233,7 @@ pub struct KvCanaryWalkResult {
 }
 
 /// A queued cache IO action.
-pub enum CacheAction<V: RadixValue = DefaultRadixValue> {
+pub enum CacheAction<V: RadixValue> {
     /// Duplicate device KV slices the cache frees after the insert.
     FreeDeviceKV(Vec<V>),
     /// Free the full side only, for a tombstoned node whose SWA peers are gone;
@@ -285,7 +285,7 @@ pub enum CacheAction<V: RadixValue = DefaultRadixValue> {
 }
 
 /// A HiCache pool transfer descriptor.
-pub struct PoolTransfer<V: RadixValue = DefaultRadixValue> {
+pub struct PoolTransfer<V: RadixValue> {
     /// The pool this transfer targets.
     pub name: PoolName,
     /// Host-side indices for the device<->host path.
@@ -372,7 +372,7 @@ pub struct BackupKV {
 }
 
 /// A device->storage backup spec.
-pub struct StorageBackupSpec<V: RadixValue = DefaultRadixValue> {
+pub struct StorageBackupSpec<V: RadixValue> {
     /// The node's FULL host value (the storage write's source indices).
     pub host_value: V,
     /// Raw token ids spanned by the node's key.
@@ -421,7 +421,7 @@ impl EvictLayer {
 }
 
 /// The request fields load-back planning reads.
-pub struct Req<V: RadixValue = DefaultRadixValue> {
+pub struct Req<V: RadixValue> {
     /// Mamba pool slot backing the request, when one is assigned.
     pub mamba_pool_idx: Option<V>,
 }
@@ -513,7 +513,7 @@ impl Default for CacheInitParams {
 /// A single eviction step's outputs: this step's per-component evicted
 /// counts (deltas, for the Controller to accumulate) and freed values.
 #[derive(Debug)]
-pub struct EvictionStepResult<V: RadixValue = DefaultRadixValue> {
+pub struct EvictionStepResult<V: RadixValue> {
     pub tracker: HashMap<ComponentType, usize>,
     pub device_frees: HashMap<ComponentType, Vec<V>>,
     pub host_frees: HashMap<ComponentType, Vec<V>>,
@@ -532,7 +532,7 @@ impl<V: RadixValue> Default for EvictionStepResult<V> {
 /// The radix tree mechanism: owns the tree structure, per-node values, the
 /// per-component LRUs, the size/leaf bookkeeping, and the component drivers,
 /// plus `reset()`.
-pub struct UnifiedTreeCore<K: ChildKeyType, V: RadixValue = DefaultRadixValue> {
+pub struct UnifiedTreeCore<K: ChildKeyType, V: RadixValue> {
     pub(crate) arena: NodeArena<K, V>,
     /// Ordered component registry; each driver reports its own type.
     components: Vec<Arc<dyn TreeComponent<K, V> + Send + Sync>>,

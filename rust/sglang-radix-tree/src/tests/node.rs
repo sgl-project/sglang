@@ -6,6 +6,7 @@ use tch::Tensor;
 use super::*;
 use crate::components::{FULL, MAMBA, SWA};
 use crate::node::TreeCoreRuntimeError;
+use crate::test_utils::{Node, NodeArena};
 
 static COUNTED_KEY_CONSTRUCTIONS: AtomicUsize = AtomicUsize::new(0);
 

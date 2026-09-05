@@ -8,7 +8,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use crate::components::{ComponentType, FULL, NUM_COMPONENT_TYPES};
-use crate::value::{DefaultRadixValue, RadixValue};
+use crate::value::RadixValue;
 use hashbrown::hash_map::Entry;
 use hashbrown::{Equivalent, HashMap as HashBrownMap};
 use sha2::{Digest, Sha256};
@@ -149,7 +149,7 @@ impl<K: ChildKeyType> Equivalent<(KeyNamespace, K)> for ChildEdgeRef<'_, K> {
 }
 
 /// A radix-tree node, generic over the child-key type `K` (single-token or bigram).
-pub struct Node<K: ChildKeyType, V: RadixValue = DefaultRadixValue> {
+pub struct Node<K: ChildKeyType, V: RadixValue> {
     /// Parent handle; `None` for the root or a not-yet-attached child.
     pub(crate) parent: Option<NodeIdx_>,
     /// Own arena slot; stamped by the arena on allocation (hand-built nodes
@@ -673,7 +673,7 @@ impl ValueSlotIdx {
 
 /// Per-(component × tier) node state: the KV-index `value` (held opaquely)
 /// and the in-flight `lock_ref`.
-pub struct ValueState<V = DefaultRadixValue> {
+pub struct ValueState<V> {
     /// KV pool indices; `None` = value-less (root) or tombstone (evicted / out-of-window).
     pub value: Option<V>,
     /// In-flight request refcount; a host slot's own `lock_ref` IS the host lock.
@@ -1049,7 +1049,7 @@ pub fn split_node_hash_value(
 
 /// Owns every `Node`; parent/children/LRU hold `NodeIdx_`s into it, with a freelist
 /// and a single root; child edges are keyed by (namespace, page key).
-pub struct NodeArena<K: ChildKeyType, V: RadixValue = DefaultRadixValue> {
+pub struct NodeArena<K: ChildKeyType, V: RadixValue> {
     /// Node store indexed by `NodeIdx_`; `None` marks a freed slot.
     nodes: Vec<Option<Node<K, V>>>,
     /// Freed slot ids available for reuse.

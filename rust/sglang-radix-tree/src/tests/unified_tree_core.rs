@@ -5,6 +5,9 @@ use tch::{Kind, Tensor};
 use super::*;
 use crate::components::{FULL, MAMBA, SWA};
 use crate::node::ValueSlotIdx;
+use crate::test_utils::{
+    CacheAction, InsertParams, InsertResult, InsertStepResult, UnifiedTreeCore,
+};
 use crate::test_utils::{accumulate_step, action_kinds};
 
 fn core() -> UnifiedTreeCore<Vec<i64>> {
@@ -18,7 +21,7 @@ struct RecordingComponentForTest {
     host_eviction_calls: Mutex<Vec<(&'static str, usize)>>,
 }
 
-impl TreeComponent<Vec<i64>> for RecordingComponentForTest {
+impl TreeComponent<Vec<i64>, Tensor> for RecordingComponentForTest {
     fn component_type(&self) -> ComponentType {
         SWA
     }
@@ -136,7 +139,7 @@ struct CountingComponentForTest {
     validator_calls: Arc<Mutex<usize>>,
 }
 
-impl TreeComponent<Vec<i64>> for CountingComponentForTest {
+impl TreeComponent<Vec<i64>, Tensor> for CountingComponentForTest {
     fn component_type(&self) -> ComponentType {
         SWA
     }
@@ -225,7 +228,7 @@ impl TreeComponent<Vec<i64>> for CountingComponentForTest {
 // test can pin that dec_swa_lock_only dispatches lower-priority releases.
 struct LowPriorityComponentForTest;
 
-impl TreeComponent<Vec<i64>> for LowPriorityComponentForTest {
+impl TreeComponent<Vec<i64>, Tensor> for LowPriorityComponentForTest {
     fn component_type(&self) -> ComponentType {
         MAMBA
     }
@@ -304,7 +307,7 @@ impl TreeComponent<Vec<i64>> for LowPriorityComponentForTest {
 
 struct SwaComponentForTest;
 
-impl TreeComponent<Vec<i64>> for SwaComponentForTest {
+impl TreeComponent<Vec<i64>, Tensor> for SwaComponentForTest {
     fn component_type(&self) -> ComponentType {
         SWA
     }
@@ -393,7 +396,7 @@ impl SwaEvictionComponentForTest {
     }
 }
 
-impl TreeComponent<Vec<i64>> for SwaEvictionComponentForTest {
+impl TreeComponent<Vec<i64>, Tensor> for SwaEvictionComponentForTest {
     fn component_type(&self) -> ComponentType {
         SWA
     }
@@ -1837,11 +1840,11 @@ fn tracked_insert_params<'k>(key: &'k Vec<i64>, value: &[i64]) -> InsertParams<'
 
 #[test]
 fn adopted_ranges_are_opt_in_and_coalesce() {
-    let mut untracked = InsertResult::<Tensor>::default();
+    let mut untracked = InsertResult::default();
     untracked.record_adopted_range(FULL, 0, 2);
     assert_eq!(untracked.adopted_ranges, None);
 
-    let mut tracked = InsertResult::<Tensor> {
+    let mut tracked = InsertResult {
         adopted_ranges: Some(HashMap::new()),
         ..InsertResult::default()
     };

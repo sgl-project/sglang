@@ -1,5 +1,6 @@
 use super::*;
 use crate::components::{FULL, MAMBA, SWA};
+use crate::test_utils::{CacheAction, InsertParams, InsertResult, PoolTransfer, UnifiedTreeCore};
 use crate::test_utils::{accumulate_step, action_kinds};
 use crate::unified_lru_list::UnifiedLRUList;
 use tch::Tensor;
@@ -465,11 +466,11 @@ fn host_unlock_skips_the_lru_for_device_backed_nodes() {
 fn eviction_priority_is_the_lowest_tier_everywhere() {
     let mamba = mamba_component();
     assert_eq!(
-        TreeComponent::<Vec<i64>>::eviction_priority(&mamba, /* is_leaf = */ true),
+        TreeComponent::<Vec<i64>, Tensor>::eviction_priority(&mamba, /* is_leaf = */ true),
         0
     );
     assert_eq!(
-        TreeComponent::<Vec<i64>>::eviction_priority(&mamba, /* is_leaf = */ false),
+        TreeComponent::<Vec<i64>, Tensor>::eviction_priority(&mamba, /* is_leaf = */ false),
         0
     );
 }

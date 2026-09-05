@@ -37,4 +37,4 @@ pub use unified_tree_core::{
     KvCanaryWalkResult, MatchPrefixParams, MatchResult, PoolHitPolicy, PoolName, PoolTransfer,
     PoolTransferResult, Req, StorageBackupSpec, StorageMedium, UnifiedTreeCore,
 };
-pub use value::{DefaultRadixValue, PageValue, RadixValue};
+pub use value::{PageValue, RadixValue};

@@ -4,14 +4,6 @@ use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
 
-/// Backward-compatible value type when callers omit `V`.
-#[cfg(feature = "torch")]
-pub type DefaultRadixValue = tch::Tensor;
-
-/// Torch-free default used by native consumers that omit `V`.
-#[cfg(not(feature = "torch"))]
-pub type DefaultRadixValue = PageValue<usize>;
-
 /// Value operations required by the radix-tree mechanism.
 ///
 /// Implementations should make [`Self::shallow_clone`] cheap. Values are index
