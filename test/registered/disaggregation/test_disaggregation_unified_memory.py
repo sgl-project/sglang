@@ -9,6 +9,9 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 register_cuda_ci(est_time=900, stage="base-b", runner_config="2-gpu-large")
 
 KIMI_LINEAR_MODEL = "yujiepan/kimi-linear-tiny-random"
+# Smallest in-tree GDN hybrid: MHA full attention + gated-delta-net linear
+# layers, i.e. the unified pool's MHA sub-pool rather than the MLA one.
+QWEN_GDN_MODEL = "Qwen/Qwen3.5-0.8B"
 SERVER_ENV = {"SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM": "0"}
 
 # --attention-backend and --enable-deterministic-inference are deliberately
@@ -61,6 +64,22 @@ class TestUnifiedMemoryDisaggregationChunkedPrefill(TestUnifiedMemoryDisaggregat
     baseline_args = _chunked_args
     extra_prefill_args = _chunked_args
     extra_decode_args = _chunked_args
+
+
+class TestUnifiedMemoryDisaggregationMHA(TestUnifiedMemoryDisaggregation):
+    """The MHA full-attention sub-pool over the wire.
+
+    Kimi-Linear above exercises the MLA sub-pool, whose whole-envelope
+    registration has always been the one PD supports. An MHA envelope is a
+    different shape -- `2 * layer_num` row-blocks per page instead of
+    `layer_num` -- and it reaches a different branch of
+    `_send_kvcache_generic`: without `force_flat` the MHA branch halves the
+    single registered region into K and V, computes `num_kv_layers = 0` and
+    transfers NOTHING, which shows up as garbage decode rather than an error.
+    Logprob parity against a non-PD unified reference is what catches that.
+    """
+
+    model = QWEN_GDN_MODEL
 
 
 if __name__ == "__main__":

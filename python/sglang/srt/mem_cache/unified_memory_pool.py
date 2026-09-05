@@ -624,10 +624,19 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             env[tgt_pages] = env[src_pages]
 
     def get_contiguous_buf_infos(self):
-        raise NotImplementedError(
-            "unified layout has no per-layer contiguous regions; "
-            "KV transfer / disaggregation is unsupported."
-        )
+        """PD-transfer registration: ONE entry, the raw buffer, addressed as
+        ``raw_ptr + physical_page_id * page_envelope_bytes``.
+
+        Same whole-envelope contract as `UnifiedMLATokenToKVPool`: the transfer
+        item is one page across ALL layers and both K and V, because the
+        per-layer views overlap inside the envelope and index in kernel-facing
+        ids. A peer must therefore build an identical spec -- enforced on the
+        wire by `_validate_envelope_kv_layout`.
+        """
+        # The address formula omits the anchor; a nonzero one would mis-address.
+        assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
+        raw = self._unified_buffer._raw
+        return [raw.data_ptr()], [raw.numel()], [self._page_bytes]
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         raise NotImplementedError(
@@ -1843,6 +1852,7 @@ def init_unified_mamba_swa_pools(
     lazy_compaction: bool = False,
     unified_total_bytes: Optional[int] = None,
     sliding_window_size: Optional[int] = None,
+    decode_pre_alloc_size: int = 0,
 ) -> UnifiedPoolBundle:
     """Build the TRI-pool unified-memory-pool stack for models with full KV +
     SWA KV + mamba/conv state (Inkling-class: `mambaish_config` AND
@@ -1968,6 +1978,7 @@ def init_unified_mamba_swa_pools(
         speculative_num_draft_tokens=speculative_num_draft_tokens,
         enable_overlap_schedule=not disable_overlap_schedule,
         start_layer=start_layer,
+        pre_alloc_size=decode_pre_alloc_size,
     )
     allocator = UnifiedMambaSWATokenToKVPoolAllocator(
         unified_buffer=shared_pool,

@@ -151,11 +151,21 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
         )
         # Host-pool retraction transfers full and sliding-window components
         # only, so a model with recurrent state stays on cpu_tensor.
-        supports_host_pool = not uses_ssm_state(
-            tp_worker.model_runner.model_config
-        ) and (
-            isinstance(kv_cache, MHATokenToKVPool)
-            or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
+        #
+        # The unified pool is excluded for the same reason hierarchical cache is
+        # (see `handle_unified_memory_pool`): the host-transfer path indexes the
+        # device buffers with the ids it is handed, and under the unified pool
+        # those are VIRTUAL. It also cannot be sized from `kv_cache.size`, which
+        # is a KERNEL-FACING row count (`num_pages * 2 * layer_num * page_size`)
+        # rather than a token capacity -- gpt-oss-20b reports 85M "tokens" and
+        # asks for 418 GB of host memory per component.
+        supports_host_pool = (
+            not uses_ssm_state(tp_worker.model_runner.model_config)
+            and not memory.enable_unified_memory
+            and (
+                isinstance(kv_cache, MHATokenToKVPool)
+                or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
+            )
         )
         schedule = get_schedule()
         priority_preemption = (
