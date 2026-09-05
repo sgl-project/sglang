@@ -107,10 +107,45 @@ def get_param_names_mapping(
     return mapping_fn
 
 
+def _fuse_tensors(
+    target_param_name: str,
+    tensors: list[torch.Tensor],
+    fused_tensor_factory: (
+        Callable[[str, torch.Size, torch.dtype], tuple[torch.Tensor, bool] | None]
+        | None
+    ),
+) -> torch.Tensor:
+    """Concatenate the pieces of one parameter along dim 0.
+
+    The factory, when given, provides the destination (a file mapping that
+    outlives anonymous memory) and says whether an earlier run already filled
+    it -- then the pieces are not even read.
+    """
+    if fused_tensor_factory is None or any(t.device.type != "cpu" for t in tensors):
+        return torch.cat(tensors, dim=0)
+    if (
+        len({tuple(t.shape[1:]) for t in tensors}) != 1
+        or len({t.dtype for t in tensors}) != 1
+    ):
+        return torch.cat(tensors, dim=0)
+    shape = torch.Size([sum(t.shape[0] for t in tensors), *tensors[0].shape[1:]])
+    provided = fused_tensor_factory(target_param_name, shape, tensors[0].dtype)
+    if provided is None:
+        return torch.cat(tensors, dim=0)
+    out, filled = provided
+    if not filled:
+        torch.cat(tensors, dim=0, out=out)
+    return out
+
+
 def hf_to_custom_state_dict(
     hf_param_sd: dict[str, torch.Tensor] | Iterator[tuple[str, torch.Tensor]],
     param_names_mapping: Callable[[str], tuple[str, Any, Any]],
     valid_target_names: set[str] | None = None,
+    fused_tensor_factory: (
+        Callable[[str, torch.Size, torch.dtype], tuple[torch.Tensor, bool] | None]
+        | None
+    ) = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, tuple[str, Any, Any]]]:
     """
     Converts a Hugging Face parameter state dictionary to a custom parameter state dictionary.
@@ -156,7 +191,9 @@ def hf_to_custom_state_dict(
                     to_merge_params[target_param_name][i]
                     for i in range(num_params_to_merge)
                 ]
-                full_tensor = torch.cat(sorted_tensors, dim=0)
+                full_tensor = _fuse_tensors(
+                    target_param_name, sorted_tensors, fused_tensor_factory
+                )
                 del to_merge_params[target_param_name]
             else:
                 continue

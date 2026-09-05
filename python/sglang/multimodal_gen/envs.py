@@ -34,6 +34,10 @@ if TYPE_CHECKING:
     VERBOSE: bool = False
     SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
     SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER: bool = False
+    SGLANG_DIFFUSION_HOST_SPILL_DIR: str = os.path.expanduser(
+        "~/.cache/sglang/diffusion/host_spill"
+    )
+    SGLANG_DIFFUSION_DISABLE_HOST_SPILL: bool = False
     SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB: float | None = None
     SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB: float | None = None
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
@@ -247,6 +251,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # synchronous copy on any failure; this forces that path up front.
     "SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER": _lazy_bool(
         "SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER"
+    ),
+    # Where transformed weight copies (fused q/k/v, reordered rows) live as
+    # file mappings when host copies must stay reclaimable; reused across
+    # starts of the same checkpoint.
+    "SGLANG_DIFFUSION_HOST_SPILL_DIR": _lazy_str(
+        "SGLANG_DIFFUSION_HOST_SPILL_DIR",
+        os.path.expanduser("~/.cache/sglang/diffusion/host_spill"),
+    ),
+    "SGLANG_DIFFUSION_DISABLE_HOST_SPILL": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_HOST_SPILL"
     ),
     # Test hook: make the host memory budget behave as if the machine had this
     # many GiB of RAM (available = this figure minus the process's own
