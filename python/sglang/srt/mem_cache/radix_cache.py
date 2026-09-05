@@ -346,7 +346,9 @@ class RadixCache(BasePrefixCache):
         else:
             self.device = torch.device("cpu")
 
-        self.eviction_strategy = get_eviction_strategy(self.eviction_policy)
+        self.eviction_strategy = get_eviction_strategy(
+            self.eviction_policy, params.eviction_policy_config
+        )
 
         self.evictable_leaves = set()
         self.reset()
