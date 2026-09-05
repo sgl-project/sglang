@@ -53,16 +53,18 @@ from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+    UnifiedMambaSWATokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.allocator.unified_mamba import (
+    UnifiedMambaTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
     zero_match_result,
-)
-from sglang.srt.mem_cache.multi_ended_allocator import (
-    UnifiedMambaSWATokenToKVPoolAllocator,
-    UnifiedMambaTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
