@@ -27,6 +27,7 @@ import torch.nn.functional as F
 
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.lora.moe.base_gemm_provider import select_provider_cls
 from sglang.srt.lora.moe.execution_plan import (
     ActivationFn,
     Phase,
@@ -195,23 +196,22 @@ def _build_runner(
     vendor: str = "cutedsl",
     activation: ActivationFn = ActivationFn.SILU,
     gated: bool = True,
+    phase: Phase = Phase.DECODE,
 ):
     device = torch.device("cuda")
     major, _ = torch.cuda.get_device_capability(device)
     architecture = architecture_for_capability(major)
     choice = resolve_plans(
+        quant_family="bf16",
         architecture=architecture,
         is_shared_outer=True,
         physical_rank=_PHYSICAL_RANK,
         activation=activation,
         hidden_size=_HIDDEN,
         num_local_experts=_EXPERTS,
-    )[Phase.DECODE]
+    )[phase]
     launch_config = choice.tiles.config_for(_NUM_TOKENS)
-    # The triton provider serves the route-major domain only; the plan's
-    # families run on either domain, so the same plan drives both vendors.
-    rows = "route_major" if vendor == "triton" else choice.base_gemm_rows
-    provider_cls = MoeLoraRunner.select_provider_cls(rows, vendor)
+    provider_cls = select_provider_cls(choice.base_gemm_rows, "bf16", vendor)
     provider = provider_cls(
         MoeLoraBf16QuantInfo(
             w13_weight=gpu["w13_weight"],
@@ -233,7 +233,7 @@ def _build_runner(
     return runner
 
 
-def _run_once(runner, gpu, use_cuda_graph=False):
+def _run_once(runner, gpu, use_cuda_graph=False, seg_indptr=None, is_prefill=False):
     dispatch = StandardDispatchOutput(
         hidden_states=gpu["hidden_states"],
         hidden_states_scale=None,
@@ -249,9 +249,13 @@ def _run_once(runner, gpu, use_cuda_graph=False):
         down_lora_a=gpu["down_lora_a"],
         down_lora_b=gpu["down_lora_b"],
         token_lora_mapping=gpu["token_lora_mapping"],
-        seg_indptr=_segments_of(gpu["token_lora_mapping"]),
+        seg_indptr=(
+            _segments_of(gpu["token_lora_mapping"])
+            if seg_indptr is None
+            else seg_indptr
+        ),
         use_cuda_graph=use_cuda_graph,
-        is_prefill=False,
+        is_prefill=is_prefill,
     )
     return runner.run(dispatch, batch)
 
@@ -307,6 +311,43 @@ def test_shared_outer_decode_replays_in_a_cuda_graph(
         captured = _run_once(runner, gpu, use_cuda_graph=True)
     graph.replay()
     torch.cuda.synchronize()
+    out = captured.hidden_states.detach().float().cpu()
+    torch.testing.assert_close(out, reference, atol=0.018, rtol=0.06)
+
+
+@pytest.mark.parametrize("vendor", ("cutedsl", "triton"))
+def test_shared_outer_prefill_graph_replays_other_request_boundaries(
+    monkeypatch: pytest.MonkeyPatch, vendor: str
+) -> None:
+    """Replay three requests after capturing one, without dropping any tokens."""
+    device = torch.device("cuda")
+    _skip_unless_supported(device)
+    monkeypatch.setattr(
+        MoeLoraRunner, "_allocate_output", _standalone_output_allocation
+    )
+    cpu = _make_cpu_tensors()
+    gpu = {name: tensor.to(device) for name, tensor in cpu.items()}
+    runner = _build_runner(gpu, vendor, phase=Phase.PREFILL)
+    seg_indptr = torch.zeros(_NUM_TOKENS + 1, dtype=torch.int32, device=device)
+    # Capture: one request holding every token, on slot 0.
+    gpu["token_lora_mapping"].fill_(0)
+    seg_indptr[1] = _NUM_TOKENS
+    capture = dict(seg_indptr=seg_indptr[:2], is_prefill=True, use_cuda_graph=True)
+    _run_once(runner, gpu, **capture)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _run_once(runner, gpu, **capture)
+    # Replay three requests on slots 0, 1, 1 in the same static buffers.
+    mapping = torch.tensor([0, 0, 0, 1, 1, 1, 1, 1], dtype=torch.int32)
+    gpu["token_lora_mapping"].copy_(mapping.to(device))
+    seg_indptr[:4] = torch.tensor(
+        [0, 3, 5, _NUM_TOKENS], dtype=torch.int32, device=device
+    )
+    graph.replay()
+    torch.cuda.synchronize()
+    cpu["token_lora_mapping"] = mapping
+    reference = _fp32_reference(cpu)
     out = captured.hidden_states.detach().float().cpu()
     torch.testing.assert_close(out, reference, atol=0.018, rtol=0.06)
 

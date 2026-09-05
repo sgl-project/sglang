@@ -1,0 +1,48 @@
+{
+  "version": {
+    "generated_on": "NVIDIA GB300",
+    "cutedsl": "4.6.2"
+  },
+  "buckets": {
+    "1": {
+      "token_width": 8
+    },
+    "2": {
+      "token_width": 8
+    },
+    "8": {
+      "token_width": 16
+    },
+    "32": {
+      "token_width": 32
+    },
+    "64": {
+      "token_width": 64
+    },
+    "128": {
+      "token_width": 128
+    }
+  },
+  "tiles": [
+    {
+      "token_width": 8,
+      "persistent_clusters": 152
+    },
+    {
+      "token_width": 16,
+      "persistent_clusters": 152
+    },
+    {
+      "token_width": 32,
+      "persistent_clusters": 152
+    },
+    {
+      "token_width": 64,
+      "persistent_clusters": 152
+    },
+    {
+      "token_width": 128,
+      "persistent_clusters": 152
+    }
+  ]
+}

@@ -55,6 +55,7 @@ def build_routes(
     max_loras: int,
     block_size: int,
     workspace: LoraWorkspace,
+    graph_mode: bool = False,
 ) -> MoeLoraRoutes:
     requirements = plan.route_requirements()
     values: dict[str, object] = {}
@@ -137,13 +138,36 @@ def build_routes(
             )
 
     if RouteRequirement.SHARED_TOKEN_PLAN in requirements:
-        values["shared_token"] = build_segmented_token_route(
-            seg_indptr=seg_indptr,
-            token_lora_mapping=token_lora_mapping,
-            num_tokens=topk_ids.shape[0],
-            num_local_experts=num_local_experts,
-            max_loras=max_loras,
-            block_size=block_size,
-            workspace=workspace,
-        )
+        if graph_mode:
+            # Request counts can change on replay; sort the fixed token buffer
+            # by adapter slot instead of capturing the live segment count.
+            num_tokens = topk_ids.shape[0]
+            token_experts = workspace.tensor(
+                "route:shared_token:sorted_experts",
+                (num_tokens, 1),
+                dtype=torch.int32,
+                device=topk_ids.device,
+                zero_on_first_allocation=True,
+            )
+            values["shared_token"] = build_group_route(
+                token_experts,
+                token_lora_mapping,
+                num_local_experts=num_local_experts,
+                max_loras=max_loras,
+                block_size=block_size,
+                is_shared_outer=True,
+                view=RouteViewKind.ALIGNED,
+                workspace=workspace,
+                tensor_prefix="route:shared_token:sorted",
+            )
+        else:
+            values["shared_token"] = build_segmented_token_route(
+                seg_indptr=seg_indptr,
+                token_lora_mapping=token_lora_mapping,
+                num_tokens=topk_ids.shape[0],
+                num_local_experts=num_local_experts,
+                max_loras=max_loras,
+                block_size=block_size,
+                workspace=workspace,
+            )
     return MoeLoraRoutes(**values)

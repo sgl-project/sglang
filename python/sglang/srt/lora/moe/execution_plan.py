@@ -49,6 +49,8 @@ class LoraAFamily(str, Enum):
     GROUPED = "grouped"
     PER_PAIR = "per_pair"
     TOKEN_GROUPED = "token_grouped"
+    # Shared gate/up A writes one token-domain bridge plane per adapter slot.
+    TOKEN_DENSE = "token_dense"
 
 
 class LoraBFamily(str, Enum):
@@ -63,7 +65,10 @@ class ActFamily(str, Enum):
 
 class FinalizeFamily(str, Enum):
     MATERIALIZED = "materialized"
-    SHARED_RANK_REDUCE = "shared_rank_reduce"
+    # Reduce in rank space before expanding the shared B once per token.
+    SHARED_TOKEN_DELTA = "shared_token_delta"
+    # Fuse the rank reduction, B expansion, and base reduction.
+    SHARED_ONE_PASS = "shared_one_pass"
 
 
 class GateUpOverlap(str, Enum):
@@ -117,6 +122,13 @@ class LoraASpec:
         elif self.family is LoraAFamily.PER_PAIR:
             if self.output_layout is not BridgeLayout.PAIR_MAJOR:
                 raise ValueError("per_pair A writes a pair-major bridge")
+        elif self.family is LoraAFamily.TOKEN_DENSE:
+            if self.site is not Site.GATE_UP:
+                raise ValueError("token_dense A is a gate/up-site family")
+            if not self.is_shared_outer:
+                raise ValueError("token_dense A requires shared-outer ownership")
+            if self.output_layout is not BridgeLayout.TOKEN_MAJOR:
+                raise ValueError("token_dense A writes a token-major bridge")
         else:
             if self.site is not Site.GATE_UP:
                 raise ValueError(f"{self.family.value} is a shared gate/up-A family")
@@ -129,7 +141,10 @@ class LoraASpec:
         return self
 
     def route_requirements(self) -> frozenset[RouteRequirement]:
-        if self.family is LoraAFamily.PER_PAIR:
+        if self.family in (
+            LoraAFamily.PER_PAIR,
+            LoraAFamily.TOKEN_DENSE,
+        ):
             return frozenset((_raw_requirement(self.is_shared_outer),))
         if self.family is LoraAFamily.TOKEN_GROUPED:
             return frozenset((RouteRequirement.SHARED_TOKEN_PLAN,))
@@ -179,7 +194,8 @@ class FinalizeSpec:
 
     def validate(self) -> FinalizeSpec:
         if (
-            self.family is FinalizeFamily.SHARED_RANK_REDUCE
+            self.family
+            in (FinalizeFamily.SHARED_TOKEN_DELTA, FinalizeFamily.SHARED_ONE_PASS)
             and not self.is_shared_outer
         ):
             raise ValueError(
@@ -190,8 +206,13 @@ class FinalizeSpec:
     def route_requirements(self) -> frozenset[RouteRequirement]:
         if self.family is FinalizeFamily.MATERIALIZED:
             return frozenset()
-        # The shared-rank finalizer builds its fixed top-k keys from the raw
-        # route.
+        if self.family is FinalizeFamily.SHARED_TOKEN_DELTA:
+            return frozenset(
+                (
+                    _raw_requirement(self.is_shared_outer),
+                    RouteRequirement.SHARED_TOKEN_PLAN,
+                )
+            )
         return frozenset((_raw_requirement(self.is_shared_outer),))
 
 
@@ -245,6 +266,13 @@ class MoeLoraExecutionPlan:
             and self.down_a.output_layout is not self.down_b.input_layout
         ):
             raise ValueError("down A output layout must match the down B input layout")
+        if self.gate_up_a.family is LoraAFamily.TOKEN_DENSE and (
+            self.gate_up_b is None or self.gate_up_b.family is not LoraBFamily.PER_PAIR
+        ):
+            raise ValueError(
+                "token_dense A writes one bridge plane per adapter slot; only a "
+                "standalone per_pair gate/up B selects planes"
+            )
 
         if self.gate_up_overlap is GateUpOverlap.GATE_UP_A_B and self.gate_up_b is None:
             raise ValueError(
@@ -270,23 +298,6 @@ class MoeLoraExecutionPlan:
             )
 
         return self
-
-    def is_fully_serial(self) -> bool:
-        return (
-            self.gate_up_overlap is GateUpOverlap.NONE
-            and self.down_overlap is DownOverlap.NONE
-            and self.down_a.family is LoraAFamily.GROUPED
-            # An into-base plan also runs in order, but its down B writes
-            # into the base down output. The row-domain conversions read this
-            # answer, and they must not treat an into-base plan as serial.
-            and not self.down_b_into_base
-        )
-
-    def is_fully_serial_materialized(self) -> bool:
-        return (
-            self.is_fully_serial()
-            and self.finalize.family is FinalizeFamily.MATERIALIZED
-        )
 
     def down_b_into_base_eligible(self) -> bool:
         # In-place B must wait for the base down GEMM to finish writing.
@@ -352,11 +363,15 @@ def _b_act_default() -> dict[str, int]:
     }
 
 
-def _shared_finalize_default() -> dict[str, dict[str, int]]:
+def _shared_token_delta_default() -> dict[str, dict[str, int]]:
     return {
         "reduce": {"BLOCK_SIZE_T": 32, "num_warps": 4, "num_stages": 2},
-        "tail": {"BLOCK_SIZE_H": 128, "BLOCK_SIZE_K": 32, "num_warps": 4, "num_stages": 3},
+        "tail": {"BLOCK_SIZE_H": 128, "num_warps": 4, "num_stages": 3},
     }
+
+
+def _shared_one_pass_default() -> dict[str, int]:
+    return {"BLOCK_SIZE_H": 128, "num_warps": 4, "num_stages": 3}
 
 
 def _is_power_of_two(value: int) -> bool:
@@ -379,9 +394,10 @@ class MoeLoraLaunchConfig:
     down_a: dict[str, int] = field(default_factory=_a_default)
     down_b: dict[str, int] = field(default_factory=_b_default)
     b_activation: dict[str, int] = field(default_factory=_b_act_default)
-    shared_finalize: dict[str, dict[str, int]] = field(
-        default_factory=_shared_finalize_default
+    shared_token_delta: dict[str, dict[str, int]] = field(
+        default_factory=_shared_token_delta_default
     )
+    shared_one_pass: dict[str, int] = field(default_factory=_shared_one_pass_default)
 
     def __post_init__(self) -> None:
         # tl.dot requires a power-of-two row tile of at least 16.
@@ -406,10 +422,13 @@ class MoeLoraLaunchConfig:
                     f"{name} declares BLOCK_SIZE_M={declared}, but the aligned "
                     f"route uses routing_block_size={self.routing_block_size}"
                 )
-        if set(self.shared_finalize) != {"reduce", "tail"}:
-            raise ValueError("shared_finalize must contain exactly 'reduce' and 'tail'")
-        for name, config in self.shared_finalize.items():
-            _validate_flat_config(f"shared_finalize.{name}", config)
+        if set(self.shared_token_delta) != {"reduce", "tail"}:
+            raise ValueError(
+                "shared_token_delta must contain exactly 'reduce' and 'tail'"
+            )
+        for name, config in self.shared_token_delta.items():
+            _validate_flat_config(f"shared_token_delta.{name}", config)
+        _validate_flat_config("shared_one_pass", self.shared_one_pass)
 
     def for_a(self, site: Site) -> Mapping[str, int]:
         return self.gate_up_a if site is Site.GATE_UP else self.down_a
@@ -480,6 +499,9 @@ class _PlanRowModel(pydantic.BaseModel):
     layout: Literal["per_expert", "shared"] | None = None
     phase: Phase | None = None
     max_rank: int | None = None
+    min_local_experts: int | None = None
+    max_local_experts: int | None = None
+    quant: list[str] | None = None
     base_gemm_rows: Literal["expert_major", "route_major"]
     plan: _PlanSpecModel
     # Rank rules first, then token buckets; a rule without max_tokens ends the ladder.
@@ -577,7 +599,7 @@ def build_plan(
     gate_up_a_family = spec.gate_up_a_family
     gate_up_layout = (
         BridgeLayout.TOKEN_MAJOR
-        if gate_up_a_family is LoraAFamily.TOKEN_GROUPED
+        if gate_up_a_family in (LoraAFamily.TOKEN_GROUPED, LoraAFamily.TOKEN_DENSE)
         else BridgeLayout.PAIR_MAJOR
     )
     act_family = spec.act_family
@@ -591,7 +613,12 @@ def build_plan(
         gate_up_b=(
             None
             if consumes_gate_up_b
-            else LoraBSpec(Site.GATE_UP, spec.gate_up_b_family, False, gate_up_layout)
+            else LoraBSpec(
+                Site.GATE_UP,
+                spec.gate_up_b_family,
+                False,
+                gate_up_layout,
+            )
         ),
         act=ActSpec(act_family, activation),
         down_a=LoraASpec(
@@ -642,6 +669,7 @@ def resolve_plans(
     activation: ActivationFn,
     hidden_size: int,
     num_local_experts: int,
+    quant_family: str,
 ) -> dict[Phase, SelectedPlan]:
     table = load_plans(architecture)
     layout_name = "shared" if is_shared_outer else "per_expert"
@@ -661,6 +689,15 @@ def resolve_plans(
                 if candidate.layout in (None, layout_name)
                 and candidate.phase in (None, phase)
                 and (candidate.max_rank is None or physical_rank <= candidate.max_rank)
+                and (
+                    candidate.min_local_experts is None
+                    or num_local_experts >= candidate.min_local_experts
+                )
+                and (
+                    candidate.max_local_experts is None
+                    or num_local_experts <= candidate.max_local_experts
+                )
+                and (candidate.quant is None or quant_family in candidate.quant)
             ),
             None,
         )

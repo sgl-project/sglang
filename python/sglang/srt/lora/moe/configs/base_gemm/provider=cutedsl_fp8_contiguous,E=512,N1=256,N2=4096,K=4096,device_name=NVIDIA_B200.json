@@ -1,0 +1,34 @@
+{
+  "version": {
+    "generated_on": "NVIDIA B200",
+    "cutedsl": "4.6.2"
+  },
+  "buckets": {
+    "16": {
+      "token_width": 16
+    },
+    "32": {
+      "token_width": 32
+    },
+    "160": {
+      "token_width": 64
+    },
+    "192": {
+      "token_width": 64
+    }
+  },
+  "tiles": [
+    {
+      "token_width": 16,
+      "persistent_clusters": 148
+    },
+    {
+      "token_width": 32,
+      "persistent_clusters": 148
+    },
+    {
+      "token_width": 64,
+      "persistent_clusters": 128
+    }
+  ]
+}

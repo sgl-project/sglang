@@ -5,9 +5,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.lora.moe.execution_plan import Phase
 from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_flags
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -46,24 +47,24 @@ def _from_layer(
     monkeypatch.setattr(
         torch.cuda, "get_device_capability", lambda device=None: capability
     )
-    monkeypatch.setattr(MoeLoraRunner, "_admit", staticmethod(lambda layer: None))
+    monkeypatch.setattr(MoeLoraRunner, "_admit", staticmethod(lambda layer: "bf16"))
 
-    def fake_build(_base_layer, *, base_gemm_rows, vendor):
+    def fake_build(_base_layer, *, base_gemm_rows, vendor, family):
         if built is not None:
             built.append((base_gemm_rows, vendor))
         return provider_cls()
 
     monkeypatch.setattr(MoeLoraRunner, "_build_provider", staticmethod(fake_build))
-    # from_layer reads --moe-lora-base-gemm. The test therefore publishes a
-    # context that holds the shipped default. Production code then needs no
-    # fallback for a missing server.
+    # from_layer reads the published MoE runner backend; publish the engine's
+    # default name so the builds see its vendor.
     with get_context().override_server_args():
-        return MoeLoraRunner.from_layer(
-            _base_layer(),
-            workspace=object(),
-            is_shared_outer=is_shared_outer,
-            physical_rank=physical_rank,
-        )
+        with get_flags().moe.override(runner_backend=MoeRunnerBackend.LORA_CUTEDSL):
+            return MoeLoraRunner.from_layer(
+                _base_layer(),
+                workspace=object(),
+                is_shared_outer=is_shared_outer,
+                physical_rank=physical_rank,
+            )
 
 
 def test_from_layer_resolves_plans_and_builds_each_row_order_once(
@@ -97,4 +98,4 @@ def test_plan_validation_failure_propagates(monkeypatch) -> None:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    raise SystemExit(pytest.main([__file__, "-v"]))

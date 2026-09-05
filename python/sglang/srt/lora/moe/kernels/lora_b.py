@@ -46,7 +46,6 @@ def _grouped_lora_b_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
-    CONSUME_PDL: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_pairs_post_padded = tl.load(num_pairs_post_padded_ptr)
@@ -83,9 +82,6 @@ def _grouped_lora_b_kernel(
             mask=store_mask,
         )
         return
-
-    if CONSUME_PDL:
-        tl.extra.cuda.gdc_wait()
 
     bridge_rows = pair_ids // INTERMEDIATE_TOP_K
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -125,7 +121,6 @@ def grouped_lora_b(
     destination_offsets: Sequence[int],
     config: Mapping[str, int],
     intermediate_top_k: int = 1,
-    consume_pdl: bool = False,
 ) -> None:
     _, weight_rows, rank = weight.shape
     num_slices = len(destination_offsets)
@@ -163,10 +158,8 @@ def grouped_lora_b(
         BLOCK_SIZE_N=block_size_n,
         BLOCK_SIZE_K=int(config["BLOCK_SIZE_K"]),
         GROUP_SIZE_M=int(config["GROUP_SIZE_M"]),
-        CONSUME_PDL=consume_pdl,
         num_warps=int(config["num_warps"]),
         num_stages=int(config["num_stages"]),
-        **({"launch_pdl": True} if consume_pdl else {}),
     )
 
 
@@ -340,7 +333,6 @@ def run_lora_b(
     destination_offsets: Sequence[int],
     config: Mapping[str, int],
     intermediate_top_k: int = 1,
-    consume_pdl: bool = False,
 ) -> None:
     family = spec.family.value
     match family:
@@ -353,23 +345,9 @@ def run_lora_b(
                 destination_offsets=destination_offsets,
                 config=config,
                 intermediate_top_k=intermediate_top_k,
-                consume_pdl=consume_pdl,
             )
         case "per_pair":
-            if consume_pdl:
-                raise ValueError(
-                    f"{family} B has no qualified programmatic-dependent-launch "
-                    "consumer"
-                )
-            num_tokens = routing.topk_ids.shape[0]
-            if (
-                intermediate_top_k > 1
-                and routing.max_loras > 1
-                and bridge.shape[0] == routing.max_loras * num_tokens
-            ):
-                # A token-major bridge with one plane per slot, as the dense
-                # shared A writes it (a pair-major bridge has M * top_k rows).
-                bridge = bridge.view(routing.max_loras, num_tokens, -1)
+            # A [slots, tokens, 2R] bridge (token_dense A) selects planes by slot.
             per_pair_lora_b(
                 bridge,
                 weight,

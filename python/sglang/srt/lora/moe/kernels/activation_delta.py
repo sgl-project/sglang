@@ -10,6 +10,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.lora.moe.activation import ActivationFn
+from sglang.srt.lora.moe.kernels.fp8_quant import quantize_fp8_groups
 
 
 @triton.jit
@@ -29,6 +30,8 @@ def _act_delta_kernel(
     delta_ptr,  # [num_tokens, top_k, slices * inter] [gate | up]
     act_out_ptr,  # [rows, inter] bf16, flat base rows
     act_lora_in_ptr,  # [num_tokens, top_k, inter] bf16
+    act_q_ptr,  # [rows, inter] fp8e4m3 (QUANT_GROUP > 0 only)
+    act_s_ptr,  # [rows, inter // QUANT_GROUP] fp32 row-major
     pair_to_row_ptr,  # [num_tokens * top_k] int32
     topk_ids_ptr,  # [num_tokens, top_k] (local ids; < 0 = invalid)
     top_k,
@@ -39,7 +42,8 @@ def _act_delta_kernel(
     ACTIVATION_TYPE: tl.constexpr,
     GATE_FIRST: tl.constexpr,
     INTERLEAVED: tl.constexpr,
-    CONSUME_BASE_PDL: tl.constexpr,
+    QUANT_GROUP: tl.constexpr,  # 0 disables the additional FP8 output.
+    WHOLE_ROW: tl.constexpr,  # Match upstream's whole-row rounding.
     BLOCK_SIZE: tl.constexpr,
 ):
     pair_idx_int32 = tl.program_id(0)
@@ -56,9 +60,6 @@ def _act_delta_kernel(
     lora_in_row = act_lora_in_ptr + pair_idx * inter
 
     vec = tl.arange(0, BLOCK_SIZE)
-    if CONSUME_BASE_PDL:
-        # Wait just before the first read of the gate/up GEMM's output.
-        tl.extra.cuda.gdc_wait()
     for start in tl.range(0, inter, BLOCK_SIZE):
         offs = start + vec
         mask = offs < inter
@@ -100,6 +101,28 @@ def _act_delta_kernel(
         tl.store(
             lora_in_row + offs, lora_in.to(act_lora_in_ptr.dtype.element_ty), mask=mask
         )
+        if QUANT_GROUP > 0:
+            # Quantize the BF16-rounded value, matching the unfused path.
+            # Admission ensures each quantization group is fully valid or masked.
+            QG: tl.constexpr = QUANT_GROUP if QUANT_GROUP > 0 else BLOCK_SIZE
+            grouped = tl.reshape(
+                tl.where(mask & valid, act_bf16.to(tl.float32), 0.0),
+                (BLOCK_SIZE // QG, QG),
+            )
+            q, scale = quantize_fp8_groups(grouped, WHOLE_ROW)
+            tl.store(
+                act_q_ptr + dst_row * inter + offs,
+                tl.reshape(q, (BLOCK_SIZE,)).to(act_q_ptr.dtype.element_ty),
+                mask=mask & valid,
+            )
+            gvec = tl.arange(0, BLOCK_SIZE // QG)
+            goffs = start // QG + gvec
+            n_groups = inter // QG
+            tl.store(
+                act_s_ptr + dst_row * n_groups + goffs,
+                scale,
+                mask=(goffs < n_groups) & valid,
+            )
 
 
 def _launch_act_delta(
@@ -114,7 +137,7 @@ def _launch_act_delta(
     gate_first: bool,
     interleaved: bool,
     activation: str,
-    consume_base_pdl: bool,
+    act_quant: tuple[torch.Tensor, torch.Tensor, int] | None = None,
 ) -> None:
     ActivationFn.parse(activation)
     num_pairs = topk_ids.numel()
@@ -122,11 +145,18 @@ def _launch_act_delta(
         return
     inter = act_out_rows.shape[-1]
     num_slices = gateup_rows.shape[-1] // inter
+    if act_quant is not None:
+        act_q, act_s, group = act_quant
+        assert inter % group == 0 and 512 % group == 0
+    else:
+        act_q, act_s, group = act_out_rows, act_out_rows, 0
     _act_delta_kernel[(num_pairs,)](
         gateup_rows,
         gate_up_delta if gate_up_delta is not None else gateup_rows,
         act_out_rows,
         activation_lora_input,
+        act_q,
+        act_s,
         pair_to_row,
         topk_ids,
         topk_ids.shape[1],
@@ -137,9 +167,9 @@ def _launch_act_delta(
         ACTIVATION_TYPE=activation,
         GATE_FIRST=gate_first,
         INTERLEAVED=interleaved,
-        CONSUME_BASE_PDL=consume_base_pdl,
+        QUANT_GROUP=group,
+        WHOLE_ROW=inter == group,
         BLOCK_SIZE=512,
-        **({"launch_pdl": True} if consume_base_pdl else {}),
     )
 
 
@@ -153,7 +183,7 @@ def act_delta_masked(
     gate_first: bool = True,
     interleaved: bool = False,
     activation: str = "silu",
-    consume_base_pdl: bool = False,
+    act_quant: tuple[torch.Tensor, torch.Tensor, int] | None = None,
 ) -> None:
     _launch_act_delta(
         gateup_output.view(-1, gateup_output.shape[-1]),
@@ -166,7 +196,7 @@ def act_delta_masked(
         gate_first=gate_first,
         interleaved=interleaved,
         activation=activation,
-        consume_base_pdl=consume_base_pdl,
+        act_quant=act_quant,
     )
 
 
@@ -181,7 +211,7 @@ def act_delta_contiguous(
     gate_first: bool = True,
     interleaved: bool = False,
     activation: str = "silu",
-    consume_base_pdl: bool = False,
+    act_quant: tuple[torch.Tensor, torch.Tensor, int] | None = None,
 ) -> None:
     _launch_act_delta(
         gateup_output,
@@ -194,5 +224,5 @@ def act_delta_contiguous(
         gate_first=gate_first,
         interleaved=interleaved,
         activation=activation,
-        consume_base_pdl=consume_base_pdl,
+        act_quant=act_quant,
     )

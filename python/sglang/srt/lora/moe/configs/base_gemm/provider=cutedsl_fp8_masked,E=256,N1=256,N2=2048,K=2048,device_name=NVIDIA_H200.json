@@ -1,0 +1,56 @@
+{
+  "version": {
+    "generated_on": "NVIDIA H200",
+    "cutedsl": "4.6.0"
+  },
+  "buckets": {
+    "4": {
+      "token_width": 8
+    },
+    "8": {
+      "token_width": 8
+    },
+    "16": {
+      "token_width": 16
+    },
+    "32": {
+      "token_width": 32
+    },
+    "96": {
+      "token_width": 64
+    },
+    "128": {
+      "token_width": 64
+    },
+    "192": {
+      "token_width": 64
+    },
+    "256": {
+      "token_width": 64
+    },
+    "384": {
+      "token_width": 64
+    },
+    "512": {
+      "token_width": 64
+    }
+  },
+  "tiles": [
+    {
+      "token_width": 8,
+      "persistent_clusters": 128
+    },
+    {
+      "token_width": 16,
+      "persistent_clusters": 128
+    },
+    {
+      "token_width": 32,
+      "persistent_clusters": 128
+    },
+    {
+      "token_width": 64,
+      "persistent_clusters": 128
+    }
+  ]
+}

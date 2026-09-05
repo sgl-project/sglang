@@ -53,6 +53,7 @@ def _resolve(
     experts=256,
 ):
     return resolve_plans(
+        quant_family="bf16",
         architecture=architecture,
         is_shared_outer=layout,
         physical_rank=rank,
@@ -117,15 +118,16 @@ class TestSm100PerExpert:
 
 
 class TestSm100Shared:
-    def test_decode_ships_wide_window_materialized_joint(self):
+    def test_decode_ships_one_pass_with_the_down_a_window(self):
+        # The one-pass finalize owns down-B, so only down-A is left to overlap.
         c = _resolve(layout=True, rank=32)[Phase.DECODE]
         assert c.base_gemm_rows == "expert_major"
         assert c.plan.gate_up_overlap is GateUpOverlap.GATE_UP_A_B
-        assert c.plan.down_overlap is DownOverlap.DOWN_A_B
+        assert c.plan.down_overlap is DownOverlap.DOWN_A
         assert c.plan.act.family is ActFamily.MATERIALIZED
-        assert c.plan.finalize.family is FinalizeFamily.MATERIALIZED
+        assert c.plan.finalize.family is FinalizeFamily.SHARED_ONE_PASS
         assert c.plan.gate_up_b.family is LoraBFamily.GROUPED
-        assert c.plan.down_b.family is LoraBFamily.GROUPED
+        assert c.plan.down_b is None
         assert c.plan.route_builder is RouteBuilderFamily.PARALLEL_SHARED_OUTER
 
     def test_prefill_ships_token_grouped_serial(self):
@@ -148,17 +150,19 @@ class TestH200:
             assert c.base_gemm_rows == "expert_major"
 
     def test_shared_prefill_rank_band(self):
-        # A rank-128 run on the Inkling model set the top of this rank band.
+        # The bands differ in their A kernels and overlap windows; every band
+        # finalizes through shared_token_delta (measured at ranks 8 to 128).
         small = _resolve(architecture=_H200, layout=True, rank=8)[Phase.PREFILL]
         assert small.name == "prefill.shared.rank_le8"
-        assert small.plan.finalize.family is FinalizeFamily.MATERIALIZED
+        assert small.plan.finalize.family is FinalizeFamily.SHARED_TOKEN_DELTA
         fused = _resolve(architecture=_H200, layout=True, rank=64)[Phase.PREFILL]
         assert fused.name == "prefill.shared.rank_le64"
-        assert fused.plan.finalize.family is FinalizeFamily.SHARED_RANK_REDUCE
+        assert fused.plan.finalize.family is FinalizeFamily.SHARED_TOKEN_DELTA
         assert fused.plan.route_builder is RouteBuilderFamily.STANDARD
         wide = _resolve(architecture=_H200, layout=True, rank=128)[Phase.PREFILL]
         assert wide.name == "prefill.shared"
-        assert wide.plan.finalize.family is FinalizeFamily.MATERIALIZED
+        assert wide.plan.finalize.family is FinalizeFamily.SHARED_TOKEN_DELTA
+        assert wide.plan.down_b is None
 
 
 class TestResolution:
@@ -169,8 +173,8 @@ class TestResolution:
                 relu2 = _resolve(
                     architecture=architecture, layout=layout, act=ActivationFn.RELU2
                 )
-                assert {p: s.name for p, s in relu2.items()} == {
-                    p: s.name for p, s in swiglu.items()
+                assert {p: sel.name for p, sel in relu2.items()} == {
+                    p: sel.name for p, sel in swiglu.items()
                 }
                 for phase, sel in relu2.items():
                     assert sel.plan.act.activation is ActivationFn.RELU2
@@ -249,6 +253,12 @@ class TestResolution:
                         parts.append(row.layout)
                     if row.max_rank is not None:
                         parts.append(f"rank_le{row.max_rank}")
+                    if row.quant is not None:
+                        parts.append("_".join(row.quant))
+                    if row.min_local_experts is not None:
+                        parts.append(f"e_ge{row.min_local_experts}")
+                    if row.max_local_experts is not None:
+                        parts.append(f"e_le{row.max_local_experts}")
                     assert row.name == ".".join(parts), (
                         architecture,
                         row.name,
@@ -264,19 +274,20 @@ class TestResolution:
             assert len(names) == len(set(names)), (architecture, names)
 
     def test_tile_rules_carry_only_the_shared_finalize_their_row_selects(self):
-        # A section on a row whose finalize never reads it is dead weight; a
-        # missing one silently serves the built-in default tile under a row
-        # that looks tuned.
+        # A row's shared finalize reads its own section. A section for the
+        # other family would be dead weight; a missing one silently serves
+        # the built-in default tile under a row that looks tuned.
+        section = {
+            FinalizeFamily.SHARED_TOKEN_DELTA: "shared_token_delta",
+            FinalizeFamily.SHARED_ONE_PASS: "shared_one_pass",
+        }
         for architecture in (_GB300, _H200, "default"):
             table = load_plans(architecture)
             for row in (*table.scenarios, *table.fallback):
-                expected = (
-                    {"shared_finalize"}
-                    if row.plan.finalize_family is FinalizeFamily.SHARED_RANK_REDUCE
-                    else set()
-                )
+                family = row.plan.finalize_family
+                expected = {section[family]} if family in section else set()
                 for rule in row.tiles:
-                    present = set(rule.sites) & {"shared_finalize"}
+                    present = set(rule.sites) & set(section.values())
                     assert present == expected, (architecture, row.name, present)
 
     def test_unknown_domain_key_fails_closed(self, tmp_path):
@@ -374,13 +385,20 @@ class TestResolution:
 
 
 class TestLoraMoeRunnerBackend:
-    def test_lora_backend_is_distinct_from_deep_gemm(self):
-        # One place treats the two backends alike. That place is the resident
-        # weight preparation, and it names both (FusedMoE.__init__).
+    def test_lora_backend_predicates_are_exclusive(self):
+        # LoRA vendors must not enter the plain vendor dispatch paths.
         from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
-        assert MoeRunnerBackend.LORA.is_lora()
-        assert not MoeRunnerBackend.LORA.is_deep_gemm()
+        for backend in (
+            MoeRunnerBackend.LORA_CUTEDSL,
+            MoeRunnerBackend.LORA_TRITON,
+            MoeRunnerBackend.LORA_MARLIN,
+        ):
+            assert backend.is_lora()
+        assert not MoeRunnerBackend.LORA_TRITON.is_triton()
+        assert not MoeRunnerBackend.LORA_MARLIN.is_marlin()
+        assert MoeRunnerBackend.LORA_MARLIN.is_lora_marlin()
+        assert not MoeRunnerBackend.MARLIN.is_lora_marlin()
         assert not MoeRunnerBackend.DEEP_GEMM.is_lora()
         assert not MoeRunnerBackend.TRITON.is_lora()
 
@@ -393,12 +411,16 @@ class TestLoraMoeRunnerBackend:
         src = inspect.getsource(FusedMoE.__init__)
         assert "use_deep_gemm" in src and "is_lora()" in src
 
-    def test_backend_value_is_a_valid_cli_choice(self):
+    def test_backend_values_are_valid_cli_choices(self):
         from sglang.srt.layers.moe.utils import MoeRunnerBackend
         from sglang.srt.server_args import MOE_RUNNER_BACKEND_CHOICES
 
-        assert MoeRunnerBackend.LORA.value == "lora"
-        assert "lora" in MOE_RUNNER_BACKEND_CHOICES
+        for backend in (
+            MoeRunnerBackend.LORA_CUTEDSL,
+            MoeRunnerBackend.LORA_TRITON,
+            MoeRunnerBackend.LORA_MARLIN,
+        ):
+            assert backend.value in MOE_RUNNER_BACKEND_CHOICES
 
 
 if __name__ == "__main__":

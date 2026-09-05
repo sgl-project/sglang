@@ -185,7 +185,12 @@ def test_zero_pair_batches_return_without_launching() -> None:
     )
 
 
-def test_run_lora_b_dispatches_the_family_and_rejects_pdl() -> None:
+def test_run_lora_b_dispatches_the_family_without_a_pdl_knob() -> None:
+    # The PDL edge is hardcoded on for the grouped family and absent for
+    # per_pair (no qualified consumer); the dispatcher takes no knob.
+    import inspect
+
+    assert "consume_pdl" not in inspect.signature(run_lora_b).parameters
     device = torch.device("cuda")
     topk_ids, token_lora_mapping = _routing_case(8, 2, 8, 0x1DB3)
     _, raw = _views(topk_ids, token_lora_mapping, 8, device)
@@ -193,17 +198,6 @@ def test_run_lora_b_dispatches_the_family_and_rejects_pdl() -> None:
         "down", 16, 8, 0x1DB3, device
     )
     spec = LoraBSpec(Site.DOWN, LoraBFamily.PER_PAIR)
-    with pytest.raises(ValueError, match="programmatic-dependent-launch"):
-        run_lora_b(
-            spec,
-            bridge=bridge,
-            weight=weight,
-            destination=_destination(16, num_slices, width, device),
-            routing=raw,
-            destination_offsets=offsets,
-            config=_PER_PAIR_CONFIG,
-            consume_pdl=True,
-        )
     dispatched = _destination(16, num_slices, width, device)
     run_lora_b(
         spec,

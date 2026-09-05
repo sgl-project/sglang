@@ -13,9 +13,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-c-test-cpu")
 
-_SOURCE = (
-    Path(__file__).resolve().parents[4] / "python/sglang/srt/lora/workspace.py"
-)
+_SOURCE = Path(__file__).resolve().parents[4] / "python/sglang/srt/lora/workspace.py"
 _SPEC = importlib.util.spec_from_file_location("_lora_workspace", _SOURCE)
 assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)
@@ -165,6 +163,23 @@ def test_parallel_region_state_fails_closed_when_first_used_during_capture(
         match="event was not created before CUDA capture: missing:ready",
     ):
         workspace.event("cuda:0", "missing:ready")
+
+
+def test_graph_mode_iota_keeps_its_address_when_eager_iota_grows():
+    workspace = LoraWorkspace()
+    workspace.begin_forward(graph_mode=True)
+    captured = workspace.iota(8, "cpu")
+    address = captured.data_ptr()
+
+    workspace.begin_forward(graph_mode=False)
+    grown = workspace.iota(64, "cpu")
+    assert grown.numel() == 64 and int(grown[-1]) == 63
+
+    workspace.begin_forward(graph_mode=True)
+    replay = workspace.iota(8, "cpu")
+    assert replay.data_ptr() == address
+    torch.testing.assert_close(replay, torch.arange(8, dtype=torch.int32))
+    assert workspace.iota(16, "cpu").data_ptr() != address
 
 
 if __name__ == "__main__":

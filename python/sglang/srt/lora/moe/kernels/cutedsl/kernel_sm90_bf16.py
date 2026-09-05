@@ -55,7 +55,6 @@ class GroupedGemmKernelSm90Bf16:
         cluster_shape_mn: Tuple[int, int],
         mma_inst_tile_k: int = 4,
         persistent_clusters: Optional[int] = None,
-        produce_pdl: bool = False,
         swap_ab: bool = False,
         contiguous_segments: bool = False,
     ):
@@ -65,7 +64,6 @@ class GroupedGemmKernelSm90Bf16:
         self.cluster_shape_mn = cluster_shape_mn
         self.mma_inst_tile_k = mma_inst_tile_k
         self.persistent_clusters = persistent_clusters
-        self.produce_pdl = produce_pdl
         self.swap_ab = swap_ab
         self.contiguous_segments = contiguous_segments
         if contiguous_segments and not swap_ab:
@@ -289,11 +287,6 @@ class GroupedGemmKernelSm90Bf16:
     ):
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        if cutlass.const_expr(self.produce_pdl):
-            # This signal starts the next kernel at entry. That kernel runs
-            # its prologue while this GEMM runs. Its griddepcontrol.wait still
-            # holds back the first read of the data that this GEMM writes.
-            cute.arch.griddepcontrol_launch_dependents()
 
         if warp_idx == 0:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
