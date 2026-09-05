@@ -1289,6 +1289,10 @@ class Envs:
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
+    # When multimodal embedding length is shorter than the number of placeholder tokens
+    # in input_ids, pad missing tokens with zeros as a compromise instead of raising a fatal
+    # RuntimeError that causes the scheduler process to SIGQUIT the server.
+    SGLANG_MM_PAD_SHORT_EMBEDDING = EnvBool(True)
 
     # ===================================================================
     # Multimodal CUDA IPC transport
