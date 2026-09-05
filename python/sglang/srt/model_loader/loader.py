@@ -644,7 +644,7 @@ class DefaultModelLoader(BaseModelLoader):
                     {"enable_multithread_load", "num_threads"} & extra_config.keys()
                 )
             ):
-                logger.warning(
+                logger.debug(
                     "Checkpoint prefetching is active; falling "
                     "back to single-threaded weight loading to avoid I/O "
                     "oversubscription with the prefetch threads. Set "

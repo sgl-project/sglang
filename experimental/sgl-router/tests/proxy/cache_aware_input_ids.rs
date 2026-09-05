@@ -25,6 +25,7 @@ use sgl_router::config::{
     PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+use sgl_router::policies::engine_load::EngineLoadTable;
 use sgl_router::policies::factory::build_registry;
 use sgl_router::policies::kv_events::{BlockSizeOracle, HashTree};
 use sgl_router::proxy::Proxy;
@@ -54,6 +55,7 @@ fn config() -> Config {
             circuit_breaker: None,
             cache_aware: Some(CacheAwareConfig::default()),
             sticky: None,
+            affinity: None,
             fused: None,
             eligibility: None,
         },
@@ -88,6 +90,7 @@ fn build_ctx(url: String) -> Arc<AppContext> {
             Arc::new(HashTree::new()),
             Arc::clone(&tokenizers),
             BlockSizeOracle::new(),
+            EngineLoadTable::new(),
         )
         .unwrap(),
     );

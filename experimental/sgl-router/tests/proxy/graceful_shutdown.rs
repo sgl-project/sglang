@@ -47,6 +47,7 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,
+            affinity: None,
             fused: None,
             eligibility: None,
         },

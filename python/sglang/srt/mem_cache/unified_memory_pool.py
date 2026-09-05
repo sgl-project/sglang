@@ -1193,7 +1193,7 @@ def init_unified_mamba_pools(
     unified_total_bytes: Optional[int] = None,
 ) -> UnifiedPoolBundle:
     """Build the Mamba-hybrid unified-memory-pool stack."""
-    from sglang.srt.mem_cache.multi_ended_allocator import (
+    from sglang.srt.mem_cache.allocator.unified_mamba import (
         UnifiedMambaTokenToKVPoolAllocator,
     )
 
@@ -1682,7 +1682,7 @@ def init_unified_swa_pools(
     sliding_window_size: Optional[int] = None,
 ) -> UnifiedSWAPoolBundle:
     """Build the SWA-hybrid unified-memory-pool stack."""
-    from sglang.srt.mem_cache.multi_ended_allocator import (
+    from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
         UnifiedSWATokenToKVPoolAllocator,
     )
 
@@ -1866,7 +1866,7 @@ def init_unified_mamba_swa_pools(
     fed until the byte configurator lands); the buffer budget is their byte
     sum and the runtime split floats.
     """
-    from sglang.srt.mem_cache.multi_ended_allocator import (
+    from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
         UnifiedMambaSWATokenToKVPoolAllocator,
     )
 
