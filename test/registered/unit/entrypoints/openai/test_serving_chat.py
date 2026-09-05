@@ -6,7 +6,7 @@ or
     python -m unittest discover -s tests -p "test_*unit.py" -v
 """
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
@@ -193,7 +193,7 @@ class _MockTemplateManager:
         self.jinja_template_may_reorder_tool_results = False
 
 
-class ServingChatTestCase(unittest.TestCase):
+class ServingChatTestCase(CustomTestCase):
     # ------------- common fixtures -------------
     def setUp(self):
         self.tm = _MockTokenizerManager()
@@ -379,6 +379,131 @@ class ServingChatTestCase(unittest.TestCase):
             [item.url for item in result.image_data], ["image-b", "image-a"]
         )
         self.assertEqual(self.tm.tokenizer.apply_chat_template.call_count, 1)
+
+    def test_prepare_messages_neutralizes_text_but_preserves_media_parts(self):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "literal <|image|> and <|video|>",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.com/image.png"},
+                    },
+                    {
+                        "type": "video_url",
+                        "video_url": {"url": "https://example.com/video.mp4"},
+                    },
+                ],
+            }
+        ]
+
+        prepared = OpenAIServingChat._prepare_glm_v_messages(messages)
+
+        self.assertEqual(
+            prepared[0]["content"][0]["text"],
+            "literal <| image |> and <| video |>",
+        )
+        self.assertEqual(
+            prepared[0]["content"][1],
+            {
+                "type": "image_url",
+                "image_url": {"url": "https://example.com/image.png"},
+            },
+        )
+        self.assertEqual(
+            prepared[0]["content"][2],
+            {
+                "type": "video_url",
+                "video_url": {"url": "https://example.com/video.mp4"},
+            },
+        )
+
+    def test_prepare_messages_covers_assistant_metadata(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "answer <|image|>",
+                "reasoning_content": {"text": "reason about <|video|>"},
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "inspect",
+                            "arguments": '{"token":"<|image|>"}',
+                        }
+                    }
+                ],
+            }
+        ]
+
+        prepared = OpenAIServingChat._prepare_glm_v_messages(messages)
+
+        self.assertEqual(prepared[0]["content"], "answer <| image |>")
+        self.assertEqual(
+            prepared[0]["reasoning_content"], {"text": "reason about <| video |>"}
+        )
+        self.assertEqual(
+            prepared[0]["tool_calls"][0]["function"]["arguments"],
+            '{"token":"<| image |>"}',
+        )
+
+    def test_architecture_gate_only_enables_glm_v_family(self):
+        for architecture, expected in (
+            ("Glm4vForConditionalGeneration", True),
+            ("Glm4vMoeForConditionalGeneration", True),
+            ("GlmOcrForConditionalGeneration", True),
+            ("Glm5NextForConditionalGeneration", True),
+            ("LlamaForCausalLM", False),
+        ):
+            with self.subTest(architecture=architecture):
+                tm = _MockTokenizerManager()
+                tm.model_config.hf_config.architectures = [architecture]
+                serving = OpenAIServingChat(tm, _MockTemplateManager())
+                self.assertEqual(serving.is_glm_v, expected)
+
+    def test_glm_v_jinja_path_neutralizes_only_literal_placeholders(self):
+        self.chat.is_glm_v = True
+        self.template_manager.jinja_template_content_format = "openai"
+        self.tm.tokenizer.apply_chat_template.return_value = "rendered prompt"
+        request = ChatCompletionRequest(
+            model="glm-v",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "explain <|image|>"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/image.png"},
+                        },
+                    ],
+                }
+            ],
+        )
+
+        result = self.chat._apply_jinja_template(
+            request, tools=None, is_multimodal=True
+        )
+
+        rendered_messages = self.tm.tokenizer.apply_chat_template.call_args.args[0]
+        self.assertEqual(
+            rendered_messages[0]["content"],
+            [
+                {"type": "text", "text": "explain <| image |>"},
+                {"type": "image"},
+            ],
+        )
+        self.assertEqual(
+            [image.url for image in result.image_data],
+            ["https://example.com/image.png"],
+        )
+        self.assertEqual(
+            request.messages[0].content[0].text,
+            "explain <|image|>",
+        )
 
     def test_parsers_follow_the_control_plane_overlay(self):
         """Template detection records the parsers through `override`, so they
