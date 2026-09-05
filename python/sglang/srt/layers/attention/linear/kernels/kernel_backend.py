@@ -13,6 +13,12 @@ class LinearAttnKernelBase(ABC):
     uses_state_checkpoints: bool = False
     supports_fused_chain_verify: bool = False
 
+    def prepare_state_checkpoint_plan(
+        self, forward_batch, forward_metadata, device
+    ) -> None:
+        """Adjust prefix-cache checkpoint metadata for this kernel's layout."""
+        del forward_batch, forward_metadata, device
+
     @abstractmethod
     def decode(
         self,

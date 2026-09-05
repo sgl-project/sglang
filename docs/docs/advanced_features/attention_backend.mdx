@@ -340,6 +340,8 @@ The GDN linear attention layers have their own kernel backends, selected via `--
 
 On SM100/SM103 with CUDA 13+, SGLang automatically selects FlashInfer for GDN prefill when the per-phase override is unset, the base linear-attention backend is Triton, recurrent state is BF16, key/value head dimensions are 128, dynamic chunking and page-major KV layout are disabled, and `--chunked-prefill-size` is between 1 and 8192. Radix caching may be disabled or use `no_buffer`, `extra_buffer`, or `extra_buffer_lazy`; the extra-buffer paths use state checkpoints.
 
+You can select the cuDNN Frontend 1.28 FROST kernel for GDN prefill on SM100-family GPUs with `--linear-attn-prefill-backend cudnn --mamba-ssm-dtype float32`. This path requires `nvidia-cudnn-frontend==1.28.0` and `nvidia-cutlass-dsl>=4.7.0`. Decode and speculative target verification continue to use Triton. The cuDNN adapter supports Radix cache tracking by emitting recurrent-state checkpoints at SGLang's 64-token cache cadence.
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "28%"}} />
@@ -385,6 +387,12 @@ On SM100/SM103 with CUDA 13+, SGLang automatically selects FlashInfer for GDN pr
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>cuDNN Frontend (CUDA, SM100 family)</strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌ (Triton fallback)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌ (Triton fallback)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>FlashInfer (CUDA, SM90/SM100/SM103)</strong></td>

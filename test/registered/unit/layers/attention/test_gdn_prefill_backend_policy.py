@@ -119,7 +119,7 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
                 self.assertEqual(self.apply_policy(runner), "flashinfer")
 
     def test_declines_when_the_prefill_backend_is_explicit(self):
-        for backend in ("triton", "flashinfer", "cutedsl"):
+        for backend in ("triton", "flashinfer", "cutedsl", "cudnn"):
             with self.subTest(backend=backend):
                 runner = make_runner(self, linear_attn_prefill_backend=backend)
                 self.assertIsNone(self.apply_policy(runner))
@@ -229,7 +229,10 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
     def test_decode_tracking_without_h_source_skips_checkpoint_plan(self):
         backend = object.__new__(GDNAttnBackend)
         backend.device = "cpu"
-        backend.kernel_dispatcher = SimpleNamespace(extend_uses_state_checkpoints=True)
+        backend.kernel_dispatcher = SimpleNamespace(
+            extend_uses_state_checkpoints=True,
+            prepare_state_checkpoint_plan=MagicMock(),
+        )
         metadata = SimpleNamespace(has_mamba_track_mask=True, track_ssm_h_src=None)
         forward_batch = SimpleNamespace(
             mamba_track_mask=torch.tensor([True]),
@@ -243,6 +246,7 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
             backend.init_forward_metadata(forward_batch)
 
         torch.testing.assert_close(metadata.conv_states_mask_indices, torch.tensor([7]))
+        backend.kernel_dispatcher.prepare_state_checkpoint_plan.assert_called_once()
 
     def test_tree_verify_uses_triton_kernel(self):
         flashinfer_kernel = MagicMock(supports_target_verify=True)
