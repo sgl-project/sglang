@@ -1,10 +1,25 @@
 """RotaryEmbedding base class and LinearScalingRotaryEmbedding variant."""
 
+from typing import Optional, Tuple
+
 import torch
 
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
-from .utils import _apply_rotary_emb
+from .utils import (
+    _apply_rotary_emb,
+    _apply_rotary_emb_complex,
+    apply_flashinfer_rope_qk_inplace,
+)
+
+if current_platform.is_npu():
+    import torch_npu
+
+    from sglang.kernels.ops.diffusion.common.fallback_npu import (
+        NPU_ROTARY_MUL_MAX_HEAD_SIZE,
+        NPU_ROTARY_MUL_MAX_NUM_HEADS,
+    )
 
 
 @CustomOp.register("rotary_embedding")
@@ -15,10 +30,12 @@ class RotaryEmbedding(CustomOp):
         self,
         head_size: int,
         rotary_dim: int,
-        max_position_embeddings: int,
-        base: int | float,
-        is_neox_style: bool,
-        dtype: torch.dtype,
+        max_position_embeddings: Optional[int] = 4096,
+        base: Optional[int | float] = 10000,
+        is_neox_style: bool = False,
+        dtype: Optional[torch.dtype] = torch.float16,
+        use_precomputed_cache: Optional[bool] = True,
+        complex_dtype: torch.dtype = torch.float32,
     ) -> None:
         super().__init__()
         self.head_size = head_size
@@ -27,11 +44,21 @@ class RotaryEmbedding(CustomOp):
         self.base = base
         self.is_neox_style = is_neox_style
         self.dtype = dtype
+        self.use_precomputed_cache = use_precomputed_cache
+        self._complex_dtype = complex_dtype
+        self._is_full_rotation = rotary_dim == head_size
+        self._is_complex_style = not is_neox_style
+        self._is_npu_rotary_mul = (
+            current_platform.is_npu()
+            and is_neox_style
+            and rotary_dim < NPU_ROTARY_MUL_MAX_HEAD_SIZE
+        )
 
-        cache = self._compute_cos_sin_cache()
-        cache = cache.to(dtype)
-        self.cos_sin_cache: torch.Tensor
-        self.register_buffer("cos_sin_cache", cache, persistent=False)
+        if self.use_precomputed_cache:
+            cache = self._compute_cos_sin_cache()
+            cache = cache.to(dtype)
+            self.cos_sin_cache: torch.Tensor
+            self.register_buffer("cos_sin_cache", cache, persistent=False)
 
     def _compute_inv_freq(self, base: int | float) -> torch.Tensor:
         """Compute the inverse frequency."""
@@ -58,41 +85,401 @@ class RotaryEmbedding(CustomOp):
         cache = torch.cat((cos, sin), dim=-1)
         return cache
 
-    def forward_cuda(self, *args, **kwargs):
-        return self.forward_native(*args, **kwargs)
+    def _combine_rotated_and_pass(
+        self,
+        q_rotated: torch.Tensor,
+        k_rotated: torch.Tensor,
+        q_pass: torch.Tensor,
+        k_pass: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Reattach the untouched tail (rotary_dim < head_size), if any.
+
+        torch.cat against an empty q_pass/k_pass (rotary_dim == head_size)
+        still allocates + copies, so skip it in that common case.
+        """
+        if self._is_full_rotation:
+            return q_rotated, k_rotated
+        return (
+            torch.cat((q_rotated, q_pass), dim=-1),
+            torch.cat((k_rotated, k_pass), dim=-1),
+        )
+
+    def forward_npu(
+        self,
+        positions: Optional[torch.Tensor] = None,
+        query: Optional[torch.Tensor] = None,
+        key: Optional[torch.Tensor] = None,
+        position_offset: int = 0,
+        cos: Optional[torch.Tensor] = None,
+        sin: Optional[torch.Tensor] = None,
+        complex_freqs: Optional[torch.Tensor] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        offsets: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        if self.use_precomputed_cache or query.dim() == 3 or key.dim() == 3:
+            return self.forward_native(
+                query=query,
+                key=key,
+                positions=positions,
+                position_offset=position_offset,
+                cos=cos,
+                sin=sin,
+                complex_freqs=complex_freqs,
+                cos_sin_cache=cos_sin_cache,
+                offsets=offsets,
+                **kwargs,
+            )
+
+        if query.dim() != 4 or key.dim() != 4:
+            raise ValueError(
+                f"query and key must be [batch_size, seq_len, num_heads, head_dim],"
+                f"got query: {tuple(query.shape)}, key: {tuple(key.shape)}"
+            )
+
+        seq_len = query.shape[1]
+
+        support_complex_style = (
+            complex_freqs is not None
+            and complex_freqs.dim() == 3
+            and self._is_complex_style
+        )
+        if support_complex_style:
+            return (
+                _apply_rotary_emb_complex(
+                    query, complex_freqs, dtype=self._complex_dtype
+                ),
+                _apply_rotary_emb_complex(
+                    key, complex_freqs, dtype=self._complex_dtype
+                ),
+            )
+
+        is_complex_derivable = (
+            complex_freqs is None
+            and cos is not None
+            and sin is not None
+            and self._is_complex_style
+            and self._is_full_rotation
+            and cos.shape[0] == seq_len
+        )
+        if is_complex_derivable:
+            # No fused kernel for interleaved rotation here; complex-multiply
+            # is equivalent and needs fewer kernel launches.
+            derived_complex_freqs = torch.complex(
+                cos.to(torch.float32), sin.to(torch.float32)
+            ).unsqueeze(-2)
+            return (
+                _apply_rotary_emb_complex(
+                    query, derived_complex_freqs, dtype=self._complex_dtype
+                ),
+                _apply_rotary_emb_complex(
+                    key, derived_complex_freqs, dtype=self._complex_dtype
+                ),
+            )
+
+        if cos is not None and sin is not None:
+            num_heads = query.shape[2]
+
+            support_npu_rotary_mul = (
+                self._is_npu_rotary_mul
+                and cos.shape[0] == seq_len
+                and num_heads < NPU_ROTARY_MUL_MAX_NUM_HEADS
+            )
+            if support_npu_rotary_mul:
+                # Called directly on the BSND [batch, seq, heads, rotary_dim]
+                # layout (no batch*seq flatten): cos/sin get a batch dim and
+                # a heads dim of 1 and broadcast against query/key (the
+                # documented "1S1D" pattern), avoiding a per-call
+                # expand+copy of cos/sin across the batch. The size gate
+                # above mirrors apply_rotary_embedding_native's own gate —
+                # if that gate disagreed, that function would silently take
+                # its always-interleaved fallback, which is wrong here.
+                q_rot = query[..., : self.rotary_dim]
+                q_pass = query[..., self.rotary_dim :]
+                k_rot = key[..., : self.rotary_dim]
+                k_pass = key[..., self.rotary_dim :]
+
+                cos_prepared = cos.reshape(1, seq_len, 1, -1).to(query.dtype)
+                sin_prepared = sin.reshape(1, seq_len, 1, -1).to(query.dtype)
+                if cos_prepared.size(-1) * 2 == self.rotary_dim:
+                    cos_prepared = torch.cat((cos_prepared, cos_prepared), dim=-1)
+                    sin_prepared = torch.cat((sin_prepared, sin_prepared), dim=-1)
+
+                q_rotated = torch_npu.npu_rotary_mul(q_rot, cos_prepared, sin_prepared)
+                k_rotated = torch_npu.npu_rotary_mul(k_rot, cos_prepared, sin_prepared)
+                return self._combine_rotated_and_pass(
+                    q_rotated, k_rotated, q_pass, k_pass
+                )
+
+            # No [batch*seq, ...] flatten: cos/sin are [seq_len,
+            # rotary_dim // 2], shared across the batch, and only
+            # broadcast correctly this way for batch_size > 1.
+            q_rot = query[..., : self.rotary_dim]
+            q_pass = query[..., self.rotary_dim :]
+
+            k_rot = key[..., : self.rotary_dim]
+            k_pass = key[..., self.rotary_dim :]
+
+            q_rotated = _apply_rotary_emb(
+                q_rot,
+                cos,
+                sin,
+                is_neox_style=self.is_neox_style,
+                interleaved=not self.is_neox_style,
+            )
+            k_rotated = _apply_rotary_emb(
+                k_rot,
+                cos,
+                sin,
+                is_neox_style=self.is_neox_style,
+                interleaved=not self.is_neox_style,
+            )
+            return self._combine_rotated_and_pass(q_rotated, k_rotated, q_pass, k_pass)
+
+        if cos_sin_cache is not None:
+            return self.forward_native(
+                query=query,
+                key=key,
+                positions=positions,
+                position_offset=position_offset,
+                cos=cos,
+                sin=sin,
+                complex_freqs=complex_freqs,
+                cos_sin_cache=cos_sin_cache,
+                offsets=offsets,
+                **kwargs,
+            )
+
+        raise ValueError(
+            "No valid inputs (complex_freqs, cos/sin, or cos_sin_cache) for interleaved RoPE."
+        )
+
+    def forward_cuda(
+        self,
+        positions: Optional[torch.Tensor] = None,
+        query: Optional[torch.Tensor] = None,
+        key: Optional[torch.Tensor] = None,
+        position_offset: int = 0,
+        cos: Optional[torch.Tensor] = None,
+        sin: Optional[torch.Tensor] = None,
+        complex_freqs: Optional[torch.Tensor] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        offsets: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        support_cuda_style = (
+            (cos_sin_cache is not None or cos is not None and sin is not None)
+            and not self.use_precomputed_cache
+            and query.dim() == 4
+            and key.dim() == 4
+        )
+
+        if not support_cuda_style:
+            return self.forward_native(
+                query=query,
+                key=key,
+                positions=positions,
+                position_offset=position_offset,
+                cos=cos,
+                sin=sin,
+                complex_freqs=complex_freqs,
+                cos_sin_cache=cos_sin_cache,
+                offsets=offsets,
+                **kwargs,
+            )
+        if cos_sin_cache is None:
+            cos_sin_cache = torch.cat(
+                [
+                    cos.to(dtype=torch.float32).contiguous(),
+                    sin.to(dtype=torch.float32).contiguous(),
+                ],
+                dim=-1,
+            )
+
+        batch_size, seq_len, _, head_dim = query.shape
+
+        if positions is None:
+            pos_1d = torch.arange(
+                position_offset,
+                position_offset + seq_len,
+                device=query.device,
+                dtype=torch.int64,
+            )
+            positions = pos_1d if batch_size == 1 else pos_1d.repeat(batch_size)
+        else:
+            positions = positions.to(device=query.device, dtype=torch.long)
+
+        return apply_flashinfer_rope_qk_inplace(
+            q=query,
+            k=key,
+            cos_sin_cache=cos_sin_cache,
+            head_size=head_dim,
+            is_neox=self.is_neox_style,
+            positions=positions,
+        )
 
     def forward_xpu(self, *args, **kwargs):
         return self.forward_native(*args, **kwargs)
 
     def forward_native(
         self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        offsets: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        positions: Optional[torch.Tensor] = None,
+        query: Optional[torch.Tensor] = None,
+        key: Optional[torch.Tensor] = None,
+        position_offset: int = 0,
+        cos: Optional[torch.Tensor] = None,
+        sin: Optional[torch.Tensor] = None,
+        complex_freqs: Optional[torch.Tensor] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        offsets: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
-        if offsets is not None:
-            positions = positions + offsets
-        positions = positions.flatten()
-        num_tokens = positions.shape[0]
-        cos_sin = self.cos_sin_cache.index_select(0, positions)
-        cos, sin = cos_sin.chunk(2, dim=-1)
 
-        query_shape = query.shape
-        query = query.reshape(num_tokens, -1, self.head_size)
-        query_rot = query[..., : self.rotary_dim]
-        query_pass = query[..., self.rotary_dim :]
-        query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
-        query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+        use_precomputed_cache = self.use_precomputed_cache
+        if use_precomputed_cache:
+            if offsets is not None:
+                positions = positions + offsets
+            positions = positions.flatten()
+            num_tokens = positions.shape[0]
+            cos_sin = self.cos_sin_cache.index_select(0, positions)
+            cos, sin = cos_sin.chunk(2, dim=-1)
 
-        key_shape = key.shape
-        key = key.reshape(num_tokens, -1, self.head_size)
-        key_rot = key[..., : self.rotary_dim]
-        key_pass = key[..., self.rotary_dim :]
-        key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
-        key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
-        return query, key
+        is_complex_derivable = (
+            not use_precomputed_cache
+            and complex_freqs is None
+            and cos is not None
+            and sin is not None
+            and self._is_complex_style
+            and query.dim() == 4
+            and key.dim() == 4
+            and self._is_full_rotation
+            and cos.shape[0] == query.shape[1]
+        )
+        if is_complex_derivable:
+            # No fused kernel for interleaved rotation on native backends;
+            # complex-multiply is equivalent and needs fewer kernel
+            # launches. CUDA has its own fused path (forward_cuda) and
+            # never reaches here for this case.
+            derived_complex_freqs = torch.complex(
+                cos.to(torch.float32), sin.to(torch.float32)
+            ).unsqueeze(-2)
+            return (
+                _apply_rotary_emb_complex(
+                    query, derived_complex_freqs, dtype=self._complex_dtype
+                ),
+                _apply_rotary_emb_complex(
+                    key, derived_complex_freqs, dtype=self._complex_dtype
+                ),
+            )
+
+        if cos is not None and sin is not None:
+            if use_precomputed_cache:
+                # Legacy callers (llama/qwen3/gemma2/gemma3 via get_rope())
+                # pass 3D [batch, seq, hidden]; cos/sin were already
+                # index_select'd per-token above, so they already match
+                # num_tokens = batch*seq row-for-row.
+                q_shape = query.shape
+                q_flat = query.reshape(num_tokens, -1, self.head_size)
+                q_rot = q_flat[..., : self.rotary_dim]
+                q_pass = q_flat[..., self.rotary_dim :]
+
+                k_shape = key.shape
+                k_flat = key.reshape(num_tokens, -1, self.head_size)
+                k_rot = k_flat[..., : self.rotary_dim]
+                k_pass = k_flat[..., self.rotary_dim :]
+
+                q_rotated = _apply_rotary_emb(
+                    q_rot,
+                    cos,
+                    sin,
+                    is_neox_style=self.is_neox_style,
+                    interleaved=not self.is_neox_style,
+                )
+                k_rotated = _apply_rotary_emb(
+                    k_rot,
+                    cos,
+                    sin,
+                    is_neox_style=self.is_neox_style,
+                    interleaved=not self.is_neox_style,
+                )
+                q, k = self._combine_rotated_and_pass(
+                    q_rotated, k_rotated, q_pass, k_pass
+                )
+                return q.reshape(q_shape), k.reshape(k_shape)
+
+            # Direct DiT-style call: same batch/seq broadcast reasoning as
+            # forward_npu's cos/sin path.
+            q_rot = query[..., : self.rotary_dim]
+            q_pass = query[..., self.rotary_dim :]
+            k_rot = key[..., : self.rotary_dim]
+            k_pass = key[..., self.rotary_dim :]
+
+            q_rotated = _apply_rotary_emb(
+                q_rot,
+                cos,
+                sin,
+                is_neox_style=self.is_neox_style,
+                interleaved=not self.is_neox_style,
+            )
+            k_rotated = _apply_rotary_emb(
+                k_rot,
+                cos,
+                sin,
+                is_neox_style=self.is_neox_style,
+                interleaved=not self.is_neox_style,
+            )
+            return self._combine_rotated_and_pass(q_rotated, k_rotated, q_pass, k_pass)
+
+        if query.dim() != 4 or key.dim() != 4:
+            raise ValueError(
+                f"query and key must be [batch_size, seq_len, num_heads, head_dim],"
+                f"got query: {tuple(query.shape)}, key: {tuple(key.shape)}"
+            )
+
+        if complex_freqs is not None:
+            return (
+                _apply_rotary_emb_complex(
+                    query, complex_freqs, dtype=self._complex_dtype
+                ),
+                _apply_rotary_emb_complex(
+                    key, complex_freqs, dtype=self._complex_dtype
+                ),
+            )
+
+        if cos_sin_cache is not None:
+            batch_size, seq_len, _, _ = query.shape
+            num_tokens = batch_size * seq_len
+
+            if positions is None:
+                pos_1d = torch.arange(
+                    position_offset,
+                    position_offset + seq_len,
+                    device=query.device,
+                    dtype=torch.int64,
+                )
+                positions = pos_1d if batch_size == 1 else pos_1d.repeat(batch_size)
+            else:
+                if positions.dim() != 1 or positions.numel() != num_tokens:
+                    raise ValueError(
+                        f"positions must be 1D of length {num_tokens}, got shape={tuple(positions.shape)}"
+                    )
+                positions = positions.to(device=query.device, dtype=torch.long)
+
+            return apply_flashinfer_rope_qk_inplace(
+                q=query,
+                k=key,
+                cos_sin_cache=cos_sin_cache,
+                head_size=self.head_size,
+                is_neox=self.is_neox_style,
+                positions=positions,
+            )
+
+        raise ValueError(
+            "No valid inputs (complex_freqs, cos/sin, or cos_sin_cache) for interleaved RoPE."
+        )
 
     def extra_repr(self) -> str:
         s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"
