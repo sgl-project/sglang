@@ -59,11 +59,21 @@ pub trait RadixValue: Debug + Sized + 'static {
 }
 
 /// Immutable, cheaply sliced list suitable for simulated KV page identifiers.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct PageValue<T> {
     storage: Arc<[T]>,
     range: Range<usize>,
 }
+
+// Equality is over the visible range only; two values may share or differ in
+// backing storage and still represent the same pages.
+impl<T: PartialEq> PartialEq for PageValue<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl<T: Eq> Eq for PageValue<T> {}
 
 impl<T> PageValue<T> {
     pub fn from_vec(values: Vec<T>) -> Self {
@@ -246,5 +256,12 @@ mod tests {
         let joined = PageValue::concat(&[head, tail]);
         assert_eq!(joined.as_slice(), &[10, 11, 12, 13]);
         assert_eq!(joined.as_slice().as_ptr(), value_ptr);
+    }
+
+    #[test]
+    fn page_value_equality_ignores_backing_storage() {
+        let shared = PageValue::from_vec(vec![1_u32, 2, 3]);
+        assert_eq!(shared.slice(0, 2), PageValue::from_vec(vec![1, 2]));
+        assert_ne!(shared.slice(0, 2), shared.slice(1, 2));
     }
 }
