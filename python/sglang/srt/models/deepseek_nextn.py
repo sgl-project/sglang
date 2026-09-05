@@ -28,12 +28,28 @@ from sglang.kernels.ops.layernorm.fused_eh_norm import fused_eh_norm
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.attention.dsa.utils import (
+    can_dsa_cp_split,
+    dsa_use_prefill_cp,
+    is_dsa_enable_prefill_cp,
+    is_dsa_prefill_cp_round_robin_split,
+)
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
+from sglang.srt.layers.cp.utils import enable_cp_v2
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization import Fp8Config
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.cp_utils import (
+    can_cp_split,
+    cp_all_gather_rerange_output,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+    is_mla_prefill_cp_enabled,
+    mla_use_prefill_cp,
+    prepare_context_parallel_metadata,
+)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -45,6 +61,34 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForC
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_model, get_parallel, get_spec
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
+
+
+def _gather_dsa_topk_indices_for_cp(
+    topk_indices: torch.Tensor,
+    local_num_tokens: int,
+    cp_size: int,
+    forward_batch: ForwardBatch,
+    stream,
+) -> torch.Tensor:
+    if (
+        is_dsa_prefill_cp_round_robin_split()
+        and topk_indices.shape[0] < local_num_tokens
+    ):
+        pad_rows = local_num_tokens - topk_indices.shape[0]
+        topk_indices = torch.cat(
+            [
+                topk_indices,
+                topk_indices.new_full((pad_rows, topk_indices.shape[1]), -1),
+            ],
+            dim=0,
+        )
+    return cp_all_gather_rerange_output(
+        topk_indices,
+        cp_size,
+        forward_batch,
+        stream,
+    )
+
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +240,13 @@ class DeepseekModelNextN(nn.Module):
                 else:
                     hidden_states = self.eh_proj(eh_input)
 
+            # Protected platforms retain their model-side token split.
+            use_platform_cp = not enable_cp_v2() and (
+                dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch)
+            )
+            if use_platform_cp:
+                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+                positions = cp_split_and_rebuild_position(forward_batch, positions)
             residual = None
             index_topk_share = IndexTopKShareState.from_mtp_carry(forward_batch)
             with get_global_expert_distribution_recorder().disable_this_region():
@@ -213,6 +264,22 @@ class DeepseekModelNextN(nn.Module):
                 else:
                     hidden_states = self.shared_head.norm(hidden_states)
 
+                if use_platform_cp:
+                    local_num_tokens = hidden_states.shape[0]
+                    hidden_states = cp_all_gather_rerange_output(
+                        hidden_states,
+                        get_parallel().attn_cp_size,
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
+                    if index_topk_share.should_publish and topk_indices is not None:
+                        topk_indices = _gather_dsa_topk_indices_for_cp(
+                            topk_indices,
+                            local_num_tokens,
+                            get_parallel().attn_cp_size,
+                            forward_batch,
+                            torch.cuda.current_stream(),
+                        )
             index_topk_share.update(topk_indices)
             index_topk_share.publish()
         finally:
@@ -280,6 +347,34 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if not enable_cp_v2():
+            if is_dsa_enable_prefill_cp():
+                if can_dsa_cp_split(
+                    len(input_ids),
+                    get_parallel().attn_cp_size,
+                    self.model.decoder.self_attn.use_dsa,
+                    forward_batch,
+                ):
+                    forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                        len(input_ids),
+                        get_parallel().attn_cp_rank,
+                        get_parallel().attn_cp_size,
+                        forward_batch.seq_lens_cpu.tolist(),
+                        extend_seqs_len=forward_batch.extend_seq_lens_cpu,
+                    )
+            elif (
+                is_mla_prefill_cp_enabled() and not self.model.decoder.self_attn.use_dsa
+            ):
+                if can_cp_split(
+                    len(input_ids), get_parallel().attn_cp_size, forward_batch
+                ):
+                    forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                        len(input_ids),
+                        get_parallel().attn_cp_rank,
+                        get_parallel().attn_cp_size,
+                        forward_batch.seq_lens_cpu.tolist(),
+                        extend_seqs_len=forward_batch.extend_seq_lens_cpu,
+                    )
         hidden_states = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch

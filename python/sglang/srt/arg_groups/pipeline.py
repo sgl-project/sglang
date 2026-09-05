@@ -156,6 +156,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_elastic_ep,
         handle_eplb_and_dispatch,
         handle_expert_distribution_metrics,
+        handle_legacy_cp_runtime_compatibility,
         handle_platform_cp_compatibility,
     )
 
@@ -285,6 +286,9 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     # Normalize load balancing defaults.
     handle_load_balance_method(server_args)
+
+    # Protected runtimes still consume platform CP fields after backend selection.
+    handle_legacy_cp_runtime_compatibility(server_args)
 
     # Handle context parallelism.
     handle_context_parallelism(server_args)

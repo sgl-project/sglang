@@ -961,15 +961,6 @@ class LayerCommunicator:
         )
 
 
-def create_deepseek_layer_communicator(**kwargs) -> LayerCommunicator:
-    """Create the communicator appropriate for the configured attention layout."""
-    if get_parallel().enable_prefill_cp:
-        from sglang.srt.layers.communicator_dsa_cp import DSACPLayerCommunicator
-
-        return DSACPLayerCommunicator(**kwargs)
-    return LayerCommunicator(**kwargs)
-
-
 @dataclass
 class CommunicateContext:
     process_group_sizes: Dict[ScatterMode, int]

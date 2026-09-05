@@ -46,13 +46,6 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
-from sglang.srt.layers.attention.distributed_layout import (
-    gather_sharded_hidden_states,
-    materialize_global_kv,
-    reduce_scatter_sharded_hidden_states,
-    resolve_model_attention_partition,
-    uses_sharded_prefill_layout,
-)
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
     dsa_use_prefill_cp,
@@ -62,9 +55,14 @@ from sglang.srt.layers.attention.dsa.utils import (
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.communicator_dsa_cp import (
+    dsa_cp_gather_hidden_states,
+    dsa_cp_reduce_scatter_hidden_states,
+)
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
     cp_materialize_global_token_order,
+    enable_cp_v2,
     is_cp_v2_active,
 )
 from sglang.srt.layers.dp_attention import (
@@ -656,9 +654,13 @@ class MqaAttentionBase(nn.Module):
         rope_original_seq_len: Optional[int] = None,
     ) -> None:
         super().__init__()
-        attn_tp_rank, attn_tp_size = resolve_model_attention_partition(
-            attn_tp_rank, attn_tp_size
-        )
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        if attn_tp_rank is None or attn_tp_size is None:
+            attn_tp_rank = get_parallel().attn_tp_rank
+            attn_tp_size = get_parallel().attn_tp_size
+            if self.dsa_enable_prefill_cp:
+                self.cp_size = get_parallel().attn_cp_size
+                attn_tp_rank, attn_tp_size = 0, 1
         self.attn_tp_rank: int = attn_tp_rank
         self.attn_tp_size: int = attn_tp_size
 
@@ -1041,8 +1043,8 @@ class MQALayer(MqaAttentionBase):
     ) -> None:
         """Fused: rmsnorm + RoPE + write directly to FlashMLA paged cache.
 
-        Replaces the bf16-kv-intermediate path when the attention backend does
-        not need a full current-chunk KV tensor.
+        Replaces the bf16-kv-intermediate path. Used everywhere except the DSA
+        prefill-CP case (which needs bf16 kv for the cross-rank all-gather).
         """
         if envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get():
             # Quantize the nope payload from bf16-rounded values (the fused
@@ -1076,7 +1078,7 @@ class MQALayer(MqaAttentionBase):
         positions: torch.Tensor,
         qkv_a: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Build bf16 KV for attention backends that materialize the full chunk."""
+        """Bf16-kv path used by the DSA prefill-CP case (needs all-gather)."""
         if qkv_a is not None:
             kv = qkv_a[..., self.q_lora_rank :]
         else:
@@ -1379,6 +1381,15 @@ class MQALayer(MqaAttentionBase):
         x_quant=None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
+        # kv_score depends only on x, so its CP all-gather can start before the
+        # projections and be collected inside forward_core_compressor below --
+        # the projections are what hides it. No-op unless the CP+TBO path armed
+        # _cp_prefetch_comm_stream.
+        if _is_hip and self.compressor is not None:
+            self.compressor.prelaunch_kv_score(x, forward_batch)
+            if self.indexer is not None:
+                self.indexer.compressor.prelaunch_kv_score(x, forward_batch)
+
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
             q_lora = qkv_a[..., : self.q_lora_rank]
@@ -1386,8 +1397,7 @@ class MQALayer(MqaAttentionBase):
             q_lora, _ = self.wq_a(x_linear)
             qkv_a = None
 
-        uses_sharded_layout = uses_sharded_prefill_layout(forward_batch)
-        legacy_hip_cp = _is_hip and dsa_use_prefill_cp(forward_batch)
+        use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         kv: Optional[torch.Tensor]
         kv_handle = None
 
@@ -1492,21 +1502,15 @@ class MQALayer(MqaAttentionBase):
             if not (unified and fuse_verify):
                 kv = None
 
-            if not unified and (uses_sharded_layout or legacy_hip_cp):
-                # The distributed layout owner needs bf16 KV before cache storage.
+            if not unified and use_cp:
+                # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
+                # write to the FlashMLA cache after gather.
                 kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
-                if legacy_hip_cp:
-                    kv = cp_materialize_global_token_order(
-                        kv.contiguous(),
-                        forward_batch,
-                        torch.cuda.current_stream(),
-                    )
-                else:
-                    kv = materialize_global_kv(
-                        kv.contiguous(),
-                        forward_batch,
-                        torch.cuda.current_stream(),
-                    )
+                kv = cp_materialize_global_token_order(
+                    kv.contiguous(),
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
         elif _is_npu:
             q_lora = self.q_norm(q_lora)
             q, _ = self.wq_b(q_lora)
@@ -1545,18 +1549,21 @@ class MQALayer(MqaAttentionBase):
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
-                # The unified two-source path is ROCm-only. A distributed token
-                # layout needs the full current chunk for both sources.
-                if legacy_hip_cp:
+                # HIP/ROCm-only: the unified_kv 2-source prefill path is exclusive
+                # to DeepseekV4HipRadixBackend. Guard with _is_hip so this CP
+                # all-gather never enters the NVIDIA (DeepseekV4AttnBackend) path.
+                if use_cp and _is_hip:
+                    # unified_kv + DSA CP: the 2-source prefill path needs the
+                    # FULL current-chunk KV (extend source + ring write), so
+                    # all-gather the per-rank bf16 KV across the CP group.
                     comm_stream = getattr(
                         forward_batch, "_cp_prefetch_comm_stream", None
                     )
                     if comm_stream is not None:
+                        # kv is not read again until this function returns, so the
+                        # indexer + compressor below can run while it gathers.
                         kv_handle = cp_all_gather_rerange_launch(
-                            kv,
-                            get_parallel().attn_cp_size,
-                            comm_stream,
-                            ("kv", self.layer_id),
+                            kv, self.cp_size, comm_stream, ("kv", self.layer_id)
                         )
                         kv = None
                     else:
@@ -1565,27 +1572,15 @@ class MQALayer(MqaAttentionBase):
                             forward_batch,
                             torch.cuda.current_stream(),
                         )
-                elif uses_sharded_layout:
-                    kv = materialize_global_kv(
-                        kv.contiguous(),
-                        forward_batch,
-                        torch.cuda.current_stream(),
-                    )
-            elif uses_sharded_layout or legacy_hip_cp:
-                # Materialize the full current chunk before writing FlashMLA cache.
+            elif use_cp:
+                # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
+                # write to the FlashMLA cache after gather.
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
-                if legacy_hip_cp:
-                    kv = cp_materialize_global_token_order(
-                        kv.contiguous(),
-                        forward_batch,
-                        torch.cuda.current_stream(),
-                    )
-                else:
-                    kv = materialize_global_kv(
-                        kv.contiguous(),
-                        forward_batch,
-                        torch.cuda.current_stream(),
-                    )
+                kv = cp_materialize_global_token_order(
+                    kv.contiguous(),
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
                 attn_backend.store_cache(
                     layer_id=self.layer_id,
                     swa_k=kv,
@@ -1614,7 +1609,7 @@ class MQALayer(MqaAttentionBase):
                 self.compressor,
             )
 
-        if kv_handle is not None:
+        if _is_hip and kv_handle is not None:
             kv = cp_all_gather_rerange_finish(kv_handle)
 
         return q, kv
@@ -1644,7 +1639,7 @@ class MQALayer(MqaAttentionBase):
                 is_in_breakable_cuda_graph()
                 or x.shape[0] <= self._multi_stream_bs_limit
             )
-            and not uses_sharded_prefill_layout(forward_batch)
+            and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
             and not (_is_hip and self.compressor is None)
         ) or (
             _is_npu
@@ -1958,6 +1953,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_ffn_scale,
         ) = make_hc_mixing_params(hc_mult, config.hidden_size)
         self.rms_norm_eps = config.rms_norm_eps
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.use_fused_mhc_post_pre = (
             is_cross_layer_mhc_fusion_enabled() or _is_fused_mhc_post_pre_enabled_xpu()
         )
@@ -2394,14 +2390,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         input_ids: torch.Tensor,
         input_ids_global: torch.Tensor,
     ) -> torch.Tensor:
-        _uses_sharded_layout = uses_sharded_prefill_layout(forward_batch)
+        _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
-            not _uses_sharded_layout
+            not _use_cp
             and get_parallel().attn_dp_size > 1
             and get_moe_a2a_backend().is_none()
         )
         _use_tp_attn_a2a_scatter = (
-            not _uses_sharded_layout
+            not _use_cp
             and get_parallel().attn_tp_size > 1
             and not get_moe_a2a_backend().is_none()
         )
@@ -2434,9 +2430,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             and forward_batch.dp_padding_mode.is_max_len()
             and get_parallel().tp_size == get_parallel().attn_dp_size
         )
-        mlp_reduce_scatter = (
-            _uses_sharded_layout or _use_reduce_scatterv or _use_reduce_scatter
-        )
+        mlp_reduce_scatter = _use_cp or _use_reduce_scatterv or _use_reduce_scatter
         # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): compute the replicated shared expert
         # on LOCAL hidden before the gather and add it back after the combine
         # (reduce_scatterv OR dp_scatter), instead of on the gathered global buffer.
@@ -2453,17 +2447,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             and getattr(self.mlp, "shared_experts", None) is not None
             and getattr(self.mlp, "_shared_expert_tp1", False)
         )
-        if _uses_sharded_layout:
+        if _use_cp:
             moe_a2a_backend = get_moe_a2a_backend()
             if moe_a2a_backend.is_none():
-                hidden_states = gather_sharded_hidden_states(hidden_states)
+                hidden_states = dsa_cp_gather_hidden_states(hidden_states)
             else:
                 assert (
                     moe_a2a_backend.is_deepep()
                     or moe_a2a_backend.is_megamoe()
                     or moe_a2a_backend.is_mori()
                 ), (
-                    "The sharded prefill layout requires DeepEP, MegaMoE, or MORI "
+                    "CP requires moe_a2a_backend in ('deepep', 'megamoe', 'mori'), "
                     f"got {moe_a2a_backend.value!r}."
                 )
         elif _use_tp_moe_gather:
@@ -2494,8 +2488,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 input_ids_global=input_ids_global,
                 skip_shared_experts=_do_shared_local,
             )
-        if _uses_sharded_layout and get_moe_a2a_backend().is_none():
-            hidden_states = reduce_scatter_sharded_hidden_states(hidden_states)
+        if _use_cp and get_moe_a2a_backend().is_none():
+            hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_tp_group()),
@@ -2800,8 +2794,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden = hidden + shared_local[:n]
         state.hidden_states_mlp_output = hidden
 
-    # Protected ROCm compatibility island for CP+TBO. Generic prefill CP uses
-    # the strategy-owned model boundary and does not enter these operations.
     def _cp_tbo_launch(self, state, x, key, out_rows, collective):
         assert _is_hip, "CP+TBO MoE overlap is HIP-only"
         x = x.contiguous()
@@ -2938,9 +2930,7 @@ class DeepseekV4Model(nn.Module):
                 self.hc_head_scale,
             ) = make_hc_head_params(hc_mult, config.hidden_size)
 
-        # Protected ROCm compatibility island: CP+TBO still uses the legacy
-        # metadata and collectives until the HIP backend migrates separately.
-        self.dsa_enable_prefill_cp = _is_hip and is_dsa_enable_prefill_cp()
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.use_fused_mhc_post_pre = (
             is_cross_layer_mhc_fusion_enabled() or _is_fused_mhc_post_pre_enabled_xpu()
         )
@@ -3007,8 +2997,8 @@ class DeepseekV4Model(nn.Module):
         model-agnostically when --enable-two-batch-overlap is set and the
         DP-attention preparer allows it (mori `normal` mode permits prefill
         TBO). We additionally restrict to: prefill (EXTEND), single PP, and a
-        path the DSV4 op strategy implements -- the non-CP path everywhere,
-        plus the protected interleaved DSA prefill CP path on HIP.
+        path the DSV4 op strategy implements -- the non-CP path everywhere, plus
+        the round-robin DSA prefill CP path on HIP.
         """
         from sglang.srt.layers.moe import is_tbo_enabled
 
@@ -3026,7 +3016,6 @@ class DeepseekV4Model(nn.Module):
                 or not get_moe_a2a_backend().is_none()
                 or get_parallel().attn_dp_size > 1
             )
-
         return (
             is_tbo_enabled()
             and forward_batch.can_run_tbo
@@ -3179,6 +3168,11 @@ class DeepseekV4Model(nn.Module):
 
         attn_backend = get_attn_backend()
         children = forward_batch.tbo_children
+        # Attention-side CP gathers run two-phase (launch early on the comm
+        # stream / collect right before their consumer). Only the MoE
+        # collectives are splittable across a YieldOperation, so without this the
+        # ~2.5 attention-side collectives per layer would stay on the compute
+        # stream and defeat most of TBO's overlap.
         prefetch_comm_stream = get_dp_tbo_comm_stream()
 
         inputs_arr = []
@@ -3266,8 +3260,8 @@ class DeepseekV4Model(nn.Module):
         # execution cannot expose per-layer completed hidden states), so skip
         # TBO when capturing -- a perf-only downgrade, not a correctness one.
         run_tbo = self._can_run_tbo(forward_batch) and not capture_dspark
-        use_legacy_hip_cp = _is_hip and dsa_use_prefill_cp(forward_batch)
-        if use_legacy_hip_cp and not run_tbo:
+        use_platform_cp = not enable_cp_v2() and dsa_use_prefill_cp(forward_batch)
+        if use_platform_cp and not run_tbo:
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
@@ -3322,7 +3316,8 @@ class DeepseekV4Model(nn.Module):
                     hidden_states, prev_residual, prev_post, prev_comb
                 )
 
-        if self.pp_group.is_last_rank and use_legacy_hip_cp and not run_tbo:
+        # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
+        if self.pp_group.is_last_rank and use_platform_cp and not run_tbo:
             stream = torch.cuda.current_stream()
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
@@ -3330,6 +3325,7 @@ class DeepseekV4Model(nn.Module):
                 forward_batch,
                 stream,
             )
+            # Gather DSpark aux tensors on the same CP token split.
             if capture_dspark:
                 dspark_aux_hidden_states = [
                     cp_all_gather_rerange_output(
@@ -3411,9 +3407,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.start_layer = self.model.start_layer
         self.end_layer = self.model.end_layer
 
-        # Protected ROCm compatibility island. Generic platforms prepare
-        # strategy metadata at the model-runner boundary.
-        self.dsa_enable_prefill_cp = _is_hip and is_dsa_enable_prefill_cp()
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
             self.cp_rank = get_parallel().attn_cp_rank
             self.cp_size = get_parallel().attn_cp_size
@@ -3484,7 +3478,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if self.dsa_enable_prefill_cp:
+        if not enable_cp_v2() and self.dsa_enable_prefill_cp:
             if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),

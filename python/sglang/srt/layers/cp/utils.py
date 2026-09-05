@@ -120,9 +120,9 @@ def get_layer_owner(local_layer_idx: int, shard_size: int, total_layers: int) ->
 
 def enable_cp_v2() -> bool:
     """Return whether the strategy-based generic prefill CP path is available."""
-    from sglang.srt.utils import is_hip, is_npu
+    from sglang.srt.utils import is_hip, is_musa, is_npu
 
-    return not (is_hip() or is_npu())
+    return not (is_hip() or is_npu() or is_musa())
 
 
 def is_cp_v2_active(forward_batch) -> bool:

@@ -62,19 +62,28 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
+from sglang.srt.layers.attention.dsa.utils import (
+    can_dsa_cp_split,
+    dsa_use_prefill_cp,
+    is_dsa_enable_prefill_cp,
+)
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStatePacker,
 )
 from sglang.srt.layers.communicator import (
+    LayerCommunicator,
     LayerScatterModes,
-    create_deepseek_layer_communicator,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
-from sglang.srt.layers.communicator_dsa_cp import maybe_prefetch_next_full_attention_kv
+from sglang.srt.layers.communicator_dsa_cp import (
+    DSACPLayerCommunicator,
+    maybe_prefetch_next_full_attention_kv,
+)
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+from sglang.srt.layers.cp.utils import enable_cp_v2
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
@@ -124,6 +133,15 @@ from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.cp_utils import (
+    can_cp_split,
+    cp_all_gather_rerange_output,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+    is_prefill_context_parallel_enabled,
+    mla_use_prefill_cp,
+    prepare_context_parallel_metadata,
+)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -451,8 +469,10 @@ class MoEGate(nn.Module):
         quant_config,
         prefix: str = "",
         is_hash_moe: bool = False,
+        is_deepseek_v4: bool = False,
     ):
         super().__init__()
+        self.is_deepseek_v4 = is_deepseek_v4
         self.weight = nn.Parameter(
             torch.empty(
                 (config.n_routed_experts, config.hidden_size),
@@ -507,6 +527,14 @@ class MoEGate(nn.Module):
             )
 
         if get_exec().deterministic.enable_deterministic_inference:
+            return F.linear(hidden_states, self.weight, None)
+
+        if (
+            not enable_cp_v2()
+            and not self.is_deepseek_v4
+            and forward_batch is not None
+            and (dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch))
+        ):
             return F.linear(hidden_states, self.weight, None)
 
         if hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens:
@@ -598,6 +626,7 @@ class DeepseekV2MoE(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("gate", prefix),
             is_hash_moe=self.is_hash,
+            is_deepseek_v4=is_deepseek_v4,
         )
 
         # scaling factor for fused shared experts on AMD-platform.
@@ -2224,16 +2253,18 @@ class DeepseekV2AttentionMLA(
         return q.view(-1, self.num_local_heads, self.qk_head_dim)
 
     def rebuild_cp_kv_cache(self, latent_cache, forward_batch, k_nope, k_pe):
-        """Compatibility shim used only by the unchanged ROCm/NPU MLA paths."""
-        from sglang.srt.layers.attention.dsa_backend import materialize_full_kv_cp
-
-        return materialize_full_kv_cp(
-            self,
+        # Retained for the platform MLA paths.
+        latent_cache[..., : self.kv_lora_rank] = k_nope.squeeze(1)
+        latent_cache[..., self.kv_lora_rank :] = k_pe.squeeze(1)
+        latent_cache_output = cp_all_gather_rerange_output(
+            latent_cache.contiguous(),
+            get_parallel().attn_cp_size,
             forward_batch,
-            latent_cache,
-            k_nope,
-            k_pe,
+            torch.cuda.current_stream(),
         )
+        k_nope = latent_cache_output[..., : self.kv_lora_rank].unsqueeze(1)
+        k_pe = latent_cache_output[..., self.kv_lora_rank :].unsqueeze(1)
+        return k_nope, k_pe
 
     @staticmethod
     def _get_q_b_proj_quant_config(quant_config):
@@ -2345,7 +2376,12 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 
-        self.layer_communicator = create_deepseek_layer_communicator(
+        communicator_cls = (
+            DSACPLayerCommunicator
+            if get_parallel().enable_prefill_cp
+            else LayerCommunicator
+        )
+        self.layer_communicator = communicator_cls(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
@@ -2752,6 +2788,15 @@ class DeepseekV2Model(nn.Module):
             else None
         )
 
+        # HIP/NPU/MUSA retain their model-side CP boundary.
+        use_platform_cp = not enable_cp_v2() and (
+            dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch)
+        )
+        if use_platform_cp:
+            if self.pp_group.is_first_rank:
+                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+            positions = cp_split_and_rebuild_position(forward_batch, positions)
+
         # llama_4_scaling: for supporting Mistral-Large-3 model
         # Compute llama 4 scaling once per forward pass if enabled
         llama_4_scaling: Optional[torch.Tensor] = None
@@ -2851,6 +2896,14 @@ class DeepseekV2Model(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
+        if self.pp_group.is_last_rank and use_platform_cp:
+            # allgather + rerrange
+            hidden_states = cp_all_gather_rerange_output(
+                hidden_states,
+                get_parallel().attn_cp_size,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states.finalize()
@@ -3011,6 +3064,41 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+
+        # Multi-modal: input_ids may be None (use input_embeds).
+        # Non-first PP ranks: both are None (activations via pp_proxy_tensors).
+        if input_ids is not None:
+            len_input_ids = input_ids.shape[0]
+        elif input_embeds is not None:
+            len_input_ids = input_embeds.shape[0]
+        else:
+            len_input_ids = pp_proxy_tensors["hidden_states"].shape[0]
+        if not enable_cp_v2():
+            if is_dsa_enable_prefill_cp():
+                if can_dsa_cp_split(
+                    len_input_ids,
+                    get_parallel().attn_cp_size,
+                    self.use_dsa,
+                    forward_batch,
+                ):
+                    forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                        len_input_ids,
+                        get_parallel().attn_cp_rank,
+                        get_parallel().attn_cp_size,
+                        forward_batch.seq_lens_cpu.tolist(),
+                        extend_seqs_len=forward_batch.extend_seq_lens_cpu,
+                    )
+            elif is_prefill_context_parallel_enabled() and not self.use_dsa:
+                if can_cp_split(
+                    len_input_ids, get_parallel().attn_cp_size, forward_batch
+                ):
+                    forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                        len_input_ids,
+                        get_parallel().attn_cp_rank,
+                        get_parallel().attn_cp_size,
+                        forward_batch.seq_lens_cpu.tolist(),
+                        extend_seqs_len=forward_batch.extend_seq_lens_cpu,
+                    )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model(
