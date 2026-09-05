@@ -545,10 +545,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             and cuda_capability[0] == 12
             and os.environ.get("SGLANG_DISABLE_SM120_FP8_GEMV", "0") != "1"
         )
-        self.use_kda_fp8_skinny = (
-            cuda_capability == (12, 0)
-            and os.environ.get("SGLANG_DISABLE_KDA_FP8_SKINNY_GEMM", "0") != "1"
-        )
+        self.use_kda_fp8_skinny = cuda_capability == (12, 0)
 
     def create_weights(
         self,
