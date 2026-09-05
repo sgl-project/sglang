@@ -18,6 +18,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
     ResidentStrategy,
     is_fsdp_managed_module,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    HostPinBudget,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
     is_resident_layerwise_module,
@@ -78,6 +81,7 @@ def build_component_residency_strategy(
     component_name: str,
     module: nn.Module,
     server_args: ServerArgs,
+    pin_budget: HostPinBudget | None = None,
 ) -> ComponentResidencyStrategy:
     residency_mode = server_args.residency_mode(component_name)
     if is_layerwise_offloaded_module(module):
@@ -97,7 +101,10 @@ def build_component_residency_strategy(
         and not is_fsdp_managed_module(module)
         and residency_mode == COMPONENT_OFFLOAD
     ):
-        return ComponentOffloadStrategy()
+        return ComponentOffloadStrategy(
+            component_name=component_name,
+            pin_budget=pin_budget if pin_budget is not None else HostPinBudget(),
+        )
     return ResidentStrategy()
 
 
@@ -129,6 +136,10 @@ class ComponentResidencyManager:
         ] = {}
         self._uses_seen: dict[str, ComponentUse] = {}
         self._modules_seen: dict[str, nn.Module] = {}
+        # One budget for every component-offload strategy in this process, so
+        # two offloaded components cannot each pin against the same headroom.
+        # Built lazily, after model load, when the free-memory reading is real.
+        self._component_offload_pin_budget: HostPinBudget | None = None
 
     def refresh_pipeline(self, pipeline: ComponentResidencyPipeline) -> None:
         custom_strategies = dict(pipeline.component_residency_strategies)
@@ -567,11 +578,19 @@ class ComponentResidencyManager:
                 component_name,
                 module,
                 self.server_args,
+                pin_budget=self._component_offload_budget(),
             )
         else:
             strategy = custom_strategy
         self._strategy_cache[component_name] = (module, strategy)
         return strategy
+
+    def _component_offload_budget(self) -> HostPinBudget:
+        if self._component_offload_pin_budget is None:
+            self._component_offload_pin_budget = HostPinBudget(
+                node_local_ranks=self.server_args.node_local_gpu_worker_count
+            )
+        return self._component_offload_pin_budget
 
     def _next_stage_name(self, stage_index: int) -> str | None:
         next_index = stage_index + 1
@@ -689,11 +708,13 @@ class ComponentResidencyManager:
         released_device_storage = (
             was_on_supported_device and not self._module_on_supported_device(module)
         )
-        released_layerwise_storage = isinstance(strategy, LayerwiseOffloadStrategy)
+        released_offload_storage = isinstance(
+            strategy, (ComponentOffloadStrategy, LayerwiseOffloadStrategy)
+        )
         should_empty_component_cache = (
             released_device_storage and not current_platform.is_npu()
         )
-        if not (should_empty_component_cache or released_layerwise_storage):
+        if not (should_empty_component_cache or released_offload_storage):
             return
         if not torch.get_device_module().is_available():
             return

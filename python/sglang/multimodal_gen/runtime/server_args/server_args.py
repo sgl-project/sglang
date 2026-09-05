@@ -665,6 +665,34 @@ class ServerArgs(DisaggServerArgsMixin):
     def _validate_breakable_cuda_graph(self):
         if not self.enable_breakable_cuda_graph:
             return
+        dit_residency = self.residency_mode("transformer")
+        if dit_residency != RESIDENT:
+            # BCG captures the DiT forward; every offload flavor rebinds or
+            # frees its weight storage between forwards, and a captured graph
+            # replays the addresses recorded at capture. Other components
+            # never enter the captured graph and stay free to offload.
+            if self.explicit_residency_mode(
+                "transformer"
+            ) is not None or self.is_explicit_layerwise_offload_component(
+                "transformer"
+            ):
+                raise ValueError(
+                    "--enable-breakable-cuda-graph requires a resident DiT: "
+                    f"the selected {dit_residency!r} placement rebinds weight "
+                    "storage between forwards, while a captured graph replays "
+                    "the addresses recorded at capture. Remove the DiT "
+                    "offload selection or drop --enable-breakable-cuda-graph."
+                )
+            logger.warning(
+                "[Diffusion BCG] the %s DiT placement was selected "
+                "automatically for this configuration; disabling "
+                "--enable-breakable-cuda-graph because a captured graph would "
+                "replay weight addresses the offload rebinds. The DiT runs "
+                "eager.",
+                dit_residency,
+            )
+            self.enable_breakable_cuda_graph = False
+            return
         # BCG graphs are captured per resolution and only replay for that exact
         # latent shape, so the user must declare the resolutions up front. We
         # capture every one of them at warmup; serving then never re-captures.
@@ -1670,6 +1698,15 @@ class ServerArgs(DisaggServerArgsMixin):
         self, component_name: str, *, supported: bool
     ) -> None:
         self._component_layerwise_capabilities[component_name] = supported
+
+    @property
+    def node_local_gpu_worker_count(self) -> int:
+        """GPU worker processes sharing this node's host memory.
+
+        Per-process host budgets divide by it, because each worker reads the
+        same host-wide free-memory number.
+        """
+        return max(1, self.num_gpus // max(1, self.nnodes))
 
     def has_layerwise_offload_components(self) -> bool:
         return bool(

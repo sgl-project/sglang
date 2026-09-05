@@ -531,6 +531,12 @@ def component_residency_bytes(module) -> Dict[str, int]:
             continue
         for _, tensor in iter_cpu_weights():
             add(tensor)
+    # component offload parks (1,) device placeholders in the module the same
+    # way; the real weights live in its host store
+    store = getattr(module, "component_offload_host_store", None)
+    if store is not None:
+        for _, tensor in store.iter_cpu_weights():
+            add(tensor)
 
     return totals
 
