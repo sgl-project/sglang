@@ -100,7 +100,9 @@ pub struct InsertParams<'k, K: ChildKeyType, V: RadixValue = DefaultRadixValue> 
     pub key: &'k K,
     /// Namespace of the insert; picks the matching subtree root.
     pub namespace: KeyNamespaceRef<'k>,
-    /// Device KV indices covering the key, one row per atom.
+    /// Device KV indices, one row per inserted atom: the whole aligned key for
+    /// `insert`, or only the atoms past `prefix_len` for
+    /// `insert_suffix_from_node`.
     pub value: V,
     /// Tokens of this request already cached before the insert (the duplicate
     /// window starts past them).
@@ -1376,10 +1378,16 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
 
     /// Insert only the suffix after a retained prefix node.
     ///
-    /// The anchor must be the terminal node for `prefix_len`, and `params.value`
-    /// holds only the atoms past `prefix_len`. Only the suffix key and value enter
-    /// the resumable walk, so decode or chunked-prefill growth skips a second root
-    /// walk.
+    /// The anchor must be the terminal node for `prefix_len`, must still hold
+    /// Full KV on device, and `params.value` holds only the atoms past
+    /// `prefix_len`. Only the suffix key and value enter the resumable walk, so
+    /// decode or chunked-prefill growth skips a second root walk.
+    ///
+    /// The retained prefix is not revisited: unlike [`Self::insert`], its nodes
+    /// get no access-tick or LRU refresh, no hit-count bump (so no write-through
+    /// backup trigger), and no component overlap hooks such as SWA tombstone
+    /// recovery. Only the anchor itself is touched. Callers that need those
+    /// effects on the prefix should use a root insert.
     pub fn insert_suffix_from_node(
         &mut self,
         prefix_node_id: NodeId,
