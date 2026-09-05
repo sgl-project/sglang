@@ -226,6 +226,7 @@ class _DeepEPv2Impl:
         hidden_size: int,
         scale_format: DeepEPv2Fp8ScaleFormat,
         num_max_dispatch_tokens_per_rank: int,
+        use_fp8_dispatch: bool,
     ):
         self.group = group
         self.router_topk = router_topk
@@ -234,6 +235,7 @@ class _DeepEPv2Impl:
         self.hidden_size = hidden_size
         self.scale_format = scale_format
         self.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
+        self.use_fp8_dispatch = use_fp8_dispatch
         self.rank = dist.get_rank(group)
         self._handle = None
         self._pad_empty_combine = False
@@ -247,7 +249,7 @@ class _DeepEPv2Impl:
             self.hidden_size,
             self.router_topk,
             self.num_max_dispatch_tokens_per_rank,
-            True,
+            self.use_fp8_dispatch,
         )
 
     def _validate_common(
@@ -267,7 +269,7 @@ class _DeepEPv2Impl:
             )
         if self.hidden_size % _SCALE_BLOCK_SIZE != 0:
             raise ValueError(
-                "DeepEP v2 FP8 dispatch requires hidden_size multiple of "
+                "DeepEP v2 requires hidden_size multiple of "
                 f"{_SCALE_BLOCK_SIZE}, got {self.hidden_size}"
             )
         if topk_ids.shape[1] != self.router_topk:
@@ -302,8 +304,13 @@ class _DeepEPv2Impl:
             ).unsqueeze(0)
             topk_weights = topk_weights.new_zeros((1, topk_weights.shape[-1]))
 
-        _ensure_fp8_quant_available()
-        if use_masked:
+        if not self.use_fp8_dispatch:
+            # BF16 experts read activations unquantized, so the wire carries
+            # them as they are and no scales come back.
+            dispatch_x = hidden_states
+            use_tma_aligned_col_major_sf = False
+        elif use_masked:
+            _ensure_fp8_quant_available()
             _ue8m0 = self.scale_format.ue8m0
             dispatch_x = sglang_per_token_group_quant_fp8(
                 hidden_states,
@@ -427,6 +434,7 @@ class DeepEPv2Dispatcher(BaseDispatcher):
         num_local_experts: int,
         hidden_size: int,
         params_dtype: torch.dtype,
+        use_fp8_dispatch: bool = True,
     ):
         super().__init__()
         if params_dtype != torch.bfloat16:
@@ -438,6 +446,7 @@ class DeepEPv2Dispatcher(BaseDispatcher):
         self.num_max_dispatch_tokens_per_rank = (
             envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
+        self.use_fp8_dispatch = use_fp8_dispatch
         self._impl = _DeepEPv2Impl(
             group=group,
             router_topk=router_topk,
@@ -446,6 +455,7 @@ class DeepEPv2Dispatcher(BaseDispatcher):
             hidden_size=hidden_size,
             scale_format=scale_format,
             num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+            use_fp8_dispatch=use_fp8_dispatch,
         )
 
     def dispatch(
