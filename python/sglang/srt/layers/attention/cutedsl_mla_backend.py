@@ -33,6 +33,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLAMultiStepDraftBackend,
 )
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
+from sglang.srt.mem_cache.layout.page_major import paged_row_view
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_flashinfer_available
 
@@ -226,7 +227,7 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             query = query.unsqueeze(1)
 
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
+        kv_cache = paged_row_view(k_cache, self.page_size).unsqueeze(1)
 
         metadata = (
             getattr(forward_batch, "decode_trtllm_mla_metadata", None)
