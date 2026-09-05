@@ -475,6 +475,10 @@ class ServerArgs(DisaggServerArgsMixin):
     host: str | None = "127.0.0.1"
     port: int | None = 30000
 
+    # API key authentication
+    api_key: str | None = field(default=None, repr=False)
+    admin_api_key: str | None = field(default=None, repr=False)
+
     # TODO: webui and their endpoint, check if webui_port is available.
     webui: bool = False
     webui_port: int | None = 12312
@@ -2718,6 +2722,21 @@ class ServerArgs(DisaggServerArgsMixin):
             action=StoreBoolean,
             default=ServerArgs.strict_ports,
             help="If enabled, fail when requested ports are unavailable instead of auto-selecting.",
+        )
+        parser.add_argument(
+            "--api-key",
+            type=str,
+            default=ServerArgs.api_key,
+            help="Set API key of the server. It is also used in the OpenAI API compatible server.",
+        )
+        parser.add_argument(
+            "--admin-api-key",
+            type=str,
+            default=ServerArgs.admin_api_key,
+            help=(
+                "Set admin API key for sensitive management endpoints. When set, "
+                "admin endpoints require this key and do NOT accept --api-key."
+            ),
         )
         parser.add_argument(
             "--webui",
