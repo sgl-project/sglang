@@ -818,6 +818,7 @@ def build_prefill_registry(
     is_multimodal: bool = False,
     hidden_size: int = 0,
     embed_dtype: Optional[torch.dtype] = None,
+    deepstack_replay_width: int = 0,
     enable_mamba_track: bool = False,
     enable_num_token_non_padded: bool = False,
     require_gathered_buffer: bool = False,
@@ -908,6 +909,17 @@ def build_prefill_registry(
                     copy_from_fb=False,
                 )
             )
+            if deepstack_replay_width > 0:
+                slots.append(
+                    GraphSlot(
+                        "input_deepstack_embeds",
+                        lambda _bs2, mt: (mt, deepstack_replay_width),
+                        embed_dtype,
+                        axis="tokens",
+                        padding_policy=PaddingPolicy.ZERO,
+                        copy_from_fb=False,
+                    )
+                )
     if enable_mamba_track:
         slots.append(GraphSlot("mamba_track_indices", _bs, torch.int64, axis="bs"))
         slots.append(GraphSlot("mamba_track_mask", _bs, torch.bool, axis="bs"))
