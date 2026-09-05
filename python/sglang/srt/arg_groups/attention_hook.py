@@ -27,7 +27,6 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
     resolving_view,
     run_post_process_pass,
-    use_mla_backend,
 )
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
@@ -202,12 +201,7 @@ def handle_attention_backend_compatibility(server_args: Any):
     # Other platforms backends
     run_post_process_pass(server_args, _attention_backend_platform_fallbacks)
 
-    prefill_backend, decode_backend = attention_backends_of(resolved_view(server_args))
-    if use_mla_backend(server_args) and prefill_backend == "intel_xpu":
-        raise ValueError(
-            "intel_xpu backend is only supported on decode for MLA models, please set --decode-attention-backend to intel_xpu and do not set --attention-backend or --prefill-attention-backend to intel_xpu for prefill instead use triton."
-        )
-
+    # XPU platforms backends
     run_post_process_pass(server_args, _intel_xpu_page_constraint)
 
     # Dual chunk flash attention backend
