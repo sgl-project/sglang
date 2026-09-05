@@ -1083,6 +1083,20 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 dst_mem_kind=dst_mem_kind,
             )
 
+    def _wait_for_transfer_handles(self, handles: List[Any], room: int) -> None:
+        """Wait for the submitted group using the existing NIXL error policy."""
+        while handles:
+            all_done = True
+            for handle in handles:
+                state = self.agent.check_xfer_state(handle)
+                if state == "ERR":
+                    raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
+                if state != "DONE":
+                    all_done = False
+            if all_done:
+                return
+            time.sleep(0)
+
     def transfer_worker(self, queue: FastQueue, staging_buffer=None, worker_index=0):
         # Per-worker staging strategy: lazy-created on first chunk so we
         # see kv_buffer_tensors (set by ModelRunner after engine init).
@@ -1093,6 +1107,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             kv_chunk: TransferKVChunk = queue.get()
             room = kv_chunk.room
             handles: List[Any] = []
+            submitted_destinations = set()
             try:
                 if room not in self.request_status:
                     logger.debug(
@@ -1153,6 +1168,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 for req in reqs_to_be_processed:
                     assert room == req.room
                     if req.is_dummy():
+                        continue
+                    if req.agent_name in kv_chunk.completed_destinations:
                         continue
 
                     assert req.agent_name in self.decode_kv_args_table
@@ -1304,6 +1321,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                         if kv_xfer_handle is not None:
                             handles.append(kv_xfer_handle)
+                            if use_staging:
+                                # The next destination gathers into this same
+                                # worker buffer. Its previous asynchronous
+                                # reader must finish before that overwrite.
+                                self._wait_for_transfer_handles([kv_xfer_handle], room)
 
                     if kv_chunk.is_last_chunk:
                         dst_info = self.decode_kv_args_table[req.agent_name]
@@ -1347,23 +1369,20 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         )
                         handles.append(aux_xfer_handle)
 
+                    submitted_destinations.add(req.agent_name)
+
+                # A partial fanout may already have posted KV, aux or state
+                # before another destination defers. Drain those handles even
+                # on requeue, then preserve the completed destinations on the
+                # common work item. This also protects DCP pack regions from
+                # being reused by a different room while these reads are live.
+                self._wait_for_transfer_handles(handles, room)
+                if self.enable_staging:
+                    kv_chunk.completed_destinations.update(submitted_destinations)
+
                 if staging_deferred:
                     # Chunk has been re-enqueued; do not advance status.
                     continue
-
-                while handles:
-                    all_done = True
-                    for handle in handles:
-                        state = self.agent.check_xfer_state(handle)
-                        if state == "ERR":
-                            raise RuntimeError(
-                                f"NIXL transfer encountered ERR room={room}"
-                            )
-                        if state != "DONE":
-                            all_done = False
-                    if all_done:
-                        break
-                    time.sleep(0)
 
                 self._staging_outstanding[room] -= 1
                 if self.enable_deferred_decode_kv_release:
@@ -1986,8 +2005,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             retried on the next pop.
           - oversized chunk (will never fit) -> raise RuntimeError.
           - staging successfully posted -> return ``(handle, False)``. The
-            caller appends the handle to the per-chunk handle list and
-            busy-polls it to DONE alongside other handles.
+            caller waits for this handle before the next gather can reuse
+            the worker's source buffer.
           - send_kvcache_staged returned None (chunk cannot fit; decode buffer
             too small, kv_buffer_tensors missing, etc.) -> raise RuntimeError
             instead of falling back to the slice path.
