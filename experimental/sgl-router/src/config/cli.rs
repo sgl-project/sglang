@@ -11,10 +11,11 @@ use std::num::NonZeroU32;
 
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
-    resolve_mode, ActiveLoadConfig, CacheAwareConfig, CircuitBreakerConfig, Config,
-    DiscoveryBackend, EligibilityConfig, FilterKind, FusedTerm, K8sDiscoveryConfig,
-    KvIndexerEndpointConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig,
-    ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, DEFAULT_FUSE,
+    resolve_mode, ActiveLoadConfig, AffinityConfig, AffinityMode, CacheAwareConfig,
+    CircuitBreakerConfig, Config, DiscoveryBackend, EligibilityConfig, FilterKind, FusedTerm,
+    K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig, ObservabilityConfig,
+    PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode, StaticUrlsDiscoveryConfig,
+    StickyConfig, StickyFallbackKind, DEFAULT_FUSE,
 };
 
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
@@ -63,7 +64,7 @@ pub struct Cli {
     #[arg(long)]
     pub cb_cool_down_secs: Option<u64>,
 
-    // ---- cache-aware-zmq tuning (only used by that policy) ----
+    // ---- legacy cache-aware-zmq tuning ----
     /// Min `matched_blocks / total_blocks` for a cache match to win.
     #[arg(long)]
     pub cache_threshold: Option<f32>,
@@ -73,19 +74,63 @@ pub struct Cli {
     /// Multiplicative load spread gating the absolute balance check.
     #[arg(long)]
     pub balance_rel_threshold: Option<f32>,
-    /// External KV indexer gRPC endpoint used as the cache signal.
+    /// External KV indexer gRPC endpoint used as the authoritative cache signal.
+    /// Needs an explicit scheme, e.g. `http://10.0.0.1:50051`.
     #[arg(long)]
     pub kv_indexer_endpoint: Option<String>,
     /// KV Indexer query timeout in milliseconds. Requires
     /// `--kv-indexer-endpoint`; defaults to 100.
     #[arg(long)]
     pub kv_indexer_query_timeout_ms: Option<u64>,
-    /// Maximum concurrent KV Indexer queries. Requires
+    /// Maximum concurrent KV Indexer queries issued by this Router. Requires
     /// `--kv-indexer-endpoint`; defaults to 32.
     #[arg(long)]
     pub kv_indexer_query_max_inflight: Option<usize>,
 
-    /// Weighted terms for `--policy fused_score`.
+    // ---- session-affinity tuning ----
+    /// Header carrying the session ID for `--policy session_aware`.
+    #[arg(long)]
+    pub session_id_header: Option<String>,
+    /// Idle timeout for a session assignment, in seconds.
+    #[arg(long)]
+    pub session_idle_secs: Option<u64>,
+    /// Session-assignment eviction cadence, in seconds.
+    #[arg(long)]
+    pub session_eviction_interval_secs: Option<u64>,
+    /// Use a deterministic backup for the affinity key and candidate range.
+    #[arg(long)]
+    pub stable_pair: bool,
+    /// Session-affinity admission mode.
+    #[arg(long, value_enum)]
+    pub affinity_mode: Option<AffinityMode>,
+    /// Session-affinity primary lookup and fallback behavior.
+    #[arg(long, value_enum)]
+    pub session_affinity_mode: Option<SessionAffinityMode>,
+    /// Minimum cache-hit tokens for a cache-aware candidate.
+    #[arg(long)]
+    pub cache_affinity_min_matched_tokens: Option<u64>,
+    /// Minimum cache-hit ratio for a cache-aware candidate.
+    #[arg(long)]
+    pub cache_affinity_min_match_ratio: Option<f64>,
+    /// Minimum number of cache-aware candidates to try.
+    #[arg(long)]
+    pub cache_candidate_min_workers: Option<usize>,
+    /// Fraction of healthy prefill workers considered as cache-aware candidates.
+    #[arg(long)]
+    pub cache_candidate_ratio: Option<f64>,
+    /// Maximum number of cache-aware candidates to try.
+    #[arg(long)]
+    pub cache_candidate_max_workers: Option<usize>,
+    /// Maximum uncached-work difference that pressure may override.
+    #[arg(long)]
+    pub cache_switch_margin_tokens: Option<u64>,
+
+    // ---- score composition ----
+    /// Policies to sum, spelled exactly as `--policy` spells them and each
+    /// optionally weighted: `--fuse prefix_cache=2.0,load_based=0.3`. An
+    /// omitted weight keeps that policy's own default. Requires `--policy
+    /// score_policy` or `fused_score`; when either policy is set and this flag
+    /// is omitted, the terms default to `prefix_cache,load_based`.
     #[arg(long, value_delimiter = ',')]
     pub fuse: Vec<FusedTerm>,
 
@@ -184,16 +229,12 @@ impl Cli {
                  enabled by --cb-threshold)"
             ));
         }
-        let tuned_cache_aware = self.cache_threshold.is_some()
+        let tuned_legacy_cache_aware = self.cache_threshold.is_some()
             || self.balance_abs_threshold.is_some()
-            || self.balance_rel_threshold.is_some()
-            || self.kv_indexer_endpoint.is_some()
-            || self.kv_indexer_query_timeout_ms.is_some()
-            || self.kv_indexer_query_max_inflight.is_some();
-        if tuned_cache_aware && self.policy != PolicyKind::CacheAwareZmq {
+            || self.balance_rel_threshold.is_some();
+        if tuned_legacy_cache_aware && self.policy != PolicyKind::CacheAwareZmq {
             return Err(anyhow!(
-                "--cache-threshold / --balance-abs-threshold / --balance-rel-threshold \
-                 require --policy cache_aware_zmq"
+                "cache-aware tuning flags require --policy cache_aware_zmq"
             ));
         }
         if self.kv_indexer_query_timeout_ms == Some(0) {
@@ -216,11 +257,59 @@ impl Cli {
                 "--kv-indexer-query-max-inflight requires --kv-indexer-endpoint"
             ));
         }
-
-        if !self.fuse.is_empty() && self.policy != PolicyKind::FusedScore {
-            return Err(anyhow!("--fuse requires --policy fused_score"));
+        if self.kv_indexer_endpoint.is_some()
+            && !matches!(
+                self.policy,
+                PolicyKind::CacheAware | PolicyKind::CacheAwareZmq
+            )
+        {
+            return Err(anyhow!(
+                "--kv-indexer-endpoint requires --policy cache_aware or cache_aware_zmq"
+            ));
         }
-        let fused = if self.policy == PolicyKind::FusedScore {
+        if self.policy == PolicyKind::CacheAware && self.kv_indexer_endpoint.is_none() {
+            return Err(anyhow!(
+                "--policy cache_aware requires --kv-indexer-endpoint"
+            ));
+        }
+        let tuned_cache_aware = tuned_legacy_cache_aware || self.kv_indexer_endpoint.is_some();
+        let affinity_policy = matches!(
+            self.policy,
+            PolicyKind::SessionAware | PolicyKind::CacheAware
+        );
+        let tuned_session_affinity = self.session_id_header.is_some()
+            || self.session_idle_secs.is_some()
+            || self.session_eviction_interval_secs.is_some()
+            || self.stable_pair
+            || self.affinity_mode.is_some()
+            || self.session_affinity_mode.is_some();
+        if tuned_session_affinity && self.policy != PolicyKind::SessionAware {
+            return Err(anyhow!(
+                "--session-id-header, --session-*-secs, --stable-pair, --affinity-mode, and \
+                 --session-affinity-mode require --policy session_aware"
+            ));
+        }
+        let tuned_cache_candidates = self.cache_affinity_min_matched_tokens.is_some()
+            || self.cache_affinity_min_match_ratio.is_some()
+            || self.cache_candidate_min_workers.is_some()
+            || self.cache_candidate_ratio.is_some()
+            || self.cache_candidate_max_workers.is_some()
+            || self.cache_switch_margin_tokens.is_some();
+        if tuned_cache_candidates && self.policy != PolicyKind::CacheAware {
+            return Err(anyhow!(
+                "cache candidate tuning flags require --policy cache_aware"
+            ));
+        }
+        let is_score_composition = matches!(
+            self.policy,
+            PolicyKind::FusedScore | PolicyKind::ScorePolicy
+        );
+        if !self.fuse.is_empty() && !is_score_composition {
+            return Err(anyhow!(
+                "--fuse requires --policy score_policy or fused_score"
+            ));
+        }
+        let fused = if is_score_composition {
             let terms = if self.fuse.is_empty() {
                 DEFAULT_FUSE
                     .iter()
@@ -250,6 +339,9 @@ impl Cli {
                 "--max-in-flight and `--filter overloaded` require each other"
             ));
         }
+        if self.max_in_flight == Some(0) {
+            return Err(anyhow!("--max-in-flight must be greater than 0"));
+        }
         if self.prefix_cache_min_share.is_some() != has(FilterKind::PrefixCache) {
             return Err(anyhow!(
                 "--prefix-cache-min-share and `--filter prefix_cache` require each other"
@@ -260,6 +352,9 @@ impl Cli {
             .is_some_and(|s| !(s > 0.0 && s <= 1.0))
         {
             return Err(anyhow!("--prefix-cache-min-share must be in (0, 1]"));
+        }
+        if self.policy == PolicyKind::Sticky && !self.filter.is_empty() {
+            return Err(anyhow!("--filter cannot be combined with --policy sticky"));
         }
         let eligibility = (!self.filter.is_empty()).then(|| EligibilityConfig {
             filters: self.filter.clone(),
@@ -318,6 +413,81 @@ impl Cli {
             None
         };
 
+        let affinity = if affinity_policy {
+            let d = AffinityConfig::default();
+            let session_id_header = self.session_id_header.unwrap_or(d.session_id_header);
+            axum::http::HeaderName::try_from(session_id_header.as_str()).map_err(|e| {
+                anyhow!("--session-id-header {session_id_header:?} is not a valid HTTP header name: {e}")
+            })?;
+            let cache_affinity_min_match_ratio = self
+                .cache_affinity_min_match_ratio
+                .or(d.cache_affinity_min_match_ratio);
+            if cache_affinity_min_match_ratio
+                .is_some_and(|ratio| !ratio.is_finite() || !(0.0..=1.0).contains(&ratio))
+            {
+                return Err(anyhow!(
+                    "--cache-affinity-min-match-ratio must be finite and in [0, 1]"
+                ));
+            }
+            let cache_candidate_ratio = self
+                .cache_candidate_ratio
+                .unwrap_or(d.cache_candidate_ratio);
+            if !cache_candidate_ratio.is_finite() || !(0.0..=1.0).contains(&cache_candidate_ratio) {
+                return Err(anyhow!(
+                    "--cache-candidate-ratio must be finite and in [0, 1]"
+                ));
+            }
+            let cache_candidate_min_workers = self
+                .cache_candidate_min_workers
+                .unwrap_or(d.cache_candidate_min_workers);
+            let cache_candidate_max_workers = self
+                .cache_candidate_max_workers
+                .unwrap_or(d.cache_candidate_max_workers);
+            if cache_candidate_min_workers == 0
+                || cache_candidate_max_workers == 0
+                || cache_candidate_min_workers > cache_candidate_max_workers
+            {
+                return Err(anyhow!(
+                    "--cache-candidate-min-workers and --cache-candidate-max-workers must be \
+                     positive and min must not exceed max"
+                ));
+            }
+            let session_idle_secs = self.session_idle_secs.unwrap_or(d.session_idle_secs);
+            let session_eviction_interval_secs = self
+                .session_eviction_interval_secs
+                .unwrap_or(d.session_eviction_interval_secs);
+            if session_idle_secs == 0 {
+                return Err(anyhow!("--session-idle-secs must be greater than 0"));
+            }
+            if session_eviction_interval_secs == 0 {
+                return Err(anyhow!(
+                    "--session-eviction-interval-secs must be greater than 0"
+                ));
+            }
+            Some(AffinityConfig {
+                session_id_header,
+                session_idle_secs,
+                session_eviction_interval_secs,
+                stable_pair: self.stable_pair,
+                mode: self.affinity_mode.unwrap_or(d.mode),
+                session_affinity_mode: self
+                    .session_affinity_mode
+                    .unwrap_or(d.session_affinity_mode),
+                cache_affinity_min_matched_tokens: self
+                    .cache_affinity_min_matched_tokens
+                    .or(d.cache_affinity_min_matched_tokens),
+                cache_affinity_min_match_ratio,
+                cache_candidate_min_workers,
+                cache_candidate_ratio,
+                cache_candidate_max_workers,
+                cache_switch_margin_tokens: self
+                    .cache_switch_margin_tokens
+                    .unwrap_or(d.cache_switch_margin_tokens),
+            })
+        } else {
+            None
+        };
+
         let circuit_breaker = self.cb_threshold.map(|threshold| CircuitBreakerConfig {
             threshold,
             cool_down_secs: self.cb_cool_down_secs.unwrap_or_else(default_cb_cool_down),
@@ -326,14 +496,17 @@ impl Cli {
         // Only build a CacheAwareConfig when the operator tuned at least
         // one knob; otherwise leave it None so the policy uses its own
         // defaults. Unset knobs fall back to the per-field defaults.
-        let kv_indexer_query_timeout_ms = self
-            .kv_indexer_query_timeout_ms
-            .unwrap_or(DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS);
-        let kv_indexer_query_max_inflight = self
-            .kv_indexer_query_max_inflight
-            .unwrap_or(DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT);
         let cache_aware = if tuned_cache_aware {
             let d = CacheAwareConfig::default();
+            let kv_indexer_endpoint = self.kv_indexer_endpoint.map(|url| KvIndexerEndpointConfig {
+                url,
+                query_timeout_ms: self
+                    .kv_indexer_query_timeout_ms
+                    .unwrap_or(DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS),
+                query_max_inflight: self
+                    .kv_indexer_query_max_inflight
+                    .unwrap_or(DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT),
+            });
             Some(CacheAwareConfig {
                 cache_threshold: self.cache_threshold.unwrap_or(d.cache_threshold),
                 balance_abs_threshold: self
@@ -342,11 +515,7 @@ impl Cli {
                 balance_rel_threshold: self
                     .balance_rel_threshold
                     .unwrap_or(d.balance_rel_threshold),
-                kv_indexer_endpoint: self.kv_indexer_endpoint.map(|url| KvIndexerEndpointConfig {
-                    url,
-                    query_timeout_ms: kv_indexer_query_timeout_ms,
-                    query_max_inflight: kv_indexer_query_max_inflight,
-                }),
+                kv_indexer_endpoint,
             })
         } else {
             None
@@ -370,6 +539,7 @@ impl Cli {
                 circuit_breaker,
                 cache_aware,
                 sticky,
+                affinity,
                 fused,
                 eligibility,
             },
@@ -889,7 +1059,7 @@ mod tests {
             "--worker-urls",
             "http://x:30000",
             "--policy",
-            "cache_aware_zmq",
+            "cache_aware",
             "--kv-indexer-endpoint",
             "http://indexer:50051",
             "--kv-indexer-query-timeout-ms",
@@ -911,6 +1081,30 @@ mod tests {
             "--worker-urls",
             "http://x:30000",
             "--policy",
+            "cache_aware",
+            "--kv-indexer-endpoint",
+            "http://indexer:50051",
+        ]))
+        .unwrap();
+        let indexer = c
+            .model
+            .cache_aware
+            .expect("cache-aware config")
+            .kv_indexer_endpoint
+            .expect("Indexer config");
+        assert_eq!(
+            indexer.query_timeout_ms,
+            DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS
+        );
+        assert_eq!(indexer.query_max_inflight, 32);
+    }
+
+    #[test]
+    fn kv_indexer_is_accepted_by_cache_aware_zmq() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
             "cache_aware_zmq",
             "--kv-indexer-endpoint",
             "http://indexer:50051",
@@ -922,8 +1116,7 @@ mod tests {
             .expect("cache-aware config")
             .kv_indexer_endpoint
             .expect("Indexer config");
-        assert_eq!(indexer.query_timeout_ms, 100);
-        assert_eq!(indexer.query_max_inflight, 32);
+        assert_eq!(indexer.url, "http://indexer:50051");
     }
 
     #[test]
@@ -936,7 +1129,7 @@ mod tests {
         ]))
         .unwrap_err()
         .to_string();
-        assert!(err.contains("require --policy cache_aware_zmq"));
+        assert!(err.contains("requires --policy cache_aware"), "got: {err}");
     }
 
     #[test]
@@ -945,7 +1138,7 @@ mod tests {
             "--worker-urls",
             "http://x:30000",
             "--policy",
-            "cache_aware_zmq",
+            "cache_aware",
             "--kv-indexer-query-timeout-ms",
             "75",
         ]))
@@ -960,7 +1153,7 @@ mod tests {
             "--worker-urls",
             "http://x:30000",
             "--policy",
-            "cache_aware_zmq",
+            "cache_aware",
             "--kv-indexer-query-max-inflight",
             "17",
         ]))
@@ -975,7 +1168,7 @@ mod tests {
             "--worker-urls",
             "http://x:30000",
             "--policy",
-            "cache_aware_zmq",
+            "cache_aware",
             "--kv-indexer-endpoint",
             "http://indexer:50051",
             "--kv-indexer-query-max-inflight",
@@ -1145,7 +1338,7 @@ mod tests {
 
     #[test]
     fn filter_misconfigurations_fail_at_startup() {
-        let cases: [(&[&str], &str); 6] = [
+        let cases: [(&[&str], &str); 8] = [
             (&["--filter", "overloaded"], "require each other"),
             (&["--max-in-flight", "64"], "require each other"),
             (&["--filter", "prefix_cache"], "require each other"),
@@ -1162,6 +1355,21 @@ mod tests {
                     "0.0",
                 ],
                 "must be in (0, 1]",
+            ),
+            (
+                &["--filter", "overloaded", "--max-in-flight", "0"],
+                "must be greater than 0",
+            ),
+            (
+                &[
+                    "--policy",
+                    "sticky",
+                    "--filter",
+                    "overloaded",
+                    "--max-in-flight",
+                    "1",
+                ],
+                "cannot be combined with --policy sticky",
             ),
         ];
         for (extra, want) in cases {
@@ -1307,8 +1515,31 @@ mod tests {
         fused_of(argv).expect("fused_score builds a term list")
     }
 
-    /// `--policy fused_score` alone composes the useful pair, and `--fuse`
-    /// overrides it with names + optional per-term weights.
+    /// `score_policy` is an independent top-level policy.
+    #[test]
+    fn score_policy_is_a_top_level_policy_with_its_own_cli_spelling() {
+        use PolicyKind::ScorePolicy;
+        use ScoreTermKind::{LoadBased, PrefixCache};
+        let pair = [(PrefixCache, None), (LoadBased, None)];
+        let config = cfg_of("--policy score_policy").unwrap();
+        assert_eq!(config.model.policy, ScorePolicy);
+        assert_eq!(
+            config
+                .model
+                .fused
+                .expect("score_policy must resolve its score terms")
+                .iter()
+                .map(|t| (t.kind, t.weight))
+                .collect::<Vec<_>>(),
+            pair,
+        );
+        assert_eq!(
+            fuse_ok("--policy score_policy --fuse prefix_cache=2.0,load_based=0.3"),
+            [(PrefixCache, Some(2.0)), (LoadBased, Some(0.3))],
+        );
+    }
+
+    /// `fused_score` keeps the compatibility entry point.
     #[test]
     fn fuse_defaults_to_the_useful_pair_and_parses_weights() {
         use ScoreTermKind::{LoadBased, PrefixCache, Random};
@@ -1345,7 +1576,7 @@ mod tests {
 
     #[test]
     fn fuse_rejects_malformed_compositions() {
-        let cases: [(&str, &[&str]); 5] = [
+        let cases: [(&str, &[&str]); 6] = [
             ("--fuse load_based", &["--fuse requires", "fused_score"]),
             (
                 "--policy fused_score --fuse fused_score,load_based",
@@ -1354,6 +1585,10 @@ mod tests {
             (
                 "--policy fused_score --fuse load_based,load_based",
                 &["load_based", "listed more than once"],
+            ),
+            (
+                "--policy score_policy --fuse score_policy,load_based",
+                &["score_policy", "not a score term"],
             ),
             (
                 "--policy fused_score --fuse not_a_policy",
@@ -1370,5 +1605,200 @@ mod tests {
                 assert!(err.contains(want), "{argv}: want {want:?}, got: {err}");
             }
         }
+    }
+
+    #[test]
+    fn session_aware_builds_affinity_config_from_its_cli_knobs() {
+        let config = cfg_of(
+            "--policy session_aware --session-id-header x-agent-session --stable-pair \
+             --affinity-mode strict --session-affinity-mode global-rebind",
+        )
+        .unwrap();
+        let affinity = config
+            .model
+            .affinity
+            .expect("session policy needs affinity config");
+
+        assert_eq!(config.model.policy, PolicyKind::SessionAware);
+        assert_eq!(affinity.session_id_header, "x-agent-session");
+        assert!(affinity.stable_pair);
+        assert_eq!(affinity.mode, AffinityMode::Strict);
+        assert_eq!(
+            affinity.session_affinity_mode,
+            SessionAffinityMode::GlobalRebind
+        );
+    }
+
+    #[test]
+    fn rejects_removed_token_pressure_flags() {
+        for flag in [
+            "--disable-pressure-guard",
+            "--pressure-abs-threshold-tokens 2048",
+            "--pressure-rel-threshold 2.0",
+        ] {
+            let error = cfg_of(&format!("--policy session_aware {flag}"))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("unexpected argument"), "{flag}: {error}");
+        }
+    }
+
+    #[test]
+    fn rejects_removed_affinity_aware_range_flag() {
+        let error = cfg_of("--policy session_aware --affinity-aware-range global-first")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unexpected argument '--affinity-aware-range'"));
+    }
+
+    #[test]
+    fn session_affinity_mode_accepts_all_new_values() {
+        for (value, expected) in [
+            ("bucket", SessionAffinityMode::Bucket),
+            ("global-rebind", SessionAffinityMode::GlobalRebind),
+            ("global-preserve", SessionAffinityMode::GlobalPreserve),
+        ] {
+            let config = cfg_of(&format!(
+                "--policy session_aware --session-affinity-mode {value}"
+            ))
+            .unwrap();
+            assert_eq!(
+                config.model.affinity.unwrap().session_affinity_mode,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn session_aware_configures_bounded_assignment_lifetime() {
+        let config = cfg_of(
+            "--policy session_aware --session-idle-secs 120 \
+             --session-eviction-interval-secs 15",
+        )
+        .unwrap();
+        let affinity = config.model.affinity.expect("session affinity config");
+        assert_eq!(affinity.session_idle_secs, 120);
+        assert_eq!(affinity.session_eviction_interval_secs, 15);
+    }
+
+    #[test]
+    fn cache_aware_accepts_indexer_endpoint_and_rejects_affinity_knobs_elsewhere() {
+        let config = cfg_of(
+            "--policy cache_aware --kv-indexer-endpoint http://indexer:50051 \
+             --kv-indexer-query-timeout-ms 40 \
+             --cache-affinity-min-matched-tokens 512 --cache-affinity-min-match-ratio 0.25 \
+             --cache-candidate-min-workers 4 --cache-candidate-ratio 0.1 \
+             --cache-candidate-max-workers 16 --cache-switch-margin-tokens 128",
+        )
+        .unwrap();
+        assert_eq!(config.model.policy, PolicyKind::CacheAware);
+        assert_eq!(
+            config
+                .model
+                .cache_aware
+                .as_ref()
+                .expect("cache-aware needs indexer config")
+                .kv_indexer_endpoint
+                .as_ref()
+                .map(|indexer| indexer.url.as_str()),
+            Some("http://indexer:50051"),
+        );
+        let indexer_timeout_ms = config
+            .model
+            .cache_aware
+            .as_ref()
+            .and_then(|cache| cache.kv_indexer_endpoint.as_ref())
+            .expect("cache-aware needs indexer config")
+            .query_timeout_ms;
+        let affinity = config
+            .model
+            .affinity
+            .expect("cache-aware needs candidate config");
+        assert_eq!(affinity.cache_affinity_min_matched_tokens, Some(512));
+        assert_eq!(affinity.cache_affinity_min_match_ratio, Some(0.25));
+        assert_eq!(affinity.cache_candidate_min_workers, 4);
+        assert_eq!(affinity.cache_candidate_ratio, 0.1);
+        assert_eq!(affinity.cache_candidate_max_workers, 16);
+        assert_eq!(affinity.cache_switch_margin_tokens, 128);
+        assert_eq!(indexer_timeout_ms, 40);
+
+        let defaults =
+            cfg_of("--policy cache_aware --kv-indexer-endpoint http://indexer:50051").unwrap();
+        let defaults_indexer_timeout_ms = defaults
+            .model
+            .cache_aware
+            .as_ref()
+            .and_then(|cache| cache.kv_indexer_endpoint.as_ref())
+            .expect("default indexer config")
+            .query_timeout_ms;
+        let defaults_affinity = defaults
+            .model
+            .affinity
+            .expect("default cache candidate config");
+        assert_eq!(
+            defaults_affinity.cache_affinity_min_matched_tokens,
+            Some(1_024)
+        );
+        assert_eq!(defaults_affinity.cache_affinity_min_match_ratio, None);
+        assert_eq!(
+            defaults_indexer_timeout_ms,
+            DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS
+        );
+
+        let err = cfg_of("--policy power_of_two --stable-pair")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--stable-pair") && err.contains("session_aware"),
+            "got: {err}"
+        );
+
+        let err =
+            cfg_of("--policy cache_aware --kv-indexer-endpoint http://indexer:50051 --stable-pair")
+                .expect_err("Cache-Aware has no stable backup")
+                .to_string();
+        assert!(err.contains("--stable-pair"), "got: {err}");
+    }
+
+    #[test]
+    fn cache_candidate_cli_rejects_invalid_bounds() {
+        for (args, expected) in [
+            (
+                "--policy cache_aware --kv-indexer-endpoint http://indexer:50051 \
+                 --cache-affinity-min-match-ratio 1.1",
+                "--cache-affinity-min-match-ratio",
+            ),
+            (
+                "--policy cache_aware --kv-indexer-endpoint http://indexer:50051 \
+                 --cache-candidate-min-workers 9 --cache-candidate-max-workers 8",
+                "--cache-candidate-min-workers",
+            ),
+            (
+                "--policy cache_aware --kv-indexer-endpoint http://indexer:50051 \
+                 --cache-candidate-ratio=-0.1",
+                "--cache-candidate-ratio",
+            ),
+            (
+                "--policy cache_aware --kv-indexer-endpoint http://indexer:50051 \
+                 --kv-indexer-query-timeout-ms 0",
+                "--kv-indexer-query-timeout-ms",
+            ),
+        ] {
+            let err = cfg_of(args)
+                .expect_err("invalid candidate bound")
+                .to_string();
+            assert!(err.contains(expected), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_affinity_options_that_cannot_affect_the_selected_policy() {
+        let missing_indexer = cfg_of("--policy cache_aware")
+            .expect_err("cache_aware without an indexer can only behave like P2")
+            .to_string();
+        assert!(
+            missing_indexer.contains("--kv-indexer-endpoint"),
+            "got: {missing_indexer}"
+        );
     }
 }

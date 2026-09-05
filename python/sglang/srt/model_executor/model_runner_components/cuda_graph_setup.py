@@ -287,6 +287,7 @@ def capture_prefill_graph(
     """Initialize a prefill graph and return its startup resource usage."""
 
     memory_phase = "draft_prefill" if model_runner.is_draft_worker else "prefill"
+    role = "draft" if model_runner.is_draft_worker else "target"
 
     def result(
         runner: Optional[BaseRunner],
@@ -430,8 +431,10 @@ def capture_prefill_graph(
         layer_model = layer_model.model
 
     if not hasattr(layer_model, "layers"):
-        logger.warning(
-            "Disable prefill CUDA graph because the model does not have a 'layers' attribute"
+        log_info_on_rank0(
+            logger,
+            f"Disable {role} prefill CUDA graph because the {role} model does "
+            "not have a 'layers' attribute",
         )
         return result(None)
 
@@ -467,7 +470,6 @@ def capture_prefill_graph(
 
     tic = time.perf_counter()
     before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
-    role = "draft" if model_runner.is_draft_worker else "target"
     capture_name = f"{role} prefill"
     logger.info(
         f"Capture {capture_name} CUDA graph begin. "

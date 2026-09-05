@@ -800,6 +800,87 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.assertEqual(req.reasoning_effort, "high")
 
+    def test_hunyuan_default_reasoning_effort_is_normalized_for_template(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            special_case="hunyuan_effort"
+        )
+        self.chat.reasoning_parser = "hunyuan"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+
+        cases = [
+            ("none", None, "no_think"),
+            ("none", "xhigh", "high"),
+        ]
+        for default_effort, request_effort, normalized_effort in cases:
+            with self.subTest(
+                default_effort=default_effort, request_effort=request_effort
+            ):
+                self.chat.default_chat_template_kwargs = {
+                    "reasoning_effort": default_effort
+                }
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "What is 2+2?"}],
+                    reasoning_effort=request_effort,
+                )
+
+                self.chat._process_messages(req, is_multimodal=False)
+
+                kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+                self.assertEqual(req.reasoning_effort, normalized_effort)
+                self.assertEqual(kwargs["reasoning_effort"], normalized_effort)
+                self.assertNotIn("reasoning_effort", req.chat_template_kwargs)
+
+    def test_hunyuan_reasoning_effort_precedence_survives_conversion(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            special_case="hunyuan_effort"
+        )
+        self.chat.reasoning_parser = "hunyuan"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+
+        cases = [
+            ("xhigh", "none", "high"),
+            (None, "no_think", "no_think"),
+        ]
+        for request_effort, template_effort, normalized_effort in cases:
+            with self.subTest(
+                request_effort=request_effort, template_effort=template_effort
+            ):
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "What is 2+2?"}],
+                    reasoning_effort=request_effort,
+                    chat_template_kwargs={"reasoning_effort": template_effort},
+                )
+
+                self.chat._convert_to_internal_request(req)
+
+                kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+                self.assertEqual(req.reasoning_effort, normalized_effort)
+                self.assertEqual(kwargs["reasoning_effort"], normalized_effort)
+                self.assertNotIn("reasoning_effort", req.chat_template_kwargs)
+
+    def test_non_hunyuan_default_reasoning_effort_is_unchanged(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.default_chat_template_kwargs = {"reasoning_effort": "medium"}
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertEqual(req.reasoning_effort, "medium")
+        self.assertEqual(kwargs["reasoning_effort"], "medium")
+        self.assertEqual(req.chat_template_kwargs["reasoning_effort"], "medium")
+
     def test_k2_selected_terminator_reaches_sampling_params(self):
         self.tm._config_overrides["reasoning_parser"] = "k2_horizon"
         self.chat = OpenAIServingChat(self.tm, self.template_manager)

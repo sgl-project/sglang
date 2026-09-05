@@ -44,6 +44,30 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 
+def _validate_dsa_tbo_index_sharing(server_args: Any, hf_config: Any) -> None:
+    cfg = resolving_view(server_args)
+    if not cfg.enable_two_batch_overlap:
+        return
+
+    index_topk_freq = getattr(hf_config, "index_topk_freq", 1) or 1
+    index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
+    indexer_types = getattr(hf_config, "indexer_types", None)
+    if (
+        index_topk_freq > 1
+        or (index_topk_pattern is not None and "S" in index_topk_pattern)
+        or (indexer_types is not None and "shared" in indexer_types)
+    ):
+        raise ValueError(
+            "--enable-two-batch-overlap is not supported with DSA "
+            "index-topk sharing: the TBO op path does not propagate topk "
+            "indices across layers, so shared layers would run sparse "
+            "attention without indices. Got "
+            f"index_topk_freq={index_topk_freq!r}, "
+            f"index_topk_pattern={index_topk_pattern!r}, and "
+            f"indexer_types={indexer_types!r}."
+        )
+
+
 def _rocm_fp8_wo_a_supported() -> bool:
     """True when ROCm can run the DeepSeek-V4 fp8 wo_a GEMM (gfx950 + aiter)."""
     try:
@@ -159,6 +183,8 @@ def handle_model_specific_adjustments(server_args: Any):
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "GlmMoeDsaForCausalLM",
+        "HYV4ForCausalLM",
+        "HYV4ForCausalLMNextN",
         "LongcatFlashForCausalLM",
         "Dots3NoteForCausalLM",
     ]:
@@ -181,19 +207,7 @@ def handle_model_specific_adjustments(server_args: Any):
             # The "dsa" attention fill moved to the override registry
             # (arg_groups/overrides.py: _deepseek_family_overrides).
 
-            index_topk_freq = getattr(hf_config, "index_topk_freq", 1) or 1
-            index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
-            if cfg.enable_two_batch_overlap and (
-                index_topk_freq > 1
-                or (index_topk_pattern is not None and "S" in index_topk_pattern)
-            ):
-                raise ValueError(
-                    "--enable-two-batch-overlap is not supported with DSA "
-                    "index-topk sharing (index_topk_freq > 1 or an "
-                    "index_topk_pattern containing shared layers): the TBO op "
-                    "path does not propagate topk indices across layers, so "
-                    "shared layers would run sparse attention without indices."
-                )
+            _validate_dsa_tbo_index_sharing(server_args, hf_config)
 
             if (
                 not get_platform().is_npu and not get_platform().is_xpu
