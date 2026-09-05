@@ -1055,7 +1055,7 @@ TWO_GPU_CASES = [
             model_path="Lightricks/LTX-2.5-Diffusers",
             modality="video",
             ulysses_degree=2,
-            # Offload both the DiT and text encoder between stages to leave 
+            # Offload both the DiT and text encoder between stages to leave
             # decoder headroom on 80 GB GPUs.
             extras=[
                 "--load-diffusion-decoder",
