@@ -77,7 +77,7 @@ def _get_ple_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
 def _get_processed_token_count(
     forward_batch: ForwardBatch, physical_tokens: int
 ) -> int:
-    processed_tokens = forward_batch.num_token_non_padded_cpu
+    processed_tokens = forward_batch.global_num_token_non_padded_cpu
     if processed_tokens is None and forward_batch.extend_seq_lens_cpu is not None:
         processed_tokens = sum(forward_batch.extend_seq_lens_cpu)
     if processed_tokens is None:
