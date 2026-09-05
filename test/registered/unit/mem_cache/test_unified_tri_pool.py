@@ -249,7 +249,7 @@ class TestUnifiedTriPool(unittest.TestCase):
                 break
         self.assertIsNotNone(boundary)
         allocator.swa.free(boundary)
-        allocator.flush_opportunistic()  # the deferred reclaim point
+        allocator.chain.flush_opportunistic()  # the deferred reclaim point
         self.assertEqual(sa._hole_pages(), 0)  # absorbed, not holed
         self.assertEqual(sa._span_pages(), span_pages - 4)
         self.assertEqual(len(sa._inverse_history), 0)  # zero copies
@@ -308,9 +308,8 @@ class TestUnifiedTriPool(unittest.TestCase):
         sa = allocator.swa.pool
         holes = sa._hole_pages()
         self.assertGreater(holes, 0)
-        from sglang.srt.mem_cache.allocator.unified_sub_pool import _relieve_for_alloc
 
-        _relieve_for_alloc(allocator, 1)
+        allocator.chain.relieve(1)
         self.assertEqual(sa._hole_pages(), holes)  # holes are assets, not backlog
 
 
@@ -569,7 +568,7 @@ class TestComputedShortSide(unittest.TestCase):
         with mock.patch.object(
             sa, "make_room", side_effect=lambda **kw: calls.append(kw) or real(**kw)
         ):
-            alloc._ask_float_for_room(chosen * self.PS)
+            alloc.chain._ask_float_for_room(chosen * self.PS)
         self.assertEqual(len(calls), 1, calls)
         self.assertEqual(calls[0]["side"], "low")  # the STATE side
 
@@ -597,7 +596,7 @@ class TestComputedShortSide(unittest.TestCase):
         with mock.patch.object(
             sa, "make_room", side_effect=lambda **kw: calls.append(kw)
         ):
-            alloc._ask_float_for_room(chosen * self.PS)
+            alloc.chain._ask_float_for_room(chosen * self.PS)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["side"], "high")
         self.assertEqual(calls[0]["min_bytes"], want)
@@ -618,18 +617,18 @@ class TestComputedShortSide(unittest.TestCase):
         )
         # Synthetic coupling: the state end joins the demand vector, the
         # override a composite with ends on both sides would ship.
-        need = lambda self, t: {
-            fa: -(-t // self.page_size),
-            sa: -(-t // self.page_size),
-            ma: -(-t // self.page_size),
+        need = lambda chain, t: {
+            fa: -(-t // alloc.page_size),
+            sa: -(-t // alloc.page_size),
+            ma: -(-t // alloc.page_size),
         }
-        with mock.patch.object(type(alloc), "_alloc_demand", need):
+        with mock.patch.object(type(alloc.chain), "_alloc_demand", need):
             # (a) both sides short: absurd need -> both demands exceed their
             # bands -> make_room must NOT be called.
             with mock.patch.object(
                 sa, "make_room", side_effect=AssertionError("zero-sum move")
             ):
-                alloc._ask_float_for_room(10_000 * self.PS)
+                alloc.chain._ask_float_for_room(10_000 * self.PS)
 
             # (b) one side short: find a need where the HIGH side (full) is
             # short while the LOW side (mamba demand) still fits.
@@ -645,7 +644,7 @@ class TestComputedShortSide(unittest.TestCase):
                 with mock.patch.object(
                     sa, "make_room", side_effect=lambda **kw: calls.append(kw)
                 ):
-                    alloc._ask_float_for_room(chosen * self.PS)
+                    alloc.chain._ask_float_for_room(chosen * self.PS)
                 self.assertEqual(len(calls), 1)
                 self.assertEqual(calls[0]["side"], "high")
 
@@ -656,13 +655,13 @@ class TestComputedShortSide(unittest.TestCase):
 
         alloc = self._tri()
         alloc.alloc(4 * self.PS)
-        demand = alloc._alloc_demand(2 * self.PS)
+        demand = alloc.chain._alloc_demand(2 * self.PS)
         self.assertEqual(demand[alloc.mamba_allocator], 0)
         sa = alloc.swa.pool
         with mock.patch.object(
             sa, "make_room", side_effect=AssertionError("needless move")
         ):
-            alloc._ask_float_for_room(1)
+            alloc.chain._ask_float_for_room(1)
 
 
 class TestFloatPolicyTotalTarget(unittest.TestCase):
@@ -718,7 +717,7 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         alloc.swa.free_segment(v[6 * self.PS :], start_pos=6 * self.PS)  # high edge
         self.assertGreater(sa._hole_pages(), 0)  # deferred
         self.assertEqual(sa._span_pages(), span)
-        moved = alloc.flush_opportunistic()
+        moved = alloc.chain.flush_opportunistic()
         self.assertGreater(moved, 0)
         self.assertLess(sa._span_pages(), span)
         self.assertEqual(alloc.verify_byte_accounting(), [])
@@ -732,9 +731,8 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         alloc.swa.free_segment(v[6 * self.PS :], start_pos=6 * self.PS)
         self.assertGreater(sa._hole_pages(), 0)
         moves_before = len(sa._inverse_history)
-        from sglang.srt.mem_cache.allocator.unified_sub_pool import _relieve_for_alloc
 
-        _relieve_for_alloc(alloc, 1)  # the ladder
+        alloc.chain.relieve(1)  # the ladder
         self.assertEqual(sa._hole_pages(), 0)  # rung 0 ran
         self.assertEqual(len(sa._inverse_history), moves_before)  # zero copies
 
@@ -760,13 +758,13 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         alloc = self._tri()
         v = alloc.alloc(8 * self.PS)
         alloc.swa.free_segment(v[2 * self.PS : 4 * self.PS], start_pos=2 * self.PS)
-        alloc.flush_opportunistic()  # consumes the dirty flag
+        alloc.chain.flush_opportunistic()  # consumes the dirty flag
         sa = alloc.swa.pool
         self.assertGreater(sa._hole_pages(), 0)  # interior holes remain
         with mock.patch.object(
             torch.Tensor, "tolist", side_effect=AssertionError("tolist = D2H")
         ):
-            self.assertEqual(alloc.flush_opportunistic(), 0)
+            self.assertEqual(alloc.chain.flush_opportunistic(), 0)
             self.assertEqual(sa._flush(urgent=False), 0)
 
     def test_alloc_between_frees_cannot_hide_a_boundary_hole(self):
@@ -781,7 +779,7 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         alloc.swa.free_segment(v[6 * self.PS :], start_pos=6 * self.PS)  # high edge
         self.assertEqual(sa._hole_pages(), n_after_free)  # same COUNT as before
         span = sa._span_pages()
-        self.assertGreater(alloc.flush_opportunistic(), 0)  # still absorbed
+        self.assertGreater(alloc.chain.flush_opportunistic(), 0)  # still absorbed
         self.assertLess(sa._span_pages(), span)
         self.assertEqual(alloc.verify_byte_accounting(), [])
 

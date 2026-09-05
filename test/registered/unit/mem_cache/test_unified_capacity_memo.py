@@ -53,7 +53,8 @@ class TestCapacityMemoCoherence(unittest.TestCase):
     def _assert_memos_fresh(self, allocator):
         """Every memoized capacity view must equal a fresh recompute."""
         self.assertEqual(
-            allocator.available_size(), allocator._compute_available_size()
+            allocator.available_size(),
+            allocator.chain._compute_joint_available_tokens(),
         )
         for band in (
             allocator.full.pool,
@@ -202,7 +203,8 @@ class TestTriCapacityMemoCoherence(unittest.TestCase):
 
     def _assert_memos_fresh(self, allocator):
         self.assertEqual(
-            allocator.available_size(), allocator._compute_available_size()
+            allocator.available_size(),
+            allocator.chain._compute_joint_available_tokens(),
         )
         for band in (
             allocator.full.pool,

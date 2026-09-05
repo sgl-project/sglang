@@ -1567,7 +1567,7 @@ class Scheduler(
             self.enable_unified_memory
             and self.disaggregation_mode != DisaggregationMode.NULL
         ):
-            self.token_to_kv_pool_allocator.set_disagg_move_gate(
+            self.token_to_kv_pool_allocator.chain.set_disagg_move_gate(
                 unified_memory_disagg_move_gate(self)
             )
 
@@ -1951,7 +1951,7 @@ class Scheduler(
                 # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
                 if self.enable_unified_memory:
                     try:
-                        self.token_to_kv_pool_allocator.flush_opportunistic()
+                        self.token_to_kv_pool_allocator.chain.flush_opportunistic()
                     except Exception:
                         pass
 
@@ -4219,14 +4219,14 @@ class Scheduler(
                         if self.enable_unified_memory:
                             # Record a `forward_done` event after the forward (before
                             # copy_to_cpu); lazy-compaction `_flush` gates src reuse on
-                            # it. Only the unified pool's allocator exposes these hooks.
-                            allocator = self.token_to_kv_pool_allocator
+                            # it. The unified pool's chain owns these hooks.
+                            chain = self.token_to_kv_pool_allocator.chain
                             forward_done = self.device_module.Event()
                             forward_done.record(stream=self.forward_stream)
-                            allocator.set_latest_forward_done_event(forward_done)
-                            # Write-set classification: hand the allocator this
+                            chain.set_latest_forward_done_event(forward_done)
+                            # Write-set classification: hand the chain this
                             # forward's virtual out_cache_loc as a tensor ref (no GPU work).
-                            allocator.set_inflight_forward(
+                            chain.set_inflight_forward(
                                 forward_done,
                                 batch.out_cache_loc,
                             )
@@ -4634,7 +4634,7 @@ class Scheduler(
 
         if self.enable_unified_memory:
             try:
-                self.token_to_kv_pool_allocator.flush_opportunistic()
+                self.token_to_kv_pool_allocator.chain.flush_opportunistic()
             except Exception:
                 pass
 

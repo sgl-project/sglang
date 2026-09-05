@@ -557,7 +557,7 @@ class PrefillAdder:
             ),
         ):
             self._mamba_slot_cost = (
-                self.token_to_kv_pool_allocator.mamba_slot_full_token_cost()
+                self.token_to_kv_pool_allocator.chain.mamba_slot_full_token_cost()
             )
 
         # `mamba_gap_reserve` is charged to `rem_total_tokens`, which INCLUDES

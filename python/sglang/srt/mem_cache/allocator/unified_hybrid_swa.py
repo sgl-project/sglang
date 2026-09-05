@@ -24,6 +24,7 @@ from torch.profiler import record_function
 
 from sglang.srt.mem_cache.allocator.hybrid import BaseHybridSWAKVAllocator
 from sglang.srt.mem_cache.allocator.pairing import VirtualIdPairing
+from sglang.srt.mem_cache.allocator.unified_chain import UnifiedChain
 from sglang.srt.mem_cache.allocator.unified_side import (
     VirtualFullKVPoolSide,
     VirtualSWAKVPoolSide,
@@ -31,10 +32,7 @@ from sglang.srt.mem_cache.allocator.unified_side import (
 from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     FloatMultiEndedKVPool,
     MultiEndedKVPool,
-    _chain_byte_accounting_violations,
     _end_pair_chain,
-    _float_open_short_side,
-    _relieve_for_alloc,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
@@ -125,12 +123,7 @@ class UnifiedHybridSWAKVAllocator(BaseHybridSWAKVAllocator):
             ),
         }
         self.pairing = VirtualIdPairing(swa_pool)
-        self._wire_peers()
-
-        # Epoch-keyed memo for the joint capacity view (any chain member's
-        # mutation invalidates -- see `MultiEndedKVPool._chain_capacity_epoch`).
-        self._joint_avail_memo_epoch: Optional[int] = None
-        self._joint_avail_memo_tokens: int = 0
+        self.chain = self._build_chain(full_pool, swa_pool)
 
         # The full/SWA KV pools need no allocator wiring (write locations resolved
         # in attention metadata); the composite keeps allocators for read-path translates.
@@ -165,68 +158,22 @@ class UnifiedHybridSWAKVAllocator(BaseHybridSWAKVAllocator):
             **kwargs,
         )
 
-    def _wire_peers(self) -> None:
-        self.full.pool.bind_peer(self.swa.pool)
-        self.swa.pool.bind_peer(self.full.pool)
+    def _build_chain(
+        self, full_pool: MultiEndedKVPool, swa_pool: MultiEndedKVPool
+    ) -> UnifiedChain:
+        """Two END pools facing each other across the shared gap."""
+        return UnifiedChain(
+            _end_pair_chain(full_pool, swa_pool),
+            token_members=(full_pool, swa_pool),
+            lazy_compaction=self.lazy_compaction,
+        )
 
     # -- capacity reporting (three-way split) --
 
     def available_size(self) -> int:
-        """Tokens available for `alloc(N)` / `alloc_extend(N)` (TOKENS)."""
-        epoch = self.full.pool._chain_capacity_epoch()
-        if self._joint_avail_memo_epoch != epoch:
-            self._joint_avail_memo_tokens = self._compute_available_size()
-            self._joint_avail_memo_epoch = epoch
-        return self._joint_avail_memo_tokens
-
-    def _compute_available_size(self) -> int:
-        """Joint byte budget in TOKENS: each composite alloc(1) consumes one
-        full-side AND one swa-side page under the same virtual id."""
-        fa, sa = self.full.pool, self.swa.pool
-        e_f = fa.entry_bytes_per_page
-        e_s = sa.entry_bytes_per_page
-        # Direction-agnostic shared gap: the free byte band between the two pools.
-        if fa.grow_direction == "up":
-            gap_bytes = max(0, sa._byte_low_frontier() - fa._byte_high_frontier())
-        else:
-            gap_bytes = max(0, fa._byte_low_frontier() - sa._byte_high_frontier())
-        R_f = fa.num_pages - fa.min_page_index - fa._allocated_pages()
-        R_s = sa.num_pages - sa.min_page_index - sa._allocated_pages()
-
-        if not self.lazy_compaction:
-            pages_by_bytes = gap_bytes // (e_f + e_s)
-            return min(pages_by_bytes, R_f, R_s) * self.page_size
-
-        H_f = len(fa._free_phys_pages)
-        H_s = len(sa._free_phys_pages)
-
-        K1 = min(H_f, H_s)  # Phase 1: both drain
-
-        # Phase 2: fewer-holes side extends; more-holes side keeps draining.
-        if H_f <= H_s:
-            e_phase2 = e_f
-            K_phase2_max = H_s
-        else:
-            e_phase2 = e_s
-            K_phase2_max = H_f
-        K2_room = K_phase2_max - K1
-        K2 = min(K2_room, gap_bytes // e_phase2) if e_phase2 > 0 else K2_room
-        gap_bytes -= K2 * e_phase2
-
-        K3 = gap_bytes // (e_f + e_s)  # Phase 3: both extend
-
-        K_total = K1 + K2 + K3
-        K_total = min(K_total, H_f + R_f, H_s + R_s)  # index-space caps
-        return K_total * self.page_size
-
-    def _flush_targets(self):
-        """Flush ALL members, including ones that are not short themselves: a
-        one-sided hole is unusable, and compacting it yields SHARED gap."""
-        return (self.full.pool, self.swa.pool)
-
-    def _ask_float_for_room(self, need_tokens: int) -> None:
-        """No float in a two-END chain -- nothing can slide."""
-        return None
+        """Tokens available for `alloc(N)` / `alloc_extend(N)`: the chain's joint
+        byte budget, since one alloc binds a page on both sides."""
+        return self.chain.joint_available_tokens()
 
     @property
     def draft_virtual_id_space(self) -> int:
@@ -311,7 +258,7 @@ class UnifiedHybridSWAKVAllocator(BaseHybridSWAKVAllocator):
             # Joint pre-check. Both sides are mutual peers (each side's compaction
             # opens gap for the other), so flush BOTH on shortfall.
             if need_size > self.available_size():
-                if not _relieve_for_alloc(self, need_size):
+                if not self.chain.relieve(need_size):
                     return None
             # Snapshot the virtual PAGES full will consume, to bind them on swa too.
             num_pages = need_size // self.page_size
@@ -346,7 +293,7 @@ class UnifiedHybridSWAKVAllocator(BaseHybridSWAKVAllocator):
             )
             need_tokens = num_new_pages * self.page_size
             if need_tokens > self.available_size():
-                if not _relieve_for_alloc(self, need_tokens):
+                if not self.chain.relieve(need_tokens):
                     return None
 
             # Snapshot the virtual PAGES the kernel will consume; clone so swa keeps
@@ -384,7 +331,7 @@ class UnifiedHybridSWAKVAllocator(BaseHybridSWAKVAllocator):
             )
             need_tokens = num_new_pages * self.page_size
             if need_tokens > self.available_size():
-                if not _relieve_for_alloc(self, need_tokens):
+                if not self.chain.relieve(need_tokens):
                     return None
 
             fa = self.full.pool
@@ -409,62 +356,13 @@ class UnifiedHybridSWAKVAllocator(BaseHybridSWAKVAllocator):
         return self.full.pool.allocator_state_str()
 
     def verify_byte_accounting(self) -> List[str]:
-        return (
-            _chain_byte_accounting_violations(
-                _end_pair_chain(self.full.pool, self.swa.pool)
-            )
-            + self._joint_capacity_memo_violations()
-        )
-
-    def _joint_capacity_memo_violations(self) -> List[str]:
-        """Idle-time twin of `MultiEndedKVPool._capacity_memo_violations`
-        for the composite joint view. Empty == healthy."""
-        if self._joint_avail_memo_epoch != self.full.pool._chain_capacity_epoch():
-            return []
-        actual = self._compute_available_size()
-        if self._joint_avail_memo_tokens == actual:
-            return []
-        return [
-            f"[joint] stale available_size memo: "
-            f"cached={self._joint_avail_memo_tokens}, actual={actual}"
-        ]
+        return self.chain.verify_byte_accounting()
 
     def clear(self) -> None:
         self.full.pool.clear()
         self.swa.pool.clear()
 
     # -- Lazy compaction hooks --
-
-    def set_latest_forward_done_event(self, event: Optional[torch.cuda.Event]) -> None:
-        """Forward the per-batch `forward_done` event to BOTH sub-allocators."""
-        with record_function("UnifiedSWAAlloc.set_latest_forward_done_event"):
-            self.full.pool.set_latest_forward_done_event(event)
-            self.swa.pool.set_latest_forward_done_event(event)
-
-    def set_inflight_forward(
-        self,
-        forward_done: torch.cuda.Event,
-        out_cache_loc_virtual: Optional[torch.Tensor],
-    ) -> None:
-        """Hand the forward's metadata to BOTH sub-pools; each materializes its own
-        write-set via its OWN v2p, and the forward writes both sides per token."""
-        with record_function("UnifiedSWAAlloc.set_inflight_forward"):
-            self.full.pool.set_inflight_forward(forward_done, out_cache_loc_virtual)
-            self.swa.pool.set_inflight_forward(forward_done, out_cache_loc_virtual)
-
-    def flush_opportunistic(self) -> int:
-        """Non-urgent flush of BOTH sub-allocators; sync-free."""
-        with record_function("UnifiedSWAAlloc.flush_opportunistic"):
-            fa = self.full.pool
-            sa = self.swa.pool
-            if (
-                fa._free_phys_pages.numel() == 0
-                and not fa._pending_reuse
-                and sa._free_phys_pages.numel() == 0
-                and not sa._pending_reuse
-            ):
-                return 0
-            return fa.flush_opportunistic() + sa.flush_opportunistic()
 
 
 class UnifiedMambaHybridSWAKVAllocator(UnifiedHybridSWAKVAllocator):
@@ -496,6 +394,9 @@ class UnifiedMambaHybridSWAKVAllocator(UnifiedHybridSWAKVAllocator):
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
     ):
+        # Read by `_build_chain`, which the base init calls once the pair exists.
+        self._mamba_kvcache = mamba_kvcache
+        self._forward_stream = forward_stream
         super().__init__(
             unified_buffer=unified_buffer,
             kvcache=kvcache,
@@ -507,25 +408,6 @@ class UnifiedMambaHybridSWAKVAllocator(UnifiedHybridSWAKVAllocator):
             forward_stream=forward_stream,
             lazy_compaction=lazy_compaction,
         )
-        # Per-request state END pool (grow-up; page_size=1 -- state is
-        # per-request, orthogonal to KV paging).
-        self.mamba_allocator = MultiEndedKVPool(
-            kvcache=mamba_kvcache,
-            unified_buffer=unified_buffer,
-            sub_pool_name="mamba",
-            device=device,
-            is_id_owner=True,
-            page_size=1,
-            need_sort=need_sort,
-            forward_stream=forward_stream,
-            lazy_compaction=lazy_compaction,
-        )
-        # Chain wiring: mamba <-> swa(float) <-> full.
-        self.mamba_allocator.bind_high_peer(self.swa.pool)
-        self.swa.pool.bind_low_peer(self.mamba_allocator)
-        self.swa.pool.bind_high_peer(self.full.pool)
-        self.full.pool.bind_low_peer(self.swa.pool)
-
         logger.info(
             "[unified-memory-pool] UnifiedMambaHybridSWAKVAllocator ready: "
             "chain=[mamba(up) | swa(float) | full(down)], "
@@ -547,103 +429,31 @@ class UnifiedMambaHybridSWAKVAllocator(UnifiedHybridSWAKVAllocator):
             **kwargs,
         )
 
-    def _wire_peers(self) -> None:
-        # Chain wired in __init__ once the mamba end exists.
-        return
-
-    # -- capacity --
-
-    def _compute_available_size(self) -> int:
-        """Joint TOKENS for `alloc(N)`: N costs N full pages AND N swa pages, drawn
-        from DIFFERENT bands -- full extends only into the high band, the float into
-        either side but only ONE per batch alloc. Feasibility is monotone in N, so
-        binary search; the order matches the alloc path (full takes the high band).
-        """
-        fa, sa = self.full.pool, self.swa.pool
-        e_f, e_s = fa.entry_bytes_per_page, sa.entry_bytes_per_page
-        # full is grow-down: its chain gap IS the high band.
-        b_high = fa._current_gap_bytes()
-        if sa._is_frontier_transparent():
-            b_low = 0
-        else:
-            b_low = max(
-                0,
-                sa._byte_low_frontier() - sa._chain_high_frontier_below_bytes(),
-            )
-        h_f = len(fa._free_phys_pages) if fa.lazy_compaction else 0
-        h_s = sa._hole_pages()
-        r_f = fa.num_pages - fa.min_page_index - fa._allocated_pages()
-        r_s = sa.num_pages - sa.min_page_index - sa._allocated_pages()
-
-        def feasible(n: int) -> bool:
-            if n > h_f + r_f or n > h_s + r_s:
-                return False
-            ext_f = max(0, n - h_f)
-            if ext_f * e_f > b_high:
-                return False
-            ext_s = max(0, n - h_s)
-            # On the float's page grid, never in raw bytes: a byte budget
-            # credits a page `take_physical_pages` cannot yield.
-            full_low_after = fa._byte_low_frontier() - ext_f * e_f
-            if sa._is_frontier_transparent():
-                room = sa.pages_in_band(
-                    low_byte=sa._chain_high_frontier_below_bytes(),
-                    high_byte=full_low_after,
-                )
-                return ext_s <= room
-            p_low = sa.pages_in_band(
-                low_byte=sa._chain_high_frontier_below_bytes(),
-                high_byte=sa._byte_low_frontier(),
-            )
-            p_high = sa.pages_in_band(
-                low_byte=sa._byte_high_frontier(),
-                high_byte=full_low_after,
-            )
-            return ext_s <= max(p_low, p_high)
-
-        lo_n, hi_n = 0, min(h_f + r_f, h_s + r_s)
-        while lo_n < hi_n:
-            mid = (lo_n + hi_n + 1) // 2
-            if feasible(mid):
-                lo_n = mid
-            else:
-                hi_n = mid - 1
-        return lo_n * self.page_size
-
-    def _flush_targets(self):
-        """All three members, float FIRST: its zero-copy boundary absorption must
-        land before the deficit math prices a relocation it already covered."""
-        return (
-            self.swa.pool,
-            self.full.pool,
-            self.mamba_allocator,
+    def _build_chain(
+        self, full_pool: MultiEndedKVPool, swa_pool: MultiEndedKVPool
+    ) -> UnifiedChain:
+        """mamba (grow-up END) | swa (FLOAT) | full (grow-down END)."""
+        # Per-request state END pool (page_size=1: state is per request,
+        # orthogonal to KV paging).
+        self.mamba_allocator = MultiEndedKVPool(
+            kvcache=self._mamba_kvcache,
+            unified_buffer=self.unified_buffer,
+            sub_pool_name="mamba",
+            device=self.device,
+            is_id_owner=True,
+            page_size=1,
+            need_sort=self.need_sort,
+            forward_stream=self._forward_stream,
+            lazy_compaction=self.lazy_compaction,
+        )
+        return UnifiedChain(
+            (self.mamba_allocator, swa_pool, full_pool),
+            token_members=(full_pool, swa_pool),
+            state_member=self.mamba_allocator,
+            lazy_compaction=self.lazy_compaction,
         )
 
-    def _alloc_demand(self, need_tokens: int):
-        """Demand VECTOR for one composite allocation, in PAGES per band. A token
-        never draws a state slot, so mamba is an explicit 0, not an omission."""
-        need_n = -(-need_tokens // self.page_size)
-        return {
-            self.full.pool: need_n,
-            self.swa.pool: need_n,
-            self.mamba_allocator: 0,
-        }
-
-    def _ask_float_for_room(self, need_tokens: int) -> None:
-        """Composite shortfall: hand the demand vector to the shared policy;
-        the float is whichever demanded band floats."""
-        demand = self._alloc_demand(need_tokens)
-        flt = None
-        for b in demand:
-            if isinstance(b, FloatMultiEndedKVPool):
-                flt = b
-        _float_open_short_side(flt, demand)
-
-    def mamba_slot_full_token_cost(self) -> int:
-        """Full-token-equivalents one mamba/conv slot removes from the shared buffer:
-        a tri-pool token costs e_f + e_s bytes, and the quotient is rounded UP."""
-        e_tok = self.full.pool.entry_bytes + self.swa.pool.entry_bytes
-        return -(-self.mamba_allocator.entry_bytes_per_page // e_tok)
+    # -- capacity --
 
     def debug_print(self) -> str:
         sa = self.swa.pool
@@ -660,20 +470,6 @@ class UnifiedMambaHybridSWAKVAllocator(UnifiedHybridSWAKVAllocator):
         super().clear()
         self.mamba_allocator.clear()
 
-    def set_latest_forward_done_event(self, event: Optional[torch.cuda.Event]) -> None:
-        super().set_latest_forward_done_event(event)
-        self.mamba_allocator.set_latest_forward_done_event(event)
-
-    def set_inflight_forward(
-        self,
-        forward_done: torch.cuda.Event,
-        out_cache_loc_virtual: Optional[torch.Tensor],
-    ) -> None:
-        # The mamba state is written by the conv kernels, not through
-        # `out_cache_loc`, so its in-flight write-set is None.
-        super().set_inflight_forward(forward_done, out_cache_loc_virtual)
-        self.mamba_allocator.set_inflight_forward(forward_done, None)
-
     def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
         """Joint-aware eviction: one tri-lifetime node frees bytes on several sides
         at once, so re-check the JOINT gate instead of the per-side shortfall."""
@@ -687,34 +483,3 @@ class UnifiedMambaHybridSWAKVAllocator(UnifiedHybridSWAKVAllocator):
             evict_from_tree_cache(tree_cache, num_tokens)
             if self.available_size() <= before:
                 return  # no progress
-
-    def verify_byte_accounting(self) -> List[str]:
-        return (
-            _chain_byte_accounting_violations(
-                [
-                    self.mamba_allocator,
-                    self.swa.pool,
-                    self.full.pool,
-                ]
-            )
-            + self._joint_capacity_memo_violations()
-        )
-
-    def flush_opportunistic(self) -> int:
-        """Per-step reclaim across the whole chain. The float participates for its
-        deferred boundary absorption, which is where its single D2H is paid."""
-        fa, ma = self.full.pool, self.mamba_allocator
-        sa = self.swa.pool
-        if (
-            fa._free_phys_pages.numel() == 0
-            and not fa._pending_reuse
-            and ma._free_phys_pages.numel() == 0
-            and not ma._pending_reuse
-            and sa._free_phys_pages.numel() == 0
-        ):
-            return 0
-        return (
-            fa.flush_opportunistic()
-            + ma.flush_opportunistic()
-            + sa.flush_opportunistic()
-        )

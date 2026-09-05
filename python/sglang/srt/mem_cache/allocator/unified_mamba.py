@@ -17,16 +17,16 @@ mamba-state end pools of one `UnifiedKVPool`."""
 from __future__ import annotations
 
 import logging
-from typing import Callable, List, Optional
+from typing import List, Optional
 
 import torch
 from torch.profiler import record_function
 
 from sglang.srt.mem_cache.allocator import BaseKVAllocator
+from sglang.srt.mem_cache.allocator.unified_chain import UnifiedChain
 from sglang.srt.mem_cache.allocator.unified_side import VirtualFullKVPoolSide
 from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     MultiEndedKVPool,
-    _chain_byte_accounting_violations,
     _end_pair_chain,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -95,8 +95,12 @@ class UnifiedMambaKVAllocator(BaseKVAllocator):
             forward_stream=forward_stream,
             lazy_compaction=lazy_compaction,
         )
-        full_pool.bind_peer(self.mamba_allocator)
-        self.mamba_allocator.bind_peer(full_pool)
+        self.chain = UnifiedChain(
+            _end_pair_chain(self.mamba_allocator, full_pool),
+            token_members=(full_pool,),
+            state_member=self.mamba_allocator,
+            lazy_compaction=lazy_compaction,
+        )
 
         # `init_unified_mamba_pools` later wraps `self.mamba_allocator` in a
         # `UnifiedMambaSlotAllocator` owning the v2p translate; the KV pools get no
@@ -133,18 +137,6 @@ class UnifiedMambaKVAllocator(BaseKVAllocator):
     # do not over-retract while the mamba peer holds drainable holes.
     def available_size(self) -> int:
         return self.full.pool.schedulable_available_size()
-
-    def mamba_slot_full_token_cost(self) -> int:
-        """Full-token-equivalents of shared-gap bytes ONE mamba state consumes; the
-        prefill planner reserves this so admission stays inside the JOINT budget,
-        rounded UP. The `dcp_size` factor is there because that budget is in widened
-        tokens, one of which is `entry_bytes / dcp_size` local bytes.
-        """
-        return -(
-            -self.mamba_allocator.entry_bytes_per_page
-            * get_parallel().attn_dcp_size
-            // self.full.pool.entry_bytes
-        )
 
     @property
     def size_full(self) -> int:
@@ -265,16 +257,6 @@ class UnifiedMambaKVAllocator(BaseKVAllocator):
         )
         return self.full.pool.translate_kv_loc(kv_indices.to(torch.int64))
 
-    def set_disagg_move_gate(self, gate: Callable[[], bool]) -> None:
-        """Install the PD-disaggregation move gate on both sub-allocators."""
-        assert self.lazy_compaction, (
-            "PD disaggregation with the unified memory pool requires lazy "
-            "compaction (eager free-path compaction moves pages under "
-            "in-flight transfers)."
-        )
-        self.full.pool.disagg_move_gate = gate
-        self.mamba_allocator.disagg_move_gate = gate
-
     def is_slot_allocated(self, slot: int) -> bool:
         return self.full.pool.is_slot_allocated(slot)
 
@@ -295,9 +277,7 @@ class UnifiedMambaKVAllocator(BaseKVAllocator):
             self.mamba_allocator.clear_inverse_history()
 
     def verify_byte_accounting(self) -> List[str]:
-        return _chain_byte_accounting_violations(
-            _end_pair_chain(self.mamba_allocator, self.full.pool)
-        )
+        return self.chain.verify_byte_accounting()
 
     def free_group_end(self) -> None:
         super().free_group_end()
@@ -308,34 +288,3 @@ class UnifiedMambaKVAllocator(BaseKVAllocator):
         self.mamba_allocator.clear()
 
     # -- Lazy compaction hooks --
-
-    def set_latest_forward_done_event(self, event: Optional[torch.cuda.Event]) -> None:
-        """Forward the per-batch `forward_done` event to BOTH sub-allocators."""
-        with record_function("UnifiedMambaAlloc.set_latest_forward_done_event"):
-            self.full.pool.set_latest_forward_done_event(event)
-            self.mamba_allocator.set_latest_forward_done_event(event)
-
-    def set_inflight_forward(
-        self,
-        forward_done: torch.cuda.Event,
-        out_cache_loc_virtual: Optional[torch.Tensor],
-    ) -> None:
-        """Hand the forward's metadata to BOTH sub-pools; the mamba state is written
-        by mamba kernels, not `set_kv_buffer`, so its write-set is `None`."""
-        with record_function("UnifiedMambaAlloc.set_inflight_forward"):
-            self.full.pool.set_inflight_forward(forward_done, out_cache_loc_virtual)
-            self.mamba_allocator.set_inflight_forward(forward_done, None)
-
-    def flush_opportunistic(self) -> int:
-        """Non-urgent flush of BOTH sub-allocators; sync-free."""
-        with record_function("UnifiedMambaAlloc.flush_opportunistic"):
-            fa = self.full.pool
-            ma = self.mamba_allocator
-            if (
-                fa._free_phys_pages.numel() == 0
-                and not fa._pending_reuse
-                and ma._free_phys_pages.numel() == 0
-                and not ma._pending_reuse
-            ):
-                return 0
-            return fa.flush_opportunistic() + ma.flush_opportunistic()
