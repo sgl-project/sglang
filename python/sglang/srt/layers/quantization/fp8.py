@@ -96,6 +96,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_sm100_supported,
     is_xpu,
     log_info_on_rank0,
     mxfp8_block_convert_required,
@@ -163,6 +164,60 @@ if _use_aiter:
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
+
+# L2-cold, CUDA-graph-replayed on two independent GB300 nodes for the frozen
+# GLM-5.2 TP8 EAGLE 5-1-6 decode path. The key is (M, TP-local N, K).
+_BS1_BF16_TGV_SHAPES = frozenset(
+    {
+        (1, 2048, 2048),  # Q-B, five draft calls
+        (6, 2048, 2048),  # Q-B, 78 target layers
+        (6, 4096, 2048),  # DSA indexer query, 22 target layers
+    }
+)
+_bs1_bf16_tgv_op = None
+_bs1_bf16_tgv_warmed = False
+
+
+def _should_use_bs1_bf16_tgv(
+    m: int,
+    n: int,
+    k: int,
+    bias: Optional[torch.Tensor],
+    dtype: torch.dtype,
+) -> bool:
+    return (
+        envs.SGLANG_BS1_BF16_TGV.get()
+        and is_sm100_supported()
+        and bias is None
+        and dtype == torch.bfloat16
+        and (m, n, k) in _BS1_BF16_TGV_SHAPES
+    )
+
+
+def _get_bs1_bf16_tgv_op():
+    global _bs1_bf16_tgv_op
+    if _bs1_bf16_tgv_op is None:
+        from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import cutedsl_bf16_gemm
+
+        _bs1_bf16_tgv_op = cutedsl_bf16_gemm
+    return _bs1_bf16_tgv_op
+
+
+def _warm_bs1_bf16_tgv(weight: torch.Tensor) -> None:
+    """Compile the selected dynamic-layout tactic before CUDA graph capture."""
+    global _bs1_bf16_tgv_warmed
+    if _bs1_bf16_tgv_warmed:
+        return
+    x = torch.zeros((1, weight.shape[1]), dtype=torch.bfloat16, device=weight.device)
+    _get_bs1_bf16_tgv_op()(x, weight)
+    torch.cuda.synchronize(weight.device)
+    _bs1_bf16_tgv_warmed = True
+    log_info_on_rank0(
+        logger,
+        "SGLANG_BS1_BF16_TGV enabled: precompiled CuTe-DSL TGV tactic for "
+        f"{len(_BS1_BF16_TGV_SHAPES)} exact GLM-5.2 decode shapes.",
+    )
+
 
 DSV4_DEQUANT_FP4_TABLE = torch.tensor(
     [
@@ -707,6 +762,39 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             return
         else:
+            # Low-latency small-batch path (SGLANG_BS1_BF16_DENSE): dequantize
+            # dense-linear weights to bf16 at load so tiny-M GEMMs (e.g. bs=1
+            # speculative decode) run through cuBLAS, which is near weight-BW-
+            # bound at M<=8, instead of the fp8 path plus its per-call
+            # activation-quant kernel. MoE experts (Fp8MoEMethod) are unaffected.
+            if (
+                envs.SGLANG_BS1_BF16_DENSE.get()
+                and layer.weight.dim() == 2
+                and not getattr(layer.weight_scale_inv, "format_ue8m0", False)
+            ):
+                from sglang.srt.layers.quantization.fp8_utils import (
+                    block_quant_dequant,
+                )
+
+                w_bf16 = block_quant_dequant(
+                    layer.weight,
+                    layer.weight_scale_inv,
+                    self.quant_config.weight_block_size,
+                    torch.bfloat16,
+                )
+                layer.weight = torch.nn.Parameter(w_bf16, requires_grad=False)
+                layer._bs1_bf16_dense = True
+                if (
+                    envs.SGLANG_BS1_BF16_TGV.get()
+                    and is_sm100_supported()
+                    and any(
+                        n == layer.weight.shape[0] and k == layer.weight.shape[1]
+                        for _, n, k in _BS1_BF16_TGV_SHAPES
+                    )
+                ):
+                    _warm_bs1_bf16_tgv(layer.weight)
+                return
+
             # Requantize block scales to UE8M0 when DeepGEMM is the active runner.
             use_deepgemm_runner = (
                 self.w8a8_block_fp8_linear
@@ -1035,6 +1123,19 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.block_quant:
+            if getattr(layer, "_bs1_bf16_dense", False):
+                # Weight was dequantized to bf16 at load (SGLANG_BS1_BF16_DENSE).
+                x_in = x[0] if isinstance(x, tuple) else x
+                if x_in.ndim == 2 and _should_use_bs1_bf16_tgv(
+                    x_in.shape[0],
+                    layer.weight.shape[0],
+                    layer.weight.shape[1],
+                    bias,
+                    x_in.dtype,
+                ):
+                    return _get_bs1_bf16_tgv_op()(x_in, layer.weight)
+                return F.linear(x_in, layer.weight, bias)
+
             if use_intel_amx_backend(layer):
                 return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
                     x,
