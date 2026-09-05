@@ -1386,6 +1386,36 @@ def test_mapped_layers_ship_through_the_courier(tmp_path, monkeypatch):
     )
 
 
+def test_collected_mapped_weights_record_the_compute_stream(monkeypatch):
+    """Courier tensors must stay live until their compute-stream kernels finish."""
+    compute_stream = _FakeStream()
+    recorded_streams = []
+    gpu_tensor = SimpleNamespace(
+        device=torch.device("cuda"), record_stream=recorded_streams.append
+    )
+    monkeypatch.setattr(
+        _FakeDeviceModule, "current_stream", staticmethod(lambda: compute_stream)
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+
+    manager = object.__new__(LayerwiseOffloadManager)
+    target = torch.nn.Parameter(torch.zeros(1))
+    manager._mapped_courier = SimpleNamespace(
+        collect=lambda _layer_idx: (_FakeEvent(), {"weight": gpu_tensor})
+    )
+    manager._named_parameters = {"weight": target}
+    manager._named_buffers = {}
+    manager._wrap_for_target = lambda _target, _tensor: target.data
+    manager._courier_inflight = {0}
+    manager._gpu_layers = set()
+
+    manager._collect_mapped_layer(0)
+
+    assert recorded_streams == [compute_stream]
+
+
 def test_the_courier_kill_switch_forces_the_synchronous_path(tmp_path, monkeypatch):
     if not pathlib.Path("/proc/self/maps").exists():
         pytest.skip("needs /proc to tell a mapping from anonymous memory")
