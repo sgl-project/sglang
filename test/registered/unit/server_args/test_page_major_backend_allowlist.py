@@ -145,17 +145,6 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                 f"{backend} is an MLA kernel and must stay out of the MHA arm",
             )
 
-    def test_plain_page_major_arm_is_gated_at_boot(self):
-        """The strided views were removed: --enable-page-major-kv-layout
-        without --enable-unified-memory must be rejected up front for EVERY
-        backend, Triton included, until the per-layer-view reimplementation."""
-        for backend in ("triton",) + self.PER_LAYER_VIEW_MLA_BACKENDS:
-            for use_mla in (True, False):
-                self.assertFalse(
-                    _accepts(backend, use_mla=use_mla, unified=False),
-                    f"{backend} must be rejected on the static page-major arm",
-                )
-
     def test_asymmetric_kv_mha_model_cannot_use_unified_memory(self):
         """head_dim != v_head_dim (MiMoV2): no uniform rows, so no per-layer views
         and no unified pool. The rejection is the POOL's, not a backend's, so

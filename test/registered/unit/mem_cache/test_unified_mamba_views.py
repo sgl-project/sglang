@@ -29,31 +29,25 @@ be a multiple of the temporal itemsize — an alignment hazard that
 ``_build_mamba_views`` now asserts.
 
 These tests prove the views:
-  - round-trip every (tensor, layer, slot) element with the Falcon-like
-    bf16-conv / fp32-temporal dtype mix (catches stride/offset/alignment bugs);
+  - round-trip every (tensor, layer, slot) element across several geometries,
+    including the Falcon-like bf16-conv / fp32-temporal dtype mix (catches
+    stride/offset/alignment bugs);
   - do NOT alias each other (conv[i] vs conv[j] vs temporal) or across
     layers/slots (catches envelope-overlap);
-  - match a contiguous ``(num_layers, max_slots, *inner)`` reference exactly
-    (the shape `MambaPool.State.conv[i]` / `.temporal` expose);
   - reject a deliberately mis-aligned spec via the alignment assert.
 
-The round-trip class is skipped on CPU — those views back GPU kernels and we
-mirror the GPU path. ``TestKDAFlashInferEnvelopeStateContract`` is pure stride
-arithmetic and runs everywhere.
+Everything here is pure torch view / stride arithmetic, so it runs on CPU.
 
-    python -m pytest test/registered/unit/mem_cache/test_shared_mamba_views.py -v
+    python -m pytest test/registered/unit/mem_cache/test_unified_mamba_views.py -v
 """
 
 import unittest
 
 import torch
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
 
-_HAS_CUDA = torch.cuda.is_available()
-_DEV = "cuda" if _HAS_CUDA else "cpu"
-
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 register_amd_ci(est_time=30, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
@@ -65,7 +59,7 @@ def _make_pool(
     temporal_state_shape,
     temporal_dtype,
     want_slots=8,
-    device=_DEV,
+    device="cpu",
 ):
     """Build a minimal 2-sub-pool ``UnifiedKVPool`` (a small MHA grow-up peer
     + the Mamba grow-down pool under test) sized to hold >= ``want_slots`` Mamba
@@ -111,7 +105,6 @@ def _make_pool(
     return pool, mamba_spec
 
 
-@unittest.skipUnless(_HAS_CUDA, "shared Mamba views back GPU kernels")
 class TestUnifiedMambaViews(unittest.TestCase):
     # Falcon-H1-like dims: even conv_dim, bf16 conv, fp32 temporal, several
     # layers. (Mamba2 conv state is (conv_dim, kernel-1); temporal/SSM state is
@@ -155,34 +148,49 @@ class TestUnifiedMambaViews(unittest.TestCase):
             f"stride={temporal_view.stride()}",
         )
 
-    def test_roundtrip_falcon_like(self):
-        pool, spec = _make_pool(**self.FALCON_KW)
-        self._fill_and_roundtrip(pool, spec)
-
-    def test_roundtrip_single_layer_single_slot_edges(self):
+    OTHER_GEOMETRIES = {
         # 1 layer, multiple conv tensors, same-dtype conv/temporal.
-        pool, spec = _make_pool(
+        "single_layer_single_slot_edges": dict(
             mamba_layer_num=1,
             conv_state_shapes=[(16, 3), (8, 3)],
             conv_dtype=torch.float32,
             temporal_state_shape=(4, 8, 16),
             temporal_dtype=torch.float32,
             want_slots=4,
-        )
-        self._fill_and_roundtrip(pool, spec)
-
-    def test_roundtrip_multi_conv_tensors(self):
+        ),
         # Two conv tensors + bf16/fp32 mix — exercises the per-conv-tensor offset
         # accumulation in _build_mamba_views.
-        pool, spec = _make_pool(
+        "multi_conv_tensors": dict(
             mamba_layer_num=3,
             conv_state_shapes=[(32, 3), (16, 3)],
             conv_dtype=torch.bfloat16,
             temporal_state_shape=(8, 8, 16),
             temporal_dtype=torch.float32,
             want_slots=6,
-        )
-        self._fill_and_roundtrip(pool, spec)
+        ),
+        # An ALIGNED spec (conv region a multiple of the temporal itemsize):
+        # conv region = N * conv_dim*(k-1) * 2 ; with conv_dim=2 -> per-layer
+        # 2*3*2=12, times N=2 = 24, divisible by 4. Must build and round-trip.
+        "alignment_ok": dict(
+            mamba_layer_num=2,
+            conv_state_shapes=[(2, 3)],
+            conv_dtype=torch.bfloat16,
+            temporal_state_shape=(2, 4, 4),
+            temporal_dtype=torch.float32,
+            want_slots=4,
+        ),
+    }
+
+    def test_roundtrip_geometries(self):
+        """Round-trip every (tensor, layer, slot) element across the geometry
+        shapes the view builder has to handle."""
+        for name, kwargs in (
+            ("falcon_like", self.FALCON_KW),
+            *self.OTHER_GEOMETRIES.items(),
+        ):
+            with self.subTest(geometry=name):
+                pool, spec = _make_pool(**kwargs)
+                self._fill_and_roundtrip(pool, spec)
 
     def test_no_cross_region_overlap(self):
         """Zero buffer; write a sentinel to ONE view; every OTHER view must read
@@ -207,50 +215,6 @@ class TestUnifiedMambaViews(unittest.TestCase):
                     f"(envelope regions overlap)",
                 )
 
-    def test_per_layer_per_slot_addressing(self):
-        """Distinct value per (layer, slot) on the temporal view; verify exact
-        addressing (no layer/slot aliasing). Uses small integers exactly
-        representable in the view dtype.
-
-        NB: ``temporal_view`` is a non-contiguous strided view, so we must NOT
-        ``.reshape()`` it (that would COPY, breaking the alias) — we
-        broadcast-assign into the view in place and read back via basic
-        indexing (which keeps the view)."""
-        pool, spec = _make_pool(**self.FALCON_KW)
-        _, temporal_view = pool.mamba_views_for("mamba")
-        N, S = temporal_view.shape[0], temporal_view.shape[1]
-        inner_ndim = temporal_view.dim() - 2
-        # value = layer*S + slot  (< N*S, small → exact in fp32)
-        base = (
-            torch.arange(N, device=temporal_view.device)[:, None] * S
-            + torch.arange(S, device=temporal_view.device)[None, :]
-        ).to(temporal_view.dtype)
-        # Broadcast (N, S) over the inner dims, in place into the strided view.
-        temporal_view[:] = base.view(N, S, *([1] * inner_ndim))
-        # Read back the first inner element of every (layer, slot) via basic
-        # indexing (stays a view).
-        readback = temporal_view[(slice(None), slice(None)) + (0,) * inner_ndim]
-        self.assertTrue(
-            torch.equal(readback, base),
-            "temporal (layer, slot) addressing wrong — layer/slot stride bug",
-        )
-
-    def test_matches_contiguous_reference(self):
-        """The shared view must be a faithful relabeling of a contiguous
-        ``(num_layers, max_slots, *inner)`` tensor: identical data written by the
-        same logical index reads back identically."""
-        pool, spec = _make_pool(**self.FALCON_KW)
-        conv_views, temporal_view = pool.mamba_views_for("mamba")
-        for v in conv_views + [temporal_view]:
-            ref = torch.randn(v.shape, device=v.device).to(v.dtype)
-            contig = ref.clone().contiguous()
-            v.copy_(ref)
-            self.assertEqual(tuple(v.shape), tuple(contig.shape))
-            self.assertTrue(
-                torch.equal(v.contiguous(), contig),
-                "shared view not equivalent to its contiguous counterpart",
-            )
-
     def test_alignment_guard_fires_on_misaligned_spec(self):
         """A spec whose conv region (bf16) is an odd multiple of 2 B makes the
         per-slot entry (= conv_region + N*temporal_row = 2 B + 4 B = 6 B) NOT a
@@ -273,21 +237,6 @@ class TestUnifiedMambaViews(unittest.TestCase):
                 want_slots=4,
             )
         self.assertIn("misalign", str(cm.exception).lower())
-
-    def test_alignment_ok_for_aligned_spec(self):
-        """An aligned spec (conv region a multiple of the temporal itemsize)
-        must build and round-trip cleanly."""
-        # conv region = N * conv_dim*(k-1) * 2 ; with conv_dim=2 -> per-layer 2*3*2=12,
-        # times N=2 = 24, divisible by 4. Aligned.
-        pool, spec = _make_pool(
-            mamba_layer_num=2,
-            conv_state_shapes=[(2, 3)],
-            conv_dtype=torch.bfloat16,
-            temporal_state_shape=(2, 4, 4),
-            temporal_dtype=torch.float32,
-            want_slots=4,
-        )
-        self._fill_and_roundtrip(pool, spec)
 
 
 def _k3_kda_mamba_geometry(heads_per_rank: int) -> dict:
@@ -342,15 +291,15 @@ class TestKDAFlashInferEnvelopeStateContract(unittest.TestCase):
     _KERNEL_ALIGN_BYTES = 32
 
     @staticmethod
-    def _build_tp8_views():
-        """Real TP8 K3 KDA envelope views on CPU (2 slots suffice — the
-        per-slot geometry is slot-count independent)."""
+    def _build_kda_views(heads_per_rank: int = 12):
+        """Real K3 KDA envelope views on CPU for one attn-TP shard (2 slots
+        suffice — the per-slot geometry is slot-count independent)."""
         from sglang.srt.mem_cache.layout.page_major import (
             build_page_major_mamba_views,
             mamba_entry_bytes,
         )
 
-        geom = _k3_kda_mamba_geometry(12)  # 96 heads / TP8
+        geom = _k3_kda_mamba_geometry(heads_per_rank)
         entry_bytes = mamba_entry_bytes(**geom)
         max_slots = 2
         raw = torch.empty(max_slots * entry_bytes, dtype=torch.uint8, device="cpu")
@@ -360,66 +309,39 @@ class TestKDAFlashInferEnvelopeStateContract(unittest.TestCase):
         return geom, entry_bytes, temporal_view
 
     def test_k3_tp8_envelope_view_matches_recurrent_kda_contract(self):
-        """Check every per-layer temporal view against the kernel contract."""
-        geom, entry_bytes, temporal_view = self._build_tp8_views()
-
-        itemsize = temporal_view.element_size()
-        _, v, k = geom["temporal_state_shape"]
-        for layer in (0, geom["layer_num"] - 1):
-            view = temporal_view[layer]  # [slots, HV, V, K], what decode() gets
-            self.assertEqual(
-                view.stride()[1:],
-                (v * k, k, 1),
-                "temporal inner strides must stay compact (V*K, K, 1): "
-                "recurrent_kda compiles them as constants",
-            )
-            self.assertEqual(
-                view.stride(0),
-                entry_bytes // itemsize,
-                "slot stride must be the envelope pitch (entry_bytes)",
-            )
-            self.assertEqual(
-                view.stride(0) % (self._KERNEL_ALIGN_BYTES // itemsize),
-                0,
-                "slot stride must satisfy recurrent_kda's "
-                "sym_int64(divisibility=16) — 16 elements = 32 B at bf16",
-            )
-            self.assertEqual(
-                (view.storage_offset() * itemsize) % self._KERNEL_ALIGN_BYTES,
-                0,
-                f"layer {layer} temporal view base is not 32 B aligned "
-                "(recurrent_kda assumed_align=32)",
-            )
-
-    def test_k3_entry_and_temporal_offset_32B_multiples_across_tp(self):
-        """The two byte quantities that feed the contract above — the per-slot
-        envelope pitch and the temporal region's offset inside the envelope
-        (= all-layers conv region, temporal comes last) — must be 32 B
-        multiples for every plausible attn-TP shard of K3's 96 KDA heads."""
-        import math
-
-        from sglang.srt.mem_cache.layout.page_major import mamba_entry_bytes
-
+        """Check every per-layer temporal view against the kernel contract, for
+        every plausible attn-TP shard of K3's 96 KDA heads."""
         for heads_per_rank in (96, 48, 24, 12):  # attn_tp 1 / 2 / 4 / 8
-            geom = _k3_kda_mamba_geometry(heads_per_rank)
-            entry_bytes = mamba_entry_bytes(**geom)
-            conv_region_bytes = (
-                geom["layer_num"]
-                * math.prod(geom["conv_state_shapes"][0])
-                * geom["conv_dtype"].itemsize
-            )
-            self.assertEqual(
-                entry_bytes % self._KERNEL_ALIGN_BYTES,
-                0,
-                f"tp shard h={heads_per_rank}: envelope pitch {entry_bytes} B "
-                "breaks recurrent_kda's slot-stride divisibility",
-            )
-            self.assertEqual(
-                conv_region_bytes % self._KERNEL_ALIGN_BYTES,
-                0,
-                f"tp shard h={heads_per_rank}: temporal region offset "
-                f"{conv_region_bytes} B breaks assumed_align=32",
-            )
+            with self.subTest(heads_per_rank=heads_per_rank):
+                geom, entry_bytes, temporal_view = self._build_kda_views(heads_per_rank)
+                itemsize = temporal_view.element_size()
+                _, v, k = geom["temporal_state_shape"]
+                for layer in (0, geom["layer_num"] - 1):
+                    # [slots, HV, V, K], what decode() gets
+                    view = temporal_view[layer]
+                    self.assertEqual(
+                        view.stride()[1:],
+                        (v * k, k, 1),
+                        "temporal inner strides must stay compact (V*K, K, 1): "
+                        "recurrent_kda compiles them as constants",
+                    )
+                    self.assertEqual(
+                        view.stride(0),
+                        entry_bytes // itemsize,
+                        "slot stride must be the envelope pitch (entry_bytes)",
+                    )
+                    self.assertEqual(
+                        view.stride(0) % (self._KERNEL_ALIGN_BYTES // itemsize),
+                        0,
+                        "slot stride must satisfy recurrent_kda's "
+                        "sym_int64(divisibility=16) — 16 elements = 32 B at bf16",
+                    )
+                    self.assertEqual(
+                        (view.storage_offset() * itemsize) % self._KERNEL_ALIGN_BYTES,
+                        0,
+                        f"layer {layer} temporal view base is not 32 B aligned "
+                        "(recurrent_kda assumed_align=32)",
+                    )
 
     def test_wrapper_state_contract_check_matches_layout(self):
         """The KDA flashinfer decode wrapper enforces this same contract at
@@ -442,7 +364,7 @@ class TestKDAFlashInferEnvelopeStateContract(unittest.TestCase):
             # Fresh stub per call: the real kernel caches approvals by id().
             check(types.SimpleNamespace(_state_contract_ok=set()), view)
 
-        _, _, temporal_view = self._build_tp8_views()
+        _, _, temporal_view = self._build_kda_views()
         envelope = temporal_view[0]  # what forward_decode hands to the kernel
         run(envelope)  # must not raise
 

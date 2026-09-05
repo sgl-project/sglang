@@ -227,13 +227,18 @@ class TestRecoverActionHandler(_RecoverTestBase):
     def test_recovery_sets_a_live_device_value_and_frees_only_the_full_side(self):
         """End-to-end through apply_component_action — the pre-fix handler
         raises AttributeError (`full_to_swa_index_mapping`) on this exact
-        call. Post-fix: the node gets a LIVE swa value, the HANDLER neither
-        allocates nor frees any swa page (ownership only moves), and the
-        incoming ids' FULL side returns to the pool."""
+        call. Post-fix: the node gets a LIVE swa value, its tombstoned ids
+        translate to live pages instead of the clamped sink, the HANDLER
+        neither allocates nor frees any swa page (ownership only moves), and
+        the incoming ids' FULL side returns to the pool."""
         probe, allocator = self._probe()
         swa = allocator.swa_attn_allocator
         kept, incoming = self._two_ranges(allocator)
         allocator.free_swa(kept)  # what eviction does when it tombstones
+        self.assertTrue(
+            bool((allocator.translate_loc_from_full_to_swa(kept) == 0).all()),
+            "precondition: a tombstoned range translates to the sink",
+        )
         # Snapshot AFTER the setup traffic: the invariant under test is that
         # the recovery handler itself moves ownership without moving capacity.
         swa_live = swa.allocated_count()
@@ -259,21 +264,6 @@ class TestRecoverActionHandler(_RecoverTestBase):
             allocator.full_attn_allocator.available_size(),
             full_avail + len(incoming),
             "the incoming ids' FULL side must come back",
-        )
-
-    def test_recovered_ids_translate_to_live_pages_not_the_sink(self):
-        """The tombstoned range translates to the clamped sink before the
-        recovery and to real pages after — recovering from the node's OWN
-        already-freed ids (instead of the donated ones) reintroduces the sink."""
-        probe, allocator = self._probe()
-        kept, incoming = self._two_ranges(allocator)
-        allocator.free_swa(kept)
-        self.assertTrue(
-            bool((allocator.translate_loc_from_full_to_swa(kept) == 0).all()),
-            "precondition: a tombstoned range translates to the sink",
-        )
-        probe.apply_component_action(
-            RecoverSWAWithLockedFull(node_id=1, kept_full=kept, incoming_full=incoming)
         )
         self.assertTrue(
             bool((allocator.translate_loc_from_full_to_swa(kept) > 0).all()),

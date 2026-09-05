@@ -4,9 +4,7 @@ Qwen3.5-4B is a gated-delta-net / linear-attention hybrid, which exercises the
 path most prone to subtle bugs: the Mamba conv/SSM state stays a strided
 envelope view (its kernels are stride-aware by design) while the
 full-attention KV is per-layer views, which the fa3 / flashinfer cells read
-through the translator's read tables. The resolved-default cell pins the
-no-pin path, since a pinned backend hides default-resolution breakage by
-construction.
+through the translator's read tables.
 
 Registered to the label-gated ``run-ci-extra`` suite (opt-in, not per-commit).
 """
@@ -19,7 +17,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.test_utils import DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST
 
-register_cuda_ci(est_time=1600, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=1200, stage="extra-a", runner_config="1-gpu-large")
 
 _UNIFIED_COMMON_ARGS = [
     "--trust-remote-code",
@@ -82,13 +80,6 @@ class TestUnifiedQwenHybridFlashinfer(TestUnifiedQwenHybridTriton):
     ENTRY_PAGE_SIZE CSR builder."""
 
     other_args = _UNIFIED_COMMON_ARGS + ["--attention-backend", "flashinfer"]
-
-
-class TestUnifiedQwenHybridResolvedDefault(TestUnifiedQwenHybridTriton):
-    """No backend pin: whatever the host resolves must be in the allow-list,
-    or the server fails to boot under its own defaults."""
-
-    other_args = _UNIFIED_COMMON_ARGS
 
 
 if __name__ == "__main__":

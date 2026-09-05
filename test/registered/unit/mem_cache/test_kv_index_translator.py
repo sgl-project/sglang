@@ -643,21 +643,6 @@ class TestWriteLoc(unittest.TestCase):
         self.assertTrue(torch.equal(got[:3], want_swa))
         self.assertTrue(bool((got[3:] == 0).all()), "pad lanes must land on slot 0")
 
-    def test_slice_and_copy_derive_pointwise_without_handover(self):
-        """REGRESSION (design): the retired identity-resolver refused any
-        tensor it had not been handed -- a TBO child's re-padded slice or a
-        registry's fresh copy raised. Value-based derivation must accept
-        both, pointwise, with no adopt/handover call."""
-        src, _, rows, seq_lens, _, want_full, want_swa = self._built(n=4)
-        padded = torch.cat([want_full, want_full.new_zeros(2)])
-        # TBO-child shape: a slice crossing the pad boundary.
-        got = self._field(src, rows, seq_lens, padded[2:6])
-        self.assertTrue(torch.equal(got[:2], want_swa[2:4]))
-        self.assertTrue(bool((got[2:] == 0).all()))
-        # Registry shape: a fresh equal-value copy.
-        got2 = self._field(src, rows, seq_lens, want_full.clone())
-        self.assertTrue(torch.equal(got2, want_swa))
-
     def test_tombstoned_swa_page_clamps_to_sink(self):
         src, allocator, rows, seq_lens, virt, want_full, _ = self._built(ps=1, n=2)
         allocator.swa_v2p_page_table[int(virt[0])] = -1

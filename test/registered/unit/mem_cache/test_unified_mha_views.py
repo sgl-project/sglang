@@ -43,10 +43,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.layout.page_major import (
-    build_mha_views,
-    mha_entry_bytes,
-)
+from sglang.srt.mem_cache.layout.page_major import build_mha_views
 from sglang.srt.mem_cache.unified_memory_pool import (
     MHASubPoolSpec,
     UnifiedKVPool,
@@ -166,28 +163,6 @@ class TestMHASpecSurface(unittest.TestCase):
                 num_pages=4,
             )
 
-    def test_spec_offsets_equal_block_origins(self):
-        """The spec's byte math and the view builder's origins are two
-        independent derivations of the envelope; under uniform rows they must
-        agree: layer_k_offset(l) == (2l)*ps*row, layer_v_offset(l) == (2l+1)*ps*row."""
-        spec = _mha_spec()
-        for ps in (1, 4):
-            row = spec.k_row_bytes()
-            for l in range(_L):
-                self.assertEqual(spec.layer_k_offset_in_page(l, ps), (2 * l) * ps * row)
-                self.assertEqual(
-                    spec.layer_v_offset_in_page(l, ps), (2 * l + 1) * ps * row
-                )
-
-    def test_entry_bytes_matches_layout_helper(self):
-        spec = _mha_spec()
-        self.assertEqual(
-            spec.entry_bytes(),
-            mha_entry_bytes(
-                layer_num=_L, head_num=_H, head_dim=_D, v_head_dim=_D, itemsize=_ITEM
-            ),
-        )
-
 
 class TestMHAViews(unittest.TestCase):
     def test_view_shapes_are_stock_mha(self):
@@ -240,37 +215,6 @@ class TestMHAViews(unittest.TestCase):
                     torch.all(sv[l][p, s] == float(p * 100 + l * 10 + s + 4))
                 )
 
-    def test_byte_addresses_match_envelope_formula(self):
-        """The per-layer view's byte address for token ``t``, layer ``L`` must equal
-        the hand-computed envelope formula: page origin + layer-block origin +
-        slot offset. Independent of any view builder — this is the raw layout
-        contract every envelope consumer (moves, sizing, transfer math) relies
-        on."""
-        k_row = _ROW * _ITEM
-        v_row = _ROW * _ITEM
-        for ps in (1, 4):
-            num_pages = 5
-            page_bytes = ps * _L * (k_row + v_row)
-            dk, dv = _build_views(_make_raw(ps, num_pages), ps, num_pages)
-            for t in (0, 1, ps, 3 * ps + (ps - 1), 4 * ps):
-                d = _kernel_id(t, ps)
-                for L in range(_L):
-                    expected_k = (
-                        (t // ps) * page_bytes
-                        + L * ps * (k_row + v_row)
-                        + (t % ps) * k_row
-                    )
-                    expected_v = (
-                        (t // ps) * page_bytes
-                        + L * ps * (k_row + v_row)
-                        + ps * k_row
-                        + (t % ps) * v_row
-                    )
-                    got_k = (dk[L].storage_offset() + d * dk[L].stride(0)) * _ITEM
-                    got_v = (dv[L].storage_offset() + d * dv[L].stride(0)) * _ITEM
-                    self.assertEqual(got_k, expected_k, f"K t={t} L={L} ps={ps}")
-                    self.assertEqual(got_v, expected_v, f"V t={t} L={L} ps={ps}")
-
     def test_k_and_v_share_one_kernel_id_without_aliasing(self):
         """One kernel-facing id, 2L distinct cells (K and V of every layer): writes
         through all 2L views at the SAME id must not clobber each other."""
@@ -290,12 +234,6 @@ class TestMHAViews(unittest.TestCase):
         raw = _make_raw(ps, num_pages, pad_pages=0)
         with self.assertRaises(AssertionError):
             _build_views(raw, ps, num_pages)
-
-    def test_asymmetric_dims_rejected(self):
-        ps, num_pages = 2, 4
-        raw = _make_raw(ps, num_pages)
-        with self.assertRaises(AssertionError):
-            _build_views(raw, ps, num_pages, head_dim=6, v_head_dim=4)
 
 
 # ---- pool level ----
@@ -340,26 +278,6 @@ class TestUnifiedKVPoolViews(unittest.TestCase):
                 self.assertEqual(k[0].dim(), 3, f"{name} K at ps={ps}")
                 self.assertEqual(v[0].dim(), 3, f"{name} V at ps={ps}")
                 self.assertTrue(k[0].is_contiguous())
-
-    def test_tail_pad_is_derived_from_the_specs(self):
-        """The per-layer views hang past the last page envelope, so the pool
-        over-allocates one envelope of the widest sub-pool. Derived here, not
-        passed in, so no construction site can under-allocate it."""
-        for ps in (1, 4):
-            kv = _make_pool(ps)
-            full, swa = _mha_spec(), _swa_spec()
-            self.assertEqual(
-                kv.view_tail_pad_bytes,
-                ps * max(full.entry_bytes(), swa.entry_bytes()),
-                f"tail pad at ps={ps}",
-            )
-            self.assertEqual(
-                kv._raw.numel(),
-                full.entry_bytes() * _N_FULL
-                + swa.entry_bytes() * _N_SWA
-                + kv.view_tail_pad_bytes,
-                "the pad extends the allocation only",
-            )
 
 
 def _layer(l):

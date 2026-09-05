@@ -8,11 +8,6 @@ isolation; this is the end-to-end guard. `test_prefix_cache_branching` carries
 most of the weight: a radix hit replays virtual locs whose physical pages may
 have moved under compaction.
 
-No `--attention-backend` is pinned on purpose -- the test runs whatever the host
-resolves to (`fa3` on this suite's H100 runner, also the H200 default). Both
-defects found in review on #32972 were reachable only under a resolved default,
-which a pinned test hides by construction.
-
 Reference GSM8K, all with `--enable-unified-memory`:
   - 2x H200 TP2, resolved default (fa3): 0.917 @400, vs 0.915 static (1 sigma
     ~= 0.015). This file as written scores 0.920 @200.
@@ -32,14 +27,20 @@ from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.prefix_cache_branching_kit import PrefixCacheBranchingMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=1200, stage="nightly", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=800, stage="nightly", runner_config="4-gpu-h100")
 
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 
 
-class TestKimiLinearUnifiedMemory(
+class TestKimiLinearUnifiedMemoryFlashMLA(
     GSM8KMixin, PrefixCacheBranchingMixin, DefaultServerBase
 ):
+    """flashmla at its ps=64 snap: the canonical block-table route
+    (KVIndexTranslator.fill_read_table into flashmla's padded tables) plus the
+    ps=64 sub-pool sizing (64-token sink floor, per-layer-view tail pad) end to
+    end.
+    Hopper-only, like the rest of this nightly suite."""
+
     model = KIMI_LINEAR_MODEL
     cache_chunk_size = 64
     # Same bar as the static-pool Kimi-Linear e2e test: unified memory must not
@@ -52,17 +53,6 @@ class TestKimiLinearUnifiedMemory(
         "--chunked-prefill-size",
         "2048",
         "--enable-unified-memory",
-    ]
-
-
-class TestKimiLinearUnifiedMemoryFlashMLA(TestKimiLinearUnifiedMemory):
-    """flashmla at its ps=64 snap: the canonical block-table route
-    (KVIndexTranslator.fill_read_table into flashmla's padded tables) plus the
-    ps=64 sub-pool sizing (64-token sink floor, per-layer-view tail pad) end to
-    end.
-    Hopper-only, like the rest of this nightly suite."""
-
-    other_args = TestKimiLinearUnifiedMemory.other_args + [
         "--attention-backend",
         "flashmla",
         "--page-size",

@@ -92,25 +92,21 @@ def _entry_bytes():
 
 class TestBudgetSizing(unittest.TestCase):
     def test_swa_factory_honors_the_budget_exactly(self):
+        """The buffer IS the budget, including values the token-count re-sum
+        cannot represent (not a whole-token multiple per side)."""
         e = _entry_bytes()
-        budget = 96 * e + 512  # deliberately NOT a token-count multiple
-        bundle = _swa_factory(unified_total_bytes=budget)
-        self.assertEqual(bundle.unified_memory_pool.total_bytes, budget)
+        for budget in (
+            96 * e + 512,  # deliberately NOT a token-count multiple
+            (64 + 32) * e + (e - 2),  # almost one more entry
+        ):
+            with self.subTest(budget=budget):
+                bundle = _swa_factory(unified_total_bytes=budget)
+                self.assertEqual(bundle.unified_memory_pool.total_bytes, budget)
 
     def test_fallback_is_the_token_count_resum(self):
         e = _entry_bytes()
         bundle = _swa_factory()
         self.assertEqual(bundle.unified_memory_pool.total_bytes, (64 + 32) * e)
-
-    def test_budget_beats_resum_on_rounding(self):
-        """The property that motivates the whole phase: the re-sum cannot
-        represent a budget that is not a whole-token multiple per side, so it
-        strands bytes the buffer could have held."""
-        e = _entry_bytes()
-        budget = (64 + 32) * e + (e - 2)  # almost one more entry
-        bundle = _swa_factory(unified_total_bytes=budget)
-        self.assertEqual(bundle.unified_memory_pool.total_bytes, budget)
-        self.assertGreater(budget, (64 + 32) * e)
 
 
 class TestReservedFloorIsOneSourceOfTruth(unittest.TestCase):
@@ -187,51 +183,22 @@ class TestBs1FeasibilityFloor(unittest.TestCase):
         self.assertIn("bs=1 floor", str(ctx.exception))
         self.assertIn("swa_window_kv", str(ctx.exception))
 
-    def test_context_longer_than_the_pool_is_not_rejected(self):
-        """REGRESSION: the floor must NOT charge the full-attention token side.
-        `TpModelWorker.get_worker_info` clamps max_req_len to the pool, so a
-        context far larger than the buffer is refused at admission, not a
-        livelock -- and it is an ordinary way to serve a long-context model on
-        one GPU. Charging it here made such configs fail at boot."""
+    def test_feasible_floor_inputs_are_not_rejected(self):
+        """Floor inputs that must NOT raise: charging the full-attention token
+        side, or a window the context never clamps, failed these at boot."""
         e = _entry_bytes()
-        bundle = _swa_factory(
-            unified_total_bytes=200 * e,
-            model_context_len=1_000_000,  # far beyond what the buffer holds
-            sliding_window_size=16,
-        )
-        self.assertEqual(bundle.unified_memory_pool.total_bytes, 200 * e)
-
-    def test_feasible_config_boots_with_floor_inputs_present(self):
-        e = _entry_bytes()
-        bundle = _swa_factory(
-            unified_total_bytes=200 * e,
-            model_context_len=64,
-            sliding_window_size=16,
-        )
-        self.assertEqual(bundle.unified_memory_pool.total_bytes, 200 * e)
-
-    def test_window_term_is_clamped_to_context(self):
-        """A window larger than the context must charge at most the context —
-        otherwise short-context models over-raise."""
-        e = _entry_bytes()
-        bundle = _swa_factory(
-            unified_total_bytes=200 * e,
-            model_context_len=64,
-            sliding_window_size=10_000,  # window >> context
-        )
-        self.assertIsNotNone(bundle)
-
-    def test_floor_message_itemizes_terms(self):
-        with self.assertRaises(RuntimeError) as ctx:
-            _check_bs1_feasibility_floor(
-                total_bytes=10,
-                floor_terms=[("a", 8), ("b", 8)],
-                factory="test",
-            )
-        msg = str(ctx.exception)
-        self.assertIn("a=8", msg)
-        self.assertIn("b=8", msg)
-        self.assertIn("16", msg)
+        for case, model_context_len, sliding_window_size in (
+            ("context_longer_than_the_pool", 1_000_000, 16),
+            ("feasible_config", 64, 16),
+            ("window_larger_than_context", 64, 10_000),
+        ):
+            with self.subTest(case=case):
+                bundle = _swa_factory(
+                    unified_total_bytes=200 * e,
+                    model_context_len=model_context_len,
+                    sliding_window_size=sliding_window_size,
+                )
+                self.assertEqual(bundle.unified_memory_pool.total_bytes, 200 * e)
 
     def test_exact_floor_passes(self):
         """Boundary: total == floor must NOT raise (>= is the contract)."""

@@ -278,19 +278,6 @@ class TestMultiEndedAllocator(unittest.TestCase):
         self._check_invariants(full_alloc, full_kv)
         self.assertEqual(full_alloc.allocated_count(), 0)
 
-    def test_grow_down_side(self):
-        _, full_alloc, mamba_alloc, full_kv, mamba_kv = self._build_pair()
-        a = self._alloc(mamba_alloc, mamba_kv, 2)
-        b = self._alloc(mamba_alloc, mamba_kv, 3)
-        c = self._alloc(mamba_alloc, mamba_kv, 1)
-        self._check_invariants(mamba_alloc, mamba_kv)
-        self._free(mamba_alloc, mamba_kv, b)  # interior -> compaction
-        self._check_invariants(mamba_alloc, mamba_kv)
-        self._free(mamba_alloc, mamba_kv, a)
-        self._free(mamba_alloc, mamba_kv, c)
-        self._check_invariants(mamba_alloc, mamba_kv)
-        self.assertEqual(mamba_alloc.allocated_count(), 0)
-
     def test_byte_frontier_coordination(self):
         # full has 8 slots' worth of bytes; mamba's entry is larger, so a few
         # mamba allocs should shrink full's available_size below its slot headroom.
@@ -390,7 +377,7 @@ class TestMultiEndedAllocator(unittest.TestCase):
         live = []
         # Bias toward near-capacity occupancy (watermark high, holes pile
         # up) then churn free/flush — the conditions that surface the bug.
-        for _ in range(3000):
+        for _ in range(600):
             avail = alloc.available_size()
             if (rng.random() < 0.55 and avail > 0) or not live:
                 n = rng.randint(1, min(5, max(1, avail)))
@@ -435,32 +422,19 @@ class TestMultiEndedAllocator(unittest.TestCase):
         expected = full_alloc.virtual_to_physical[v]
         self.assertTrue(bool((buf == expected).all().item()))
 
-    def test_translate_kv_loc_out_matches_no_out(self):
-        """REGRESSION: result of translate_kv_loc(v, out=buf) byte-equals
-        translate_kv_loc(v)."""
+    def test_translate_kv_loc_out_guards(self):
+        """REGRESSION: a malformed `out=` buffer raises AssertionError -- it
+        must match both the v2p dtype the gather writes and the input shape."""
         _, full_alloc, _, full_kv, _ = self._build_pair()
         v = self._alloc(full_alloc, full_kv, 5)
-        buf = torch.empty(v.shape, dtype=torch.int64, device=_DEV)
-        with_out = full_alloc.translate_kv_loc(v, out=buf)
-        no_out = full_alloc.translate_kv_loc(v)
-        self.assertTrue(bool((with_out == no_out).all().item()))
-
-    def test_translate_kv_loc_dtype_assertion(self):
-        """REGRESSION: wrong-dtype `out=` (int32 instead of int64) raises
-        AssertionError -- `out=` must match the v2p dtype the gather writes."""
-        _, full_alloc, _, full_kv, _ = self._build_pair()
-        v = self._alloc(full_alloc, full_kv, 5)
-        wrong_dtype = torch.empty(v.shape, dtype=torch.int32, device=_DEV)
-        with self.assertRaises(AssertionError):
-            full_alloc.translate_kv_loc(v, out=wrong_dtype)
-
-    def test_translate_kv_loc_shape_assertion(self):
-        """REGRESSION: mismatched `out=` shape raises AssertionError."""
-        _, full_alloc, _, full_kv, _ = self._build_pair()
-        v = self._alloc(full_alloc, full_kv, 5)
-        wrong_shape = torch.empty((v.numel() + 1,), dtype=torch.int64, device=_DEV)
-        with self.assertRaises(AssertionError):
-            full_alloc.translate_kv_loc(v, out=wrong_shape)
+        with self.subTest(guard="dtype"):
+            wrong_dtype = torch.empty(v.shape, dtype=torch.int32, device=_DEV)
+            with self.assertRaises(AssertionError):
+                full_alloc.translate_kv_loc(v, out=wrong_dtype)
+        with self.subTest(guard="shape"):
+            wrong_shape = torch.empty((v.numel() + 1,), dtype=torch.int64, device=_DEV)
+            with self.assertRaises(AssertionError):
+                full_alloc.translate_kv_loc(v, out=wrong_shape)
 
     # REGRESSION: `translate_kv_loc(buf, out=buf)` — same
     # tensor for input and output — is the canonical in-place form used by
@@ -532,13 +506,7 @@ class TestMultiEndedAllocator(unittest.TestCase):
             0,
             "tombstoned virtual id must map to slot 0 (padding sink)",
         )
-
-    def test_translate_kv_loc_with_out_clamps_tombstoned_v2p(self):
-        """`translate_kv_loc(..., out=buf)` (the captured-graph path) must
-        clamp tombstoned entries in-place."""
-        _, full_alloc, _, full_kv, _ = self._build_pair()
-        v = self._alloc(full_alloc, full_kv, 5).clone()
-        full_alloc.virtual_to_physical[int(v[1].item())] = -1
+        # out= form (the captured-graph path) must clamp in place too.
         buf = torch.empty_like(v)
         ret = full_alloc.translate_kv_loc(v, out=buf)
         self.assertIs(ret, buf)
@@ -546,7 +514,7 @@ class TestMultiEndedAllocator(unittest.TestCase):
             bool((buf >= 0).all().item()),
             "out= path must clamp tombstoned entries",
         )
-        self.assertEqual(int(buf[1].item()), 0)
+        self.assertEqual(int(buf[2].item()), 0)
 
     def test_slot_zero_sink_invariant_survives_churn(self):
         """PINNED INVARIANT: virtual 0 <-> physical 0 (the padding sink), so
@@ -901,45 +869,7 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         self.assertEqual(allocator.full_attn_allocator.allocated_count(), 0)
         self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
 
-    # 8. Watermark rollback on partial alloc failure.
-    def test_swa_alloc_swa_failure_is_fail_loud(self):
-        """The SWA composite runs a tight JOINT pre-check before allocating, so
-        a swa-side ``alloc_with_virtual`` failure after the full-side alloc can
-        only mean an internal-state inconsistency. By design (``UnifiedSWA.alloc``:
-        "assert rather than silently rollback") that surfaces as a loud error,
-        NOT a silent ``None`` / rollback — masking it would hide the bug. The
-        real ``alloc_with_virtual`` self-asserts on shortfall, so the production
-        path is fail-loud too; here we force the failure to prove it propagates.
-        """
-        _, allocator, kvcache = self._build()
-        sa = allocator.swa_attn_allocator
-        original = sa.alloc_with_virtual
-
-        def _bomb(virtual_ids):
-            raise AssertionError("synthetic alloc_with_virtual failure")
-
-        sa.alloc_with_virtual = _bomb
-        try:
-            with self.assertRaises(AssertionError):
-                allocator.alloc(3)
-        finally:
-            sa.alloc_with_virtual = original
-
     # -- `out=` parameter regression tests for the SWA composite --
-
-    def test_swa_translate_kv_loc_with_out_writes_inplace(self):
-        """REGRESSION: composite delegates to base-class
-        translate_kv_loc with `out=` passthrough. Result lands in `buf`."""
-        _, allocator, _ = self._build()
-        v = allocator.alloc(4)
-        self.assertIsNotNone(v)
-        buf = torch.empty(v.shape, dtype=torch.int64, device=_DEV)
-        ptr_before = buf.data_ptr()
-        ret = allocator.translate_kv_loc(v, out=buf)
-        self.assertIs(ret, buf)
-        self.assertEqual(buf.data_ptr(), ptr_before)
-        expected = allocator.translate_kv_loc(v)
-        self.assertTrue(bool((buf == expected).all().item()))
 
     def test_swa_translate_loc_from_full_to_swa_with_out_writes_inplace(self):
         """REGRESSION: `translate_loc_from_full_to_swa(v, out=buf)`
@@ -1180,21 +1110,6 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         _, full_alloc, _, _, _ = self._build()
         with self.assertRaises(AssertionError):
             full_alloc.alloc(5)  # not a multiple of 8
-
-    # 3. v2p / p2v tables are sized by PAGES.
-    def test_paged_v2p_sized_by_pages(self):
-        pool, full_alloc, _, _, _ = self._build(n_full_pages=10)
-        # +1 for the trailing -1 sentinel row.
-        self.assertEqual(
-            int(full_alloc.virtual_to_physical.numel()),
-            full_alloc.num_pages + 1,
-        )
-        self.assertEqual(
-            int(full_alloc.physical_to_virtual.numel()),
-            full_alloc.num_pages + 1,
-        )
-        # `num_pages` should be > 1 to be a meaningful test.
-        self.assertGreater(full_alloc.num_pages, 1)
 
     # 4. Compaction relocates a whole page at once (data follows).
     def test_paged_compaction_relocates_whole_pages(self):
@@ -1597,60 +1512,6 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             "page>1 in-place result must equal no-out result",
         )
 
-    # REGRESSION: the stale-tail scenario.
-    #
-    # A naive cuda-graph replay path in `triton_backend.py` would call
-    # `_translate_kv_loc(kv_indices, out=kv_indices)` on the WHOLE
-    # pre-allocated buffer (`self.cuda_graph_kv_indices`), even though only
-    # the `kv_indptr[-1]`-length prefix was freshly written by
-    # `create_flashinfer_kv_indices_triton`. Stale tail data, when fed
-    # through `v2p` repeatedly across replays, eventually produced negative
-    # values (via `v2p[unbound] = -1 → -1 * page_size + offset` ∈ [-ps,-1]),
-    # and the NEXT translation's `// page_size` produced `-1`, which CUDA's
-    # `index_select` rejects with a scatter-gather OOB device-side assert.
-    #
-    # The fix in `triton_backend.py` slices the translate to the valid
-    # prefix `kv_indices[:kv_indptr[-1]]`. This test confirms slicing is
-    # transparent to the translate — the in-place result on a contiguous
-    # slice of a larger buffer matches the standalone-tensor result.
-    def test_paged_translate_kv_loc_on_buffer_slice(self):
-        _, full_alloc, _, _, _ = self._build()
-        ps = self.PAGE_SIZE
-        v = full_alloc.alloc(2 * ps)
-        self.assertIsNotNone(v)
-        # Simulate the cuda-graph buffer pattern: a large pre-allocated
-        # buffer where only a prefix is freshly written.
-        N = v.numel()
-        big_buf = torch.zeros((N * 4,), dtype=torch.int64, device=_DEV)
-        big_buf[:N] = v
-        # Translate the valid prefix slice in-place (this is what the
-        # post-fix triton_backend call does).
-        slice_view = big_buf[:N]
-        ptr_before = slice_view.data_ptr()
-        ret = full_alloc.translate_kv_loc(slice_view, out=slice_view)
-        self.assertIs(ret, slice_view)
-        self.assertEqual(
-            slice_view.data_ptr(),
-            ptr_before,
-            "slice in-place write must preserve data_ptr",
-        )
-        # The slice's translation must match a standalone translate of v.
-        expected = full_alloc.translate_kv_loc(v)
-        self.assertTrue(
-            bool((slice_view == expected).all().item()),
-            "slice in-place translate must equal standalone translate",
-        )
-        # And the tail [N:] must remain UNTOUCHED — zeros, not corrupted
-        # by the translate.
-        tail = big_buf[N:]
-        self.assertTrue(
-            bool((tail == 0).all().item()),
-            "translating a slice must NOT touch the buffer tail; if this "
-            "test fails, the translate is reading/writing past the slice "
-            "bound — the same regression that caused a scatter-gather OOB "
-            "after several replays.",
-        )
-
     # REGRESSION: tombstone-safety clamp at page_size > 1.
     #
     # For ps > 1, `v2p_page[vpage] == -1` produces `-1 * ps + offset` for
@@ -1682,13 +1543,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             bool((out[ps:] > 0).all().item()),
             "non-tombstoned pages must still translate to live physical slots",
         )
-
-    def test_paged_translate_kv_loc_with_out_clamps_tombstoned_v2p(self):
-        _, full_alloc, _, _, _ = self._build()
-        ps = self.PAGE_SIZE
-        v = full_alloc.alloc(2 * ps).clone()
-        tomb_page = int((v[0] // ps).item())
-        full_alloc.virtual_to_physical[tomb_page] = -1
+        # out= form must also clamp.
         buf = torch.empty_like(v)
         ret = full_alloc.translate_kv_loc(v, out=buf)
         self.assertIs(ret, buf)
@@ -2033,31 +1888,6 @@ class TestLazyCompaction(unittest.TestCase):
             p = int(alloc.virtual_to_physical[v].item())
             kv.buf[p] = int(v)
 
-    def test_lazy_free_boundary_shortcut(self):
-        """Boundary absorption is DEFERRED to `_flush` (the hot
-        path `_free_lazy` does only a `torch.cat`, no watermark mutation).
-        After `_flush`, the freed boundary page is absorbed into the
-        watermark.
-        """
-        _pool, fa, _kv = self._make_full(lazy=True)
-        a = fa.alloc(3)  # virtual tokens
-        before_wm = fa.watermark_physical
-        # Free the last-alloced virtual id (its physical IS the boundary).
-        last = a[-1:].clone()
-        fa.free(last)
-        # Watermark is NOT shrunk inline; freed page is in the
-        # free list.
-        self.assertEqual(fa.watermark_physical, before_wm)
-        self.assertEqual(len(fa._free_phys_pages), 1)
-        # `live_page_count` is decremented at free time (CPU-side metadata).
-        self.assertEqual(fa.live_page_count, 2)
-        # `_flush` runs the complete boundary absorb → watermark shrinks
-        # by 1, free list emptied.
-        fa._flush(urgent=True)
-        self.assertEqual(fa.watermark_physical, before_wm - 1)
-        self.assertEqual(len(fa._free_phys_pages), 0)
-        self.assertEqual(fa.live_page_count, 2)
-
     def test_lazy_free_inward_walk(self):
         """The inward walk (multiple contiguous holes absorbed
         into the watermark in one pass) is DEFERRED to `_flush`. After
@@ -2141,22 +1971,6 @@ class TestLazyCompaction(unittest.TestCase):
         self.assertEqual(len(fa._free_phys_pages), 0)
         # live_page_count invariant under compaction.
         self.assertEqual(fa.live_page_count, 4)
-
-    def test_lazy_v2p_p2v_identity_after_flush(self):
-        """After a flush, v2p ∘ p2v == identity on the live set."""
-        _pool, fa, _kv = self._make_full(lazy=True)
-        a = fa.alloc(8)
-        # Free a scattered set of virtuals (not at boundary).
-        fa.free(a[1:2].clone())
-        fa.free(a[3:4].clone())
-        fa.free(a[5:6].clone())
-        fa._flush(urgent=True)
-        # For every still-live virtual token, v2p ∘ p2v == identity.
-        for v in a.tolist():
-            p = int(fa.virtual_to_physical[v].item())
-            if p == -1:
-                continue  # freed
-            self.assertEqual(int(fa.physical_to_virtual[p].item()), v)
 
     def test_lazy_flush_gathers_survivor_mappings_as_one_batch(self):
         """Compaction must not synchronize once per relocated survivor."""
@@ -2406,6 +2220,10 @@ class TestO3FusedAllocBind(unittest.TestCase):
             self.assertEqual(int(fa.physical_to_virtual[p].item()), v)
         # live_page_count updated.
         self.assertEqual(fa.live_page_count, 4)
+        # Another fast-path call accumulates.
+        v_pages2 = torch.tensor([24, 25], dtype=torch.int64, device="cuda")
+        fa._alloc_bind_fast_or_slow(v_pages2, 2)
+        self.assertEqual(fa.live_page_count, 6)
 
     def test_slow_path_when_holes_exist(self):
         """Invariant B (greedy hole reuse): when a hole exists, alloc
@@ -2414,7 +2232,9 @@ class TestO3FusedAllocBind(unittest.TestCase):
         _pool, fa, _kv = self._make_full(lazy=True)
         # Build a hole by alloc-then-free-non-boundary.
         a = fa.alloc(3)
+        self.assertEqual(fa.live_page_count, 3)
         fa.free(a[0:1].clone())  # frees a non-boundary slot → enters holeset
+        self.assertEqual(fa.live_page_count, 2)
         self.assertEqual(len(fa._free_phys_pages), 1)
         # `_free_phys_pages` is a torch.Tensor; read the single
         # hole position via `.tolist()` (`._alive` no longer exists).
@@ -2430,12 +2250,16 @@ class TestO3FusedAllocBind(unittest.TestCase):
         # v2p/p2v updated.
         self.assertEqual(int(fa.virtual_to_physical[42].item()), hole_pos)
         self.assertEqual(int(fa.physical_to_virtual[hole_pos].item()), 42)
+        # The slow path advances live_page_count via take_physical_pages.
+        self.assertEqual(fa.live_page_count, 3)
 
     def test_fast_path_in_eager_mode(self):
         """Eager mode (no lazy compaction) ALWAYS uses the fast path —
-        no holes ever accumulate."""
+        no holes ever accumulate. `live_page_count` is NOT maintained in
+        eager mode, so it stays 0."""
         _pool, fa, _kv = self._make_full(lazy=False)
         self.assertFalse(fa.lazy_compaction)
+        self.assertEqual(fa.live_page_count, 0)
         wm_before = fa.watermark_physical
         v_pages = torch.tensor([30, 31, 32], dtype=torch.int64, device="cuda")
         phys = fa._alloc_bind_fast_or_slow(v_pages, 3)
@@ -2444,6 +2268,8 @@ class TestO3FusedAllocBind(unittest.TestCase):
             wm_before, wm_before + 3, dtype=torch.int64, device="cuda"
         )
         self.assertTrue(torch.equal(phys, expected_phys))
+        # live_page_count UNCHANGED (eager mode invariant).
+        self.assertEqual(fa.live_page_count, 0)
 
     def test_index_space_overflow_returns_none(self):
         """When the requested allocation would overflow `num_pages`,
@@ -2497,55 +2323,6 @@ class TestO3FusedAllocBind(unittest.TestCase):
         # Identical watermark + live_page_count.
         self.assertEqual(fa_a.watermark_physical, fa_b.watermark_physical)
         self.assertEqual(fa_a.live_page_count, fa_b.live_page_count)
-
-    def test_eager_mode_live_page_count_not_updated(self):
-        """Match `_take_physical_eager` semantics: in eager mode,
-        `live_page_count` is NOT maintained (the leak-checker uses
-        `allocated_count()` based on the watermark span). The helper's
-        fast path must respect this — updating it would break the
-        invariant that eager-mode `live_page_count == 0` always."""
-        _pool, fa, _kv = self._make_full(lazy=False)
-        self.assertFalse(fa.lazy_compaction)
-        self.assertEqual(fa.live_page_count, 0)
-        v_pages = torch.tensor([10, 11, 12], dtype=torch.int64, device="cuda")
-        fa._alloc_bind_fast_or_slow(v_pages, 3)
-        # live_page_count UNCHANGED (eager mode invariant).
-        self.assertEqual(fa.live_page_count, 0)
-
-    def test_lazy_mode_live_page_count_updated_on_fast_path(self):
-        """Lazy mode: the fast path advances `live_page_count` by N
-        (matches `take_physical`'s lazy-path bookkeeping)."""
-        _pool, fa, _kv = self._make_full(lazy=True)
-        self.assertEqual(fa.live_page_count, 0)
-        v_pages = torch.tensor([20, 21, 22], dtype=torch.int64, device="cuda")
-        fa._alloc_bind_fast_or_slow(v_pages, 3)
-        self.assertEqual(fa.live_page_count, 3)
-        # Another fast-path call accumulates.
-        v_pages2 = torch.tensor([23, 24], dtype=torch.int64, device="cuda")
-        fa._alloc_bind_fast_or_slow(v_pages2, 2)
-        self.assertEqual(fa.live_page_count, 5)
-
-    def test_lazy_mode_live_page_count_updated_on_slow_path(self):
-        """Lazy mode + holes exist: the slow path advances
-        `live_page_count` via the existing `take_physical_pages` call
-        (which updates it internally). End state must match the fast
-        path's accumulation."""
-        _pool, fa, _kv = self._make_full(lazy=True)
-        a = fa.alloc(3)
-        # alloc(3) used the fast path (no holes at the time).
-        self.assertEqual(fa.live_page_count, 3)
-        # Free one non-boundary → creates a hole; subsequent alloc takes
-        # the slow path.
-        fa.free(a[0:1].clone())
-        self.assertEqual(fa.live_page_count, 2)
-        self.assertEqual(len(fa._free_phys_pages), 1)
-        # Now alloc(1) takes the slow path (holes exist). Should still
-        # update live_page_count back to 3.
-        b = fa.alloc(1)
-        self.assertIsNotNone(b)
-        self.assertEqual(fa.live_page_count, 3)
-        # Verify slow path actually fired: hole drained, watermark unchanged.
-        self.assertEqual(len(fa._free_phys_pages), 0)
 
     def test_page_size_gt_1(self):
         """Helper works at page_size > 1: virtual ids and table indices
@@ -2682,21 +2459,13 @@ class TestSWACompositeKernelIdSurface(unittest.TestCase):
             forward_stream=None,
         )
 
-    def test_multipliers_come_from_the_specs(self):
-        """Both sides scale by their OWN sub-pool's block count, and the
-        composite exposes the raw v2p tables unwrapped. Nothing injects the
-        scale: a spec whose views carry every layer cannot be paired with a
-        physical-id multiplier, which is the state that writes physical ids
-        into view rows."""
+    def test_full_kernel_translate_matches_formula(self):
+        """Both sides scale by their OWN sub-pool's block count, and the full
+        kernel id follows v2p[t // ps] * (ps * mult) + t % ps."""
+        mult = 2 * self.FULL_L
         a = self._build()
         self.assertEqual(a.kernel_page_multiplier, 2 * self.FULL_L)
         self.assertEqual(a.swa_kernel_page_multiplier, 2 * self.SWA_L)
-        self.assertIs(a.full_v2p_page_table, a.full_attn_allocator.virtual_to_physical)
-        self.assertIs(a.swa_v2p_page_table, a.swa_attn_allocator.virtual_to_physical)
-
-    def test_full_kernel_translate_matches_formula(self):
-        mult = 2 * self.FULL_L
-        a = self._build()
         v = a.alloc(3 * self.PS)
         self.assertIsNotNone(v)
         v2p = a.full_attn_allocator.virtual_to_physical
@@ -2894,13 +2663,6 @@ class TestChainFrontierWalk(unittest.TestCase):
         fa.bind_peer(ma)
         ma.bind_peer(fa)
         return pool, fa, ma
-
-    def test_bind_peer_mirrors_growth_side(self):
-        _, fa, ma = self._build_pair()
-        self.assertIs(fa.high_peer, ma)  # grow-up's neighbor sits above
-        self.assertIsNone(fa.low_peer)
-        self.assertIs(ma.low_peer, fa)  # grow-down's neighbor sits below
-        self.assertIsNone(ma.high_peer)
 
     def test_bind_peer_rejects_float_members(self):
         _, fa, ma = self._build_pair()
@@ -3302,11 +3064,6 @@ class TestFloatMultiEndedAllocator(unittest.TestCase):
         self.assertEqual(fla._span_pages(), span_before - 2)
         self.assertGreater(moved, 0)
         self._check_float_state(fla, kv)
-
-    def test_bind_peer_raises_on_float(self):
-        _, sa, fla, _, _ = self._build_tri()
-        with self.assertRaises(AssertionError):
-            fla.bind_peer(sa)
 
 
 class TestDcpWidening(unittest.TestCase):

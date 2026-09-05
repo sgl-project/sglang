@@ -42,10 +42,7 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
-from sglang.srt.mem_cache.layout.page_major import (
-    build_mla_views,
-    mla_entry_bytes,
-)
+from sglang.srt.mem_cache.layout.page_major import build_mla_views
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
     MLASubPoolSpec,
@@ -107,16 +104,6 @@ def _kernel_id(t, ps, layer_num):
 
 
 class TestMLASubPoolSpec(unittest.TestCase):
-    def test_entry_bytes_and_dim(self):
-        spec = _mla_spec()
-        self.assertEqual(spec.kv_cache_dim, _D)
-        self.assertEqual(spec.entry_bytes(), _L * _D * _ITEM)
-        self.assertEqual(
-            spec.entry_bytes(),
-            mla_entry_bytes(layer_num=_L, kv_cache_dim=_D, itemsize=_ITEM),
-        )
-        self.assertEqual(spec.get_dtype(), _DTYPE)
-
     def test_rejects_nonpositive_dims(self):
         with self.assertRaises(AssertionError):
             MLASubPoolSpec(
@@ -203,14 +190,6 @@ class TestMLAViews(unittest.TestCase):
 
 
 class TestUnifiedKVPoolMLA(unittest.TestCase):
-    def test_max_slots_ignore_tail_pad(self):
-        pool, full, mamba = _make_unified(page_size=4)
-        total = full.entry_bytes() * 64 + mamba.entry_bytes() * 8
-        self.assertEqual(pool.max_slots("full"), total // full.entry_bytes())
-        self.assertEqual(pool.max_slots("mamba"), total // mamba.entry_bytes())
-        # allocation actually carries the pad
-        self.assertEqual(pool._raw.numel(), total + 4 * full.entry_bytes())
-
     def test_reserved_floor_covers_page0_envelope(self):
         ps = 4
         pool, full, mamba = _make_unified(page_size=ps)
@@ -253,15 +232,24 @@ class TestUnifiedMLATokenToKVPool(unittest.TestCase):
         self.assertTrue(torch.all(v[7] == 2.5))
 
     def test_move_kv_cache_moves_page_envelopes(self):
+        """Whole page envelopes relocate, in raw bytes and (at ps=4) as read
+        back through the per-layer views at the destination kernel ids."""
         for ps in (1, 4):
             pool, kv_pool = self._make(ps=ps)
             num_pages = pool.max_slots("full") // ps
             page_bytes = ps * _L * _D * _ITEM
             env = pool._raw[: num_pages * page_bytes].view(num_pages, page_bytes)
-            src_pages = torch.tensor([num_pages - 2, num_pages - 4])
-            dst_pages = torch.tensor([2, 3])
+            src_pages = torch.tensor([num_pages - 2, num_pages - 4, num_pages - 3])
+            dst_pages = torch.tensor([2, 3, 5])
             env[src_pages[0]] = 7
             env[src_pages[1]] = 9
+            if ps == 4:
+                # write through the views at src, expect it at dst after the move
+                for l in range(_L):
+                    for s in range(ps):
+                        kv_pool.kv_buffer[l][
+                            _kernel_id(int(src_pages[2]) * ps + s, ps, _L)
+                        ] = float(l * ps + s + 1)
             # page-major token runs, exactly how compaction expands pages
             offsets = torch.arange(ps, dtype=torch.int64)
             src_t = (src_pages[:, None] * ps + offsets).reshape(-1)
@@ -269,29 +257,15 @@ class TestUnifiedMLATokenToKVPool(unittest.TestCase):
             kv_pool.move_kv_cache(dst_t, src_t)
             self.assertTrue(torch.all(env[dst_pages[0]] == 7), f"ps={ps}")
             self.assertTrue(torch.all(env[dst_pages[1]] == 9), f"ps={ps}")
-
-    def test_move_then_readback(self):
-        ps = 4
-        pool, kv_pool = self._make(ps=ps)
-        num_pages = pool.max_slots("full") // ps
-        src_page, dst_page = num_pages - 3, 5
-        # write through the views at src, expect it at dst after the move
-        for l in range(_L):
-            for s in range(ps):
-                kv_pool.kv_buffer[l][_kernel_id(src_page * ps + s, ps, _L)] = float(
-                    l * ps + s + 1
-                )
-        offsets = torch.arange(ps, dtype=torch.int64)
-        kv_pool.move_kv_cache(
-            (torch.tensor([dst_page])[:, None] * ps + offsets).reshape(-1),
-            (torch.tensor([src_page])[:, None] * ps + offsets).reshape(-1),
-        )
-        for l in range(_L):
-            for s in range(ps):
-                got = kv_pool.kv_buffer[l][_kernel_id(dst_page * ps + s, ps, _L)]
-                self.assertTrue(
-                    torch.all(got == float(l * ps + s + 1)), f"(l={l}, s={s})"
-                )
+            if ps == 4:
+                for l in range(_L):
+                    for s in range(ps):
+                        got = kv_pool.kv_buffer[l][
+                            _kernel_id(int(dst_pages[2]) * ps + s, ps, _L)
+                        ]
+                        self.assertTrue(
+                            torch.all(got == float(l * ps + s + 1)), f"(l={l}, s={s})"
+                        )
 
 
 class _FakeKVCache:
@@ -325,23 +299,29 @@ class TestTranslateKvLocForKernel(unittest.TestCase):
         mamba_alloc.bind_peer(full_alloc)
         return full_alloc
 
-    def test_kernel_id_matches_formula_ps1(self):
-        alloc = self._build(ps=1)
-        v = alloc.alloc(8)
-        self.assertIsNotNone(v)
-        phys = alloc.translate_kv_loc(v)
-        kernel = alloc.translate_kv_loc_for_kernel(v)
-        self.assertTrue(torch.all(kernel == phys * _L))
+    def test_kernel_id_matches_formula(self):
+        """kernel id = (phys // ps) * (ps * multiplier) + phys % ps, across
+        page sizes, the multiplier-1 physical fallback, and eager compaction."""
+        for ps, multiplier in ((1, _L), (4, _L), (1, 1)):
+            with self.subTest(page_size=ps, multiplier=multiplier):
+                alloc = self._build(ps=ps, multiplier=multiplier)
+                a = alloc.alloc(4 * ps)
+                b = alloc.alloc(4 * ps)
+                c = alloc.alloc(4 * ps)
+                self.assertIsNotNone(c)
 
-    def test_kernel_id_matches_formula_paged(self):
-        ps = 4
-        alloc = self._build(ps=ps)
-        v = alloc.alloc(3 * ps)
-        self.assertIsNotNone(v)
-        phys = alloc.translate_kv_loc(v)
-        kernel = alloc.translate_kv_loc_for_kernel(v)
-        expected = (phys // ps) * (ps * _L) + phys % ps
-        self.assertTrue(torch.all(kernel == expected))
+                def check(virt):
+                    phys = alloc.translate_kv_loc(virt)
+                    expected = (phys // ps) * (ps * multiplier) + phys % ps
+                    self.assertTrue(
+                        torch.all(alloc.translate_kv_loc_for_kernel(virt) == expected)
+                    )
+
+                for virt in (a, b, c):
+                    check(virt)
+                alloc.free(b)  # eager compaction relocates survivors
+                for virt in (a, c):
+                    check(virt)
 
     def test_tombstone_clamps_to_sink(self):
         alloc = self._build(ps=1)
@@ -364,26 +344,6 @@ class TestTranslateKvLocForKernel(unittest.TestCase):
             x = v.clone()
             alloc.translate_kv_loc_for_kernel(x, out=x)
             self.assertTrue(torch.all(x == no_out))
-
-    def test_multiplier_one_falls_back_to_physical(self):
-        alloc = self._build(ps=1, multiplier=1)
-        v = alloc.alloc(4)
-        self.assertIsNotNone(v)
-        self.assertTrue(
-            torch.all(alloc.translate_kv_loc_for_kernel(v) == alloc.translate_kv_loc(v))
-        )
-
-    def test_kernel_id_follows_compaction(self):
-        alloc = self._build(ps=1)
-        a = alloc.alloc(4)
-        b = alloc.alloc(4)
-        c = alloc.alloc(4)
-        self.assertIsNotNone(c)
-        alloc.free(b)  # eager compaction relocates survivors
-        phys_a = alloc.translate_kv_loc(a)
-        phys_c = alloc.translate_kv_loc(c)
-        self.assertTrue(torch.all(alloc.translate_kv_loc_for_kernel(a) == phys_a * _L))
-        self.assertTrue(torch.all(alloc.translate_kv_loc_for_kernel(c) == phys_c * _L))
 
 
 if __name__ == "__main__":

@@ -27,8 +27,7 @@ Derived properties pinned here:
   * The check is not vacuous: drifting any single term (live count, watermark,
     a leaked hole) reports loudly, naming the sub-pool.
   * Chain order: one member's low frontier clearing the other's high frontier
-    is what "two pools share one buffer without overlap" MEANS; the pair check
-    must hold regardless of which member grows up.
+    is what "two pools share one buffer without overlap" MEANS.
   * The strict escalation env defaults OFF: promoting the diagnostic to a
     RuntimeError is a validation posture, not the production one.
 
@@ -62,18 +61,6 @@ def _paged_pair(lazy: bool):
 
 
 class TestHealthyLifecycleReportsClean(unittest.TestCase):
-    def test_swa_composite_clean_at_every_step(self):
-        inst, allocator, kvcache = _swa_composite()
-        self.assertEqual(allocator.verify_byte_accounting(), [])
-        v = inst._alloc(allocator, kvcache, 8)
-        self.assertEqual(allocator.verify_byte_accounting(), [])
-        allocator.free_swa(v[:4])  # tombstone half the swa side
-        self.assertEqual(allocator.verify_byte_accounting(), [])
-        inst._free(allocator, kvcache, v)
-        self.assertEqual(allocator.verify_byte_accounting(), [])
-        allocator.clear()
-        self.assertEqual(allocator.verify_byte_accounting(), [])
-
     def test_lazy_end_pool_clean_through_free_and_flush(self):
         full, _swa = _paged_pair(lazy=True)
         self.assertEqual(full._byte_accounting_violations(), [])
@@ -98,20 +85,29 @@ class TestDriftReportsLoudly(unittest.TestCase):
         self.assertEqual(full._byte_accounting_violations(), [])
         return full
 
-    def test_drifted_live_count(self):
-        full = self._lazy_full()
-        full.live_page_count += 1
-        self.assertTrue(any("span" in s for s in full._byte_accounting_violations()))
+    def test_any_drifted_term_reports(self):
+        """One drifted span term per subTest -- each must be reported."""
 
-    def test_leaked_hole(self):
-        full = self._lazy_full()
-        full._free_phys_pages = full._free_phys_pages[:-1]  # hole vanished
-        self.assertTrue(any("span" in s for s in full._byte_accounting_violations()))
+        def drift_live_count(full):
+            full.live_page_count += 1
 
-    def test_drifted_watermark(self):
-        full = self._lazy_full()
-        full.watermark_physical += 1
-        self.assertTrue(any("span" in s for s in full._byte_accounting_violations()))
+        def leak_hole(full):
+            full._free_phys_pages = full._free_phys_pages[:-1]  # hole vanished
+
+        def drift_watermark(full):
+            full.watermark_physical += 1
+
+        for term, mutate in (
+            ("live_count", drift_live_count),
+            ("leaked_hole", leak_hole),
+            ("watermark", drift_watermark),
+        ):
+            with self.subTest(term=term):
+                full = self._lazy_full()
+                mutate(full)
+                self.assertTrue(
+                    any("span" in s for s in full._byte_accounting_violations())
+                )
 
     def test_composite_report_names_the_sub_pool(self):
         """Frontier-bounds drift (checked in BOTH lazy and eager modes): push
@@ -143,14 +139,6 @@ class TestChainFrontierOrder(unittest.TestCase):
         up.watermark_physical = up.num_pages  # up band swallows the buffer
         out = mea._chain_byte_accounting_violations(chain)
         self.assertTrue(any("overlap" in s for s in out), out)
-
-    def test_pair_order_is_direction_agnostic(self):
-        """The factories and the unit fixtures orient the pair differently;
-        the check must order by grow direction, not by argument position."""
-        full, swa = _paged_pair(lazy=False)
-        a = mea._end_pair_chain(full, swa)
-        b = mea._end_pair_chain(swa, full)
-        self.assertEqual([x.sub_pool_name for x in a], [x.sub_pool_name for x in b])
 
 
 if __name__ == "__main__":

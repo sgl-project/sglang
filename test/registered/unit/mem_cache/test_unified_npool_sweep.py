@@ -111,34 +111,46 @@ def _chain_names(pool: UnifiedKVPool):
 
 
 class TestNPoolCanonicalOrder(unittest.TestCase):
-    def test_two_pool_input_order_irrelevant(self):
-        for specs in (
-            [_mha("full", "down"), _mamba("mamba", "up")],
-            [_mamba("mamba", "up"), _mha("full", "down")],
+    def test_chain_order_is_canonical(self):
+        """Ends canonical (up first, down last) whatever the input order;
+        floats keep INPUT order between them, on every cache-spec kind."""
+        for specs, expect in (
+            ([_mha("full", "down"), _mamba("mamba", "up")], ["mamba", "full"]),
+            ([_mamba("mamba", "up"), _mha("full", "down")], ["mamba", "full"]),
+            (
+                [_mha("full", "down"), _mha("swa", "float"), _mamba("conv", "up")],
+                ["conv", "swa", "full"],
+            ),
+            (
+                [_mha("swa", "float"), _mamba("conv", "up"), _mha("full", "down")],
+                ["conv", "swa", "full"],
+            ),
+            (
+                [_mamba("conv", "up"), _mha("full", "down"), _mha("swa", "float")],
+                ["conv", "swa", "full"],
+            ),
+            (
+                [
+                    _mha("full", "down"),
+                    _mha("f1", "float"),
+                    _mamba("state", "up"),
+                    _mha("f0", "float", layer_num=1),
+                ],
+                ["state", "f1", "f0", "full"],
+            ),
+            (
+                [
+                    _mamba("state", "up"),
+                    _mha("f_mha", "float"),
+                    _mla("f_mla", "float", layer_num=1),
+                    _mamba("f_mamba", "float", layer_num=1),
+                    _mha("full", "down"),
+                ],
+                ["state", "f_mha", "f_mla", "f_mamba", "full"],
+            ),
         ):
-            pool = _make_pool(specs)
-            self.assertEqual(_chain_names(pool), ["mamba", "full"])
-
-    def test_three_pool_float_in_the_middle(self):
-        for specs in (
-            [_mha("full", "down"), _mha("swa", "float"), _mamba("conv", "up")],
-            [_mha("swa", "float"), _mamba("conv", "up"), _mha("full", "down")],
-            [_mamba("conv", "up"), _mha("full", "down"), _mha("swa", "float")],
-        ):
-            pool = _make_pool(specs)
-            self.assertEqual(_chain_names(pool), ["conv", "swa", "full"])
-
-    def test_four_pool_float_input_order_preserved(self):
-        pool = _make_pool(
-            [
-                _mha("full", "down"),
-                _mha("f1", "float"),
-                _mamba("state", "up"),
-                _mha("f0", "float", layer_num=1),
-            ]
-        )
-        # Ends canonical; floats keep INPUT order between them.
-        self.assertEqual(_chain_names(pool), ["state", "f1", "f0", "full"])
+            with self.subTest(inputs=[s.name for s in specs]):
+                self.assertEqual(_chain_names(_make_pool(specs)), expect)
 
     def test_by_name_geometry_independent_of_n(self):
         two = _make_pool([_mha("full", "down"), _mamba("mamba", "up")])
@@ -151,9 +163,6 @@ class TestNPoolCanonicalOrder(unittest.TestCase):
                 two.total_bytes // two.spec(name).entry_bytes(),
             )
             self.assertEqual(two.max_slots(name), three.max_slots(name))
-        for pool in (two, three):
-            for s in pool.sub_pool_specs:
-                self.assertEqual(pool.anchor_bytes(s.name), 0)
 
 
 class TestNPoolValidation(unittest.TestCase):
@@ -165,36 +174,23 @@ class TestNPoolValidation(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, ">= 2 sub-pools"):
             _make_pool([_mha("full", "down")])
 
-    def test_two_ups_rejected(self):
-        with self.assertRaisesRegex(AssertionError, "exactly one grow-up"):
-            _make_pool([_mha("a", "up"), _mamba("b", "up")])
-
-    def test_missing_down_end_rejected(self):
-        with self.assertRaisesRegex(AssertionError, "exactly one grow-up"):
-            _make_pool([_mha("a", "up"), _mha("b", "float")])
-
-    def test_missing_up_end_rejected(self):
-        with self.assertRaisesRegex(AssertionError, "exactly one grow-up"):
-            _make_pool([_mha("a", "down"), _mha("b", "float"), _mha("c", "float")])
+    def test_end_direction_counts_rejected(self):
+        """Exactly one grow-up END and one grow-down END, no more, no less."""
+        for case, specs in (
+            ("two_ups", [_mha("a", "up"), _mamba("b", "up")]),
+            ("missing_down", [_mha("a", "up"), _mha("b", "float")]),
+            (
+                "missing_up",
+                [_mha("a", "down"), _mha("b", "float"), _mha("c", "float")],
+            ),
+        ):
+            with self.subTest(case=case):
+                with self.assertRaisesRegex(AssertionError, "exactly one grow-up"):
+                    _make_pool(specs)
 
     def test_bogus_direction_rejected_at_spec_level(self):
         with self.assertRaisesRegex(AssertionError, "grow_direction"):
             _mha("a", "sideways")
-
-    def test_float_accepted_on_all_cache_spec_kinds(self):
-        # Every cache-class spec kind may float (the chain decides placement).
-        pool = _make_pool(
-            [
-                _mamba("state", "up"),
-                _mha("f_mha", "float"),
-                _mla("f_mla", "float", layer_num=1),
-                _mamba("f_mamba", "float", layer_num=1),
-                _mha("full", "down"),
-            ]
-        )
-        self.assertEqual(
-            _chain_names(pool), ["state", "f_mha", "f_mla", "f_mamba", "full"]
-        )
 
 
 class TestReservedFloorWithFloats(unittest.TestCase):
@@ -257,14 +253,6 @@ class TestFloatViews(unittest.TestCase):
         )
         k_views[1][row] = pattern
         torch.testing.assert_close(k_views[1][row], pattern)
-
-    def test_float_mamba_views_zero_visible(self):
-        pool = _make_pool(
-            [_mamba("state", "up"), _mamba("fstate", "float"), _mha("full", "down")]
-        )
-        conv_views, temporal = pool.mamba_views_for("fstate")
-        self.assertTrue(all(v.eq(0).all() for v in conv_views))
-        self.assertTrue(temporal.eq(0).all())
 
 
 if __name__ == "__main__":

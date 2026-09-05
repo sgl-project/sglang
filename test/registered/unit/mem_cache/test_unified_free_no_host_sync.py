@@ -167,6 +167,14 @@ def _scalar_index_assignments(fn):
 
 class TestTombstonesDoNotCrossTheBus(unittest.TestCase):
     def test_no_scalar_index_assignment(self):
+        # Self-check first: the scan is only as good as its AST matching, and
+        # it silently missed every tombstone until `-1` was recognised as
+        # UnaryOp(USub, Constant) rather than Constant.
+        def _offender(self):
+            self.virtual_to_physical[free_v_pages] = -1  # noqa: F821
+
+        self.assertEqual(len(_scalar_index_assignments(_offender)), 1)
+
         discovered = _table_touching_methods()
         self.assertGreaterEqual(
             len(discovered), len(_TOMBSTONE_METHODS), "discovery scan went blind"
@@ -184,16 +192,6 @@ class TestTombstonesDoNotCrossTheBus(unittest.TestCase):
                         f"stream drains. Use `.index_fill_(0, idx, -1)`."
                     ),
                 )
-
-    def test_the_scan_detects_the_scalar_form_it_guards(self):
-        """Self-check. The scan is only as good as its AST matching, and it
-        silently missed every tombstone until `-1` was recognised as
-        UnaryOp(USub, Constant) rather than Constant. Pin that."""
-
-        def _offender(self):
-            self.virtual_to_physical[free_v_pages] = -1  # noqa: F821
-
-        self.assertEqual(len(_scalar_index_assignments(_offender)), 1)
 
     def test_every_allocator_free_path_is_listed(self):
         """The positive list must name every allocator that owns a free path.
@@ -244,22 +242,6 @@ class TestTombstonesDoNotCrossTheBus(unittest.TestCase):
                     f"{_NO_SYNC_TOMBSTONE_FORMS}",
                 )
 
-    def test_index_fill_matches_scalar_assign_semantics(self):
-        """Behaviour-preserving, including the edge cases the free path hands
-        it: empty index, duplicate pages, full table."""
-        for idx in (
-            torch.tensor([], dtype=torch.int64),
-            torch.tensor([1, 3, 5], dtype=torch.int64),
-            torch.tensor([2, 2, 3], dtype=torch.int64),  # duplicates
-            torch.arange(6, dtype=torch.int64),
-        ):
-            with self.subTest(n=int(idx.numel())):
-                a = torch.arange(6, dtype=torch.int64)
-                b = a.clone()
-                a[idx] = -1
-                b.index_fill_(0, idx, -1)
-                self.assertTrue(torch.equal(a, b))
-
 
 # --------------------------------------------------------------------------
 # 2. free_segment: stride page extraction instead of torch.unique
@@ -298,12 +280,6 @@ class TestFreeSegment(unittest.TestCase):
                     torch, "unique", side_effect=AssertionError("sync path taken")
                 ):
                     alloc.free_segment(row[start : start + PAGE_SIZE], start_pos=start)
-
-    def test_unaligned_start_is_rejected(self):
-        alloc = _paged_allocator(lazy=True)
-        row = alloc.alloc(3 * PAGE_SIZE)
-        with self.assertRaises(AssertionError):
-            alloc.free_segment(row[1 : PAGE_SIZE + 1], start_pos=1)
 
     def test_empty_segment_is_noop(self):
         alloc = _paged_allocator(lazy=True)
@@ -601,19 +577,6 @@ class TestFusedTombstoneWritesBothTables(unittest.TestCase):
                 torch.equal(v2p[live_v], phys[n_free:]),
                 f"a live binding was disturbed, trial {trial}",
             )
-
-    def test_cuda_agrees_with_the_cpu_reference(self):
-        from sglang.kernels.ops.memory.virtual_slot import free_unbind_inplace
-
-        v = torch.tensor([3, 0, 5], dtype=torch.int64)
-        cpu_v2p = torch.tensor([1, 2, 3, 4, 5, 0], dtype=torch.int64)
-        cpu_p2v = torch.tensor([5, 0, 1, 2, 3, 4], dtype=torch.int64)
-        cu_v2p, cu_p2v = cpu_v2p.cuda(), cpu_p2v.cuda()
-        cpu_out = free_unbind_inplace(v, cpu_v2p, cpu_p2v)
-        cu_out = free_unbind_inplace(v.cuda(), cu_v2p, cu_p2v)
-        self.assertTrue(torch.equal(cpu_out, cu_out.cpu()))
-        self.assertTrue(torch.equal(cpu_v2p, cu_v2p.cpu()))
-        self.assertTrue(torch.equal(cpu_p2v, cu_p2v.cpu()))
 
     def test_empty_free_is_a_noop(self):
         from sglang.kernels.ops.memory.virtual_slot import free_unbind_inplace

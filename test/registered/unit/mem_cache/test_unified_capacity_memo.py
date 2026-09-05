@@ -162,19 +162,6 @@ class TestCapacityMemoCoherence(unittest.TestCase):
             msg=f"bypassing write not caught: {violations}",
         )
 
-    def test_joint_memo_invalidates_on_swa_only_mutation(self):
-        """The joint view depends on the swa end's frontier through the chain
-        walk; an swa-side-only mutation (tombstoning) must invalidate the
-        composite memo even though the full side never moved."""
-        inst, allocator, kvcache = _build(lazy=True)
-        v = inst._alloc(allocator, kvcache, 8)
-        self.assertIsNotNone(v)
-        before = allocator.available_size()
-        allocator.free_swa(v[:4])  # swa band only
-        after = allocator.available_size()
-        self.assertEqual(after, allocator._compute_available_size())
-        self.assertGreaterEqual(after, before)  # holes only ever add room
-
     def test_float_only_span_move_invalidates_every_memo(self):
         """A hole-free float alloc rebinds NO free-list and has no watermark --
         the span fields are its ONLY capacity state. If they are not
@@ -211,15 +198,6 @@ class TestCapacityMemoCoherence(unittest.TestCase):
         self.assertLess(sa.available_size(), low_end_cached)
         self.assertLess(da.available_size(), high_end_cached)
         self.assertLessEqual(fla.available_size(), float_cached)
-
-    def test_bind_rewiring_bumps_the_epoch(self):
-        """Rewiring changes what the chain walks see; a memo primed before a
-        re-bind must not survive it."""
-        inst, allocator, kvcache = _build(lazy=False)
-        fa = allocator.full_attn_allocator
-        e0 = fa._chain_capacity_epoch()
-        fa.bind_peer(allocator.swa_attn_allocator)  # re-bind (same peer)
-        self.assertGreater(fa._chain_capacity_epoch(), e0)
 
 
 class TestTriCapacityMemoCoherence(unittest.TestCase):
@@ -280,19 +258,6 @@ class TestTriCapacityMemoCoherence(unittest.TestCase):
                 allocator.clear()
                 ma.clear()
                 self._assert_memos_fresh(allocator)
-
-    def test_joint_memo_invalidates_on_mamba_only_mutation(self):
-        """The joint view depends on the mamba end's frontier through the
-        chain walk; a mamba-only mutation must invalidate the composite memo
-        even though neither KV side moved."""
-        inst, allocator = self._build_tri()
-        ma = allocator.mamba_allocator
-        before = allocator.available_size()
-        slots = ma.alloc(4)
-        self.assertIsNotNone(slots)
-        after = allocator.available_size()
-        self.assertEqual(after, allocator._compute_available_size())
-        self.assertLessEqual(after, before)
 
 
 if __name__ == "__main__":

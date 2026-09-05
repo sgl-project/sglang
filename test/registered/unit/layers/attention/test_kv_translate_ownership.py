@@ -60,26 +60,19 @@ def _iter_sources():
 
 class TestUnifiedTranslateBanned(CustomTestCase):
     def test_no_unified_translate_calls(self):
-        """No backend calls the unified translate surfaces. A hit here means
-        a backend re-grew its own id-space transition -- the design whose two
-        failure modes (forgotten translate, duplicated translate) this scan
-        exists to prevent. Route reads through KVIndexTranslator views and
-        writes through the ForwardBatch rebind instead."""
+        """No backend calls the unified translate surfaces, and none probes an
+        allocator for translate capability (the getattr-hook pattern is how
+        per-backend translation grew the first time). Route reads through
+        KVIndexTranslator views and writes through the ForwardBatch rebind."""
         banned = re.compile(r"\.translate_kv_loc(_kernel_id)?\(")
-        hits = [
-            f"{rel}: {m.group(0)}"
-            for rel, src in _iter_sources()
-            for m in banned.finditer(src)
-        ]
-        self.assertEqual(hits, [])
-
-    def test_no_translate_capability_probing(self):
-        """No backend probes an allocator for translate capability -- the
-        getattr-hook pattern is how per-backend translation grew the first
-        time."""
         probing = re.compile(r"""getattr\([^)]*['"]translate_kv_loc""")
-        hits = [rel for rel, src in _iter_sources() if probing.search(src)]
-        self.assertEqual(hits, [])
+        calls, probes = [], []
+        for rel, src in _iter_sources():
+            calls += [f"{rel}: {m.group(0)}" for m in banned.finditer(src)]
+            if probing.search(src):
+                probes.append(rel)
+        self.assertEqual(calls, [])
+        self.assertEqual(probes, [])
 
     def test_hooks_module_deleted_and_unimported(self):
         """The per-backend hooks module (the previous owner of backend-side

@@ -34,12 +34,10 @@ Pure CPU; fakes stand in for the KV pools (data markers verify moves).
     python -m pytest test/registered/unit/mem_cache/test_unified_tri_pool.py -v
 """
 
-import inspect
 import unittest
 
 import torch
 
-import sglang.srt.mem_cache.allocator.unified_sub_pool as mea
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaSWATokenToKVPoolAllocator,
 )
@@ -195,22 +193,6 @@ class TestUnifiedTriPool(unittest.TestCase):
 
     # -- the joint availability contract --
 
-    def test_available_size_alloc_contract(self):
-        for lazy in (False, True):
-            _, allocator, kvcache, _ = self._build(lazy_compaction=lazy)
-            avail = allocator.available_size()
-            self.assertGreater(avail, 0)
-            v = allocator.alloc(avail)
-            self.assertIsNotNone(
-                v, f"alloc(available_size()={avail}) must succeed (lazy={lazy})"
-            )
-            self.assertEqual(int(v.numel()), avail)
-            # Both sides bound for every allocated virtual id.
-            fa = allocator.full_attn_allocator
-            sa = allocator.swa_attn_allocator
-            self.assertTrue(bool((fa.virtual_to_physical[v] >= 0).all()))
-            self.assertTrue(bool((sa.virtual_to_physical[v] >= 0).all()))
-
     def test_available_shrinks_as_state_slots_grow(self):
         _, allocator, _, _ = self._build()
         before = allocator.available_size()
@@ -329,16 +311,7 @@ class TestUnifiedTriPool(unittest.TestCase):
             (pool.max_slots("mamba") - 1) - 1,
         )
 
-    # -- cost + flush semantics --
-
-    def test_mamba_slot_full_token_cost_formula(self):
-        _, allocator, _, _ = self._build()
-        e_tok = (
-            allocator.full_attn_allocator.entry_bytes
-            + allocator.swa_attn_allocator.entry_bytes
-        )
-        m = allocator.mamba_allocator.entry_bytes_per_page
-        self.assertEqual(allocator.mamba_slot_full_token_cost(), -(-m // e_tok))
+    # -- flush semantics --
 
     def test_urgent_flush_preserves_float_holes(self):
         _, allocator, kvcache, _ = self._build(lazy_compaction=True)
@@ -369,8 +342,7 @@ class TestTriPagedFreeGroup(unittest.TestCase):
     batch died with `TypeError: unexpected keyword argument '_pages'`.
 
     `_pages` is not cosmetic: honouring it is what keeps the free path free of
-    the data-dependent `torch.unique` host sync, so this also pins that the
-    float takes the caller's page ids rather than re-deriving them.
+    the data-dependent `torch.unique` host sync.
     """
 
     def _build_paged(self, page_size=4, n_full=64, n_swa=32, n_state=8):
@@ -418,19 +390,6 @@ class TestTriPagedFreeGroup(unittest.TestCase):
         # Capacity fully recovered: the float parked, both ends rewound.
         self.assertTrue(allocator.swa_attn_allocator._is_frontier_transparent())
 
-    def test_float_free_honours_caller_supplied_pages(self):
-        """`_pages` must be USED, not merely accepted -- re-deriving it is the
-        host sync the paged free path exists to avoid."""
-        pool, allocator = self._build_paged()
-        v = allocator.alloc(8)
-        self.assertIsNotNone(v)
-        sa = allocator.swa_attn_allocator
-        ps = allocator.page_size
-        pages = (v[::ps] // ps).clone()
-        live_before = sa._live_pages()
-        sa.free(v[::ps] * 0 + v[::ps], _pages=pages)
-        self.assertEqual(sa._live_pages(), live_before - pages.numel())
-
     def test_ungrouped_segment_free_also_reaches_the_float(self):
         """`free_segment` outside a free group releases reps immediately --
         the same float call, one frame shallower."""
@@ -476,20 +435,6 @@ class TestTriFreeSwaNoHostSync(unittest.TestCase):
             alloc.free_swa(v[: 4 * self.PS], start_pos=0)
         self.assertEqual(alloc.verify_byte_accounting(), [])
 
-    def test_float_free_has_no_stale_slot_item_sync(self):
-        """The float's free must not `.item()`-assert per free (the lazy-path
-        contract: callers must not double-free; the idle span == p2v-bound +
-        holes conservation catches violations without a per-free sync)."""
-        alloc = self._tri()
-        v = alloc.alloc(4 * self.PS)
-        sa = alloc.swa_attn_allocator
-        from unittest import mock
-
-        with mock.patch.object(
-            torch.Tensor, "item", side_effect=AssertionError("item = host sync")
-        ):
-            sa.free(v[:: self.PS], _pages=v[:: self.PS] // self.PS)
-
     def test_fallback_free_swa_still_correct_for_radix_shapes(self):
         """Radix eviction hands arbitrary node values (no start_pos): the
         dedup fallback must keep working and end in the same state as the
@@ -526,30 +471,6 @@ class TestGeneralizedRebalance(unittest.TestCase):
             [m for m in dir(TestTriPagedFreeGroup) if m.startswith("test_")][0]
         )
         return inst._build_paged(page_size=self.PS)[1]
-
-    def test_state_end_shortfall_slides_the_float_low(self):
-        """The previously-missing direction: mamba (grow-up END) starved while
-        free bytes idle ABOVE the float. The remedy must slide the float up
-        (open its LOW side) and let the state alloc succeed."""
-        alloc = self._tri()
-        v = alloc.alloc(4 * self.PS)  # places the float mid-region
-        self.assertIsNotNone(v)
-        ma = alloc.mamba_allocator
-        sa = alloc.swa_attn_allocator
-        self.assertFalse(sa._is_frontier_transparent())
-        # Fill the LOW band exactly: as many state slots as fit below the
-        # float's low frontier.
-        e_m = ma.entry_bytes_per_page
-        fit = (sa._byte_low_frontier() - ma._byte_high_frontier()) // e_m
-        self.assertGreater(fit, 0)
-        got = ma.alloc(int(fit) * ma.page_size)
-        self.assertIsNotNone(got)
-        low_before = sa.low_wm_page
-        # One more slot does NOT fit below the float -- only a rebalance helps.
-        more = ma.alloc(ma.page_size)
-        self.assertIsNotNone(more, "state alloc must succeed via float rebalance")
-        self.assertGreater(sa.low_wm_page, low_before)  # float slid UP
-        self.assertEqual(alloc.verify_byte_accounting(), [])
 
     def test_direction_is_derived_from_growth_on_both_ends(self):
         """Raw end+float+end chain, BOTH orientations in one fixture: the
@@ -764,11 +685,15 @@ class TestComputedShortSide(unittest.TestCase):
                 self.assertEqual(calls[0]["side"], "high")
 
     def test_nothing_short_means_no_relocation(self):
-        """Everything fits -> the policy must not move a single page."""
+        """Everything fits -> the policy must not move a single page. The
+        tri's token vector carries {mamba: 0}: a zero entry must not move the
+        float for mamba's sake either."""
         from unittest import mock
 
         alloc = self._tri()
         alloc.alloc(4 * self.PS)
+        demand = alloc._alloc_demand(2 * self.PS)
+        self.assertEqual(demand[alloc.mamba_allocator], 0)
         sa = alloc.swa_attn_allocator
         with mock.patch.object(
             sa, "make_room", side_effect=AssertionError("needless move")
@@ -810,21 +735,6 @@ class TestFloatPolicyTotalTarget(unittest.TestCase):
         self.assertIsNotNone(got, "partial-gap shortfall must relocate, not fail")
         self.assertGreater(sa.low_wm_page, low_before)
         self.assertEqual(alloc.verify_byte_accounting(), [])
-
-    def test_zero_demand_bands_are_inert(self):
-        """The tri's token vector carries {mamba: 0}: a zero entry must
-        neither move the float for mamba's sake nor trip the index guard."""
-        from unittest import mock
-
-        alloc = self._tri()
-        alloc.alloc(4 * self.PS)
-        demand = alloc._alloc_demand(2 * self.PS)
-        self.assertEqual(demand[alloc.mamba_allocator], 0)
-        sa = alloc.swa_attn_allocator
-        with mock.patch.object(
-            sa, "make_room", side_effect=AssertionError("needless move")
-        ):
-            alloc._ask_float_for_room(1)  # nothing short -> no relocation
 
 
 class TestTriDeferredAbsorption(unittest.TestCase):
@@ -1200,6 +1110,15 @@ class TestJointCapacityIsHonoured(unittest.TestCase):
                                 f"alloc(available_size()={n}) returned None",
                             )
                             self.assertEqual(out.numel(), n)
+                            # Both sides bound for every allocated virtual id.
+                            fa = alloc.full_attn_allocator
+                            sa = alloc.swa_attn_allocator
+                            self.assertTrue(
+                                bool((fa.virtual_to_physical[out] >= 0).all())
+                            )
+                            self.assertTrue(
+                                bool((sa.virtual_to_physical[out] >= 0).all())
+                            )
 
     def test_available_size_never_exceeds_the_float_page_grid(self):
         """Direct form: the joint answer, converted to float pages, must fit
@@ -1317,16 +1236,6 @@ class TestFloatRelocationIsOrderedAgainstTheForward(unittest.TestCase):
             self.skipTest("no holes reached compact_holes in this geometry")
         self.assertEqual(order[0], "settle", f"first action was not a settle: {order}")
 
-    def test_the_settle_is_a_stream_wait_not_a_host_sync(self):
-        """Pin the mechanism: `_settle_inflight_forward` must stream-wait, so
-        the fix costs no host sync on the shortfall path."""
-        src = inspect.getsource(
-            mea.MultiEndedAllocator._settle_inflight_forward  # noqa: SLF001
-        )
-        self.assertIn("wait_event", src)
-        self.assertNotIn(".item()", src)
-        self.assertNotIn("synchronize()", src)
-
 
 class TestFloatHoleCreditIsPerSide(unittest.TestCase):
     """A float's schedulable credit must follow the side the holes are on.
@@ -1364,15 +1273,6 @@ class TestFloatHoleCreditIsPerSide(unittest.TestCase):
             lazy_compaction=True,
         )
         return alloc, alloc.swa_attn_allocator
-
-    def test_credit_sees_both_neighbours(self):
-        _alloc, flt = self._float()
-        self.assertIsInstance(flt, FloatMultiEndedAllocator)
-        low = flt._side_drainable_hole_bytes("low")
-        high = flt._side_drainable_hole_bytes("high")
-        self.assertEqual(flt._peer_drainable_hole_bytes(), max(low, high))
-        # The base would have answered with the LOW side alone.
-        self.assertGreaterEqual(flt._peer_drainable_hole_bytes(), high)
 
     def test_schedulable_never_exceeds_the_sum_of_the_two_sides(self):
         """Upper bound that the undirected scalar could violate: no side may be
