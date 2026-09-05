@@ -384,6 +384,36 @@ def all_gather_kv_cache_for_dcp(
 _FI_A2A_STATE: Optional[dict] = None
 
 
+def _check_fi_a2a_intra_node_fallback(
+    cp_group: "GroupCoordinator", cp_size: int
+) -> None:
+    import importlib.util
+    import socket
+
+    import torch.distributed as dist
+
+    if importlib.util.find_spec("flashinfer.comm.fd_exchange") is None:
+        raise RuntimeError(
+            "--dcp-comm-backend fi_a2a on a system without MNNVL fabric memory "
+            "needs the SCM_RIGHTS fd exchange added in FlashInfer 0.6.16 "
+            "(flashinfer #3701); the installed FlashInfer has no "
+            "flashinfer.comm.fd_exchange and would use pidfd_getfd, which fails "
+            "with EPERM in a default-capability container. Upgrade FlashInfer, "
+            "or use --dcp-comm-backend a2a or ag_rs."
+        )
+
+    hosts = [None] * cp_size
+    dist.all_gather_object(hosts, socket.gethostname(), group=cp_group.device_group)
+    if len(set(hosts)) != 1:
+        raise RuntimeError(
+            "--dcp-comm-backend fi_a2a spans several nodes "
+            f"({sorted(set(hosts))}) but this system has no MNNVL fabric memory "
+            "(is_mnnvl_fabric_supported() returned False), so the FlashInfer "
+            "workspace can only be mapped within one node. Use "
+            "--dcp-comm-backend a2a or ag_rs for multi-node DCP off GB200 NVL72."
+        )
+
+
 def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
     # Call once per process BEFORE CUDA-graph capture: the FlashInfer init syncs
     # the stream and barriers cross-rank, neither of which is capturable.
@@ -416,15 +446,12 @@ def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
         TorchDistributedCommBackend,
     )
 
-    if not is_mnnvl_fabric_supported(torch.cuda.current_device()):
-        raise RuntimeError(
-            "--dcp-comm-backend fi_a2a requires MNNVL fabric memory (e.g. "
-            "GB200 NVL72); is_mnnvl_fabric_supported() returned False. Use "
-            "--dcp-comm-backend a2a or ag_rs on clusters without MNNVL."
-        )
-
     cp_size = cp_group.world_size
     cp_rank = cp_group.rank_in_group
+
+    if not is_mnnvl_fabric_supported(torch.cuda.current_device()):
+        _check_fi_a2a_intra_node_fallback(cp_group, cp_size)
+
     mapping = Mapping(
         world_size=cp_size,
         rank=cp_rank,
