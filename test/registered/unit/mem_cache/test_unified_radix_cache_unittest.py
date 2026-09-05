@@ -4982,10 +4982,9 @@ class UnifiedRadixCacheSuite:
     def _fill_full_kv(self, allocator, indices, marker):
         kv_pool = self._get_full_kv_pool(allocator)
         layer_id = kv_pool.start_layer
-        k_buf = kv_pool.get_key_buffer(layer_id)
-        v_buf = kv_pool.get_value_buffer(layer_id)
-        k_buf[indices].fill_(marker)
-        v_buf[indices].fill_(marker + 1)
+        # `buf[indices]` is an advanced-index copy — assign, never `fill_()`.
+        kv_pool.get_key_buffer(layer_id)[indices] = marker
+        kv_pool.get_value_buffer(layer_id)[indices] = marker + 1
 
     def _snapshot_full_kv(self, allocator, indices):
         kv_pool = self._get_full_kv_pool(allocator)
@@ -5000,9 +4999,9 @@ class UnifiedRadixCacheSuite:
             return
         mamba_indices = indices.reshape(-1)
         mamba_cache = req_to_token_pool.mamba_pool.mamba_cache
-        mamba_cache.temporal[:, mamba_indices].fill_(marker)
+        mamba_cache.temporal[:, mamba_indices] = marker
         for offset, conv_buf in enumerate(mamba_cache.conv, start=1):
-            conv_buf[:, mamba_indices].fill_(marker + offset)
+            conv_buf[:, mamba_indices] = marker + offset
 
     def _snapshot_mamba_state(self, req_to_token_pool, indices):
         mamba_indices = indices.reshape(-1)
@@ -7525,6 +7524,19 @@ def _component_with_cache(component_type, cache):
 class TestUnifiedRadixCacheActionRouting(CustomTestCase):
     """CacheAction routing: each type forwards to the right Controller API."""
 
+    def test_backup_publish_node_ids_collects_component_nodes_once(self):
+        comp_xfers = {
+            ComponentType.SWA: [PoolTransfer(name=PoolName.SWA, nodes_to_load=[3, 4])],
+            ComponentType.MAMBA: [
+                PoolTransfer(name=PoolName.MAMBA, nodes_to_load=[4, 5])
+            ],
+        }
+
+        self.assertEqual(
+            UnifiedRadixCache._backup_publish_node_ids(7, comp_xfers),
+            [3, 4, 5, 7],
+        )
+
     def test_apply_cache_action_routes_replace_write_through(self):
         cache = mock.MagicMock()
         action = ReplaceWriteThroughOnNodeSplit(
@@ -7993,6 +8005,27 @@ class TestResumableInsertWalk(_InsertWalkSuite):
             with self.assertRaises(RuntimeError):
                 cache.evict(EvictParams(num_tokens=8))
         self.assertEqual(allocator.available_size(), available + 4)
+
+    def test_write_through_publish_list_is_ordered_ancestors_first(self):
+        """One ack spanning several nodes publishes a parent before its children,
+        whatever order the component transfers listed them in."""
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
+        (parent,) = _node_children(cache, cache.root_node_handle())
+        self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4, 5, 6])
+        (child,) = _node_children(cache, parent)
+
+        cache._track_write_through_node(
+            child, lock_params=None, publish_node_ids=[child, parent]
+        )
+
+        self.assertEqual(
+            cache.ongoing_write_through[child].publish_node_ids, [parent, child]
+        )
+        cache._finish_write_through_ack(child)
+        self.assertIsNone(cache.tree_core.get_write_through_pending_id(parent))
+        self.assertIsNone(cache.tree_core.get_write_through_pending_id(child))
+        cache.sanity_check()
 
     def test_match_split_relocation_survives_finalizer_failure(self):
         """A match-walk split's pending write-through relocation applies before

@@ -17,7 +17,7 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     unified_memory_disagg_move_gate,
 )
-from sglang.srt.mem_cache.multi_ended_allocator import MultiEndedKVAllocator
+from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedKVAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

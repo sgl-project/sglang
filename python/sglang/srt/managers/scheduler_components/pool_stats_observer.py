@@ -12,7 +12,7 @@ from typing import (
 )
 
 from sglang.srt.mem_cache.allocator.hybrid import BaseHybridSWAKVAllocator
-from sglang.srt.mem_cache.multi_ended_allocator import (
+from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaHybridSWAKVAllocator,
 )
 
