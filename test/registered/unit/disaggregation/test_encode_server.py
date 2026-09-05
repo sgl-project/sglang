@@ -1,8 +1,9 @@
 import asyncio
 import pickle
+import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
 import torch
@@ -23,7 +24,14 @@ from sglang.srt.disaggregation.encoder.server import (
     rid_to_receive_count,
     rid_to_receive_endpoint,
 )
+from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+    MooncakeTransferEngine,
+)
 from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.mem_cache.multimodal_cache import (
+    EmbeddingResult,
+    MultiModalStaticCache,
+)
 from sglang.srt.utils.common import safe_pickle_loads
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -130,6 +138,129 @@ class TestEncoderPreprocessorKimiGrid(CustomTestCase):
 
 
 class TestEncoderDelivery(CustomTestCase):
+    @staticmethod
+    def _global_cache_context(num_items=2):
+        return SimpleNamespace(
+            req_id="req",
+            num_items=num_items,
+            str_mm_hashes=[f"hash-{i}" for i in range(num_items)],
+            modality=Modality.IMAGE,
+            preprocess_result=SimpleNamespace(token_counts=[2] * num_items),
+        )
+
+    @staticmethod
+    def _make_prefix_cache_encoder_and_context(get_feature_fn):
+        encoder = MMEncoder.__new__(MMEncoder)
+        encoder.mm_cache = MultiModalStaticCache(1024 * 1024)
+        encoder.mm_cache_lock = asyncio.Lock()
+        item = SimpleNamespace(hash=123, set_pad_value=lambda: None)
+        encoder._build_model_mm_items = Mock(return_value=[item])
+        ctx = SimpleNamespace(
+            req_id="req",
+            modality=Modality.IMAGE,
+            num_items=1,
+            mm_feature=None,
+            preprocess_result=SimpleNamespace(token_counts=[2], mm_inputs={}),
+            get_feature_fn=get_feature_fn,
+            is_health_check=False,
+            items_per_req=[1],
+            aux_data={},
+        )
+        return encoder, ctx
+
+    def test_invalid_fresh_embedding_is_not_cached(self):
+        async def run():
+            for actual_tokens in (1, 3):
+                with self.subTest(actual_tokens=actual_tokens):
+                    get_feature_fn = Mock(return_value=torch.zeros((actual_tokens, 4)))
+                    encoder, ctx = self._make_prefix_cache_encoder_and_context(
+                        get_feature_fn
+                    )
+
+                    with (
+                        patch(
+                            "sglang.srt.disaggregation.encoder.server.get_mm",
+                            return_value=SimpleNamespace(enable_prefix_mm_cache=True),
+                        ),
+                        self.assertRaisesRegex(
+                            InternalError,
+                            f"Encoder produced {actual_tokens} tokens, but "
+                            "preprocessor metadata expected 2",
+                        ),
+                    ):
+                        await encoder._compute_direct_embedding(ctx, keep_on_gpu=False)
+
+                    self.assertEqual(len(encoder.mm_cache), 0)
+                    get_feature_fn.assert_called_once()
+
+        asyncio.run(run())
+
+    def test_valid_fresh_embedding_is_cached_and_reused(self):
+        async def run():
+            get_feature_fn = Mock(return_value=torch.zeros((2, 4)))
+            encoder, ctx = self._make_prefix_cache_encoder_and_context(get_feature_fn)
+
+            with patch(
+                "sglang.srt.disaggregation.encoder.server.get_mm",
+                return_value=SimpleNamespace(enable_prefix_mm_cache=True),
+            ):
+                first = await encoder._compute_direct_embedding(ctx, keep_on_gpu=False)
+                second = await encoder._compute_direct_embedding(ctx, keep_on_gpu=False)
+
+            torch.testing.assert_close(first, second)
+            self.assertEqual(len(encoder.mm_cache), 1)
+            get_feature_fn.assert_called_once()
+
+        asyncio.run(run())
+
+    def test_invalid_cached_embedding_is_evicted(self):
+        async def run():
+            get_feature_fn = Mock()
+            encoder, ctx = self._make_prefix_cache_encoder_and_context(get_feature_fn)
+            mm_hash = MultiModalStaticCache.combine_hashes([123])
+            encoder.mm_cache.set(
+                mm_hash,
+                EmbeddingResult(embedding=torch.zeros((1, 4))),
+            )
+
+            with (
+                patch(
+                    "sglang.srt.disaggregation.encoder.server.get_mm",
+                    return_value=SimpleNamespace(enable_prefix_mm_cache=True),
+                ),
+                self.assertRaisesRegex(
+                    InternalError,
+                    "Encoder produced 1 tokens, but preprocessor metadata expected 2",
+                ),
+            ):
+                await encoder._compute_direct_embedding(ctx, keep_on_gpu=False)
+
+            self.assertEqual(len(encoder.mm_cache), 0)
+            get_feature_fn.assert_not_called()
+
+        asyncio.run(run())
+
+    def test_background_task_failure_is_observed(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.background_tasks = set()
+
+            async def fail():
+                raise RuntimeError("background failure")
+
+            with patch(
+                "sglang.srt.disaggregation.encoder.server.logger.exception"
+            ) as log_exception:
+                task = encoder._create_background_task(fail())
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+
+            self.assertTrue(task.done())
+            self.assertNotIn(task, encoder.background_tasks)
+            log_exception.assert_called_once_with("MMEncoder background task failed")
+
+        asyncio.run(run())
+
     def test_contract_has_two_direct_implementations(self):
         self.assertEqual(EncoderDelivery.__abstractmethods__, {"send", "release"})
         self.assertEqual(
@@ -139,6 +270,116 @@ class TestEncoderDelivery(CustomTestCase):
                 ZmqDelivery,
             },
         )
+
+    @staticmethod
+    def _make_mooncake_send(engine):
+        embedding = torch.zeros((2, 4), dtype=torch.float32)
+        mm_data = EmbeddingData(
+            "req",
+            1,
+            0,
+            None,
+            Modality.IMAGE,
+            embedding=embedding,
+        )
+        encoder = MMEncoder.__new__(MMEncoder)
+        encoder._element_size = embedding.element_size()
+        encoder.engine = engine
+        return encoder, embedding, mm_data
+
+    def test_mooncake_fallback_registration_is_released_after_transfer_error(self):
+        async def run():
+            events = []
+
+            def register(*_):
+                events.append("register")
+
+            def transfer_sync(*_):
+                events.append("transfer")
+                raise RuntimeError("transfer failed")
+
+            def deregister(*_):
+                events.append("deregister")
+
+            engine = SimpleNamespace(
+                register=register,
+                transfer_sync=transfer_sync,
+                deregister=deregister,
+            )
+            encoder, embedding, mm_data = self._make_mooncake_send(engine)
+
+            with (
+                patch(
+                    "sglang.srt.disaggregation.encoder.server.get_disagg",
+                    return_value=SimpleNamespace(encoder_transfer_backend="mooncake"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "transfer failed"),
+            ):
+                await encoder._send(
+                    embedding,
+                    mm_data,
+                    session_id="session",
+                    buffer_address=1,
+                )
+
+            self.assertEqual(events, ["register", "transfer", "deregister"])
+
+        asyncio.run(run())
+
+    def test_mooncake_cancel_waits_before_releasing_fallback_registration(self):
+        async def run():
+            events = []
+            transfer_started = threading.Event()
+            finish_transfer = threading.Event()
+
+            def register(*_):
+                events.append("register")
+
+            def transfer_sync(*_):
+                events.append("transfer-start")
+                transfer_started.set()
+                finish_transfer.wait(timeout=2)
+                events.append("transfer-finish")
+                return 0
+
+            def deregister(*_):
+                events.append("deregister")
+
+            engine = SimpleNamespace(
+                register=register,
+                transfer_sync=transfer_sync,
+                deregister=deregister,
+            )
+            encoder, embedding, mm_data = self._make_mooncake_send(engine)
+
+            with patch(
+                "sglang.srt.disaggregation.encoder.server.get_disagg",
+                return_value=SimpleNamespace(encoder_transfer_backend="mooncake"),
+            ):
+                send_task = asyncio.create_task(
+                    encoder._send(
+                        embedding,
+                        mm_data,
+                        session_id="session",
+                        buffer_address=1,
+                    )
+                )
+                self.assertTrue(await asyncio.to_thread(transfer_started.wait, 1))
+                send_task.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(send_task.done())
+                self.assertNotIn("deregister", events)
+
+                finish_transfer.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await send_task
+
+            self.assertEqual(
+                events,
+                ["register", "transfer-start", "transfer-finish", "deregister"],
+            )
+
+        asyncio.run(run())
 
     def test_zmq_delivery_cleanup_is_configurable(self):
         async def run():
@@ -214,6 +455,90 @@ class TestEncoderDelivery(CustomTestCase):
 
         asyncio.run(run())
 
+    def test_global_cache_lookup_failure_falls_back_to_all_misses(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.rank = 0
+            encoder.mm_global_cache = SimpleNamespace(
+                batch_is_exist=AsyncMock(side_effect=RuntimeError("store down"))
+            )
+            encoder._broadcast_global_cache_mask = unittest.mock.Mock()
+
+            missing_indices, hit_indices = await encoder._lookup_global_cache(
+                self._global_cache_context()
+            )
+
+            self.assertEqual(missing_indices, [0, 1])
+            self.assertEqual(hit_indices, [])
+            torch.testing.assert_close(
+                encoder._broadcast_global_cache_mask.call_args.args[0],
+                torch.zeros(2, dtype=torch.int32),
+            )
+
+        asyncio.run(run())
+
+    def test_global_cache_prefetch_failure_immediately_falls_back(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.rank = 0
+            encoder.mm_global_cache = SimpleNamespace(
+                prefetch=unittest.mock.Mock(side_effect=RuntimeError("store down"))
+            )
+            encoder._broadcast_global_cache_mask = unittest.mock.Mock()
+            ctx = self._global_cache_context()
+
+            hit_hashes, failed = encoder._prefetch_global_cache_hits(ctx, [0, 1])
+            fallback_indices = await encoder._wait_global_cache_prefetch(
+                ctx, [0, 1], hit_hashes, failed
+            )
+
+            self.assertTrue(failed)
+            self.assertEqual(hit_hashes, [])
+            self.assertEqual(fallback_indices, [0, 1])
+            torch.testing.assert_close(
+                encoder._broadcast_global_cache_mask.call_args.args[0],
+                torch.ones(2, dtype=torch.int32),
+            )
+
+        asyncio.run(run())
+
+    def test_global_cache_staging_failure_skips_insert(self):
+        encoder = MMEncoder.__new__(MMEncoder)
+        encoder.mm_global_cache = SimpleNamespace(
+            store_to_pool_async=unittest.mock.Mock(
+                side_effect=RuntimeError("pool full")
+            )
+        )
+
+        hashes, handles = encoder._stage_global_cache_slices(
+            self._global_cache_context(num_items=1),
+            [0],
+            [torch.ones((2, 4))],
+        )
+
+        self.assertEqual(hashes, [])
+        self.assertEqual(handles, [])
+
+    def test_global_cache_insert_failure_is_contained(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.background_tasks = set()
+            encoder.mm_global_cache = SimpleNamespace(
+                wait_store_to_pool=unittest.mock.Mock(
+                    side_effect=RuntimeError("store down")
+                ),
+                insert_batch=unittest.mock.Mock(),
+            )
+
+            encoder._launch_global_cache_insert(
+                self._global_cache_context(num_items=1), ["hash-0"], [object()]
+            )
+            await asyncio.gather(*encoder.background_tasks)
+
+            encoder.mm_global_cache.insert_batch.assert_not_called()
+
+        asyncio.run(run())
+
     def test_mooncake_embedding_is_ready_only_after_cuda_sync(self):
         class FakeCudaEmbedding:
             shape = (2, 4)
@@ -228,7 +553,9 @@ class TestEncoderDelivery(CustomTestCase):
         encoder = MMEncoder.__new__(MMEncoder)
         encoder.rank = 0
         events = []
-        encoder._stage_embedding = lambda mm_data: events.append("ready")
+        state = ReqState("req", active_encodes=1)
+        state.embedding_ready = SimpleNamespace(set=lambda: events.append("ready"))
+        encoder.req_states = {"req": state}
         ctx = SimpleNamespace(
             req_id="req",
             modality=Modality.IMAGE,
@@ -251,6 +578,71 @@ class TestEncoderDelivery(CustomTestCase):
             )
 
         self.assertEqual(events, ["sync", "ready"])
+
+    def test_shared_mr_registration_failure_keeps_send_fallback_enabled(self):
+        encoder = MMEncoder.__new__(MMEncoder)
+        encoder.engine = unittest.mock.Mock()
+        encoder.engine.register.side_effect = RuntimeError("register failed")
+        embedding = torch.ones((2, 4))
+        mm_data = EmbeddingData(
+            "req", 1, 0, [[1, 1, 1]], Modality.IMAGE, embedding=embedding
+        )
+
+        encoder._register_shared_mr(mm_data, embedding)
+
+        self.assertIsNone(mm_data._mr_ptr)
+
+    def test_fused_staging_rolls_back_mrs_before_any_result_is_published(self):
+        encoder = MMEncoder.__new__(MMEncoder)
+        encoder.rank = 0
+        encoder.engine = Mock()
+        first_state = ReqState("req-0", active_encodes=1)
+        second_metadata = EmbeddingData(
+            "req-1",
+            1,
+            0,
+            [[1, 1, 1]],
+            Modality.IMAGE,
+            embedding_shape=[2, 4],
+            dtype=torch.float32,
+        )
+        second_state = ReqState(
+            "req-1", embedding_data=second_metadata, active_encodes=1
+        )
+        encoder.req_states = {"req-0": first_state, "req-1": second_state}
+        ctx = SimpleNamespace(
+            req_id="req-0",
+            modality=Modality.IMAGE,
+            items_per_req=[1, 1],
+            preprocess_result=SimpleNamespace(
+                token_counts=[1, 1],
+                grid_thw=[[1, 1, 1], [1, 1, 1]],
+            ),
+            aux_data={},
+            use_global_cache=False,
+        )
+        requests = [
+            {"req_id": "req-0", "num_parts": 1, "part_idx": 0},
+            {"req_id": "req-1", "num_parts": 1, "part_idx": 0},
+        ]
+
+        with self.assertRaisesRegex(InternalError, "Embedding metadata mismatch"):
+            encoder._stage_embeddings(
+                ctx, requests, torch.ones((2, 4)), keep_on_gpu=True
+            )
+
+        registered_ptrs = [
+            call.args[0] for call in encoder.engine.register.call_args_list
+        ]
+        deregistered_ptrs = [
+            call.args[0] for call in encoder.engine.deregister.call_args_list
+        ]
+        self.assertEqual(len(registered_ptrs), 2)
+        self.assertCountEqual(deregistered_ptrs, registered_ptrs)
+        self.assertIsNone(first_state.embedding_data)
+        self.assertIs(second_state.embedding_data, second_metadata)
+        self.assertFalse(first_state.embedding_ready.is_set())
+        self.assertFalse(second_state.embedding_ready.is_set())
 
     def test_stage_embedding_does_not_resurrect_missing_state(self):
         encoder = MMEncoder.__new__(MMEncoder)
@@ -533,6 +925,27 @@ class TestEncoderDelivery(CustomTestCase):
             self.assertNotIn("req", encoder.req_states)
 
         asyncio.run(run())
+
+
+class TestMooncakeRegistration(CustomTestCase):
+    def setUp(self):
+        self.engine = MooncakeTransferEngine.__new__(MooncakeTransferEngine)
+        self.engine.engine = unittest.mock.Mock()
+
+    def test_register_raises_on_nonzero_status(self):
+        self.engine.engine.register_memory.return_value = -1
+
+        with self.assertRaisesRegex(RuntimeError, "registration failed.*ret=-1"):
+            self.engine.register(1234, 4096)
+
+    def test_deregister_preserves_backend_failure(self):
+        backend_error = OSError("backend failed")
+        self.engine.engine.unregister_memory.side_effect = backend_error
+
+        with self.assertRaisesRegex(RuntimeError, "deregistration failed") as ctx:
+            self.engine.deregister(1234)
+
+        self.assertIs(ctx.exception.__cause__, backend_error)
 
 
 if __name__ == "__main__":

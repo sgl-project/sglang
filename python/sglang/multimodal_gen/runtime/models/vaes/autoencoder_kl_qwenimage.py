@@ -37,11 +37,88 @@ from sglang.multimodal_gen.runtime.models.vaes.common import (
     has_decode_parallel_world,
     should_run_spatial_shard_parallel_decode,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+if current_platform.is_cuda():
+    try:
+        from sglang.kernels.ops.diffusion import cat_pad_channels_last_3d
+    except ImportError:  # pragma: no cover
+        cat_pad_channels_last_3d = None
+else:
+    cat_pad_channels_last_3d = None
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
 CACHE_T = 2
+
+
+def _fused_conv_cache_supported(conv: nn.Module, x: torch.Tensor) -> bool:
+    """The fused cat+pad writes channels_last_3d, so it only pays off (and is
+    only exercised) when the conv weights are channels_last_3d too; the kernel
+    symbol being present already implies a CUDA platform."""
+    return (
+        cat_pad_channels_last_3d is not None
+        and type(conv) is QwenImageCausalConv3d
+        and x.dim() == 5
+        and x.is_cuda
+        and conv.weight.is_contiguous(memory_format=torch.channels_last_3d)
+        and not torch.compiler.is_compiling()
+    )
+
+
+def _run_cached_causal_conv(
+    conv: nn.Module,
+    x: torch.Tensor,
+    cache_list: list,
+    idx: int,
+) -> torch.Tensor:
+    """Run one causal conv, consuming and refreshing its feature-cache slot.
+
+    Same contract as the Wan VAE helper (this VAE is the Wan 2.1 VAE): the
+    fast path builds the conv input (cache frames + hidden state + padding)
+    directly in channels_last_3d with one kernel and takes the next cache
+    entry as one compact copy of that input's unpadded tail, instead of the
+    per-chunk ``clone``/``cat``/``F.pad``/relayout bookkeeping. The compact
+    cache holds exactly the reference cache values, so fused and fallback
+    chunks can interleave. Pure data movement plus zero fill, so the conv
+    input is bit-identical to the aten chain. Falls back to the original op
+    chain whenever the fused kernel does not support the request.
+    """
+    cache = cache_list[idx]
+    is_rep = isinstance(cache, str)  # "Rep" marker from QwenImageResample
+    payload = None if is_rep else cache
+    if _fused_conv_cache_supported(conv, x) and (
+        payload is None or (payload.device == x.device and payload.dtype == x.dtype)
+    ):
+        # Emit exactly the frames the reference bookkeeping would keep: the
+        # first chunk of a clip stores only its own tail (``x[:, :, -CACHE_T:]``),
+        # later chunks and the "Rep" slot always hold ``CACHE_T`` frames. This
+        # keeps single-frame (image) decodes from pinning a second full-size
+        # frame per conv site.
+        keep_t = (
+            CACHE_T if (payload is not None or is_rep) else min(CACHE_T, x.shape[2])
+        )
+        pair = cat_pad_channels_last_3d(x, payload, conv._padding, keep_cache_t=keep_t)
+        if pair is not None:
+            inp, cache_list[idx] = pair
+            return nn.Conv3d.forward(conv, inp)
+    # Original aten path (bit-identical bookkeeping).
+    cache_x = x[:, :, -CACHE_T:, :, :].clone()
+    if cache_x.shape[2] < 2 and payload is not None:
+        # cache last frame of last two chunk
+        cache_x = torch.cat(
+            [payload[:, :, -1, :, :].unsqueeze(2).to(cache_x.device), cache_x],
+            dim=2,
+        )
+    elif cache_x.shape[2] < 2 and is_rep:
+        cache_x = torch.cat(
+            [torch.zeros_like(cache_x).to(cache_x.device), cache_x],
+            dim=2,
+        )
+    out = conv(x) if payload is None else conv(x, payload)
+    cache_list[idx] = cache_x
+    return out
 
 
 class QwenImageCausalConv3d(nn.Conv3d):
@@ -88,6 +165,18 @@ class QwenImageCausalConv3d(nn.Conv3d):
 
     def forward(self, x, cache_x=None):
         padding = list(self._padding)
+        if (
+            any(padding)
+            and _fused_conv_cache_supported(self, x)
+            and (
+                cache_x is None
+                or (cache_x.device == x.device and cache_x.dtype == x.dtype)
+            )
+        ):
+            # Bit-exact: cat + pad + channels_last_3d relayout in one pass.
+            inp = cat_pad_channels_last_3d(x, cache_x, padding)
+            if inp is not None:
+                return super().forward(inp)
         x = causal_conv3d_cat_pad(x, cache_x, padding)
         return super().forward(x)
 
@@ -138,6 +227,10 @@ class QwenImageUpsample(nn.Upsample):
     """
 
     def forward(self, x):
+        if current_platform.is_amp_supported():
+            # nearest-exact is a pure gather, so bf16/fp16 is bit-identical to
+            # the fp32 round trip; skip its three full-size copies.
+            return super().forward(x)
         return super().forward(x.float()).type_as(x)
 
 
@@ -220,36 +313,7 @@ class QwenImageResample(nn.Module):
                     feat_cache[idx] = "Rep"
                     feat_idx[0] += 1
                 else:
-                    cache_x = x[:, :, -CACHE_T:, :, :].clone()
-                    if (
-                        cache_x.shape[2] < 2
-                        and feat_cache[idx] is not None
-                        and feat_cache[idx] != "Rep"
-                    ):
-                        # cache last frame of last two chunk
-                        cache_x = torch.cat(
-                            [
-                                feat_cache[idx][:, :, -1, :, :]
-                                .unsqueeze(2)
-                                .to(cache_x.device),
-                                cache_x,
-                            ],
-                            dim=2,
-                        )
-                    if (
-                        cache_x.shape[2] < 2
-                        and feat_cache[idx] is not None
-                        and feat_cache[idx] == "Rep"
-                    ):
-                        cache_x = torch.cat(
-                            [torch.zeros_like(cache_x).to(cache_x.device), cache_x],
-                            dim=2,
-                        )
-                    if feat_cache[idx] == "Rep":
-                        x = self.time_conv(x)
-                    else:
-                        x = self.time_conv(x, feat_cache[idx])
-                    feat_cache[idx] = cache_x
+                    x = _run_cached_causal_conv(self.time_conv, x, feat_cache, idx)
                     feat_idx[0] += 1
 
                     x = x.reshape(b, 2, c, t, h, w)
@@ -327,18 +391,7 @@ class QwenImageResidualBlock(nn.Module):
 
         if feat_cache is not None:
             idx = feat_idx[0]
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                cache_x = torch.cat(
-                    [
-                        feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-
-            x = self.conv1(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
+            x = _run_cached_causal_conv(self.conv1, x, feat_cache, idx)
             feat_idx[0] += 1
         else:
             x = self.conv1(x)
@@ -352,18 +405,7 @@ class QwenImageResidualBlock(nn.Module):
 
         if feat_cache is not None:
             idx = feat_idx[0]
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                cache_x = torch.cat(
-                    [
-                        feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-
-            x = self.conv2(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
+            x = _run_cached_causal_conv(self.conv2, x, feat_cache, idx)
             feat_idx[0] += 1
         else:
             x = self.conv2(x)
@@ -421,7 +463,16 @@ class QwenImageAttentionBlock(nn.Module):
         x = x.view(batch_size, time, channels, height, width)
         x = x.permute(0, 2, 1, 3, 4)
 
-        x = x + identity
+        gate = getattr(self, "_sgl_gate", None)
+        if gate is not None and gate.enabled and not torch.compiler.is_compiling():
+            # ``identity`` carries the decoder's channels_last_3d layout;
+            # putting it first makes the sum inherit that layout so the next
+            # block's fused RMSNorm+SiLU applies. The add is commutative, but
+            # the layout changes the reduction order of an eager norm that
+            # follows under fp32 autocast, so this stays quality-gated.
+            x = identity + x
+        else:
+            x = x + identity
         if self.spatial_parallel:
             x = chunk_height_for_parallel_decode(x)
         return x
@@ -565,18 +616,7 @@ class QwenImageEncoder3d(nn.Module):
     def forward(self, x, feat_cache=None, feat_idx=[0]):
         if feat_cache is not None:
             idx = feat_idx[0]
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                # cache last frame of last two chunk
-                cache_x = torch.cat(
-                    [
-                        feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-            x = self.conv_in(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
+            x = _run_cached_causal_conv(self.conv_in, x, feat_cache, idx)
             feat_idx[0] += 1
         else:
             x = self.conv_in(x)
@@ -596,18 +636,7 @@ class QwenImageEncoder3d(nn.Module):
         x = self.nonlinearity(x)
         if feat_cache is not None:
             idx = feat_idx[0]
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                # cache last frame of last two chunk
-                cache_x = torch.cat(
-                    [
-                        feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-            x = self.conv_out(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
+            x = _run_cached_causal_conv(self.conv_out, x, feat_cache, idx)
             feat_idx[0] += 1
         else:
             x = self.conv_out(x)
@@ -828,18 +857,7 @@ class QwenImageDecoder3d(nn.Module):
         ## conv1
         if feat_cache is not None:
             idx = feat_idx[0]
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                # cache last frame of last two chunk
-                cache_x = torch.cat(
-                    [
-                        feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-            x = self.conv_in(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
+            x = _run_cached_causal_conv(self.conv_in, x, feat_cache, idx)
             feat_idx[0] += 1
         else:
             x = self.conv_in(x)
@@ -856,18 +874,7 @@ class QwenImageDecoder3d(nn.Module):
         x = self.nonlinearity(x)
         if feat_cache is not None:
             idx = feat_idx[0]
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                # cache last frame of last two chunk
-                cache_x = torch.cat(
-                    [
-                        feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-            x = self.conv_out(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
+            x = _run_cached_causal_conv(self.conv_out, x, feat_cache, idx)
             feat_idx[0] += 1
         else:
             x = self.conv_out(x)
