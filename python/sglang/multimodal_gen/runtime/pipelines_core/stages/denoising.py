@@ -55,6 +55,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     quality_allows_kernel_fusions,
+    resolve_skip_softmax_params,
 )
 from sglang.multimodal_gen.runtime.breakable_cuda_graph import (
     prompt_padding as bcg_utils,
@@ -96,12 +97,16 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
     world_group_is_initialized,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.skip_softmax import (
+    set_request_skip_softmax_params,
+)
 from sglang.multimodal_gen.runtime.layers.attention.layer import (
     LocalAttention,
     UlyssesAttention,
     USPAttention,
     apply_attention_backend_override,
     prepare_attention_backend_override,
+    supports_skip_softmax,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
@@ -383,6 +388,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._attn_backend_default = self.attn_backend
         self._attn_metadata_head_size = attn_head_size
         self._attention_backend_active_override: AttentionBackendEnum | None = None
+        self._skip_softmax_forced_fa = False
 
         # cfg
         self.guidance = None
@@ -570,13 +576,37 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self, num_inference_steps: int | tuple[int, int], batch: Req
     ) -> None:
         """Apply request-dependent transformer acceleration in trace-safe order."""
-        self._maybe_override_attention_backend(batch)
+        skip_softmax_params = resolve_skip_softmax_params(
+            batch.sampling_params.skip_softmax_params
+        )
+        if skip_softmax_params is not None:
+            capability = current_platform.get_device_capability()
+            capability_tuple = (
+                (capability.major, capability.minor) if capability is not None else None
+            )
+            if capability_tuple not in ((9, 0), (10, 0), (10, 3), (10, 7)):
+                found = capability.as_version_str() if capability else "unknown"
+                raise ValueError(
+                    "skip_softmax_params requires Hopper SM90 or Blackwell "
+                    f"SM100/SM103/SM107; found {found}."
+                )
+            if (self.server_args.ring_degree or 1) > 1:
+                raise ValueError(
+                    "skip_softmax_params does not support Ring Attention because "
+                    "the ring merge requires dense per-hop softmax statistics."
+                )
+        set_request_skip_softmax_params(batch, skip_softmax_params)
+        self._maybe_override_attention_backend(
+            batch, force_fa_for_self_attention=skip_softmax_params is not None
+        )
         self._maybe_toggle_quality_fusions(batch)
         self._maybe_enable_cache_dit(num_inference_steps, batch)
         for transformer in filter(None, [self.transformer, self.transformer_2]):
             self._maybe_torch_compile(transformer)
 
-    def _maybe_override_attention_backend(self, batch: Req) -> None:
+    def _maybe_override_attention_backend(
+        self, batch: Req, *, force_fa_for_self_attention: bool = False
+    ) -> None:
         """Two-phase per-request backend switch: prepare all layers (may
         raise, mutates nothing), then flip all — a rejected request leaves the
         transformers untouched. Safe at this batch boundary because the field
@@ -584,21 +614,59 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         target = self._parse_attention_backend_override(
             batch.sampling_params.attention_backend_override
         )
-        if target == self._attention_backend_active_override:
+        if force_fa_for_self_attention and target not in (
+            None,
+            AttentionBackendEnum.FA,
+        ):
+            raise ValueError(
+                "skip_softmax_params requires the FA attention backend; "
+                f"attention_backend_override={target.name.lower()!r} is incompatible."
+            )
+        if (
+            target == self._attention_backend_active_override
+            and force_fa_for_self_attention == self._skip_softmax_forced_fa
+        ):
             return
         layers = self._request_switchable_attention_layers()
         stage_backend = self._attn_backend_default
+        layer_targets: list[tuple[nn.Module, AttentionBackendEnum | None]]
         if target is not None:
             stage_backend = self._validate_attention_backend_override(target, layers)
-            for layer in layers:
-                prepare_attention_backend_override(layer, target)
-        for layer in layers:
-            apply_attention_backend_override(layer, target)
+            layer_targets = [(layer, target) for layer in layers]
+        elif force_fa_for_self_attention:
+            self_attention_layers = [
+                layer for layer in layers if supports_skip_softmax(layer)
+            ]
+            if self_attention_layers:
+                stage_backend = self._validate_attention_backend_override(
+                    AttentionBackendEnum.FA, self_attention_layers
+                )
+            elif layers or self.attn_backend.get_enum() is not AttentionBackendEnum.FA:
+                self._validate_attention_backend_override(
+                    AttentionBackendEnum.FA, self_attention_layers
+                )
+            layer_targets = [
+                (
+                    layer,
+                    (AttentionBackendEnum.FA if supports_skip_softmax(layer) else None),
+                )
+                for layer in layers
+            ]
+        else:
+            layer_targets = [(layer, None) for layer in layers]
+
+        for layer, layer_target in layer_targets:
+            if layer_target is not None:
+                prepare_attention_backend_override(layer, layer_target)
+        for layer, layer_target in layer_targets:
+            apply_attention_backend_override(layer, layer_target)
         self.attn_backend = stage_backend
         self._attention_backend_active_override = target
+        self._skip_softmax_forced_fa = force_fa_for_self_attention
         logger.debug(
-            "Attention backend for this batch: %s (%d layers switched)",
+            "Attention backend for this batch: %s%s (%d layers considered)",
             target.name.lower() if target else "server default",
+            "; FA for self-attention" if force_fa_for_self_attention else "",
             len(layers),
         )
 
