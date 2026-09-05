@@ -250,25 +250,33 @@ inline void canary_write_step_cuda(
 
   SymbolicSize N_real_kv_rows_0 = {"real_kv_rows_0"};
   SymbolicSize N_real_kv_cols_0 = {"real_kv_cols_0"};
+  SymbolicSize N_real_kv_stride_0 = {"real_kv_stride_0"};
   TensorMatcher({N_real_kv_rows_0, N_real_kv_cols_0})
+      .with_strides({N_real_kv_stride_0, 1})
       .with_dtype<uint8_t>()
       .with_device<kDLGPU>(device_)
       .verify(real_kv_buf_0);
   SymbolicSize N_real_kv_rows_1 = {"real_kv_rows_1"};
   SymbolicSize N_real_kv_cols_1 = {"real_kv_cols_1"};
+  SymbolicSize N_real_kv_stride_1 = {"real_kv_stride_1"};
   TensorMatcher({N_real_kv_rows_1, N_real_kv_cols_1})
+      .with_strides({N_real_kv_stride_1, 1})
       .with_dtype<uint8_t>()
       .with_device<kDLGPU>(device_)
       .verify(real_kv_buf_1);
   SymbolicSize N_real_kv_rows_2 = {"real_kv_rows_2"};
   SymbolicSize N_real_kv_cols_2 = {"real_kv_cols_2"};
+  SymbolicSize N_real_kv_stride_2 = {"real_kv_stride_2"};
   TensorMatcher({N_real_kv_rows_2, N_real_kv_cols_2})
+      .with_strides({N_real_kv_stride_2, 1})
       .with_dtype<uint8_t>()
       .with_device<kDLGPU>(device_)
       .verify(real_kv_buf_2);
   SymbolicSize N_real_kv_rows_3 = {"real_kv_rows_3"};
   SymbolicSize N_real_kv_cols_3 = {"real_kv_cols_3"};
+  SymbolicSize N_real_kv_stride_3 = {"real_kv_stride_3"};
   TensorMatcher({N_real_kv_rows_3, N_real_kv_cols_3})
+      .with_strides({N_real_kv_stride_3, 1})
       .with_dtype<uint8_t>()
       .with_device<kDLGPU>(device_)
       .verify(real_kv_buf_3);
@@ -329,7 +337,7 @@ inline void canary_write_step_cuda(
   tvm::ffi::TensorView source_bufs[kMaxRealKvSources] = {real_kv_buf_0, real_kv_buf_1, real_kv_buf_2, real_kv_buf_3};
   for (int s = 0; s < kMaxRealKvSources; ++s) {
     p.sources[s].tensor = static_cast<const uint8_t*>(source_bufs[s].data_ptr());
-    p.sources[s].row_stride_bytes = static_cast<int32_t>(source_bufs[s].size(1));
+    p.sources[s].row_stride_bytes = static_cast<int32_t>(source_bufs[s].stride(0));
     p.sources[s].page_size = params[s * kRealKvSourceFieldsPerEntry + kRealKvSourceFieldPageSize];
     p.sources[s].num_bytes_per_token = params[s * kRealKvSourceFieldsPerEntry + kRealKvSourceFieldNumBytesPerToken];
     p.sources[s].read_bytes = params[s * kRealKvSourceFieldsPerEntry + kRealKvSourceFieldReadBytes];

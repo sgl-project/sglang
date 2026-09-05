@@ -149,6 +149,17 @@ def _rel_proj_kernel_eligible(r: torch.Tensor) -> bool:
     )
 
 
+def _is_slot_major_nhd(buf: torch.Tensor, head_dim: int) -> bool:
+    """[slot, head, head_dim] with a contiguous (head, head_dim) row; the slot
+    stride may exceed head * head_dim (strided pool views)."""
+    return (
+        buf.dim() == 3
+        and buf.shape[-1] == head_dim
+        and buf.stride(2) == 1
+        and buf.stride(1) == head_dim
+    )
+
+
 class RelLogitsProj(nn.Module):
     def __init__(self, d_rel: int, rel_extent: int, *, deterministic: bool = False):
         super().__init__()
@@ -439,15 +450,18 @@ class InklingAttention(nn.Module):
         k_buf = pool.get_key_buffer(self.layer_id)
         v_buf = pool.get_value_buffer(self.layer_id)
         # The fused store writes raw bf16 into an NHD [slot, head, head_dim]
-        # buffer indexed by loc. Take it only for that exact layout: FP8/MXFP8
-        # (non-bf16) and HND/vectorized_5d (4D/5D, paged (page, head) index)
-        # pools keep the backend store, which owns their quant + layout. conv +
-        # windows + qk-norm stay fused regardless.
+        # buffer indexed by loc, stepping slots by the buffer's own stride (so
+        # strided per-layer pool views qualify). Take it only for that layout:
+        # FP8/MXFP8 (non-bf16) and HND/vectorized_5d (4D/5D, paged (page, head)
+        # index) pools keep the backend store, which owns their quant + layout.
+        # conv + windows + qk-norm stay fused regardless.
         do_bf16_store = (
             k_buf.dtype == torch.bfloat16
-            and k_buf.dim() == 3
-            and k_buf.shape[-1] == self.head_dim
-            and k_buf.is_contiguous()
+            and v_buf.dtype == torch.bfloat16
+            and _is_slot_major_nhd(k_buf, self.head_dim)
+            and _is_slot_major_nhd(v_buf, self.head_dim)
+            and k_buf.stride(0) == v_buf.stride(0)
+            and k_buf.stride(0) % 8 == 0
         )
         sfk = sfv = None
         do_mxfp8_store = False
@@ -458,12 +472,10 @@ class InklingAttention(nn.Module):
             do_mxfp8_store = (
                 k_buf.dtype == torch.float8_e4m3fn
                 and v_buf.dtype == torch.float8_e4m3fn
-                and k_buf.dim() == 3
-                and v_buf.dim() == 3
-                and k_buf.shape[-1] == self.head_dim
-                and v_buf.shape[-1] == self.head_dim
-                and k_buf.is_contiguous()
-                and v_buf.is_contiguous()
+                and _is_slot_major_nhd(k_buf, self.head_dim)
+                and _is_slot_major_nhd(v_buf, self.head_dim)
+                and k_buf.stride(0) == v_buf.stride(0)
+                and k_buf.stride(0) % 32 == 0
                 and sfk.dim() == 5
                 and sfv.dim() == 5
                 and getattr(pool, "page_size", 0) == 128
@@ -556,12 +568,10 @@ class InklingAttention(nn.Module):
         do_bf16_store = (
             k_buf.dtype == torch.bfloat16
             and v_buf.dtype == torch.bfloat16
-            and k_buf.dim() == 3
-            and v_buf.dim() == 3
-            and k_buf.shape[-1] == self.head_dim
-            and v_buf.shape[-1] == self.head_dim
-            and k_buf.is_contiguous()
-            and v_buf.is_contiguous()
+            and _is_slot_major_nhd(k_buf, self.head_dim)
+            and _is_slot_major_nhd(v_buf, self.head_dim)
+            and k_buf.stride(0) == v_buf.stride(0)
+            and k_buf.stride(0) % 8 == 0
         )
         sfk = sfv = None
         do_mxfp8_store = False
@@ -572,12 +582,10 @@ class InklingAttention(nn.Module):
             do_mxfp8_store = (
                 k_buf.dtype == torch.float8_e4m3fn
                 and v_buf.dtype == torch.float8_e4m3fn
-                and k_buf.dim() == 3
-                and v_buf.dim() == 3
-                and k_buf.shape[-1] == self.head_dim
-                and v_buf.shape[-1] == self.head_dim
-                and k_buf.is_contiguous()
-                and v_buf.is_contiguous()
+                and _is_slot_major_nhd(k_buf, self.head_dim)
+                and _is_slot_major_nhd(v_buf, self.head_dim)
+                and k_buf.stride(0) == v_buf.stride(0)
+                and k_buf.stride(0) % 32 == 0
                 and sfk.dim() == 5
                 and sfv.dim() == 5
                 and getattr(pool, "page_size", 0) == 128
@@ -675,12 +683,10 @@ class InklingAttention(nn.Module):
         do_bf16_store = (
             k_buf.dtype == torch.bfloat16
             and v_buf.dtype == torch.bfloat16
-            and k_buf.dim() == 3
-            and v_buf.dim() == 3
-            and k_buf.shape[-1] == self.head_dim
-            and v_buf.shape[-1] == self.head_dim
-            and k_buf.is_contiguous()
-            and v_buf.is_contiguous()
+            and _is_slot_major_nhd(k_buf, self.head_dim)
+            and _is_slot_major_nhd(v_buf, self.head_dim)
+            and k_buf.stride(0) == v_buf.stride(0)
+            and k_buf.stride(0) % 8 == 0
         )
         sfk = sfv = None
         do_mxfp8_store = False
@@ -691,12 +697,10 @@ class InklingAttention(nn.Module):
             do_mxfp8_store = (
                 k_buf.dtype == torch.float8_e4m3fn
                 and v_buf.dtype == torch.float8_e4m3fn
-                and k_buf.dim() == 3
-                and v_buf.dim() == 3
-                and k_buf.shape[-1] == self.head_dim
-                and v_buf.shape[-1] == self.head_dim
-                and k_buf.is_contiguous()
-                and v_buf.is_contiguous()
+                and _is_slot_major_nhd(k_buf, self.head_dim)
+                and _is_slot_major_nhd(v_buf, self.head_dim)
+                and k_buf.stride(0) == v_buf.stride(0)
+                and k_buf.stride(0) % 32 == 0
                 and sfk.dim() == 5
                 and sfv.dim() == 5
                 and getattr(pool, "page_size", 0) == 128
