@@ -34,11 +34,13 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.diffusion import (
+    can_use_vdn_delta_factors,
     can_use_vdn_frame_stats_prep,
     can_use_vdn_gather_linear_state,
     can_use_vdn_linear_epilogue,
     can_use_vdn_silu_l2norm,
     can_use_vdn_temporal_conv_act,
+    vdn_delta_factors,
     vdn_frame_stats_prep,
     vdn_gather_linear_state,
     vdn_linear_epilogue,
@@ -490,6 +492,7 @@ def delta_factor_apply(
     B: torch.Tensor,
     *,
     tokens_per_frame: int,
+    fused: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One frame's statistics -> (transition [F,H,dk,dk], injection [F,H,dv,dk]) fp32.
 
@@ -497,6 +500,10 @@ def delta_factor_apply(
                exact Cholesky inverse.
     sana_scaled: S' = (S diag(alpha))(I - c^2 A) + c B, c = 1/sqrt(S).
     vdn_scaled: S' = (S diag(alpha) + c B)(I + c^2 A)^-1.
+
+    ``fused`` takes the inverse and both products through one CUDA kernel
+    (``vdn_delta_factors``, fp32 / head_dim 128) with the same accuracy as the
+    Cholesky chain; anything the kernel does not cover falls back to eager.
     """
     A32, B32 = A.float(), B.float()
     eye = torch.eye(A32.shape[-1], device=A32.device, dtype=_FP32).expand_as(A32)
@@ -511,6 +518,14 @@ def delta_factor_apply(
         B32 = B32 * math.sqrt(inv_tokens)
     elif rule != "vdn_solve":
         raise ValueError(f"unknown delta rule {rule!r}")
+    if fused:
+        A32, B32, alpha32 = (
+            A32.contiguous(),
+            B32.contiguous(),
+            alpha.float().contiguous(),
+        )
+        if can_use_vdn_delta_factors(A32, B32, alpha32):
+            return vdn_delta_factors(A32, B32, alpha32)
     chol = torch.linalg.cholesky(A32 + eye)
     # (I+A)^-1 = L^-T L^-1: a batched trsm at 128x128 is far slower than the GEMM
     linv = torch.linalg.solve_triangular(chol, eye, upper=False, left=True)
@@ -867,7 +882,12 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         heads, head_dim = A.shape[1], self.head_dim
         ones = torch.ones(1, heads, head_dim, device=A.device, dtype=_FP32)
         _, injection = delta_factor_apply(
-            self.hybrid.delta_rule, ones, A, B, tokens_per_frame=length
+            self.hybrid.delta_rule,
+            ones,
+            A,
+            B,
+            tokens_per_frame=length,
+            fused=self.fused_kernels,
         )
         return TEXT_STATE_SCALE * injection[0]
 
@@ -1012,7 +1032,12 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         else:
             alpha_all = alpha
         transitions, injections = delta_factor_apply(
-            self.hybrid.delta_rule, alpha_all, A, B, tokens_per_frame=per_frame
+            self.hybrid.delta_rule,
+            alpha_all,
+            A,
+            B,
+            tokens_per_frame=per_frame,
+            fused=self.fused_kernels,
         )
         if text_stats is not None:
             text_state = TEXT_STATE_SCALE * injections[0]

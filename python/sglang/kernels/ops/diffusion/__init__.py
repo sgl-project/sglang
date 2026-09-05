@@ -335,6 +335,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Out-of-place fused QK-norm + RoPE (raw q/k preserved).",
     ),
     (
+        "diffusion.vdn_delta_factors",
+        KernelBackend.JIT,
+        "attention.vdn_delta_factors_jit:vdn_delta_factors",
+        _CUDA,
+        "VDN-H3 delta rule: fused (I + A)^-1 -> transition / injection (fp32, head_dim 128).",
+    ),
+    (
         "diffusion.vdn_temporal_conv_act",
         KernelBackend.TRITON,
         "attention.vdn_linear_branch_triton:vdn_temporal_conv_act",
@@ -587,6 +594,8 @@ _EXPORTS: dict[str, str] = {
     "fused_causal_conv3d_cat_pad": "layout.causal_conv3d_cat_pad_triton",
     "pack_qkv_destination_major": "layout.ulysses_qkv_triton",
     "fused_qknorm_rope_out_of_place": "rope.qknorm_rope_jit",
+    "vdn_delta_factors": "attention.vdn_delta_factors_jit",
+    "can_use_vdn_delta_factors": "attention.vdn_delta_factors_jit",
     "vdn_temporal_conv_act": "attention.vdn_linear_branch_triton",
     "can_use_vdn_temporal_conv_act": "attention.vdn_linear_branch_triton",
     "can_use_vdn_silu_l2norm": "attention.vdn_linear_branch_triton",
