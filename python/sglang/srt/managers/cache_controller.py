@@ -235,7 +235,8 @@ class StorageOperation:
         self.all_hash_values: Optional[List[str]] = None
         # Prefetch-outcome accounting, set at enqueue by the tree cache.
         self.stats_requested_tokens = 0
-        self.stats_total_tokens = 0
+        # Absolute token offset at which this storage-prefetched span starts.
+        self.storage_start = 0
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1

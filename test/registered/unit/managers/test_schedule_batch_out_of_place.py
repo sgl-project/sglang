@@ -11,7 +11,10 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
+from sglang.srt.managers.schedule_batch import (  # noqa: E402
+    ScheduleBatch,
+    split_cached_prefix_by_tier,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 from sglang.srt.utils.common import Range  # noqa: E402
@@ -19,6 +22,65 @@ from sglang.srt.utils.common import Range  # noqa: E402
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 AUTO_FILL_EXCLUDED_FIELDS = ["reqs"]
+
+
+class TestCachedPrefixTierAttribution(unittest.TestCase):
+    def test_split_cached_prefix_by_tier(self):
+        cases = [
+            (
+                {"prefix_len": 100, "host_hit_len": 70, "storage_hit_len": 20},
+                (30, 50, 20),
+            ),
+            (
+                {
+                    "prefix_len": 80,
+                    "host_hit_len": 50,
+                    "storage_hit_len": 20,
+                    "storage_hit_start": 80,
+                },
+                (30, 50, 0),
+            ),
+            (
+                {
+                    "prefix_len": 90,
+                    "host_hit_len": 60,
+                    "storage_hit_len": 20,
+                    "storage_hit_start": 80,
+                },
+                (30, 50, 10),
+            ),
+            (
+                {
+                    "prefix_len": 100,
+                    "host_hit_len": 70,
+                    "storage_hit_len": 70,
+                    "host_hit_is_storage": True,
+                },
+                (30, 0, 70),
+            ),
+            (
+                {
+                    "prefix_len": 100,
+                    "host_hit_len": 0,
+                    "storage_hit_len": 20,
+                    "storage_hit_start": 80,
+                },
+                (80, 0, 20),
+            ),
+            (
+                {
+                    "prefix_len": 100,
+                    "host_hit_len": 0,
+                    "storage_hit_len": 20,
+                    "storage_hit_start": 80,
+                    "host_hit_is_storage": True,
+                },
+                (80, 0, 20),
+            ),
+        ]
+        for kwargs, expected in cases:
+            with self.subTest(**kwargs):
+                self.assertEqual(split_cached_prefix_by_tier(**kwargs), expected)
 
 
 def make_schedule_batch(bs: int, **overrides) -> ScheduleBatch:

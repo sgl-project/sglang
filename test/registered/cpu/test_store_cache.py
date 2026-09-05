@@ -11,7 +11,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=14, suite="base-b-test-cpu")
+register_cpu_ci(est_time=14, suite="stage-a-test-cpu-intel")
 
 torch.manual_seed(42)
 
