@@ -107,6 +107,32 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
 
         fake_flash_attn.set_fa_ver.assert_called_once_with(4)
 
+    def test_hybrid_window_h3_on_sm120_uses_fa4(self):
+        FakeCudaPlatform.is_sm120_device = True
+        FakeCudaPlatform.device_capability = DeviceCapability(12, 0)
+        fa_module = "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn"
+        fake_flash_attn = ModuleType(fa_module)
+        fake_flash_attn.set_fa_ver = Mock()
+        hybrid_module = "sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_h3"
+        fake_hybrid = ModuleType(hybrid_module)
+        fake_hybrid.HybridWindowAttentionH3Backend = object
+
+        with patch.dict(
+            "sys.modules", {fa_module: fake_flash_attn, hybrid_module: fake_hybrid}
+        ):
+            self.assertEqual(
+                self.resolve(AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3),
+                f"{hybrid_module}.HybridWindowAttentionH3Backend",
+            )
+
+        fake_flash_attn.set_fa_ver.assert_called_once_with(4)
+
+    def test_hybrid_window_h3_rejects_unsupported_capability(self):
+        FakeCudaPlatform.device_capability = DeviceCapability(8, 9)
+
+        with self.assertRaisesRegex(ValueError, "12.0"):
+            self.resolve(AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3)
+
     def test_default_backend_uses_torch_sdpa_on_sm120(self):
         FakeCudaPlatform.is_sm120_device = True
 

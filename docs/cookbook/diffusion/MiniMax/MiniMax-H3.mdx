@@ -789,17 +789,19 @@ these weights would silently skip the linear branch and the softmax gates and
 produce the wrong model, so it is rejected. The window softmax runs as a union
 of dense FlashAttention varlen calls, exact to bf16 rounding. The
 linear branch runs on fused Triton kernels (temporal conv + SiLU + L2 norm,
-statistics prologue, gated RMSNorm epilogue). On Blackwell the transformer
-defaults to online MXFP8 (`--quantization fp8` selects it too, `--quantization
-bf16` opts out); the gates, beta, alpha and the conv stay bf16. Before SM100
-`--quantization fp8` is the per-channel fp8 path of base H3. Ulysses sequence parallelism is supported;
+statistics prologue, gated RMSNorm epilogue). On Blackwell (SM100 / SM103,
+and SM120 such as the RTX PRO 6000) the transformer defaults to online MXFP8
+(`--quantization fp8` selects it too, `--quantization bf16` opts out); the
+gates, beta, alpha and the conv stay bf16. Before SM100 `--quantization fp8`
+is the per-channel fp8 path of base H3. Ulysses sequence parallelism is supported;
 `--model-variant`, `quality: "high"`, `--ring-degree` greater than 1,
 `torch.compile`, and breakable CUDA graph execution are rejected. See
 [Attention Backends](/docs/sglang-diffusion/attention_backends) for the
 backend options.
 
 Measured latencies for the 4× B200 recipe are in
-[VDN-H3 on B200](#vdn-h3-on-b200).
+[VDN-H3 on B200](#vdn-h3-on-b200); single-card and PCIe multi-card numbers
+for the RTX PRO 6000 are in [VDN-H3 on RTX PRO 6000](#vdn-h3-on-rtx-pro-6000).
 
 ## 8. Sampling and output controls
 
@@ -1441,6 +1443,36 @@ shape (window FlashAttention 46 ms, projections 24 ms, the linear branch and
 its fused kernels the rest). A static-tile block-sparse Triton kernel was
 measured at 226 ms against 169 ms for the decomposed FlashAttention path and
 is not shipped.
+
+### VDN-H3 on RTX PRO 6000
+
+The same paper workload (1344×768, 345 frames, 8 DiT forwards, seed 1000,
+`hybrid_window_attn_h3`, `--performance-mode speed`, served-shape warmup) on
+RTX PRO 6000 Blackwell Server Edition cards (SM120, 96 GB, PCIe, no NVLink).
+The window runs on FA4's sm120 kernel and the transformer defaults to online
+`mxfp8` (a cutlass sm120 block-scaled GEMM); `--quantization fp8` maps to it.
+One card needs `--layerwise-offload-components text_encoder`: the fp8 DiT
+(33 GB) and the bf16 text encoder (48 GB) do not both fit, and the whole-module
+`--text-encoder-cpu-offload` re-homes the encoder in one piece and runs out of
+memory when it is used. Multi-card Ulysses goes over PCIe; the all-to-all is
+the bulk of the step there (54% of GPU time at 8 cards), so the per-card
+efficiency drops with count. A 2-card run should use a pair on one PCIe
+switch (`nvidia-smi topo -m` shows `PIX`): a pair across the CPU root complex
+measured 15.7 to 17.0 s/NFE on a shared host.
+
+| Config | Steady s/NFE | Denoise (8 forwards) | Decode | Peak/GPU |
+| --- | ---: | ---: | ---: | ---: |
+| 1× RTX PRO 6000, `--layerwise-offload-components text_encoder` (default `mxfp8`) | **20.27** | **160.0 s** | 20.6 s | 95,790 MB |
+| 1× RTX PRO 6000, same, per-channel `fp8` path (before this mapping) | 22.85 | 180.3 s | 20.7 s | 95,160 MB |
+| 2× RTX PRO 6000 Ulysses2, one PCIe switch (default `mxfp8`) | 13.61 | 107.4 s | 10.6 s | 93,846 MB |
+| 2× RTX PRO 6000 Ulysses2, one PCIe switch, per-channel `fp8` | 14.97 | 118.1 s | 10.6 s | 94,700 MB |
+| 4× RTX PRO 6000 Ulysses4 (default `mxfp8`) | 7.98 | 63.0 s | 5.6 s | 82,178 MB |
+| 4× RTX PRO 6000 Ulysses4, per-channel `fp8` | 8.23 | 65.1 s | 5.6 s | 82,422 MB |
+| 8× RTX PRO 6000 Ulysses8 (default `mxfp8`) | 5.43 | 43.1 s | 3.5 s | 77,704 MB |
+| 8× RTX PRO 6000 Ulysses8, per-channel `fp8` | 5.47 | 43.4 s | 3.5 s | 77,236 MB |
+
+For comparison the same code on B200 measures 6.23 / 3.34 / 1.73 / 0.89 s/NFE
+at 1 / 2 / 4 / 8 cards (NVLink, 87% parallel efficiency at 8).
 
 ### H200 topology comparison
 

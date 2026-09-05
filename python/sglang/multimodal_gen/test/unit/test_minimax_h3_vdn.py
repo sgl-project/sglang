@@ -123,13 +123,17 @@ def test_vdn_h3_pipeline_config_rejections() -> None:
 
 
 def test_vdn_h3_quantization_defaults_to_mxfp8_on_blackwell(monkeypatch) -> None:
-    """Online MXFP8 is the default on SM100+ and what `fp8` maps to there;
-    `bf16` opts out; before SM100 the block-scaled GEMM does not exist, so an
-    unset flag stays bf16 and `fp8` stays the per-channel path."""
+    """Online MXFP8 is the default on SM100+ (SM120 included) and what `fp8`
+    maps to there; `bf16` opts out; before SM100 the block-scaled GEMM does
+    not exist, so an unset flag stays bf16 and `fp8` stays the per-channel
+    path."""
     from sglang.multimodal_gen.configs.pipeline_configs import minimax_h3_vdn as module
 
-    def resolved(quantization: str | None, blackwell: bool) -> str | None:
+    def resolved(
+        quantization: str | None, blackwell: bool, sm120: bool = False
+    ) -> str | None:
         monkeypatch.setattr(module.current_platform, "is_blackwell", lambda: blackwell)
+        monkeypatch.setattr(module.current_platform, "is_sm120", lambda: sm120)
         args = _server_args(quantization=quantization)
         VDNH3PipelineConfig().validate_server_args(args)
         return args.quantization
@@ -139,6 +143,9 @@ def test_vdn_h3_quantization_defaults_to_mxfp8_on_blackwell(monkeypatch) -> None
     assert resolved("bf16", True) is None
     assert resolved(None, False) is None
     assert resolved("fp8", False) == "fp8"
+    assert resolved(None, False, sm120=True) == "mxfp8"
+    assert resolved("fp8", False, sm120=True) == "mxfp8"
+    assert resolved("bf16", False, sm120=True) is None
 
 
 def test_hybrid_arch_config_from_transform_config_and_mapping() -> None:

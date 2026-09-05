@@ -36,9 +36,14 @@ class VDNH3PipelineConfig(MiniMaxH3PipelineConfig):
         quantization = (server_args.quantization or "").lower()
         if quantization in ("none", "bf16"):
             server_args.quantization = None
-        elif current_platform.is_blackwell() and quantization in ("", "fp8"):
-            # the default: online MXFP8 on cuBLASLt, 0.93 s/NFE on 8x B200 against
-            # 1.05 per-channel fp8; the block-scaled GEMM needs SM100
+        elif (
+            current_platform.is_blackwell() or current_platform.is_sm120()
+        ) and quantization in ("", "fp8"):
+            # the default: online MXFP8, 0.93 s/NFE on 8x B200 against 1.05
+            # per-channel fp8. The block-scaled GEMM needs SM100+; on SM120
+            # (RTX PRO 6000) it is a cutlass sm120 block-scaled kernel that beats
+            # the per-channel path's generic GEMM by 37% (1 GPU: 20.3 vs 22.8
+            # s/NFE on the paper workload).
             server_args.quantization = "mxfp8"
         # an unset backend would resolve to the platform default (dense FA)
         if server_args.attention_backend is None and not (
