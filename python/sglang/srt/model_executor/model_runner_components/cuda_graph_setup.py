@@ -564,6 +564,12 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
                 "xpu": XPUGraphRunner,
             },
         )
+        if model_runner.device == "npu" and model_runner.spec_algorithm.is_uno():
+            from sglang.srt.hardware_backend.npu.graph_runner.uno_npu_graph_runner import (
+                UnoNPUGraphRunner,
+            )
+
+            graph_runners["npu"] = UnoNPUGraphRunner
         runner = graph_runners[model_runner.device](model_runner)
 
     after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
