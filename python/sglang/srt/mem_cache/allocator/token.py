@@ -74,6 +74,10 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
 
+    def free_page_reps(self, reps: torch.Tensor):
+        # page_size == 1: a page's representative is the page.
+        self.free(reps)
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
 

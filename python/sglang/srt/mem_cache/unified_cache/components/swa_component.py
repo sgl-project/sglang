@@ -1424,7 +1424,8 @@ class SWAComponent(TreeComponent):
         alloc = self.cache.token_to_kv_pool_allocator
         if isinstance(action, FreeComponentDeviceSlot):
             for indices in action.indices:
-                alloc.free_swa(indices)
+                # Component values are page-aligned copies of a kv row.
+                alloc.free_swa(indices, start_pos=0)
             return
         if isinstance(action, FreeComponentHostSlot):
             for host_indices in action.host_indices:

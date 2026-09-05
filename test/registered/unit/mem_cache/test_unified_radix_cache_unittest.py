@@ -7866,7 +7866,9 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         _component_with_cache(ComponentType.SWA, cache).apply_component_action(
             FreeComponentDeviceSlot([indices], component_type=ComponentType.SWA)
         )
-        cache.token_to_kv_pool_allocator.free_swa.assert_called_once_with(indices)
+        cache.token_to_kv_pool_allocator.free_swa.assert_called_once_with(
+            indices, start_pos=0
+        )
 
     def test_apply_component_action_device_kv_mamba_uses_mamba_allocator(self):
         cache = mock.MagicMock()

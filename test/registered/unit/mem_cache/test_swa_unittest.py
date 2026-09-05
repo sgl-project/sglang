@@ -299,14 +299,20 @@ class TestSWA(unittest.TestCase):
         )
 
     def test_free_swa_group_owns_deferred_indices(self):
+        for page_size in (1, 4):
+            with self.subTest(page_size=page_size):
+                self._free_swa_group_owns_deferred_indices(page_size)
+
+    def _free_swa_group_owns_deferred_indices(self, page_size):
         _, allocator, _ = _build_swa_tree(
             is_eagle=False,
-            kv_size=32,
-            kv_size_swa=32,
+            page_size=page_size,
+            kv_size=32 * page_size,
+            kv_size_swa=32 * page_size,
         )
         index_batches = []
         for size in (2, 3, 1, 4):
-            indices = _swa_alloc(allocator, size)
+            indices = _swa_alloc(allocator, size * page_size)
             assert indices is not None
             index_batches.append(indices)
         original_indices = torch.cat([indices.clone() for indices in index_batches])
@@ -314,9 +320,10 @@ class TestSWA(unittest.TestCase):
         available_before_free = allocator.swa_available_size()
         allocator.free_group_begin()
         for indices in index_batches:
-            allocator.free_swa(indices)
+            allocator.free_swa(indices, start_pos=0)
 
-        self.assertEqual(len(allocator.swa_free_group), len(index_batches))
+        # The reps were gathered at enqueue time, not from these views.
+        self.assertEqual(len(allocator.swa_page_reps_group), len(index_batches))
         self.assertEqual(allocator.swa_available_size(), available_before_free)
         for indices in index_batches:
             indices.zero_()
@@ -1144,12 +1151,54 @@ class TestSWAPeerMappedContract(CustomTestCase):
     def _strict(self):
         return envs.SGLANG_INVARIANT_CHECK.override(int(InvariantCheckLevel.STRICT))
 
-    def _condition_checked_by(self, allocator, indices):
+    def _condition_checked_by(self, allocator, indices, **kwargs):
         """The predicate free_swa hands the async assert, as a python bool."""
         with self._strict():
             with mock.patch.object(torch, "_assert_async") as assert_async:
-                allocator.free_swa(indices)
+                allocator.free_swa(indices, **kwargs)
         return bool(assert_async.call_args.args[0])
+
+    def test_segment_free_flags_a_page_whose_peer_is_already_gone(self):
+        _, allocator, _ = _build_swa_tree(is_eagle=False, page_size=4)
+        live = _swa_alloc(allocator, 8)
+        stale = _swa_alloc(allocator, 8)
+        allocator.clear_full_to_swa_mapping(stale)
+
+        self.assertTrue(self._condition_checked_by(allocator, live, start_pos=0))
+        self.assertFalse(self._condition_checked_by(allocator, stale, start_pos=0))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "sync detection needs CUDA")
+    def test_segment_free_does_not_synchronize_on_pages(self):
+        """page_size > 1: page reps by stride replace the page expansion's
+        filter and the inner allocator's torch.unique, in and out of a group."""
+        ps = 4
+        _, allocator, _ = _build_swa_tree(is_eagle=False, page_size=ps)
+
+        def grouped(indices):
+            allocator.free_group_begin()
+            allocator.free_swa(indices, start_pos=0)
+            allocator.free_group_end()
+
+        # Warm up outside the window, both paths: a first-time cudaMalloc can
+        # synchronize on its own, which the detector would report as this
+        # call's fault.
+        allocator.free_swa(_swa_alloc(allocator, 2 * ps), start_pos=0)
+        grouped(_swa_alloc(allocator, 2 * ps))
+        first = _swa_alloc(allocator, 3 * ps)
+        second = _swa_alloc(allocator, 2 * ps)
+
+        # Gate on the pre-fix form: a detector blind to this sync class would pass
+        # the asserts below no matter how free_swa derives the pages.
+        if _sync_error(lambda: torch.unique(first // ps)) is None:
+            self.skipTest("sync debug mode does not flag a data-dependent shape here")
+
+        with self._strict():
+            self.assertIsNone(
+                _sync_error(
+                    lambda: allocator.free_swa(first[: 3 * ps - 1], start_pos=0)
+                )
+            )
+            self.assertIsNone(_sync_error(lambda: grouped(second[: 2 * ps - 1])))
 
     def test_free_swa_flags_a_slot_whose_peer_is_already_gone(self):
         _, allocator, _ = _build_swa_tree(is_eagle=False)
@@ -1181,6 +1230,71 @@ class TestSWAPeerMappedContract(CustomTestCase):
 
         with self._strict():
             self.assertIsNone(_sync_error(lambda: allocator.free_swa(indices)))
+
+
+class TestSWAPageRepsFree(CustomTestCase):
+    """page_size > 1: a kv-row segment hands `free_swa` its start position, so
+    the SWA side frees by one representative per page instead of expanding
+    pages, filtering the sentinel and dedup'ing through torch.unique."""
+
+    PS = 4
+
+    def _allocator(self):
+        _, allocator, _ = _build_swa_tree(is_eagle=False, page_size=self.PS)
+        return allocator
+
+    def _sizes(self, allocator):
+        return allocator.full_available_size(), allocator.swa_available_size()
+
+    def test_segment_free_releases_the_mapped_pages_for_every_tail(self):
+        ps = self.PS
+        for num_tokens in (1, ps, ps + 1, 3 * ps - 1, 3 * ps):
+            with self.subTest(num_tokens=num_tokens):
+                allocator = self._allocator()
+                indices = _swa_alloc(allocator, 3 * ps)
+                mapping = allocator.full_to_swa_index_mapping
+                expected = torch.unique(mapping[indices[:num_tokens]] // ps)
+                before = allocator.swa_attn_allocator.free_pages.numel()
+
+                allocator.free_swa(indices[:num_tokens], start_pos=0)
+
+                free_pages = allocator.swa_attn_allocator.free_pages
+                freed = free_pages[: free_pages.numel() - before]
+                self.assertTrue(torch.equal(torch.sort(freed)[0], expected))
+                # The whole last page goes back, and its mapping with it.
+                touched = -(num_tokens // -ps) * ps
+                self.assertTrue(torch.all(mapping[indices[:touched]] == 0))
+                self.assertTrue(torch.all(mapping[indices[touched:]] > 0))
+
+    def test_node_frees_take_the_page_path_through_the_tree(self):
+        """Tree values are page-aligned copies of a kv row: SWA eviction of
+        internal nodes and leaves, then full eviction of the tombstones, all
+        free by page reps."""
+        ps = self.PS
+        tree, allocator, _ = _build_swa_tree(
+            is_eagle=False, page_size=ps, sliding_window_size=ps
+        )
+        full_before, swa_before = self._sizes(allocator)
+        _insert(tree, allocator, list(range(1, 3 * ps + 1)))
+
+        # Either inner `free` is the torch.unique path a caller falls back to
+        # when it hands no start position.
+        with (
+            patch.object(
+                allocator.full_attn_allocator,
+                "free",
+                side_effect=AssertionError("full side took the unique path"),
+            ),
+            patch.object(
+                allocator.swa_attn_allocator,
+                "free",
+                side_effect=AssertionError("swa side took the unique path"),
+            ),
+        ):
+            tree.evict(EvictParams(num_tokens=0, swa_num_tokens=ps))
+            tree.evict(EvictParams(num_tokens=3 * ps, swa_num_tokens=0))
+
+        self.assertEqual(self._sizes(allocator), (full_before, swa_before))
 
 
 class TestCacheUnfinishedReqEvictedPrefix(CustomTestCase):
