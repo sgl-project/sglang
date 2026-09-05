@@ -336,7 +336,7 @@ def test_branch_forward_matches_reference(
             lambda t, i, ts, *, chunk, frame_offset=0: run_scans(t, i, ts),
         )
     else:
-        monkeypatch.setattr(module, "_FUSED_KERNELS_ENABLED", False)
+        branch.fused_kernels = False
     expected = branch(**kwargs)
     assert expected.abs().sum() > 0
     # fused kernels skip the eager chain's bf16 roundings; the scans re-associate fp32

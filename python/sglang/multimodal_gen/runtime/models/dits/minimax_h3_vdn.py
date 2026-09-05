@@ -413,13 +413,13 @@ def linear_features(
     frame_size: tuple[int, int] | None,
     heads: slice | None = None,
     frame_major: bool = False,
+    fused: bool = True,
 ) -> torch.Tensor:
     """[N, H, d] raw projection -> [N, H, d] branch features:
     [short conv ->] SiLU [-> L2 norm for q, k]. ``frame_major`` returns
     [F, H, S, d] instead (the readout's bmm layout), written by the fused
     kernels directly; the eager path permutes."""
     l2norm = proj != "v"
-    fused = _use_fused_kernels()
     heads_n, head_dim = tokens.shape[-2], tokens.shape[-1]
     if frame_major and (num_frames is None or frame_size is None):
         raise ValueError("frame_major needs the (frames, height, width) grid")
@@ -442,19 +442,6 @@ def linear_features(
         per_frame = frame_size[0] * frame_size[1]
         return out.view(num_frames, per_frame, heads_n, head_dim).permute(0, 2, 1, 3)
     return out
-
-
-_FUSED_KERNELS_ENABLED = True
-
-
-def _use_fused_kernels() -> bool:
-    return _FUSED_KERNELS_ENABLED
-
-
-def set_fused_kernels_enabled(enabled: bool) -> None:
-    """Test/debug switch between the fused Triton stages and the eager chain."""
-    global _FUSED_KERNELS_ENABLED
-    _FUSED_KERNELS_ENABLED = bool(enabled)
 
 
 def frame_statistics(
@@ -691,6 +678,7 @@ def gather_linear_state(
     bridge: str,
     text_state: torch.Tensor | None,
     out_dtype: torch.dtype,
+    fused: bool = True,
 ) -> torch.Tensor:
     """Everything OUTSIDE the softmax window of frame t, decayed to t:
     prefix[lo-1] * prod_{u=lo..t} alpha_u + suffix[hi+1] * prod_{u=t..hi} alpha_u.
@@ -706,7 +694,7 @@ def gather_linear_state(
         has_after,
         frames,
     ) = _gather_indices(tuple(bounds), num_frames, str(prefix.device))
-    if _use_fused_kernels() and can_use_vdn_gather_linear_state(prefix):
+    if fused and can_use_vdn_gather_linear_state(prefix):
         return vdn_gather_linear_state(
             prefix,
             suffix,
@@ -798,6 +786,8 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         self.hybrid = hybrid
         self.local_heads = local_heads
         self.head_dim = arch.attention_head_dim
+        # tests flip this to compare the fused Triton stages with the eager chain
+        self.fused_kernels = True
         hidden = arch.hidden_size
         channels = local_heads * self.head_dim
         self.short_conv = (
@@ -838,10 +828,20 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         length = text_k_raw.shape[0]
         heads, head_dim = text_k_raw.shape[1], self.head_dim
         key = linear_features(
-            text_k_raw, proj="k", conv=None, num_frames=None, frame_size=None
+            text_k_raw,
+            proj="k",
+            conv=None,
+            num_frames=None,
+            frame_size=None,
+            fused=self.fused_kernels,
         )
         value = linear_features(
-            text_v_raw, proj="v", conv=None, num_frames=None, frame_size=None
+            text_v_raw,
+            proj="v",
+            conv=None,
+            num_frames=None,
+            frame_size=None,
+            fused=self.fused_kernels,
         )
         key = key.view(1, length, heads, head_dim).permute(0, 2, 1, 3)
         value = value.view(1, length, heads, head_dim).permute(0, 2, 1, 3)
@@ -969,36 +969,21 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
     ) -> torch.Tensor:
         n_heads, head_dim = q_raw.shape[1], self.head_dim
         shape = (num_frames, per_frame, n_heads, head_dim)
-        conv = self.short_conv
-        query_by_frame = linear_features(
-            q_raw,
-            proj="q",
-            conv=conv,
+        fused = self.fused_kernels
+        features = functools.partial(
+            linear_features,
+            conv=self.short_conv,
             num_frames=num_frames,
             frame_size=frame_size,
             heads=heads,
-            frame_major=True,
+            fused=fused,
         )
-        key = linear_features(
-            k_raw,
-            proj="k",
-            conv=conv,
-            num_frames=num_frames,
-            frame_size=frame_size,
-            heads=heads,
-        )
-        value = linear_features(
-            v_raw,
-            proj="v",
-            conv=conv,
-            num_frames=num_frames,
-            frame_size=frame_size,
-            heads=heads,
-        )
+        query_by_frame = features(q_raw, proj="q", frame_major=True)
+        key = features(k_raw, proj="k")
+        value = features(v_raw, proj="v")
         key_by_frame = key.view(shape).permute(0, 2, 1, 3)
         value_by_frame = value.view(shape).permute(0, 2, 1, 3)
         beta_by_frame = beta.view(num_frames, per_frame, n_heads).permute(0, 2, 1)
-        fused = _use_fused_kernels()
         prepared = (
             vdn_frame_stats_prep(key, value, beta, num_frames, per_frame)
             if fused and self.hybrid.a_fp32 and can_use_vdn_frame_stats_prep(key, value)
@@ -1042,6 +1027,7 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
             bridge=self.hybrid.bridge,
             text_state=text_state,
             out_dtype=q_raw.dtype,
+            fused=fused,
         )
         del prefix, suffix
         readout = torch.matmul(query_by_frame, linear_state.transpose(-1, -2))

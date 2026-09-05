@@ -108,11 +108,7 @@ def test_gather_linear_state_matches_eager(bridge: str, with_text_state: bool) -
     text = torch.randn(heads, dim, dim, generator=g).cuda() if with_text_state else None
     assert can_use_vdn_gather_linear_state(prefix)
     kwargs = dict(bridge=bridge, text_state=text, out_dtype=torch.float32)
-    vdn.set_fused_kernels_enabled(False)
-    try:
-        ref = vdn.gather_linear_state(prefix, suffix, alpha, bounds, **kwargs)
-    finally:
-        vdn.set_fused_kernels_enabled(True)
+    ref = vdn.gather_linear_state(prefix, suffix, alpha, bounds, fused=False, **kwargs)
     got = vdn.gather_linear_state(prefix, suffix, alpha, bounds, **kwargs)
     torch.testing.assert_close(got, ref, atol=1e-5, rtol=1e-5)
 
