@@ -141,6 +141,42 @@ class TestHybridSendUsesLayerIdPairing(CustomTestCase):
         self._run_case(model_full_ids=ids, stage_full_ids=ids[:5], start_offset=0)
 
 
+class TestMambaSlotTransfer(CustomTestCase):
+    def test_stage1_uses_paired_slot_sizes_and_offsets(self):
+        manager = _RecordingKVManager(prefill_start_layer=1, pp_size=2)
+        # The PP-local layer maps to destination entry 1, not entry 0.
+        MooncakeKVManager._send_mamba_state(
+            manager,
+            req=SimpleNamespace(mooncake_session_id="session"),
+            prefill_mamba_index=[2],
+            src_state_data_ptrs=[1000],
+            src_state_item_lens=[16],
+            dst_state_data_ptrs=[2000, 3000],
+            dst_mamba_index=[3],
+            src_layer_ids=[7],
+            dst_layer_ids=[3, 7],
+            dst_state_item_lens=[8, 16],
+        )
+        self.assertEqual(manager.blocks, [(1032, 3048, 16)])
+
+    def test_slot_size_mismatch_rejected_before_transfer(self):
+        manager = _RecordingKVManager(prefill_start_layer=0, pp_size=1)
+        for dst_length in (8, 32):
+            with self.subTest(dst_length=dst_length):
+                with self.assertRaisesRegex(RuntimeError, "Mamba slot size mismatch"):
+                    MooncakeKVManager._send_mamba_state(
+                        manager,
+                        req=SimpleNamespace(mooncake_session_id="session"),
+                        prefill_mamba_index=[1],
+                        src_state_data_ptrs=[1000],
+                        src_state_item_lens=[16],
+                        dst_state_data_ptrs=[2000],
+                        dst_mamba_index=[1],
+                        dst_state_item_lens=[dst_length],
+                    )
+                self.assertEqual(manager.blocks, [])
+
+
 class TestGetMhaKvPtrsWithPp(CustomTestCase):
     """Derived property: the modulo heuristic in get_mha_kv_ptrs_with_pp exists
     for the decode-has-draft-KV layout [K_main, V_main, draft_K, draft_V]. Pin

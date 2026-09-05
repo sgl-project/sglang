@@ -586,12 +586,18 @@ class MambaPool:
                 if _is_npu:
                     from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                         _init_npu_conv_state,
+                        resolve_npu_state_layout_draft_tokens,
                     )
 
+                    npu_state_layout_draft_tokens = (
+                        resolve_npu_state_layout_draft_tokens(
+                            speculative_num_draft_tokens
+                        )
+                    )
                     conv_state = _init_npu_conv_state(
                         conv_state[0],
                         conv_state_shape,
-                        speculative_num_draft_tokens,
+                        npu_state_layout_draft_tokens,
                         is_kda=cache_params.is_kda,
                     )
 
@@ -716,14 +722,17 @@ class MambaPool:
                         device=device,
                     )
 
+            # NPU PD prefill must use Decode's persistent state layout even
+            # though it does not allocate or execute speculative verify.
+            if _is_npu and npu_state_layout_draft_tokens is not None:
+                temporal_state = temporal_state.transpose(-1, -2)
+                temporal_state_shape = (
+                    *temporal_state_shape[:-2],
+                    temporal_state_shape[-1],
+                    temporal_state_shape[-2],
+                )
+
             if speculative_num_draft_tokens is not None:
-                if _is_npu:
-                    temporal_state = temporal_state.transpose(-1, -2)
-                    temporal_state_shape = (
-                        *temporal_state_shape[:-2],
-                        temporal_state_shape[-1],
-                        temporal_state_shape[-2],
-                    )
                 # Cache intermediate SSM states per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
                 #
@@ -3752,6 +3761,9 @@ class HybridLinearKVPool(KVCache):
     def get_kv_layer_ids(self):
         """Global layer ids aligned with the full-attention KV buffers."""
         layer_ids = list(self.full_attention_layer_id_mapping)
+        if self.use_mla and _is_npu and layer_ids:
+            data_ptrs, _, _ = self.get_contiguous_buf_infos()
+            return layer_ids * (len(data_ptrs) // len(layer_ids))
         return layer_ids if self.use_mla else layer_ids * 2
 
     def get_state_buf_infos(self):
