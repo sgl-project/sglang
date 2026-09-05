@@ -478,7 +478,8 @@ def get_available_gpu_memory(
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
         total_free_memory = psutil.virtual_memory().available
-        n_numa_node: int = len(get_cpu_ids_by_node())
+        (mode, cpu_ids_by_node) = get_cpu_ids_by_node()
+        n_numa_node: int = len(cpu_ids_by_node)
         free_gpu_memory = round(total_free_memory / n_numa_node, 3)
     elif device == "npu":
         num_gpus = torch.npu.device_count()
@@ -738,31 +739,38 @@ def get_cpu_memory_capacity():
     # Per-rank memory capacity cannot be determined for customized core settings
     if os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", ""):
         return None
-    n_numa_node: int = len(get_cpu_ids_by_node())
-    if n_numa_node == 0:
-        # Cannot determine NUMA config, fallback to total memory and avoid ZeroDivisionError.
-        return float(psutil.virtual_memory().total // (1 << 20))
-    try:
-        numa_mem_list = list()
-        file_prefix = "/sys/devices/system/node/"
-        for numa_id in range(n_numa_node):
-            file_meminfo = f"node{numa_id}/meminfo"
-            with open(os.path.join(file_prefix, file_meminfo), "r") as f:
-                # MemTotal info is at the 1st line
-                line = f.readline()
-                # Expected format: "Node 0 MemTotal:       100000000 kB"
-                parts = line.split()
-                if len(parts) >= 4 and parts[2] == "MemTotal:":
-                    numa_mem_list.append(int(parts[3]))
-                else:
-                    raise ValueError(f"Unexpected format in {file_meminfo}: {line}")
-        # Retrieved value in KB, need MB
-        numa_mem = float(min(numa_mem_list) // 1024)
-        return numa_mem
-    except (FileNotFoundError, ValueError, IndexError):
-        numa_mem = psutil.virtual_memory().total / n_numa_node
-        # Retrieved value in Byte, need MB
-        return float(numa_mem // (1 << 20))
+    mode, node_map = get_cpu_ids_by_node()
+    n_numa_node: int = len(node_map)
+    if mode == 0:  # NUMA mode
+        if n_numa_node == 0:
+            # Cannot determine NUMA config, fallback to total memory and avoid ZeroDivisionError.
+            return float(psutil.virtual_memory().total // (1 << 20))
+        try:
+            numa_mem_list = list()
+            file_prefix = "/sys/devices/system/node/"
+            for numa_id in range(n_numa_node):
+                file_meminfo = f"node{numa_id}/meminfo"
+                with open(os.path.join(file_prefix, file_meminfo), "r") as f:
+                    # MemTotal info is at the 1st line
+                    line = f.readline()
+                    # Expected format: "Node 0 MemTotal:       100000000 kB"
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[2] == "MemTotal:":
+                        numa_mem_list.append(int(parts[3]))
+                    else:
+                        raise ValueError(f"Unexpected format in {file_meminfo}: {line}")
+            # Retrieved value in KB, need MB
+            numa_mem = float(min(numa_mem_list) // 1024)
+            return numa_mem
+        except (FileNotFoundError, ValueError, IndexError):
+            numa_mem = psutil.virtual_memory().total / n_numa_node
+            # Retrieved value in Byte, need MB
+            return float(numa_mem // (1 << 20))
+    else:  # CBB mode
+        if n_numa_node == 0:
+            n_numa_node = 1  # Avoid ZeroDivisionError.
+        # An equivalent memory capacity "per-CBB" is retrieved in CBB mode.
+        return float(psutil.virtual_memory().total / n_numa_node // (1 << 20))
 
 
 def get_xpu_memory_capacity():
@@ -4187,7 +4195,7 @@ def parse_lscpu_topology():
     try:
         # Get CPU topology: CPU,Core,Socket,Node
         output = subprocess.check_output(
-            ["lscpu", "-p=CPU,Core,Socket,Node"], text=True
+            ["lscpu", "-p=CPU,Core,Socket,Node,Cache"], text=True
         )
     except Exception as e:
         raise RuntimeError(f"Unexpected error running 'lscpu': {e}")
@@ -4196,19 +4204,18 @@ def parse_lscpu_topology():
     cpu_info = []
     for line in output.splitlines():
         if not line.startswith("#"):
-            parts = line.strip().split(",")
-            if len(parts) != 4:
-                logger.warning("Skipping malformed lscpu line: %s", line.strip())
-                continue
-            cpu = int(parts[0])  # CPU id must always be present
-            core, socket, node = [int(p) if p else 0 for p in parts[1:]]
-            cpu_info.append((cpu, core, socket, node))
+            parts = re.split(r"[,:]+", line)
+            line_info = list()
+            for p in parts:
+                line_info.append(int(p) if p.isdigit() else 0)
+            # (cpu, core, socket, node, L3)
+            cpu_info.append(line_info[:4] + [line_info[-1]])
 
-    # [(0,0,0,0),(1,1,0,0),...,(43,43,0,1),...,(256,0,0,0),...]
+    # [(0,0,0,0,0),(1,1,0,0,0),...,(43,43,0,1,0),...,(256,0,0,0,0),...]
     return cpu_info
 
 
-def get_physical_cpus_by_numa():
+def get_physical_cpus_by_numa_or_block():
     cpu_info = parse_lscpu_topology()
 
     # Map NUMA node -> set of (core_id, socket) to avoid duplicates
@@ -4216,11 +4223,17 @@ def get_physical_cpus_by_numa():
     # ...
     # 5: {(214,1): 214, (215,1): 215}
     physical_by_node = defaultdict(dict)  # node -> core_id -> cpu_id
+    # L3 cache index represents block
+    physical_by_block = defaultdict(dict)  # block -> core_id -> cpu_id
 
-    for cpu, core, socket, node in cpu_info:
+    for cpu, core, socket, node, block in cpu_info:
         key = (core, socket)
         if key not in physical_by_node[node]:
             physical_by_node[node][key] = (
+                cpu  # pick first CPU seen for that physical core
+            )
+        if key not in physical_by_block[block]:
+            physical_by_block[block][key] = (
                 cpu  # pick first CPU seen for that physical core
             )
 
@@ -4234,24 +4247,33 @@ def get_physical_cpus_by_numa():
     # ...
     # 5: [214,215,...,255]
     node_to_cpus = {}
+    block_to_cpus = {}
     for node, core_to_cpu in physical_by_node.items():
         cpus = sorted(core_to_cpu.values())
         allowed_cpus = set(cpus).intersection(cpus_allowed_list)
         node_to_cpus[node] = allowed_cpus
+    for block, core_to_cpu in physical_by_block.items():
+        cpus = sorted(core_to_cpu.values())
+        allowed_cpus = set(cpus).intersection(cpus_allowed_list)
+        block_to_cpus[block] = allowed_cpus
 
-    return node_to_cpus
+    return (
+        (1, block_to_cpus)
+        if len(block_to_cpus) > len(node_to_cpus)
+        else (0, node_to_cpus)
+    )
 
 
 # Only physical cores are used. Logical cores are excluded.
 def get_cpu_ids_by_node():
-    node_to_cpus = get_physical_cpus_by_numa()
-    # Sort by NUMA node index
+    mode, node_to_cpus = get_physical_cpus_by_numa_or_block()
+    # Sort by NUMA node index or CBB block index
     cpu_ids = [
         ",".join(map(str, sorted(node_to_cpus[node]))) for node in sorted(node_to_cpus)
     ]
 
     # ['0,1,2,3', '4,5,6,7', '8,9,10,11', '12,13,14,15', '16,17,18,19', '20,21,22,23']
-    return cpu_ids
+    return mode, cpu_ids
 
 
 def is_shm_available(dtype, world_size, local_size):
