@@ -83,4 +83,16 @@ RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
     pip install --no-cache-dir ".[dev,diffusion]" --extra-index-url https://download.pytorch.org/whl/xpu && \
     pip install --no-cache-dir --no-deps xgrammar==0.1.33
 
+# Install torch_memory_saver for release/resume_memory_occupation ("memory saver").
+# XPU ships no prebuilt wheel: it is built from source against the local oneAPI +
+# torch-XPU runtime (the .so links libsycl.so.<N>, which must match the installed
+# intel-sycl-rt). TMS_PLATFORM=xpu forces the XPU backend; --no-build-isolation
+# lets the build import the installed torch (above) so it can match the libsycl
+# major to it -- under build isolation torch is absent and the match is skipped.
+# Pinned to the commit that merged the XPU backend, so image builds are reproducible.
+ARG TORCH_MEMORY_SAVER_REF=990ec133b7b178ca4e30fe7aaac921d3701bcb3a
+RUN . /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 && \
+    TMS_PLATFORM=xpu pip install --no-cache-dir --no-build-isolation \
+    git+https://github.com/fzyzcjy/torch_memory_saver.git@${TORCH_MEMORY_SAVER_REF}
+
 CMD ["bash", "-c", "source /opt/intel/oneapi/setvars.sh --force && exec bash"]
