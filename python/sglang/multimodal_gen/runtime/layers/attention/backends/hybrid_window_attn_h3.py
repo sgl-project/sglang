@@ -20,6 +20,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+import msgspec
 import torch
 
 from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
@@ -140,56 +141,66 @@ def _chunk_groups(
     return groups
 
 
+class _ChunkGroup(msgspec.Struct, frozen=True):
+    frames: list[int]
+    query_rows: torch.Tensor
+    kv_rows: torch.Tensor
+
+
+class _WindowPass(msgspec.Struct, frozen=True):
+    query_rows: torch.Tensor
+    query_slice: tuple[int, int] | None  # set when the query rows are contiguous
+    kv_rows: torch.Tensor
+    cu_q: torch.Tensor
+    cu_k: torch.Tensor
+    max_q: int
+    max_k: int
+
+
+def _window_pass(
+    layout: VDNH3Layout, groups: list[_ChunkGroup], device: torch.device
+) -> _WindowPass:
+    query_lens = [int(group.query_rows.numel()) for group in groups]
+    kv_lens = [int(group.kv_rows.numel()) for group in groups]
+    frames = [frame for group in groups for frame in group.frames]
+    contiguous = frames == list(range(frames[0], frames[0] + len(frames)))
+    zero = torch.zeros(1, dtype=torch.long)
+    return _WindowPass(
+        query_rows=torch.cat([group.query_rows for group in groups]),
+        query_slice=(
+            (layout.frame_rows(frames[0])[0], layout.frame_rows(frames[-1])[1])
+            if contiguous
+            else None
+        ),
+        kv_rows=torch.cat([group.kv_rows for group in groups]),
+        cu_q=torch.cat([zero, torch.tensor(query_lens).cumsum(0)]).to(
+            device, torch.int32
+        ),
+        cu_k=torch.cat([zero, torch.tensor(kv_lens).cumsum(0)]).to(device, torch.int32),
+        max_q=max(query_lens),
+        max_k=max(kv_lens),
+    )
+
+
 def _window_passes(
     layout: VDNH3Layout,
-    per_group: list[tuple[list[int], torch.Tensor, torch.Tensor]],
+    groups: list[_ChunkGroup],
     max_gather_rows: int,
     device: torch.device,
-) -> list[dict]:
+) -> list[_WindowPass]:
     # one varlen call per pass; consecutive chunk groups fill up to max_gather_rows
-    passes: list[dict] = []
-    current: list[tuple] = []
+    passes: list[_WindowPass] = []
+    current: list[_ChunkGroup] = []
     current_rows = 0
-
-    def flush() -> None:
-        if not current:
-            return
-        q_idx = [g[1] for g in current]
-        kv_idx = [g[2] for g in current]
-        q_lens = [int(t.numel()) for t in q_idx]
-        k_lens = [int(t.numel()) for t in kv_idx]
-        flat = [f for g in current for f in g[0]]
-        zero = torch.zeros(1, dtype=torch.long)
-        contiguous = flat == list(range(flat[0], flat[0] + len(flat)))
-        passes.append(
-            dict(
-                win_q=torch.cat(q_idx),
-                # contiguous frames -> slice instead of gather/scatter
-                win_q_slice=(
-                    (layout.frame_rows(flat[0])[0], layout.frame_rows(flat[-1])[1])
-                    if contiguous
-                    else None
-                ),
-                kv_gather=torch.cat(kv_idx),
-                cu_q=torch.cat([zero, torch.tensor(q_lens).cumsum(0)]).to(
-                    device, torch.int32
-                ),
-                cu_k=torch.cat([zero, torch.tensor(k_lens).cumsum(0)]).to(
-                    device, torch.int32
-                ),
-                max_q=max(q_lens),
-                max_k=max(k_lens),
-            )
-        )
-
-    for frames, qi, ki in per_group:
-        rows = int(ki.numel())
+    for group in groups:
+        rows = int(group.kv_rows.numel())
         if current and current_rows + rows > max_gather_rows:
-            flush()
+            passes.append(_window_pass(layout, current, device))
             current, current_rows = [], 0
-        current.append((frames, qi, ki))
+        current.append(group)
         current_rows += rows
-    flush()
+    if current:
+        passes.append(_window_pass(layout, current, device))
     return passes
 
 
@@ -219,15 +230,17 @@ class _DecomposedPlan:
             [0, int(self.dense_q.numel())], dtype=torch.int32, device=device
         )
         self.dense_cu_k = torch.tensor([0, used], dtype=torch.int32, device=device)
-        per_group = []
+        groups = []
         for frames in _chunk_groups(hybrid.window_bounds(num_frames), dense_rows):
             lo, hi = bounds[frames[0]]
             kv_frames = sorted(set(range(lo, hi + 1)) | dense_cols)
-            per_group.append(
-                (
-                    frames,
-                    rows(_merge_ranges([layout.frame_rows(f) for f in frames])),
-                    rows(
+            groups.append(
+                _ChunkGroup(
+                    frames=frames,
+                    query_rows=rows(
+                        _merge_ranges([layout.frame_rows(f) for f in frames])
+                    ),
+                    kv_rows=rows(
                         _merge_ranges(
                             layout.global_ranges
                             + [layout.frame_rows(f) for f in kv_frames]
@@ -235,10 +248,10 @@ class _DecomposedPlan:
                     ),
                 )
             )
-        self.passes = _window_passes(layout, per_group, max_gather_rows, device)
+        self.passes = _window_passes(layout, groups, max_gather_rows, device)
         self.has_windows = bool(self.passes)
-        win_rows = sum(int(p["win_q"].numel()) for p in self.passes)
-        covered = int(self.dense_q.numel()) + win_rows
+        window_rows = sum(int(p.query_rows.numel()) for p in self.passes)
+        covered = int(self.dense_q.numel()) + window_rows
         if covered != used:
             raise ValueError(
                 f"window decomposition covers {covered} of {used} packed rows"
@@ -302,7 +315,7 @@ def _fa_varlen(
     scale: float,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    result = flash_attn_varlen_func(
+    attn_out = flash_attn_varlen_func(
         q,
         k,
         v,
@@ -315,11 +328,11 @@ def _fa_varlen(
         ver=_flash_attn_backend.fa_ver,
         out=out,
     )
-    result = result[0] if isinstance(result, tuple) else result
-    if out is not None and result.data_ptr() != out.data_ptr():
-        out.copy_(result)
+    attn_out = attn_out[0] if isinstance(attn_out, tuple) else attn_out
+    if out is not None and attn_out.data_ptr() != out.data_ptr():
+        out.copy_(attn_out)
         return out
-    return result
+    return attn_out
 
 
 class HybridWindowAttentionH3Impl(AttentionImpl):
@@ -469,35 +482,35 @@ class HybridWindowAttentionH3Impl(AttentionImpl):
                 max_k=used,
                 scale=self.softmax_scale,
             )
-        for p in plan.passes:
+        for window in plan.passes:
             # index_select on contiguous copies takes the vectorized gather kernel
-            kw = torch.index_select(key_used, 0, p["kv_gather"])
-            vw = torch.index_select(value_used, 0, p["kv_gather"])
-            if p["win_q_slice"] is not None:
-                start, stop = p["win_q_slice"]
+            keys = torch.index_select(key_used, 0, window.kv_rows)
+            values = torch.index_select(value_used, 0, window.kv_rows)
+            if window.query_slice is not None:
+                start, stop = window.query_slice
                 _fa_varlen(
                     query[start:stop],
-                    kw,
-                    vw,
-                    cu_q=p["cu_q"],
-                    cu_k=p["cu_k"],
-                    max_q=p["max_q"],
-                    max_k=p["max_k"],
+                    keys,
+                    values,
+                    cu_q=window.cu_q,
+                    cu_k=window.cu_k,
+                    max_q=window.max_q,
+                    max_k=window.max_k,
                     scale=self.softmax_scale,
                     out=out[start:stop],
                 )
             else:
-                out[p["win_q"]] = _fa_varlen(
-                    torch.index_select(query, 0, p["win_q"]),
-                    kw,
-                    vw,
-                    cu_q=p["cu_q"],
-                    cu_k=p["cu_k"],
-                    max_q=p["max_q"],
-                    max_k=p["max_k"],
+                out[window.query_rows] = _fa_varlen(
+                    torch.index_select(query, 0, window.query_rows),
+                    keys,
+                    values,
+                    cu_q=window.cu_q,
+                    cu_k=window.cu_k,
+                    max_q=window.max_q,
+                    max_k=window.max_k,
                     scale=self.softmax_scale,
                 )
-            del kw, vw
+            del keys, values
         return out
 
 

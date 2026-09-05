@@ -420,19 +420,19 @@ def linear_features(
     [F, H, S, d] instead (the readout's bmm layout), written by the fused
     kernels directly; the eager path permutes."""
     l2norm = proj != "v"
-    heads_n, head_dim = tokens.shape[-2], tokens.shape[-1]
+    n_heads, head_dim = tokens.shape[-2], tokens.shape[-1]
     if frame_major and (num_frames is None or frame_size is None):
         raise ValueError("frame_major needs the (frames, height, width) grid")
     if conv is not None and proj in conv.targets:
         if frame_size is None or num_frames is None:
             raise ValueError("the short conv needs the (frames, height, width) grid")
         x, w_tm = conv.spatial(proj, tokens, num_frames, frame_size, heads=heads)
-        if fused and can_use_vdn_temporal_conv_act(x, heads_n, head_dim):
+        if fused and can_use_vdn_temporal_conv_act(x, n_heads, head_dim):
             # one kernel: 5 taps + SiLU + L2 norm, the conv output never hits HBM
             return vdn_temporal_conv_act(
-                x, w_tm, heads_n, head_dim, l2norm, frame_major=frame_major
+                x, w_tm, n_heads, head_dim, l2norm, frame_major=frame_major
             )
-        out = _activate(_temporal_shift(x, w_tm).reshape(-1, heads_n, head_dim), l2norm)
+        out = _activate(_temporal_shift(x, w_tm).reshape(-1, n_heads, head_dim), l2norm)
     elif fused and can_use_vdn_silu_l2norm(tokens):
         per_frame = frame_size[0] * frame_size[1] if frame_major else None
         return vdn_silu_l2norm(tokens, l2norm, per_frame=per_frame)
@@ -440,7 +440,7 @@ def linear_features(
         out = _activate(tokens, l2norm)
     if frame_major:
         per_frame = frame_size[0] * frame_size[1]
-        return out.view(num_frames, per_frame, heads_n, head_dim).permute(0, 2, 1, 3)
+        return out.view(num_frames, per_frame, n_heads, head_dim).permute(0, 2, 1, 3)
     return out
 
 
@@ -555,17 +555,19 @@ def _compose_chunk(
         order.reverse()
     chunks, heads = transitions.shape[1], transitions.shape[2]
     dk, dv = transitions.shape[-1], injections.shape[-2]
-    M = transitions[order[0]]
-    Cc = injections[order[0]]
+    folded_t = transitions[order[0]]
+    folded_b = injections[order[0]]
     for j in order[1:]:
-        T = transitions[j].view(chunks * heads, dk, dk)
-        Cc = torch.baddbmm(
+        step_t = transitions[j].view(chunks * heads, dk, dk)
+        folded_b = torch.baddbmm(
             injections[j].view(chunks * heads, dv, dk),
-            Cc.view(chunks * heads, dv, dk),
-            T,
+            folded_b.view(chunks * heads, dv, dk),
+            step_t,
         ).view(chunks, heads, dv, dk)
-        M = torch.bmm(M.view(chunks * heads, dk, dk), T).view(chunks, heads, dk, dk)
-    return M, Cc
+        folded_t = torch.bmm(folded_t.view(chunks * heads, dk, dk), step_t).view(
+            chunks, heads, dk, dk
+        )
+    return folded_t, folded_b
 
 
 @functools.lru_cache(maxsize=64)
@@ -623,22 +625,26 @@ def run_boundary_scans(
         ]
     )
     # frame-major so each composition step reads contiguous operands
-    T = transitions.view(num_chunks, chunk, heads, dk, dk).transpose(0, 1).contiguous()
-    B = injections.view(num_chunks, chunk, heads, dv, dk).transpose(0, 1).contiguous()
+    by_frame_t = (
+        transitions.view(num_chunks, chunk, heads, dk, dk).transpose(0, 1).contiguous()
+    )
+    by_frame_b = (
+        injections.view(num_chunks, chunk, heads, dv, dk).transpose(0, 1).contiguous()
+    )
     start = (
         torch.zeros(heads, dv, dk, dtype=injections.dtype, device=injections.device)
         if text_state is None
         else text_state.to(injections.dtype)
     )
     # step c: the forward chain on chunk c and the reverse chain on chunk C-1-c
-    Mf, Cf = _compose_chunk(T, B, reverse=False)
-    Mr, Cr = _compose_chunk(T, B, reverse=True)
-    M2 = torch.stack([Mf, Mr.flip(0)], dim=1)  # [C, 2, H, dk, dk]
-    boundary = torch.stack([Cf, Cr.flip(0)], dim=1)  # [C, 2, H, dv, dk]
+    fwd_t, fwd_b = _compose_chunk(by_frame_t, by_frame_b, reverse=False)
+    rev_t, rev_b = _compose_chunk(by_frame_t, by_frame_b, reverse=True)
+    chunk_t = torch.stack([fwd_t, rev_t.flip(0)], dim=1)  # [C, 2, H, dk, dk]
+    boundary = torch.stack([fwd_b, rev_b.flip(0)], dim=1)  # [C, 2, H, dv, dk]
     flat = boundary.view(num_chunks, 2 * heads, dv, dk)
     state = torch.stack([start, start], dim=0).view(2 * heads, dv, dk)
     for c in range(num_chunks):
-        flat[c].baddbmm_(state, M2[c].view(2 * heads, dk, dk))
+        flat[c].baddbmm_(state, chunk_t[c].view(2 * heads, dk, dk))
         state = flat[c]
     prefix = torch.zeros(
         num_frames, heads, dv, dk, dtype=injections.dtype, device=injections.device

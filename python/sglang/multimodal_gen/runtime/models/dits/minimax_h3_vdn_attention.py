@@ -145,14 +145,13 @@ class MiniMaxH3VDNHybridAttention(nn.Module):
         )
         out, _ = attention.out_proj(softmax_out.reshape(total, -1))
         if linear_out is not None:
-            far, _ = self.to_out_linear(linear_out)
-            if far.shape[0] == total:
-                out.add_(far)
+            linear_proj, _ = self.to_out_linear(linear_out)
+            if linear_proj.shape[0] == total:
+                out.add_(linear_proj)
             else:
                 # single-rank path: the readout covers the video rows only
-                meta = get_forward_context().attn_metadata
-                layout = meta.layout
-                out[layout.video_start : layout.video_end].add_(far)
+                layout = get_forward_context().attn_metadata.layout
+                out[layout.video_start : layout.video_end].add_(linear_proj)
         return out
 
 
@@ -506,15 +505,15 @@ def _vdn_return_to_rows(
     process_group,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     # [S, h, d] per branch -> ([L, H, d], [L, H * d] or None), both trips in flight together
-    outs = [out for out in (softmax_out, linear_out) if out is not None]
-    returning = [
+    branch_outputs = [out for out in (softmax_out, linear_out) if out is not None]
+    inflight = [
         _vdn_a2a_heads_to_rows(
             out, ulysses_ws=ulysses_ws, role=f"vdn_out{i}", process_group=process_group
         )
-        for i, out in enumerate(outs)
+        for i, out in enumerate(branch_outputs)
     ]
     merged = []
-    for work, recv in returning:
+    for work, recv in inflight:
         work.wait()
         merged.append(_vdn_merge_heads(recv))
     linear_rows = (
