@@ -2209,14 +2209,15 @@ class TritonAttnBackend(AttentionBackend):
         # would never activate on the default path. There we key the bake on capture-time-known
         # signals (batch, head-tiles, is_mla) via lean_capture_policy -- Lean's fixed persistent
         # grid still adapts to raggedness on-device at replay. In eager decode, real seq_lens
-        # are known, so lean_decode_seqlen_gate uses them. An explicit True/False override is
-        # respected; the SGLANG_DISABLE_LEAN_ATTENTION kill-switch forces the standard kernel.
+        # are known, so lean_decode_seqlen_gate uses them. Deterministic inference requires
+        # the batch-invariant standard path; the SGLANG_DISABLE_LEAN_ATTENTION kill-switch
+        # also forces that path. Otherwise, an explicit True/False override is respected.
         from sglang.srt.environ import envs
         from sglang.srt.model_executor.runner_utils.capture_mode import (
             get_is_capture_mode,
         )
 
-        if envs.SGLANG_DISABLE_LEAN_ATTENTION.get():
+        if self.enable_deterministic or envs.SGLANG_DISABLE_LEAN_ATTENTION.get():
             enable_lean = False
         else:
             enable_lean = self.enable_lean_attention
