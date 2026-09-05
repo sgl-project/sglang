@@ -9,6 +9,7 @@ from sglang.srt.configs.model_config import (
     ModelConfig,
     get_num_indexer_layers,
     is_deepseek_dsa,
+    is_deepseek_v4,
 )
 from sglang.srt.runtime_context import (
     get_exec,
@@ -102,11 +103,10 @@ def create_indexer_capturer(
 
     enable = get_exec().features.enable_return_indexer_topk
     hf_text_config = model_config.hf_text_config
-    npu_dsa_supported = device == "npu" and is_deepseek_dsa(hf_text_config)
-    # CUDA producers and the NPU DSA producer feed the common capturer. The
-    # NPU C4 producer has different layer/index semantics and is not wired to
-    # this capturer yet.
-    if enable and device != "cuda" and not npu_dsa_supported:
+    npu_indexer_supported = device == "npu" and (
+        is_deepseek_dsa(hf_text_config) or is_deepseek_v4(hf_text_config)
+    )
+    if enable and device != "cuda" and not npu_indexer_supported:
         logger.warning(
             "indexer-topk capture is not wired for %s model/backend. "
             "Disabling capturer.",

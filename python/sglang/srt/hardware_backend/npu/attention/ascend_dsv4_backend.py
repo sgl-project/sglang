@@ -21,6 +21,7 @@ from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -889,6 +890,10 @@ class C4IndexerAscendBackendMixin:
             q, weights = self._forward_prepare(c4_indexer, x, q_lora, forward_batch)
         topk_idxs = self._forward_indexer(c4_indexer, x, q, weights, forward_batch)
         self.forward_metadata.c4_topk_indices = topk_idxs
+        compress_layer_id = sum(
+            ratio == 4 for ratio in self._dsv4_compress_ratios[: c4_indexer.layer_id]
+        )
+        maybe_capture_indexer_topk(compress_layer_id, topk_idxs)
 
 
 class DeepseekV4AscendAttnBackend(
