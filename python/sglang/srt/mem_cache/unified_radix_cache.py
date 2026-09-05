@@ -3119,6 +3119,12 @@ class UnifiedRadixCache(BasePrefixCache):
     def release_session(self, session_id: str) -> None:
         self.session.release_session(session_id)
 
+    def has_slot(self, session_id: str) -> bool:
+        return self.session.has_slot(session_id)
+
+    def abort_queued_req(self, req: Req) -> bool:
+        return self.session.abort_queued_req(req)
+
     def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
         return self.session.session_held_tokens(active_pool_idxs)
 

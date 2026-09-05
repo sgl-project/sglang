@@ -1,8 +1,10 @@
 import asyncio
+import dataclasses
+import inspect
 import os
 import re
 import tempfile
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 from urllib.parse import unquote, urlparse
 
 import pybase64
@@ -11,22 +13,59 @@ import torch
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
+    MultimodalInputs,
     MultimodalProcessorOutput,
 )
 from sglang.srt.models.moss_vl import MossVLForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.multimodal.processors.base_processor import (
-    MultimodalSpecialTokens,
-)
+from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 from sglang.srt.utils.common import download_remote_media
+
+
+def _patch_moss_vl_image_processor(image_processor) -> None:
+    if image_processor is None:
+        return
+
+    processor_cls = type(image_processor)
+    if getattr(processor_cls, "_sglang_resample_compat", False):
+        return
+
+    preprocess_params = inspect.signature(processor_cls._preprocess).parameters
+    resize_params = inspect.signature(processor_cls.resize).parameters
+    if (
+        "interpolation" not in preprocess_params
+        or "resample" in preprocess_params
+        or "resample" not in resize_params
+    ):
+        return
+
+    original_preprocess = processor_cls._preprocess
+    original_resize = processor_cls.resize
+
+    # The released MOSS-VL processor uses the pre-v5 keyword while current
+    # Transformers passes `resample` into `_preprocess` and `resize`.
+    def preprocess_compat(self, *args, **kwargs):
+        if "resample" in kwargs and "interpolation" not in kwargs:
+            kwargs["interpolation"] = kwargs.pop("resample")
+        return original_preprocess(self, *args, **kwargs)
+
+    def resize_compat(self, *args, **kwargs):
+        if "interpolation" in kwargs and "resample" not in kwargs:
+            kwargs["resample"] = kwargs.pop("interpolation")
+        return original_resize(self, *args, **kwargs)
+
+    processor_cls._preprocess = preprocess_compat
+    processor_cls.resize = resize_compat
+    processor_cls._sglang_resample_compat = True
 
 
 class MossVLImageProcessor(SGLangBaseProcessor):
     models = [MossVLForConditionalGeneration]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        _patch_moss_vl_image_processor(getattr(_processor, "image_processor", None))
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         self.image_only_mm_tokens = MultimodalSpecialTokens(
             image_token="<|image|>",
@@ -391,6 +430,166 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             vision_token_info,
         )
 
+    @staticmethod
+    def _collect_realtime_grid_thw(
+        mm_items: List[MultimodalDataItem],
+    ) -> torch.Tensor:
+        grid_chunks = []
+        for item in mm_items:
+            grid_thw = getattr(item, "grid_thw", None)
+            if grid_thw is None:
+                raise ValueError(
+                    "Moss-VL realtime requires grid_thw for every multimodal item"
+                )
+
+            grid_thw = torch.as_tensor(grid_thw, dtype=torch.long).cpu()
+            if grid_thw.ndim == 1:
+                grid_thw = grid_thw.unsqueeze(0)
+            if grid_thw.ndim != 2 or grid_thw.shape[1] != 3:
+                raise ValueError(
+                    "Moss-VL realtime grid_thw must have shape (num_frames, 3), "
+                    f"got {tuple(grid_thw.shape)}"
+                )
+            if grid_thw.numel() > 0:
+                grid_chunks.append(grid_thw)
+
+        if not grid_chunks:
+            return torch.empty((0, 3), dtype=torch.long)
+
+        grid_thw = torch.cat(grid_chunks, dim=0)
+        if not torch.all(grid_thw[:, 0] == 1):
+            raise ValueError(
+                "Moss-VL realtime only supports one frame per grid (grid_thw t == 1)"
+            )
+        return grid_thw
+
+    def compute_realtime_metadata(
+        self,
+        input_ids: Union[Sequence[int], torch.Tensor],
+        historical_mm_items: List[MultimodalDataItem],
+        new_mm_items: List[MultimodalDataItem],
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        torch.Tensor,
+    ]:
+        input_ids = torch.as_tensor(input_ids, dtype=torch.long).cpu()
+        if input_ids.ndim == 1:
+            input_ids = input_ids.unsqueeze(0)
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise ValueError(
+                "Moss-VL realtime metadata requires one unpadded token sequence"
+            )
+
+        historical_grid_thw = self._collect_realtime_grid_thw(historical_mm_items)
+        new_grid_thw = self._collect_realtime_grid_thw(new_mm_items)
+        grid_thw = torch.cat([historical_grid_thw, new_grid_thw], dim=0)
+
+        image_token_count = int((input_ids == self.image_token_id).sum().item())
+        if image_token_count != grid_thw.shape[0]:
+            raise ValueError(
+                "Moss-VL realtime grids must map one-to-one to image tokens: "
+                f"found {grid_thw.shape[0]} grid(s) and {image_token_count} token(s)"
+            )
+
+        position_ids, rope_delta, vision_position_ids, _ = (
+            self._compute_position_metadata(
+                input_ids=input_ids,
+                attention_mask=None,
+                grid_thw=grid_thw if grid_thw.shape[0] > 0 else None,
+                media_nums_per_sample=(
+                    [grid_thw.shape[0]] if grid_thw.shape[0] > 0 else None
+                ),
+            )
+        )
+        position_ids = position_ids.squeeze(1)
+        if vision_position_ids is not None:
+            vision_position_ids = vision_position_ids.squeeze(1)
+
+        new_vision_position_ids = None
+        if new_grid_thw.shape[0] > 0:
+            merge_square = self.spatial_merge_size**2
+            new_vision_len = int(
+                ((new_grid_thw[:, 1] * new_grid_thw[:, 2]) // merge_square + 1)
+                .sum()
+                .item()
+            )
+            new_vision_position_ids = vision_position_ids[:, -new_vision_len:].clone()
+
+        visible_frame_counts = (input_ids == self.image_token_id).cumsum(
+            dim=1, dtype=torch.int32
+        )
+        return (
+            position_ids,
+            rope_delta,
+            vision_position_ids,
+            new_vision_position_ids,
+            visible_frame_counts.reshape(-1),
+        )
+
+    def merge_realtime_inputs(
+        self,
+        input_ids: Union[Sequence[int], torch.Tensor],
+        previous: Optional[MultimodalInputs],
+        current: MultimodalInputs,
+    ) -> MultimodalInputs:
+        historical_mm_items = previous.mm_items if previous is not None else []
+        mm_inputs = dataclasses.replace(
+            current,
+            mm_items=[*historical_mm_items, *current.mm_items],
+        )
+
+        if previous is not None:
+            for field_name in (
+                "im_token_id",
+                "im_start_id",
+                "im_end_id",
+                "slice_start_id",
+                "slice_end_id",
+                "video_token_id",
+                "audio_token_id",
+                "audio_start_id",
+                "audio_end_id",
+            ):
+                if getattr(mm_inputs, field_name) is None:
+                    setattr(mm_inputs, field_name, getattr(previous, field_name))
+
+        (
+            mm_inputs.mrope_positions,
+            mm_inputs.mrope_position_delta,
+            full_vision_position_ids,
+            mm_inputs.vision_position_ids,
+            mm_inputs.visible_frame_counts,
+        ) = self.compute_realtime_metadata(
+            input_ids=input_ids,
+            historical_mm_items=historical_mm_items,
+            new_mm_items=current.mm_items,
+        )
+
+        encoder_total_len = (
+            full_vision_position_ids.shape[-1]
+            if full_vision_position_ids is not None
+            else 0
+        )
+        encoder_append_len = (
+            mm_inputs.vision_position_ids.shape[-1]
+            if mm_inputs.vision_position_ids is not None
+            else 0
+        )
+        num_frames = sum(
+            int(torch.as_tensor(item.grid_thw).reshape(-1, 3)[:, 0].sum().item())
+            for item in mm_inputs.mm_items
+        )
+        mm_inputs.mrope_position_delta_repeated_cache = None
+        mm_inputs.media_nums_per_sample = [num_frames] if num_frames > 0 else None
+        mm_inputs.incremental_encoder_cache = True
+        mm_inputs.encoder_cached_len = encoder_total_len - encoder_append_len
+        mm_inputs.encoder_append_len = encoder_append_len
+        mm_inputs.num_image_tokens = encoder_total_len
+        return mm_inputs
+
     def _compute_visible_frame_counts(
         self, cross_attention_mask: Optional[Union[torch.Tensor, List]]
     ) -> Optional[torch.Tensor]:
@@ -529,6 +728,54 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             except FileNotFoundError:
                 pass
 
+    def _is_text_only_placeholder(
+        self,
+        request_obj,
+        image_data,
+        video_data,
+        input_ids: torch.Tensor,
+        grid_thw: Optional[torch.Tensor],
+        media_nums_per_sample: Optional[List[int]],
+        visible_frame_counts: Optional[torch.Tensor],
+        mm_items: List[MultimodalDataItem],
+    ) -> bool:
+        session_params = getattr(request_obj, "session_params", None)
+        session_id = (
+            session_params.get("id")
+            if isinstance(session_params, dict)
+            else getattr(session_params, "id", None)
+        )
+        if (
+            getattr(self.hf_config, "vision_seq_pad_multiple", None) != 1
+            or not getattr(self.server_args, "enable_streaming_session", False)
+            or not session_id
+        ):
+            return False
+        if any(item is not None for item in (image_data or [])) or any(
+            item is not None for item in (video_data or [])
+        ):
+            return False
+        if (
+            len(mm_items) != 1
+            or grid_thw is None
+            or media_nums_per_sample != [1]
+            or visible_frame_counts is None
+            or visible_frame_counts.numel() == 0
+            or not bool(torch.all(visible_frame_counts == 0).item())
+        ):
+            return False
+
+        grid_thw = torch.as_tensor(grid_thw)
+        if grid_thw.ndim == 1:
+            grid_thw = grid_thw.unsqueeze(0)
+        if grid_thw.ndim != 2 or grid_thw.shape[1] != 3:
+            return False
+        return (
+            grid_thw.shape[0] == 1
+            and int(grid_thw[0, 0].item()) == 1
+            and int((input_ids == self.image_token_id).sum().item()) == 0
+        )
+
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes, Dict]],
@@ -566,6 +813,18 @@ class MossVLImageProcessor(SGLangBaseProcessor):
                 processor_output.get("cross_attention_mask")
             )
 
+            mm_items = self._build_mm_items(processor_output, input_ids)
+            text_only_placeholder = self._is_text_only_placeholder(
+                request_obj,
+                image_data,
+                normalized_video_data,
+                input_ids,
+                grid_thw,
+                media_nums_per_sample,
+                visible_frame_counts,
+                mm_items,
+            )
+
             (
                 mrope_positions,
                 mrope_position_delta,
@@ -574,12 +833,17 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             ) = self._compute_position_metadata(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                grid_thw=grid_thw,
-                media_nums_per_sample=media_nums_per_sample,
+                grid_thw=None if text_only_placeholder else grid_thw,
+                media_nums_per_sample=(
+                    None if text_only_placeholder else media_nums_per_sample
+                ),
             )
 
             input_ids = input_ids.flatten()
-            mm_items = self._build_mm_items(processor_output, input_ids)
+            if text_only_placeholder:
+                # The released processor synthesizes this image for text-only input.
+                # The scheduler decides whether the owning session may discard it.
+                mm_items[0].set("moss_vl_text_only_placeholder", True)
             if mm_items and vision_token_info:
                 mm_items[0].set("vision_token_info", vision_token_info[0])
 
