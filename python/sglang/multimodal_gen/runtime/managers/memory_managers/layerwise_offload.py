@@ -729,9 +729,9 @@ class LayerwiseOffloadManager:
                         # below swaps that same object's storage for a (1,)
                         # placeholder, leaving the placeholder in the store.
                         # Keep an independent tensor over the mapped storage.
-                        self._mapped_cpu_weights[layer_idx][
-                            name
-                        ] = local_weight.detach().view_as(local_weight)
+                        self._mapped_cpu_weights[layer_idx][name] = (
+                            local_weight.detach().view_as(local_weight)
+                        )
                         self._weight_metadata[layer_idx][name] = {
                             "dtype": local_weight.dtype,
                             "shape": tuple(local_weight.shape),
@@ -1130,11 +1130,16 @@ class LayerwiseOffloadManager:
             self._courier_inflight.discard(layer_idx)
             self.prefetch_layer(layer_idx, non_blocking=False)
             return
+        compute_stream = torch.get_device_module().current_stream()
+        compute_stream.wait_event(event)
         with torch.inference_mode(False), torch.no_grad():
             for name, gpu_tensor in tensors.items():
+                # wait_event orders the copy; record_stream keeps its storage
+                # live until the consuming kernels finish.
+                if gpu_tensor.device.type != "cpu":
+                    gpu_tensor.record_stream(compute_stream)
                 target = self.get_target_with_name(name)
                 target.data = self._wrap_for_target(target, gpu_tensor)
-        torch.get_device_module().current_stream().wait_event(event)
         self._courier_inflight.discard(layer_idx)
         self._gpu_layers.add(layer_idx)
 

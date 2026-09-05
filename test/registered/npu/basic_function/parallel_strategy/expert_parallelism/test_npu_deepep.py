@@ -26,7 +26,6 @@ TEST_MODEL_MATRIX = {
 
 
 class TestAscendDeepEP(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.models = TEST_MODEL_MATRIX.keys()
