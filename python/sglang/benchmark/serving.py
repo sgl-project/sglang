@@ -996,6 +996,122 @@ def flush_server_cache(
     response.raise_for_status()
 
 
+def collect_gsp_cache_prefix_requests(
+    input_requests: List[DatasetRow],
+) -> List[DatasetRow]:
+    """Collect one cache-priming request per generated prefix group."""
+    prefix_requests = []
+    seen = set()
+    for request in input_requests:
+        cache_prefix = getattr(request, "cache_prefix", None)
+        cache_prefix_len = getattr(request, "cache_prefix_len", None)
+        if cache_prefix is None or not cache_prefix_len:
+            continue
+
+        # The routing key is part of the identity because a routed deployment may
+        # keep the same textual prefix on different workers.
+        prefix_key = (
+            request.routing_key,
+            json.dumps(cache_prefix, ensure_ascii=False, sort_keys=True),
+        )
+        if prefix_key in seen:
+            continue
+        seen.add(prefix_key)
+        prefix_requests.append(
+            DatasetRow(
+                prompt=cache_prefix,
+                prompt_len=cache_prefix_len,
+                output_len=1,
+                routing_key=request.routing_key,
+            )
+        )
+    return prefix_requests
+
+
+async def prewarm_gsp_prefix_cache(
+    request_func: Callable,
+    api_url: str,
+    model_id: str,
+    input_requests: List[DatasetRow],
+    extra_request_body: Dict[str, Any],
+    max_concurrency: int,
+    lora_names: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Populate every generated-shared-prefix group before measurement."""
+    prefix_requests = collect_gsp_cache_prefix_requests(input_requests)
+    if not prefix_requests:
+        raise ValueError(
+            "No generated prefix metadata is available for cache prewarming. "
+            "Regenerate the generated-shared-prefix dataset with "
+            "--gsp-prewarm-prefixes enabled."
+        )
+
+    semaphore = asyncio.Semaphore(max_concurrency)
+    warmup_loras = list(dict.fromkeys(lora_names or [None]))
+
+    async def prewarm_one(prefix_request: DatasetRow, lora_name: Optional[str]):
+        request_input = RequestFuncInput(
+            model=model_id,
+            prompt=prefix_request.prompt,
+            api_url=api_url,
+            prompt_len=prefix_request.prompt_len,
+            output_len=1,
+            lora_name=lora_name,
+            image_data=None,
+            extra_request_body=extra_request_body,
+            routing_key=prefix_request.routing_key,
+        )
+        async with semaphore:
+            return await request_func(request_func_input=request_input)
+
+    print(
+        f"Prewarming {len(prefix_requests)} generated prefix groups "
+        f"with concurrency {max_concurrency}..."
+    )
+    outputs = await asyncio.gather(
+        *(
+            prewarm_one(prefix_request, lora_name)
+            for prefix_request in prefix_requests
+            for lora_name in warmup_loras
+        )
+    )
+    failed = [output for output in outputs if not output.success]
+    if failed:
+        raise ValueError(
+            f"Prefix cache prewarm failed for {len(failed)} of {len(outputs)} "
+            f"requests. First error: {failed[0].error}"
+        )
+
+    expected_cached_tokens = sum(
+        min(getattr(request, "cache_prefix_len", 0) or 0, request.prompt_len)
+        for request in input_requests
+    )
+    expected_prompt_tokens = sum(request.prompt_len for request in input_requests)
+    expected_hit_rate_pct = (
+        expected_cached_tokens / expected_prompt_tokens * 100
+        if expected_prompt_tokens > 0
+        else 0.0
+    )
+    primed_prefix_tokens = sum(request.prompt_len for request in prefix_requests) * len(
+        warmup_loras
+    )
+    print(
+        f"Prefix cache prewarm completed: {len(outputs)} requests, "
+        f"{primed_prefix_tokens} prompt tokens, expected measured hit rate "
+        f"{expected_hit_rate_pct:.2f}%."
+    )
+    return {
+        "mode": "prewarmed",
+        "num_prefixes": len(prefix_requests),
+        "prewarm_requests": len(outputs),
+        "prewarm_concurrency": max_concurrency,
+        "primed_prefix_tokens": primed_prefix_tokens,
+        "expected_cached_tokens": expected_cached_tokens,
+        "expected_prompt_tokens": expected_prompt_tokens,
+        "expected_hit_rate_pct": round(expected_hit_rate_pct, 2),
+    }
+
+
 @dataclass
 class BenchmarkMetrics:
     # Request counts and token totals
@@ -1354,6 +1470,8 @@ async def benchmark(
     flush_cache: bool = False,
     flush_cache_timeout: float = _DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT,
     warmup_requests: int = 1,
+    gsp_prewarm_prefixes: bool = False,
+    gsp_prewarm_concurrency: int = 1,
     use_trace_timestamps: bool = False,
     mooncake_slowdown_factor=1.0,
     mooncake_num_rounds=1,
@@ -1361,7 +1479,8 @@ async def benchmark(
     profile_decode_url: Optional[List[str]] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
-        request_func = ASYNC_REQUEST_FUNCS[backend]
+        base_request_func = ASYNC_REQUEST_FUNCS[backend]
+        request_func = base_request_func
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
@@ -1471,6 +1590,18 @@ async def benchmark(
         flush_server_cache(base_url, backend, flush_cache_timeout)
 
     time.sleep(1.0)
+
+    prefix_cache_config = None
+    if gsp_prewarm_prefixes:
+        prefix_cache_config = await prewarm_gsp_prefix_cache(
+            request_func=base_request_func,
+            api_url=api_url,
+            model_id=model_id,
+            input_requests=input_requests,
+            extra_request_body=extra_request_body,
+            max_concurrency=gsp_prewarm_concurrency,
+            lora_names=lora_names,
+        )
 
     # Build profile URLs for PD separated mode (do this once at the beginning)
     pd_profile_urls = []
@@ -1858,6 +1989,12 @@ async def benchmark(
                 "storage_cached_tokens": (total_storage if total_storage > 0 else None),
                 "storage_backend": storage_backend_name,
             }
+        if prefix_cache_config is not None:
+            prefix_cache_config["actual_hit_rate_pct"] = (
+                round(hit_rate, 2) if args.cache_report else None
+            )
+            prefix_cache_config["hit_rate_verified"] = bool(args.cache_report)
+            result["prefix_cache_config"] = prefix_cache_config
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
         print("-" * 30)
@@ -1972,6 +2109,10 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "cache_report"):
         args.cache_report = False
+    if not hasattr(args, "gsp_prewarm_prefixes"):
+        args.gsp_prewarm_prefixes = False
+    if not hasattr(args, "gsp_prewarm_concurrency"):
+        args.gsp_prewarm_concurrency = 1
 
     if getattr(args, "print_requests", False):
         assert args.backend == "sglang-oai-chat"  # only support this now
@@ -1993,6 +2134,11 @@ def run_benchmark(args_: argparse.Namespace):
             print("WARNING: --cache-report is only supported with sglang backends.")
         elif args.backend in ("sglang-oai", "sglang-oai-chat"):
             extra_request_body["return_cached_tokens_details"] = True
+    elif args.gsp_prewarm_prefixes:
+        print(
+            "WARNING: --gsp-prewarm-prefixes is enabled without --cache-report; "
+            "the achieved cache hit rate will not be verified."
+        )
 
     # Inject bootstrap fields for fake decode benchmarking
     if getattr(args, "fake_prefill", False):
@@ -2151,6 +2297,8 @@ def run_benchmark(args_: argparse.Namespace):
             flush_cache=args.flush_cache,
             flush_cache_timeout=args.flush_cache_timeout,
             warmup_requests=args.warmup_requests,
+            gsp_prewarm_prefixes=args.gsp_prewarm_prefixes,
+            gsp_prewarm_concurrency=args.gsp_prewarm_concurrency,
             use_trace_timestamps=args.use_trace_timestamps,
             mooncake_slowdown_factor=args.mooncake_slowdown_factor,
             mooncake_num_rounds=args.mooncake_num_rounds,
@@ -2170,6 +2318,19 @@ def _finite_positive_float(value) -> float:
         ) from exc
     if not math.isfinite(parsed) or parsed <= 0:
         raise argparse.ArgumentTypeError(f"expected a finite float > 0, got {value!r}")
+    return parsed
+
+
+def _positive_int(value) -> int:
+    """argparse type for a strictly positive integer."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"expected an integer > 0, got {value!r}"
+        ) from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"expected an integer > 0, got {value!r}")
     return parsed
 
 
@@ -2196,6 +2357,26 @@ def _validate_parsed_gsp_args(
             "--gsp-group-distribution=zipf; remove --gsp-zipf-alpha "
             "or set --gsp-group-distribution=zipf"
         )
+    if getattr(args, "gsp_prewarm_prefixes", False):
+        if args.dataset_name != "generated-shared-prefix":
+            parser.error(
+                "--gsp-prewarm-prefixes requires "
+                "--dataset-name=generated-shared-prefix"
+            )
+        if not args.backend.startswith("sglang"):
+            parser.error("--gsp-prewarm-prefixes requires an SGLang backend")
+        if args.gsp_system_prompt_len <= 0:
+            parser.error("--gsp-prewarm-prefixes requires --gsp-system-prompt-len > 0")
+        if args.gsp_fast_prepare:
+            parser.error(
+                "--gsp-prewarm-prefixes is incompatible with --gsp-fast-prepare "
+                "because cache-hit measurement requires accurate prompt lengths"
+            )
+        if args.gsp_num_turns != 1:
+            parser.error(
+                "--gsp-prewarm-prefixes currently supports single-turn GSP "
+                "workloads only; omit it for natural multi-turn cache reuse"
+            )
 
 
 class LoRAPathAction(argparse.Action):
@@ -2674,6 +2855,21 @@ def cli_main():
         "--gsp-ordered",
         action="store_true",
         help="Keep requests in order without shuffling. By default, requests are shuffled randomly.",
+    )
+    group.add_argument(
+        "--gsp-prewarm-prefixes",
+        action="store_true",
+        help=(
+            "Prewarm every generated shared-prefix group after the optional "
+            "cache flush and before measured traffic. Priming requests are "
+            "excluded from benchmark metrics."
+        ),
+    )
+    group.add_argument(
+        "--gsp-prewarm-concurrency",
+        type=_positive_int,
+        default=1,
+        help="Maximum concurrent prefix-cache priming requests (default: 1).",
     )
     group.add_argument(
         "--gsp-group-distribution",

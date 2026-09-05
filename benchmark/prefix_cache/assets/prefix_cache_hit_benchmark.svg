@@ -1,0 +1,222 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1200" viewBox="0 0 1600 1200" role="img" aria-labelledby="title desc">
+  <title id="title">SGLang prefix-cache-hit benchmark workflow</title>
+  <desc id="desc">End-to-end workflow from matrix configuration through generated shared-prefix requests, cache priming, measured traffic, cache reporting, validation, and resumable artifacts.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f8fbff"/>
+      <stop offset="1" stop-color="#eef4fb"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="5" stdDeviation="7" flood-color="#17324d" flood-opacity="0.13"/>
+    </filter>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#49647d"/>
+    </marker>
+    <marker id="arrowGood" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#16835f"/>
+    </marker>
+    <marker id="arrowBad" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#c55045"/>
+    </marker>
+    <style>
+      .title { font-family: "DejaVu Sans", Arial, sans-serif; font-size: 34px; font-weight: 700; fill: #102a43; }
+      .subtitle { font-family: "DejaVu Sans", Arial, sans-serif; font-size: 17px; font-weight: 400; fill: #52677b; }
+      .lane { font-family: "DejaVu Sans", Arial, sans-serif; font-size: 15px; font-weight: 700; letter-spacing: 1.2px; fill: #557086; }
+      .head { font-family: "DejaVu Sans", Arial, sans-serif; font-size: 18px; font-weight: 700; fill: #102a43; }
+      .body { font-family: "DejaVu Sans", Arial, sans-serif; font-size: 14px; font-weight: 400; fill: #334e68; }
+      .small { font-family: "DejaVu Sans", Arial, sans-serif; font-size: 12px; font-weight: 500; fill: #52677b; }
+      .label { font-family: "DejaVu Sans", Arial, sans-serif; font-size: 13px; font-weight: 700; fill: #334e68; }
+      .box { stroke-width: 1.5; filter: url(#shadow); }
+      .arrow { fill: none; stroke: #49647d; stroke-width: 2.4; marker-end: url(#arrow); }
+      .arrow-good { fill: none; stroke: #16835f; stroke-width: 2.4; marker-end: url(#arrowGood); }
+      .arrow-bad { fill: none; stroke: #c55045; stroke-width: 2.4; marker-end: url(#arrowBad); }
+      .connector { fill: none; stroke: #49647d; stroke-width: 2.4; stroke-dasharray: 7 6; }
+      .connector-good { fill: none; stroke: #16835f; stroke-width: 2.4; stroke-dasharray: 7 6; }
+      .dashed { stroke-dasharray: 7 6; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1200" fill="url(#bg)"/>
+  <rect x="34" y="28" width="1532" height="1144" rx="24" fill="#ffffff" stroke="#d8e4ef"/>
+
+  <text x="80" y="84" class="title">SGLang Prefix-Cache-Hit Benchmark Workflow</text>
+  <text x="80" y="116" class="subtitle">Controlled matrix generation, explicit prefix priming, measured serving, cache accounting, and strict resumable validation</text>
+
+  <text x="80" y="166" class="lane">1 · MATRIX ORCHESTRATION</text>
+  <text x="80" y="480" class="lane">2 · CACHE STATE CONTROL</text>
+  <text x="80" y="770" class="lane">3 · MEASUREMENT &amp; VALIDATION</text>
+
+  <!-- Matrix configuration -->
+  <rect x="78" y="186" width="300" height="150" rx="18" fill="#e8f1ff" stroke="#4c82c3" class="box"/>
+  <text x="102" y="220" class="head">Matrix CLI</text>
+  <text x="102" y="250" class="body">
+    <tspan x="102" dy="0">input lengths × output lengths</tspan>
+    <tspan x="102" dy="22">× cache-hit targets × concurrency</tspan>
+    <tspan x="102" dy="22">× repetitions</tspan>
+  </text>
+  <rect x="102" y="302" width="246" height="24" rx="12" fill="#d5e6fb"/>
+  <text x="225" y="319" text-anchor="middle" class="small">manifest.json records configuration</text>
+
+  <!-- Point construction -->
+  <rect x="430" y="186" width="320" height="150" rx="18" fill="#e8f1ff" stroke="#4c82c3" class="box"/>
+  <text x="454" y="220" class="head">Build tagged matrix point</text>
+  <text x="454" y="250" class="body">
+    <tspan x="454" dy="0">prefix = floor(input × hit%)</tspan>
+    <tspan x="454" dy="22">suffix = input − prefix</tspan>
+    <tspan x="454" dy="22">tag = in/out/hit/concurrency/repetition</tspan>
+  </text>
+  <text x="590" y="316" text-anchor="middle" class="small">build_point_command()</text>
+
+  <!-- Decision -->
+  <path d="M943 187 L1070 261 L943 335 L816 261 Z" fill="#fff4d6" stroke="#c99b2e" class="box"/>
+  <text x="943" y="251" text-anchor="middle" class="head">Target hit</text>
+  <text x="943" y="276" text-anchor="middle" class="head">equals 0%?</text>
+
+  <!-- Cold branch -->
+  <rect x="1132" y="176" width="350" height="142" rx="18" fill="#f4f7fa" stroke="#8194a6" class="box"/>
+  <text x="1156" y="210" class="head">Cold-cache control</text>
+  <text x="1156" y="240" class="body">
+    <tspan x="1156" dy="0">groups = number of requests</tspan>
+    <tspan x="1156" dy="22">one unique prefix per request</tspan>
+    <tspan x="1156" dy="22">no explicit cache priming</tspan>
+  </text>
+
+  <!-- Warm branch -->
+  <rect x="1132" y="350" width="350" height="92" rx="18" fill="#e7f7f1" stroke="#26936e" class="box"/>
+  <text x="1156" y="378" class="head">Warm-cache point</text>
+  <text x="1156" y="404" class="body">
+    <tspan x="1156" dy="0">configured shared-prefix groups</tspan>
+    <tspan x="1156" dy="20">cache_prefix metadata · uniform / Zipf</tspan>
+  </text>
+
+  <!-- Dataset -->
+  <rect x="78" y="510" width="330" height="178" rx="18" fill="#eeeaff" stroke="#7566c7" class="box"/>
+  <text x="102" y="544" class="head">Generate DatasetRow objects</text>
+  <text x="102" y="574" class="body">
+    <tspan x="102" dy="0">prompt = system prefix + question</tspan>
+    <tspan x="102" dy="22">prompt_len / output_len</tspan>
+    <tspan x="102" dy="22">cache_prefix / cache_prefix_len</tspan>
+    <tspan x="102" dy="22">optional routing_key</tspan>
+  </text>
+  <text x="243" y="670" text-anchor="middle" class="small">legacy cache entries regenerate if metadata is absent</text>
+
+  <!-- Warmup + flush -->
+  <rect x="476" y="510" width="280" height="178" rx="18" fill="#fff4d6" stroke="#c99b2e" class="box"/>
+  <text x="500" y="544" class="head">Warmup then flush</text>
+  <text x="500" y="574" class="body">
+    <tspan x="500" dy="0">run generic engine warmups</tspan>
+    <tspan x="500" dy="22">require at least one success</tspan>
+    <tspan x="500" dy="22">POST /flush_cache</tspan>
+    <tspan x="500" dy="22">wait before cache priming</tspan>
+  </text>
+
+  <!-- Prefix priming -->
+  <rect x="824" y="510" width="330" height="178" rx="18" fill="#e7f7f1" stroke="#26936e" class="box"/>
+  <text x="848" y="544" class="head">Deduplicate and prime prefixes</text>
+  <text x="848" y="574" class="body">
+    <tspan x="848" dy="0">identity = routing_key + prefix</tspan>
+    <tspan x="848" dy="22">one request per unique group</tspan>
+    <tspan x="848" dy="22">output_len = 1</tspan>
+    <tspan x="848" dy="22">all priming requests must succeed</tspan>
+  </text>
+  <rect x="848" y="656" width="282" height="23" rx="11" fill="#cdeade"/>
+  <text x="989" y="672" text-anchor="middle" class="small">priming excluded from benchmark metrics</text>
+
+  <!-- Measured traffic -->
+  <rect x="1222" y="510" width="260" height="178" rx="18" fill="#e5f5fb" stroke="#3396b7" class="box"/>
+  <text x="1246" y="544" class="head">Measured traffic</text>
+  <text x="1246" y="574" class="body">
+    <tspan x="1246" dy="0">request-rate control</tspan>
+    <tspan x="1246" dy="22">max concurrency</tspan>
+    <tspan x="1246" dy="22">streaming token timing</tspan>
+    <tspan x="1246" dy="22">temperature 0 / ignore EOS</tspan>
+  </text>
+
+  <!-- Per-request outputs -->
+  <rect x="78" y="800" width="330" height="178" rx="18" fill="#e5f5fb" stroke="#3396b7" class="box"/>
+  <text x="102" y="834" class="head">RequestFuncOutput</text>
+  <text x="102" y="864" class="body">
+    <tspan x="102" dy="0">success, latency, TTFT, ITL[]</tspan>
+    <tspan x="102" dy="22">prompt/output token counts</tspan>
+    <tspan x="102" dy="22">cached_tokens</tspan>
+    <tspan x="102" dy="22">device / host / storage details</tspan>
+  </text>
+
+  <!-- Aggregation -->
+  <rect x="466" y="800" width="340" height="178" rx="18" fill="#eeeaff" stroke="#7566c7" class="box"/>
+  <text x="490" y="834" class="head">Aggregate result row</text>
+  <text x="490" y="864" class="body">
+    <tspan x="490" dy="0">TTFT / TPOT / ITL percentiles</tspan>
+    <tspan x="490" dy="22">request and token throughput</tspan>
+    <tspan x="490" dy="22">cache_report: observed tokens</tspan>
+    <tspan x="490" dy="22">prefix_cache_config: expected tokens</tspan>
+  </text>
+
+  <!-- Validation diamond -->
+  <path d="M1000 796 L1138 889 L1000 982 L862 889 Z" fill="#fff4d6" stroke="#c99b2e" class="box"/>
+  <text x="1000" y="868" text-anchor="middle" class="head">Valid point?</text>
+  <text x="1000" y="894" text-anchor="middle" class="small">request count complete</text>
+  <text x="1000" y="914" text-anchor="middle" class="small">hit error ≤ page-aware tolerance</text>
+
+  <!-- Success -->
+  <rect x="1216" y="774" width="286" height="154" rx="18" fill="#e7f7f1" stroke="#26936e" class="box"/>
+  <text x="1240" y="808" class="head">Accept and persist</text>
+  <text x="1240" y="838" class="body">
+    <tspan x="1240" dy="0">append results.jsonl</tspan>
+    <tspan x="1240" dy="22">regenerate summary.csv</tspan>
+    <tspan x="1240" dy="22">skip valid tag on restart</tspan>
+  </text>
+
+  <!-- Failure -->
+  <rect x="1216" y="954" width="286" height="132" rx="18" fill="#fff0ee" stroke="#c55045" class="box"/>
+  <text x="1240" y="988" class="head">Reject and abort</text>
+  <text x="1240" y="1018" class="body">
+    <tspan x="1240" dy="0">preserve rejected JSONL attempt</tspan>
+    <tspan x="1240" dy="22">rerun tag after capacity/config fix</tspan>
+  </text>
+
+  <!-- Arrows, top -->
+  <path d="M378 261 H420" class="arrow"/>
+  <path d="M750 261 H806" class="arrow"/>
+  <path d="M1070 261 H1132" class="arrow"/>
+  <text x="1094" y="248" class="label">YES</text>
+  <path d="M1010 319 V342 H1307 V350" class="arrow-good"/>
+  <text x="1040" y="334" class="label">NO</text>
+
+  <!-- Branch convergence to dataset -->
+  <path d="M1482 247 H1520 V480 H1488" class="connector"/>
+  <path d="M1307 442 V480 H1488" class="connector-good"/>
+  <circle cx="1488" cy="480" r="6" fill="#ffffff" stroke="#49647d" stroke-width="2"/>
+  <path d="M1482 480 H412 Q400 480 400 492 V510" class="arrow dashed"/>
+
+  <!-- Control chain -->
+  <path d="M408 599 H466" class="arrow"/>
+  <path d="M756 599 H814" class="arrow"/>
+  <path d="M1154 599 H1212" class="arrow-good"/>
+  <path d="M616 688 V725 H1245 V698" class="arrow dashed"/>
+  <text x="760" y="718" class="small">0% path bypasses explicit priming after flush</text>
+
+  <!-- Measurement chain -->
+  <path d="M1352 688 V744 H420 Q408 744 408 756 V800" class="arrow"/>
+  <path d="M408 889 H456" class="arrow"/>
+  <path d="M806 889 H852" class="arrow"/>
+  <path d="M1138 858 H1206" class="arrow-good"/>
+  <text x="1154" y="841" class="label">YES</text>
+  <path d="M1084 948 L1206 999" class="arrow-bad"/>
+  <text x="1122" y="963" class="label">NO</text>
+
+  <!-- Footer legend -->
+  <g transform="translate(80,1140)">
+    <rect width="20" height="14" rx="4" fill="#e8f1ff" stroke="#4c82c3"/>
+    <text x="30" y="12" class="small">orchestration</text>
+    <rect x="150" width="20" height="14" rx="4" fill="#e7f7f1" stroke="#26936e"/>
+    <text x="180" y="12" class="small">cache control / valid</text>
+    <rect x="350" width="20" height="14" rx="4" fill="#e5f5fb" stroke="#3396b7"/>
+    <text x="380" y="12" class="small">measurement</text>
+    <rect x="500" width="20" height="14" rx="4" fill="#eeeaff" stroke="#7566c7"/>
+    <text x="530" y="12" class="small">data / aggregation</text>
+    <rect x="680" width="20" height="14" rx="4" fill="#fff0ee" stroke="#c55045"/>
+    <text x="710" y="12" class="small">rejected attempt</text>
+  </g>
+</svg>

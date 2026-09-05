@@ -1,7 +1,9 @@
 import argparse
 import asyncio
 import base64
+import csv
 import functools
+import importlib.util
 import io
 import json
 import pickle
@@ -53,12 +55,37 @@ from sglang.benchmark.serving import (
     _BACKEND_API_PATHS,
     _EMBEDDING_BACKENDS,
     ASYNC_REQUEST_FUNCS,
+    RequestFuncOutput,
     _finite_positive_float,
+    _positive_int,
     async_request_openai_embeddings,
+    collect_gsp_cache_prefix_requests,
     flush_server_cache,
+    prewarm_gsp_prefix_cache,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+_PREFIX_CACHE_SCRIPT = (
+    Path(__file__).resolve().parents[3]
+    / "benchmark"
+    / "prefix_cache"
+    / "bench_prefix_cache.py"
+)
+_PREFIX_CACHE_SPEC = importlib.util.spec_from_file_location(
+    "sglang_prefix_cache_benchmark", _PREFIX_CACHE_SCRIPT
+)
+assert _PREFIX_CACHE_SPEC is not None and _PREFIX_CACHE_SPEC.loader is not None
+_PREFIX_CACHE_MODULE = importlib.util.module_from_spec(_PREFIX_CACHE_SPEC)
+_PREFIX_CACHE_SPEC.loader.exec_module(_PREFIX_CACHE_MODULE)
+
+build_point_command = _PREFIX_CACHE_MODULE.build_point_command
+cache_hit_tolerance_for_row = _PREFIX_CACHE_MODULE.cache_hit_tolerance_for_row
+load_completed_results = _PREFIX_CACHE_MODULE.load_completed_results
+make_tag = _PREFIX_CACHE_MODULE.make_tag
+parse_prefix_cache_args = _PREFIX_CACHE_MODULE.parse_args
+result_validation_error = _PREFIX_CACHE_MODULE.result_validation_error
+write_summary = _PREFIX_CACHE_MODULE.write_summary
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 register_cpu_ci(est_time=46, suite="stage-b-test-cpu-intel")
@@ -88,6 +115,48 @@ _BENCH_SERVING_CLI_CASES = {
         "uniform",
         "--gsp-zipf-alpha",
         "1.0",
+        "--ready-check-timeout-sec",
+        "0",
+    ],
+    "prewarm_wrong_dataset": [
+        "--dataset-name",
+        "random",
+        "--gsp-prewarm-prefixes",
+        "--ready-check-timeout-sec",
+        "0",
+    ],
+    "prewarm_wrong_backend": [
+        "--backend",
+        "vllm",
+        "--dataset-name",
+        "generated-shared-prefix",
+        "--gsp-prewarm-prefixes",
+        "--ready-check-timeout-sec",
+        "0",
+    ],
+    "prewarm_bad_concurrency": [
+        "--dataset-name",
+        "generated-shared-prefix",
+        "--gsp-prewarm-prefixes",
+        "--gsp-prewarm-concurrency",
+        "0",
+        "--ready-check-timeout-sec",
+        "0",
+    ],
+    "prewarm_fast_prepare": [
+        "--dataset-name",
+        "generated-shared-prefix",
+        "--gsp-prewarm-prefixes",
+        "--gsp-fast-prepare",
+        "--ready-check-timeout-sec",
+        "0",
+    ],
+    "prewarm_multi_turn": [
+        "--dataset-name",
+        "generated-shared-prefix",
+        "--gsp-prewarm-prefixes",
+        "--gsp-num-turns",
+        "2",
         "--ready-check-timeout-sec",
         "0",
     ],
@@ -324,6 +393,8 @@ def make_args(**overrides):
         "gsp_send_routing_key": False,
         "gsp_num_turns": 1,
         "gsp_ordered": False,
+        "gsp_prewarm_prefixes": False,
+        "gsp_prewarm_concurrency": 1,
         "gsp_group_distribution": "uniform",
         "gsp_zipf_alpha": None,
         "seed": 1,
@@ -1097,6 +1168,140 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertEqual(len(rows_a), 3 * 4)
         self.assertEqual(self._row_fields(rows_a), self._row_fields(rows_b))
 
+    def test_gsp_prewarm_metadata_and_deduplication(self):
+        args = make_args(
+            dataset_name="generated-shared-prefix",
+            gsp_num_groups=3,
+            gsp_prompts_per_group=4,
+            gsp_system_prompt_len=8,
+            gsp_question_len=4,
+            gsp_output_len=2,
+            gsp_range_ratio=1.0,
+            gsp_ordered=True,
+            gsp_prewarm_prefixes=True,
+            seed=17,
+        )
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        rows = get_dataset(args, self.tokenizer, model_id="dummy-model")
+
+        self.assertEqual(len(rows), 12)
+        self.assertTrue(all(row.cache_prefix for row in rows))
+        self.assertTrue(all(row.cache_prefix_len > 0 for row in rows))
+        prefix_requests = collect_gsp_cache_prefix_requests(rows)
+        self.assertEqual(len(prefix_requests), 3)
+        self.assertTrue(all(row.output_len == 1 for row in prefix_requests))
+
+    def test_gsp_prewarm_regenerates_legacy_cache_without_metadata(self):
+        from sglang.benchmark.datasets import generated_shared_prefix as gsp_mod
+
+        args = make_args(
+            dataset_name="generated-shared-prefix",
+            gsp_num_groups=2,
+            gsp_prompts_per_group=2,
+            gsp_system_prompt_len=8,
+            gsp_question_len=4,
+            gsp_output_len=2,
+            gsp_range_ratio=1.0,
+            gsp_ordered=True,
+            gsp_prewarm_prefixes=True,
+            seed=18,
+        )
+        cache_path = get_gen_prefix_cache_path(
+            seed=args.seed,
+            num_groups=args.gsp_num_groups,
+            prompts_per_group=args.gsp_prompts_per_group,
+            system_prompt_len=args.gsp_system_prompt_len,
+            question_len=args.gsp_question_len,
+            output_len=args.gsp_output_len,
+            tokenizer=self.tokenizer,
+        )
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, "wb") as f:
+            pickle.dump([DatasetRow(prompt="legacy", prompt_len=1, output_len=1)], f)
+
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        with patch.object(gsp_mod, "gen_prompt", wraps=gsp_mod.gen_prompt) as gen:
+            rows = get_dataset(args, self.tokenizer, model_id="dummy-model")
+
+        self.assertGreater(gen.call_count, 0)
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all(row.cache_prefix for row in rows))
+
+    def test_gsp_prefix_prewarm_requests_and_stats(self):
+        rows = [
+            DatasetRow(
+                prompt=f"prefix-a question-{i}",
+                prompt_len=10,
+                output_len=2,
+                cache_prefix="prefix-a ",
+                cache_prefix_len=6,
+            )
+            for i in range(2)
+        ] + [
+            DatasetRow(
+                prompt="prefix-b question",
+                prompt_len=20,
+                output_len=2,
+                cache_prefix="prefix-b ",
+                cache_prefix_len=8,
+            )
+        ]
+        seen = []
+
+        async def request_func(request_func_input, pbar=None):
+            seen.append(request_func_input)
+            return RequestFuncOutput(success=True)
+
+        stats = asyncio.run(
+            prewarm_gsp_prefix_cache(
+                request_func=request_func,
+                api_url="http://127.0.0.1:30000/generate",
+                model_id="test-model",
+                input_requests=rows,
+                extra_request_body={},
+                max_concurrency=2,
+            )
+        )
+
+        self.assertEqual(
+            [request.prompt for request in seen], ["prefix-a ", "prefix-b "]
+        )
+        self.assertTrue(all(request.output_len == 1 for request in seen))
+        self.assertEqual(stats["num_prefixes"], 2)
+        self.assertEqual(stats["prewarm_requests"], 2)
+        self.assertEqual(stats["primed_prefix_tokens"], 14)
+        self.assertEqual(stats["expected_cached_tokens"], 20)
+        self.assertEqual(stats["expected_prompt_tokens"], 40)
+        self.assertEqual(stats["expected_hit_rate_pct"], 50.0)
+
+    def test_gsp_prefix_prewarm_failure_is_fatal(self):
+        rows = [
+            DatasetRow(
+                prompt="prefix question",
+                prompt_len=10,
+                output_len=2,
+                cache_prefix="prefix ",
+                cache_prefix_len=6,
+            )
+        ]
+
+        async def request_func(request_func_input, pbar=None):
+            return RequestFuncOutput(success=False, error="intentional failure")
+
+        with self.assertRaisesRegex(ValueError, "intentional failure"):
+            asyncio.run(
+                prewarm_gsp_prefix_cache(
+                    request_func=request_func,
+                    api_url="http://127.0.0.1:30000/generate",
+                    model_id="test-model",
+                    input_requests=rows,
+                    extra_request_body={},
+                    max_concurrency=1,
+                )
+            )
+
     def test_gsp_uniform_cache_path_format_unchanged(self):
         # The uniform-mode cache filename keeps its existing
         # gen_shared_prefix_<seed>_<N>_<P>_<sysL>_<qL>_<outL>_<TokenizerCls>.pkl
@@ -1418,6 +1623,8 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         # Both new flags appear.
         self.assertIn("--gsp-group-distribution", out)
         self.assertIn("--gsp-zipf-alpha", out)
+        self.assertIn("--gsp-prewarm-prefixes", out)
+        self.assertIn("--gsp-prewarm-concurrency", out)
         # Rank-based Zipf formula and alpha constraint are documented.
         self.assertIn("1/rank**alpha", out)
         self.assertIn("rank starts at 1", out)
@@ -1438,6 +1645,24 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             with self.subTest(value=value):
                 with self.assertRaises(argparse.ArgumentTypeError):
                     _finite_positive_float(value)
+
+        for value in ("0", "-1", "not-an-int"):
+            with self.subTest(value=value):
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    _positive_int(value)
+
+    def test_bench_serving_cli_rejects_invalid_prewarm_options(self):
+        for case in (
+            "prewarm_wrong_dataset",
+            "prewarm_wrong_backend",
+            "prewarm_bad_concurrency",
+            "prewarm_fast_prepare",
+            "prewarm_multi_turn",
+        ):
+            with self.subTest(case=case):
+                res = _bench_serving_cli_results()[case]
+                self.assertEqual(res.returncode, 2, res.stderr)
+                self.assertIn("gsp-prewarm", res.stderr + res.stdout)
 
     def test_bench_serving_cli_rejects_zipf_without_alpha_before_server(self):
         # Malformed CLI combinations (zipf with no alpha) must fail at
@@ -1476,6 +1701,188 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             "Traceback",
         ]:
             self.assertNotIn(forbidden, stderr)
+
+
+class TestPrefixCacheBenchmark(unittest.TestCase):
+    def _parse(self, *extra):
+        return parse_prefix_cache_args(
+            [
+                "--base-url",
+                "http://127.0.0.1:30000",
+                "--model",
+                "test-model",
+                "--tokenizer",
+                "test-tokenizer",
+                "--input-lens",
+                "32768",
+                "--output-lens",
+                "512",
+                "--cache-hit-percentages",
+                "50",
+                "--concurrencies",
+                "8",
+                *extra,
+            ]
+        )
+
+    def test_build_point_command(self):
+        args = self._parse("--num-prompts", "50", "--num-groups", "2")
+        tag, command = build_point_command(
+            args,
+            Path("results.jsonl"),
+            input_len=32768,
+            output_len=512,
+            cache_hit_percent=50,
+            concurrency=8,
+            repetition=1,
+        )
+
+        self.assertEqual(tag, "prefix-cache-in32768-out512-hit50-c8")
+        self.assertEqual(command[command.index("--gsp-num-groups") + 1], "2")
+        self.assertEqual(command[command.index("--gsp-prompts-per-group") + 1], "25")
+        self.assertEqual(command[command.index("--gsp-system-prompt-len") + 1], "16384")
+        self.assertEqual(command[command.index("--gsp-question-len") + 1], "16384")
+        self.assertIn("--gsp-prewarm-prefixes", command)
+
+    def test_zero_hit_uses_unique_groups_without_prewarm(self):
+        args = self._parse(
+            "--num-prompts", "50", "--num-groups", "2", "--repetitions", "2"
+        )
+        tag, command = build_point_command(
+            args,
+            Path("results.jsonl"),
+            input_len=32768,
+            output_len=512,
+            cache_hit_percent=0,
+            concurrency=1,
+            repetition=2,
+        )
+
+        self.assertEqual(tag, "prefix-cache-in32768-out512-hit0-c1-r2")
+        self.assertEqual(command[command.index("--gsp-num-groups") + 1], "50")
+        self.assertEqual(command[command.index("--gsp-prompts-per-group") + 1], "1")
+        self.assertEqual(command[command.index("--gsp-system-prompt-len") + 1], "0")
+        self.assertNotIn("--gsp-prewarm-prefixes", command)
+
+    def test_matrix_argument_validation(self):
+        with self.assertRaises(SystemExit):
+            self._parse("--num-prompts", "50", "--num-groups", "3")
+        with self.assertRaises(SystemExit):
+            self._parse("--cache-hit-percentages", "101")
+        with self.assertRaises(SystemExit):
+            self._parse("--group-distribution", "zipf")
+
+    def test_matrix_tag_supports_fractional_hit_rate(self):
+        self.assertEqual(
+            make_tag("model", 4096, 128, 33.3, 4, 1),
+            "model-in4096-out128-hit33p3-c4-r1",
+        )
+
+    def test_result_validation_checks_cache_hit_tolerance(self):
+        row = {
+            "tag": "prefix-cache-in32768-out512-hit50-c8",
+            "completed": 50,
+            "cache_report": {"cache_hit_rate_pct": 49.8},
+            "prefix_cache_config": {"expected_hit_rate_pct": 49.9},
+        }
+        self.assertIsNone(result_validation_error(row, 50, 50, 0.5))
+
+        row["cache_report"]["cache_hit_rate_pct"] = 48.0
+        error = result_validation_error(row, 50, 50, 0.5)
+        self.assertIn("exceeding the 0.50-point tolerance", error)
+
+        row["cache_report"] = {}
+        self.assertIn(
+            "missing a finite achieved hit rate",
+            result_validation_error(row, 50, 50, 0.5),
+        )
+
+    def test_result_validation_allows_cache_page_rounding(self):
+        row = {
+            "tag": "prefix-cache-in128-out8-hit50-c1",
+            "completed": 50,
+            "total_input_tokens": 6400,
+            "server_info": {"page_size": 64},
+            "cache_report": {"cache_hit_rate_pct": 25.0},
+            "prefix_cache_config": {"expected_hit_rate_pct": 50.0},
+        }
+        self.assertEqual(cache_hit_tolerance_for_row(row, 0.5), 50.0)
+        self.assertIsNone(result_validation_error(row, 50, 50, 0.5))
+
+    def test_load_completed_results_validates_warm_and_cold_points(self):
+        warm_tag = "prefix-cache-in32768-out512-hit50-c8"
+        cold_tag = "prefix-cache-in32768-out512-hit0-c1"
+        rows = [
+            {
+                "tag": warm_tag,
+                "completed": 50,
+                "cache_report": {"cache_hit_rate_pct": 49.8},
+                "prefix_cache_config": {"expected_hit_rate_pct": 49.9},
+            },
+            {
+                "tag": cold_tag,
+                "completed": 50,
+                "cache_report": {"cache_hit_rate_pct": 0.1},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_path = Path(temp_dir) / "results.jsonl"
+            result_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            completed = load_completed_results(
+                result_path,
+                expected_requests=50,
+                target_hit_rates={warm_tag: 50, cold_tag: 0},
+                cache_hit_tolerance=0.5,
+            )
+
+        self.assertEqual(set(completed), {warm_tag, cold_tag})
+
+    def test_load_completed_results_uses_latest_attempt(self):
+        tag = "prefix-cache-in32768-out512-hit50-c8"
+        valid = {
+            "tag": tag,
+            "completed": 50,
+            "cache_report": {"cache_hit_rate_pct": 50.0},
+            "prefix_cache_config": {"expected_hit_rate_pct": 50.0},
+        }
+        invalid = {
+            **valid,
+            "cache_report": {"cache_hit_rate_pct": 40.0},
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_path = Path(temp_dir) / "results.jsonl"
+            result_path.write_text(
+                "\n".join(json.dumps(row) for row in (valid, invalid)) + "\n"
+            )
+            completed = load_completed_results(
+                result_path,
+                expected_requests=50,
+                target_hit_rates={tag: 50},
+                cache_hit_tolerance=0.5,
+            )
+
+        self.assertNotIn(tag, completed)
+
+    def test_summary_records_effective_cache_hit_tolerance(self):
+        row = {
+            "tag": "prefix-cache-in128-out8-hit50-c1",
+            "completed": 50,
+            "total_input_tokens": 6400,
+            "server_info": {"page_size": 64},
+            "cache_report": {"cache_hit_rate_pct": 25.0},
+            "prefix_cache_config": {"expected_hit_rate_pct": 50.0},
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_path = Path(temp_dir) / "results.jsonl"
+            summary_path = Path(temp_dir) / "summary.csv"
+            result_path.write_text(json.dumps(row) + "\n")
+            write_summary(result_path, summary_path, cache_hit_tolerance=0.5)
+            with summary_path.open(newline="") as summary_file:
+                summary = next(csv.DictReader(summary_file))
+
+        self.assertEqual(summary["cache_hit_error_percentage_points"], "25.0")
+        self.assertEqual(summary["allowed_cache_hit_error_percentage_points"], "50.0")
+        self.assertEqual(summary["cache_hit_within_tolerance"], "True")
 
 
 if __name__ == "__main__":
