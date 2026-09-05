@@ -671,12 +671,15 @@ def _validate_flashinfer_sparse_mla_backend(
             f"decode_impl={decode_impl!r}."
         )
     if is_glm_sm12_fp8:
-        unsupported = selected - {"flashinfer_sparse_mla"}
+        # flashinfer_sparse_mla stays the auto-selected default on this
+        # platform; triton_sparse_mla is a validated alternative prefill
+        # implementation that the user may select explicitly.
+        unsupported = selected - {"flashinfer_sparse_mla", "triton_sparse_mla"}
         if unsupported:
             raise ValueError(
                 "GLM DSA with FP8 KV cache on NVIDIA SM120/SM121 supports "
-                "only flashinfer_sparse_mla, "
-                f"but got {sorted(unsupported)}."
+                "only flashinfer_sparse_mla (default) or triton_sparse_mla "
+                f"(prefill), but got {sorted(unsupported)}."
             )
     return uses_flashinfer_sparse_mla
 
