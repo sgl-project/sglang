@@ -15,21 +15,9 @@
 `HybridLinearKVPool`).
 
 All write-location info travels in the attention metadata (`KVWriteLoc`); the
-pools hold none and never translate — the write loc reaching `set_kv_buffer` is
-always PHYSICAL. Two routing contracts are pinned here:
-
-1. Full-attention. The full-physical loc is carried in `KVWriteLoc.full_loc`
-   (from `ForwardMetadata.out_cache_loc_full_physical`) and written directly.
-   `UnifiedSWAKVPool` asserts it's present (the unified memory pool always precomputes
-   it); `HybridLinearKVPool` falls back to `loc` for a static (non-shared) pool,
-   where `loc` is itself already physical.
-2. SWA. The swa-physical loc rides the backend `swa_out_cache_loc` slot
-   (`KVWriteLoc.swa_loc`) and is written directly.
-
-Pure dispatch tests: the inner sub-pools are recording stubs, so no GPU / real
-buffers are needed (CPU CI).
-
-    python -m pytest test/registered/unit/mem_cache/test_full_loc_fast_path.py -v
+pools hold none and never translate, so the loc reaching `set_kv_buffer` is
+always PHYSICAL. Pure dispatch: the inner sub-pools are recording stubs, so no
+GPU and no real buffers are needed.
 """
 
 import types
@@ -61,9 +49,8 @@ class _RecordingPool:
 class TestUnifiedSWARouting(unittest.TestCase):
     """`UnifiedSWAKVPool.set_kv_buffer` routing: full layers write `full_loc`
     when present (triton's capture-stable buffer), else the rebound generic
-    `loc` -- the same id space once the loc is rebound; SWA layers write the swa-physical
-    `swa_loc`, which has no fallback (a different id space). The pool never
-    translates."""
+    `loc` -- the same id space; SWA layers write the swa-physical `swa_loc`,
+    which has no fallback (a different id space)."""
 
     def _make_bare_pool(self):
         from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
@@ -93,18 +80,15 @@ class TestUnifiedSWARouting(unittest.TestCase):
         self.assertEqual(len(pool.full_kv_pool.calls), 1)
         forwarded, kwargs = pool.full_kv_pool.calls[0]
         # Forward the full-physical tensor from the write metadata, NOT the
-        # virtual loc. No `already_physical` — the pool only ever gets physical.
+        # virtual loc; no `already_physical`, the pool only ever gets physical.
         self.assertIs(forwarded, full_phys)
         self.assertIsNot(forwarded, virtual_loc)
         self.assertNotIn("already_physical", kwargs)
 
     def test_full_layer_falls_back_to_generic_loc(self):
-        """Bug regression: fa3 x unified-SWA crashed at gpt-oss
-        cuda-graph capture because every backend except triton bundles the
-        2-arg KVWriteLoc(loc, swa) and the full-layer door demanded an explicit
-        full_loc. Once the loc is rebound the generic `loc` IS the full-side kernel-facing id
-        (rebind_write_loc runs at ForwardBatch construction),
-        so the door must fall back to it -- the pool still never translates."""
+        """Bug regression: a 2-arg `KVWriteLoc(loc, swa)` with no explicit
+        `full_loc` must fall back to the rebound `loc` -- which IS the full-side
+        kernel-facing id -- instead of failing the full-layer door."""
         pool = self._make_bare_pool()
         rebound_loc = torch.tensor([10, 11, 12], dtype=torch.int64)
         swa_phys = torch.tensor([1, 2, 0], dtype=torch.int64)
@@ -163,10 +147,9 @@ class TestUnifiedSWATombstoneClamp(unittest.TestCase):
     """`UnifiedSWAKVPool.translate_loc_from_full_to_swa` must clamp tombstoned
     ids to the reserved padding sink (0).
 
-    A token whose swa page was freed carries -1 in `virtual_to_physical`. Before
-    the clamp, that produced a negative id, which a captured graph stores at a
-    negative offset from the buffer base. The composite allocator's method of
-    the same name already clamped; this path did not.
+    A token whose swa page was freed carries -1 in `virtual_to_physical`, and a
+    negative id makes a captured graph store at a negative offset from the
+    buffer base.
     """
 
     def _make_bare_pool(self, page_size, v2p, multiplier=1):
@@ -203,83 +186,66 @@ class TestUnifiedSWATombstoneClamp(unittest.TestCase):
 
 
 class TestHybridLinearFullLocRouting(unittest.TestCase):
-    """`HybridLinearKVPool.set_kv_buffer` (non-MLA) writes the full-physical
-    `full_loc` from the write metadata when present (unified memory pool), else the
-    already-physical `loc` (static pool). No translate, no `already_physical`."""
+    """`HybridLinearKVPool.set_kv_buffer` writes the full-physical `full_loc`
+    when present (unified memory pool), else the already-physical `loc` (static
+    pool) -- the same rule on the MHA and MLA branches."""
 
-    def _make_bare_pool(self):
+    def _make_bare_pool(self, use_mla):
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
         pool = object.__new__(HybridLinearKVPool)
         pool.full_kv_pool = _RecordingPool()
-        pool.use_mla = False
+        pool.use_mla = use_mla
         pool.full_attention_layer_id_mapping = {0: 0}
         return pool
 
     def test_writes_full_loc_from_write_loc(self):
-        pool = self._make_bare_pool()
-        virtual_loc = torch.tensor([7, 8, 9], dtype=torch.int64)
-        full_phys = torch.tensor([2, 3, 4], dtype=torch.int64)
+        for use_mla in (False, True):
+            for has_full_loc in (True, False):
+                with self.subTest(use_mla=use_mla, has_full_loc=has_full_loc):
+                    pool = self._make_bare_pool(use_mla)
+                    loc = torch.tensor([7, 8, 9], dtype=torch.int64)
+                    full_phys = (
+                        torch.tensor([2, 3, 4], dtype=torch.int64)
+                        if has_full_loc
+                        else None
+                    )
 
-        layer = types.SimpleNamespace(layer_id=0)
-        pool.set_kv_buffer(
-            layer,
-            _loc_info(virtual_loc, full_phys=full_phys),
-            torch.zeros(3, 4, 8),
-            torch.zeros(3, 4, 8),
-        )
+                    layer = types.SimpleNamespace(layer_id=0)
+                    pool.set_kv_buffer(
+                        layer,
+                        _loc_info(loc, full_phys=full_phys),
+                        torch.zeros(3, 4, 8),
+                        None if use_mla else torch.zeros(3, 4, 8),
+                    )
 
-        self.assertEqual(len(pool.full_kv_pool.calls), 1)
-        forwarded, kwargs = pool.full_kv_pool.calls[0]
-        self.assertIs(forwarded, full_phys)
-        self.assertIsNot(forwarded, virtual_loc)
-        self.assertNotIn("already_physical", kwargs)
-
-    def test_falls_back_to_loc_when_absent(self):
-        # Static (non-shared) pool: no full_loc bundled; `loc` is already
-        # physical, so write it directly.
-        pool = self._make_bare_pool()
-        phys_loc = torch.tensor([7, 8, 9], dtype=torch.int64)
-
-        layer = types.SimpleNamespace(layer_id=0)
-        pool.set_kv_buffer(
-            layer,
-            _loc_info(phys_loc),
-            torch.zeros(3, 4, 8),
-            torch.zeros(3, 4, 8),
-        )
-
-        self.assertEqual(len(pool.full_kv_pool.calls), 1)
-        forwarded, kwargs = pool.full_kv_pool.calls[0]
-        self.assertIs(forwarded, phys_loc)
-        self.assertNotIn("already_physical", kwargs)
+                    self.assertEqual(len(pool.full_kv_pool.calls), 1)
+                    forwarded, kwargs = pool.full_kv_pool.calls[0]
+                    if has_full_loc:
+                        self.assertIs(forwarded, full_phys)
+                        self.assertIsNot(forwarded, loc)
+                    else:
+                        # Static (non-shared) pool: no full_loc bundled; `loc`
+                        # is already physical, so write it directly.
+                        self.assertIs(forwarded, loc)
+                    self.assertNotIn("already_physical", kwargs)
 
 
 class _RecordingMLAPool(_RecordingPool):
-    """Also records the model-level MLA entry points."""
+    """Also records the model-level MLA write entry point."""
 
     def __init__(self):
         super().__init__()
         self.mla_set_calls = []
-        self.mla_get_calls = []
 
     def set_mla_kv_buffer(self, layer, loc, cache_k_nope, cache_k_rope):
         self.mla_set_calls.append(loc)
 
-    def get_mla_kv_buffer(self, layer, loc, dst_dtype=None):
-        self.mla_get_calls.append(loc)
-        return None, None
-
 
 class TestHybridLinearMLARouting(unittest.TestCase):
-    """MLA-side routing contracts of `HybridLinearKVPool`:
-
-    - `set_kv_buffer` (MLA branch) mirrors the MHA branch — write the
-      pre-translated `KVWriteLoc.full_loc` when present (unified pool, where it
-      carries the kernel-facing loc), else the raw `loc` (static pool, already physical).
-    - `set_mla_kv_buffer` / `get_mla_kv_buffer` forward `loc` untouched:
-      writes are kernel-facing since the ForwardBatch rebind, and read
-      indices are translated at their production sites."""
+    """MLA-side door contract of `HybridLinearKVPool`: `set_mla_kv_buffer`
+    forwards `loc` untouched -- writes are kernel-facing since the ForwardBatch
+    rebind."""
 
     def _make_bare_pool(self):
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -290,46 +256,10 @@ class TestHybridLinearMLARouting(unittest.TestCase):
         pool.full_attention_layer_id_mapping = {0: 0}
         return pool
 
-    def test_mla_writes_full_loc_from_write_loc(self):
-        pool = self._make_bare_pool()
-        virtual_loc = torch.tensor([7, 8, 9], dtype=torch.int64)
-        kernel_phys = torch.tensor([21, 24, 27], dtype=torch.int64)
-
-        layer = types.SimpleNamespace(layer_id=0)
-        pool.set_kv_buffer(
-            layer,
-            _loc_info(virtual_loc, full_phys=kernel_phys),
-            torch.zeros(3, 1, 8),
-            None,
-        )
-
-        self.assertEqual(len(pool.full_kv_pool.calls), 1)
-        forwarded, _ = pool.full_kv_pool.calls[0]
-        self.assertIs(forwarded, kernel_phys)
-        self.assertIsNot(forwarded, virtual_loc)
-
-    def test_mla_falls_back_to_loc_when_absent(self):
-        pool = self._make_bare_pool()
-        phys_loc = torch.tensor([7, 8, 9], dtype=torch.int64)
-
-        layer = types.SimpleNamespace(layer_id=0)
-        pool.set_kv_buffer(
-            layer,
-            _loc_info(phys_loc),
-            torch.zeros(3, 1, 8),
-            None,
-        )
-
-        self.assertEqual(len(pool.full_kv_pool.calls), 1)
-        forwarded, _ = pool.full_kv_pool.calls[0]
-        self.assertIs(forwarded, phys_loc)
-
     def test_set_mla_kv_buffer_door_never_translates(self):
-        """Physical-loc contract: the write door forwards `loc` UNTOUCHED.
-        The translate happens exactly once at ForwardBatch construction
-        (rebind_write_loc, kernel-facing-first); a door that translated
-        again would double-translate every unified MLA write. Deleting the
-        forward (or re-adding a door translate) turns this red."""
+        """The translate happens exactly once, at ForwardBatch construction
+        (`rebind_write_loc`); a door that translated again would
+        double-translate every unified MLA write."""
         pool = self._make_bare_pool()
         loc = torch.tensor([107, 108, 109], dtype=torch.int64)
         layer = types.SimpleNamespace(layer_id=0)
@@ -339,21 +269,6 @@ class TestHybridLinearMLARouting(unittest.TestCase):
         self.assertEqual(len(pool.full_kv_pool.mla_set_calls), 1)
         self.assertIs(pool.full_kv_pool.mla_set_calls[0], loc)
 
-    def test_get_mla_kv_buffer_door_never_translates(self):
-        """Kernel-facing contract, read side: `loc` is a read-index tensor
-        already translated at its production site
-        (fetch_mha_one_shot_kv_indices / prepare_chunked_kv_indices); the
-        door forwards it UNTOUCHED -- a re-added door translate would
-        double-translate every unified MLA prefix read."""
-        pool = self._make_bare_pool()
-        loc = torch.tensor([104, 105], dtype=torch.int64)
-        layer = types.SimpleNamespace(layer_id=0)
-
-        pool.get_mla_kv_buffer(layer, loc)
-
-        self.assertEqual(len(pool.full_kv_pool.mla_get_calls), 1)
-        self.assertIs(pool.full_kv_pool.mla_get_calls[0], loc)
-
 
 class TestMlaWriteDoorsUnderDcp(unittest.TestCase):
     """Which MLA write door is DCP-aware, and which refuses.
@@ -362,10 +277,8 @@ class TestMlaWriteDoorsUnderDcp(unittest.TestCase):
     the DCP write. `set_kv_buffer` (the combined latent+rope row) cannot: the
     two backends that could reach it disagree on the loc space -- flashinfer's
     `k_rope is None` branch passes a WIDENED loc, the Triton backend one it
-    already collapsed -- so there is no single correct translation. It used to
-    select `loc % dcp_size == dcp_rank` and then write WITHOUT dividing, i.e.
-    widened ids straight into a rank-local buffer. Refusing is the contract;
-    a re-added masked-but-undivided write is what this guards."""
+    already collapsed -- so there is no single correct translation and refusing
+    is the contract."""
 
     def _bare_mla_pool(self):
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool

@@ -1,20 +1,16 @@
 """Nothing under layers/attention may translate KV ids for itself.
 
-Ownership is exactly two places: `KVIndexTranslator` for READS (indices are
-born kernel-facing, backends consume its tables) and the ForwardBatch rebind
-(`rebind_write_loc`) for WRITES. Virtual and physical ids share a value range,
-so a backend that forgets a translate -- or does one twice -- reads the wrong
-rows and nothing crashes. This scan makes both unrepresentable.
+Ownership is exactly two places: `KVIndexTranslator` for READS and the
+ForwardBatch rebind (`rebind_write_loc`) for WRITES. Virtual and physical ids
+share a value range, so a backend that forgets a translate -- or does one
+twice -- reads the wrong rows and nothing crashes.
 
-Out of scope, deliberately: the allocator-internal implementations
-(`allocator/unified_*` / `unified_memory_pool`), which ARE the mechanism the
+Deliberately out of scope: the allocator-internal implementations
+(`allocator/unified_*`, `unified_memory_pool`), which ARE the mechanism the
 translator calls; the PD transfer plane's `translate_kv_indices_for_transfer`,
 which stages for RDMA outside the forward path; and the STATIC SWA pool's
 legacy full->swa slot map, a different mapping kind with no virtual/physical
-ambiguity -- its call sites are count-pinned below so new ones are added
-consciously.
-
-    python3 -m pytest test/registered/unit/layers/attention/test_kv_translate_ownership.py -v
+ambiguity.
 """
 
 import ast
@@ -60,30 +56,21 @@ def _iter_sources():
 
 class TestUnifiedTranslateBanned(CustomTestCase):
     def test_no_unified_translate_calls(self):
-        """No backend calls the unified translate surfaces. A hit here means
-        a backend re-grew its own id-space transition -- the design whose two
-        failure modes (forgotten translate, duplicated translate) this scan
-        exists to prevent. Route reads through KVIndexTranslator views and
-        writes through the ForwardBatch rebind instead."""
+        """No backend calls the unified translate surfaces, and none probes an
+        allocator for translate capability through getattr."""
         banned = re.compile(r"\.translate_kv_loc(_kernel_id)?\(")
-        hits = [
-            f"{rel}: {m.group(0)}"
-            for rel, src in _iter_sources()
-            for m in banned.finditer(src)
-        ]
-        self.assertEqual(hits, [])
-
-    def test_no_translate_capability_probing(self):
-        """No backend probes an allocator for translate capability -- the
-        getattr-hook pattern is how per-backend translation grew the first
-        time."""
         probing = re.compile(r"""getattr\([^)]*['"]translate_kv_loc""")
-        hits = [rel for rel, src in _iter_sources() if probing.search(src)]
-        self.assertEqual(hits, [])
+        calls, probes = [], []
+        for rel, src in _iter_sources():
+            calls += [f"{rel}: {m.group(0)}" for m in banned.finditer(src)]
+            if probing.search(src):
+                probes.append(rel)
+        self.assertEqual(calls, [])
+        self.assertEqual(probes, [])
 
     def test_hooks_module_deleted_and_unimported(self):
-        """The per-backend hooks module (the previous owner of backend-side
-        v2p knowledge) stays deleted, and nothing imports it."""
+        """The per-backend v2p hooks module stays deleted, and nothing imports
+        it."""
         self.assertFalse(
             os.path.exists(os.path.join(_ATTN_DIR, "unified_mem_hooks.py"))
         )
@@ -96,10 +83,9 @@ class TestUnifiedTranslateBanned(CustomTestCase):
 
 
 def _derive_wrapper_names():
-    """Wrapper classes, read off the source so a NEW one shows up the day it is
-    written: an AttentionBackend subclass whose own __init__ takes another
-    backend. Per class, not per file -- a file-wide scan passes as soon as any
-    one class in it forwards."""
+    """Wrapper classes discovered from source, so a new one shows up the day it
+    is written: an AttentionBackend subclass whose own __init__ takes another
+    backend. Per class, not per file."""
     backend = re.compile(r"Att(?:ention|n)Backend")
     names = set()
     for _rel, src in _iter_sources():
@@ -155,8 +141,8 @@ class _Runner:
 
 def _build_wrappers(translator):
     """One live instance per wrapper. Only the inner that MUST supply the
-    translator carries it; every other inner carries None, so a wrapper that
-    copies from the linear / sparse / DSA side ends up with None and fails."""
+    translator carries it, so a wrapper copying off the linear / sparse / DSA
+    side ends up with None and fails."""
     carrier = _Inner(translator)
     # HybridAttnBackend reads the spec bag in __init__; the bag is unpublished
     # outside a launched server.
@@ -176,10 +162,9 @@ def _build_wrappers(translator):
 
 
 class TestWrapperBackendsForwardTranslator(CustomTestCase):
-    """BUG REGRESSION. `AttentionBackend.kv_index_translator` defaults to None,
-    so a wrapper that does not re-expose its inner's copy reads as "needs no
-    translation" and producers that fetch it off `get_attn_backend()` skip the
-    virtual->kernel-facing translation instead of failing."""
+    """Bug regression: `AttentionBackend.kv_index_translator` defaults to None,
+    so a wrapper that does not re-expose its inner's copy makes producers skip
+    the virtual->kernel-facing translation instead of failing."""
 
     def test_every_wrapper_is_constructed_here(self):
         self.assertEqual(

@@ -11,31 +11,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Locked-full SWA tombstone-recovery under the unified pool (action handler).
+"""Locked-full SWA tombstone recovery under the unified pool (action handler).
 
-`RecoverSWAWithLockedFull` recovers a tombstoned SWA node whose full value is
-LOCKED: the node cannot adopt the incoming request's ids wholesale, so the
-static-pool recipe hands the node the INCOMING ids' swa pages, frees only their
-FULL pages, and re-points the locked ids through `full_to_swa_index_mapping`.
+`RecoverSWAWithLockedFull` hands a tombstoned SWA node the INCOMING request's
+swa pages and frees only their FULL pages. The static recipe re-points the
+locked ids through `full_to_swa_index_mapping`; the unified composite has no
+such tensor -- the swa sub-pool's v2p IS the mapping -- so it expresses the
+same move as a page-ownership rebind and then frees the incoming ids through
+the composite, whose `swa_v2p_pages > 0` filter skips the tombstoned swa side.
 
-The unified composite has no mapping tensor — the swa sub-pool's v2p IS the
-mapping — and its `set_full_to_swa_mapping` is an explicit no-op stub. The
-pre-fix handler therefore raised AttributeError on `full_to_swa_index_mapping`
-(and, had that line been removed, would have silently skipped the rebind while
-line 1 freed swa pages the kept ids still referenced). The fix expresses the
-same move as a page-ownership REBIND: bind the node's virtual pages to the
-incoming pages' physical pages, tombstone the incoming ones, then free the
-incoming ids through the composite — whose `swa_v2p_pages > 0` filter skips the
-tombstoned swa side, releasing ONLY the full side.
-
-Why the recovery must succeed rather than decline (the v1 lesson, still true on
-this branch): the TreeCore insert walk counts the node in `prefix_len`
-regardless of component consumption, while the SWA match validator rejects a
-`value is None` node — a declined recovery makes `insert` report a prefix the
-follow-up `match_prefix` cannot honor, tripping
+The recovery must succeed rather than decline: the TreeCore insert walk counts
+the node in `prefix_len` regardless of component consumption, while the SWA
+match validator rejects a `value is None` node, so a declined recovery reports
+a prefix `match_prefix` cannot honor and trips
 `new_prefix_len <= len(new_indices)` in `cache_unfinished_req`.
-
-    python -m pytest test/registered/unit/mem_cache/test_swa_locked_full_recover_unified.py -v
 """
 
 import unittest
@@ -121,8 +110,8 @@ class _Probe(SWAComponent):
 
 class _StaticAllocRecorder:
     """Stands in for the STATIC SWATokenToKVPoolAllocator: has the mapping
-    tensor and a real set_full_to_swa_mapping. The handler must keep routing
-    static pools through the original recipe."""
+    tensor and a real `set_full_to_swa_mapping`, so the handler must keep
+    routing static pools through the original recipe."""
 
     def __init__(self, n=16):
         self.full_to_swa_index_mapping = torch.arange(n, dtype=torch.int64)
@@ -133,9 +122,8 @@ class _StaticAllocRecorder:
         self.full_attn_allocator = self
 
     def set_full_to_swa_mapping(self, full, swa):
-        # Honour the write like the real static allocator: the handler routes
-        # every mapping write THROUGH the API (never by indexing the tensor),
-        # so the fake must apply it for the mapping asserts to observe it.
+        # The handler routes every mapping write THROUGH the API, so the fake
+        # must apply it for the mapping asserts to observe anything.
         self.mapping_calls.append((full, swa))
         self.full_to_swa_index_mapping[full.to(torch.int64)] = swa.to(torch.int64)
 
@@ -171,9 +159,9 @@ class _RecoverTestBase(unittest.TestCase):
 
 class TestPagePairing(_RecoverTestBase):
     def test_pairs_positionally_not_by_sorted_id(self):
-        """Allocation hands out virtual ids in no particular order; deduping
-        with `torch.unique` (which sorts) would bind the node's page k to an
-        unrelated incoming page — silent wrong-KV."""
+        """Allocation hands out virtual ids in no particular order, so a
+        `torch.unique` dedup (which sorts) would bind the node's page k to an
+        unrelated incoming page."""
         probe, _ = self._probe()
         kept = torch.tensor([9, 7, 5], dtype=torch.int64)  # descending
         incoming = torch.tensor([2, 4, 6], dtype=torch.int64)  # ascending
@@ -225,15 +213,17 @@ class TestOwnershipTransfer(_RecoverTestBase):
 
 class TestRecoverActionHandler(_RecoverTestBase):
     def test_recovery_sets_a_live_device_value_and_frees_only_the_full_side(self):
-        """End-to-end through apply_component_action — the pre-fix handler
-        raises AttributeError (`full_to_swa_index_mapping`) on this exact
-        call. Post-fix: the node gets a LIVE swa value, the HANDLER neither
-        allocates nor frees any swa page (ownership only moves), and the
-        incoming ids' FULL side returns to the pool."""
+        """Bug regression: recovery must give the node a LIVE swa value and
+        return only the incoming ids' FULL side, allocating and freeing no swa
+        page of its own."""
         probe, allocator = self._probe()
         swa = allocator.swa_attn_allocator
         kept, incoming = self._two_ranges(allocator)
         allocator.free_swa(kept)  # what eviction does when it tombstones
+        self.assertTrue(
+            bool((allocator.translate_loc_from_full_to_swa(kept) == 0).all()),
+            "precondition: a tombstoned range translates to the sink",
+        )
         # Snapshot AFTER the setup traffic: the invariant under test is that
         # the recovery handler itself moves ownership without moving capacity.
         swa_live = swa.allocated_count()
@@ -260,21 +250,6 @@ class TestRecoverActionHandler(_RecoverTestBase):
             full_avail + len(incoming),
             "the incoming ids' FULL side must come back",
         )
-
-    def test_recovered_ids_translate_to_live_pages_not_the_sink(self):
-        """The tombstoned range translates to the clamped sink before the
-        recovery and to real pages after — recovering from the node's OWN
-        already-freed ids (instead of the donated ones) reintroduces the sink."""
-        probe, allocator = self._probe()
-        kept, incoming = self._two_ranges(allocator)
-        allocator.free_swa(kept)
-        self.assertTrue(
-            bool((allocator.translate_loc_from_full_to_swa(kept) == 0).all()),
-            "precondition: a tombstoned range translates to the sink",
-        )
-        probe.apply_component_action(
-            RecoverSWAWithLockedFull(node_id=1, kept_full=kept, incoming_full=incoming)
-        )
         self.assertTrue(
             bool((allocator.translate_loc_from_full_to_swa(kept) > 0).all()),
             "after recovery the node's ids must address live swa pages",
@@ -283,8 +258,8 @@ class TestRecoverActionHandler(_RecoverTestBase):
 
 class TestStaticPoolPathUnchanged(unittest.TestCase):
     def test_static_allocator_keeps_the_mapping_recipe(self):
-        """A static SWA allocator (has the mapping tensor) must keep the
-        original recipe — the unified branch must not hijack it."""
+        """A static SWA allocator must keep the mapping recipe; the unified
+        branch must not hijack it."""
         static = _StaticAllocRecorder()
         probe = _Probe.__new__(_Probe)
         probe.cache = _Cache(static)
@@ -296,11 +271,8 @@ class TestStaticPoolPathUnchanged(unittest.TestCase):
             RecoverSWAWithLockedFull(node_id=3, kept_full=kept, incoming_full=incoming)
         )
 
-        # Both mapping writes go through the allocator API -- the kept remap
-        # via set_full_to_swa_mapping, the incoming tombstone via
-        # clear_full_to_swa_mapping -- never by indexing
-        # `full_to_swa_index_mapping` (the tensor is absent on the unified
-        # composite by design).
+        # Both mapping writes go through the allocator API, never by indexing
+        # `full_to_swa_index_mapping` (absent on the unified composite).
         self.assertEqual(len(static.mapping_calls), 1, "static recipe must run")
         self.assertEqual(len(static.clear_calls), 1, "incoming must be tombstoned")
         self.assertTrue(
