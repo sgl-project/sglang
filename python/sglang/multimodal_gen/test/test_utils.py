@@ -52,16 +52,6 @@ SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     f"{SGL_TEST_FILES_CI_DATA_REPO}/{SGL_TEST_FILES_CI_DATA_REVISION}/"
     "diffusion-ci/consistency_gt"
 )
-
-# Some self-hosted CI runners (e.g. NPU) cannot reach raw.githubusercontent.com
-# directly; GT downloads then time out and consistency checks fail spuriously.
-# Route them through the same prefix proxy the CI dependency install step uses,
-# e.g. GITHUB_PROXY_URL=https://gh-proxy.test.osinfra.cn/
-_github_proxy_url = os.getenv("GITHUB_PROXY_URL", "").rstrip("/")
-if _github_proxy_url:
-    SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
-        f"{_github_proxy_url}/{SGL_TEST_FILES_CONSISTENCY_GT_ROOT}"
-    )
 SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE = (
     f"{SGL_TEST_FILES_CONSISTENCY_GT_ROOT}/official_generated"
 )

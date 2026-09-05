@@ -176,11 +176,6 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
                 "SGLANG_CACHE_DIT_TAYLORSEER": "true",
                 "SGLANG_CACHE_DIT_TS_ORDER": "2",
                 "HCCL_BUFFSIZE": "256",
-                # cgroup memory.current counts page cache left by earlier
-                # models, so the offload planner misreads the host as full and
-                # degrades layerwise offload. Force the real budget so the
-                # text encoder stays pinned.
-                "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB": "32",
             },
         ),
         DiffusionSamplingParams(
@@ -233,13 +228,6 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
             tp_size=2,
             dit_layerwise_offload=True,
             extras=EXTRAS_DISABLE_WARMUP,
-            env_vars={
-                # cgroup memory.current counts page cache left by earlier
-                # models, so the offload planner misreads the host as full and
-                # degrades layerwise offload. Force the real budget so the
-                # offloaded DiT weights stay pinned.
-                "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB": "64",
-            },
         ),
         run_consistency_check=False,
     ),

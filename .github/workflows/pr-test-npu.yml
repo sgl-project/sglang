@@ -211,7 +211,6 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
-          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
         run: |
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
@@ -276,7 +275,6 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
-          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
         run: |
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
