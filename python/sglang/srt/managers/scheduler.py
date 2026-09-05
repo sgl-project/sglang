@@ -155,6 +155,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
+    PullWeightsReqInput,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
@@ -1738,6 +1739,7 @@ class Scheduler(
                     CheckWeightsReqInput,
                     self.weight_updater.check_weights,
                 ),
+                (PullWeightsReqInput, self.weight_updater.pull_weights),
                 (SlowDownReqInput, self.slow_down),
                 (
                     ProfileReq,
