@@ -95,7 +95,7 @@ def worker(world_size, rank, port):
     input_size_bytes = base_input.numel() * base_input.element_size()
     if input_size_bytes > custom_ar.max_size and rank == 0:
         print(
-            f"Warning: Input size ({input_size_bytes/(1024*1024):.1f} MB) exceeds buffer size ({custom_ar.max_size/(1024*1024):.1f} MB)"
+            f"Warning: Input size ({input_size_bytes / (1024 * 1024):.1f} MB) exceeds buffer size ({custom_ar.max_size / (1024 * 1024):.1f} MB)"
         )
         print("  Using unregistered mode (will copy to buffer)")
 
@@ -105,9 +105,9 @@ def worker(world_size, rank, port):
     # TEST 1: Deterministic kernel (same batch size) - should be DETERMINISTIC
     # =========================================================================
     if rank == 0:
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print("TEST 1: Deterministic kernel (same batch size)")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
     dist.barrier()
 
     results_allreduce_only = []
@@ -125,7 +125,7 @@ def worker(world_size, rank, port):
 
         if rank == 0:
             print(
-                f"  Trial {trial+1:2d}: sum={checksum:.6f}, first5={first_vals.tolist()}"
+                f"  Trial {trial + 1:2d}: sum={checksum:.6f}, first5={first_vals.tolist()}"
             )
 
     # Check determinism
@@ -135,7 +135,7 @@ def worker(world_size, rank, port):
         for i, (s, vals) in enumerate(results_allreduce_only[1:], 1):
             if abs(ref_sum - s) > 1e-3 or not torch.allclose(ref_vals, vals, rtol=1e-3):
                 all_match = False
-                print(f"  Trial {i+1} DIFFERS! ref_sum={ref_sum:.6f}, got={s:.6f}")
+                print(f"  Trial {i + 1} DIFFERS! ref_sum={ref_sum:.6f}, got={s:.6f}")
 
         if all_match:
             print("  ✓ DETERMINISTIC KERNEL (fixed BS): DETERMINISTIC (as expected)")
@@ -151,10 +151,10 @@ def worker(world_size, rank, port):
     # [a], [a, x], [a, x, x], ...
     # =========================================================================
     if rank == 0:
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print("TEST 2: Deterministic kernel (different batch size)")
         print("Batches: [a], [a,x], [a,x,x], ...")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
     dist.barrier()
 
     results_allreduce_only = {trial: [] for trial in range(num_trials)}

@@ -20,6 +20,7 @@ import torch
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -37,8 +38,9 @@ class _MockDllmReq(ReqDllmMixin):
         self.full_untruncated_fill_ids = array("q", fill_ids)
         self.extend_range = Range(0, len(self.full_untruncated_fill_ids))
         self.dllm_incomplete_ids = array("q", incomplete_ids)
-        self.req_pool_idx = req_pool_idx
-        self.cache_protected_len = 0
+        # Device-KV bookkeeping lives on `req.kv` (ReqKvInfo). Use the real class rather
+        # than duplicating its fields, so this mock tracks upstream refactors.
+        self.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
         self.last_node = None
         self.extra_key = None
         self.cache_salt = None

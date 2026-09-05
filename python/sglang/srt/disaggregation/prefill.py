@@ -72,13 +72,18 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
+from sglang.srt.observability.scheduler_stage_metrics import (
+    SCHEDULER_STAGE_GET_NEXT_BATCH,
+    SCHEDULER_STAGE_PROCESS_QUEUE,
+    SchedulerStageMetricsRecorder,
+    scheduler_stage_method,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
     get_schedule,
 )
 from sglang.srt.utils import is_npu
-from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -147,6 +152,7 @@ class PrefillBootstrapQueue:
         gloo_group: ProcessGroup,
         max_total_num_tokens: int,
         scheduler: Scheduler,
+        scheduler_stage_metrics: SchedulerStageMetricsRecorder,
         pp_rank: int,
         pp_size: int,
         transfer_backend: TransferBackend,
@@ -165,6 +171,7 @@ class PrefillBootstrapQueue:
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
         self.scheduler = scheduler
+        self.scheduler_stage_metrics = scheduler_stage_metrics
         self.max_total_num_tokens = (
             self.scheduler.tp_worker.model_runner.effective_max_total_num_tokens
         )
@@ -407,6 +414,7 @@ class PrefillBootstrapQueue:
         """
         req.sampling_params.max_new_tokens = 1
 
+    @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def pop_bootstrapped(
         self,
         return_failed_reqs: bool = False,
@@ -524,6 +532,7 @@ class SchedulerDisaggregationPrefillMixin:
             if room is not None and room in kv_mgr.transfer_infos:
                 prefetch(room)
 
+    @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def resolve_waiting_queue_bootstrap(self: Scheduler) -> None:
         """Resolve bootstrap status for waiting prefill requests before admission.
 
@@ -565,7 +574,7 @@ class SchedulerDisaggregationPrefillMixin:
             for req in self.waiting_queue
         )
 
-    @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
+    @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
         running_batch: ScheduleBatch,
@@ -599,6 +608,7 @@ class SchedulerDisaggregationPrefillMixin:
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                self._record_scheduler_state_for_paused_engine()
                 continue
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
@@ -638,6 +648,7 @@ class SchedulerDisaggregationPrefillMixin:
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                self._record_scheduler_state_for_paused_engine()
                 continue
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
@@ -852,9 +863,9 @@ class SchedulerDisaggregationPrefillMixin:
                 # In non-overlap-mode, KV is sent in process_prefill_chunk
                 # Only send when req's sender is initialized
                 if self.enable_overlap and not req.pending_bootstrap:
-                    assert (
-                        req.metadata_buffer_index >= 0
-                    ), f"Req {req.rid} does not have metadata buffer allocated"
+                    assert req.metadata_buffer_index >= 0, (
+                        f"Req {req.rid} does not have metadata buffer allocated"
+                    )
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
@@ -873,6 +884,7 @@ class SchedulerDisaggregationPrefillMixin:
             dp_cooperation_info=batch.dp_cooperation_info,
         )
 
+    @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None
     ) -> List[Req]:
@@ -1036,7 +1048,7 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        if req.is_holding_kv or req.mamba_pool_idx is not None:
+        if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache)
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
@@ -1215,7 +1227,7 @@ class SchedulerDisaggregationPrefillMixin:
                 return [
                     self.req_to_token_pool.translate_mamba_indices(
                         self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                            req.req_pool_idx
+                            req.kv.req_pool_idx
                         ]
                     )
                     .cpu()
@@ -1227,7 +1239,7 @@ class SchedulerDisaggregationPrefillMixin:
                 window_start = max(req.disagg_decode_prefix_len, seq_len - window_size)
                 window_start = (window_start // page_size) * page_size
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, window_start:seq_len
+                    req.kv.req_pool_idx, window_start:seq_len
                 ]
                 window_kv_indices_swa = (
                     self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
@@ -1238,7 +1250,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             def _full_kv_pages_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, :seq_len
+                    req.kv.req_pool_idx, :seq_len
                 ]
                 return kv_to_page_indices(kv_indices_full, page_size)
 
@@ -1251,7 +1263,7 @@ class SchedulerDisaggregationPrefillMixin:
                 window_size = _pool.unified_swa_window
                 window_start = max(0, seq_len - window_size)
                 positions = np.arange(window_start, seq_len, dtype=np.int64)
-                state_slot = int(req.req_pool_idx)
+                state_slot = int(req.kv.req_pool_idx)
                 ring_rows = state_slot * ring_stride + (positions % ring_stride)
                 return ring_rows.astype(np.int32)
 
@@ -1265,7 +1277,7 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                 )
                 return get_dsv4_c128_state_indices(
-                    int(req.req_pool_idx),
+                    int(req.kv.req_pool_idx),
                     c128_seq_len,
                     online=online,
                     ring_size=ring_size,
@@ -1295,7 +1307,7 @@ class SchedulerDisaggregationPrefillMixin:
                 payloads.update(
                     dsv4_state_payloads(
                         self.req_to_token_pool,
-                        req.req_pool_idx,
+                        req.kv.req_pool_idx,
                         seq_len,
                         page_size,
                         prefix_len=req.disagg_decode_prefix_len,
@@ -1321,7 +1333,7 @@ class SchedulerDisaggregationPrefillMixin:
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, seg_start:seg_end
+                req.kv.req_pool_idx, seg_start:seg_end
             ]
             # Unified memory: req_to_token holds VIRTUAL ids; the transfer needs
             # physical ones. Per segment, since each is its own gather.

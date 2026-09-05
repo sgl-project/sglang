@@ -438,6 +438,15 @@ export const Qwen35Deployment = () => {
       }
     }
 
+    // B200 NVFP4 with MTP runs TP2/EP2 (set above). Keep Triton as the base
+    // linear-attention backend while routing GDN decode and prefill through
+    // FlashInfer.
+    if (model === '397b' && hardware === 'b200' && quantization === 'fp4' && speculative === 'enabled') {
+      cmd += ` \\\n  --linear-attn-backend triton`;
+      cmd += ` \\\n  --linear-attn-decode-backend flashinfer`;
+      cmd += ` \\\n  --linear-attn-prefill-backend flashinfer`;
+    }
+
     // Append backend configurations
     if (hardware === 'b200' || (hardware === 'b300' && quantization === 'fp4')) {
       cmd += ` \\\n  --attention-backend trtllm_mha`;

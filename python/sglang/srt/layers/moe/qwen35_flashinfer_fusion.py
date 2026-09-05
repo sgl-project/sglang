@@ -8,7 +8,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.overrides import cutedsl_moe_max_num_tokens, resolving_view
 from sglang.srt.layers.communicator import (
     CommunicateWithAllReduceAndLayerNormFn,
     LayerCommunicator,
@@ -37,7 +37,7 @@ def resolve_max_m(model_runner) -> int:
     decode_config = server_args.cuda_graph_config.decode
     prefill_config = server_args.cuda_graph_config.prefill
     candidates = [
-        server_args.cutedsl_moe_max_num_tokens(),
+        cutedsl_moe_max_num_tokens(model_runner.server_args),
         model_runner.max_running_requests,
         decode_config.max_bs,
         prefill_config.max_bs,

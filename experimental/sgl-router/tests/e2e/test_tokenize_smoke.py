@@ -20,9 +20,9 @@ def test_tokenize_round_trip(router: str) -> None:
     )
     assert tok_resp.status_code == 200, tok_resp.text
     tokens = tok_resp.json()["tokens"]
-    assert (
-        isinstance(tokens, list) and len(tokens) > 0
-    ), f"Expected non-empty token list, got: {tokens}"
+    assert isinstance(tokens, list) and len(tokens) > 0, (
+        f"Expected non-empty token list, got: {tokens}"
+    )
 
     # Detokenize
     detok_resp = httpx.post(
@@ -32,6 +32,6 @@ def test_tokenize_round_trip(router: str) -> None:
     )
     assert detok_resp.status_code == 200, detok_resp.text
     recovered = detok_resp.json()["text"]
-    assert (
-        TEXT in recovered or recovered in TEXT
-    ), f"Round-trip mismatch: original={TEXT!r}, recovered={recovered!r}"
+    assert TEXT in recovered or recovered in TEXT, (
+        f"Round-trip mismatch: original={TEXT!r}, recovered={recovered!r}"
+    )

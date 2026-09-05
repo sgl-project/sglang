@@ -3,14 +3,17 @@
 
 from __future__ import annotations
 
+import glob
 import importlib
 import logging
 import os
 from typing import Any, Optional
 
 from sglang.srt.arg_groups.overrides import (
+    _gguf_quantization,
     declare_resolution,
     resolving_view,
+    run_post_process_pass,
 )
 from sglang.srt.utils.common import is_remote_url
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
@@ -162,10 +165,6 @@ def handle_load_format(server_args: Any):
     # (arg_groups/overrides.py: _gguf_quantization); load_format itself is
     # genuine config (runtime user updates write it) and stays imperative.
     cfg = resolving_view(server_args)
-    from sglang.srt.arg_groups.overrides import (
-        _gguf_quantization,
-        run_post_process_pass,
-    )
 
     run_post_process_pass(server_args, _gguf_quantization)
     if (cfg.load_format == "auto" or cfg.load_format == "gguf") and check_gguf_file(
@@ -177,7 +176,7 @@ def handle_load_format(server_args: Any):
             load_format="gguf",
         )
 
-    if cfg.load_format == "auto" and server_args._is_mistral_native_format():
+    if cfg.load_format == "auto" and is_mistral_native_format(server_args):
         declare_resolution(
             server_args,
             "_handle_load_format",
@@ -306,3 +305,62 @@ def validate_transfer_engine(server_args: Any):
         return False
     else:
         return True
+
+
+def is_mistral_native_format(server_args: Any) -> bool:
+    """True iff the checkpoint requires load_format=mistral.
+
+    Looks for consolidated*.safetensors with no competing
+    model*.safetensors; when both weight formats ship in the
+    same checkpoint (e.g. Mistral-7B-Instruct-v0.3) the HF path is
+    preferred to avoid loading Mistral-named weights into an
+    HF-named architecture.
+
+    Name override: mistral-large-3 / mistral-small-4 /
+    leanstral always treat as Mistral-native when params.json
+    is present -- those families need Mistral weight loading
+    regardless of which weight files happen to be present.
+    """
+    cfg = resolving_view(server_args)
+    _MISTRAL_NATIVE_PATTERNS = (
+        "mistral-large-3",
+        "mistral-small-4",
+        "leanstral",
+    )
+    name_matches = any(
+        p in str(cfg.model_path).lower() for p in _MISTRAL_NATIVE_PATTERNS
+    )
+
+    def _check_format(has_params, has_consolidated, has_hf_weights) -> bool:
+        if has_params and name_matches:
+            return True
+        return has_consolidated and not has_hf_weights
+
+    if os.path.isdir(cfg.model_path):
+        return _check_format(
+            has_params=os.path.exists(os.path.join(cfg.model_path, "params.json")),
+            has_consolidated=bool(
+                glob.glob(os.path.join(cfg.model_path, "consolidated*.safetensors"))
+            ),
+            has_hf_weights=bool(
+                glob.glob(os.path.join(cfg.model_path, "model*.safetensors"))
+            ),
+        )
+
+    try:
+        from huggingface_hub import HfApi
+
+        files = {s.rfilename for s in HfApi().model_info(cfg.model_path).siblings}
+        return _check_format(
+            has_params="params.json" in files,
+            has_consolidated=any(
+                f.startswith("consolidated") and f.endswith(".safetensors")
+                for f in files
+            ),
+            has_hf_weights=any(
+                f.startswith("model") and f.endswith(".safetensors") and "/" not in f
+                for f in files
+            ),
+        )
+    except Exception:
+        return False

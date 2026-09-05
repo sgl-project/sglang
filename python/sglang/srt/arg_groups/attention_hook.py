@@ -8,20 +8,32 @@ import os
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
+    _attention_backend_default,
+    _attention_backend_dual_chunk,
+    _attention_backend_fa3_fp8_fallback,
+    _attention_backend_platform_fallbacks,
+    _cutedsl_prefill_backend_fill,
+    _deterministic_allreduce_fusion_disable,
+    _deterministic_attention_backend,
+    _deterministic_sampling_backend,
+    _fa4_page_constraint,
+    _intel_xpu_page_constraint,
+    _mla_backend_page_constraints,
+    _mla_kv_cache_dtype_checks,
+    attention_backends_of,
     declare_resolution,
+    mamba_extra_buffer_of,
+    model_config_of,
     resolved_view,
     resolving_view,
+    run_post_process_pass,
+    use_mla_backend,
 )
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
-    is_cuda,
-    is_hip,
-    is_sm90_supported,
-    is_sm100_or_sm110_supported,
-    is_sm100_supported,
-    is_sm120_supported,
     parse_connector_type,
 )
 
@@ -29,22 +41,13 @@ logger = logging.getLogger(__name__)
 
 
 def handle_attention_backend_compatibility(server_args: Any):
+
     cfg = resolving_view(server_args)
-    model_config = server_args.get_model_config()
+    model_config = model_config_of(server_args)
 
     # The attention_backend write clusters of this handler moved to the
     # resolution pipeline (arg_groups/overrides.py), each invoked below at
     # its legacy slot; the interleaved non-attention adjustments stay.
-    from sglang.srt.arg_groups.overrides import (
-        _attention_backend_default,
-        _attention_backend_dual_chunk,
-        _attention_backend_fa3_fp8_fallback,
-        _attention_backend_platform_fallbacks,
-        _fa4_page_constraint,
-        _intel_xpu_page_constraint,
-        _mla_backend_page_constraints,
-        run_post_process_pass,
-    )
 
     # Split-backend override + default fill.
     run_post_process_pass(server_args, _attention_backend_default)
@@ -88,9 +91,9 @@ def handle_attention_backend_compatibility(server_args: Any):
                 cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
             ),
         )
-        assert (
-            cfg.speculative_algorithm is None
-        ), "Speculative decoding is currently not supported with Flex Attention backend"
+        assert cfg.speculative_algorithm is None, (
+            "Speculative decoding is currently not supported with Flex Attention backend"
+        )
 
     # Whisper's encoder token padding conflicts with prefix caching.
     # Only disable for Whisper; other encoder-decoder models (e.g., mllama) use radix cache.
@@ -116,21 +119,19 @@ def handle_attention_backend_compatibility(server_args: Any):
     # The TRT-LLM / tokenspeed MLA kv-dtype validations moved to the
     # resolution pipeline (arg_groups/overrides.py:
     # _mla_kv_cache_dtype_checks), invoked here at their legacy slot.
-    from sglang.srt.arg_groups.overrides import _mla_kv_cache_dtype_checks
 
     run_post_process_pass(server_args, _mla_kv_cache_dtype_checks)
 
     # The CuteDSL MLA validation + prefill fill moved to the resolution
     # pipeline (arg_groups/overrides.py: _cutedsl_prefill_backend_fill),
     # invoked here at its legacy slot.
-    from sglang.srt.arg_groups.overrides import _cutedsl_prefill_backend_fill
 
     run_post_process_pass(server_args, _cutedsl_prefill_backend_fill)
 
-    prefill_backend, decode_backend = server_args._resolved_attention_backends()
+    prefill_backend, decode_backend = attention_backends_of(resolved_view(server_args))
     if "trtllm_mha" in (prefill_backend, decode_backend):
         if prefill_backend == "trtllm_mha" and not (
-            is_sm90_supported() or is_sm100_supported() or is_sm120_supported()
+            get_platform().is_sm90 or get_platform().is_sm100 or get_platform().is_sm120
         ):
             raise ValueError(
                 "TRTLLM MHA backend for prefill requires Hopper (SM90), Blackwell (SM100), or SM120 GPUs. "
@@ -138,7 +139,7 @@ def handle_attention_backend_compatibility(server_args: Any):
             )
         if (
             prefill_backend == "trtllm_mha"
-            and is_sm120_supported()
+            and get_platform().is_sm120
             and (
                 cfg.kv_cache_dtype == "fp8_e4m3"
                 or (
@@ -152,14 +153,14 @@ def handle_attention_backend_compatibility(server_args: Any):
                 "fp8_e4m3 KV cache or skip-softmax."
             )
         if decode_backend == "trtllm_mha" and not (
-            is_sm90_supported() or is_sm100_supported() or is_sm120_supported()
+            get_platform().is_sm90 or get_platform().is_sm100 or get_platform().is_sm120
         ):
             raise ValueError(
                 "TRTLLM MHA backend for decode is only supported on Hopper (SM90), Blackwell (SM100) and (SM120) GPUs. Please use a different decode backend."
             )
         if (
             prefill_backend == "trtllm_mha"
-            and not is_sm100_supported()
+            and not get_platform().is_sm100
             and (cfg.enable_prefill_context_parallel or cfg.attn_cp_size > 1)
         ):
             raise ValueError(
@@ -175,17 +176,34 @@ def handle_attention_backend_compatibility(server_args: Any):
     # AMD platforms backends
     if resolved_view(server_args).attention_backend == "aiter":
         if model_config.context_len > 8192:
-            declare_resolution(
-                server_args,
-                "_handle_attention_backend_compatibility",
-                mem_fraction_static=cfg.mem_fraction_static * 0.85,
-            )
+            explicit_mem_fraction = (
+                getattr(server_args, "_raw_input", None) or {}
+            ).get("mem_fraction_static") is not None
+            if (
+                explicit_mem_fraction
+                and envs.SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION.get()
+            ):
+                logger.warning(
+                    "attention_backend=aiter with context_len=%d (>8192) normally "
+                    "scales mem_fraction_static by 0.85 to reserve non-static "
+                    "workspace, but SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION is set, "
+                    "so mem_fraction_static=%.3f is used as-is. Ensure enough memory "
+                    "is left for attention workspace and CUDA graphs.",
+                    model_config.context_len,
+                    cfg.mem_fraction_static,
+                )
+            else:
+                declare_resolution(
+                    server_args,
+                    "_handle_attention_backend_compatibility",
+                    mem_fraction_static=cfg.mem_fraction_static * 0.85,
+                )
 
     # Other platforms backends
     run_post_process_pass(server_args, _attention_backend_platform_fallbacks)
 
-    prefill_backend, decode_backend = server_args._resolved_attention_backends()
-    if server_args.use_mla_backend() and prefill_backend == "intel_xpu":
+    prefill_backend, decode_backend = attention_backends_of(resolved_view(server_args))
+    if use_mla_backend(server_args) and prefill_backend == "intel_xpu":
         raise ValueError(
             "intel_xpu backend is only supported on decode for MLA models, please set --decode-attention-backend to intel_xpu and do not set --attention-backend or --prefill-attention-backend to intel_xpu for prefill instead use triton."
         )
@@ -221,7 +239,7 @@ def handle_linear_attn_backend(server_args: Any):
     if (
         cfg.linear_attn_decode_backend is None
         and cfg.linear_attn_backend != "helion"
-        and is_sm100_supported()
+        and get_platform().is_sm100
         and cfg.mamba_ssm_dtype == "bfloat16"
         # Stage 4: flashinfer's recurrent_kda compiles the state slot stride
         # as a free int64, so it reads the page-major/unified envelope-strided
@@ -267,7 +285,7 @@ def handle_linear_attn_backend(server_args: Any):
     if (
         decode == "flashinfer"
         and cfg.mamba_ssm_dtype != "bfloat16"
-        and is_cuda()
+        and get_platform().is_cuda
         and torch.cuda.get_device_capability()[0] >= 10
     ):
         raise ValueError(
@@ -282,7 +300,7 @@ def handle_linear_attn_backend(server_args: Any):
     if (
         verify == "flashinfer"
         and cfg.mamba_ssm_dtype != "bfloat16"
-        and is_cuda()
+        and get_platform().is_cuda
         and torch.cuda.get_device_capability()[0] >= 10
     ):
         raise ValueError(
@@ -298,7 +316,7 @@ def handle_linear_attn_backend(server_args: Any):
     cuda_major = int(cuda_version.split(".")[0]) if cuda_version is not None else 0
     if (
         prefill == "flashinfer"
-        and is_cuda()
+        and get_platform().is_cuda
         and torch.cuda.get_device_capability()[0] >= 10
         and cuda_major < 13
     ):
@@ -328,9 +346,6 @@ def handle_linear_attn_backend(server_args: Any):
                 "KDA, as the linear-attn decode backend; got "
                 f"--linear-attn-decode-backend={decode!r}."
             )
-        from sglang.srt.arg_groups.overrides import (
-            mamba_extra_buffer_of,
-        )
 
         if mamba_extra_buffer_of(resolved_view(server_args)):
             raise ValueError(
@@ -356,9 +371,9 @@ def handle_linear_attn_backend(server_args: Any):
             )
 
     # ReplaySSM spec-verify (Part B of #28511): linear-chain target verify via
-    # fold-every-commit -- the verify stores each draft step's raw inputs into
-    # the per-slot (rawv, rawk, g, beta) window and the commit replays the
-    # accepted prefix into the fp32 checkpoint. The intra-window interaction
+    # compact cached replay. Verify stores normalized keys, update vectors,
+    # and fp32 log-decays; accepted BF16 windows are materialized with
+    # compensated hi/lo accumulation. The intra-window interaction
     # uses a strictly-lower causal mask, so it is valid ONLY for a linear
     # draft chain (speculative_eagle_topk in {None, 1}, i.e. NEXTN / MTP);
     # EAGLE tree verify (topk > 1) must fall back to the recurrent verify.
@@ -424,8 +439,8 @@ def handle_linear_attn_backend(server_args: Any):
         if cfg.mamba_ssm_dtype is None:
             logger.info(
                 "--enable-linear-replayssm-spec: setting --mamba-ssm-dtype "
-                "float32 (the closed-loop exact fold keeps the SSM checkpoint "
-                "bit-identical to the recurrent baseline)."
+                "float32 (cached replay uses compensated checkpoint "
+                "projection and materialization)."
             )
             declare_resolution(
                 server_args,
@@ -435,10 +450,8 @@ def handle_linear_attn_backend(server_args: Any):
         elif cfg.mamba_ssm_dtype != "float32":
             logger.warning(
                 "--enable-linear-replayssm-spec with --mamba-ssm-dtype=%s: the "
-                "closed-loop fold re-quantizes the committed state each "
-                "commit/flush (fp32 keeps it bit-exact to the fp32 recurrent "
-                "baseline), so it may drift over long sequences. Validate "
-                "accuracy for your model.",
+                "compact checkpoint is materialized after each accepted "
+                "verify window; validate long-sequence accuracy and throughput.",
                 cfg.mamba_ssm_dtype,
             )
 
@@ -451,6 +464,7 @@ def handle_multi_item_scoring(server_args: Any):
     changing it silently could surprise users who intentionally picked
     a non-flashinfer backend.
     """
+
     cfg = resolving_view(server_args)
     if not cfg.enable_mis:
         return
@@ -488,7 +502,7 @@ def handle_multi_item_scoring(server_args: Any):
             chunked_prefill_size=-1,
         )
 
-    prefill_backend, decode_backend = server_args._resolved_attention_backends()
+    prefill_backend, decode_backend = attention_backends_of(resolved_view(server_args))
     assert prefill_backend == "flashinfer" and decode_backend == "flashinfer", (
         "Multi-item scoring requires flashinfer attention backend for custom attention mask support. "
         f"Please set --attention-backend flashinfer when using --enable-mis. "
@@ -529,27 +543,18 @@ def handle_deterministic_inference(server_args: Any):
         # Moved to the resolution pipeline (arg_groups/overrides.py:
         # _deterministic_allreduce_fusion_disable), invoked here at its
         # legacy slot.
-        from sglang.srt.arg_groups.overrides import (
-            _deterministic_allreduce_fusion_disable,
-            run_post_process_pass,
-        )
 
         run_post_process_pass(server_args, _deterministic_allreduce_fusion_disable)
 
         # The forced-pytorch sampling write and the attention backend
         # fill/validation moved to the resolution pipeline
         # (arg_groups/overrides.py), invoked at their legacy slots.
-        from sglang.srt.arg_groups.overrides import (
-            _deterministic_attention_backend,
-            _deterministic_sampling_backend,
-            run_post_process_pass,
-        )
 
         run_post_process_pass(server_args, _deterministic_sampling_backend)
         is_deepseek_model = False
         if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
             try:
-                hf_config = server_args.get_model_config().hf_config
+                hf_config = model_config_of(server_args).hf_config
                 model_arch = hf_config.architectures[0]
                 is_deepseek_model = model_arch in [
                     "DeepseekV2ForCausalLM",
@@ -572,7 +577,7 @@ def handle_deterministic_inference(server_args: Any):
                 raise ValueError(
                     f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with absorbed-MLA models. But you're using {attention_backend}."
                 )
-            if attention_backend == "fa4" and not is_sm100_or_sm110_supported():
+            if attention_backend == "fa4" and not get_platform().is_sm100_or_sm110:
                 raise ValueError(
                     "Deterministic inference with absorbed-MLA models on the fa4 "
                     "attention backend requires SM100/SM110: it runs "
@@ -593,7 +598,7 @@ def handle_deterministic_inference(server_args: Any):
 
         # Check TP size
         if cfg.tp_size > 1:
-            if is_hip():
+            if get_platform().is_hip:
                 # AMD: use 1-stage all-reduce kernel which is inherently deterministic
                 # (each GPU reads all data from all GPUs, reduces locally in fixed order)
                 logger.info("AMD/ROCm: Using 1-stage all-reduce kernel (deterministic)")

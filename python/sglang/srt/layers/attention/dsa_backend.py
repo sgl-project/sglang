@@ -16,8 +16,10 @@ import torch
 
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
 from sglang.srt.runtime_context import (
+    get_buffer,
     get_exec,
     get_parallel,
+    get_platform,
     get_spec,
 )
 
@@ -73,13 +75,11 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_split_and_rebuild_position,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_buffer
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_gfx95_supported,
     is_hip,
-    is_sm100_supported,
     print_warning_once,
 )
 
@@ -289,7 +289,6 @@ _DSA_IMPL_T: TypeAlias = Literal[
 class DeepseekSparseAttnBackend(
     DeepseekSparseAttnBackendMTPPrecomputeMixin, AttentionBackend
 ):
-
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
     extend_dummy_seqs_capped_by_req_pool: bool = True
@@ -349,6 +348,7 @@ class DeepseekSparseAttnBackend(
             # Keep original head count if it exceeds current padded variants.
             self.flashmla_kv_num_q_heads = self.num_q_heads
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
+        self._sink_pad_cache: dict[tuple[int, int], torch.Tensor] = {}
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
 
@@ -670,7 +670,7 @@ class DeepseekSparseAttnBackend(
             forward_mode.is_target_verify()
             and next_n
             and next_n >= 2
-            and is_sm100_supported()
+            and get_platform().is_sm100
         ):
             return cache_seqlens_int32.view(-1, 1).expand(-1, next_n).contiguous()
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
@@ -980,9 +980,9 @@ class DeepseekSparseAttnBackend(
                         )
                     ]
                 )
-                assert page_table_1_flattened.shape[0] == sum(
-                    indexer_seq_lens_cpu
-                ), f"{page_table_1_flattened.shape[0] = } must be the same as {sum(indexer_seq_lens_cpu) = }"
+                assert page_table_1_flattened.shape[0] == sum(indexer_seq_lens_cpu), (
+                    f"{page_table_1_flattened.shape[0] = } must be the same as {sum(indexer_seq_lens_cpu) = }"
+                )
 
                 # Validate indices when logical tokens exceed physical capacity
                 # This is likely to be triggered by PP with high kv reuse & parallelism
@@ -1497,7 +1497,7 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_ctx_lens_2d = None
                 if (
                     self.speculative_num_draft_tokens >= 2
-                    and is_sm100_supported()
+                    and get_platform().is_sm100
                     and metadata.paged_mqa_ctx_lens_2d is not None
                     and metadata.paged_mqa_ctx_lens_2d.dim() == 2
                     and metadata.paged_mqa_ctx_lens_2d.size(0) == bs
@@ -1886,6 +1886,7 @@ class DeepseekSparseAttnBackend(
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
@@ -1900,6 +1901,10 @@ class DeepseekSparseAttnBackend(
             )
             else self.dsa_prefill_impl
         )
+        if attn_sink is not None and dsa_impl != "flashmla_sparse":
+            raise RuntimeError(
+                f"Learnable attention sinks require flashmla_sparse, got {dsa_impl}"
+            )
 
         if dsa_impl == "trtllm" and not self.use_mha:
             return self._forward_trtllm(
@@ -1938,9 +1943,9 @@ class DeepseekSparseAttnBackend(
         if self.use_mha:
             assert k is not None and v is not None
             assert q_rope is None, "MHA_ONE_SHOT path should not pass q_rope"
-            assert (
-                layer.tp_k_head_num == layer.tp_q_head_num > 1
-            ), "MHA_ONE_SHOT requires dense multi-head config"
+            assert layer.tp_k_head_num == layer.tp_q_head_num > 1, (
+                "MHA_ONE_SHOT requires dense multi-head config"
+            )
             return self._forward_standard_mha(
                 q=q,
                 k=k,
@@ -2125,6 +2130,7 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
                 topk_length=metadata.dsa_cache_seqlens_int32,
+                attn_sink=attn_sink,
             )
         elif dsa_impl == "flashinfer_sparse_mla":
             if q_rope is not None:
@@ -2196,11 +2202,18 @@ class DeepseekSparseAttnBackend(
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
+
+        if attn_sink is not None and self.dsa_decode_impl != "flashmla_sparse":
+            raise RuntimeError(
+                "Learnable attention sinks require flashmla_sparse, got "
+                f"{self.dsa_decode_impl}"
+            )
 
         if self.dsa_decode_impl == "trtllm":
             return self._forward_trtllm(
@@ -2282,6 +2295,7 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
                 topk_length=metadata.dsa_cache_seqlens_int32,
+                attn_sink=attn_sink,
             )
         elif self.dsa_decode_impl == "flashinfer_sparse_mla":
             if q_all is None:
@@ -2397,6 +2411,7 @@ class DeepseekSparseAttnBackend(
         page_table_1: torch.Tensor,
         sm_scale: float,
         topk_length: Optional[torch.Tensor] = None,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
@@ -2422,6 +2437,15 @@ class DeepseekSparseAttnBackend(
         else:
             q_input = q_all
 
+        sink_input = attn_sink
+        if need_padding and attn_sink is not None:
+            key = (attn_sink.data_ptr(), required_padding)
+            sink_input = self._sink_pad_cache.get(key)
+            if sink_input is None:
+                sink_input = attn_sink.new_zeros(required_padding)
+                self._sink_pad_cache[key] = sink_input
+            sink_input[:num_heads].copy_(attn_sink)
+
         # indices shape must be (s_q, h_kv=1, topk), keep h_kv=1 unchanged
         indices_input = page_table_1.unsqueeze(1)
 
@@ -2443,6 +2467,7 @@ class DeepseekSparseAttnBackend(
             indices=indices_input,
             sm_scale=sm_scale,
             d_v=v_head_dim,
+            attn_sink=sink_input,
             topk_length=topk_length,
         )
 
@@ -2875,8 +2900,8 @@ class DeepseekSparseAttnBackend(
 
         # Verify batch sizes match (length of cu_seqlens should be batch_size + 1)
         assert len(cu_seqlens_q) == len(cu_seqlens_k), (
-            f"batch_size mismatch: cu_seqlens_q has {len(cu_seqlens_q)-1} requests, "
-            f"cu_seqlens_k has {len(cu_seqlens_k)-1} requests"
+            f"batch_size mismatch: cu_seqlens_q has {len(cu_seqlens_q) - 1} requests, "
+            f"cu_seqlens_k has {len(cu_seqlens_k) - 1} requests"
         )
 
         # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues.
@@ -3135,9 +3160,9 @@ class DeepseekSparseAttnBackend(
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
             assert q_rope is not None, "For FP8 path q_rope should not be None."
             assert k_rope is not None, "For FP8 path k_rope should not be None."
-            assert (
-                cos_sin_cache is not None
-            ), "For FP8 path cos_sin_cache should not be None."
+            assert cos_sin_cache is not None, (
+                "For FP8 path cos_sin_cache should not be None."
+            )
 
             rope_positions = forward_batch.positions
             if dsa_use_prefill_cp(forward_batch):
@@ -3172,9 +3197,9 @@ class DeepseekSparseAttnBackend(
 
             # Save KV cache if requested
         if save_kv_cache:
-            assert (
-                k is not None and k_rope is not None
-            ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+            assert k is not None and k_rope is not None, (
+                "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+            )
             cache_loc = (
                 forward_batch.out_cache_loc
                 if not layer.is_cross_attention
@@ -3425,7 +3450,6 @@ class DeepseekSparseAttnBackend(
 
 
 class DeepseekSparseAttnMultiStepBackend:
-
     # Per-step draft decode replays from precomputed GPU metadata; opt out so
     # decide_needs_cpu_seq_lens' OR over the backends stays False.
     needs_cpu_seq_lens: bool = False
@@ -3439,6 +3463,7 @@ class DeepseekSparseAttnMultiStepBackend:
     ):
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
+        self._sink_pad_cache: dict[tuple[int, int], torch.Tensor] = {}
         self.attn_backends = []
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(

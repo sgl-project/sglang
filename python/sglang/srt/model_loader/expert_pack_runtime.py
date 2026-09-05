@@ -15,6 +15,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from sglang.srt.arg_groups.overrides import (
+    declare_resolution,
+    resolving_view,
+)
+
 METADATA_FORMAT_VERSION = 3
 GGUF_SHARD_SUFFIX_RE = re.compile(r"-\d{5}-of-\d{5}\.gguf$")
 DEEPSEEK_METADATA_FORMAT_VERSION = 4
@@ -202,8 +207,6 @@ def prepare_raw_kimi_server_args(
 ) -> None:
     """Resolve a raw GGUF model path into the normal loader inputs."""
 
-    from sglang.srt.arg_groups.overrides import resolving_view
-
     cfg = resolving_view(server_args)
     model_path = Path(cfg.model_path).expanduser()
     if not model_path.is_file() or model_path.suffix.lower() != ".gguf":
@@ -215,7 +218,8 @@ def prepare_raw_kimi_server_args(
         model_path,
         tokenizer_dir=tokenizer_path,
     )
-    server_args._declare(
+    declare_resolution(
+        server_args,
         "prepare_raw_kimi_server_args",
         model_path=str(assets["model_dir"]),
         tokenizer_path=str(assets["model_dir"]),
@@ -513,8 +517,6 @@ def prepare_raw_deepseek_server_args(
 ) -> None:
     """Resolve a raw DeepSeek V4 GGUF into metadata and Expert Pack inputs."""
 
-    from sglang.srt.arg_groups.overrides import resolving_view
-
     cfg = resolving_view(server_args)
     source = Path(cfg.model_path).expanduser().resolve(strict=True)
     if not source.is_file():
@@ -538,7 +540,8 @@ def prepare_raw_deepseek_server_args(
     config_sha256 = _deepseek_digest(
         model_value.get("config_sha256"), "model.config_sha256"
     )
-    server_args._declare(
+    declare_resolution(
+        server_args,
         "prepare_raw_deepseek_server_args",
         model_path=str(model_config.parent),
         tokenizer_path=str(model_config.parent),
@@ -559,8 +562,6 @@ def prepare_raw_expert_pack_server_args(
     server_args: Any, loader_config: dict[str, Any]
 ) -> None:
     """Dispatch a raw GGUF to the model-specific expert-pack preparation path."""
-
-    from sglang.srt.arg_groups.overrides import resolving_view
 
     cfg = resolving_view(server_args)
     source = Path(cfg.model_path).expanduser()

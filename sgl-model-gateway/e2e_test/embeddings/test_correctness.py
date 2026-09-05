@@ -239,9 +239,9 @@ class TestEmbeddingCorrectness:
 
             # Verify all similarities are close to 1.0
             for j, sim in enumerate(similarities):
-                assert (
-                    abs(sim - 1.0) < tolerance
-                ), f"Set {i+1}, text {j+1}: similarity {sim:.4f} not close to 1.0"
+                assert abs(sim - 1.0) < tolerance, (
+                    f"Set {i + 1}, text {j + 1}: similarity {sim:.4f} not close to 1.0"
+                )
 
             logger.info("Semantic similarity test set %d passed", i + 1)
 
@@ -273,8 +273,8 @@ class TestEmbeddingCorrectness:
         logger.info("Gateway relevance scores: %s", scores_gateway)
         logger.info("HF relevance scores: %s", scores_hf)
 
-        assert np.allclose(
-            scores_gateway, scores_hf, atol=tolerance
-        ), f"Scores differ beyond tolerance:\nGateway: {scores_gateway}\nHF: {scores_hf}"
+        assert np.allclose(scores_gateway, scores_hf, atol=tolerance), (
+            f"Scores differ beyond tolerance:\nGateway: {scores_gateway}\nHF: {scores_hf}"
+        )
 
         logger.info("Relevance scores comparison passed")

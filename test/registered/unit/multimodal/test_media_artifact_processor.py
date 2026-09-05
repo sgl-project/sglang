@@ -1,8 +1,12 @@
 import asyncio
+import base64
+import io
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import Optional
+
+from PIL import Image
 
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.cache import MultimodalPreprocessCache, snapshot_media
@@ -85,6 +89,22 @@ class _Processor(MediaArtifactCacheMixin):
 
 
 class TestMediaArtifactProcessor(unittest.TestCase):
+    def test_default_image_decoder_rejects_lazy_pil_failure(self):
+        malformed_png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLJSwAAAABJRU5ErkJggg=="
+        )
+        processor = MediaArtifactCacheMixin()
+        processor.gpu_image_decode = False
+
+        with self.assertRaisesRegex(ValueError, "Could not decode image"):
+            processor.decode_media_snapshot(
+                snapshot_media(malformed_png), Modality.IMAGE
+            )
+
+        lazy_image = Image.open(io.BytesIO(malformed_png))
+        with self.assertRaisesRegex(ValueError, "Could not decode image"):
+            snapshot_media(lazy_image)
+
     def test_unknown_model_option_is_part_of_artifact_identity(self):
         processor = _Processor()
         digest = snapshot_media(b"image").content_digest

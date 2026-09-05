@@ -206,6 +206,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
+            registration_granularity_bytes=(
+                self.page_size * self.layout_dim
+                if self.layout in ("page_first", "page_first_direct")
+                else None
+            ),
         )
         return buffer
 
@@ -436,9 +441,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 )
             return
 
-        device_data_ptrs, device_kv_buffers = self._resolve_device_transfer_buffers(
-            device_pool
-        )
+        if io_backend == "kernel_ascend":
+            # NPU pools use contiguous multi-layer tensors and intentionally do
+            # not build the CUDA-style data_ptrs array.
+            device_data_ptrs, device_kv_buffers = None, None
+        else:
+            device_data_ptrs, device_kv_buffers = self._resolve_device_transfer_buffers(
+                device_pool
+            )
 
         if io_backend == "kernel":
             if self.layout == "layer_first":

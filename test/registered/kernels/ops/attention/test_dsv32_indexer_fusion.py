@@ -178,9 +178,9 @@ def test_q_rope_quant_matches_reference(pos_dtype):
     # scale step at the bottom of the range.
     deq = q_fp8.float() * scale
     err = (deq - ref).abs()
-    assert (
-        err <= 0.0625 * ref.abs() + scale
-    ).all(), f"max fp8 dequant error {err.max().item()}"
+    assert (err <= 0.0625 * ref.abs() + scale).all(), (
+        f"max fp8 dequant error {err.max().item()}"
+    )
 
 
 # ----------------------------------------------------------------------------

@@ -413,9 +413,10 @@ class CausalWanTransformerBlock(nn.Module):
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
             hidden_states, attn_output, gate_msa, null_shift, null_scale
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         # 2. Cross-attention
         attn_output = self.attn2(
@@ -427,9 +428,10 @@ class CausalWanTransformerBlock(nn.Module):
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         # 3. Feed-forward
         ff_output = self.ffn(norm_hidden_states)

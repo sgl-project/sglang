@@ -112,7 +112,7 @@ class TestQwen3Next80BA3B_aime25(TestNpuAccuracyTestCaseBase):
     max_concurrency = 16
 
     def test_aime25(self):
-        self.run_accuracy_multiple(n_runs=3)
+        self.run_accuracy()
 
 
 if __name__ == "__main__":

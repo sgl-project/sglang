@@ -5,6 +5,7 @@ import dataclasses
 import multiprocessing as mp
 import os
 import re
+import threading
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import (
@@ -37,10 +38,14 @@ from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecuto
 from sglang.srt.multimodal.transport.cuda_ipc import (
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
+    CudaIpcTensorTransportProxy,
     MmItemMemoryPool,
     get_mm_feature_pool_size_per_worker,
 )
-from sglang.srt.runtime_context import get_mm, get_serving
+from sglang.srt.runtime_context import (
+    get_mm,
+    get_serving,
+)
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
     configure_media_url_security,
@@ -52,6 +57,7 @@ from sglang.srt.utils import (
     load_image,
     load_video,
     logger,
+    smart_to_rgb,
 )
 
 _is_cpu = is_cpu()
@@ -205,6 +211,8 @@ def _tokenizer_of(processor):
 class BaseMultimodalProcessor(ABC):
     models = []
     gpu_image_decode = True  # Enable GPU decoding by default
+    smart_rgb_conversion = False
+    video_preprocessing_device = None
     prefer_tokenized_input = False
     precompute_hash_before_cpu_transfer = False
     # Set by processors that already build input_ids from the request's own
@@ -364,13 +372,8 @@ class BaseMultimodalProcessor(ABC):
                 self.mm_processor_worker_num,
                 "auto" if requested_mm_processor_worker_num == 0 else "explicit",
             )
-        cpu_worker_start_method = (
-            "spawn" if self.mm_feature_transport == "cuda_vmm" else "fork"
-        )
-        self.cpu_executor = concurrent.futures.ProcessPoolExecutor(
-            mp_context=mp.get_context(cpu_worker_start_method),
-            max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
-        )
+        self._cpu_executor_lock = threading.Lock()
+        self.cpu_executor = self._create_cpu_executor()
 
         # Mapping from attribute names to modality types
         self.ATTR_NAME_TO_MODALITY = {
@@ -489,6 +492,41 @@ class BaseMultimodalProcessor(ABC):
         self.cpu_executor.shutdown(wait=False, cancel_futures=True)
         if self.mm_processor_executor is not None:
             self.mm_processor_executor.shutdown()
+
+    def _create_cpu_executor(self) -> concurrent.futures.ProcessPoolExecutor:
+        start_method = "spawn" if self.mm_feature_transport == "cuda_vmm" else "fork"
+        return concurrent.futures.ProcessPoolExecutor(
+            mp_context=mp.get_context(start_method),
+            max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
+        )
+
+    def _replace_broken_cpu_executor(
+        self, failed_executor: concurrent.futures.ProcessPoolExecutor
+    ) -> None:
+        """Replace a failed preprocess pool once across concurrent requests."""
+        with self._cpu_executor_lock:
+            if self.cpu_executor is not failed_executor:
+                return
+            self.cpu_executor = self._create_cpu_executor()
+        logger.warning("Replaced a broken multimodal CPU preprocess pool")
+        threading.Thread(
+            target=self._shutdown_broken_cpu_executor,
+            args=(failed_executor,),
+            name="sglang-mm-cpu-pool-cleanup",
+            daemon=True,
+        ).start()
+
+    @staticmethod
+    def _shutdown_broken_cpu_executor(
+        failed_executor: concurrent.futures.ProcessPoolExecutor,
+    ) -> None:
+        try:
+            failed_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            logger.warning(
+                "Failed to shut down a broken multimodal CPU preprocess pool",
+                exc_info=True,
+            )
 
     def compute_mrope_positions(self, input_ids, mm_items):
         """Compute M-RoPE positions from expanded input_ids and multimodal items.
@@ -663,6 +701,8 @@ class BaseMultimodalProcessor(ABC):
         if _is_xpu:
             return "xpu"
         if not _is_npu:
+            # Per-worker placement travels as a constructor argument, and
+            # this record is that argument.
             return f"cuda:{server_args.base_gpu_id}"
         if processor.__class__.__name__ == "MiniMaxVLProcessor":
             # MiniMax's image/video processors create 10-dim tensors during
@@ -774,6 +814,10 @@ class BaseMultimodalProcessor(ABC):
             if processor_device is not None:
                 kwargs["device"] = processor_device
 
+        # Long-video preprocessing stays on CPU to avoid competing with scheduler GPU pools.
+        if videos and self.video_preprocessing_device is not None:
+            kwargs["device"] = self.video_preprocessing_device
+
         # Avoid double BOS when the chat template already wrote one.
         if self._tokenizer_auto_adds_specials and isinstance(input_text, str):
             bos = getattr(tokenizer, "bos_token", None)
@@ -858,11 +902,11 @@ class BaseMultimodalProcessor(ABC):
                 img, _ = load_image(data, cls.gpu_image_decode)
                 if isinstance(img, torch.Tensor):
                     return img  # JPEG already decoded on GPU by nvJPEG
-                # PIL decodes lazily; do it here in the io worker so the decode
-                # doesn't run later on the event-loop thread.
-                if discard_alpha_channel and img.mode != "RGB":
-                    return img.convert("RGB")
-                img.load()
+                if discard_alpha_channel:
+                    if cls.smart_rgb_conversion:
+                        return smart_to_rgb(img)
+                    if img.mode != "RGB":
+                        return img.convert("RGB")
                 return img
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
@@ -1427,6 +1471,22 @@ class BaseMultimodalProcessor(ABC):
 
         return list(zip(indices_start.tolist(), indices_end.tolist()))
 
+    def get_mm_item_offsets(
+        self,
+        input_ids: torch.Tensor,
+        mm_tokens: MultimodalSpecialTokens,
+        modality: Modality,
+    ) -> List[Tuple[int, int]]:
+        """Return placeholder offsets belonging to one modality.
+
+        Processors that reuse one token ID for multiple modalities can override
+        this method and use surrounding boundary tokens to disambiguate spans.
+        """
+        mm_token_id = mm_tokens.get_token_id_by_modality(modality)
+        if mm_token_id is None:
+            raise ValueError(f"No token id found for modality: {modality}")
+        return self.get_mm_items_offset(input_ids, mm_token_id)
+
     def collect_mm_items_from_processor_output(
         self, data_dict: dict, modality: Modality = None
     ) -> List[MultimodalDataItem]:
@@ -1710,9 +1770,9 @@ class BaseMultimodalProcessor(ABC):
                 and not raw_audios
                 and not raw_videos
             ):
-                assert isinstance(
-                    base_output.input_ids, list
-                ), f"expected list[int] input_ids, got {type(base_output.input_ids)}"
+                assert isinstance(base_output.input_ids, list), (
+                    f"expected list[int] input_ids, got {type(base_output.input_ids)}"
+                )
                 try:
                     counts = self.resolve_image_token_counts(raw_images)
                     image_placeholder_token_id = mm_tokens.image_token_id
@@ -1790,12 +1850,10 @@ class BaseMultimodalProcessor(ABC):
         for mm_item in all_collected_items:
             if mm_item.offsets is not None:
                 continue
-            mm_token_id = mm_tokens.get_token_id_by_modality(mm_item.modality)
-            if mm_token_id is None:
-                raise ValueError(f"No token id found for modality: {mm_item.modality}")
-            mm_item.offsets = self.get_mm_items_offset(
+            mm_item.offsets = self.get_mm_item_offsets(
                 input_ids=input_ids,
-                mm_token_id=mm_token_id,
+                mm_tokens=mm_tokens,
+                modality=mm_item.modality,
             )
 
         # Split bundled items into per-image/video items for better cache granularity
@@ -1842,19 +1900,41 @@ class BaseMultimodalProcessor(ABC):
     def _prepare_mm_items_for_transport(
         self, mm_items: List[MultimodalDataItem]
     ) -> List[MultimodalDataItem]:
-        """Wrap final GPU features for dispatch to the scheduler."""
+        """Wrap final GPU features, rolling back every lease if one wrap fails."""
         if not self.use_cuda_ipc:
             return mm_items
 
         # Pool misses fall back to plain CPU tensors. The scheduler copies out
         # and releases each successful pool slice.
-        for item in mm_items:
-            if isinstance(item.feature, torch.Tensor):
-                item.feature = self._wrap_tensor_for_cuda_ipc(item.feature)
-            if isinstance(item.precomputed_embeddings, torch.Tensor):
-                item.precomputed_embeddings = self._wrap_tensor_for_cuda_ipc(
-                    item.precomputed_embeddings
+        updates = []
+        try:
+            for item in mm_items:
+                fields = (
+                    ("feature", item.feature),
+                    ("precomputed_embeddings", item.precomputed_embeddings),
                 )
+                for field, tensor in fields:
+                    if not isinstance(tensor, torch.Tensor):
+                        continue
+                    wrapped = self._wrap_tensor_for_cuda_ipc(tensor)
+                    setattr(item, field, wrapped)
+                    updates.append((item, field, tensor, wrapped))
+        except BaseException as error:
+            rollback_errors = []
+            for item, field, tensor, wrapped in reversed(updates):
+                try:
+                    if isinstance(wrapped, CudaIpcTensorTransportProxy):
+                        self.cudaipc_mmfeature_pool.cancel_proxy(wrapped)
+                except BaseException as rollback_error:
+                    rollback_errors.append(rollback_error)
+                finally:
+                    setattr(item, field, tensor)
+            if rollback_errors:
+                error.add_note(
+                    f"{len(rollback_errors)} CUDA IPC rollback operation(s) also failed"
+                )
+                raise error from rollback_errors[0]
+            raise
         return mm_items
 
     async def process_and_combine_mm_data_async(

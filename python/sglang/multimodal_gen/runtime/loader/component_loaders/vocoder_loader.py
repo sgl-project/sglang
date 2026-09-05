@@ -29,9 +29,9 @@ class VocoderLoader(PlainStateDictComponentLoader):
             component_model_path, server_args, component_name
         )
         class_name = config.pop("_class_name", None) or self.component_architecture
-        assert (
-            class_name is not None
-        ), "Vocoder class name must be available from component config or pipeline config."
+        assert class_name is not None, (
+            "Vocoder class name must be available from component config or pipeline config."
+        )
 
         server_args.model_paths[component_name] = component_model_path
 

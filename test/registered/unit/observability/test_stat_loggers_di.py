@@ -39,17 +39,49 @@ from sglang.srt.observability.metrics_collector import (
     TokenizerMetricsCollector,
     resolve_collector_class,
 )
+from sglang.srt.runtime_context import get_context, reset_context
 
 
-class _StubArgs:
-    """Minimal ServerArgs stand-in.
+class _BoundRecordingMetric:
+    def __init__(self, metric, labels):
+        self.metric = metric
+        self.labels = labels
 
-    Avoids triggering the heavy real ServerArgs import chain for unit-level
-    ``resolve_collector_class`` cases.
-    """
+    def inc(self, value=1):
+        self.metric.increments.append((self.labels, value))
 
-    def __init__(self, stat_loggers=None):
-        self.stat_loggers = stat_loggers
+    def observe(self, value):
+        self.metric.observations.append((self.labels, value))
+
+    def set(self, value):
+        self.metric.sets.append((self.labels, value))
+
+
+class _RecordingMetric:
+    """Small prometheus_client-compatible metric that preserves labels."""
+
+    def __init__(self, *args, name=None, labelnames=(), **kwargs):
+        self.name = name if name is not None else args[0]
+        self.labelnames = tuple(labelnames)
+        self.increments = []
+        self.observations = []
+        self.sets = []
+
+    def labels(self, *values, **labels):
+        if values:
+            labels = dict(zip(self.labelnames, values, strict=True))
+        return _BoundRecordingMetric(self, labels)
+
+
+class _RecordingTokenizerMetricsCollector(TokenizerMetricsCollector):
+    _counter_cls = _RecordingMetric
+    _gauge_cls = _RecordingMetric
+    _histogram_cls = _RecordingMetric
+
+
+class _RecordingStorageMetricsCollector(StorageMetricsCollector):
+    _counter_cls = _RecordingMetric
+    _histogram_cls = _RecordingMetric
 
 
 class TestCollectorClassAttrs(unittest.TestCase):
@@ -79,30 +111,37 @@ class TestCollectorClassAttrs(unittest.TestCase):
 
 
 class TestResolveCollectorClass(unittest.TestCase):
-    def test_returns_default_when_server_args_none(self):
-        cls = resolve_collector_class(None, "scheduler", SchedulerMetricsCollector)
-        self.assertIs(cls, SchedulerMetricsCollector)
+    """The role table is read from the published `observability` bag."""
+
+    def _resolve(self, role, default_cls, **fields):
+        if not fields:
+            return resolve_collector_class(role, default_cls)
+        with get_context().override_server_args(**fields):
+            return resolve_collector_class(role, default_cls)
+
+    def test_returns_default_when_nothing_is_published(self):
+        reset_context()
+        self.assertIs(
+            resolve_collector_class("scheduler", SchedulerMetricsCollector),
+            SchedulerMetricsCollector,
+        )
 
     def test_returns_default_when_stat_loggers_none(self):
-        cls = resolve_collector_class(
-            _StubArgs(stat_loggers=None), "scheduler", SchedulerMetricsCollector
-        )
+        cls = self._resolve("scheduler", SchedulerMetricsCollector, stat_loggers=None)
         self.assertIs(cls, SchedulerMetricsCollector)
 
     def test_returns_default_when_stat_loggers_empty(self):
-        cls = resolve_collector_class(
-            _StubArgs(stat_loggers={}), "scheduler", SchedulerMetricsCollector
-        )
+        cls = self._resolve("scheduler", SchedulerMetricsCollector, stat_loggers={})
         self.assertIs(cls, SchedulerMetricsCollector)
 
     def test_returns_default_when_role_missing(self):
         class MyTokenizer(TokenizerMetricsCollector):
             pass
 
-        cls = resolve_collector_class(
-            _StubArgs(stat_loggers={"tokenizer": MyTokenizer}),
+        cls = self._resolve(
             "scheduler",
             SchedulerMetricsCollector,
+            stat_loggers={"tokenizer": MyTokenizer},
         )
         self.assertIs(cls, SchedulerMetricsCollector)
 
@@ -110,10 +149,10 @@ class TestResolveCollectorClass(unittest.TestCase):
         class MyScheduler(SchedulerMetricsCollector):
             pass
 
-        cls = resolve_collector_class(
-            _StubArgs(stat_loggers={"scheduler": MyScheduler}),
+        cls = self._resolve(
             "scheduler",
             SchedulerMetricsCollector,
+            stat_loggers={"scheduler": MyScheduler},
         )
         self.assertIs(cls, MyScheduler)
 
@@ -137,6 +176,51 @@ class TestDefaultBackend(unittest.TestCase):
         self.assertIsInstance(collector.eviction_num_tokens, prometheus_client.Counter)
         self.assertIsInstance(
             collector.eviction_duration_seconds, prometheus_client.Histogram
+        )
+
+
+class TestHiCacheMetrics(unittest.TestCase):
+    def test_cached_tokens_uses_literal_storage_source(self):
+        labels = {"model_name": "test"}
+        with get_context().override_server_args(
+            prompt_tokens_buckets=None, generation_tokens_buckets=None
+        ):
+            collector = _RecordingTokenizerMetricsCollector(labels=labels)
+
+        collector.observe_one_finished_request(
+            labels=labels,
+            prompt_tokens=20,
+            generation_tokens=2,
+            cached_tokens=12,
+            e2e_latency=0.1,
+            has_grammar=False,
+            cached_tokens_details={
+                "device": 3,
+                "host": 4,
+                "storage": 5,
+                "storage_backend": "BackendShim",
+            },
+        )
+
+        by_source = {
+            metric_labels["cache_source"]: value
+            for metric_labels, value in collector.cached_tokens_total.increments
+        }
+        self.assertEqual(by_source, {"device": 3, "host": 4, "storage": 5})
+
+    def test_storage_prefetch_lifecycle_metrics(self):
+        labels = {"model_name": "test"}
+        collector = _RecordingStorageMetricsCollector(labels=labels)
+
+        collector.log_storage_prefetch_hit_tokens(21)
+        collector.log_storage_prefetch_unfulfilled_tokens(4, "storage_transfer")
+
+        self.assertEqual(
+            collector.storage_prefetch_hit_tokens_total.increments, [(labels, 21)]
+        )
+        self.assertEqual(
+            collector.storage_prefetch_unfulfilled_tokens_total.increments,
+            [({**labels, "reason": "storage_transfer"}, 4)],
         )
 
 

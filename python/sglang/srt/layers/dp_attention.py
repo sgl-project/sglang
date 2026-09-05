@@ -34,7 +34,10 @@ from sglang.srt.runtime_context import (
     get_device,
     get_exec,
     get_flags,
+    get_forward,
     get_parallel,
+    get_resources,
+    get_stream,
 )
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip
 
@@ -80,7 +83,6 @@ _is_cpu = is_cpu()
 
 
 class DpPaddingMode(IntEnum):
-
     # Padding tokens to max length and then gather tokens using `all_gather_into_tensor`
     MAX_LEN = auto()
     # Padding tokens to sum length and then gather tokens using `all_reduce`
@@ -166,7 +168,6 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
-        from sglang.srt.runtime_context import get_flags
 
         dp = get_flags().dp
         dp.buffer_hidden_size = hidden_size
@@ -190,7 +191,6 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def get_global_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
-        from sglang.srt.runtime_context import get_flags
 
         dp = get_flags().dp
         with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
@@ -203,7 +203,6 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def get_local_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
-        from sglang.srt.runtime_context import get_flags
 
         dp = get_flags().dp
         with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
@@ -236,19 +235,16 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def get_dp_hidden_size(cls) -> int:
-        from sglang.srt.runtime_context import get_flags
 
         return get_flags().dp.buffer_hidden_size
 
     @classmethod
     def get_dp_dtype(cls) -> torch.dtype:
-        from sglang.srt.runtime_context import get_flags
 
         return get_flags().dp.buffer_dtype
 
     @classmethod
     def get_dp_device(cls) -> torch.device:
-        from sglang.srt.runtime_context import get_flags
 
         return get_flags().dp.buffer_device
 
@@ -313,13 +309,11 @@ def set_is_extend_in_batch(is_extend_in_batch: bool):
     # Sticky within the thread: every ForwardBatch construction writes it,
     # graph runners force False around capture; readers are the EP
     # dispatchers on the same (single) forward thread.
-    from sglang.srt.runtime_context import get_forward
 
     get_forward().set("is_extend_in_batch", is_extend_in_batch)
 
 
 def get_is_extend_in_batch() -> bool:
-    from sglang.srt.runtime_context import get_forward
 
     return get_forward().is_extend_in_batch
 
@@ -517,9 +511,9 @@ def _dp_gather_via_all_reduce(
     if local_tokens.shape[0] > 0 and (
         is_partial or get_attn_tensor_model_parallel_rank() == 0
     ):
-        assert (
-            local_tokens.untyped_storage() is not global_tokens.untyped_storage()
-        ), "aliasing between global_tokens and local_tokens not allowed"
+        assert local_tokens.untyped_storage() is not global_tokens.untyped_storage(), (
+            "aliasing between global_tokens and local_tokens not allowed"
+        )
 
         memcpy(global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False)
 
@@ -870,9 +864,9 @@ def dp_scatter(
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
     if local_tokens.shape[0] > 0:
-        assert (
-            local_tokens.untyped_storage() is not global_tokens.untyped_storage()
-        ), "aliasing between local_tokens and global_tokens not allowed"
+        assert local_tokens.untyped_storage() is not global_tokens.untyped_storage(), (
+            "aliasing between local_tokens and global_tokens not allowed"
+        )
 
         memcpy(local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True)
 
@@ -909,7 +903,6 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
 # deadlock on the RCCL communicator), each overlapping the other's compute.
 # ---------------------------------------------------------------------------
 def get_dp_tbo_comm_stream() -> torch.cuda.Stream:
-    from sglang.srt.runtime_context import get_stream
 
     return get_stream("dp_tbo_comm")
 
@@ -921,7 +914,6 @@ def get_dp_tbo_comm_stream() -> torch.cuda.Stream:
 # ("...create internal OS-specific events"). Reuse one event per (kind, subbatch)
 # and just re-record it (mirrors the mori CommStreamPool event reuse).
 def _tbo_event(key) -> torch.cuda.Event:
-    from sglang.srt.runtime_context import get_resources
 
     pool = get_resources().tbo_event_pool
     ev = pool.get(key)

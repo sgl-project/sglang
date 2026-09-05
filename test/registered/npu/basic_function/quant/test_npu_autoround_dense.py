@@ -28,7 +28,6 @@ TEST_MODEL_MATRIX = {
 
 
 class TestAscendAutoRoundDense(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.models = TEST_MODEL_MATRIX.keys()
