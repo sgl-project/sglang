@@ -64,7 +64,10 @@ from sglang.srt.layers.cp.bcg import (
     execute_prefill_cp_bcg,
     filter_prefill_cp_bcg_capture_num_tokens,
 )
-from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.cp.utils import (
+    is_cp_v2_active,
+    is_mla_prefill_cp_enabled,
+)
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -72,7 +75,6 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
-from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     build_prefill_registry,

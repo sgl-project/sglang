@@ -23,6 +23,7 @@ from sglang.srt.layers.cp.base import (
     ContextParallelStrategyKind,
     CPAttentionBackendKind,
     get_cp_strategy,
+    is_cp_enabled,
 )
 from sglang.srt.layers.cp.interleave import (
     InterleaveContextParallelMetadata,
@@ -35,7 +36,7 @@ from sglang.srt.layers.cp.zigzag import (
     ZigzagCPStrategy,
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, uses_mla_backend
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -119,9 +120,9 @@ def get_layer_owner(local_layer_idx: int, shard_size: int, total_layers: int) ->
 
 def enable_cp_v2() -> bool:
     """Return whether the strategy-based generic prefill CP path is available."""
-    from sglang.srt.utils import is_hip, is_npu
+    from sglang.srt.utils import is_hip, is_musa, is_npu
 
-    return not (is_hip() or is_npu())
+    return not (is_hip() or is_npu() or is_musa())
 
 
 def is_cp_v2_active(forward_batch) -> bool:
@@ -141,6 +142,24 @@ def is_cp_v2_active(forward_batch) -> bool:
         return False
 
     return strategy.can_apply(len(input_ids), forward_batch)
+
+
+def is_mla_prefill_cp_enabled() -> bool:
+    """Return whether prefill CP is configured for an MLA attention backend."""
+    if enable_cp_v2():
+        return is_cp_enabled() and uses_mla_backend()
+    return get_parallel().enable_prefill_context_parallel and uses_mla_backend()
+
+
+def mla_use_prefill_cp(forward_batch) -> bool:
+    """Return whether this MLA forward batch is using prefill CP."""
+    if enable_cp_v2():
+        return is_mla_prefill_cp_enabled() and is_cp_v2_active(forward_batch)
+    return (
+        getattr(forward_batch, "attn_cp_metadata", None) is not None
+        and is_mla_prefill_cp_enabled()
+        and forward_batch.forward_mode.is_context_parallel_extend()
+    )
 
 
 def prepare_cp_forward(forward_batch) -> None:
@@ -251,8 +270,8 @@ def cp_materialize_global_token_order(
         assert strategy is not None
         return strategy.gather_kv_cache(x, forward_batch, stream)
 
-    # TODO(hzh0425): Keep the legacy gather temporarily for CP-v1 compatibility. Remove it
-    # with the follow-up CP-v1 cleanup.
+    # HIP/NPU still materialize their protected platform layout through the
+    # legacy collective until those backends migrate independently.
     from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 
     return cp_all_gather_rerange_output(
@@ -265,6 +284,7 @@ def cp_shard_model_inputs(
     complete_hidden_states: Any,
     complete_position_ids: Any,
     forward_batch,
+    complete_input_ids: Optional[Any] = None,
 ):
     """Restore the shared batch so logits processing keeps full-batch metadata."""
     assert is_cp_v2_active(forward_batch)
@@ -272,6 +292,18 @@ def cp_shard_model_inputs(
         complete_hidden_states, forward_batch
     )
     sharded_positions = cp_shard_position_ids(complete_position_ids, forward_batch)
+    model_input_ids = (
+        cp_shard_hidden_states(complete_input_ids, forward_batch)
+        if complete_input_ids is not None
+        else None
+    )
+
+    had_input_ids_global = hasattr(forward_batch, "input_ids_global")
+    input_ids_global_backup = getattr(forward_batch, "input_ids_global", None)
+    if complete_input_ids is not None:
+        forward_batch.input_ids_global = cp_round_robin_input_ids_v2(
+            complete_input_ids, forward_batch
+        )
 
     spec_info = getattr(forward_batch, "spec_info", None)
     spec_hidden_states = getattr(spec_info, "hidden_states", None)
@@ -286,10 +318,14 @@ def cp_shard_model_inputs(
         )
 
     try:
-        yield sharded_hidden_states, sharded_positions
+        yield sharded_hidden_states, sharded_positions, model_input_ids
     finally:
         if spec_hidden_states_backup is not None:
             spec_info.hidden_states = spec_hidden_states_backup
+        if had_input_ids_global:
+            forward_batch.input_ids_global = input_ids_global_backup
+        elif hasattr(forward_batch, "input_ids_global"):
+            delattr(forward_batch, "input_ids_global")
 
 
 def _to_int_list(values) -> Optional[list[int]]:
@@ -313,6 +349,8 @@ __all__ = [
     "enable_cp_v2",
     "get_cp_strategy",
     "is_cp_v2_active",
+    "is_mla_prefill_cp_enabled",
+    "mla_use_prefill_cp",
     "cp_gather_after_forward",
     "cp_materialize_global_token_order",
     "cp_round_robin_input_ids_v2",
