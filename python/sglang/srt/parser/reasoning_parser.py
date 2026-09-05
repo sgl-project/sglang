@@ -1608,6 +1608,7 @@ class CohereCommand4Detector(BaseReasoningFormatDetector):
         self._saw_text_start = False
         self._saw_text_end = False
         self._in_action_mode = False
+        self._echoed_think_start_settled = False
 
     @classmethod
     def _strip_text_markers(cls, raw: str) -> str:
@@ -1681,6 +1682,24 @@ class CohereCommand4Detector(BaseReasoningFormatDetector):
             )
         )
 
+    def _consume_echoed_think_start(self) -> bool:
+        """Drop a ``<|START_THINKING|>`` the model echoed back, once.
+
+        Returns False while the buffer is still only a prefix of the token, so
+        the caller waits instead of streaming half a marker to the client.
+        """
+        if self._echoed_think_start_settled:
+            return True
+        token = self.think_start_token + self.think_start_self_label
+        if self._buffer.startswith(token):
+            self._buffer = self._strip_leading_think_start(self._buffer)
+            self._echoed_think_start_settled = True
+            return True
+        if self._buffer and token.startswith(self._buffer):
+            return False
+        self._echoed_think_start_settled = bool(self._buffer)
+        return self._echoed_think_start_settled
+
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         """Streaming parse. Custom state machine -- we don't reuse the base
         class because Cohere's "reasoning=False" path (the model emits no
@@ -1688,6 +1707,8 @@ class CohereCommand4Detector(BaseReasoningFormatDetector):
         is fundamentally incompatible with the base detector's
         ``force_reasoning`` semantics."""
         self._buffer += new_text
+        if not self._reasoning_done and not self._consume_echoed_think_start():
+            return StreamingParseResult()
         buf = self._buffer
 
         if not self._reasoning_done:
