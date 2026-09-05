@@ -117,7 +117,7 @@ export const config = {
           disabled: (s) => s.hw !== "gb300",
           disableReason: "DCP is validated only on 4x GB300 TP4/EP4 for now.",
           flags: ["--dcp-size 4", "--dcp-comm-backend a2a", "--dcp-replicate-q-proj"],
-          hints: ["Measured on 4x GB300 with both KV/DSA pairings, adaptive MTP 5/1/6, full decode graph."],
+          hints: ["Measured on 4x GB300 on the FP8 recipe with both KV/DSA pairings and on the NVFP4 recipe with BF16 KV + TileLang DSA, adaptive MTP 5/1/6, full decode graph."],
         },
       ],
     },
@@ -241,6 +241,8 @@ sgl-eval run gsm8k \\
             id: "deep_gemm",
             label: "DeepGemm",
             flags: ["--moe-runner-backend deep_gemm"],
+            disabled: (s) => s.quant === "nvfp4",
+            disableReason: "DeepGemm has no NVFP4 W4A4 kernel path for this checkpoint; keep flashinfer_cutlass.",
           },
         ],
       },
@@ -307,12 +309,9 @@ sgl-eval run gsm8k \\
             "--speculative-draft-model-path incoai/GLM-5.3-Flash-DFlash2",
             "--speculative-draft-attention-backend fa4",
           ],
-          // DFLASH needs this model's hidden-state capture, which landed on the
-          // GLM-5.3-Flash support branch (PR #36708 into #36507's
-          // xinyuan/glm-5.3-flash-support), not on main — so it postdates the
-          // image the Install accordion pins. Drop this note once #36507 merges
-          // and a published image carries it.
-          note: "⚠️ Needs the GLM-5.3-Flash hidden-state capture from PR #36708. It is merged into the PR #36507 support branch (xinyuan/glm-5.3-flash-support), not into main, so pull that branch at its current head — or add #36708's commit on top of an older checkout — before serving. The lmsysorg/sglang:glm-5.3-flash image alone is not enough.",
+          // The pinned image carries the hidden-state capture DFLASH needs
+          // (PR #36708 is an ancestor of the image tree), so no custom build.
+          note: "⚠️ The incoai/GLM-5.3-Flash-DFlash2 draft repository is access-gated: request access on its model page and download it alongside the target before serving. DFlash2 on this model is unmeasured on the cookbook hardware and still being shaken out upstream — treat it as a starting point.",
           disable: [
             {
               when: { dpAttnOn: [true] },
@@ -387,7 +386,7 @@ sgl-eval run gsm8k \\
     // 16): routed and shared experts plus the dense MLPs are FP4; attention,
     // router, MTP, embeddings, and the vision tower stay BF16. Validated on
     // 4x GB300 and 4x B300 with both KV/DSA pairings; the benchmark rows
-    // carry measured speed for both pairings on the current release image.
+    // carry measured speed for both pairings on the release image at tree fe236ea6c3.
     {
       match: { hw: "gb300", strategy: "low-latency", quant: "nvfp4" },
       nnodes: 1,
@@ -396,7 +395,7 @@ sgl-eval run gsm8k \\
         ["bf16-tilelang", "fp8-trtllm"].includes(s.kvDsaPair) &&
         s.mmTransport === "auto" &&
         s.hicache === "off" &&
-        s.dcp === "off"
+        (s.dcp === "off" || (s.dcp === "4" && s.kvDsaPair === "bf16-tilelang"))
           ? "verified"
           : "unverified",
       env: [],
@@ -416,7 +415,7 @@ sgl-eval run gsm8k \\
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 32",
+        "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -472,7 +471,7 @@ sgl-eval run gsm8k \\
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 32",
+        "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -518,7 +517,7 @@ sgl-eval run gsm8k \\
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 32",
+        "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -564,7 +563,7 @@ sgl-eval run gsm8k \\
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 32",
+        "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

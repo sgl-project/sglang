@@ -102,7 +102,7 @@ The **Speculative** card in the Playground changes the algorithm without leaving
 
 - **EAGLE / Adaptive MTP 5-1-6** is exactly what Low Latency serves, so a Low Latency base starts on this chip. Pick it from a High Throughput base to keep that recipe's other settings and add the MTP head.
 - **Off (greedy)** strips the whole `--speculative-*` family, which is what High Throughput already starts from.
-- **DFlash2** swaps the in-checkpoint MTP head for the trained block-diffusion draft in [`incoai/GLM-5.3-Flash-DFlash2`](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2). The draft proposes a whole block per step and the target verifies it in one forward pass, so output quality stays the target's. Its block size comes from the draft checkpoint, and the draft runs on `fa4` rather than the target's DSA backends. It needs a build that carries the GLM-5.3-Flash hidden-state capture from [PR #36708](https://github.com/sgl-project/sglang/pull/36708), which is merged into the [PR #36507](https://github.com/sgl-project/sglang/pull/36507) support branch (`xinyuan/glm-5.3-flash-support`) rather than into `main`, so the image pinned above is not enough on its own — pull that branch at its current head, or add #36708's commit on top of an older checkout. The draft repository is also access-gated: request access on its model page, then download it alongside the target before serving. This combination is not yet measured on the cookbook hardware, so treat it as a starting point.
+- **DFlash2** swaps the in-checkpoint MTP head for the trained block-diffusion draft in [`incoai/GLM-5.3-Flash-DFlash2`](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2). The draft proposes a whole block per step and the target verifies it in one forward pass, so output quality stays the target's. Its block size comes from the draft checkpoint, and the draft runs on `fa4` rather than the target's DSA backends. The image pinned above carries the GLM-5.3-Flash hidden-state capture from [PR #36708](https://github.com/sgl-project/sglang/pull/36708), so no custom build is needed. The draft repository is access-gated: request access on its model page, then download it alongside the target before serving. This combination is not yet measured on the cookbook hardware and is still being shaken out upstream, so treat it as a starting point.
 
 Neither algorithm runs with DP-Attention; the card disables the affected chips and names the reason.
 
@@ -120,7 +120,7 @@ On Blackwell, the recipes default to an FP8 KV cache with TRT-LLM DSA: on GB300 
 
 ### Decode context parallelism
 
-Decode context parallelism (DCP) shards the KV across GPUs during decode to cut long-context latency. The **Context Parallelism** row offers DCP4, validated on 4x GB300 (TP4/EP4) with both KV pairings and adaptive MTP 5/1/6; it requires the current release image, which carries the TileLang LSE fix. Other platforms and attention backends are unvalidated, and draft-extend v2 is unsupported under DCP.
+Decode context parallelism (DCP) shards the KV across GPUs during decode to cut long-context latency. The **Context Parallelism** row offers DCP4, validated on 4x GB300 (TP4/EP4) with both KV pairings and adaptive MTP 5/1/6; it requires the published lmsysorg/sglang:glm-5.3-flash image, which carries the TileLang LSE fix. Other platforms and attention backends are unvalidated, and draft-extend v2 is unsupported under DCP.
 
 ### Extend the cache hierarchy
 
