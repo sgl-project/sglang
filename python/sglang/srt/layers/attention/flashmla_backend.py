@@ -108,10 +108,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         # only; draft-side instances must not allocate it.
         self.is_draft_runner = model_runner.is_draft_worker
 
-        # get dcp info
-        self.dcp_world_size = get_parallel().attn_dcp_size
-        self.dcp_rank = get_parallel().attn_dcp_rank
-
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -440,9 +436,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
         if self.is_fp8_kvcache:
-            assert self.dcp_world_size == 1, (
-                "FlashMLA does not support DCP for FP8 kv cache"
-            )
             if layer.k_scale is not None:
                 q_scale = layer.k_scale
                 descale_q = layer.k_scale.reshape(1)
@@ -492,6 +485,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             # TODO uniform output for forward_decode and forward_extend to
             # return tuple instead of single output
             # decode context parallel needs lse to correct attn_output via online softmax
+            # Not reached for the target decode backend under DCP, which
+            # create_flashmla_backend refuses; the draft path runs on a replicated
+            # pool. The LSE half is here, the rank-local page table is not.
             if get_parallel().dcp_enabled:
                 return o, lse
             return o
