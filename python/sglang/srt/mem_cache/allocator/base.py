@@ -122,13 +122,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         return kv_indices
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
-        # FIXME: reuse the get_cpu_copy after paged allocator is implemented
         raise NotImplementedError()
 
     def load_cpu_copy(
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
-        # FIXME: reuse the load_cpu_copy after paged allocator is implemented
         raise NotImplementedError()
 
     def alloc_extend(self, *args, **kwargs):
