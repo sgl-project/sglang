@@ -171,12 +171,15 @@ def create_dsv4_backend(runner):
         )
         return DeepseekV4HipRadixBackend(runner)
     else:
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
-            DeepseekV4AttnBackend,
+        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+            create_deepseek_v4_attn_backend,
         )
 
-        logger.info("Using DeepseekV4AttnBackend for dsv4 attention backend (CUDA).")
-        return DeepseekV4AttnBackend(runner)
+        backend = create_deepseek_v4_attn_backend(runner)
+        logger.info(
+            f"Using {type(backend).__name__} for dsv4 attention backend (CUDA)."
+        )
+        return backend
 
 
 @register_attention_backend("triton")

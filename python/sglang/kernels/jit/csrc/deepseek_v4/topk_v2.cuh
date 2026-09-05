@@ -79,6 +79,10 @@ struct TopKPagedParams {
   const PlanItem* __restrict__ metadata;  // [0]=GlobalMetadata, [1+i]=PlanItem
   int64_t score_stride;
   int64_t page_table_stride;
+  // Row stride of `page_indices` in elements. Equals `topk` for a dense
+  // output; larger when the caller aims the kernel at a column slice of a
+  // wider table (e.g. the trtllm combined [SWA | topk] table tail).
+  int64_t out_stride;
   uint32_t topk;
   uint32_t page_bits;
   uint32_t cluster_floor;  // seq_len > this routes to the cluster path (batch-aware, host-set)
@@ -93,13 +97,12 @@ struct TopKPagedParams {
     return metadata[1 + i];
   }
   SGL_DEVICE int32_t* get_output_ptr(uint32_t batch_id) const {
-    return page_indices + batch_id * static_cast<int64_t>(topk);
+    return page_indices + batch_id * out_stride;
   }
   SGL_DEVICE TopKProblem problem(uint32_t batch_id, uint32_t seq_len) const {
-    const auto k = static_cast<int64_t>(topk);
     return TopKProblem{
         .in = scores + batch_id * score_stride,
-        .out = page_indices + batch_id * k,
+        .out = get_output_ptr(batch_id),
         .page_table = page_table + batch_id * page_table_stride,
         .topk = topk,
         .seq_len = seq_len,
@@ -523,7 +526,11 @@ struct TopKKernel {
       page_table_ptr = static_cast<const int32_t*>(page_table.value().data_ptr());
       page_table_stride = P.unwrap();
     }
+    // A row stride larger than topk means the output is a column slice of a
+    // wider table (trtllm combined-table tail); rows must still be unit-stride.
+    auto O = SymbolicSize{"out_stride"};
     TensorMatcher({B, K})  // page_indices
+        .with_strides({O, 1})
         .with_dtype<int32_t>()
         .with_device(device_)
         .verify(page_indices);
@@ -558,6 +565,7 @@ struct TopKKernel {
         .metadata = static_cast<const PlanItem*>(metadata.data_ptr()),
         .score_stride = S.unwrap(),
         .page_table_stride = page_table_stride,
+        .out_stride = O.unwrap(),
         .topk = topk,
         .page_bits = page_bits,
         .cluster_floor = (batch_size <= kSmallBatchLowFloor) ? kClusterFloorSmall : kClusterFloor,
