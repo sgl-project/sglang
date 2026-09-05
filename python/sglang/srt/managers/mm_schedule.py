@@ -5,6 +5,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
@@ -679,9 +680,32 @@ def _adjust_embedding_length(
                 num_multimodal = num_mm_tokens_in_input_ids // embedding.shape[0]
                 embedding = embedding[-num_multimodal:, :]
         else:
-            raise RuntimeError(
-                f"Insufficient multimodal embedding length: {num_mm_tokens_in_input_ids=} vs {num_mm_tokens_in_embedding=}. This is an internal error"
-            )
+            if envs.SGLANG_MM_PAD_SHORT_EMBEDDING.get():
+                pad_len = num_mm_tokens_in_input_ids - num_mm_tokens_in_embedding
+                logger.error(
+                    f"Insufficient multimodal embedding length: "
+                    f"num_mm_tokens_in_input_ids={num_mm_tokens_in_input_ids} vs "
+                    f"num_mm_tokens_in_embedding={num_mm_tokens_in_embedding}. "
+                    f"Padding missing {pad_len} tokens with zeros as a compromise to prevent "
+                    f"server crash (SGLANG_MM_PAD_SHORT_EMBEDDING=True)."
+                )
+                if embedding.dim() == 2:
+                    pad = torch.zeros(
+                        (pad_len, embedding.shape[1]),
+                        dtype=embedding.dtype,
+                        device=embedding.device,
+                    )
+                else:
+                    pad = torch.zeros(
+                        (pad_len, *embedding.shape[1:]),
+                        dtype=embedding.dtype,
+                        device=embedding.device,
+                    )
+                embedding = torch.cat([embedding, pad], dim=0)
+            else:
+                raise RuntimeError(
+                    f"Insufficient multimodal embedding length: {num_mm_tokens_in_input_ids=} vs {num_mm_tokens_in_embedding=}. This is an internal error"
+                )
     return embedding
 
 
