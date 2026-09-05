@@ -272,7 +272,7 @@ class TestRidToStateCleanupOnAbort(CustomTestCase):
         )
 
     def test_abort_ack_drops_embedding_cache_context(self):
-        tm = _make_tokenizer_manager()
+        tm = _make_tokenizer_manager(self)
         rid = "abort_lease_rid"
         tm.rid_to_state[rid] = _make_req_state(rid)
         tm._mm_cache_retry_contexts[rid] = Mock(
@@ -285,7 +285,7 @@ class TestRidToStateCleanupOnAbort(CustomTestCase):
         tm._release_mm_embedding_cache.assert_not_called()
 
     def test_abort_request_waits_for_scheduler_before_releasing_lease(self):
-        tm = _make_tokenizer_manager()
+        tm = _make_tokenizer_manager(self)
         rid = "abort_pending_lease_rid"
         tm.server_args.tokenizer_worker_num = 1
         tm.rid_to_state[rid] = _make_req_state(rid)
