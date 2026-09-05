@@ -526,6 +526,26 @@ def fuse_scale_shift_kernel(
     return output
 
 
+def _fuse_scale_shift_kernel_cpu(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    scale_constant: float = 1.0,
+    block_l: int = 128,
+    block_c: int = 128,
+) -> torch.Tensor:
+    import sgl_kernel  # noqa: F401
+
+    del block_l, block_c
+
+    return torch.ops.sgl_kernel.fused_scale_shift_cpu(
+        x,
+        scale,
+        shift,
+        scale_constant,
+    )
+
+
 def fuse_layernorm_scale_shift_gate_select01_kernel(
     x: torch.Tensor,
     weight: torch.Tensor | None,
@@ -733,5 +753,5 @@ fuse_scale_shift_kernel = select_impl(
     npu=lazy_fallback("npu", "fuse_scale_shift_native"),
     mps=lazy_fallback("torch", "fuse_scale_shift_kernel_native"),
     musa=lazy_fallback("torch", "fuse_scale_shift_kernel_native"),
-    cpu=lazy_fallback("torch", "fuse_scale_shift_kernel_native"),
+    cpu=_fuse_scale_shift_kernel_cpu,
 )
