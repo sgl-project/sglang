@@ -615,7 +615,9 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_direct_gpu_weight_loading()
         if self.lora_alpha is not None and self.lora_alpha <= 0:
             raise ValueError("lora_alpha must be a positive integer")
-        if not current_platform.is_cpu():
+        if current_platform.is_cpu():
+            self._validate_cpu_parallelism()
+        else:
             self._validate_parallelism()
         self._validate_cfg_parallel()
         self._validate_batching()
@@ -1371,9 +1373,12 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.tp_size is None:
             self.tp_size = 1
 
-        if current_platform.is_cpu() and self.tp_size > 1:
-            # CPU platform reuse num_gpus to represent num cpu numa nodes as devices
-            self.num_gpus = self.tp_size
+        if current_platform.is_cpu() and (
+            self.tp_size > 1 or (self.ulysses_degree or 1) > 1
+        ):
+            # CPU reuses num_gpus to represent the number of CPU workers.
+            # TODO: Extend this when Ring SP is supported on CPU.
+            self.num_gpus = self.tp_size * (self.ulysses_degree or 1)
 
         if self.hsdp_shard_dim is None:
             self.hsdp_shard_dim = self.num_gpus
@@ -3681,6 +3686,20 @@ class ServerArgs(DisaggServerArgsMixin):
                     "cache-dit is enabled with hybrid parallelism (SP + TP). "
                     "Proceeding anyway (SGLang integration may support this mode)."
                 )
+
+    def _validate_cpu_parallelism(self):
+        # TODO: Add Ring SP support on CPU.
+        # The initial CPU sequence-parallel implementation only enables Ulysses.
+        if self.ring_degree not in (None, 1):
+            raise ValueError("CPU currently supports Ulysses SP only")
+
+        ulysses_degree = self.ulysses_degree or 1
+
+        if self.sp_degree != ulysses_degree:
+            raise ValueError(
+                f"For CPU Ulysses, sp_degree ({self.sp_degree}) "
+                f"must equal ulysses_degree ({ulysses_degree})"
+            )
 
     def _validate_cfg_parallel(self):
         if not self.enable_cfg_parallel:
