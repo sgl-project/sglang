@@ -12,6 +12,7 @@ per-request from ``batch.data_type`` and the presence of
 import copy
 import json
 import math
+import time
 from typing import Any
 
 import numpy as np
@@ -34,6 +35,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.candidates import (
+    CandidateContractError,
+    reduce_candidates,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -1523,6 +1528,11 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         enable_cfg_parallel = server_args.enable_cfg_parallel and (
             do_cfg or any_control_cfg
         )
+        # This predates and is independent of candidate_spec (see
+        # runtime.pipelines_core.candidates / #35331): candidates reuse the
+        # existing num_outputs_per_prompt batch axis, so a candidate group
+        # hits this same guard rather than silently producing an
+        # unvalidated CFG-parallel combine.
         if action_latents is not None and enable_cfg_parallel:
             raise NotImplementedError(
                 "Cosmos3 action generation does not support CFG parallel yet"
@@ -1544,6 +1554,10 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             get_classifier_free_guidance_world_size() if enable_cfg_parallel else 1
         )
 
+        # action_latents (unlike video latents) is never chunked across SP
+        # ranks below -- it's small and passed to _run_transformer whole on
+        # every rank, so it needs no SP all-gather/reconstruction before the
+        # candidate-trajectory reducer runs on it in Cosmos3DecodingStage.
         sp_size = get_sp_world_size()
         sp_rank = get_sp_parallel_rank() if sp_size > 1 else 0
         ulysses_enabled = sp_size > 1
@@ -2409,12 +2423,44 @@ class Cosmos3DecodingStage(PipelineStage):
         if batch.data_type == DataType.ACTION:
             if action_pred is None:
                 raise RuntimeError("Cosmos3 action request produced no action tensor")
-            payload_actions = (
-                action_pred[0] if action_pred.shape[0] == 1 else action_pred
-            )
+            candidate_spec = batch.candidate_spec
+            candidate_metrics = None
+            if candidate_spec is not None:
+                # _build_candidate_spec (entrypoints/action/cosmos3.py) only
+                # allows candidate_spec with a single observation image, so
+                # this and the multi-image batch branch below are mutually
+                # exclusive: action_pred's leading dim is either the
+                # candidate axis or the multi-image batch axis, never both.
+                reduce_start = time.perf_counter()
+                try:
+                    reduced_action = reduce_candidates(action_pred, candidate_spec)
+                except CandidateContractError as exc:
+                    raise RuntimeError(
+                        f"Cosmos3 candidate-trajectory reduction failed: {exc}"
+                    ) from exc
+                reduce_time_ms = (time.perf_counter() - reduce_start) * 1000
+                actions_out = reduced_action.numpy()
+                # See #35331's metrics integration point (candidate count,
+                # reducer time); batch.metrics may be None under warmup/perf
+                # suppression, so this is best-effort logging, not required
+                # for correctness.
+                if batch.metrics is not None:
+                    batch.metrics.record_stage(
+                        "candidate_reduction", reduce_time_ms / 1000
+                    )
+                candidate_metrics = {
+                    "count": candidate_spec.count,
+                    "reducer": candidate_spec.reducer,
+                    "reduce_time_ms": reduce_time_ms,
+                }
+            else:
+                payload_actions = (
+                    action_pred[0] if action_pred.shape[0] == 1 else action_pred
+                )
+                actions_out = payload_actions.numpy()
             payload = {
                 "request_id": batch.request_id,
-                "actions": payload_actions.numpy(),
+                "actions": actions_out,
                 "action_mode": action_metadata["action_mode"],
                 "domain_id": action_metadata["action_domain_id"],
                 "raw_action_dim": action_metadata["action_raw_action_dim"],
@@ -2423,6 +2469,10 @@ class Cosmos3DecodingStage(PipelineStage):
                     "num_frames": batch.num_frames,
                 },
             }
+            if candidate_metrics is not None:
+                payload["candidate_metrics"] = candidate_metrics
+            if candidate_spec is not None and candidate_spec.return_candidates:
+                payload["candidates"] = action_pred.numpy()
             return OutputBatch(
                 output=[payload],
                 action_pred=action_pred,

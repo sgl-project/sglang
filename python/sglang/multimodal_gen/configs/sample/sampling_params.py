@@ -228,6 +228,18 @@ class SamplingParams:
     seed: int | list[int] = field(default=42, metadata={"batch_sig_exclude": True})
     generator_device: str | None = None  # None means use the pipeline/model default
 
+    # Opt-in candidate-trajectory contract (see
+    # runtime.pipelines_core.candidates.CandidateTrajectorySpec): when set,
+    # this request's `num_outputs_per_prompt` outputs are candidates for one
+    # logical prediction rather than independent public outputs, and
+    # InputValidationStage derives their RNG streams via the contract's
+    # splitmix64-based per-candidate mixer instead of the default
+    # `base_seed + i` scheme. Typed loosely to avoid importing
+    # runtime.pipelines_core (which would create a circular import through
+    # runtime.server_args), matching teacache_params'/step_reuse_params' own
+    # convention.
+    candidate_spec: Any = None
+
     # Original dimensions (before VAE scaling)
     num_frames: int = 1  # Default for image models
     num_frames_round_down: bool = (
@@ -551,6 +563,18 @@ class SamplingParams:
             raise ValueError(
                 f"num_outputs_per_prompt must be a positive int, got {self.num_outputs_per_prompt!r}"
             )
+
+        if self.candidate_spec is not None:
+            candidate_count = getattr(self.candidate_spec, "count", None)
+            if candidate_count != self.num_outputs_per_prompt:
+                raise ValueError(
+                    "candidate_spec.count must equal num_outputs_per_prompt "
+                    f"(candidate_spec.count={candidate_count!r}, "
+                    f"num_outputs_per_prompt={self.num_outputs_per_prompt!r}); "
+                    "the candidate axis is num_outputs_per_prompt's existing "
+                    "outputs, reinterpreted as candidates for one logical "
+                    "prediction, not a separate count."
+                )
 
         if isinstance(self.seed, list):
             if not self.seed:

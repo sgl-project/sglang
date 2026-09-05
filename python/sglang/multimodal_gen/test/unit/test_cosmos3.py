@@ -59,6 +59,9 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     compute_mrope_position_ids_sound,
     compute_mrope_position_ids_vision,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.candidates import (
+    CandidateTrajectorySpec,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DecodingStage,
     Cosmos3DenoisingStage,
@@ -558,6 +561,45 @@ class TestCosmos3SamplingParamsDataType(unittest.TestCase):
 
         self.assertEqual(params.data_type, DataType.VIDEO)
 
+    def test_adjust_fans_out_candidate_spec_image_and_prompt(self):
+        # This is the chokepoint every entry point runs _adjust() through
+        # (the action HTTP endpoint and DiffGenerator.generate_action
+        # alike -- see #35331), so a single image/prompt with candidate_spec
+        # set must be fanned out here regardless of which entry point built
+        # the SamplingParams, or the denoiser only ever produces one
+        # candidate to reduce.
+        params = Cosmos3SamplingParams(
+            prompt="pick up the block",
+            action_mode="policy",
+            num_frames=17,
+            image_path="observation.png",
+            candidate_spec=CandidateTrajectorySpec(count=3, reducer="mean"),
+            num_outputs_per_prompt=3,
+        )
+
+        params._adjust(_cosmos3_server_args())
+
+        self.assertEqual(params.image_path, ["observation.png"] * 3)
+        self.assertEqual(params.prompt, ["pick up the block"] * 3)
+
+    def test_adjust_is_idempotent_when_image_path_already_a_list(self):
+        # The action HTTP endpoint (entrypoints/action/cosmos3.py) already
+        # fans out image_path/prompt itself before _adjust runs; _adjust
+        # must not fan out a second time.
+        params = Cosmos3SamplingParams(
+            prompt=["pick up the block"] * 2,
+            action_mode="policy",
+            num_frames=17,
+            image_path=["observation.png"] * 2,
+            candidate_spec=CandidateTrajectorySpec(count=2, reducer="mean"),
+            num_outputs_per_prompt=2,
+        )
+
+        params._adjust(_cosmos3_server_args())
+
+        self.assertEqual(params.image_path, ["observation.png"] * 2)
+        self.assertEqual(params.prompt, ["pick up the block"] * 2)
+
 
 class TestCosmos3ActionEndpoint(unittest.TestCase):
     @staticmethod
@@ -724,6 +766,7 @@ class TestCosmos3ActionEndpoint(unittest.TestCase):
         self.assertTrue(metadata["capabilities"]["batch_inputs"])
         self.assertEqual(metadata["capabilities"]["max_batch_size"], 4)
         self.assertEqual(metadata["capabilities"]["batched_action_modes"], ["policy"])
+        self.assertTrue(metadata["capabilities"]["multiple_candidates"])
 
     def test_metadata_keeps_batching_opt_in(self):
         metadata = action_metadata(_cosmos3_server_args())
@@ -749,6 +792,127 @@ class TestCosmos3ActionEndpoint(unittest.TestCase):
         self.assertEqual(action["domain_id"], 8)
         self.assertEqual(action["raw_action_dim"], 10)
         self.assertEqual(response["usage"]["denoise_steps"], 30)
+
+    def test_candidate_count_one_or_absent_is_unaffected(self):
+        payload = {
+            "input": {
+                "task": "pick up the block",
+                "observation": {"image": "observation.png"},
+            },
+            "parameters": {
+                "action_mode": "policy",
+                "action_horizon": 16,
+                "domain_name": "droid_lerobot",
+            },
+        }
+        params_absent = build_action_sampling_params(payload, _cosmos3_server_args())
+        self.assertIsNone(params_absent.candidate_spec)
+        self.assertEqual(params_absent.num_outputs_per_prompt, 1)
+
+        payload["parameters"]["candidate_count"] = 1
+        params_one = build_action_sampling_params(payload, _cosmos3_server_args())
+        self.assertIsNone(params_one.candidate_spec)
+        self.assertEqual(params_one.num_outputs_per_prompt, 1)
+
+    def test_candidate_count_builds_spec_and_matching_output_count(self):
+        payload = {
+            "input": {
+                "task": "pick up the block",
+                "observation": {"image": "observation.png"},
+            },
+            "parameters": {
+                "action_mode": "policy",
+                "action_horizon": 16,
+                "domain_name": "droid_lerobot",
+                "candidate_count": 3,
+                "return_candidates": True,
+            },
+        }
+
+        params = build_action_sampling_params(payload, _cosmos3_server_args())
+
+        self.assertIsNotNone(params.candidate_spec)
+        self.assertEqual(params.candidate_spec.count, 3)
+        self.assertEqual(params.candidate_spec.reducer, "mean")
+        self.assertTrue(params.candidate_spec.return_candidates)
+        self.assertEqual(params.num_outputs_per_prompt, 3)
+        # The single image/prompt must be fanned out to 3 physical copies
+        # (see #35331's "Expand/fan out conditioning" step) or the denoiser
+        # never actually produces 3 candidate trajectories to reduce.
+        self.assertEqual(params.image_path, ["observation.png"] * 3)
+        self.assertEqual(params.prompt, ["pick up the block"] * 3)
+
+    def test_candidate_count_rejects_multi_image_batch(self):
+        # candidate_spec is one candidate group per logical request (#35331);
+        # combining it with the multi-image batch axis would leave it
+        # ambiguous whether the group is per-image or shared, so this must
+        # be rejected rather than guessed at.
+        payload = {
+            "input": {
+                "task": "pick up the block",
+                "observation": {"image": ["observation0.png", "observation1.png"]},
+            },
+            "parameters": {
+                "action_mode": "policy",
+                "action_horizon": 16,
+                "domain_name": "droid_lerobot",
+                "candidate_count": 2,
+            },
+        }
+
+        with self.assertRaisesRegex(ValueError, "candidate_count > 1 requires"):
+            build_action_sampling_params(payload, _cosmos3_server_args(batching_max_size=2))
+
+    def test_response_exposes_raw_candidates_when_present(self):
+        candidates = torch.stack(
+            [torch.full((16, 10), v) for v in (1.0, 2.0, 3.0)], dim=0
+        ).numpy()
+        output = {
+            "request_id": "cosmos-action-3",
+            "actions": candidates.mean(axis=0),
+            "candidates": candidates,
+            "action_mode": "policy",
+            "domain_id": 8,
+            "raw_action_dim": 10,
+            "parameters": {"num_inference_steps": 30},
+        }
+
+        response = action_generation_response(output, _cosmos3_server_args())
+
+        self.assertEqual(len(response["data"]), 4)
+        self.assertEqual(response["data"][0]["candidate_index"], 0)
+        self.assertEqual(response["data"][0]["action"]["shape"], [16, 10])
+        candidate_indices = [item["candidate_index"] for item in response["data"][1:]]
+        self.assertEqual(candidate_indices, [1, 2, 3])
+
+    def test_response_without_candidates_field_is_unaffected(self):
+        output = {
+            "request_id": "cosmos-action-4",
+            "actions": torch.zeros(16, 10).numpy(),
+            "parameters": {},
+        }
+
+        response = action_generation_response(output, _cosmos3_server_args())
+
+        self.assertEqual(len(response["data"]), 1)
+        self.assertNotIn("candidate_metrics", response)
+
+    def test_response_surfaces_candidate_metrics(self):
+        output = {
+            "request_id": "cosmos-action-5",
+            "actions": torch.zeros(16, 10).numpy(),
+            "candidate_metrics": {
+                "count": 3,
+                "reducer": "mean",
+                "reduce_time_ms": 1.23,
+            },
+            "parameters": {},
+        }
+
+        response = action_generation_response(output, _cosmos3_server_args())
+
+        self.assertEqual(response["candidate_metrics"]["count"], 3)
+        self.assertEqual(response["candidate_metrics"]["reducer"], "mean")
 
     def test_batched_action_response_emits_one_data_item_per_input(self):
         output = {
@@ -803,6 +967,10 @@ class TestCosmos3ActionEndpoint(unittest.TestCase):
             num_inference_steps=30,
             num_frames=5,
             metrics=None,
+            # Req.__getattr__ proxies unknown attrs to sampling_params; the
+            # decode stage reads batch.candidate_spec directly, so mirror
+            # that here since SimpleNamespace doesn't proxy.
+            candidate_spec=None,
         )
 
         output = stage.forward(batch, types.SimpleNamespace(vae_cpu_offload=False))
@@ -833,6 +1001,7 @@ class TestCosmos3ActionEndpoint(unittest.TestCase):
             num_inference_steps=30,
             num_frames=5,
             metrics=None,
+            candidate_spec=None,
         )
 
         output = stage.forward(batch, types.SimpleNamespace(vae_cpu_offload=False))
@@ -2043,6 +2212,172 @@ class TestCosmos3DurationTemplateSuppression(unittest.TestCase):
     def test_prose_prompt_still_gets_the_duration_suffix(self):
         final = self._run_prompt_stage("A curious raccoon.", use_duration_template=True)
         self.assertIn("seconds long", final)
+
+
+class TestCosmos3CandidateReduction(unittest.TestCase):
+    """Cosmos3 is the RFC's model-adapter phase for the candidate-trajectory
+    contract (see #35331 and
+    ``runtime.pipelines_core.candidates``): its action output is the
+    tensor the reducer applies to.
+    """
+
+    def _decode_action(self, action_latents, candidate_spec, raw_action_dim=None):
+        stage = Cosmos3DecodingStage.__new__(Cosmos3DecodingStage)
+        stage.log_info = lambda *_args, **_kwargs: None
+        batch = types.SimpleNamespace(
+            action_latents=action_latents,
+            extra={"raw_action_dim": raw_action_dim}
+            if raw_action_dim is not None
+            else {},
+            sampling_params=types.SimpleNamespace(
+                action_mode="policy",
+                candidate_spec=candidate_spec,
+                action_stats_path=None,
+            ),
+            # Req.__getattr__ proxies unknown attrs to sampling_params; the
+            # decode stage reads batch.candidate_spec directly, so mirror
+            # that here since SimpleNamespace doesn't proxy.
+            candidate_spec=candidate_spec,
+            data_type=DataType.ACTION,
+            request_id="req-0",
+            num_inference_steps=4,
+            num_frames=1,
+            metrics=None,
+        )
+        server_args = types.SimpleNamespace()
+        output = stage.forward(batch, server_args)
+        return output.output[0]
+
+    def test_no_candidate_spec_single_output_is_unaffected(self):
+        # Byte-identical to the pre-RFC path: candidate_spec is None and
+        # there is one output, so this must still pick action_pred[0].
+        action_latents = torch.full((1, 2, 3), 1.0)
+        payload = self._decode_action(action_latents, candidate_spec=None)
+        torch.testing.assert_close(
+            torch.as_tensor(payload["actions"]), torch.full((2, 3), 1.0)
+        )
+        self.assertNotIn("candidates", payload)
+        self.assertNotIn("candidate_metrics", payload)
+
+    def test_no_candidate_spec_multi_item_leading_dim_is_multi_image_batch(self):
+        # Without candidate_spec, action_pred's leading dim (when > 1) is the
+        # multi-image batch axis (a different, unrelated Cosmos3 feature --
+        # see test_batched_action_decode_keeps_batch_dimension), not a
+        # candidate axis, so it must be returned in full rather than reduced
+        # to a single output.
+        action_latents = torch.stack(
+            [torch.full((2, 3), 1.0), torch.full((2, 3), 5.0)], dim=0
+        )
+        payload = self._decode_action(action_latents, candidate_spec=None)
+        torch.testing.assert_close(torch.as_tensor(payload["actions"]), action_latents)
+
+    def test_candidate_spec_reports_reduction_metrics(self):
+        spec = CandidateTrajectorySpec(count=2, reducer="mean")
+        action_latents = torch.stack(
+            [torch.full((2, 3), v) for v in (0.0, 2.0)], dim=0
+        )
+        payload = self._decode_action(action_latents, candidate_spec=spec)
+        self.assertIn("candidate_metrics", payload)
+        self.assertEqual(payload["candidate_metrics"]["count"], 2)
+        self.assertEqual(payload["candidate_metrics"]["reducer"], "mean")
+        self.assertGreaterEqual(payload["candidate_metrics"]["reduce_time_ms"], 0.0)
+
+    def test_count_one_candidate_spec_is_identical_to_no_spec(self):
+        spec = CandidateTrajectorySpec(count=1, reducer="none")
+        action_latents = torch.full((1, 2, 3), 7.0)
+        payload = self._decode_action(action_latents, candidate_spec=spec)
+        torch.testing.assert_close(
+            torch.as_tensor(payload["actions"]), torch.full((2, 3), 7.0)
+        )
+
+    def test_mean_reducer_averages_across_candidate_axis(self):
+        spec = CandidateTrajectorySpec(count=3, reducer="mean")
+        action_latents = torch.stack(
+            [torch.full((2, 3), v) for v in (1.0, 2.0, 3.0)], dim=0
+        )
+        payload = self._decode_action(action_latents, candidate_spec=spec)
+        torch.testing.assert_close(
+            torch.as_tensor(payload["actions"]), torch.full((2, 3), 2.0)
+        )
+
+    def test_return_candidates_includes_raw_per_candidate_tensor(self):
+        spec = CandidateTrajectorySpec(count=2, reducer="mean", return_candidates=True)
+        action_latents = torch.stack(
+            [torch.full((2, 3), v) for v in (0.0, 4.0)], dim=0
+        )
+        payload = self._decode_action(action_latents, candidate_spec=spec)
+        self.assertIn("candidates", payload)
+        torch.testing.assert_close(
+            torch.as_tensor(payload["candidates"]), action_latents
+        )
+
+    def test_mismatched_candidate_count_raises(self):
+        spec = CandidateTrajectorySpec(count=3, reducer="mean")
+        action_latents = torch.stack(
+            [torch.full((2, 3), v) for v in (1.0, 2.0)], dim=0
+        )
+        with self.assertRaises(RuntimeError):
+            self._decode_action(action_latents, candidate_spec=spec)
+
+
+class TestCosmos3CandidateDistributedGuards(unittest.TestCase):
+    """The RFC (#35331) calls out CFG-parallel candidate membership and
+    TP/SP reconstruction-before-reduction as needing a real distributed run
+    to validate. Cosmos3 action generation already refuses CFG-parallel
+    outright (independent of candidates), and action_latents is never SP-
+    sharded (see the comments in Cosmos3DenoisingStage.forward) -- these
+    tests lock in both invariants so a future change can't silently combine
+    candidates with an unvalidated CFG-parallel action path.
+    """
+
+    def _forward_kwargs(self, candidate_spec):
+        action_latents = torch.zeros(2, 4, 8)
+        batch = types.SimpleNamespace(
+            latents=torch.zeros(2, 4, 8, 8, 8),
+            audio_latents=None,
+            action_latents=action_latents,
+            extra={
+                "cond_text_ids": torch.zeros(1, 1, dtype=torch.long),
+                "cond_text_mask": torch.ones(1, 1),
+                "uncond_text_ids": torch.zeros(1, 1, dtype=torch.long),
+                "uncond_text_mask": torch.ones(1, 1),
+                "video_shape": (4, 8, 8),
+            },
+            sampling_params=types.SimpleNamespace(
+                action_fps=None,
+                guidance_interval=None,
+                candidate_spec=candidate_spec,
+            ),
+            candidate_spec=candidate_spec,
+            timesteps=torch.tensor([1.0, 0.5]),
+            guidance_scale=4.0,
+            generator=None,
+            seed=0,
+            # Non-None so _denoise_once doesn't fall back to self.scheduler,
+            # which __new__ (skipping __init__) never sets.
+            scheduler=types.SimpleNamespace(),
+            rollout=False,
+        )
+        server_args = types.SimpleNamespace(enable_cfg_parallel=True)
+        return batch, server_args
+
+    def test_cfg_parallel_action_guard_fires_with_candidate_spec(self):
+        # forward() is a thin use_declared_component wrapper around
+        # _denoise_once (which the guard lives in); call _denoise_once
+        # directly to avoid needing to stub the component-manager machinery.
+        stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
+        spec = CandidateTrajectorySpec(count=2, reducer="mean")
+        batch, server_args = self._forward_kwargs(candidate_spec=spec)
+        with self.assertRaises(NotImplementedError):
+            stage._denoise_once(batch, server_args)
+
+    def test_cfg_parallel_action_guard_fires_without_candidate_spec(self):
+        # Same guard must still fire with no candidate_spec at all, so the
+        # candidate-trajectory feature never weakens this existing check.
+        stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
+        batch, server_args = self._forward_kwargs(candidate_spec=None)
+        with self.assertRaises(NotImplementedError):
+            stage._denoise_once(batch, server_args)
 
 
 if __name__ == "__main__":
