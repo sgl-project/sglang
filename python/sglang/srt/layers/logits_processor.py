@@ -584,16 +584,26 @@ class LogitsProcessor(nn.Module):
             and not logits_metadata.extend_return_logprob
         ):
             # Prefill without input logprobs.
-            last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
-            pruned_states = hidden_states[last_index]
-            if hidden_states_before_norm is not None:
-                pruned_states_before_norm = hidden_states_before_norm[last_index]
-            if aux_hidden_states is not None:
-                aux_pruned_states = (
-                    aux_hidden_states[last_index]
-                    if isinstance(aux_hidden_states, torch.Tensor)
-                    else [hidden[last_index] for hidden in aux_hidden_states]
-                )
+            if (
+                logits_metadata.extend_seq_lens is not None
+                and hidden_states.shape[0] == logits_metadata.extend_seq_lens.shape[0]
+            ):
+                pruned_states = hidden_states
+                if hidden_states_before_norm is not None:
+                    pruned_states_before_norm = hidden_states_before_norm
+                if aux_hidden_states is not None:
+                    aux_pruned_states = aux_hidden_states
+            else:
+                last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+                pruned_states = hidden_states[last_index]
+                if hidden_states_before_norm is not None:
+                    pruned_states_before_norm = hidden_states_before_norm[last_index]
+                if aux_hidden_states is not None:
+                    aux_pruned_states = (
+                        aux_hidden_states[last_index]
+                        if isinstance(aux_hidden_states, torch.Tensor)
+                        else [hidden[last_index] for hidden in aux_hidden_states]
+                    )
             sample_indices = None
             input_logprob_indices = None
         else:
