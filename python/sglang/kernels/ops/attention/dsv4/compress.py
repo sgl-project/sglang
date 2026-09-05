@@ -49,6 +49,7 @@ def _jit_compress_norm_rope_module(
     rope_dim: int,
     page_size: int,
     bf16_store: bool = False,
+    fp8_2buff: bool = False,
 ) -> Module:
     args = make_cpp_args(
         dtype,
@@ -63,6 +64,13 @@ def _jit_compress_norm_rope_module(
     if head_dim == 128:
         cuda_wrappers.append(
             ("forward_fp4", f"FusedNormRopeKernel<{args}>::forward_fp4")
+        )
+    # elif because forward_fp8_2buff cannot even instantiate at head_dim 128 -- the kernel
+    # static_asserts the two-pool store is latent-only. The default latent arm skips it as
+    # well, so it doesn't carry a symbol nothing calls.
+    elif fp8_2buff:
+        cuda_wrappers.append(
+            ("forward_fp8_2buff", f"FusedNormRopeKernel<{args}>::forward_fp8_2buff")
         )
     return load_jit(
         make_name(f"fused_norm_rope_v2"),
@@ -162,6 +170,7 @@ class CompressorDecodePlan(NamedTuple):
         seq_lens: torch.Tensor,
         swa_page_size: int,
         ring_size: int,
+        use_req_ring: bool = False,
     ) -> CompressorDecodePlan:
         if _is_xpu:
             fn = plan_compress_decode
@@ -169,7 +178,7 @@ class CompressorDecodePlan(NamedTuple):
             module = _jit_compress_plan_module()
             fn = module.plan_decode
 
-        plan_d = fn(
+        args = (
             req_pool_indices,
             req_to_token,
             full_to_state,
@@ -178,6 +187,7 @@ class CompressorDecodePlan(NamedTuple):
             int(swa_page_size),
             int(ring_size),
         )
+        plan_d = fn(*args) if _is_xpu else fn(*args, bool(use_req_ring))
         return CompressorDecodePlan(compress_ratio, torch.from_dlpack(plan_d))
 
     @staticmethod
@@ -247,6 +257,7 @@ class CompressorPrefillPlan(NamedTuple):
         ring_size: int,
         num_q_tokens: int,
         use_cuda_graph: bool = False,
+        use_req_ring: bool = False,
     ) -> CompressorPrefillPlan:
         is_gpu_input = seq_lens.device.type in ["cuda", "xpu"]
         pin_buffer = torch.empty(
@@ -274,7 +285,7 @@ class CompressorPrefillPlan(NamedTuple):
             module = _jit_compress_plan_module()
             fn = module.plan_prefill
 
-        plan_c, plan_w = fn(
+        args = (
             req_pool_indices,
             req_to_token,
             full_to_state,
@@ -285,7 +296,11 @@ class CompressorPrefillPlan(NamedTuple):
             int(compress_ratio),
             int(swa_page_size),
             int(ring_size),
-            bool(use_cuda_graph),
+        )
+        plan_c, plan_w = (
+            fn(*args, bool(use_cuda_graph))
+            if _is_xpu
+            else fn(*args, bool(use_req_ring), bool(use_cuda_graph))
         )
         return CompressorPrefillPlan(
             compress_ratio,
@@ -434,6 +449,8 @@ def compress_norm_rope_store(
     kvcache_scale: Optional[torch.Tensor] = None,
     rope_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     fp4_k_write_metadata=None,
+    fp8_2buff: bool = False,
+    kvcache_rope: Optional[torch.Tensor] = None,
 ) -> None:
     if use_fp4:
         assert kv.shape[-1] == 128
@@ -457,6 +474,11 @@ def compress_norm_rope_store(
         )
         return
 
+    if fp8_2buff:
+        assert not (use_fp4 or bf16_store), "fp8 two-pool store is its own layout"
+        assert kv.shape[-1] != 128, "fp8 two-pool store is the latent, not the indexer"
+        assert kvcache_rope is not None, "fp8 two-pool store needs the rope pool"
+        assert not _is_xpu, "fp8 two-pool store is only wired for the CUDA/HIP kernel"
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     if _is_xpu:
         compress_norm_rope_store_xpu(
@@ -474,9 +496,19 @@ def compress_norm_rope_store(
         )
     else:
         module = _jit_compress_norm_rope_module(
-            kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store
+            kv.dtype,
+            kv.shape[-1],
+            freq_cis.shape[-1],
+            page_size,
+            bf16_store,
+            fp8_2buff,
         )
-        fn = module.forward_fp4 if use_fp4 else module.forward
+        if use_fp4:
+            fn, extra = module.forward_fp4, ()
+        elif fp8_2buff:
+            fn, extra = module.forward_fp8_2buff, (kvcache_rope,)
+        else:
+            fn, extra = module.forward, ()
         if norm_weight.dtype != kv.dtype:
             norm_weight = norm_weight.to(dtype=kv.dtype)
         fn(
@@ -487,6 +519,7 @@ def compress_norm_rope_store(
             freq_cis,
             out_loc,
             kvcache,
+            *extra,
             plan.is_decode,
             plan.compress_ratio,
         )
