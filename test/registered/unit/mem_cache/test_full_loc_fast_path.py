@@ -170,7 +170,7 @@ class TestUnifiedSWATombstoneClamp(unittest.TestCase):
     """
 
     def _make_bare_pool(self, page_size, v2p, multiplier=1):
-        from sglang.srt.mem_cache.multi_ended_allocator import MultiEndedAllocator
+        from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
         from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
 
         # A real sub-allocator (not a stand-in): the translation reads its v2p

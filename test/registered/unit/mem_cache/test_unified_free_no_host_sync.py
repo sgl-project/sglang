@@ -44,7 +44,8 @@ from unittest import mock
 import torch
 from test_multi_ended_allocator import TestPagedMultiEndedAllocator as _PagedFixture
 
-from sglang.srt.mem_cache import multi_ended_allocator as mea
+from sglang.srt.mem_cache.allocator import unified_hybrid_swa, unified_mamba
+from sglang.srt.mem_cache.allocator import unified_sub_pool as mea
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -87,14 +88,18 @@ _TOMBSTONE_METHODS = [
 _NO_SYNC_TOMBSTONE_FORMS = ("index_fill_", "free_unbind_inplace")
 
 
+_UNIFIED_MODULES = (mea, unified_mamba, unified_hybrid_swa)
+
+
 def _allocators_in_module():
-    """Every allocator class DEFINED in multi_ended_allocator (not imported)."""
+    """Every allocator class DEFINED in the unified allocator modules (not imported)."""
     return sorted(
         (
             c
-            for c in vars(mea).values()
+            for mod in _UNIFIED_MODULES
+            for c in vars(mod).values()
             if isinstance(c, type)
-            and c.__module__ == mea.__name__
+            and c.__module__ == mod.__name__
             and "Allocator" in c.__name__
         ),
         key=lambda c: c.__name__,
@@ -380,8 +385,8 @@ class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
     def test_all_overridden(self):
         for cls in (
             mea.MultiEndedAllocator,
-            mea.UnifiedMambaTokenToKVPoolAllocator,
-            mea.UnifiedSWATokenToKVPoolAllocator,
+            unified_mamba.UnifiedMambaTokenToKVPoolAllocator,
+            unified_hybrid_swa.UnifiedSWATokenToKVPoolAllocator,
         ):
             with self.subTest(cls=cls.__name__):
                 self.assertIsNot(
@@ -399,8 +404,8 @@ class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
         segment free, or `free_segment` raises inside a group."""
         for cls in (
             mea.MultiEndedAllocator,
-            mea.UnifiedMambaTokenToKVPoolAllocator,
-            mea.UnifiedSWATokenToKVPoolAllocator,
+            unified_mamba.UnifiedMambaTokenToKVPoolAllocator,
+            unified_hybrid_swa.UnifiedSWATokenToKVPoolAllocator,
         ):
             with self.subTest(cls=cls.__name__):
                 self.assertIn("free_page_reps_group", inspect.getsource(cls))
@@ -462,7 +467,7 @@ class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
             def attach_allocators(self, **kwargs):
                 pass
 
-        return mea.UnifiedSWATokenToKVPoolAllocator(
+        return unified_hybrid_swa.UnifiedSWATokenToKVPoolAllocator(
             unified_buffer=pool,
             kvcache=_KV(pool),
             device="cpu",

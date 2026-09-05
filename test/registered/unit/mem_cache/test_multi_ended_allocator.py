@@ -30,11 +30,15 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.multi_ended_allocator import (
+from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+    UnifiedSWATokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.allocator.unified_mamba import (
+    UnifiedMambaTokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     FloatMultiEndedAllocator,
     MultiEndedAllocator,
-    UnifiedMambaTokenToKVPoolAllocator,
-    UnifiedSWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
@@ -1263,7 +1267,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
 
     # 7. SWA composite joint byte-budget in page units.
     def test_paged_swa_joint_byte_budget(self):
-        from sglang.srt.mem_cache.multi_ended_allocator import (
+        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
             UnifiedSWATokenToKVPoolAllocator,
         )
 
@@ -1334,7 +1338,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
     # stays -1 and `translate_kv_loc(virt_token)` returns negative token
     # ids → CUDA OOB in the Triton attention kernel.
     def test_paged_alloc_extend_binds_v2p_p2v(self):
-        from sglang.srt.mem_cache import multi_ended_allocator as mea_mod
+        from sglang.srt.mem_cache.allocator import unified_sub_pool as mea_mod
 
         _, full_alloc, _, _, _ = self._build()
         PS = self.PAGE_SIZE
@@ -1417,7 +1421,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
     # prefix's tail page (num_new_pages == 0), but the page-wrapping case
     # must update tables.
     def test_paged_alloc_decode_binds_v2p_p2v_on_page_wrap(self):
-        from sglang.srt.mem_cache import multi_ended_allocator as mea_mod
+        from sglang.srt.mem_cache.allocator import unified_sub_pool as mea_mod
 
         _, full_alloc, _, _, _ = self._build()
         PS = self.PAGE_SIZE
@@ -1496,7 +1500,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
     # (the common case — the decode token reuses the prefix's tail page)
     # must NOT advance the watermark and NOT touch v2p / p2v.
     def test_paged_alloc_decode_no_op_when_no_new_page(self):
-        from sglang.srt.mem_cache import multi_ended_allocator as mea_mod
+        from sglang.srt.mem_cache.allocator import unified_sub_pool as mea_mod
 
         _, full_alloc, _, _, _ = self._build()
         PS = self.PAGE_SIZE
@@ -1699,7 +1703,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
     # `full_available_size() + allocated_tokens == static_cap` must hold for
     # the SWA composite.
     def test_paged_swa_full_available_size_in_tokens(self):
-        from sglang.srt.mem_cache.multi_ended_allocator import (
+        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
             UnifiedSWATokenToKVPoolAllocator,
         )
 
@@ -1785,7 +1789,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
     # (`#full token`, `full token usage`) and would have crashed Mamba+radix
     # if radix weren't auto-downgraded to page=1.
     def test_paged_mamba_size_in_tokens(self):
-        from sglang.srt.mem_cache.multi_ended_allocator import (
+        from sglang.srt.mem_cache.allocator.unified_mamba import (
             UnifiedMambaTokenToKVPoolAllocator,
         )
 
@@ -1887,7 +1891,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
     # The instance methods in production wrap this helper, so the same
     # math is covered.
     def test_paged_pool_translate_helper_returns_physical_tokens(self):
-        from sglang.srt.mem_cache.multi_ended_allocator import (
+        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
             UnifiedSWATokenToKVPoolAllocator,
         )
         from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
@@ -3440,7 +3444,7 @@ class TestDcpWidening(unittest.TestCase):
                 self.assertTrue(bool((written[owned] > 0).all()))
 
     def _build_composite(self, *, page_size):
-        from sglang.srt.mem_cache.multi_ended_allocator import (
+        from sglang.srt.mem_cache.allocator.unified_mamba import (
             UnifiedMambaTokenToKVPoolAllocator,
         )
 

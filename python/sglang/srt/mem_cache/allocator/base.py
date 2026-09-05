@@ -52,36 +52,26 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         return self.size
 
     # -- scheduler-facing capacity hooks --
-    # The scheduler calls these UNCONDITIONALLY (zero feature branches on its
-    # side); the defaults reproduce the historical token behavior exactly, and
-    # unified composites override them with byte-denominated logic.
+    # The scheduler calls these unconditionally, with no allocator-type branches
+    # on its side; byte-accounted composites override the token-count defaults.
 
     def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
-        """Ask the prefix cache to evict unlocked entries until this allocator
-        can serve ``num_tokens`` (or nothing evictable remains). Default = the
-        shared token-count eviction; joint-byte composites override (evicting
-        one multi-lifetime tree node frees bytes on several sides at once).
-        """
+        """Evict unlocked prefix-cache entries until this allocator can serve
+        ``num_tokens`` or nothing evictable remains."""
         from sglang.srt.mem_cache.common import evict_from_tree_cache
 
         evict_from_tree_cache(tree_cache, num_tokens)
 
     def check_decode_capacity(self, *, num_tokens: int, tree_cache) -> bool:
-        """Whether the NEXT decode step's ``num_tokens`` allocation fits,
-        evicting reclaimable cache first. The retract loop converges on this
-        same check, so allocator-side shortfalls retract gracefully instead of
-        tripping fail-loud alloc errors. Default reproduces the historical
-        ``ScheduleBatch.check_decode_mem`` body; unified composites override
-        with byte gates + per-step reservations of their own.
-        """
+        """Whether the next decode step's ``num_tokens`` allocation fits after
+        evicting reclaimable cache. The retract loop converges on this same
+        check, so a shortfall here retracts instead of failing in alloc."""
         self.evict_to_free_tokens(tree_cache, num_tokens)
         return self.available_size() >= num_tokens
 
     def verify_byte_accounting(self) -> list:
-        """Idle-time conservation diagnostic: recompute this allocator's
-        byte/slot accounting and return human-readable violation strings
-        (empty == healthy). Default: static pools have no byte model.
-        """
+        """Idle-time diagnostic: recompute byte/slot accounting and return
+        violation strings, empty when healthy. Static pools have no byte model."""
         return []
 
     def debug_print(self) -> str:
@@ -126,11 +116,9 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def translate_kv_indices_for_transfer(
         self, kv_indices: torch.Tensor
     ) -> torch.Tensor:
-        """Token ids as the PD-disaggregation transfer engine addresses them.
-
-        Identity here: a static pool's token ids index its registered buffers
-        directly. Virtual-id pools must override.
-        """
+        """Token ids as the PD transfer engine addresses them. Identity here
+        because a static pool's ids index its registered buffers directly;
+        virtual-id pools must override."""
         return kv_indices
 
     def get_cpu_copy(self, indices, mamba_indices=None):
@@ -166,11 +154,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         raise NotImplementedError()
 
     def free_full(self, free_index: torch.Tensor):
-        """Free slots whose SWA peers the caller already released.
-
-        A hybrid SWA allocator pairs each full-attention slot with an SWA slot
-        that can die first; this releases the full side alone. A single pool has
-        no peer, so it is a plain free()."""
+        """Free full-attention slots whose paired SWA slots the caller already
+        released. A single pool has no SWA peer, so this is a plain free()."""
         self.free(free_index)
 
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
@@ -178,7 +163,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
         In page units the segment is ``[start_pos // ps, ceil(end / ps))``:
         ``start_pos`` sits on a page boundary, the end may fall mid-page, and
-        the whole last page is released. Default: plain free()."""
+        the whole last page is released."""
         assert start_pos % self.page_size == 0, (
             f"segment start {start_pos} is not page-aligned"
         )
@@ -186,18 +171,15 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
     def free_segments(self, segments):
         """Free several ``(free_index, start_pos)`` segments of one request's
-        kv row.
-
-        Each segment covers the pages ``[start_pos // ps, ceil(end / ps))``.
-        Starts sit on page boundaries, ends may fall mid-page, and the page
-        ranges of consecutive segments do not overlap -- so in page units the
-        segments are aligned and disjoint, and every page is released once."""
+        kv row. Each covers pages ``[start_pos // ps, ceil(end / ps))``; starts
+        are page-aligned and consecutive page ranges do not overlap, so every
+        page is released exactly once."""
         for free_index, start_pos in self._page_disjoint(segments):
             self.free_segment(free_index, start_pos=start_pos)
 
     def free_full_segment(self, free_index: torch.Tensor, *, start_pos: int):
         """free_full() for a kv-row segment; same start-alignment contract as
-        free_segment(). Default: plain free_full()."""
+        free_segment()."""
         assert start_pos % self.page_size == 0, (
             f"segment start {start_pos} is not page-aligned"
         )

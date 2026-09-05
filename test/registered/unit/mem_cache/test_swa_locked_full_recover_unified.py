@@ -43,7 +43,9 @@ import unittest
 import torch
 from test_multi_ended_allocator import _FakeUnifiedSWAKVPool  # sibling fixture
 
-from sglang.srt.mem_cache.multi_ended_allocator import UnifiedSWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+    UnifiedSWATokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.unified_cache.cache_action import RecoverSWAWithLockedFull
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.swa_component import SWAComponent

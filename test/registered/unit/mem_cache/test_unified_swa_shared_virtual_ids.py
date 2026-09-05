@@ -30,7 +30,7 @@ import unittest
 import torch
 from test_swa_locked_full_recover_unified import _DEV, _FakeUnifiedSWAKVPool
 
-from sglang.srt.mem_cache.multi_ended_allocator import (
+from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
