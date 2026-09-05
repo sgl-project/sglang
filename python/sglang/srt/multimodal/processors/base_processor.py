@@ -1471,6 +1471,22 @@ class BaseMultimodalProcessor(ABC):
 
         return list(zip(indices_start.tolist(), indices_end.tolist()))
 
+    def get_mm_item_offsets(
+        self,
+        input_ids: torch.Tensor,
+        mm_tokens: MultimodalSpecialTokens,
+        modality: Modality,
+    ) -> List[Tuple[int, int]]:
+        """Return placeholder offsets belonging to one modality.
+
+        Processors that reuse one token ID for multiple modalities can override
+        this method and use surrounding boundary tokens to disambiguate spans.
+        """
+        mm_token_id = mm_tokens.get_token_id_by_modality(modality)
+        if mm_token_id is None:
+            raise ValueError(f"No token id found for modality: {modality}")
+        return self.get_mm_items_offset(input_ids, mm_token_id)
+
     def collect_mm_items_from_processor_output(
         self, data_dict: dict, modality: Modality = None
     ) -> List[MultimodalDataItem]:
@@ -1834,12 +1850,10 @@ class BaseMultimodalProcessor(ABC):
         for mm_item in all_collected_items:
             if mm_item.offsets is not None:
                 continue
-            mm_token_id = mm_tokens.get_token_id_by_modality(mm_item.modality)
-            if mm_token_id is None:
-                raise ValueError(f"No token id found for modality: {mm_item.modality}")
-            mm_item.offsets = self.get_mm_items_offset(
+            mm_item.offsets = self.get_mm_item_offsets(
                 input_ids=input_ids,
-                mm_token_id=mm_token_id,
+                mm_tokens=mm_tokens,
+                modality=mm_item.modality,
             )
 
         # Split bundled items into per-image/video items for better cache granularity
