@@ -51,11 +51,15 @@ inline constexpr bool group_fits(int64_t bytes, uint32_t num_threads, uint32_t g
 }
 
 inline constexpr uint32_t pick_group_bytes(int64_t bytes, uint32_t num_threads) {
+#ifdef USE_ROCM
   return group_fits(bytes, num_threads, 128)  ? 128u
          : group_fits(bytes, num_threads, 64) ? 64u
          : group_fits(bytes, num_threads, 32) ? 32u
          : group_fits(bytes, num_threads, 16) ? 16u
                                               : 0u;
+#else
+  return group_fits(bytes, num_threads, 128) ? 128u : 0u;
+#endif
 }
 
 // NVIDIA exposes an explicit "do not allocate in L1" cache hint via PTX. ROCm

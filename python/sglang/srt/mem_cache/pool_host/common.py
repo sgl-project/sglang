@@ -204,16 +204,18 @@ def _cuda_host_register(
         # cudaHostUnregister to receive each base pointer, not just the tensor's
         # original base once after several independent registrations.
         setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, registered_ranges)
-        with _registered_host_ptrs_lock:
-            _registered_host_ptrs.add(base)
+        if _is_hip:
+            with _registered_host_ptrs_lock:
+                _registered_host_ptrs.add(base)
     except Exception:
         remaining_ranges = _cuda_host_unregister_ranges(
             cudart, registered_ranges, operation="registration rollback"
         )
         if remaining_ranges:
             setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, remaining_ranges)
-            with _registered_host_ptrs_lock:
-                _registered_host_ptrs.add(base)
+            if _is_hip:
+                with _registered_host_ptrs_lock:
+                    _registered_host_ptrs.add(base)
         raise
 
 
@@ -238,11 +240,12 @@ def _cuda_host_unregister_ranges(
 
 
 def _cuda_host_unregister(buffer: torch.Tensor) -> None:
-    with _registered_host_ptrs_lock:
-        was_registered = buffer.data_ptr() in _registered_host_ptrs
-        _registered_host_ptrs.discard(buffer.data_ptr())
-    if not was_registered:
-        return
+    if _is_hip:
+        with _registered_host_ptrs_lock:
+            was_registered = buffer.data_ptr() in _registered_host_ptrs
+            _registered_host_ptrs.discard(buffer.data_ptr())
+        if not was_registered:
+            return
 
     cudart = torch.cuda.cudart()
     registered_ranges = getattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, None)

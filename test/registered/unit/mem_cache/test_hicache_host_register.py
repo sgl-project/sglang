@@ -439,7 +439,10 @@ class TestHostRegisterLedger(_IsolatedLedger):
     def test_a_buffer_that_was_never_registered_is_left_alone(self):
         cudart = _FakeCudart()
 
-        with mock.patch.object(torch.cuda, "cudart", return_value=cudart):
+        with (
+            mock.patch.object(pool_host_common, "_is_hip", True),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
             _cuda_host_unregister(_FakeBuffer(0x10000000, 4096))
 
         self.assertEqual(cudart.unregistrations, [])
@@ -448,9 +451,23 @@ class TestHostRegisterLedger(_IsolatedLedger):
         cudart = _FakeCudart()
         buffer = _FakeBuffer(0x10000000, 4096)
 
-        with mock.patch.object(torch.cuda, "cudart", return_value=cudart):
+        with (
+            mock.patch.object(pool_host_common, "_is_hip", True),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
             _cuda_host_register(buffer)
             _cuda_host_unregister(buffer)
+
+        self.assertEqual(cudart.unregistrations, [0x10000000])
+
+    def test_non_rocm_preserves_unregister_without_the_ledger(self):
+        cudart = _FakeCudart()
+
+        with (
+            mock.patch.object(pool_host_common, "_is_hip", False),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
+            _cuda_host_unregister(_FakeBuffer(0x10000000, 4096))
 
         self.assertEqual(cudart.unregistrations, [0x10000000])
 
