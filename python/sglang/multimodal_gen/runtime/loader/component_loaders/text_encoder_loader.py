@@ -56,8 +56,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.quanto_int8 import (
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
-    ComponentLoader,
     NativeComponentLoaderRequired,
+    OnlineQuantizationComponentLoader,
     uses_native_transformers_quantization,
 )
 from sglang.multimodal_gen.runtime.loader.gguf_weights import (
@@ -67,12 +67,13 @@ from sglang.multimodal_gen.runtime.loader.gguf_weights import (
     remap_gguf_tensor_meta,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
+    _list_safetensors_files,
+    checkpoint_bytes,
     get_param_names_mapping,
     set_default_torch_dtype,
     skip_init_modules,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
-    filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
     pt_weights_iterator,
     safetensors_weights_iterator,
@@ -101,10 +102,6 @@ from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     get_quant_config_from_safetensors_metadata,
     inspect_comfy_quant_markers,
     resolve_comfy_checkpoint_quantization,
-)
-from sglang.multimodal_gen.runtime.weights.source import (
-    materialize_weight,
-    resolve_weight,
 )
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.environ import envs
@@ -265,7 +262,10 @@ def _configure_encoder_quantization(
     explicit_quantization: str | None = None,
     ignored_layers: list[str] | None = None,
 ) -> None:
-    if getattr(model_cls, "manages_checkpoint_quantization", False):
+    if (
+        issubclass(model_cls, EncoderTensorParallelMixin)
+        and model_cls.checkpoint_quantization_backend == "model"
+    ):
         if explicit_quantization is not None:
             raise ComponentCheckpointUnsupportedError(
                 f"{component_name!r} manages its own checkpoint quantization and "
@@ -463,42 +463,26 @@ def _require_quantized_encoder_layers(
             )
 
 
-def _checkpoint_bytes(model_path: str) -> int:
-    """On-disk size of a checkpoint, readable before any weight of it is."""
-    if os.path.isfile(model_path):
-        return os.path.getsize(model_path)
-    total = 0
-    for path in glob.glob(
-        os.path.join(str(model_path), "**", "*.safetensors"), recursive=True
-    ):
-        try:
-            total += os.path.getsize(path)
-        except OSError:
-            continue
-    return total
-
-
 def _keep_this_checkpoint_mapped(model_path: str) -> bool:
     """Whether this encoder's weights should stay on their file mapping."""
-    checkpoint_bytes = _checkpoint_bytes(model_path)
-    if not host_copies_would_not_fit(checkpoint_bytes):
+    weight_bytes = checkpoint_bytes(model_path)
+    if not host_copies_would_not_fit(weight_bytes):
         return False
     logger.info(
         "Text encoder checkpoint is %.2f GiB against %.2f GiB of host memory, "
         "so its compatible weights stay on the checkpoint mapping instead of "
         "being copied in.",
-        checkpoint_bytes / 1024**3,
+        weight_bytes / 1024**3,
         host_memory_available_bytes() / 1024**3,
     )
     return True
 
 
-class TextEncoderLoader(ComponentLoader):
+class TextEncoderLoader(OnlineQuantizationComponentLoader):
     """Loader for text encoders."""
 
     component_names = ["text_encoder"]
     expected_library = "transformers"
-    supports_online_quantization_override = True
 
     def component_load_precision(
         self, server_args: ServerArgs, component_name: str
@@ -518,33 +502,13 @@ class TextEncoderLoader(ComponentLoader):
             or component_name in server_args.component_quantizations
         )
 
-    @staticmethod
-    def resolve_model_weights_path(
-        component_model_path: str,
-        server_args: ServerArgs,
-        component_name: str,
-    ) -> str:
-        weights_override = server_args.component_weights_paths.get(component_name)
-        if weights_override is None:
-            return component_model_path
-        if names_gguf_checkpoint(weights_override):
+    def validate_component_weight_override(self, override: str) -> None:
+        if names_gguf_checkpoint(override):
             if not current_platform.is_cuda():
                 raise ValueError(
                     "GGUF encoder checkpoints require CUDA; the GGML kernels have "
                     f"no {current_platform.device_type} implementation"
                 )
-            if server_args.should_use_fsdp_for_component(component_name):
-                raise ValueError(
-                    f"GGUF encoder checkpoint {component_name!r} is incompatible "
-                    "with FSDP; select resident or layerwise placement"
-                )
-        model_weights_path = materialize_weight(resolve_weight(weights_override))
-        logger.info(
-            "Using weight-file override for %s: %s",
-            component_name,
-            model_weights_path,
-        )
-        return model_weights_path
 
     @dataclasses.dataclass
     class Source:
@@ -620,20 +584,20 @@ class TextEncoderLoader(ComponentLoader):
 
         hf_weights_files: list[str] = []
         for pattern in allow_patterns:
-            hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
+            if pattern == "*.safetensors":
+                hf_weights_files = _list_safetensors_files(
+                    hf_folder,
+                    index_file=index_file,
+                    key_filter=key_filter,
+                )
+            else:
+                hf_weights_files = glob.glob(os.path.join(hf_folder, pattern))
             if len(hf_weights_files) > 0:
                 if pattern == "*.safetensors":
                     use_safetensors = True
                 break
 
-        if use_safetensors:
-            hf_weights_files = filter_duplicate_safetensors_files(
-                hf_weights_files,
-                hf_folder,
-                index_file,
-                key_filter=key_filter,
-            )
-        else:
+        if not use_safetensors:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
 
         if len(hf_weights_files) == 0:
@@ -731,7 +695,7 @@ class TextEncoderLoader(ComponentLoader):
         component_starts_on_cpu: bool | None = None,
     ):
         """Load the text encoders based on the model path, and inference args."""
-        component_weights_path = self.resolve_model_weights_path(
+        component_weights_path = self.resolve_component_weights_path(
             component_model_path,
             server_args,
             component_name,
@@ -904,8 +868,9 @@ class TextEncoderLoader(ComponentLoader):
             model_device = local_torch_device
 
         encoder_tp_group = get_folding_tp_group(model_config)
-        with use_tensor_parallel_group(encoder_tp_group), set_default_torch_dtype(
-            PRECISION_TO_TYPE[dtype]
+        with (
+            use_tensor_parallel_group(encoder_tp_group),
+            set_default_torch_dtype(PRECISION_TO_TYPE[dtype]),
         ):
             with model_device, skip_init_modules():
                 architectures = getattr(model_config, "architectures", [])

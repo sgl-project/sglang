@@ -175,7 +175,7 @@ def make_forward_batch(
     input_ids: Optional[torch.Tensor] = None,
     positions: Optional[torch.Tensor] = None,
     out_cache_loc: Optional[torch.Tensor] = None,
-    num_token_non_padded_cpu: Optional[int] = None,
+    global_num_token_non_padded_cpu: Optional[int] = None,
 ) -> SimpleNamespace:
     seq_lens_default = list(seq_lens_list[:bs])
     if req_pool_indices is None:
@@ -216,7 +216,7 @@ def make_forward_batch(
         input_ids=input_ids,
         positions=positions,
         out_cache_loc=out_cache_loc,
-        num_token_non_padded_cpu=num_token_non_padded_cpu,
+        global_num_token_non_padded_cpu=global_num_token_non_padded_cpu,
         req_all_ids_flat=None,
         req_all_ids_lens=None,
     )

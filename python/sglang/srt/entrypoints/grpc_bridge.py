@@ -545,9 +545,11 @@ class RuntimeHandle:
             obj = UpdateWeightFromDiskReqInput(
                 model_path=model_path, load_format=load_format
             )
-            success, message, num_paused = (
-                await self.tokenizer_manager.update_weights_from_disk(obj, request=None)
-            )
+            (
+                success,
+                message,
+                num_paused,
+            ) = await self.tokenizer_manager.update_weights_from_disk(obj, request=None)
             return {
                 "success": success,
                 "message": message,

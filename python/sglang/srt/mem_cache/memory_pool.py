@@ -66,6 +66,7 @@ from sglang.srt.mem_cache.layout.page_major import (
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
     maybe_init_custom_mem_pool,
+    set_mla_kv_buffer_dcp_sharded_triton,
     set_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton_fp8_quant,
     set_mla_kv_scale_buffer_triton,
@@ -292,24 +293,17 @@ class ReqToTokenPool:
     def alloc(self, reqs: list[Req]) -> Optional[List[int]]:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
-        reusing = [i for i, r in enumerate(reqs) if r.kv.req_pool_idx is not None]
-        # NOTE: this check is relaxed temporarily
-        # https://github.com/sgl-project/sglang/pull/20476
-        # if not any(r.is_dllm() for r in reqs):
-        #     assert (
-        #         sum(1 for i in reusing if reqs[i].inflight_middle_chunks > 0) <= 1
-        #     ), "only one chunked request may reuse req_pool_idx in a batch"
-        assert all(
-            reqs[i].inflight_middle_chunks > 0 or reqs[i].kv.kv_committed_len > 0
-            for i in reusing
-        ), "reusing request must be chunked or have committed KV"
+        reusing = [i for i, r in enumerate(reqs) if r.kv.holds_kv]
+        assert all(reqs[i].kv.kv_allocated_len > 0 for i in reusing), (
+            "a reused row must carry allocated KV"
+        )
 
         select_index = self.alloc_rows(len(reqs) - len(reusing))
         if select_index is None:
             return None
         offset = 0
         for r in reqs:
-            if r.kv.req_pool_idx is None:
+            if not r.kv.holds_kv:
                 r.kv.req_pool_idx = select_index[offset]
                 offset += 1
         return [r.kv.req_pool_idx for r in reqs]
@@ -338,7 +332,7 @@ class ReqToTokenPool:
         self.free_slots.extend(indices)
 
     def free(self, req: Req):
-        assert req.kv.req_pool_idx is not None, "request must have req_pool_idx"
+        assert req.kv.holds_kv, "request must have req_pool_idx"
         self.free_rows([req.kv.req_pool_idx])
         req.kv.req_pool_idx = None
 
@@ -389,14 +383,8 @@ class MambaPool:
         #   replayssm_d: [num_layers, num_slots, HV, L, V]
         #   replayssm_k: [num_layers, num_slots, H,  L, K]
         #   replayssm_g: [num_layers, num_slots, HV, L]  (fp32)
-        #   replayssm_rawv: [num_layers, num_slots, HV, L, V]  (conv/activation dtype)
-        #   replayssm_rawk: [num_layers, num_slots, H,  L, K]  (conv/activation dtype)
-        #   replayssm_beta: [num_layers, num_slots, HV, L]     (fp32)
-        # The raw rings + beta exist only under --enable-linear-replayssm-spec: the
-        # closed-loop exact fold sequentially replays them through the recurrent
-        # update at flush -- bit-identical to the recurrent baseline -- instead
-        # of folding the chunked `d` records open-loop (which accumulates error
-        # across flushes). See fla/gdn_replayssm_spec_decode.py.
+        # Under GDN spec verify, rawv/rawk hold compact D/K low parts and beta is
+        # None. KDA uses the same fields for its raw-input fold window.
         replayssm_d: Optional[torch.Tensor] = None
         replayssm_k: Optional[torch.Tensor] = None
         replayssm_g: Optional[torch.Tensor] = None
@@ -535,12 +523,13 @@ class MambaPool:
         self.linear_replayssm_cache_len = linear_replayssm_cache_len
         # ReplaySSM: the decode ring (--enable-linear-replayssm) allocates the
         # chunked (d, k) records + write_pos; the spec-verify flag
-        # (--enable-linear-replayssm-spec) always uses fold-every-commit and
-        # allocates only the raw (v, k, g, beta) window -- no chunked records,
-        # no cursors (KDA additionally keeps d/k, see the allocation below).
-        # The shared g allocation gates on `_replayssm_on`.
+        # (--enable-linear-replayssm-spec) uses compact replay for GDN and raw
+        # fold-every-commit for KDA. The shared g allocation gates on
+        # `_replayssm_on`.
         self.enable_linear_replayssm_spec = enable_linear_replayssm_spec
-        self.replayssm_spec_fold = bool(enable_linear_replayssm_spec)
+        self.replayssm_spec_fold = bool(
+            enable_linear_replayssm_spec and cache_params.is_kda
+        )
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
 
         # for disagg with nvlink
@@ -561,9 +550,9 @@ class MambaPool:
                 # mamba layers/slots share one contiguous byte buffer; conv and
                 # temporal are strided views into it (see mem_cache/layout/
                 # page_major.py). Only the standard CUDA Triton path is supported.
-                assert not _is_npu and not (
-                    _is_cpu and _cpu_has_amx_support
-                ), "envelope_layout mamba is only supported on the CUDA path"
+                assert not _is_npu and not (_is_cpu and _cpu_has_amx_support), (
+                    "envelope_layout mamba is only supported on the CUDA path"
+                )
                 max_slots = size + 1
                 entry_bytes = mamba_entry_bytes(
                     layer_num=num_mamba_layers,
@@ -629,16 +618,15 @@ class MambaPool:
                 hv, v_dim, k_dim = temporal_state_shape
                 h_k = getattr(cache_params.shape, "num_k_heads_per_tp", hv)
                 L = linear_replayssm_cache_len
-                num_slots = size + 1
-                # Ring dtype. DECODE ring (--enable-linear-replayssm): records
-                # follow the SSM dtype -- its flush folds `d` directly into the
-                # state. SPEC-verify ring (--enable-linear-replayssm-spec): d/k feed
-                # ONLY the one-shot output reconstruction (the closed-loop exact
-                # fold replays the raw rings for state instead), so their
-                # quantization noise stays below the bf16 output cast; keep them
-                # in the conv/activation dtype instead of the (fp32-enforced)
-                # SSM dtype to halve the ring traffic. g stays fp32 everywhere
-                # (exact-fold input). The two flags are mutually exclusive.
+                # GDN speculative replay is request-lifetime scratch. Size it by
+                # active requests instead of every persistent radix-cache slot.
+                num_slots = (
+                    spec_state_size + 1
+                    if enable_linear_replayssm_spec and not cache_params.is_kda
+                    else size + 1
+                )
+                # Decode records follow the SSM dtype. Spec-verify compact d/k
+                # records follow the activation dtype; g stays fp32.
                 ring_dtype = conv_dtype if enable_linear_replayssm_spec else ssm_dtype
                 # Fold-every-commit: one verify window, no chunked (d, k)
                 # records. KDA is the exception on both counts: its window
@@ -680,14 +668,10 @@ class MambaPool:
                     dtype=torch.float32,
                     device=device,
                 )
-                # Closed-loop exact-fold rings (spec-verify only). Raw v / raw
-                # pre-norm k live in the conv (activation) dtype -- they are born
-                # there, so storage round-trips losslessly -- beta in fp32. The
-                # flush replays these through the recurrent update sequentially
-                # (bit-identical to the recurrent baseline) instead of folding
-                # the chunked `d` records open-loop.
-                if enable_linear_replayssm_spec:
-                    if cache_params.is_kda:
+                # KDA still uses raw-input fold-every-commit. GDN materializes
+                # its compact d/k/g history directly and needs no duplicate ring.
+                if enable_linear_replayssm_spec and cache_params.is_kda:
+                    if cache_params.is_kda or not self.replayssm_spec_fold:
                         # Backstop for the KDA ring invariants; this pool is
                         # sized with the final adaptive-aware draft maximum.
                         if L & (L - 1) != 0:
@@ -715,6 +699,20 @@ class MambaPool:
                     replayssm_beta = torch.zeros(
                         size=(num_mamba_layers, num_slots, hv, record_len),
                         dtype=torch.float32,
+                        device=device,
+                    )
+                elif enable_linear_replayssm_spec and ring_dtype != torch.float32:
+                    # Low parts of compact D and normalized K. The rings follow
+                    # the activation dtype regardless of checkpoint dtype, so
+                    # materialization always needs both parts.
+                    replayssm_rawv = torch.zeros(
+                        size=(num_mamba_layers, num_slots, hv, record_len, v_dim),
+                        dtype=conv_dtype,
+                        device=device,
+                    )
+                    replayssm_rawk = torch.zeros(
+                        size=(num_mamba_layers, num_slots, h_k, record_len, k_dim),
+                        dtype=conv_dtype,
                         device=device,
                     )
 
@@ -881,8 +879,12 @@ class MambaPool:
                     + (
                         f"rawv={get_tensor_size_bytes(replayssm_rawv) / GB:.3f}GB, "
                         f"rawk={get_tensor_size_bytes(replayssm_rawk) / GB:.3f}GB, "
-                        f"beta={get_tensor_size_bytes(replayssm_beta) / GB:.3f}GB "
-                        if enable_linear_replayssm_spec
+                        + (
+                            f"beta={get_tensor_size_bytes(replayssm_beta) / GB:.3f}GB "
+                            if replayssm_beta is not None
+                            else ""
+                        )
+                        if replayssm_rawv is not None
                         else ""
                     )
                 )
@@ -890,26 +892,24 @@ class MambaPool:
             # IS_KDA path + the g_cache layout). Read by the backend metadata to
             # decide the per-K (KDA) vs scalar (GDN) flush/advance handling.
             self.replayssm_is_kda = bool(_replayssm_on and cache_params.is_kda)
-            # Persistent per-slot decode-position cursor for ReplaySSM. Shared
-            # across all linear-attn layers; advanced once per decode forward by
-            # the backend metadata build (decode ring) or once per verify step by
-            # the worker (spec-verify ring). Index 0..size; reset on slot (re)alloc.
+            # Decode ReplaySSM remains keyed by persistent mamba slots.
             self.replayssm_write_pos = (
                 torch.zeros((size + 1,), dtype=torch.int32, device=device)
-                if _replayssm_on and not self.replayssm_spec_fold
+                if enable_linear_replayssm
                 else None
             )
-            # ReplaySSM spec-verify (Part B of #28511) extra per-slot cursors. The
-            # circular ring's rolling origin (cache_base) + the per-slot flush flag
-            # (is_flush). Block-keyed (indexed by the physical mamba slot), shared by
-            # all GDN layers of one verify step; advanced by commit_gdn_replayssm_spec.
+            self.replayssm_spec_write_pos = (
+                torch.zeros((spec_state_size + 1,), dtype=torch.int32, device=device)
+                if enable_linear_replayssm_spec and not self.replayssm_spec_fold
+                else None
+            )
             self.replayssm_cache_base = (
-                torch.zeros((size + 1,), dtype=torch.int32, device=device)
+                torch.zeros((spec_state_size + 1,), dtype=torch.int32, device=device)
                 if enable_linear_replayssm_spec and not self.replayssm_spec_fold
                 else None
             )
             self.replayssm_is_flush = (
-                torch.zeros((size + 1,), dtype=torch.int8, device=device)
+                torch.zeros((spec_state_size + 1,), dtype=torch.int8, device=device)
                 if enable_linear_replayssm_spec and not self.replayssm_spec_fold
                 else None
             )
@@ -1037,12 +1037,6 @@ class MambaPool:
             ]
         if self.replayssm_write_pos is not None:
             self.replayssm_write_pos[dst_indices] = 0
-        # ReplaySSM spec-verify ring: a copied checkpoint has no pending ring
-        # entries, so its rolling origin + flush flag reset alongside write_pos.
-        if self.replayssm_cache_base is not None:
-            self.replayssm_cache_base[dst_indices] = 0
-        if self.replayssm_is_flush is not None:
-            self.replayssm_is_flush[dst_indices] = 0
 
     def get_cpu_copy(self, indices):
         current_platform.synchronize()
@@ -1053,46 +1047,22 @@ class MambaPool:
         temporal_cpu = self.mamba_cache.temporal[:, indices].to(
             "cpu", non_blocking=True
         )
-        # ReplaySSM spec-verify ring: round-trip the per-slot cursors with the
-        # checkpoint so a restored slot reconstructs exactly. Only the spec ring
-        # adds the 3rd tuple element; every other config keeps the legacy 2-tuple
-        # so those paths stay byte-identical.
-        if self.replayssm_cache_base is not None:
-            cursors_cpu = (
-                self.replayssm_write_pos[indices].to("cpu", non_blocking=True),
-                self.replayssm_cache_base[indices].to("cpu", non_blocking=True),
-                self.replayssm_is_flush[indices].to("cpu", non_blocking=True),
-            )
-            current_platform.synchronize()
-            return conv_cpu, temporal_cpu, cursors_cpu
         current_platform.synchronize()
         return conv_cpu, temporal_cpu
 
     def load_cpu_copy(self, mamba_cache_cpu, indices):
-        # Accept both the legacy 2-tuple (conv, temporal) and the 3-tuple that also
-        # carries the ReplaySSM spec-verify cursors.
+        # Accept historical 3-tuples, but request-keyed replay scratch is not
+        # restored with a physical checkpoint slot.
         if len(mamba_cache_cpu) == 3:
-            conv_cpu, temporal_cpu, cursors_cpu = mamba_cache_cpu
+            conv_cpu, temporal_cpu, _ = mamba_cache_cpu
         else:
             conv_cpu, temporal_cpu = mamba_cache_cpu
-            cursors_cpu = None
         current_platform.synchronize()
         for i, conv in enumerate(self.mamba_cache.conv):
             conv[:, indices] = conv_cpu[i].to(conv.device, non_blocking=True)
         self.mamba_cache.temporal[:, indices] = temporal_cpu.to(
             self.mamba_cache.temporal.device, non_blocking=True
         )
-        if cursors_cpu is not None and self.replayssm_cache_base is not None:
-            wp_cpu, cb_cpu, fl_cpu = cursors_cpu
-            self.replayssm_write_pos[indices] = wp_cpu.to(
-                self.replayssm_write_pos.device, non_blocking=True
-            )
-            self.replayssm_cache_base[indices] = cb_cpu.to(
-                self.replayssm_cache_base.device, non_blocking=True
-            )
-            self.replayssm_is_flush[indices] = fl_cpu.to(
-                self.replayssm_is_flush.device, non_blocking=True
-            )
         current_platform.synchronize()
 
     _NON_TRANSFER_STATE_FIELDS = frozenset(
@@ -1355,9 +1325,20 @@ class HybridReqToTokenPool(ReqToTokenPool):
     # For chunk prefill req, we do not need to allocate mamba cache,
     # We could use allocated mamba cache instead.
     def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
+        fresh_req_rows = [req.kv.req_pool_idx is None for req in reqs]
         select_index = super().alloc(reqs)
         if select_index is None:
             return None
+
+        spec_write_pos = getattr(self.mamba_pool, "replayssm_spec_write_pos", None)
+        if spec_write_pos is not None:
+            fresh_indices = [
+                idx for idx, fresh in zip(select_index, fresh_req_rows) if fresh
+            ]
+            if fresh_indices:
+                spec_write_pos[fresh_indices] = 0
+                self.mamba_pool.replayssm_cache_base[fresh_indices] = 0
+                self.mamba_pool.replayssm_is_flush[fresh_indices] = 0
 
         mamba_indices: list[torch.Tensor] = []
         mamba_ping_pong_track_buffers: list[torch.Tensor] = []
@@ -1366,9 +1347,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 pass
             else:
                 mid = self.mamba_allocator.alloc(1)
-                assert (
-                    mid is not None
-                ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
+                assert mid is not None, (
+                    f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
+                )
                 req.kv.mamba_pool_idx = mid[0]
                 req.kv.mamba_needs_clear = True
                 # GDN ReplaySSM: a freshly (re)assigned slot starts an empty
@@ -1377,12 +1358,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 # (the post-prefill state that prefill wrote into this slot).
                 if self.mamba_pool.replayssm_write_pos is not None:
                     self.mamba_pool.replayssm_write_pos[req.kv.mamba_pool_idx] = 0
-                # ReplaySSM spec-verify ring: an empty ring also resets the
-                # circular origin + flush flag so the first verify step on this
-                # freshly-prefilled slot reconstructs from the checkpoint alone.
-                if self.mamba_pool.replayssm_cache_base is not None:
-                    self.mamba_pool.replayssm_cache_base[req.kv.mamba_pool_idx] = 0
-                    self.mamba_pool.replayssm_is_flush[req.kv.mamba_pool_idx] = 0
             mamba_indices.append(req.kv.mamba_pool_idx)
             if self.enable_mamba_extra_buffer:
                 if req.kv.mamba_ping_pong_track_buffer is None:
@@ -1390,13 +1365,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 mamba_ping_pong_track_buffers.append(
                     req.kv.mamba_ping_pong_track_buffer
                 )
-        assert len(select_index) == len(
-            mamba_indices
-        ), "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
+        assert len(select_index) == len(mamba_indices), (
+            "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
+        )
         if self.enable_mamba_extra_buffer:
-            assert len(select_index) == len(
-                mamba_ping_pong_track_buffers
-            ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
+            assert len(select_index) == len(mamba_ping_pong_track_buffers), (
+                "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
+            )
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
         self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
@@ -1540,7 +1515,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 assert mamba_ping_pong_track_buffer_to_keep in [
                     0,
                     1,
-                ], f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
+                ], (
+                    f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
+                )
                 # Avoid Python-list advanced indexing on a device tensor.
                 # The ping-pong buffer size is either 2 (normal) or 1 (spec decode).
                 if self.mamba_ping_pong_track_buffer_size == 2:
@@ -1860,7 +1837,9 @@ class MHATokenToKVPool(KVCache):
         self.v_head_dim = (
             swa_v_head_dim
             if swa_v_head_dim is not None
-            else v_head_dim if v_head_dim is not None else head_dim
+            else v_head_dim
+            if v_head_dim is not None
+            else head_dim
         )
 
         # Layout: NHD (default) | HND (SGLANG_USE_HND_KVCACHE) | vectorized_5d (ROCm AITER).
@@ -2892,9 +2871,9 @@ class MHATokenToKVPool(KVCache):
         if N == 0:
             return
 
-        assert (
-            self._kv_copy_config is not None
-        ), "KV copy not initialized. Set enable_kv_cache_copy=True in __init__"
+        assert self._kv_copy_config is not None, (
+            "KV copy not initialized. Set enable_kv_cache_copy=True in __init__"
+        )
 
         cfg = self._kv_copy_config
         cap = int(cfg.get("num_locs_upper", 256))
@@ -3664,8 +3643,9 @@ class HybridLinearKVPool(KVCache):
         self.head_num = head_num
         self.head_dim = head_dim
         self.mamba_pool = mamba_pool
-        # virtual->physical mamba-slot translate for the HiCache offload path;
-        # identity for a static pool, the allocator's `translate` for the unified pool.
+        # Identity even though the unified pool holds VIRTUAL mamba ids: its
+        # composite allocator implements neither `get_cpu_copy` nor
+        # `load_cpu_copy`, the only readers, so those ids never arrive here.
         self._mamba_translate = lambda ids: ids
         self.use_mla = use_mla
         if full_kv_pool is not None:
@@ -3680,9 +3660,9 @@ class HybridLinearKVPool(KVCache):
                 TokenToKVPoolClass = current_platform.get_mha_kv_pool_cls()
                 quant_method_kwarg = {}
             elif _is_npu:
-                assert not is_float4_e2m1fn_x2(
-                    dtype
-                ), "FP4 is not supported on NPU yet."
+                assert not is_float4_e2m1fn_x2(dtype), (
+                    "FP4 is not supported on NPU yet."
+                )
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMHATokenToKVPool,
                 )
@@ -4085,6 +4065,32 @@ class MLATokenToKVPool(KVCache):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
+    # Has the WRITE loc arriving here already had the DCP owner rule resolved?
+    # False: this pool takes a WIDENED loc. The unified pool resolves it in
+    # `KVIndexTranslator.rebind_write_loc` and flips this. Not derivable from
+    # `kernel_page_blocks`: that is `layer_num`, so a rank owning one
+    # full-attention layer is translated with blocks_per_page 1.
+    write_loc_is_dcp_resolved = False
+
+    @property
+    def _write_loc_dcp_span(self) -> int:
+        """How many logical ids one stored row spans in the write-loc space."""
+        return 1 if self.write_loc_is_dcp_resolved else get_parallel().attn_dcp_size
+
+    def _scatter_mla_rows(
+        self,
+        dst_buffer: torch.Tensor,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ) -> None:
+        if self.write_loc_is_dcp_resolved:
+            set_mla_kv_buffer_triton(dst_buffer, loc, cache_k_nope, cache_k_rope)
+        else:
+            set_mla_kv_buffer_dcp_sharded_triton(
+                dst_buffer, loc, cache_k_nope, cache_k_rope
+            )
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -4102,12 +4108,15 @@ class MLATokenToKVPool(KVCache):
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
         assert not self.dsa_kv_cache_store_fp8
-        parallel = get_parallel()
-        if parallel.dcp_enabled:
-            valid_mask = loc % parallel.attn_dcp_size == parallel.attn_dcp_rank
-            if not valid_mask.all():
-                loc = loc[valid_mask]
-                cache_k = cache_k[valid_mask]
+        # No DCP-aware variant is possible: the two backends reaching this door
+        # disagree on the loc space (flashinfer-MLA widened, Triton collapsed).
+        assert self.write_loc_is_dcp_resolved or not get_parallel().dcp_enabled, (
+            "MLATokenToKVPool.set_kv_buffer has no DCP-aware write path. Under "
+            "--dcp-size > 1 the MLA write must go through set_mla_kv_buffer, "
+            "whose kernel resolves the owner rule; reaching the combined-row "
+            "door means an attention backend took a write path that never "
+            "declared which loc space it emits."
+        )
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
@@ -4125,6 +4134,10 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ) -> None:
+        assert not (
+            self.write_loc_is_dcp_resolved
+            and (self.use_dsa or self.dsa_kv_cache_store_fp8)
+        ), "the DSA write paths have no resolved-loc variant"
         if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
             # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
@@ -4146,12 +4159,7 @@ class MLATokenToKVPool(KVCache):
             # Reuse existing two-tensor write kernel (works with FP8 byte layout)
             # cache_k_nope_fp8: (num_tokens, 1, 528) uint8 [nope_fp8(512) | scales(16)]
             # cache_k_rope_fp8: (num_tokens, 1, 128) uint8 [rope_bf16_bytes(128)]
-            set_mla_kv_buffer_triton(
-                dst_buffer,
-                loc,
-                cache_k_nope_fp8,
-                cache_k_rope_fp8,
-            )
+            self._scatter_mla_rows(dst_buffer, loc, cache_k_nope_fp8, cache_k_rope_fp8)
         else:
             if cache_k_nope.dtype != self.dtype:
                 cache_k_nope = cache_k_nope.to(self.dtype)
@@ -4160,12 +4168,7 @@ class MLATokenToKVPool(KVCache):
                 cache_k_nope = cache_k_nope.view(self.store_dtype)
                 cache_k_rope = cache_k_rope.view(self.store_dtype)
 
-            set_mla_kv_buffer_triton(
-                dst_buffer,
-                loc,
-                cache_k_nope,
-                cache_k_rope,
-            )
+            self._scatter_mla_rows(dst_buffer, loc, cache_k_nope, cache_k_rope)
 
     def set_mla_kv_buffer(
         self,
@@ -4175,11 +4178,11 @@ class MLATokenToKVPool(KVCache):
         cache_k_rope: torch.Tensor,
         layer_id_override: Optional[int] = None,
     ):
-        # loc is widened under DCP; the kernel divides by the world size itself.
+        # loc is widened under DCP unless the pool declares it resolved.
         maybe_detect_oob(
             loc,
             0,
-            (self.size + self.page_size) * get_parallel().attn_dcp_size,
+            (self.size + self.page_size) * self._write_loc_dcp_span,
             "set_mla_kv_buffer (MLA)",
         )
         maybe_detect_kernel_facing_loc(
@@ -4386,7 +4389,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
                 cache_k_nope = cache_k_nope.view(self.store_dtype)
                 cache_k_rope = cache_k_rope.view(self.store_dtype)
 
-            set_mla_kv_buffer_triton(
+            self._scatter_mla_rows(
                 self.kv_buffer[layer_id - self.start_layer],
                 loc,
                 cache_k_nope_fp4,
@@ -4458,13 +4461,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
         if _is_hip:
             if aiter_can_use_preshuffle_paged_mqa():
-                assert (
-                    self.page_size % 16 == 0
-                ), f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
+                assert self.page_size % 16 == 0, (
+                    f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
+                )
             else:
-                assert (
-                    self.page_size == 1
-                ), f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
+                assert self.page_size == 1, (
+                    f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
+                )
         else:
             assert self.page_size == 64
         self.index_key_cache = self._create_index_key_cache()

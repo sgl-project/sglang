@@ -234,7 +234,7 @@ class QuantizationConfig(ABC):
             if key in config:
                 return config[key]
         raise ValueError(
-            f"Cannot find any of {keys} in the model's " "quantization config."
+            f"Cannot find any of {keys} in the model's quantization config."
         )
 
     @staticmethod
@@ -268,9 +268,7 @@ class QuantizationConfig(ABC):
         """
         raise NotImplementedError()
 
-    def apply_weight_name_mapper(
-        self, hf_to_sglang_mapper: WeightsMapper
-    ):  # noqa: B027
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):  # noqa: B027
         """
         Interface for models to update module names referenced in
         quantization configs in order to reflect the sglang model structure

@@ -151,6 +151,7 @@ def test_hybrid_wrappers_forward_in_graph_hook():
                 token_to_kv_pool=None,
                 req_to_token_pool=None,
                 needs_cpu_seq_lens=False,
+                kv_index_translator=None,
                 init_forward_metadata_in_graph=lambda fb: calls.append(name),
             )
 
@@ -162,6 +163,7 @@ def test_hybrid_wrappers_forward_in_graph_hook():
                 kv_cache_dtype=torch.bfloat16,
                 token_to_kv_pool=None,
                 req_to_token_pool=None,
+                kv_index_translator=None,
                 server_args=SimpleNamespace(speculative_attention_mode="decode"),
                 model_config=SimpleNamespace(context_len=2048),
             ),

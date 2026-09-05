@@ -247,7 +247,7 @@ def resolve_current_platform_cls_qualname() -> str:
     if platform_cls_qualname is not None:
         return platform_cls_qualname
 
-    raise RuntimeError("No platform plugin found. Please check your " "installation.")
+    raise RuntimeError("No platform plugin found. Please check your installation.")
 
 
 _current_platform: Platform | None = None

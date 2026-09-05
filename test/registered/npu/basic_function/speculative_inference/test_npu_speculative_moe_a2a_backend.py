@@ -21,7 +21,6 @@ register_npu_ci(est_time=400, suite="nightly-16-npu-a3", nightly=True)
 
 
 class TestAscendDistTimeout(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEEPSEEK_R1_0528_W8A8_WEIGHTS_PATH

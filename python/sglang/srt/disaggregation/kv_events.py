@@ -263,21 +263,13 @@ class BlockStoredMetadata(msgspec.Struct, omit_defaults=True, gc=False):
     cache_salt: str
 
 
-class OffloadedState:
-    """
-    OffloadedState represents the state of a KV cache block offloaded to the hicache.
+class OffloadedState(msgspec.Struct):
+    """Decode-side offload progress for one request, keyed by Req in the manager."""
 
-    - prefill_len (int): The length of the prefill part of the KV cache block.
-    - inc_len (int): The length of the incremental part of the KV cache block.
-    - last_hash (Optional[str]): The hash of the last token in the KV cache block.
-    """
-
-    def __init__(
-        self, prefill_len: int, inc_len: int = 0, last_hash: Optional[str] = None
-    ):
-        self.prefill_len = prefill_len
-        self.inc_len = inc_len
-        self.last_hash = last_hash
+    # Decode-incremental length already submitted for D2H offload.
+    inc_len: int = 0
+    # Tail of the page hash chain, extended as each offloaded chunk is backed up.
+    last_hash: Optional[str] = None
 
 
 class BlockStored(KVCacheEvent):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -11,38 +12,48 @@ from typing import (
     Union,
 )
 
+import torch
 import zmq
-from torch.distributed import barrier
+from torch.distributed import ReduceOp, all_reduce, barrier
 
 from sglang.srt.disaggregation.utils import prepare_abort
+from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    MMInputsProcessError,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     sock_recv,
 )
 from sglang.srt.managers.mm_utils import (
+    discard_shm_features,
     has_shm_features,
     unwrap_shm_features,
+)
+from sglang.srt.observability.scheduler_stage_metrics import (
+    SCHEDULER_STAGE_RECV_REQUESTS,
+    SchedulerStageMetricsRecorder,
+    scheduler_stage_method,
 )
 from sglang.srt.runtime_context import get_disagg, get_parallel, is_ep_scale_joiner
 from sglang.srt.utils import (
     broadcast_pyobj,
     point_to_point_pyobj,
 )
-from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-    from sglang.srt.managers.rust_server import RustServer
+    from sglang.srt.rust_server.server import RustServer
     from sglang.srt.server_args import ServerArgs
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
     from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
         ScriptedTokenizerRecvProxy,
     )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -66,13 +77,14 @@ class SchedulerRequestReceiver:
     stream_output: Callable[..., None]
     get_last_batch: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
+    scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
             return False
         return num_recv_reqs >= self.max_recv_per_poll
 
-    @scheduler_nvtx_method("scheduler.recv_requests")
+    @scheduler_stage_method(SCHEDULER_STAGE_RECV_REQUESTS)
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
@@ -158,21 +170,7 @@ class SchedulerRequestReceiver:
                 work_reqs = None
                 control_reqs = None
 
-            if self.ps.attn_tp_size != 1:
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_tp_group.rank,
-                    self.attn_tp_cpu_group,
-                    src=self.attn_tp_group.ranks[0],
-                )
-
-            if self.ps.attn_cp_size != 1:
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_cp_group.rank,
-                    self.attn_cp_cpu_group,
-                    src=self.attn_cp_group.ranks[0],
-                )
+            work_reqs = attn_cp_tp_broadcast_pyobj(work_reqs)
 
             # When dp_attention_local_control_broadcast is enabled, each DP
             # group leader already receives control messages from the DP
@@ -184,20 +182,7 @@ class SchedulerRequestReceiver:
                 or is_ep_scale_joiner()
             )
             if _local_ctrl:
-                if self.ps.attn_tp_size != 1:
-                    control_reqs = broadcast_pyobj(
-                        control_reqs,
-                        self.attn_tp_group.rank,
-                        self.attn_tp_cpu_group,
-                        src=self.attn_tp_group.ranks[0],
-                    )
-                if self.ps.attn_cp_size != 1:
-                    control_reqs = broadcast_pyobj(
-                        control_reqs,
-                        self.attn_cp_group.rank,
-                        self.attn_cp_cpu_group,
-                        src=self.attn_cp_group.ranks[0],
-                    )
+                control_reqs = attn_cp_tp_broadcast_pyobj(control_reqs)
             elif self.ps.tp_size != 1:
                 control_reqs = broadcast_pyobj(
                     control_reqs,
@@ -249,24 +234,63 @@ class SchedulerRequestReceiver:
         return recv_reqs
 
     def _finalize_shm_features(self, recv_reqs: Optional[List]) -> None:
-        # Unwrap shared memory features AFTER all broadcasts complete,
-        # so that ShmPointerMMData metadata (not full tensor data) is what
-        # gets serialized during broadcast_pyobj.
-        if recv_reqs:
-            if self.model_config.is_multimodal and has_shm_features(recv_reqs):
-                # The broadcast source returns with its original objects while
-                # peer ranks may still be unpickling ShmPointerMMData
-                # (-> shm_open).  Synchronize the same CPU groups that carried
-                # SHM-backed work requests before materialize() unlinks them.
-                if get_parallel().enable_dp_attention:
-                    if self.ps.attn_tp_size > 1:
-                        barrier(group=self.attn_tp_cpu_group)
-                    if self.ps.attn_cp_size > 1:
-                        barrier(group=self.attn_cp_cpu_group)
-                elif self.ps.tp_size > 1:
-                    barrier(group=self.tp_cpu_group)
-            for req in recv_reqs:
+        """Materialize SHM features or mark the request failed on every rank."""
+        if not recv_reqs or not self.model_config.is_multimodal:
+            return
+
+        tokenized_reqs = []
+        for req in recv_reqs:
+            if isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
+                tokenized_reqs.append(req)
+            elif isinstance(
+                req,
+                (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput),
+            ):
+                tokenized_reqs.extend(req.batch)
+        if not tokenized_reqs or not has_shm_features(tokenized_reqs):
+            return
+
+        # 1. wait until every rank has opened the shared feature segments
+        parallel = get_parallel()
+        if parallel.enable_dp_attention:
+            if self.ps.attn_tp_size > 1:
+                barrier(group=self.attn_tp_cpu_group)
+            if self.ps.attn_cp_size > 1:
+                barrier(group=self.attn_cp_cpu_group)
+        elif self.ps.tp_size > 1:
+            barrier(group=self.tp_cpu_group)
+
+        # 2. materialize independently so one bad VLM request does not stop the loop
+        failed = torch.zeros(len(tokenized_reqs), dtype=torch.int32)
+        for index, req in enumerate(tokenized_reqs):
+            if not has_shm_features([req]):
+                continue
+            try:
                 unwrap_shm_features(req)
+            except Exception:
+                logger.exception(
+                    "Failed to materialize shared-memory multimodal features for rid=%s",
+                    req.rid,
+                )
+                discard_shm_features(req)
+                failed[index] = 1
+
+        # 3. all ranks reject the same requests before entering model collectives
+        if parallel.enable_dp_attention:
+            if self.ps.attn_tp_size > 1:
+                all_reduce(failed, op=ReduceOp.MAX, group=self.attn_tp_cpu_group)
+            if self.ps.attn_cp_size > 1:
+                all_reduce(failed, op=ReduceOp.MAX, group=self.attn_cp_cpu_group)
+        elif self.ps.tp_size > 1:
+            all_reduce(failed, op=ReduceOp.MAX, group=self.tp_cpu_group)
+
+        error = MMInputsProcessError(
+            "Failed to materialize shared-memory multimodal features on a scheduler rank."
+        )
+        for index, req in enumerate(tokenized_reqs):
+            if failed[index].item():
+                discard_shm_features(req)
+                req.mm_inputs = error
 
     def _split_work_and_control_reqs(self, recv_reqs: List):
         work_reqs = [

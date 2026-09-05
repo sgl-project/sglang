@@ -467,8 +467,13 @@ struct TopKKernel {
         .with_device(device_)
         .verify(metadata);
 
-    const auto batch_size = static_cast<uint32_t>(B.unwrap());
     RuntimeCheck(Bp1.unwrap() == B.unwrap() + 1, "invalid metadata shape");
+#ifdef USE_ROCM
+    // ROCm compiles out the cluster path, the only consumer of this plan.
+    (void)static_cluster_threshold;
+    return;
+#else
+    const auto batch_size = static_cast<uint32_t>(B.unwrap());
     const auto device = device_.unwrap();
     LaunchKernel(1, kBlockSize, device)(  //
         topk_plan,
@@ -476,6 +481,7 @@ struct TopKKernel {
         static_cast<PlanItem*>(metadata.data_ptr()),
         batch_size,
         static_cluster_threshold);
+#endif
   }
 
   static void transform_paged(

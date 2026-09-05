@@ -1465,8 +1465,7 @@ async def _extract_encoder_error(responses, endpoint, context, encode_requests=N
         if isinstance(resp, asyncio.TimeoutError):
             timeout_val = envs.SGLANG_ENCODER_HTTP_TIMEOUT.get()
             logger.error(
-                f"Encoder {endpoint} timeout ({timeout_val}s) for {ctx} "
-                f"(request {i})"
+                f"Encoder {endpoint} timeout ({timeout_val}s) for {ctx} (request {i})"
             )
             return f"Encoder {endpoint} timeout ({timeout_val}s)"
         if isinstance(resp, Exception):
@@ -1692,9 +1691,9 @@ def _view_pool_buffer_by_modality(raw_buffer, embedding_data, dtype):
         if info is None:
             mod_info[mod] = [start, end, shape[0], shape[1]]
         else:
-            assert (
-                info[3] == shape[1]
-            ), f"hidden_dim mismatch in modality {mod}: {info[3]} vs {shape[1]}"
+            assert info[3] == shape[1], (
+                f"hidden_dim mismatch in modality {mod}: {info[3]} vs {shape[1]}"
+            )
             assert info[1] == start, f"non-contiguous parts in modality {mod}"
             info[1] = end
             info[2] += shape[0]

@@ -91,9 +91,9 @@ def handle_attention_backend_compatibility(server_args: Any):
                 cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
             ),
         )
-        assert (
-            cfg.speculative_algorithm is None
-        ), "Speculative decoding is currently not supported with Flex Attention backend"
+        assert cfg.speculative_algorithm is None, (
+            "Speculative decoding is currently not supported with Flex Attention backend"
+        )
 
     # Whisper's encoder token padding conflicts with prefix caching.
     # Only disable for Whisper; other encoder-decoder models (e.g., mllama) use radix cache.
@@ -176,20 +176,19 @@ def handle_attention_backend_compatibility(server_args: Any):
     # AMD platforms backends
     if resolved_view(server_args).attention_backend == "aiter":
         if model_config.context_len > 8192:
-            # The 0.85 covers the extra non-static workspace aiter reserves for
-            # long contexts, but it is a heuristic for the auto-derived default
-            # only. Shrinking a value the user picked can push the static budget
-            # below the model-weight footprint on a nearly full GPU and break
-            # KV-cache allocation outright, so an explicit value is honored.
-            if (getattr(server_args, "_raw_input", None) or {}).get(
-                "mem_fraction_static"
-            ) is not None:
+            explicit_mem_fraction = (
+                getattr(server_args, "_raw_input", None) or {}
+            ).get("mem_fraction_static") is not None
+            if (
+                explicit_mem_fraction
+                and envs.SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION.get()
+            ):
                 logger.warning(
-                    "attention_backend=aiter with context_len=%d (>8192) "
-                    "normally scales mem_fraction_static by 0.85, but "
-                    "mem_fraction_static=%.3f was set explicitly and will be "
-                    "used as-is. Ensure enough non-static memory is left for "
-                    "attention workspace and CUDA graphs.",
+                    "attention_backend=aiter with context_len=%d (>8192) normally "
+                    "scales mem_fraction_static by 0.85 to reserve non-static "
+                    "workspace, but SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION is set, "
+                    "so mem_fraction_static=%.3f is used as-is. Ensure enough memory "
+                    "is left for attention workspace and CUDA graphs.",
                     model_config.context_len,
                     cfg.mem_fraction_static,
                 )
@@ -372,9 +371,9 @@ def handle_linear_attn_backend(server_args: Any):
             )
 
     # ReplaySSM spec-verify (Part B of #28511): linear-chain target verify via
-    # fold-every-commit -- the verify stores each draft step's raw inputs into
-    # the per-slot (rawv, rawk, g, beta) window and the commit replays the
-    # accepted prefix into the fp32 checkpoint. The intra-window interaction
+    # compact cached replay. Verify stores normalized keys, update vectors,
+    # and fp32 log-decays; accepted BF16 windows are materialized with
+    # compensated hi/lo accumulation. The intra-window interaction
     # uses a strictly-lower causal mask, so it is valid ONLY for a linear
     # draft chain (speculative_eagle_topk in {None, 1}, i.e. NEXTN / MTP);
     # EAGLE tree verify (topk > 1) must fall back to the recurrent verify.
@@ -440,8 +439,8 @@ def handle_linear_attn_backend(server_args: Any):
         if cfg.mamba_ssm_dtype is None:
             logger.info(
                 "--enable-linear-replayssm-spec: setting --mamba-ssm-dtype "
-                "float32 (the closed-loop exact fold keeps the SSM checkpoint "
-                "bit-identical to the recurrent baseline)."
+                "float32 (cached replay uses compensated checkpoint "
+                "projection and materialization)."
             )
             declare_resolution(
                 server_args,
@@ -451,10 +450,8 @@ def handle_linear_attn_backend(server_args: Any):
         elif cfg.mamba_ssm_dtype != "float32":
             logger.warning(
                 "--enable-linear-replayssm-spec with --mamba-ssm-dtype=%s: the "
-                "closed-loop fold re-quantizes the committed state each "
-                "commit/flush (fp32 keeps it bit-exact to the fp32 recurrent "
-                "baseline), so it may drift over long sequences. Validate "
-                "accuracy for your model.",
+                "compact checkpoint is materialized after each accepted "
+                "verify window; validate long-sequence accuracy and throughput.",
                 cfg.mamba_ssm_dtype,
             )
 

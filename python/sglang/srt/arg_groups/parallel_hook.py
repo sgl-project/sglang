@@ -31,35 +31,35 @@ def handle_context_parallelism(server_args: Any):
 
     cfg = resolving_view(server_args)
     if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
-        from sglang.srt.configs.model_config import is_deepseek_dsa
-        from sglang.srt.layers.cp.utils import CP_V2_DEFAULT_MODEL_CLASSES
-
         model_config = model_config_of(server_args)
         hf_config = model_config.hf_config
         model_arch = hf_config.architectures[0]
-        if model_arch in CP_V2_DEFAULT_MODEL_CLASSES:
-            is_dsa_default_model = is_deepseek_dsa(hf_config)
-            # DSA CP-v2 currently supports only the interleave strategy.
-            enable_default_cp_v2 = not is_dsa_default_model or (
-                cfg.enable_prefill_cp and cfg.cp_strategy == "interleave"
-            )
-            if enable_default_cp_v2 and not envs.SGLANG_ENABLE_CP_V2.is_set():
-                envs.SGLANG_ENABLE_CP_V2.set(True)
-
+        platform = get_platform()
         if (
             cfg.enable_prefill_cp
-            and model_arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
-            and envs.SGLANG_ENABLE_CP_V2.get()
+            and model_arch == "DeepseekV32ForCausalLM"
+            and cfg.cp_strategy == "zigzag"
+            and not (platform.is_hip or platform.is_npu)
+        ):
+            raise ValueError(
+                "DeepSeek V3.2 prefill CP does not support --cp-strategy "
+                "zigzag; use interleave."
+            )
+        if cfg.enable_prefill_cp and model_arch in (
+            "MiMoV2ForCausalLM",
+            "MiMoV2FlashForCausalLM",
         ):
             if cfg.cp_strategy != "zigzag":
-                raise ValueError("MiMo V2 CP-v2 only supports --cp-strategy zigzag.")
+                raise ValueError(
+                    "MiMo V2 prefill CP only supports --cp-strategy zigzag."
+                )
             if (
                 model_config.is_multimodal
                 and not cfg.language_only
                 and not cfg.language_model_only
             ):
                 raise ValueError(
-                    "MiMo V2 CP-v2 only supports text inference; add "
+                    "MiMo V2 prefill CP only supports text inference; add "
                     "--language-only."
                 )
 
@@ -81,40 +81,40 @@ def handle_context_parallelism(server_args: Any):
     view = resolved_view(server_args)
     if view.attn_cp_size > 1:
         # The tp_size is the world size, not the real tensor parallel size
-        assert (
-            cfg.tp_size % view.attn_cp_size == 0
-        ), "tp_size must be divisible by attn_cp_size"
-        assert (
-            cfg.tp_size % (cfg.dp_size * view.attn_cp_size) == 0
-        ), "tp_size must be divisible by dp_size * attn_cp_size"
+        assert cfg.tp_size % view.attn_cp_size == 0, (
+            "tp_size must be divisible by attn_cp_size"
+        )
+        assert cfg.tp_size % (cfg.dp_size * view.attn_cp_size) == 0, (
+            "tp_size must be divisible by dp_size * attn_cp_size"
+        )
 
-        assert (
-            not cfg.enable_aiter_allreduce_fusion
-        ), "Aiter allreduce fusion is not supported with context parallelism"
+        assert not cfg.enable_aiter_allreduce_fusion, (
+            "Aiter allreduce fusion is not supported with context parallelism"
+        )
 
     if cfg.moe_dp_size > 1:
         # The tp_size is the world size, not the real tensor parallel size
-        assert (
-            cfg.tp_size % cfg.moe_dp_size == 0
-        ), "tp_size must be divisible by moe_dp_size"
-        assert (
-            view.ep_size * cfg.moe_dp_size <= cfg.tp_size
-        ), "ep_size * moe_dp_size must be less than or equal to tp_size"
+        assert cfg.tp_size % cfg.moe_dp_size == 0, (
+            "tp_size must be divisible by moe_dp_size"
+        )
+        assert view.ep_size * cfg.moe_dp_size <= cfg.tp_size, (
+            "ep_size * moe_dp_size must be less than or equal to tp_size"
+        )
         assert cfg.pp_size == 1, "PP is not supported with context parallelism"
 
         if view.ep_size > 1:
-            assert (
-                view.ep_size * cfg.moe_dp_size == cfg.tp_size
-            ), "ep_size * moe_dp_size must be equal to tp_size"
+            assert view.ep_size * cfg.moe_dp_size == cfg.tp_size, (
+                "ep_size * moe_dp_size must be equal to tp_size"
+            )
 
-        assert (
-            not cfg.enable_aiter_allreduce_fusion
-        ), "Aiter allreduce fusion is not supported with context parallelism"
+        assert not cfg.enable_aiter_allreduce_fusion, (
+            "Aiter allreduce fusion is not supported with context parallelism"
+        )
 
     if view.attn_cp_size != cfg.moe_dp_size:
-        assert (
-            cfg.moe_dp_size == 1
-        ), "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
+        assert cfg.moe_dp_size == 1, (
+            "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
+        )
 
     from sglang.srt.layers.cp.base import init_cp_strategy
 
@@ -244,26 +244,26 @@ def handle_dwdp(server_args: Any):
     if cfg.dwdp_size <= 1:
         return
 
-    assert (
-        cfg.dwdp_size >= 2
-    ), f"dwdp_size must be >= 2 when enabled, got {cfg.dwdp_size}"
-    assert (
-        cfg.dwdp_size == cfg.tp_size
-    ), f"dwdp_size ({cfg.dwdp_size}) must equal tp_size ({cfg.tp_size})"
+    assert cfg.dwdp_size >= 2, (
+        f"dwdp_size must be >= 2 when enabled, got {cfg.dwdp_size}"
+    )
+    assert cfg.dwdp_size == cfg.tp_size, (
+        f"dwdp_size ({cfg.dwdp_size}) must equal tp_size ({cfg.tp_size})"
+    )
     assert cfg.disaggregation_mode in (
         "null",
         "prefill",
     ), "DWDP requires --disaggregation-mode null or prefill"
-    assert (
-        not cfg.enable_eplb
-    ), "EPLB dynamic migration conflicts with static DWDP partitioning"
-    assert (
-        cfg.speculative_algorithm is None
-    ), "DWDP does not support speculative decoding (MTP/draft workers)"
+    assert not cfg.enable_eplb, (
+        "EPLB dynamic migration conflicts with static DWDP partitioning"
+    )
+    assert cfg.speculative_algorithm is None, (
+        "DWDP does not support speculative decoding (MTP/draft workers)"
+    )
     assert cfg.pp_size == 1, "DWDP requires pp_size == 1"
-    assert (
-        not cfg.enable_two_batch_overlap
-    ), "DWDP's prefetch event protocol does not support two-batch overlap"
+    assert not cfg.enable_two_batch_overlap, (
+        "DWDP's prefetch event protocol does not support two-batch overlap"
+    )
 
     if cfg.disaggregation_mode == "null":
         logger.warning(
@@ -359,7 +359,9 @@ def handle_elastic_ep(server_args: Any):
             assert cfg.eplb_algorithm in [
                 "elasticity_aware",
                 "elasticity_aware_hierarchical",
-            ], "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware(_hierarchical)'."
+            ], (
+                "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware(_hierarchical)'."
+            )
 
         assert cfg.pp_size == 1, "PP size should be set to 1 under elastic EP"
 
@@ -370,9 +372,9 @@ def handle_elastic_ep(server_args: Any):
                 mooncake_ib_device=validate_ib_devices(cfg.mooncake_ib_device),
             )
     if cfg.ep_join_mode is not None:
-        assert (
-            cfg.elastic_ep_backend is not None
-        ), "--elastic-ep-join-mode requires --elastic-ep-backend to be set."
+        assert cfg.elastic_ep_backend is not None, (
+            "--elastic-ep-join-mode requires --elastic-ep-backend to be set."
+        )
         if cfg.ep_join_mode == "scale":
             assert cfg.node_rank == 1, (
                 "Elastic EP scale-up requires one joining TP group at "
@@ -390,9 +392,9 @@ def handle_elastic_ep(server_args: Any):
         )
         assert cfg.ep_join_rank_offset >= 0, "elastic EP join rank offset must be >= 0."
     if cfg.max_ep_size is not None:
-        assert (
-            cfg.elastic_ep_backend is not None
-        ), "--max-ep-size requires --elastic-ep-backend to be set."
+        assert cfg.elastic_ep_backend is not None, (
+            "--max-ep-size requires --elastic-ep-backend to be set."
+        )
         assert cfg.max_ep_size > 0, "--max-ep-size must be a positive integer."
 
     scaling_active = (
@@ -407,16 +409,15 @@ def handle_elastic_ep(server_args: Any):
         )
     if scaling_active:
         resolved = resolved_view(server_args)
-        assert (
-            cfg.elastic_ep_scale_timeout > 0
-        ), "--elastic-ep-scale-timeout must be greater than zero."
-        assert cfg.tokenizer_worker_num == 1, (
-            "Elastic EP runtime scale-up currently requires "
-            "--tokenizer-worker-num 1."
+        assert cfg.elastic_ep_scale_timeout > 0, (
+            "--elastic-ep-scale-timeout must be greater than zero."
         )
-        assert (
-            not cfg.use_ray
-        ), "Elastic EP runtime scale-up does not support --use-ray."
+        assert cfg.tokenizer_worker_num == 1, (
+            "Elastic EP runtime scale-up currently requires --tokenizer-worker-num 1."
+        )
+        assert not cfg.use_ray, (
+            "Elastic EP runtime scale-up does not support --use-ray."
+        )
         assert not cfg.enable_elastic_expert_backup, (
             "Elastic EP runtime scale-up does not support "
             "--enable-elastic-expert-backup."
@@ -559,36 +560,51 @@ def handle_eplb_and_dispatch(server_args: Any):
         assert resolved_view(server_args).ep_size > 1
 
 
-def handle_legacy_cp_arguments(server_args: Any):
+def handle_platform_cp_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
+    platform = get_platform()
+    is_protected_platform = platform.is_hip or platform.is_npu
+    if not is_protected_platform:
+        if (
+            cfg.enable_prefill_context_parallel
+            or cfg.enable_dsa_prefill_context_parallel
+        ):
+            raise ValueError(
+                "Legacy prefill context-parallel options are supported only "
+                "by protected HIP or Ascend NPU paths. Use "
+                "--enable-prefill-cp with --cp-strategy."
+            )
+        return
+
     legacy_mode_to_strategy = {
         "in-seq-split": "zigzag",
         "round-robin-split": "interleave",
-    }
-    strategy_to_legacy_mode = {
-        "zigzag": "in-seq-split",
-        "interleave": "round-robin-split",
     }
 
     if cfg.enable_prefill_context_parallel or cfg.enable_dsa_prefill_context_parallel:
         declare_resolution(
             server_args,
-            "_handle_legacy_cp_arguments",
+            "_handle_platform_cp_compatibility",
             enable_prefill_cp=True,
         )
 
     if cfg.enable_prefill_context_parallel and cfg.cp_strategy is None:
         declare_resolution(
             server_args,
-            "_handle_legacy_cp_arguments",
+            "_handle_platform_cp_compatibility",
             cp_strategy=legacy_mode_to_strategy[cfg.prefill_cp_mode],
         )
     if cfg.enable_dsa_prefill_context_parallel and cfg.cp_strategy is None:
         declare_resolution(
             server_args,
-            "_handle_legacy_cp_arguments",
+            "_handle_platform_cp_compatibility",
             cp_strategy=legacy_mode_to_strategy[cfg.dsa_prefill_cp_mode],
         )
+
+
+def handle_legacy_cp_runtime_compatibility(server_args: Any):
+    """Project canonical CP settings for runtime consumers removed by PR3."""
+    cfg = resolving_view(server_args)
 
     if cfg.enable_prefill_context_parallel and cfg.enable_dsa_prefill_context_parallel:
         return
@@ -596,6 +612,10 @@ def handle_legacy_cp_arguments(server_args: Any):
     if not cfg.enable_prefill_cp or cfg.cp_strategy is None:
         return
 
+    strategy_to_legacy_mode = {
+        "zigzag": "in-seq-split",
+        "interleave": "round-robin-split",
+    }
     mode = strategy_to_legacy_mode[cfg.cp_strategy]
     use_dsa_legacy_aliases = cfg.enable_dsa_prefill_context_parallel or getattr(
         resolved_view(server_args), "attention_backend", None
@@ -603,28 +623,28 @@ def handle_legacy_cp_arguments(server_args: Any):
     if use_dsa_legacy_aliases:
         declare_resolution(
             server_args,
-            "_handle_legacy_cp_arguments",
+            "_handle_legacy_cp_runtime_compatibility",
             enable_dsa_prefill_context_parallel=True,
         )
         declare_resolution(
             server_args,
-            "_handle_legacy_cp_arguments",
+            "_handle_legacy_cp_runtime_compatibility",
             enable_prefill_context_parallel=False,
         )
     else:
         declare_resolution(
             server_args,
-            "_handle_legacy_cp_arguments",
+            "_handle_legacy_cp_runtime_compatibility",
             enable_prefill_context_parallel=True,
         )
     declare_resolution(
         server_args,
-        "_handle_legacy_cp_arguments",
+        "_handle_legacy_cp_runtime_compatibility",
         dsa_prefill_cp_mode=mode,
     )
     declare_resolution(
         server_args,
-        "_handle_legacy_cp_arguments",
+        "_handle_legacy_cp_runtime_compatibility",
         prefill_cp_mode=mode,
     )
 

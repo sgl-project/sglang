@@ -60,6 +60,24 @@ def _warmup_zmq(writers, reader, attempts=20, interval=0.05):
     raise RuntimeError(f"warmup failed: expected {expected}, received {received}")
 
 
+def _read_until(read_fn, predicate, attempts=100, interval=0.05):
+    """Poll ``read_fn`` until ``predicate`` holds on its result, or give up.
+
+    zmq delivery is asynchronous: once ``write()`` returns, the background IO
+    thread may not have handed the message to the reader yet, so a fixed sleep
+    races with delivery and flakes under load. Polling keeps the reads
+    deterministic without weakening the assertions -- a backend that never
+    surfaces the expected snapshot still fails, only after the full timeout.
+    """
+    result = read_fn()
+    for _ in range(attempts):
+        if predicate(result):
+            return result
+        time.sleep(interval)
+        result = read_fn()
+    raise AssertionError(f"predicate never held; last result: {result!r}")
+
+
 class TestShmRoundTrip(CustomTestCase):
     def test_single_rank_write_read(self):
         path = _temp_path()
@@ -140,9 +158,11 @@ class TestZmqRoundTrip(CustomTestCase):
             _warmup_zmq([writer], reader)
 
             writer.write(LoadSnapshot(dp_rank=0, num_running_reqs=7, timestamp=2.0))
-            time.sleep(0.05)
 
-            load = reader.read(0)
+            load = _read_until(
+                lambda: reader.read(0),
+                lambda snap: snap is not None and snap.timestamp == 2.0,
+            )
             self.assertIsNotNone(load)
             self.assertEqual(load.num_running_reqs, 7)
             self.assertEqual(load.timestamp, 2.0)
@@ -169,9 +189,14 @@ class TestZmqRoundTrip(CustomTestCase):
                 w.write(
                     LoadSnapshot(dp_rank=rank, num_running_reqs=rank + 1, timestamp=3.0)
                 )
-            time.sleep(0.05)
 
-            loads = reader.read_all()
+            loads = _read_until(
+                lambda: reader.read_all(),
+                lambda snaps: (
+                    len(snaps) == dp_size
+                    and all(snap.timestamp == 3.0 for snap in snaps)
+                ),
+            )
             self.assertEqual(len(loads), dp_size)
             for load in loads:
                 self.assertEqual(load.num_running_reqs, load.dp_rank + 1)
@@ -194,9 +219,11 @@ class TestZmqRoundTrip(CustomTestCase):
                 writer.write(
                     LoadSnapshot(dp_rank=0, num_running_reqs=i, timestamp=float(i))
                 )
-            time.sleep(0.05)
 
-            load = reader.read(0)
+            load = _read_until(
+                lambda: reader.read(0),
+                lambda snap: snap is not None and snap.num_running_reqs == 9,
+            )
             self.assertIsNotNone(load)
             self.assertEqual(load.num_running_reqs, 9)
             self.assertEqual(load.timestamp, 9.0)
@@ -348,8 +375,9 @@ class TestZmqReaderOwner(CustomTestCase):
         override = get_context().override_server_args(**fields)
         override.install()
         self.addCleanup(override.restore)
-        with mock.patch.object(rc, "_ROLE_NS_MODE", "enforce"), mock.patch.object(
-            rc._CONTEXT, "_publish_role", "dp_controller"
+        with (
+            mock.patch.object(rc, "_ROLE_NS_MODE", "enforce"),
+            mock.patch.object(rc._CONTEXT, "_publish_role", "dp_controller"),
         ):
             self.assertTrue(zmq_reader_owner("DataParallelController"))
 
@@ -414,9 +442,14 @@ class TestEndToEndZmqSimulation(CustomTestCase):
                         num_total_tokens=100 + rank * 50,
                     )
                 )
-            time.sleep(0.05)
 
-            loads = reader.read_all()
+            loads = _read_until(
+                lambda: reader.read_all(),
+                lambda snaps: (
+                    len(snaps) == dp_size
+                    and all(snap.timestamp == 1.0 for snap in snaps)
+                ),
+            )
             self.assertEqual(len(loads), dp_size)
             self.assertEqual(loads[0].num_running_reqs, 10)
             self.assertEqual(loads[1].num_running_reqs, 11)
@@ -433,9 +466,14 @@ class TestEndToEndZmqSimulation(CustomTestCase):
                         num_total_tokens=200 + rank * 50,
                     )
                 )
-            time.sleep(0.05)
 
-            loads = reader.read_all()
+            loads = _read_until(
+                lambda: reader.read_all(),
+                lambda snaps: (
+                    len(snaps) == dp_size
+                    and all(snap.timestamp == 2.0 for snap in snaps)
+                ),
+            )
             self.assertEqual(loads[0].num_running_reqs, 20)
             self.assertEqual(loads[1].num_running_reqs, 21)
             self.assertEqual(loads[0].num_total_tokens, 200)
