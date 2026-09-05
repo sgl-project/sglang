@@ -276,6 +276,31 @@ class TestPrepareServerArgs(CustomTestCase):
         finally:
             os.unlink(config_file)
 
+    def test_config_accepts_canonical_option_shadowed_by_deprecated_alias(self):
+        # Regression for #36326: a DeprecatedAliasStoreAction sharing `dest`
+        # with a canonical `_StoreAction` must not cause --config to reject
+        # the canonical key.
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write("mamba-radix-cache-strategy: no_buffer\n")
+            config_file = f.name
+
+        try:
+            parser = server_args_module.argparse.ArgumentParser()
+            ServerArgs.add_cli_args(parser)
+            merged = ConfigArgumentMerger(parser).merge_config_with_args(
+                [
+                    "--config",
+                    config_file,
+                    "--model-path",
+                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                ]
+            )
+            parsed = parser.parse_args(merged)
+
+            self.assertEqual(parsed.mamba_radix_cache_strategy, "no_buffer")
+        finally:
+            os.unlink(config_file)
+
 
 class TestMmEncoderDataParallelLogging(CustomTestCase):
     def test_logs_when_encoder_dp_has_no_parallelism(self):
