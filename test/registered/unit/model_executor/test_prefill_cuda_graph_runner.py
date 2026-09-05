@@ -23,7 +23,7 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -168,29 +168,63 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
         self.assertIs(capture.runner, prefill_runner)
 
-    def test_eagle_target_tc_piecewise_skips_last_mode_capture(self):
+    def test_eagle_target_tc_piecewise_still_captures_prefill_graph(self):
+        """The EAGLE target now captures FULL on tc_piecewise too, so a
+        sub-FULL server ceiling leaves no dead graph behind and the capture must
+        not fall back to eager."""
         eager_runner = object()
-        # The server-side hidden-state ceiling and graph config are bag leaves.
+        prefill_runner = object()
+        # Bag leaves; the hidden-state ceiling is held below FULL on purpose.
         override = get_context().override_server_args(
+            enable_lora=False,
             enable_return_hidden_states=True,
             return_hidden_states_mode="last",
             cuda_graph_config=SimpleNamespace(
-                prefill=SimpleNamespace(backend=Backend.TC_PIECEWISE)
+                prefill=SimpleNamespace(bs=[1], backend=Backend.TC_PIECEWISE)
             ),
         )
         override.install()
         self.addCleanup(override.restore)
         model_runner = SimpleNamespace(
+            device="cuda",
+            gpu_id=0,
             is_draft_worker=False,
+            lora_manager=None,
             spec_algorithm=SimpleNamespace(is_eagle=lambda: True),
+            server_args=SimpleNamespace(),
+            model=SimpleNamespace(),
+            model_config=SimpleNamespace(context_len=8192, num_hidden_layers=1),
+            req_to_token_pool=SimpleNamespace(size=1),
         )
+        language_model = SimpleNamespace(layers=[object()])
 
-        capture = capture_prefill_graph(
-            model_runner=model_runner,
-            eager_runner=eager_runner,
-        )
+        with (
+            patch.object(graph_setup, "check_cuda_graph_backend", return_value=False),
+            patch.object(
+                graph_setup, "resolve_language_model", return_value=language_model
+            ),
+            patch.object(
+                graph_setup,
+                "compute_attention_and_moe_layers",
+                return_value=([object()], [], [], [], []),
+            ),
+            patch.object(
+                graph_setup,
+                "get_available_gpu_memory",
+                side_effect=[10.0, 9.5],
+            ),
+            patch.object(
+                graph_setup,
+                "PrefillCudaGraphRunner",
+                return_value=prefill_runner,
+            ),
+        ):
+            capture = capture_prefill_graph(
+                model_runner=model_runner,
+                eager_runner=eager_runner,
+            )
 
-        self.assertIs(capture.runner, eager_runner)
+        self.assertIs(capture.runner, prefill_runner)
 
     def test_pp_proxy_output_is_trimmed_to_raw_prefill_tokens(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
@@ -490,6 +524,81 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         )
         forward_batch.extend_prefix_lens_cpu = [9, 1]
         self.assertFalse(runner.can_run_graph(forward_batch))
+
+
+class _StopInit(Exception):
+    """Ends __init__ right after the capture-mode block, before buffers."""
+
+
+class TestPrefillCudaGraphRunnerCaptureHiddenMode(CustomTestCase):
+    """The hidden-state capture mode PrefillCudaGraphRunner.__init__ pins.
+
+    EAGLE prefill requests FULL on the target and LAST on the draft; a graph
+    captured below the requested mode is rejected by can_run_graph on every
+    replay, so the mode must not depend on the prefill backend.
+    """
+
+    @staticmethod
+    def _eagle_capture_hidden_mode(*, is_draft_worker):
+        model_runner = SimpleNamespace(
+            device="cpu",
+            gpu_id=0,
+            is_draft_worker=is_draft_worker,
+            is_generation=True,
+            lora_manager=None,
+            spec_algorithm=SimpleNamespace(
+                is_eagle=lambda: True,
+                is_dflash_family=lambda: False,
+            ),
+            server_args=SimpleNamespace(tp_size=1, enable_pdmux=False),
+            model=SimpleNamespace(),
+            model_config=SimpleNamespace(is_multimodal=False),
+            req_to_token_pool=SimpleNamespace(size=8),
+        )
+
+        captured = {}
+
+        def stop(self):
+            captured["runner"] = self
+            raise _StopInit
+
+        with (
+            get_parallel().override(attn_tp_size=1, attn_tp_rank=0),
+            patch.object(PrefillCudaGraphRunner, "_is_mamba_track_enabled", stop),
+        ):
+            try:
+                PrefillCudaGraphRunner(model_runner)
+            except _StopInit:
+                pass
+
+        return captured["runner"].capture_hidden_mode
+
+    def _install_config(self, backend):
+        override = get_context().override_server_args(
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(bs=[4], backend=backend)
+            ),
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+    def test_eagle_target_captures_full_on_every_backend(self):
+        for backend in (Backend.TC_PIECEWISE, Backend.BREAKABLE, Backend.FULL):
+            with self.subTest(backend=backend):
+                self._install_config(backend)
+                self.assertEqual(
+                    self._eagle_capture_hidden_mode(is_draft_worker=False),
+                    CaptureHiddenMode.FULL,
+                )
+
+    def test_eagle_draft_worker_captures_last_on_every_backend(self):
+        for backend in (Backend.TC_PIECEWISE, Backend.BREAKABLE):
+            with self.subTest(backend=backend):
+                self._install_config(backend)
+                self.assertEqual(
+                    self._eagle_capture_hidden_mode(is_draft_worker=True),
+                    CaptureHiddenMode.LAST,
+                )
 
 
 if __name__ == "__main__":

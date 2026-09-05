@@ -149,12 +149,10 @@ class TestInklingSmallNvfp4DsparkDeterministic(CustomTestCase):
     prefix restored from the radix cache that does not reproduce a fresh
     prefill -- rather than the float noise a loose threshold would hide.
 
-    DSPARK drives the decode loop because the spec-side mamba/sconv save is
-    otherwise unreachable: that gate lives in PrefillCudaGraphRunner, and EAGLE
-    targets disable the prefill graph outright (#28386), so the MTP class in
-    test_unified_radix_cache_kl_hybrid_bitexact.py never reaches it. Reverting
-    #34043 reads 1.10e-01 on prefill_cache_hit here and exactly 0 without
-    speculation.
+    DSPARK drives the decode loop because the spec-side mamba/sconv save gate
+    lives in PrefillCudaGraphRunner, and this is the configuration that
+    exercises it here. Reverting #34043 reads 1.10e-01 on prefill_cache_hit
+    here and exactly 0 without speculation.
 
     Runs its own server: the accuracy case above has to stay on the production
     numerics, so it cannot share this one.
