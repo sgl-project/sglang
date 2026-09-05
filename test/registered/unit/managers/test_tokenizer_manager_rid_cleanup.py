@@ -129,6 +129,7 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     tm.server_args.dp_size = 1
     tm.disaggregation_mode = "none"
     tm.rid_to_state = {}
+    tm.encoder_dispatch_ready = {}
     tm.enable_metrics = False
     tm.enable_trace = False
     tm.enable_lora = False
