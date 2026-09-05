@@ -128,6 +128,10 @@ emit("DIST_SOCK", rt.get("dist_socket_ifname", ""))
 # hardcoded value) so EP<=8 recipes stay byte-identical; wide-EP spur recipes
 # set mooncake, which is the validated cross-node KV path there.
 emit("XFER", rt.get("kv_transfer_backend", "mori"))
+# --disable-radix-cache is added by default. A HiCache recipe MUST set
+# disable_radix_cache: false, else server_args _handle_cache_compatibility
+# raises on enable-hierarchical-cache + disable-radix-cache.
+emit("NORADIX", 1 if rt.get("disable_radix_cache", True) else 0)
 # SGLANG_USE_ROCM700A toggles the ROCm-7.0.0-alpha codepath. Default 1 (the
 # pre-wide hardcoded value) keeps EP<=8 recipes byte-identical; the validated
 # wide-EP run on the rocm720 0715 image needs 0, set via runtime.rocm700a.
@@ -428,6 +432,10 @@ PREFILL_TAIL="$PREFILL_DPEP$EXTRA_COMMON$(sp "$WECOMMON")$(sp "$PEXTRA")"
 DECODE_TAIL="$DECODE_DPEP$EXTRA_COMMON$(sp "$WECOMMON")$(sp "$DEXTRA")"
 echo "prefill tail:${PREFILL_TAIL:-<none>} | decode tail:${DECODE_TAIL:-<none>} (pep=$PEP pdp=$PDP dep=$DEP ddp=$DDP mtp=$MTP_ENABLED)"
 
+# --disable-radix-cache is applied unless a recipe sets disable_radix_cache: false
+# (required for HiCache). Defined before the role-flag if/else so both branches see it.
+RADIX_FLAG=""
+[[ "$NORADIX" == "1" ]] && RADIX_FLAG=" --disable-radix-cache"
 if [[ "$HAS_MODEL" == "1" ]]; then
     # Generic path (e.g. Kimi): attention + swa from the recipe, model parsers /
     # quirks ride MODEL_SERVER_ARGS. Single `--attention-backend` when the recipe
@@ -439,12 +447,12 @@ if [[ "$HAS_MODEL" == "1" ]]; then
     [[ -n "$DATTN" ]] && ATTN_FLAGS="$ATTN_FLAGS --decode-attention-backend $DATTN"
     SWA_FLAG=""
     [[ -n "$SWA" ]] && SWA_FLAG=" --swa-full-tokens-ratio $SWA"
-    PREFILL_COMMON_FLAGS="--trust-remote-code --tp $PTP --disable-radix-cache \
+    PREFILL_COMMON_FLAGS="--trust-remote-code --tp $PTP$RADIX_FLAG \
 $ATTN_FLAGS --max-running-requests $PMAXREQ --page-size $PAGE \
 --mem-fraction-static $PMEMFRAC$SWA_FLAG \
 --chunked-prefill-size $PCHUNK \
 --disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB$KV_FLAG$PREFILL_TAIL"
-    DECODE_COMMON_FLAGS="--trust-remote-code --tp $DTP --disable-radix-cache \
+    DECODE_COMMON_FLAGS="--trust-remote-code --tp $DTP$RADIX_FLAG \
 $ATTN_FLAGS --max-running-requests $DMAXREQ --page-size $PAGE \
 --mem-fraction-static $DMEMFRAC$SWA_FLAG \
 --chunked-prefill-size $CHUNK \
@@ -452,13 +460,13 @@ $ATTN_FLAGS --max-running-requests $DMAXREQ --page-size $PAGE \
 else
     # DSV4 path: for EP<=8 recipes (PTP==DTP, no wide_ep) both role strings equal
     # the pre-Kimi launcher's COMMON_FLAGS exactly.
-    PREFILL_COMMON_FLAGS="--trust-remote-code --tp $PTP --disable-radix-cache \
+    PREFILL_COMMON_FLAGS="--trust-remote-code --tp $PTP$RADIX_FLAG \
 --attention-backend $ATTN --max-running-requests $PMAXREQ --page-size $PAGE \
 --mem-fraction-static $PMEMFRAC --swa-full-tokens-ratio $SWA \
 --chunked-prefill-size $PCHUNK --disable-shared-experts-fusion \
 --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4 \
 --disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB$KV_FLAG$PREFILL_TAIL"
-    DECODE_COMMON_FLAGS="--trust-remote-code --tp $DTP --disable-radix-cache \
+    DECODE_COMMON_FLAGS="--trust-remote-code --tp $DTP$RADIX_FLAG \
 --attention-backend $ATTN --max-running-requests $DMAXREQ --page-size $PAGE \
 --mem-fraction-static $DMEMFRAC --swa-full-tokens-ratio $SWA \
 --chunked-prefill-size $CHUNK --disable-shared-experts-fusion \
@@ -682,7 +690,7 @@ docker run $DOCKER_COMMON --name mi355x_prefill \
   -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   -e NODE_RANK="\$NODE_RANK" -e NNODES="\$NNODES" -e DIST_ADDR="\$DIST_ADDR" -e DIST_PORT=${DIST_PORT} \
   "\${IONIC_MOUNTS[@]}" \
-  $MORI_ENV$PENV_ARG $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
+  $MORI_ENV $DSV4_ENV_STR$PENV_ARG "\${MODEL_ENV_ARGS[@]}" \
   $IMAGE bash /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/prefill_entry.sh
 EOF
 
@@ -696,7 +704,7 @@ docker run $DOCKER_COMMON --name mi355x_decode \
   -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   -e NODE_RANK="\$NODE_RANK" -e NNODES="\$NNODES" -e DIST_ADDR="\$DIST_ADDR" -e DIST_PORT=${DIST_PORT} \
   "\${IONIC_MOUNTS[@]}" \
-  $MORI_ENV$DENV_ARG $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
+  $MORI_ENV $DSV4_ENV_STR$DENV_ARG "\${MODEL_ENV_ARGS[@]}" \
   $IMAGE bash /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/decode_entry.sh
 EOF
 
@@ -739,7 +747,7 @@ source "$WORKDIR/model_flags.sh"
 source "$WORKDIR/ionic_mounts.sh"
 docker rm -f mi355x_prefill 2>/dev/null || true
 docker run $DOCKER_COMMON "\${IONIC_MOUNTS[@]}" --name mi355x_prefill \
-  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV$PENV_ARG $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
+  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR$PENV_ARG "\${MODEL_ENV_ARGS[@]}" \
   $IMAGE bash /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/prefill_entry.sh
 EOF
 
@@ -749,7 +757,7 @@ source "$WORKDIR/model_flags.sh"
 source "$WORKDIR/ionic_mounts.sh"
 docker rm -f mi355x_decode 2>/dev/null || true
 docker run $DOCKER_COMMON "\${IONIC_MOUNTS[@]}" --name mi355x_decode \
-  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV$DENV_ARG $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
+  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR$DENV_ARG "\${MODEL_ENV_ARGS[@]}" \
   $IMAGE bash /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/decode_entry.sh
 EOF
 fi
