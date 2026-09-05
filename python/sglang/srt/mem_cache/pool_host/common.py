@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from collections import defaultdict
 
 import torch
@@ -10,8 +11,11 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 from sglang.srt.runtime_context import get_memory
+from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
+
+_is_hip = is_hip()
 
 _CUDA_HOST_REGISTERED_RANGES_ATTR = "_sglang_cuda_host_registered_ranges"
 
@@ -103,14 +107,19 @@ def get_allocator_from_storage(allocator_type):
         return HostTensorAllocator()
 
 
-def get_allocator_type() -> str:
-    """The host-allocator kind the published HiCache configuration asks for."""
+# The values get_allocator_from_storage() maps to something other than
+# HostTensorAllocator.
+_OWNED_MEMORY_ALLOCATOR_TYPES = ("shm", "mooncake", "mori")
 
-    backend = get_memory().hicache_storage_backend
+
+def allocator_type_of(cfg) -> str:
+    """The host-allocator kind a config-shaped object asks for."""
+
+    backend = cfg.hicache_storage_backend
     if backend == "shm":
         return "shm"
     if backend == "dynamic":
-        extra_config_str = get_memory().hicache_storage_backend_extra_config
+        extra_config_str = cfg.hicache_storage_backend_extra_config
         if extra_config_str:
             try:
                 config = json.loads(extra_config_str)
@@ -119,6 +128,30 @@ def get_allocator_type() -> str:
             except Exception:
                 pass
     return backend or "default"
+
+
+def get_allocator_type() -> str:
+    """The host-allocator kind the published HiCache configuration asks for."""
+
+    return allocator_type_of(get_memory())
+
+
+def host_allocator_owns_memory(cfg) -> bool:
+    """Whether ``cfg`` selects an allocator that owns its host memory.
+
+    The config-shaped form of the ``type(allocator) is HostTensorAllocator``
+    test in alloc_with_host_register(), for callers that must decide before any
+    pool exists. Over-reports if mooncake or mori is selected but its allocator
+    is unavailable, which is the safe direction.
+    """
+    return allocator_type_of(cfg) in _OWNED_MEMORY_ALLOCATOR_TYPES
+
+
+# Only these may be unregistered. A buffer that came from hipHostMalloc was
+# never registered, and unregistering one reports success while corrupting the
+# runtime's memory-object map.
+_registered_host_ptrs: set[int] = set()
+_registered_host_ptrs_lock = threading.Lock()
 
 
 def _cuda_host_register(
@@ -171,12 +204,18 @@ def _cuda_host_register(
         # cudaHostUnregister to receive each base pointer, not just the tensor's
         # original base once after several independent registrations.
         setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, registered_ranges)
+        if _is_hip:
+            with _registered_host_ptrs_lock:
+                _registered_host_ptrs.add(base)
     except Exception:
         remaining_ranges = _cuda_host_unregister_ranges(
             cudart, registered_ranges, operation="registration rollback"
         )
         if remaining_ranges:
             setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, remaining_ranges)
+            if _is_hip:
+                with _registered_host_ptrs_lock:
+                    _registered_host_ptrs.add(base)
         raise
 
 
@@ -188,7 +227,7 @@ def _cuda_host_unregister_ranges(
         rc = int(cudart.cudaHostUnregister(ptr))
         if rc != 0:
             failed_ranges.append((ptr, size))
-            logger.warning(
+            logger.error(
                 "cudaHostUnregister failed during %s (rc=%d, %s) for ptr=%#x size=%d",
                 operation,
                 rc,
@@ -201,6 +240,13 @@ def _cuda_host_unregister_ranges(
 
 
 def _cuda_host_unregister(buffer: torch.Tensor) -> None:
+    if _is_hip:
+        with _registered_host_ptrs_lock:
+            was_registered = buffer.data_ptr() in _registered_host_ptrs
+            _registered_host_ptrs.discard(buffer.data_ptr())
+        if not was_registered:
+            return
+
     cudart = torch.cuda.cudart()
     registered_ranges = getattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, None)
     if registered_ranges is None:
@@ -228,10 +274,28 @@ def alloc_with_host_register(
     """
     Allocate tensor and register host memory with cudaHostRegister.
     CudaHostRegister only applies when pin_memory=True.
+
+    ROCm gets pin_memory instead wherever the buffer is ours to place: the
+    transfer kernels dereference a table of host pointers on the GPU, and
+    hipHostRegister maps a region at a device address that differs from its host
+    virtual address, while hipHostMalloc (what pin_memory uses) returns one
+    address valid on both sides. A storage backend owns its memory and must
+    still register, ShmHostTensorAllocator included -- hence the exact type test
+    rather than isinstance().
     """
+    if pin_memory and _is_hip and type(allocator) is HostTensorAllocator:
+        return torch.empty(dims, dtype=dtype, device=device, pin_memory=True)
+
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
         _cuda_host_register(buffer, registration_granularity_bytes)
+        if _is_hip:
+            logger.warning(
+                "%s owns its host memory, which ROCm cannot address from the GPU "
+                "at its host virtual address, so the kernel io backend cannot "
+                "read or write these buffers.",
+                type(allocator).__name__,
+            )
     return buffer
 
 
