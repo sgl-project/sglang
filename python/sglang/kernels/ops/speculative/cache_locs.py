@@ -429,6 +429,36 @@ def assign_extend_cache_locs_uniform_func(
     )
 
 
+def _assign_extend_cache_locs_torch(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    start_offset: torch.Tensor,
+    end_offset: torch.Tensor,
+    batch_size: int,
+    draft_token_num: int,
+    device,
+) -> torch.Tensor:
+    lengths = end_offset[:batch_size] - start_offset[:batch_size]
+    output_size = batch_size * draft_token_num
+    batch_indices = torch.repeat_interleave(
+        torch.arange(batch_size, dtype=torch.int64, device=device),
+        lengths,
+        output_size=output_size,
+    )
+    segment_offsets = torch.repeat_interleave(
+        torch.cumsum(lengths, dim=0) - lengths,
+        lengths,
+        output_size=output_size,
+    )
+    token_offsets = (
+        start_offset[:batch_size][batch_indices]
+        + torch.arange(output_size, dtype=torch.int64, device=device)
+        - segment_offsets
+    )
+    request_indices = req_pool_indices[:batch_size][batch_indices]
+    return req_to_token[request_indices.long(), token_offsets.long()].to(torch.int64)
+
+
 def assign_extend_cache_locs_func(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -488,3 +518,13 @@ def assign_extend_cache_locs_func(
         )
 
         return out_cache_loc
+
+    return _assign_extend_cache_locs_torch(
+        req_pool_indices=req_pool_indices,
+        req_to_token=req_to_token,
+        start_offset=start_offset,
+        end_offset=end_offset,
+        batch_size=batch_size,
+        draft_token_num=draft_token_num,
+        device=device,
+    )
