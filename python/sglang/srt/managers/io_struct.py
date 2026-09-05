@@ -216,6 +216,8 @@ class GenerateReqInput:
     top_logprobs_num: Optional[Union[List[int], int]] = None
     # If return logprobs, the token ids to return logprob for.
     token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None
+    # One ID list per input token position, for single scoring-only requests.
+    token_ids_logprob_positions: Optional[List[List[int]]] = None
     # Whether to return output-token sampling support and renormalized logprobs.
     return_sampling_mask: Optional[Union[List[bool], bool]] = None
     # Whether to detokenize tokens in text in the returned logprobs.
@@ -509,6 +511,10 @@ class GenerateReqInput:
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
+        if self.token_ids_logprob_positions is not None:
+            raise ValueError(
+                "Per-position scoring accepts one input sequence per HTTP request"
+            )
         # Calculate expanded batch size
         if self.parallel_sample_num == 1:
             num = self.batch_size

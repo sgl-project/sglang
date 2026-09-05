@@ -50,6 +50,7 @@ from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.logprob_types import PerPositionTokenIds
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
@@ -1346,6 +1347,45 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     def _validate_token_ids_logprob(self, obj: GenerateReqInput) -> None:
+        if obj.token_ids_logprob_positions is not None:
+            positions = obj.token_ids_logprob_positions
+            if obj.token_ids_logprob is not None and not isinstance(
+                obj.token_ids_logprob, PerPositionTokenIds
+            ):
+                raise ValueError(
+                    "Flat and per-position requested token IDs are mutually exclusive"
+                )
+            if obj.input_ids is None or len(positions) != len(obj.input_ids):
+                raise ValueError(
+                    "Per-position requested IDs must match input_ids length"
+                )
+            if (
+                not obj.return_logprob
+                or obj.sampling_params.get("max_new_tokens") != 0
+                or obj.logprob_start_len < 0
+                or obj.stream
+            ):
+                raise ValueError(
+                    "Per-position scoring requires return_logprob, max_new_tokens=0, nonnegative logprob_start_len, and no streaming"
+                )
+            if obj.multi_item_delimiter_indices is not None:
+                raise ValueError(
+                    "Per-position requested IDs do not support multi-item scoring; "
+                    "omit multi_item_delimiter_indices"
+                )
+            for row in positions:
+                if not isinstance(row, list) or any(
+                    type(i) is not int or not 0 <= i < self.model_config.vocab_size
+                    for i in row
+                ):
+                    raise ValueError(
+                        "Per-position IDs must be lists of in-vocabulary integers"
+                    )
+                if len(row) != len(set(row)):
+                    raise ValueError("Per-position IDs must be unique within each row")
+            obj.token_ids_logprob = PerPositionTokenIds(positions)
+            return
+
         # Batch requests are split into per-request sub-objects before this
         # runs (normalize_batch_and_arguments + __getitem__), so the only
         # legal shape here is the per-request contract of
