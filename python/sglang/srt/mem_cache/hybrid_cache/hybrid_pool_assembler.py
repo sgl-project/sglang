@@ -35,7 +35,6 @@ from sglang.srt.runtime_context import (
 
 if TYPE_CHECKING:
     import torch
-
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -769,6 +768,59 @@ def build_deepseek_v4_hicache_stack(
     return host_pool_group, cache_controller
 
 
+def _hybrid_dsa_index_buffers(kv_pool, draft_pools=()):
+    """Keep index buffers layer-aligned, including empty shared-topk layers."""
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+    if not isinstance(kv_pool, DSATokenToKVPool):
+        return []
+    return [
+        buffer
+        for pool in (kv_pool, *draft_pools)
+        for buffer in pool.index_k_with_scale_buffer
+    ]
+
+
+def _build_hybrid_dsa_index_entry(
+    *, kv_pool, kv_host_pool, layer_mapping, transfer_layer_num, draft_pools=()
+):
+    buffers = _hybrid_dsa_index_buffers(kv_pool, draft_pools)
+    live_layers = [i for i, buffer in enumerate(buffers) if buffer.numel()]
+    if not live_layers:
+        return None
+    compact_layers = {layer: i for i, layer in enumerate(live_layers)}
+    live_buffers = [buffers[i] for i in live_layers]
+    item_bytes = live_buffers[0].shape[1] * live_buffers[0].element_size()
+    if any(b.shape[1] * b.element_size() != item_bytes for b in live_buffers):
+        raise ValueError("Hybrid DSA index buffers must have the same page row width.")
+    # The paged pool transfers explicit byte rows, so shared-topk layers with
+    # zero-row placeholders can be omitted without dereferencing a null pointer.
+    # KV-derived physical page indices remain valid for compressed index rows
+    # when the radix tree only shares complete compression groups.
+    host_pool = DeepSeekV4PagedHostPool(
+        pool_name=str(PoolName.INDEXER),
+        device_buffers=live_buffers,
+        item_bytes=item_bytes,
+        num_host_pages=kv_host_pool.page_num,
+        slot_page_size=kv_pool.page_size,
+        layout=get_memory().hicache_mem_layout,
+        allocator_type=_get_allocator_type(),
+        page_aligned_only=True,
+    )
+    return build_pool_entry(
+        name=PoolName.INDEXER,
+        host_pool=host_pool,
+        device_pool=kv_pool,
+        layer_mapping={
+            global_layer: compact_layers[local_layer]
+            for global_layer, local_layer in layer_mapping.items()
+            if local_layer in compact_layers
+        },
+        transfer_layer_num=transfer_layer_num,
+        packed_draft_device_pools=draft_pools,
+    )
+
+
 def build_hybrid_mamba_stack(
     *,
     params: CacheInitParams,
@@ -799,6 +851,22 @@ def build_hybrid_mamba_stack(
         kv_host_size, mamba_host_size = _split_hicache_size(
             get_memory().hicache_size, (kv_pool, mamba_pool)
         )
+        index_buffers = _hybrid_dsa_index_buffers(kv_pool, mtp_draft_device_pools)
+        if index_buffers:
+            kv_bytes_per_token = sum(
+                pool.kv_cache_dim * pool.store_dtype.itemsize * pool.layer_num
+                for pool in (kv_pool, *mtp_draft_device_pools)
+            )
+            index_bytes_per_token = sum(
+                b.shape[1] * b.element_size() / kv_pool.page_size
+                for b in index_buffers
+                if b.numel()
+            )
+            # The KV and index host pools share a token capacity and together
+            # consume the KV share of --hicache-size, not two separate budgets.
+            kv_host_size *= kv_bytes_per_token / (
+                kv_bytes_per_token + index_bytes_per_token
+            )
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
@@ -846,6 +914,15 @@ def build_hybrid_mamba_stack(
             device_free_fn=mamba_allocator.free,
         ),
     ]
+    index_entry = _build_hybrid_dsa_index_entry(
+        kv_pool=kv_pool,
+        kv_host_pool=kv_host_pool,
+        layer_mapping=full_layer_mapping,
+        transfer_layer_num=transfer_layer_num + len(mtp_draft_device_pools),
+        draft_pools=mtp_draft_device_pools,
+    )
+    if index_entry is not None:
+        entries.append(index_entry)
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -1414,6 +1491,7 @@ class _MambaStrategy(StackStrategy):
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
         )
+        has_indexer = PoolName.INDEXER in host_pool_group.entry_map
         return StackBuildResult(
             host_pool_group=host_pool_group,
             cache_controller=cache_controller,
@@ -1423,7 +1501,16 @@ class _MambaStrategy(StackStrategy):
             },
             register_req_to_token_counter=True,
             transfer_layer_num=len(full_layer_mapping | mamba_layer_mapping),
-            pools_desc="KV + MAMBA",
+            sidecars=(
+                [
+                    SidecarPoolSpec(
+                        pool_name=PoolName.INDEXER, indices_from_pool=PoolName.KV
+                    )
+                ]
+                if has_indexer
+                else []
+            ),
+            pools_desc="KV + MAMBA + INDEXER" if has_indexer else "KV + MAMBA",
         )
 
 
