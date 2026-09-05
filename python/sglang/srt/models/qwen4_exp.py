@@ -43,6 +43,9 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptMixedPrecisionConfig,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -71,6 +74,24 @@ from sglang.srt.utils import logger
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
 _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
+
+
+def _ple_table_is_fp8(
+    config: Qwen4ExpTextConfig,
+    quant_config: Optional[QuantizationConfig],
+    prefix: str,
+) -> bool:
+    """fp8 PLE shards: declared by config, an fp8 checkpoint, or a ModelOpt
+    MIXED_PRECISION entry for the ngram table (nvidia/*-Flash-Next-NVFP4)."""
+    if config.ple_embedding_dtype == "float8_e4m3fn":
+        return True
+    if quant_config is None:
+        return False
+    if quant_config.get_name() == "fp8":
+        return True
+    if isinstance(quant_config, ModelOptMixedPrecisionConfig):
+        return quant_config.resolve_quant_algo(prefix) == "FP8"
+    return False
 
 
 def _get_ple_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -437,6 +458,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         embedding_dim: int,
         ple_layer_index: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
@@ -493,13 +515,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             and get_attention_dp_size() > 1
             and not self.use_attn_tp_ngram
         )
+        ngram_prefix = f"{prefix}.ngram_embedding" if prefix else "ngram_embedding"
         self.ngram_embedding = VocabParallelEmbedding(
             padded_vocab_size,
             self.head_dim_per_ngram,
             params_dtype=(
                 torch.float8_e4m3fn
-                if (quant_config is not None and quant_config.get_name() == "fp8")
-                or getattr(config, "ple_embedding_dtype", None) == "float8_e4m3fn"
+                if _ple_table_is_fp8(config, quant_config, ngram_prefix)
                 else torch.bfloat16
             ),
             output_dtype=torch.bfloat16,
@@ -915,6 +937,7 @@ class Qwen4ExpPLELayer(nn.Module):
             self.ple_embed_dim,
             ple_layer_index=ple_layer_index,
             quant_config=quant_config,
+            prefix=f"{prefix}.ple_embedding" if prefix else "ple_embedding",
         )
         if config.ple_offload_embedding:
             self.ple_embedding.ngram_embedding = Qwen4ExpPinnedHostEmbedding(
