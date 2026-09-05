@@ -267,9 +267,9 @@ class PyMscclppCommunicator:
         self.available = True
         self.group = group
 
-        assert (
-            dist.get_backend(group) != dist.Backend.NCCL
-        ), "CustomAllreduce should be attached to a non-NCCL group."
+        assert dist.get_backend(group) != dist.Backend.NCCL, (
+            "CustomAllreduce should be attached to a non-NCCL group."
+        )
 
         rank = dist.get_rank(group=self.group)
         world_size = dist.get_world_size(group=self.group)

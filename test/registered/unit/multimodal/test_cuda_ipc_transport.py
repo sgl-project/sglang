@@ -14,6 +14,12 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.multimodal.transport.cuda_ipc import (
     CudaIpcTensorTransportProxy,
     MmItemMemoryPool,
@@ -122,6 +128,74 @@ class TestCudaIpcTransport(CustomTestCase):
                     producer.join(timeout=10)
             self.assertEqual(producer.exitcode, 0)
 
+    def test_failed_reconstruction_releases_pooled_tensor(self):
+        ctx = mp.get_context("spawn")
+        proxy_queue = ctx.Queue()
+        producer_results = ctx.Queue()
+        consumer_done = ctx.Event()
+        producer = ctx.Process(
+            target=_produce_pooled_tensor,
+            args=(proxy_queue, consumer_done, producer_results),
+        )
+        producer.start()
+        proxy = None
+        producer_result = None
+        original_empty = torch.empty
+        try:
+            try:
+                proxy, _expected = proxy_queue.get(timeout=60)
+            except queue.Empty:
+                producer_result = producer_results.get(timeout=5)
+                _status, payload = producer_result
+                self.fail(
+                    f"CUDA IPC producer failed before sending its proxy: {payload}"
+                )
+
+            output_shape = proxy.proxy_state["ipc_extra"]["recons_shape"]
+
+            def fail_destination_allocation(size, *args, **kwargs):
+                if isinstance(size, (tuple, torch.Size)) and tuple(size) == tuple(
+                    output_shape
+                ):
+                    raise RuntimeError("forced reconstruction failure")
+                return original_empty(size, *args, **kwargs)
+
+            item = MultimodalDataItem(
+                modality=Modality.IMAGE,
+                hash=1,
+                pad_value=1,
+                feature=proxy,
+            )
+            output = MultimodalProcessorOutput(input_ids=[1], mm_items=[item])
+            with (
+                patch(
+                    "sglang.srt.multimodal.transport.cuda_ipc.torch.empty",
+                    side_effect=fail_destination_allocation,
+                ),
+                self.assertRaisesRegex(RuntimeError, "forced reconstruction failure"),
+            ):
+                MultimodalInputs.from_processor_output(output)
+
+            torch.cuda.synchronize()
+            self.assertTrue(proxy._consumer_acknowledged)
+        finally:
+            del proxy
+            _pool_handle_cache_clear()
+            gc.collect()
+            torch.cuda.ipc_collect()
+            consumer_done.set()
+            producer.join(timeout=60)
+            try:
+                if producer_result is None:
+                    producer_result = producer_results.get(timeout=5)
+                status, payload = producer_result
+                self.assertEqual(status, "ok", payload)
+            finally:
+                if producer.is_alive():
+                    producer.terminate()
+                    producer.join(timeout=10)
+            self.assertEqual(producer.exitcode, 0)
+
     def test_uncached_mapping_waits_before_proxy_release(self):
         proxy = object.__new__(CudaIpcTensorTransportProxy)
         proxy.proxy_state = {"ipc_extra": {"use_pool_handle_cache": False}}
@@ -136,6 +210,83 @@ class TestCudaIpcTransport(CustomTestCase):
 
         stream.synchronize.assert_called_once_with()
         self.assertIsNone(proxy._pool_storage)
+
+    def test_failed_item_batch_releases_undispatched_pool_slice(self):
+        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        pool = MmItemMemoryPool(
+            memory_size=1 << 20,
+            recycle_interval=0.01,
+            base_gpu_id=0,
+            consumer_count=4,
+        )
+        with patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()):
+            processor = BaseMultimodalProcessor.__new__(BaseMultimodalProcessor)
+        processor.use_cuda_ipc = True
+        processor.use_ipc_pool_handle_cache = True
+        processor.cudaipc_mmfeature_pool = pool
+        features = [
+            torch.ones(16, device="cuda"),
+            torch.empty(0, device="cuda"),
+        ]
+        items = [
+            MultimodalDataItem(modality=Modality.IMAGE, feature=feature)
+            for feature in features
+        ]
+
+        try:
+            with self.assertRaisesRegex(ValueError, "empty tensor"):
+                processor._prepare_mm_items_for_transport(items)
+
+            deadline = time.monotonic() + 5
+            while pool.active_lease_count and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(pool.active_lease_count, 0)
+            self.assertIs(items[0].feature, features[0])
+            self.assertIs(items[1].feature, features[1])
+        finally:
+            pool.shutdown()
+
+    def test_rejected_request_releases_unconsumed_pool_slice(self):
+        ctx = mp.get_context("spawn")
+        proxy_queue = ctx.Queue()
+        producer_results = ctx.Queue()
+        consumer_done = ctx.Event()
+        producer = ctx.Process(
+            target=_produce_pooled_tensor,
+            args=(proxy_queue, consumer_done, producer_results),
+        )
+        producer.start()
+        proxy = None
+        producer_result = None
+        try:
+            proxy, _ = proxy_queue.get(timeout=60)
+            item = MultimodalDataItem(modality=Modality.IMAGE, feature=proxy)
+            mm_inputs = MultimodalInputs(mm_items=[item])
+
+            mm_inputs.release_features()
+            torch.cuda.synchronize()
+
+            self.assertIsNone(item.feature)
+        finally:
+            del proxy
+            _pool_handle_cache_clear()
+            gc.collect()
+            torch.cuda.ipc_collect()
+            consumer_done.set()
+            producer.join(timeout=60)
+            try:
+                producer_result = producer_results.get(timeout=5)
+                status, payload = producer_result
+                self.assertEqual(status, "ok", payload)
+            finally:
+                if producer.is_alive():
+                    producer.terminate()
+                    producer.join(timeout=10)
+            self.assertEqual(producer.exitcode, 0)
 
 
 if __name__ == "__main__":

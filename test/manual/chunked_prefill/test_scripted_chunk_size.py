@@ -73,9 +73,9 @@ class TestChunkSizeDefault(ScriptedTestCase):
         r = t.start_req(prompt_len=1, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finished
-        assert (
-            r.chunks_done == 0
-        ), f"single-token prompt should not chunk, got chunks_done={r.chunks_done}"
+        assert r.chunks_done == 0, (
+            f"single-token prompt should not chunk, got chunks_done={r.chunks_done}"
+        )
 
     def test_chunk_size_256_prompt_100x(self):
         self.server.execute_script(self._script_chunk_size_256_prompt_100x)

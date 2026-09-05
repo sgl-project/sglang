@@ -27,6 +27,7 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
+from sglang.srt.layers.layernorm_sp import initialize_layernorm_sp
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -277,6 +278,10 @@ def _init_parallel_groups(
     )
     _tag_groups_for_flashinfer_allreduce_only()
     initialize_dp_attention(
+        server_args=server_args,
+        model_config=model_config,
+    )
+    initialize_layernorm_sp(
         server_args=server_args,
         model_config=model_config,
     )

@@ -14,7 +14,7 @@ import sys
 import time
 import unittest
 from array import array
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Callable
 
@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=25, suite="stage-b-test-1-gpu-small-amd")
@@ -59,6 +60,7 @@ _BENCH_KV_SIZE = 500_000
 _BENCH_CHUNK_LEN = 256
 
 _DEFAULT_COMPONENTS = (ComponentType.FULL, ComponentType.MAMBA)
+_TREE_CORE_TEST_BACKEND: str | None = None
 
 
 @contextmanager
@@ -226,16 +228,22 @@ def create_bench_cache(
     # --- tree ---
     if tree_cls is None:
         tree_cls = UnifiedRadixCache
-    tree = tree_cls(
-        params=CacheInitParams(
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=allocator,
-            page_size=page_size,
-            disable=False,
-            tree_components=components if tree_cls is UnifiedRadixCache else None,
-            sliding_window_size=sliding_window_size if has_swa else None,
-        )
+    backend_override = (
+        envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(_TREE_CORE_TEST_BACKEND)
+        if _TREE_CORE_TEST_BACKEND is not None and tree_cls is UnifiedRadixCache
+        else nullcontext()
     )
+    with backend_override:
+        tree = tree_cls(
+            params=CacheInitParams(
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=allocator,
+                page_size=page_size,
+                disable=False,
+                tree_components=components if tree_cls is UnifiedRadixCache else None,
+                sliding_window_size=sliding_window_size if has_swa else None,
+            )
+        )
 
     _rid = [0]
 
@@ -334,7 +342,7 @@ def _insert_seq(env, seq):
     mamba_val = None
     if env.has_mamba:
         req = env.make_req()
-        mamba_val = req.mamba_pool_idx.unsqueeze(0)
+        mamba_val = req.kv.mamba_pool_idx.unsqueeze(0)
     key = RadixKey(array("q", seq))
     env.tree.insert(InsertParams(key=key, value=v[: len(key)], mamba_value=mamba_val))
     return True
@@ -356,7 +364,7 @@ def _fill_no_evict(env):
         mamba_val = None
         if env.has_mamba:
             req = env.make_req()
-            mamba_val = req.mamba_pool_idx.unsqueeze(0)
+            mamba_val = req.kv.mamba_pool_idx.unsqueeze(0)
         key = RadixKey(array("q", seq))
         env.tree.insert(
             InsertParams(key=key, value=v[: len(key)], mamba_value=mamba_val)
@@ -416,9 +424,9 @@ def bench_api(
     (excluded from latency measurement).
     """
     items = setup_fn()
-    assert (
-        len(items) >= num_ops + warmup
-    ), f"need {num_ops + warmup} items, got {len(items)}"
+    assert len(items) >= num_ops + warmup, (
+        f"need {num_ops + warmup} items, got {len(items)}"
+    )
 
     for i in range(warmup):
         op_fn(items[i])
@@ -780,6 +788,10 @@ class _BenchSuite:
             verify=True,
             page_size=cfg["page_size"],
         )
+        backend = (
+            _TREE_CORE_TEST_BACKEND or envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
+        )
+        print(f"[{backend}] {r.report()}")
         self.assertGreater(r.num_ops, 0)
         self.assertGreater(r.ops_per_sec, 0)
 
@@ -803,7 +815,7 @@ for _cfg in _CI_BENCH_CONFIGS:
     _name = f"TestBench_{_cfg['label']}"
     globals()[_name] = type(
         _name,
-        (_BenchSuite, unittest.TestCase),
+        (_BenchSuite, CustomTestCase),
         {"bench_cfg": _cfg},
     )
     globals()[_name].__module__ = __name__

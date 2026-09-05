@@ -254,9 +254,9 @@ class BaseRunner(ABC):
 
         if should_run_flashinfer_autotune(self.model_runner):
             buffers, batch_size = self._autotune_buffers()
-            assert (
-                buffers is not None
-            ), "_autotune_buffers() must return a reusable buffer set for autotune"
+            assert buffers is not None, (
+                "_autotune_buffers() must return a reusable buffer set for autotune"
+            )
             self._flashinfer_autotune(buffers=buffers, batch_size=batch_size)
             maybe_flashinfer_autotune_extend(self, decode_num_tokens=batch_size)
 
@@ -427,9 +427,9 @@ class BaseRunner(ABC):
         )
         if mr.spec_algorithm.is_speculative() and not _is_pd_prefill_target:
             if mr.is_draft_worker:
-                assert (
-                    mr.spec_algorithm.supports_target_verify_for_draft()
-                ), "This should not happen"
+                assert mr.spec_algorithm.supports_target_verify_for_draft(), (
+                    "This should not happen"
+                )
             capture_forward_mode = ForwardMode.TARGET_VERIFY
             num_tokens_per_req = mr.decode_num_tokens_per_req()
         if extend_num_tokens_per_req is not None:

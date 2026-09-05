@@ -161,8 +161,7 @@ def multigpu_launch(
         for N in num_gpus:
             if N <= 1 or N > num_devices:
                 raise ValueError(
-                    f"Invalid number of GPUs requested: {N} "
-                    f"(available: {num_devices})"
+                    f"Invalid number of GPUs requested: {N} (available: {num_devices})"
                 )
     os.environ[env_key] = "1"
     os.environ[pid_key] = str(os.getpid())

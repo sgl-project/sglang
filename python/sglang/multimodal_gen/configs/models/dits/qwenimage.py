@@ -26,6 +26,25 @@ class QwenImageArchConfig(DiTArchConfig):
 
     param_names_mapping: dict = field(
         default_factory=lambda: {
+            # Merge the short text-stream projections into one tensor-parallel
+            # GEMM. The loader only applies these rules when the fused target
+            # exists, so quantization backends that keep the original modules
+            # continue to load their unfused parameters.
+            r"^(.*\.attn)\.add_q_proj\.(.+)$": (
+                r"\1.to_added_qkv.\2",
+                0,
+                3,
+            ),
+            r"^(.*\.attn)\.add_k_proj\.(.+)$": (
+                r"\1.to_added_qkv.\2",
+                1,
+                3,
+            ),
+            r"^(.*\.attn)\.add_v_proj\.(.+)$": (
+                r"\1.to_added_qkv.\2",
+                2,
+                3,
+            ),
             # LoRA mappings
             r"^(transformer_blocks\.\d+\.attn\..*\.lora_[AB])\.default$": r"\1",
             # SVDquant mappings
@@ -34,6 +53,11 @@ class QwenImageArchConfig(DiTArchConfig):
             r".*\.wtscale$": r"",
         }
     )
+
+    # Serialized ModelOpt checkpoints keep the added Q/K/V projections as
+    # separate modules, including their BF16 fallback layers. Do not apply the
+    # runtime-only fused mapping while inferring their quantized tensor layout.
+    quant_param_names_mapping: dict = field(default_factory=dict)
 
     def __post_init__(self):
         super().__post_init__()

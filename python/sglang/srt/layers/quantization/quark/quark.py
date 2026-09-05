@@ -287,7 +287,6 @@ _SHARED_EXPERT_BODY_PROJ_SUFFIXES: tuple[str, ...] = (
 
 
 class QuarkConfig(QuantizationConfig):
-
     def __init__(
         self,
         quant_config: dict[str, Any] | None = None,
@@ -963,7 +962,6 @@ class QuarkConfig(QuantizationConfig):
 
 
 class QuarkLinearMethod(LinearMethodBase):
-
     def __init__(self, quantization_config: QuarkConfig):
         self.quantization_config = quantization_config
         self.quant_config = quantization_config
@@ -1016,7 +1014,6 @@ class QuarkLinearMethod(LinearMethodBase):
 
 
 class QuarkFusedMoEMethod(FusedMoEMethodBase):
-
     def __init__(self, quantization_config: QuarkConfig):
         self.quantization_config = quantization_config
 

@@ -105,6 +105,12 @@ class BaseBatchReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
         return msgspec_struct_pydantic_core_schema(cls, handler)
 
 
+class MMInputsProcessError(msgspec.Struct, frozen=True):
+    """Request-local multimodal input failure produced after tokenizer fanout."""
+
+    message: str
+
+
 class BeamSearchOutput(BaseBatchReq, kw_only=True):
     sequences: List[BeamSearchSequence]
 

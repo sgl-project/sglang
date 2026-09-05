@@ -375,8 +375,7 @@ class TestNoRenamedAccessorImports(CustomTestCase):
                     base = imported.name.rsplit(".", 1)[-1]
                     if base == "get_server_args":
                         offenders.append(
-                            f"{rel}:{node.lineno}: {imported.name} as "
-                            f"{imported.asname}"
+                            f"{rel}:{node.lineno}: {imported.name} as {imported.asname}"
                         )
         self.assertFalse(
             offenders,

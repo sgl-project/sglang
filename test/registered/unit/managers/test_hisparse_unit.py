@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -49,7 +50,7 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
         output_ids=output_ids,
         fill_ids=origin_input_ids + output_ids,
         seqlen=len(origin_input_ids) + len(output_ids),
-        kv=SimpleNamespace(req_pool_idx=None, kv_allocated_len=0, kv_committed_len=0),
+        kv=ReqKvInfo(),
         finished_reason=None,
         hisparse_staging=False,
         staging=False,

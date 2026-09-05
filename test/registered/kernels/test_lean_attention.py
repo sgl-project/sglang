@@ -209,9 +209,9 @@ def _run_pair_paged(
     kv_group_num = H_Q // H_KV
     sm = 1.0 / (D**0.5)
     tot = B * S
-    assert (
-        tot % page_size == 0
-    ), "test setup: total tokens must be a multiple of page_size"
+    assert tot % page_size == 0, (
+        "test setup: total tokens must be a multiple of page_size"
+    )
     num_pages = tot // page_size
 
     # 4-D paged KV buffers [num_pages, page_size, head, dim] (the shared-pool layout).

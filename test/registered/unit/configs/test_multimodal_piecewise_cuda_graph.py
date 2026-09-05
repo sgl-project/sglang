@@ -176,7 +176,9 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         args.disable_radix_cache = False
         args.chunked_prefill_size = 2048
 
-        with (override_platform(is_cuda=True),):
+        with (
+            override_platform(is_cuda=True),
+        ):
             handle_model_capability_adjustments(args)
 
         self.assertTrue(resolution_result(args, "disable_radix_cache"))

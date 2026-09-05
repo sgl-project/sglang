@@ -8,6 +8,8 @@ on:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    env:
+      MINT_VERSION: 4.2.559
     steps:
       - uses: actions/checkout@v4
         with:
@@ -33,11 +35,19 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: .pre-commit-config.yaml
 
       - name: Install pre-commit hook
         run: |
           python -m pip install pre-commit
           pre-commit install
+
+      - name: Cache pre-commit environments
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-3|${{ env.pythonLocation }}|${{ hashFiles('.pre-commit-config.yaml') }}
 
       # The clippy-rust-workspace pre-commit hook compiles the rust/ workspace
       # (debug profile); cache cargo registry + target across runs.
@@ -66,19 +76,20 @@ jobs:
       - name: Check cookbook authoring contracts
         run: node docs/scripts/check_cookbook_configs.mjs
 
+      - name: Cache mint
+        uses: actions/cache@v4
+        with:
+          path: ~/.mint-cli
+          key: mint-${{ runner.os }}-${{ env.MINT_VERSION }}
+
       # Hard gate: docs internal links/anchors/redirects must resolve.
       # mint is pinned for reproducibility (its heading-slug rules are
       # version-sensitive); bump deliberately after re-verifying locally.
       - name: Check docs links (Mintlify broken-links)
         run: |
-          npm install -g mint@4.2.559
+          if [ ! -x "$HOME/.mint-cli/node_modules/.bin/mint" ]; then
+            npm install --prefix "$HOME/.mint-cli" "mint@${MINT_VERSION}"
+          fi
+          export PATH="$HOME/.mint-cli/node_modules/.bin:$PATH"
           cd docs
           mint broken-links --check-anchors --check-redirects
-
-      - name: Run sgl-kernel clang-format checks
-        uses: DoozyX/clang-format-lint-action@v0.20
-        with:
-          source: python/sglang/kernels/aot
-          extensions: h,c,cpp,hpp,cu,cuh,cc
-          clangFormatVersion: 20
-          style: file

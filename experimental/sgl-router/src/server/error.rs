@@ -229,10 +229,7 @@ impl IntoResponse for ApiError {
                 );
                 "request expired before completion".to_string()
             }
-            ApiError::PolicySelectionFailed { model } => {
-                tracing::warn!(model = %model, reason = "policy_selection_failed", "service unavailable");
-                "service unavailable".to_string()
-            }
+            ApiError::PolicySelectionFailed { .. } => "service unavailable".to_string(),
             ApiError::BreakerOpen { worker } => {
                 tracing::warn!(upstream = %worker, reason = "breaker_open", "service unavailable");
                 "service unavailable".to_string()
@@ -368,6 +365,21 @@ mod tests {
             !body.contains(worker_str),
             "client body must NOT leak worker URL; got: {body}",
         );
+    }
+
+    #[test]
+    fn policy_selection_failed_envelope_is_unchanged() {
+        let resp = ApiError::PolicySelectionFailed {
+            model: "tiny".into(),
+        }
+        .into_response();
+        let (status, code_header, env) = parse_envelope(resp);
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code_header.as_deref(), Some("policy_selection_failed"));
+        assert_eq!(env.error.typ, "server_error");
+        assert_eq!(env.error.code, "policy_selection_failed");
+        assert_eq!(env.error.message, "service unavailable");
     }
 
     #[test]
