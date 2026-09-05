@@ -13,7 +13,10 @@
 // params keeps compute small and the N-gram table is the only large weight block.
 // The one multi-node shape is NVFP4 on a pair of DGX Sparks (GB10): the 126 GiB
 // checkpoint does not fit one 128 GB unified-memory box, so it runs TP=2 across
-// two of them over the 200GbE ConnectX-7 link.
+// two of them over the 200GbE ConnectX-7 link. NVFP4 also runs on one 96 GB
+// RTX PRO 6000 Blackwell (SM120) once the 47.7 GiB FP8 N-gram table is offloaded
+// to pinned host memory (--ple-offload-embedding), leaving ~81 GiB of weights on
+// the card.
 //
 // A hardware x quantization x strategy combination with no launch recipe has no
 // cell, and the engine greys it out.
@@ -21,7 +24,14 @@
 export const config = {
   modelName: "Qwen3.8-Flash-Next",
 
-  supportedHardware: ["h200", "b200", "b300", "gb300", "dgx-spark", "mi350x", "mi355x"],
+  supportedHardware: ["h200", "b200", "b300", "gb300", "rtx6000", "dgx-spark", "mi350x", "mi355x"],
+
+  // RTX PRO 6000 (SM120, Blackwell workstation) is not in the shared
+  // HARDWARE_CATALOG, so it carries a local vendor override here (same id and
+  // label as the Qwen3.8-27B page).
+  hardware: [
+    { id: "rtx6000", label: "RTX PRO 6000", vram: "96GB", vendor: "blackwell" },
+  ],
 
   variants: [
     { id: "default", label: "Default" },
@@ -67,18 +77,28 @@ export const config = {
       // On are greyed out — Off is the only pick, and the engine falls back to
       // it. Re-enable On for DGX Spark once an NVMe-backed PLE table ships
       // (sgl-project/sglang#37068 / #36567).
+      //
+      // RTX PRO 6000 is the opposite case: on a 96 GB discrete card the FP8
+      // N-gram table (47.7 GiB) has to leave the GPU for the remaining ~81 GiB
+      // of weights plus the pools to fit, so Auto and Off are greyed out and On
+      // is the only pick — the forced chip appends --ple-offload-embedding, so
+      // the cells do not list it themselves.
       showWhen: (sel) => !["mi350x", "mi355x"].includes(sel.hw),
       default: "auto",
       options: [
         { id: "auto", label: "Auto",
-          disabled: (sel) => sel.hw === "dgx-spark",
-          disableReason: "DGX Spark is unified memory: PLE offload to RAM frees nothing (the pinned table shares the 128 GB pool with the weights). Off is the verified setting until NVMe-backed PLE lands.",
+          disabled: (sel) => sel.hw === "dgx-spark" || sel.hw === "rtx6000",
+          disableReason: (sel) => sel.hw === "rtx6000"
+            ? "RTX PRO 6000 (96 GB) only fits this checkpoint with the 47.7 GiB FP8 N-gram table in pinned host RAM; the verified cells pass --ple-offload-embedding explicitly, so On is the only pick."
+            : "DGX Spark is unified memory: PLE offload to RAM frees nothing (the pinned table shares the 128 GB pool with the weights). Off is the verified setting until NVMe-backed PLE lands.",
           hints: ["PLE Offload: auto-enabled for BF16 on CUDA, off otherwise"] },
         { id: "on",   label: "On",
           disabled: (sel) => sel.hw === "dgx-spark",
           disableReason: "DGX Spark is unified memory: PLE offload to RAM frees nothing (the pinned table shares the 128 GB pool with the weights). Off is the verified setting until NVMe-backed PLE lands.",
           flags: ["--ple-offload-embedding"] },
         { id: "off",  label: "Off",
+          disabled: (sel) => sel.hw === "rtx6000",
+          disableReason: "RTX PRO 6000 (96 GB) cannot hold the 47.7 GiB FP8 N-gram table alongside the ~81 GiB of NVFP4 weights; the table must be offloaded to pinned host RAM (On).",
           flags: ["--no-ple-offload-embedding"] },
       ],
     },
@@ -144,6 +164,7 @@ export const config = {
   dockerImages: {
     h200:   "lmsysorg/sglang:qwen38flashnext",
     "dgx-spark": "lmsysorg/sglang:qwen38flashnext",
+    rtx6000: "lmsysorg/sglang:qwen38flashnext",
     b200:   "lmsysorg/sglang:qwen38flashnext",
     b300:   "lmsysorg/sglang:qwen38flashnext",
     gb300:  "lmsysorg/sglang:qwen38flashnext",
@@ -743,6 +764,105 @@ export const config = {
         "--max-mamba-cache-size 384",
         "--reasoning-parser qwen3",
         "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ==== NVFP4 on 1x RTX PRO 6000 Blackwell (SM120, 96 GB) ====
+    // A single 96 GB workstation card holds the NVFP4 checkpoint only with the
+    // 47.7 GiB FP8 N-gram table offloaded to pinned host memory: the PLE Offload
+    // row is forced to On on this hardware (see overlayDims), which appends
+    // --ple-offload-embedding, and the boot then leaves ~81 GiB of weights
+    // resident with ~19 GiB (no MTP) / ~12 GiB (with MTP) for the pools.
+    // The host needs >= 64 GB of free RAM for the locked table and Docker
+    // needs --ulimit memlock=-1.
+    //
+    // Both cells are the model card's recipe (modelopt_fp4, flashinfer_cutlass
+    // FP4 GEMM and MoE runner, page 64, track interval 64, 4096-token prefill
+    // chunks, 262k context) with the concurrency pinned explicitly. With the
+    // stock radix strategy (5 fp32 state slots per request, 0.109 GiB each) the
+    // scheduler caps the card at 3 requests with MTP and 12 without, so the
+    // cells use --disable-radix-cache (1 slot per request) and
+    // --mamba-ssm-dtype bfloat16 (halves the slot) and pin
+    // --max-mamba-cache-size = requests x 1. --linear-attn-decode-backend
+    // triton keeps the same GDN decode kernel the fp32 runs used (bf16 state
+    // would otherwise be routed to the FlashInfer GDN decode on SM100+).
+    // With the state pool pinned, the KV pool takes whatever is left of the
+    // static budget, so --mem-fraction-static is what sets the activation
+    // headroom: 4096-token prefill chunks of real (ShareGPT-length) prompts
+    // peak ~1.3-1.5 GB above the post-graph-capture level, and a cell left
+    // with 2.4 GB OOMed in the GDN short-conv during prefill. The values
+    // below keep >= 3.5 GB free after graph capture and were driven through
+    // both a 1024-in/256-out random benchmark and a ShareGPT chat sweep.
+    // Verified 2026-09-05 on the qwen38flashnext image (SGLang 593134d17a):
+    // GSM8K (chat API, thinking off, n=200) 97.5% low latency / 97.0% high
+    // throughput, inside the 95-98% band of the datacenter runs.
+    //
+    // Low latency: in-checkpoint MTP head (NEXTN 3/1/4), 24 concurrent
+    // requests. The D=4 draft tokens each carry an intermediate SSM state per
+    // request, which is what limits MTP concurrency on this card (~31 is the
+    // ceiling); at 0.96 the KV pool is ~61k tokens (2.5k per request when
+    // full) with ~3.6 GB free after graph capture. MTP accept length 3.3 of 4
+    // on non-thinking output; 1024-in/256-out: 6.0 ms TPOT at 1 request,
+    // 19 ms at 16, 24 ms at 24 (vs 11 / 25 / - without MTP).
+    {
+      match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      warn: "Single RTX PRO 6000 (96 GB). The FP8 N-gram table lives in pinned host RAM: keep >= 64 GB of host memory free and run Docker with --ulimit memlock=-1. 24 concurrent requests is close to the MTP ceiling on this card (~31), and the KV pool is ~61k tokens (~2.5k per request when full) — lower --max-running-requests for long-context work. See [RTX PRO 6000 notes](#rtx6000-note).",
+      env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--quantization modelopt_fp4",
+        "--fp4-gemm-backend flashinfer_cutlass",
+        "--moe-runner-backend flashinfer_cutlass",
+        "--page-size 64",
+        "--mamba-track-interval 64",
+        "--chunked-prefill-size 4096",
+        "--context-length 262144",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--disable-radix-cache",
+        "--max-running-requests 24",
+        "--max-mamba-cache-size 24",
+        "--mamba-ssm-dtype bfloat16",
+        "--linear-attn-decode-backend triton",
+        "--reasoning-parser qwen3",
+        "--mem-fraction-static 0.96",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // High throughput: speculation off, 96 concurrent requests (96 bf16 state
+    // slots, 5.3 GiB). At 0.93 the KV pool is ~320k tokens (3.3k per request
+    // when full) with ~5 GB free after graph capture. 1024-in/256-out at
+    // 96-way: 1,020 output tok/s, 4.0 req/s, 69 ms TPOT; ShareGPT chat at
+    // 96-way: 1,507 output tok/s.
+    {
+      match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      warn: "Single RTX PRO 6000 (96 GB). The FP8 N-gram table lives in pinned host RAM: keep >= 64 GB of host memory free and run Docker with --ulimit memlock=-1. At 96 concurrent requests the KV pool is ~320k tokens (~3.3k per request when full); lower --max-running-requests for long-context workloads. See [RTX PRO 6000 notes](#rtx6000-note).",
+      env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--quantization modelopt_fp4",
+        "--fp4-gemm-backend flashinfer_cutlass",
+        "--moe-runner-backend flashinfer_cutlass",
+        "--page-size 64",
+        "--mamba-track-interval 64",
+        "--chunked-prefill-size 4096",
+        "--context-length 262144",
+        "--disable-radix-cache",
+        "--max-running-requests 96",
+        "--max-mamba-cache-size 96",
+        "--mamba-ssm-dtype bfloat16",
+        "--linear-attn-decode-backend triton",
+        "--reasoning-parser qwen3",
+        "--mem-fraction-static 0.93",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

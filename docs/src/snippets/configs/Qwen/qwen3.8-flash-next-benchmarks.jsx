@@ -79,6 +79,19 @@ export const benchmarks = [
     sglang_version: "qwen38flashnext image @ 593134d17a",
     accuracy: { gsm8k_pct: 97.0 },
   },
+  // 1x RTX PRO 6000 Blackwell (96 GB), TP=1, lmsysorg/sglang:qwen38flashnext
+  // (SGLang 593134d17a), 2026-09-05. Same chat-API GSM8K protocol as the DGX
+  // Spark rows (thinking off, n=200); AIME26 and MMMU-Pro not run.
+  {
+    match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "qwen38flashnext image @ 593134d17a",
+    accuracy: { gsm8k_pct: 97.5 },
+  },
+  {
+    match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "qwen38flashnext image @ 593134d17a",
+    accuracy: { gsm8k_pct: 97.0 },
+  },
   { match: { hw: "mi350x", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
   { match: { hw: "mi350x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" } },
   { match: { hw: "mi355x", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },

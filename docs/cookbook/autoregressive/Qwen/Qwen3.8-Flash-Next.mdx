@@ -40,7 +40,7 @@ Then run the **Python** output of the command panel below in that environment.
 
 <Tab title="Docker">
 
-**NVIDIA GPUs** (H200 / B200 / B300 / GB300, and 2x DGX Spark for NVFP4) — the launch image, since this is a day-0 model with no release cut yet:
+**NVIDIA GPUs** (H200 / B200 / B300 / GB300, plus a single RTX PRO 6000 or 2x DGX Spark for NVFP4) — the launch image, since this is a day-0 model with no release cut yet:
 
 ```bash Command
 docker pull lmsysorg/sglang:qwen38flashnext
@@ -80,6 +80,19 @@ The NVFP4 checkpoint is 126 GiB — 78 GiB of experts and dense weights plus a 4
 - **Concurrency.** The hybrid GDN/QSA model reserves mamba state slots per running request (5 with the default `extra_buffer` radix strategy, 4 with `extra_buffer_lazy`), and the scheduler caps `--max-running-requests` to what the mamba pool admits — read the effective value from the startup log, not from `/get_server_info`. The cells pin `--max-mamba-cache-size` to requests × slots (24 × 5 = 120 for low latency, 96 × 4 = 384 for high throughput); raising concurrency further takes memory from the KV pool one-for-one.
 - **Flags.** The cells are the model card's TP=2 recipe without `--mamba-track-interval 64`: the default of 256 tokens satisfies the constraints (a multiple of the 64-token page, at least the 4 draft tokens) and leaves a ~40% larger KV pool (1.48M tokens at 24 concurrent with MTP, 1.07M at 96 without), at the cost of coarser prefix-cache reuse of the recurrent state. `--trust-remote-code` is not needed; the architecture is native to SGLang.
 - **Measured.** GSM8K via the chat API with thinking off, n=200: 97.5% (low latency, 24 concurrent) and 97.0% (high throughput, 96 concurrent); 100k-token prefill at 2,400–2,840 tok/s; MTP accept length 3.5–3.7 of 4 draft tokens on non-thinking output (lower, ~2.5, on thinking output).
+
+</Accordion>
+
+<a id="rtx6000-note" />
+
+<Accordion title="RTX PRO 6000 notes (1x 96 GB, TP=1)">
+
+The NVFP4 checkpoint fits a single 96 GB RTX PRO 6000 Blackwell (SM120) only with the 47.7 GiB FP8 N-gram table in **CPU pinned memory** (`--ple-offload-embedding`, the forced setting of the PLE Offload row on this hardware): the remaining ~81 GiB of weights stay on the card, and the boot leaves ~19 GiB for the KV and state pools without MTP, ~12 GiB with it. The host needs ≥ 64 GB of free RAM for the locked table (plus page cache for the checkpoint) and Docker needs `--ulimit memlock=-1`, or the pinned allocation fails.
+
+- **Concurrency.** With the default `extra_buffer` radix strategy the hybrid model reserves 5 fp32 state slots per running request at 0.109 GiB each, and the scheduler caps `--max-running-requests` to 3 with MTP and 12 without on this card. The cells instead run `--disable-radix-cache` (1 slot per request; prefix caching off) with `--mamba-ssm-dtype bfloat16` (0.055 GiB per slot) and pin `--max-mamba-cache-size` to the request count, which is what the verified 24 / 96 need. `--linear-attn-decode-backend triton` keeps the same GDN decode kernel the fp32 runs used. The ceilings from the pool arithmetic are ~31 requests with MTP (each request carries 4 intermediate draft states, 0.27 GiB in total) and ~200 without.
+- **Memory headroom.** With the state pool pinned, the KV pool absorbs the rest of the static budget, so `--mem-fraction-static` is what sets the activation headroom. 4096-token prefill chunks of ShareGPT-length prompts peak 1.3–1.5 GB above the post-graph-capture level, and a cell left with 2.4 GB free OOMed in the GDN short-conv during prefill. The cells keep ≥ 3.5 GB free after graph capture: 0.96 with MTP (61k-token KV pool, ~2.5k per request when full) and 0.93 without (320k tokens, ~3.3k per request). `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is set on both.
+- **Accuracy.** GSM8K via the chat API with thinking off, n=200: 97.5% and 98.0% on two runs of the MTP cell, 97.0% on the no-MTP cell — the same band as the fp32-state runs at the capped concurrency (97.0% / 97.5%).
+- **Measured (1024-in / 256-out random prompts, `ignore_eos`).** MTP vs no-MTP at 1 request: TTFT 122 vs 116 ms median, TPOT 6.1 vs 11.3 ms, 154 vs 84 tok/s. At 16: TPOT 18.5 vs 25.1 ms, 695 vs 523 tok/s. MTP at 24: TPOT 24.1 ms, 785 tok/s; no-MTP at 96: TPOT 69.5 ms, 1,022 tok/s, 4.0 req/s. ShareGPT chat (thinking off, ≤ 512 output tokens): 979 tok/s at 24-way with MTP, 1,507 tok/s at 96-way without. MTP accept length 3.3 of 4 on GSM8K / random prompts, 2.8–2.9 on long-form ShareGPT answers.
 
 </Accordion>
 
@@ -139,7 +152,7 @@ Each precision is its own repository:
     <tr style={{background: "rgba(255,255,255,0.02)"}}>
       <td style={{padding: "9px 12px"}}><strong>NVFP4</strong></td>
       <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4">RadixArk/Qwen3.8-Flash-Next-NVFP4</a></td>
-      <td style={{padding: "9px 12px"}}>B200, B300, GB300, 2x DGX Spark (Blackwell only)</td>
+      <td style={{padding: "9px 12px"}}>B200, B300, GB300, RTX PRO 6000, 2x DGX Spark (Blackwell only)</td>
     </tr>
   </tbody>
 </table>
