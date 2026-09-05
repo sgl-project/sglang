@@ -51,7 +51,7 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, get_bool_env_var, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 Glm4Config = None
@@ -207,6 +207,7 @@ class Glm4Attention(nn.Module):
                 forward_batch.spec_info
                 and getattr(forward_batch.spec_info, "is_ragged_verify", False)
             )
+            and not get_bool_env_var("SGLANG_DISABLE_FINAL_LAYER_OPT", "false")
         )
 
         if can_optimize:
@@ -364,6 +365,7 @@ class Glm4DecoderLayer(nn.Module):
                 forward_batch.spec_info
                 and getattr(forward_batch.spec_info, "is_ragged_verify", False)
             )
+            and not get_bool_env_var("SGLANG_DISABLE_FINAL_LAYER_OPT", "false")
         )
 
         if can_optimize_last_layer:

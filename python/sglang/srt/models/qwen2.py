@@ -52,7 +52,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, get_bool_env_var, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 Qwen2Config = None
@@ -223,6 +223,7 @@ class Qwen2Attention(nn.Module):
                 forward_batch.spec_info
                 and getattr(forward_batch.spec_info, "is_ragged_verify", False)
             )
+            and not get_bool_env_var("SGLANG_DISABLE_FINAL_LAYER_OPT", "false")
         )
 
         if can_optimize:
@@ -387,6 +388,7 @@ class Qwen2DecoderLayer(nn.Module):
                 forward_batch.spec_info
                 and getattr(forward_batch.spec_info, "is_ragged_verify", False)
             )
+            and not get_bool_env_var("SGLANG_DISABLE_FINAL_LAYER_OPT", "false")
         )
 
         if can_optimize_last_layer:

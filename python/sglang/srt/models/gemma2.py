@@ -43,7 +43,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_npu, make_layers
+from sglang.srt.utils import add_prefix, get_bool_env_var, is_npu, make_layers
 
 _is_npu = is_npu()
 
@@ -212,6 +212,7 @@ class Gemma2Attention(nn.Module):
                 forward_batch.spec_info
                 and getattr(forward_batch.spec_info, "is_ragged_verify", False)
             )
+            and not get_bool_env_var("SGLANG_DISABLE_FINAL_LAYER_OPT", "false")
         )
 
         if can_optimize:
@@ -390,6 +391,7 @@ class Gemma2DecoderLayer(nn.Module):
                 forward_batch.spec_info
                 and getattr(forward_batch.spec_info, "is_ragged_verify", False)
             )
+            and not get_bool_env_var("SGLANG_DISABLE_FINAL_LAYER_OPT", "false")
         )
 
         if can_optimize:

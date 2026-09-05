@@ -317,6 +317,7 @@ class Qwen3Attention(nn.Module):
                 forward_batch.spec_info
                 and getattr(forward_batch.spec_info, "is_ragged_verify", False)
             )
+            and not get_bool_env_var("SGLANG_DISABLE_FINAL_LAYER_OPT", "false")
         )
 
         if can_optimize:
@@ -492,6 +493,7 @@ class Qwen3DecoderLayer(nn.Module):
                 forward_batch.spec_info
                 and getattr(forward_batch.spec_info, "is_ragged_verify", False)
             )
+            and not get_bool_env_var("SGLANG_DISABLE_FINAL_LAYER_OPT", "false")
         )
 
         if can_optimize_last_layer:
