@@ -16,9 +16,9 @@ test_cases = [
     (
         0,  # threshold_single
         0,  # threshold_acc
-        [1, 2, 18, -1, -1, -1, 11, -1, -1, -1, 12, 18],
-        [[0, 1, 2, -1], [6, 10, 11, -1]],
-        [2, 2],
+        [3, -1, -1, 4, 5, 18, 11, -1, -1, -1, 12, 18],
+        [[0, 3, 4, 5], [6, 10, 11, -1]],
+        [3, 2],
     ),
 ]
 
@@ -125,6 +125,86 @@ def test_tree_speculative_sampling_target_only(
     assert accept_token_num.tolist() == expected_accept_token_num, (
         f"Accept token num mismatch for thresholds ({threshold_single}, {threshold_acc})"
     )
+
+
+@pytest.mark.parametrize(
+    "candidate_tokens,target_probabilities,coin,threshold_single,expected_token,expected_accept_token_num",
+    [
+        ([2], [0.0, 1.0, 0.0], 0.0, 0.0, 1, 0),
+        ([2], [0.0, 1.0, 0.0], 0.0, 1.0, 1, 0),
+        ([1, 2, 3], [0.0, 0.25, 0.0, 0.75], 0.25, 1.0, 3, 1),
+        ([1], [0.0, 0.25, 0.75], 0.0, 1.0, 1, 1),
+        ([1], [0.0, 1.0], 1.0 - 2**-24, 1.0, 1, 1),
+    ],
+    ids=[
+        "zero-mass-zero-threshold",
+        "zero-mass-default-threshold",
+        "interior-boundary",
+        "lower-endpoint",
+        "upper-endpoint",
+    ],
+)
+def test_target_only_sampling_cdf_boundaries(
+    candidate_tokens,
+    target_probabilities,
+    coin,
+    threshold_single,
+    expected_token,
+    expected_accept_token_num,
+):
+    num_candidates = len(candidate_tokens)
+    candidates = torch.tensor(
+        [[0, *candidate_tokens]], dtype=torch.int64, device="cuda"
+    )
+    num_draft_tokens = candidates.shape[1]
+    retrive_index = torch.arange(
+        num_draft_tokens, dtype=torch.int64, device="cuda"
+    ).unsqueeze(0)
+    retrive_next_token = torch.full_like(retrive_index, -1)
+    retrive_next_token[0, 0] = 1
+    retrive_next_sibling = torch.full_like(retrive_index, -1)
+    if num_candidates > 1:
+        retrive_next_sibling[0, 1:num_candidates] = torch.arange(
+            2, num_candidates + 1, dtype=torch.int64, device="cuda"
+        )
+
+    target_probs = torch.zeros(
+        (1, num_draft_tokens, len(target_probabilities)),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    target_probs[0, 0] = torch.tensor(
+        target_probabilities, dtype=torch.float32, device="cuda"
+    )
+    target_probs[0, 1:, 0] = 1.0
+    draft_probs = torch.zeros_like(target_probs)
+    predicts = torch.full((num_draft_tokens,), -1, dtype=torch.int32, device="cuda")
+    accept_index = torch.full((1, 2), -1, dtype=torch.int32, device="cuda")
+    accept_token_num = torch.zeros((1,), dtype=torch.int32, device="cuda")
+    coins = torch.zeros((1, num_draft_tokens), dtype=torch.float32, device="cuda")
+    coins[0, 0] = coin
+
+    tree_speculative_sampling_target_only(
+        predicts=predicts,
+        accept_index=accept_index,
+        accept_token_num=accept_token_num,
+        candidates=candidates,
+        retrive_index=retrive_index,
+        retrive_next_token=retrive_next_token,
+        retrive_next_sibling=retrive_next_sibling,
+        uniform_samples=coins,
+        uniform_samples_for_final_sampling=torch.zeros(
+            (1,), dtype=torch.float32, device="cuda"
+        ),
+        target_probs=target_probs,
+        draft_probs=draft_probs,
+        threshold_single=threshold_single,
+        threshold_acc=1.0,
+        deterministic=True,
+    )
+
+    assert predicts[0].item() == expected_token
+    assert accept_token_num.item() == expected_accept_token_num
 
 
 if __name__ == "__main__":
