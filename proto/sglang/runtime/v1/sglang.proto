@@ -187,8 +187,16 @@ message GetModelInfoResponse {
 
 message GetServerInfoRequest {}
 
+message HiCacheInfo {
+  // Realized host-tier capacity for one DP rank, in logical tokens.
+  uint64 host_total_tokens = 1;
+}
+
 message GetServerInfoResponse {
+  // Full server-info JSON, retained for backward compatibility.
   string json_info = 1;
+  // Absent when hierarchical caching is disabled.
+  HiCacheInfo hicache = 2;
 }
 
 // ---- Abort ----

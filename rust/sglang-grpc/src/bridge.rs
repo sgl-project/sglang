@@ -32,6 +32,12 @@ pub struct ResponseData {
     pub meta_info: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerInfo {
+    pub json_info: String,
+    pub hicache_host_total_tokens: Option<u64>,
+}
+
 pub const DEFAULT_RESPONSE_CHANNEL_CAPACITY: usize = 64;
 
 type BridgeStateRef = Arc<Mutex<BridgeState>>;
@@ -274,10 +280,15 @@ impl PyBridge {
         })
     }
 
-    pub fn get_server_info(&self) -> PyResult<String> {
+    pub fn get_server_info(&self) -> PyResult<ServerInfo> {
         Python::attach(|py| {
             let result = self.runtime_handle.call_method0(py, "get_server_info")?;
-            result.extract::<String>(py)
+            let (json_info, hicache_host_total_tokens) =
+                result.extract::<(String, Option<u64>)>(py)?;
+            Ok(ServerInfo {
+                json_info,
+                hicache_host_total_tokens,
+            })
         })
     }
 

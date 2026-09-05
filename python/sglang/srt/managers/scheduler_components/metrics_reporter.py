@@ -14,6 +14,10 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.hicache_info import (
+    build_hicache_info,
+    get_hicache_host_pool,
+)
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
     QueueCount,
@@ -1156,11 +1160,8 @@ class SchedulerMetricsReporter:
         if not self.scheduler.enable_hierarchical_cache:
             return
 
-        host_pool = getattr(
-            self.scheduler.tree_cache, "token_to_kv_pool_host", None
-        ) or getattr(self.scheduler.tree_cache, "full_kv_pool_host", None)
-        assert host_pool is not None, "Host pool not found"
-        host_total = host_pool.logical_size
+        host_pool = get_hicache_host_pool(self.scheduler.tree_cache)
+        host_total = build_hicache_info(host_pool).host_total_tokens
         self.stats.hicache_host_used_tokens = host_total - host_pool.available_size()
         self.stats.hicache_host_total_tokens = host_total
 

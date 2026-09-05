@@ -10,7 +10,7 @@ import asyncio
 import json
 import logging
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from pydantic import ValidationError
 
@@ -423,13 +423,18 @@ class RuntimeHandle:
             )
         return json.dumps(result, default=str)
 
-    def get_server_info(self) -> str:
+    def get_server_info(self) -> Tuple[str, Optional[int]]:
         result: Dict[str, Any] = self.tokenizer_manager.server_args.resolved_dict()
         result.update(self.scheduler_info)
         result["kv_events"] = describe_kv_events_publisher(
             self.tokenizer_manager.server_args
         )
-        return json.dumps(msgspec_to_builtins(result), default=str)
+        result = msgspec_to_builtins(result)
+        hicache = result.get("hicache")
+        host_total_tokens = (
+            hicache["host_total_tokens"] if hicache is not None else None
+        )
+        return json.dumps(result, default=str), host_total_tokens
 
     def health_check(self) -> bool:
         from sglang.srt.managers.tokenizer_manager import ServerStatus

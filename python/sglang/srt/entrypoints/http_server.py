@@ -817,6 +817,9 @@ async def server_info():
     after publication -- the model a weight update swapped in, its load format,
     an operator-set weight version -- are reported by `/model_info`, and the
     HiCache mirror by `GET /hicache/storage-backend`.
+
+    When hierarchical caching is enabled, `hicache.host_total_tokens` reports
+    the realized per-DP-rank host-tier capacity in logical tokens.
     """
     # Returns internal states per DP.
     internal_states: List[
