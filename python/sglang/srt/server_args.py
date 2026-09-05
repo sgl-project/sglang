@@ -1823,8 +1823,8 @@ class ServerArgs:
     dsa_topk_backend: A[
         str,
         Arg(
-            help="DSA indexer top-k backend for the target model. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
-            choices=["sgl-kernel", "torch", "flashinfer"],
+            help="DSA indexer top-k backend for the target model. Options: 'sgl-kernel', 'torch', 'flashinfer', 'aiter' (ROCm only). The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
+            choices=["sgl-kernel", "torch", "flashinfer", "aiter"],
         ),
         NS("exec.kernel"),
     ] = "sgl-kernel"
@@ -2198,8 +2198,8 @@ class ServerArgs:
     speculative_dsa_topk_backend: A[
         str,
         Arg(
-            help="DSA indexer top-k backend for speculative draft workers. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
-            choices=["sgl-kernel", "torch", "flashinfer"],
+            help="DSA indexer top-k backend for speculative draft workers. Options: 'sgl-kernel', 'torch', 'flashinfer', 'aiter' (ROCm only). The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
+            choices=["sgl-kernel", "torch", "flashinfer", "aiter"],
         ),
         NS("spec"),
     ] = "sgl-kernel"

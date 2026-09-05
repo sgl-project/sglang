@@ -213,7 +213,7 @@ To enable EAGLE speculative decoding the following parameters are relevant:
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-dsa-topk-backend</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Select the DSA indexer top-k backend for speculative draft workers independently of <code>--dsa-topk-backend</code>. Options are <code>sgl-kernel</code>, <code>torch</code>, and <code>flashinfer</code>; <code>torch</code> requires <code>SGLANG_DSA_FUSE_TOPK=false</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Select the DSA indexer top-k backend for speculative draft workers independently of <code>--dsa-topk-backend</code>. Options are <code>sgl-kernel</code>, <code>torch</code>, <code>flashinfer</code>, and <code>aiter</code> (ROCm only); <code>torch</code> requires <code>SGLANG_DSA_FUSE_TOPK=false</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>sgl-kernel</code></td>
     </tr>
     <tr>
@@ -934,7 +934,7 @@ Below is a comprehensive list of all speculative decoding parameters available i
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-dsa-topk-backend</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>str</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>sgl-kernel</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DSA indexer top-k backend for speculative draft workers, independent of <code>--dsa-topk-backend</code> (<code>sgl-kernel</code>, <code>torch</code>, or <code>flashinfer</code>)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DSA indexer top-k backend for speculative draft workers, independent of <code>--dsa-topk-backend</code> (<code>sgl-kernel</code>, <code>torch</code>, <code>flashinfer</code>, or <code>aiter</code> on ROCm)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-moe-runner-backend</code></td>

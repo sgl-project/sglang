@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -28,6 +29,7 @@ class DSATopKBackend(Enum):
     SGL_KERNEL = "sgl-kernel"
     TORCH = "torch"
     FLASHINFER = "flashinfer"
+    AITER = "aiter"
 
     @classmethod
     def resolve(cls, model_runner: ModelRunner) -> DSATopKBackend:
@@ -36,9 +38,15 @@ class DSATopKBackend(Enum):
         ``--dsa-topk-backend`` selects the target backend, while
         ``--speculative-dsa-topk-backend`` independently selects the draft.
         """
-        if model_runner.is_draft_worker:
-            return cls(get_spec().speculative_dsa_topk_backend)
-        return cls(get_exec().kernel.dsa_topk_backend)
+        value = (
+            get_spec().speculative_dsa_topk_backend
+            if model_runner.is_draft_worker
+            else get_exec().kernel.dsa_topk_backend
+        )
+        backend = cls(value)
+        if backend.is_aiter() and not is_hip():
+            raise ValueError("dsa_topk_backend='aiter' requires ROCm.")
+        return backend
 
     def is_sgl_kernel(self) -> bool:
         return self == DSATopKBackend.SGL_KERNEL
@@ -48,6 +56,9 @@ class DSATopKBackend(Enum):
 
     def is_flashinfer(self) -> bool:
         return self == DSATopKBackend.FLASHINFER
+
+    def is_aiter(self) -> bool:
+        return self == DSATopKBackend.AITER
 
     def should_use_topk_v2(self) -> bool:
         return self.is_sgl_kernel() and envs.SGLANG_OPT_USE_TOPK_V2.get()
@@ -88,6 +99,8 @@ class DSATopKBackend(Enum):
                     "dsa_graph_safe": True,
                 },
             )
+        if self.is_aiter():
+            return _aiter_topk(score, lengths, topk, row_starts=row_starts)
         raise RuntimeError(f"Unsupported {self = }.")
 
     def topk_transform(
@@ -146,6 +159,19 @@ class DSATopKBackend(Enum):
         ):
             return _topk_transform_v2_ragged(
                 logits, lengths, topk, topk_indices_offset, row_starts
+            )
+
+        if self.is_aiter():
+            return _aiter_topk_transform(
+                logits=logits,
+                lengths=lengths,
+                topk=topk,
+                topk_transform_method=topk_transform_method,
+                attn_metadata=attn_metadata,
+                cu_seqlens_q_topk=cu_seqlens_q_topk,
+                topk_indices_offset=topk_indices_offset,
+                row_starts=row_starts,
+                batch_idx_list=batch_idx_list,
             )
 
         # The legacy transforms below read attn_metadata.page_table_1 (page_size=1),
@@ -231,6 +257,257 @@ class DSATopKBackend(Enum):
             raise RuntimeError(f"Unsupported {topk_transform_method = }.")
 
         raise RuntimeError(f"Unsupported {self = } for SGLANG_DSA_FUSE_TOPK.")
+
+
+def _aiter_row_bounds(
+    lengths: torch.Tensor,
+    row_starts: Optional[torch.Tensor],
+    device: torch.device,
+) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+    lengths = lengths.to(dtype=torch.int32, device=device).contiguous()
+    if row_starts is None:
+        starts = torch.zeros_like(lengths)
+        return None, starts, lengths
+    starts = row_starts.to(dtype=torch.int32, device=device).contiguous()
+    return starts, starts, starts + lengths
+
+
+def _aiter_topk(
+    score: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+    row_starts: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if not is_hip():
+        raise ValueError("The AITER DSA top-k backend requires ROCm.")
+    if score.dtype != torch.float32 or score.dim() != 2:
+        raise ValueError("AITER DSA top-k expects a 2D float32 score tensor.")
+    if score.stride(1) != 1:
+        score = score.contiguous()
+
+    num_rows, width = score.shape
+    if out is None:
+        out = score.new_full((num_rows, topk), -1, dtype=torch.int32)
+    if num_rows == 0 or topk == 0 or width == 0:
+        out.fill_(-1)
+        return out
+
+    lengths = lengths.to(dtype=torch.int32, device=score.device).contiguous()
+    if width <= topk:
+        positions = torch.arange(topk, dtype=torch.int32, device=score.device)
+        out.copy_(
+            torch.where(
+                positions.unsqueeze(0) < lengths.unsqueeze(1),
+                positions.unsqueeze(0),
+                -1,
+            )
+        )
+        return out
+
+    import aiter
+
+    op_name = "top_k_per_row_decode" if row_starts is None else "top_k_per_row_prefill"
+    topk_op = getattr(aiter, op_name, None)
+    if not callable(topk_op):
+        raise RuntimeError(f"The AITER DSA top-k backend requires {op_name}.")
+    if row_starts is None:
+        topk_op(
+            score,
+            1,
+            lengths,
+            out,
+            num_rows,
+            score.stride(0),
+            score.stride(1),
+            k=topk,
+        )
+        return out
+
+    _, starts, ends = _aiter_row_bounds(lengths, row_starts, score.device)
+    topk_op(
+        score,
+        starts,
+        ends,
+        out,
+        None,
+        num_rows,
+        score.stride(0),
+        score.stride(1),
+        k=topk,
+        stable=True,
+    )
+    valid = out >= 0
+    out.sub_(starts.unsqueeze(1))
+    out.masked_fill_(~valid, -1)
+    return out
+
+
+def _map_topk_to_pages(
+    raw_indices: torch.Tensor,
+    page_table: torch.Tensor,
+    page_size: int,
+    row_to_batch: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if page_size <= 0 or page_size & (page_size - 1):
+        raise ValueError("page_size must be a positive power of two.")
+    if row_to_batch is None and page_table.shape[0] != raw_indices.shape[0]:
+        raise ValueError("AITER top-k rows must match page-table rows.")
+    if page_table.shape[1] == 0:
+        mapped = torch.full_like(raw_indices, -1)
+        if out is not None:
+            out.copy_(mapped)
+            return out
+        return mapped
+
+    page_bits = page_size.bit_length() - 1
+    page_mask = page_size - 1
+    valid = raw_indices >= 0
+    safe_indices = raw_indices.clamp_min(0)
+    logical_pages = (safe_indices >> page_bits).to(torch.long)
+    if row_to_batch is None:
+        physical_pages = torch.gather(page_table, 1, logical_pages)
+    else:
+        physical_pages = page_table[
+            row_to_batch.to(torch.long).unsqueeze(1), logical_pages
+        ]
+    mapped = (physical_pages << page_bits) | (safe_indices & page_mask)
+    mapped.masked_fill_(~valid, -1)
+    if out is not None:
+        out.copy_(mapped)
+        return out
+    return mapped
+
+
+def _build_aiter_row_to_batch(
+    batch_idx_list: Optional[List[int]],
+    cu_seqlens_q_topk: Optional[torch.Tensor],
+    device: torch.device,
+    num_rows: int,
+    require_mapping: bool = False,
+) -> Optional[torch.Tensor]:
+    row_to_batch = (
+        torch.as_tensor(batch_idx_list, dtype=torch.int32, device=device)
+        if batch_idx_list is not None
+        else None
+    )
+    if row_to_batch is not None and cu_seqlens_q_topk is not None:
+        if row_to_batch.shape[0] != num_rows:
+            q_lens = (cu_seqlens_q_topk[1:] - cu_seqlens_q_topk[:-1]).to(
+                dtype=torch.int32, device=device
+            )
+            row_to_batch = torch.repeat_interleave(
+                row_to_batch, q_lens, output_size=num_rows
+            )
+        return row_to_batch
+
+    if row_to_batch is None and cu_seqlens_q_topk is not None:
+        num_batches = cu_seqlens_q_topk.shape[0] - 1
+        if require_mapping or num_rows != num_batches:
+            q_lens = (cu_seqlens_q_topk[1:] - cu_seqlens_q_topk[:-1]).to(
+                dtype=torch.int32, device=device
+            )
+            row_to_batch = torch.repeat_interleave(
+                torch.arange(q_lens.shape[0], dtype=torch.int32, device=device),
+                q_lens,
+                output_size=num_rows,
+            )
+    return row_to_batch
+
+
+def aiter_topk_transform_paged(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    page_table: torch.Tensor,
+    page_size: int,
+    topk: int,
+    row_starts: Optional[torch.Tensor] = None,
+    row_to_batch: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if out is None:
+        out = logits.new_empty((logits.shape[0], topk), dtype=torch.int32)
+    if logits.shape[0] == 0 or topk == 0 or logits.shape[1] == 0:
+        out.fill_(-1)
+        if out_raw_indices is not None:
+            out_raw_indices.fill_(-1)
+        return out
+
+    import aiter
+
+    fused_op = getattr(aiter, "dsa_topk_transform", None)
+    if callable(fused_op) and topk == 2048 and out_raw_indices is None:
+        starts_arg, _, ends = _aiter_row_bounds(lengths, row_starts, logits.device)
+        fused_op(
+            logits,
+            starts_arg,
+            ends,
+            page_table,
+            out,
+            page_size,
+            topk,
+            ptRowMap=row_to_batch,
+        )
+        return out
+
+    raw_indices = (
+        out_raw_indices
+        if out_raw_indices is not None
+        else logits.new_empty((logits.shape[0], topk), dtype=torch.int32)
+    )
+    _aiter_topk(logits, lengths, topk, row_starts=row_starts, out=raw_indices)
+    return _map_topk_to_pages(
+        raw_indices,
+        page_table,
+        page_size,
+        row_to_batch=row_to_batch,
+        out=out,
+    )
+
+
+def _aiter_topk_transform(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+    topk_transform_method: TopkTransformMethod,
+    attn_metadata,
+    cu_seqlens_q_topk: Optional[torch.Tensor],
+    topk_indices_offset: Optional[torch.Tensor],
+    row_starts: Optional[torch.Tensor],
+    batch_idx_list: Optional[List[int]],
+) -> torch.Tensor:
+    if topk_transform_method == TopkTransformMethod.PAGED:
+        if attn_metadata.page_table_1 is None:
+            raise RuntimeError("PAGED AITER top-k requires a page table.")
+        row_to_batch = _build_aiter_row_to_batch(
+            batch_idx_list,
+            cu_seqlens_q_topk,
+            logits.device,
+            logits.shape[0],
+            require_mapping=row_starts is not None,
+        )
+        return aiter_topk_transform_paged(
+            logits,
+            lengths,
+            attn_metadata.page_table_1,
+            1,
+            topk,
+            row_starts=row_starts,
+            row_to_batch=row_to_batch,
+        )
+
+    if topk_transform_method == TopkTransformMethod.RAGGED:
+        if topk_indices_offset is None:
+            raise RuntimeError("RAGGED AITER top-k requires topk_indices_offset.")
+        raw_indices = _aiter_topk(logits, lengths, topk, row_starts=row_starts)
+        offsets = topk_indices_offset.to(dtype=torch.int32, device=logits.device)
+        if offsets.dim() == 1:
+            offsets = offsets.unsqueeze(1)
+        return torch.where(raw_indices >= 0, raw_indices + offsets, -1)
+
+    raise RuntimeError(f"Unsupported {topk_transform_method = }.")
 
 
 def _topk_unfused(

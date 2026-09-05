@@ -723,6 +723,7 @@ class DeepseekSparseAttnBackend(
         if (
             self.dsa_topk_backend.is_sgl_kernel()
             or self.dsa_topk_backend.is_flashinfer()
+            or self.dsa_topk_backend.is_aiter()
         ):
             return topk_indices
         raise RuntimeError(
