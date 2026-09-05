@@ -98,6 +98,30 @@ def get_dsv4_c128_state_indices(
     return np.array([page], dtype=np.int32)
 
 
+def get_dsa_state_page_indices(
+    kv_indices: torch.Tensor,
+    logical_input_len: int,
+    device_page_size: int,
+) -> np.ndarray:
+    """Build request-scoped DSA state indices from the logical input range."""
+    if logical_input_len < 0:
+        raise ValueError(
+            f"logical_input_len must be non-negative, got {logical_input_len}"
+        )
+    if device_page_size <= 0:
+        raise ValueError(f"device_page_size must be positive, got {device_page_size}")
+
+    logical_kv_indices = kv_indices[:logical_input_len]
+    if logical_kv_indices.numel() != logical_input_len:
+        raise ValueError(
+            "DSA state range exceeds the request-to-token row: "
+            f"logical_input_len={logical_input_len}, "
+            f"available={logical_kv_indices.numel()}"
+        )
+
+    return (logical_kv_indices[::device_page_size] // device_page_size).cpu().numpy()
+
+
 class DisaggregationMode(Enum):
     NULL = "null"
     PREFILL = "prefill"

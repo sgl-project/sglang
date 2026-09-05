@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    get_dsa_state_page_indices,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
@@ -1254,6 +1255,13 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
                 return kv_to_page_indices(kv_indices_full, page_size)
 
+            def _dsa_payload():
+                return get_dsa_state_page_indices(
+                    self.req_to_token_pool.req_to_token[req.kv.req_pool_idx],
+                    transfer_input_len,
+                    self.token_to_kv_pool_allocator.get_kvcache().page_size,
+                )
+
             def _swa_ring_payload():
                 # Unified_kv SWA ring rows (req_pool_idx*ring_stride + pos%ring_stride)
                 # for the last `window` positions, in ascending position order so
@@ -1289,7 +1297,7 @@ class SchedulerDisaggregationPrefillMixin:
             payloads = {
                 StateType.MAMBA: _mamba_payload,
                 StateType.SWA: _swa_payload,
-                StateType.DSA: _full_kv_pages_payload,
+                StateType.DSA: _dsa_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.C128_STATE: _c128_state_payload,
