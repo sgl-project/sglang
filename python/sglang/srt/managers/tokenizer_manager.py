@@ -3277,13 +3277,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         output_ids = state.output_ids
         meta_info["completion_tokens"] = len(output_ids)
-        if is_stream:
+        if is_stream and self.incremental_streaming_output:
             output_ids = [output_ids[-1]] if len(output_ids) > 0 else []
         out = {
             "text": state.get_text(),
             "output_ids": output_ids,
             "meta_info": meta_info,
         }
+        if state.prompt_token_ids is not None:
+            out["prompt_token_ids"] = state.prompt_token_ids
         del self.rid_to_state[recv_obj.rid]
 
         state.out_list.append(out)
