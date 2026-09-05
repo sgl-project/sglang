@@ -1,9 +1,10 @@
 # Adapted from https://github.com/thinking-machines-lab/batch_invariant_ops/blob/main/batch_invariant_ops/batch_invariant_ops.py
 
 import contextlib
+import logging
 from collections import namedtuple
 from collections.abc import Callable
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Set, Tuple
 
 import torch
 import triton
@@ -38,6 +39,10 @@ _ENABLE_MM_COMPARISON_TEST = get_bool_env_var(
 
 if not _ENABLE_MM_DEEPGEMM:
     print("Disable DeepGEMM in batch invariant ops. Performance may be suboptimal.")
+
+logger = logging.getLogger(__name__)
+
+_DEEPGEMM_FAILING_SHAPES: Set[Tuple[int, int, int, torch.dtype]] = set()
 
 __all__ = [
     "set_batch_invariant_mode",
@@ -257,13 +262,22 @@ def _matmul_persistent_deepgemm(
 
     try:
         deep_gemm.bf16_gemm_nn(a, b, out)
+    except torch.cuda.OutOfMemoryError:
+        raise
     except RuntimeError as e:
-        raise RuntimeError(
-            f"DeepGEMM failed for matrix shapes M={M}, N={N}, K={K}. "
-            f"This typically occurs when dimensions are too small for DeepGEMM's TMA descriptors. "
-            f"Consider increasing MIN_DEEPGEMM_DIM in matmul_persistent() or disabling DeepGEMM "
-            f"for small matrices. Original error: {e}"
-        ) from e
+        if _ENABLE_MM_COMPARISON_TEST:
+            raise
+        _DEEPGEMM_FAILING_SHAPES.add((M, N, K, dtype))
+        logger.warning(
+            "DeepGEMM matmul failed for (M=%d, N=%d, K=%d, dtype=%s); "
+            "shape cached, falling back to triton. Error: %s",
+            M,
+            N,
+            K,
+            dtype,
+            e,
+        )
+        return _matmul_persistent_triton(a=a, b=b, bias=bias)
 
     # TODO can this be put in DeepGEMM's `c`?
     if bias is not None:
@@ -275,10 +289,13 @@ def _matmul_persistent_deepgemm(
 def matmul_persistent(
     a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
 ):
-    K, N = b.shape
+    M, K = a.shape
+    _, N = b.shape
 
     # DeepGEMM has minimum dimension requirements for TMA descriptors
     MIN_DEEPGEMM_DIM = 16
+
+    shape_key = (M, N, K, a.dtype)
 
     if (
         _ENABLE_MM_DEEPGEMM
@@ -288,6 +305,7 @@ def matmul_persistent(
         and a.is_contiguous()
         and b.transpose(0, 1).is_contiguous()
         and N >= MIN_DEEPGEMM_DIM
+        and shape_key not in _DEEPGEMM_FAILING_SHAPES
     ):
         if _ENABLE_MM_COMPARISON_TEST:
             out_triton = _matmul_persistent_triton(a=a, b=b, bias=bias)
