@@ -414,6 +414,13 @@ class LlamaModel(nn.Module):
         else:
             self.norm = PPMissingLayer(return_tuple=True)
         self.layers_to_capture = []
+        self.flashinfer_agmm_true_sp = None
+        if get_parallel().enable_flashinfer_agmm_true_sp:
+            from sglang.srt.models.llama_flashinfer_agmm import (
+                LlamaFlashInferAgmmTrueSP,
+            )
+
+            self.flashinfer_agmm_true_sp = LlamaFlashInferAgmmTrueSP(self)
 
     def forward(
         self,
@@ -423,6 +430,17 @@ class LlamaModel(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]], PPProxyTensors]:
+        if self.flashinfer_agmm_true_sp is not None:
+            agmm_output = self.flashinfer_agmm_true_sp.maybe_forward(
+                self,
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds,
+                pp_proxy_tensors,
+            )
+            if agmm_output is not None:
+                return agmm_output
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
