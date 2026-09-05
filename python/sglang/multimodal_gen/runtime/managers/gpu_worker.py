@@ -15,6 +15,8 @@ import numpy as np
 import torch
 from setproctitle import setproctitle
 
+from sglang.multimodal_gen.runtime.warmup_request_builder import lighten_warmup_req
+
 from sglang.multimodal_gen.runtime.utils.logging_utils import (  # isort: skip
     globally_suppress_loggers,
 )
@@ -50,8 +52,11 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     save_outputs,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
+    EXTRAPOLATED_VRAM_RESERVE_FRACTION,
+    MIN_VRAM_RESERVE_BYTES,
     DefaultWorkload,
     WarmupMemoryRecord,
+    estimate_default_workload_peak_bytes,
     resolve_default_workload,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -137,6 +142,49 @@ OFFLOAD_DISABLE_RECOMMENDATION_ORDER = (
     "text_encoder_2",
     "transformer",
 )
+
+
+def _shape_label(req: Req) -> str:
+    return f"{req.width}x{req.height}x{req.num_frames or 1}f"
+
+
+def fit_auto_residency_probe(
+    req: Req,
+    *,
+    records: list[WarmupMemoryRecord],
+    free_bytes: int,
+    total_bytes: int,
+    server_args: ServerArgs,
+) -> tuple[Req, int | None, int]:
+    """Shrink a full-shape probe until its extrapolated peak fits the memory left.
+
+    The probe measures the default workload under the load-safe placement, so
+    a probe the card cannot hold would only be found out by running out of
+    memory. The bounded warmup that runs before it gives one measurement to
+    extrapolate from; while that extrapolation exceeds free memory minus the
+    reserve, frames go first and then area, the ladder the OOM retry walks.
+    Returns the fitted request, its estimate and the number of shrink steps.
+    """
+    reserve = max(
+        MIN_VRAM_RESERVE_BYTES, int(total_bytes * EXTRAPOLATED_VRAM_RESERVE_FRACTION)
+    )
+    budget = free_bytes - reserve
+    fitted, steps = req, 0
+    while True:
+        units = (
+            max(1, int(fitted.width or 1))
+            * max(1, int(fitted.height or 1))
+            * max(1, int(fitted.num_frames or 1))
+        )
+        estimate = estimate_default_workload_peak_bytes(
+            records=records, target_units=units
+        )
+        if estimate is None or estimate <= budget:
+            return fitted, estimate, steps
+        lighter = lighten_warmup_req(server_args, fitted)
+        if lighter is None:
+            return fitted, estimate, steps
+        fitted, steps = lighter, steps + 1
 
 
 class GPUWorker(GPUWorkerPostTrainingMixin):
@@ -450,6 +498,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             return self._execute_forward_batch(batch)
 
         req = batch[0]
+        if req.is_warmup and req.extra.get("auto_residency_full_shape_probe"):
+            self._fit_auto_residency_probe(req)
         return self._execute_forward_common(
             req,
             forward_fn=lambda: self.pipeline.forward(req, self.server_args),
@@ -923,6 +973,49 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             upscaling_scale=req.upscaling_scale,
         )
         return np.asarray(materialized.frames)
+
+    def _fit_auto_residency_probe(self, req: Req) -> None:
+        """Size the full-shape probe to what the card has left, on every rank alike."""
+        records = [r for r in self._auto_residency_warmup_records if r.succeeded]
+        if not records or not current_platform.is_cuda():
+            return
+        device = current_platform.get_device(self.local_rank)
+        free_bytes = int(
+            current_platform.get_available_gpu_memory(empty_cache=True) * (1 << 30)
+        )
+        total_bytes = int(torch.cuda.get_device_properties(device).total_memory)
+        _, estimate, steps = fit_auto_residency_probe(
+            req,
+            records=records,
+            free_bytes=free_bytes,
+            total_bytes=total_bytes,
+            server_args=self.server_args,
+        )
+        # Ranks see different free memory and hold different records; the
+        # forward must run one shape everywhere, so the most cautious rank wins.
+        agreed = torch.tensor([steps], dtype=torch.int64, device=device)
+        agreed = get_replica_group().all_reduce(
+            agreed, op=torch.distributed.ReduceOp.MAX
+        )
+        steps = int(agreed.item())
+        if steps == 0:
+            return
+        fitted = req
+        for _ in range(steps):
+            lighter = lighten_warmup_req(self.server_args, fitted)
+            if lighter is None:
+                break
+            fitted = lighter
+        if self.is_output_rank:
+            logger.warning(
+                "Auto residency probe %s would not fit: extrapolated peak %.1f GiB "
+                "against %.1f GiB free; probing at %s instead",
+                _shape_label(req),
+                (estimate or 0) / (1 << 30),
+                free_bytes / (1 << 30),
+                _shape_label(fitted),
+            )
+        req.sampling_params = fitted.sampling_params
 
     def _record_output_peak_memory(
         self, output_batch: OutputBatch, *, is_warmup: bool = False
