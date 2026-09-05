@@ -14,8 +14,14 @@ from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
     is_supported_forward_mode,
     resolve_max_m,
 )
+from sglang.srt.model_executor.cuda_graph_config import (
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models.qwen3_5_text import Qwen3_5ForCausalLM
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
@@ -65,12 +71,19 @@ def test_supported_forward_modes(forward_mode, expected):
     return_value=8192,
 )
 def test_framework_capacity_is_maximum_of_all_sources(_cutedsl_moe_max_num_tokens):
-    graph = SimpleNamespace(
-        decode=SimpleNamespace(max_bs=512, bs=[1, 64, 256]),
-        prefill=SimpleNamespace(max_bs=4096, bs=[1024, 2048, 4096]),
+    # The graph bounds are a bag leaf, so the test states them by publishing.
+    reset_context()
+    publish(
+        ServerArgs(
+            model_path="dummy",
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(max_bs=512, bs=[1, 64, 256]),
+                prefill=PhaseConfig(max_bs=4096, bs=[1024, 2048, 4096]),
+            ),
+        ),
+        role="test",
     )
-    server_args = SimpleNamespace(cuda_graph_config=graph)
-    runner = SimpleNamespace(server_args=server_args, max_running_requests=2048)
+    runner = SimpleNamespace(server_args=SimpleNamespace(), max_running_requests=2048)
 
     assert resolve_max_m(runner) == 8192
 

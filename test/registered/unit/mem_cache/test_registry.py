@@ -1,5 +1,6 @@
 """Unit tests for the radix-cache registry, routing, and selection chain."""
 
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -16,7 +17,7 @@ from sglang.srt.mem_cache.registry import (
     register_radix_cache_backend,
     registered_radix_cache_backends,
 )
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_override
 
 
 def _publish(testcase, **fields):
@@ -340,14 +341,14 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
         from sglang.srt.mem_cache.storage.umbp import umbp_direct_linker
 
         ctx = _make_ctx(self)
-        object.__setattr__(
-            ctx.server_args, "enable_unified_cache_external_linker", True
+        # The factory reads the linker settings from the bags.
+        enter_override(
+            self,
+            get_context().override_server_args(
+                enable_unified_cache_external_linker=True,
+                unified_cache_external_linker_backend="mori",
+            ),
         )
-        object.__setattr__(
-            ctx.server_args, "unified_cache_external_linker_backend", "mori"
-        )
-        self.assertTrue(ctx.server_args.enable_unified_cache_external_linker)
-        self.assertEqual(ctx.server_args.unified_cache_external_linker_backend, "mori")
         fake_components = MagicMock()
         fake_components.ComponentType.FULL = "full"
         fake_radix = MagicMock()
