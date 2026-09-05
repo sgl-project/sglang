@@ -455,7 +455,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self._track_mamba_state_decode(
                 forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
             )
-            return core_attn_out
+            torch._assert_async(
+            torch.isfinite(core_attn_out).all(),
+            f"PR2874 GDN decode core_attn_out nonfinite L{layer.layer_id}",
+        )
+        return core_attn_out
 
         query, key, value = torch.split(
             mixed_qkv,
@@ -485,6 +489,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
         )
 
+        torch._assert_async(
+            torch.isfinite(core_attn_out).all(),
+            f"PR2874 GDN decode core_attn_out nonfinite L{layer.layer_id}",
+        )
         return core_attn_out
 
     def forward_extend(

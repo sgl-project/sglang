@@ -124,6 +124,12 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             prefix=add_prefix("mtp", prefix),
             is_nextn=True,
         )
+        # PR2874: tag the draft model's modules so layer probes name the role.
+        _pr2874_inner = getattr(self.model, "model", None)
+        if _pr2874_inner is not None:
+            _pr2874_inner._pr2874_role = "draft"
+            for _pr2874_layer in getattr(_pr2874_inner, "layers", []):
+                _pr2874_layer._pr2874_role = "draft"
 
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:

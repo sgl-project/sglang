@@ -863,6 +863,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def _draft_extend_for_decode(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
+        # PR2874: the target hidden states handed to the draft must be finite.
+        _pr2874_h = batch_result.logits_output.hidden_states
+        if _pr2874_h is not None and torch.is_tensor(_pr2874_h) and _pr2874_h.numel() > 0:
+            torch._assert_async(
+                torch.isfinite(_pr2874_h).all(),
+                "PR2874 target hidden_states fed to draft_extend_for_decode nonfinite",
+            )
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,

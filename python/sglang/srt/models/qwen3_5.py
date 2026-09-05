@@ -226,6 +226,20 @@ if _is_npu:
     )
 
 
+
+def _pr2874_layer_probe(module, hidden_states, stage, forward_batch):
+    """Decode/verify/draft-phase localization probe (PR2874). Async device assert
+    naming role, layer, stage and forward mode; no host sync."""
+    h = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+    if h is None or not torch.is_tensor(h) or h.numel() == 0:
+        return
+    role = getattr(module, "_pr2874_role", "target")
+    mode = forward_batch.forward_mode.name if forward_batch is not None else "unknown"
+    torch._assert_async(
+        torch.isfinite(h).all(),
+        f"PR2874 {role} L{getattr(module, 'layer_id', -1)} {stage} nonfinite mode={mode} n={h.shape[0]}",
+    )
+
 class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(
         self,
@@ -833,11 +847,13 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
         )
 
+        _pr2874_layer_probe(self, hidden_states, "attn_in", forward_batch)
         if not forward_batch.forward_mode.is_idle() and hidden_states.shape[0] > 0:
             hidden_states = self.linear_attn(
                 hidden_states,
                 forward_batch,
             )
+            _pr2874_layer_probe(self, hidden_states, "attn_out", forward_batch)
 
         # Fully Connected
         hidden_states, residual = self.layer_communicator.prepare_mlp(
@@ -864,6 +880,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 )
             else:
                 hidden_states = self.mlp(hidden_states)
+        _pr2874_layer_probe(self, hidden_states, "mlp_out", forward_batch)
         if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
@@ -1237,12 +1254,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
         )
 
+        _pr2874_layer_probe(self, hidden_states, "attn_in", forward_batch)
         if not forward_batch.forward_mode.is_idle() and hidden_states.shape[0] > 0:
             hidden_states = self.self_attention(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+            _pr2874_layer_probe(self, hidden_states, "attn_out", forward_batch)
 
         # Fully Connected
         hidden_states, residual = self.layer_communicator.prepare_mlp(
@@ -1268,6 +1287,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 )
             else:
                 hidden_states = self.mlp(hidden_states)
+        _pr2874_layer_probe(self, hidden_states, "mlp_out", forward_batch)
         if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
@@ -1509,6 +1529,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 hidden_states = self.norm(hidden_states)
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
+        _pr2874_layer_probe(self, hidden_states, "final_norm", forward_batch)
 
         if len(aux_hidden_states) == 0:
             return hidden_states
