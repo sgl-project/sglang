@@ -1,10 +1,8 @@
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use sglang_radix_tree::{
     CacheInitParams, FULL, InsertParams, InsertResult, KeyNamespaceRef, MAMBA, MatchPrefixParams,
-    PageValue, TreeCoreRuntimeError, UnifiedTreeCore,
+    PageValue, RadixValue, TreeCoreRuntimeError, UnifiedTreeCore,
 };
 
 type TestCore = UnifiedTreeCore<Vec<i64>, PageValue<u32>>;
@@ -210,55 +208,20 @@ fn every_eviction_policy_operates_without_torch() {
     }
 }
 
-#[derive(Debug)]
-struct CountedPage {
-    id: u32,
-    clone_count: Arc<AtomicUsize>,
-}
-
-impl Clone for CountedPage {
-    fn clone(&self) -> Self {
-        self.clone_count.fetch_add(1, Ordering::Relaxed);
-        Self {
-            id: self.id,
-            clone_count: Arc::clone(&self.clone_count),
-        }
-    }
-}
-
 #[test]
 fn continuation_insert_shares_immutable_value_storage() {
-    type CountedCore = UnifiedTreeCore<Vec<i64>, PageValue<CountedPage>>;
-
-    let clone_count = Arc::new(AtomicUsize::new(0));
-    let page = |id| CountedPage {
-        id,
-        clone_count: Arc::clone(&clone_count),
-    };
-    let mut tree =
-        CountedCore::new_with_empty(CacheInitParams::default(), vec![FULL], PageValue::default());
-
+    let mut tree = core("lru");
     let initial_key = vec![10, 20];
-    tree.insert(&InsertParams {
-        key: &initial_key,
-        namespace: KeyNamespaceRef::default(),
-        value: PageValue::from_vec(vec![page(1), page(2)]),
-        prev_prefix_len: 0,
-        swa_evicted_seqlen: 0,
-        mamba_value: None,
-        chunked: false,
-        priority: 0,
-        track_adopted_ranges: false,
-    });
+    insert(&mut tree, &initial_key, &[1, 2]);
     let prefix = tree.match_prefix(&MatchPrefixParams {
         key: &initial_key,
         namespace: KeyNamespaceRef::default(),
     });
 
     let extended_key = vec![10, 20, 30, 40];
-    let extended_value = PageValue::from_vec(vec![page(3), page(4)]);
-    clone_count.store(0, Ordering::Relaxed);
-    tree.insert_suffix_from_node(
+    let extended_value = PageValue::from_vec(vec![3, 4]);
+    let extended_ptr = extended_value.as_slice().as_ptr();
+    let result = tree.insert_suffix_from_node(
         prefix.last_device_node_id,
         2,
         &InsertParams {
@@ -274,5 +237,12 @@ fn continuation_insert_shares_immutable_value_storage() {
         },
     );
 
-    assert_eq!(clone_count.load(Ordering::Relaxed), 0);
+    // The stored suffix still points at the caller's buffer: no page was copied.
+    let stored = tree.collect_full_device_indices(
+        result.last_device_node_id.expect("inserted node"),
+        prefix.last_device_node_id,
+    );
+    assert_eq!(stored.as_slice(), &[3, 4]);
+    assert_eq!(stored.as_slice().as_ptr(), extended_ptr);
+    assert_eq!(stored.to_i64_vec(), vec![3, 4]);
 }

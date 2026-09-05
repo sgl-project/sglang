@@ -44,10 +44,8 @@ pub trait RadixValue: Debug + Sized + 'static {
     /// Convert a request slot to the representation expected by the Mamba pool.
     fn to_mamba_device_indices(&self) -> Self;
 
-    /// Materialize integer values for optional inspection/debug APIs.
-    fn to_i64_vec(&self) -> Vec<i64> {
-        panic!("this value backend does not support integer inspection")
-    }
+    /// Materialize the indices as integers for inspection and canary walks.
+    fn to_i64_vec(&self) -> Vec<i64>;
 }
 
 /// Immutable, cheaply sliced list suitable for simulated KV page identifiers.
@@ -105,7 +103,7 @@ impl<T> From<Vec<T>> for PageValue<T> {
 
 impl<T> RadixValue for PageValue<T>
 where
-    T: Clone + Debug + 'static,
+    T: Copy + Debug + TryInto<i64> + 'static,
 {
     fn len(&self) -> usize {
         self.range.len()
@@ -181,6 +179,16 @@ where
 
     fn to_mamba_device_indices(&self) -> Self {
         self.shallow_clone()
+    }
+
+    fn to_i64_vec(&self) -> Vec<i64> {
+        self.as_slice()
+            .iter()
+            .map(|&page| {
+                page.try_into()
+                    .unwrap_or_else(|_| panic!("page id does not fit in i64"))
+            })
+            .collect()
     }
 }
 
