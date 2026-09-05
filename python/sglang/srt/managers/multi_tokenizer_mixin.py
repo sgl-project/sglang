@@ -71,6 +71,7 @@ from sglang.srt.utils import (
     kill_process_tree,
 )
 from sglang.srt.utils.network import get_zmq_socket
+from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.utils import get_exception_traceback
 
 if TYPE_CHECKING:
@@ -452,6 +453,9 @@ class MultiTokenizerRouter:
     ):
         self.server_args = server_args
         self.startup_time: Optional[Dict[str, Any]] = None
+        # Set by engine.py after construction, mirroring TokenizerManager
+        self.max_req_input_len: Optional[int] = None
+        self._subprocess_watchdog: Optional[SubprocessWatchdog] = None
         context = zmq.asyncio.Context(3)
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
