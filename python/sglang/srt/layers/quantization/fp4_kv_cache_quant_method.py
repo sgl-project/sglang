@@ -120,6 +120,47 @@ class KVCacheQuantMethodBase(ABC):
     def attention_accesses(self) -> tuple[KVCacheAttentionAccess, ...]:
         return KV_CACHE_ATTENTION_ACCESS_REGISTRY.get(self.name, ())
 
+    def configure_attention_backends(
+        self, prefill_backend: str, decode_backend: str
+    ) -> None:
+        """Select the accesses that this server will actually instantiate.
+
+        Keeping this selection on the recipe object lets memory allocation
+        omit compatibility workspaces/layouts that the chosen backend pair can
+        never read. Directly-constructed methods retain the complete registry,
+        which is useful for introspection and backwards-compatible unit tests.
+        """
+        selected = []
+        for phase, backend in (
+            (KVCacheAttentionPhase.PREFILL, prefill_backend),
+            (KVCacheAttentionPhase.DECODE, decode_backend),
+        ):
+            access = self.resolve_attention_access(phase, backend)
+            if access is not None:
+                selected.append(access)
+        self._active_attention_accesses = tuple(selected)
+
+    def configure_attention_backends_from_server_args(self, server_args) -> None:
+        """Select accesses from the resolved per-phase attention backends.
+
+        Attention backend resolution is declaration based: model hooks can
+        override a pristine ``ServerArgs`` without mutating its raw fields.
+        Always use the public resolution projection here instead of depending
+        on a private ``ServerArgs`` helper, and keep pool sizing/allocation on
+        the same selection path.
+        """
+        from sglang.srt.arg_groups.overrides import (
+            attention_backends_of,
+            resolved_view,
+        )
+
+        self.configure_attention_backends(
+            *attention_backends_of(resolved_view(server_args))
+        )
+
+    def active_attention_accesses(self) -> tuple[KVCacheAttentionAccess, ...]:
+        return getattr(self, "_active_attention_accesses", self.attention_accesses())
+
     def resolve_attention_access(
         self, phase, backend_name: str, backend_tags: Iterable[str] = ()
     ) -> Optional[KVCacheAttentionAccess]:
@@ -146,8 +187,19 @@ class KVCacheQuantMethodBase(ABC):
         """Whether the pool should allocate dq_k_buffer / dq_v_buffer."""
         return any(
             access.kind == KVCacheAttentionAccessKind.DEQUANT_WORKSPACE
-            for access in self.attention_accesses()
+            for access in self.active_attention_accesses()
         )
+
+    def has_native_fp4_access(self) -> bool:
+        """Whether a selected backend consumes native packed FP4 + scales."""
+        return any(
+            access.kind == KVCacheAttentionAccessKind.NATIVE_FP4
+            for access in self.active_attention_accesses()
+        )
+
+    def needs_native_fp4_scales(self) -> bool:
+        """Whether the pool needs a separate native FP4 scale layout."""
+        return self.has_native_fp4_access()
 
     def needs_plain_kv_dequant_read(self) -> bool:
         """Whether plain attention reads require dequantizing packed KV first."""
@@ -160,7 +212,7 @@ class KVCacheQuantMethodBase(ABC):
     def dequant_workspace_dtype(self) -> Optional[torch.dtype]:
         """Workspace dtype required by DEQUANT_WORKSPACE access rules."""
         workspace_dtypes = set()
-        for access in self.attention_accesses():
+        for access in self.active_attention_accesses():
             if access.kind != KVCacheAttentionAccessKind.DEQUANT_WORKSPACE:
                 continue
             if access.workspace_dtype is None:
@@ -249,6 +301,8 @@ class KVCacheQuantMethodBase(ABC):
         cache_v: Tensor,
         k_scale=None,
         v_scale=None,
+        native_k_scale_buffer: Optional[Tensor] = None,
+        native_v_scale_buffer: Optional[Tensor] = None,
     ) -> None:
         """Quantize cache_k / cache_v and write into buffers at loc."""
 
@@ -310,6 +364,8 @@ class UnquantizedKVCacheMethod(KVCacheQuantMethodBase):
         cache_v,
         k_scale=None,
         v_scale=None,
+        native_k_scale_buffer=None,
+        native_v_scale_buffer=None,
     ) -> None:
         raise RuntimeError(
             "Unquantized KV cache writes are handled by MHATokenToKVPool.set_kv_buffer."
@@ -391,9 +447,21 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
     name = "nvfp4"
     SCALE_BLOCK_SIZE = 16
 
-    def __init__(self, num_layers: int, device: str):
+    def __init__(
+        self,
+        num_layers: int,
+        device: str,
+        page_size: int = 16,
+        native_scale_layout: Optional[bool] = None,
+    ):
         self.num_layers = num_layers
         self.device = device
+        self.page_size = page_size
+        self.use_trtllm_gen_native_scale_layout = (
+            get_platform().is_sm100
+            if native_scale_layout is None
+            else native_scale_layout
+        )
         # Per-layer global FP32 scales; filled by load_scales_from_model()
         self.k_scales_gpu = torch.ones(num_layers, dtype=torch.float32, device=device)
         self.v_scales_gpu = torch.ones(num_layers, dtype=torch.float32, device=device)
@@ -402,6 +470,17 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
 
     def needs_global_scale(self) -> bool:
         return True
+
+    def needs_native_fp4_scales(self) -> bool:
+        """Whether SM100 TRT-LLM GenMHA's physical HND scales are needed."""
+        return self.has_native_fp4_access() and self.use_trtllm_gen_native_scale_layout
+
+    def needs_linear_scale_buffer(self) -> bool:
+        # FlashInfer DQ prefill always needs token-linear scales. SM120 XQA also
+        # consumes the legacy linear layout instead of SM100's GenMHA layout.
+        return self.needs_dequant_workspace() or (
+            self.has_native_fp4_access() and not self.use_trtllm_gen_native_scale_layout
+        )
 
     def scale_buffer_view_dtype(self) -> Optional[torch.dtype]:
         return torch.float8_e4m3fn
@@ -461,15 +540,21 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
                 if hasattr(layer, "v_scale") and layer.v_scale is not None
                 else 1.0
             )
-            # SM100 uses TRT-LLM XQA kernels that expect KV scales as
+            # SM100 uses TRT-LLM GenMHA kernels that expect KV scales as
             # amax / 448, but the calibrated checkpoint stores amax / (6 * 448).
             # We multiply by E2M1_MAX (6.0) to bridge the gap.  SM120 uses a
             # different kernel path where scales already include this factor.
             # The FP4 data type itself is identical on both architectures.
             # Reference: TRT-LLM FP8QDQLinearMethod.process_weights_after_loading_fused_qkv_linear
             # https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/linear.py
-            if get_platform().is_sm100:
+            # BaseKVCacheMethod uses exactly 1.0 when the checkpoint did not
+            # provide calibrated KV scales. Keep that neutral fallback: turning
+            # it into 6.0 needlessly pushes the online block scales toward the
+            # low-precision end of E4M3. Real calibrated scales are tiny
+            # positive values and need the E2M1_MAX conversion below.
+            if get_platform().is_sm100 and k_scale != 1.0:
                 k_scale *= E2M1_MAX
+            if get_platform().is_sm100 and v_scale != 1.0:
                 v_scale *= E2M1_MAX
             k_scales_cpu[layer_id] = k_scale
             v_scales_cpu[layer_id] = v_scale
@@ -490,6 +575,24 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         k = head_dim
         store_dtype = self.kv_storage_dtype()
         dq_dtype = self.dequant_workspace_dtype()
+        needs_linear_scales = self.needs_linear_scale_buffer()
+        needs_native_scales = self.needs_native_fp4_scales()
+
+        if needs_native_scales:
+            if self.page_size % 4 != 0:
+                raise ValueError(
+                    "Native NVFP4 requires page_size divisible by 4, got "
+                    f"{self.page_size}."
+                )
+            if k % 64 != 0:
+                raise ValueError(
+                    f"Native NVFP4 requires head_dim divisible by 64, got {k}."
+                )
+            if m % self.page_size != 0:
+                raise ValueError(
+                    "NVFP4 pool rows must be page aligned, got "
+                    f"rows={m}, page_size={self.page_size}."
+                )
 
         k_buffer = [
             torch.zeros((m, n, k // 2), dtype=store_dtype, device=device)
@@ -499,18 +602,52 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
             torch.zeros((m, n, k // 2), dtype=store_dtype, device=device)
             for _ in range(layer_num)
         ]
-        k_scale_buffer = [
-            torch.zeros(
-                (m, n, k // self.SCALE_BLOCK_SIZE), dtype=store_dtype, device=device
-            )
-            for _ in range(layer_num)
-        ]
-        v_scale_buffer = [
-            torch.zeros(
-                (m, n, k // self.SCALE_BLOCK_SIZE), dtype=store_dtype, device=device
-            )
-            for _ in range(layer_num)
-        ]
+        k_scale_buffer = (
+            [
+                torch.zeros(
+                    (m, n, k // self.SCALE_BLOCK_SIZE),
+                    dtype=store_dtype,
+                    device=device,
+                )
+                for _ in range(layer_num)
+            ]
+            if needs_linear_scales
+            else None
+        )
+        v_scale_buffer = (
+            [
+                torch.zeros(
+                    (m, n, k // self.SCALE_BLOCK_SIZE),
+                    dtype=store_dtype,
+                    device=device,
+                )
+                for _ in range(layer_num)
+            ]
+            if needs_linear_scales
+            else None
+        )
+        native_scale_shape = (
+            m // self.page_size,
+            n,
+            self.page_size,
+            k // self.SCALE_BLOCK_SIZE,
+        )
+        native_k_scale_buffer = (
+            [
+                torch.zeros(native_scale_shape, dtype=store_dtype, device=device)
+                for _ in range(layer_num)
+            ]
+            if needs_native_scales
+            else None
+        )
+        native_v_scale_buffer = (
+            [
+                torch.zeros(native_scale_shape, dtype=store_dtype, device=device)
+                for _ in range(layer_num)
+            ]
+            if needs_native_scales
+            else None
+        )
         # Shared dequant workspace: one copy, reused per layer during prefill.
         dq_k_buffer = (
             torch.zeros((m, n, k), dtype=dq_dtype, device=device)
@@ -528,6 +665,8 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
             "v_buffer": v_buffer,
             "k_scale_buffer": k_scale_buffer,
             "v_scale_buffer": v_scale_buffer,
+            "native_k_scale_buffer": native_k_scale_buffer,
+            "native_v_scale_buffer": native_v_scale_buffer,
             "dq_k_buffer": dq_k_buffer,
             "dq_v_buffer": dq_v_buffer,
             "store_dtype": store_dtype,
@@ -544,8 +683,13 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         cache_v: Tensor,
         k_scale=None,
         v_scale=None,
+        native_k_scale_buffer: Optional[Tensor] = None,
+        native_v_scale_buffer: Optional[Tensor] = None,
     ) -> None:
         from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
+        from sglang.srt.layers.quantization.nvfp4_kv_cache import (
+            store_nvfp4_kv_cache,
+        )
 
         cache_k, cache_k_fp4_sf, _ = NVFP4KVQuantizeUtil.quantize(
             cache_k.contiguous(), k_scale
@@ -559,10 +703,20 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         cache_k_fp4_sf = cache_k_fp4_sf.view(torch.uint8)
         cache_v_fp4_sf = cache_v_fp4_sf.view(torch.uint8)
 
-        k_buffer[loc] = cache_k
-        v_buffer[loc] = cache_v
-        k_scale_buffer[loc] = cache_k_fp4_sf
-        v_scale_buffer[loc] = cache_v_fp4_sf
+        store_nvfp4_kv_cache(
+            cache_k,
+            cache_v,
+            cache_k_fp4_sf,
+            cache_v_fp4_sf,
+            loc,
+            k_buffer,
+            v_buffer,
+            k_scale_buffer,
+            v_scale_buffer,
+            native_k_scale_buffer,
+            native_v_scale_buffer,
+            self.page_size,
+        )
 
     def dequantize_prev_kv(
         self,
@@ -590,9 +744,13 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
     ) -> int:
         # FP4 data: per-layer, K+V
         fp4_size = head_num * (head_dim // 2) * num_layers * 2 * kv_size
-        # Block scales: per-layer, K+V (uint8)
-        scale_size = (
+        # Linear scales serve the FP8-prefill compatibility recipe; native HND
+        # scales serve TRT-LLM GenMHA. Mixed mode intentionally owns both.
+        one_scale_layout_size = (
             head_num * (head_dim // self.SCALE_BLOCK_SIZE) * num_layers * 2 * kv_size
+        )
+        scale_size = one_scale_layout_size * (
+            int(self.needs_linear_scale_buffer()) + int(self.needs_native_fp4_scales())
         )
         # Dequant workspace is shared across layers, not multiplied by num_layers.
         dq_dtype = self.dequant_workspace_dtype()
@@ -622,6 +780,7 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
         self,
         num_layers: Optional[int] = None,
         device: Optional[str] = None,
+        page_size: Optional[int] = None,
     ):
         pass
 
@@ -689,6 +848,8 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
         cache_v,
         k_scale=None,
         v_scale=None,
+        native_k_scale_buffer=None,
+        native_v_scale_buffer=None,
     ) -> None:
         from sglang.srt.layers.quantization.kvfp4_tensor import (
             FP4MXBlock16KVQuantizeUtil,
@@ -763,7 +924,8 @@ _FP4_MX_SCALE = "fp4_mx_block16"
 _FP8_E4M3 = torch.float8_e4m3fn
 _TORCH_FP4 = getattr(torch, "float4_e2m1fn_x2", None)
 _BF16 = torch.bfloat16
-_NVFP4_PREFILL_BACKENDS = frozenset({"flashinfer"})
+_NVFP4_DQ_PREFILL_BACKENDS = frozenset({"flashinfer"})
+_NVFP4_NATIVE_BACKENDS = frozenset({"trtllm_mha"})
 _NVFP4_DECODE_BACKENDS = frozenset({"trtllm_mha"})
 _FP4_MX_MHA_BACKENDS = frozenset(
     {"triton", "torch_native", "flex_attention", "trtllm_mha"}
@@ -837,7 +999,8 @@ KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]
         _plain(_DECODE, _CPU_FP8_BACKENDS),
     ),
     NVFP4KVCacheMethod.name: (
-        _dq_workspace(_PREFILL, _NVFP4_PREFILL_BACKENDS, _NVFP4_SCALE, _FP8_E4M3),
+        _dq_workspace(_PREFILL, _NVFP4_DQ_PREFILL_BACKENDS, _NVFP4_SCALE, _FP8_E4M3),
+        _native_fp4(_PREFILL, _NVFP4_NATIVE_BACKENDS, _NVFP4_SCALE, _TORCH_FP4),
         _native_fp4(_DECODE, _NVFP4_DECODE_BACKENDS, _NVFP4_SCALE, _TORCH_FP4),
     ),
     FP4MXBlock16KVCacheMethod.name: (

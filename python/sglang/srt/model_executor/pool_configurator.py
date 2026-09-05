@@ -371,14 +371,31 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
 
             if is_float4_e2m1fn_x2(kv_cache_dtype):
-                # kv_scale_buffer
-                scale_block_size = 16
-                k = model_config.head_dim
-                cell_size = (cell_size // 2) + (
-                    (n * k * effective_num_layers * 2 * kv_size) // scale_block_size
+                from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+                    get_kv_cache_quant_method,
+                    resolve_kv_cache_quant,
                 )
-                # FP4 prefill uses one shared FP8 dequant workspace across layers.
-                cell_size += n * k * 2 * kv_size
+
+                quant_name = resolve_kv_cache_quant(kvc.kv_cache_dtype_str)
+                if quant_name is None:
+                    raise ValueError(
+                        "FP4 storage dtype requires an explicit KV recipe name."
+                    )
+                quant_method = get_kv_cache_quant_method(
+                    quant_name,
+                    num_layers=effective_num_layers,
+                    device=kvc.device,
+                    page_size=kvc.page_size,
+                )
+                quant_method.configure_attention_backends_from_server_args(
+                    kvc.server_args
+                )
+                cell_size = quant_method.compute_cell_size(
+                    n,
+                    model_config.head_dim,
+                    effective_num_layers,
+                    kv_size,
+                )
             elif self.kv_cache_dtype_str == "mxfp8":
                 scale_block_size = 32
                 cell_size += (
