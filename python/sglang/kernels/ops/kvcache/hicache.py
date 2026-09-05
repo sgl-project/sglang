@@ -72,11 +72,14 @@ def can_use_hicache_jit_kernel(
     block_quota: int | None = None,  # can be tuned for less interference
 ) -> bool:
     logger = logging.getLogger(__name__)
-    if element_size % 128 != 0:
-        logger.warning(f"Unsupported {element_size = } for JIT HiCache kernel")
-        return False
     try:
-        unroll = unroll or _default_unroll(element_size)
+        unroll = _resolve_unroll(element_size, unroll)
+        if unroll is None:
+            logger.warning(
+                f"Unsupported {element_size = } for JIT HiCache kernel: "
+                f"no unroll satisfies the per-thread 4-byte alignment"
+            )
+            return False
         block_quota = block_quota or DEFAULT_BLOCK_QUOTA
         _jit_hicache_module(
             element_size=element_size,
@@ -124,6 +127,31 @@ def _default_unroll(element_size: int) -> int:
     return 1
 
 
+def _viable_unroll(element_size: int, unroll: int) -> bool:
+    num_threads = 32 // unroll
+    return element_size % num_threads == 0 and (element_size // num_threads) % 4 == 0
+
+
+def _resolve_unroll(element_size: int, unroll: int | None = None) -> int | None:
+    """Resolve a viable unroll for the non-staged JIT HiCache kernels.
+
+    Keeps the caller-provided unroll when it satisfies the kernel
+    constraints. Otherwise walks the unroll ladder starting from the
+    performance-oriented default and moving to larger unroll (fewer
+    threads per package) as needed, returning the first candidate where
+    element_size is divisible by num_threads and the per-thread byte
+    count is a multiple of 4 (see get_mem_unit in kvcacheio/hicache.cuh).
+    Returns None when no candidate works.
+    """
+    if unroll is not None:
+        return unroll if _viable_unroll(element_size, unroll) else None
+    default = _default_unroll(element_size)
+    for candidate in (1, 2, 4, 8, 16, 32):
+        if candidate >= default and _viable_unroll(element_size, candidate):
+            return candidate
+    return None
+
+
 @debug_kernel_api
 def transfer_hicache_one_layer(
     k_cache_dst: torch.Tensor,
@@ -144,7 +172,12 @@ def transfer_hicache_one_layer(
     v_cache_dst = v_cache_dst.view(-1, element_dim)
     element_size = element_dim * k_cache_dst.element_size()
     block_quota = block_quota or DEFAULT_BLOCK_QUOTA
-    unroll = unroll or _default_unroll(element_size)
+    unroll = _resolve_unroll(element_size, unroll)
+    if unroll is None:
+        raise ValueError(
+            f"No viable unroll for element_size={element_size}: JIT HiCache "
+            f"kernels require element_size / num_threads to be a multiple of 4"
+        )
     module = _jit_hicache_module(
         element_size=element_size,
         unroll=unroll,
@@ -180,7 +213,12 @@ def transfer_hicache_all_layer(
         element_size = kv_cache_dst_stride_bytes
 
     block_quota = block_quota or DEFAULT_BLOCK_QUOTA
-    unroll = unroll or _default_unroll(element_size)
+    unroll = _resolve_unroll(element_size, unroll)
+    if unroll is None:
+        raise ValueError(
+            f"No viable unroll for element_size={element_size}: JIT HiCache "
+            f"kernels require element_size / num_threads to be a multiple of 4"
+        )
     module = _jit_hicache_module(
         element_size=element_size,
         unroll=unroll,
@@ -213,7 +251,12 @@ def transfer_hicache_one_layer_mla(
     cache_dst = cache_dst.view(-1, element_dim)
     element_size = element_dim * cache_dst.element_size()
     block_quota = block_quota or DEFAULT_BLOCK_QUOTA
-    unroll = unroll or _default_unroll(element_size)
+    unroll = _resolve_unroll(element_size, unroll)
+    if unroll is None:
+        raise ValueError(
+            f"No viable unroll for element_size={element_size}: JIT HiCache "
+            f"kernels require element_size / num_threads to be a multiple of 4"
+        )
     module = _jit_hicache_module(
         element_size=element_size,
         unroll=unroll,
@@ -244,7 +287,12 @@ def transfer_hicache_all_layer_mla(
         element_size = cache_dst_stride_bytes
 
     block_quota = block_quota or DEFAULT_BLOCK_QUOTA
-    unroll = unroll or _default_unroll(element_size)
+    unroll = _resolve_unroll(element_size, unroll)
+    if unroll is None:
+        raise ValueError(
+            f"No viable unroll for element_size={element_size}: JIT HiCache "
+            f"kernels require element_size / num_threads to be a multiple of 4"
+        )
     module = _jit_hicache_module(
         element_size=element_size,
         unroll=unroll,
