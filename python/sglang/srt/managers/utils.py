@@ -15,7 +15,11 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_tokens
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_spec,
+    max_speculative_num_draft_tokens,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 
@@ -56,6 +60,7 @@ class GenerationBatchResult:
     accept_length_per_req_cpu: Optional[List[int]] = None
     dllm_algo_state: Optional[List[Any]] = None
     can_run_cuda_graph: bool = False
+    mm_embedding_errors: Optional[torch.Tensor] = None
 
     # PP skip output comm: True when output send/recv was skipped and
     # next_token_ids are placeholder zeros. Used by process_batch_result_prefill
@@ -161,6 +166,7 @@ class GenerationBatchResult:
                 self.logits_output.hidden_states
             )
         self.next_token_ids = _async_d2h(self.next_token_ids)
+        self.copy_mm_embedding_errors_to_cpu()
 
         if self.accept_lens is not None:
             self.accept_lens = _async_d2h(self.accept_lens)
@@ -186,6 +192,10 @@ class GenerationBatchResult:
 
         self.copy_done.record()
 
+    def copy_mm_embedding_errors_to_cpu(self) -> None:
+        if self.mm_embedding_errors is not None and not self.mm_embedding_errors.is_cpu:
+            self.mm_embedding_errors = _async_d2h(self.mm_embedding_errors)
+
     def copy_auxiliary_output_to_cpu(self) -> None:
         if self.logits_output is None or self.auxiliary_host_output is not None:
             return
@@ -209,7 +219,110 @@ class GenerationBatchResult:
                 "extend_logprob_start_len_per_req", None
             ),
             can_run_cuda_graph=can_run_cuda_graph,
+            mm_embedding_errors=next_pp_outputs.tensors.get(MM_EMBEDDING_ERRORS_KEY),
         )
+
+
+MM_EMBEDDING_ERRORS_KEY = "mm_embedding_errors"
+
+
+def decode_mm_embedding_errors(
+    errors: Optional[torch.Tensor],
+) -> List[tuple[int, int, int]]:
+    if errors is None:
+        return []
+    rows = errors.tolist() if errors.is_cpu else errors.cpu().tolist()
+    return [
+        (req_idx, expected, actual)
+        for req_idx, (_validated, failed, expected, actual) in enumerate(rows)
+        if failed
+    ]
+
+
+def has_mm_embedding_failures(errors: Optional[torch.Tensor]) -> bool:
+    return errors is not None and bool(errors[:, 1].any().item())
+
+
+def complete_mm_embedding_validations(reqs: List[Req], result: torch.Tensor) -> None:
+    rows = result.tolist() if result.is_cpu else result.cpu().tolist()
+    for req, (validated, _failed, _expected, _actual) in zip(reqs, rows, strict=True):
+        if validated:
+            assert req.mm_embedding_validation_count > 0
+            req.mm_embedding_validation_count -= 1
+
+
+def synchronize_mm_embedding_errors(
+    errors: Optional[List[tuple[int, int, int]]],
+    batch_size: int,
+    device: torch.device,
+    validated_indices: List[int],
+) -> torch.Tensor:
+    validated = torch.zeros(batch_size, dtype=torch.int64, device=device)
+    validated[validated_indices] = 1
+    local_failure = torch.zeros(batch_size, dtype=torch.int64, device=device)
+    local_details = torch.zeros((batch_size, 2), dtype=torch.int64, device=device)
+    for req_idx, expected, actual in errors or []:
+        local_failure[req_idx] = 1
+        local_details[req_idx] = torch.tensor((expected, actual), device=device)
+
+    parallel = get_parallel()
+    groups = []
+    for group in (parallel.attn_tp_group, parallel.attn_cp_group):
+        if group.world_size > 1 and all(
+            group.device_group is not existing.device_group for existing in groups
+        ):
+            groups.append(group)
+
+    failure = local_failure.clone()
+    for group in groups:
+        torch.distributed.all_reduce(
+            failure, op=torch.distributed.ReduceOp.MAX, group=group.device_group
+        )
+
+    if not groups:
+        return torch.cat(
+            (validated.unsqueeze(1), failure.unsqueeze(1), local_details), dim=1
+        )
+
+    rank = torch.distributed.get_rank()
+    owner = torch.where(
+        local_failure.bool(),
+        torch.full_like(local_failure, rank),
+        torch.full_like(local_failure, torch.iinfo(torch.int64).max),
+    )
+    for group in groups:
+        torch.distributed.all_reduce(
+            owner, op=torch.distributed.ReduceOp.MIN, group=group.device_group
+        )
+
+    details = torch.where(
+        (owner == rank).unsqueeze(1), local_details, torch.zeros_like(local_details)
+    )
+    for group in groups:
+        torch.distributed.all_reduce(
+            details, op=torch.distributed.ReduceOp.SUM, group=group.device_group
+        )
+    return torch.cat((validated.unsqueeze(1), failure.unsqueeze(1), details), dim=1)
+
+
+def merge_mm_embedding_error_tensors(
+    incoming: Optional[torch.Tensor], local: Optional[torch.Tensor]
+) -> Optional[torch.Tensor]:
+    if incoming is None:
+        return local
+    if local is None:
+        return incoming
+    incoming = incoming.to(local.device)
+    use_incoming = incoming[:, 1].bool().unsqueeze(1)
+    details = torch.where(use_incoming, incoming[:, 2:], local[:, 2:])
+    return torch.cat(
+        (
+            torch.maximum(incoming[:, :1], local[:, :1]),
+            torch.maximum(incoming[:, 1:2], local[:, 1:2]),
+            details,
+        ),
+        dim=1,
+    )
 
 
 def validate_input_length(
@@ -316,6 +429,7 @@ class EmbeddingBatchResult:
     pooled_hidden_states: Optional[torch.Tensor] = None
     copy_done: Optional[torch.cuda.Event] = None
     can_run_cuda_graph: bool = False
+    mm_embedding_errors: Optional[torch.Tensor] = None
 
     @torch.profiler.record_function("copy_embedding_to_cpu")
     def copy_to_cpu(self):
@@ -338,6 +452,9 @@ class EmbeddingBatchResult:
                 ]
             else:
                 self.pooled_hidden_states = _async_d2h(self.pooled_hidden_states)
+
+        if self.mm_embedding_errors is not None:
+            self.mm_embedding_errors = _async_d2h(self.mm_embedding_errors)
 
         self.copy_done.record()
 

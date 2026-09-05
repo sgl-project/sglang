@@ -432,11 +432,14 @@ class CommonKVManager(BaseKVManager):
     def _maybe_ack_drained_abort(self, room: int) -> None:
         """Send the deferred ack once an aborted room's chunks have drained
         (outstanding == 0). pop() makes it fire at most once."""
-        if self._staging_outstanding.get(room, 0) > 0:
+        if not self.is_transfer_quiesced(room):
             return
         target = self._deferred_ack_targets.pop(room, None)
         if target is not None:
             self._send_abort_ack(target[0], target[1], room)
+
+    def is_transfer_quiesced(self, room: int) -> bool:
+        return self._staging_outstanding.get(room, 0) == 0
 
     def register_deferred_ack_target(
         self, room: int, decode_ip: str, decode_port: int

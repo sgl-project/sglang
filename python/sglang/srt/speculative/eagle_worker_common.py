@@ -664,4 +664,5 @@ def run_eagle_verify(
         routed_experts_output=forward_batch_output.routed_experts_output,
         indexer_topk_output=forward_batch_output.indexer_topk_output,
         extra_keep_alive_refs=[verify_forward_batch],
+        mm_embedding_errors=forward_batch_output.mm_embedding_errors,
     )

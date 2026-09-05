@@ -206,6 +206,35 @@ class KVArgsRegisterInfo:
 class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
 
+    def _count_transfer_chunk(self, kv_chunk: TransferKVChunk) -> None:
+        with self._staging_outstanding_lock:
+            outstanding = self._staging_outstanding.get(kv_chunk.room, 0)
+            if kv_chunk.staging_counted:
+                if outstanding <= 0:
+                    raise RuntimeError(
+                        f"Counted transfer chunk has no outstanding owner for room {kv_chunk.room}"
+                    )
+                return
+            self._staging_outstanding[kv_chunk.room] = outstanding + 1
+            kv_chunk.staging_counted = True
+
+    def _finish_counted_transfer_chunk(self, kv_chunk: TransferKVChunk) -> None:
+        with self._staging_outstanding_lock:
+            outstanding = self._staging_outstanding.get(kv_chunk.room)
+            if not kv_chunk.staging_counted or outstanding is None or outstanding <= 0:
+                raise RuntimeError(
+                    f"Unmatched transfer chunk finish for room {kv_chunk.room}"
+                )
+            if outstanding == 1:
+                self._staging_outstanding.pop(kv_chunk.room)
+            else:
+                self._staging_outstanding[kv_chunk.room] = outstanding - 1
+            kv_chunk.staging_counted = False
+
+    def is_transfer_quiesced(self, room: int) -> bool:
+        with self._staging_outstanding_lock:
+            return self._staging_outstanding.get(room, 0) == 0
+
     def __init__(
         self,
         args: KVArgs,
@@ -222,10 +251,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
-            self.start_prefill_thread()
             # Per-room count of chunks not yet transferred; teardown waits for
             # zero so a deferred chunk is not dropped by an early conclude.
             self._staging_outstanding = defaultdict(int)
+            self._staging_outstanding_lock = threading.Lock()
+            self.start_prefill_thread()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = (
@@ -845,21 +875,27 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
     def _await_transfer_futures(self, futures) -> int:
         """Await a chunk's per-layer RDMA writes; return the first non-zero status.
-        cancel() is a no-op for a running future, so with deferred release on we
-        still drain the running ones before returning (no write may outlive this
-        call, which the drain-ack relies on). Off: original early-return."""
+        cancel() is a no-op for a running future, so drain every future before
+        returning or raising; no native transfer may outlive this call."""
         ret = 0
+        first_exception = None
         for future in concurrent.futures.as_completed(futures):
             try:
                 status = future.result()
             except concurrent.futures.CancelledError:
                 continue
+            except Exception as e:
+                if first_exception is None:
+                    first_exception = e
+                    for f in futures:
+                        f.cancel()
+                continue
             if status != 0 and ret == 0:
                 ret = status
                 for f in futures:
                     f.cancel()
-                if not self.enable_deferred_decode_kv_release:
-                    return ret
+        if first_exception is not None:
+            raise first_exception
         return ret
 
     def send_kvcache(
@@ -1658,6 +1694,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
         while True:
+            kv_chunk = None
+            chunk_outstanding = False
             try:
                 kv_chunk: TransferKVChunk = queue.get()
                 if self.enable_trace:
@@ -1671,9 +1709,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # `outstanding == 0` means nothing is dequeued or in flight --
                 # the predicate the abort ack relies on. The flag survives
                 # re-enqueue on defer.
-                if not kv_chunk.staging_counted:
-                    self._staging_outstanding[kv_chunk.room] += 1
-                    kv_chunk.staging_counted = True
+                self._count_transfer_chunk(kv_chunk)
+                chunk_outstanding = True
 
                 if (
                     kv_chunk.room not in self.request_status
@@ -1688,7 +1725,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
                             thread_finish_flag=True,
                         )
-                    self._staging_outstanding.pop(kv_chunk.room, None)
+                    self._finish_counted_transfer_chunk(kv_chunk)
+                    chunk_outstanding = False
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(kv_chunk.room)
@@ -1965,9 +2003,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
 
                 if staging_deferred:
+                    chunk_outstanding = False
                     continue
 
-                self._staging_outstanding[kv_chunk.room] -= 1
+                self._finish_counted_transfer_chunk(kv_chunk)
+                chunk_outstanding = False
                 if self.enable_deferred_decode_kv_release:
                     # In-flight write finished; if aborted and nothing outstanding,
                     # the pages are idle -> release the held ack.
@@ -1977,7 +2017,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # chunk. A non-last Failed chunk keeps the room (more chunks may
                 # follow), not on the last chunk alone since an earlier deferred
                 # chunk may still need to transfer.
-                if self._staging_outstanding.get(kv_chunk.room, 0) <= 0 and (
+                if self.is_transfer_quiesced(kv_chunk.room) and (
                     kv_chunk.room not in self.request_status
                     or self.check_status(kv_chunk.room) == KVPoll.Success
                     or (
@@ -1985,7 +2025,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         and self.check_status(kv_chunk.room) == KVPoll.Failed
                     )
                 ):
-                    self._staging_outstanding.pop(kv_chunk.room, None)
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
                     self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
@@ -1998,10 +2037,74 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         self._staging_ctx.prefetched_rooms.discard(kv_chunk.room)
 
             except Exception as e:
-                # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
-                raise RuntimeError(
-                    f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
+                room = kv_chunk.room if kv_chunk is not None else None
+                logger.exception(
+                    "Transfer worker failed for room=%s on bootstrap_port=%s; "
+                    "failing the request and continuing",
+                    room,
+                    self.bootstrap_port,
                 )
+                if room is None:
+                    continue
+
+                transfer_infos = list(self.transfer_infos.get(room, {}).values())
+                try:
+                    try:
+                        self.record_failure(
+                            room,
+                            f"Prefill transfer worker raised an unexpected exception: {e}",
+                        )
+                        self.update_status(room, KVPoll.Failed)
+                    except Exception:
+                        logger.exception(
+                            "Failed to record transfer worker failure for room=%s", room
+                        )
+                    prefill_unique_rank = (
+                        self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
+                        + self.pp_rank * self.attn_cp_size
+                        + self.attn_cp_rank
+                    )
+                    for failed_req in transfer_infos:
+                        if failed_req.is_dummy:
+                            continue
+                        try:
+                            self.sync_status_to_decode_endpoint(
+                                failed_req.endpoint,
+                                failed_req.dst_port,
+                                failed_req.room,
+                                KVPoll.Failed,
+                                prefill_unique_rank,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to notify decode of transfer failure for room=%s",
+                                room,
+                            )
+                finally:
+                    try:
+                        self.transfer_infos.pop(room, None)
+                        self.req_to_decode_prefix_len.pop(room, None)
+                        if self.enable_staging:
+                            for key in list(self._staging_ctx.prefetch_requested):
+                                if key[0] == room:
+                                    self._staging_ctx.prefetch_requested.discard(key)
+                            self._staging_ctx.prefetched_rooms.discard(room)
+                    except Exception:
+                        logger.exception(
+                            "Failed to clear transfer worker state for room=%s", room
+                        )
+                    finally:
+                        if chunk_outstanding:
+                            try:
+                                self._finish_counted_transfer_chunk(kv_chunk)
+                                chunk_outstanding = False
+                                if self.enable_deferred_decode_kv_release:
+                                    self._maybe_ack_drained_abort(room)
+                            except Exception:
+                                logger.exception(
+                                    "Failed to reconcile transfer ownership for room=%s",
+                                    room,
+                                )
 
     def start_prefill_thread(self):
         def bootstrap_thread():
@@ -2047,7 +2150,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 f"Received abort notification for room {room_to_be_aborted}, "
                                 f"marked as Failed; ACK deferred until transfer drains"
                             )
-                        elif self._staging_outstanding.get(room_to_be_aborted, 0) == 0:
+                        elif self.is_transfer_quiesced(room_to_be_aborted):
                             # Concluded/unknown AND quiescent: ack now. A cleared
                             # room is not automatically quiescent -- clear() can
                             # drop a room whose chunk is still transferring.
@@ -2396,14 +2499,13 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         self._record_transfer_indices(kv_indices, state_indices)
 
     def poll(self) -> KVPoll:
+        if self.conclude_state == KVPoll.Failed and not self.is_transfer_quiesced():
+            return KVPoll.Transferring
         if self.conclude_state is None:
             status = self.kv_mgr.check_status(self.bootstrap_room)
             # Hold Success until all staging chunks transferred: a deferred
             # chunk can still be pending, and concluding now would drop it.
-            if (
-                status == KVPoll.Success
-                and self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
-            ):
+            if status == KVPoll.Success and not self.is_transfer_quiesced():
                 return KVPoll.Transferring
             if status in (KVPoll.Success, KVPoll.Failed):
                 self.conclude_state = status
@@ -2436,6 +2538,9 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         super().abort()
         self.trace_ctx.abort(abort_info={"reason": "Aborted"})
         self.trace_ctx.trace_req_finish()
+
+    def is_transfer_quiesced(self) -> bool:
+        return self.kv_mgr.is_transfer_quiesced(self.bootstrap_room)
 
 
 class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):

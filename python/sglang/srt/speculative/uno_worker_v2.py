@@ -8,7 +8,10 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.managers.utils import (
+    GenerationBatchResult,
+    has_mm_embedding_failures,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -433,7 +436,9 @@ class UnoWorkerV2(BaseSpecWorker):
             forward_width=self.forward_width,
         )
 
-        if on_publish is not None:
+        if on_publish is not None and not has_mm_embedding_failures(
+            result.mm_embedding_errors
+        ):
             on_publish(result.new_seq_lens)
         return result
 

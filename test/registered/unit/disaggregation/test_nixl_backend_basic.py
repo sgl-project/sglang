@@ -472,6 +472,7 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.enable_deferred_decode_kv_release = False
         mgr._staging_ctx = None
         mgr._staging_outstanding = defaultdict(int)
+        mgr._staging_outstanding_lock = threading.Lock()
         mgr.is_mla_backend = False
         mgr.is_hybrid_mla_backend = False
         mgr.attn_tp_size = 1

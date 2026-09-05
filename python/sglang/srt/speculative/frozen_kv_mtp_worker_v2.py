@@ -36,6 +36,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.managers.utils import has_mm_embedding_failures
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -759,7 +760,9 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             batch_output.new_seq_lens = batch.seq_lens
             # Publish before draft-extend so the fence is at target-end.
-            if on_publish is not None:
+            if on_publish is not None and not has_mm_embedding_failures(
+                batch_output.mm_embedding_errors
+            ):
                 on_publish(batch_output.new_seq_lens)
 
             # Draft prefill seed (no forward).

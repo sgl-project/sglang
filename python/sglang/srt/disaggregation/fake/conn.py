@@ -91,6 +91,9 @@ class FakeKVSender(BaseKVSender):
     def abort(self):
         self.conclude_state = KVPoll.Failed
 
+    def is_transfer_quiesced(self) -> bool:
+        return True
+
 
 class FakeKVReceiver(BaseKVReceiver):
     def __init__(

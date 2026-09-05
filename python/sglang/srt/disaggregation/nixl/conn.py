@@ -397,6 +397,35 @@ class TransferStatus:
 
 
 class NixlKVManager(StagingManagerMixin, CommonKVManager):
+    def _count_transfer_chunk(self, kv_chunk: TransferKVChunk) -> None:
+        with self._staging_outstanding_lock:
+            outstanding = self._staging_outstanding.get(kv_chunk.room, 0)
+            if kv_chunk.staging_counted:
+                if outstanding <= 0:
+                    raise RuntimeError(
+                        f"Counted NIXL chunk has no outstanding owner for room {kv_chunk.room}"
+                    )
+                return
+            self._staging_outstanding[kv_chunk.room] = outstanding + 1
+            kv_chunk.staging_counted = True
+
+    def _finish_counted_transfer_chunk(self, kv_chunk: TransferKVChunk) -> None:
+        with self._staging_outstanding_lock:
+            outstanding = self._staging_outstanding.get(kv_chunk.room)
+            if not kv_chunk.staging_counted or outstanding is None or outstanding <= 0:
+                raise RuntimeError(
+                    f"Unmatched NIXL chunk finish for room {kv_chunk.room}"
+                )
+            if outstanding == 1:
+                self._staging_outstanding.pop(kv_chunk.room)
+            else:
+                self._staging_outstanding[kv_chunk.room] = outstanding - 1
+            kv_chunk.staging_counted = False
+
+    def is_transfer_quiesced(self, room: int) -> bool:
+        with self._staging_outstanding_lock:
+            return self._staging_outstanding.get(room, 0) == 0
+
     def __init__(
         self,
         args: KVArgs,
@@ -497,6 +526,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             # Per-room count of chunks not yet transferred; teardown waits for
             # zero so a deferred chunk is not dropped by an early conclude.
             self._staging_outstanding = defaultdict(int)
+            self._staging_outstanding_lock = threading.Lock()
             # Mirror mooncake: one staging buffer per worker queue, all
             # built before workers spawn so each worker owns a private
             # buffer (no cross-worker contention on the staging ring).
@@ -1083,6 +1113,26 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 dst_mem_kind=dst_mem_kind,
             )
 
+    def _wait_for_transfer_handles(
+        self, handles: List[Any], room: int
+    ) -> Optional[Exception]:
+        first_error = None
+        while handles:
+            all_terminal = True
+            for handle in handles:
+                state = self.agent.check_xfer_state(handle)
+                if state == "ERR":
+                    if first_error is None:
+                        first_error = RuntimeError(
+                            f"NIXL transfer encountered ERR room={room}"
+                        )
+                elif state != "DONE":
+                    all_terminal = False
+            if all_terminal:
+                return first_error
+            time.sleep(0)
+        return None
+
     def transfer_worker(self, queue: FastQueue, staging_buffer=None, worker_index=0):
         # Per-worker staging strategy: lazy-created on first chunk so we
         # see kv_buffer_tensors (set by ModelRunner after engine init).
@@ -1093,25 +1143,26 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             kv_chunk: TransferKVChunk = queue.get()
             room = kv_chunk.room
             handles: List[Any] = []
+            chunk_outstanding = False
             try:
+                self._count_transfer_chunk(kv_chunk)
+                chunk_outstanding = True
                 if room not in self.request_status:
                     logger.debug(
                         "Skipping chunk for room %s because it has been cleared",
                         room,
                     )
-                    self._staging_outstanding.pop(room, None)
+                    self._finish_counted_transfer_chunk(kv_chunk)
+                    chunk_outstanding = False
                     continue
 
                 # Counted at dequeue, before the status check, so
                 # `outstanding == 0` means nothing is dequeued or in flight --
                 # the predicate the abort ack relies on. The flag survives
                 # re-enqueue on defer.
-                if not kv_chunk.staging_counted:
-                    self._staging_outstanding[room] += 1
-                    kv_chunk.staging_counted = True
-
                 if self.check_status(room) == KVPoll.Failed:
-                    self._staging_outstanding.pop(room, None)
+                    self._finish_counted_transfer_chunk(kv_chunk)
+                    chunk_outstanding = False
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(room)
@@ -1124,7 +1175,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         "has been cleared",
                         room,
                     )
-                    self._staging_outstanding.pop(room, None)
+                    self._finish_counted_transfer_chunk(kv_chunk)
+                    chunk_outstanding = False
                     continue
 
                 # Lazily build a per-worker staging strategy bound to this
@@ -1349,23 +1401,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                 if staging_deferred:
                     # Chunk has been re-enqueued; do not advance status.
+                    chunk_outstanding = False
                     continue
 
-                while handles:
-                    all_done = True
-                    for handle in handles:
-                        state = self.agent.check_xfer_state(handle)
-                        if state == "ERR":
-                            raise RuntimeError(
-                                f"NIXL transfer encountered ERR room={room}"
-                            )
-                        if state != "DONE":
-                            all_done = False
-                    if all_done:
-                        break
-                    time.sleep(0)
-
-                self._staging_outstanding[room] -= 1
+                transfer_error = self._wait_for_transfer_handles(handles, room)
+                if transfer_error is not None:
+                    raise transfer_error
+                self._finish_counted_transfer_chunk(kv_chunk)
+                chunk_outstanding = False
                 if self.enable_deferred_decode_kv_release:
                     # Handles all DONE => this room's writes landed; ack if it
                     # was aborted and nothing else is outstanding.
@@ -1381,14 +1424,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # the room has concluded: Success, or a Failed *last* chunk. A
                 # non-last Failed chunk keeps the room (more chunks may follow); a
                 # late chunk for an already-Failed room is skipped at loop top.
-                if self._staging_outstanding.get(room, 0) <= 0 and (
+                if self.is_transfer_quiesced(room) and (
                     self.check_status(room) == KVPoll.Success
                     or (
                         kv_chunk.is_last_chunk
                         and self.check_status(room) == KVPoll.Failed
                     )
                 ):
-                    self._staging_outstanding.pop(room, None)
                     self.transfer_infos.pop(room, None)
                     self.req_to_decode_prefix_len.pop(room, None)
                     if self.enable_staging and self._staging_ctx is not None:
@@ -1398,6 +1440,21 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                             if k[0] == room:
                                 self._staging_ctx.prefetch_requested.discard(k)
             except Exception as e:
+                if handles:
+                    try:
+                        self._wait_for_transfer_handles(handles, room)
+                    except Exception as quiescence_error:  # noqa: BLE001
+                        logger.critical(
+                            "Cannot prove NIXL transfer quiescence for room %s; "
+                            "retaining source KV ownership",
+                            room,
+                            exc_info=quiescence_error,
+                        )
+                        self.exceptions[room] = quiescence_error
+                        self.record_failure(room, str(quiescence_error))
+                        self.update_status(room, KVPoll.Failed)
+                        chunk_outstanding = False
+                        continue
                 # Catch all exceptions to prevent silently killing this
                 # worker thread, but still propagate via failure_exception().
                 if isinstance(e, _NIXL_TRANSPORT_ERRORS):
@@ -1409,8 +1466,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 self.exceptions[room] = e
                 self.record_failure(room, str(e))
                 self.update_status(room, KVPoll.Failed)
-                # No ack here on purpose: the DONE barrier bails on the first
-                # ERR, so siblings may still be writing; fall back to the timeout.
+                if chunk_outstanding:
+                    self._finish_counted_transfer_chunk(kv_chunk)
+                    if self.enable_deferred_decode_kv_release:
+                        self._maybe_ack_drained_abort(room)
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -2718,7 +2777,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     room_to_be_aborted, decode_ip, decode_port
                 )
                 self._maybe_ack_drained_abort(room_to_be_aborted)
-            elif self._staging_outstanding.get(room_to_be_aborted, 0) == 0:
+            elif self.is_transfer_quiesced(room_to_be_aborted):
                 self._send_abort_ack(decode_ip, decode_port, room_to_be_aborted)
 
         return True
@@ -2856,10 +2915,7 @@ class NixlKVSender(CommonKVSender):
                 return timeout_result
         # Hold Success until all staging chunks transferred: a deferred chunk
         # can still be pending, and concluding now would drop it.
-        if (
-            status == KVPoll.Success
-            and self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
-        ):
+        if status == KVPoll.Success and not self.is_transfer_quiesced():
             return KVPoll.Transferring  # type: ignore
         if (
             status == KVPoll.Success
@@ -2870,6 +2926,9 @@ class NixlKVSender(CommonKVSender):
                 time.perf_counter() - self._transfer_start_time
             )
         return status
+
+    def is_transfer_quiesced(self) -> bool:
+        return self.kv_mgr.is_transfer_quiesced(self.bootstrap_room)
 
     def clear(self) -> None:
         super().clear()

@@ -294,6 +294,35 @@ class TransferTarget:
 class MoriKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
 
+    def _count_transfer_chunk(self, kv_chunk: TransferKVChunk) -> None:
+        with self._transfer_outstanding_lock:
+            outstanding = self._transfer_outstanding.get(kv_chunk.room, 0)
+            if kv_chunk.staging_counted:
+                if outstanding <= 0:
+                    raise RuntimeError(
+                        f"Counted MORI chunk has no outstanding owner for room {kv_chunk.room}"
+                    )
+                return
+            self._transfer_outstanding[kv_chunk.room] = outstanding + 1
+            kv_chunk.staging_counted = True
+
+    def _finish_counted_transfer_chunk(self, kv_chunk: TransferKVChunk) -> None:
+        with self._transfer_outstanding_lock:
+            outstanding = self._transfer_outstanding.get(kv_chunk.room)
+            if not kv_chunk.staging_counted or outstanding is None or outstanding <= 0:
+                raise RuntimeError(
+                    f"Unmatched MORI chunk finish for room {kv_chunk.room}"
+                )
+            if outstanding == 1:
+                self._transfer_outstanding.pop(kv_chunk.room)
+            else:
+                self._transfer_outstanding[kv_chunk.room] = outstanding - 1
+            kv_chunk.staging_counted = False
+
+    def is_transfer_quiesced(self, room: int) -> bool:
+        with self._transfer_outstanding_lock:
+            return self._transfer_outstanding.get(room, 0) == 0
+
     def __init__(
         self,
         args: KVArgs,
@@ -321,6 +350,8 @@ class MoriKVManager(CommonKVManager):
             self._transfer_timeout_ms = envs.SGLANG_MORI_TRANSFER_TIMEOUT_MS.get()
             self._room_status_notified: Dict[int, bool] = {}
             self._room_notify_lock = threading.Lock()
+            self._transfer_outstanding: Dict[int, int] = {}
+            self._transfer_outstanding_lock = threading.Lock()
             for shard, queue in enumerate(self._transfer_queues):
                 threading.Thread(
                     target=self._transfer_worker,
@@ -431,7 +462,10 @@ class MoriKVManager(CommonKVManager):
     def _transfer_worker(self, queue: FastQueue) -> None:
         while True:
             kv_chunk = queue.get()
+            chunk_outstanding = False
             try:
+                self._count_transfer_chunk(kv_chunk)
+                chunk_outstanding = True
                 self._process_transfer_chunk(kv_chunk)
             except Exception as exc:
                 failure_reason = f"transfer worker raised: {exc!r}"
@@ -452,12 +486,12 @@ class MoriKVManager(CommonKVManager):
                         )
                     except Exception:
                         pass
+            finally:
+                if chunk_outstanding:
+                    self._finish_counted_transfer_chunk(kv_chunk)
 
     def _process_transfer_chunk(self, kv_chunk: TransferKVChunk) -> None:
         room = kv_chunk.room
-        if self._should_skip_transfer(room):
-            return
-
         if kv_chunk.wait_event is not None:
             kv_chunk.wait_event.synchronize()
 
@@ -472,9 +506,6 @@ class MoriKVManager(CommonKVManager):
             aux_index=kv_chunk.prefill_aux_index,
             state_indices=kv_chunk.state_indices,
         )
-
-        if self._should_skip_transfer(room):
-            return
 
         failure_reason = self._wait_transfer_completion(statuses)
         if self._should_skip_transfer(room):
@@ -506,15 +537,24 @@ class MoriKVManager(CommonKVManager):
 
         start = time.perf_counter()
         sla_ms = self._transfer_timeout_ms
+        sla_failure = None
 
         while True:
             rc = self.engine.wait_all(statuses, timeout_ms=self._wait_poll_ms)
             if rc != StatusCode.IN_PROGRESS:
                 if rc == StatusCode.SUCCESS:
-                    return None
+                    return sla_failure
                 return self._collect_transfer_failure_reason(statuses)
-            if sla_ms > 0 and (time.perf_counter() - start) * 1000 >= sla_ms:
-                return f"KV transfer exceeded SLA {sla_ms}ms"
+            if (
+                sla_failure is None
+                and sla_ms > 0
+                and (time.perf_counter() - start) * 1000 >= sla_ms
+            ):
+                sla_failure = f"KV transfer exceeded SLA {sla_ms}ms"
+                logger.error(
+                    "%s; retaining source KV until MORI reports completion",
+                    sla_failure,
+                )
 
     @staticmethod
     def _collect_transfer_failure_reason(statuses: List[TransferStatus]) -> str:
@@ -1709,6 +1749,9 @@ class MoriKVSender(CommonKVSender):
         super().clear()
         with self.kv_mgr._room_notify_lock:
             self.kv_mgr._room_status_notified.pop(self.bootstrap_room, None)
+
+    def is_transfer_quiesced(self) -> bool:
+        return self.kv_mgr.is_transfer_quiesced(self.bootstrap_room)
 
     def failure_exception(self):
         if self.conclude_state is None:

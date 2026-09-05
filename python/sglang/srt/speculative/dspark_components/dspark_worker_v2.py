@@ -16,6 +16,7 @@ from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.managers.utils import has_mm_embedding_failures
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -546,7 +547,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_TARGET, next_token_ids)
         new_seq_lens = batch.seq_lens
         batch_output.new_seq_lens = new_seq_lens
-        if on_publish is not None:
+        if on_publish is not None and not has_mm_embedding_failures(
+            batch_output.mm_embedding_errors
+        ):
             on_publish(batch_output.new_seq_lens)
 
         if logits_output.hidden_states is None:

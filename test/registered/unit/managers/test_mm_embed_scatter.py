@@ -1,7 +1,14 @@
 import pytest
 import torch
+from torch import nn
 
-from sglang.srt.managers.mm_utils import _scatter_mm_embedding
+from sglang.srt.environ import envs
+from sglang.srt.managers.mm_utils import _scatter_mm_embedding, embed_mm_inputs
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu-intel")
@@ -53,6 +60,51 @@ def test_scatter_row_count_mismatch_fails_loud():
     mask_heavy[2:6] = True
     with pytest.raises((RuntimeError, IndexError)):
         _scatter_mm_embedding(dest=dest, mask=mask_heavy, src=torch.ones(1, 4))
+
+
+def test_embed_mm_inputs_isolates_offset_mask_count_mismatch():
+    bad_embedding = torch.tensor(
+        [[10.0, 11.0, 12.0, 13.0], [20.0, 21.0, 22.0, 23.0], [30.0, 31.0, 32.0, 33.0]]
+    )
+    good_embedding = torch.tensor([[40.0, 41.0, 42.0, 43.0], [50.0, 51.0, 52.0, 53.0]])
+    mm_inputs = [
+        MultimodalInputs(
+            mm_items=[
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    pad_value=100,
+                    offsets=[(0, 2)],
+                    precomputed_embeddings=bad_embedding,
+                )
+            ]
+        ),
+        MultimodalInputs(
+            mm_items=[
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    pad_value=101,
+                    offsets=[(0, 1)],
+                    precomputed_embeddings=good_embedding,
+                )
+            ]
+        ),
+    ]
+    input_ids = torch.tensor([100, 100, 0, 101, 101, 0])
+    input_embedding = nn.Embedding(128, 4)
+    input_embedding.weight.data.zero_()
+
+    with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True):
+        actual, other_info = embed_mm_inputs(
+            mm_inputs_list=mm_inputs,
+            extend_prefix_lens=[0, 0],
+            extend_seq_lens=[3, 3],
+            input_ids=input_ids,
+            input_embedding=input_embedding,
+            data_embedding_func_mapping={Modality.IMAGE: lambda _items: None},
+        )
+
+    assert other_info["mm_embedding_errors"] == [(0, 3, 2)]
+    assert torch.equal(actual[3:5], good_embedding)
 
 
 if __name__ == "__main__":

@@ -113,7 +113,7 @@ def _run_by_item_chunks(encoder):
     return [
         mm_schedule._get_chunked_embedding_by_item(
             encoder, items, ITEM_OFFSETS, prefix_len, extend_len, _CPU
-        )
+        )[0]
         for prefix_len, extend_len in CHUNKS
     ]
 
@@ -124,7 +124,7 @@ def _run_full_chunks(encoder):
     input_ids = torch.zeros(TOTAL_LEN, dtype=torch.long)
     outs = []
     for prefix_len, extend_len in CHUNKS:
-        chunk, _ = mm_schedule._get_chunked_embedding_full(
+        chunk, _, _ = mm_schedule._get_chunked_embedding_full(
             encoder, items, ITEM_OFFSETS, prefix_len, extend_len, input_ids, _CPU
         )
         outs.append(chunk)
@@ -198,10 +198,11 @@ def test_by_item_mismatched_cache_entry_is_reencoded():
     )
     encoder = Mock(side_effect=_encoder_list)
 
-    chunk = mm_schedule._get_chunked_embedding_by_item(
+    chunk, error = mm_schedule._get_chunked_embedding_by_item(
         encoder, items, ITEM_OFFSETS, 0, TOTAL_LEN, _CPU
     )
 
+    assert error is None
     assert chunk.shape == (sum(_num_tokens(item) for item in items), HIDDEN)
     encoder.assert_called_once()
     assert mm_schedule.embedding_cache.get_single(first_item.hash).embedding.shape[
@@ -226,8 +227,11 @@ def test_batched_mismatched_cache_entry_is_reencoded():
     )
     encoder = Mock(side_effect=_encoder_list)
 
-    embeddings = mm_schedule._batch_encode_per_image_misses(encoder, [request], _CPU)
+    embeddings, errors = mm_schedule._batch_encode_per_image_misses(
+        encoder, [request], _CPU
+    )
 
+    assert errors == {}
     assert embeddings[(first_item.hash, _num_tokens(first_item))].shape == (
         _num_tokens(first_item),
         HIDDEN,
@@ -251,8 +255,11 @@ def test_batched_colliding_hashes_with_different_lengths_are_not_deduplicated():
     ]
     encoder = Mock(side_effect=_encoder_list)
 
-    embeddings = mm_schedule._batch_encode_per_image_misses(encoder, requests, _CPU)
+    embeddings, errors = mm_schedule._batch_encode_per_image_misses(
+        encoder, requests, _CPU
+    )
 
+    assert errors == {}
     first_key = (items[0].hash, _num_tokens(items[0]))
     second_key = (items[1].hash, _num_tokens(items[1]))
     assert embeddings[first_key].shape == (_num_tokens(items[0]), HIDDEN)
@@ -274,15 +281,97 @@ def test_full_mismatched_cache_entry_is_reencoded(caplog):
     encoder = Mock(side_effect=_encoder_tensor)
 
     with caplog.at_level(logging.WARNING, logger=mm_schedule.logger.name):
-        chunk, _ = mm_schedule._get_chunked_embedding_full(
+        chunk, _, error = mm_schedule._get_chunked_embedding_full(
             encoder, items, ITEM_OFFSETS, 0, TOTAL_LEN, input_ids, _CPU
         )
 
+    assert error is None
     assert chunk.shape == (sum(_num_tokens(item) for item in items), HIDDEN)
     encoder.assert_called_once()
     assert "Discarding cached multimodal embedding" in caplog.text
     assert "expected_tokens=15" in caplog.text
     assert "cached_tokens=1" in caplog.text
+
+
+def test_mixed_fresh_embeddings_isolate_short_request_and_preserve_shape():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    good_item = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        hash=2000,
+        feature=torch.zeros(1),
+        offsets=[(0, 3)],
+    )
+    bad_item = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        hash=2001,
+        feature=torch.zeros(1),
+        offsets=[(0, 5)],
+    )
+    good_embedding = torch.ones(4, HIDDEN)
+    bad_embedding = torch.full((2, HIDDEN), 2.0)
+
+    embedding, _, errors = mm_schedule._get_chunked_prefill_embedding(
+        lambda items: [
+            good_embedding if item.hash == good_item.hash else bad_embedding
+            for item in items
+        ],
+        [good_item, bad_item],
+        [0, 1, 2],
+        [0, 0],
+        [4, 6],
+        [[(0, 3)], [(0, 5)]],
+        torch.zeros(10, dtype=torch.long),
+    )
+
+    assert errors == [(1, 6, 2)]
+    assert embedding.shape == (10, HIDDEN)
+    torch.testing.assert_close(embedding[:4], good_embedding)
+    torch.testing.assert_close(embedding[4:6], bad_embedding)
+    torch.testing.assert_close(embedding[6:], torch.zeros(4, HIDDEN))
+    assert mm_schedule.embedding_cache.get_single(good_item.hash) is not None
+    assert mm_schedule.embedding_cache.get_single(bad_item.hash) is None
+
+
+def test_overlong_combined_result_only_rejects_mismatched_retry():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    good_item = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        hash=3000,
+        feature=torch.zeros(1),
+        offsets=[(0, 3)],
+    )
+    bad_item = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        hash=3001,
+        feature=torch.zeros(1),
+        offsets=[(0, 5)],
+    )
+    good_embedding = torch.arange(4 * HIDDEN, dtype=torch.float32).reshape(4, HIDDEN)
+    bad_embedding = torch.full((2, HIDDEN), 2.0)
+    encoder = Mock(
+        side_effect=[
+            torch.zeros(11, HIDDEN),
+            good_embedding,
+            bad_embedding,
+        ]
+    )
+
+    embedding, _, errors = mm_schedule._get_chunked_prefill_embedding(
+        encoder,
+        [good_item, bad_item],
+        [0, 1, 2],
+        [0, 0],
+        [4, 6],
+        [[(0, 3)], [(0, 5)]],
+        torch.zeros(10, dtype=torch.long),
+    )
+
+    assert errors == [(1, 6, 2)]
+    assert torch.equal(embedding[:4], good_embedding)
+    assert torch.equal(embedding[4:6], bad_embedding)
+    assert torch.equal(embedding[6:], torch.zeros(4, HIDDEN))
+    assert mm_schedule.embedding_cache.get_single(good_item.hash) is not None
+    assert mm_schedule.embedding_cache.get_single(bad_item.hash) is None
 
 
 if __name__ == "__main__":

@@ -576,6 +576,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For multimodal
     mm_input_embeds: Optional[torch.Tensor] = None
+    mm_embedding_errors: Optional[List[Tuple[int, int, int]]] = None
 
     # Encoder-decoder cross-attention mask
     cross_attention_custom_mask: Optional[torch.Tensor] = None
