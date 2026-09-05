@@ -65,6 +65,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
     requant_block_scale_ue8m0_for_deepgemm,
     resolve_mxfp8_dense_gemm_backend,
+    use_aiter_bpreshuffle_gemm,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
@@ -885,7 +886,8 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale = weight_scale.t().contiguous()
                     if _use_aiter and self.use_aiter_fp8_per_token:
                         self.use_per_token_if_dynamic = True
-                        qweight = shuffle_weight(qweight.contiguous(), (16, 16))
+                        if use_aiter_bpreshuffle_gemm(qweight.shape[0]):
+                            qweight = shuffle_weight(qweight.contiguous(), (16, 16))
                 else:
                     # per-tensor quantization
                     qweight, weight_scale = input_to_float8(layer.weight)
@@ -941,7 +943,8 @@ class Fp8LinearMethod(LinearMethodBase):
                                 weight=weight,
                                 weight_scale=weight_scale,
                             )
-                        weight = shuffle_weight(weight.contiguous(), (16, 16))
+                        if use_aiter_bpreshuffle_gemm(weight.shape[0]):
+                            weight = shuffle_weight(weight.contiguous(), (16, 16))
                 else:
                     # Dequant -> Quant with max scale so we can run per tensor.
                     weight = layer.weight
