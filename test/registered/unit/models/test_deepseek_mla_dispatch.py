@@ -17,12 +17,12 @@ from unittest import mock
 from sglang.srt.layers.cp import base as cp_base
 from sglang.srt.layers.cp import utils as cp_utils
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
+from sglang.srt.layers.utils import cp_utils as platform_cp_utils
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models.deepseek_common import attention_backend_handler as abh
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,
 )
-from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -114,7 +114,11 @@ class TestCPMLADispatch(CustomTestCase):
             mock.patch.object(abh, "_is_hip", False),
             mock.patch.object(cp_utils, "enable_cp_v2", return_value=True),
             mock.patch.object(cp_base, "_STRATEGY", ZigzagCPStrategy(cp_size=4)),
-            get_parallel().override(enable_prefill_context_parallel=False),
+            mock.patch.object(
+                platform_cp_utils,
+                "get_parallel",
+                return_value=SimpleNamespace(enable_prefill_context_parallel=False),
+            ),
         ):
             for prefix in (0, 32):
                 for capacity in (0, 8192):
