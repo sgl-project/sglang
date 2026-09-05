@@ -2286,10 +2286,14 @@ def _post_process_topk_ids(
             fused_shared_experts_scaling_factor
         )
 
-    if _is_hip and not _skip_hip_pad_mask:
+    if _is_hip and not _skip_hip_pad_mask and not _fold_pad_into_append:
         # Shared-expert append/remap can introduce non-zero weights after the
         # initial HIP padding mask above. Ensure padded tokens leave this helper
         # with all expert weights zeroed.
+        #
+        # Skipped when the fused append+remap ran, because it was given
+        # num_token_non_padded and already zeroed both the routed and the shared
+        # weights on padded rows, making this a redundant per-layer launch.
         _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
 
     return topk_ids, topk_weights, recorder_topk_ids
