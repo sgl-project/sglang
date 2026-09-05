@@ -30,6 +30,8 @@ PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
 TEST_GROUPS_FILE_PATH = "scripts/ci/rerun_test_groups.json"
 PRECISION_BASELINE_TEST = "registered/debug_utils/test_nightly_precision_regression.py"
 PRECISION_BASELINE_REFRESH_FLAG = "--refresh-precision-baseline"
+CHANGED_TESTS_FLAG = "--changed"
+CHANGED_TESTS_SHORT_FLAG = "-c"
 
 
 MAINTENANCE_ISSUE_NUMBER = 21065
@@ -588,8 +590,8 @@ def expand_glob_spec(file_part):
     Globs are matched against the same locations resolve_test_file() searches
     — test/registered/ and the multimodal_gen test dir — so e.g.
     `test_*backend*.py` reruns every backend test without hand-enumerating
-    each file. Two constraints keep a broad pattern from pulling in non-tests:
-    a match must live under a known test root and be named `test_*.py`.
+    each file. `_is_rerunnable_test_path` keeps a broad pattern from pulling in
+    non-tests.
 
     glob's `*` matches path separators only via `**`, so a bare pattern is
     searched recursively under each root; a path-ful pattern is anchored.
@@ -628,19 +630,11 @@ def expand_glob_spec(file_part):
             expanded.add(p)
     matches = expanded
 
-    def _under_test_root(path):
-        return path.startswith("test/registered/") or path.startswith(
-            MULTIMODAL_TEST_DIR + "/"
-        )
-
     files = sorted(
         {
             os.path.normpath(p)
             for p in matches
-            if os.path.isfile(p)
-            and os.path.basename(p).startswith("test_")
-            and p.endswith(".py")
-            and _under_test_root(os.path.normpath(p))
+            if os.path.isfile(p) and _is_rerunnable_test_path(os.path.normpath(p))
         }
     )
     if not files:
@@ -650,6 +644,76 @@ def expand_glob_spec(file_part):
             f"(patterns only match files named `test_*.py`)."
         )
     return files, None
+
+
+def _collects_pytest_tests(path):
+    """Whether a test file defines anything pytest would collect."""
+    if not os.path.isfile(path):
+        # Fork-added file, absent from the handler's main checkout; leave it for
+        # resolve_test_file() to report as `File not found`.
+        return True
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        content = f.read()
+    return (
+        re.search(r"^\s*((async )?def test_|class Test)", content, re.MULTILINE)
+        is not None
+    )
+
+
+def _is_rerunnable_test_path(path):
+    """A repo-relative test file /rerun-test may select on its own (glob or --changed)."""
+    under_test_root = path.startswith("test/registered/") or path.startswith(
+        MULTIMODAL_TEST_DIR + "/"
+    )
+    if (
+        not under_test_root
+        or not os.path.basename(path).startswith("test_")
+        or not path.endswith(".py")
+    ):
+        return False
+    if not path.startswith(MULTIMODAL_TEST_DIR + "/"):
+        # detect_suite() rejects an unregistered file, and a registered one may
+        # expose its cases through load_tests() rather than `def test_`.
+        return True
+    # Nothing downstream rejects a multimodal path, so a `test_*.py` helper that
+    # collects nothing reaches `pytest -x` and exits 5. manual/ is hand-run.
+    return "manual" not in path.split("/") and _collects_pytest_tests(path)
+
+
+def _move_changes_dispatch(previous_filename, filename):
+    """Whether a content-free move still changes how `filename` dispatches."""
+    previous_filename = previous_filename or ""
+    is_mm = filename.startswith(MULTIMODAL_TEST_DIR + "/")
+    if is_mm != previous_filename.startswith(MULTIMODAL_TEST_DIR + "/"):
+        return True
+    if not _is_rerunnable_test_path(previous_filename):
+        return True
+    return is_mm and (
+        detect_multimodal_suite(previous_filename)[0]
+        != detect_multimodal_suite(filename)[0]
+    )
+
+
+def changed_test_files(pr):
+    """Rerunnable test files the PR adds or edits, as repo-relative paths.
+
+    A pure move reports `renamed` with an empty diff and is dropped, unless the
+    move itself changes dispatch: into a CI root, across the multimodal
+    boundary, or onto a different multimodal pool.
+    """
+    return sorted(
+        f.filename
+        for f in pr.get_files()
+        if f.status != "removed"
+        and _is_rerunnable_test_path(f.filename)
+        and (
+            f.changes > 0
+            or (
+                f.status == "renamed"
+                and _move_changes_dispatch(f.previous_filename, f.filename)
+            )
+        )
+    )
 
 
 def resolve_test_file(file_part):
@@ -1196,6 +1260,7 @@ def handle_rerun_test(
     skip_permission_check=False,
     command_label=None,
     refresh_precision_baseline=False,
+    include_changed_tests=False,
 ):
     """
     Handles the /rerun-test command. Resolves all test specs, groups them by
@@ -1212,7 +1277,7 @@ def handle_rerun_test(
     ):
         return False
 
-    if not test_specs:
+    if not test_specs and not include_changed_tests:
         comment.create_reaction("confused")
         pr.create_issue_comment(
             "⛔ Please specify a test: `/rerun-test <file>::<TestClass.test_method>`\n\n"
@@ -1222,7 +1287,9 @@ def handle_rerun_test(
             "- `/rerun-test test_srt_endpoint.py`\n"
             "- `/rerun-test test_a.py test_b.py test_c.py` (multiple tests)\n"
             "- `/rerun-test test_*backend*.py` (wildcard — reruns every matching "
-            "file; wrap the pattern in backticks so GitHub keeps the `*` literal)"
+            "file; wrap the pattern in backticks so GitHub keeps the `*` literal)\n"
+            f"- `/rerun-test {CHANGED_TESTS_FLAG}` (or `{CHANGED_TESTS_SHORT_FLAG}`; "
+            "every test file this PR adds or modifies)"
         )
         return False
 
@@ -1231,6 +1298,17 @@ def handle_rerun_test(
         comment.create_reaction("confused")
         pr.create_issue_comment(gate_msg)
         return False
+
+    if include_changed_tests:
+        changed = changed_test_files(pr)
+        if not changed and not test_specs:
+            comment.create_reaction("confused")
+            pr.create_issue_comment(
+                f"⛔ `{CHANGED_TESTS_FLAG}`: this PR adds or modifies no runnable test files "
+                f"under `test/registered/` or `{MULTIMODAL_TEST_DIR}/`."
+            )
+            return False
+        test_specs = list(test_specs or []) + changed
 
     # Phase 0: Expand wildcard specs into concrete test files. A spec whose
     # file part contains a glob metacharacter (* ? [) expands to every
@@ -1542,9 +1620,10 @@ def main():
     elif first_line.startswith("/rerun-test"):
         rerun_args = first_line.split()[1:]
         refresh_precision_baseline = PRECISION_BASELINE_REFRESH_FLAG in rerun_args
-        test_specs = [
-            arg for arg in rerun_args if arg != PRECISION_BASELINE_REFRESH_FLAG
-        ]
+        changed_flags = {CHANGED_TESTS_FLAG, CHANGED_TESTS_SHORT_FLAG}
+        include_changed_tests = bool(changed_flags & set(rerun_args))
+        flags = changed_flags | {PRECISION_BASELINE_REFRESH_FLAG}
+        test_specs = [arg for arg in rerun_args if arg not in flags]
         handle_rerun_test(
             repo,
             pr,
@@ -1554,6 +1633,7 @@ def main():
             token,
             command_label=first_line,
             refresh_precision_baseline=refresh_precision_baseline,
+            include_changed_tests=include_changed_tests,
         )
 
     else:
