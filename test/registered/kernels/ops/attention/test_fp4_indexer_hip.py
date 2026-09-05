@@ -37,6 +37,10 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     prepare_fp4_k_write_metadata,
     prepare_fp4_prefill_workspace,
 )
+from sglang.srt.layers.attention.dsv4.fp4_logits_workspace import (
+    FP4LogitsWorkspace,
+    plan_fp4_logits_workspace,
+)
 from sglang.srt.utils import get_device, is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
@@ -624,7 +628,14 @@ def _build_logits_case(
     }
 
 
-def _run_logits(case, *, is_decode: bool, decode_ws=None, prefill_ws=None):
+def _run_logits(
+    case,
+    *,
+    is_decode: bool,
+    decode_ws=None,
+    prefill_ws=None,
+    logits_out=None,
+):
     return aiter_fp4_paged_mqa_logits(
         q_fp4=case["q_fp4"],
         q_scale=case["q_scale"],
@@ -637,6 +648,7 @@ def _run_logits(case, *, is_decode: bool, decode_ws=None, prefill_ws=None):
         is_decode=is_decode,
         decode_workspace=decode_ws,
         prefill_workspace=prefill_ws,
+        logits_out=logits_out,
     )
 
 
@@ -751,9 +763,6 @@ def test_pinned_schedule_matches_unpinned_logits(is_decode: bool) -> None:
             case["page_table"], case["c4_seq_lens"]
         )
         pinned = _run_logits(case, is_decode=False, prefill_ws=workspace)
-    # Prefill scores are views of one pooled block, so the second call would
-    # otherwise hand back the same memory and compare it against itself.
-    pinned = pinned.clone()
     unpinned = _run_logits(case, is_decode=is_decode)
 
     seq_len = case["seq_len"]
@@ -775,33 +784,62 @@ def test_stale_workspace_row_count_falls_back_to_inline_schedule() -> None:
     torch.testing.assert_close(with_stale[:, :seq_len], without[:, :seq_len])
 
 
-def test_prefill_logits_come_from_one_pooled_block() -> None:
-    """Prefill must score into one constant-size block, not a per-call rectangle.
-
-    The logits width tracks context length, so a fresh allocation per call feeds
-    the caching allocator a growing size sequence: each request outgrows every
-    cached block and strands a segment, until an allocator that bypasses torch
-    (Triton kernel scratch) is refused. One pooled block keeps the request size
-    constant, which is what makes the blocks reusable.
-    """
+def test_prefill_logits_use_explicit_output_storage() -> None:
+    """The adapter writes a caller-owned view without hidden global pooling."""
     torch.manual_seed(14)
-    narrow = _run_logits(_build_logits_case(2, 256), is_decode=False)
-    wide = _run_logits(_build_logits_case(4, 512), is_decode=False)
+    case = _build_logits_case(2, 256)
+    workspace = prepare_fp4_prefill_workspace(case["page_table"], case["c4_seq_lens"])
+    out = torch.empty(
+        (2, workspace.max_seq_len), dtype=torch.float32, device=get_device()
+    )
 
-    assert narrow.shape != wide.shape
-    assert narrow.data_ptr() == wide.data_ptr()
+    logits = _run_logits(
+        case,
+        is_decode=False,
+        prefill_ws=workspace,
+        logits_out=out,
+    )
+
+    assert logits.data_ptr() == out.data_ptr()
+    _assert_logits_agree(logits, case)
+
+
+def test_managed_workspace_orders_cross_stream_reuse() -> None:
+    """A second stream must observe the first consumer before overwriting."""
+    width = 512
+    plan = plan_fp4_logits_workspace(
+        max_seq_len=width,
+        max_query_rows=2,
+        runtime_headroom_bytes=1 << 20,
+        free_memory_fraction=1.0,
+        max_workspace_bytes=None,
+    )
+    workspace = FP4LogitsWorkspace(plan=plan, device=get_device())
+    stream_a = torch.cuda.Stream()
+    stream_b = torch.cuda.Stream()
+    try:
+        with torch.cuda.stream(stream_a):
+            with workspace.acquire(2, width, stream=stream_a) as out:
+                out.fill_(1)
+        with torch.cuda.stream(stream_b):
+            with workspace.acquire(2, width, stream=stream_b) as out:
+                out.add_(1)
+                observed = out.sum()
+        stream_b.synchronize()
+        assert observed.item() == 2 * 2 * width
+    finally:
+        workspace.close()
 
 
 def test_row_chunks_reproduce_the_unsplit_batch() -> None:
     """Rows are scored and reduced independently, which is what lets callers chunk.
 
-    ``forward_c4_indexer`` splits prefill rows to whatever fits the pooled block,
-    so a chunk must score its rows exactly as an unsplit call would.
+    ``forward_c4_indexer`` splits prefill rows to whatever fits the managed
+    workspace, so a chunk must score its rows exactly as an unsplit call would.
     """
     torch.manual_seed(15)
     batch, chunk_rows = 6, 2
     case = _build_logits_case(batch, 512)
-    # Cloned: the chunk calls below score into the same pooled block.
     full = _run_logits(case, is_decode=False).clone()
 
     for start in range(0, batch, chunk_rows):

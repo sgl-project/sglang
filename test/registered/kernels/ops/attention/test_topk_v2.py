@@ -34,6 +34,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_paged_v2,
     topk_transform_ragged_v2,
 )
+from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -159,6 +160,25 @@ def _plan(seq_lens):
     metadata = plan_topk_v2(seq_lens)
     torch.cuda.synchronize()
     return metadata
+
+
+def test_plan_topk_v2_refreshes_stable_output_address():
+    """Graph-owned callers can refresh plan contents without rebinding pointers."""
+    seq_lens = torch.tensor([64, 1024, 17], dtype=torch.int32, device="cuda")
+    out = torch.zeros((4, 2), dtype=torch.int32, device="cuda")
+    returned = plan_topk_v2(seq_lens, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+
+    updated_lens = torch.tensor([2048, 1, 511], dtype=torch.int32, device="cuda")
+    plan_topk_v2(updated_lens, out=out)
+    if is_hip():
+        # The AMD top-k v2 planner is intentionally a no-op; only stable
+        # address forwarding is part of its contract there.
+        assert out.count_nonzero().item() == 0
+        return
+    expected = plan_topk_v2(updated_lens)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, expected)
 
 
 def _run(scores, seq_lens, page_table, inv_cpu, k):

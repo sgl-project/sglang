@@ -49,6 +49,7 @@ COMMON_ENV_VARS = {
 
 FP4_ENV_VARS = {
     "SGLANG_DSV4_FP4_EXPERTS": "true",
+    "SGLANG_DSV4_FP4_LOGITS_BUDGET_MB": "64",
 }
 
 
@@ -69,6 +70,7 @@ class TestDeepseekV4ProFp4MTP(CustomTestCase):
             "--disable-radix-cache",
             "--attention-backend",
             "dsv4",
+            "--enable-deepseek-v4-fp4-indexer",
             # MTP / EAGLE speculative decoding (NextN head from the base model).
             "--speculative-algorithm",
             "EAGLE",
