@@ -61,6 +61,18 @@ export const config = {
   specCollapses(s) {
     return config.isPipelined(s) && !!(config.cellFor(s) || {}).specCollapsePp;
   },
+  // DSPARK refuses DP attention at dp_size > 1 unless the LM head is sharded
+  // with it (speculative_hook.py `_handle_dspark` — dp_size == 1 is degenerate
+  // and exempt there, hence the same > 1 test). The flag re-shapes the LM head
+  // whether or not speculation is on, so it rides on the DSPARK overlay rather
+  // than on a cell, where it would reach the Non-Spec selections too. A cell
+  // that declares it keeps its own — overlay flags append without dedup.
+  needsDpLmHead(s) {
+    const cell = config.cellFor(s);
+    return !!config.flagOf(cell, "--enable-dp-attention")
+      && config.sizeOf(cell, "--dp-size") > 1
+      && !config.flagOf(cell, "--enable-dp-lm-head");
+  },
   // The playground's chip `disable` is declarative only (no predicates), so the
   // DCP-carrying recipes are enumerated — but generated from the cells here
   // rather than typed out per platform, so it is the same single source of truth
@@ -295,6 +307,7 @@ export const config = {
               : [],
           flags: (s) => [
             ...(config.specCollapses(s) ? config.specCollapsedFlags(s) : []),
+            ...(config.needsDpLmHead(s) ? ["--enable-dp-lm-head"] : []),
             "--speculative-algorithm DSPARK",
             "--speculative-draft-model-path RadixArk/Kimi-K3-DSpark",
             "--speculative-dspark-block-size 7",
