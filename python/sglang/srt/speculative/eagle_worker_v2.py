@@ -1607,3 +1607,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
         )
         return success, message
+
+    @property
+    def draft_models(self) -> list:
+        return [self.draft_runner.model]
