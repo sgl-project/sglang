@@ -7,7 +7,7 @@ import os
 import pkgutil
 import traceback
 from abc import ABC
-from typing import Any, Type
+from typing import Any
 
 import torch
 import transformers
@@ -32,6 +32,8 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     component_name_to_loader_cls,
     format_component_residency,
     get_memory_usage_of_component,
+    load_safetensors_state_dict,
+    set_default_torch_dtype,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     RESIDENT,
@@ -40,6 +42,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     is_fsdp_managed_module,
 )
+from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
@@ -48,7 +51,10 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     prepare_diffusers_component_path_for_loading,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
+from sglang.multimodal_gen.runtime.utils.precision import (
+    resolve_component_precision,
+    resolve_precision,
+)
 from sglang.multimodal_gen.runtime.weights.source import (
     materialize_weight,
     resolve_weight,
@@ -310,6 +316,7 @@ class ComponentLoader(ABC):
         *,
         component_attn_backend: Any = None,
         component_attn_name: str | None = None,
+        allow_native_fallback: bool = True,
     ) -> tuple[AutoModel, float]:
         """
         Template method that standardizes logging around the core load implementation.
@@ -381,7 +388,7 @@ class ComponentLoader(ABC):
         ):
             raise
         except Exception as e:
-            if require_backend_selection:
+            if require_backend_selection or not allow_native_fallback:
                 raise
             native_loader_required = isinstance(e, NativeComponentLoaderRequired)
             if native_loader_required and component_weight_override is not None:
@@ -631,6 +638,8 @@ class ComponentLoader(ABC):
         component_type: str,
         transformers_or_diffusers: str,
         component_architecture: str | None = None,
+        *,
+        loader_cls: type["ComponentLoader"] | None = None,
     ) -> "ComponentLoader":
         """
         Factory method to create a component loader for a specific component type.
@@ -649,10 +658,9 @@ class ComponentLoader(ABC):
             transformers_or_diffusers, loader_type
         )
 
-        if loader_type in component_name_to_loader_cls:
-            loader_cls: Type[ComponentLoader] = component_name_to_loader_cls[
-                loader_type
-            ]
+        if loader_cls is None:
+            loader_cls = component_name_to_loader_cls.get(loader_type)
+        if loader_cls is not None:
             expected_library = loader_cls.expected_library
             # Assert that the library matches what's expected for this component type
             assert transformers_or_diffusers == expected_library, (
@@ -711,7 +719,42 @@ class OnlineQuantizationComponentLoader(WeightOverrideComponentLoader):
 
 
 class PlainStateDictComponentLoader(WeightOverrideComponentLoader):
-    """Base for native loaders whose current materializer expects plain weights."""
+    """Load registered ``model_cls(**config)`` modules with a strict state dict.
+
+    Pipelines opt in through ``component_loaders``. Specialized loaders may
+    override ``load_customized`` when their constructor or weights differ.
+    """
+
+    expected_library = "diffusers"
+
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, component_name: str
+    ) -> nn.Module:
+        config = self.load_component_config(component_model_path, component_name)
+        class_name = config.pop("_class_name", None) or self.component_architecture
+        if class_name is None:
+            raise ComponentCheckpointUnsupportedError(
+                f"{component_name!r} must declare _class_name in config.json "
+                "or its architecture in model_index.json"
+            )
+        model_cls, _ = ModelRegistry.resolve_model_cls(class_name)
+        dtype = resolve_precision(
+            server_args, component_name, precision_attr="dit_precision"
+        )
+        # Diffusers metadata is not part of the model constructor's kwargs.
+        config = {
+            key: value for key, value in config.items() if not key.startswith("_")
+        }
+        with set_default_torch_dtype(dtype), torch.device("cpu"):
+            model = model_cls(**config).to(dtype=dtype)
+
+        weights_path = self.resolve_component_weights_path(
+            component_model_path, server_args, component_name
+        )
+        model.load_state_dict(load_safetensors_state_dict(weights_path), strict=True)
+        server_args.model_paths[component_name] = component_model_path
+        # ComponentLoader.load owns eval mode and final residency placement.
+        return model
 
     def component_load_precision(
         self, server_args: ServerArgs, component_name: str
@@ -856,6 +899,7 @@ class PipelineComponentLoader:
         component_attn_backend: Any = None,
         component_attn_name: str | None = None,
         component_type: str | None = None,
+        loader_cls: type[ComponentLoader] | None = None,
     ):
         """
         Load a pipeline component.
@@ -866,6 +910,7 @@ class PipelineComponentLoader:
             transformers_or_diffusers: Whether the component is from transformers or diffusers
             component_architecture: the class name of the module
             component_type: structural config slot when it differs from the exact key
+            loader_cls: explicit pipeline-local loader, with no native fallback
         """
 
         # Get the appropriate loader for this component type
@@ -873,6 +918,7 @@ class PipelineComponentLoader:
             component_type or component_name,
             transformers_or_diffusers,
             component_architecture,
+            loader_cls=loader_cls,
         )
 
         try:
@@ -883,6 +929,7 @@ class PipelineComponentLoader:
                 transformers_or_diffusers,
                 component_attn_backend=component_attn_backend,
                 component_attn_name=component_attn_name,
+                allow_native_fallback=loader_cls is None,
             )
         except Exception:
             logger.error(
