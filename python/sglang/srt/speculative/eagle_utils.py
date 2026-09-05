@@ -607,11 +607,9 @@ def _seeded_verify_coins(
     per-draft rejection coins; column draft_token_num drives the final
     fallback-sampling coin.
 
-    Scope: this seeds only the verify-side RNG. With rejection sampling the
-    draft workers still pick candidates via unseeded multinomial
-    (fast_sample in eagle_worker_v2), so that mode stays non-deterministic
-    until the draft RNG is seeded in a follow-up; top-k/greedy draft
-    selection is already deterministic.
+    Draft proposal draws use a separate domain-separated seeded stream in
+    ``fast_sample``. Keeping the streams separate preserves the independence
+    required by rejection sampling.
     """
     from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 
