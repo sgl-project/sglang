@@ -493,6 +493,8 @@ class RayEngine(Engine):
                 "startup_time": controller.startup_time,
             }
         ]
+        if controller.hicache_info is not None:
+            scheduler_infos[0]["hicache"] = controller.hicache_info
 
         event_loop_refs = controller.event_loop_refs
 
