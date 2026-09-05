@@ -12,7 +12,11 @@ from sglang.srt.distributed.device_communicators.all_reduce_utils import (
     TORCH_SYMM_MEM_ALL_REDUCE_MAX_SIZES,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    max_prefill_buffer_tokens,
+)
 from sglang.srt.utils import is_cuda, is_hip
 
 try:
@@ -60,9 +64,21 @@ class TorchSymmMemCommunicator:
             device: Target CUDA device (index, 'cuda:X', or torch.device).
         """
 
+        # disabled: entire communicator unusable.
+        # allreduce_disabled: only the allreduce fast path is off; buffers
+        # may still serve fused-kernel contexts (RS/AG).
         self.disabled = True
+        self.allreduce_disabled = True
+        # Set by the eligibility gate for one fused-CP prefill forward.
+        self.use_cp_fused_symm_mem = False
         self.buffer = None
         self.max_size = 0
+        # Lazy fused-kernel contexts (cached on first use).
+        self._moe_rs_ctx = None
+        self._moe_rs_key = None
+        self._ag_gemm_ctx = None
+        self._ag_gemm_key = None
+        self._ag_gemm_stream: Optional[torch.cuda.Stream] = None
 
         if not torch_symm_mem_available:
             return
@@ -113,15 +129,38 @@ class TorchSymmMemCommunicator:
             dtype=self.dtype,
         )
         handle = torch_symm_mem.rendezvous(self.buffer, self.group.group_name)
+        # Enable communicator; allreduce gated separately by multicast.
+        self.disabled = False
         if handle.multicast_ptr == 0:
             logger.warning(
                 "TorchSymmMemCommunicator: torch symmetric memory "
-                "multicast operations are not supported."
+                "multicast operations are not supported; symm-mem all-reduce "
+                "fast path disabled (fused-kernel contexts may still work)."
             )
-            self.buffer = None
-            self.disabled = True
+            self.allreduce_disabled = True
             return
-        self.disabled = False
+        self.allreduce_disabled = False
+
+    def set_use_cp_fused_symm_mem(self, value: bool) -> None:
+        """Set the fused CP AG/RS flag for this forward."""
+        self.use_cp_fused_symm_mem = value
+
+    @staticmethod
+    def get_active_comm() -> "Optional[TorchSymmMemCommunicator]":
+        """Return the TP group's communicator if enabled and the fused CP
+        path is active, else None."""
+        from sglang.srt.distributed import get_tp_group
+
+        comm = get_tp_group().torch_symm_mem_comm
+        if comm is None or comm.disabled or not comm.use_cp_fused_symm_mem:
+            return None
+        return comm
+
+    def _attn_cp_group_info(self):
+        """(cpu pg, rank, world size) on the attn CP group, the same ranks
+        dsa_cp_* collectives use; NOT this communicator's TP group."""
+        cp = get_parallel().attn_cp_group
+        return cp.cpu_group, cp.rank_in_group, cp.world_size
 
     def should_torch_symm_mem_allreduce(self, inp: torch.Tensor):
         """
@@ -136,7 +175,7 @@ class TorchSymmMemCommunicator:
         Returns:
             True if the symmetric-memory path can handle this tensor.
         """
-        if self.disabled:
+        if self.disabled or self.allreduce_disabled:
             return False
         if inp.device != self.device:
             return False
@@ -183,3 +222,101 @@ class TorchSymmMemCommunicator:
             )
         out.copy_(self.buffer[: inp.numel()].view(out.shape))
         return out
+
+    def get_or_create_moe_rs_ctx(
+        self,
+        N: int,
+        num_experts: int,
+        topk: int,
+        dtype: torch.dtype,
+        n_chunks_max: int = 8,
+    ):
+        """Lazy-init / cache the MoE reduce-scatter symm-mem context."""
+        if self.disabled:
+            return None
+        _, _, cp_world_size = self._attn_cp_group_info()
+        key = (N, num_experts, topk, dtype, n_chunks_max, cp_world_size)
+        if self._moe_rs_key == key and self._moe_rs_ctx is not None:
+            return self._moe_rs_ctx
+        if self._moe_rs_ctx is not None:
+            try:
+                self._moe_rs_ctx.finalize()
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "TorchSymmMemCommunicator: failed to finalize stale MoE RS "
+                    "context: %s",
+                    e,
+                )
+            self._moe_rs_ctx = None
+            self._moe_rs_key = None
+
+        from sglang.srt.distributed.device_communicators.symm_mem_kernels import (
+            create_moe_rs_symm_mem_context,
+        )
+
+        max_M = max_prefill_buffer_tokens()
+
+        cp_group, cp_rank, cp_world_size = self._attn_cp_group_info()
+
+        self._moe_rs_ctx = create_moe_rs_symm_mem_context(
+            rank=cp_rank,
+            world_size=cp_world_size,
+            local_world_size=cp_world_size,
+            max_token_num=max_M,
+            hidden_dim=N,
+            num_experts=num_experts,
+            topk=topk,
+            input_dtype=dtype,
+            n_chunks_max=n_chunks_max,
+            group=cp_group,
+        )
+        self._moe_rs_key = key
+        return self._moe_rs_ctx
+
+    def get_or_create_ag_gemm_ctx(
+        self,
+        K: int,
+        NUM_COMM_SMS: int = 0,
+    ):
+        """Lazy-init / cache the all-gather + GEMM symm-mem context."""
+        if self.disabled:
+            return None
+        _, _, cp_world_size = self._attn_cp_group_info()
+        key = (K, NUM_COMM_SMS, cp_world_size)
+        if self._ag_gemm_key == key and self._ag_gemm_ctx is not None:
+            return self._ag_gemm_ctx
+        if self._ag_gemm_ctx is not None:
+            try:
+                self._ag_gemm_ctx.finalize()
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "TorchSymmMemCommunicator: failed to finalize stale AG+GEMM "
+                    "context: %s",
+                    e,
+                )
+            self._ag_gemm_ctx = None
+            self._ag_gemm_key = None
+
+        from sglang.srt.distributed.device_communicators.symm_mem_kernels import (
+            create_allgather_gemm_context_symm_mem,
+        )
+
+        if self._ag_gemm_stream is None:
+            self._ag_gemm_stream = torch.cuda.Stream(device=self.device, priority=-1)
+
+        max_M = max_prefill_buffer_tokens()
+
+        cp_group, cp_rank, cp_world_size = self._attn_cp_group_info()
+
+        self._ag_gemm_ctx = create_allgather_gemm_context_symm_mem(
+            ag_stream=self._ag_gemm_stream,
+            rank=cp_rank,
+            world_size=cp_world_size,
+            max_M=max_M // cp_world_size,
+            K=K,
+            NUM_COMM_SMS=NUM_COMM_SMS,
+            enable_multicast=False,
+            group=cp_group,
+        )
+        self._ag_gemm_key = key
+        return self._ag_gemm_ctx

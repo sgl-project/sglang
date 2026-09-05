@@ -1428,6 +1428,8 @@ class Envs:
     SGLANG_OPT_USE_AITER_BATCHED_GEMM = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
+    # Fused AG-GEMM and MoE reduce-scatter via torch symmetric memory.
+    SGLANG_OPT_USE_TORCH_SYMM_MEM_FUSED_KERNEL = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================
