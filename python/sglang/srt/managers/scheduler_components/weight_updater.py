@@ -163,7 +163,13 @@ class SchedulerWeightUpdaterManager:
                 worker = self.tp_worker
             else:
                 worker = self.draft_worker or self.tp_worker
-            success, message = worker.update_weights_from_tensor(recv_req)
+            try:
+                success, message = worker.update_weights_from_tensor(recv_req)
+            except Exception as e:
+                # A malformed/malicious serialized payload (e.g. one rejected by
+                # SafeUnpickler) must not take down the scheduler event loop.
+                logger.error("Failed to update weights from tensor: %s", e)
+                success, message = False, str(e)
             if success:
                 self.flush_cache_after_weight_update(recv_req)
                 self.record_weight_version_after_update(recv_req.weight_version)

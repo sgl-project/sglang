@@ -3004,6 +3004,35 @@ def _looks_like_pickle_payload(data: bytes) -> bool:
     return len(data) >= 2 and data[0] == 0x80 and data[1] <= pickle.HIGHEST_PROTOCOL
 
 
+def _looks_like_safetensors_payload(data: bytes) -> bool:
+    """safetensors blobs start with an 8-byte little-endian JSON header length
+    followed by the JSON header itself (which begins with '{')."""
+    if len(data) < 8:
+        return False
+    header_len = int.from_bytes(data[:8], "little")
+    if header_len <= 0 or 8 + header_len > len(data):
+        return False
+    return data[8] == 0x7B  # '{'
+
+
+def deserialize_tensor_payload(data) -> Dict[str, torch.Tensor]:
+    """Deserialize a serialized tensor payload sent over the wire.
+
+    Prefers the safetensors format (no code-execution semantics); falls back to
+    the legacy MultiprocessingSerializer pickle for backward compatibility with
+    old clients (the pickle path remains constrained by SafeUnpickler).
+    """
+    if isinstance(data, str):
+        data = pybase64.b64decode(data, validate=True)
+
+    if _looks_like_safetensors_payload(data):
+        import safetensors.torch
+
+        return safetensors.torch.load(data)
+
+    return MultiprocessingSerializer.deserialize(data)
+
+
 def normalize_serialized_named_tensor_payload(data: SerializedTensorPayload) -> bytes:
     """Normalize a serialized tensor payload to raw MultiprocessingSerializer bytes."""
     if isinstance(data, str):
@@ -3031,16 +3060,17 @@ def normalize_serialized_named_tensor_payloads(
 
 
 class SafeUnpickler(pickle.Unpickler):
+    # Prefix allowlisting remains ONLY for trusted third-party libraries whose
+    # payloads SGLang itself serializes (torch tensors/state, multiprocessing
+    # reductions, NPU storage, peft/transformers objects). SGLang's own
+    # `sglang.srt.*` modules are NOT prefix-trusted anymore: prefix allowlisting
+    # there let an attacker reach reflective primitives
+    # (sglang.srt.utils.common.dynamic_import) and even nested unrestricted
+    # `pickle.loads` helpers (sglang.srt.managers.io_struct._maybe_unwrap_pickle
+    # + PickleWrapper) that defeat the whole sandbox. Internal classes that
+    # legitimate payloads actually reference are instead listed exactly in
+    # ALLOWED_SGLANG_CLASSES.
     ALLOWED_MODULE_PREFIXES = {
-        # --- Python types ---
-        "builtins.",
-        "collections.",
-        "copyreg.",
-        "functools.",
-        "itertools.",
-        "operator.",
-        "types.",
-        "weakref.",
         # --- PyTorch types ---
         "torch.",
         "torch._tensor.",
@@ -3057,20 +3087,97 @@ class SafeUnpickler(pickle.Unpickler):
         # --- multiprocessing ---
         "multiprocessing.resource_sharer.",
         "multiprocessing.reduction.",
-        "pickletools.",
-        # --- PEFT / LoRA ---
+        # --- PEFT / LoRA / tokenizer payloads ---
         "peft.",
         "transformers.",
         "huggingface_hub.",
-        # --- SGLang & Unitest ---
-        "sglang.srt.weight_sync.tensor_bucket.",
-        "sglang.srt.model_executor.model_runner.",
-        "sglang.srt.model_executor.model_runner_components.weight_updater.",
-        "sglang.srt.layers.",
-        "sglang.srt.utils.",
-        "sglang.srt.disaggregation.",
-        "sglang.srt.managers.",
         "torch_npu.",
+    }
+
+    # Exact (module, symbol) allowlist for SGLang-internal classes that real
+    # payloads reference. Nothing else under sglang.srt.* may be loaded.
+    ALLOWED_SGLANG_CLASSES = {
+        ("sglang.srt.disaggregation.encode_receiver", "EmbeddingData"),
+        ("sglang.srt.managers.schedule_batch", "Modality"),
+        ("sglang.srt.weight_sync.tensor_bucket", "FlattenedTensorBucket"),
+        ("sglang.srt.weight_sync.tensor_bucket", "FlattenedTensorMetadata"),
+        (
+            "sglang.srt.model_executor.model_runner_components.weight_updater",
+            "LocalSerializedTensor",
+        ),
+    }
+
+    # Modules whose members must match an exact name allowlist instead of being
+    # allowlisted by module prefix. Only the side-effect-free primitives that
+    # SGLang's own serialized payloads actually need are permitted. Anything
+    # reflective or reachable-to-syscalls (getattr, __import__, eval, open,
+    # operator.attrgetter/itemgetter, pickletools.*, types.CodeType/...,
+    # types.FunctionType/...) is rejected.
+    ALLOWED_CLASSES = {
+        "builtins": {
+            "bool",
+            "bytearray",
+            "bytes",
+            "complex",
+            "dict",
+            "enumerate",
+            "filter",
+            "float",
+            "frozenset",
+            "int",
+            "iter",
+            "list",
+            "map",
+            "object",
+            "range",
+            "reversed",
+            "set",
+            "slice",
+            "str",
+            "tuple",
+            "type",
+            "zip",
+        },
+        "collections": {
+            "Counter",
+            "OrderedDict",
+            "defaultdict",
+            "deque",
+            "namedtuple",
+        },
+        "copyreg": {
+            "_reconstructor",
+            "__newobj__",
+            "__newobj_ex__",
+            "_slotnames",
+        },
+        "functools": {
+            "partial",
+            "reduce",
+        },
+        "itertools": {
+            "chain",
+            "count",
+            "cycle",
+            "islice",
+            "repeat",
+            "starmap",
+            "takewhile",
+            "zip_longest",
+        },
+        # operator.attrgetter / itemgetter / getitem / methodcaller are RCE
+        # primitives; nothing in SGLang's own payloads needs them.
+        "operator": {},
+        # pickletools is only a debugging utility and exposes module refs
+        # (e.g. sys) that enable bypass chains.
+        "pickletools": {},
+        "types": {
+            "ModuleType",
+            "SimpleNamespace",
+        },
+        "weakref": {
+            "ref",
+        },
     }
 
     DENY_CLASSES = {
@@ -3083,6 +3190,15 @@ class SafeUnpickler(pickle.Unpickler):
         ("codecs", "decode"),
         ("types", "CodeType"),
         ("types", "FunctionType"),
+        # High-risk code-loading entry points inside the otherwise-trusted
+        # torch.* prefix (defense in depth): torch.load / torch.hub.load /
+        # torch.utils.cpp_extension.load* can load files or execute code, and
+        # nothing SGLang serializes references them.
+        ("torch", "load"),
+        ("torch.hub", "load"),
+        ("torch.utils.cpp_extension", "load"),
+        ("torch.utils.cpp_extension", "load_inline"),
+        ("torch.jit", "load"),
     }
 
     def find_class(self, module, name):
@@ -3092,6 +3208,21 @@ class SafeUnpickler(pickle.Unpickler):
                 f"Blocked unsafe class loading ({module}.{name}), "
                 f"to prevent exploitation of CVE-2025-10164"
             )
+        # Exact-name allowlist for generic building-block modules.
+        allowed_names = self.ALLOWED_CLASSES.get(module)
+        if allowed_names is not None:
+            if name in allowed_names:
+                return super().find_class(module, name)
+            raise RuntimeError(
+                f"Blocked unsafe class loading ({module}.{name}), "
+                f"to prevent exploitation of CVE-2025-10164"
+            )
+        # Exact (module, symbol) allowlist for SGLang-internal classes that
+        # legitimate payloads reference. No sglang.srt.* module is
+        # prefix-trusted, so reflective helpers (dynamic_import) and nested
+        # pickle.loads helpers (io_struct._maybe_unwrap_pickle) are unreachable.
+        if (module, name) in self.ALLOWED_SGLANG_CLASSES:
+            return super().find_class(module, name)
         # Allowlist of safe-to-load modules.
         if any(
             (module + ".").startswith(prefix) for prefix in self.ALLOWED_MODULE_PREFIXES
