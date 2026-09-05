@@ -16,6 +16,8 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -89,6 +91,16 @@ def alloc_extend(pool, req_pool_idx: int, seq_len: int):
         req_pool_indices_cpu=torch.tensor([req_pool_idx], dtype=torch.int64),
         target_seq_lens_cpu=torch.tensor([seq_len], dtype=torch.int64),
     )
+
+
+def setup_function(_):
+    # The cache reads its parallel topology from the context.
+    reset_context()
+    publish(ServerArgs(model_path="dummy"), role="test")
+
+
+def teardown_function(_):
+    reset_context()
 
 
 def test_extend_allocates_at_sparse_boundaries():

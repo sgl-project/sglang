@@ -53,8 +53,6 @@ from sglang.srt.arg_groups.argparse_actions import (
     LoRAPathAction,
 )
 from sglang.srt.arg_groups.overrides import (
-    mamba_extra_buffer_lazy_of,
-    mamba_extra_buffer_of,
     remote_instance_transfer_engine_of,
     resolution_projection,
     resolving_view,
@@ -721,12 +719,6 @@ class ServerArgs:
                 )
         object.__setattr__(self, name, value)
 
-    def enable_mamba_extra_buffer(self) -> bool:
-        return mamba_extra_buffer_of(resolving_view(self))
-
-    def enable_mamba_extra_buffer_lazy(self) -> bool:
-        return mamba_extra_buffer_lazy_of(resolving_view(self))
-
     def check_server_args(self):
         from sglang.srt.arg_groups.validation_hook import check_server_args
 
@@ -753,6 +745,7 @@ class ServerArgs:
 # record had before the split. Grouping by namespace would otherwise move the
 # positional constructor's arguments onto different fields.
 # ---------------------------------------------------------------------------
+
 
 _INPUT_NAMESPACES = [
     Model,
@@ -783,6 +776,9 @@ ServerArgs.__annotations__ = {**_annotations, **ServerArgs.__annotations__}
 # The assembled record has no base classes, so it carries the map the classes
 # used to answer through their `_NS_PATH`.
 ServerArgs._NS_BY_FIELD = _namespaces
+# The classes themselves, so the bag projection can find the declarations
+# that are not fields -- the derived half of each namespace.
+ServerArgs._NAMESPACES = _INPUT_NAMESPACES
 for _name, _value in _defaults.items():
     setattr(ServerArgs, _name, _value)
 ServerArgs = dataclasses.dataclass(ServerArgs)
