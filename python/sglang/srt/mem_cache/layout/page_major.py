@@ -1,23 +1,33 @@
-"""Page-granularity envelope (page-major, layer-major within a page) cache views.
+"""Page-granularity envelope (page-major, token-major within a page) cache views.
 
 A pool of this layout keeps all layers of all slots in one contiguous byte
-buffer. The buffer is split into pages of ``page_size`` slots; within a page,
-each layer's K and V (or each Mamba conv/temporal tensor) are grouped together:
+buffer, split into pages of ``page_size`` slots. Within a page the slots follow
+one another, and one slot's ENTRY holds every part of that token -- K and V of
+every layer for MHA, the latent row of every layer for MLA -- at a fixed byte
+offset:
 
-    page bytes = [L0_K * ps | L0_V * ps | L1_K * ps | L1_V * ps | ...]
+    page bytes  = [ entry(slot 0) | entry(slot 1) | ... | entry(slot ps-1) ]
+    entry bytes = [ K_0 | V_0 | K_1 | V_1 | ... ]  (MHA)
+                  [ lat_0 | lat_1 | ... ]           (MLA)
 
-Across pages the layout is envelope-major (one ``page_bytes`` block per page).
-At ``page_size == 1`` a page is a single slot, so the within-page block is the
-per-slot ``[L0_K | L0_V | L1_K | L1_V | ...]`` envelope (token-granularity).
+Every per-layer view is therefore a flat ``(num_pages * page_size, *row_shape)``
+tensor with slot stride ``entry_bytes`` and storage offset
+``anchor + part offset``, indexed by the PHYSICAL token id
+``page * page_size + slot``. Parts may differ in row width (K vs V); only their
+offsets differ, never the stride.
 
-These builders produce per-layer views into a raw ``uint8`` buffer; they hold
-no allocator/ownership state. ``anchor_bytes`` is the byte offset of the
-pool's region inside the raw buffer (0 for a standalone pool).
+These builders produce views into a raw ``uint8`` buffer; they hold no
+allocator/ownership state. ``anchor_bytes`` is the byte offset of the pool's
+region inside the raw buffer (0 for a standalone pool).
 """
 
 from typing import List, Sequence, Tuple
 
+import msgspec
 import torch
+
+ENTRY_ALIGN_BYTES = 32
+ROW_ALIGN_BYTES = 16
 
 
 def _prod(shape: Sequence[int]) -> int:
@@ -25,6 +35,20 @@ def _prod(shape: Sequence[int]) -> int:
     for s in shape:
         out *= int(s)
     return out
+
+
+def _contiguous_strides(shape: Sequence[int]) -> Tuple[int, ...]:
+    strides = []
+    acc = 1
+    for s in reversed(shape):
+        strides.append(acc)
+        acc *= int(s)
+    return tuple(reversed(strides))
+
+
+def align_entry_bytes(num_bytes: int) -> int:
+    """Round a slot's byte sum up to the entry alignment."""
+    return -(-num_bytes // ENTRY_ALIGN_BYTES) * ENTRY_ALIGN_BYTES
 
 
 def paged_view(flat: torch.Tensor, page_size: int) -> torch.Tensor:
@@ -45,149 +69,121 @@ def paged_row_view(flat: torch.Tensor, page_size: int) -> torch.Tensor:
     return paged_view(flat.view(int(flat.shape[0]), -1), page_size)
 
 
-def mha_entry_bytes(
-    *, layer_num: int, head_num: int, head_dim: int, v_head_dim: int, itemsize: int
-) -> int:
-    """Bytes occupied by one slot across all layers (K and V)."""
-    k_row_bytes = head_num * head_dim * itemsize
-    v_row_bytes = head_num * v_head_dim * itemsize
-    return layer_num * (k_row_bytes + v_row_bytes)
+class DensePart(msgspec.Struct, frozen=True, kw_only=True):
+    """One row family inside the entry: ``layer_num`` rows of ``row_shape``,
+    layer ``l`` at ``offset_bytes + l * layer_stride_bytes``."""
+
+    name: str
+    offset_bytes: int
+    layer_stride_bytes: int
+    layer_num: int
+    row_shape: Tuple[int, ...]
+    dtype: torch.dtype
+
+    def row_bytes(self) -> int:
+        return _prod(self.row_shape) * self.dtype.itemsize
+
+    def layer_offset_bytes(self, layer: int) -> int:
+        return self.offset_bytes + layer * self.layer_stride_bytes
 
 
-def build_mha_views(
-    raw: torch.Tensor,
-    *,
-    layer_num: int,
-    head_num: int,
-    head_dim: int,
-    v_head_dim: int,
-    store_dtype: torch.dtype,
-    page_size: int,
-    num_pages: int,
-    anchor_bytes: int = 0,
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    """Per-layer K/V views over ``raw`` for uniform-row MHA.
+class DenseEntryLayout(msgspec.Struct, frozen=True, kw_only=True):
+    """Byte layout of one slot's entry; ``entry_bytes`` is the slot stride of
+    every view built over it."""
 
-    The page envelope ``[L0_K*ps | L0_V*ps | L1_K*ps | ...]`` is a uniform
-    array of ``2*layer_num`` row-blocks when K and V rows are equally wide, so
-    it is a valid paged pool under
+    entry_bytes: int
+    parts: Tuple[DensePart, ...]
 
-        kernel_id(t) = (t // ps) * (ps * 2 * layer_num) + t % ps
+    def __post_init__(self):
+        self.validate()
 
-    with layer ``l``'s K at block ``2l`` and its V at block ``2l+1``. Each view
-    is a contiguous ``(num_pages * 2 * layer_num * ps, head_num, head_dim)``.
+    def part(self, name: str) -> DensePart:
+        for p in self.parts:
+            if p.name == name:
+                return p
+        raise KeyError(f"no part {name!r} in {[p.name for p in self.parts]}")
 
-    Views overlap by ``ps`` rows per block, safe because an id always resolves
-    inside its own block; the last view runs ``(2*layer_num - 1) * ps`` rows
-    past the envelope, so ``raw`` needs ``UnifiedKVPool.view_tail_pad_bytes``.
-    """
-    assert head_dim == v_head_dim, (
-        f"build_mha_views requires uniform rows (head_dim == v_head_dim); "
-        f"got head_dim={head_dim}, v_head_dim={v_head_dim}. Asymmetric-KV "
-        "models cannot use the unified pool (screened out at startup)."
-    )
-    itemsize = store_dtype.itemsize
-    row_elems = head_num * head_dim
-    row_bytes = row_elems * itemsize
-    blocks = 2 * layer_num
-    page_bytes = page_size * blocks * row_bytes
-    n_rows = num_pages * blocks * page_size
-    assert anchor_bytes % itemsize == 0
-    last_view_end = (
-        anchor_bytes + (blocks - 1) * page_size * row_bytes + n_rows * row_bytes
-    )
-    assert last_view_end <= raw.numel() * raw.itemsize, (
-        f"build_mha_views: block {blocks - 1}'s view ends at byte "
-        f"{last_view_end} but the raw buffer holds only "
-        f"{raw.numel() * raw.itemsize} bytes; allocate the tail pad "
-        f"(one page envelope = {page_bytes} B) via view_tail_pad_bytes"
-    )
-
-    as_dtype_view = raw.view(store_dtype)
-    k_buffer: List[torch.Tensor] = []
-    v_buffer: List[torch.Tensor] = []
-    for layer in range(layer_num):
-        k_base_bytes = anchor_bytes + (2 * layer) * page_size * row_bytes
-        v_base_bytes = k_base_bytes + page_size * row_bytes
-        for base_bytes, out in ((k_base_bytes, k_buffer), (v_base_bytes, v_buffer)):
-            assert base_bytes % itemsize == 0
-            out.append(
-                torch.as_strided(
-                    as_dtype_view,
-                    size=(n_rows, head_num, head_dim),
-                    stride=(row_elems, head_dim, 1),
-                    storage_offset=base_bytes // itemsize,
-                )
+    def validate(self) -> None:
+        assert self.entry_bytes % ENTRY_ALIGN_BYTES == 0, (
+            f"entry_bytes={self.entry_bytes} is not a multiple of {ENTRY_ALIGN_BYTES}"
+        )
+        spans = []
+        for p in self.parts:
+            row = p.row_bytes()
+            assert (
+                p.offset_bytes % ROW_ALIGN_BYTES == 0
+                and p.layer_stride_bytes % ROW_ALIGN_BYTES == 0
+                and row % ROW_ALIGN_BYTES == 0
+            ), (
+                f"part {p.name!r}: offset {p.offset_bytes}, layer stride "
+                f"{p.layer_stride_bytes} and row {row} B must all be multiples of "
+                f"{ROW_ALIGN_BYTES} (vector stores)"
             )
-    return k_buffer, v_buffer
+            for l in range(p.layer_num):
+                lo = p.layer_offset_bytes(l)
+                assert 0 <= lo and lo + row <= self.entry_bytes, (
+                    f"part {p.name!r} layer {l} spans [{lo}, {lo + row}) outside "
+                    f"the {self.entry_bytes}-byte entry"
+                )
+                spans.append((lo, lo + row, p.name, l))
+        spans.sort()
+        for a, b in zip(spans, spans[1:]):
+            assert a[1] <= b[0], (
+                f"parts overlap: {a[2]}[{a[3]}] [{a[0]}, {a[1]}) and "
+                f"{b[2]}[{b[3]}] [{b[0]}, {b[1]})"
+            )
 
 
-def mla_entry_bytes(*, layer_num: int, kv_cache_dim: int, itemsize: int) -> int:
-    """Bytes occupied by one MLA slot across all layers (single latent row, no V)."""
-    return layer_num * kv_cache_dim * itemsize
-
-
-def build_mla_views(
+def build_dense_views(
     raw: torch.Tensor,
     *,
-    layer_num: int,
-    kv_cache_dim: int,
-    store_dtype: torch.dtype,
+    layout: DenseEntryLayout,
+    part: DensePart,
     page_size: int,
     num_pages: int,
     anchor_bytes: int = 0,
 ) -> List[torch.Tensor]:
-    """Per-layer views over ``raw`` for MLA in the page-major layout.
-
-    The page envelope is ``[L0_latent * ps | L1_latent * ps | ...]``. Because all
-    MLA layers share one uniform row size (``kv_cache_dim``), the envelope is
-    itself a valid paged pool under a re-numbered index space: folding the
-    layer offset ``l * ps * kv_cache_dim`` into each view's storage_offset makes
-    every per-layer view a plain CONTIGUOUS ``(num_pages * layer_num * ps, 1,
-    kv_cache_dim)`` tensor, addressed by the layer-independent kernel-facing id
-
-        kernel_id(t) = (t // ps) * (ps * layer_num) + t % ps      (t = physical token)
-
-    so one shared block table (entry = page * layer_num) serves every layer, and
-    kernels that require ``.view(-1, page_size, kv_cache_dim)`` (trtllm/cutlass/
-    flashmla) work on the views natively.
-
-    The views overlap each other (view ``l+1`` is view ``l`` shifted by ``ps``
-    rows); that is safe because layer ``l`` is only ever indexed at kernel-facing ids,
-    which always resolve to layer-``l`` bytes relative to view ``l``'s origin.
-    Layer ``layer_num-1``'s view extends ``(layer_num-1) * ps`` rows past the
-    last page envelope, so ``raw`` must carry at least one extra page envelope
-    of tail padding (``UnifiedKVPool``'s ``view_tail_pad_bytes``).
+    """Per-layer views of one part: ``(num_pages * page_size, *row_shape)`` with
+    slot stride ``layout.entry_bytes``, indexed by the physical token id
+    ``page * page_size + slot`` (``paged_view`` regroups them by page).
     """
-    itemsize = store_dtype.itemsize
-    row_bytes = kv_cache_dim * itemsize
-    page_bytes = page_size * layer_num * row_bytes
-    n_rows = num_pages * layer_num * page_size
-    assert anchor_bytes % itemsize == 0
-    last_view_end = (
-        anchor_bytes + (layer_num - 1) * page_size * row_bytes + (n_rows * row_bytes)
+    itemsize = part.dtype.itemsize
+    assert layout.entry_bytes % itemsize == 0 and anchor_bytes % itemsize == 0
+    n_rows = num_pages * page_size
+    end = anchor_bytes + n_rows * layout.entry_bytes
+    assert end <= raw.numel() * raw.itemsize, (
+        f"build_dense_views: {n_rows} slots of {layout.entry_bytes} B end at byte "
+        f"{end} but the raw buffer holds only {raw.numel() * raw.itemsize} bytes"
     )
-    assert last_view_end <= raw.numel() * raw.itemsize, (
-        f"build_mla_views: layer {layer_num - 1}'s view ends at byte "
-        f"{last_view_end} but the raw buffer holds only "
-        f"{raw.numel() * raw.itemsize} bytes; allocate the tail pad "
-        f"(one page envelope = {page_bytes} B) via view_tail_pad_bytes"
-    )
-
-    as_dtype_view = raw.view(store_dtype)
+    as_dtype_view = raw.view(part.dtype)
+    stride = (layout.entry_bytes // itemsize, *_contiguous_strides(part.row_shape))
     views: List[torch.Tensor] = []
-    for layer in range(layer_num):
-        base_bytes = anchor_bytes + layer * page_size * row_bytes
+    for layer in range(part.layer_num):
+        base_bytes = anchor_bytes + part.layer_offset_bytes(layer)
         assert base_bytes % itemsize == 0
         views.append(
             torch.as_strided(
                 as_dtype_view,
-                size=(n_rows, 1, kv_cache_dim),
-                stride=(kv_cache_dim, kv_cache_dim, 1),
+                size=(n_rows, *part.row_shape),
+                stride=stride,
                 storage_offset=base_bytes // itemsize,
             )
         )
     return views
+
+
+def mha_entry_bytes(
+    *, layer_num: int, head_num: int, head_dim: int, v_head_dim: int, itemsize: int
+) -> int:
+    """Bytes occupied by one slot across all layers (K and V), aligned."""
+    k_row_bytes = head_num * head_dim * itemsize
+    v_row_bytes = head_num * v_head_dim * itemsize
+    return align_entry_bytes(layer_num * (k_row_bytes + v_row_bytes))
+
+
+def mla_entry_bytes(*, layer_num: int, kv_cache_dim: int, itemsize: int) -> int:
+    """Bytes occupied by one MLA slot across all layers (latent rows), aligned."""
+    return align_entry_bytes(layer_num * kv_cache_dim * itemsize)
 
 
 def mamba_entry_bytes(

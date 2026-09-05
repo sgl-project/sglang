@@ -13,12 +13,16 @@
 # ==============================================================================
 """`--enable-page-major-kv-layout` full-attention backend allowlist.
 
-`handle_page_major_kv_layout` gates two ways, because the per-layer views the
-unified pool exposes are all the allowlisted backends can read: an MLA arm
-(`build_mla_views`), an MHA/SWA arm (`build_mha_views`), and no page-major arm
-at all without the unified pool. `fa3` is the resolved default on pre-Blackwell
-hosts, so its absence from an arm makes `--enable-unified-memory` fail to boot
-under its own default configuration.
+Two-way gate (see `_handle_page_major_kv_layout`), because the unified pool
+exposes per-layer views and nothing else:
+  * unified-memory MLA models allow the whole wired
+    paged MLA family -- `fa3`, `flashinfer`'s MLA backend, `trtllm_mla` with
+    its `cutedsl_mla` / `tokenspeed_mla` subclasses, and `flashmla` (ps=64
+    snap);
+  * unified-memory MHA/SWA models allow `fa3` /
+    `fa4` / `flashinfer` / `trtllm_mha` alongside Triton;
+  * plain `--enable-page-major-kv-layout` without the unified pool keeps the
+    envelope-strided 4-D views only the stride-aware Triton kernels read.
 
 The same handler screens the pool itself: the MHA/SWA per-layer views need
 uniform K/V rows, so an asymmetric-K/V model (MiMoV2: head_dim 192 !=

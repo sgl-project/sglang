@@ -85,7 +85,6 @@ from sglang.srt.utils import (
     next_power_of_2,
 )
 from sglang.srt.utils.async_probe import (
-    maybe_detect_kernel_facing_loc,
     maybe_detect_oob,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -1722,10 +1721,6 @@ class KVCache(abc.ABC):
     ):
         self.size = size
         self.page_size = page_size
-        # Row-blocks one page holds in this pool's kernel-facing id space; >1
-        # only for the unified pool's per-layer views, and then a write loc must
-        # have been translated into that space first.
-        self.kernel_page_blocks = 1
         self.dtype = dtype
         self.device = device
         if dtype in (torch.float8_e5m2, torch.float8_e4m3fn, torch.float8_e4m3fnuz):
@@ -2441,9 +2436,6 @@ class MHATokenToKVPool(KVCache):
         # Catch stale slot ids here instead of as illegal-addr / silent KV
         # corruption in the store_kvcache write (gated on SGLANG_ENABLE_ASYNC_ASSERT).
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MHA)")
-        maybe_detect_kernel_facing_loc(
-            loc, self.page_size, self.kernel_page_blocks, "set_kv_buffer (MHA)"
-        )
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
@@ -4269,9 +4261,7 @@ class MLATokenToKVPool(KVCache):
 
     # Has the WRITE loc arriving here already had the DCP owner rule resolved?
     # False: this pool takes a WIDENED loc. The unified pool resolves it in
-    # `KVIndexTranslator.rebind_write_loc` and flips this. Not derivable from
-    # `kernel_page_blocks`: that is `layer_num`, so a rank owning one
-    # full-attention layer is translated with blocks_per_page 1.
+    # `KVIndexTranslator.rebind_write_loc` and flips this.
     write_loc_is_dcp_resolved = False
 
     @property
@@ -4303,9 +4293,6 @@ class MLATokenToKVPool(KVCache):
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
-        maybe_detect_kernel_facing_loc(
-            loc, self.page_size, self.kernel_page_blocks, "set_kv_buffer (MLA)"
-        )
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
@@ -4388,9 +4375,6 @@ class MLATokenToKVPool(KVCache):
             0,
             (self.size + self.page_size) * self._write_loc_dcp_span,
             "set_mla_kv_buffer (MLA)",
-        )
-        maybe_detect_kernel_facing_loc(
-            loc, self.page_size, self.kernel_page_blocks, "set_mla_kv_buffer (MLA)"
         )
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id

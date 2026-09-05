@@ -1700,16 +1700,13 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             "v2p_page[virt_pages] * page_size + offsets.",
         )
 
-        # The composite emits KERNEL-FACING ids, not the physical token ids this
-        # helper returns; they coincide only at multiplier 1, which nothing uses.
-        swa_mult = allocator.swa_kernel_page_multiplier
-        self.assertEqual(swa_mult, 2 * swa_spec.layer_num)
+        # The composite emits the swa sub-pool's PHYSICAL token ids (the
+        # kernel-facing id space of the token-major views).
         composite_out = allocator.translate_loc_from_full_to_swa(v_tokens)
-        expected_kernel = swa_phys_pages_direct * (PS * swa_mult) + offsets_in
         self.assertTrue(
-            bool((composite_out.long() == expected_kernel.long()).all().item()),
+            bool((composite_out.long() == expected.long()).all().item()),
             "REGRESSION: translate_loc_from_full_to_swa must emit the swa "
-            "sub-pool's kernel-facing ids (phys_page * ps * blocks_per_page + offset).",
+            "sub-pool's physical token ids (phys_page * ps + offset).",
         )
 
 
@@ -2304,16 +2301,16 @@ class TestSWACompositeKernelIdSurface(unittest.TestCase):
         )
 
     def test_full_kernel_translate_matches_formula(self):
-        """Both sides scale by their OWN sub-pool's block count, and the full
-        kernel id follows v2p[t // ps] * (ps * mult) + t % ps."""
-        mult = 2 * self.FULL_L
+        """Kernel-facing ids ARE the physical token ids under the token-major
+        views, so both sides pin at multiplier 1 and the id follows
+        v2p[t // ps] * ps + t % ps."""
         a = self._build()
-        self.assertEqual(a.kernel_page_multiplier, 2 * self.FULL_L)
-        self.assertEqual(a.swa_kernel_page_multiplier, 2 * self.SWA_L)
+        self.assertEqual(a.kernel_page_multiplier, 1)
+        self.assertEqual(a.swa_kernel_page_multiplier, 1)
         v = a.alloc(3 * self.PS)
         self.assertIsNotNone(v)
         v2p = a.full_attn_allocator.virtual_to_physical
-        expected = v2p[v // self.PS] * (self.PS * mult) + v % self.PS
+        expected = v2p[v // self.PS] * self.PS + v % self.PS
         self.assertTrue(torch.equal(a.translate_kv_loc_for_kernel(v), expected))
         # The PHYSICAL translate must stay unscaled -- compaction and the byte
         # machinery depend on it staying in physical space.
@@ -2428,8 +2425,8 @@ class TestPs64MLACompositeFeasibility(unittest.TestCase):
 
     def test_construction_alloc_and_kernel_formula(self):
         a = self._build()
-        # MLA: one latent row per layer, so the spec reports LAYERS blocks.
-        self.assertEqual(a.kernel_page_multiplier, self.LAYERS)
+        # Token-major views: the kernel id is the physical token id.
+        self.assertEqual(a.kernel_page_multiplier, 1)
         v = a.alloc(2 * self.PS)
         self.assertIsNotNone(v, "2-page alloc infeasible at ps=64")
         # Page-aligned virtual run (page-granular allocator invariant).
@@ -2437,7 +2434,7 @@ class TestPs64MLACompositeFeasibility(unittest.TestCase):
         # The kernel translate follows the affine formula at ps=64, and every id
         # fits int32 (the canonical narrows on store).
         v2p = a.full_v2p_page_table
-        want = v2p[v // self.PS] * (self.PS * self.LAYERS) + v % self.PS
+        want = v2p[v // self.PS] * self.PS + v % self.PS
         got = a.translate_kv_loc_for_kernel(v)
         self.assertTrue(torch.equal(got, want), "kernel-facing formula broke at ps=64")
         self.assertTrue(bool((got < 2**31).all().item()))
