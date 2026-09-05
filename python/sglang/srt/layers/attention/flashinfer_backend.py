@@ -758,6 +758,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=None,
             )
         elif forward_mode.is_draft_extend_v2():
+            if spec_info is None or spec_info.num_tokens_per_req <= 0:
+                raise RuntimeError(
+                    "FlashInfer draft extend requires speculative metadata with "
+                    "num_tokens_per_req > 0."
+                )
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -971,6 +976,39 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_verify,
+                False,
+                False,
+                swa_out_cache_loc=swa_out_cache_loc,
+            )
+        elif forward_batch.forward_mode.is_draft_extend_v2():
+            spec_info = forward_batch.spec_info
+            if spec_info is None or spec_info.num_tokens_per_req <= 0:
+                raise RuntimeError(
+                    "FlashInfer draft extend requires speculative metadata with "
+                    "num_tokens_per_req > 0."
+                )
+            prefix_lens = forward_batch.extend_prefix_lens
+            if prefix_lens is None:
+                prefix_lens = forward_batch.seq_lens - spec_info.num_tokens_per_req
+
+            # Draft extend uses the same physical-slot page table as target
+            # verification. It intentionally ignores dq_page_table and the CPU
+            # mirrors owned by prompt/chunk prefill; those may remain bound to a
+            # capture-stable full-prefill graph.
+            self.indices_updater_prefill.update(
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.seq_lens_cpu,
+                forward_batch.seq_lens_sum,
+                prefix_lens,
+                prefill_wrappers=self.prefill_wrappers_paged,
+                use_ragged=False,
+                encoder_lens=forward_batch.encoder_lens,
+                spec_info=spec_info,
+                fixed_split_size=self.prefill_split_tile_size,
+            )
+            self.forward_metadata = PrefillMetadata(
+                self.prefill_wrappers_paged,
                 False,
                 False,
                 swa_out_cache_loc=swa_out_cache_loc,
@@ -1316,18 +1354,54 @@ class FlashInferAttnBackend(AttentionBackend):
         # We perform dequant for chunk prefill/cache reuse.
         pool = self.token_to_kv_pool
         if self.prefill_uses_dequant_workspace:
-            kv_cache = pool.get_flashinfer_dequant_workspace_kv_buffer(
-                layer,
-                self.req_to_token_pool.req_to_token,
-                self.cpu_req_pool_indices,
-                forward_batch.extend_prefix_lens_cpu,
-                forward_batch.extend_seq_lens_cpu,
-                self.page_size,
-                prepare_workspace=self.dq_page_table is not None,
-                use_ragged=self.forward_metadata.use_ragged,
-                k_cur=k,
-                v_cur=v,
-            )
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            ):
+                phase = (
+                    "target verification"
+                    if forward_batch.forward_mode.is_target_verify()
+                    else "draft extend"
+                )
+                if k is None or v is None:
+                    raise RuntimeError(f"NVFP4 {phase} requires current K/V tensors.")
+                spec_info = forward_batch.spec_info
+                if spec_info is None or spec_info.num_tokens_per_req <= 0:
+                    raise RuntimeError(
+                        f"NVFP4 {phase} requires speculative metadata with "
+                        "num_tokens_per_req > 0."
+                    )
+                if cache_loc is None:
+                    raise RuntimeError(f"NVFP4 {phase} requires KV write locations.")
+                prefix_len_delta = (
+                    spec_info.num_tokens_per_req
+                    if forward_batch.forward_mode.is_draft_extend_v2()
+                    else 0
+                )
+                kv_cache = pool.get_flashinfer_speculative_dequant_workspace_kv_buffer(
+                    layer,
+                    self.req_to_token_pool.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    k,
+                    v,
+                    cache_loc,
+                    spec_info.num_tokens_per_req,
+                    prefix_len_delta,
+                )
+            else:
+                kv_cache = pool.get_flashinfer_dequant_workspace_kv_buffer(
+                    layer,
+                    self.req_to_token_pool.req_to_token,
+                    self.cpu_req_pool_indices,
+                    forward_batch.extend_prefix_lens_cpu,
+                    forward_batch.extend_seq_lens_cpu,
+                    self.page_size,
+                    prepare_workspace=self.dq_page_table is not None,
+                    use_ragged=self.forward_metadata.use_ragged,
+                    k_cur=k,
+                    v_cur=v,
+                )
         else:
             kv_cache = pool.get_kv_buffer(layer.layer_id)
 

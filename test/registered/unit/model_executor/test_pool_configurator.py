@@ -716,6 +716,37 @@ class TestEagleConfigurator(CustomTestCase):
         self.assertLessEqual(used, available)
 
     @patch(
+        "sglang.srt.model_executor.pool_configurator.is_float4_e2m1fn_x2",
+        return_value=True,
+    )
+    def test_fp4_eagle_accounts_for_separate_draft_workspace(self, _mock_is_fp4):
+        available = 10_000_000
+        num_layers = 32
+        draft_num_layers = 4
+
+        mr = _make_model_runner(self, num_layers=num_layers)
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = draft_num_layers
+
+        with mock_cpu_env(kv_size=1):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            cfg = DefaultPoolConfigurator(mr)
+            config = cfg.calculate_pool_sizes(available, page_size=1)
+
+        # Each worker owns packed data/scales for its layers and one shared
+        # FP8 K/V dequant workspace. Target: 9728 B/token; draft: 1664 B/token.
+        actual_bytes_per_token = 9_728 + 1_664
+        self.assertEqual(cfg._cell_size, actual_bytes_per_token)
+        self.assertLessEqual(
+            config.max_total_num_tokens * actual_bytes_per_token,
+            available,
+        )
+
+    @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,
     )
