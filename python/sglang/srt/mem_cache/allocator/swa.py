@@ -1,16 +1,18 @@
 import torch
 
 from sglang.srt.mem_cache.allocator.base import (
-    BaseKVAllocator,
+    BaseKVPool,
     BaseKVPoolSide,
+    KVPoolSide,
+    SinglePoolKVAllocator,
     invariant_checks_enabled,
 )
 from sglang.srt.mem_cache.allocator.hybrid import BaseHybridSWAKVAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedKVAllocator
 from sglang.srt.mem_cache.allocator.pairing import MappingTensorPairing
-from sglang.srt.mem_cache.allocator.side import KVPoolSide
 from sglang.srt.mem_cache.allocator.token import TokenedKVAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import get_num_new_pages
 from sglang.srt.utils.invariants import Bucket, Invariant, IsTrue, expect
@@ -34,7 +36,7 @@ class MappedSWAKVPoolSide(BaseKVPoolSide):
     """The SWA pool of a static hybrid, addressed by full slot ids through the
     pairing table."""
 
-    def __init__(self, pool: BaseKVAllocator, pairing: MappingTensorPairing):
+    def __init__(self, pool: BaseKVPool, pairing: MappingTensorPairing):
         self.pool = pool
         self.pairing = pairing
         self.page_size = pool.page_size
@@ -115,7 +117,7 @@ class PairedFullKVPoolSide(KVPoolSide):
     """The full pool of a static hybrid: a slot is released only once its SWA
     peer is gone (pairing entry == 0)."""
 
-    def __init__(self, pool: BaseKVAllocator, pairing: MappingTensorPairing):
+    def __init__(self, pool: BaseKVPool, pairing: MappingTensorPairing):
         super().__init__(pool)
         self.pairing = pairing
 
@@ -192,9 +194,10 @@ class HybridSWAKVAllocator(BaseHybridSWAKVAllocator):
         self.pairing = MappingTensorPairing(
             size_full=size, page_size=page_size, device=device
         )
-        self.swa = MappedSWAKVPoolSide(swa_pool, self.pairing)
-        self.full = PairedFullKVPoolSide(full_pool, self.pairing)
-        self.free_group = None
+        self.sides = {
+            ComponentType.SWA: MappedSWAKVPoolSide(swa_pool, self.pairing),
+            ComponentType.FULL: PairedFullKVPoolSide(full_pool, self.pairing),
+        }
 
         self.clear()
         self._kvcache.register_mapping(self.pairing.mapping)
@@ -382,7 +385,6 @@ class HybridSWAKVAllocator(BaseHybridSWAKVAllocator):
     def clear(self):
         self.swa.clear()
         self.full.pool.clear()
-        self.free_group = None
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
@@ -393,12 +395,10 @@ class HybridSWAKVAllocator(BaseHybridSWAKVAllocator):
         )
 
 
-class PureSWAKVAllocator(TokenedKVAllocator):
-    """Single pool for models whose every layer is sliding-window attention.
-
-    The attention kernels read a full -> swa mapping off the KV pool, so an
-    identity mapping is registered; nothing else sets this apart from a plain
-    token pool."""
+class PureSWAKVAllocator(SinglePoolKVAllocator):
+    """One SWA pool for models whose every layer is sliding-window attention;
+    its only side is ``swa``. The attention kernels read a full -> swa mapping
+    off the KV pool, so an identity mapping is registered."""
 
     def __init__(
         self,
@@ -411,7 +411,10 @@ class PureSWAKVAllocator(TokenedKVAllocator):
     ):
         assert page_size == 1
         assert isinstance(kvcache, BaseSWAKVPool)
-        super().__init__(size_swa, dtype, device, kvcache.swa_kv_pool, need_sort)
+        super().__init__(
+            TokenedKVAllocator(size_swa, dtype, device, kvcache.swa_kv_pool, need_sort),
+            component=ComponentType.SWA,
+        )
         self._kvcache = kvcache
         self.full_to_swa_index_mapping = torch.cat(
             [

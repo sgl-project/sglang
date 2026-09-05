@@ -656,12 +656,8 @@ class PrefillAdder:
 
     @property
     def rem_swa_tokens(self):
-        alloc = self.token_to_kv_pool_allocator
-        swa_available = (
-            alloc.available_size() if self.is_all_swa else alloc.swa.available_size()
-        )
         return (
-            swa_available
+            self.token_to_kv_pool_allocator.swa.available_size()
             + self.tree_cache.swa_evictable_size()
             - self.rem_swa_token_offset
         )

@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     _chain_byte_accounting_violations,
     _end_pair_chain,
 )
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.runtime_context import get_parallel
 
@@ -54,16 +55,10 @@ class UnifiedMambaKVAllocator(BaseKVAllocator):
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
     ):
-        full_max = unified_buffer.max_slots("full")
         dcp_size = get_parallel().attn_dcp_size
-        super().__init__(
-            size=(full_max - 1) * dcp_size,
-            page_size=page_size * dcp_size,
-            dtype=unified_buffer.spec("full").get_dtype(),
-            device=device,
-            kvcache=kvcache,
-            need_sort=need_sort,
-        )
+        self.dtype = unified_buffer.spec("full").get_dtype()
+        self.device = device
+        self.need_sort = need_sort
         self.unified_buffer = unified_buffer
         self._kvcache = kvcache
         # Widened under DCP, matching the full sub-allocator; see its __init__.
@@ -84,9 +79,11 @@ class UnifiedMambaKVAllocator(BaseKVAllocator):
             forward_stream=forward_stream,
             lazy_compaction=lazy_compaction,
         )
-        self.full = VirtualFullKVPoolSide(
-            full_pool, conserve_cap=(full_pool.max_slots - 1) * dcp_size
-        )
+        self.sides = {
+            ComponentType.FULL: VirtualFullKVPoolSide(
+                full_pool, conserve_cap=(full_pool.max_slots - 1) * dcp_size
+            )
+        }
         self.mamba_allocator = MultiEndedKVAllocator(
             kvcache=kvcache.mamba_pool,
             unified_buffer=unified_buffer,
@@ -104,8 +101,6 @@ class UnifiedMambaKVAllocator(BaseKVAllocator):
         # `init_unified_mamba_pools` later wraps `self.mamba_allocator` in a
         # `UnifiedMambaSlotAllocator` owning the v2p translate; the KV pools get no
         # allocator (write locations resolve in the attention metadata).
-
-        self.free_group = None
 
         logger.info(
             "[unified-memory-pool] UnifiedMambaKVAllocator ready: "
@@ -131,10 +126,6 @@ class UnifiedMambaKVAllocator(BaseKVAllocator):
             self.full.pool.schedulable_available_size()
             + self.full.pool.allocated_count()
         )
-
-    @size.setter
-    def size(self, value) -> None:
-        pass  # base init writes here; computed dynamically
 
     # -- token-slot surface: MHA side --
 
@@ -290,14 +281,16 @@ class UnifiedMambaKVAllocator(BaseKVAllocator):
     def allocator_state_str(self) -> str:
         return self.full.pool.allocator_state_str()
 
+    # The mamba end shares the inverse-history buffer semantics with the full
+    # pool, so a full-side free clears it too once the frees are not deferred.
     def free(self, free_index: torch.Tensor) -> None:
         with record_function("UnifiedMambaAlloc.free"):
-            self.full.free(free_index)
+            super().free(free_index)
             if self.full.pool.free_group is None:
                 self.mamba_allocator.clear_inverse_history()
 
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
-        self.full.free_segment(free_index, start_pos=start_pos)
+        super().free_segment(free_index, start_pos=start_pos)
         if self.full.pool.free_group is None:
             self.mamba_allocator.clear_inverse_history()
 
@@ -306,18 +299,13 @@ class UnifiedMambaKVAllocator(BaseKVAllocator):
             _end_pair_chain(self.mamba_allocator, self.full.pool)
         )
 
-    # No group of its own: the full side defers its half.
-    def free_group_begin(self) -> None:
-        self.full.free_group_begin()
-
     def free_group_end(self) -> None:
-        self.full.free_group_end()
+        super().free_group_end()
         self.mamba_allocator.clear_inverse_history()
 
     def clear(self) -> None:
         self.full.pool.clear()
         self.mamba_allocator.clear()
-        self.free_group = None
 
     # -- Lazy compaction hooks --
 

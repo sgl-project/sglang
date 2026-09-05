@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.allocator import (
     PagedKVAllocator,
     TokenedKVAllocator,
 )
+from sglang.srt.mem_cache.allocator.base import SinglePoolKVAllocator
 from sglang.srt.mem_cache.allocator.hisparse import (
     HiSparseHybridSWAKVAllocator,
     HiSparseKVAllocator,
@@ -1878,13 +1879,15 @@ class KVCacheConfigurator:
         if token_to_kv_pool_allocator is None:
             if current_platform.is_out_of_tree():
                 AllocatorCls = current_platform.get_paged_allocator_cls()
-                token_to_kv_pool_allocator = AllocatorCls(
-                    sizes.max_total_num_tokens,
-                    page_size=get_schedule().page_size,
-                    dtype=self.kv_cache_dtype,
-                    device=self.device,
-                    kvcache=token_to_kv_pool,
-                    need_sort=need_sort,
+                token_to_kv_pool_allocator = SinglePoolKVAllocator(
+                    AllocatorCls(
+                        sizes.max_total_num_tokens,
+                        page_size=get_schedule().page_size,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=token_to_kv_pool,
+                        need_sort=need_sort,
+                    )
                 )
             elif _is_npu and (
                 get_exec().kernel.attention_backend == "ascend"
@@ -1916,13 +1919,15 @@ class KVCacheConfigurator:
                         NPUPagedKVAllocator,
                     )
 
-                    token_to_kv_pool_allocator = NPUPagedKVAllocator(
-                        sizes.max_total_num_tokens,
-                        page_size=get_schedule().page_size,
-                        dtype=self.kv_cache_dtype,
-                        device=self.device,
-                        kvcache=token_to_kv_pool,
-                        need_sort=need_sort,
+                    token_to_kv_pool_allocator = SinglePoolKVAllocator(
+                        NPUPagedKVAllocator(
+                            sizes.max_total_num_tokens,
+                            page_size=get_schedule().page_size,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=token_to_kv_pool,
+                            need_sort=need_sort,
+                        )
                     )
             else:
                 if self.is_hybrid_swa and sizes.full_max_total_num_tokens == 0:
@@ -1967,22 +1972,27 @@ class KVCacheConfigurator:
                     elif (
                         get_schedule().page_size == 1 and not get_parallel().dcp_enabled
                     ):
-                        token_to_kv_pool_allocator = TokenedKVAllocator(
-                            sizes.max_total_num_tokens,
-                            dtype=self.kv_cache_dtype,
-                            device=self.device,
-                            kvcache=token_to_kv_pool,
-                            need_sort=need_sort,
+                        token_to_kv_pool_allocator = SinglePoolKVAllocator(
+                            TokenedKVAllocator(
+                                sizes.max_total_num_tokens,
+                                dtype=self.kv_cache_dtype,
+                                device=self.device,
+                                kvcache=token_to_kv_pool,
+                                need_sort=need_sort,
+                            )
                         )
                     else:
-                        token_to_kv_pool_allocator = PagedKVAllocator(
-                            sizes.max_total_num_tokens * get_parallel().attn_dcp_size,
-                            page_size=get_schedule().page_size
-                            * get_parallel().attn_dcp_size,
-                            dtype=self.kv_cache_dtype,
-                            device=self.device,
-                            kvcache=token_to_kv_pool,
-                            need_sort=need_sort,
+                        token_to_kv_pool_allocator = SinglePoolKVAllocator(
+                            PagedKVAllocator(
+                                sizes.max_total_num_tokens
+                                * get_parallel().attn_dcp_size,
+                                page_size=get_schedule().page_size
+                                * get_parallel().attn_dcp_size,
+                                dtype=self.kv_cache_dtype,
+                                device=self.device,
+                                kvcache=token_to_kv_pool,
+                                need_sort=need_sort,
+                            )
                         )
 
             if get_memory().enable_hisparse and is_dsv4_model:

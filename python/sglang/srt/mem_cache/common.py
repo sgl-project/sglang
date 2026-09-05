@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.allocator.hybrid import BaseHybridSWAKVAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
 
@@ -103,12 +104,9 @@ def free_swa_out_of_window_slots(
         ]
         # One contiguous, page-aligned range with host-int bounds: the segment
         # form, so a side that can derive pages by stride math never dedups.
-        swa_side = (
-            token_to_kv_pool_allocator.swa
-            if isinstance(token_to_kv_pool_allocator, BaseHybridSWAKVAllocator)
-            else token_to_kv_pool_allocator
+        token_to_kv_pool_allocator.swa.free_segment(
+            free_slots, start_pos=req.kv.swa_evicted_seqlen
         )
-        swa_side.free_segment(free_slots, start_pos=req.kv.swa_evicted_seqlen)
         req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 
@@ -141,8 +139,8 @@ def free_kv_row_segments(
             f"SWA eviction floor {swa_evicted_seqlen} splits a page "
             f"(page_size {allocator.page_size})"
         )
-    if swa_dead and isinstance(allocator, BaseHybridSWAKVAllocator):
-        # A single pool has no full side left to release: the ratchet took it.
+    if swa_dead and ComponentType.FULL in allocator.sides:
+        # A pure-SWA pool has no full side left to release: the ratchet took it.
         allocator.full.free_segments(swa_dead)
     if swa_alive:
         allocator.free_segments(swa_alive)

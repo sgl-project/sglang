@@ -20,12 +20,13 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
     SchedulerPoolStatsObserver,
 )
-from sglang.srt.mem_cache.allocator import BaseHybridSWAKVAllocator, BaseKVAllocator
+from sglang.srt.mem_cache.allocator import BaseKVAllocator
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaHybridSWAKVAllocator,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_SANITY_CHECK_CACHE,
     SchedulerStageMetricsRecorder,
@@ -385,14 +386,14 @@ class SchedulerInvariantChecker:
         mask = torch.arange(row_width, device=rtt.device)[None, :] < allocs[:, None]
         owner_pages = rtt[idx][mask] // self.page_size
 
-        # Pools to check: a flat allocator is its own single pool, a hybrid-SWA
-        # allocator has one per side. Pools without a page free list are skipped.
+        # One pool per side, full first (Check A below reads sub_allocs[0]);
+        # pools without a page free list are skipped.
         alloc = self.token_to_kv_pool_allocator
-        pools = (
-            [alloc.full.pool, alloc.swa.pool]
-            if isinstance(alloc, BaseHybridSWAKVAllocator)
-            else [alloc]
-        )
+        pools = [
+            alloc.side(ct).pool
+            for ct in (ComponentType.FULL, ComponentType.SWA)
+            if ct in alloc.sides
+        ]
         sub_allocs = [p for p in pools if p.get_all_free_pages() is not None]
         if not sub_allocs:
             return

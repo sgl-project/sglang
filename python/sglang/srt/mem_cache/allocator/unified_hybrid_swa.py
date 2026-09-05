@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     _float_open_short_side,
     _relieve_for_alloc,
 )
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.utils.common import get_num_new_pages
 
@@ -52,14 +53,9 @@ class UnifiedHybridSWAKVAllocator(BaseHybridSWAKVAllocator):
     alloc pre-check.
     """
 
-    # Base init does `self.size = size`; the no-op setter below absorbs that write.
     @property
     def size(self) -> int:
         return min(self._size_full, self._size_swa)
-
-    @size.setter
-    def size(self, value) -> None:
-        pass
 
     # Static caps, not `max_slots - 1` (~= full_max + swa_max, which over-promises).
     @property
@@ -90,15 +86,9 @@ class UnifiedHybridSWAKVAllocator(BaseHybridSWAKVAllocator):
         self._full_max_total_num_tokens = full_max_total_num_tokens
         self._swa_max_total_num_tokens = swa_max_total_num_tokens
         self.page_size = page_size
-
-        super().__init__(
-            size=full_max_total_num_tokens,
-            page_size=page_size,
-            dtype=unified_buffer.mha_spec("full").store_dtype,
-            device=device,
-            kvcache=kvcache,
-            need_sort=need_sort,
-        )
+        self.dtype = unified_buffer.mha_spec("full").store_dtype
+        self.device = device
+        self.need_sort = need_sort
         self.unified_buffer = unified_buffer
         self._kvcache = kvcache
         self.lazy_compaction = lazy_compaction
@@ -126,10 +116,14 @@ class UnifiedHybridSWAKVAllocator(BaseHybridSWAKVAllocator):
             # full's whole id space.
             virtual_num_pages=full_pool.num_virtual_ids,
         )
-        self.full = VirtualFullKVPoolSide(
-            full_pool, conserve_cap=full_max_total_num_tokens
-        )
-        self.swa = VirtualSWAKVPoolSide(swa_pool, conserve_cap=swa_max_total_num_tokens)
+        self.sides = {
+            ComponentType.SWA: VirtualSWAKVPoolSide(
+                swa_pool, conserve_cap=swa_max_total_num_tokens
+            ),
+            ComponentType.FULL: VirtualFullKVPoolSide(
+                full_pool, conserve_cap=full_max_total_num_tokens
+            ),
+        }
         self.pairing = VirtualIdPairing(swa_pool)
         self._wire_peers()
 
@@ -144,11 +138,6 @@ class UnifiedHybridSWAKVAllocator(BaseHybridSWAKVAllocator):
             full_allocator=self.full.pool,
             swa_allocator=self.swa.pool,
         )
-
-        self.free_group = None
-        # Empty (not None) for the leak checker.
-        self.free_pages = torch.empty(0, dtype=torch.int64, device=device)
-        self.release_pages = torch.empty(0, dtype=torch.int64, device=device)
 
         logger.info(
             "[unified-memory-pool] UnifiedHybridSWAKVAllocator ready: "
@@ -443,7 +432,6 @@ class UnifiedHybridSWAKVAllocator(BaseHybridSWAKVAllocator):
     def clear(self) -> None:
         self.full.pool.clear()
         self.swa.pool.clear()
-        self.free_group = None
 
     # -- Lazy compaction hooks --
 
@@ -537,11 +525,6 @@ class UnifiedMambaHybridSWAKVAllocator(UnifiedHybridSWAKVAllocator):
         self.swa.pool.bind_low_peer(self.mamba_allocator)
         self.swa.pool.bind_high_peer(self.full.pool)
         self.full.pool.bind_low_peer(self.swa.pool)
-
-        # None, not empty: `free_pages is None` is the leak checker's documented
-        # skip contract; its mamba census would mix physical and virtual ids.
-        self.free_pages = None
-        self.release_pages = None
 
         logger.info(
             "[unified-memory-pool] UnifiedMambaHybridSWAKVAllocator ready: "

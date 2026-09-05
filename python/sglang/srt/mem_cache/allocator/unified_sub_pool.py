@@ -45,7 +45,7 @@ from sglang.kernels.ops.memory.virtual_slot import (
     free_unbind_inplace,
 )
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocator import BaseKVAllocator
+from sglang.srt.mem_cache.allocator.base import BaseKVPool
 from sglang.srt.mem_cache.allocator.paged import (
     alloc_decode_kernel,
     alloc_extend_kernel,
@@ -205,7 +205,7 @@ def _relieve_for_alloc(short_pool, need_tokens: int) -> bool:
     return need_tokens <= short_pool.available_size()
 
 
-class MultiEndedKVAllocator(BaseKVAllocator):
+class MultiEndedKVAllocator(BaseKVPool):
     """Allocator for one sub-pool over a `UnifiedKVPool`."""
 
     # Capacity-bearing state: any rebind bumps `_capacity_epoch`, invalidating

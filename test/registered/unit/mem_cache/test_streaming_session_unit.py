@@ -5,22 +5,21 @@ import torch
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.mem_cache.allocator import (
     BaseHybridSWAKVAllocator,
-    BaseKVAllocator,
+    BaseKVPool,
     BaseKVPoolSide,
+    SinglePoolKVAllocator,
 )
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
-class _FakeAllocator(BaseKVAllocator):
-    """Single-pool double. Subclassing the base routes free_full / free_segment /
-    free_segments into free(), so a new free API cannot slip past the recorder."""
-
-    def available_size(self):
-        return 0
+class _RecordingPool(BaseKVPool):
+    """Pool double: the base routes free_segment / free_segments into free(),
+    so a new free API cannot slip past the recorder."""
 
     def __init__(self, page_size: int = 1):
         super().__init__(
@@ -33,6 +32,9 @@ class _FakeAllocator(BaseKVAllocator):
         )
         self.freed = []
 
+    def available_size(self):
+        return 0
+
     def clear(self):
         self.freed = []
 
@@ -41,6 +43,17 @@ class _FakeAllocator(BaseKVAllocator):
 
     def free(self, free_index: torch.Tensor):
         self.freed.append(free_index.clone())
+
+
+class _FakeAllocator(SinglePoolKVAllocator):
+    """Single-pool double over `_RecordingPool`."""
+
+    def __init__(self, page_size: int = 1):
+        super().__init__(_RecordingPool(page_size))
+
+    @property
+    def freed(self):
+        return self.pool.freed
 
 
 class _FakeSide(BaseKVPoolSide):
@@ -66,17 +79,16 @@ class _FakeHybridAllocator(BaseHybridSWAKVAllocator):
         return 0
 
     def __init__(self, page_size: int = 1):
-        BaseKVAllocator.__init__(
-            self,
-            size=1024,
-            page_size=page_size,
-            dtype=torch.bfloat16,
-            device="cpu",
-            kvcache=None,
-            need_sort=False,
-        )
-        self.full = _FakeSide(page_size)
-        self.swa = _FakeSide(page_size)
+        self.size = 1024
+        self.page_size = page_size
+        self.dtype = torch.bfloat16
+        self.device = "cpu"
+        self.need_sort = False
+        self._kvcache = None
+        self.sides = {
+            ComponentType.SWA: _FakeSide(page_size),
+            ComponentType.FULL: _FakeSide(page_size),
+        }
 
     def clear(self):
         self.full.freed = []

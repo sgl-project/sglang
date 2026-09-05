@@ -10,7 +10,44 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     HiSparseC4DevicePool,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.utils.common import get_num_new_pages
+
+
+class _HiSparseDSASide(BaseKVPoolSide):
+    """The single side of the DSA hisparse allocator: a logical slot and its
+    hisparse device slot die together, and the mapping is cleared at once, so
+    frees are never deferred."""
+
+    def __init__(self, allocator: "HiSparseKVAllocator"):
+        self.allocator = allocator
+        self.pool = allocator.logical_attn_allocator
+        self.page_size = self.pool.page_size
+        self.free_group = None
+
+    def available_size(self) -> int:
+        return self.allocator.available_size()
+
+    def free(self, free_index: torch.Tensor):
+        if free_index.numel() == 0:
+            return
+        allocator = self.allocator
+        allocator.logical_attn_allocator.free(free_index)
+        allocator.free_hisparse(free_index)
+        assert (
+            allocator.logical_attn_allocator.available_size()
+            <= allocator.logical_attn_allocator.size
+        )
+        assert (
+            allocator.hisparse_attn_allocator.available_size()
+            <= allocator.hisparse_attn_allocator.size
+        )
+
+    def free_group_begin(self):
+        return
+
+    def free_group_end(self):
+        return
 
 
 class HiSparseKVAllocator(BaseKVAllocator):
@@ -60,7 +97,7 @@ class HiSparseKVAllocator(BaseKVAllocator):
             ]
         )
 
-        self.free_group = None
+        self.sides = {ComponentType.FULL: _HiSparseDSASide(self)}
         self.clear()
         self._kvcache.register_mapping(
             weakref.proxy(self.full_to_hisparse_device_index_mapping)
@@ -240,28 +277,6 @@ class HiSparseKVAllocator(BaseKVAllocator):
         self.hisparse_attn_allocator.clear()
         # Keep the trailing -1: it is what a last_loc of -1 translates to.
         self.full_to_hisparse_device_index_mapping[:-1].fill_(0)
-        self.free_group = None
-
-    # No deferred frees: free() must clear the full-to-hisparse mapping at once.
-    def free_group_begin(self):
-        return
-
-    def free_group_end(self):
-        return
-
-    def free(self, free_index: torch.Tensor):
-        if free_index.numel() == 0:
-            return
-        self.logical_attn_allocator.free(free_index)
-        self.free_hisparse(free_index)
-        assert (
-            self.logical_attn_allocator.available_size()
-            <= self.logical_attn_allocator.size
-        )
-        assert (
-            self.hisparse_attn_allocator.available_size()
-            <= self.hisparse_attn_allocator.size
-        )
 
 
 class _HiSparseFullSide(BaseKVPoolSide):
@@ -349,7 +364,7 @@ class HiSparseHybridSWAKVAllocator(HybridSWAKVAllocator):
         )
         # Base init calls clear(), which needs the hisparse pool above.
         super().__init__(size, size_swa, page_size, dtype, device, kvcache, need_sort)
-        self.full = _HiSparseFullSide(
+        self.sides[ComponentType.FULL] = _HiSparseFullSide(
             self.full, self.hisparse_attn_allocator, self.compress_ratio
         )
         self.hisparse_kvcache.register_mapping(

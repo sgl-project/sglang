@@ -7,7 +7,7 @@ from array import array
 import torch
 
 from sglang.srt.disaggregation.kv_events import BlockStored, StorageMedium
-from sglang.srt.mem_cache.allocator import TokenedKVAllocator
+from sglang.srt.mem_cache.allocator import SinglePoolKVAllocator, TokenedKVAllocator
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
@@ -58,12 +58,14 @@ class TestHiRadixCacheKVEvents(CustomTestCase):
             device="cuda",
             enable_memory_saver=False,
         )
-        allocator = TokenedKVAllocator(
-            size=256,
-            dtype=torch.bfloat16,
-            device="cuda",
-            kvcache=kv_pool,
-            need_sort=False,
+        allocator = SinglePoolKVAllocator(
+            TokenedKVAllocator(
+                size=256,
+                dtype=torch.bfloat16,
+                device="cuda",
+                kvcache=kv_pool,
+                need_sort=False,
+            )
         )
         params = CacheInitParams(
             req_to_token_pool=req_to_token_pool,

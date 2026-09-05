@@ -17,6 +17,7 @@ Usage:
     python -m pytest test_radix_cache_unit.py::TestRadixCache::test_insert_basic
 """
 
+from sglang.srt.mem_cache.allocator import SinglePoolKVAllocator
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # CPU-based unit test, runs quickly on any GPU runner
@@ -497,12 +498,14 @@ class TestRadixCache(unittest.TestCase):
             def write(self, indices, values):
                 self.req_to_token[indices] = values
 
-        allocator = TokenedKVAllocator(
-            size=16,
-            dtype=torch.float16,
-            device="cpu",
-            kvcache=None,
-            need_sort=False,
+        allocator = SinglePoolKVAllocator(
+            TokenedKVAllocator(
+                size=16,
+                dtype=torch.float16,
+                device="cpu",
+                kvcache=None,
+                need_sort=False,
+            )
         )
         cache = RadixCache.create_simulated(mock_allocator=allocator)
         token_ids = array("q", [1, 2, 3])
@@ -535,7 +538,7 @@ class TestRadixCache(unittest.TestCase):
             allocator.available_size(),
             available_before_free + request_indices.numel(),
         )
-        torch.testing.assert_close(allocator.free_pages[-3:], request_indices)
+        torch.testing.assert_close(allocator.pool.free_pages[-3:], request_indices)
         torch.testing.assert_close(
             cache.req_to_token_pool.req_to_token[0], tree_indices
         )

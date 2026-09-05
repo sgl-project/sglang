@@ -304,7 +304,7 @@ class SchedulerPoolStatsObserver:
         else:
             # All-SWA: one pool and no full side.
             full_available_size = 0
-            swa_available_size = allocator.available_size()
+            swa_available_size = allocator.swa.available_size()
         full_evictable_size = self.tree_cache.full_evictable_size()
         swa_evictable_size = self.tree_cache.swa_evictable_size()
         full_num_used = self.full_tokens_per_layer - (

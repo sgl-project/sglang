@@ -39,7 +39,7 @@ from sglang.srt.mem_cache.allocator import (
     unified_side,
 )
 from sglang.srt.mem_cache.allocator import unified_sub_pool as mea
-from sglang.srt.mem_cache.allocator.base import BaseKVAllocator
+from sglang.srt.mem_cache.allocator.base import BaseKVPool, BaseKVPoolSide
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
@@ -327,15 +327,15 @@ class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
     """
 
     def test_all_overridden(self):
-        for cls in (
-            mea.MultiEndedKVAllocator,
-            unified_mamba.UnifiedMambaKVAllocator,
-            unified_hybrid_swa.UnifiedHybridSWAKVAllocator,
+        for cls, base in (
+            (mea.MultiEndedKVAllocator, BaseKVPool),
+            (unified_side.VirtualFullKVPoolSide, BaseKVPoolSide),
+            (unified_side.VirtualSWAKVPoolSide, BaseKVPoolSide),
         ):
             with self.subTest(cls=cls.__name__):
                 self.assertIsNot(
                     cls.free_segment,
-                    BaseKVAllocator.free_segment,
+                    base.free_segment,
                     msg=(
                         f"{cls.__name__} inherits the base `free_segment`, which "
                         f"discards `start_pos` -- every segment free will take the "

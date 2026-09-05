@@ -93,6 +93,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
@@ -455,10 +456,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return self.tree_cache.protected_size()
 
     def _radix_full_available(self) -> int:
-        alloc = self.token_to_kv_pool_allocator
-        if isinstance(alloc, BaseHybridSWAKVAllocator):
-            return alloc.full.available_size()
-        return alloc.available_size()
+        return self.token_to_kv_pool_allocator.side(ComponentType.FULL).available_size()
 
     def _swa_tail_len(self, seq_len: int) -> int:
         if not self._uses_swa_tail_prealloc() or seq_len <= 0:
@@ -1708,11 +1706,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         window_size = self.scheduler.sliding_window_size or 0
         alloc = self.token_to_kv_pool_allocator
         swa_total = alloc.size_swa
-        swa_available = (
-            alloc.swa.available_size()
-            if isinstance(alloc, BaseHybridSWAKVAllocator)
-            else alloc.available_size()
-        )
+        swa_available = alloc.swa.available_size()
         swa_evictable = self.tree_cache.swa_evictable_size()
         swa_used = swa_total - swa_available - swa_evictable
         swa_growth_potential = max(0, n_active * window_size - swa_used)

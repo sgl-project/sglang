@@ -14,7 +14,7 @@ from sglang.srt.managers.scheduler_components.invariant_checker import (
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
-from sglang.srt.mem_cache.allocator import BaseKVAllocator
+from sglang.srt.mem_cache.allocator import BaseKVPool, SinglePoolKVAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -22,9 +22,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-class RecordingAllocator(BaseKVAllocator):
-    """Single-pool double. Subclassing the base routes free_full / free_segment /
-    free_segments into free(), so a new free API cannot slip past the recorder."""
+class RecordingPool(BaseKVPool):
+    """Pool double: the base routes free_segment / free_segments into free(),
+    so a new free API cannot slip past the recorder."""
 
     def __init__(self, capacity: int):
         super().__init__(
@@ -38,6 +38,7 @@ class RecordingAllocator(BaseKVAllocator):
         self.capacity = capacity
         self.next_slot = 1
         self.live: set[int] = set()
+        self.free_pages = None
 
     def alloc(self, size: int):
         if size > self.available_size():
@@ -59,6 +60,38 @@ class RecordingAllocator(BaseKVAllocator):
     def clear(self):
         self.next_slot = 1
         self.live.clear()
+
+
+class RecordingAllocator(SinglePoolKVAllocator):
+    """Single-pool double over `RecordingPool`; the pool's counters are exposed
+    so the tests keep reading them off the allocator."""
+
+    def __init__(self, capacity: int):
+        super().__init__(RecordingPool(capacity))
+
+    @property
+    def live(self):
+        return self.pool.live
+
+    @property
+    def next_slot(self):
+        return self.pool.next_slot
+
+    @property
+    def capacity(self):
+        return self.pool.capacity
+
+    @capacity.setter
+    def capacity(self, value):
+        self.pool.capacity = value
+
+    @property
+    def free_pages(self):
+        return self.pool.free_pages
+
+    @free_pages.setter
+    def free_pages(self, value):
+        self.pool.free_pages = value
 
 
 def make_pool_and_req(capacity: int = 64):

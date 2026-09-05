@@ -13,7 +13,7 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
     MlxAuxiliaryStateReqToTokenPool,
 )
-from sglang.srt.mem_cache.allocator import TokenedKVAllocator
+from sglang.srt.mem_cache.allocator import SinglePoolKVAllocator, TokenedKVAllocator
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
@@ -302,12 +302,14 @@ class MlxModelRunnerStub(ModelRunner):
             device="cpu",
         )
         self.token_to_kv_pool = dummy_kv
-        self.token_to_kv_pool_allocator = TokenedKVAllocator(
-            size=self.max_total_num_tokens,
-            dtype=self.kv_cache_dtype,
-            device="cpu",
-            kvcache=dummy_kv,
-            need_sort=False,
+        self.token_to_kv_pool_allocator = SinglePoolKVAllocator(
+            TokenedKVAllocator(
+                size=self.max_total_num_tokens,
+                dtype=self.kv_cache_dtype,
+                device="cpu",
+                kvcache=dummy_kv,
+                need_sort=False,
+            )
         )
 
         # No CUDA graphs, no attention backend

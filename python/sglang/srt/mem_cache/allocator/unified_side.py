@@ -9,9 +9,9 @@ import torch
 
 from sglang.srt.mem_cache.allocator.base import (
     BaseKVPoolSide,
+    KVPoolSide,
     invariant_checks_enabled,
 )
-from sglang.srt.mem_cache.allocator.side import KVPoolSide
 from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedKVAllocator
 from sglang.srt.utils.invariants import Bucket, Invariant, IsTrue, expect
 

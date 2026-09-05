@@ -506,12 +506,9 @@ class HybridCacheController(BaseHiCacheController):
     ) -> Optional[torch.Tensor]:
         need_load_kv = host_indices.numel() > 0
 
-        from sglang.srt.mem_cache.allocator import BaseHybridSWAKVAllocator
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
-        alloc = self.mem_pool_device_allocator
-        full_allocator = (
-            alloc.full.pool if isinstance(alloc, BaseHybridSWAKVAllocator) else alloc
-        )
+        full_allocator = self.mem_pool_device_allocator.side(ComponentType.FULL).pool
         if not need_load_kv:
             device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
         else:

@@ -1,5 +1,6 @@
 """Tests for session references on UnifiedRadixCache."""
 
+from sglang.srt.mem_cache.allocator import SinglePoolKVAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -109,12 +110,14 @@ def make_params(enable_session: bool) -> CacheInitParams:
         device="cpu",
         enable_memory_saver=False,
     )
-    allocator = TokenedKVAllocator(
-        size=64,
-        dtype=dtype,
-        device="cpu",
-        kvcache=kv_pool,
-        need_sort=False,
+    allocator = SinglePoolKVAllocator(
+        TokenedKVAllocator(
+            size=64,
+            dtype=dtype,
+            device="cpu",
+            kvcache=kv_pool,
+            need_sort=False,
+        )
     )
     req_pool = ReqToTokenPool(
         size=8,

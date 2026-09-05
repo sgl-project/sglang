@@ -8,7 +8,10 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
 from sglang.srt.environ import InvariantCheckLevel, envs
-from sglang.srt.mem_cache.allocator.base import BaseKVAllocator
+from sglang.srt.mem_cache.allocator.base import (
+    BaseKVPool,
+    SinglePoolKVAllocator,
+)
 from sglang.srt.mem_cache.allocator.swa import (
     HybridSWAKVAllocator,
     PureSWAKVAllocator,
@@ -30,6 +33,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -947,13 +951,7 @@ class TestSWASplitLeafOnInsert(CustomTestCase):
         tree.sanity_check()
 
 
-class _SinglePoolAllocator(BaseKVAllocator):
-    """Minimal single-pool allocator: no full side, so the part below the
-    eviction floor was already released by the window ratchet."""
-
-    def available_size(self):
-        return 0
-
+class _RecordingPool(BaseKVPool):
     def __init__(self):
         super().__init__(
             size=16,
@@ -965,6 +963,9 @@ class _SinglePoolAllocator(BaseKVAllocator):
         )
         self.freed = []
 
+    def available_size(self):
+        return 0
+
     def clear(self):
         self.freed = []
 
@@ -973,6 +974,18 @@ class _SinglePoolAllocator(BaseKVAllocator):
 
     def free(self, free_index: torch.Tensor):
         self.freed.append(free_index)
+
+
+class _SinglePoolAllocator(SinglePoolKVAllocator):
+    """Pure-SWA single pool: only an swa side, so the part below the eviction
+    floor was already released by the window ratchet."""
+
+    def __init__(self):
+        super().__init__(_RecordingPool(), component=ComponentType.SWA)
+
+    @property
+    def freed(self):
+        return self.pool.freed
 
 
 class TestFreeFullPartition(CustomTestCase):

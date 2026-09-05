@@ -12,7 +12,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
-from sglang.srt.mem_cache.allocator.base import BaseKVAllocator
+from sglang.srt.mem_cache.allocator.base import BaseKVPool
 from sglang.srt.mem_cache.allocator.paged import PagedKVAllocator
 from sglang.srt.mem_cache.common import _release_overallocated_kv_indices
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -191,7 +191,7 @@ class TestFreeSegments(unittest.TestCase):
                 self._freed_by_segments(11, spans)
 
 
-class _RecordingBaseAllocator(BaseKVAllocator):
+class _RecordingBaseAllocator(BaseKVPool):
     """Base-fallback allocator: free_segment inherits the default (ignore
     start_pos, call free()), free() records what it received."""
 

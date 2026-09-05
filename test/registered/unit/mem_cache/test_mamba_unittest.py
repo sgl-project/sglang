@@ -8,7 +8,7 @@ from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.mem_cache.allocator import TokenedKVAllocator
+from sglang.srt.mem_cache.allocator import SinglePoolKVAllocator, TokenedKVAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
@@ -599,12 +599,14 @@ class TestMamba(unittest.TestCase):
             enable_memory_saver=False,
             mamba_pool=req_to_token_pool.mamba_pool,
         )
-        allocator = TokenedKVAllocator(
-            size=size,
-            dtype=dtype,
-            device=device,
-            kvcache=pool,
-            need_sort=False,
+        allocator = SinglePoolKVAllocator(
+            TokenedKVAllocator(
+                size=size,
+                dtype=dtype,
+                device=device,
+                kvcache=pool,
+                need_sort=False,
+            )
         )
         params = CacheInitParams(
             req_to_token_pool=req_to_token_pool,

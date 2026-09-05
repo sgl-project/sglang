@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.mem_cache.allocator import SinglePoolKVAllocator
 from sglang.test.ci.ci_register import register_xpu_ci
 
 # Must be set before lmcache imports. Save prior values so tearDownModule can
@@ -120,12 +121,14 @@ class TestLMCRadixCacheXPU(unittest.TestCase):
             device=self.DEVICE,
             enable_memory_saver=False,
         )
-        allocator = TokenedKVAllocator(
-            size=self.BUFFER_SIZE,
-            dtype=torch.bfloat16,
-            device=self.DEVICE,
-            kvcache=kv_pool,
-            need_sort=False,
+        allocator = SinglePoolKVAllocator(
+            TokenedKVAllocator(
+                size=self.BUFFER_SIZE,
+                dtype=torch.bfloat16,
+                device=self.DEVICE,
+                kvcache=kv_pool,
+                need_sort=False,
+            )
         )
         req_to_token_pool = ReqToTokenPool(
             size=8,
