@@ -2,10 +2,12 @@ import json
 import math
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import requests
 import torch
 
+from sglang.srt.layers import sampler as sampler_module
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
     SamplingMaskStatus,
@@ -14,7 +16,7 @@ from sglang.srt.layers.sampler import Sampler, _SamplingMaskCapture
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -41,6 +43,235 @@ _SERVER_ARGS = (
 _INVALID_SAMPLING_MASK_ERROR = (
     "return_sampling_mask requires top_k=1 for greedy sampling"
 )
+
+
+class TestSamplingMaskCapture(CustomTestCase):
+    def setUp(self):
+        self.sampler = Sampler.__new__(Sampler)
+        torch.nn.Module.__init__(self.sampler)
+        self.sampler.sampling_mask_max_tokens = 4096
+        self.sampler.tp_sync_group = None
+        self.sampler.cp_sync_group = None
+
+    def test_min_p_capture_matches_filtered_support_and_logprob(self):
+        backends = ("pytorch",) if is_hip() else ("pytorch", "flashinfer")
+        for backend in backends:
+            with self.subTest(backend=backend):
+                probs = torch.tensor([[0.4, 0.3, 0.2, 0.1]], device="cuda")
+                sampling_info = SimpleNamespace(
+                    sampling_seed=None,
+                    need_top_k_sampling=True,
+                    need_top_p_sampling=False,
+                    need_min_p_sampling=True,
+                    top_ks=torch.tensor([3], dtype=torch.int32, device="cuda"),
+                    top_ps=torch.tensor([1.0], device="cuda"),
+                    min_ps=torch.tensor([0.6], device="cuda"),
+                    sampling_mask_batch_indices=torch.tensor([0], device="cuda"),
+                )
+                with patch(
+                    "sglang.srt.layers.sampler.get_exec",
+                    return_value=SimpleNamespace(
+                        kernel=SimpleNamespace(sampling_backend=backend)
+                    ),
+                ):
+                    sampled, capture = self.sampler._sample_from_probs(
+                        probs,
+                        sampling_info,
+                        positions=torch.tensor([0], device="cuda"),
+                        simple_sampling_case=False,
+                    )
+                output = self.sampler._build_sampling_mask_output(sampled, capture)
+                self.assertEqual(output.statuses.tolist(), [SamplingMaskStatus.OK])
+                self.assertEqual(output.lengths.tolist(), [2])
+                self.assertEqual(set(output.token_ids[0, :2].tolist()), {0, 1})
+                expected = (0.4 if sampled.item() == 0 else 0.3) / 0.7
+                self.assertAlmostEqual(
+                    output.selected_logprobs.item(), math.log(expected), places=6
+                )
+
+    @unittest.skipIf(is_hip(), "FlashInfer is not available on ROCm")
+    def test_flashinfer_joint_cutoff_ties_match_capture(self):
+        batch_size = 256
+        top_k = 2
+        top_p = 0.45
+        base_probs = torch.tensor([[0.4, 0.2, 0.2, 0.1, 0.1]], device="cuda")
+        probs = base_probs.repeat(batch_size, 1)
+
+        # Derive the threshold-based joint support independently. Both filters
+        # cut at 0.2, so the tied entries must survive even though this yields
+        # more support entries than top_k.
+        sorted_probs = base_probs[0].sort(descending=True).values
+        top_k_cutoff = sorted_probs[top_k - 1]
+        mass_before = sorted_probs.cumsum(dim=-1) - sorted_probs
+        top_p_cutoff = sorted_probs[mass_before <= top_p][-1]
+        expected_support = (base_probs[0] >= top_k_cutoff) & (
+            base_probs[0] >= top_p_cutoff
+        )
+        expected_ids = expected_support.nonzero(as_tuple=True)[0].tolist()
+        self.assertEqual(expected_ids, [0, 1, 2])
+
+        sampling_info = SimpleNamespace(
+            sampling_seed=None,
+            need_top_k_sampling=True,
+            need_top_p_sampling=True,
+            need_min_p_sampling=False,
+            top_ks=torch.full((batch_size,), top_k, dtype=torch.int32, device="cuda"),
+            top_ps=torch.full((batch_size,), top_p, device="cuda"),
+            min_ps=torch.zeros(batch_size, device="cuda"),
+            return_sampling_masks=[True] * batch_size,
+            sampling_mask_batch_indices=torch.arange(batch_size, device="cuda"),
+        )
+        with patch(
+            "sglang.srt.layers.sampler.get_exec",
+            return_value=SimpleNamespace(
+                kernel=SimpleNamespace(sampling_backend="flashinfer")
+            ),
+        ):
+            sampled, capture = self.sampler._sample_from_probs(
+                probs,
+                sampling_info,
+                positions=torch.zeros(batch_size, dtype=torch.int64, device="cuda"),
+                simple_sampling_case=False,
+            )
+
+        self.assertIsNotNone(capture)
+        self.assertEqual(capture.batch_rows.cpu().tolist(), list(range(batch_size)))
+        actual_support = capture.weights > 0
+        self.assertTrue(
+            torch.equal(actual_support, expected_support.expand_as(actual_support))
+        )
+        self.assertGreater(int(actual_support[0].sum().item()), top_k)
+        self.assertTrue(
+            bool(actual_support.gather(1, sampled.view(-1, 1)).all().item())
+        )
+
+    @unittest.skipIf(is_hip(), "FlashInfer is not available on ROCm")
+    def test_flashinfer_capture_only_materializes_requested_rows(self):
+        batch_size = 4
+        top_k = 2
+        top_p = 0.45
+        requested_rows = [1, 3]
+        probs = torch.tensor([[0.4, 0.2, 0.2, 0.1, 0.1]], device="cuda").repeat(
+            batch_size, 1
+        )
+        sampling_info = SimpleNamespace(
+            sampling_seed=None,
+            need_top_k_sampling=True,
+            need_top_p_sampling=True,
+            need_min_p_sampling=False,
+            top_ks=torch.full((batch_size,), top_k, dtype=torch.int32, device="cuda"),
+            top_ps=torch.full((batch_size,), top_p, device="cuda"),
+            min_ps=torch.zeros(batch_size, device="cuda"),
+            return_sampling_masks=[False, True, False, True],
+            sampling_mask_batch_indices=torch.tensor(requested_rows, device="cuda"),
+        )
+        top_k_renorm = sampler_module.top_k_renorm_prob
+        top_p_renorm = sampler_module.top_p_renorm_prob
+        with (
+            patch(
+                "sglang.srt.layers.sampler.get_exec",
+                return_value=SimpleNamespace(
+                    kernel=SimpleNamespace(sampling_backend="flashinfer")
+                ),
+            ),
+            patch(
+                "sglang.srt.layers.sampler.top_k_renorm_prob",
+                wraps=top_k_renorm,
+            ) as top_k_mock,
+            patch(
+                "sglang.srt.layers.sampler.top_p_renorm_prob",
+                wraps=top_p_renorm,
+            ) as top_p_mock,
+        ):
+            sampled, capture = self.sampler._sample_from_probs(
+                probs,
+                sampling_info,
+                positions=torch.zeros(batch_size, dtype=torch.int64, device="cuda"),
+                simple_sampling_case=False,
+            )
+
+        self.assertIsNotNone(capture)
+        self.assertEqual(capture.batch_rows.cpu().tolist(), requested_rows)
+        self.assertEqual(tuple(capture.weights.shape), (len(requested_rows), 5))
+        self.assertEqual(tuple(top_k_mock.call_args.args[0].shape), (2, 5))
+        self.assertEqual(tuple(top_p_mock.call_args.args[0].shape), (2, 5))
+
+        output = LogitsProcessorOutput(next_token_logits=None)
+        output.sampling_mask_output = self.sampler._build_sampling_mask_output(
+            sampled, capture
+        )
+        output.sampling_mask_output.map_device_tensors(lambda tensor: tensor.cpu())
+        SchedulerBatchResultProcessor.materialize_sampling_mask_output(
+            [
+                SimpleNamespace(return_sampling_mask=flag)
+                for flag in sampling_info.return_sampling_masks
+            ],
+            output,
+        )
+        self.assertIsNone(output.next_token_sampling_mask_idx[0])
+        self.assertEqual(set(output.next_token_sampling_mask_idx[1]), {0, 1, 2})
+        self.assertIsNone(output.next_token_sampling_mask_idx[2])
+        self.assertEqual(set(output.next_token_sampling_mask_idx[3]), {0, 1, 2})
+        self.assertIsNone(output.next_token_sampling_logprobs[0])
+        self.assertIsNotNone(output.next_token_sampling_logprobs[1])
+        self.assertIsNone(output.next_token_sampling_logprobs[2])
+        self.assertIsNotNone(output.next_token_sampling_logprobs[3])
+
+    def test_pytorch_capture_compacts_requested_rows(self):
+        batch_size = 4
+        requested_rows = [1, 3]
+        probs = torch.tensor([[0.4, 0.2, 0.2, 0.1, 0.1]], device="cuda").repeat(
+            batch_size, 1
+        )
+        sampling_info = SimpleNamespace(
+            sampling_seed=None,
+            need_top_k_sampling=True,
+            need_top_p_sampling=True,
+            need_min_p_sampling=False,
+            top_ks=torch.full((batch_size,), 2, dtype=torch.int32, device="cuda"),
+            top_ps=torch.full((batch_size,), 0.45, device="cuda"),
+            min_ps=torch.zeros(batch_size, device="cuda"),
+            return_sampling_masks=[False, True, False, True],
+            sampling_mask_batch_indices=torch.tensor(requested_rows, device="cuda"),
+        )
+        with patch(
+            "sglang.srt.layers.sampler.get_exec",
+            return_value=SimpleNamespace(
+                kernel=SimpleNamespace(sampling_backend="pytorch")
+            ),
+        ):
+            sampled, capture = self.sampler._sample_from_probs(
+                probs,
+                sampling_info,
+                positions=torch.zeros(batch_size, dtype=torch.int64, device="cuda"),
+                simple_sampling_case=False,
+            )
+
+        self.assertIsNotNone(capture)
+        self.assertEqual(capture.batch_rows.cpu().tolist(), requested_rows)
+        self.assertEqual(tuple(capture.weights.shape), (len(requested_rows), 5))
+        self.assertEqual(tuple(capture.token_ids.shape), (len(requested_rows), 5))
+
+        output = LogitsProcessorOutput(next_token_logits=None)
+        output.sampling_mask_output = self.sampler._build_sampling_mask_output(
+            sampled, capture
+        )
+        output.sampling_mask_output.map_device_tensors(lambda tensor: tensor.cpu())
+        SchedulerBatchResultProcessor.materialize_sampling_mask_output(
+            [
+                SimpleNamespace(return_sampling_mask=flag)
+                for flag in sampling_info.return_sampling_masks
+            ],
+            output,
+        )
+        for batch_row in requested_rows:
+            self.assertIn(
+                int(sampled[batch_row]),
+                output.next_token_sampling_mask_idx[batch_row],
+            )
+            self.assertIsNotNone(output.next_token_sampling_logprobs[batch_row])
+        self.assertIsNone(output.next_token_sampling_mask_idx[0])
+        self.assertIsNone(output.next_token_sampling_mask_idx[2])
 
 
 class SamplingMaskTestMixin:
@@ -163,8 +394,11 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
         ``temperature=1.0`` these are the sampler's distribution, so
         ``p = exp(logprob)`` are the exact probabilities. For each token, we check:
 
-        1. the returned mask matches the nucleus reconstructed from those probs,
-        2. sampling_logprob == log(p[sampled] / sum(p[t] for t in mask)).
+        1. the sampled token is in the returned mask,
+        2. every mask token is in the returned top logprobs and at or above
+           the top-k cutoff (ties at the cutoff survive, so the mask may
+           exceed ``top_k``),
+        3. sampling_logprob == log(p[sampled] / sum(p[t] for t in mask)).
         """
         top_k, top_p = _TOP_K, _TOP_P
         response = self._post_generate(
@@ -198,27 +432,16 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
                 int(tid): math.exp(logprob) for logprob, tid, _ in step_top_logprobs
             }
 
-            mass_before = 0.0
-            positional_support = []
-            for position, (logprob, tid, _) in enumerate(step_top_logprobs):
-                if position < top_k and mass_before <= top_p:
-                    positional_support.append((math.exp(logprob), int(tid)))
-                mass_before += math.exp(logprob)
+            mask_set = set(mask)
 
-            if self._sampling_backend == "flashinfer":
-                # FlashInfer applies threshold filters, so cutoff ties survive.
-                cutoff = positional_support[-1][0]
-                reconstructed = {
-                    int(tid)
-                    for logprob, tid, _ in step_top_logprobs
-                    if math.exp(logprob) >= cutoff
-                }
-            else:
-                # PyTorch filters its sorted tensor by position.
-                reconstructed = {tid for _, tid in positional_support}
-            self.assertEqual(set(mask), reconstructed)
+            self.assertIn(output_id, mask_set)
+            self.assertTrue(mask_set.issubset(probs))
+            top_k_cutoff = sorted(probs.values(), reverse=True)[top_k - 1]
+            for token_id in mask_set:
+                # 1e-3 slack: the kernel cuts on its own probs, not these logprobs.
+                self.assertGreaterEqual(probs[token_id], top_k_cutoff * (1 - 1e-3))
 
-            support_mass = sum(probs[tid] for tid in mask)
+            support_mass = sum(probs[token_id] for token_id in mask_set)
             expected_logprob = math.log(probs[output_id] / support_mass)
             self.assertAlmostEqual(mask_logprob, expected_logprob, delta=1e-2)
 
@@ -316,6 +539,65 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
 
 
 class TestSamplingMaskPacking(CustomTestCase):
+    def test_selected_token_must_have_positive_captured_weight(self):
+        sampler = Sampler.__new__(Sampler)
+        sampler.sampling_mask_max_tokens = 3
+        sampler.tp_sync_group = None
+        sampler.cp_sync_group = None
+        for token_ids in (None, torch.tensor([[2, 1, 0]], dtype=torch.int32)):
+            with self.subTest(sorted_capture=token_ids is not None):
+                capture = _SamplingMaskCapture(
+                    batch_rows=torch.tensor([0]),
+                    weights=torch.tensor([[0.7, 0.3, 0.0]]),
+                    token_ids=token_ids,
+                    selected_weight=None,
+                )
+                selected = torch.tensor([2 if token_ids is None else 0])
+                output = sampler._build_sampling_mask_output(selected, capture)
+                self.assertEqual(output.statuses.tolist(), [SamplingMaskStatus.INVALID])
+
+    def test_synced_token_logprob_is_recomputed_from_capture(self):
+        sampler = Sampler.__new__(Sampler)
+        sampler.sampling_mask_max_tokens = 3
+        sampler.tp_sync_group = None
+        sampler.cp_sync_group = None
+        capture = _SamplingMaskCapture(
+            batch_rows=torch.tensor([0]),
+            weights=torch.tensor([[0.6, 0.2, 0.0]]),
+            token_ids=torch.tensor([[2, 1, 0]], dtype=torch.int32),
+            selected_weight=None,
+        )
+        output = sampler._build_sampling_mask_output(torch.tensor([1]), capture)
+        self.assertEqual(output.statuses.tolist(), [SamplingMaskStatus.OK])
+        self.assertAlmostEqual(output.selected_logprobs.item(), math.log(0.25))
+
+    def test_greedy_device_output_survives_async_copy(self):
+        from sglang.srt.managers.utils import GenerationBatchResult
+
+        sampler = Sampler.__new__(Sampler)
+        tokens = torch.tensor([3, 4, 5], device="cuda")
+        output = LogitsProcessorOutput(
+            next_token_logits=None,
+            sampling_mask_output=sampler._build_greedy_sampling_mask_output(
+                torch.tensor([0, 2], device="cuda"), tokens
+            ),
+        )
+        result = GenerationBatchResult(
+            logits_output=output, next_token_ids=tokens, copy_done=torch.cuda.Event()
+        )
+        result.copy_to_cpu(return_logprob=False)
+        result.copy_done.synchronize()
+        self.assertEqual(output.sampling_mask_output.token_ids.device.type, "cpu")
+        SchedulerBatchResultProcessor.materialize_sampling_mask_output(
+            [
+                SimpleNamespace(return_sampling_mask=flag)
+                for flag in (True, False, True)
+            ],
+            output,
+        )
+        self.assertEqual(output.next_token_sampling_mask_idx, [[3], None, [5]])
+        self.assertEqual(output.next_token_sampling_logprobs, [0.0, None, 0.0])
+
     def test_overflow_never_materializes_a_partial_mask(self):
         # Simulate a top-k cutoff tie: a nominal top_k below the cap can still
         # produce more positive weights than the fixed transport can hold.
@@ -324,7 +606,7 @@ class TestSamplingMaskPacking(CustomTestCase):
         sampler.tp_sync_group = None
         sampler.cp_sync_group = None
         capture = _SamplingMaskCapture(
-            batch_indices=torch.tensor([0]),
+            batch_rows=torch.tensor([0]),
             weights=torch.tensor([[0.2, 0.2, 0.2, 0.2, 0.2]]),
             token_ids=None,
             selected_weight=torch.tensor([0.2]),

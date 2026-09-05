@@ -16,7 +16,7 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata
-from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.managers.utils import GenerationBatchResult, get_logprob_from_pp_outputs
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -127,6 +127,29 @@ def test_sampling_mask_output_uses_generation_result_copy_path():
     assert sampling_output.lengths.tolist() == [2]
     assert sampling_output.statuses.tolist() == [SamplingMaskStatus.OK]
     assert result.copy_done.record_count == 1
+
+
+def test_pipeline_sampling_mask_round_trip_without_logprobs():
+    sampling_output = SamplingMaskOutput(
+        token_ids=torch.tensor([[3, 5]], dtype=torch.int32),
+        lengths=torch.tensor([2], dtype=torch.int32),
+        selected_logprobs=torch.tensor([-0.5]),
+        statuses=torch.tensor([SamplingMaskStatus.OK], dtype=torch.int32),
+    )
+    result = GenerationBatchResult(
+        logits_output=LogitsProcessorOutput(
+            next_token_logits=None, sampling_mask_output=sampling_output
+        ),
+        next_token_ids=torch.tensor([3]),
+    )
+    payload = Scheduler._pp_prepare_tensor_dict(
+        SimpleNamespace(), result, SimpleNamespace(return_logprob=False)
+    )
+    output, _, _ = get_logprob_from_pp_outputs(PPProxyTensors(payload))
+    for name in ("token_ids", "lengths", "selected_logprobs", "statuses"):
+        torch.testing.assert_close(
+            getattr(output.sampling_mask_output, name), getattr(sampling_output, name)
+        )
 
 
 def test_non_pp_auxiliary_output_only_requires_host_copy_support():
@@ -421,6 +444,8 @@ def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
     )
     copy_done = CopyDone()
     scheduler = object.__new__(Scheduler)
+    scheduler.scheduler_stage_metrics = None
+    scheduler.metrics_reporter = Mock()
     scheduler.forward_ct = 0
     scheduler._sched_idled = False
     scheduler.scripted_scheduler_hook = None

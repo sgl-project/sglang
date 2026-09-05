@@ -99,7 +99,6 @@ _is_npu = is_npu()
 
 
 class DeepseekModelNextN(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -117,7 +116,7 @@ class DeepseekModelNextN(nn.Module):
             moe_quant_config_override = None
 
         if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
-            logger.warning(
+            logger.debug(
                 "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
             )
             quant_config = None

@@ -77,6 +77,7 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
 )
+from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.multimodal_gen.runtime.utils.realtime_video import (
     RAW_RGB_CONTENT_TYPE,
     build_raw_rgb_frame_batches,
@@ -231,10 +232,31 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             )
         return self.memory_occupation
 
+    def _cap_device_memory_for_tests(self) -> None:
+        """Make a large CI card behave like the consumer card a case targets.
+
+        The caching allocator otherwise reserves past the pretended budget
+        whenever the physical card has room, and a peak-VRAM baseline stops
+        meaning "fits the card". OOM inside the cap is the intended signal.
+        """
+        cap_gib = envs.SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB
+        if cap_gib is None or not current_platform.is_cuda():
+            return
+        device = torch.cuda.current_device()
+        total = torch.cuda.get_device_properties(device).total_memory
+        fraction = min(1.0, cap_gib * 1024**3 / total)
+        torch.cuda.set_per_process_memory_fraction(fraction, device)
+        logger.info(
+            "Test hook: CUDA allocator capped at %.1f GiB (fraction %.4f)",
+            cap_gib,
+            fraction,
+        )
+
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
         if not current_platform.is_mps():
             current_platform.set_device(current_platform.get_device(self.local_rank))
+        self._cap_device_memory_for_tests()
         # num_gpus is the total world size across every node; the co-located,
         # CPU-contending worker count on THIS host is num_gpus // nnodes.
         local_num_gpus = self.server_args.num_gpus // self.server_args.nnodes
@@ -266,11 +288,16 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             dist_timeout=self.server_args.dist_timeout,
         )
 
-        from sglang.srt.runtime_context import get_context
+        from sglang.srt.runtime_context import get_context, publish
         from sglang.srt.server_args import ServerArgs as SrtServerArgs
 
         if get_context()._server_args is None:
-            get_context().set_server_args(SrtServerArgs(model_path="dummy"))
+            # srt reads the size from the configuration and the rank from the
+            # live group, so the dummy carries the width just installed.
+            publish(
+                SrtServerArgs(model_path="dummy", tp_size=self.server_args.tp_size),
+                role="diffusion_gpu_worker",
+            )
 
         # set proc title
         if model_parallel_is_initialized():
@@ -408,8 +435,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     ),
                     log_reqs=[req],
                     return_req=False,
-                    save_output_paths=lambda output_batch, req=req: self._save_output_paths(
-                        req, output_batch
+                    save_output_paths=lambda output_batch, req=req: (
+                        self._save_output_paths(req, output_batch)
                     ),
                     error_context=f"grouped request {req.request_id}",
                     execution_start_time=group_start_time,
@@ -524,7 +551,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             for metrics in output_metrics:
                 metrics.total_duration_ms = duration_ms
 
-            self._materialize_output_transport(output_batch, req, save_output_paths)
+            req_label = req.request_id[:8] if req.request_id else "unnamed"
+            with maybe_record_function(f"SAVE_OUTPUTS {req_label}"):
+                self._materialize_output_transport(output_batch, req, save_output_paths)
             self._record_output_peak_memory(output_batch)
 
             collect_perf = (
@@ -546,7 +575,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 and output_batch.output is None
                 and not req.return_raw_frames
             ):
-                torch.get_device_module().empty_cache()
+                with maybe_record_function("EMPTY_CACHE"):
+                    torch.get_device_module().empty_cache()
 
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
                 if not req.is_warmup:

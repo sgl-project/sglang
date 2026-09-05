@@ -8,6 +8,7 @@ from torch import nn
 
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -26,6 +27,7 @@ from sglang.srt.utils.async_probe import sanitize_nan_logits
 from sglang.srt.utils.common import (
     get_bool_env_var,
     is_cuda,
+    is_gfx1250_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -59,7 +61,9 @@ if _use_aiter:
 # to an empty string and breaks downstream consumers. Set this to 1 to fall back to
 # torch.argmax (which always returns a valid index). Default off so behavior is
 # unchanged elsewhere.
-_disable_aiter_greedy_sample = get_bool_env_var("SGLANG_DISABLE_AITER_GREEDY_SAMPLE")
+_disable_aiter_greedy_sample = (
+    get_bool_env_var("SGLANG_DISABLE_AITER_GREEDY_SAMPLE") or is_gfx1250_supported()
+)
 
 if is_npu():
     import torch_npu
@@ -72,13 +76,25 @@ _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 
 
-class _SamplingMaskCapture(NamedTuple):
-    """Actual post-filter sampling weights and their token mapping."""
+def _trace_e2e_sampler(stage: str, **fields) -> None:
+    if not envs.SGLANG_TRACE_SAMPLER_E2E.get():
+        return
+    try:
+        parallel = get_parallel()
+        rank = f"dp={parallel.attn_dp_rank} tp={parallel.tp_rank}"
+    except Exception:
+        rank = "rank=unknown"
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    print(f"SGLANG_TRACE_SAMPLER_E2E {rank} stage={stage} {details}", flush=True)
 
-    batch_indices: torch.Tensor
+
+class _SamplingMaskCapture(NamedTuple):
+    """Compact post-filter weights and their original batch-row mapping."""
+
     weights: torch.Tensor
     token_ids: Optional[torch.Tensor]
     selected_weight: Optional[torch.Tensor]
+    batch_rows: torch.Tensor
 
 
 def _select_sampling_mask_rows(
@@ -144,17 +160,25 @@ class Sampler(nn.Module):
                 to get the unique seed for each position.
         """
         logits = logits_output.next_token_logits
+        _trace_e2e_sampler(
+            "forward_enter",
+            logits_shape=tuple(logits.shape),
+            all_greedy=sampling_info.is_all_greedy,
+        )
 
         if _is_hip and logits.shape[0] == 0:
             return torch.empty((0,), dtype=torch.int64, device=logits.device)
 
         # Preprocess logits (custom processors and NaN handling)
+        _trace_e2e_sampler("preprocess_enter")
         logits = self._preprocess_logits(logits, sampling_info)
+        _trace_e2e_sampler("preprocess_returned")
         sampling_mask_batch_indices = sampling_info.sampling_mask_batch_indices
         return_sampling_mask = sampling_mask_batch_indices is not None
         sampling_mask_capture = None
 
         if sampling_info.is_all_greedy:
+            _trace_e2e_sampler("greedy_enter")
             if _use_aiter and not _disable_aiter_greedy_sample:
                 batch_next_token_ids = torch.empty(
                     logits.shape[0], device=logits.device, dtype=torch.int32
@@ -162,6 +186,9 @@ class Sampler(nn.Module):
                 _aiter_greedy_sample(batch_next_token_ids, logits)
             else:
                 batch_next_token_ids = torch.argmax(logits, -1)
+            _trace_e2e_sampler(
+                "greedy_returned", output_shape=tuple(batch_next_token_ids.shape)
+            )
             if return_logprob:
                 original_logprobs = logprobs = torch.nn.functional.log_softmax(
                     logits, dim=-1
@@ -259,7 +286,9 @@ class Sampler(nn.Module):
             )
             logprob_result.write_output_to(logits_output)
 
+        _trace_e2e_sampler("token_sync_enter")
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
+        _trace_e2e_sampler("token_sync_returned")
 
         if return_sampling_mask:
             assert sampling_mask_batch_indices is not None
@@ -281,6 +310,7 @@ class Sampler(nn.Module):
                     sampling_mask_capture,
                 )
 
+        _trace_e2e_sampler("forward_returned")
         return batch_next_token_ids
 
     def _sample_from_probs(
@@ -296,68 +326,63 @@ class Sampler(nn.Module):
         Handles both simple (direct multinomial) and complex (top-k/top-p/min-p) cases.
         Capture work is performed only when return_sampling_mask is enabled.
         """
-        sampling_mask_batch_indices = sampling_info.sampling_mask_batch_indices
+        capture_rows = sampling_info.sampling_mask_batch_indices
+        return_sampling_mask = capture_rows is not None
         sampling_mask_capture = None
+        select_capture_rows = partial(
+            _select_sampling_mask_rows, batch_indices=capture_rows
+        )
+
         if simple_sampling_case:
             batch_next_token_ids = sampling_from_probs_torch(
                 probs,
                 sampling_seed=sampling_info.sampling_seed,
                 positions=positions,
             )
-            if sampling_mask_batch_indices is not None:
-                requested_probs = _select_sampling_mask_rows(
-                    probs, sampling_mask_batch_indices
-                )
-                requested_tokens = batch_next_token_ids.index_select(
-                    0, sampling_mask_batch_indices
-                )
+            if return_sampling_mask:
+                capture_probs = select_capture_rows(probs)
+                capture_tokens = select_capture_rows(batch_next_token_ids)
                 selected_weight = torch.gather(
-                    requested_probs, 1, requested_tokens.long().view(-1, 1)
+                    capture_probs, 1, capture_tokens.long().view(-1, 1)
                 ).squeeze(1)
                 sampling_mask_capture = _SamplingMaskCapture(
-                    batch_indices=sampling_mask_batch_indices,
-                    weights=requested_probs,
+                    weights=capture_probs,
                     token_ids=None,
                     selected_weight=selected_weight,
+                    batch_rows=capture_rows,
                 )
         else:
             backend = get_exec().kernel.sampling_backend
             if backend == "flashinfer":
-                assert (
-                    sampling_info.sampling_seed is None
-                ), "Sampling seed is not supported for flashinfer backend"
+                assert sampling_info.sampling_seed is None, (
+                    "Sampling seed is not supported for flashinfer backend"
+                )
                 if sampling_info.need_min_p_sampling:
                     probs = top_k_renorm_prob(probs, sampling_info.top_ks)
                     probs = top_p_renorm_prob(probs, sampling_info.top_ps)
                     batch_next_token_ids = min_p_sampling_from_probs(
                         probs, sampling_info.min_ps
                     )
-                    if sampling_mask_batch_indices is not None:
-                        requested_probs = _select_sampling_mask_rows(
-                            probs, sampling_mask_batch_indices
-                        )
-                        requested_min_ps = _select_sampling_mask_rows(
-                            sampling_info.min_ps, sampling_mask_batch_indices
-                        )
+                    if return_sampling_mask:
+                        capture_probs = select_capture_rows(probs)
+                        capture_min_ps = select_capture_rows(sampling_info.min_ps)
+                        capture_tokens = select_capture_rows(batch_next_token_ids)
                         min_p_thresholds = (
-                            requested_probs.max(dim=-1).values * requested_min_ps
+                            capture_probs.max(dim=-1).values * capture_min_ps
                         )
-                        filtered_probs = requested_probs.masked_fill(
-                            requested_probs < min_p_thresholds.view(-1, 1), 0
-                        )
-                        requested_tokens = batch_next_token_ids.index_select(
-                            0, sampling_mask_batch_indices
+                        filtered_probs = capture_probs.masked_fill(
+                            capture_probs < min_p_thresholds.view(-1, 1), 0
                         )
                         selected_weight = torch.gather(
                             filtered_probs,
                             1,
-                            requested_tokens.long().view(-1, 1),
+                            capture_tokens.long().view(-1, 1),
                         ).squeeze(1)
                         sampling_mask_capture = _SamplingMaskCapture(
-                            batch_indices=sampling_mask_batch_indices,
                             weights=filtered_probs,
                             token_ids=None,
                             selected_weight=selected_weight,
+                            batch_rows=capture_rows,
                         )
                 else:
                     batch_next_token_ids = top_k_top_p_sampling_from_probs(
@@ -366,42 +391,38 @@ class Sampler(nn.Module):
                         sampling_info.top_ps,
                         filter_apply_order="joint",
                     )
-                    if sampling_mask_batch_indices is not None:
-                        requested_probs = _select_sampling_mask_rows(
-                            probs, sampling_mask_batch_indices
-                        )
-                        filtered_probs = requested_probs
+                    if return_sampling_mask:
+                        # Correctness invariant: the fused joint sampler and these
+                        # separate renormalization primitives must share cutoff,
+                        # tie, and joint-support semantics so captured positive
+                        # support exactly describes the sampler's action space.
+                        capture_probs = select_capture_rows(probs)
+                        capture_top_ks = select_capture_rows(sampling_info.top_ks)
+                        capture_top_ps = select_capture_rows(sampling_info.top_ps)
+                        capture_tokens = select_capture_rows(batch_next_token_ids)
+                        filtered_probs = capture_probs
                         if sampling_info.need_top_k_sampling:
-                            requested_top_ks = _select_sampling_mask_rows(
-                                sampling_info.top_ks, sampling_mask_batch_indices
-                            )
                             filtered_probs = top_k_renorm_prob(
-                                requested_probs, requested_top_ks
+                                capture_probs, capture_top_ks
                             )
                         if sampling_info.need_top_p_sampling:
-                            requested_top_ps = _select_sampling_mask_rows(
-                                sampling_info.top_ps, sampling_mask_batch_indices
-                            )
                             top_p_probs = top_p_renorm_prob(
-                                requested_probs, requested_top_ps
+                                capture_probs, capture_top_ps
                             )
-                            if filtered_probs is requested_probs:
+                            if filtered_probs is capture_probs:
                                 filtered_probs = top_p_probs
                             else:
                                 filtered_probs.masked_fill_(top_p_probs <= 0, 0)
-                        requested_tokens = batch_next_token_ids.index_select(
-                            0, sampling_mask_batch_indices
-                        )
                         selected_weight = torch.gather(
                             filtered_probs,
                             1,
-                            requested_tokens.long().view(-1, 1),
+                            capture_tokens.long().view(-1, 1),
                         ).squeeze(1)
                         sampling_mask_capture = _SamplingMaskCapture(
-                            batch_indices=sampling_mask_batch_indices,
                             weights=filtered_probs,
                             token_ids=None,
                             selected_weight=selected_weight,
+                            batch_rows=capture_rows,
                         )
             elif backend == "pytorch":
                 # A slower fallback implementation with torch native operations.
@@ -413,9 +434,9 @@ class Sampler(nn.Module):
                     sampling_info.need_min_p_sampling,
                     sampling_info.sampling_seed,
                     positions,
-                    return_filtered_probs=sampling_mask_batch_indices is not None,
+                    return_filtered_probs=return_sampling_mask,
                 )
-                if sampling_mask_batch_indices is not None:
+                if return_sampling_mask:
                     (
                         batch_next_token_ids,
                         filtered_probs,
@@ -423,16 +444,10 @@ class Sampler(nn.Module):
                         selected_weight,
                     ) = sample_result
                     sampling_mask_capture = _SamplingMaskCapture(
-                        batch_indices=sampling_mask_batch_indices,
-                        weights=_select_sampling_mask_rows(
-                            filtered_probs, sampling_mask_batch_indices
-                        ),
-                        token_ids=_select_sampling_mask_rows(
-                            token_ids, sampling_mask_batch_indices
-                        ),
-                        selected_weight=_select_sampling_mask_rows(
-                            selected_weight, sampling_mask_batch_indices
-                        ),
+                        weights=select_capture_rows(filtered_probs),
+                        token_ids=select_capture_rows(token_ids),
+                        selected_weight=select_capture_rows(selected_weight),
+                        batch_rows=capture_rows,
                     )
                 else:
                     batch_next_token_ids = sample_result
@@ -469,7 +484,7 @@ class Sampler(nn.Module):
         sampling_mask_capture: _SamplingMaskCapture,
     ) -> SamplingMaskOutput:
         """Pack captured positive support into the fixed-cap device result."""
-        batch_indices = sampling_mask_capture.batch_indices
+        batch_indices = sampling_mask_capture.batch_rows
         weights = sampling_mask_capture.weights
         token_ids = sampling_mask_capture.token_ids
         selected_weight = sampling_mask_capture.selected_weight
@@ -558,9 +573,9 @@ class Sampler(nn.Module):
         Used for deterministic sampling with simple cases (no top-k/top-p/min-p).
         Requires sampling_seed to be set in sampling_info.
         """
-        assert (
-            sampling_info.sampling_seed is not None
-        ), "sampling_seed is required for sampling from logprobs"
+        assert sampling_info.sampling_seed is not None, (
+            "sampling_seed is required for sampling from logprobs"
+        )
         sampled_index = multinomial_with_seed(
             logprobs, sampling_info.sampling_seed, positions
         )
@@ -588,9 +603,9 @@ class Sampler(nn.Module):
                 batch_next_token_ids = torch.multinomial(probs, num_samples=1).view(-1)
             return batch_next_token_ids.to(torch.int32)
         else:
-            assert (
-                self.use_ascend_backend
-            ), "Only ascend backend supports sampling from logits"
+            assert self.use_ascend_backend, (
+                "Only ascend backend supports sampling from logits"
+            )
             batch_next_token_ids = top_k_top_p_min_p_sampling_from_logits_ascend(
                 logits,
                 sampling_info.top_ks,
@@ -728,9 +743,9 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
 
     if need_min_p_sampling:
         # TODO: probs_sort should be re-normalized for the use of multinomial_with_seed
-        assert (
-            sampling_seed is None
-        ), "With sampling seed, multinomial_with_seed will provide wrong results"
+        assert sampling_seed is None, (
+            "With sampling seed, multinomial_with_seed will provide wrong results"
+        )
         min_p_thresholds = probs_sort[:, 0] * min_ps
         probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
 

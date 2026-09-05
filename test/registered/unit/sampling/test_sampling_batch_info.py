@@ -3,7 +3,7 @@
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="base-c-test-cpu")
+register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
 
 import unittest
 from types import SimpleNamespace
@@ -50,7 +50,6 @@ def _serial_batched_fill(entries, vocab_mask):
 
 
 class TestMergeBiasTensor(CustomTestCase):
-
     def test_both_none_returns_none(self):
         """Test that merging two None tensors returns None."""
         result = merge_bias_tensor(None, None, 2, 3, DEVICE, 0.0)
@@ -95,7 +94,6 @@ class TestMergeBiasTensor(CustomTestCase):
 
 # SamplingBatchInfo.__len__
 class TestSamplingBatchInfoLen(CustomTestCase):
-
     def test_len_matches_batch_size(self):
         """Test that __len__ returns batch size (number of temperature rows)."""
         info = _make_info(batch_size=5)
@@ -103,6 +101,22 @@ class TestSamplingBatchInfoLen(CustomTestCase):
 
 
 class TestSamplingMaskBatchIndices(CustomTestCase):
+    def test_filter_removes_last_opted_in_row_then_merge_restores_capture(self):
+        info = _make_info(
+            batch_size=2,
+            return_sampling_masks=[False, True],
+            sampling_mask_batch_indices=torch.tensor([1]),
+        )
+        info.filter_batch([0], torch.tensor([0]))
+        self.assertIsNone(info.sampling_mask_batch_indices)
+        other = _make_info(
+            batch_size=1,
+            return_sampling_masks=[True],
+            sampling_mask_batch_indices=torch.tensor([0]),
+        )
+        info.merge_batch(other)
+        self.assertEqual(info.return_sampling_masks, [False, True])
+        self.assertEqual(info.sampling_mask_batch_indices.tolist(), [1])
 
     def test_filter_rebuilds_row_indices(self):
         info = _make_info(
@@ -135,7 +149,6 @@ class TestSamplingMaskBatchIndices(CustomTestCase):
 
 
 class TestMergeCustomLogitProcessor(CustomTestCase):
-
     def test_both_none_returns_none(self):
         """Test that merging two None processor dicts returns None."""
         result = SamplingBatchInfo.merge_custom_logit_processor(
@@ -182,7 +195,6 @@ class TestMergeCustomLogitProcessor(CustomTestCase):
 
 # apply_logits_bias
 class TestApplyLogitsBias(CustomTestCase):
-
     def test_applies_additive_penalties(self):
         """Test that pre-accumulated additive penalties are added to logits."""
         info = _make_info(batch_size=1)
@@ -271,8 +283,8 @@ class TestApplyLogitsBias(CustomTestCase):
 
         def make_info():
             grammar = MagicMock()
-            grammar.apply_vocab_mask.side_effect = (
-                lambda logits, vocab_mask: logits.add_(vocab_mask)
+            grammar.apply_vocab_mask.side_effect = lambda logits, vocab_mask: (
+                logits.add_(vocab_mask)
             )
             info = _make_info(batch_size=1)
             info.acc_additive_penalties = torch.linspace(
@@ -304,7 +316,6 @@ class TestApplyLogitsBias(CustomTestCase):
 
 # update_penalties
 class TestUpdatePenalties(CustomTestCase):
-
     def test_required_creates_penalties_tensor(self):
         """Test that update_penalties allocates a zero tensor and calls orchestrator methods."""
         orch = MagicMock(is_required=True)
@@ -328,7 +339,6 @@ class TestUpdatePenalties(CustomTestCase):
 
 # update_regex_vocab_mask
 class TestUpdateRegexVocabMask(CustomTestCase):
-
     def test_no_grammars_clears_mask(self):
         """Test that None grammars clears the grammar_mask."""
         info = _make_info(batch_size=1)
@@ -411,7 +421,6 @@ class TestUpdateRegexVocabMask(CustomTestCase):
 
 # filter_batch
 class TestFilterBatch(CustomTestCase):
-
     def test_filter_keeps_correct_indices(self):
         """Test that filter retains rows at indices 0 and 2, dropping index 1."""
         info = _make_info(batch_size=3)
@@ -466,7 +475,6 @@ class TestFilterBatch(CustomTestCase):
 
 # merge_batch
 class TestMergeBatch(CustomTestCase):
-
     def test_merge_concatenates_tensors(self):
         """Test that merge concatenates temperature tensors from both batches."""
         info1 = _make_info(batch_size=2)
@@ -545,7 +553,6 @@ class TestMergeBatch(CustomTestCase):
 
 # copy_for_forward
 class TestCopyForForward(CustomTestCase):
-
     def test_returns_copy_without_orchestrator(self):
         """Test that copy_for_forward returns a copy with orchestrator set to None."""
         orch = MagicMock(is_required=False)
@@ -558,7 +565,6 @@ class TestCopyForForward(CustomTestCase):
 
 # from_schedule_batch
 class TestFromScheduleBatch(CustomTestCase):
-
     def setUp(self):
         super().setUp()
         # from_schedule_batch reads these two flags from the exec bag; give

@@ -41,6 +41,9 @@ async fn failover_when_one_worker_dies() {
             }),
             cache_aware: None,
             sticky: None,
+            affinity: None,
+            fused: None,
+            eligibility: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec![w1.url.clone(), w2.url.clone(), w3.url.clone()],

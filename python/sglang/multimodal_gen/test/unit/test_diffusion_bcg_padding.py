@@ -58,6 +58,63 @@ class SanaVideoTransformer3DModel(torch.nn.Module):
     pass
 
 
+class TestQualityFusionBCGCompatibility(unittest.TestCase):
+    def setUp(self):
+        self.stage = DenoisingStage.__new__(DenoisingStage)
+        self.stage.server_args = SimpleNamespace(enable_breakable_cuda_graph=True)
+        self.stage.transformer = OtherTransformer2DModel()
+        self.stage.transformer_2 = None
+        self.stage._quality_fusions_mounted = False
+
+    @staticmethod
+    def _batch(quality: str):
+        return SimpleNamespace(sampling_params=SimpleNamespace(quality=quality))
+
+    def test_rejects_fusion_levels_when_they_would_replace_captured_graph(self):
+        for quality in ("extra-high", "high"):
+            with self.subTest(quality=quality):
+                unmounted = []
+                handlers = (
+                    (
+                        "test fusion",
+                        lambda _: True,
+                        lambda transformer: unmounted.append(transformer),
+                    ),
+                )
+
+                with patch.object(
+                    denoising_module, "_QUALITY_FUSION_HANDLERS", handlers
+                ):
+                    with self.assertRaisesRegex(ValueError, "lossless warmup graphs"):
+                        self.stage._maybe_toggle_quality_fusions(self._batch(quality))
+
+                self.assertEqual(unmounted, [self.stage.transformer])
+                self.assertFalse(self.stage._quality_fusions_mounted)
+
+    def test_allows_high_when_model_has_no_dit_quality_fusions(self):
+        handlers = (("test fusion", lambda _: False, lambda _: None),)
+
+        with patch.object(denoising_module, "_QUALITY_FUSION_HANDLERS", handlers):
+            self.stage._maybe_toggle_quality_fusions(self._batch("high"))
+
+        self.assertTrue(self.stage._quality_fusions_mounted)
+
+    def test_high_keeps_extra_high_fusions_mounted(self):
+        self.stage.server_args.enable_breakable_cuda_graph = False
+        mounted = []
+        handlers = (
+            ("test fusion", lambda _: mounted.append(True) or True, lambda _: None),
+        )
+
+        with patch.object(denoising_module, "_QUALITY_FUSION_HANDLERS", handlers):
+            self.stage._maybe_toggle_quality_fusions(self._batch("extra-high"))
+            self.assertTrue(self.stage._quality_fusions_mounted)
+            self.stage._maybe_toggle_quality_fusions(self._batch("high"))
+
+        self.assertEqual(mounted, [True])
+        self.assertTrue(self.stage._quality_fusions_mounted)
+
+
 def _fake_cache_dit_batch(*, is_warmup: bool) -> SimpleNamespace:
     return SimpleNamespace(
         is_warmup=is_warmup,
