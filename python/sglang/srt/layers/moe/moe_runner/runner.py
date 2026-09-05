@@ -60,6 +60,8 @@ class MoeRunner:
             self.runner_core = AscendRunnerCore(config)
         elif runner_backend.is_triton_kernels():
             self.runner_core = TritonKernelsRunnerCore(config)
+        elif runner_backend.is_lora():
+            self.runner_core = None  # MoE LoRA only supports the fused path
         elif runner_backend.is_deep_gemm():
             self.runner_core = DeepGemmRunnerCore(config)
         elif runner_backend.is_humming():
@@ -112,8 +114,8 @@ class MoeRunner:
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 
-        # Skip fused func if LoRA is enabled (LoRA requires non-fused path)
-        if not lora_enabled:
+        # Legacy LoRA needs hooks; the lora_* backends incorporate LoRA directly.
+        if not lora_enabled or runner_backend.is_lora():
             a2a_backend_name = get_moe_a2a_backend().value
             runner_backend_name = runner_backend.value
 
@@ -143,7 +145,9 @@ class MoeRunner:
     def run(
         self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo, lora_info=None
     ) -> CombineInput:
-        if self.fused_func is not None and not self.lora_enabled:
+        if self.fused_func is not None and (
+            not self.lora_enabled or self.runner_backend.is_lora()
+        ):
             return self.fused_func(dispatch_output, quant_info, self.config)
 
         assert self.runner_core is not None

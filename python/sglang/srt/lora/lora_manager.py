@@ -103,7 +103,13 @@ class LoRAManager:
         self._experts_shared_outer_override: Optional[bool] = (
             server_args.experts_shared_outer_loras
         )
+        from sglang.srt.layers.moe.utils import get_moe_runner_backend
+
+        self.moe_lora_runner_backend = get_moe_runner_backend()
         self.lora_use_virtual_experts: bool = server_args.lora_use_virtual_experts
+        self.prefill_cuda_graph_backend: str = (
+            server_args.cuda_graph_config.prefill.backend
+        )
         self.lora_strict_loading: bool = getattr(
             server_args, "lora_strict_loading", False
         )
@@ -156,14 +162,21 @@ class LoRAManager:
         self.lora_backend.init_prefill_cuda_graph_batch_info(
             max_num_tokens=max_num_tokens
         )
+        self.lora_backend.init_prefill_cuda_graph_moe_buffers(
+            max_num_tokens=max_num_tokens
+        )
 
     @property
     def supports_prefill_cuda_graph(self) -> bool:
-        """Whether LoRA kernels can be captured into the prefill CUDA graph;
-        excludes MoE LoRA and DP attention."""
+        """Whether this LoRA configuration can enter a prefill CUDA graph."""
         return (
             self.lora_backend.supports_prefill_cuda_graph
-            and not self.lora_backend.is_moe_lora
+            # Dynamo guards in tc_piecewise reject per-batch LoRA metadata rebinds.
+            and self.prefill_cuda_graph_backend == "breakable"
+            and (
+                not self.lora_backend.is_moe_lora
+                or self.moe_lora_runner_backend.is_lora()
+            )
             and not self.enable_dp_attention
         )
 
@@ -199,7 +212,12 @@ class LoRAManager:
         )
 
     def init_cuda_graph_moe_buffers(
-        self, max_bs: int, max_loras: int, compute_dtype, moe_layer
+        self,
+        max_bs: int,
+        max_loras: int,
+        compute_dtype,
+        moe_layer,
+        include_legacy_kernel_buffers: bool = True,
     ):
         """Phase 1 of LoRA CUDA graph init: MoE intermediate buffers.
 
@@ -211,6 +229,7 @@ class LoRAManager:
             max_loras=max_loras,
             compute_dtype=compute_dtype,
             moe_layer=moe_layer,
+            include_legacy_kernel_buffers=include_legacy_kernel_buffers,
         )
 
     def create_lora_update_result(
@@ -470,6 +489,10 @@ class LoRAManager:
         )
         self.lora_backend.batch_info.has_active_lora = any(
             lora_ranks[wi] > 0 for wi in weight_indices
+        )
+        self.lora_backend.batch_info.is_prefill = (
+            forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_cuda_graph()
         )
 
     def update_lora_info(self):
@@ -890,9 +913,9 @@ class LoRAManager:
         # Initializing memory pool with base model
         self.fetch_new_loras({None})
 
-    def set_lora_module(self, module_name, module):
+    def set_lora_module(self, module_name, module, **kwargs):
         """Wrap any module (standard or MoE) with LoRA support."""
-        lora_module = get_lora_layer(module, self.lora_backend)
+        lora_module = get_lora_layer(module, self.lora_backend, **kwargs)
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
 
@@ -1020,12 +1043,31 @@ class LoRAManager:
                     module.initialize_lora(self.lora_backend)
                     lora_module = module
                 else:
-                    lora_module = self.set_lora_module(module_name, module)
-                    lora_module.experts_shared_outer_loras = (
-                        self.experts_shared_outer_loras
+                    lora_module = self.set_lora_module(
+                        module_name,
+                        module,
+                        experts_shared_outer_loras=self.experts_shared_outer_loras,
+                        max_lora_rank=self.max_lora_rank,
                     )
                     lora_module.lora_use_virtual_experts = self.lora_use_virtual_experts
                 self.lora_modules[layer_id][module_name] = lora_module
+
+        # The quant methods create no base runner under a lora_* backend, so an
+        # MoE layer the adapter did not wrap would fail at its first forward.
+        # (getattr: unit tests build partial managers without __init__.)
+        backend = getattr(self, "moe_lora_runner_backend", None)
+        modules = list(self.base_model.modules())
+        if (
+            backend is not None
+            and backend.is_lora()
+            and any(isinstance(module, FusedMoE) for module in modules)
+            and not any(isinstance(module, FusedMoEWithLoRA) for module in modules)
+        ):
+            raise ValueError(
+                f"--moe-runner-backend {backend.value} requires "
+                "the LoRA target modules to include gate_up_proj and down_proj; "
+                "this adapter leaves the MoE experts without a runner"
+            )
 
 
 def init_lora_cuda_graph_moe_buffers(
@@ -1057,11 +1099,18 @@ def init_lora_cuda_graph_moe_buffers(
     max_loras = get_lora().max_loras_per_batch
     for module in model.modules():
         if isinstance(module, FusedMoEWithLoRA):
+            # New engines share metadata but allocate their own kernel scratch.
+            include_legacy = not module._lora_runner_backend.is_lora()
             lora_manager.init_cuda_graph_moe_buffers(
-                max_tokens, max_loras, dtype, module
+                max_tokens,
+                max_loras,
+                dtype,
+                module,
+                include_legacy_kernel_buffers=include_legacy,
             )
             logger.info(
                 f"Pre-allocated shared MoE LoRA CUDA graph buffers "
-                f"(max_tokens={max_tokens}, max_loras={max_loras})"
+                f"(max_tokens={max_tokens}, max_loras={max_loras}, "
+                f"legacy_kernel_buffers={include_legacy})"
             )
             break

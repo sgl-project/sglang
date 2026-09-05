@@ -173,6 +173,14 @@ def get_model_config(
         E = config.n_routed_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
+    elif architecture == "InklingForConditionalGeneration":
+        # Routed experts are non-gated (relu2, one up projection). The runtime
+        # keys its config on N = intermediate_size / TP, which the gated shard
+        # width below reproduces (2 * I / TP, halved in the filename); gemm1 is
+        # therefore tuned at twice its real width while gemm2 is exact.
+        E = config.n_routed_experts // ep_size
+        topk = config.num_experts_per_tok
+        intermediate_size = config.intermediate_size
     else:
         # Default: Mixtral
         E = config.num_local_experts // ep_size

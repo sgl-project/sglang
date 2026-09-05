@@ -1,0 +1,137 @@
+{
+ "arch": "default",
+ "rules": {
+  "fallback.decode": [
+   {
+    "sites": {
+     "b_activation": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_W": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 3,
+      "num_warps": 4
+     },
+     "down_a": {
+      "BLOCK_SIZE_K": 64,
+      "BLOCK_SIZE_N": 32,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "down_b": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_M": 16,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "gate_up_a": {
+      "BLOCK_SIZE_K": 64,
+      "BLOCK_SIZE_N": 32,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "gate_up_b": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_M": 16,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "routing_block_size": 16
+    }
+   }
+  ],
+  "fallback.prefill.per_expert": [
+   {
+    "sites": {
+     "b_activation": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_W": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 3,
+      "num_warps": 4
+     },
+     "down_a": {
+      "BLOCK_SIZE_K": 64,
+      "BLOCK_SIZE_N": 32,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "down_b": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_M": 16,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "gate_up_a": {
+      "BLOCK_SIZE_K": 64,
+      "BLOCK_SIZE_N": 32,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "gate_up_b": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_M": 16,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "routing_block_size": 16
+    }
+   }
+  ],
+  "fallback.prefill.shared": [
+   {
+    "sites": {
+     "b_activation": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_W": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 3,
+      "num_warps": 4
+     },
+     "down_a": {
+      "BLOCK_SIZE_K": 64,
+      "BLOCK_SIZE_N": 32,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "down_b": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_M": 16,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "gate_up_a": {
+      "BLOCK_SIZE_K": 64,
+      "BLOCK_SIZE_N": 32,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "gate_up_b": {
+      "BLOCK_SIZE_K": 32,
+      "BLOCK_SIZE_M": 16,
+      "BLOCK_SIZE_N": 64,
+      "GROUP_SIZE_M": 8,
+      "num_stages": 2,
+      "num_warps": 4
+     },
+     "routing_block_size": 16
+    }
+   }
+  ]
+ }
+}
