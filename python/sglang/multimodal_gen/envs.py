@@ -79,6 +79,9 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
     SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE: bool = True
+    SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION: bool = True
+    SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_FIRST_STEPS: int = 3
+    SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_LAST_STEPS: int = 3
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
     SGLANG_USE_ROCM_VAE: bool = False
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
@@ -364,6 +367,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # memory is low or when this flag is disabled.
     "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE": _lazy_bool(
         "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE", "true"
+    ),
+    # Run the first/last denoising steps of a ModelOpt FP8 (W8A8) Cosmos3 DiT
+    # as W8A16 when the checkpoint's diffusion_step_policy asks for it; the
+    # same FP8 weights are dequantized per call and fed to a 16-bit GEMM.
+    # Kill-switch: set 0 to run pure W8A8 regardless of the checkpoint.
+    "SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION": _lazy_bool(
+        "SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION", "true"
+    ),
+    # Manual overrides for experiments: setting either explicitly overrides
+    # that field of the checkpoint policy, or force-enables mixed precision
+    # on a checkpoint without one (the other field then takes the default
+    # below). When neither is set, the checkpoint fully owns the behavior.
+    "SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_FIRST_STEPS": _lazy_int(
+        "SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_FIRST_STEPS", 3
+    ),
+    "SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_LAST_STEPS": _lazy_int(
+        "SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_LAST_STEPS", 3
     ),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),
