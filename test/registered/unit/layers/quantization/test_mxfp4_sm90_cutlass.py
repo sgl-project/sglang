@@ -345,15 +345,9 @@ def test_apply_sm90_cutlass_matches_flashinfer_direct(
     here we just verify that ``apply`` calls the kernel with the right
     arguments (incl. input padding + output trim)."""
     import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass as fi_cutlass_mod
-    import sglang.srt.layers.quantization.mxfp4 as mxfp4_mod
 
-    # Bypass symmetric-memory / TP-group in both the legacy quant_method and
-    # the new fused-func module (where the kernel call now lives).
-    monkeypatch.setattr(
-        mxfp4_mod, "use_symmetric_memory", lambda *a, **kw: nullcontext()
-    )
-    monkeypatch.setattr(mxfp4_mod, "is_allocation_symmetric", lambda: False)
-    monkeypatch.setattr(mxfp4_mod, "get_tp_group", lambda: None)
+    # Bypass symmetric-memory / TP-group in the fused-func module, which is where
+    # the kernel call lives.
     monkeypatch.setattr(
         fi_cutlass_mod, "use_symmetric_memory", lambda *a, **kw: nullcontext()
     )

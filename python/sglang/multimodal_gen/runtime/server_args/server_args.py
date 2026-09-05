@@ -180,6 +180,8 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "ideogram-v4-instant",
         "ideogram-ai/ideogram-4-fp8",
         "ideogram-ai/ideogram-4-nf4",
+        "jdopensource/joyai-echo",
+        "joyai-echo",
         "lightricks/ltx-2",
         "lightricks/ltx-2.3",
         "meituan-longcat/longcat-image",
@@ -203,6 +205,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
     {
         "GlmImagePipelineConfig",
         "Ideogram4PipelineConfig",
+        "JoyEchoPipelineConfig",
         "LTX2PipelineConfig",
         "LTX23PipelineConfig",
         "LongCatImagePipelineConfig",
@@ -735,10 +738,10 @@ class ServerArgs(DisaggServerArgsMixin):
 
         logger.warning(
             "[Diffusion BCG] disabled for %s: only Ideogram-4, "
-            "Lightricks/LTX-2, LongCat-Image, MiniMax-H3, "
-            "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, SANA-Video, "
-            "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image are "
-            "currently supported.",
+            "jdopensource/JoyAI-Echo, Lightricks/LTX-2, LongCat-Image, "
+            "MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, "
+            "SANA-Video, Tongyi-MAI/Z-Image/Z-Image-Turbo, and "
+            "zai-org/GLM-Image are currently supported.",
             pipeline_config_name,
         )
         self.enable_breakable_cuda_graph = False
