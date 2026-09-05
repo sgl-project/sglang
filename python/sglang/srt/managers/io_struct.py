@@ -997,6 +997,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # tokenizer-manager-side: the scheduler ships arrays either way.
     return_flat_raw_top_logprobs: bool = False
 
+    # Internal PP control bit, set by PP0 before forwarding the request.
+    pp_prefetch_ticketed: bool = False
+
     # Whether to return hidden states
     return_hidden_states: ReturnHiddenStatesMode = False
 
