@@ -909,7 +909,12 @@ class BaseMultimodalProcessor(ABC):
                         return img.convert("RGB")
                 return img
             elif modality == Modality.VIDEO:
-                return load_video(data, frame_count_limit)
+                # NOTE: frame_count_limit is only computed for IMAGE items
+                # (see the caller); it must not be forwarded here. load_video's
+                # second parameter is use_gpu, so passing frame_count_limit
+                # positionally would silently route video decoding to CUDA
+                # whenever it is a positive int.
+                return load_video(data, use_gpu=False)
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 
