@@ -18,6 +18,8 @@ It supporst page size = 1.
 
 # Adapted from
 # https://github.com/ModelTC/lightllm/blob/f2a54f0912293f683bf1d1695fd12c4098a5bf82/lightllm/models/llama/triton_kernel/context_flashattention_nopad.py#L1
+from typing import Optional, Tuple
+
 import torch
 import triton
 import triton.language as tl
@@ -40,6 +42,7 @@ def _fwd_kernel(
     B_Start_Loc,
     B_Seqlen,
     Out,
+    Sinks,
     stride_qbs,
     stride_qh,
     stride_kbs,
@@ -54,6 +57,9 @@ def _fwd_kernel(
     BLOCK_N: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     Lk: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr,
+    WINDOW_RIGHT: tl.constexpr,
+    HAS_SINKS: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -89,9 +95,17 @@ def _fwd_kernel(
     k_ptrs = K + off_k
     v_ptrs = V + off_v
 
-    # initialize pointer to m and l
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    # initialize pointer to m and l.  A sink is a value-less virtual key whose
+    # logit s is learned per q-head, so seeding (m_i, l_i) with (s, 1) is
+    # exactly "process the sink first": every later rescale by alpha carries
+    # exp(s - m_i_new) in the denominator, and the numerator never sees it.
+    if HAS_SINKS:
+        sink = tl.load(Sinks + cur_head).to(tl.float32)
+        m_i = tl.zeros([BLOCK_M], dtype=tl.float32) + sink
+        l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
+    else:
+        m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+        l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
 
     block_mask = tl.where(block_start_loc < cur_batch_seq_len, 1, 0)
@@ -101,7 +115,13 @@ def _fwd_kernel(
         if not IS_CAUSAL
         else tl.minimum((start_m + 1) * BLOCK_M, cur_batch_seq_len)
     )
-    for start_n in range(0, block_mask * end_n, BLOCK_N):
+    lo = 0
+    if WINDOW_LEFT != -1:
+        # keys below the first row's window can never score: skip whole blocks
+        lo = tl.maximum(block_start_loc - WINDOW_LEFT, 0) // BLOCK_N * BLOCK_N
+    if WINDOW_RIGHT != -1:
+        end_n = tl.minimum(end_n, block_start_loc + BLOCK_M + WINDOW_RIGHT)
+    for start_n in range(lo, block_mask * end_n, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- compute qk ----
         k = tl.load(
@@ -116,19 +136,23 @@ def _fwd_kernel(
         qk *= sm_scale
 
         if IS_CAUSAL:
-            qk += tl.where(
-                (start_n + offs_n[None, :] < cur_batch_seq_len)
-                & (offs_m[:, None] >= (start_n + offs_n[None, :])),
-                0,
-                float("-inf"),
+            mask = (start_n + offs_n[None, :] < cur_batch_seq_len) & (
+                offs_m[:, None] >= (start_n + offs_n[None, :])
             )
         else:
-            qk += tl.where(
-                (start_n + offs_n[None, :]) < cur_batch_seq_len, 0, float("-inf")
-            )
+            mask = (start_n + offs_n[None, :]) < cur_batch_seq_len
+        if WINDOW_LEFT != -1:
+            mask = mask & (start_n + offs_n[None, :] >= offs_m[:, None] - WINDOW_LEFT)
+        if WINDOW_RIGHT != -1:
+            mask = mask & (start_n + offs_n[None, :] <= offs_m[:, None] + WINDOW_RIGHT)
+        qk += tl.where(mask, 0, float("-inf"))
 
         # -- compute m_ij, p, l_ij
         m_ij = tl.max(qk, 1)
+        if WINDOW_LEFT != -1 or WINDOW_RIGHT != -1:
+            # with a window, a row's valid keys may miss this whole KV block;
+            # keep the running max finite or exp(-inf - (-inf)) turns NaN
+            m_ij = tl.where(m_ij == float("-inf"), 0.0, m_ij)
         p = tl.exp(qk - m_ij[:, None])
         l_ij = tl.sum(p, 1)
         # -- update m_i and l_i
@@ -136,12 +160,18 @@ def _fwd_kernel(
         alpha = tl.exp(m_i - m_i_new)
         beta = tl.exp(m_ij - m_i_new)
         l_i_new = alpha * l_i + beta * l_ij
-        # -- update output accumulator --
-        # scale p
-        p_scale = beta / l_i_new
+        if WINDOW_LEFT != -1 or WINDOW_RIGHT != -1:
+            # rows whose window has not intersected any block yet keep
+            # l_i_new == 0; hold both scales at 0 until their first block
+            p_scale = tl.where(l_i_new == 0.0, 0.0, beta / l_i_new)
+            acc_scale = tl.where(l_i_new == 0.0, 0.0, l_i / l_i_new * alpha)
+        else:
+            # -- update output accumulator --
+            # scale p
+            p_scale = beta / l_i_new
+            acc_scale = l_i / l_i_new * alpha
         p = p * p_scale[:, None]
         # scale acc
-        acc_scale = l_i / l_i_new * alpha
         acc = acc * acc_scale[:, None]
         # update acc
         v = tl.load(
@@ -168,7 +198,17 @@ def _fwd_kernel(
 
 
 def context_attention_fwd(
-    q, k, v, o, b_start_loc, b_seq_len, max_input_len, is_causal=True, sm_scale=None
+    q,
+    k,
+    v,
+    o,
+    b_start_loc,
+    b_seq_len,
+    max_input_len,
+    is_causal=True,
+    sm_scale=None,
+    window_size: Tuple[int, int] = (-1, -1),
+    sinks: Optional[torch.Tensor] = None,
 ):
     """
     q, k, v: [b * s, head, head_dim]
@@ -176,6 +216,10 @@ def context_attention_fwd(
     b_seq_len: [b]
     out: [b * s, head, head_dim]
     sm_scale: softmax scale, defaults to 1/sqrt(head_dim)
+    window_size: (left, right) sliding window, -1 on a side means unbounded;
+        query i attends keys in [i - left, i + right] (flash-attn convention)
+    sinks: optional [num_q_heads] per-head sink logits appended to the softmax
+        denominator without a value vector (dilutes real attention weights)
     """
     if (_is_cuda or _is_hip) and CUDA_CAPABILITY[0] > 8:
         BLOCK = 128
@@ -189,8 +233,24 @@ def context_attention_fwd(
     batch, head = b_seq_len.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k.shape[1]
 
+    window_left = int(window_size[0]) if window_size[0] >= 0 else -1
+    window_right = int(window_size[1]) if window_size[1] >= 0 else -1
+    if sinks is not None:
+        if sinks.numel() != head:
+            raise ValueError(
+                f"sinks must have one logit per q head ({head}), got {sinks.numel()}"
+            )
+        # the kernel reads Sinks as a raw flat pointer: a strided view or a
+        # wrong-device tensor would silently read garbage
+        if not sinks.is_contiguous():
+            raise ValueError("sinks must be contiguous")
+        if sinks.device != q.device:
+            raise ValueError(
+                f"sinks on {sinks.device} but q on {q.device}"
+            )
+
     grid = (batch, head, triton.cdiv(max_input_len, BLOCK))
-    num_warps = 4 if Lk <= 64 else 8
+    num_warps = 8 if Lk > 64 else 4
 
     _fwd_kernel[grid](
         q,
@@ -200,6 +260,7 @@ def context_attention_fwd(
         b_start_loc,
         b_seq_len,
         o,
+        sinks if sinks is not None else q,  # placeholder; never read without HAS_SINKS
         q.stride(0),
         q.stride(1),
         k.stride(0),
@@ -216,4 +277,7 @@ def context_attention_fwd(
         num_warps=num_warps,
         num_stages=1,
         Lk=Lk,
+        WINDOW_LEFT=window_left,
+        WINDOW_RIGHT=window_right,
+        HAS_SINKS=sinks is not None,
     )

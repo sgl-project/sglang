@@ -515,6 +515,8 @@ class VisionTritonAttention(nn.Module):
             max_seqlen,
             is_causal=False,
             sm_scale=softmax_scale,
+            window_size=kwargs.get("window_size", (-1, -1)),
+            sinks=kwargs.get("s_aux", None),
         )
 
         return output
