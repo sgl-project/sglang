@@ -169,9 +169,14 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
 
         # The EAGLE v2 future map holds one hidden state per request;
         # reduce a token-shaped draft-extend HC tensor to its last token per request.
-        if (
-            not forward_batch.forward_mode.is_draft_extend_v2()
-            and forward_batch.extend_seq_lens is not None
+        if forward_batch.forward_mode.is_draft_extend_v2():
+            # Mirror LogitsProcessor: the graph path selects rows via
+            # spec_info.select_index and the worker no longer re-indexes them.
+            select_index = forward_batch.spec_info.select_index
+            if select_index is not None:
+                hc_hidden_states = hc_hidden_states[select_index]
+        elif (
+            forward_batch.extend_seq_lens is not None
             and hc_hidden_states.shape[0] != forward_batch.extend_seq_lens.shape[0]
         ):
             last_index = (
