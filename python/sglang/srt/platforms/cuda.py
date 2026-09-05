@@ -104,7 +104,9 @@ class CudaSRTPlatform(CudaDeviceMixin, SRTPlatform):
     """Default in-tree CUDA SRT platform."""
 
     def supports_fp8(self) -> bool:
-        return True
+        from sglang.srt.layers.quantization.fp8_utils import cutlass_fp8_supported
+
+        return cutlass_fp8_supported()
 
     def support_cuda_graph(self) -> bool:
         return True
