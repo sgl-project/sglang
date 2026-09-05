@@ -37,6 +37,8 @@ class MulAdd(CustomOp):
     def forward_xpu(
         self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, k: int = 0
     ):
+        if a.is_contiguous():
+            return fuse_scale_shift_kernel(a, b, c, scale_constant=k)
         return self.forward_native(a, b, c, k=k)
 
     @torch.compile

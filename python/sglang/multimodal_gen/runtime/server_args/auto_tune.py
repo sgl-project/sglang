@@ -185,6 +185,7 @@ class ServerArgsAutoTuner:
                 args.text_encoder_cpu_offload
                 and LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP in components
                 and args.explicit_residency_mode("text_encoder") is None
+                and not args.is_arg_explicitly_set("text_encoder_cpu_offload")
             ):
                 args.text_encoder_cpu_offload = False
                 changed.append("text_encoder_cpu_offload=False")
@@ -192,6 +193,7 @@ class ServerArgsAutoTuner:
                 args.image_encoder_cpu_offload
                 and LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP in components
                 and args.explicit_residency_mode("image_encoder") is None
+                and not args.is_arg_explicitly_set("image_encoder_cpu_offload")
             ):
                 args.image_encoder_cpu_offload = False
                 changed.append("image_encoder_cpu_offload=False")
@@ -199,6 +201,7 @@ class ServerArgsAutoTuner:
                 args.vae_cpu_offload
                 and LAYERWISE_OFFLOAD_VAE_GROUP in components
                 and args.explicit_residency_mode("vae") is None
+                and not args.is_arg_explicitly_set("vae_cpu_offload")
             ):
                 args.vae_cpu_offload = False
                 changed.append("vae_cpu_offload=False")
@@ -356,7 +359,7 @@ class ServerArgsAutoTuner:
         if (
             not self.could_override_server_args()
             or current_platform.is_cpu()
-            or not current_platform.is_cuda()
+            or (not current_platform.is_cuda() and not current_platform.is_xpu())
             or envs.SGLANG_CACHE_DIT_ENABLED
             or args.use_fsdp_inference
             or args.layerwise_offload_components is not None
