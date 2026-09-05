@@ -2,6 +2,7 @@
 
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.runtime.managers.memory_managers import layerwise_offload
@@ -98,26 +99,21 @@ class TestDetachAndRestore:
         assert detached == []
         assert not model.embed._forward_pre_hooks
 
-    def test_float_inputs_are_not_moved_to_host(self):
-        # regression for Qwen3VL: a VL encoder can feed floating tensors (RoPE
-        # freqs / position embeddings) into the same module; moving them to the
-        # host table mixed cpu/cuda tensors and crashed index_select.
-        model = _Declared()
-        with patch(THRESHOLD_PATH, 1024):
-            restore_host_resident_tables(detach_host_resident_tables(model), "cpu")
-        # forward a float tensor: the hook must pass it through untouched
-        # (nn.Embedding would reject it, so assert the hook leaves dtype/device)
-        hook = next(iter(model.embed._forward_pre_hooks.values()))
-        out = hook(model.embed, (torch.randn(2, 3),), {})
-        assert out is None  # not an integer index -> hook declines to rewrite
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_a_device_resident_table_is_parked_on_the_host(self):
+        model = _Declared().to("cuda")
+        ids = torch.tensor([[1, 2, 3], [4, 5, 6]], device="cuda")
+        with torch.no_grad():
+            expected = model.embed(ids)
 
-    def test_integer_inputs_are_moved_and_floats_skipped(self):
-        model = _Declared()
         with patch(THRESHOLD_PATH, 1024):
-            restore_host_resident_tables(detach_host_resident_tables(model), "cpu")
-        hook = next(iter(model.embed._forward_pre_hooks.values()))
-        ids = torch.tensor([[1, 2]])
-        freqs = torch.randn(2, 4)
-        moved, _ = hook(model.embed, (ids, freqs), {})
-        assert moved[0].device.type == "cpu"
-        assert moved[1] is freqs  # float tensor left in place
+            detached = detach_host_resident_tables(model)
+            assert model.embed.weight.numel() == 0
+            model.to("cuda")
+            restore_host_resident_tables(detached, "cuda")
+
+        with torch.no_grad():
+            actual = model.embed(ids)
+        assert model.embed.weight.device.type == "cpu"
+        assert actual.device.type == "cuda"
+        assert torch.equal(actual, expected)
