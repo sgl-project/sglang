@@ -147,6 +147,25 @@ These techniques can change the denoising path, numerical representation, or gen
 6. Profile if the bottleneck is unclear.
 7. Add `quality=high`, caching, progressive resolution, or quantization only after comparing output quality against your acceptance target.
 
+## Per-Model Tuning Decision Table
+
+The output-preserving levers do not help every model equally. Profiling each supported model on a single Blackwell-class GPU (B300/GB300) shows that the dominant lever depends on two properties: whether the per-step Python/host overhead exceeds the kernel time (launch-bound), and how many denoising steps run per request. Use this table to pick the first lever to try instead of enabling every flag at once.
+
+| Model pattern | Examples | Recommended first lever | Why |
+| --- | --- | --- | --- |
+| Launch-bound turbo / few-step distilled | ERNIE-Image-Turbo, GLM-Image, FastWan / TurboWan family, FLUX.2-klein-4B, LingBot-World, LongLive, Cosmos3, SANA, LongCat-Image-Edit-Turbo | `--warmup-mode request` | A single server-side compile/warmup request removes per-step launch overhead; measured denoising drops roughly 50–98%. |
+| Supported fixed-shape pipeline on the BCG list | GLM-Image, Z-Image-Turbo, Qwen-Image-2512, Ideogram-4, LongCat-Image, LTX-2 / LTX-2.3, SANA-1.5 1.6B, JoyEcho | `--enable-breakable-cuda-graph` + `--warmup-resolutions <WxH>` | Captured graph replay eliminates launch-bound Python dispatch; confirm capture in the server log. |
+| Large dual-DiT MoE that fits only with offload | Wan2.2-T2V-A14B, Wan2.2-I2V-A14B, LingBot-Video-MoE | `--dit-layerwise-offload` (+ `--warmup-mode request`) | Layerwise offload makes the model fit on one GPU while keeping denoising near compute-bound. |
+| Edit pipeline with many image conditions | Qwen-Image-Edit family, FireRed-Image-Edit | `--warmup-mode request`, keep eager (avoid BCG) | Per-step mask/meta rebuild cost exceeds graph replay savings; measured BCG is ~3.8x slower than eager, so these are intentionally excluded from the BCG list. |
+| Near compute-bound many-step model | Qwen-Image, FLUX.1-dev, FLUX.2-dev, LTX-2, Wan2.1 14B, HunyuanVideo, MOVA | `--warmup-mode request` only | Little launch overhead remains; gains are modest (single-digit to ~50%) and the model is already kernel-bound. |
+| Very few-step distilled model | FastVideo-FastH3 (4-step) | Keep `--warmup-mode off` | A synthetic warmup request costs more than it saves over a handful of steps; measured `warmup-mode request` regresses ~59%. |
+
+Notes:
+
+- Breakable CUDA graph only supports the pipeline configs in `BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS`; for anything else prefer `--warmup-mode request`. Both levers are output-preserving — a captured graph replays the same kernels and `warmup-mode request` only primes compilation ahead of real traffic.
+- Always confirm a byte/MD5-identical or quality-accepted output before rolling a lever into production. Some pipelines (for example SANA and ERNIE) change the scheduler/schedule under server warmup, which changes the output hash even though the path is numerically sound.
+- Treat the exact numbers as model- and shape-dependent. Re-profile with [Profiling](/docs/sglang-diffusion/profiling) at your target resolution, frame count, and step count.
+
 ## Diagnostics
 
 [Profiling](/docs/sglang-diffusion/profiling) is not an optimization technique by itself. It belongs in the performance workflow because it tells you which stage, kernel, or denoising step is worth optimizing before you change multiple levers.
