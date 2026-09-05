@@ -193,6 +193,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         ] = {}
 
         self.background_tasks: dict[str, asyncio.Task] = {}
+        self.background_response_ids: set[str] = set()
 
     @staticmethod
     def _has_response_tool(request: ResponsesRequest, *tool_types: str) -> bool:
@@ -501,6 +502,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 )
                 async with self.response_store_lock:
                     self.response_store[response.id] = response
+                    self.background_response_ids.add(response.id)
 
                 # Run the request in the background
                 task = asyncio.create_task(
@@ -1436,6 +1438,17 @@ class OpenAIServingResponses(OpenAIServingChat):
             response = self.response_store.get(response_id)
             if response is None:
                 return self._make_not_found_error(response_id)
+
+            # Only background responses can be cancelled
+            if response_id not in self.background_response_ids:
+                return self.create_error_response(
+                    message=(
+                        "Responses can only be cancelled if they were created with "
+                        "`background=true`."
+                    ),
+                    err_type="invalid_request_error",
+                    status_code=400,
+                )
 
             prev_status = response.status
             if prev_status not in ("queued", "in_progress"):
