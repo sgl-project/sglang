@@ -191,6 +191,8 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 "_configure_mega_moe_deep_gemm_num_sms",
                 return_value=nullcontext(),
             ),
+            # Toy shapes; the alignment rule has its own test below.
+            patch.object(mega_moe, "_check_mega_moe_shapes"),
             patch.object(
                 mega_moe.ExpertLocationDispatchInfo,
                 "init_new",
@@ -213,6 +215,83 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         call = deep_gemm.mega_moe_pre_dispatch.call_args
         self.assertEqual(call.kwargs.get("mma_type"), "mxf4xmxf4")
         self.assertNotIn("use_fp4_acts", call.kwargs)
+
+    def test_run_mega_routed_experts_generic_entry(self):
+        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm.fp8_fp4_mega_moe = MagicMock()
+        buffer = SimpleNamespace(
+            x=object(),
+            x_sf=object(),
+            topk_idx=object(),
+            topk_weights=object(),
+        )
+        experts = SimpleNamespace(
+            num_experts=8,
+            mega_l1_weights=object(),
+            mega_l2_weights=object(),
+        )
+        hidden_states = torch.zeros((3, 4), dtype=torch.bfloat16)
+        topk_ids = torch.tensor([[0, 1], [2, 3], [4, 5]], dtype=torch.int64)
+        topk_weights = torch.full((3, 2), 0.5, dtype=torch.bfloat16)
+
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(mega_moe, "_device_sm", 100),
+            patch.object(mega_moe, "_mega_moe_mma_type", return_value="fp8xfp4"),
+            patch.object(mega_moe, "mega_moe_pre_dispatch") as pre_dispatch,
+            patch.object(
+                mega_moe, "_get_mega_moe_symm_buffer", return_value=buffer
+            ) as get_buffer,
+            patch.object(
+                mega_moe,
+                "_configure_mega_moe_deep_gemm_num_sms",
+                return_value=nullcontext(),
+            ),
+            # Toy shapes; the alignment rule has its own test below.
+            patch.object(mega_moe, "_check_mega_moe_shapes"),
+            patch(
+                "sglang.srt.distributed.parallel_state.get_moe_ep_group",
+                return_value=SimpleNamespace(device_group=object()),
+            ),
+        ):
+            out = mega_moe.run_mega_routed_experts(
+                experts,
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                hidden_size=4,
+                intermediate_size=8,
+                top_k=2,
+                num_tokens=3,
+                activation_clamp=7.0,
+                routed_scaling_factor=1.0,
+            )
+
+        self.assertEqual(out.shape, (3, 4))
+        self.assertEqual(out.dtype, torch.bfloat16)
+        buf_call = get_buffer.call_args
+        self.assertEqual(buf_call.kwargs.get("num_topk"), 2)
+        self.assertEqual(buf_call.kwargs.get("hidden"), 4)
+        self.assertEqual(buf_call.kwargs.get("intermediate_hidden"), 8)
+        # The kernel wants int32 ids and fp32 weights regardless of the router dtype.
+        ids_arg, weights_arg = pre_dispatch.call_args.args[1:3]
+        self.assertEqual(ids_arg.dtype, torch.int32)
+        self.assertEqual(weights_arg.dtype, torch.float32)
+        mega_call = deep_gemm.fp8_fp4_mega_moe.call_args
+        self.assertIs(mega_call.args[1], experts.mega_l1_weights)
+        self.assertIs(mega_call.args[2], experts.mega_l2_weights)
+        self.assertEqual(mega_call.kwargs.get("activation_clamp"), 7.0)
+
+    def test_shape_check_rejects_unaligned_intermediate(self):
+        # Qwen3-30B-A3B: intermediate 768 leaves a 24-byte scale row.
+        with self.assertRaisesRegex(ValueError, "multiples of 512"):
+            mega_moe._check_mega_moe_shapes(2048, 768, "fp8xfp4")
+        mega_moe._check_mega_moe_shapes(4096, 1536, "fp8xfp4")
+        mega_moe._check_mega_moe_shapes(4096, 1024, "mxf4xmxf4")
+        # 768 is a multiple of 256, so the NVFP4 (g16) rule accepts it.
+        mega_moe._check_mega_moe_shapes(2048, 768, "nvfp4xnvfp4")
+        with self.assertRaisesRegex(ValueError, "multiples of 256"):
+            mega_moe._check_mega_moe_shapes(2048, 384, "nvfp4xnvfp4")
 
     def test_mxf4_l1_uses_packed_gate_up_interleave(self):
         source = torch.arange(32).reshape(1, 32)

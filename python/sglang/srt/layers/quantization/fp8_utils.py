@@ -1496,7 +1496,11 @@ def quantize_block_fp8_weight_to_mxfp4(
         *fp8_weight_dequant.shape[:-1],
         fp8_weight_dequant.shape[-1] // mxfp4_block_size,
     )
-    return fp4_weight, fp4_scale.contiguous().view(torch.float8_e8m0fnu)
+    # An all-zero group yields exponent byte 0 (2^-127), which is an fp32
+    # subnormal and trips DeepGEMM's UE8M0 layout check once the scale is
+    # widened to fp32; its values are zero, so any scale is exact.
+    fp4_scale = fp4_scale.contiguous().clamp_(min=1)
+    return fp4_weight, fp4_scale.view(torch.float8_e8m0fnu)
 
 
 def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
