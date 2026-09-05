@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+import torch
 
 from sglang.benchmark.serving import run_benchmark
 from sglang.srt.environ import envs
@@ -19,6 +20,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=443, stage="base-c", runner_config="8-gpu-h20")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationDPAttention(PDDisaggregationServerBase):
     """PD-disagg + DP-attention e2e on `total_tokens` LB — the most complex
     dispatch (token accounting + tie-break + estimated_tokens). Simpler

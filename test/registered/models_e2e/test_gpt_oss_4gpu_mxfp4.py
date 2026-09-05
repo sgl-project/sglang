@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.gpt_oss_common import BaseTestGptOss
 
@@ -7,6 +9,7 @@ register_cuda_ci(est_time=220, stage="base-c", runner_config="4-gpu-h100")
 register_cuda_ci(est_time=220, stage="base-c", runner_config="4-gpu-b200")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestGptOss4GpuMxfp4(BaseTestGptOss):
     def test_mxfp4_120b(self):
         self.run_test(

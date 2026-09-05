@@ -8,6 +8,8 @@ Runs nightly on the 8-GPU H200 runner with TP=4.
 
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
@@ -16,6 +18,7 @@ register_cuda_ci(est_time=300, stage="nightly", runner_config="8-gpu-h200")
 register_cuda_ci(est_time=300, stage="nightly", runner_config="8-gpu-b200")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLing26Flash(GSM8KMixin, DefaultServerBase):
     model = "inclusionAI/Ling-2.6-flash"
 

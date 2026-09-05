@@ -8,7 +8,9 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=8, stage="jit-kernel-unit", runner_config="amd")
-
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
 
 @pytest.mark.parametrize("size", [1, 2, 127, 128, 1024, 1025, 4096, 4097])
 @pytest.mark.parametrize("constant", [0, 1, 7, 1024, -3])

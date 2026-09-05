@@ -7,6 +7,8 @@ This test verifies that DLLM works on AMD with triton attention backend.
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.run_eval import run_eval
@@ -23,6 +25,7 @@ from sglang.test.test_utils import (
 register_amd_ci(est_time=1000, suite="stage-b-test-1-gpu-small-amd")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLLaDA2MiniAMD(CustomTestCase):
     @classmethod
     def setUpClass(cls):

@@ -1,6 +1,7 @@
 import unittest
 
 import requests
+import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
@@ -24,6 +25,7 @@ class TestNgramSpeculativeDecodingNoOverlap(NgramServerBase, GSM8KMixin):
     extra_args = ["--disable-overlap-schedule"]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNgramSpeculativeDecodingFlashinfer(NgramServerBase, GSM8KMixin):
     attention_backend = "flashinfer"
     extra_args = ["--speculative-ngram-external-sam-budget", "8"]

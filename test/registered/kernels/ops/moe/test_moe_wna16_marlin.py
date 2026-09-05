@@ -21,7 +21,9 @@ from sglang.test.test_marlin_utils import (
 )
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
-
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
 
 def _has_aot_moe_wna16_marlin_gemm() -> bool:
     return hasattr(torch.ops.sgl_kernel, "moe_wna16_marlin_gemm") and hasattr(

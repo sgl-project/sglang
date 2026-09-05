@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -28,6 +29,7 @@ register_cuda_ci(
 ib_devices = get_rdma_devices_args()
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestTP(CustomTestCase):
     extra_args = []
 
@@ -91,6 +93,7 @@ class TestTP(CustomTestCase):
         self.assertGreater(metrics["score"], 0.60)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestPureDP(TestTP):
     extra_args = [
         "--enable-dp-attention",
@@ -132,6 +135,7 @@ class TestPureDP(TestTP):
         super().test_gsm8k()
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
 class TestHybridDPTP(TestPureDP):
     extra_args = [

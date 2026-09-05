@@ -4,6 +4,7 @@ import unittest
 
 import aiohttp
 import numpy as np
+import torch
 
 from sglang.srt.state_capturer.indexer_topk import (
     extract_indexer_topk_from_meta_info,
@@ -32,6 +33,7 @@ INDEX_TOPK_FREQ = 2
 logger = logging.getLogger(__name__)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestReturnIndexerTopk(CustomTestCase):
     """Indexer-topk capture e2e test for DSv3.2 (DSA).
 
