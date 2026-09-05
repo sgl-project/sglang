@@ -7,7 +7,7 @@ import os
 import re
 import threading
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import (
     Any,
     Dict,
@@ -51,6 +51,7 @@ from sglang.srt.utils import (
     configure_media_url_security,
     envs,
     is_cpu,
+    is_hip,
     is_npu,
     is_xpu,
     load_audio,
@@ -61,8 +62,16 @@ from sglang.srt.utils import (
 )
 
 _is_cpu = is_cpu()
+_is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
+
+# torch.cuda.use_mem_pool() drives the allocator's captures_underway bookkeeping,
+# which is process-wide and not re-entrant. Concurrent processor threads entering
+# it at once leave an entry behind, and the MemPool destructor then trips
+# `captures_underway.empty()`. Only ROCm is confirmed affected, so CUDA keeps the
+# unserialized path.
+_fast_processor_pool_lock = threading.Lock() if _is_hip else nullcontext()
 
 
 @dataclasses.dataclass
@@ -753,8 +762,9 @@ class BaseMultimodalProcessor(ABC):
 
         with torch.cuda.device(device):
             pool = torch.cuda.MemPool()
-        with torch.cuda.use_mem_pool(pool, device=device):
-            yield
+        with _fast_processor_pool_lock:
+            with torch.cuda.use_mem_pool(pool, device=device):
+                yield
 
     def process_mm_data(
         self,
