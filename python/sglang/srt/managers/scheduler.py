@@ -1637,12 +1637,6 @@ class Scheduler(
             self.copy_stream
         )
 
-        if not self.enable_overlap:
-            return
-
-        self.batch_record_buf = [None] * 2
-        self.batch_record_ct = 0
-
     def maybe_init_ngram_embedding(self):
         self.ngram_embedding_manager = (
             self.tp_worker.model_runner.ngram_embedding_manager
@@ -4075,20 +4069,27 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
-    def record_batch_in_overlap(self, batch: ScheduleBatch):
-        # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
-        # NOTE: More Reliable: record all tensors into the forward stream
-        # NOTE: - for all future tensors, we shall always read from future map
-        #       - for all non-future tensors (produced only by schedule stream),
-        #       we shall keep its reference not being release during all the forwarding pass
-        # Snapshot all fields: spec V2 rebinds seq_lens / spec_info mid-forward.
-        attr_snapshot = [
-            getattr(batch, f.name, None) for f in dataclasses.fields(batch)
-        ]
-        self.batch_record_ct = (self.batch_record_ct + 1) % 2
-        # List (not tuple) so that workers can register additional refs via
-        # GenerationBatchResult.extra_keep_alive_refs after forward returns.
-        self.batch_record_buf[self.batch_record_ct] = [batch, attr_snapshot]
+    def _snapshot_batch_for_overlap(self, batch: ScheduleBatch) -> Tuple[Any, ...]:
+        """References that must outlive this batch's asynchronous forward.
+
+        The batch plus the object currently bound to each of its dataclass
+        fields. This is a shallow reference snapshot: it preserves objects across
+        field rebinding, which ``filter_batch`` does to the mamba slot ids and
+        spec V2 does to ``seq_lens`` / ``spec_info``, but it does not copy
+        mutable objects. The caller parks the tuple on the batch's result;
+        ``process_batch_result`` drops it after the wait on ``copy_done``.
+
+        The snapshot is not blanket-recorded on the forward stream. Its lifetime
+        is bounded by the per-result completion event instead, and tensors that
+        cross onto auxiliary streams keep their own stream-lifetime mechanism.
+        """
+        # Keep schedule-stream-owned objects alive until the result completion
+        # event. Future tensors are resolved through FutureMap; non-future
+        # tensors are retained by this shallow reference snapshot.
+        return (
+            batch,
+            *(getattr(batch, f.name, None) for f in dataclasses.fields(batch)),
+        )
 
     @contextmanager
     def _forward_isolation(self, batch: ScheduleBatch, *, overlap: bool):
@@ -4101,12 +4102,11 @@ class Scheduler(
         2. Substitute sampling_info with a forward-only copy (orchestrator=None,
            shares the pre-accumulated penalty buffer) so V2's multiple init_new
            calls don't double-accumulate penalties.
-        3. (overlap=True only) Pin (batch, snapshot) into batch_record_buf
-           for 2 iters so GPU tensors in the snapshot survive the caching
-           allocator past the forward stream. Must run AFTER the sampling_info
-           swap so the forward-only copy gets pinned. The non-overlap (sync) path
-           runs on a single stream and doesn't allocate batch_record_buf, so it
-           passes overlap=False.
+        3. (overlap=True only) Yield the snapshot of GPU tensors that has to
+           outlive the forward; the caller parks it on the batch's result. Must
+           run AFTER the sampling_info swap so the forward-only copy is in it.
+           The non-overlap (sync) path runs on a single stream and needs no
+           snapshot, so it passes overlap=False and yields None.
         """
         # 1. snapshot
         snapshot_v2_full = not batch.spec_algorithm.is_none()
@@ -4121,12 +4121,11 @@ class Scheduler(
         if sched_sampling_info is not None:
             batch.sampling_info = sched_sampling_info.copy_for_forward()
 
-        # 3. pin for 2-iter tensor lifetime (overlap path only)
-        if overlap:
-            self.record_batch_in_overlap(batch)
+        # 3. snapshot for the forward's tensor lifetime (overlap path only)
+        overlap_refs = self._snapshot_batch_for_overlap(batch) if overlap else None
 
         try:
-            yield
+            yield overlap_refs
         finally:
             if snapshot_v2_full:
                 for name, value in sched_snapshot.items():
@@ -4183,7 +4182,7 @@ class Scheduler(
                     # post-forward must not un-consume staging.
                     resolve_forward_inputs(batch, self.future_map)
 
-                    with self._forward_isolation(batch, overlap=True):
+                    with self._forward_isolation(batch, overlap=True) as overlap_refs:
                         future_indices = batch.req_pool_indices
 
                         # Spec_v2 fires on_publish mid-worker (between verify and
@@ -4209,13 +4208,12 @@ class Scheduler(
                         )
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
-                        # Park any refs the worker wants kept alive 2 iters
-                        # (cross-stream tensor lifetime; pinned in the same
-                        # ring slot as the SB attr snapshot).
-                        if batch_result.extra_keep_alive_refs:
-                            self.batch_record_buf[self.batch_record_ct].extend(
-                                batch_result.extra_keep_alive_refs
-                            )
+                        # The result owns the snapshot from here: it sits in
+                        # result_queue until process_batch_result runs, which is
+                        # after this batch's copy_done. extra_keep_alive_refs is
+                        # already a field of the same result, so it needs no
+                        # separate parking.
+                        batch_result.overlap_keep_alive_refs = overlap_refs
                         if self.enable_unified_memory:
                             # Record a `forward_done` event after the forward (before
                             # copy_to_cpu); lazy-compaction `_flush` gates src reuse on
@@ -4337,7 +4335,11 @@ class Scheduler(
             ret = batch_result
         else:  # embedding or reward model
             if self.enable_overlap:
-                self.record_batch_in_overlap(batch)
+                # Snapshot before resolve, matching the existing embedding
+                # ordering. The individual tuple entries retain the pre-resolve
+                # field objects, while the batch object stored in the tuple
+                # observes and retains fields rebound by resolve_forward_inputs.
+                overlap_refs = self._snapshot_batch_for_overlap(batch)
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
                     resolve_forward_inputs(batch, self.future_map)
@@ -4349,7 +4351,11 @@ class Scheduler(
                         pooled_hidden_states=pooler_output.pooled_hidden_states,
                         can_run_cuda_graph=can_run_cuda_graph,
                     )
+                    # Create it here so it is recorded even for a batch with
+                    # nothing to copy; the result processor waits on it.
+                    ret.copy_done = self.device_module.Event()
                     ret.copy_to_cpu()
+                ret.overlap_keep_alive_refs = overlap_refs
             else:
                 resolve_forward_inputs(batch, self.future_map)
                 pooler_output, can_run_cuda_graph = (
@@ -4472,9 +4478,11 @@ class Scheduler(
         # Release the closure and large GPU tensors that are no longer needed.
         # The delay_sample_func closure captures forward_batch (which holds
         # sampling_info with vocab_mask) and logits_output (which holds
-        # next_token_logits). Without clearing these, they stay alive via
-        # batch_result in result_queue and batch_record_buf until the next
-        # iteration, causing a steady VRAM leak with structured output.
+        # next_token_logits). result_queue retains both until this result is
+        # processed, so without clearing them here structured output leaks VRAM
+        # steadily. The overlap snapshot on the result is a separate owner; of
+        # these it holds the forward-only sampling_info copy, not the closure or
+        # the logits.
         batch_result.delay_sample_func = None
         if batch_result.logits_output is not None:
             batch_result.logits_output.next_token_logits = None
@@ -4497,31 +4505,42 @@ class Scheduler(
             snapshot=snapshot,
         )
 
-        if batch.forward_mode.is_decode():
-            self.batch_result_processor.process_batch_result_decode(batch, result)
-        elif batch.forward_mode.is_extend():
-            if batch.is_dllm():
-                self.process_batch_result_dllm(batch, result)
-            elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.process_batch_result_disagg_prefill(batch, result)
-            else:
-                self.batch_result_processor.process_batch_result_prefill(batch, result)
-        elif batch.forward_mode.is_prebuilt():
-            self.batch_result_processor.process_batch_result_prebuilt(batch)
-        elif batch.forward_mode.is_idle():
-            self.batch_result_processor.process_batch_result_idle(batch, result)
+        try:
+            if batch.forward_mode.is_decode():
+                self.batch_result_processor.process_batch_result_decode(batch, result)
+            elif batch.forward_mode.is_extend():
+                if batch.is_dllm():
+                    self.process_batch_result_dllm(batch, result)
+                elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    self.process_batch_result_disagg_prefill(batch, result)
+                else:
+                    self.batch_result_processor.process_batch_result_prefill(
+                        batch, result
+                    )
+            elif batch.forward_mode.is_prebuilt():
+                self.batch_result_processor.process_batch_result_prebuilt(batch)
+            elif batch.forward_mode.is_idle():
+                self.batch_result_processor.process_batch_result_idle(batch, result)
 
-        self._record_step_counters(batch, result)
+            self._record_step_counters(batch, result)
 
-        self.metrics_reporter.log_batch_result_stats(batch, result)
+            self.metrics_reporter.log_batch_result_stats(batch, result)
 
-        # Emit forward pass metrics (every iteration when enabled)
-        if self.enable_fpm:
-            self.metrics_reporter._emit_forward_pass_metrics(batch, result)
+            # Emit forward pass metrics (every iteration when enabled)
+            if self.enable_fpm:
+                self.metrics_reporter._emit_forward_pass_metrics(batch, result)
 
-        self._maybe_clear_mm_inputs(batch)
-        self.maybe_send_health_check_signal()
-        self.metrics_reporter.update_device_timer()
+            self._maybe_clear_mm_inputs(batch)
+            self.maybe_send_health_check_signal()
+            self.metrics_reporter.update_device_timer()
+        finally:
+            # release_keep_alive_refs waits on copy_done itself, so the snapshot
+            # outlives the forward whatever the branch above did, including a
+            # mode with no processor and a processor that raises. The processors
+            # keep their own earlier waits because they read the host copy, and
+            # process_batch_result_prefill runs free_group_begin() before its
+            # wait on purpose.
+            result.release_keep_alive_refs()
 
     def _record_step_counters(
         self, batch: ScheduleBatch, result: GenerationBatchResult

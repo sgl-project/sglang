@@ -1871,9 +1871,9 @@ class ModelRunner:
 
         # Release the vocab_mask GPU tensor immediately after it has been applied
         # to the logits. In overlap scheduling, the sampling_info (and its
-        # grammar_mask) can be kept alive by the delay_sample_func closure and
-        # batch_record_buf until the next iteration, causing a steady VRAM leak
-        # when structured output (grammar) is used.
+        # grammar_mask) can be kept alive by the delay_sample_func closure and by
+        # the scheduler's overlap snapshot until the result is processed, causing
+        # a steady VRAM leak when structured output (grammar) is used.
         sampling_info.grammar_mask = None
         return observer_state
 

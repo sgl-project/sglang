@@ -4,7 +4,7 @@ import dataclasses
 import logging
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import msgspec
 import torch
@@ -99,10 +99,15 @@ class GenerationBatchResult:
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[SpecInput] = None
 
-    # Refs the worker wants scheduler to keep alive for the same 2-iter window
-    # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
-    # V2 verify ForwardBatch whose tensors must outlive mid-iter SB rebinds).
+    # Refs the worker wants kept alive across the forward (e.g. a spec V2 verify
+    # ForwardBatch whose tensors must outlive mid-iter SB rebinds). Set by the
+    # worker, released by release_keep_alive_refs.
     extra_keep_alive_refs: Optional[List[Any]] = None
+
+    # Overlap mode: the scheduler's snapshot of the launched ScheduleBatch, so
+    # its device tensors outlive the asynchronous forward. Set by
+    # Scheduler.run_batch, released by release_keep_alive_refs.
+    overlap_keep_alive_refs: Optional[Tuple[Any, ...]] = None
 
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[TopkCaptureOutput] = None
@@ -116,6 +121,18 @@ class GenerationBatchResult:
     fpm_end_event: Optional[torch.cuda.Event] = None
 
     auxiliary_host_output: Optional[HostAuxiliaryOutput] = None
+
+    def release_keep_alive_refs(self) -> None:
+        """Drop everything held only to outlive this result's device work.
+
+        Waits on ``copy_done`` first, so dropping the references is safe on its
+        own rather than depending on the caller having waited. Result processors
+        wait earlier as well, because they read the host copy.
+        """
+        if self.copy_done is not None:
+            self.copy_done.synchronize()
+        self.overlap_keep_alive_refs = None
+        self.extra_keep_alive_refs = None
 
     @property
     def has_sampled_token_ids(self) -> bool:
@@ -300,6 +317,10 @@ def get_logprob_from_pp_outputs(
     return logits_output, extend_input_len_per_req, extend_logprob_start_len_per_req
 
 
+# Uniform shapes give a tensor; multi-item scoring gives a list of them.
+EmbeddingTensorOutput = Union[torch.Tensor, List[torch.Tensor]]
+
+
 @dataclass
 class EmbeddingBatchResult:
     """Result from an embedding/classification forward pass.
@@ -309,28 +330,52 @@ class EmbeddingBatchResult:
         pooled_hidden_states: Raw hidden states before the task head.  Present
             only when the batch contained ``return_pooled_hidden_states=True``
             requests.  Tensor (uniform shapes) or list of tensors (MIS).
-        copy_done: CUDA event recorded after the async CPU copy completes.
+        copy_done: Device event created by the caller and recorded once this
+            result's device work is enqueued, copy or not.
+        can_run_cuda_graph: Whether the forward ran as a captured graph.
+        overlap_keep_alive_refs: Overlap mode only; see the field of the same
+            name on ``GenerationBatchResult``.
     """
 
-    embeddings: torch.Tensor
-    pooled_hidden_states: Optional[torch.Tensor] = None
+    embeddings: EmbeddingTensorOutput
+    pooled_hidden_states: Optional[EmbeddingTensorOutput] = None
     copy_done: Optional[torch.cuda.Event] = None
     can_run_cuda_graph: bool = False
+    overlap_keep_alive_refs: Optional[Tuple[Any, ...]] = None
+
+    def release_keep_alive_refs(self) -> None:
+        """Drop everything held only to outlive this result's device work.
+
+        Waits on ``copy_done`` first, like the generation result. No
+        ``extra_keep_alive_refs`` here: nothing produces worker refs for an
+        embedding forward, so this class does not declare it.
+        """
+        if self.copy_done is not None:
+            self.copy_done.synchronize()
+        self.overlap_keep_alive_refs = None
 
     @torch.profiler.record_function("copy_embedding_to_cpu")
-    def copy_to_cpu(self):
-        """Copy embeddings and pooled hidden states to CPU for overlap scheduling."""
+    def copy_to_cpu(self) -> None:
+        """Copy embeddings and pooled hidden states to CPU for overlap scheduling.
+
+        ``copy_done`` is created by the caller, as it is for
+        ``GenerationBatchResult``, and recorded here. It is therefore recorded
+        even when the batch produced nothing to copy, which callers rely on: they
+        take it as proof that this result's device work finished.
+        """
+        if self.copy_done is None:
+            raise RuntimeError(
+                "EmbeddingBatchResult.copy_done must be created before copy_to_cpu()"
+            )
         if isinstance(self.embeddings, torch.Tensor):
-            self.copy_done = torch.get_device_module(self.embeddings.device).Event()
             self.embeddings = _async_d2h(self.embeddings)
         else:
             assert isinstance(self.embeddings, list)
-            if len(self.embeddings) == 0:
-                return
-
-            self.copy_done = torch.get_device_module(self.embeddings[0].device).Event()
             self.embeddings = [_async_d2h(emb) for emb in self.embeddings]
 
+        # main returned before this block when the embeddings list was empty, so
+        # pooled_hidden_states was left on device for the processor to pull over.
+        # It is copied here in that case now; the end state is the same.
         if self.pooled_hidden_states is not None:
             if isinstance(self.pooled_hidden_states, list):
                 self.pooled_hidden_states = [
