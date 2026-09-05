@@ -31,7 +31,10 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import should_skip_post_experts_all_reduce
+from sglang.srt.layers.moe import (
+    get_moe_a2a_backend,
+    should_skip_post_experts_all_reduce,
+)
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -101,6 +104,7 @@ class HYV3MoEFused(nn.Module):
         super().__init__()
         self.tp_size = get_parallel().moe_tp_size
         self.ep_size = get_parallel().moe_ep_size
+        self.is_mori = get_moe_a2a_backend().is_mori()
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.n_routed_experts = config.num_experts
@@ -173,6 +177,18 @@ class HYV3MoEFused(nn.Module):
             return self._forward_dual_stream(hidden_states)
         return self._forward_single_stream(hidden_states)
 
+    def _reduce_mori_shared_output(self, shared_output: torch.Tensor) -> torch.Tensor:
+        # MoRI's combine already returns the full routed output replicated across
+        # ranks, so the blanket post-experts all-reduce is skipped (see
+        # should_skip_post_experts_all_reduce). The shared expert output is still a
+        # partial (shared_mlp uses reduce_results=False), so reduce it on its own
+        # over the same group(s) the blanket all-reduce would have used.
+        if self.ep_size > 1:
+            shared_output = moe_expert_parallel_all_reduce(shared_output)
+        if self.tp_size > 1:
+            shared_output = moe_tensor_model_parallel_all_reduce(shared_output)
+        return shared_output
+
     def _forward_single_stream(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
@@ -185,6 +201,8 @@ class HYV3MoEFused(nn.Module):
             final_hidden_states = self.experts(
                 hidden_states=hidden_states, topk_output=topk_output
             )
+            if self.is_mori:
+                shared_output = self._reduce_mori_shared_output(shared_output)
             final_hidden_states = final_hidden_states + shared_output
         else:
             final_hidden_states = self.experts(
@@ -224,6 +242,8 @@ class HYV3MoEFused(nn.Module):
             )
 
         current_stream.wait_stream(self.alt_stream)
+        if self.is_mori:
+            shared_output = self._reduce_mori_shared_output(shared_output)
         final_hidden_states = final_hidden_states + shared_output
 
         if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
