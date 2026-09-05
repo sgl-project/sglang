@@ -55,7 +55,6 @@ if TYPE_CHECKING:
         DispatchOutput,
         StandardDispatchOutput,
     )
-    from sglang.srt.server_args import ServerArgs
 
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUUnquantMoEMethod,
@@ -151,7 +150,7 @@ def should_enable_bf16_splitk_gemm(backend: Bf16GemmBackend) -> bool:
     return backend.is_optimized() and envs.SGLANG_ENABLE_BF16_SPLITK_GEMM.get()
 
 
-def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
+def initialize_bf16_gemm_config() -> None:
     global _BF16_GEMM_BACKEND
     global _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
     global _flashinfer_pr4266_splitk_tactic
@@ -161,7 +160,7 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
     global _flashinfer_pr4266_run_direct_dense
     global _enable_bf16_splitk_gemm
 
-    backend_str = server_args.bf16_gemm_backend
+    backend_str = get_exec().kernel.bf16_gemm_backend
     if backend_str == "auto" and get_platform().is_sm100:
         backend_str = (
             "torch"

@@ -17,6 +17,7 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     TranscriptionAdapter,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.runtime_context import get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import random_uuid
 
@@ -85,7 +86,7 @@ async def handle_realtime_transcription(
             websocket,
             "too_many_sessions",
             f"Maximum concurrent sessions reached "
-            f"({server_args.asr_max_concurrent_sessions}).",
+            f"({get_serving().asr_max_concurrent_sessions}).",
             error_type="rate_limit_exceeded",
         )
         return

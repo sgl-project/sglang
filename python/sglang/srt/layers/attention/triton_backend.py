@@ -175,7 +175,7 @@ class TritonAttnBackend(AttentionBackend):
         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
         # Work-Centric (Lean) Attention activation. None => auto-gate from host-side
         # seqlen metadata in forward_decode; True/False => explicit override.
-        self.enable_lean_attention = model_runner.server_args.enable_lean_attention
+        self.enable_lean_attention = get_exec().kernel.enable_lean_attention
         self._lean_decode_seqlen_gate = lean_decode_seqlen_gate
         self._lean_capture_policy = lean_capture_policy
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
@@ -333,9 +333,7 @@ class TritonAttnBackend(AttentionBackend):
             )
             self.static_kv_splits = False
         else:
-            self.split_tile_size = (
-                model_runner.server_args.triton_attention_split_tile_size
-            )
+            self.split_tile_size = get_exec().kernel.triton_attention_split_tile_size
 
         if self.split_tile_size is not None:
             self.max_kv_splits = (

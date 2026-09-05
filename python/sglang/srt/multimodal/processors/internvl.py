@@ -20,6 +20,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultiModalProcessorOutput,
     MultimodalSpecialTokens,
 )
+from sglang.srt.runtime_context import get_model
 from sglang.srt.utils import get_device
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
@@ -135,7 +136,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
         ).build(_image_processor)
 
         self.max_context_len = (
-            getattr(server_args, "context_length", None)
+            get_model().context_length
             or getattr(server_args, "max_context_len", None)
             or getattr(hf_config, "max_position_embeddings", None)
             or getattr(text_cfg, "max_position_embeddings", None)

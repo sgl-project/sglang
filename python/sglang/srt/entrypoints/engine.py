@@ -104,9 +104,11 @@ from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import (
+    get_device,
     get_disagg,
     get_exec,
     get_model,
+    get_observability,
     get_parallel,
     get_serving,
     publish,
@@ -315,7 +317,7 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Initialize ZMQ sockets
         context = zmq.Context(2)
-        if self.server_args.node_rank == 0:
+        if get_parallel().node_rank == 0:
             self.send_to_rpc = get_zmq_socket(
                 context, zmq.DEALER, self.port_args.rpc_ipc_name, True
             )
@@ -323,11 +325,11 @@ class Engine(EngineScoreMixin, EngineBase):
             self.send_to_rpc = None
 
         # Enable tracing
-        if server_args.enable_trace:
+        if get_observability().enable_trace:
             process_tracing_init(
-                server_args.otlp_traces_endpoint,
+                get_observability().otlp_traces_endpoint,
                 "sglang",
-                trace_modules=server_args.trace_modules,
+                trace_modules=get_observability().trace_modules,
             )
             thread_label = "Tokenizer"
             if get_disagg().disaggregation_mode == "prefill":
@@ -691,27 +693,27 @@ class Engine(EngineScoreMixin, EngineBase):
         # Multi-node needs an explicit rendezvous address; otherwise each node
         # picks its own local 127.0.0.1 port (below) and the per-node daemons
         # can never form the joint process group.
-        if server_args.nnodes > 1 and not server_args.dist_init_addr:
+        if get_parallel().nnodes > 1 and not get_parallel().dist_init_addr:
             raise ValueError(
                 "Multi-node weight cache daemons (nnodes > 1) require "
                 "--dist-init-addr so all nodes rendezvous at the same endpoint."
             )
 
-        tp_size = server_args.tp_size
+        tp_size = get_parallel().tp_size
 
         pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
             _calculate_rank_ranges(
-                server_args.nnodes,
+                get_parallel().nnodes,
                 get_parallel().pp_size,
                 tp_size,
-                server_args.node_rank,
+                get_parallel().node_rank,
             )
         )
 
         # Build the distributed init method (multi-node uses the user-provided
         # dist_init_addr so all nodes reach the same endpoint).
-        if server_args.dist_init_addr:
-            host, port = server_args.dist_init_addr.rsplit(":", 1)
+        if get_parallel().dist_init_addr:
+            host, port = get_parallel().dist_init_addr.rsplit(":", 1)
             dist_init_method = f"tcp://{host}:{port}"
         else:
             # Fresh free port for the daemons' own rendezvous, not the engine's
@@ -723,7 +725,7 @@ class Engine(EngineScoreMixin, EngineBase):
         daemon_procs = []
         logger.info(
             f"Launching {num_daemons} weight cache daemon(s) on node "
-            f"{server_args.node_rank} for model={get_model().model_path}, "
+            f"{get_parallel().node_rank} for model={get_model().model_path}, "
             f"pp_ranks={pp_rank_range.start}..{pp_rank_range.stop - 1}, "
             f"tp_ranks={tp_rank_range.start}..{tp_rank_range.stop - 1}, "
             f"dist_init_method={dist_init_method}"
@@ -738,8 +740,8 @@ class Engine(EngineScoreMixin, EngineBase):
                     tp_rank,
                     pp_size_per_node,
                     tp_size_per_node,
-                    base_gpu_id=server_args.base_gpu_id,
-                    gpu_id_step=server_args.gpu_id_step,
+                    base_gpu_id=get_device().base_gpu_id,
+                    gpu_id_step=get_device().gpu_id_step,
                 )
                 cleanup_stale_daemon_files(current_platform.get_device_uuid(gpu_id))
 
@@ -750,8 +752,8 @@ class Engine(EngineScoreMixin, EngineBase):
                     tp_rank,
                     pp_size_per_node,
                     tp_size_per_node,
-                    base_gpu_id=server_args.base_gpu_id,
-                    gpu_id_step=server_args.gpu_id_step,
+                    base_gpu_id=get_device().base_gpu_id,
+                    gpu_id_step=get_device().gpu_id_step,
                 )
                 proc = spawn_weight_cache_daemon(
                     server_args,
@@ -767,7 +769,7 @@ class Engine(EngineScoreMixin, EngineBase):
         # (readiness timeout or a daemon exiting early) terminate the siblings
         # we already spawned before propagating, so a partial launch does not
         # leak GPU-resident daemons.
-        timeout = server_args.weight_cache_timeout
+        timeout = get_model().weight_cache_timeout
         check_interval = 2
         start_time = time.time()
         try:
@@ -778,8 +780,8 @@ class Engine(EngineScoreMixin, EngineBase):
                         tp_rank,
                         pp_size_per_node,
                         tp_size_per_node,
-                        base_gpu_id=server_args.base_gpu_id,
-                        gpu_id_step=server_args.gpu_id_step,
+                        base_gpu_id=get_device().base_gpu_id,
+                        gpu_id_step=get_device().gpu_id_step,
                     )
                     ready_path = get_ready_path(
                         current_platform.get_device_uuid(gpu_id)
@@ -809,7 +811,7 @@ class Engine(EngineScoreMixin, EngineBase):
 
         logger.info(
             f"All {num_daemons} weight cache daemons on node "
-            f"{server_args.node_rank} are ready"
+            f"{get_parallel().node_rank} are ready"
         )
         return daemon_procs
 
@@ -864,16 +866,16 @@ class Engine(EngineScoreMixin, EngineBase):
         if not use_dp_controller:
             # Launch tensor parallel scheduler processes
             memory_saver_adapter = TorchMemorySaverAdapter.create(
-                enable=server_args.enable_memory_saver
+                enable=get_exec().features.enable_memory_saver
             )
             scheduler_pipe_readers = []
 
             pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
                 _calculate_rank_ranges(
-                    server_args.nnodes,
+                    get_parallel().nnodes,
                     get_parallel().pp_size,
-                    server_args.tp_size,
-                    server_args.node_rank,
+                    get_parallel().tp_size,
+                    get_parallel().node_rank,
                 )
             )
 
@@ -881,12 +883,12 @@ class Engine(EngineScoreMixin, EngineBase):
                 for tp_rank in tp_rank_range:
                     reader, writer = mp.Pipe(duplex=False)
                     gpu_id = (
-                        server_args.base_gpu_id
+                        get_device().base_gpu_id
                         + ((pp_rank % pp_size_per_node) * tp_size_per_node)
-                        + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+                        + (tp_rank % tp_size_per_node) * get_device().gpu_id_step
                     )
                     attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(
-                        server_args, tp_rank
+                        tp_rank
                     )
 
                     with maybe_reindex_device_id(gpu_id) as gpu_id:
@@ -1109,9 +1111,9 @@ class Engine(EngineScoreMixin, EngineBase):
             engine_info_bootstrap_server = None
             if (
                 get_model().remote_instance_weight_loader_start_seed_via_transfer_engine
-                and server_args.node_rank == 0
+                and get_parallel().node_rank == 0
             ):
-                bootstrap_port = server_args.engine_info_bootstrap_port
+                bootstrap_port = get_model().engine_info_bootstrap_port
                 if not is_port_available(bootstrap_port):
                     raise RuntimeError(
                         f"engine_info_bootstrap_port {bootstrap_port} is already in use. "
@@ -1119,13 +1121,13 @@ class Engine(EngineScoreMixin, EngineBase):
                         f"different --engine-info-bootstrap-port."
                     )
                 engine_info_bootstrap_server = EngineInfoBootstrapServer(
-                    host=server_args.host, port=bootstrap_port
+                    host=get_serving().host, port=bootstrap_port
                 )
 
             # Launch daemons (daemon mode only). The handles travel back to the
             # Engine that spawned them; shutdown() reaps from there.
             weight_cache_daemon_procs: List = []
-            if server_args.weight_cache_mode == "daemon":
+            if get_model().weight_cache_mode == "daemon":
                 weight_cache_daemon_procs = cls._launch_weight_cache_daemons(
                     server_args
                 )
@@ -1147,12 +1149,12 @@ class Engine(EngineScoreMixin, EngineBase):
         )
 
         if (
-            server_args.enable_elastic_expert_backup
-            and server_args.elastic_ep_backend is not None
+            get_exec().moe.enable_elastic_expert_backup
+            and get_exec().moe.elastic_ep_backend is not None
         ):
             run_expert_backup_manager(server_args, port_args)
 
-        if server_args.node_rank >= 1:
+        if get_parallel().node_rank >= 1:
             # Non-zero-rank nodes do not run tokenizer processes.
             scheduler_init_result.wait_for_ready()
 
@@ -1168,7 +1170,9 @@ class Engine(EngineScoreMixin, EngineBase):
                 )
 
             launch_dummy_health_check_server(
-                server_args.host, server_args.port, server_args.enable_metrics
+                get_serving().host,
+                get_serving().port,
+                get_observability().enable_metrics,
             )
 
             scheduler_init_result.block_until_scheduler_exits()
@@ -1215,7 +1219,7 @@ class Engine(EngineScoreMixin, EngineBase):
             scheduler_init_result.all_child_pids.append(p.pid)
 
         # Init tokenizer manager first, as the bootstrap server is initialized here
-        if server_args.tokenizer_worker_num == 1:
+        if get_serving().tokenizer_worker_num == 1:
             tokenizer_manager, template_manager = init_tokenizer_manager_func(
                 server_args, port_args
             )
@@ -1534,7 +1538,7 @@ class Engine(EngineScoreMixin, EngineBase):
         else:
             return [
                 MultiprocessingSerializer.serialize(tensors)
-                for _ in range(self.server_args.tp_size)
+                for _ in range(get_parallel().tp_size)
             ]
 
     def load_lora_adapter_from_tensors(
@@ -1866,16 +1870,14 @@ def _calculate_rank_ranges(
     return pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node
 
 
-def _compute_parallelism_ranks(
-    server_args: ServerArgs, tp_rank: int
-) -> Tuple[int, int, int]:
+def _compute_parallelism_ranks(tp_rank: int) -> Tuple[int, int, int]:
     """Compute attention-CP, MoE-DP, and MoE-EP ranks for a TP rank.
 
     Called while the launcher is deciding what to spawn, so the sizes are the
     configured ones -- the groups this is laying out do not exist yet.
     """
     attn_dp_size = get_parallel().dp_size if get_parallel().enable_dp_attention else 1
-    tp_size = server_args.tp_size
+    tp_size = get_parallel().tp_size
     attn_cp_size = get_parallel().attn_cp_size
     moe_dp_size = get_parallel().moe_dp_size
 

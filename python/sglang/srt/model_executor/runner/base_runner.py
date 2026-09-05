@@ -220,7 +220,7 @@ class BaseRunner(ABC):
         # elastic-EP scale-up rewrites dp_size on the published config
         self.dp_size = get_parallel().dp_size
         self.pp_size = get_parallel().pp_size
-        self.enable_pdmux = model_runner.server_args.enable_pdmux
+        self.enable_pdmux = get_disagg().enable_pdmux
         self.return_hidden_states_mode = (
             CaptureHiddenMode.NULL
             if model_runner.is_draft_worker
