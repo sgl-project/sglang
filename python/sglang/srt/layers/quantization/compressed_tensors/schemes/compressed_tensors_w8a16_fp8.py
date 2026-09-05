@@ -15,6 +15,9 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
+from sglang.srt.layers.quantization.marlin_utils import (
+    get_marlin_workspace_for_forward,
+)
 from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     apply_fp8_marlin_linear,
     prepare_fp8_layer_for_marlin,
@@ -129,7 +132,7 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
             input=x,
             weight=layer.weight,
             weight_scale=layer.weight_scale,
-            workspace=layer.workspace,
+            workspace=get_marlin_workspace_for_forward(layer),
             size_n=layer.output_size_per_partition,
             size_k=layer.input_size_per_partition,
             bias=bias,

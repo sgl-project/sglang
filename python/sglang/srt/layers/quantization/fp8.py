@@ -67,6 +67,9 @@ from sglang.srt.layers.quantization.fp8_utils import (
     resolve_mxfp8_dense_gemm_backend,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.marlin_utils import (
+    get_marlin_workspace_for_forward,
+)
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
@@ -998,7 +1001,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 input=x,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
-                workspace=layer.workspace,
+                workspace=get_marlin_workspace_for_forward(layer),
                 size_n=layer.output_size_per_partition,
                 size_k=layer.input_size_per_partition,
                 bias=bias,

@@ -44,6 +44,9 @@ from sglang.srt.layers.quantization.fp8_utils import (
     flashinfer_per_tensor_fp8_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.marlin_utils import (
+    get_marlin_workspace_for_forward,
+)
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     apply_fp4_marlin_linear,
     prepare_moe_nvfp4_layer_for_marlin,
@@ -641,7 +644,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 input=x,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
-                workspace=layer.workspace,
+                workspace=get_marlin_workspace_for_forward(layer),
                 size_n=layer.output_size_per_partition,
                 size_k=layer.input_size_per_partition,
                 bias=bias,
@@ -2001,7 +2004,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
                 weight_global_scale=layer.weight_global_scale,
-                workspace=layer.workspace,
+                workspace=get_marlin_workspace_for_forward(layer),
                 size_n=layer.output_size_per_partition,
                 size_k=layer.input_size_per_partition,
                 bias=bias,
@@ -2217,7 +2220,7 @@ class ModelOptNvFp4A16LinearMethod(LinearMethodBase):
             weight=layer.weight,
             weight_scale=layer.weight_scale,
             weight_global_scale=layer.weight_global_scale,
-            workspace=layer.workspace,
+            workspace=get_marlin_workspace_for_forward(layer),
             size_n=layer.output_size_per_partition,
             size_k=layer.input_size_per_partition,
             bias=bias,
