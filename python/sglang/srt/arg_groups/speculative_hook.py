@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.arg_groups.overrides import (
@@ -146,6 +147,19 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
                 "--speculative-draft-window-size has no effect with "
                 "speculative_algorithm=%s (honored by Llama EAGLE-3 and DFLASH only).",
                 cfg.speculative_algorithm,
+            )
+
+    if cfg.speculative_dspark_asd_config_path is not None:
+        if cfg.speculative_algorithm != "DSPARK":
+            raise ValueError(
+                "--speculative-dspark-asd-config-path is only supported with "
+                "speculative_algorithm == DSPARK, got "
+                f"{cfg.speculative_algorithm!r}."
+            )
+        if not Path(cfg.speculative_dspark_asd_config_path).is_file():
+            raise ValueError(
+                "--speculative-dspark-asd-config-path must be an existing "
+                f"JSON file, got {cfg.speculative_dspark_asd_config_path!r}."
             )
 
     algo = None
