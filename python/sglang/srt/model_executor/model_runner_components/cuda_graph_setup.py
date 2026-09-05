@@ -42,6 +42,8 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_flags,
+    get_model,
+    get_observability,
     get_parallel,
     get_schedule,
     get_spec,
@@ -260,10 +262,8 @@ def capture_cuda_graphs(
     # not traced into any captured graph — capture stays hook-free and hooks
     # fire only on the eager forward path (capture replay never runs Python
     # hooks anyway).
-    if model_runner.server_args.forward_hooks:
-        register_forward_hooks(
-            model_runner.model, model_runner.server_args.forward_hooks
-        )
+    if get_observability().forward_hooks:
+        register_forward_hooks(model_runner.model, get_observability().forward_hooks)
 
     prealloc_symmetric_memory_pool(
         is_draft_worker=model_runner.is_draft_worker,
@@ -516,7 +516,7 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
     if not model_runner.is_generation:
         # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
         return no_capture
-    if model_runner.server_args.model_impl.lower() == ModelImpl.MINDSPORE:
+    if get_model().model_impl.lower() == ModelImpl.MINDSPORE:
         return no_capture
     if model_runner.device != "cpu" and check_cuda_graph_backend(
         Phase.DECODE, Backend.DISABLED

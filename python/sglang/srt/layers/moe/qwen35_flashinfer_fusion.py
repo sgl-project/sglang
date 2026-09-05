@@ -18,7 +18,11 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_parallel,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +38,8 @@ def is_supported_forward_mode(forward_mode: ForwardMode) -> bool:
 def resolve_max_m(model_runner) -> int:
     """Use framework token bounds as the workspace-capacity source of truth."""
     server_args = resolving_view(model_runner.server_args)
-    decode_config = server_args.cuda_graph_config.decode
-    prefill_config = server_args.cuda_graph_config.prefill
+    decode_config = get_exec().graph.cuda_graph_config.decode
+    prefill_config = get_exec().graph.cuda_graph_config.prefill
     candidates = [
         cutedsl_moe_max_num_tokens(model_runner.server_args),
         model_runner.max_running_requests,
@@ -335,7 +339,7 @@ def prepare_qwen35_flashinfer_fusion(model, model_runner) -> None:
     service = getattr(model, "flashinfer_mnnvl_cutedsl_fusion", None)
     if service is None:
         return
-    if model_runner.server_args.enable_pdmux:
+    if get_disagg().enable_pdmux:
         raise RuntimeError(
             "FlashInfer MNNVL CuTe DSL fusion does not support concurrent PDMux "
             "streams sharing one mutable workspace"

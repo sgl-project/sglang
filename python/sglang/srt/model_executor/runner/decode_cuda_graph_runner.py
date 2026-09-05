@@ -229,7 +229,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # --- core state ------------------------------------------------
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
-        self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
+        self.disable_padding = get_exec().graph.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.require_mlp_tp_gather = (
             require_mlp_tp_gather() and not self._forward_is_dp_local(model_runner)
@@ -244,18 +244,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.require_mlp_sync = (
             get_parallel().enable_dp_attention or self.require_gathered_buffer
         )
-        self.enable_two_batch_overlap = (
-            model_runner.server_args.enable_two_batch_overlap
-        )
+        self.enable_two_batch_overlap = get_exec().overlap.enable_two_batch_overlap
         self.use_ngram_embedding = model_runner.ngram_embedding_manager.enabled
         if self.use_ngram_embedding:
             hf_config = model_runner.model_config.hf_config
             self.ngram_embedding_n = hf_config.ngram_embedding_n
             self.ngram_embedding_k = hf_config.ngram_embedding_k
         self.speculative_algorithm = get_spec().speculative_algorithm
-        self.enable_profile_cuda_graph = (
-            model_runner.server_args.enable_profile_cuda_graph
-        )
+        self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph
 
         # --- DSA dense-decode dual-graph -------------------------------
         # Capture a "dense" (k-only, skip-indexer) and a "sparse" (full indexer)
@@ -402,7 +398,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         enable_mamba_track = (
-            self.model_runner.server_args.enable_mamba_extra_buffer()
+            get_exec().mamba.enable_mamba_extra_buffer
             and self.model_runner.spec_algorithm.is_none()
         )
 
@@ -1067,7 +1063,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
-        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
+        with freeze_gc(get_exec().graph.enable_cudagraph_gc):
             if not self.enable_pdmux:
                 with (
                     graph_capture(

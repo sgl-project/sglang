@@ -186,11 +186,39 @@ def handle_cache_compatibility(server_args: Any) -> None:
                 "both build a decode host pool."
             )
 
+    handle_generic_kv_cache_ratios(server_args)
+
     # Validate the effective ratio: model branches may declare a reset
     # (e.g. Step3p forces 1.0 under hierarchical cache) that supersedes
     # the user input before it ever takes effect.
     if not (0 < resolved_view(server_args).swa_full_tokens_ratio <= 1.0):
         raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
+
+
+def handle_generic_kv_cache_ratios(server_args: Any) -> None:
+    """Supply the ratios nobody claimed.
+
+    Neither `swa_full_tokens_ratio` nor `mamba_full_memory_ratio` carries a
+    static default any more: `None` means the operator did not set it and no
+    model family declared one. Stating the value as a class default instead is
+    what made a family ask "is this field still the default?" -- a question
+    that stops being answerable the moment any other pass declares the field,
+    and that an operator who happens to type the default value gets the wrong
+    answer to.
+
+    Called from two slots, and idempotent because both arms test for `None`:
+    from `handle_cache_compatibility`, late enough that the model families have
+    had their say, and from the dummy-model short circuit, which returns long
+    before that and would otherwise leave the bags holding `None`.
+    """
+    generic: dict = {}
+    resolved = resolved_view(server_args)
+    if resolved.mamba_full_memory_ratio is None:
+        generic["mamba_full_memory_ratio"] = 0.9
+    if resolved.swa_full_tokens_ratio is None:
+        generic["swa_full_tokens_ratio"] = 0.8
+    if generic:
+        declare_resolution(server_args, "_handle_kv_cache_ratios", **generic)
 
 
 def handle_unified_memory_pool(server_args: Any) -> None:

@@ -990,7 +990,7 @@ class Scheduler(
         # Initialize GEMM-related configuration for FP8 and FP4 backends.
         initialize_fp8_gemm_config()
         initialize_fp4_gemm_config()
-        initialize_bf16_gemm_config(self.server_args)
+        initialize_bf16_gemm_config()
 
         # This must be called after initialize_moe_config
         self.require_mlp_sync = require_mlp_sync()
@@ -1090,7 +1090,7 @@ class Scheduler(
     def init_model_worker(self):
         # Load model weights.
         self.init_tp_model_worker()
-        if self.server_args.is_startup_weight_load_overlap:
+        if get_model().is_startup_weight_load_overlap:
             self.tp_worker.start_startup_weight_load()
         self.maybe_init_draft_worker()
 
@@ -1115,7 +1115,7 @@ class Scheduler(
             model_runner.post_capture_resize_kv_pool()
             self.kv_cache_allocation_time += time.perf_counter() - tic
 
-        if self.server_args.is_startup_weight_load_overlap:
+        if get_model().is_startup_weight_load_overlap:
             self.tp_worker.finalize_startup_weight_load()
 
         if (

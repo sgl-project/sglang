@@ -32,6 +32,8 @@ from test_multi_ended_allocator import (
 )
 
 from sglang.srt.mem_cache.allocator import unified_sub_pool as mea
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -51,6 +53,12 @@ def _paged_pair(lazy: bool):
 
 
 class TestHealthyLifecycleReportsClean(unittest.TestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_lazy_end_pool_clean_through_free_and_flush(self):
         full, _swa = _paged_pair(lazy=True)
         self.assertEqual(full._byte_accounting_violations(), [])
@@ -67,6 +75,12 @@ class TestDriftReportsLoudly(unittest.TestCase):
     the drifted sub-pool. Without these, a regression in any single counter
     passes every other test -- the pool still 'works', it just lies about
     capacity."""
+
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
     def _lazy_full(self):
         full, _swa = _paged_pair(lazy=True)
@@ -112,6 +126,12 @@ class TestDriftReportsLoudly(unittest.TestCase):
 
 
 class TestChainFrontierOrder(unittest.TestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_overlapping_frontiers_report(self):
         """Both bands hold pages, then the up member's watermark is pushed
         past the down member's LIVE low frontier. Both sides must be populated

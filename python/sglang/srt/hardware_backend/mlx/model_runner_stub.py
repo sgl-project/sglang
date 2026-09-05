@@ -19,7 +19,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     ModelLayerInfo,
 )
-from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
+from sglang.srt.runtime_context import get_exec, get_memory, get_model, get_schedule
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +119,7 @@ class MlxModelRunnerStub(ModelRunner):
 
     @staticmethod
     def validate_startup_weight_load_mode(server_args) -> None:
-        if server_args.is_startup_weight_load_overlap:
+        if get_model().is_startup_weight_load_overlap:
             raise ValueError(
                 "--startup-weight-load-mode=overlap is not supported: CUDA only"
             )

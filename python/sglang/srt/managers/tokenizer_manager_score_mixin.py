@@ -9,6 +9,7 @@ from sglang.srt.configs.model_config import is_cross_encoding_pooler_model
 from sglang.srt.constants import MIS_DELIMITER_TOKEN_ID
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.runtime_context import get_exec
 
 logger = logging.getLogger(__name__)
 
@@ -509,7 +510,7 @@ class TokenizerManagerScoreMixin:
                     )
 
         # Check if multi-item scoring is enabled
-        use_multi_item_scoring = self.server_args.enable_mis
+        use_multi_item_scoring = get_exec().features.enable_mis
 
         input_ids = None
         text_prompts = None
