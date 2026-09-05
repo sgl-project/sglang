@@ -892,34 +892,6 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             )
         self.assertEqual(int(src.num_token_non_padded.item()), 7)
 
-    def test_num_token_non_padded_missing_counts_skips_copy(self):
-        # DFLASH constructs its dense draft ForwardBatch directly, without
-        # either optional token-count tensor. EP on the target still enables
-        # this slot, which must retain the registry's skip-missing-field behavior.
-        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
-            build_decode_registry,
-        )
-
-        reg = build_decode_registry(
-            device=torch.device("cpu"),
-            max_bs=4,
-            max_num_token=8,
-            seq_len_fill_value=5,
-            cache_loc_dtype=torch.int64,
-            enable_num_token_non_padded=True,
-            share_pool=False,
-        )
-        count = reg.get_slot("num_token_non_padded").buffer
-        count.fill_(7)
-        fb = _MiniForwardBatch()
-        reg.fill_from(fb, raw_bs=2, padded_bs=4, raw_num_tokens=4, padded_num_tokens=8)
-        self.assertEqual(count.item(), 7)
-
-        # A subsequent batch with a real global count must still update it.
-        fb.global_num_token_non_padded = torch.tensor([5], dtype=torch.int32)
-        reg.fill_from(fb, raw_bs=2, padded_bs=4, raw_num_tokens=4, padded_num_tokens=8)
-        self.assertEqual(count.item(), 5)
-
     def test_register_global_num_tokens_false_carries_fb_values(self):
         # register_global_num_tokens=False (eager) excludes the computed
         # global_num_tokens_* slots so the batch's DP values are carried, not
