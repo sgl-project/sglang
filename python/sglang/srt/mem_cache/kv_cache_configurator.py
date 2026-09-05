@@ -103,6 +103,13 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 
+def _req_slot_capacity(req_to_token_pool: ReqToTokenPool) -> int:
+    """Return the non-padding request-slot domain of a request table."""
+    capacity = int(req_to_token_pool.req_to_token.shape[0]) - 1
+    assert capacity >= 0, "req_to_token must include its padding row"
+    return capacity
+
+
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     memory_config = get_memory()
     return (
@@ -1235,7 +1242,7 @@ class KVCacheConfigurator:
         elif self.use_mla_backend and is_dsa_model and not self.mambaish_config:
             token_to_kv_pool = self._build_dsa_kv_pool(
                 max_total_num_tokens=sizes.max_total_num_tokens,
-                max_running_requests=sizes.max_running_requests,
+                req_to_token_pool=req_to_token_pool,
             )
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_dsa_model
@@ -1525,7 +1532,7 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_dsa_kv_pool(
-        self, *, max_total_num_tokens: int, max_running_requests: int
+        self, *, max_total_num_tokens: int, req_to_token_pool: ReqToTokenPool
     ) -> KVCache:
         from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
 
@@ -1580,7 +1587,12 @@ class KVCacheConfigurator:
                 self.model_config.hf_config
             ),
             tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
-            max_running_requests=max_running_requests,
+            # KPool tails are indexed by req_pool_idx, not by the number of
+            # requests admitted to execution.  Disaggregated decode reserves
+            # additional in-transfer rows in DecodeReqToTokenPool, so size the
+            # tails for that complete slot domain (excluding padding row 0,
+            # which DSATokenToKVPool adds back).
+            max_running_requests=_req_slot_capacity(req_to_token_pool),
             **pool_kwargs,
         )
         return token_to_kv_pool
@@ -1811,7 +1823,7 @@ class KVCacheConfigurator:
                 if dsa_index_kpool > 1:
                     extra_args.update(
                         tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
-                        max_running_requests=(req_to_token_pool.req_to_token.shape[0]),
+                        max_running_requests=_req_slot_capacity(req_to_token_pool),
                     )
         quant_method = self._build_mha_quant_method(
             num_layers=len(full_attention_layer_ids)

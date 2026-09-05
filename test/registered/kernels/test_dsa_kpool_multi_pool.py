@@ -105,7 +105,14 @@ class TestDsaKpoolMultiPool(CustomTestCase):
             ),
         )
 
-    def _run_compress_case(self, effective_n: int, expected_closed_pools: int):
+    def _run_compress_case(
+        self,
+        effective_n: int,
+        expected_closed_pools: int,
+        *,
+        req_pool_idx: int = 0,
+        req_pool_size: int = 1,
+    ):
         torch.manual_seed(42)
         pool = self._pool()
         num_draft_tokens = self.NUM_DRAFT_TOKENS
@@ -120,7 +127,11 @@ class TestDsaKpoolMultiPool(CustomTestCase):
             self.POOL_SIZE, INDEX_HEAD_DIM, dtype=torch.float32, device="cuda"
         )
         tail_k_initial = torch.randn(
-            1, tail_size, INDEX_HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+            req_pool_size,
+            tail_size,
+            INDEX_HEAD_DIM,
+            dtype=torch.bfloat16,
+            device="cuda",
         )
         tail_score_initial = torch.randn_like(tail_k_initial)
 
@@ -128,8 +139,8 @@ class TestDsaKpoolMultiPool(CustomTestCase):
         tail_score_expected = tail_score_initial.clone()
         for i in range(num_draft_tokens):
             physical_slot = (write_start_value + i) % tail_size
-            tail_k_expected[0, physical_slot] = key[i]
-            tail_score_expected[0, physical_slot] = score[i]
+            tail_k_expected[req_pool_idx, physical_slot] = key[i]
+            tail_score_expected[req_pool_idx, physical_slot] = score[i]
 
         expected_cache = self._empty_cache()
         dummy_chunk = torch.zeros(
@@ -142,8 +153,11 @@ class TestDsaKpoolMultiPool(CustomTestCase):
             chunk_score=dummy_chunk,
             tail_k=tail_k_expected,
             tail_score=tail_score_expected,
-            req_pool_idx=torch.zeros(
-                expected_closed_pools, dtype=torch.int64, device="cuda"
+            req_pool_idx=torch.full(
+                (expected_closed_pools,),
+                req_pool_idx,
+                dtype=torch.int64,
+                device="cuda",
             ),
             n_from_tail=torch.full(
                 (expected_closed_pools,),
@@ -177,7 +191,9 @@ class TestDsaKpoolMultiPool(CustomTestCase):
             tail_k=tail_k_actual,
             tail_score=tail_score_actual,
             ape=ape,
-            req_pool_indices=torch.zeros(1, dtype=torch.int64, device="cuda"),
+            req_pool_indices=torch.tensor(
+                [req_pool_idx], dtype=torch.int64, device="cuda"
+            ),
             write_start=torch.tensor(
                 [write_start_value], dtype=torch.int32, device="cuda"
             ),
@@ -208,6 +224,13 @@ class TestDsaKpoolMultiPool(CustomTestCase):
     def test_effective_n_only_compresses_accepted_pools(self):
         self._run_compress_case(effective_n=2, expected_closed_pools=1)
 
+    def test_pd_decode_high_request_slot_writes_its_own_tail(self):
+        self._run_compress_case(
+            effective_n=self.NUM_DRAFT_TOKENS,
+            expected_closed_pools=2,
+            req_pool_idx=96,
+            req_pool_size=97,
+        )
 
 if __name__ == "__main__":
     unittest.main()
