@@ -1588,6 +1588,7 @@ def test_collected_mapped_weights_record_the_compute_stream(monkeypatch):
     manager._wrap_for_target = lambda _target, _tensor: target.data
     manager._courier_inflight = {0}
     manager._gpu_layers = set()
+    manager._debug_collect_wait_s = 0.0
 
     manager._collect_mapped_layer(0)
 
