@@ -11,10 +11,3 @@ class VocoderLoader(PlainStateDictComponentLoader):
     config_classes = {"vocoder": LTXVocoderConfig}
     default_precision_attr = "audio_vae_precision"
     default_dtype = torch.float32
-
-    def checkpoint_key_mapping(self, model_config):
-        return model_config.arch_config.param_names_mapping
-
-    def place_model(self, model, device, dtype):
-        # filter construction owns its precision independently of learned weights
-        return model.to(device=device)

@@ -11,6 +11,7 @@ import os
 import re
 from collections import defaultdict
 from collections.abc import Callable, Iterator
+from itertools import chain
 from typing import Any, Dict, Type
 
 import torch
@@ -43,6 +44,31 @@ def set_default_torch_dtype(dtype: torch.dtype):
         yield
     finally:
         torch.set_default_dtype(old_dtype)
+
+
+def initialize_model(
+    model_cls: type[nn.Module],
+    init_params: dict[str, Any],
+    dtype: torch.dtype,
+    device: torch.device | None = None,
+) -> nn.Module:
+    """Construct a checkpoint-backed module without initializing replaceable weights."""
+    with (
+        set_default_torch_dtype(dtype),
+        skip_init_modules(),
+        device if device is not None else contextlib.nullcontext(),
+    ):
+        return model_cls(**init_params)
+
+
+def finalize_loaded_model(model: nn.Module) -> nn.Module:
+    """Reject unmaterialized state and freeze parameters before inference."""
+    for name, tensor in chain(model.named_parameters(), model.named_buffers()):
+        if tensor.is_meta:
+            raise RuntimeError(f"Unexpected param or buffer {name} on meta device.")
+        if isinstance(tensor, nn.Parameter):
+            tensor.requires_grad = False
+    return model.eval()
 
 
 def get_param_names_mapping(
@@ -111,6 +137,8 @@ def hf_to_custom_state_dict(
     hf_param_sd: dict[str, torch.Tensor] | Iterator[tuple[str, torch.Tensor]],
     param_names_mapping: Callable[[str], tuple[str, Any, Any]],
     valid_target_names: set[str] | None = None,
+    *,
+    strict: bool = False,
 ) -> tuple[dict[str, torch.Tensor], dict[str, tuple[str, Any, Any]]]:
     """
     Converts a Hugging Face parameter state dictionary to a custom parameter state dictionary.
@@ -149,6 +177,10 @@ def hf_to_custom_state_dict(
             num_params_to_merge,
         )
         if merge_index is not None:
+            if strict and merge_index in to_merge_params[target_param_name]:
+                raise ValueError(
+                    f"Duplicate checkpoint slice for {target_param_name!r}"
+                )
             to_merge_params[target_param_name][merge_index] = full_tensor
             if len(to_merge_params[target_param_name]) == num_params_to_merge:
                 # cat at output dim according to the merge_index order
@@ -161,6 +193,8 @@ def hf_to_custom_state_dict(
             else:
                 continue
         existing_tensor = custom_param_sd.get(target_param_name)
+        if strict and existing_tensor is not None:
+            raise ValueError(f"Duplicate checkpoint mapping for {target_param_name!r}")
         if existing_tensor is not None and existing_tensor.dtype != full_tensor.dtype:
             existing_is_quantized = existing_tensor.dtype in _QUANTIZED_DTYPES
             current_is_quantized = full_tensor.dtype in _QUANTIZED_DTYPES
@@ -180,6 +214,8 @@ def hf_to_custom_state_dict(
                     full_tensor.dtype,
                 )
         custom_param_sd[target_param_name] = full_tensor
+    if strict and to_merge_params:
+        raise ValueError(f"Incomplete checkpoint slices for {sorted(to_merge_params)}")
     return custom_param_sd, reverse_param_names_mapping
 
 

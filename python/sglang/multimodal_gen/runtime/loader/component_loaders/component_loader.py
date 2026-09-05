@@ -5,7 +5,6 @@
 import importlib
 import os
 import pkgutil
-import re
 import traceback
 from abc import ABC
 from typing import Any, Type
@@ -32,11 +31,15 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
 from sglang.multimodal_gen.runtime.loader.utils import (
     _normalize_component_type,
     component_name_to_loader_cls,
+    finalize_loaded_model,
     format_component_residency,
     get_memory_usage_of_component,
-    load_safetensors_state_dict,
-    set_default_torch_dtype,
-    skip_init_modules,
+    get_param_names_mapping,
+    hf_to_custom_state_dict,
+    initialize_model,
+)
+from sglang.multimodal_gen.runtime.loader.weight_utils import (
+    checkpoint_weights_iterator,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     RESIDENT,
@@ -459,7 +462,7 @@ class ComponentLoader(ABC):
                 # a parallel capability declaration for FSDP support.
                 server_args.disable_fsdp_for_component(component_name)
             if isinstance(component, nn.Module):
-                component = component.eval()
+                component = finalize_loaded_model(component)
                 if (
                     not is_fsdp_managed_module(component)
                     and not self._native_load_manages_placement
@@ -746,32 +749,27 @@ class PlainStateDictComponentLoader(WeightOverrideComponentLoader):
         target_device = self.target_device(
             server_args.should_start_component_on_cpu(component_name)
         )
-        with set_default_torch_dtype(dtype), skip_init_modules():
-            model = (
-                model_cls(**model_config)
-                if isinstance(model_config, dict)
-                else model_cls(model_config)
-            )
-            model = self.place_model(model, target_device, dtype)
+        model = initialize_model(
+            model_cls,
+            model_config
+            if isinstance(model_config, dict)
+            else {"config": model_config},
+            dtype,
+        ).to(target_device)
 
-        state_dict = load_safetensors_state_dict(weights_path)
-        mapping = self.checkpoint_key_mapping(model_config)
-        if mapping:
-            remapped = {}
-            for name, tensor in state_dict.items():
-                # ordered rules can rename both a module and its nested buffer
-                for pattern, replacement in mapping.items():
-                    name = re.sub(pattern, replacement, name)
-                if name in remapped:
-                    raise ComponentCheckpointUnsupportedError(
-                        f"Checkpoint mapping for {component_name!r} produces "
-                        f"duplicate key {name!r}"
-                    )
-                remapped[name] = tensor
-            state_dict = remapped
         try:
+            state_dict, _ = hf_to_custom_state_dict(
+                checkpoint_weights_iterator(weights_path),
+                get_param_names_mapping(
+                    model_config.arch_config.param_names_mapping
+                    if isinstance(model_config, ModelConfig)
+                    else {}
+                ),
+                valid_target_names=set(model.state_dict()),
+                strict=True,
+            )
             missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        except RuntimeError as error:
+        except (RuntimeError, ValueError) as error:
             raise ComponentCheckpointUnsupportedError(
                 f"Cannot restore checkpoint for {component_name!r}: {error}"
             ) from error
@@ -800,12 +798,6 @@ class PlainStateDictComponentLoader(WeightOverrideComponentLoader):
             )
         except AttributeError:
             return self.default_dtype
-
-    def checkpoint_key_mapping(self, model_config) -> dict[str, str]:
-        return {}
-
-    def place_model(self, model: nn.Module, device: torch.device, dtype: torch.dtype):
-        return model.to(device=device, dtype=dtype)
 
     def validate_checkpoint_keys(
         self, missing: list[str], unexpected: list[str], component_name: str

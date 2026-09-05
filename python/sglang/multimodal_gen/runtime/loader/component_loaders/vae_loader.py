@@ -26,9 +26,9 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
     _normalize_component_type,
     checkpoint_bytes,
+    initialize_model,
     keep_checkpoint_mapped,
     set_default_torch_dtype,
-    skip_init_modules,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
@@ -664,21 +664,15 @@ class VAELoader(WeightOverrideComponentLoader):
             return vae
 
         # Load from ModelRegistry (standard VAE classes)
-        if direct_gpu_weight_loading:
-            with (
-                set_default_torch_dtype(vae_dtype),
-                skip_init_modules(),
-                torch.device("meta"),
-            ):
-                vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
-                vae = vae_cls(vae_config)
-        else:
-            with (
-                set_default_torch_dtype(vae_dtype),
-                skip_init_modules(),
-            ):
-                vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
-                vae = vae_cls(vae_config).to(target_device)
+        vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
+        vae = initialize_model(
+            vae_cls,
+            {"config": vae_config},
+            vae_dtype,
+            torch.device("meta") if direct_gpu_weight_loading else None,
+        )
+        if not direct_gpu_weight_loading:
+            vae = vae.to(target_device)
 
         if os.path.isfile(component_weights_path):
             if not component_weights_path.endswith(".safetensors"):

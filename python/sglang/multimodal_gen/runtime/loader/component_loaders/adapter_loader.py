@@ -16,6 +16,3 @@ class AdapterLoader(PlainStateDictComponentLoader):
         "connectors": LTX2ConnectorConfig,
         "duration_head": LTX2DurationHeadConfig,
     }
-
-    def checkpoint_key_mapping(self, model_config):
-        return model_config.arch_config.param_names_mapping

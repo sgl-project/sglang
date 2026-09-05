@@ -35,11 +35,13 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader 
     TextEncoderLoader,
     _configure_encoder_quantization,
     _get_encoder_quant_config,
-    _process_quantized_encoder_weights,
     _require_quantized_encoder_layers,
     _resolve_and_configure_encoder_quantization,
 )
 from sglang.multimodal_gen.runtime.loader.gguf_weights import GGUFTensorMeta
+from sglang.multimodal_gen.runtime.loader.weight_utils import (
+    checkpoint_weights_iterator,
+)
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     EncoderTensorParallelMixin,
     TextEncoder,
@@ -49,6 +51,9 @@ from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLEncoder,
 )
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLTextModel
+from sglang.multimodal_gen.runtime.utils.quantization_utils import (
+    process_model_weights_after_loading,
+)
 from sglang.srt.layers.linear import LinearBase as SrtLinearBase
 
 
@@ -59,22 +64,13 @@ class TestTextEncoderWeightDiscovery(unittest.TestCase):
             canonical = model_dir / "model.safetensors"
             variant = model_dir / "model.fp16.safetensors"
 
-            canonical.touch()
-            variant.touch()
+            weight = torch.ones(2, 2)
+            save_file({"weight": weight}, canonical)
+            save_file({"weight": weight.half()}, variant)
 
-            (
-                hf_folder,
-                weight_files,
-                use_safetensors,
-            ) = TextEncoderLoader()._prepare_weights(
-                str(model_dir),
-                fall_back_to_pt=True,
-                allow_patterns_overrides=None,
-            )
-
-            self.assertEqual(hf_folder, str(model_dir))
-            self.assertTrue(use_safetensors)
-            self.assertEqual(weight_files, [str(canonical)])
+            state = dict(checkpoint_weights_iterator(str(model_dir)))
+            self.assertEqual(state["weight"].dtype, torch.float32)
+            torch.testing.assert_close(state["weight"], weight)
 
 
 class TestTextEncoderClassResolution(unittest.TestCase):
@@ -757,7 +753,10 @@ class TestTextEncoderQuantization(unittest.TestCase):
                 ),
             ):
                 _resolve_and_configure_encoder_quantization(
-                    SimpleNamespace(architectures=[architecture], quant_config=None),
+                    SimpleNamespace(
+                        arch_config=SimpleNamespace(architectures=[architecture]),
+                        quant_config=None,
+                    ),
                     component_config,
                     "/model/text_encoder",
                     "/model/text_encoder",
@@ -791,7 +790,10 @@ class TestTextEncoderQuantization(unittest.TestCase):
         ):
             _resolve_and_configure_encoder_quantization(
                 SimpleNamespace(
-                    architectures=["ThirdPartyTextEncoder"], quant_config=None
+                    arch_config=SimpleNamespace(
+                        architectures=["ThirdPartyTextEncoder"]
+                    ),
+                    quant_config=None,
                 ),
                 {
                     "quantization_config": {
@@ -812,7 +814,10 @@ class TestTextEncoderQuantization(unittest.TestCase):
         ):
             _resolve_and_configure_encoder_quantization(
                 SimpleNamespace(
-                    architectures=["ThirdPartyTextEncoder"], quant_config=None
+                    arch_config=SimpleNamespace(
+                        architectures=["ThirdPartyTextEncoder"]
+                    ),
+                    quant_config=None,
                 ),
                 {
                     "quantization_config": {
@@ -887,10 +892,10 @@ class TestQuantizedTextEncoderPostprocess(unittest.TestCase):
         quant_method = _RecordingQuantMethod()
         model = _SRTQuantizedLinear(quant_method)
 
-        processed = _process_quantized_encoder_weights(
+        processed = process_model_weights_after_loading(
             model,
             torch.device("cpu"),
-            "image_encoder",
+            quantized_only=True,
         )
 
         self.assertEqual(processed, 1)
@@ -926,10 +931,10 @@ class TestQuantizedTextEncoderPostprocess(unittest.TestCase):
         quant_method = _RecordingQuantMethod()
         model = _QuantizedEncoder(quant_method)
 
-        processed = _process_quantized_encoder_weights(
+        processed = process_model_weights_after_loading(
             model,
             torch.device("cpu"),
-            "text_encoder",
+            quantized_only=True,
         )
 
         self.assertEqual(processed, 1)
@@ -941,10 +946,10 @@ class TestQuantizedTextEncoderPostprocess(unittest.TestCase):
         quant_method = _RecordingQuantMethod()
         model = _QuantizedEncoder(quant_method)
 
-        processed = _process_quantized_encoder_weights(
+        processed = process_model_weights_after_loading(
             model,
             torch.device("cuda", torch.cuda.current_device()),
-            "text_encoder",
+            quantized_only=True,
         )
 
         self.assertEqual(processed, 1)
@@ -957,10 +962,10 @@ class TestQuantizedTextEncoderPostprocess(unittest.TestCase):
         model = _QuantizedEncoder(_RecordingQuantMethod(error=RuntimeError("boom")))
 
         with self.assertRaisesRegex(RuntimeError, "boom"):
-            _process_quantized_encoder_weights(
+            process_model_weights_after_loading(
                 model,
                 torch.device("cuda", torch.cuda.current_device()),
-                "text_encoder",
+                quantized_only=True,
             )
 
         self.assertEqual(model.quantized.weight.device, torch.device("cpu"))

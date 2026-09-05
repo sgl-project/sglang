@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+from dataclasses import dataclass, field
 from unittest.mock import patch
 
 import pytest
@@ -14,6 +15,7 @@ from sglang.multimodal_gen.configs.models.adapter.ltx_2_connector import (
 from sglang.multimodal_gen.configs.models.adapter.ltx_2_duration_head import (
     LTX2DurationHeadConfig,
 )
+from sglang.multimodal_gen.configs.models.base import ArchConfig, ModelConfig
 from sglang.multimodal_gen.configs.models.decoders.ltx_2_5_diffusion_decoder import (
     LTX25DiffusionDecoderConfig,
 )
@@ -21,6 +23,7 @@ from sglang.multimodal_gen.configs.models.vocoder.ltx_vocoder import LTXVocoderC
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
     PipelineComponentLoader,
+    PlainStateDictComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import set_default_torch_dtype
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
@@ -173,6 +176,51 @@ class _DecoderOnly(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.decoder = nn.Linear(config["width"], 2)
+
+
+@dataclass
+class _MappedArch(ArchConfig):
+    param_names_mapping: dict = field(
+        default_factory=lambda: {
+            r"^q.weight$": ("proj.weight", 0, 2),
+            r"^k.weight$": ("proj.weight", 1, 2),
+        }
+    )
+
+
+@dataclass
+class _MappedConfig(ModelConfig):
+    arch_config: ArchConfig = field(default_factory=_MappedArch)
+
+
+class _MappedModule(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.proj = nn.Linear(2, 4, bias=False)
+
+
+@pytest.mark.parametrize("invalid", [None, "collision", "incomplete"])
+def test_plain_components_use_shared_fused_weight_mapping(tmp_path, invalid):
+    weights = {"q.weight": torch.ones(2, 2), "k.weight": torch.zeros(2, 2)}
+    if invalid == "collision":
+        weights["proj.weight"] = torch.ones(4, 2)
+    elif invalid == "incomplete":
+        weights.pop("k.weight")
+    _write_checkpoint(tmp_path, {"_class_name": "TestMappedModule"}, weights)
+    loader = PlainStateDictComponentLoader()
+    loader.config_classes = {"auxiliary": _MappedConfig}
+    args = ServerArgs(
+        model_path="x", component_residency={"auxiliary": "component-offload"}
+    )
+    with patch.dict(ModelRegistry.registered_models):
+        ModelRegistry.register_model("TestMappedModule", _MappedModule)
+        if invalid:
+            with pytest.raises(ComponentCheckpointUnsupportedError):
+                loader.load(str(tmp_path), args, "auxiliary", "diffusers")
+        else:
+            model, _ = loader.load(str(tmp_path), args, "auxiliary", "diffusers")
+            expected = torch.cat([weights["q.weight"], weights["k.weight"]]).bfloat16()
+            torch.testing.assert_close(model.proj.weight, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("invalid", [None, "missing", "unexpected", "shape"])
