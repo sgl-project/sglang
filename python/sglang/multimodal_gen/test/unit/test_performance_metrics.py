@@ -555,3 +555,36 @@ def test_warmup_peak_stays_out_of_the_runtime_peak():
         worker._record_output_peak_memory(SimpleNamespace(), is_warmup=False)
     assert worker._warmup_peak_reserved_mb == 40000.0
     assert worker._runtime_peak_reserved_mb == 20000.0
+
+
+def test_worker_releases_the_warmup_pool_once_before_serving(monkeypatch):
+    calls = []
+    fake_device = SimpleNamespace(empty_cache=lambda: calls.append("empty_cache"))
+    monkeypatch.setattr(
+        gpu_worker_module.torch, "get_device_module", lambda: fake_device
+    )
+    monkeypatch.setattr(type(current_platform), "is_cpu", lambda self: False)
+    monkeypatch.setattr(type(current_platform), "is_mps", lambda self: False)
+    worker = GPUWorker.__new__(GPUWorker)
+    worker._release_warmup_pool_before_serving = False
+
+    worker._release_warmup_pool(SimpleNamespace(is_warmup=True))
+    worker._release_warmup_pool(SimpleNamespace(is_warmup=True))
+    assert calls == []
+
+    worker._release_warmup_pool(SimpleNamespace(is_warmup=False))
+    worker._release_warmup_pool(SimpleNamespace(is_warmup=False))
+    assert calls == ["empty_cache"]
+
+
+def test_worker_does_not_release_a_pool_without_warmup(monkeypatch):
+    calls = []
+    fake_device = SimpleNamespace(empty_cache=lambda: calls.append("empty_cache"))
+    monkeypatch.setattr(
+        gpu_worker_module.torch, "get_device_module", lambda: fake_device
+    )
+    worker = GPUWorker.__new__(GPUWorker)
+    worker._release_warmup_pool_before_serving = False
+
+    worker._release_warmup_pool(SimpleNamespace(is_warmup=False))
+    assert calls == []
