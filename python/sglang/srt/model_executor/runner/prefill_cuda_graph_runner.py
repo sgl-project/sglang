@@ -124,6 +124,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.runtime_context import (
     get_exec,
+    get_flags,
     get_memory,
     get_parallel,
     get_schedule,
@@ -845,9 +846,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # DSV4 DP attention / DeepEP collectives need every DP rank to enter
         # the same replay path. Sparse-DP batches (one or more ranks with
         # zero local tokens) fall back to eager to avoid hanging ranks.
-        # MegaMoE is exempt (prefill_graph_tolerates_sum_len): its idle ranks
-        # still execute MegaMoE with 0 tokens, so per-rank SUM_LEN buckets stay
-        # collective-safe and need no eager fallback.
+        # MegaMoE graphs without a captured DP gather tolerate per-rank buckets
+        # and an eager idle rank; graphs with one fall through to the check.
         global_num_tokens = forward_batch.global_num_tokens_cpu
         if global_num_tokens is None:
             return False
@@ -1410,13 +1410,23 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
-        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
-            with graph_capture(
-                stream=get_or_create_global_graph_capture_stream()
-            ) as graph_capture_context:
-                self.stream = graph_capture_context.stream
-                with self.backend.capture_session(self.stream):
-                    self._capture_one_stream()
+        dp_flags = get_flags().dp
+        dp_flags.capturing_prefill_graph = True
+        try:
+            with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
+                with graph_capture(
+                    stream=get_or_create_global_graph_capture_stream()
+                ) as graph_capture_context:
+                    self.stream = graph_capture_context.stream
+                    with self.backend.capture_session(self.stream):
+                        self._capture_one_stream()
+        finally:
+            dp_flags.capturing_prefill_graph = False
+        if dp_flags.prefill_graph_has_dp_gather:
+            logger.info(
+                "Prefill CUDA graph captured a DP gather/scatter; "
+                "DP ranks will replay a shared MAX_LEN bucket."
+            )
 
     def _capture_one_stream(self) -> None:
         avail_mem = get_available_gpu_memory(

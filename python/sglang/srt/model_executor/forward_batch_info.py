@@ -53,6 +53,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_flags,
     get_lora,
     get_parallel,
 )
@@ -301,12 +302,18 @@ def compute_local_num_token_non_padded_cpu(
 
 
 def prefill_graph_tolerates_sum_len() -> bool:
-    """Whether MegaMoE may replay prefill graphs with local shapes."""
+    """Whether MegaMoE may replay prefill graphs with per-rank SUM_LEN buckets.
+
+    The graph body is captured with MAX_LEN geometry, so a graph that recorded
+    a DP gather/scatter only replays correctly when every rank uses one bucket.
+    """
     from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
     from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 
     if not get_moe_a2a_backend().is_megamoe():
+        return False
+    if get_flags().dp.prefill_graph_has_dp_gather:
         return False
     return not (is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled())
 
