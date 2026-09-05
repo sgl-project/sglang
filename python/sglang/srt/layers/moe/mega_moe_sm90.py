@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -23,8 +23,6 @@ from sglang.srt.models.deepseek_common.utils import _device_sm
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
-
-    from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
 
 def is_sm90_fp8_mega_moe_available(experts) -> bool:
@@ -42,19 +40,18 @@ def is_sm90_fp8_mega_moe_available(experts) -> bool:
 
 
 def run_sm90_mega_routed(
-    moe: DeepseekV2MoE,
+    experts,
     hidden_states: torch.Tensor,
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     buf: SymmBuffer,
     num_tokens: int,
+    *,
+    hidden_size: int,
+    activation_clamp: Optional[float] = None,
+    routed_scaling_factor: float = 1.0,
 ) -> torch.Tensor:
     import deep_gemm
-
-    if moe.experts.should_fuse_routed_scaling_factor_in_topk:
-        routed_scaling_factor = 1.0
-    else:
-        routed_scaling_factor = float(moe.routed_scaling_factor)
 
     deep_gemm.mega_moe_pre_dispatch_sm90(
         hidden_states,
@@ -70,18 +67,18 @@ def run_sm90_mega_routed(
     )
 
     y = torch.empty(
-        (max(num_tokens, 1), moe.config.hidden_size),
+        (max(num_tokens, 1), hidden_size),
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
     deep_gemm.fp8_mega_moe(
         y,
-        moe.experts.mega_l1_weights,
-        moe.experts.mega_l2_weights,
+        experts.mega_l1_weights,
+        experts.mega_l2_weights,
         buf,
         recipe=(128, 128, 128),
         activation="swiglu",
-        activation_clamp=getattr(moe.config, "swiglu_limit", None),
+        activation_clamp=activation_clamp,
         fast_math=True,
     )
     y = y[:num_tokens]
