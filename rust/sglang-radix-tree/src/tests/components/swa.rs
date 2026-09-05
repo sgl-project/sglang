@@ -547,6 +547,7 @@ fn insert_params_swa<'k>(
         swa_evicted_seqlen,
         chunked: false,
         priority: 0,
+        session_id: None,
         track_adopted_ranges: false,
     }
 }

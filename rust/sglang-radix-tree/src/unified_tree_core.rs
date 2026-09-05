@@ -100,6 +100,9 @@ pub struct InsertParams<'k, K: ChildKeyType> {
     pub key: &'k K,
     /// Namespace of the insert; picks the matching subtree root.
     pub namespace: KeyNamespaceRef<'k>,
+    /// Request session attributed to newly stored blocks. This is event metadata only;
+    /// it does not participate in tree matching or block hashing.
+    pub session_id: Option<&'k str>,
     /// Device KV indices covering the key, one row per atom.
     pub value: Tensor,
     /// Tokens of this request already cached before the insert (the duplicate
@@ -1287,20 +1290,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &mut self,
         params: &InsertParams<'_, K>,
     ) -> Result<InsertResult, TreeCoreRuntimeError> {
-        self.try_insert_with_session_id(params, None)
-    }
-
-    /// Fallible insert with optional request-session attribution for store events.
-    /// The session ID is deliberately not part of the tree namespace or block hash.
-    pub fn try_insert_with_session_id(
-        &mut self,
-        params: &InsertParams<'_, K>,
-        session_id: Option<&str>,
-    ) -> Result<InsertResult, TreeCoreRuntimeError> {
         // Single-shot pump over the resumable walk: run every step inline and
         // fold the step actions into the result for the caller to apply.
         let mut actions = Vec::new();
-        let mut step = self.try_begin_insert_with_session_id(params, session_id)?;
+        let mut step = self.try_begin_insert(params)?;
         loop {
             actions.append(&mut step.actions);
             if let Some(mut result) = step.result {
@@ -1321,15 +1314,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     pub fn try_begin_insert(
         &mut self,
         params: &InsertParams<'_, K>,
-    ) -> Result<InsertStepResult, TreeCoreRuntimeError> {
-        self.try_begin_insert_with_session_id(params, None)
-    }
-
-    /// Fallible resumable insert with optional request-session event attribution.
-    pub fn try_begin_insert_with_session_id(
-        &mut self,
-        params: &InsertParams<'_, K>,
-        session_id: Option<&str>,
     ) -> Result<InsertStepResult, TreeCoreRuntimeError> {
         // Insert walks are single-flight; a live walk means re-entrancy.
         if self.ongoing_insert_walk_state.is_some() {
@@ -1373,7 +1357,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             aligned_key_len,
             value: params.value.narrow(0, 0, aligned_key_len as i64),
             namespace: params.namespace.to_owned(),
-            session_id: session_id.map(Arc::from),
+            session_id: params.session_id.map(Arc::from),
             prev_prefix_len: params.prev_prefix_len,
             swa_evicted_seqlen: params.swa_evicted_seqlen,
             mamba_value: params.mamba_value.as_ref().map(Tensor::shallow_clone),
@@ -1498,6 +1482,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let params = InsertParams {
             key: &state.key,
             namespace: state.namespace.as_ref(),
+            session_id: state.session_id.as_deref(),
             value: state.value.shallow_clone(),
             prev_prefix_len: state.prev_prefix_len,
             swa_evicted_seqlen: state.swa_evicted_seqlen,
@@ -1650,6 +1635,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let params = InsertParams {
             key: &state.key,
             namespace: state.namespace.as_ref(),
+            session_id: state.session_id.as_deref(),
             value: state.value.shallow_clone(),
             prev_prefix_len: state.prev_prefix_len,
             swa_evicted_seqlen: state.swa_evicted_seqlen,

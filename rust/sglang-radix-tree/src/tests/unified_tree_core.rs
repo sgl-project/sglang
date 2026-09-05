@@ -1824,6 +1824,7 @@ fn insert_params<'k>(key: &'k Vec<i64>, value: &[i64]) -> InsertParams<'k, Vec<i
         swa_evicted_seqlen: 0,
         chunked: false,
         priority: 0,
+        session_id: None,
         track_adopted_ranges: false,
     }
 }
@@ -2386,6 +2387,32 @@ fn insert_coalesces_parent_linked_block_stores() {
 }
 
 #[test]
+fn insert_attributes_stored_blocks_to_session_without_changing_hashes() {
+    let mut tc = events_core(2);
+    let key = vec![1, 2, 7, 8];
+    let mut params = insert_params(&key, &[10, 11, 12, 13]);
+    params.session_id = Some("session-a");
+    tc.insert(&params);
+
+    let hashes = crate::node::get_hash_str::<Vec<i64>>(&key, None, 2);
+    assert_eq!(
+        tc.take_events(),
+        vec![KvCacheEvent::BlockStored {
+            block_hashes: hashes
+                .iter()
+                .map(|hash| crate::node::hash_str_to_int64(hash))
+                .collect(),
+            parent_block_hash: None,
+            token_ids: key,
+            block_size: 2,
+            medium: StorageMedium::Gpu,
+            cache_salt: None,
+            session_id: Some(Arc::from("session-a")),
+        }]
+    );
+}
+
+#[test]
 fn salted_event_hashes_are_sparse_and_removed_with_the_node() {
     let mut tc = events_core(2);
     let key = vec![1, 2, 7, 8];
@@ -2639,6 +2666,7 @@ fn bigram_insert_events_carry_pair_token_payloads() {
         swa_evicted_seqlen: 0,
         chunked: false,
         priority: 0,
+        session_id: None,
         track_adopted_ranges: false,
     });
     let hashes = crate::node::get_hash_str::<Vec<(i64, i64)>>(&key, None, 1);
@@ -7585,6 +7613,7 @@ fn sequence_insert_params<'k>(
         swa_evicted_seqlen: 0,
         chunked: false,
         priority: 0,
+        session_id: None,
         track_adopted_ranges: false,
     }
 }

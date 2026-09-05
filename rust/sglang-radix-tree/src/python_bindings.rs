@@ -999,13 +999,13 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             Some(mamba_value) => Some(mamba_value.bind(py).extract::<PyTensor>()?.0),
             None => None,
         };
-        let session_id = params.session_id.as_deref();
         let params = InsertParams {
             key,
             namespace: KeyNamespaceRef::new(
                 params.extra_key.as_deref(),
                 params.cache_salt.as_deref(),
             ),
+            session_id: params.session_id.as_deref(),
             value: value.0,
             mamba_value,
             prev_prefix_len: params.prev_prefix_len,
@@ -1015,7 +1015,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             track_adopted_ranges: params.track_adopted_ranges,
         };
         let result = py
-            .allow_threads(move || self.core().try_insert_with_session_id(&params, session_id))
+            .allow_threads(move || self.core().try_insert(&params))
             .map_err(tree_core_runtime_error)?;
         InsertResultBinding::from_insert_result(py, result)
     }
@@ -1035,13 +1035,13 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             Some(mamba_value) => Some(mamba_value.bind(py).extract::<PyTensor>()?.0),
             None => None,
         };
-        let session_id = params.session_id.as_deref();
         let params = InsertParams {
             key,
             namespace: KeyNamespaceRef::new(
                 params.extra_key.as_deref(),
                 params.cache_salt.as_deref(),
             ),
+            session_id: params.session_id.as_deref(),
             value: value.0,
             mamba_value,
             prev_prefix_len: params.prev_prefix_len,
@@ -1051,10 +1051,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             track_adopted_ranges: params.track_adopted_ranges,
         };
         let step = py
-            .allow_threads(move || {
-                self.core()
-                    .try_begin_insert_with_session_id(&params, session_id)
-            })
+            .allow_threads(move || self.core().try_begin_insert(&params))
             .map_err(tree_core_runtime_error)?;
         InsertStepResultBinding::from_insert_step(py, step)
     }
