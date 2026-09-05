@@ -23,6 +23,7 @@
 // the paper workload; the injection error is dominated by cond(M) in both implementations).
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
+
 #include <sgl_kernel/utils.cuh>
 
 #include <cstdint>
@@ -33,30 +34,38 @@ namespace vdn_delta_factors {
 
 namespace {
 
-constexpr int kDim = 128;             // dk == dv == 128
-constexpr int kBlockSize = 256;       // 16 x 16 tiles of 8 x 8
-constexpr int kMinBlocksPerSm = 2;    // 128 registers per thread
+constexpr int kDim = 128;                                                // dk == dv == 128
+constexpr int kBlockSize = 256;                                          // 16 x 16 tiles of 8 x 8
+constexpr int kMinBlocksPerSm = 2;                                       // 128 registers per thread
 constexpr int kXsBytes = kDim * kDim * static_cast<int>(sizeof(float));  // 64 KB dynamic smem
 constexpr unsigned kFullMask = 0xffffffffu;
 
 // thread tj's tile columns 8tj..8tj+3 land at 4tj.., 8tj+4..8tj+7 at 64+4tj.., so a quarter warp
 // reads 8 consecutive 16-byte chunks
-SGL_DEVICE int swz_lo(int tj) { return 4 * tj; }
-SGL_DEVICE int swz_hi(int tj) { return 64 + 4 * tj; }
+SGL_DEVICE int swz_lo(int tj) {
+  return 4 * tj;
+}
+SGL_DEVICE int swz_hi(int tj) {
+  return 64 + 4 * tj;
+}
 
 SGL_DEVICE float rcp_nr(float p) {
   float r;
   asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(p));
   return fmaf(r, fmaf(-p, r, 1.f), r);  // one Newton step: ~0.5 ulp
 }
-SGL_DEVICE float4 ld4(const float* p) { return *reinterpret_cast<const float4*>(p); }
+SGL_DEVICE float4 ld4(const float* p) {
+  return *reinterpret_cast<const float4*>(p);
+}
 SGL_DEVICE void st4(float* p, float a, float b, float c, float d) {
   *reinterpret_cast<float4*>(p) = make_float4(a, b, c, d);
 }
 SGL_DEVICE void st4(float* p, float2 a, float2 b) {
   *reinterpret_cast<float4*>(p) = make_float4(a.x, a.y, b.x, b.y);
 }
-SGL_DEVICE float2 f2(float a) { return make_float2(a, a); }
+SGL_DEVICE float2 f2(float a) {
+  return make_float2(a, a);
+}
 // packed fma: (a.x*b.x+c.x, a.y*b.y+c.y); one FFMA2 on sm_100+ (the first operand is a scalar
 // broadcast in SASS), two FFMA elsewhere.  Bitwise identical results either way.
 SGL_DEVICE float2 fma2(float2 a, float2 b, float2 c) {
@@ -97,7 +106,8 @@ SGL_DEVICE void prepare(float2 (&t)[8][4], Smem& sm, int kt1, int ti, int tj, in
       if (!band) t[r][CP] = make_float2(0.f, 0.f);
     }
 #pragma unroll
-    for (int q = 0; q < 4; ++q) st4(dst + 4 * q, g[2 * q], g[2 * q + 1]);
+    for (int q = 0; q < 4; ++q)
+      st4(dst + 4 * q, g[2 * q], g[2 * q + 1]);
   }
   if (ti == kt1) {
     const float det = fmaf(pa, pd, -pb * pc);
@@ -255,13 +265,15 @@ __global__ void __launch_bounds__(kBlockSize, kMinBlocksPerSm) vdn_delta_factors
 #pragma unroll
   for (int r = 0; r < 8; ++r)
 #pragma unroll
-    for (int cp = 0; cp < 4; ++cp) t[r][cp] = make_float2(0.f, 0.f);
+    for (int cp = 0; cp < 4; ++cp)
+      t[r][cp] = make_float2(0.f, 0.f);
   const float* Bp = Bn + i0 * kDim;
 #pragma unroll 1
   for (int k = 0; k < kDim; k += 4) {
     float4 b[8];
 #pragma unroll
-    for (int r = 0; r < 8; ++r) b[r] = __ldg(reinterpret_cast<const float4*>(Bp + r * kDim + k));
+    for (int r = 0; r < 8; ++r)
+      b[r] = __ldg(reinterpret_cast<const float4*>(Bp + r * kDim + k));
 #pragma unroll
     for (int kk = 0; kk < 4; ++kk) {
       const float* xr = Xs + (k + kk) * kDim;
@@ -272,7 +284,8 @@ __global__ void __launch_bounds__(kBlockSize, kMinBlocksPerSm) vdn_delta_factors
       for (int r = 0; r < 8; ++r) {
         const float2 bv = f2(get(b[r], kk));
 #pragma unroll
-        for (int cp = 0; cp < 4; ++cp) t[r][cp] = fma2(bv, xv[cp], t[r][cp]);
+        for (int cp = 0; cp < 4; ++cp)
+          t[r][cp] = fma2(bv, xv[cp], t[r][cp]);
       }
     }
   }
@@ -299,8 +312,8 @@ struct VdnDeltaFactorsKernel {
    * \param B          [N, 128, 128] fp32
    * \param alpha      [N, 128] fp32
    */
-  static void run(
-      tvm::ffi::TensorView transition,
+  static void
+  run(tvm::ffi::TensorView transition,
       tvm::ffi::TensorView injection,
       tvm::ffi::TensorView A,
       tvm::ffi::TensorView B,
@@ -330,8 +343,7 @@ struct VdnDeltaFactorsKernel {
     const int dev_id = dev.device_id;
     CHECK_HOST(dev_id >= 0 && dev_id < 64) << "vdn_delta_factors: unexpected device id " << dev_id;
     if (!attr_set[dev_id]) {
-      CHECK_CUDA(cudaFuncSetAttribute(
-          vdn_delta_factors_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kXsBytes))
+      CHECK_CUDA(cudaFuncSetAttribute(vdn_delta_factors_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kXsBytes))
           << "vdn_delta_factors: cannot reserve " << kXsBytes << " bytes of dynamic shared memory";
       attr_set[dev_id] = true;
     }

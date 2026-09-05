@@ -40,6 +40,8 @@ def _layer(in_f: int, out_f: int, bias: bool):
 
 
 def test_mxfp8_linear_matches_bf16_and_accepts_prequantized() -> None:
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("cuBLASLt MXFP8 block scaling requires Blackwell or newer")
     _init_parallel()
     from sglang.kernels.ops.diffusion import silu_mul_mxfp8
 
@@ -65,6 +67,25 @@ def test_mxfp8_linear_matches_bf16_and_accepts_prequantized() -> None:
     out_tensor, _ = layer(act)
     out_tuple, _ = layer(silu_mul_mxfp8(hidden))
     assert torch.equal(out_tensor, out_tuple)
+
+
+def test_pre_blackwell_aligned_layer_falls_back_to_channelwise() -> None:
+    if torch.cuda.get_device_capability()[0] >= 10:
+        pytest.skip("requires a pre-Blackwell GPU")
+    _init_parallel()
+    layer = _layer(512, 384, bias=False)
+    g = torch.Generator(device="cpu").manual_seed(1)
+    weight = (torch.randn(384, 512, generator=g) * 0.02).to("cuda", torch.bfloat16)
+    with torch.no_grad():
+        layer.weight.copy_(weight)
+    layer.quant_method.process_weights_after_loading(layer)
+    assert not layer.mxfp8
+    assert not layer.quant_method.accepts_mxfp8_input(layer)
+    x = torch.randn(200, 512, generator=g).to("cuda", torch.bfloat16)
+    out, _ = layer(x)
+    ref = x.float() @ weight.float().t()
+    rel = ((out.float() - ref).norm() / ref.norm()).item()
+    assert rel < 0.05, rel
 
 
 def test_unaligned_layer_falls_back_to_channelwise() -> None:
