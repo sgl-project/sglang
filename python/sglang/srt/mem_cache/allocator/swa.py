@@ -84,9 +84,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 swa_kv_pool,
                 need_sort,
             )
-        # Note: append one more item of value -1 in the end so -1 maps to -1.
-        # It is needed for the last_loc in alloc_extend, where the first full_last_loc
-        # is -1, and we need to map it to swa_last_loc -1 as well.
+        # Trailing -1: a last_loc of -1 (no prefix) indexes it, so alloc_extend and
+        # alloc_decode see -1 on the SWA side as well.
         self.full_to_swa_index_mapping = torch.cat(
             [
                 torch.zeros(
@@ -233,12 +232,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         extend_num_tokens: int,
         swa_tail_len: int,
     ):
-        """Allocate full KV for the whole extend and SWA KV only for the tail.
-
-        This is used by disaggregated decode preallocation: decode receives full
-        prompt KV for full-attention layers, but only the sliding-window state is
-        transferred for SWA layers.
-        """
+        """Allocate full KV for the whole extend and SWA KV only for the tail."""
         assert self.page_size > 1
         assert len(seq_lens_cpu) == 1, "SWA tail allocation currently supports bs=1"
         assert len(prefix_lens_cpu) == 1
@@ -334,10 +328,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:
-        """Write full_to_swa_index_mapping[full_indices[i]] = swa_indices[i].
-
-        Used by HiCache load-back path to rebuild the mapping after FULL and SWA device alloc.
-        """
         if full_indices.numel() == 0:
             return
         assert full_indices.numel() == swa_indices.numel()

@@ -64,6 +64,7 @@ fn config() -> Config {
                 idle_secs: 3600,
                 eviction_interval_secs: 3600,
             }),
+            affinity: None,
             fused: None,
             eligibility: None,
         },
