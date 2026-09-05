@@ -817,7 +817,11 @@ statistics prologue, gated RMSNorm epilogue). On Blackwell (SM100 / SM103,
 and SM120 such as the RTX PRO 6000) the transformer defaults to online MXFP8
 (`--quantization fp8` selects it too, `--quantization bf16` opts out); the
 gates, beta, alpha and the conv stay bf16. Before SM100 `--quantization fp8`
-is the per-channel fp8 path of base H3. Ulysses sequence parallelism is supported;
+is the per-channel fp8 path of base H3 (SM89 and SM90); SM80 has no fp8
+tensor cores, so it runs the bf16 DiT (62 GB, budget for
+`--layerwise-offload-components` or `--dit-layerwise-offload`). Ampere and
+Ada run the window on FA3's Sm80 mainloop, which is FA2-class throughput; they
+are enabled but not benchmarked. Ulysses sequence parallelism is supported;
 `--model-variant`, `quality: "high"`, `--ring-degree` greater than 1,
 `torch.compile`, and breakable CUDA graph execution are rejected. See
 [Attention Backends](/docs/sglang-diffusion/attention_backends) for the

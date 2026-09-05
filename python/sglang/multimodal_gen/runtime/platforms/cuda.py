@@ -289,9 +289,21 @@ class _VideoSparseAttentionH3BackendResolver(_CudaAttentionBackendResolver):
 class _HybridWindowAttentionH3BackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3
 
-    # The window rides FlashAttention varlen (FA3 on Hopper, FA4 on Blackwell).
-    # SM120 (RTX PRO 6000 Blackwell) runs FA4's sm120 forward kernel.
-    supported_capabilities = {(9, 0), (10, 0), (10, 3), (12, 0)}
+    # The window rides FlashAttention varlen: FA4 on Blackwell (SM100 / SM103,
+    # and SM120 through the sm120 forward kernel), FA3 on Hopper. Ampere and
+    # Ada (SM80 / SM86 / SM89) take sgl-kernel's FA3 build as well, which
+    # carries the Sm80 collective mainloop (mma.sync, FA2-class throughput)
+    # for those targets; head dim 128 is within its range. bf16 only on SM80
+    # (no fp8 tensor cores), so budget the 62 GB DiT accordingly.
+    supported_capabilities = {
+        (8, 0),
+        (8, 6),
+        (8, 9),
+        (9, 0),
+        (10, 0),
+        (10, 3),
+        (12, 0),
+    }
 
     @classmethod
     def resolve(cls, platform) -> str:
@@ -302,9 +314,10 @@ class _HybridWindowAttentionH3BackendResolver(_CudaAttentionBackendResolver):
         if capability_tuple not in cls.supported_capabilities:
             found = capability.as_version_str() if capability else "unknown"
             raise ValueError(
-                "hybrid_window_attn_h3 (VDN-H3) needs compute capability 9.0 "
-                "(Hopper), 10.0 (B200 / GB200), 10.3 (B300 / GB300) or 12.0 "
-                f"(RTX PRO 6000 Blackwell); this device reports {found}."
+                "hybrid_window_attn_h3 (VDN-H3) needs compute capability 8.0 / "
+                "8.6 / 8.9 (Ampere, Ada), 9.0 (Hopper), 10.0 (B200 / GB200), "
+                "10.3 (B300 / GB300) or 12.0 (RTX PRO 6000 Blackwell); this "
+                f"device reports {found}."
             )
         if not platform._prepare_flash_attention_for_blackwell():
             raise RuntimeError(
