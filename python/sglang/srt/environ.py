@@ -1134,6 +1134,12 @@ class Envs:
     SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     # 0 lets ElasticBuffer select its theoretical communication SM/QP counts.
     SGLANG_DEEPEP_V2_NUM_SMS = EnvInt(0)
+    # Prefill: True uses DeepEP's expanded layout (skips ep_scatter); False uses
+    # the non-expand ep_scatter/ep_gather path.
+    SGLANG_DEEPEP_V2_PREFILL_DO_EXPAND = EnvBool(True)
+    # GPU-side ElasticBuffer barrier timeout (seconds); raise it so idle ranks
+    # tolerate the first-request JIT compile. 0 keeps DeepEP's default (100s).
+    SGLANG_DEEPEP_V2_GPU_TIMEOUT_SECS = EnvInt(0)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP = EnvBool(True)

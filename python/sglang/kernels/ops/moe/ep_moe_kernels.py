@@ -1318,6 +1318,8 @@ def ep_scatter_from_psum(
         output_index,
         output_index.stride(0),
         output_index.stride(1),
+        0,
+        num_experts,
         topk_num=recv_topk.shape[1],
         num_warps=num_warps,
         HIDDEN_SIZE=hidden_size,
@@ -2569,6 +2571,135 @@ def masked_slab_to_expand(
         num_warps=4,
     )
     return output_tensor
+
+
+@triton.jit
+def _fwd_kernel_fill_m_indices_from_psum(
+    psum_ptr,
+    m_indices_ptr,
+    total_rows,
+    num_local_experts,
+    ALIGN: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    # psum is the alignment-padded exclusive prefix sum; padding rows get a real
+    # expert id (not a sentinel) so every m_indices entry stays valid.
+    e = tl.program_id(0)
+    prev_end = tl.load(psum_ptr + e - 1, mask=e > 0, other=0)
+    start = ((prev_end + ALIGN - 1) // ALIGN) * ALIGN
+    end = tl.load(psum_ptr + e)
+    seg_end = ((end + ALIGN - 1) // ALIGN) * ALIGN
+    if e == num_local_experts - 1:
+        seg_end = total_rows
+    count = seg_end - start
+    off = tl.arange(0, BLOCK_M)
+    for base in tl.range(0, count, BLOCK_M):
+        idx = start + base + off
+        tl.store(m_indices_ptr + idx, e, mask=(base + off < count) & (idx < total_rows))
+
+
+@torch.no_grad()
+def fill_m_indices_from_psum(
+    psum_num_recv_tokens_per_expert: torch.Tensor,
+    num_local_experts: int,
+    total_rows: int,
+    expert_alignment: int,
+) -> torch.Tensor:
+    """Build contiguous-GEMM `m_indices` straight from the device psum.
+
+    deepep_v2 `do_expand=True` prefill path; the psum from DeepEP already is the
+    alignment-padded per-expert prefix sum, so this only labels rows (no cumsum,
+    no H2D, no hidden data moved).
+    """
+    m_indices = torch.empty(
+        (total_rows,),
+        device=psum_num_recv_tokens_per_expert.device,
+        dtype=torch.int32,
+    )
+    _fwd_kernel_fill_m_indices_from_psum[(num_local_experts,)](
+        psum_num_recv_tokens_per_expert,
+        m_indices,
+        total_rows,
+        num_local_experts,
+        ALIGN=expert_alignment,
+        BLOCK_M=128,
+        num_warps=4,
+    )
+    return m_indices
+
+
+@triton.jit
+def _fwd_kernel_scale_expanded_rows(
+    x_ptr,
+    x_stride0,
+    x_stride1,
+    weight_ptr,
+    HIDDEN: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    HIDDEN_IS_MULTIPLE: tl.constexpr,
+):
+    # In-place row scaling x[r,:] *= weight[r]; x_stride1 handles column-major
+    # views like the transposed fp8 down_input scale (hidden axis not unit-stride).
+    row = tl.program_id(0).to(tl.int64)
+    blk = tl.program_id(1)
+
+    offs = blk * BLOCK_H + tl.arange(0, BLOCK_H)
+    base = x_ptr + row * x_stride0 + offs * x_stride1
+
+    w = tl.load(weight_ptr + row).to(tl.float32)
+
+    if HIDDEN_IS_MULTIPLE:
+        v = tl.load(base)
+        tl.store(base, (v.to(tl.float32) * w).to(v.dtype))
+    else:
+        mask = offs < HIDDEN
+        v = tl.load(base, mask=mask)
+        tl.store(base, (v.to(tl.float32) * w).to(v.dtype), mask=mask)
+
+
+@torch.no_grad()
+def scale_expanded_rows_(
+    x: torch.Tensor,
+    row_weights: torch.Tensor,
+) -> torch.Tensor:
+    """In-place `x[r, :] *= row_weights[r]` for a 2D `x`, any strides.
+
+    deepep_v2 `do_expand=True` prefill path: folds the top-k weights into the
+    expanded GEMM output (or, folded earlier, into down_proj's transposed fp8
+    input scale) before ElasticBuffer.combine (which ignores topk_weights in
+    expand mode). The weight normalizations below are no-ops on the hot path
+    (DeepEP hands back a 1D contiguous fp32 tensor).
+    """
+    assert x.dim() == 2, f"expected 2D x, got {tuple(x.shape)}"
+    rows, hidden = x.shape
+    assert row_weights.numel() >= rows, (
+        f"row_weights has {row_weights.numel()} entries but x has {rows} rows"
+    )
+
+    if rows == 0:
+        return x
+
+    block_h = 2048 if hidden >= 2048 else triton.next_power_of_2(hidden)
+
+    weights = row_weights
+    if weights.dim() != 1:
+        weights = weights.reshape(-1)
+    if weights.dtype != torch.float32:
+        weights = weights.to(torch.float32)
+    if not weights.is_contiguous():
+        weights = weights.contiguous()
+
+    _fwd_kernel_scale_expanded_rows[(rows, ceil_div(hidden, block_h))](
+        x,
+        x.stride(0),
+        x.stride(1),
+        weights,
+        HIDDEN=hidden,
+        BLOCK_H=block_h,
+        HIDDEN_IS_MULTIPLE=(hidden % block_h == 0),
+        num_warps=4,
+    )
+    return x
 
 
 def _moe_permute_rows(
