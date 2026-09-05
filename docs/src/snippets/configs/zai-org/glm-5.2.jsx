@@ -185,11 +185,22 @@ sgl-eval run aime25 \\
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"],
           disable: { hw: ["mi355x", "mi325x", "mi300x"] },
           disableReason: "MTP/EAGLE speculative decoding is not yet validated on AMD ROCm (MI300X/MI325X/MI355X): the gfx950 spec-decode draft kernel is not yet validated and at --speculative-num-steps > 3 hits a separate build issue; the DSA nextn draft path is CUDA-only." },
+        // Validated only on MI355X gfx950 with amd/GLM-5.2-MXFP4 (InferenceX
+        // AgentX sweep, GSM8K em_strict 0.971); num-steps=3 stays inside the
+        // gfx950 spec-decode build envelope (>3 hits a separate build issue).
+        // evaluateChip in _playground.jsx gates chips on `disable` only, so the
+        // restriction is written as its negation: hw != mi355x OR quant != mxfp4.
         { id: "mtp-314", label: "EAGLE / MTP 3-1-4 (agentic · MI355X MXFP4)",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 3",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"],
-          enable: { hw: ["mi355x"], quant: ["mxfp4"] },
-          enableReason: "Validated on MI355X gfx950 with amd/GLM-5.2-MXFP4 (InferenceX AgentX sweep, GSM8K em_strict 0.971). num-steps=3 stays within the validated gfx950 spec-decode build envelope (≤3). Pair with SGLANG_SIMULATE_ACC_LEN=2.99 for benchmarking (golden AL from golden_al_distribution/glm5.2_mtp.yaml, thinking_on, num_speculative_tokens=3)." },
+          disable: [
+            { when: { hw: ["h200", "b200", "gb300", "b300"] },
+              reason: "3-1-4 is the AMD MI355X MXFP4 agentic operating point. On NVIDIA use EAGLE / MTP 5-1-6 (low-latency) or 1-1-2 (balanced)." },
+            { when: { hw: ["mi325x", "mi300x"] },
+              reason: "MXFP4 is a gfx950 build, and MTP/EAGLE is not yet validated on MI300X/MI325X (gfx942)." },
+            { when: { quant: ["fp8", "bf16", "nvfp4"] },
+              reason: "Validated only against amd/GLM-5.2-MXFP4 on MI355X (gfx950); the gfx950 spec-decode draft kernel is not yet validated on the FP8/BF16 builds." },
+          ] },
       ],
     },
 
@@ -235,7 +246,16 @@ sgl-eval run aime25 \\
     },
 
     // ----- Card 6: "Hierarchical KV Cache" -----
+    // amdIo pins the ROCm host-transfer pair. Without it the AMD chips inherit
+    // the server defaults (--hicache-io-backend kernel, --hicache-mem-layout
+    // page_first) and, with no L3 backend selected, the overlay emits no
+    // layout/io flags at all — which is exactly the L2-only DRAM-offload shape
+    // the MI355X MXFP4 agentic recipe runs. page_first_direct + direct keeps
+    // ROCm on the plain host-copy path instead of the AOT transfer kernels, and
+    // matches the AMD pair already pinned on DeepSeek-V4 and Qwen3.5. Sizing
+    // stays on the engine default (ratio 2) pending an MI355X measurement.
     hicache: {
+      amdIo: { memLayout: "page_first_direct", ioBackend: "direct" },
       backends: [
         { id: null,       label: "Auto" },
         { id: "file",     label: "File" },
