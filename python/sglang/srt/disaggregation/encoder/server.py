@@ -88,6 +88,7 @@ rid_to_receive_endpoint: Dict[str, Set[str]] = dict()
 rid_to_receive_count: Dict[str, int] = dict()
 cond_dict_lock = asyncio.Lock()
 rid_to_cond: Dict[str, asyncio.Condition] = {}
+encode_state_condition = asyncio.Condition()
 
 
 async def _get_receive_condition(req_id: str) -> asyncio.Condition:
@@ -860,6 +861,22 @@ class MMEncoder:
         destination_urls: Iterable[str],
     ) -> None:
         state = self.req_states.get(req_id)
+        if state is None:
+            # registration can beat /encode or its queued batch; only encode creates state
+            try:
+                async with encode_state_condition:
+                    await asyncio.wait_for(
+                        encode_state_condition.wait_for(
+                            lambda: req_id in self.req_states
+                        ),
+                        timeout=ENCODER_REQ_TIMEOUT,
+                    )
+            except asyncio.TimeoutError as exc:
+                raise MMError(
+                    f"Timed out waiting for encoder request to start: {req_id}",
+                    code=HTTPStatus.GATEWAY_TIMEOUT,
+                ) from exc
+            state = self.req_states.get(req_id)
         if state is None:
             raise BadRequestError(f"Encoder request is not active: {req_id}")
 
@@ -2204,6 +2221,9 @@ class MMEncoder:
         keep_on_gpu = self.use_mooncake and not is_health_check
         use_global_cache = self.mm_global_cache is not None and not is_health_check
         try:
+            if self.rank == 0:
+                async with encode_state_condition:
+                    encode_state_condition.notify_all()
             ctx = await self._prepare_encode_context_on_all_ranks(
                 requests,
                 modality,

@@ -2080,6 +2080,131 @@ class TestEncoderDelivery(CustomTestCase):
 
         asyncio.run(run())
 
+    def test_destination_registration_rendezvous_with_encode(self):
+        async def run(register_first):
+            req_id = "registration-before-encode"
+            await meta_registry.discard(req_id)
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.rank = 0
+            encoder.req_states = {}
+            encoder.abandoned_req_ids = set()
+            encoder.use_mooncake = False
+            encoder.mm_global_cache = None
+            encoder.profiler = None
+            encoder.send_timeout = 1
+            encoder.delivery = ZmqDelivery(encoder, cleanup_receive_state=True)
+            embedding = torch.ones((1, 4))
+            ctx = SimpleNamespace(
+                req_id=req_id,
+                modality=Modality.IMAGE,
+                items_per_req=[1],
+                preprocess_result=SimpleNamespace(
+                    token_counts=[1], grid_thw=[[1, 1, 1]]
+                ),
+                aux_data={},
+                use_global_cache=False,
+            )
+            request = {
+                "req_id": req_id,
+                "receive_count": 1,
+                "receive_url": "tcp://127.0.0.1:1",
+            }
+            with (
+                patch.object(
+                    encoder_server, "encode_state_condition", asyncio.Condition()
+                ),
+                patch.object(http_server, "encoder", encoder),
+                patch.object(http_server, "dp_dispatcher", None),
+                patch.object(
+                    encoder,
+                    "_prepare_encode_context_on_all_ranks",
+                    AsyncMock(return_value=ctx),
+                ),
+                patch.object(
+                    encoder, "_compute_embedding", AsyncMock(return_value=embedding)
+                ),
+                patch.object(encoder, "_send", AsyncMock()) as send,
+            ):
+                registration = None
+                if register_first:
+                    registration = asyncio.create_task(
+                        http_server.handle_scheduler_receive_url_request(request)
+                    )
+                    await asyncio.sleep(0)
+                    self.assertFalse(registration.done())
+                    self.assertNotIn(req_id, encoder.req_states)
+                await encoder.encode([], Modality.IMAGE, req_id, 1, 0)
+                if registration is None:
+                    registration = asyncio.create_task(
+                        http_server.handle_scheduler_receive_url_request(request)
+                    )
+                response = await asyncio.wait_for(registration, timeout=1)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    rid_to_receive_endpoint[req_id], {request["receive_url"]}
+                )
+                await asyncio.wait_for(encoder.send_with_url(req_id), timeout=1)
+                send.assert_awaited_once()
+                torch.testing.assert_close(send.await_args.args[0], embedding)
+                self.assertNotIn(req_id, encoder.req_states)
+                self.assertNotIn(req_id, rid_to_receive_endpoint)
+                self.assertNotIn(req_id, rid_to_receive_count)
+                self.assertNotIn(req_id, rid_to_cond)
+
+        for register_first in (True, False):
+            with self.subTest(register_first=register_first):
+                asyncio.run(run(register_first))
+
+    def test_destination_registration_timeout_does_not_create_state(self):
+        async def run():
+            req_id = "registration-without-encode"
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.req_states = {}
+            with (
+                patch.object(
+                    encoder_server, "encode_state_condition", asyncio.Condition()
+                ),
+                patch.object(encoder_server, "ENCODER_REQ_TIMEOUT", 0.01),
+                patch.object(http_server, "encoder", encoder),
+                patch.object(http_server, "dp_dispatcher", None),
+            ):
+                response = await http_server.handle_scheduler_receive_url_request(
+                    {
+                        "req_id": req_id,
+                        "receive_count": 1,
+                        "receive_url": "tcp://127.0.0.1:1",
+                    }
+                )
+                self.assertEqual(response.status_code, 504)
+                self.assertNotIn(req_id, encoder.req_states)
+                self.assertNotIn(req_id, rid_to_receive_endpoint)
+                self.assertNotIn(req_id, rid_to_receive_count)
+                self.assertNotIn(req_id, rid_to_cond)
+
+        asyncio.run(run())
+
+    def test_destination_registration_cancellation_does_not_create_state(self):
+        async def run():
+            req_id = "cancelled-registration"
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.req_states = {}
+            with patch.object(
+                encoder_server, "encode_state_condition", asyncio.Condition()
+            ):
+                registration = asyncio.create_task(
+                    encoder.register_embedding_destinations(
+                        req_id, 1, ["tcp://127.0.0.1:1"]
+                    )
+                )
+                await asyncio.sleep(0)
+                registration.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await registration
+                self.assertNotIn(req_id, encoder.req_states)
+                self.assertNotIn(req_id, rid_to_cond)
+
+        asyncio.run(run())
+
     def test_destination_registration_respects_request_lifecycle(self):
         async def run():
             req_id = "registration-lifecycle"
