@@ -11,6 +11,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 import base64
 import binascii
 import io
+import traceback
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -19,7 +20,7 @@ from PIL import Image
 
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.utils.common import CLIENT_MEDIA_EXCEPTIONS
+from sglang.srt.utils.common import CLIENT_MEDIA_EXCEPTIONS, ImageData
 from sglang.test.test_utils import CustomTestCase
 
 MODALITIES = (Modality.IMAGE, Modality.AUDIO, Modality.VIDEO)
@@ -113,6 +114,69 @@ class TestServerFaultStaysServerError(CustomTestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "too many open files"):
                 _StubProcessor._load_single_item("file:///image.png", Modality.IMAGE)
+
+
+class TestBadInputDoesNotLeakMedia(CustomTestCase):
+    """Loader failures must not expose request media in formatted exceptions."""
+
+    def test_malformed_url_preserves_sanitized_client_error(self):
+        url = "https://[invalid"
+
+        with self.assertRaises(ValueError) as ctx:
+            _StubProcessor._load_single_item(url, Modality.IMAGE)
+
+        formatted = "".join(traceback.format_exception(ctx.exception))
+        self.assertNotIn(url, formatted)
+        self.assertIn("Error while loading image data <url scheme=https>", formatted)
+        self.assertIsInstance(ctx.exception.__cause__, ValueError)
+        self.assertIn("<url scheme=https>", str(ctx.exception.__cause__))
+        self.assertIsNone(ctx.exception.__context__)
+
+    def test_authenticated_url_is_redacted_from_client_error(self):
+        url = (
+            "https://media-user:media-password@example.com/private.jpg"
+            "?token=MOCK_PRIVATE_TOKEN"
+        )
+        loader_error = requests.HTTPError(f"404 Client Error for url: {url}")
+
+        with patch(
+            "sglang.srt.multimodal.processors.base_processor.load_image",
+            side_effect=loader_error,
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                _StubProcessor._load_single_item(ImageData(url=url), Modality.IMAGE)
+
+        formatted = "".join(traceback.format_exception(ctx.exception))
+        self.assertNotIn(url, formatted)
+        self.assertNotIn("media-password", formatted)
+        self.assertNotIn("MOCK_PRIVATE_TOKEN", formatted)
+        self.assertIn("<url scheme=https>", formatted)
+        self.assertIn("404 Client Error", formatted)
+        self.assertIsInstance(ctx.exception.__cause__, requests.HTTPError)
+        self.assertIsNone(ctx.exception.__context__)
+
+    def test_data_uri_is_redacted_from_client_error(self):
+        encoded = base64.b64encode(b"MOCK_PRIVATE_MEDIA").decode()
+        data_uri = f"data:image/jpeg;base64,{encoded}"
+        loader_error = binascii.Error(f"Non-base64 digit found in {data_uri}")
+
+        with patch(
+            "sglang.srt.multimodal.processors.base_processor.load_image",
+            side_effect=loader_error,
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                _StubProcessor._load_single_item(data_uri, Modality.IMAGE)
+
+        formatted = "".join(traceback.format_exception(ctx.exception))
+        self.assertNotIn(data_uri, formatted)
+        self.assertNotIn(encoded, formatted)
+        self.assertNotIn("data:image/jpeg;base64", formatted)
+        self.assertIn(
+            f"<data-uri mime=image/jpeg encoded_length={len(encoded)}>", formatted
+        )
+        self.assertIn("Non-base64 digit found", formatted)
+        self.assertIsInstance(ctx.exception.__cause__, binascii.Error)
+        self.assertIsNone(ctx.exception.__context__)
 
 
 class TestClientMediaExceptions(CustomTestCase):
