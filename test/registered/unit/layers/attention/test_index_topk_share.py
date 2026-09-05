@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -15,9 +16,7 @@ def _batch(
 ) -> SimpleNamespace:
     return SimpleNamespace(
         reuse_dsa_topk_indices=reuse,
-        forward_mode=SimpleNamespace(
-            is_extend=lambda include_draft_extend_v2: is_extend
-        ),
+        forward_mode=ForwardMode.DRAFT_EXTEND_V2 if is_extend else ForwardMode.DECODE,
         spec_info=SimpleNamespace(
             dsa_topk_indices=carried,
             dsa_seed_topk_capture=seed_buf,
