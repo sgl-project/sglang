@@ -209,23 +209,37 @@ class JointThreshold(DllmAlgorithm):
         # request, re-mixed with fresh rows each round), so gather them into
         # batched tensors for this round's single step, then scatter the results
         # back onto the per-request dicts.
-        device = forward_batch.input_ids.device
-        prompt_masks = torch.stack([state["prompt_mask"] for state in states])
-        finished = torch.tensor(
-            [state["finished"] for state in states], dtype=torch.bool, device=device
-        )
-        post_edit_steps = torch.tensor(
-            [state["post_edit_steps"] for state in states],
-            dtype=torch.int32,
-            device=device,
-        )
+        ctx = self.fdfo_batched_begin(forward_batch, states)
+        self.fdfo_batched_step(forward_batch, full_logits, ctx)
+        return self.fdfo_batched_end(ctx, states)
 
+    def fdfo_batched_begin(self, forward_batch: ForwardBatch, states: List[Any]):
+        if not self.vectorized_decoding or self._use_shared_state:
+            return None
+        device = forward_batch.input_ids.device
+        return {
+            "prompt_masks": torch.stack([state["prompt_mask"] for state in states]),
+            "finished": torch.tensor(
+                [state["finished"] for state in states],
+                dtype=torch.bool,
+                device=device,
+            ),
+            "post_edit_steps": torch.tensor(
+                [state["post_edit_steps"] for state in states],
+                dtype=torch.int32,
+                device=device,
+            ),
+        }
+
+    def fdfo_batched_step(
+        self, forward_batch: ForwardBatch, full_logits: torch.Tensor, ctx
+    ) -> None:
         joint_threshold_update_step_vectorized(
             input_ids_1d=forward_batch.input_ids,
             full_logits_2d=full_logits,
-            prompt_masks=prompt_masks,
-            finished=finished,
-            post_edit_steps=post_edit_steps,
+            prompt_masks=ctx["prompt_masks"],
+            finished=ctx["finished"],
+            post_edit_steps=ctx["post_edit_steps"],
             mask_id=self.mask_id,
             blk=self.block_size,
             threshold=self.threshold,
@@ -234,8 +248,12 @@ class JointThreshold(DllmAlgorithm):
             penalty_lambda=self.penalty_lambda,
         )
 
-        done = finished.tolist()
-        new_post_edit_steps = post_edit_steps.tolist()
+    def fdfo_batched_all_finished(self, ctx) -> bool:
+        return bool(ctx["finished"].all().item())
+
+    def fdfo_batched_end(self, ctx, states: List[Any]) -> List[bool]:
+        done = ctx["finished"].tolist()
+        new_post_edit_steps = ctx["post_edit_steps"].tolist()
         for i, state in enumerate(states):
             state["finished"] = done[i]
             state["post_edit_steps"] = new_post_edit_steps[i]
