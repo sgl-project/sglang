@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -84,8 +85,32 @@ class SWAComponent(TreeComponent):
 
     component_type = ComponentType.SWA
 
+    def _dirty_backup_window(self, node: UnifiedTreeNode) -> list[UnifiedTreeNode]:
+        if not self.tree_core.has_swa_host_pool:
+            return []
+
+        ct = self.component_type
+        covered = 0
+        dirty: list[UnifiedTreeNode] = []
+        cur = node
+        while (
+            cur is not self.tree_core.root_node and covered < self.sliding_window_size
+        ):
+            if cur.write_through_pending_id is not None:
+                break
+
+            cd = cur.component_data[ct]
+            value = cd.value if cd.value is not None else cd.host_value
+            if value is None:
+                break
+            covered += len(value)
+            if cd.value is not None and cd.host_value is None:
+                dirty.append(cur)
+            cur = cur.parent
+        return dirty
+
     def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
-        return False
+        return bool(self._dirty_backup_window(node))
 
     def reset_session_state(self) -> None:
         super().reset_session_state()
@@ -308,6 +333,16 @@ class SWAComponent(TreeComponent):
         best_value_len: int,
     ) -> MatchResult:
         ct = self.component_type
+        swa_boundary_len = len(result.device_indices) + result.host_hit_length
+
+        # Full KV may extend beyond the latest reusable SWA window. The branching
+        # point is the last page-aligned position within the Full-KV hit that lies
+        # beyond the current SWA boundary.
+        aligned_seqlen = (
+            result.full_kv_hit_length // self.tree_core.page_size
+        ) * self.tree_core.page_size
+        branching_seqlen = aligned_seqlen if aligned_seqlen > swa_boundary_len else None
+
         n_swa = 0
         swa_host_hit = 0
         node = result.best_match_node
@@ -328,11 +363,11 @@ class SWAComponent(TreeComponent):
             else:
                 break
             node = node.parent
-        if swa_host_hit > 0:
-            return result._replace(
-                swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit)
-            )
-        return result
+
+        return result._replace(
+            swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit),
+            swa_branching_seqlen=branching_seqlen,
+        )
 
     def update_component_on_insert_overlap(
         self,
@@ -466,6 +501,11 @@ class SWAComponent(TreeComponent):
         result: InsertResult,
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
+        branching_seqlen = params.swa_branching_seqlen
+        if branching_seqlen is not None:
+            assert params.key is not None
+            result.swa_branch_inserted = len(params.key) >= branching_seqlen
+
         if not is_new_leaf:
             return
 
@@ -857,22 +897,58 @@ class SWAComponent(TreeComponent):
         # Unfinished requests can already have an SWA-evicted prefix; preserve
         # that boundary so insertion creates a tombstone instead of live SWA KV.
         insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
-        return None
+
+        branching_seqlen = req.swa_branching_seqlen
+        if branching_seqlen is None or branching_seqlen <= req.kv.cache_protected_len:
+            return None
+
+        # An EAGLE key with N bigrams spans N + 1 raw tokens.
+        effective_cache_len = branching_seqlen + int(self.tree_core.is_eagle)
+        if effective_cache_len > token_ids_len:
+            return None
+
+        # Record the logical SWA branch boundary for insertion.
+        insert_params.swa_branching_seqlen = branching_seqlen
+        return effective_cache_len
+
+    def _free_out_of_window_slots(self, req: Req, pre_len: int) -> None:
+        if self.sliding_window_size is None:
+            return
+        free_swa_out_of_window_slots(
+            req,
+            pre_len,
+            sliding_window_size=self.sliding_window_size,
+            page_size=self.cache.page_size,
+            req_to_token_pool=self.cache.req_to_token_pool,
+            token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,
+            retain_floor=self.cache.swa_retain_floor(req),
+        )
 
     def free_out_of_window_slots(
         self, req: Req, pre_len: int, insert_params: InsertParams
     ) -> None:
-        if self.sliding_window_size is not None:
-            free_swa_out_of_window_slots(
-                req,
-                pre_len,
-                sliding_window_size=self.sliding_window_size,
-                page_size=self.cache.page_size,
-                req_to_token_pool=self.cache.req_to_token_pool,
-                token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,
-                retain_floor=self.cache.swa_retain_floor(req),
-            )
+        self._free_out_of_window_slots(req, pre_len)
         insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
+
+    def cleanup_after_caching_req(
+        self,
+        req: Req,
+        is_finished: bool,
+        insert_result: Optional[InsertResult] = None,
+        insert_params: Optional[InsertParams] = None,
+    ) -> None:
+        if insert_result is not None and insert_result.swa_branch_inserted:
+            req.swa_branching_seqlen = None
+
+        # Free unused SWA slots after inserting the branch.
+        if (
+            not is_finished
+            and insert_result is not None
+            and insert_result.swa_branch_inserted
+            and envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get()
+        ):
+            forward_key_len = len(req.get_fill_ids()) - int(self.tree_core.is_eagle)
+            self._free_out_of_window_slots(req, forward_key_len - 1)
 
     # ---- HiCache Hooks ----
 
@@ -933,15 +1009,22 @@ class SWAComponent(TreeComponent):
             return None
 
         if phase == CacheTransferPhase.BACKUP_HOST:
-            cd = node.component_data[ct]
-            if cd.value is None:
+            if self.cache.host_memory_mode == "buffer_only":
+                # Buffer mode stages one node/hash span per FIFO backup intent.
+                cd = node.component_data[ct]
+                dirty = [node] if cd.value is not None else []
+            else:
+                dirty = self._dirty_backup_window(node)
+            if not dirty:
                 return None
-            # cd.value already holds SWA-pool indices (translated at insert time).
-            # Host pool indexing wants int64.
+            dirty.reverse()
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
-                    device_indices=cd.value.to(torch.int64),
+                    device_indices=torch.cat(
+                        [n.component_data[ct].value for n in dirty]
+                    ).to(torch.int64),
+                    nodes_to_load=[n.id for n in dirty],
                 )
             ]
 
@@ -1120,10 +1203,18 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
 
         if phase == CacheTransferPhase.BACKUP_HOST:
-            if transfers and transfers[0].host_indices is not None:
-                cd = node.component_data[ct]
-                if cd.host_value is None:
-                    cd.host_value = transfers[0].host_indices.clone()
+            if not transfers or transfers[0].host_indices is None:
+                return
+            xfer = transfers[0]
+            offset = 0
+            for node_id in xfer.nodes_to_load or [node.id]:
+                target = self.tree_core.node_by_id(node_id)
+                cd = target.component_data[ct]
+                assert cd.value is not None and cd.host_value is None
+                size = len(cd.value)
+                cd.host_value = xfer.host_indices[offset : offset + size].clone()
+                offset += size
+            assert offset == len(xfer.host_indices)
             return
 
         if phase == CacheTransferPhase.LOAD_BACK:
