@@ -62,6 +62,7 @@ def _build_server_args(scheduler: Scheduler) -> ServerArgs:
         tokenizer_worker_num=get_serving().tokenizer_worker_num,
         detokenizer_worker_num=get_serving().detokenizer_worker_num,
         skip_tokenizer_init=get_serving().skip_tokenizer_init,
+        skip_server_warmup=get_serving().skip_server_warmup,
         incremental_streaming_output=get_serving().incremental_streaming_output,
         disaggregation_mode=disaggregation_mode,
         model_config=ext.ModelConfig(

@@ -119,6 +119,9 @@ pub struct ServerArgs {
     /// Token-ids-in / token-ids-out mode: no tokenizer load, raw `output_ids`
     /// frames.
     pub skip_tokenizer_init: bool,
+    /// Start accepting health checks immediately instead of waiting for the
+    /// main process's startup warmup request to finish.
+    pub skip_server_warmup: bool,
     /// Streamed `/generate` frames carry per-step deltas instead of cumulative
     /// text. Matches the Python `TokenizerManager`.
     pub incremental_streaming_output: bool,
@@ -171,6 +174,7 @@ impl ServerArgs {
         tokenizer_worker_num,
         detokenizer_worker_num,
         skip_tokenizer_init,
+        skip_server_warmup,
         incremental_streaming_output,
         disaggregation_mode,
         model_config,
@@ -202,6 +206,7 @@ impl ServerArgs {
         tokenizer_worker_num: usize,
         detokenizer_worker_num: usize,
         skip_tokenizer_init: bool,
+        skip_server_warmup: bool,
         incremental_streaming_output: bool,
         disaggregation_mode: DisaggregationMode,
         model_config: ModelConfig,
@@ -231,6 +236,7 @@ impl ServerArgs {
             tokenizer_worker_num,
             detokenizer_worker_num,
             skip_tokenizer_init,
+            skip_server_warmup,
             incremental_streaming_output,
             disaggregation_mode,
             model_config,
@@ -268,6 +274,7 @@ impl Default for ServerArgs {
             tokenizer_worker_num: 1,
             detokenizer_worker_num: 1,
             skip_tokenizer_init: false,
+            skip_server_warmup: false,
             incremental_streaming_output: false,
             disaggregation_mode: DisaggregationMode::Null,
             model_config: ModelConfig::default(),

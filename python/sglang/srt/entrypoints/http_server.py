@@ -2202,6 +2202,10 @@ def _execute_server_warmup(server_args: ServerArgs):
     url = server_args.url()
     if server_args.api_key:
         headers["Authorization"] = f"Bearer {server_args.api_key}"
+    if envs.SGLANG_RUST_SERVER.get():
+        # The Rust listener binds before this request so /model_info is
+        # available, but health stays 503 until this marked request succeeds.
+        headers["x-sglang-startup-warmup"] = "1"
 
     ssl_verify = ssl_verify_of(server_args)
 
