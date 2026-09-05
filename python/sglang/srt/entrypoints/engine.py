@@ -1159,9 +1159,13 @@ class Engine(EngineScoreMixin, EngineBase):
                     weight_cache_daemon_procs,
                 )
 
-            launch_dummy_health_check_server(
-                server_args.host, server_args.port, server_args.enable_metrics
-            )
+            # A node-local Rust listener owns the health endpoints when present.
+            if not (
+                envs.SGLANG_RUST_SERVER.get() and _node_hosts_rust_server(server_args)
+            ):
+                launch_dummy_health_check_server(
+                    server_args.host, server_args.port, server_args.enable_metrics
+                )
 
             scheduler_init_result.block_until_scheduler_exits()
             return (
@@ -1855,6 +1859,22 @@ def _calculate_rank_ranges(
     )
 
     return pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node
+
+
+def _node_hosts_rust_server(server_args: ServerArgs) -> bool:
+    """Whether this node contains a scheduler that embeds a Rust server."""
+    pp_rank_range, tp_rank_range, _, _ = _calculate_rank_ranges(
+        server_args.nnodes,
+        get_parallel().pp_size,
+        server_args.tp_size,
+        server_args.node_rank,
+    )
+    if 0 not in pp_rank_range:
+        return False
+
+    # Rust servers run on the first (CP, TP) rank of each attention DP group.
+    dp_group_width = server_args.tp_size // get_parallel().dp_size
+    return any(tp_rank % dp_group_width == 0 for tp_rank in tp_rank_range)
 
 
 def _compute_parallelism_ranks(

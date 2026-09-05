@@ -80,7 +80,16 @@ class RustServer:
         # Per-DP-rank HTTP port with client load balancing. `None` when DP is off,
         # so the rank is not conflated with rank 0 of a one-rank group.
         dp_rank = scheduler.ps.attn_dp_rank if scheduler.ps.dp_size > 1 else None
-        listen_port = get_serving().port + (dp_rank or 0)
+        if dp_rank is not None:
+            nnodes_per_pp_rank = max(server_args.nnodes // scheduler.ps.pp_size, 1)
+            tp_size_per_node = scheduler.ps.tp_size // nnodes_per_pp_rank
+            dp_group_width = scheduler.ps.attn_tp_size * scheduler.ps.attn_cp_size
+            # Count DP leaders within this node's TP range. The first leader must
+            # use the base port even when a DP group spans multiple nodes.
+            local_dp_rank = (scheduler.ps.tp_rank % tp_size_per_node) // dp_group_width
+        else:
+            local_dp_rank = None
+        listen_port = get_serving().port + (local_dp_rank or 0)
         listen_addr = NetworkAddress(get_serving().host, listen_port).to_host_port_str()
 
         launch_cores, server_cores = _partition_cores(
@@ -95,7 +104,7 @@ class RustServer:
             _build_server_args(scheduler),
             # None -> run unpinned; the list carries the pinning decision.
             cores=server_cores,
-            port_offset=dp_rank,
+            port_offset=local_dp_rank,
         )
 
         # Multimodal models must have a Rust pipeline — there is no Python
