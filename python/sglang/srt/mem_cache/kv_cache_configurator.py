@@ -548,7 +548,8 @@ class KVCacheConfigurator:
         # Initialize req_to_token_pool
         if req_to_token_pool is None:
             req_to_token_pool = self._build_req_to_token_pool(
-                max_num_reqs=sizes.max_running_requests
+                max_num_reqs=sizes.max_running_requests,
+                max_total_num_tokens=sizes.max_total_num_tokens,
             )
         else:
             # Draft worker shares req_to_token_pool with the target worker.
@@ -969,7 +970,9 @@ class KVCacheConfigurator:
                 "attention, no HiSparse, and --kv-cache-dtype not in {nvfp4, fp4_mx_block16}."
             )
 
-    def _build_req_to_token_pool(self, *, max_num_reqs: int) -> ReqToTokenPool:
+    def _build_req_to_token_pool(
+        self, *, max_num_reqs: int, max_total_num_tokens: int
+    ) -> ReqToTokenPool:
         extra_max_context_len = get_req_to_token_extra_context_len()
 
         if get_disagg().disaggregation_mode == "decode":
@@ -996,6 +999,7 @@ class KVCacheConfigurator:
             req_to_token_pool = self._build_default_req_pool(
                 max_num_reqs=max_num_reqs,
                 extra_max_context_len=extra_max_context_len,
+                max_total_num_tokens=max_total_num_tokens,
             )
         return req_to_token_pool
 
@@ -1137,6 +1141,7 @@ class KVCacheConfigurator:
         *,
         max_num_reqs: int,
         extra_max_context_len: int,
+        max_total_num_tokens: int,
     ) -> ReqToTokenPool:
         # DSV4 on NPU needs an extended ReqToTokenPool holding per-req
         # swa/c4/c128/c{4,128}_state tables; others stay on the stock one.
@@ -1148,9 +1153,16 @@ class KVCacheConfigurator:
 
             req_to_token_pool_cls = DSV4NPUReqToTokenPool
 
+        # A single request can never map more tokens than the whole KV pool
+        # holds, so cap the per-request width at max_total_num_tokens to avoid
+        # reserving unreachable context slots (context_len can far exceed it).
+        max_context_len = (
+            min(self.model_config.context_len, max_total_num_tokens)
+            + extra_max_context_len
+        )
         req_to_token_pool = req_to_token_pool_cls(
             size=max_num_reqs,
-            max_context_len=self.model_config.context_len + extra_max_context_len,
+            max_context_len=max_context_len,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
         )
