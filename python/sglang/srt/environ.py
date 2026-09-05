@@ -298,6 +298,12 @@ class Envs:
     #        keeping access relatively ordered.
     SGLANG_SORT_WEIGHT_FILES = EnvInt(0)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
+    # Shard the Qwen4-Exp PLE n-gram embedding within each attention-TP group
+    # instead of gathering DP tokens for a global-TP lookup.
+    SGLANG_USE_ATTN_TP_NGRAM = EnvBool(False)
+    # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
+    # and phases fall back to the original implementation.
+    SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)

@@ -174,6 +174,7 @@ ATTENTION_BACKEND_CHOICES = [
     "flex_attention",
     "dsa",
     "nsa",  # Deprecated alias for "dsa"
+    "qsa",
     "dsv4",
     "compressed",  # Deprecated alias for "dsv4"
     # NVIDIA specific
@@ -2704,6 +2705,17 @@ class ServerArgs:
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
         NS("exec.mamba"),
+    ] = None
+    ple_offload_embedding: A[
+        Optional[bool],
+        Arg(
+            help="Offload Qwen4 PLE n-gram embedding weights to CPU pinned "
+            "memory. Enabled by default for BF16 Qwen4-Exp on CUDA; use "
+            "--no-ple-offload-embedding to disable.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+        ),
+        NS("exec.offload"),
     ] = None
     linear_attn_verify_backend: A[
         Optional[str],

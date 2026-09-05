@@ -66,6 +66,7 @@ from sglang.srt.configs.qwen3_5 import (
 )
 from sglang.srt.configs.qwen3_asr import Qwen3ASRConfig
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
+from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig
 from sglang.srt.configs.spark2_5 import Spark2_5Config
 from sglang.srt.configs.step3_vl import (
     Step3TextConfig,
@@ -106,6 +107,8 @@ __all__ = [
     "KimiK25Config",
     "LagunaConfig",
     "Qwen3NextConfig",
+    "Qwen4ExpConfig",
+    "Qwen4ExpTextConfig",
     "Qwen3_5Config",
     "Qwen3_5MoeConfig",
     "Qwen3_5TextConfig",
