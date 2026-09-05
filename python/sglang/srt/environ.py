@@ -1229,6 +1229,17 @@ class Envs:
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB = EnvInt(None)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
+    # FlashInfer PCIe-IPC all-reduce, for switch-free intra-node hosts (no
+    # NVLink, no multicast) where the backends above do not apply. Which shapes
+    # the kernels take is FlashInfer's own decision, not a size knob here: an
+    # unsupported shape is reported as such and the caller keeps its NCCL path.
+    SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
+    # Elements its workspace is sized for. It cannot grow after construction, so
+    # 0 sizes it for the widest decode (cuda_graph_config[decode].max_bs *
+    # hidden), leaving prefill chunks on NCCL -- measured faster than routing
+    # them here. Raise it to hand larger reductions to the kernels, at
+    # ~2 * world_size * max_numel * itemsize bytes per rank.
+    SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
 
     # ===================================================================
     # RoPE cache
