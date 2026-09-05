@@ -46,10 +46,12 @@ from sglang.srt.mem_cache.layout.page_major import (
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
+    KVWriteLoc,
     MambaPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     unwrap_write_loc,
+    write_loc_id_space,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -556,6 +558,8 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
     differ in width. `move_kv_cache` relocates whole page envelopes.
     """
 
+    requires_translated_write_loc = True
+
     def __init__(
         self,
         *,
@@ -658,6 +662,8 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
     `MLATokenToKVPool` read/write methods work on the views unmodified.
     `move_kv_cache` relocates whole page envelopes on the raw buffer.
     """
+
+    requires_translated_write_loc = True
 
     def __init__(
         self,
@@ -1563,6 +1569,7 @@ class UnifiedSWAKVPool(SWAKVPool):
         (pre-translated once per forward by the attention backend); never translates here.
         """
         loc, swa_loc, full_loc = unwrap_write_loc(loc_info)
+        id_space = write_loc_id_space(loc_info)
         layer_id = layer.layer_id
         pool_layer_id, is_swa = self.layers_mapping[layer_id]
         if is_swa:
@@ -1574,7 +1581,7 @@ class UnifiedSWAKVPool(SWAKVPool):
             )
             self.swa_kv_pool.set_kv_buffer(
                 None,
-                swa_loc,
+                KVWriteLoc(swa_loc, id_space=id_space),
                 cache_k,
                 cache_v,
                 k_scale,
@@ -1589,7 +1596,7 @@ class UnifiedSWAKVPool(SWAKVPool):
             full_loc = loc
         self.full_kv_pool.set_kv_buffer(
             None,
-            full_loc,
+            KVWriteLoc(full_loc, id_space=id_space),
             cache_k,
             cache_v,
             k_scale,

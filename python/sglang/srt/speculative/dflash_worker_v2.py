@@ -2128,6 +2128,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
+            out_cache_loc_id_space="kernel",
             batch_size=bs,
             input_ids=block_ids.flatten(),
             req_pool_indices=batch.req_pool_indices,

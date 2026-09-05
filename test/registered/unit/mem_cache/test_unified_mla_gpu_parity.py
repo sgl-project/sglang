@@ -46,6 +46,13 @@ def _kernel_id(t: torch.Tensor, ps: int) -> torch.Tensor:
     return t  # token-major views: the kernel id is the physical token id
 
 
+def _marked(loc: torch.Tensor):
+    # The unified doors take a KVWriteLoc that declares its id space.
+    from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+
+    return KVWriteLoc(loc, id_space="kernel")
+
+
 def _make_pools(ps: int, n_tokens: int = 4096):
     from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
     from sglang.srt.mem_cache.unified_memory_pool import (
@@ -129,7 +136,7 @@ class TestUnifiedMLAPoolGPUParity(unittest.TestCase):
             layer = types.SimpleNamespace(layer_id=l)
             nope = torch.randn(n_loc, 1, _LORA, dtype=_DTYPE, device=_DEV)
             rope = torch.randn(n_loc, 1, _ROPE, dtype=_DTYPE, device=_DEV)
-            unified.set_mla_kv_buffer(layer, _kernel_id(locs, ps), nope, rope)
+            unified.set_mla_kv_buffer(layer, _marked(_kernel_id(locs, ps)), nope, rope)
             ref.set_mla_kv_buffer(layer, locs, nope, rope)
         torch.cuda.synchronize()
         self._assert_parity(unified, ref, locs, ps)
@@ -150,7 +157,7 @@ class TestUnifiedMLAPoolGPUParity(unittest.TestCase):
             for l in (0, _L // 2, _L - 1):
                 layer = types.SimpleNamespace(layer_id=l)
                 k = torch.randn(n_loc, 1, _D, dtype=_DTYPE, device=_DEV)
-                unified.set_kv_buffer(layer, _kernel_id(locs, ps), k, None)
+                unified.set_kv_buffer(layer, _marked(_kernel_id(locs, ps)), k, None)
                 ref.set_kv_buffer(layer, locs, k, None)
             torch.cuda.synchronize()
             self._assert_parity(unified, ref, locs, ps, layers=(0, _L // 2, _L - 1))
@@ -164,11 +171,34 @@ class TestUnifiedMLAPoolGPUParity(unittest.TestCase):
             layer = types.SimpleNamespace(layer_id=3)
             nope = torch.randn(n_loc, 1, _LORA, dtype=_DTYPE, device=_DEV)
             rope = torch.randn(n_loc, 1, _ROPE, dtype=_DTYPE, device=_DEV)
-            unified.set_mla_kv_buffer(layer, _kernel_id(locs, ps), nope, rope)
+            unified.set_mla_kv_buffer(layer, _marked(_kernel_id(locs, ps)), nope, rope)
             got_nope, got_rope = unified.get_mla_kv_buffer(layer, _kernel_id(locs, ps))
             torch.cuda.synchronize()
             torch.testing.assert_close(got_nope, nope, rtol=0, atol=0)
             torch.testing.assert_close(got_rope, rope, rtol=0, atol=0)
+
+    def test_move_kv_cache_page_envelope_gpu(self):
+        for ps in (1, 64):
+            unified, ref, max_tokens = _make_pools(ps)
+            num_pages = max_tokens // ps
+            n_loc = ps  # one full page of tokens
+            src_page, dst_page = num_pages - 2, 2
+            src_t = torch.arange(ps, device=_DEV, dtype=torch.int64) + src_page * ps
+            dst_t = torch.arange(ps, device=_DEV, dtype=torch.int64) + dst_page * ps
+            torch.manual_seed(17)
+            for l in range(_L):
+                layer = types.SimpleNamespace(layer_id=l)
+                k = torch.randn(n_loc, 1, _D, dtype=_DTYPE, device=_DEV)
+                unified.set_kv_buffer(layer, _marked(_kernel_id(src_t, ps)), k, None)
+            before = [
+                unified.get_key_buffer(l)[_kernel_id(src_t, ps)].clone()
+                for l in range(_L)
+            ]
+            unified.move_kv_cache(dst_t, src_t)
+            torch.cuda.synchronize()
+            for l in range(_L):
+                got = unified.get_key_buffer(l)[_kernel_id(dst_t, ps)]
+                torch.testing.assert_close(got, before[l], rtol=0, atol=0)
 
 
 if __name__ == "__main__":

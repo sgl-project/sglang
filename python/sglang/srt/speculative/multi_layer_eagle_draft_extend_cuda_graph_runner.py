@@ -331,6 +331,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # Forward batch
         forward_batch = ForwardBatch(
             forward_mode=self.forward_mode,
+            out_cache_loc_id_space="kernel",
             batch_size=bs,
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,

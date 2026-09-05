@@ -1564,9 +1564,9 @@ class TritonAttnBackend(AttentionBackend):
         else:
             # Save KV cache first (must do this before unified kernel)
             if save_kv_cache:
-                loc_info = KVWriteLoc(
-                    forward_batch.out_cache_loc,
-                    self.forward_metadata.swa_out_cache_loc,
+                loc_info = KVWriteLoc.for_batch(
+                    forward_batch,
+                    swa_loc=self.forward_metadata.swa_out_cache_loc,
                     full_loc=self.forward_metadata.out_cache_loc_full_physical,
                 )
                 if layer.k_scale is None:
@@ -2152,9 +2152,9 @@ class TritonAttnBackend(AttentionBackend):
                     # pool, refreshed into a capture-stable buffer before replay —
                     # translating inside set_kv_buffer would be captured and replay
                     # a stale v2p. None (-> raw loc) for static pools.
-                    KVWriteLoc(
-                        forward_batch.out_cache_loc,
-                        self.forward_metadata.swa_out_cache_loc,
+                    KVWriteLoc.for_batch(
+                        forward_batch,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
                         full_loc=self.forward_metadata.out_cache_loc_full_physical,
                     ),
                     k,
@@ -2164,9 +2164,9 @@ class TritonAttnBackend(AttentionBackend):
                 self._set_kv_buffer(
                     forward_batch,
                     layer,
-                    KVWriteLoc(
-                        forward_batch.out_cache_loc,
-                        self.forward_metadata.swa_out_cache_loc,
+                    KVWriteLoc.for_batch(
+                        forward_batch,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
                         full_loc=self.forward_metadata.out_cache_loc_full_physical,
                     ),
                     k,

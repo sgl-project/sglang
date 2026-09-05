@@ -50,6 +50,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.mem_cache.layout.page_major import paged_row_view
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.runtime_context import (
     get_parallel,
     get_resources,
@@ -289,7 +290,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         k_pe_fp8 = k_fp8[:, 0:1, layer.qk_nope_head_dim :]
         self.token_to_kv_pool.set_mla_kv_buffer(
             layer.attn_mha,
-            forward_batch.out_cache_loc,
+            KVWriteLoc.for_batch(forward_batch),
             kv_a_fp8.unsqueeze(1),
             k_pe_fp8,
         )
@@ -402,7 +403,12 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
 
         if save_kv_cache:
             self.token_to_kv_pool.set_mla_kv_buffer(
-                layer, self._kv_write_loc(forward_batch), k, k_rope
+                layer,
+                KVWriteLoc.for_batch(
+                    forward_batch, self._kv_write_loc(forward_batch)
+                ),
+                k,
+                k_rope,
             )
 
         query = q.view(-1, layer.tp_q_head_num, layer.head_dim)

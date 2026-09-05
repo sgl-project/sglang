@@ -49,6 +49,7 @@ from sglang.srt.mem_cache.layout.page_major import (
     mha_entry_bytes,
     paged_view,
 )
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.unified_memory_pool import (
     MHASubPoolSpec,
     UnifiedKVPool,
@@ -424,7 +425,7 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
                 shape = (len(probes), _H, _D)
                 k = torch.full(shape, float(l + 1), dtype=_DTYPE, device=_STORE_DEV)
                 v = torch.full(shape, float(l + 101), dtype=_DTYPE, device=_STORE_DEV)
-                pool.set_kv_buffer(_layer(l), toks, k, v)
+                pool.set_kv_buffer(_layer(l), KVWriteLoc(toks, id_space="kernel"), k, v)
                 for p, s in probes:
                     self.assertTrue(
                         torch.all(sk[l][p, s] == float(l + 1)),

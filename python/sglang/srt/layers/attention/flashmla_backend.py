@@ -20,6 +20,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.mem_cache.layout.page_major import paged_view
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel, get_spec
 
@@ -432,7 +433,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             if save_kv_cache:
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    cache_loc,
+                    KVWriteLoc.for_batch(forward_batch, cache_loc),
                     k,
                     v,
                 )
@@ -515,7 +516,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
-                    self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer, KVWriteLoc.for_batch(forward_batch, cache_loc), k, v
+                    )
 
             bs = forward_batch.batch_size
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
