@@ -14,6 +14,7 @@ Covers:
 """
 
 import asyncio
+import threading
 import unittest
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -131,6 +132,7 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     tm.rid_to_state = {}
     tm._mm_cache_retry_contexts = {}
     tm._release_mm_embedding_cache = MagicMock()
+    tm.encoder_dispatch_ready = {}
     tm.enable_metrics = False
     tm.enable_trace = False
     tm.enable_lora = False
@@ -298,6 +300,51 @@ class TestRidToStateCleanupOnAbort(CustomTestCase):
         self.assertIs(tm._mm_cache_retry_contexts[rid], context)
         tm._release_mm_embedding_cache.assert_not_called()
         self.assertIsInstance(tm._dispatch_to_scheduler.call_args.args[0], AbortReq)
+
+
+class TestAbortOutputPayload(CustomTestCase):
+    """An abort chunk is often the only thing a client sees;
+    it must carry the same optional fields as a normal finish chunk."""
+
+    def test_abort_includes_prompt_token_ids_only_when_requested(self):
+        """The abort chunk carries prompt_token_ids captured at tokenization,
+        and omits the field when the request did not ask for them."""
+        tm = _make_tokenizer_manager(self)
+        with_ids = _make_req_state("abort_prompt_ids_rid")
+        with_ids.prompt_token_ids = [1, 2, 3]
+        without_ids = _make_req_state("abort_no_prompt_ids_rid")
+
+        for state in (with_ids, without_ids):
+            tm.rid_to_state[state.obj.rid] = state
+            tm._handle_abort_req(_make_abort_req(state.obj.rid))
+
+        self.assertEqual(with_ids.out_list[0]["prompt_token_ids"], [1, 2, 3])
+        self.assertNotIn("prompt_token_ids", without_ids.out_list[0])
+
+    def test_abort_output_ids_match_the_streaming_mode(self):
+        """Only incremental streaming collapses the abort chunk to the last
+        token; cumulative chunks supersede, so they carry the whole generation.
+        """
+        cases = [
+            ("incremental stream", True, True, [7]),
+            ("cumulative stream", True, False, [5, 6, 7]),
+            ("non-stream", False, False, [5, 6, 7]),
+        ]
+        for name, is_stream, incremental, expected in cases:
+            with self.subTest(name):
+                tm = _make_tokenizer_manager(self)
+                tm.incremental_streaming_output = incremental
+                rid = f"abort_output_ids_{name}"
+                state = _make_req_state(rid)
+                state.obj.stream = is_stream
+                state.output_ids = [5, 6, 7]
+                tm.rid_to_state[rid] = state
+
+                tm._handle_abort_req(_make_abort_req(rid))
+
+                out = state.out_list[0]
+                self.assertEqual(out["output_ids"], expected)
+                self.assertEqual(out["meta_info"]["completion_tokens"], 3)
 
 
 class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
@@ -511,18 +558,22 @@ class TestReleaseReqStatesOnFailure(CustomTestCase):
         tm._release_req_states_on_failure(["p1", "already_gone"])
         self.assertNotIn("p1", tm.rid_to_state)
 
-    def test_failure_releases_pending_embedding_cache_lease(self):
+    def test_failure_releases_pending_lease_and_encoder_waiter(self):
         tm = _make_tokenizer_manager(self)
         rid = "discard_lease_rid"
         tm.rid_to_state[rid] = _make_req_state(rid)
         tm._mm_cache_retry_contexts[rid] = Mock(
             lease_id="lease-2", routed_dp_rank=3, dispatched=False
         )
+        dispatch_ready = threading.Event()
+        tm.encoder_dispatch_ready[rid] = dispatch_ready
 
         tm._release_req_states_on_failure([rid])
 
         self.assertNotIn(rid, tm._mm_cache_retry_contexts)
         tm._release_mm_embedding_cache.assert_called_once_with("lease-2", 3)
+        self.assertNotIn(rid, tm.encoder_dispatch_ready)
+        self.assertTrue(dispatch_ready.is_set())
 
     def test_dispatched_single_is_aborted_and_state_kept(self):
         tm = _make_tokenizer_manager(self)

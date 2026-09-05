@@ -1007,5 +1007,66 @@ class TestDflashDraftKvBudget(CustomTestCase):
         self.assertLess(_tokens(10240), _tokens(None))
 
 
+class TestSWAPoolFloor(CustomTestCase):
+    """An SWA pool below the prefill admission floor must fail here, not livelock
+    the scheduler at warmup."""
+
+    def _hybrid_swa_from_max_tokens(self, max_tokens, ratio, page_size, window):
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=list(range(16)),
+            swa_attention_layer_ids=list(range(16, 32)),
+            swa_num_kv_heads=4,
+            page_size=page_size,
+            swa_full_tokens_ratio=ratio,
+            sliding_window_size=window,
+        )
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            return cfg.calculate_pool_sizes_from_max_tokens(max_tokens, page_size)
+
+    def test_hybrid_swa_rejects_single_page_pool(self):
+        with self.assertRaisesRegex(ValueError, "cannot hold even one request"):
+            self._hybrid_swa_from_max_tokens(
+                max_tokens=4096, ratio=0.1, page_size=256, window=128
+            )
+
+    def test_hybrid_swa_accepts_pool_above_floor(self):
+        config = self._hybrid_swa_from_max_tokens(
+            max_tokens=32768, ratio=0.1, page_size=256, window=128
+        )
+        self.assertEqual(config.swa_max_total_num_tokens, 3072)
+
+    def _dsv4_sizes(self, max_tokens, page_size):
+        """Exercise the DSV4 size arithmetic without a full V4 model fixture:
+        _compute_dsv4_sizes reads only these five attributes."""
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        cfg = object.__new__(DSV4PoolConfigurator)
+        cfg.swa_ratio = 0.1
+        cfg.sliding_window_size = 128
+        cfg.swa_page_size = 128
+        cfg.c4_ring_size = 8
+        cfg.c4_shrink_factor = 1
+        return cfg._compute_dsv4_sizes(max_tokens, page_size)
+
+    def test_dsv4_rejects_single_page_pool(self):
+        # DeepSeek-V4-Flash defaults: page_size=256, swa_full_tokens_ratio=0.1.
+        # int(4096 * 0.1) page-aligns down to 256 -- exactly one page, below the
+        # 128 + 256 floor.
+        with self.assertRaisesRegex(ValueError, "cannot hold even one request"):
+            self._dsv4_sizes(max_tokens=4096, page_size=256)
+
+    def test_dsv4_accepts_pool_above_floor(self):
+        sizes = self._dsv4_sizes(max_tokens=32768, page_size=256)
+        self.assertEqual(sizes.full_max_total_num_tokens, 32768)
+        self.assertEqual(sizes.swa_max_total_num_tokens, 3072)
+
+
 if __name__ == "__main__":
     unittest.main()

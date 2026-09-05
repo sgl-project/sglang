@@ -73,6 +73,7 @@ from sglang.srt.managers.io_struct import (
     ContinueGenerationReqInput,
     ElasticScaleUpdateReq,
     EmbeddingReqInput,
+    EncoderDispatchErrorReq,
     FreezeGCReq,
     GenerateReqInput,
     HealthCheckOutput,
@@ -641,6 +642,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
+        self.encoder_dispatch_ready: Dict[str, threading.Event] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
         self._mm_cache_acquire_futures: Dict[
@@ -1814,6 +1816,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self._mark_state_dispatched(tokenized_obj.rid)
             dispatched = True
             self._mark_mm_cache_lease_dispatched(tokenized_obj.rid)
+            dispatch_ready = self.encoder_dispatch_ready.pop(tokenized_obj.rid, None)
+            if dispatch_ready is not None:
+                dispatch_ready.set()
             tokenized_obj.time_stats = time_stats
             tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
         finally:
@@ -3528,13 +3533,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         output_ids = state.output_ids
         meta_info["completion_tokens"] = len(output_ids)
-        if is_stream:
+        if is_stream and self.incremental_streaming_output:
             output_ids = [output_ids[-1]] if len(output_ids) > 0 else []
         out = {
             "text": state.get_text(),
             "output_ids": output_ids,
             "meta_info": meta_info,
         }
+        if state.prompt_token_ids is not None:
+            out["prompt_token_ids"] = state.prompt_token_ids
         del self.rid_to_state[recv_obj.rid]
 
         state.out_list.append(out)
@@ -3754,6 +3761,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
                 else:
                     del self.rid_to_state[rid]
+            dispatch_ready = self.encoder_dispatch_ready.pop(rid, None)
+            if dispatch_ready is not None:
+                dispatch_ready.set()
             self._release_pending_mm_cache_lease(rid)
 
     def _release_pending_mm_cache_lease(self, rid: str) -> None:
@@ -3770,6 +3780,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self._mm_cache_retry_contexts[rid] = dataclasses.replace(
                 context, dispatched=True
             )
+
+    def _forward_encoder_dispatch_error(self, error: EncoderDispatchErrorReq) -> None:
+        if error.rid in self.rid_to_state:
+            self._dispatch_to_scheduler(error)
+
+    def _schedule_encoder_dispatch_error(self, error: EncoderDispatchErrorReq) -> None:
+        self.event_loop.call_soon_threadsafe(
+            self._forward_encoder_dispatch_error, error
+        )
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
@@ -3820,9 +3839,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         if state is not None:
                             time_stats_json = state.time_stats.encode_json()
 
-                    self.mm_receiver.send_encode_request(
-                        obj, time_stats_json=time_stats_json
+                    dispatch_ready = self.mm_receiver.send_encode_request(
+                        obj,
+                        time_stats_json=time_stats_json,
+                        on_dispatch_error=self._schedule_encoder_dispatch_error,
                     )
+                    if dispatch_ready is not None:
+                        self.encoder_dispatch_ready[obj.rid] = dispatch_ready
             else:
                 obj.need_wait_for_mm_inputs = False
 

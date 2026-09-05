@@ -1028,9 +1028,7 @@ async def _push_embedding_to_prefill(
     if backend == "zmq_to_scheduler" and request.get("embedding_port") is None:
         send_coro = enc.send_with_url(req_id=req_id)
         if background_url_send:
-            task = asyncio.create_task(send_coro)
-            enc.background_tasks.add(task)
-            task.add_done_callback(enc.background_tasks.discard)
+            enc._create_background_task(send_coro)
         else:
             await send_coro
         return
