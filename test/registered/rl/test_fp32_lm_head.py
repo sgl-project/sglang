@@ -10,6 +10,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.runtime_context import get_context
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd")
@@ -30,7 +31,7 @@ class DummyMeta:
     def compute_dp_attention_metadata(self): ...
 
 
-class TestLMHeadFP32(unittest.TestCase):
+class TestLMHeadFP32(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         if not torch.cuda.is_available() and not (
@@ -38,13 +39,17 @@ class TestLMHeadFP32(unittest.TestCase):
         ):
             raise unittest.SkipTest("needs CUDA GPU or XPU")
 
-    def _make_logprocessor(self, vocab_size, enable_fp32):
+    def _make_logprocessor(self, vocab_size, enable_fp32, config_enable_fp32=False):
         # LogitsProcessor reads get_exec().features.enable_fp32_lm_head
         # from the published config.
         override = get_context().override_server_args(enable_fp32_lm_head=enable_fp32)
         override.install()
         self.addCleanup(override.restore)
-        cfg = SimpleNamespace(vocab_size=vocab_size, final_logit_softcapping=None)
+        cfg = SimpleNamespace(
+            vocab_size=vocab_size,
+            final_logit_softcapping=None,
+            enable_lm_head_fp32=config_enable_fp32,
+        )
         return LogitsProcessor(cfg, skip_all_gather=True, logit_scale=None)
 
     def _run_case(
@@ -55,6 +60,7 @@ class TestLMHeadFP32(unittest.TestCase):
         expected_a_dtype,
         expected_b_dtype,
         expected_operation,
+        config_enable_fp32=False,
     ):
         device = get_device()
         BATCH_SIZE, HIDDEN_SIZE, VOCAB_SIZE = 2, 64, 128
@@ -63,7 +69,9 @@ class TestLMHeadFP32(unittest.TestCase):
         )
         head = LMHeadStub(VOCAB_SIZE, HIDDEN_SIZE, dtype=weights_dtype, device=device)
         meta = DummyMeta()
-        logprocessor = self._make_logprocessor(VOCAB_SIZE, enable_fp32)
+        logprocessor = self._make_logprocessor(
+            VOCAB_SIZE, enable_fp32, config_enable_fp32
+        )
 
         original_matmul = torch.matmul
         original_mm = torch.mm
@@ -171,6 +179,21 @@ class TestLMHeadFP32(unittest.TestCase):
             torch.bfloat16,
             torch.bfloat16,
             "matmul",
+        )
+
+    def test_model_config_enables_fp32_without_server_flag(self):
+        expected_operation = "mm" if torch.cuda.is_available() else "matmul"
+        expected_dtype = (
+            torch.float32 if expected_operation == "matmul" else torch.bfloat16
+        )
+        self._run_case(
+            torch.bfloat16,
+            False,
+            torch.bfloat16,
+            expected_dtype,
+            expected_dtype,
+            expected_operation,
+            config_enable_fp32=True,
         )
 
 
