@@ -164,10 +164,10 @@ impl Intake {
                     registered = true;
                     // `validate` advanced Received → Validating; keep driving.
                 }
-                // Control and detokenize skip normalization (no sampling params)
-                // straight to the pre-send checks; generate goes to Normalizing.
+                // Control skips normalization (no sampling params) straight to
+                // the pre-send checks; generate goes to Normalizing.
                 RequestState::Validating => match &req.kind {
-                    RequestKind::Control(_) | RequestKind::Detokenize { .. } => {
+                    RequestKind::Control(_) => {
                         let _ = req
                             .state
                             .apply(Event::Validated(ValidationOutcome::AlreadyTokenized));
@@ -181,7 +181,7 @@ impl Intake {
                 RequestState::Normalizing => {
                     let outcome = {
                         let RequestKind::Generate(g) = &mut req.kind else {
-                            // Unreachable (control/detokenize never reach here);
+                            // Unreachable (control never reaches here);
                             // reject so a bug can't leak/hang a registered request.
                             self.fail(
                                 &mut req,
@@ -284,16 +284,14 @@ impl Intake {
                     }
                     let _ = req.state.apply(Event::PreSendValidated); // → Queued
                 }
-                // Hand the request to the stage that answers it: the scheduler
-                // ring (generate payload or control frame), or — for detokenize
-                // — the detok shard itself.
+                // Hand the request to the scheduler ring as a generate payload
+                // or control frame.
                 RequestState::Queued => {
                     // The patterns bind nothing, so the match reads only the
                     // discriminant and `req` can be moved into each push.
                     match req.kind {
                         RequestKind::Generate(_) => self.push_to_ring(req),
                         RequestKind::Control(_) => self.push_control_to_ring(req),
-                        RequestKind::Detokenize { .. } => self.push_detokenize_to_shard(req),
                     }
                     return;
                 }
@@ -327,7 +325,7 @@ impl Intake {
                 g.return_text_in_logprobs.unwrap_or(false),
                 g.sampling_params.no_stop_trim,
             ),
-            RequestKind::Control(_) | RequestKind::Detokenize { .. } => (false, false),
+            RequestKind::Control(_) => (false, false),
         };
         self.senders
             .detok_for(&req.rid)
@@ -338,34 +336,6 @@ impl Intake {
                 no_stop_trim,
             })
             .is_ok()
-    }
-
-    /// Hand a `Detokenize` request to its owning detok shard — the stage that
-    /// answers this kind (it never touches the scheduler ring). The shard
-    /// already holds this rid's sink: `register_detok` queued `Register` on the
-    /// same channel from this same thread, so FIFO gives Register → Decode.
-    fn push_detokenize_to_shard(&self, mut req: Request) {
-        let RequestKind::Detokenize { token_ids } = &req.kind else {
-            self.fail(
-                &mut req,
-                Error::Internal("non-detokenize request reached push_detokenize_to_shard".into()),
-                true,
-            );
-            return;
-        };
-        // Infallible: `validate` rejected out-of-range ids at `Received`.
-        let token_ids: Vec<u32> = token_ids.iter().map(|&id| id as u32).collect();
-        if self
-            .senders
-            .detok_for(&req.rid)
-            .send(DetokMsg::Decode {
-                rid: req.rid.clone(),
-                token_ids,
-            })
-            .is_err()
-        {
-            self.fail(&mut req, Error::Internal("detok shard gone".into()), true);
-        }
     }
 
     /// Push a bare control request (`[tag, rid, nil]`) onto the to_scheduler channel. The

@@ -64,6 +64,11 @@ pub struct GenerateBody {
     pub input_ids: Option<OneOrMany<TokenIds>>,
     #[serde(default)]
     pub stream: bool,
+    /// Override the server-wide streaming frame format for this response.
+    /// `None` preserves the configured default; one value applies to the whole
+    /// response, including every item in a batch.
+    #[serde(default)]
+    pub incremental_streaming_output: Option<bool>,
     /// One params object (broadcast) or a list of them (per item); see
     /// [`SamplingParamsInput`].
     pub sampling_params: Option<SamplingParamsInput>,
@@ -571,13 +576,6 @@ pub enum RequestKind {
     /// A control endpoint (e.g. `/server_info`, `/health`): no tokenization, and
     /// the response is a single non-streamed JSON result.
     Control(Box<ControlRequest>),
-    /// Internal service call: decode a complete token-id sequence to text. Walks
-    /// the same FSM as every request (validate → register → Queued), but the
-    /// stage that answers it is the detok shard itself, never the scheduler
-    /// ring; the result arrives on the registered sink as one `Data` payload
-    /// (the raw UTF-8 text). First caller: `/v1/completions` `echo` for
-    /// token-id prompts; a future `/detokenize` parity endpoint maps 1:1.
-    Detokenize { token_ids: TokenIds },
 }
 
 /// A single in-flight `/generate` request (per-item from

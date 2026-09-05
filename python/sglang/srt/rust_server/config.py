@@ -25,7 +25,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _build_server_args(scheduler: Scheduler) -> ServerArgs:
+def _build_server_args(
+    scheduler: Scheduler,
+    *,
+    host: Optional[str] = None,
+    port: Optional[int] = None,
+) -> ServerArgs:
     """The typed launch handoff for the scheduler's embedded Rust server:
     the ``server_args`` fields it reads, the already-resolved
     ``model_config``, and launch-time facts — as the Rust extension's own
@@ -51,8 +56,8 @@ def _build_server_args(scheduler: Scheduler) -> ServerArgs:
         revision=get_model().revision,
         load_format=get_model().load_format,
         weight_version=get_serving().weight_version,
-        host=get_serving().host,
-        port=get_serving().port,
+        host=get_serving().host if host is None else host,
+        port=get_serving().port if port is None else port,
         log_level=get_observability().log_level,
         log_level_http=get_observability().log_level_http,
         chat_template=get_serving().chat_template,

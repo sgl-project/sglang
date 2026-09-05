@@ -39,12 +39,6 @@ bytemuck = "1"
 core_affinity = "0.8"
 # the dynamo-tokenizers is deps on hf-hub, should bump version together.
 dynamo-tokenizers = "1.7.0"
-# Keep the HTTP adapter on Dynamo's public OpenAI types, renderer, and parsers.
-# `dynamo-llm` stays excluded because it pulls the full runtime just to reuse
-# small service helpers.
-dynamo-parsers = "7.0.1"
-dynamo-protocols = "5.1.0"
-dynamo-renderer = "5.0.0"
 flume = "0.12.0"
 hf-hub = { version = "0.4", default-features = false }
 itertools = "0.14"
@@ -63,7 +57,3 @@ rmpv = { version = "1", features = ["with-serde"] }
 # pyo3 bindings so it links as a plain rlib; renamed so `use sglang_mm::…` reads
 # naturally while the crate keeps its own artifact name in the shared target/.
 sglang_mm = { package = "sglang-mm", path = "../sglang-mm", default-features = false }
-
-[dev-dependencies]
-# `Router::oneshot` for handler-level router tests.
-tower = { version = "0.5", features = ["util"] }
