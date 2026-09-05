@@ -3,6 +3,7 @@
 //! pre-bound listener until shutdown.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use axum::Router;
 
@@ -26,6 +27,8 @@ pub(super) struct AppState {
     pub(super) chat_formatter: Option<openai::ChatFormatter>,
     /// Response heartbeat (bumped per drained ring frame).
     pub(super) response_activity: ActivityCounter,
+    /// Startup readiness, set only after the Python launcher finishes warmup.
+    pub(super) ready: AtomicBool,
 }
 
 pub async fn serve(
@@ -47,6 +50,7 @@ pub async fn serve(
         server_args: server_args.clone(),
         chat_formatter,
         response_activity,
+        ready: AtomicBool::new(false),
     });
     // Each endpoint module registers its own routes and merges here.
     let router = Router::new()

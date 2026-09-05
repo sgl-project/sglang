@@ -26,6 +26,7 @@ import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import (
@@ -2386,6 +2387,69 @@ def _freeze_gc_after_server_warmup(server_args: ServerArgs):
         logger.warning("post-warmup freeze_gc failed", exc_info=True)
 
 
+def _warmup_and_mark_rust_server_ready(
+    server_args: ServerArgs, port_args: PortArgs
+) -> bool:
+    urls = [
+        server_args.url(port=get_serving().port + rank)
+        for rank in range(get_parallel().dp_size)
+    ]
+    headers = {"X-SGLang-Startup-Token": port_args.instance_id}
+    if server_args.api_key:
+        headers["Authorization"] = f"Bearer {server_args.api_key}"
+    is_pd = get_disagg().disaggregation_mode != "null"
+    timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
+    timeout = timeout if timeout > 0 else (1800 if is_pd else 600)
+
+    def post(rank, path, payload=None):
+        res = requests.post(
+            urls[rank] + path,
+            json=payload,
+            headers=headers,
+            timeout=10 if path == "/startup_ready" else timeout,
+            verify=ssl_verify_of(server_args),
+        )
+        if res.status_code != 200:
+            raise RuntimeError(f"Rust startup failed on {urls[rank]}{path}: {res.text}")
+
+    def warmup(rank):
+        payload = {"sampling_params": {"temperature": 0, "max_new_tokens": 8}}
+        if is_pd:
+            payload.update(
+                input_ids=[10, 11, 12, 13],
+                bootstrap_host=FAKE_BOOTSTRAP_HOST,
+                bootstrap_room=rank,
+                routed_dp_rank=rank,
+            )
+            payload["sampling_params"]["ignore_eos"] = True
+        elif server_args.skip_tokenizer_init:
+            payload["input_ids"] = [10, 11, 12]
+        else:
+            payload["text"] = "The capital city of France is"
+        if not is_pd and server_args.debug_tensor_dump_input_file:
+            payload.pop("text", None)
+            payload["input_ids"] = np.load(
+                server_args.debug_tensor_dump_input_file
+            ).tolist()
+            payload["sampling_params"]["max_new_tokens"] = 0
+        post(rank, "/generate", payload)
+
+    try:
+        if not port_args.instance_id:
+            raise ValueError("empty Rust startup token")
+        if not get_serving().skip_server_warmup:
+            # DP attention requires concurrent requests to the per-rank listeners.
+            with ThreadPoolExecutor(max_workers=len(urls)) as pool:
+                list(pool.map(warmup, range(len(urls))))
+        for rank in range(len(urls)):
+            post(rank, "/startup_ready")
+        return True
+    except Exception:
+        logger.exception("Rust server startup failed")
+        kill_process_tree(os.getpid())
+        return False
+
+
 def _wait_and_warmup(
     server_args: ServerArgs,
     launch_callback: Optional[Callable[[], None]] = None,
@@ -2827,14 +2891,8 @@ def launch_server(
     )
 
     if envs.SGLANG_RUST_SERVER.get():
-        # The Rust server serves api-server, tokenizer, and detokenizer, so the
-        # main process has no Python HTTP server / tokenizer manager to run.
-        # Run a warmup /generate before advertising readiness: the Rust /health
-        # and /get_model_info endpoints are static (200 as soon as the server
-        # binds, before any forward pass), so without this the first real request
-        # pays the cold-start cost (observed as a >60s first generation).
-        if not get_serving().skip_server_warmup:
-            _execute_server_warmup(server_args)
+        if not _warmup_and_mark_rust_server_ready(server_args, port_args):
+            return
         logger.info("The server is fired up and ready to roll!")
         if launch_callback is not None:
             launch_callback()

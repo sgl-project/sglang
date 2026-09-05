@@ -337,6 +337,8 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
 mod tests {
     use super::*;
     use crate::message::config::{RuntimeConfig, RustServerServerArgs, ServerArgs};
+    use std::io::{Read, Write};
+    use std::net::SocketAddr;
 
     /// Minimal boot config: no tokenizer load, complete `model_config` (from
     /// `Default`), unified role.
@@ -345,6 +347,19 @@ mod tests {
             skip_tokenizer_init: true,
             ..Default::default()
         }
+    }
+
+    fn request(addr: SocketAddr, method: &str, path: &str, token: Option<&str>) -> u16 {
+        let mut conn = std::net::TcpStream::connect(addr).unwrap();
+        conn.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let header = token
+            .map(|t| format!("X-SGLang-Startup-Token: {t}\r\n"))
+            .unwrap_or_default();
+        write!(conn, "{method} {path} HTTP/1.1\r\nHost: t\r\n{header}Content-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        let mut response = String::new();
+        conn.read_to_string(&mut response).unwrap();
+        response.split_whitespace().nth(1).unwrap().parse().unwrap()
     }
 
     /// Regression: `request_shutdown` must actually stop the API server — it joins
@@ -381,6 +396,56 @@ mod tests {
             std::net::TcpStream::connect(addr).is_err(),
             "port still accepting connections after shutdown",
         );
+    }
+
+    #[test]
+    fn health_generate_waits_for_startup_ready() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let server_args = test_server_args();
+        let startup_ready_token = server_args.startup_ready_token.clone();
+        let cfg = RuntimeConfig {
+            rust_server_args: RustServerServerArgs {
+                http_addr: addr,
+                http_api_worker_num: 1,
+                ..Default::default()
+            },
+            server_args: Arc::new(server_args),
+        };
+        let rt = start(cfg).expect("start runtime");
+
+        for path in ["/health", "/health_generate"] {
+            assert_eq!(request(addr, "GET", path, None), 503);
+        }
+        assert!(rt.to_scheduler_rx.drain(1).headers.is_empty());
+        assert_eq!(request(addr, "GET", "/model_info", None), 200);
+        for (token, status) in [
+            (None, 401),
+            (Some("wrong-token"), 401),
+            (Some(startup_ready_token.as_str()), 200),
+        ] {
+            assert_eq!(request(addr, "POST", "/startup_ready", token), status);
+        }
+        let health = std::thread::spawn(move || request(addr, "GET", "/health_generate", None));
+
+        let mut saw_probe = false;
+        for _ in 0..500 {
+            if !rt.to_scheduler_rx.drain(1).headers.is_empty() {
+                saw_probe = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(saw_probe, "ready health check did not reach the scheduler");
+
+        let header = rmp_serde::to_vec(&vec![Vec::<u32>::new(); 4]).unwrap();
+        let frame = crate::message::response::frame_decode_batch_cols(&header, &[]);
+        assert!(rt.from_scheduler_tx.try_push(frame).is_ok());
+        assert_eq!(health.join().unwrap(), 200);
+
+        rt.request_shutdown();
     }
 
     /// Regression: shutdown must return promptly even with an in-flight

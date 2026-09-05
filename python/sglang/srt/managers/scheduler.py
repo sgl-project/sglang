@@ -460,6 +460,7 @@ class Scheduler(
 
         # Parse args
         self.server_args = server_args
+        self.port_args = port_args
         self.nccl_port = port_args.nccl_port
         self.schedule_policy = get_schedule().schedule_policy
         self.enable_priority_scheduling = get_schedule().enable_priority_scheduling

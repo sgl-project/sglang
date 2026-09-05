@@ -93,6 +93,7 @@ def _build_server_args(scheduler: Scheduler) -> ServerArgs:
         # can serve them statically (no scheduler round-trip).
         version=__version__,
         max_total_num_tokens=scheduler.max_total_num_tokens,
+        startup_ready_token=scheduler.port_args.instance_id,
     )
 
 
