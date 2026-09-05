@@ -163,6 +163,18 @@ class TestPrepareServerArgs(CustomTestCase):
         ):
             ServerArgs(model_path="dummy", prefill_decode_interval=-1).resolve_once()
 
+    def test_prefill_max_requests_rejects_non_positive_values(self):
+        for value in (0, -1):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
+                    ValueError, "--prefill-max-requests must be positive"
+                ),
+            ):
+                ServerArgs(
+                    model_path="dummy", prefill_max_requests=value
+                ).resolve_once()
+
     def test_dsv4_prefill_backend_cli_choices(self):
         parser = server_args_module.argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)

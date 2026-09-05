@@ -419,6 +419,12 @@ def validate_prefill_decode_interval(server_args: Any):
         raise ValueError("--prefill-decode-interval must be non-negative.")
 
 
+def validate_prefill_max_requests(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.prefill_max_requests is not None and cfg.prefill_max_requests <= 0:
+        raise ValueError("--prefill-max-requests must be positive when set.")
+
+
 def check_two_batch_overlap(server_args: Any):
     # With no EP a2a backend, two-batch-overlap is only valid on the non-EP
     # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with
