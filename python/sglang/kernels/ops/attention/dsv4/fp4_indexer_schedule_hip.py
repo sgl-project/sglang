@@ -22,14 +22,14 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.attention.dsv4.fp4_logits_workspace import MAX_FUSED_ROWS
+
 _KV_BLOCK_SIZE = 64
 
 # Rows are query tokens: tens to a few hundred for MTP target-verify, up to the
 # chunked-prefill size for EXTEND. The prep kernel holds one row per lane, so
 # past this it hands back to AITER's torch preamble -- a prefill that wide is
 # compute-bound and does not care about ~30 extra launches.
-MAX_FUSED_ROWS = 4096
-
 # Columns per page-table tile. The padded table is the row's page count rounded
 # up to a multiple of 4, plus 4 more for the scheduler's one-chunk lookahead.
 _PT_BLOCK = 256

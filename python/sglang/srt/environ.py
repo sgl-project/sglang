@@ -1409,6 +1409,10 @@ class Envs:
     # Per-rank local query rows (after DP-attention sharding when enabled),
     # not request ISL.
     SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS = EnvInt(8192)
+    # The HIP FP4 indexer's persistent logits workspace is workload-sized and
+    # bounded by both this ceiling and a fraction of runtime memory headroom.
+    SGLANG_DSV4_FP4_LOGITS_BUDGET_MB = EnvInt(512)
+    SGLANG_DSV4_FP4_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)

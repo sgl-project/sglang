@@ -26,7 +26,7 @@ from sglang.kernels.ops.attention.dsv4 import (
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     aiter_fp4_paged_mqa_logits,
     aiter_q_indexer_fp4,
-    logits_rows_per_chunk,
+    fp4_logits_max_seq_len,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
@@ -34,6 +34,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
+from sglang.srt.layers.attention.dsv4.fp4_logits_workspace import MAX_FUSED_ROWS
 from sglang.srt.layers.attention.dsv4.metadata import (
     _SM120_INDEXER_M_CHUNK,
     NonPagedIndexerPlan,
@@ -848,7 +849,11 @@ class C4IndexerBackendMixin:
 
         all_rows = slice(0, _c4sl.shape[0])
 
-        def run_topk_transform(rows: slice, logits: torch.Tensor) -> None:
+        def run_topk_transform(
+            rows: slice,
+            logits: torch.Tensor,
+            topk_metadata: Optional[torch.Tensor] = None,
+        ) -> None:
             row_raw_indices = raw_indices[rows] if raw_indices is not None else None
             if self.dsa_topk_backend.is_torch():
                 topk_transform_pytorch_vectorized(
@@ -878,9 +883,13 @@ class C4IndexerBackendMixin:
                     # The cached plan routes rows by their index in the full
                     # range, so a chunk needs one built over its own rows.
                     (
-                        indexer_metadata.topk_metadata
-                        if rows == all_rows or not is_hip()
-                        else plan_topk_v2(c4_seq_lens[rows])
+                        topk_metadata
+                        if topk_metadata is not None
+                        else (
+                            indexer_metadata.topk_metadata
+                            if rows == all_rows or not is_hip()
+                            else plan_topk_v2(c4_seq_lens[rows])
+                        )
                     ),
                 )
             else:
@@ -906,6 +915,13 @@ class C4IndexerBackendMixin:
         elif use_aiter_fp4:
             q_fp4, q_scale = q
             is_decode = forward_batch.forward_mode.is_decode()
+            fp4_logits_workspace = getattr(self, "fp4_logits_workspace", None)
+            use_managed_logits = (
+                not is_decode
+                and fp4_logits_workspace is not None
+                and not torch.cuda.is_current_stream_capturing()
+            )
+            logits_max_seq_len = fp4_logits_max_seq_len(page_table)
             # Hoisted: these await this layer's KV transfer, which every chunk
             # would otherwise re-await.
             k_payload = token_to_kv_pool.get_index_k_fp4_payload_buffer(
@@ -913,37 +929,75 @@ class C4IndexerBackendMixin:
             )
             k_scale = token_to_kv_pool.get_index_k_fp4_scale_buffer(c4_indexer.layer_id)
 
-            def run_fp4_indexer(rows: slice) -> None:
-                logits = aiter_fp4_paged_mqa_logits(
-                    q_fp4=q_fp4[rows],
-                    q_scale=q_scale[rows],
-                    k_payload=k_payload,
-                    k_scale=k_scale,
-                    weights=weights[rows],
-                    page_table=page_table[rows],
-                    c4_seq_lens=c4_seq_lens[rows],
-                    weight_scale=c4_indexer.weight_scale,
-                    is_decode=is_decode,
-                    decode_workspace=metadata.fp4_decode_workspace,
-                    prefill_workspace=metadata.fp4_prefill_workspace,
-                )
-                run_topk_transform(rows, logits)
+            chunk_plans = getattr(metadata, "fp4_prefill_chunk_plans", None)
+
+            def run_fp4_indexer(rows: slice, chunk_id: int) -> None:
+                start = rows.start or 0
+                stop = rows.stop if rows.stop is not None else query_rows
+                prefill_workspace = metadata.fp4_prefill_workspace
+                planned_topk = None
+                if (
+                    not is_decode
+                    and chunk_plans is not None
+                    and chunk_id < len(chunk_plans)
+                ):
+                    candidate = chunk_plans[chunk_id]
+                    if candidate.start == start and candidate.stop == stop:
+                        prefill_workspace = candidate.workspace
+                        planned_topk = candidate.topk_metadata
+
+                def score_and_topk(logits_out: Optional[torch.Tensor]) -> None:
+                    logits = aiter_fp4_paged_mqa_logits(
+                        q_fp4=q_fp4[rows],
+                        q_scale=q_scale[rows],
+                        k_payload=k_payload,
+                        k_scale=k_scale,
+                        weights=weights[rows],
+                        page_table=page_table[rows],
+                        c4_seq_lens=c4_seq_lens[rows],
+                        weight_scale=c4_indexer.weight_scale,
+                        is_decode=is_decode,
+                        decode_workspace=metadata.fp4_decode_workspace,
+                        prefill_workspace=prefill_workspace,
+                        logits_out=logits_out,
+                    )
+                    run_topk_transform(rows, logits, planned_topk)
+
+                if use_managed_logits:
+                    with fp4_logits_workspace.acquire(
+                        stop - start,
+                        logits_max_seq_len,
+                        stream=torch.cuda.current_stream(q_fp4.device),
+                    ) as logits_out:
+                        score_and_topk(logits_out)
+                else:
+                    score_and_topk(None)
 
             # The scores are the layer's largest transient and their width tracks
             # context length, so prefill splits the rows into whatever fits the
-            # pooled logits block and reduces each chunk before the next one
-            # reuses it. Rows are scored and reduced independently, so this
+            # managed logits workspace and reduces each chunk before the next
+            # one reuses it. Rows are scored and reduced independently, so this
             # matches a single pass. Decode's rectangle is bounded by its capture
             # shapes, so it always stays whole.
             rows_per_chunk = (
-                query_rows if is_decode else logits_rows_per_chunk(page_table)
+                fp4_logits_workspace.rows_per_chunk(
+                    logits_max_seq_len, max_rows=MAX_FUSED_ROWS
+                )
+                if use_managed_logits
+                else query_rows
             )
+            planned_chunk_rows = getattr(metadata, "fp4_prefill_chunk_rows", 0)
+            if chunk_plans and planned_chunk_rows > 0:
+                rows_per_chunk = min(rows_per_chunk, planned_chunk_rows)
             if rows_per_chunk >= query_rows:
-                run_fp4_indexer(all_rows)
+                run_fp4_indexer(all_rows, 0)
             else:
-                for start in range(0, query_rows, max(1, rows_per_chunk)):
+                for chunk_id, start in enumerate(
+                    range(0, query_rows, max(1, rows_per_chunk))
+                ):
                     run_fp4_indexer(
-                        slice(start, min(start + rows_per_chunk, query_rows))
+                        slice(start, min(start + rows_per_chunk, query_rows)),
+                        chunk_id,
                     )
         else:
             c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
