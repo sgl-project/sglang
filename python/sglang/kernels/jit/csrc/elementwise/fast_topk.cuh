@@ -63,6 +63,9 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
   alignas(128) __shared__ int s_histogram_buf[2][RADIX + 128];
   alignas(128) __shared__ int s_counter;
   alignas(128) __shared__ int s_threshold_bin_id;
+  // Exact-fallback path: refined radix digit selected in each previous
+  // round (digit p of convert_to_uint32, bits [24 - 8p, 32 - 8p)).
+  alignas(128) __shared__ int s_prefix_bins[4];
   alignas(128) __shared__ int s_num_input[2];
 
   auto& s_histogram = s_histogram_buf[0];
@@ -106,13 +109,13 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
   }
   __syncthreads();
 
-  const auto threshold_bin = s_threshold_bin_id;
-  topk -= s_histogram[threshold_bin + 1];
+  const auto coarse_threshold_bin = s_threshold_bin_id;
+  topk -= s_histogram[coarse_threshold_bin + 1];
 
   if (topk == 0) {
     for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
       const auto bin = static_cast<int>(convert_to_uint8(input[idx + row_start]));
-      if (bin > threshold_bin) {
+      if (bin > coarse_threshold_bin) {
         const auto pos = ::atomicAdd(&s_counter, 1);
         index[pos] = idx;
       }
@@ -129,10 +132,10 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
     for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
       const auto raw_input = input[idx + row_start];
       const auto bin = static_cast<int>(convert_to_uint8(raw_input));
-      if (bin > threshold_bin) {
+      if (bin > coarse_threshold_bin) {
         const auto pos = ::atomicAdd(&s_counter, 1);
         index[pos] = idx;
-      } else if (bin == threshold_bin) {
+      } else if (bin == coarse_threshold_bin) {
         const auto pos = ::atomicAdd(&s_num_input[0], 1);
         // fuse the histogram computation here
         if (pos < int(SMEM_INPUT_SIZE)) {
@@ -141,6 +144,28 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
           const auto sub_bin = (bin >> 24) & 0xFF;
           ::atomicAdd(&s_histogram[sub_bin], 1);
         }
+      }
+    }
+    __syncthreads();
+  }
+
+  // The staging buffer is a capacity bound, not a correctness bound: a
+  // concentrated row can place far more than SMEM_INPUT_SIZE candidates in
+  // the threshold bin (sgl-project/sglang#36807). Overflowing candidates
+  // were dropped above *together with* their fused histogram contributions,
+  // so the staged subset no longer represents the threshold-bin population.
+  // Detect the overflow and refine from a full-row rescan instead; the fast
+  // path below is unchanged.
+  const bool overflow = s_num_input[0] > int(SMEM_INPUT_SIZE);
+  if (overflow) {
+    if (tx < RADIX + 1) {
+      s_histogram[tx] = 0;
+    }
+    __syncthreads();
+    for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+      const auto raw = input[idx + row_start];
+      if (static_cast<int>(convert_to_uint8(raw)) == coarse_threshold_bin) {
+        ::atomicAdd(&s_histogram[(convert_to_uint32(raw) >> 24) & 0xFF], 1);
       }
     }
     __syncthreads();
@@ -159,6 +184,7 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
     run_cumsum();
     if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
       s_threshold_bin_id = tx;
+      s_prefix_bins[round] = tx;
       s_num_input[r_idx ^ 1] = 0;
       s_last_remain = topk - s_histogram[tx + 1];
     }
@@ -167,9 +193,25 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
     const auto threshold_bin = s_threshold_bin_id;
     topk -= s_histogram[threshold_bin + 1];
 
+    // Overflow fallback: rescan the full row; a candidate qualifies iff its
+    // coarse fp16 bin and its refined radix digits so far all match.
+    const int scan_len = overflow ? length : num_input;
     if (topk == 0) {
-      for (int i = tx; i < num_input; i += BLOCK_SIZE) {
-        const auto idx = s_input_idx[r_idx][i];
+      for (int i = tx; i < scan_len; i += BLOCK_SIZE) {
+        int idx;
+        if (overflow) {
+          idx = i;
+          const auto raw = input[idx + row_start];
+          if (static_cast<int>(convert_to_uint8(raw)) != coarse_threshold_bin) continue;
+          const auto key = convert_to_uint32(raw);
+          bool ok = true;
+          for (int p = 0; p < round; ++p) {
+            if (((key >> (24 - 8 * p)) & 0xFF) != s_prefix_bins[p]) { ok = false; break; }
+          }
+          if (!ok) continue;
+        } else {
+          idx = s_input_idx[r_idx][i];
+        }
         const auto offset = 24 - round * 8;
         const auto bin = (convert_to_uint32(input[idx + row_start]) >> offset) & 0xFF;
         if (bin > threshold_bin) {
@@ -185,9 +227,23 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
         s_histogram[tx] = 0;
       }
       __syncthreads();
-      for (int i = tx; i < num_input; i += BLOCK_SIZE) {
-        const auto idx = s_input_idx[r_idx][i];
-        const auto raw_input = input[idx + row_start];
+      for (int i = tx; i < scan_len; i += BLOCK_SIZE) {
+        int idx;
+        float raw_input;
+        if (overflow) {
+          idx = i;
+          raw_input = input[idx + row_start];
+          if (static_cast<int>(convert_to_uint8(raw_input)) != coarse_threshold_bin) continue;
+          const auto key = convert_to_uint32(raw_input);
+          bool ok = true;
+          for (int p = 0; p < round; ++p) {
+            if (((key >> (24 - 8 * p)) & 0xFF) != s_prefix_bins[p]) { ok = false; break; }
+          }
+          if (!ok) continue;
+        } else {
+          idx = s_input_idx[r_idx][i];
+          raw_input = input[idx + row_start];
+        }
         const auto offset = 24 - round * 8;
         const auto bin = (convert_to_uint32(raw_input) >> offset) & 0xFF;
         if (bin > threshold_bin) {
@@ -199,6 +255,12 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
             if (pos > 0) {
               index[kTopK - pos] = idx;
             }
+          } else if (overflow) {
+            // Next round rescans the full row: only the fused histogram
+            // contribution is needed, no staging.
+            const auto key = convert_to_uint32(raw_input);
+            const auto sub_bin = (key >> (offset - 8)) & 0xFF;
+            ::atomicAdd(&s_histogram[sub_bin], 1);
           } else {
             const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
             if (pos < int(SMEM_INPUT_SIZE)) {
