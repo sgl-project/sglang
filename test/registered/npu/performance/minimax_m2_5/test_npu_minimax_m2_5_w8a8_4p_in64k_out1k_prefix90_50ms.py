@@ -9,7 +9,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=3600, suite="base-c-test-perf-8-npu-a3")
+register_npu_ci(est_time=3600, suite="nightly-perf-8-npu-a3", nightly=True)
 
 MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -20,11 +20,11 @@ MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_ENVS = {
     "ASCEND_USE_FIA": "1",
     "SGLANG_SET_CPU_AFFINITY": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_NPU_FUSED_MOE_MODE": "2",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "140000",
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "DEEPEP_HCCL_BUFFSIZE": "1024",
     "SGLANG_EXTERNAL_MODEL_PACKAGE": "custom_eagle3",
+    "SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE": "999999999",
     "PYTHONPATH": f"{MINIMAX_M2_5_EAGLE3_MODEL_PATH}:{os.environ.get('PYTHONPATH', '')}",
 }
 
@@ -34,12 +34,14 @@ MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_OTHER_ARGS = [
     "--mem-fraction-static",
     0.63,
     "--max-running-requests",
-    26,
+    24,
     "--reasoning-parser",
     "minimax-append-think",
     "--tool-call-parser",
     "minimax-m2",
     "--enable-prefill-delayer",
+    "--prefill-delayer-max-delay-passes",
+    30,
     "--prefill-max-requests",
     10,
     "--chunked-prefill-size",
@@ -56,9 +58,10 @@ MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_OTHER_ARGS = [
     20,
     22,
     24,
-    26,
     "--moe-a2a-backend",
     "ascend_fuseep",
+    "--fuseep-mode",
+    2,
     "--deepep-mode",
     "auto",
     "--quantization",
@@ -95,8 +98,8 @@ class TestNPUMiniMaxM2_5W8A8_4P_In64k_Out1k_Prefix90_50ms(
     other_args = MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_OTHER_ARGS
     envs = MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_ENVS
     dataset_name = "generated-shared-prefix"
-    max_concurrency = 26
-    num_prompts = 104
+    max_concurrency = 24
+    num_prompts = 96
     input_len = 65536
     output_len = 1024
     random_range_ratio = 1

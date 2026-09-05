@@ -10,7 +10,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_npu_ci(
     est_time=400,
-    suite="nightly-1-npu-a3",
+    suite="full-1-npu-a3",
     nightly=True,
 )
 
@@ -63,9 +63,9 @@ class TestBgeReranker(CustomTestCase):
         for i in range(len(srt_scores)):
             score_difference = abs(hf_scores[i] - srt_scores[i])
 
-            assert (
-                score_difference < score_tolerance
-            ), "cross encoder scores are not all close"
+            assert score_difference < score_tolerance, (
+                "cross encoder scores are not all close"
+            )
 
     def preprocess_prompts(self, prompt):
         processed_prompts = []

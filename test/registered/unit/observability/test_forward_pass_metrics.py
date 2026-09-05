@@ -13,7 +13,9 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
     SchedulerMetricsReporter,
+    _CacheHitRateWindow,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 def _make_ps(**overrides) -> ParallelState:
@@ -134,6 +136,12 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.scheduler.disaggregation_mode = DisaggregationMode.NULL
         self.reporter = _make_reporter(self, self.scheduler)
         self.scheduler.enable_fpm = True
+
+    def test_cache_hit_rate_window_keeps_last_15s_of_tokens(self):
+        window = _CacheHitRateWindow()
+        self.assertEqual(window.add(hit_tokens=20, total_tokens=100, now=0.0), 0.2)
+        self.assertEqual(window.add(hit_tokens=80, total_tokens=100, now=10.0), 0.5)
+        self.assertEqual(window.add(hit_tokens=90, total_tokens=100, now=15.0), 0.85)
 
     def _make_batch(self, **overrides):
         defaults = dict(
@@ -397,6 +405,155 @@ class TestIdleMetrics(unittest.TestCase):
         self.assertTrue(math.isnan(self.reporter.stats.fwd_occupancy))
         self.assertEqual(self.reporter._device_timer_window_batch_count, 0)
         self.assertEqual(self.published_occupancies, [])
+
+
+class TestSchedulerTimeAccounting(CustomTestCase):
+    def setUp(self):
+        self.reporter = _make_reporter(self, types.SimpleNamespace())
+        self.idle_seconds = []
+        self.process_cpu_seconds = []
+        self.stage_seconds = []
+        self.reporter.enable_metrics = True
+        self.reporter.scheduler_stage_metrics.enabled = True
+        self.reporter.metrics_collector = types.SimpleNamespace(
+            increment_scheduler_idle_seconds=self.idle_seconds.append,
+            increment_scheduler_process_cpu_seconds=self.process_cpu_seconds.append,
+            increment_scheduler_stage_seconds=lambda **kwargs: (
+                self.stage_seconds.append(kwargs)
+            ),
+        )
+
+    def test_counts_idle_wall_time_and_process_cpu_time(self):
+        wall_timestamps = [
+            0,
+            1_200_000_000,
+            1_500_000_000,
+            2_700_000_000,
+            3_000_000_000,
+            4_100_000_000,
+        ]
+        process_cpu_timestamps = [
+            0,
+            400_000_000,
+            1_200_000_000,
+            1_900_000_000,
+        ]
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic_ns",
+                side_effect=wall_timestamps,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.process_time_ns",
+                side_effect=process_cpu_timestamps,
+            ),
+        ):
+            self.reporter.start_scheduler_time_accounting()
+            self.reporter.record_scheduler_idle()
+            self.reporter.record_scheduler_active()
+            self.reporter.record_scheduler_active()
+            self.reporter.record_scheduler_idle()
+            self.reporter.record_scheduler_idle()
+
+        self.assertAlmostEqual(sum(self.idle_seconds), 2.6)
+        self.assertAlmostEqual(sum(self.process_cpu_seconds), 1.9)
+        self.assertAlmostEqual(
+            sum(sample["seconds"] for sample in self.stage_seconds), 4.1
+        )
+        self.assertEqual({sample["stage"] for sample in self.stage_seconds}, {"other"})
+
+    def test_state_transitions_accumulate_until_periodic_update(self):
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic_ns",
+                side_effect=[0, 200_000_000, 400_000_000, 700_000_000, 1_100_000_000],
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.process_time_ns",
+                side_effect=[0, 300_000_000],
+            ) as process_time,
+        ):
+            self.reporter.start_scheduler_time_accounting()
+            accounting = self.reporter._scheduler_time_accounting
+            self.reporter.record_scheduler_active()
+            self.reporter.record_scheduler_idle()
+            self.reporter.record_scheduler_active()
+            self.assertEqual(self.idle_seconds, [])
+            self.assertEqual(self.process_cpu_seconds, [])
+            self.assertEqual(
+                self.reporter._scheduler_time_accounting.accumulate_idle_ns,
+                500_000_000,
+            )
+            self.reporter.record_scheduler_active()
+
+        self.assertIs(self.reporter._scheduler_time_accounting, accounting)
+        self.assertEqual(process_time.call_count, 2)
+        self.assertEqual(self.idle_seconds, [0.5])
+        self.assertAlmostEqual(self.process_cpu_seconds[0], 0.3)
+
+    def test_periodic_update_skips_zero_idle_but_records_cpu_sample(self):
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic_ns",
+                side_effect=[0, 0, 1_000_000_000],
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.process_time_ns",
+                side_effect=[0, 0],
+            ),
+        ):
+            self.reporter.start_scheduler_time_accounting()
+            self.reporter.record_scheduler_active()
+            self.reporter.record_scheduler_active()
+
+        self.assertEqual(self.idle_seconds, [])
+        self.assertEqual(self.process_cpu_seconds, [0.0])
+
+
+class TestEstimatedPrefillPerf(CustomTestCase):
+    """Causal pair count behind ``est. prefill TFLOPS/s`` and ``estimated_flops``."""
+
+    def setUp(self):
+        self.scheduler = types.SimpleNamespace()
+        self.scheduler.waiting_queue = []
+        self.scheduler.disaggregation_mode = DisaggregationMode.NULL
+        self.reporter = _make_reporter(self, self.scheduler)
+        # One unit per query-key pair and nothing else, so the returned FLOPs
+        # are exactly the attention pair count.
+        self.reporter._linear_flops_per_token = 0.0
+        self.reporter._attn_dot_flops_coeff = 1.0
+        self.reporter._weight_read_bytes_per_token = 0.0
+        self.reporter._qkv_act_bytes_per_token = 0.0
+        self.reporter._prefill_attn_act_read_per_token = 0.0
+        self.reporter._kv_cache_bytes_per_token = 0.0
+        self.reporter._ffn_act_bytes_per_token = 0.0
+
+    def _pair_count(self, extend_lens, prefix_lens):
+        batch = types.SimpleNamespace(extend_lens=extend_lens, prefix_lens=prefix_lens)
+        flops, _, _ = self.reporter._estimate_prefill_perf(batch)
+        return flops
+
+    def test_chunk_is_charged_for_its_cached_prefix(self):
+        self.assertEqual(self._pair_count([4], [3]), 4 * 3 + 4 * 5 / 2)
+
+    def test_prefix_kv_is_read_once_per_chunk(self):
+        # One pass over the prefix per chunk, not one read per query-key pair:
+        # the chunk's queries share the same KV stream.
+        self.reporter._kv_cache_bytes_per_token = 1.0
+        batch = types.SimpleNamespace(extend_lens=[4], prefix_lens=[3])
+        _, read_bytes, _ = self.reporter._estimate_prefill_perf(batch)
+        self.assertEqual(read_bytes, 3)
+
+    def test_requests_in_one_batch_do_not_attend_to_each_other(self):
+        self.assertEqual(self._pair_count([100, 100], [0, 0]), 2 * (100 * 101 / 2))
+
+    def test_mixed_prefill_and_decode_rows_use_their_own_context(self):
+        # mix_with_running appends running requests as extend_len 1 with their
+        # full context as prefix_len.
+        self.assertEqual(
+            self._pair_count([8, 1, 1], [0, 100, 200]),
+            8 * 9 / 2 + (100 + 1) + (200 + 1),
+        )
 
 
 if __name__ == "__main__":

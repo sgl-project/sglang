@@ -1,5 +1,6 @@
 {
     "_comment": "Per-model comparison config. Sampling params omitted where model defaults are correct — only override resolution, seed, and params that differ from defaults.",
+    "measurement_repeats": 3,
     "test_image_url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/cat.png",
     "cases": [
         {
@@ -13,7 +14,7 @@
             "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup-mode server --dit-layerwise-offload false --tp-size 2",
+                    "serve_args": "--warmup-mode server --component-residency dit=resident --tp-size 2",
                     "extra_env": {}
                 }
             }
@@ -29,7 +30,7 @@
             "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup-mode server --dit-layerwise-offload false --tp-size 2",
+                    "serve_args": "--warmup-mode server --component-residency dit=resident --tp-size 2",
                     "extra_env": {}
                 }
             }

@@ -151,8 +151,7 @@ class _SageAttentionBackendResolver(_CudaAttentionBackendResolver):
     def resolve(cls, platform) -> str | AttentionBackendEnum:
         try:
             from sageattention import sageattn  # noqa: F401
-        except ImportError as e:
-            logger.info(e)
+        except ImportError:
             logger.info(
                 "Sage Attention backend is not installed (To install it, run `pip install git+https://github.com/thu-ml/SageAttention.git@d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4 --no-build-isolation`). Falling back to Flash Attention."
             )
@@ -176,8 +175,7 @@ class _SageAttentionBackendResolver(_CudaAttentionBackendResolver):
             )
 
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn.SageAttentionBackend"
-        except ImportError as e:
-            logger.info(e)
+        except ImportError:
             logger.info(
                 "Sage Attention backend failed to import. Falling back to Flash Attention."
             )
@@ -195,12 +193,45 @@ class _SageAttention3BackendResolver(_CudaAttentionBackendResolver):
             )
 
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3.SageAttention3Backend"
-        except ImportError as e:
-            logger.info(e)
+        except ImportError:
             logger.info(
                 "Sage Attention 3 backend is not installed (To install it, see https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell#installation). Falling back to Torch SDPA."
             )
             return AttentionBackendEnum.TORCH_SDPA
+
+
+class _SpargeAttentionBackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.SPARGE_ATTN
+    supported_capabilities = {(8, 0), (8, 6), (8, 7), (8, 9), (9, 0)}
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        capability = platform.get_device_capability()
+        capability_tuple = (
+            (capability.major, capability.minor) if capability is not None else None
+        )
+        if capability_tuple not in cls.supported_capabilities:
+            found = capability.as_version_str() if capability else "unknown"
+            raise ValueError(
+                "SpargeAttention supports CUDA compute capabilities "
+                f"8.0, 8.6, 8.7, 8.9, and 9.0; found {found}."
+            )
+        try:
+            from spas_sage_attn import (  # noqa: F401
+                spas_sage2_attn_meansim_topk_cuda,
+            )
+
+            from sglang.multimodal_gen.runtime.layers.attention.backends.sparge_attn import (  # noqa: F401
+                SpargeAttentionBackend,
+            )
+
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.sparge_attn.SpargeAttentionBackend"
+        except ImportError as e:
+            raise ImportError(
+                "SpargeAttention is not installed. Install it with "
+                "`pip install git+https://github.com/thu-ml/SpargeAttn.git "
+                "--no-build-isolation`."
+            ) from e
 
 
 class _VideoSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
@@ -219,6 +250,56 @@ class _VideoSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
         except ImportError as e:
             logger.error("Failed to import Video Sparse Attention backend: %s", str(e))
             raise ImportError("Video Sparse Attention backend is not installed.") from e
+
+
+class _VideoSparseAttentionH3BackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
+
+    # The vendored Triton tile-64 kernel is written against Hopper and
+    # Blackwell block-sparse geometry; older architectures fail closed.
+    supported_capabilities = {(9, 0), (10, 0), (10, 3)}
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        capability = platform.get_device_capability()
+        capability_tuple = (
+            (capability.major, capability.minor) if capability is not None else None
+        )
+        if capability_tuple not in cls.supported_capabilities:
+            found = capability.as_version_str() if capability else "unknown"
+            raise ValueError(
+                "VSA-H3 (video_sparse_attn_h3) needs compute capability 9.0 "
+                "(Hopper), 10.0 (B200 / GB200) or 10.3 (B300 / GB300); "
+                f"this device reports {found}."
+            )
+        try:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (  # noqa: F401
+                VideoSparseAttentionH3Backend,
+            )
+
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3.VideoSparseAttentionH3Backend"
+        except Exception as e:
+            logger.error("Failed to import VSA-H3 attention backend: %s", str(e))
+            raise ImportError(
+                "VSA-H3 attention needs Triton and the in-tree tile-64 "
+                "block-sparse kernel."
+            ) from e
+
+
+class _CubeSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.CUBE_SPARSE_ATTN
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        # MiniMax H3's text-only token refiner deliberately stays on the exact
+        # FA baseline when the packed multimodal blocks use cube attention.
+        # Initialize the Blackwell FA generation on the cube selection path as
+        # well, otherwise the refiner can fall into an unavailable FA2 package.
+        if not platform._prepare_flash_attention_for_blackwell():
+            raise RuntimeError(
+                "cube sparse attention requires FlashAttention for H3's dense paths"
+            )
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.cube_sparse_attn.CubeSparseAttentionBackend"
 
 
 class _SparseVideoGen2AttentionBackendResolver(_CudaAttentionBackendResolver):
@@ -300,39 +381,64 @@ class _VMOBAAttentionBackendResolver(_CudaAttentionBackendResolver):
 class _SubBlockSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
 
-    # The blk64 kernel is built `-gencode=arch=compute_100a,code=sm_100a`, which
-    # is arch-specific: 10.3 (B300 / GB300) and 12.x have no cubin. Its own guard
-    # only compares the major version, so it would accept 10.3 and fail later.
-    required_capability = (10, 0)
+    # Hopper uses SGLang's SM90 CuTe-DSL block-sparse kernel. SM100 uses
+    # FlashInfer's architecture-specific sm_100a kernel; SM120 uses FlashInfer's
+    # CuTe-DSL SM120 blk64 kernel. Other capabilities still fail closed.
+    supported_capabilities = {(9, 0), (10, 0), (12, 0)}
 
     @classmethod
     def resolve(cls, platform) -> str:
         capability = platform.get_device_capability()
-        if capability is None or capability != cls.required_capability:
+        capability_tuple = (
+            (capability.major, capability.minor) if capability is not None else None
+        )
+        if capability_tuple not in cls.supported_capabilities:
             found = capability.as_version_str() if capability else "unknown"
             raise ValueError(
-                "SubBlock sparse attention needs compute capability "
-                f"{'.'.join(map(str, cls.required_capability))} (B200 / GB200); "
-                f"this device reports {found}."
+                "SubBlock sparse attention needs compute capability 9.0, 10.0, "
+                f"or 12.0; this device reports {found}."
             )
         try:
-            from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (  # noqa: F401
-                load_bsa_attn_blk64_fwd,
-            )
             from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (  # noqa: F401
                 SubBlockSparseAttentionBackend,
             )
 
-            # Importing the entry point catches a missing or broken FlashInfer;
-            # the CUDA extension itself is built lazily on the first call.
-            load_bsa_attn_blk64_fwd()
+            if capability_tuple == (9, 0):
+                # Importing catches missing/incompatible CuTe-DSL and Quack;
+                # the CUDA kernel itself is compiled lazily on the first call.
+                from sglang.kernels.ops.attention.flash_attn.cute.block_sparsity import (  # noqa: F401
+                    BlockSparseTensorsTorch,
+                )
+                from sglang.kernels.ops.attention.flash_attn.cute.interface import (  # noqa: F401
+                    flash_attn_func,
+                )
+            elif capability_tuple == (10, 0):
+                from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (  # noqa: F401
+                    load_bsa_attn_blk64_fwd,
+                )
+
+                load_bsa_attn_blk64_fwd()
+            else:
+                from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
+                    load_bsa_attn_sm120_blk64_fwd,
+                )
+
+                load_bsa_attn_sm120_blk64_fwd()
             return "sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn.SubBlockSparseAttentionBackend"
         except Exception as e:
             logger.error("Failed to import SubBlock sparse attention: %s", str(e))
-            raise ImportError(
-                "SubBlock sparse attention needs FlashInfer with the blk64 "
-                "block-sparse kernel (flashinfer.cute_dsl.sparse.bsa_attn_blk64_fwd)."
-            ) from e
+            dependency = (
+                "SGLang's SM90 CuTe-DSL FlashAttention dependencies"
+                if capability_tuple == (9, 0)
+                else (
+                    "FlashInfer with the SM100 blk64 block-sparse kernel "
+                    "(flashinfer.cute_dsl.sparse.bsa_attn_blk64_fwd)"
+                    if capability_tuple == (10, 0)
+                    else "FlashInfer with the SM120 blk64 block-sparse kernel "
+                    "(flashinfer.cute_dsl.sparse.bsa_attn_sm120)"
+                )
+            )
+            raise ImportError(f"SubBlock sparse attention needs {dependency}.") from e
 
 
 class _FlashAttention2BackendResolver(_CudaAttentionBackendResolver):
@@ -372,7 +478,10 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _SlidingTileAttentionBackendResolver,
         _SageAttentionBackendResolver,
         _SageAttention3BackendResolver,
+        _SpargeAttentionBackendResolver,
         _VideoSparseAttentionBackendResolver,
+        _VideoSparseAttentionH3BackendResolver,
+        _CubeSparseAttentionBackendResolver,
         _SparseVideoGen2AttentionBackendResolver,
         _SolAttnBackendResolver,
         _VMOBAAttentionBackendResolver,
@@ -432,7 +541,10 @@ class CudaPlatformBase(Platform):
     @lru_cache(maxsize=1)
     def get_modelopt_flashinfer_fp4_backend(cls) -> str:
         backend = envs.SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND
-        default_backend = "trtllm"
+        # flashinfer.mm_fp4 rejects backend="trtllm" on sm_120 ("does not support
+        # backend 'trtllm' with capability 120"); "auto" resolves to its sm_12x
+        # NVFP4 kernel there.
+        default_backend = "auto" if cls.is_sm120() else "trtllm"
         if backend is None:
             return default_backend
 
@@ -636,8 +748,8 @@ class CudaPlatformBase(Platform):
         """Install the quality-gated FLUX.2 / AutoencoderKL / Wan VAE decoder
         fast paths.
 
-        Requests with quality == "high" run the fast paths; the "lossless"
-        default runs the original module path bit-for-bit. See
+        Requests with quality="extra-high" or "high" run the fast paths; the
+        "lossless" default runs the original module path bit-for-bit. See
         flux2_vae_cuda_opt and wan_vae_cuda_opt for details.
         """
         try:

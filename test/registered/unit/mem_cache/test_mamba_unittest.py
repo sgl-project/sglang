@@ -142,7 +142,7 @@ class TestMamba(unittest.TestCase):
         assert req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size
 
         # alloc req without free mamba cache
-        req.mamba_pool_idx = None
+        req.kv.mamba_pool_idx = None
         req_to_token_pool.alloc([req])
         req_to_token_pool.free(req)
         assert req_to_token_pool.available_size() == max_num_reqs
@@ -233,7 +233,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key,
                 value=req1_kv_indices[: len(key)],
-                mamba_value=req1.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req1.kv.mamba_pool_idx.unsqueeze(0),
             )
         )
         prefix_len = result.prefix_len
@@ -251,7 +251,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key,
                 value=req2_kv_indices[: len(key)],
-                mamba_value=req2.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req2.kv.mamba_pool_idx.unsqueeze(0),
             )
         )
         prefix_len = result.prefix_len
@@ -270,7 +270,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key,
                 value=req3_kv_indices[: len(key)],
-                mamba_value=req3.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req3.kv.mamba_pool_idx.unsqueeze(0),
             )
         )
         prefix_len = result.prefix_len
@@ -288,7 +288,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key,
                 value=req4_kv_indices[: len(key)],
-                mamba_value=req4.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req4.kv.mamba_pool_idx.unsqueeze(0),
             )
         )
         prefix_len = result.prefix_len
@@ -300,17 +300,17 @@ class TestMamba(unittest.TestCase):
         full_num_tokens = 1
         print(f"evicting {full_num_tokens} full token")
         result = tree.evict(EvictParams(num_tokens=full_num_tokens))
-        assert (
-            result.num_tokens_evicted >= full_num_tokens
-        ), f"evicted {result.num_tokens_evicted} full tokens, expected {full_num_tokens}"
+        assert result.num_tokens_evicted >= full_num_tokens, (
+            f"evicted {result.num_tokens_evicted} full tokens, expected {full_num_tokens}"
+        )
         tree.pretty_print()
 
         mamba_num = 1
         print(f"evicting {mamba_num} mamba")
         result = tree.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
-        assert (
-            result.mamba_num_evicted >= mamba_num
-        ), f"evicted {result.mamba_num_evicted} mamba states, expected {mamba_num}"
+        assert result.mamba_num_evicted >= mamba_num, (
+            f"evicted {result.mamba_num_evicted} mamba states, expected {mamba_num}"
+        )
         tree.pretty_print()
 
         req5_token_ids = [1, 2, 3, 4, 5]
@@ -348,9 +348,9 @@ class TestMamba(unittest.TestCase):
         mamba_num = 1
         print(f"evicting {mamba_num} mamba")
         result = tree.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
-        assert (
-            result.mamba_num_evicted >= mamba_num
-        ), f"evicted {result.mamba_num_evicted} mamba states, expected {mamba_num}"
+        assert result.mamba_num_evicted >= mamba_num, (
+            f"evicted {result.mamba_num_evicted} mamba states, expected {mamba_num}"
+        )
         tree.pretty_print()
 
         req8_token_ids = [1, 2, 3, 4, 5, 60, 70]
@@ -372,13 +372,13 @@ class TestMamba(unittest.TestCase):
             )
         )
         kv_indices, last_node = result.device_indices, result.last_device_node
-        assert req9.mamba_pool_idx is not None
+        assert req9.kv.holds_mamba
         assert torch.all(
-            mamba_pool.mamba_cache.conv[0][:, req9.mamba_pool_idx]
+            mamba_pool.mamba_cache.conv[0][:, req9.kv.mamba_pool_idx]
             == mamba_pool.mamba_cache.conv[0][:, last_node.mamba_value]
         )
         assert torch.all(
-            mamba_pool.mamba_cache.temporal[:, req9.mamba_pool_idx]
+            mamba_pool.mamba_cache.temporal[:, req9.kv.mamba_pool_idx]
             == mamba_pool.mamba_cache.temporal[:, last_node.mamba_value]
         )
 
@@ -404,7 +404,7 @@ class TestMamba(unittest.TestCase):
                 InsertParams(
                     key=RadixKey(array("q", token_ids)),
                     value=kv,
-                    mamba_value=req.mamba_pool_idx.unsqueeze(0),
+                    mamba_value=req.kv.mamba_pool_idx.unsqueeze(0),
                 )
             )
 
@@ -459,14 +459,16 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key1,
                 value=allocator.alloc(3)[: len(key1)],
-                mamba_value=req1.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req1.kv.mamba_pool_idx.unsqueeze(0),
             )
         )
         events = tree.take_events()
         stored_events = [e for e in events if isinstance(e, BlockStored)]
-        self.assertEqual(len(stored_events), 3)
-        self.assertEqual([e.token_ids[0] for e in stored_events], [1, 2, 3])
-        stored_hashes.extend(e.block_hashes[0] for e in stored_events)
+        self.assertEqual(len(stored_events), 1)
+        self.assertEqual(list(stored_events[0].token_ids), [1, 2, 3])
+        stored_hashes.extend(
+            block_hash for event in stored_events for block_hash in event.block_hashes
+        )
 
         req2 = make_dummy_req()
         key2 = RadixKey(array("q", [1, 2, 3, 4, 5]))
@@ -474,14 +476,16 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key2,
                 value=allocator.alloc(5)[: len(key2)],
-                mamba_value=req2.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req2.kv.mamba_pool_idx.unsqueeze(0),
             )
         )
         events = tree.take_events()
         stored_events = [e for e in events if isinstance(e, BlockStored)]
-        self.assertEqual(len(stored_events), 2)
-        self.assertEqual([e.token_ids[0] for e in stored_events], [4, 5])
-        stored_hashes.extend(e.block_hashes[0] for e in stored_events)
+        self.assertEqual(len(stored_events), 1)
+        self.assertEqual(list(stored_events[0].token_ids), [4, 5])
+        stored_hashes.extend(
+            block_hash for event in stored_events for block_hash in event.block_hashes
+        )
 
         # Evicting an internal mamba state creates a tombstone but does not
         # remove full-attention KV blocks, so it must not emit BlockRemoved.
@@ -511,14 +515,14 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key1,
                 value=allocator.alloc(4)[: len(key1)],
-                mamba_value=req1.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req1.kv.mamba_pool_idx.unsqueeze(0),
             )
         )
         first_insert_events = [
             e for e in tree.take_events() if isinstance(e, BlockStored)
         ]
-        self.assertEqual(len(first_insert_events), 4)
-        split_parent_hash = first_insert_events[1].block_hashes[0]
+        self.assertEqual(len(first_insert_events), 1)
+        split_parent_hash = first_insert_events[0].block_hashes[1]
 
         req2 = make_dummy_req()
         key2 = RadixKey(array("q", [1, 2, 5, 6]))
@@ -526,14 +530,14 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key2,
                 value=allocator.alloc(4)[: len(key2)],
-                mamba_value=req2.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req2.kv.mamba_pool_idx.unsqueeze(0),
             )
         )
         second_insert_events = [
             e for e in tree.take_events() if isinstance(e, BlockStored)
         ]
-        self.assertEqual(len(second_insert_events), 2)
-        self.assertEqual(list(second_insert_events[0].token_ids), [5])
+        self.assertEqual(len(second_insert_events), 1)
+        self.assertEqual(list(second_insert_events[0].token_ids), [5, 6])
         self.assertEqual(second_insert_events[0].parent_block_hash, split_parent_hash)
 
     def _setup_tree_and_allocator(self, enable_kv_cache_events=False):
@@ -767,7 +771,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key1,
                 value=allocator.alloc(3)[: len(key1)],
-                mamba_value=req1.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req1.kv.mamba_pool_idx.unsqueeze(0),
             )
         )
         assert allocator.available_size() == initial_avail - 3
@@ -780,7 +784,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key2,
                 value=allocator.alloc(7)[: len(key2)],
-                mamba_value=req2.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req2.kv.mamba_pool_idx.unsqueeze(0),
                 prev_prefix_len=0,
             )
         )
@@ -798,7 +802,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key3,
                 value=allocator.alloc(8)[: len(key3)],
-                mamba_value=req3.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req3.kv.mamba_pool_idx.unsqueeze(0),
                 prev_prefix_len=2,
             )
         )
@@ -815,7 +819,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key4,
                 value=allocator.alloc(9)[: len(key4)],
-                mamba_value=req4.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req4.kv.mamba_pool_idx.unsqueeze(0),
                 prev_prefix_len=8,
             )
         )

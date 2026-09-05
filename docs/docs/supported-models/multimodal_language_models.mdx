@@ -136,6 +136,12 @@ in the GitHub search bar.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use <code>--chat-template glm-4v</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>PaddleOCR-VL</strong> (0.9B, 1.5, 1.6)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>PaddlePaddle/PaddleOCR-VL-1.6</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Baidu's 0.9B document-parsing VLM: a NaViT-style dynamic-resolution SigLIP encoder on an ERNIE-4.5-0.3B backbone, covering text, tables, formulas, charts and seals in 109 languages. See the <a href="/cookbook/autoregressive/Baidu/PaddleOCR-VL">cookbook page</a>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Task is selected by the prompt (<code>OCR:</code>, <code>Table Recognition:</code>, ...). Leave <code>--trust-remote-code</code> off — <code>transformers</code> supports this architecture natively and its image processor is the faster one.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>GLM-OCR</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>zai-org/GLM-OCR</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>GLM-OCR: A fast and accurate general OCR model</td>
@@ -164,6 +170,18 @@ in the GitHub search bar.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>NVIDIA Nemotron Nano v2 VL enables multi-image reasoning and video understanding, along with strong document intelligence, visual Q&amp;A and summarization capabilities. It builds on Nemotron Nano V2, a hybrid Mamba-Transformer LLM, in order to achieve higher inference throughput in long document and video scenarios.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use <code>--trust-remote-code</code>. You may need to adjust <code>--max-mamba-cache-size</code> [default is 512] to fit memory constraints.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>NVIDIA Cosmos3 Reasoner</strong> (Nano)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>nvidia/Cosmos3-Nano</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>The understanding tower (Qwen3-VL-based reasoner) of NVIDIA's Cosmos3 world model, served as a standalone VLM for image and video understanding from the unified diffusers-layout checkpoint. The generation (diffusion) tower is dropped at load time.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Launch with <code>--model-type llm</code>; see <a href="#serving-the-llm-tower-of-cosmos3-checkpoints">Cosmos3 LLM serving</a>. Pass <code>--language-model-only</code> for text-only serving.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>NVIDIA Cosmos3-Edge</strong> (4B)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>nvidia/Cosmos3-Edge</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>The 4B dense understanding tower of Cosmos3-Edge: an Arcee-structure text model with a SigLIP2 vision tower and an Edge-specific spatial-merge projector, supporting image and video understanding.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Launch with <code>--model-type llm</code>; see <a href="#serving-the-llm-tower-of-cosmos3-checkpoints">Cosmos3 LLM serving</a>. Pass <code>--language-model-only</code> for text-only serving.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Ernie4.5-VL</strong></td>
@@ -341,6 +359,45 @@ data = {
 
 response = requests.post(url, json=data)
 print(response.text)
+```
+
+## Serving the LLM tower of Cosmos3 checkpoints
+
+`nvidia/Cosmos3-Nano` and `nvidia/Cosmos3-Edge` are unified world-model checkpoints in a diffusers layout, so `sglang serve` routes them to the diffusion runtime by default (see the [Cosmos3 cookbook page](/cookbook/diffusion/Cosmos/Cosmos3) for media generation). To serve the understanding tower as a vision-language model instead, force the LLM backend with `--model-type llm`:
+
+```bash Launch Server
+sglang serve \
+  --model-path nvidia/Cosmos3-Nano \
+  --model-type llm \
+  --host 0.0.0.0 --port 30000
+```
+
+The same command serves `nvidia/Cosmos3-Edge` by swapping the model path. Both accept image and video inputs through the OpenAI-compatible API:
+
+```bash Example Request
+curl http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "nvidia/Cosmos3-Nano",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "Describe this image."},
+        {"type": "image_url", "image_url": {"url": "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png"}}
+      ]
+    }],
+    "max_tokens": 128
+  }'
+```
+
+To serve only the text model (skipping the vision tower entirely), add `--language-model-only`. In this mode `/model_info` reports `has_image_understanding: false`, and requests containing image or video inputs are rejected:
+
+```bash Text-Only Launch
+sglang serve \
+  --model-path nvidia/Cosmos3-Nano \
+  --model-type llm \
+  --language-model-only \
+  --host 0.0.0.0 --port 30000
 ```
 
 ## Usage Notes

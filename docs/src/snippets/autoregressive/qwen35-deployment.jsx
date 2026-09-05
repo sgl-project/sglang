@@ -110,6 +110,17 @@ export const Qwen35Deployment = () => {
         { id: 'enabled',  label: 'Enabled',  default: true  }
       ]
     },
+    kvOffload: {
+      name: 'kvOffload',
+      title: 'KV Cache Offloading',
+      // HiCache adds a host-DRAM tier below the device KV cache. Only wired up
+      // for the MI355X MXFP4 recipe, which is the arm it is tuned on.
+      condition: (values) => values.hardware === 'mi355x' && values.quantization === 'fp4',
+      items: [
+        { id: 'disabled', label: 'Disabled',            default: true  },
+        { id: 'hicache',  label: 'Host DRAM (HiCache)', default: false }
+      ]
+    },
     mambaCache: {
       name: 'mambaCache',
       title: 'Mamba Radix Cache',
@@ -296,7 +307,7 @@ export const Qwen35Deployment = () => {
   // Generate command — must produce byte-identical output to sgl-cookbook's
   // config.generateCommand(values) for every valid combination.
   const generateCommand = () => {
-    const { model, hardware, quantization, speculative, mambaCache } = values;
+    const { model, hardware, quantization, speculative, mambaCache, kvOffload } = values;
 
     let hwConfig = modelConfigs[model]?.[hardware]?.[quantization];
     if (!hwConfig) {
@@ -427,6 +438,15 @@ export const Qwen35Deployment = () => {
       }
     }
 
+    // B200 NVFP4 with MTP runs TP2/EP2 (set above). Keep Triton as the base
+    // linear-attention backend while routing GDN decode and prefill through
+    // FlashInfer.
+    if (model === '397b' && hardware === 'b200' && quantization === 'fp4' && speculative === 'enabled') {
+      cmd += ` \\\n  --linear-attn-backend triton`;
+      cmd += ` \\\n  --linear-attn-decode-backend flashinfer`;
+      cmd += ` \\\n  --linear-attn-prefill-backend flashinfer`;
+    }
+
     // Append backend configurations
     if (hardware === 'b200' || (hardware === 'b300' && quantization === 'fp4')) {
       cmd += ` \\\n  --attention-backend trtllm_mha`;
@@ -479,7 +499,19 @@ export const Qwen35Deployment = () => {
         // ROCm quick all-reduce env are emitted by the AMD backend block above
         // (this recipe uses quick all-reduce instead of AITER allreduce fusion).
         // Add the FP4-specific flags here.
-        cmd += ' \\\n  --disable-radix-cache';
+        if (kvOffload === 'hicache') {
+          // HiCache keeps a host-DRAM tier below the device KV cache, so the
+          // radix cache has to stay on: --enable-hierarchical-cache and
+          // --disable-radix-cache are rejected together at startup.
+          cmd += ' \\\n  --enable-hierarchical-cache';
+          cmd += ' \\\n  --hicache-ratio 1.5';
+          cmd += ' \\\n  --hicache-write-policy write_through';
+          cmd += ' \\\n  --hicache-io-backend direct';
+          cmd += ' \\\n  --hicache-mem-layout page_first_direct';
+        } else {
+          cmd += ' \\\n  --disable-radix-cache';
+        }
+        cmd += ' \\\n  --kv-cache-dtype fp8_e4m3';
         // Cap concurrency under MTP to avoid OOM at tp=2.
         if (speculative === 'enabled') {
           cmd += ' \\\n  --max-running-requests 128';

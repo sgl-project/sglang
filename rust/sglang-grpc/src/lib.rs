@@ -257,7 +257,7 @@ fn start_server(
 }
 
 #[pymodule]
-fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _grpc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(start_server, m)?)?;
     m.add_class::<GrpcServerHandle>()?;
     m.add_class::<ChunkSendStatus>()?;

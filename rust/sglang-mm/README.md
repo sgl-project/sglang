@@ -6,9 +6,9 @@ GIL-released.
 
 Built two ways:
 
-- **PyO3 extension** `sglang.srt.multimodal._core` (features `python,parallel`,
-  requested by the wheel build) via setuptools-rust when installing sglang —
-  used by Python processors and parity tests.
+- **PyO3 extension** `sglang.srt.rust_extensions._multimodal` (features
+  `python,parallel`, requested by the wheel build) via setuptools-rust when
+  installing sglang — used by Python processors and parity tests.
 - **Pure-Rust `rlib`** (default features, i.e. neither) linked by
   `sglang-server`'s MM worker path — that copy needs no pyo3, no libpython, and
   no rayon: it spawns no threads and runs inline on the calling thread, because
@@ -19,7 +19,7 @@ Built two ways:
 
 ```
 src/
-├── lib.rs                    # module root; PyO3 module (_core) feature-gated
+├── lib.rs                    # module root; PyO3 module (_multimodal) feature-gated
 ├── pipeline.rs               # the server-pipeline contract: MmFamilyProcessor
 │                             #   trait + the carriers (Tensor, TokenLayout, ...)
 ├── driver.rs                 # model-independent request driver (fetch →
@@ -107,15 +107,15 @@ Adding one = a `MmFamilyProcessor` impl in `src/<model>/mod.rs` plus a
 
 `common::fetch` matches the Python `get_image_bytes` semantics
 (`REQUEST_TIMEOUT` env, `HTTP(S)_PROXY` / `ALL_PROXY` / `NO_PROXY` including
-IPv4-CIDR and `host:port` entries) with two deliberate differences: every
-source form is capped at 64 MiB — plus 64 items / 256 MiB per request in the
-driver — and `file://` URLs actually work (the Python helper passes the
-un-stripped URL to `open()`).
+IPv4-CIDR and `host:port` entries) with deliberate safety bounds: every media
+source contributes to a shared 64-item / 1.25 GiB request budget, and each
+remote I/O stream has an additional 64 MiB cap. `file://` URLs also work (the
+Python helper passes the un-stripped URL to `open()`).
 
 ## Python API
 
 ```python
-from sglang.srt.multimodal._core import common, inkling
+from sglang.srt.rust_extensions._multimodal import common, inkling
 
 # Common (model-agnostic)
 common.resize_rgb(arr, out_w, out_h)
@@ -174,7 +174,8 @@ impl ImageProcessorSpec for MyModelProcessor {
 
 4. Wire up in `src/lib.rs`: `mod my_model;` and `my_model::register(m)?;`.
 
-5. Add Python processor class that calls `from sglang.srt.multimodal._core import my_model`.
+5. Add Python processor class that calls
+   `from sglang.srt.rust_extensions._multimodal import my_model`.
 
 ## Available transform primitives (`common::transforms`)
 

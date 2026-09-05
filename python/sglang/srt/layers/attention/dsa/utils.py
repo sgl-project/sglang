@@ -13,10 +13,12 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
     get_parallel,
     process_model_config,
 )
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import ceil_align, ceil_div
 
 
@@ -67,27 +69,24 @@ INDEXER_K_CACHE_PRESHUFFLE_TILE = 16
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.server_args import ServerArgs
 
 
 def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
     return original_seq_lens.clamp(max=dsa_index_topk)
 
 
-def should_remap_pd_dsa_seed_to_local_slots(server_args: "ServerArgs") -> bool:
+def should_remap_pd_dsa_seed_to_local_slots() -> bool:
     """Whether a PD seed should enter the allocator-local fused TopK domain."""
     return (
-        is_cuda()
+        (is_cuda() or is_hip())
         and envs.SGLANG_DSA_FUSE_TOPK.get()
-        and server_args.disaggregation_mode == "decode"
-        and not server_args.enable_hisparse
+        and get_disagg().disaggregation_mode == "decode"
+        and not get_memory().enable_hisparse
         and not get_parallel().dcp_enabled
     )
 
 
-def should_use_dsa_fused_topk(
-    server_args: "ServerArgs", seed_dsa_topk_from_draft_extend: bool
-) -> bool:
+def should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend: bool) -> bool:
     """Select fused TopK for PD IndexShare.
 
     PD Prefill worker:
@@ -98,20 +97,19 @@ def should_use_dsa_fused_topk(
     - Draft decode / target verify / draft extend: fused TopK enabled.
     """
     pd_index_share_seed = (
-        server_args.disaggregation_mode != "null" and seed_dsa_topk_from_draft_extend
+        get_disagg().disaggregation_mode != "null" and seed_dsa_topk_from_draft_extend
     )
     return envs.SGLANG_DSA_FUSE_TOPK.get() and (
-        not pd_index_share_seed or should_remap_pd_dsa_seed_to_local_slots(server_args)
+        not pd_index_share_seed or should_remap_pd_dsa_seed_to_local_slots()
     )
 
 
 def is_dsa_enable_prefill_cp():
-    if not envs.SGLANG_ENABLE_CP_V2.get():
+    if is_hip() or is_npu():
         return get_parallel().enable_dsa_prefill_context_parallel
 
-    # Derive from the runtime CP topology + model arch rather than the legacy
-    # flag under CP-v2: DSA prefill CP is active when the CP group is on for a
-    # DeepSeek Sparse Attention model.
+    # Generic prefill CP derives activation from the runtime topology and model
+    # architecture. Protected HIP/NPU paths continue to use their legacy field.
     if get_parallel().attn_cp_size <= 1:
         return False
     from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
@@ -265,9 +263,9 @@ def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
 
     if is_dsa_prefill_cp_round_robin_split():
         cur_cp_seq_len = seq_len // cp_size
-        assert (
-            seq_len % cp_size == 0
-        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when dsa_prefill_cp_mode is round-robin-split"
+        assert seq_len % cp_size == 0, (
+            f"seq_len {seq_len} is not divisible by cp_size {cp_size} when dsa_prefill_cp_mode is round-robin-split"
+        )
     else:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
