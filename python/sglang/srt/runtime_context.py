@@ -296,23 +296,28 @@ class ParallelContext:
             raise ValueError("no parallel leaf is stated")
         return derive_parallel_widths(**leaves)
 
-    def _derived_width(self, name, getter):
+    def _derived_width(self, name):
         """A width the leaves imply: the stamp, else the live group, else the
         leaves themselves.
 
-        The live-group fallback keeps a process that installed groups without
-        going through `initialize_model_parallel` working, and it stays ahead of
-        the leaf derivation on purpose: where a group exists it *is* the truth,
-        and elastic scale-up moves the group without restamping (see
-        `world_size`, which is not a quotient and so is not derived here).
+        A quotient *is* a function of the configured leaves -- that is what it
+        is, and it is why the declaration in `arg_groups/fields/parallel.py`
+        names nothing but the field. The other two steps are how a value that
+        moved after publish reaches a reader: `initialize_model_parallel`
+        stamps all six as its last statement, and an elastic scale-up restamps
+        `attn_dp_size` through `update_dp_attention_post_scale`.
 
-        The leaf derivation is last, so it only answers where no group has been
-        built. That is the case a test is in when it states a topology --
-        `override(tp_size=8, attn_dp_size=2)` now yields `attn_tp_size == 4`
-        instead of raising, so a caller can override the inputs rather than the
-        answer. When even the leaves are unavailable, the failure says which of
-        the three is missing rather than surfacing a group getter's bare
-        assertion.
+        The live-group step is kept below the stamp and above the leaves. On
+        every path in this tree a built group has already been stamped, so it
+        does not fire; `test_size_rank_delegate_to_canonical_getters` and the
+        DCP tests pin it for a process that installs groups some other way.
+        (`world_size` is not a quotient, is not derived here, and stays a live
+        read outright.)
+
+        The leaf derivation answers where nothing has been stamped, which is
+        the case a test is in when it states a topology:
+        `override(tp_size=8, attn_dp_size=2)` yields `attn_tp_size == 4`, so a
+        caller can override the inputs rather than the answer.
         """
         overrides = self._overrides
         if name in overrides:
@@ -320,18 +325,20 @@ class ParallelContext:
         derived = self._derived
         if name in derived:
             return derived[name]
-        try:
-            return getter()
-        except (AssertionError, AttributeError, RuntimeError):
-            pass
+        getter = _LIVE_WIDTH_READINGS.get(name)
+        if getter is not None:
+            try:
+                return getter(self)
+            except (AssertionError, AttributeError, RuntimeError):
+                pass
         try:
             return self._widths_from_leaves()[name]
         except (AssertionError, AttributeError, KeyError, ValueError) as exc:
             raise RuntimeError(
                 f"derived parallel width {name!r} is not available: it is "
-                "computed from the configured leaves when the process groups "
-                "are built (initialize_model_parallel / "
-                "initialize_dp_attention). No stamp, no live group, and the "
+                "computed from the configured leaves, and stamped when the "
+                "process groups are built (initialize_model_parallel / "
+                "initialize_dp_attention). Nothing has been stamped and the "
                 "leaves it derives from are not readable either -- publish a "
                 "parallel config, or state the leaves with "
                 "get_parallel().override(...)"
@@ -368,12 +375,6 @@ class ParallelContext:
         return self._v("pp_rank", _ps().get_pipeline_model_parallel_rank)
 
     @property
-    def moe_ep_size(self) -> int:
-        return self._derived_width(
-            "moe_ep_size", _ps().get_moe_expert_parallel_world_size
-        )
-
-    @property
     def moe_ep_rank(self) -> int:
         return self._v("moe_ep_rank", _ps().get_moe_expert_parallel_rank)
 
@@ -382,20 +383,8 @@ class ParallelContext:
         return self._v("moe_dp_rank", _ps().get_moe_data_parallel_rank)
 
     @property
-    def moe_tp_size(self) -> int:
-        return self._derived_width(
-            "moe_tp_size", _ps().get_moe_tensor_parallel_world_size
-        )
-
-    @property
     def moe_tp_rank(self) -> int:
         return self._v("moe_tp_rank", _ps().get_moe_tensor_parallel_rank)
-
-    @property
-    def attn_tp_size(self) -> int:
-        return self._derived_width(
-            "attn_tp_size", _ps().get_attn_tensor_model_parallel_world_size
-        )
 
     @property
     def attn_tp_rank(self) -> int:
@@ -410,30 +399,10 @@ class ParallelContext:
         return self._v("dcp_rank", _ps().get_dcp_rank)
 
     @property
-    def dcp_enabled(self) -> bool:
-        def getter():
-            if _ps().get_dcp_group_no_assert() is None:
-                return False
-            return _ps().get_dcp_world_size() > 1
-
-        return self._derived_width("dcp_enabled", getter)
-
-    @property
-    def attn_dcp_size(self) -> int:
-        return self._derived_width(
-            "attn_dcp_size",
-            lambda: _ps().get_dcp_world_size() if self.dcp_enabled else 1,
-        )
-
-    @property
     def attn_dcp_rank(self) -> int:
         return self._v(
             "attn_dcp_rank", lambda: self.dcp_rank if self.dcp_enabled else 0
         )
-
-    @property
-    def attn_dp_size(self) -> int:
-        return self._derived_width("attn_dp_size", _dp().get_attention_dp_size)
 
     @property
     def attn_dp_rank(self) -> int:
@@ -474,6 +443,51 @@ class ParallelContext:
     @property
     def dcp_group(self) -> Any:
         return self._v("dcp_group", _ps().get_dcp_group)
+
+
+# How a built process group reports each quotient. This is a property of the
+# reading, not of the field: what `attn_tp_size` *is* is the quotient declared
+# in `arg_groups/fields/parallel.py`, which names nothing but itself.
+_LIVE_WIDTH_READINGS = {
+    "attn_tp_size": lambda ctx: _ps().get_attn_tensor_model_parallel_world_size(),
+    "attn_dp_size": lambda ctx: _dp().get_attention_dp_size(),
+    "attn_dcp_size": lambda ctx: _ps().get_dcp_world_size() if ctx.dcp_enabled else 1,
+    "moe_ep_size": lambda ctx: _ps().get_moe_expert_parallel_world_size(),
+    "moe_tp_size": lambda ctx: _ps().get_moe_tensor_parallel_world_size(),
+    "dcp_enabled": lambda ctx: (
+        False
+        if _ps().get_dcp_group_no_assert() is None
+        else _ps().get_dcp_world_size() > 1
+    ),
+}
+
+
+def _install_derived_widths() -> None:
+    """Give `ParallelContext` a property per declared quotient.
+
+    They are declared in `arg_groups/fields/parallel.py`, in the same class as
+    the leaves they are computed from -- unannotated, so `collect_input_fields`
+    leaves them off the record while they still live where the namespace does. Written here as
+    properties rather than answered by `__getattr__` because they are read
+    inside compiled model code, where an attribute load is traceable and a
+    dynamic lookup is not.
+    """
+    from sglang.srt.arg_groups.arg_utils import Derived
+    from sglang.srt.arg_groups.fields.parallel import Parallel
+
+    for name, decl in vars(Parallel).items():
+        if not isinstance(decl, Derived):
+            continue
+
+        def getter(self, _name=name):
+            return self._derived_width(_name)
+
+        getter.__name__ = name
+        getter.__doc__ = decl.doc
+        setattr(ParallelContext, name, property(getter))
+
+
+_install_derived_widths()
 
 
 class _FlagGroupBase:
