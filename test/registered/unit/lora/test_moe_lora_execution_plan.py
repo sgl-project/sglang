@@ -167,12 +167,12 @@ class TestFusionOwnership(unittest.TestCase):
         # exactly-one-owner rules are plan-level (tested below).
         self.assertIsNotNone(ActSpec(ActFamily.B_ACTIVATION, ActivationFn.SILU))
 
-    def test_shared_rank_finalize_requires_shared_ownership(self):
+    def test_shared_finalize_requires_shared_ownership(self):
         with self.assertRaisesRegex(ValueError, "shared-outer"):
-            FinalizeSpec(FinalizeFamily.SHARED_RANK_REDUCE)
+            FinalizeSpec(FinalizeFamily.SHARED_TOKEN_DELTA)
         self.assertTrue(
             FinalizeSpec(
-                FinalizeFamily.SHARED_RANK_REDUCE, is_shared_outer=True
+                FinalizeFamily.SHARED_TOKEN_DELTA, is_shared_outer=True
             ).is_shared_outer
         )
 
@@ -201,7 +201,7 @@ class TestWholePipelineValidation(unittest.TestCase):
                 act=ActSpec(ActFamily.B_ACTIVATION, ActivationFn.SILU),
                 down_b=None,
                 finalize=FinalizeSpec(
-                    FinalizeFamily.SHARED_RANK_REDUCE, is_shared_outer=True
+                    FinalizeFamily.SHARED_TOKEN_DELTA, is_shared_outer=True
                 ),
             ),
         )
@@ -218,7 +218,7 @@ class TestWholePipelineValidation(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exactly one owner"):
             _plan(
                 finalize=FinalizeSpec(
-                    FinalizeFamily.SHARED_RANK_REDUCE, is_shared_outer=True
+                    FinalizeFamily.SHARED_TOKEN_DELTA, is_shared_outer=True
                 )
             )
 
@@ -252,7 +252,7 @@ class TestWholePipelineValidation(unittest.TestCase):
             _plan(
                 down_b=None,
                 finalize=FinalizeSpec(
-                    FinalizeFamily.SHARED_RANK_REDUCE, is_shared_outer=True
+                    FinalizeFamily.SHARED_TOKEN_DELTA, is_shared_outer=True
                 ),
                 down_overlap=DownOverlap.DOWN_B,
             )
@@ -330,9 +330,7 @@ class TestRouteRequirementUnion(unittest.TestCase):
     def test_shared_finalize_adds_raw_without_hiding_aligned_routes(self):
         plan = _plan(
             down_b=None,
-            finalize=FinalizeSpec(
-                FinalizeFamily.SHARED_RANK_REDUCE, is_shared_outer=True
-            ),
+            finalize=FinalizeSpec(FinalizeFamily.SHARED_ONE_PASS, is_shared_outer=True),
         )
         self.assertEqual(
             plan.route_requirements(),
@@ -344,6 +342,31 @@ class TestRouteRequirementUnion(unittest.TestCase):
             ),
         )
 
+
+class TestTokenDenseBridgeOwnership(unittest.TestCase):
+    def test_token_dense_a_requires_a_standalone_per_pair_gate_up_b(self):
+        token_dense_a = _a(
+            Site.GATE_UP, LoraAFamily.TOKEN_DENSE, True, BridgeLayout.TOKEN_MAJOR
+        )
+        _plan(
+            gate_up_a=token_dense_a,
+            gate_up_b=_b(
+                Site.GATE_UP, LoraBFamily.PER_PAIR, True, BridgeLayout.TOKEN_MAJOR
+            ),
+        )
+        with self.assertRaises(ValueError):
+            _plan(
+                gate_up_a=token_dense_a,
+                gate_up_b=_b(
+                    Site.GATE_UP, LoraBFamily.GROUPED, True, BridgeLayout.TOKEN_MAJOR
+                ),
+            )
+        with self.assertRaises(ValueError):
+            _plan(
+                gate_up_a=token_dense_a,
+                gate_up_b=None,
+                act=ActSpec(ActFamily.B_ACTIVATION, ActivationFn.SILU),
+            )
 
 
 if __name__ == "__main__":

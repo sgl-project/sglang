@@ -106,13 +106,6 @@ class Lora(msgspec.Struct):
             action=argparse.BooleanOptionalAction,
         ),
     ] = False
-    moe_lora_base_gemm: A[
-        str,
-        Arg(
-            help="Kernel vendor for the MoE LoRA base GEMMs.",
-            choices=["cutedsl", "triton"],
-        ),
-    ] = "cutedsl"
     lora_drain_wait_threshold: A[
         float,
         "When any LoRA adapter request waits longer than this threshold (in seconds), the scheduler will selectively drain one running adapter to make room. This mitigates extreme tail latency under high or skewed workloads by preventing a small set of adapters from monopolizing batch slots. Set to 0 to disable draining (default).",
