@@ -18,6 +18,7 @@ limitations under the License.
 // build takes this file instead of; see include/hip/dsa_topk_coop.cuh for what the
 // kernel does differently and why.
 
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
 #include <c10/util/Exception.h>
 #include <hip/hip_runtime.h>
@@ -69,7 +70,7 @@ using Ws = CoopMbWorkspace<kHistBits, kTieCap>;
 //
 // `row_len_hint` is the score buffer's row stride, not the true sequence length, which
 // lives on the device. That is deliberate: the decision has to be identical on capture
-// and on replay for a CUDA-graphed decode, and the stride is the only length-like
+// and on replay for a graph-captured decode, and the stride is the only length-like
 // quantity the host can see. The cost of that is a wide buffer holding short rows,
 // which is the 32768/b1 line above -- 18% on a case the kernel already wins by 2x.
 int row_split(int batch, int64_t row_len_hint) {
@@ -81,13 +82,16 @@ int row_split(int batch, int64_t row_len_hint) {
       return v;
     }
   }
-  static const int cu = [] {
-    int dev = 0;
-    (void)hipGetDevice(&dev);
+  int dev = 0;
+  (void)hipGetDevice(&dev);
+  static thread_local int cached_dev = -1;
+  static thread_local int cached_cu = 0;
+  if (cached_dev != dev) {
     hipDeviceProp_t p{};
     (void)hipGetDeviceProperties(&p, dev);
-    return p.multiProcessorCount;
-  }();
+    cached_dev = dev;
+    cached_cu = p.multiProcessorCount;
+  }
 
   constexpr int64_t kMinRowLen = 65536;
   constexpr int kMinSplit = 4;
@@ -98,7 +102,7 @@ int row_split(int batch, int64_t row_len_hint) {
   if (row_len_hint < kMinRowLen) {
     return 0;
   }
-  const int g = std::min(cu / std::max(batch, 1), kMaxSplit);
+  const int g = std::min(cached_cu / std::max(batch, 1), kMaxSplit);
   return g < kMinSplit ? 0 : g;
 }
 
@@ -155,7 +159,8 @@ void launch(
   coop_mb_refine<kTopK, kHistBits, kTieCap, kBlock><<<batch, kBlock, 0, stream>>>(p);
 }
 
-#define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
+#define CHECK_HIP(x) TORCH_CHECK(x.is_cuda(), #x " must be a HIP tensor")
+#define CHECK_SAME_DEVICE(x, ref) TORCH_CHECK(x.device() == ref.device(), #x " must be on the same device as " #ref)
 
 struct Common {
   const float* input;
@@ -167,8 +172,9 @@ struct Common {
 
 Common
 check_common(const at::Tensor& score, const at::Tensor& lengths, const std::optional<at::Tensor>& row_starts_opt) {
-  CHECK_CUDA(score);
-  CHECK_CUDA(lengths);
+  CHECK_HIP(score);
+  CHECK_HIP(lengths);
+  CHECK_SAME_DEVICE(lengths, score);
   TORCH_CHECK(score.dim() == 2 && score.scalar_type() == at::kFloat, "score must be a float32 [B, L] tensor");
   TORCH_CHECK(score.stride(1) == 1, "score must be contiguous along the last dim");
   const auto B = score.size(0);
@@ -180,7 +186,8 @@ check_common(const at::Tensor& score, const at::Tensor& lengths, const std::opti
   const int32_t* row_starts = nullptr;
   if (row_starts_opt.has_value()) {
     const auto& rs = row_starts_opt.value();
-    CHECK_CUDA(rs);
+    CHECK_HIP(rs);
+    CHECK_SAME_DEVICE(rs, score);
     TORCH_CHECK(
         rs.dim() == 1 && rs.is_contiguous() && rs.scalar_type() == at::kInt,
         "row_starts must be a contiguous int32 [B] tensor");
@@ -203,8 +210,10 @@ void check_output(const at::Tensor& out, int64_t B) {
 
 void fast_topk_interface(
     const at::Tensor& score, at::Tensor& indices, const at::Tensor& lengths, std::optional<at::Tensor> row_starts_opt) {
-  CHECK_CUDA(indices);
   const auto c = check_common(score, lengths, row_starts_opt);
+  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(score));
+  CHECK_HIP(indices);
+  CHECK_SAME_DEVICE(indices, score);
   check_output(indices, c.batch);
   if (c.batch == 0) {
     return;
@@ -230,10 +239,14 @@ void fast_topk_transform_interface(
     const at::Tensor& src_page_table,
     const at::Tensor& cu_seqlens_q,
     std::optional<at::Tensor> row_starts_opt) {
-  CHECK_CUDA(dst_page_table);
-  CHECK_CUDA(src_page_table);
-  CHECK_CUDA(cu_seqlens_q);
   const auto c = check_common(score, lengths, row_starts_opt);
+  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(score));
+  CHECK_HIP(dst_page_table);
+  CHECK_HIP(src_page_table);
+  CHECK_HIP(cu_seqlens_q);
+  CHECK_SAME_DEVICE(dst_page_table, score);
+  CHECK_SAME_DEVICE(src_page_table, score);
+  CHECK_SAME_DEVICE(cu_seqlens_q, score);
   check_output(dst_page_table, c.batch);
   TORCH_CHECK(
       src_page_table.dim() == 2 && src_page_table.stride(1) == 1 && src_page_table.scalar_type() == at::kInt,
@@ -279,9 +292,12 @@ void fast_topk_transform_ragged_interface(
     at::Tensor& topk_indices_ragged,
     const at::Tensor& topk_indices_offset,
     std::optional<at::Tensor> row_starts_opt) {
-  CHECK_CUDA(topk_indices_ragged);
-  CHECK_CUDA(topk_indices_offset);
   const auto c = check_common(score, lengths, row_starts_opt);
+  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(score));
+  CHECK_HIP(topk_indices_ragged);
+  CHECK_HIP(topk_indices_offset);
+  CHECK_SAME_DEVICE(topk_indices_ragged, score);
+  CHECK_SAME_DEVICE(topk_indices_offset, score);
   check_output(topk_indices_ragged, c.batch);
   TORCH_CHECK(
       topk_indices_offset.dim() == 1 && topk_indices_offset.is_contiguous() &&
