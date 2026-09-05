@@ -36,6 +36,7 @@ use crate::{
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
         rerank::RerankRequest,
+        responses::ResponsesRequest,
     },
     routers::{
         error,
@@ -1646,6 +1647,50 @@ impl RouterTrait for PDRouter {
             batch_size,
             is_stream,
             return_logprob,
+            request_text,
+            model_id,
+            headers: headers.cloned(),
+        };
+
+        self.execute_dual_dispatch(headers, body, context).await
+    }
+
+    async fn route_responses(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ResponsesRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let is_stream = body.is_stream();
+
+        // A background request with stream=true stays attached to this
+        // connection (the worker runs it as a foreground stream), but a
+        // detached one is retrieved via /v1/responses/{id}, which the PD
+        // router does not implement; reject it instead of dispatching a
+        // request whose lifecycle cannot complete in PD mode.
+        if body.background.unwrap_or(false) && !is_stream {
+            warn!("PD mode does not support detached background responses; returning bad request");
+            return error::bad_request(
+                "pd_unsupported_background_responses",
+                "PD mode does not support background responses without streaming",
+            );
+        }
+
+        let request_text = if self.policies_need_request_text() {
+            let text = body.extract_text_for_routing();
+            (!text.is_empty()).then_some(text)
+        } else {
+            None
+        };
+
+        let context = PDRequestContext {
+            route: "/v1/responses",
+            // The Responses API carries one logical response per request.
+            batch_size: None,
+            is_stream,
+            // The PD logprob merging expects /generate-style meta_info,
+            // which the Responses API schema does not carry.
+            return_logprob: false,
             request_text,
             model_id,
             headers: headers.cloned(),
