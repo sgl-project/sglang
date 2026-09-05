@@ -672,6 +672,7 @@ class ComponentResidencyManager:
             current_platform.is_cuda()
             or current_platform.is_rocm()
             or current_platform.is_npu()
+            or current_platform.is_xpu()
         )
         return is_supported_platform and current_platform.is_device_type(
             self._module_device(module)
