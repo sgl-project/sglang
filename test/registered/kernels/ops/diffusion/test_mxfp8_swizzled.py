@@ -2,6 +2,8 @@
 unfused kernel stores: payload and the swizzled E8M0 scale buffer, padding
 included, byte for byte."""
 
+import sys
+
 import pytest
 import torch
 
@@ -70,3 +72,7 @@ def test_predicates_reject_unsupported_input() -> None:
     assert not can_use_silu_mul_mxfp8(
         torch.randn(4, 96, device="cuda", dtype=torch.bfloat16)
     )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -11,6 +11,7 @@ attention.
 from __future__ import annotations
 
 import math
+import sys
 
 import pytest
 import torch
@@ -258,3 +259,7 @@ def test_metadata_layout_mismatch_is_rejected() -> None:
             cu_seqlens_host=(0, layout.used - 48, layout.seq_len),
             attn_metadata=meta,
         )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

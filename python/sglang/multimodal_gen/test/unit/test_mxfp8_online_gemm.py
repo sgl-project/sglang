@@ -3,6 +3,8 @@
 block quant, the prequantized (e4m3, swizzled scales) input from the fused
 SwiGLU kernel, and the per-layer fallback to the per-channel fp8 path."""
 
+import sys
+
 import pytest
 import torch
 
@@ -74,3 +76,7 @@ def test_unaligned_layer_falls_back_to_channelwise() -> None:
     assert not layer.mxfp8 and not layer.quant_method.accepts_mxfp8_input(layer)
     out, _ = layer(torch.randn(4, 8, device="cuda", dtype=torch.bfloat16))
     assert out.shape == (4, 128)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
