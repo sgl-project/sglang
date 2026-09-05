@@ -451,6 +451,17 @@ at::Tensor causal_conv1d_update_cpu(
     const std::optional<at::Tensor>& conv_state_indices,
     int64_t pad_slot_id,
     bool is_vnni);
+
+at::Tensor causal_conv1d_verify_cpu(
+    const at::Tensor& x,
+    at::Tensor& conv_states,
+    const at::Tensor& conv_state_indices,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias,
+    bool silu_activation,
+    at::Tensor& intermediate_conv_window,
+    const at::Tensor& intermediate_state_indices,
+    bool is_vnni);
 #endif
 
 // conv3d fast path for patch embedding
@@ -514,6 +525,24 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
     const at::Tensor& initial_state_indices,
     const at::Tensor& cu_seqlens,
     bool use_qk_l2norm_in_kernel,
+    double softplus_beta = 1.0,
+    double softplus_threshold = 20.0);
+// fused_sigmoid_gating_delta_rule_update_spec
+at::Tensor fused_sigmoid_gating_delta_rule_update_spec_cpu(
+    const at::Tensor& A_log,
+    const at::Tensor& dt_bias,
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& a,
+    const at::Tensor& b,
+    at::Tensor& initial_state_source,
+    const at::Tensor& initial_state_indices,
+    at::Tensor& intermediate_states_buffer,
+    const at::Tensor& intermediate_state_indices,
+    int64_t steps,
+    bool use_qk_l2norm_in_kernel,
+    bool disable_state_update,
     double softplus_beta = 1.0,
     double softplus_threshold = 20.0);
 // fused_gdn_gating
@@ -847,6 +876,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "causal_conv1d_update_cpu(Tensor x, Tensor(a!) conv_states, Tensor weight, Tensor? bias, bool silu_activation,"
       "Tensor? cache_seqlens, Tensor? conv_state_indices, int pad_slot_id, bool is_vnni) -> Tensor");
   m.impl("causal_conv1d_update_cpu", torch::kCPU, &causal_conv1d_update_cpu);
+  // causal_conv1d_verify
+  m.def(
+      "causal_conv1d_verify_cpu(Tensor x, Tensor(a!) conv_states, Tensor conv_state_indices, Tensor weight, "
+      "Tensor? bias, bool silu_activation, Tensor(b!) intermediate_conv_window, Tensor intermediate_state_indices, "
+      "bool is_vnni) -> Tensor");
+  m.impl("causal_conv1d_verify_cpu", torch::kCPU, &causal_conv1d_verify_cpu);
 #endif
 
   // conv3d fast path for patch embedding
@@ -893,6 +928,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "a, Tensor b, Tensor(a!) initial_state_source, Tensor initial_state_indices, Tensor cu_seqlens, bool "
       "use_qk_l2norm_in_kernel, float softplus_beta=1.0, float softplus_threshold=20.0) -> Tensor");
   m.impl("fused_sigmoid_gating_delta_rule_update_cpu", torch::kCPU, &fused_sigmoid_gating_delta_rule_update_cpu);
+  // fused_sigmoid_gating_delta_rule_update_spec
+  m.def(
+      "fused_sigmoid_gating_delta_rule_update_spec_cpu(Tensor A_log, Tensor dt_bias, Tensor q, Tensor k, Tensor v, "
+      "Tensor a, Tensor b, Tensor(a!) initial_state_source, Tensor initial_state_indices, "
+      "Tensor(b!) intermediate_states_buffer, Tensor intermediate_state_indices, int steps, bool "
+      "use_qk_l2norm_in_kernel, bool disable_state_update, float softplus_beta=1.0, float softplus_threshold=20.0) "
+      "-> Tensor");
+  m.impl(
+      "fused_sigmoid_gating_delta_rule_update_spec_cpu", torch::kCPU, &fused_sigmoid_gating_delta_rule_update_spec_cpu);
   // fused_gdn_gating
   m.def("fused_gdn_gating_cpu(Tensor A_log, Tensor a, Tensor b, Tensor dt_bias) -> (Tensor, Tensor)");
   m.impl("fused_gdn_gating_cpu", torch::kCPU, &fused_gdn_gating_cpu);
