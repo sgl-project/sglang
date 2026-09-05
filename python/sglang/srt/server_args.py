@@ -3369,10 +3369,10 @@ class ServerArgs:
         bool, "Disable mmap while loading weight using safetensors.", NS("model")
     ] = False
     weight_loader_prefetch_checkpoints: A[
-        bool,
-        "Prefetch checkpoint files into OS page cache before loading. Each rank prefetches a fraction of the shards, reducing total network I/O on shared filesystems (NFS/Lustre) from N*checkpoint to 1*checkpoint. Recommended for models on network storage. When enabled, multi-threaded safetensors loading is disabled by default to avoid I/O oversubscription with the prefetch threads; set enable_multithread_load=true in --model-loader-extra-config to keep multi-threaded loading (e.g. on local NVMe where prefetch is a no-op).",
+        Optional[bool],
+        "Prefetch checkpoint files into OS page cache before loading. Each rank prefetches a fraction of the shards, reducing total network I/O on shared filesystems (NFS/Lustre) from N*checkpoint to 1*checkpoint. Left unset (the default), this is enabled automatically when the checkpoint sits on a network filesystem (NFS/Lustre) and fits in available RAM; pass True or False to override the detection. When enabled, multi-threaded safetensors loading is disabled by default to avoid I/O oversubscription with the prefetch threads; set enable_multithread_load=true in --model-loader-extra-config to keep multi-threaded loading (e.g. on local NVMe where prefetch is a no-op).",
         NS("model"),
-    ] = False
+    ] = None
     weight_loader_prefetch_num_threads: A[
         int,
         "Number of threads per rank for checkpoint prefetching (default: 4).",

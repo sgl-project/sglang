@@ -918,6 +918,104 @@ def np_cache_weights_iterator(
         yield name, torch.from_numpy(param)
 
 
+_NETWORK_FS_TYPES = ("nfs", "nfs4", "lustre")
+_PREFETCH_RAM_THRESHOLD_PCT = 90
+
+
+def _get_fs_type(files: List[str]) -> str:
+    """Return the filesystem type backing *files* (Linux only, "" if unknown)."""
+    if not files:
+        return ""
+    try:
+        # All checkpoint shards live in the same directory, so probing the first
+        # file is enough.
+        resolved = os.path.realpath(files[0])
+        best_mount = ""
+        best_fstype = ""
+        # /proc/mounts can contain nested mount points (e.g. "/" -> ext4,
+        # "/data" -> lustre, "/data/local" -> ext4). Pick the longest matching
+        # mount point, which is the rule the kernel uses to resolve a path.
+        with open("/proc/mounts") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mount_point, fstype = parts[1], parts[2]
+                if (
+                    resolved == mount_point
+                    or resolved.startswith(os.path.join(mount_point, ""))
+                ) and len(mount_point) > len(best_mount):
+                    best_mount = mount_point
+                    best_fstype = fstype
+        return best_fstype
+    except Exception:
+        # /proc/mounts is Linux-specific; treat anything unreadable as unknown.
+        return ""
+
+
+def should_auto_prefetch_checkpoints(files: List[str]) -> bool:
+    """Decide whether to prefetch checkpoints when the user left it unset.
+
+    Prefetching turns the loader's random mmap page faults into sequential reads,
+    which matters on network filesystems where a fault costs a network round
+    trip. It only pays off if the checkpoint can actually stay resident in the
+    page cache, so a checkpoint larger than most of RAM is skipped: prefetching
+    it would just evict its own earlier pages.
+    """
+    if not files:
+        return False
+
+    fs_type = _get_fs_type(files)
+    is_net_fs = fs_type in _NETWORK_FS_TYPES
+
+    try:
+        import psutil
+
+        total_bytes = sum(os.path.getsize(f) for f in files)
+        avail_bytes = psutil.virtual_memory().available
+    except Exception:
+        logger.debug("Could not size checkpoints or RAM; skipping auto-prefetch.")
+        return False
+
+    fits_in_ram = total_bytes <= (_PREFETCH_RAM_THRESHOLD_PCT / 100.0) * avail_bytes
+    fs_name = fs_type.upper() if fs_type else "unknown"
+
+    logger.info(
+        "Filesystem type for checkpoints: %s. Checkpoint size: %.2f GiB. "
+        "Available RAM: %.2f GiB.",
+        fs_name,
+        total_bytes / 1024**3,
+        avail_bytes / 1024**3,
+    )
+
+    if not is_net_fs:
+        logger.info(
+            "Auto-prefetch disabled: %s is not a recognized network filesystem "
+            "(%s). Pass --weight-loader-prefetch-checkpoints to force it.",
+            fs_name,
+            "/".join(_NETWORK_FS_TYPES),
+        )
+        return False
+
+    if not fits_in_ram:
+        logger.warning(
+            "Network filesystem (%s) detected, but the checkpoint (%.2f GiB) "
+            "exceeds %d%% of available RAM (%.2f GiB); skipping auto-prefetch.",
+            fs_name,
+            total_bytes / 1024**3,
+            _PREFETCH_RAM_THRESHOLD_PCT,
+            avail_bytes / 1024**3,
+        )
+        return False
+
+    logger.info(
+        "Network filesystem (%s) detected; enabling checkpoint prefetch. "
+        "Pass --weight-loader-prefetch-checkpoints=False to disable.",
+        fs_name,
+    )
+    return True
+
+
 def _prefetch_checkpoint_file(
     file_path: str,
     cancel_event: Optional[threading.Event] = None,
