@@ -132,7 +132,6 @@ def _is_context_only_pp_prefill_rank(
 
 
 class DSparkWorkerV2(BaseSpecWorker):
-
     def __init__(
         self,
         server_args: ServerArgs,
