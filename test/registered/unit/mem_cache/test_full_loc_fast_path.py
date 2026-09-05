@@ -15,21 +15,9 @@
 `HybridLinearKVPool`).
 
 All write-location info travels in the attention metadata (`KVWriteLoc`); the
-pools hold none and never translate — the write loc reaching `set_kv_buffer` is
-always PHYSICAL. Two routing contracts are pinned here:
-
-1. Full-attention. The full-physical loc is carried in `KVWriteLoc.full_loc`
-   (from `ForwardMetadata.out_cache_loc_full_physical`) and written directly.
-   `UnifiedSWAKVPool` asserts it's present (the unified memory pool always precomputes
-   it); `HybridLinearKVPool` falls back to `loc` for a static (non-shared) pool,
-   where `loc` is itself already physical.
-2. SWA. The swa-physical loc rides the backend `swa_out_cache_loc` slot
-   (`KVWriteLoc.swa_loc`) and is written directly.
-
-Pure dispatch tests: the inner sub-pools are recording stubs, so no GPU / real
-buffers are needed (CPU CI).
-
-    python -m pytest test/registered/unit/mem_cache/test_full_loc_fast_path.py -v
+pools hold none and never translate, so the loc reaching `set_kv_buffer` is
+always PHYSICAL. Pure dispatch: the inner sub-pools are recording stubs, so no
+GPU and no real buffers are needed.
 """
 
 import types
@@ -61,9 +49,8 @@ class _RecordingPool:
 class TestUnifiedSWARouting(unittest.TestCase):
     """`UnifiedSWAKVPool.set_kv_buffer` routing: full layers write `full_loc`
     when present (triton's capture-stable buffer), else the rebound generic
-    `loc` -- the same id space once the loc is rebound; SWA layers write the swa-physical
-    `swa_loc`, which has no fallback (a different id space). The pool never
-    translates."""
+    `loc` -- the same id space; SWA layers write the swa-physical `swa_loc`,
+    which has no fallback (a different id space)."""
 
     def _make_bare_pool(self):
         from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
@@ -93,18 +80,15 @@ class TestUnifiedSWARouting(unittest.TestCase):
         self.assertEqual(len(pool.full_kv_pool.calls), 1)
         forwarded, kwargs = pool.full_kv_pool.calls[0]
         # Forward the full-physical tensor from the write metadata, NOT the
-        # virtual loc. No `already_physical` — the pool only ever gets physical.
+        # virtual loc; no `already_physical`, the pool only ever gets physical.
         self.assertIs(forwarded, full_phys)
         self.assertIsNot(forwarded, virtual_loc)
         self.assertNotIn("already_physical", kwargs)
 
     def test_full_layer_falls_back_to_generic_loc(self):
-        """Bug regression: fa3 x unified-SWA crashed at gpt-oss
-        cuda-graph capture because every backend except triton bundles the
-        2-arg KVWriteLoc(loc, swa) and the full-layer door demanded an explicit
-        full_loc. Once the loc is rebound the generic `loc` IS the full-side kernel-facing id
-        (rebind_write_loc runs at ForwardBatch construction),
-        so the door must fall back to it -- the pool still never translates."""
+        """Bug regression: a 2-arg `KVWriteLoc(loc, swa)` with no explicit
+        `full_loc` must fall back to the rebound `loc` -- which IS the full-side
+        kernel-facing id -- instead of failing the full-layer door."""
         pool = self._make_bare_pool()
         rebound_loc = torch.tensor([10, 11, 12], dtype=torch.int64)
         swa_phys = torch.tensor([1, 2, 0], dtype=torch.int64)
@@ -163,10 +147,9 @@ class TestUnifiedSWATombstoneClamp(unittest.TestCase):
     """`UnifiedSWAKVPool.translate_loc_from_full_to_swa` must clamp tombstoned
     ids to the reserved padding sink (0).
 
-    A token whose swa page was freed carries -1 in `virtual_to_physical`. Before
-    the clamp, that produced a negative id, which a captured graph stores at a
-    negative offset from the buffer base. The composite allocator's method of
-    the same name already clamped; this path did not.
+    A token whose swa page was freed carries -1 in `virtual_to_physical`, and a
+    negative id makes a captured graph store at a negative offset from the
+    buffer base.
     """
 
     def _make_bare_pool(self, page_size, v2p, multiplier=1):
@@ -204,9 +187,8 @@ class TestUnifiedSWATombstoneClamp(unittest.TestCase):
 
 class TestHybridLinearFullLocRouting(unittest.TestCase):
     """`HybridLinearKVPool.set_kv_buffer` writes the full-physical `full_loc`
-    from the write metadata when present (unified memory pool), else the
-    already-physical `loc` (static pool) -- the same rule on the MHA and MLA
-    branches. No translate, no `already_physical`."""
+    when present (unified memory pool), else the already-physical `loc` (static
+    pool) -- the same rule on the MHA and MLA branches."""
 
     def _make_bare_pool(self, use_mla):
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -275,11 +257,9 @@ class TestHybridLinearMLARouting(unittest.TestCase):
         return pool
 
     def test_set_mla_kv_buffer_door_never_translates(self):
-        """Physical-loc contract: the write door forwards `loc` UNTOUCHED.
-        The translate happens exactly once at ForwardBatch construction
-        (rebind_write_loc, kernel-facing-first); a door that translated
-        again would double-translate every unified MLA write. Deleting the
-        forward (or re-adding a door translate) turns this red."""
+        """The translate happens exactly once, at ForwardBatch construction
+        (`rebind_write_loc`); a door that translated again would
+        double-translate every unified MLA write."""
         pool = self._make_bare_pool()
         loc = torch.tensor([107, 108, 109], dtype=torch.int64)
         layer = types.SimpleNamespace(layer_id=0)
@@ -297,10 +277,8 @@ class TestMlaWriteDoorsUnderDcp(unittest.TestCase):
     the DCP write. `set_kv_buffer` (the combined latent+rope row) cannot: the
     two backends that could reach it disagree on the loc space -- flashinfer's
     `k_rope is None` branch passes a WIDENED loc, the Triton backend one it
-    already collapsed -- so there is no single correct translation. It used to
-    select `loc % dcp_size == dcp_rank` and then write WITHOUT dividing, i.e.
-    widened ids straight into a rank-local buffer. Refusing is the contract;
-    a re-added masked-but-undivided write is what this guards."""
+    already collapsed -- so there is no single correct translation and refusing
+    is the contract."""
 
     def _bare_mla_pool(self):
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool

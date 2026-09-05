@@ -13,26 +13,17 @@
 # ==============================================================================
 """Byte-budget buffer sizing for the unified 2-pool factories.
 
-Derived properties pinned here:
+With ``unified_total_bytes`` set the buffer is that many bytes exactly (the
+mamba pair adds the state pool's bytes on top -- the budget is captured AFTER
+the state carve-out); without it, sizing falls back to the token-count re-sum.
+Sizing from the ratio-derived token counts instead would re-introduce the
+configurator's rounding, which floors by the cell size and then page-aligns
+EACH side, losing up to about a page of tokens per side.
 
-  * Budget honored EXACTLY: with ``unified_total_bytes`` set, the swa pair's
-    buffer is that many bytes (the mamba pair adds the state pool's bytes on
-    top — the budget is captured AFTER the state carve-out). Sizing from the
-    ratio-derived token counts instead re-introduces the configurator's
-    rounding: the swa split floors the budget by the cell size and then
-    page-aligns EACH side's token count, so the re-sum reconstructs less
-    than the profiled budget by up to about one page of tokens per side.
-  * Fallback: without the budget, sizing is the historical token-count re-sum,
-    bit-for-bit.
-  * bs=1 feasibility floor: a budget that cannot fit ONE worst-case request
-    (full KV at max context, plus one SWA window / the state slots a single
-    running request locks) raises at BOOT, before any pool construction —
-    under-sizing is a retract LIVELOCK at runtime, not a perf bug.
-  * The 4096-byte alignment exists because the factories ``.view()`` the whole
-    uint8 buffer as the KV dtype; an unaligned budget must be floored, never
-    rounded up (rounding up overcommits profiled memory).
-
-    python -m pytest test/registered/unit/mem_cache/test_unified_byte_budget_sizing.py -v
+The bs=1 feasibility floor raises at BOOT, before any pool construction: a
+budget that cannot fit ONE worst-case request (full KV at max context, plus
+one SWA window / the state slots a running request locks) is a retract
+LIVELOCK at runtime, not a perf bug.
 """
 
 import unittest
@@ -113,12 +104,11 @@ class TestReservedFloorIsOneSourceOfTruth(unittest.TestCase):
     """The bs=1 floor charges the slot-0 sink, and MUST charge exactly what
     `UnifiedKVPool` actually reserves.
 
-    Regression (GPU eval_434/436, Falcon-H1 boot): the floor hand-copied the
-    formula as `page_size * max(entry_bytes)`, applying the page multiplier to
-    the MAMBA spec. The pool deliberately excludes mamba (it is page_size=1),
-    so with page_size=256 and a ~139 MB state entry the floor over-charged the
-    sink by 256x — ~33 GiB of phantom requirement — and a healthy config
-    failed to boot with 25 GiB of real headroom.
+    Regression (Falcon-H1 boot): the floor hand-copied the formula as
+    `page_size * max(entry_bytes)`, applying the page multiplier to the MAMBA
+    spec, which the pool deliberately excludes because it is page_size=1. At
+    page_size=256 that over-charged the sink 256x and a healthy config failed
+    to boot with real headroom to spare.
     """
 
     def _specs(self, page_size):
@@ -130,7 +120,7 @@ class TestReservedFloorIsOneSourceOfTruth(unittest.TestCase):
             store_dtype=torch.float16,
             grow_direction="down",
         )
-        # A state entry vastly larger than a KV token entry — the real ratio
+        # A state entry vastly larger than a KV token entry: the real ratio
         # (~139 MB vs ~45 KB) is what made the over-charge fatal.
         mamba = MambaSubPoolSpec(
             name="mamba",

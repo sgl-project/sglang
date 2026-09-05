@@ -14,19 +14,11 @@
 """GPU parity of the per-layer-view `UnifiedMLATokenToKVPool` against the stock
 `MLATokenToKVPool` on real K3 MLA geometry (L=24, D=512+64).
 
-The unified pool receives kernel-facing locs (kernel_id(t) = (t//ps)*(ps*L) + t%ps); the
-reference pool receives the raw token ids. Every (layer, token) cell must hold
-identical bytes afterwards. Covers:
-
-  - `set_mla_kv_buffer` under BOTH kernel paths — the Triton fallback
-    (n_loc < 768) and the TMA JIT fast path (n_loc >= 768, which flattens the
-    buffer via `.view(shape[0], -1)`, only legal because per-layer views are
-    contiguous);
-  - `set_kv_buffer` (combined pre-concatenated write, the Triton-backend path);
-  - `get_mla_kv_buffer` roundtrip;
-  - page_size 1 and 64.
-
-    python -m pytest test/registered/unit/mem_cache/test_unified_mla_gpu_parity.py -v
+The unified pool receives kernel-facing locs (kernel_id(t) = (t//ps)*(ps*L) +
+t%ps) where the reference pool receives raw token ids; every (layer, token)
+cell must hold identical bytes afterwards. The TMA JIT fast path (n_loc >= 768)
+flattens the buffer via `.view(shape[0], -1)`, which is legal only because the
+per-layer views are contiguous.
 """
 
 import types

@@ -11,34 +11,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Round-trip correctness of ``UnifiedKVPool._build_mamba_views`` — the
+"""Round-trip correctness of ``UnifiedKVPool._build_mamba_views`` -- the
 envelope-strided conv/temporal (SSM) state views that back ``UnifiedMambaPool``.
-
-This isolates the unified-memory-pool Mamba STATE layout from the full model. It guards
-against a class of correctness defect where Falcon-H1 greedy decode is garbled
-under the unified memory pool, isolated to the Mamba conv/temporal state path: a
-stride/offset/alignment bug in the view construction (analogous to the fixed
-`_extract_kv_strides` MHA bug).
+Guards against garbled greedy decode from a stride/offset/alignment bug in the
+state views. CPU-only.
 
 Within one slot's envelope the bytes are
-``[conv[0]·L0 | conv[0]·L1 | ... | conv[1]·L0 | ... | temporal·L0 | ...]`` and
-across slots the layout is envelope (slot stride == entry_bytes). Each returned
-view is ``(num_layers, max_slots, *inner_shape)``. The conv dtype (bf16, 2 B)
-and temporal dtype (fp32, 4 B) DIFFER, so the temporal view's byte offset must
-be a multiple of the temporal itemsize — an alignment hazard that
-``_build_mamba_views`` now asserts.
-
-These tests prove the views:
-  - round-trip every (tensor, layer, slot) element across several geometries,
-    including the Falcon-like bf16-conv / fp32-temporal dtype mix (catches
-    stride/offset/alignment bugs);
-  - do NOT alias each other (conv[i] vs conv[j] vs temporal) or across
-    layers/slots (catches envelope-overlap);
-  - reject a deliberately mis-aligned spec via the alignment assert.
-
-Everything here is pure torch view / stride arithmetic, so it runs on CPU.
-
-    python -m pytest test/registered/unit/mem_cache/test_unified_mamba_views.py -v
+``[conv[0] L0 | conv[0] L1 | ... | conv[1] L0 | ... | temporal L0 | ...]``,
+the slot stride is ``entry_bytes``, and each returned view is
+``(num_layers, max_slots, *inner_shape)``. The conv dtype (bf16, 2 B) and
+temporal dtype (fp32, 4 B) may DIFFER, so the temporal view's byte offset must
+be a multiple of the temporal itemsize -- an alignment hazard that
+``_build_mamba_views`` asserts.
 """
 
 import unittest
@@ -61,9 +45,8 @@ def _make_pool(
     want_slots=8,
     device="cpu",
 ):
-    """Build a minimal 2-sub-pool ``UnifiedKVPool`` (a small MHA grow-up peer
-    + the Mamba grow-down pool under test) sized to hold >= ``want_slots`` Mamba
-    slots, and return ``(pool, mamba_spec)``."""
+    """Minimal 2-sub-pool ``UnifiedKVPool`` sized to hold >= ``want_slots``
+    Mamba slots; returns ``(pool, mamba_spec)``."""
     from sglang.srt.mem_cache.unified_memory_pool import (
         MambaSubPoolSpec,
         MHASubPoolSpec,
@@ -91,9 +74,8 @@ def _make_pool(
     entry_mamba = mamba_spec.entry_bytes()
     entry_full = full_spec.entry_bytes()
     entry_max = max(entry_mamba, entry_full)
-    # Need max_slots("mamba") = total // entry_mamba >= want_slots, and total
-    # large enough that BOTH pools clear their min_slot_index. Add generous
-    # headroom, then round up to a multiple of 8 (covers bf16/fp32 .view()).
+    # Headroom so BOTH pools clear their min_slot_index, then round up to a
+    # multiple of 8 so bf16/fp32 ``.view()`` stays legal.
     total_bytes = want_slots * entry_mamba + 8 * entry_max
     total_bytes = ((total_bytes + 7) // 8) * 8
     pool = UnifiedKVPool(
@@ -106,9 +88,7 @@ def _make_pool(
 
 
 class TestUnifiedMambaViews(unittest.TestCase):
-    # Falcon-H1-like dims: even conv_dim, bf16 conv, fp32 temporal, several
-    # layers. (Mamba2 conv state is (conv_dim, kernel-1); temporal/SSM state is
-    # (nheads, head_dim, ssm_state_size).)
+    # Falcon-H1-like dims: even conv_dim, bf16 conv, fp32 temporal.
     FALCON_KW = dict(
         mamba_layer_num=5,  # odd, to stress the temporal-offset alignment
         conv_state_shapes=[(48, 3)],  # conv_dim=48, kernel-1=3
@@ -118,11 +98,9 @@ class TestUnifiedMambaViews(unittest.TestCase):
     )
 
     def _fill_and_roundtrip(self, pool, mamba_spec):
-        """Write a distinct random tensor to each conv view + the temporal view
-        (in their own dtypes), then read all back and assert exact equality.
-        Writing ALL views first and reading ALL after means any envelope overlap
-        (conv[i]/conv[j]/temporal aliasing) corrupts an earlier write → mismatch.
-        """
+        """Write a distinct random tensor to every view, then read all of them
+        back: writing all first makes any envelope overlap corrupt an earlier
+        write."""
         conv_views, temporal_view = pool.mamba_views_for("mamba")
         torch.manual_seed(0)
         refs = []
@@ -158,7 +136,7 @@ class TestUnifiedMambaViews(unittest.TestCase):
             temporal_dtype=torch.float32,
             want_slots=4,
         ),
-        # Two conv tensors + bf16/fp32 mix — exercises the per-conv-tensor offset
+        # Two conv tensors + bf16/fp32 mix: exercises the per-conv-tensor offset
         # accumulation in _build_mamba_views.
         "multi_conv_tensors": dict(
             mamba_layer_num=3,
@@ -168,9 +146,8 @@ class TestUnifiedMambaViews(unittest.TestCase):
             temporal_dtype=torch.float32,
             want_slots=6,
         ),
-        # An ALIGNED spec (conv region a multiple of the temporal itemsize):
-        # conv region = N * conv_dim*(k-1) * 2 ; with conv_dim=2 -> per-layer
-        # 2*3*2=12, times N=2 = 24, divisible by 4. Must build and round-trip.
+        # ALIGNED spec: conv region = 2 layers * 2*3*2 B = 24 B, a multiple of
+        # the fp32 temporal itemsize, so it must build and round-trip.
         "alignment_ok": dict(
             mamba_layer_num=2,
             conv_state_shapes=[(2, 3)],
@@ -216,17 +193,9 @@ class TestUnifiedMambaViews(unittest.TestCase):
                 )
 
     def test_alignment_guard_fires_on_misaligned_spec(self):
-        """A spec whose conv region (bf16) is an odd multiple of 2 B makes the
-        per-slot entry (= conv_region + N*temporal_row = 2 B + 4 B = 6 B) NOT a
-        multiple of the temporal itemsize (fp32, 4 B). The temporal/SSM-state
-        view's storage_offset is computed by integer-dividing a byte offset by
-        the temporal itemsize, so this would silently mis-offset the view.
-        ``_build_mamba_views`` must reject it with a loud alignment assert.
-
-        NOTE: the ``entry_bytes % itemsize`` guard is what fires here, and it
-        subsumes the conv-region offset check (see the comment in
-        ``_build_mamba_views``). We assert on the shared "misaligned" wording
-        rather than on which specific guard trips."""
+        """A per-slot entry that is not a multiple of the temporal itemsize would
+        mis-offset the view and must trip the alignment assert; either guard can
+        fire first, so match on the shared "misaligned" wording."""
         with self.assertRaises(AssertionError) as cm:
             _make_pool(
                 mamba_layer_num=1,  # entry = 2 B conv + 4 B temporal = 6 B, not %4
@@ -240,13 +209,10 @@ class TestUnifiedMambaViews(unittest.TestCase):
 
 
 def _k3_kda_mamba_geometry(heads_per_rank: int) -> dict:
-    """Kimi K3 KDA per-rank state geometry: 69 KDA layers, K = V = 128,
-    conv width 4 (=> 3 cached tokens), conv row ``(kernel-1, q+k+v dim)``
-    in the KimiLinear layout (``KimiLinearStateShape.create`` with
-    num_k_heads == num_heads, head_k_dim == head_dim — see
-    ``models/kimi_linear.py``), temporal/SSM state ``(HV, V, K)``.
-    ``heads_per_rank`` = 96 total KDA heads / attn_tp (12 at the TP8
-    deployment shape, cf. ``kernels/ops/attention/kda_fused_decode.py``)."""
+    """Kimi K3 KDA per-rank state geometry: 69 KDA layers, K = V = 128, conv
+    width 4 (=> 3 cached tokens), conv row ``(kernel-1, q+k+v dim)`` per
+    ``KimiLinearStateShape.create``, temporal/SSM state ``(HV, V, K)``, and
+    ``heads_per_rank`` = 96 total KDA heads / attn_tp."""
     h = heads_per_rank
     return dict(
         layer_num=69,
@@ -260,40 +226,29 @@ def _k3_kda_mamba_geometry(heads_per_rank: int) -> dict:
 
 
 class TestKDAFlashInferEnvelopeStateContract(unittest.TestCase):
-    """Derived property: the envelope-strided KDA temporal view (unified memory
-    / page-major layout) must satisfy the state contract of FlashInfer
-    ``recurrent_kda``, because the KDA flashinfer decode wrapper
-    (``linear/kernels/kda_flashinfer.py``) passes the committed per-layer pool
-    view straight into the kernel (in-place state update on the cu_seqlens path
-    — no gather/scatter copy around the call).
+    """Derived property: the envelope-strided KDA temporal view must satisfy the
+    state contract of FlashInfer ``recurrent_kda``, because the KDA flashinfer
+    decode wrapper (``linear/kernels/kda_flashinfer.py``) passes the per-layer
+    pool view straight into the kernel, with no gather/scatter copy.
 
     The kernel compiles its state argument as a CuTe fake tensor of shape
     ``[N, HV, V, K]`` with stride ``(sym_int64(divisibility=16), V*K, K, 1)``
-    and ``assumed_align=32`` (flashinfer ``kda_kernels/recurrent_kda.py``), so
-    a per-layer pool view is only readable by the kernel when:
+    and ``assumed_align=32``, so a per-layer pool view is readable only when:
 
       * its inner strides are exactly compact ``(V*K, K, 1)``;
-      * its slot stride — the per-slot envelope pitch, NOT ``HV*V*K`` — is a
+      * its slot stride -- the per-slot envelope pitch, NOT ``HV*V*K`` -- is a
         multiple of 16 elements (32 bytes at bf16);
       * its base byte offset is 32-byte aligned (for every layer).
-
-    Any envelope-layout change that breaks one of these (per-slot padding that
-    is not a 32 B multiple, a conv-shape change misaligning the temporal
-    region, a transposed/padded temporal inner layout) would silently
-    mis-address every KDA state read/write on SM100 flashinfer decode; this
-    test turns such a diff red without a GPU.
     """
 
-    # 32 B: recurrent_kda's assumed_align AND its slot-stride divisibility
-    # (16 elements * 2 B bf16). External-source literal from flashinfer
-    # kda_kernels/recurrent_kda.py (S_batch = cute.sym_int64(divisibility=16),
-    # make_fake_tensor(..., assumed_align=32)).
+    # recurrent_kda's assumed_align AND its slot-stride divisibility (16
+    # elements * 2 B bf16), from flashinfer kda_kernels/recurrent_kda.py.
     _KERNEL_ALIGN_BYTES = 32
 
     @staticmethod
     def _build_kda_views(heads_per_rank: int = 12):
-        """Real K3 KDA envelope views on CPU for one attn-TP shard (2 slots
-        suffice — the per-slot geometry is slot-count independent)."""
+        """Real K3 KDA envelope views on CPU for one attn-TP shard; 2 slots
+        suffice, the per-slot geometry is slot-count independent."""
         from sglang.srt.mem_cache.layout.page_major import (
             build_page_major_mamba_views,
             mamba_entry_bytes,
@@ -344,14 +299,9 @@ class TestKDAFlashInferEnvelopeStateContract(unittest.TestCase):
                     )
 
     def test_wrapper_state_contract_check_matches_layout(self):
-        """The KDA flashinfer decode wrapper enforces this same contract at
-        runtime (``FlashInferKDAKernel._check_state_stride_contract``, called
-        once per pool view before handing the pool to ``recurrent_kda``). A
-        regression in that check would only surface on SM100 hardware, so pin
-        its accept/reject behavior here: it must ACCEPT exactly what the
-        layouts produce — the envelope-strided per-layer view and a plain
-        contiguous pool — and REJECT views the kernel would silently
-        mis-address (wrong inner strides; a slot stride off the divisibility)."""
+        """``FlashInferKDAKernel._check_state_stride_contract`` enforces the same
+        contract at runtime, and a regression there would only surface on SM100
+        hardware, so pin its accept/reject behavior on CPU."""
         import types
 
         from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (

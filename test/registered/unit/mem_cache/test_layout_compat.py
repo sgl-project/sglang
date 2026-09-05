@@ -11,19 +11,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Unit tests for the page-major envelope byte layout.
+"""``move_kv_cache_native`` -- the stock per-layer 3-D move static-pool
+compaction rides on -- must stay byte-exact. CPU-only.
 
-The subject here is the ENVELOPE — the byte layout the unified pool stores its
-KV in. The 3-D per-layer views the pool exposes over the same bytes are covered
-by ``test_unified_mha_views.py``, which pins the view addressing against the
+The page-major envelope layout and the per-layer views over it are covered by
+``test_unified_mha_views.py``, which pins the view addressing against the
 envelope formula byte for byte.
-
-Verifies that ``move_kv_cache_native`` (the stock per-layer 3-D move) stays
-byte-exact.
-
-CPU-only — no GPU / Triton needed.
-
-    python -m pytest test/registered/unit/mem_cache/test_layout_compat.py -v
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -40,7 +33,7 @@ from sglang.srt.mem_cache.memory_pool import move_kv_cache_native
 class TestMoveKVCacheNative(unittest.TestCase):
     def test_move_kv_cache_3d_path_unchanged(self):
         """The stock per-layer 3-D move must relocate exactly the named token
-        rows, byte-identically — compaction on static pools rides on it."""
+        rows, byte-identically; compaction on static pools rides on it."""
         k = [torch.zeros((32, 2, 4), dtype=torch.float16) for _ in range(2)]
         v = [torch.zeros((32, 2, 4), dtype=torch.float16) for _ in range(2)]
         for L in range(2):

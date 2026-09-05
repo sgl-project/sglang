@@ -11,26 +11,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""MLA views for the unified memory pool (MLA-hybrid-Mamba, Kimi K3).
+"""MLA views for the unified memory pool (MLA-hybrid-Mamba, Kimi K3), CPU-only.
 
-Covers, CPU-only (pure torch — no GPU / Triton kernels):
-  - `MLASubPoolSpec` byte math;
-  - `build_mla_views` addressing: view_l[kernel_id(t)] must land exactly at
-    the page-major envelope byte offset `p*(L*ps*D) + l*(ps*D) + s*D`, the
-    overlapping per-layer views must not alias at equal kernel-facing ids, and the
-    missing-tail-pad case must fail loud;
-  - `UnifiedKVPool` MLA plumbing: `view_tail_pad_bytes` extends the allocation
-    only, and the reserved sink floor covers the whole page-0 envelope;
-  - `UnifiedMLATokenToKVPool`: buffer wiring, V-as-prefix-slice, and the
-    page-envelope `move_kv_cache` (REAL physical token ids, page-major runs);
-  - `MultiEndedAllocator.translate_kv_loc_for_kernel`: kernel id = v2p-page * (ps*L) +
-    offset, tombstone clamp to the sink, `out=` contract, multiplier-1
-    fallback, and correctness across eager compaction.
+Addressing law under test: the (page, layer, slot) cell sits at envelope byte
+offset `p*(L*ps*D) + l*(ps*D) + s*D`, reached through the kernel-facing id
+`(t // ps) * (ps * L) + t % ps`.
 
-GPU parity of the actual read/write kernels (set_mla_kv_buffer TMA path etc.)
-lives in the server-level tests, not here.
-
-    python -m pytest test/registered/unit/mem_cache/test_unified_mla_views.py -v
+GPU parity of the read/write kernels (set_mla_kv_buffer TMA path etc.) lives in
+`test_unified_mla_gpu_parity.py`.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -52,8 +40,8 @@ from sglang.srt.mem_cache.unified_memory_pool import (
 
 _DEV = "cpu"
 
-# Small-but-nontrivial MLA geometry: L=3 layers, D=8 (=6+2), so every byte
-# offset is hand-checkable. Real K3 is L=24, D=576 (=512+64).
+# Geometry kept tiny so every byte offset is hand-checkable; real K3 is
+# L=24, D=576 (=512+64).
 _L = 3
 _LORA = 6
 _ROPE = 2
@@ -140,7 +128,7 @@ class TestMLAViews(unittest.TestCase):
             n_rows = num_pages * _L * ps
             for v in views:
                 self.assertEqual(tuple(v.shape), (n_rows, 1, _D))
-                # contiguous in the (row, dim) sense — .view(-1, ps, D) legality
+                # contiguous in the (row, dim) sense: .view(-1, ps, D) legality
                 self.assertEqual(v.stride(0), _D)
                 self.assertEqual(v.stride(2), 1)
             flat = raw.view(_DTYPE)

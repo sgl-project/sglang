@@ -5,8 +5,6 @@ path most prone to subtle bugs: the Mamba conv/SSM state stays a strided
 envelope view (its kernels are stride-aware by design) while the
 full-attention KV is per-layer views, which the fa3 / flashinfer cells read
 through the translator's read tables.
-
-Registered to the label-gated ``run-ci-extra`` suite (opt-in, not per-commit).
 """
 
 import unittest
@@ -38,9 +36,8 @@ class TestUnifiedQwenHybridTriton(DefaultServerBase):
 
     model = DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST
 
-    # Measured ~0.86 in this harness on both the static pools and the envelope
-    # layout; 0.80 leaves noise margin and still catches a corrupted prefill
-    # state, which reads ~0.61.
+    # Measured ~0.86 on both the static pools and the envelope layout; 0.80
+    # leaves noise margin and still catches a corrupted prefill state (~0.61).
     gsm8k_threshold = 0.80
     num_gsm8k_questions = 200
     num_shots = 5

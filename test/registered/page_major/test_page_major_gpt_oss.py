@@ -4,8 +4,6 @@ gpt-oss-20b is uniform-row hybrid-SWA, so its MHA and SWA sub-pools are
 per-layer views and the fa3 cell reads them through the translator's read
 tables. flashinfer is absent on purpose: gpt-oss uses attention sinks, which
 it does not support.
-
-Registered to the label-gated ``run-ci-extra`` suite (opt-in, not per-commit).
 """
 
 import unittest

@@ -11,27 +11,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Byte-conservation verifier for the unified 2-pool composites.
+"""Byte-conservation verifier (`verify_byte_accounting`) for the unified
+2-pool composites.
 
-`verify_byte_accounting` is the idle-time tripwire the token-identity leak
-check cannot provide: the unified pool's correctness rests on BYTE bookkeeping
-(watermark spans, holes, pending compaction, frontier ordering inside one
-shared buffer), and a drifted counter admits requests into memory that is not
-actually free — silent corruption territory, not a crash.
+The unified pool's correctness rests on BYTE bookkeeping -- watermark spans,
+holes, pending compaction, frontier ordering inside one shared buffer -- and
+a drifted counter admits requests into memory that is not actually free.
+Nothing about that is visible to the token-identity leak check, so this
+verifier is the only idle-time tripwire for it.
 
-Derived properties pinned here:
-
-  * Conservation: on a lazy end pool the watermark span must equal
-    live + holes + pending pages at EVERY point of a healthy lifecycle
-    (alloc, partial free, group free, flush) — not just at rest.
-  * The check is not vacuous: drifting any single term (live count, watermark,
-    a leaked hole) reports loudly, naming the sub-pool.
-  * Chain order: one member's low frontier clearing the other's high frontier
-    is what "two pools share one buffer without overlap" MEANS.
-  * The strict escalation env defaults OFF: promoting the diagnostic to a
-    RuntimeError is a validation posture, not the production one.
-
-    python -m pytest test/registered/unit/mem_cache/test_unified_byte_accounting.py -v
+The conservation identity: on a lazy end pool the watermark span equals
+live + holes + pending pages at EVERY point of a lifecycle, not just at rest.
 """
 
 import unittest
@@ -73,10 +63,10 @@ class TestHealthyLifecycleReportsClean(unittest.TestCase):
 
 
 class TestDriftReportsLoudly(unittest.TestCase):
-    """Each mutation below models a distinct bookkeeping bug; the verifier
-    must name the drifted sub-pool. Without these, a regression in any single
-    counter passes every other test (the pool still 'works' — it just lies
-    about capacity)."""
+    """Each mutation models a distinct bookkeeping bug; the verifier must name
+    the drifted sub-pool. Without these, a regression in any single counter
+    passes every other test -- the pool still 'works', it just lies about
+    capacity."""
 
     def _lazy_full(self):
         full, _swa = _paged_pair(lazy=True)
@@ -86,8 +76,6 @@ class TestDriftReportsLoudly(unittest.TestCase):
         return full
 
     def test_any_drifted_term_reports(self):
-        """One drifted span term per subTest -- each must be reported."""
-
         def drift_live_count(full):
             full.live_page_count += 1
 
@@ -125,11 +113,10 @@ class TestDriftReportsLoudly(unittest.TestCase):
 
 class TestChainFrontierOrder(unittest.TestCase):
     def test_overlapping_frontiers_report(self):
-        """Both bands hold pages, then the up member's watermark is pushed past
-        the down member's LIVE low frontier: the two bands now claim the same
-        bytes of one buffer. (An empty down band cannot overlap — its low
-        frontier IS the buffer top — so both sides must be populated for the
-        scenario to be a real corruption.)"""
+        """Both bands hold pages, then the up member's watermark is pushed
+        past the down member's LIVE low frontier. Both sides must be populated
+        for this to be real corruption: an empty down band cannot overlap,
+        its low frontier IS the buffer top."""
         full, swa = _paged_pair(lazy=False)
         chain = mea._end_pair_chain(full, swa)
         up, down = chain

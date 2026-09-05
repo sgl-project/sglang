@@ -13,25 +13,13 @@
 # ==============================================================================
 """N-sub-pool construction sweep for ``UnifiedKVPool``.
 
-The pool accepts N sub-pool specs: exactly one grow-up END, exactly one
-grow-down END, and >= 0 "float" MIDDLE pools between their frontiers. These
-tests pin the constructor contract the N-pool chain machinery builds on:
+The pool accepts N sub-pool specs -- exactly one grow-up END, exactly one
+grow-down END, and >= 0 "float" MIDDLE pools between their frontiers -- and
+sorts them into the canonical chain order
+``[up end, floats (input order), down end]``. Every sub-pool view spans the
+whole buffer at anchor 0; keeping the bands disjoint is the allocators' job.
 
-  - canonical chain order ``[up end, floats (input order), down end]`` —
-    input list order is irrelevant (2-pool configs stay byte-identical);
-  - by-name geometry (``max_slots = total_bytes // entry_bytes``,
-    ``min_slot_index`` past the shared reserved floor) independent of N;
-  - the reserved slot-0 sink covers EVERY sub-pool's page-0 dummy-write
-    envelope, floats included (mamba stays page_size=1);
-  - validation: unique names, exactly one up + one down, >= 2 specs, and
-    per-spec ``_allowed_grow_directions`` narrowing;
-  - float sub-pool views build and round-trip like end-pool views (all views
-    span the whole buffer at anchor 0; keeping the bands disjoint is the
-    allocators' job).
-
-Pure CPU geometry — no allocator, no GPU.
-
-    python -m pytest test/registered/unit/mem_cache/test_unified_npool_sweep.py -v
+Pure CPU geometry -- no allocator, no GPU.
 """
 
 import unittest
@@ -46,10 +34,8 @@ from sglang.srt.mem_cache.unified_memory_pool import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-# Plain unittest.TestCase, importing only ci_register -- the deliberate
-# hermetic convention of the pool-geometry tests in this directory (see
-# test_multi_ended_allocator.py): no heavy sglang.test.test_utils import
-# chain, so the suite runs in a lean torch-only environment.
+# Hermetic convention of this directory's pool tests: plain unittest.TestCase,
+# only ci_register imported (no heavy sglang.test.test_utils chain).
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 _DEV = "cpu"
@@ -213,8 +199,7 @@ class TestReservedFloorWithFloats(unittest.TestCase):
 
     def test_too_small_buffer_fails_loud(self):
         # 2048 B with page_size=16 and 128 B/entry MHA specs: the page-0 sink
-        # (16*128 = 2048 B) consumes the whole buffer -> min_slot_index ==
-        # max_slots for the MHA pools -> no allocatable slot -> loud error.
+        # (16*128 = 2048 B) consumes the whole buffer, leaving no slot.
         with self.assertRaisesRegex(RuntimeError, "no room"):
             _make_pool(
                 [_mamba("state", "up"), _mha("swa", "float"), _mha("full", "down")],

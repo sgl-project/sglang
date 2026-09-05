@@ -11,26 +11,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""MHA K/V views for the unified memory pool (uniform-row hybrid models).
+"""MHA K/V views for the unified memory pool (uniform-row hybrid models), CPU-only.
 
-Covers, CPU-only (pure torch — no GPU / Triton kernels):
-  - `build_mha_views` refuses an asymmetric-KV spec: its addressing
-    assumes one uniform row width, so it is the boundary that checks;
-  - `build_mha_views` addressing: view_l[kernel_id(t)] must land exactly at
-    the page-major envelope byte offset the STRIDED builder assigns to the same
-    (page, slot, layer, K|V) cell — the two builders are views over one truth;
-  - K and V of one token share ONE kernel-facing id (per-layer origin shift does the
-    disambiguation), with no aliasing across the 2*L overlapping views;
-  - the missing-tail-pad and asymmetric-dims cases fail loud at construction.
-
-Addressing law under test (the derived property everything else builds on):
+Addressing law under test:
 
     kernel_id(t) = (t // ps) * (ps * 2L) + t % ps
-    K of layer l at block 2l, V at block 2l+1, blocks are ps rows of
-    head_num*head_dim elements — offsets identical to
+    K of layer l at block 2l, V at block 2l+1; blocks are ps rows of
+    head_num*head_dim elements, at offsets identical to
     MHASubPoolSpec.layer_k/v_offset_in_page when rows are uniform.
-
-    python -m pytest test/registered/unit/mem_cache/test_unified_mha_views.py -v
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -52,12 +40,10 @@ from sglang.srt.mem_cache.unified_memory_pool import (
 
 _DEV = "cpu"
 # `set_kv_buffer` dispatches on the PLATFORM (memory_pool._is_cuda, resolved at
-# import), not on the tensors it is handed, so cases driving it must build on
-# the platform's device. The rest of this file is byte arithmetic, so CPU.
+# import), not on the tensors it is handed, so cases driving it build there.
 _STORE_DEV = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Small-but-nontrivial MHA geometry: L=2 layers, H=2 heads, D=4, so every byte
-# offset is hand-checkable. blocks = 2L = 4 per page.
+# Geometry kept tiny so every byte offset is hand-checkable.
 _L = 2
 _H = 2
 _D = 4
@@ -105,13 +91,8 @@ def _build_views(raw, ps, num_pages, head_dim=_D, v_head_dim=_D, layer_num=_L):
 
 
 def _reference_strided_views(raw, *, page_size, num_pages, anchor_bytes=0):
-    """Independent 4-D strided description of the page-major envelope.
-
-    This is the retired production strided builder, kept here as the oracle:
-    per-layer ``(num_pages, page_size, head_num, head_dim)`` views addressed by
-    ``(page, slot)``, so the builder's addressing can be cross-checked
-    against a second, independently-derived description of the same bytes.
-    """
+    """Independent 4-D strided description of the same page-major envelope,
+    addressed by ``(page, slot)`` -- the oracle for the view builder."""
     k_row_bytes = _ROW * _ITEM
     v_row_bytes = _ROW * _ITEM
     page_bytes = page_size * _L * (k_row_bytes + v_row_bytes)
@@ -144,11 +125,8 @@ def _reference_strided_views(raw, *, page_size, num_pages, anchor_bytes=0):
 
 class TestMHASpecSurface(unittest.TestCase):
     def test_asymmetric_rows_refused_by_the_view_builder(self):
-        """The row-block array exists only for uniform rows, so the builder
-        whose addressing depends on it is the one that refuses (the MiMoV2
-        shape, scaled down). ServerArgs screens such models out of
-        --enable-unified-memory long before we get here; this is the check for
-        a caller that reaches the builder directly."""
+        """ServerArgs screens asymmetric-KV models out of
+        --enable-unified-memory; this guards a caller reaching the builder."""
         spec = _mha_spec()
         raw = torch.zeros(1 << 16, dtype=torch.uint8)
         with self.assertRaises(AssertionError):
@@ -177,11 +155,8 @@ class TestMHAViews(unittest.TestCase):
             self.assertEqual(v.stride(), (_ROW, _D, 1))
 
     def test_addressing_matches_strided_reference(self):
-        """Cross-readback: bytes written through the reference STRIDED views at
-        (page, slot) must be read back through the views at kernel_id(t),
-        for both K and V of every layer — and vice versa. This pins that the
-        view builder and the independent strided description agree on the
-        same physical envelope."""
+        """Cross-readback both ways: a write through the strided oracle at
+        (page, slot) must read back through the view at kernel_id(t)."""
         for ps in (1, 4):
             num_pages = 5
             raw = _make_raw(ps, num_pages)
@@ -304,12 +279,8 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
             self.assertEqual(pool_under_test.size, n_rows - ps)
 
     def test_stock_write_lands_on_envelope_truth(self):
-        """Byte-identity: the pool's stock inherited `set_kv_buffer` at kernel-facing
-        locs must produce exactly the bytes that direct writes through STRIDED
-        views over the same envelope produce at the same (page, slot, layer)
-        cells. The strided views are built here purely as the independent
-        description of the envelope — pins the whole write path (loc -> view ->
-        raw bytes) end to end."""
+        """Byte-identity: the inherited `set_kv_buffer` at kernel-facing locs must
+        produce the same bytes as writes through the strided oracle."""
         for ps in (1, 4):
             kv, pool = _make_pool_and_kv(ps, device=_STORE_DEV)
             # An independent strided view of the SAME sub-pool region.
@@ -349,10 +320,8 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
                     )
 
     def test_move_kv_cache_relocates_whole_envelopes(self):
-        """Compaction hands PHYSICAL token runs, not kernel-facing ids. The override
-        must relocate exactly the page envelopes those runs name — red if it is
-        lost, since the inherited per-layer move would apply physical ids to
-        the row space."""
+        """Compaction hands PHYSICAL token runs, not kernel-facing ids; the
+        override must relocate exactly the page envelopes those runs name."""
         ps = 4
         kv, pool = _make_pool_and_kv(ps)
         live = kv._raw.numel() - kv.view_tail_pad_bytes
@@ -377,8 +346,7 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
 
     def test_transfer_entry_points_fail_loud(self):
         """PD / CPU-copy entry points assume per-layer buffers indexed by TOKEN
-        id; against the row space they would silently mis-index (or hit a
-        missing-attr AttributeError). Every one of them must raise."""
+        id and would silently mis-index the row space, so each must raise."""
         _, pool = _make_pool_and_kv(1)
         with self.assertRaises(NotImplementedError):
             pool.get_contiguous_buf_infos()
@@ -390,10 +358,8 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
             pool.set_kv_buffer_prefix_valid()
 
     def test_hnd_env_cannot_hijack_layout(self):
-        """SGLANG_USE_HND_KVCACHE=1 used to flip the inherited env-driven
-        layout selector, putting the pool in a mode whose code paths do not
-        match its buffers (HND indexes 4-D; the per-layer views are 3-D). The
-        pinned label must win."""
+        """SGLANG_USE_HND_KVCACHE must not flip this pool's layout: HND indexes
+        4-D while the per-layer views are 3-D, so the pinned label has to win."""
         with envs.SGLANG_USE_HND_KVCACHE.override(True):
             _, pool = _make_pool_and_kv(1)
             self.assertFalse(pool.use_hnd)
@@ -401,17 +367,15 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
 
 
 class TestFactoryViews(unittest.TestCase):
-    """The real SWA factory builds the sub-pools and wires the matching
-    kernel-facing multipliers into the composite allocator. End-to-end over
-    that factory, the rebind must emit BOTH kernel-facing write locs."""
+    """Over the real SWA factory: matching kernel-facing multipliers in the
+    composite allocator, and a rebind that emits both write locs."""
 
     # _swa_factory geometry: L_full = L_swa = 2, uniform 8/8 dims, ps = 1.
     FULL_MULT = 4  # 2 * L_full
     SWA_MULT = 4  # 2 * L_swa
 
     def _bundle(self):
-        # Self-contained tiny SWA-factory bundle (L_full = L_swa = 2, uniform
-        # 8/8 dims, ps = 1) — small enough that per-layer views build on CPU.
+        # Kept tiny so the per-layer views build on CPU.
         from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 
         return init_unified_swa_pools(
@@ -446,11 +410,8 @@ class TestFactoryViews(unittest.TestCase):
         self.assertGreater(pool.view_tail_pad_bytes, 0)
 
     def test_rebind_emits_kernel_facing_full_and_build_derives_swa(self):
-        """End-to-end over the real factory: rebind_write_loc rebinds
-        out_cache_loc to FULL-kernel-facing ids (phase 1), and the per-batch build
-        derives the SWA write loc pointwise from those kernel-facing values
-        (phase 2) — both checked against the formulas over the VIRTUAL
-        ids."""
+        """rebind_write_loc rebinds out_cache_loc to FULL-kernel-facing ids, and
+        the SWA write loc is derived pointwise from those kernel-facing values."""
         from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 
         b = self._bundle()
