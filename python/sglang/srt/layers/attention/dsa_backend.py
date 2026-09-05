@@ -160,6 +160,16 @@ else:
     )
 
 
+def _new_aiter_mla_output(q: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
+    """Allocate the output tensor required by AITER MLA kernels.
+
+    AITER MLA writes BF16 output even when the query is FP8. Deriving the
+    output dtype from ``q`` would under-allocate the destination by one byte
+    per element and let the kernel write past the end of the buffer.
+    """
+    return torch.empty(shape, dtype=torch.bfloat16, device=q.device)
+
+
 def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tensor:
     # Always normalize to (N_total, 1) layout, to avoid deadlock at deep_gemm.fp8_paged_mqa_logits
     if seqlens_32.dim() == 2:
@@ -2975,20 +2985,23 @@ class DeepseekSparseAttnBackend(
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
 
         if layer.head_dim != layer.v_head_dim:
-            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+            o = _new_aiter_mla_output(
+                q, (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+            )
         else:
-            o = torch.empty_like(q)
+            o = _new_aiter_mla_output(q, q.shape)
 
         if self.need_pad_heads:
             q_kernel = q.view(
                 -1, layer.tp_q_head_num, layer.head_dim
             ).repeat_interleave(self.head_repeat_factor, dim=1)
-            o_kernel = q.new_empty(
+            o_kernel = _new_aiter_mla_output(
+                q,
                 (
                     q.shape[0],
                     layer.tp_q_head_num * self.head_repeat_factor,
                     layer.v_head_dim,
-                )
+                ),
             )
         else:
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -3053,20 +3066,23 @@ class DeepseekSparseAttnBackend(
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
 
         if layer.head_dim != layer.v_head_dim:
-            o = q.new_empty((num_tokens, layer.tp_q_head_num * layer.v_head_dim))
+            o = _new_aiter_mla_output(
+                q, (num_tokens, layer.tp_q_head_num * layer.v_head_dim)
+            )
         else:
-            o = torch.empty_like(q)
+            o = _new_aiter_mla_output(q, q.shape)
 
         if self.need_pad_heads:
             q_kernel = q.view(
                 -1, layer.tp_q_head_num, layer.head_dim
             ).repeat_interleave(self.head_repeat_factor, dim=1)
-            o_kernel = q.new_empty(
+            o_kernel = _new_aiter_mla_output(
+                q,
                 (
                     num_tokens,
                     layer.tp_q_head_num * self.head_repeat_factor,
                     layer.v_head_dim,
-                )
+                ),
             )
         else:
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
