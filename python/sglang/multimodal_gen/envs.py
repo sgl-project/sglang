@@ -52,6 +52,11 @@ if TYPE_CHECKING:
     # distinct (n_local, n_peer, dtype) staging pairs kept; each is two
     # slots and is never freed, so multi-resolution serving needs a cap
     SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS: int = 16
+    # Experimental communication-aware layerwise H2D prefetch. The feature is
+    # opt-in and currently supports the standard NCCL Ulysses path only.
+    SGLANG_DIT_COMM_AWARE_PREFETCH: bool = False
+    SGLANG_DIT_PREFETCH_CHUNK_MIB: int = 2
+    SGLANG_DIT_PREFETCH_INFLIGHT: int = 2
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
     SGLANG_CACHE_DIT_BN: int = 0
@@ -312,6 +317,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS": _lazy_int(
         "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS", 16
     ),
+    "SGLANG_DIT_COMM_AWARE_PREFETCH": _lazy_bool(
+        "SGLANG_DIT_COMM_AWARE_PREFETCH", "false"
+    ),
+    "SGLANG_DIT_PREFETCH_CHUNK_MIB": _lazy_int("SGLANG_DIT_PREFETCH_CHUNK_MIB", 2),
+    "SGLANG_DIT_PREFETCH_INFLIGHT": _lazy_int("SGLANG_DIT_PREFETCH_INFLIGHT", 2),
     "SGLANG_CACHE_DIT_ENABLED": _lazy_bool("SGLANG_CACHE_DIT_ENABLED"),
     # Number of first blocks to always compute (DBCache F parameter)
     "SGLANG_CACHE_DIT_FN": _lazy_int("SGLANG_CACHE_DIT_FN", 1),

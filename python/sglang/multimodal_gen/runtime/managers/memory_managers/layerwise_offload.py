@@ -2,6 +2,7 @@ import bisect
 import queue
 import re
 import threading
+from collections import deque
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from time import perf_counter
@@ -368,6 +369,7 @@ class LayerwiseOffloadManager:
         residency_policy: str = RESIDENCY_POLICY_LEADING,
         pin_budget: HostPinBudget | None = None,
         pin_component_name: str = "layerwise offload",
+        communication_aware_prefetch: bool = False,
     ) -> None:
         self.model = model
         self.layers_attr_str = layers_attr_str
@@ -410,6 +412,16 @@ class LayerwiseOffloadManager:
         # never flips back, so disable_offload/enable_offload can toggle
         # `enabled` without losing track of which managers can be re-armed.
         self._configured = False
+        self._coordinated_prefetch_requested = bool(communication_aware_prefetch)
+        self._coordinated_prefetch_active = False
+        self._prefetch_chunk_bytes = envs.SGLANG_DIT_PREFETCH_CHUNK_MIB * 1024**2
+        self._prefetch_inflight = envs.SGLANG_DIT_PREFETCH_INFLIGHT
+        self._prefetch_coordinator = None
+        self._prefetch_registered = False
+        self._prefetch_submission_lock = threading.Lock()
+        self._prefetch_threads: Dict[int, threading.Thread] = {}
+        self._prefetch_errors: Dict[int, Exception] = {}
+        self._coordinated_prefetch_logged = False
         self.enabled = bool(enabled and torch.get_device_module().is_available())
         if not self.enabled:
             return
@@ -818,6 +830,7 @@ class LayerwiseOffloadManager:
                 self._consolidated_cpu_weights[layer_idx][dtype] = cpu_buffer
 
     def _finalize_initialization(self) -> None:
+        self._initialize_coordinated_prefetch()
         # prefetch the head of the stream for warm-up; residency is not armed
         # yet, so this is layer 0 regardless of policy
         self.prepare_for_next_req(non_blocking=False)
@@ -885,6 +898,8 @@ class LayerwiseOffloadManager:
         # caller decides whether to block on it.
         for layer_idx in sorted(self._retained_set):
             self.prefetch_layer(layer_idx, non_blocking=non_blocking)
+            if not non_blocking:
+                self._finish_prefetch_submission(layer_idx)
         if not non_blocking and self.copy_stream is not None:
             torch.get_device_module().current_stream().wait_stream(self.copy_stream)
 
@@ -962,6 +977,150 @@ class LayerwiseOffloadManager:
             target = self._named_buffers[name]
         return target
 
+    def _deactivate_coordinated_prefetch(self) -> None:
+        self._coordinated_prefetch_active = False
+        if self._prefetch_registered:
+            self._prefetch_coordinator.unregister()
+            self._prefetch_registered = False
+
+    def _disable_coordinated_prefetch(self, reason: str) -> None:
+        self._deactivate_coordinated_prefetch()
+        self._coordinated_prefetch_requested = False
+        logger.warning(
+            "Communication-aware prefetch disabled for %s: %s",
+            self.layers_attr_str,
+            reason,
+        )
+
+    @torch.compiler.disable
+    def _initialize_coordinated_prefetch(self) -> None:
+        if not self._coordinated_prefetch_requested:
+            return
+        if self._coordinated_prefetch_active:
+            return
+        if self.device.type != "cuda" or not self.pin_cpu_memory:
+            self._disable_coordinated_prefetch("requires CUDA and pinned CPU weights")
+            return
+        if envs.SGLANG_DIFFUSION_IPC_A2A:
+            self._disable_coordinated_prefetch(
+                "requires SGLANG_DIFFUSION_IPC_A2A=0 so Ulysses traffic "
+                "crosses the coordinator"
+            )
+            return
+        if self._prefetch_chunk_bytes <= 0:
+            self._disable_coordinated_prefetch("chunk size must be positive")
+            return
+        if self._prefetch_inflight <= 0:
+            self._disable_coordinated_prefetch("inflight depth must be positive")
+            return
+        if any(self._strided_cpu_weights.values()):
+            self._disable_coordinated_prefetch(
+                "stride-preserving weights are not supported"
+            )
+            return
+
+        from sglang.multimodal_gen.runtime.managers.memory_managers.prefetch_traffic import (
+            get_prefetch_traffic_coordinator,
+        )
+
+        self._prefetch_coordinator = get_prefetch_traffic_coordinator(self.device)
+        self._prefetch_coordinator.register()
+        self._prefetch_registered = True
+        self._coordinated_prefetch_active = True
+        logger.info(
+            "Communication-aware prefetch enabled for %s: chunk=%d MiB, "
+            "max_inflight=%d",
+            self.layers_attr_str,
+            self._prefetch_chunk_bytes // 1024**2,
+            self._prefetch_inflight,
+        )
+
+    def _start_coordinated_prefetch_submission(
+        self,
+        layer_idx: int,
+        cpu_buffers: Dict[torch.dtype, torch.Tensor],
+        gpu_buffers: Dict[torch.dtype, torch.Tensor],
+        completion: torch.cuda.Event,
+    ) -> None:
+        """Submit bounded H2D chunks from a producer thread."""
+
+        def producer() -> None:
+            outstanding: deque[tuple[int, torch.cuda.Event]] = deque()
+            try:
+                torch.cuda.set_device(self.device)
+                observed_generation = 0
+                with self._prefetch_submission_lock, torch.cuda.stream(
+                    self.copy_stream
+                ):
+                    for dtype, cpu_buffer in cpu_buffers.items():
+                        gpu_buffer = gpu_buffers[dtype]
+                        element_size = cpu_buffer.element_size()
+                        chunk_numel = max(1, self._prefetch_chunk_bytes // element_size)
+                        for start in range(0, cpu_buffer.numel(), chunk_numel):
+                            if len(outstanding) >= self._prefetch_inflight:
+                                retired_token, retired_event = outstanding.popleft()
+                                retired_event.synchronize()
+                                self._prefetch_coordinator.retire_block(retired_token)
+                            observed_generation, token = (
+                                self._prefetch_coordinator.before_submit_block(
+                                    self.copy_stream, observed_generation
+                                )
+                            )
+                            try:
+                                end = min(start + chunk_numel, cpu_buffer.numel())
+                                gpu_buffer[start:end].copy_(
+                                    cpu_buffer[start:end], non_blocking=True
+                                )
+                                retired = torch.cuda.Event()
+                                retired.record(self.copy_stream)
+                                self._prefetch_coordinator.publish_block(token, retired)
+                                outstanding.append((token, retired))
+                            except Exception:
+                                self._prefetch_coordinator.cancel_block(token)
+                                raise
+                    while outstanding:
+                        retired_token, retired_event = outstanding.popleft()
+                        retired_event.synchronize()
+                        self._prefetch_coordinator.retire_block(retired_token)
+                    completion.record(self.copy_stream)
+            except Exception as exc:
+                cleanup_error = None
+                while outstanding:
+                    token, event = outstanding.popleft()
+                    try:
+                        event.synchronize()
+                    except Exception as event_exc:
+                        if cleanup_error is None:
+                            cleanup_error = event_exc
+                    finally:
+                        self._prefetch_coordinator.retire_block(token)
+                self._prefetch_errors[layer_idx] = cleanup_error or exc
+
+        thread = threading.Thread(
+            target=producer,
+            name=f"coordinated-prefetch-layer-{layer_idx}",
+            daemon=True,
+        )
+        self._prefetch_threads[layer_idx] = thread
+        thread.start()
+
+    def _finish_prefetch_submission(self, layer_idx: int) -> None:
+        thread = self._prefetch_threads.pop(layer_idx, None)
+        if thread is not None:
+            thread.join()
+        error = self._prefetch_errors.pop(layer_idx, None)
+        if error is not None:
+            self._disable_coordinated_prefetch(
+                f"runtime failure while loading layer {layer_idx}"
+            )
+            raise RuntimeError(
+                f"communication-aware prefetch failed for layer {layer_idx}"
+            ) from error
+
+    def _finish_all_prefetch_submissions(self) -> None:
+        for layer_idx in list(self._prefetch_threads):
+            self._finish_prefetch_submission(layer_idx)
+
     @torch.compiler.disable
     def prefetch_layer(self, layer_idx: int, non_blocking: bool = True) -> None:
         """
@@ -1003,6 +1162,13 @@ class LayerwiseOffloadManager:
             non_blocking = False
             stream_context = nullcontext()
 
+        use_coordinated_prefetch = (
+            self._coordinated_prefetch_active
+            and self.copy_stream is not None
+            and layer_idx in self._consolidated_cpu_weights
+            and not self._mapped_cpu_weights.get(layer_idx)
+        )
+
         # A mapped source is synchronous on this thread however the copy is
         # requested, so hand those weights to the courier and let it overlap
         # this layer's transfer with the previous layer's compute. Blocking
@@ -1027,7 +1193,8 @@ class LayerwiseOffloadManager:
                 gpu_buffer = torch.empty(
                     cpu_buffer.shape, dtype=dtype, device=self.device
                 )
-                gpu_buffer.copy_(cpu_buffer, non_blocking=non_blocking)
+                if not use_coordinated_prefetch:
+                    gpu_buffer.copy_(cpu_buffer, non_blocking=non_blocking)
                 gpu_buffers[dtype] = gpu_buffer
 
             # restore model's weights by their metadata using the same copy stream
@@ -1075,10 +1242,29 @@ class LayerwiseOffloadManager:
                 target.data = self._wrap_for_target(target, local_tensor)
 
         if self.copy_stream is not None:
-            # record after all copies so the consumer waits for every weight copy
+            # The producer records this event after every chunk has been
+            # submitted. The consumer joins the producer before waiting on it,
+            # so CUDA never waits on an event that has not been recorded yet.
             event = torch.get_device_module().Event()
-            event.record(self.copy_stream)
             self._prefetch_events[layer_idx] = event
+            if use_coordinated_prefetch:
+                if not self._coordinated_prefetch_logged:
+                    self._coordinated_prefetch_logged = True
+                    logger.info(
+                        "Communication-aware prefetch activated: chunk_mib=%d "
+                        "max_inflight=%d",
+                        self._prefetch_chunk_bytes // 1024**2,
+                        self._prefetch_inflight,
+                    )
+                self._start_coordinated_prefetch_submission(
+                    layer_idx,
+                    self._consolidated_cpu_weights[layer_idx],
+                    gpu_buffers,
+                    event,
+                )
+            else:
+                # record after all copies so the consumer waits for every weight copy
+                event.record(self.copy_stream)
 
         if not ship_mapped:
             self._gpu_layers.add(layer_idx)
@@ -1189,6 +1375,7 @@ class LayerwiseOffloadManager:
         denoise stage that the resident set is scoped to."""
         if not self.enabled or self.device is None:
             return
+        self._finish_all_prefetch_submissions()
         if self.copy_stream is not None:
             torch.get_device_module().current_stream().wait_stream(self.copy_stream)
 
@@ -1205,12 +1392,18 @@ class LayerwiseOffloadManager:
         """Load all layers from CPU to GPU."""
         if not self.enabled or self.device is None:
             return
+        # A layer is added to ``_gpu_layers`` when its producer starts, not
+        # when all chunks have been submitted. Join those producers before the
+        # membership check below so disable_offload cannot mistake an in-flight
+        # layer for a fully resident one.
+        self._finish_all_prefetch_submissions()
         if self.copy_stream is not None:
             torch.get_device_module().current_stream().wait_stream(self.copy_stream)
 
         for layer_idx in range(self.num_layers):
             if layer_idx not in self._gpu_layers:
                 self.prefetch_layer(layer_idx, non_blocking=False)
+                self._finish_prefetch_submission(layer_idx)
 
     @torch.compiler.disable
     def sync_layer_to_cpu(self, layer_idx: int) -> None:
@@ -1422,7 +1615,8 @@ class LayerwiseOffloadManager:
                 if i not in self._gpu_layers:
                     # LTX audio VAE traverses decoder.up in reverse order
                     self.prefetch_layer(i, non_blocking=False)
-                if i in self._prefetch_events and self.copy_stream is not None:
+                self._finish_prefetch_submission(i)
+                if i in self._prefetch_events:
                     torch.get_device_module().current_stream().wait_event(
                         self._prefetch_events[i]
                     )
@@ -1785,6 +1979,10 @@ class LayerwiseOffloadableModuleMixin:
                 resident_layers=resident_layers,
                 initialize=False,
                 residency_policy=residency_policy,
+                communication_aware_prefetch=(
+                    self.layerwise_offload_dit_group_enabled
+                    and envs.SGLANG_DIT_COMM_AWARE_PREFETCH
+                ),
             )
             self.layerwise_offload_managers.append(manager)
 
@@ -1867,6 +2065,7 @@ class LayerwiseOffloadableModuleMixin:
             if manager.enabled:
                 manager.remove_forward_hooks()
                 manager.load_all_layers()
+                manager._deactivate_coordinated_prefetch()
                 manager.enabled = False
 
     def enable_offload(self) -> None:
@@ -1878,6 +2077,7 @@ class LayerwiseOffloadableModuleMixin:
                 manager.enabled = True
                 manager.sync_all_layers_to_cpu()
                 manager.release_all()
+                manager._initialize_coordinated_prefetch()
                 manager.register_forward_hooks()
 
 
