@@ -128,6 +128,7 @@ Selecting weights:
 | 2 GPUs, long sequences | `--num-gpus 2 --ulysses-degree 2` | Sequence parallel; the memory/long-sequence tool. |
 | 2 GPUs, large DiT | `--num-gpus 2 --tp-size 2` | Tensor parallel across attention heads. |
 | 2 GPUs, dev weights | `--num-gpus 2 --enable-cfg-parallel` | Splits the guided and unguided branches across GPUs. Measured 1.77x on denoising (15.1s to 8.5s, 960×544 / 57 frames / 30 steps). |
+| 2 GPUs, diffusion decoder | `--num-gpus 2 --ulysses-degree 2` | The decoder's tiles are split across the ranks by default. See [section 4.6.1](#4-6-1-memory-and-multi-gpu). |
 
 <Warning>
 **CFG parallelism does not apply on the default (distilled) path.** That DiT
@@ -340,3 +341,63 @@ uv pip install natten==0.21.6+torch2110cu130 -f https://whl.natten.org/
 Nothing else changes if you skip it: the decoder still produces the same video,
 just slower.
 </Tip>
+
+#### 4.6.1 Memory and multi-GPU
+
+Two flags govern how the decode is executed. Both default to on, so the numbers
+below are what you already get — they matter when you want to turn one off.
+
+`--diffusion-decoder-tiling` runs the decoder's two expensive stages over
+overlapping tiles instead of the whole volume. It is a **memory** control, not a
+speed one: it costs wall clock and buys headroom.
+
+`--diffusion-decoder-parallel-tiling` splits those tiles across the
+decode-parallel ranks -- the TP, SP, PP and CFG ranks of one replica, since the
+decoder is replicated over all of them. Without it every one of those ranks
+decodes every tile and keeps its own identical copy. It only applies on the
+tiled path, so it does nothing when tiling is off, and nothing at a single
+rank.
+
+Decoding stage on 2xH200 at 960×544, Ulysses degree 2. "Peak" is the whole
+process, not the decode alone:
+
+| Frames | Tiling | Parallel tiling | Decode | Peak |
+| --- | --- | --- | --- | --- |
+| 121 | off | *(n/a)* | **3.38s** | 103.2 GB |
+| 121 | on | off | 5.68s | 78.2 GB |
+| 121 | on | on | 4.08s | 79.3 GB |
+| 49 | off | *(n/a)* | **1.93s** | 84.0 GB |
+| 49 | on | off | 2.79s | 78.2 GB |
+| 49 | on | on | 2.12s | 78.2 GB |
+
+Reading that:
+
+- **Untiled is the fastest option** whenever it fits. Tiling exists for the
+  ~25 GB it saves at 121 frames, which is the difference between fitting on an
+  80 GB card and not.
+- **Parallel tiling recovers most of tiling's cost** — 1.39x at 121 frames,
+  1.32x at 49 — but does not beat an untiled decode. It also adds about 1 GB
+  for the gather buffers.
+- The gain grows with tile count, so it is larger at higher resolution: at
+  1920×1088 / 49 frames the decode goes from 12.32s to 7.86s, **1.57x**.
+
+Output is bitwise identical however many ranks the tiles are split over: every
+rank draws the whole grid's noise in the same order, and only the decode is
+shared out. Turning *tiling* on or off does change the result slightly near
+tile borders, so pick one and stay with it if you need reproducible frames:
+
+```bash
+# Fastest, if the untiled decode fits in VRAM
+sglang serve \
+  --model-path Lightricks/LTX-2.5-Diffusers \
+  --pipeline-class-name LTX2Pipeline \
+  --load-diffusion-decoder \
+  --diffusion-decoder-tiling false
+
+# Memory-bound: keep tiling, and split the tiles over both GPUs
+sglang serve \
+  --model-path Lightricks/LTX-2.5-Diffusers \
+  --pipeline-class-name LTX2Pipeline \
+  --load-diffusion-decoder \
+  --num-gpus 2 --ulysses-degree 2
+```
