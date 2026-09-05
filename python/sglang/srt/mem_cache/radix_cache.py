@@ -685,6 +685,33 @@ class RadixCache(BasePrefixCache):
         # protected size refers to the size of the cache that is locked
         return self.protected_size_
 
+    def sanity_check(self) -> None:
+        """Recompute accounting from the tree and assert the counters agree.
+
+        Debug aid for counter drift of the kind reported in sgl-project/sglang#35270:
+        walks every node, sums key lengths by lock state, and asserts the running
+        evictable_/protected_size_ counters match. O(tree size); intended for tests
+        and idle-time diagnostics, never the serving path.
+        """
+        evictable = 0
+        protected = 0
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            assert node.lock_ref >= 0, f"negative lock_ref on node id={node.id}"
+            if node is not self.root_node and node.value is not None:
+                if node.lock_ref == 0:
+                    evictable += len(node.key)
+                else:
+                    protected += len(node.key)
+            stack.extend(node.children.values())
+        assert evictable == self.evictable_size_, (
+            f"evictable drift: counter={self.evictable_size_} recomputed={evictable}"
+        )
+        assert protected == self.protected_size_, (
+            f"protected drift: counter={self.protected_size_} recomputed={protected}"
+        )
+
     def all_values_flatten(self):
         values = []
 
