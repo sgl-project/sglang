@@ -71,6 +71,7 @@ from sglang.srt.mem_cache.allocator.unified_mamba import (
 )
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.unified_draft_pool import fused_draft_host_allocator
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -112,13 +113,18 @@ class KVIndexTranslator:
         self.page_size = page_size
         self.device = device
 
-        self.is_translating = (
+        is_unified_target = (
             isinstance(
                 token_to_kv_pool_allocator,
                 (UnifiedMambaTokenToKVPoolAllocator, UnifiedSWAAllocatorBase),
             )
             and token_to_kv_pool_allocator.get_kvcache() is token_to_kv_pool
         )
+        host_allocator = fused_draft_host_allocator(token_to_kv_pool)
+        is_fused_draft = (
+            host_allocator is not None and host_allocator is token_to_kv_pool_allocator
+        )
+        self.is_translating = is_unified_target or is_fused_draft
         if self.is_translating:
             alloc = token_to_kv_pool_allocator
             self._capture_page_size = alloc.page_size
@@ -133,13 +139,17 @@ class KVIndexTranslator:
             # DCP read ids stay WIDENED to the consumer: selecting this rank's
             # share changes the length, so only the production site can do it.
             self.defer_read_translate = get_parallel().attn_dcp_size > 1
-            if isinstance(alloc, UnifiedSWAAllocatorBase):
+            routes_window_layers = is_unified_target or isinstance(
+                token_to_kv_pool, BaseSWAKVPool
+            )
+            if isinstance(alloc, UnifiedSWAAllocatorBase) and routes_window_layers:
                 self._swa_v2p_table = alloc.swa_v2p_page_table
                 self._swa_write_loc_from_full = self._swa_write_loc_unified
             else:
                 self._swa_v2p_table = None
                 self._swa_write_loc_from_full = None
         else:
+            self._capture_page_size = page_size
             self._full_v2p_table = None
             self._full_p2v_table = None
             self._translate_full = None
