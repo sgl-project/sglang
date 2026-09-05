@@ -477,6 +477,39 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         self.assertEqual(len(modalities), 1)
         self.assertEqual(modalities[0], ["video"])
 
+    def test_process_content_preserves_tool_reference(self):
+        """Test that tool_reference is preserved in processed content."""
+        msg_dict = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Use this tool:"},
+                {
+                    "type": "tool_reference",
+                    "name": "get_weather",
+                },
+            ],
+        }
+
+        image_data = []
+        video_data = []
+        audio_data = []
+        modalities = []
+
+        result = process_content_for_template_format(
+            msg_dict, "openai", image_data, video_data, audio_data, modalities
+        )
+
+        self.assertEqual(
+            result["content"],
+            [
+                {"type": "text", "text": "Use this tool:"},
+                {
+                    "type": "tool_reference",
+                    "name": "get_weather",
+                },
+            ],
+        )
+
     def test_detect_template_with_filter(self):
         """Test that content access through a Jinja filter is detected as openai."""
         # Template with | trim filter on content iteration
