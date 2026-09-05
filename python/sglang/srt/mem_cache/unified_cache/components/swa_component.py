@@ -970,8 +970,7 @@ class SWAComponent(TreeComponent):
         elif prefetch_pages <= 0:
             return PreparePrefetchResult()
         elif (
-            self.tree_core.is_root(node_id)
-            or self.cache.host_memory_mode == "buffer_only"
+            self.tree_core.is_root(node_id) or self.tree_core.host_memory_is_buffer_only
         ):
             # Sub-window fetch: at root the sequence IS its window; mid-tree
             # (buffer mode) the window head is the device prefix's own ring
@@ -1009,7 +1008,7 @@ class SWAComponent(TreeComponent):
             return None
 
         if phase == CacheTransferPhase.BACKUP_HOST:
-            if self.cache.host_memory_mode == "buffer_only":
+            if self.tree_core.host_memory_is_buffer_only:
                 # Buffer mode stages one node/hash span per FIFO backup intent.
                 cd = node.component_data[ct]
                 dirty = [node] if cd.value is not None else []

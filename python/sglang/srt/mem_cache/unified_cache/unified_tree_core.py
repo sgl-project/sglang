@@ -398,6 +398,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.page_size = params.page_size
         self.is_eagle = params.is_eagle and ComponentType.MAMBA not in components
         self.enable_hicache = False
+        self.host_memory_is_buffer_only = False
         self.enable_storage = False
         self.enable_external_cache_linker = False
         self.write_through_threshold = 256
@@ -1897,6 +1898,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def set_hicache_enabled(self) -> None:
         self.enable_hicache = True
+
+    def set_host_memory_buffer_only(self) -> None:
+        self.host_memory_is_buffer_only = True
 
     def insert_host(
         self,

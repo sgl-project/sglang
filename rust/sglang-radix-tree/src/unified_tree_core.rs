@@ -75,6 +75,8 @@ pub struct MatchResult {
     /// SWA tokens that hit on host (within the sliding window) and will be
     /// loaded back into the SWA device pool.
     pub swa_host_hit_length: usize,
+    /// The longest page-aligned position that could have hit if an SWA window existed.
+    pub swa_branching_seqlen: Option<usize>,
     /// Mamba slots that hit on host and will be loaded back; 0 or 1.
     pub mamba_host_hit_length: usize,
     /// The longest chunk-aligned position that could have hit if a mamba state existed.
@@ -107,6 +109,8 @@ pub struct InsertParams<'k, K: ChildKeyType> {
     pub prev_prefix_len: usize,
     /// The request's SWA-evicted prefix boundary; SWA data below it stays tombstoned.
     pub swa_evicted_seqlen: usize,
+    /// The Full-KV-derived boundary whose SWA window this insert should materialize.
+    pub swa_branching_seqlen: Option<usize>,
     /// The donated mamba slot for the insert target leaf; None on non-mamba trees.
     pub mamba_value: Option<Tensor>,
     /// Whether this is a chunked-prefill insert (no hit-count bump).
@@ -129,6 +133,8 @@ pub struct InsertResult {
     /// Whether the cache holds Mamba state covering the inserted sequence;
     /// vacuously true for an empty insert.
     pub mamba_exist: bool,
+    /// Whether this insert reached the requested SWA branch boundary.
+    pub swa_branch_inserted: bool,
     /// The deepest host-backed node an insert_host attached or matched.
     pub inserted_host_node: Option<NodeId>,
     /// Whether write-through rejected a host suffix below an unbacked parent.
@@ -190,6 +196,7 @@ pub struct InsertWalkState<K: ChildKeyType> {
     namespace: KeyNamespace,
     prev_prefix_len: usize,
     swa_evicted_seqlen: usize,
+    swa_branching_seqlen: Option<usize>,
     mamba_value: Option<Tensor>,
     chunked: bool,
     priority: i64,
@@ -515,6 +522,9 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) is_write_back: bool,
     /// Whether the host tier (HiCache) is wired.
     pub(crate) enable_hicache: bool,
+    /// Whether the host tier stages one node per FIFO backup intent rather than
+    /// caching windows; buffer mode sizes its storage keys off a single node.
+    pub(crate) host_memory_is_buffer_only: bool,
     /// Whether the storage tier (L3) is wired; gates page-hash computation.
     pub(crate) enable_storage: bool,
     /// Whether the cache wired a host SWA pool (HiCache).
@@ -699,6 +709,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             page_size: params.page_size,
             is_write_back: params.is_write_back,
             enable_hicache: params.enable_hicache,
+            host_memory_is_buffer_only: false,
             enable_storage: false,
             has_swa_host_pool: params.has_swa_host_pool,
             enable_kv_cache_events: params.enable_kv_cache_events,
@@ -1181,6 +1192,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             mamba_host_hit_length: 0,
             mamba_branching_seqlen: None,
             swa_host_hit_length: 0,
+            swa_branching_seqlen: None,
             full_kv_hit_length,
             cache_actions: Vec::new(),
         };
@@ -1208,6 +1220,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             best_match_node_id: root_id,
             host_hit_length: 0,
             swa_host_hit_length: 0,
+            swa_branching_seqlen: None,
             full_kv_hit_length: 0,
             mamba_host_hit_length: 0,
             mamba_branching_seqlen: None,
@@ -1334,6 +1347,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     inserted_host_node: None,
                     host_insert_dropped: false,
                     mamba_exist: true,
+                    swa_branch_inserted: false,
                     adopted_ranges: None,
                     cache_actions: Vec::new(),
                 }),
@@ -1355,6 +1369,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             namespace: params.namespace.to_owned(),
             prev_prefix_len: params.prev_prefix_len,
             swa_evicted_seqlen: params.swa_evicted_seqlen,
+            swa_branching_seqlen: params.swa_branching_seqlen,
             mamba_value: params.mamba_value.as_ref().map(Tensor::shallow_clone),
             chunked: params.chunked,
             priority: params.priority,
@@ -1480,6 +1495,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             value: state.value.shallow_clone(),
             prev_prefix_len: state.prev_prefix_len,
             swa_evicted_seqlen: state.swa_evicted_seqlen,
+            swa_branching_seqlen: state.swa_branching_seqlen,
             mamba_value: state.mamba_value.as_ref().map(Tensor::shallow_clone),
             chunked: state.chunked,
             priority: state.priority,
@@ -1630,6 +1646,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             value: state.value.shallow_clone(),
             prev_prefix_len: state.prev_prefix_len,
             swa_evicted_seqlen: state.swa_evicted_seqlen,
+            swa_branching_seqlen: state.swa_branching_seqlen,
             mamba_value: state.mamba_value.as_ref().map(Tensor::shallow_clone),
             chunked: state.chunked,
             priority: state.priority,
@@ -2661,6 +2678,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.enable_hicache = true;
     }
 
+    /// Mark the host tier as buffer-only; wired after the host pools are built.
+    pub fn set_host_memory_buffer_only(&mut self) {
+        self.host_memory_is_buffer_only = true;
+    }
+
     /// Whether the storage tier (L3) is wired; storage attaches after tree construction.
     pub fn set_enable_storage(&mut self, value: bool) {
         self.enable_storage = value;
@@ -2943,6 +2965,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 inserted_host_node: None,
                 host_insert_dropped: false,
                 mamba_exist: true,
+                swa_branch_inserted: false,
                 adopted_ranges: None,
                 cache_actions: Vec::new(),
             });
@@ -2982,6 +3005,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             inserted_host_node: None,
             host_insert_dropped: false,
             mamba_exist: false,
+            swa_branch_inserted: false,
             adopted_ranges: None,
             cache_actions,
         };
