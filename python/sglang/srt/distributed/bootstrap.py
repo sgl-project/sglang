@@ -238,8 +238,8 @@ def _init_parallel_groups(
     moe_dp_size: int,
     dcp_size: int,
 ) -> None:
-    is_ep_joiner = server_args.is_ep_joiner
-    is_scale_joiner = server_args.is_ep_scale_joiner
+    is_ep_joiner = get_exec().moe.is_ep_joiner
+    is_scale_joiner = get_exec().moe.is_ep_scale_joiner
     rank_offset = get_parallel().ep_join_rank_offset if is_scale_joiner else 0
     world_size = (
         rank_offset + tp_size * pp_size if is_scale_joiner else tp_size * pp_size
