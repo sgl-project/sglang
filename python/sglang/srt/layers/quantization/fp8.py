@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
@@ -134,6 +135,22 @@ _is_gfx1250_supported = is_gfx1250_supported()
 # gfx1250 grouped MoE runs the a8w4 (fp8 activation) FlyDSL kernel when
 # AITER_FORCE_A8W4 is set; that kernel consumes (16,16)-preshuffled weights.
 _use_aiter_a8w4 = get_bool_env_var("AITER_FORCE_A8W4", "false")
+
+
+def _aiter_clamped_swiglu_limit(config: MoeRunnerConfig) -> float:
+    # SiTU uses linear_beta for clamp; swiglu_limit must stay 0 (see mxfp4).
+    if config.activation == "situ":
+        return 0.0
+    return float(config.gemm1_clamp_limit or config.swiglu_limit or 0.0)
+
+
+def _aiter_runner_moe_config(config: MoeRunnerConfig) -> MoeRunnerConfig:
+    # MiniMax-M3 declares activation="silu" with gemm1_clamp_limit; route
+    # clamped-SwiGLU through the AITER runner (mirrors unquant / mxfp4).
+    limit = _aiter_clamped_swiglu_limit(config)
+    if limit > 0 and config.activation != "situ":
+        return replace(config, activation="swiglu")
+    return config
 
 
 def _require_fp4_dtype():
@@ -2418,7 +2435,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_flashinfer_trtllm_routed()
             or moe_runner_backend.is_hpc_ops()
         ):
-            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+            runner_config = moe_runner_config
+            if moe_runner_backend.is_aiter():
+                runner_config = _aiter_runner_moe_config(moe_runner_config)
+            self.runner = MoeRunner(moe_runner_backend, runner_config)
             self._owns_moe_runner = True
         else:
             # TODO(cwan): refactor other backends
@@ -2780,7 +2800,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w13_scale=w13_scale,
             w2_scale=w2_scale,
             expert_mask=layer.dispatcher.expert_mask_gpu if _use_aiter else None,
-            swiglu_limit=self.moe_runner_config.swiglu_limit or 0.0,
+            swiglu_limit=_aiter_clamped_swiglu_limit(self.moe_runner_config),
             hidden_pad=getattr(layer, "hidden_pad", 0),
             intermediate_pad=getattr(layer, "intermediate_pad", 0),
         )
