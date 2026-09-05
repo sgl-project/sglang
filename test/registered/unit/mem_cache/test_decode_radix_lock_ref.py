@@ -85,6 +85,7 @@ class MockReq:
             kv_committed_len=len(fill_ids),
             kv_allocated_len=len(fill_ids),
             cache_protected_len=cache_protected_len,
+            swa_evicted_seqlen=0,
         )
 
     def get_fill_ids(self):

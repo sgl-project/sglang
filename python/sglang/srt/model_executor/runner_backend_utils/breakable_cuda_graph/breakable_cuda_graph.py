@@ -23,6 +23,7 @@ buffers to keep break-point tensors at stable addresses.
 """
 
 import threading
+import warnings
 from contextvars import ContextVar
 from typing import Any, Callable, Optional
 
@@ -317,9 +318,9 @@ class BreakableCUDAGraphCapture:
         capture_error_mode: str = "global",
         barrier_fn: Callable[[], None] | None = None,
     ):
-        assert isinstance(
-            cuda_graph, BreakableCUDAGraph
-        ), "cuda_graph must be a BreakableCUDAGraph"
+        assert isinstance(cuda_graph, BreakableCUDAGraph), (
+            "cuda_graph must be a BreakableCUDAGraph"
+        )
         self.cuda_graph = cuda_graph
         self._pool = pool if pool is not None else (0, 0)
         self._stream = stream
@@ -394,7 +395,12 @@ class BreakableCUDAGraphCapture:
             forked.clear()
         graph = self._current_graph
         assert graph is not None
-        graph.capture_end()
+        # A segment that enqueued no kernels (back-to-back breaks, or a segment
+        # whose ops all ran eagerly) captures an empty graph, which replays as a
+        # no-op. Torch warns about it on every such capture_end; expected here.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="The CUDA Graph is empty")
+            graph.capture_end()
         self.cuda_graph._append_segment(graph, self._current_graph_needs_instantiate)
         self._current_graph = None
         self._current_graph_needs_instantiate = False

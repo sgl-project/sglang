@@ -134,12 +134,12 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
         input_logprobs = j["meta_info"]["input_token_logprobs"]
         output_logprobs = j["meta_info"]["output_token_logprobs"]
 
-        assert (
-            len(output_logprobs) == completion_tokens
-        ), f"output_logprobs and completion_tokens should have the same length, but got {len(output_logprobs)} and {completion_tokens}"
-        assert (
-            len(input_logprobs) > 0
-        ), f"input_logprobs should have at least one token, but got {len(input_logprobs)}"
+        assert len(output_logprobs) == completion_tokens, (
+            f"output_logprobs and completion_tokens should have the same length, but got {len(output_logprobs)} and {completion_tokens}"
+        )
+        assert len(input_logprobs) > 0, (
+            f"input_logprobs should have at least one token, but got {len(input_logprobs)}"
+        )
 
     def test_structured_output(self):
         json_schema = json.dumps(

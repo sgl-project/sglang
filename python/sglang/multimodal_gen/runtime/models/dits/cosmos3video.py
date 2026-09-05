@@ -43,6 +43,13 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8_step_precision import (
+    MODELOPT_FP8_QUANT_CONFIGS,
+    StepMixedPrecisionController,
+    install_step_mixed_precision,
+    read_checkpoint_step_policy,
+    resolve_step_policy,
+)
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     Qwen3VLTextRotaryEmbedding,
 )
@@ -1281,6 +1288,12 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.cached_kv: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {}
         self.cached_gen_rope_inputs: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
+        # Installed in post_load_weights when step mixed precision is enabled.
+        self.step_precision_controller: StepMixedPrecisionController | None = None
+        self.modelopt_fp8_checkpoint = isinstance(
+            quant_config, MODELOPT_FP8_QUANT_CONFIGS
+        )
+
         self.__post_init__()
 
         self.layer_names = ["gen_layers", "language_model.layers"]
@@ -2002,6 +2015,77 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         for module in self.modules():
             if isinstance(module, RMSNorm):
                 module.to(target_dtype)
+
+        self._maybe_install_step_mixed_precision()
+
+    def _maybe_install_step_mixed_precision(self) -> None:
+        """Wrap ModelOpt FP8 linears for per-denoising-step W8A16 dispatch.
+
+        The checkpoint owns the behavior: mixed precision runs only when the
+        checkpoint carries a diffusion_step_policy
+        (quantization_config.runtime in config.json). Explicitly-set env vars
+        act as a manual override, and
+        SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION=0 disables. Runs
+        at the end of post_load_weights so the base quant method has already
+        transposed weights and collapsed scales.
+        """
+        checkpoint_quant_config = self.hf_config.get("quantization_config")
+        if not self.modelopt_fp8_checkpoint:
+            # A checkpoint that carries a step policy the runtime cannot honor
+            # must fail closed rather than silently run without it.
+            if read_checkpoint_step_policy(checkpoint_quant_config) is not None:
+                raise ValueError(
+                    "Checkpoint carries a diffusion_step_policy but was not "
+                    "loaded as a ModelOpt FP8 checkpoint; step mixed precision "
+                    "supports only ModelOpt FP8 in sglang."
+                )
+            return
+        policy, source = resolve_step_policy(checkpoint_quant_config)
+        if policy is None:
+            logger.info(
+                "Step mixed precision off (%s); running W8A8 on every denoising step.",
+                source,
+            )
+            return
+        controller = StepMixedPrecisionController(
+            first_steps=policy.first_steps,
+            last_steps=policy.last_steps,
+            reasoner_a16=policy.reasoner_a16,
+        )
+        reasoner_wrapped, generation_wrapped = install_step_mixed_precision(
+            reasoner_modules=[self.language_model.layers],
+            generation_modules=[self.gen_layers],
+            controller=controller,
+        )
+        if reasoner_wrapped + generation_wrapped == 0:
+            logger.warning(
+                "ModelOpt FP8 quant config detected but no ModelOpt FP8 "
+                "linears were found; running without step mixed precision."
+            )
+            return
+        self.step_precision_controller = controller
+        logger.info(
+            "Step mixed precision enabled (policy source: %s): %d generation "
+            "FP8 linears run W8A16 on the first %d and last %d denoising "
+            "steps; %d reasoner FP8 linears run %s.",
+            source,
+            generation_wrapped,
+            controller.first_steps,
+            controller.last_steps,
+            reasoner_wrapped,
+            "W8A16" if controller.reasoner_a16 else "W8A8",
+        )
+
+    def set_denoising_step(self, step_index: int, num_steps: int) -> None:
+        """Select this step's precision before any transformer call for it."""
+        if self.step_precision_controller is not None:
+            self.step_precision_controller.set_step(
+                step_index=step_index, num_steps=num_steps
+            )
+
+    def reset_denoising_step(self) -> None:
+        if self.step_precision_controller is not None:
+            self.step_precision_controller.reset()
 
 
 EntryClass = Cosmos3OmniTransformer

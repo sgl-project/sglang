@@ -235,6 +235,7 @@ class TestHybridNeedsCpuSeqLens(CustomTestCase):
             kv_cache_dtype=torch.bfloat16,
             token_to_kv_pool=None,
             req_to_token_pool=None,
+            kv_index_translator=None,
             model_config=SimpleNamespace(context_len=2048),
         )
         # The backend takes the mode from the published configuration, not from

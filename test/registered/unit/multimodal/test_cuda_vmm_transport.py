@@ -9,7 +9,7 @@ import pickle
 import queue
 import threading
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import torch
 
@@ -184,24 +184,25 @@ class TestCudaVmmTransport(CustomTestCase):
         finally:
             pool.shutdown()
 
-    def test_packed_tensors_round_trip_through_one_shared_buffer(self):
+    def test_packed_cpu_tensors_round_trip_through_one_shared_buffer(self):
         pool = CudaVmmMemoryPool(4 << 20, 60, 0, 1, allow_posix_fallback=True)
         sources = [
-            torch.arange(24, dtype=torch.float32, device="cuda:0")
-            .reshape(4, 6)
-            .transpose(0, 1),
+            torch.arange(24, dtype=torch.float32).reshape(4, 6).transpose(0, 1),
             torch.arange(7, dtype=torch.bfloat16),
-            torch.arange(5, dtype=torch.int64, device="cuda:0"),
+            torch.arange(5, dtype=torch.int64),
         ]
         expected = [source.contiguous().cpu() for source in sources]
         proxies = reconstructed = None
         try:
-            stream = MagicMock(wraps=torch.cuda.current_stream(0))
-            with patch("torch.cuda.current_stream", return_value=stream):
+            with patch.object(
+                pool._publish_stream,
+                "synchronize",
+                wraps=pool._publish_stream.synchronize,
+            ) as synchronize:
                 proxies = pool.wrap_tensors(sources)
 
             self.assertIsNotNone(proxies)
-            self.assertEqual(stream.synchronize.call_count, 1)
+            self.assertEqual(synchronize.call_count, 1)
             self.assertEqual(len(pool.occupied_chunks), 1)
             self.assertTrue(
                 all(
@@ -337,11 +338,13 @@ class TestCudaVmmTransport(CustomTestCase):
 
     def test_failed_cleanup_sync_quarantines_pool(self):
         pool = CudaVmmMemoryPool(4 << 20, 60, 0, 1, allow_posix_fallback=True)
-        stream = MagicMock()
-        stream.synchronize.side_effect = RuntimeError("forced sync failure")
         try:
             with (
-                patch("torch.cuda.current_stream", return_value=stream),
+                patch.object(
+                    pool._publish_stream,
+                    "synchronize",
+                    side_effect=RuntimeError("forced sync failure"),
+                ),
                 self.assertRaisesRegex(RuntimeError, "forced sync failure"),
             ):
                 pool.wrap_tensor(torch.ones(16, device="cuda:0"))
@@ -359,20 +362,21 @@ class TestCudaVmmTransport(CustomTestCase):
         shutdown_entered = threading.Event()
         shutdown_finished = threading.Event()
         errors = []
-        real_stream = torch.cuda.current_stream(0)
-        stream = MagicMock(wraps=real_stream)
+        real_synchronize = pool._publish_stream.synchronize
 
         def synchronize():
             publisher_entered.set()
             if not allow_publisher_to_finish.wait(timeout=10):
                 raise TimeoutError("publisher was not released")
-            real_stream.synchronize()
-
-        stream.synchronize.side_effect = synchronize
+            real_synchronize()
 
         def publish():
             try:
-                with patch("torch.cuda.current_stream", return_value=stream):
+                with patch.object(
+                    pool._publish_stream,
+                    "synchronize",
+                    side_effect=synchronize,
+                ):
                     pool.wrap_tensor(torch.ones(16, device="cuda:0"))
             except Exception as error:  # pragma: no cover
                 errors.append(error)

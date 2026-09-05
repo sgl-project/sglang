@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import Iterator, Literal
+from typing import Iterator, Literal, Mapping
 
 try:
     import tomllib
@@ -52,6 +52,7 @@ class _CrateSpec:
     package: str
     library: str
     python_module: str
+    manifest: Path
     workspace: Path
     features: tuple[str, ...]
 
@@ -69,6 +70,10 @@ def load_rust_extension(
     mode: RustBuildMode | None = None,
     cache_dir: Path | None = None,
     workspace: Path | None = None,
+    additional_features: tuple[str, ...] = (),
+    extension_module: str | None = None,
+    build_environment: Mapping[str, str] | None = None,
+    build_fingerprint: Mapping[str, object] | None = None,
 ) -> ModuleType:
     """Import a PyO3 extension, compiling it locally when permitted and needed.
 
@@ -77,9 +82,13 @@ def load_rust_extension(
     to ``python_module`` (the same metadata setup.py uses for wheel builds), so
     new crates need no registration here.
 
-    ``auto`` prefers a module bundled in the installed wheel, then a cached
-    local build, and finally Cargo. ``never`` permits the first two but never
-    invokes Cargo. ``force`` rebuilds from source and replaces the cache entry.
+    ``auto`` prefers a module bundled in an installed wheel. In a source tree,
+    it ignores unverified in-package artifacts and uses the fingerprinted cache
+    before invoking Cargo. ``never`` explicitly trusts a bundled module, then
+    permits the cache but never invokes Cargo. ``force`` rebuilds from source.
+    A same-name feature variant is always sourced from the fingerprinted cache.
+    A distinctly named variant may be supplied by test infrastructure and is
+    otherwise built into that cache after its bundled import misses.
     ``mode`` defaults to ``SGLANG_RUST_BUILD_MODE``.
     """
     if mode is None:
@@ -89,29 +98,45 @@ def load_rust_extension(
             f"invalid Rust extension build mode {mode!r}; expected auto, never, or force"
         )
 
-    if mode != "force":
-        module = _import_bundled_extension(python_module)
-        if module is not None:
-            return module
-    elif python_module in sys.modules:
+    load_module = extension_module or python_module
+    same_name_feature_variant = (
+        bool(additional_features) and load_module == python_module
+    )
+    if loaded := sys.modules.get(load_module):
+        if mode != "force":
+            return loaded
         raise RuntimeError(
-            f"cannot force-build {python_module} after it has been imported; "
+            f"cannot force-build {load_module} after it has been imported; "
             "start a new Python process"
         )
-
     if workspace is None:
         workspace = _RUST_WORKSPACE
+    source_checkout = (Path(workspace) / "Cargo.toml").is_file()
+    trust_bundled = mode == "never" or not source_checkout
+    if mode != "force" and trust_bundled and not same_name_feature_variant:
+        module = _import_bundled_extension(load_module)
+        if module is not None:
+            return module
+
     crate = _discover_crate(workspace, python_module)
-    context = _build_context(crate)
+    features = tuple(dict.fromkeys((*crate.features, *additional_features)))
+    context = _build_context(
+        crate,
+        features=features,
+        build_fingerprint=build_fingerprint,
+        extension_module=load_module,
+    )
     cache_root = _cache_root(cache_dir)
-    extension_path = _cached_extension_path(cache_root, crate, context.fingerprint)
+    extension_path = _cached_extension_path(
+        cache_root, crate, context.fingerprint, load_module
+    )
     lock_path = (
         cache_root / "locks" / f"{crate.package}-{context.target_fingerprint}.lock"
     )
 
     with _filesystem_lock(lock_path):
         if mode != "force" and extension_path.is_file():
-            return _load_extension_from_path(crate.python_module, extension_path)
+            return _load_extension_from_path(load_module, extension_path)
 
         if mode == "never":
             raise ModuleNotFoundError(
@@ -121,14 +146,19 @@ def load_rust_extension(
             )
 
         target_dir = cache_root / "targets" / context.target_fingerprint
-        artifact = _cargo_build(crate, target_dir)
+        artifact = _cargo_build(
+            crate,
+            target_dir,
+            features=features,
+            build_environment=build_environment,
+        )
         if _source_digest(crate.workspace) != context.source_digest:
             raise RuntimeError(
                 f"Rust sources under {crate.workspace} changed during the build; "
                 "the result was not cached"
             )
         _stage_atomically(artifact, extension_path)
-        return _load_extension_from_path(crate.python_module, extension_path)
+        return _load_extension_from_path(load_module, extension_path)
 
 
 def _import_bundled_extension(module_name: str) -> ModuleType | None:
@@ -143,16 +173,10 @@ def _import_bundled_extension(module_name: str) -> ModuleType | None:
 def _discover_crate(workspace: Path, python_module: str) -> _CrateSpec:
     workspace = Path(workspace).resolve()
     workspace_manifest = workspace / "Cargo.toml"
-    lockfile = workspace / "Cargo.lock"
     if not workspace_manifest.is_file():
         raise FileNotFoundError(
             f"Rust workspace for {python_module} was not found at {workspace}"
         )
-    if not lockfile.is_file():
-        raise FileNotFoundError(
-            f"{lockfile} is required for reproducible `cargo build --locked` builds"
-        )
-
     matches: list[_CrateSpec] = []
     declared_modules: list[str] = []
     for manifest in _source_files(workspace):
@@ -178,12 +202,19 @@ def _discover_crate(workspace: Path, python_module: str) -> _CrateSpec:
                 f"{manifest} declares python-module {python_module!r} but must "
                 "also set `package.name` and `lib.name`"
             )
+        crate_workspace = manifest.parent if "workspace" in document else workspace
+        lockfile = crate_workspace / "Cargo.lock"
+        if not lockfile.is_file():
+            raise FileNotFoundError(
+                f"{lockfile} is required for reproducible `cargo build --locked` builds"
+            )
         matches.append(
             _CrateSpec(
                 package=package_name,
                 library=library,
                 python_module=python_module,
-                workspace=workspace,
+                manifest=manifest,
+                workspace=crate_workspace,
                 features=tuple(sglang_metadata.get("features", ())),
             )
         )
@@ -203,7 +234,17 @@ def _discover_crate(workspace: Path, python_module: str) -> _CrateSpec:
     return matches[0]
 
 
-def _build_context(crate: _CrateSpec) -> _BuildContext:
+def _build_context(
+    crate: _CrateSpec,
+    *,
+    features: tuple[str, ...] | None = None,
+    build_fingerprint: Mapping[str, object] | None = None,
+    extension_module: str | None = None,
+) -> _BuildContext:
+    if features is None:
+        features = crate.features
+    if extension_module is None:
+        extension_module = crate.python_module
     source_digest = _source_digest(crate.workspace)
     toolchain = {
         "cargo": _command_version(
@@ -224,6 +265,7 @@ def _build_context(crate: _CrateSpec) -> _BuildContext:
     }
     target_inputs = {
         "build_environment": build_environment,
+        "extension_build": dict(build_fingerprint or {}),
         "python_abi": python_abi,
         "toolchain": toolchain,
     }
@@ -234,6 +276,8 @@ def _build_context(crate: _CrateSpec) -> _BuildContext:
             "package": crate.package,
             "library": crate.library,
             "python_module": crate.python_module,
+            "extension_module": extension_module,
+            "features": features,
             "source_digest": source_digest,
             **target_inputs,
         }
@@ -301,12 +345,15 @@ def _cache_root(cache_dir: Path | None) -> Path:
 
 
 def _cached_extension_path(
-    cache_root: Path, crate: _CrateSpec, fingerprint: str
+    cache_root: Path,
+    crate: _CrateSpec,
+    fingerprint: str,
+    extension_module: str | None = None,
 ) -> Path:
     extension_suffix = sysconfig.get_config_var("EXT_SUFFIX")
     if not extension_suffix:
         raise RuntimeError("Python did not report an EXT_SUFFIX for native extensions")
-    module_leaf = crate.python_module.rsplit(".", 1)[-1]
+    module_leaf = (extension_module or crate.python_module).rsplit(".", 1)[-1]
     return (
         cache_root
         / "artifacts"
@@ -327,7 +374,15 @@ def _filesystem_lock(path: Path) -> Iterator[None]:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
-def _cargo_build(crate: _CrateSpec, target_dir: Path) -> Path:
+def _cargo_build(
+    crate: _CrateSpec,
+    target_dir: Path,
+    *,
+    features: tuple[str, ...] | None = None,
+    build_environment: Mapping[str, str] | None = None,
+) -> Path:
+    if features is None:
+        features = crate.features
     target_dir.mkdir(parents=True, exist_ok=True)
     command = [
         "cargo",
@@ -337,10 +392,10 @@ def _cargo_build(crate: _CrateSpec, target_dir: Path) -> Path:
         "--package",
         crate.package,
     ]
-    if crate.features:
-        command.extend(("--features", ",".join(crate.features)))
+    if features:
+        command.extend(("--features", ",".join(features)))
 
-    environment = os.environ.copy()
+    environment = dict(os.environ if build_environment is None else build_environment)
     environment["CARGO_TARGET_DIR"] = os.fspath(target_dir)
     environment["PYO3_PYTHON"] = sys.executable
     logger.info("Building %s with `%s`", crate.python_module, " ".join(command))

@@ -14,6 +14,7 @@ from sglang.srt.managers.scheduler_components.invariant_checker import (
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -21,16 +22,22 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-class RecordingAllocator:
+class RecordingAllocator(BaseTokenToKVPoolAllocator):
+    """Single-pool double. Subclassing the base routes free_full / free_segment /
+    free_segments into free(), so a new free API cannot slip past the recorder."""
+
     def __init__(self, capacity: int):
+        super().__init__(
+            size=capacity,
+            page_size=1,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
         self.capacity = capacity
-        self.page_size = 1
         self.next_slot = 1
         self.live: set[int] = set()
-
-    @property
-    def size(self):
-        return self.capacity
 
     def alloc(self, size: int):
         if size > self.available_size():
@@ -45,6 +52,9 @@ class RecordingAllocator:
 
     def available_size(self):
         return self.capacity - len(self.live)
+
+    def get_all_free_pages(self):
+        return self.free_pages
 
     def clear(self):
         self.next_slot = 1
@@ -68,7 +78,7 @@ def make_pool_and_req(capacity: int = 64):
     )
     req = SimpleNamespace(
         inflight_middle_chunks=0,
-        kv=SimpleNamespace(req_pool_idx=None),
+        kv=ReqKvInfo(),
     )
     req_pool_idx = pool.alloc([req])[0]
     return pool, req, req_pool_idx, allocator
@@ -172,6 +182,7 @@ def test_reserved_slots_are_excluded_from_full_pool_invariant():
         pool_stats_observer=SimpleNamespace(session_held_tokens=lambda: 0),
         get_last_batch=lambda: None,
         get_running_batch=lambda: None,
+        scheduler_stage_metrics=None,
     )
 
     leak, message = checker._check_full_pool(
@@ -237,7 +248,6 @@ def test_streaming_session_release_frees_compressed_slots():
 def test_mamba_leak_diagnostic_does_not_report_reserved_slots():
     pool, _, _, allocator = make_pool_and_req(capacity=69)
     allocator.free_pages = torch.arange(6, 70, dtype=torch.int64)
-    allocator.release_pages = torch.empty(0, dtype=torch.int64)
     pool.mamba_pool = SimpleNamespace(size=1)
     pool.mamba_allocator = SimpleNamespace(
         size=1,
@@ -263,6 +273,7 @@ def test_mamba_leak_diagnostic_does_not_report_reserved_slots():
         ),
         get_last_batch=lambda: None,
         get_running_batch=lambda: None,
+        scheduler_stage_metrics=None,
     )
 
     leak, message = checker._check_mamba_pool(

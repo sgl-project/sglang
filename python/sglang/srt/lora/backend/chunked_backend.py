@@ -53,9 +53,9 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         *args,
         **kwargs,
     ) -> torch.Tensor:
-        assert (
-            extra_embeddings is None
-        ), "Extra embeddings for lora a is not supported yet in chunked backend"
+        assert extra_embeddings is None, (
+            "Extra embeddings for lora a is not supported yet in chunked backend"
+        )
         return chunked_embedding_lora_a_forward(
             input_ids=input_ids,
             weights=weights,

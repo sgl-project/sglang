@@ -358,6 +358,7 @@ static size_t g_cursors[BUMPARENA_MAX_EXTENTS];
 static size_t g_num_extents = 0;
 static size_t g_freed_bytes = 0;
 static size_t g_align = 512;
+static int g_best_fit = 0;
 static std::mutex g_mu;
 static size_t align_up(size_t v, size_t a){{ return (v + a - 1) / a * a; }}
 void bumparena_set_extents_{sfx}(const uintptr_t* bases, const size_t* sizes, size_t n){{
@@ -372,6 +373,7 @@ void bumparena_set_extents_{sfx}(const uintptr_t* bases, const size_t* sizes, si
   }}
 }}
 void bumparena_set_align_{sfx}(size_t a){{ std::lock_guard<std::mutex> lk(g_mu); if (a) g_align=a; }}
+void bumparena_set_best_fit_{sfx}(int on){{ std::lock_guard<std::mutex> lk(g_mu); g_best_fit = on; }}
 size_t bumparena_cursor_{sfx}(void){{
   std::lock_guard<std::mutex> lk(g_mu);
   size_t total = 0;
@@ -380,14 +382,21 @@ size_t bumparena_cursor_{sfx}(void){{
 }}
 void* bumparena_malloc_{sfx}(size_t size, int device, void* stream){{
   std::lock_guard<std::mutex> lk(g_mu);
+  size_t need = align_up(size, g_align);
+  size_t pick = BUMPARENA_MAX_EXTENTS;
   for (size_t i = 0; i < g_num_extents; ++i) {{
-    size_t need = g_cursors[i] + align_up(size, g_align);
-    if (need > g_reserved[i]) continue;
-    void* p = reinterpret_cast<void*>(g_bases[i] + g_cursors[i]);
-    g_cursors[i] = need;
-    return p;
+    size_t avail = g_reserved[i] - g_cursors[i];
+    if (avail < need) continue;
+    // First fit is for callers that map physical pages at the offsets they
+    // are handed, so extent order is theirs to choose.
+    if (!g_best_fit) {{ pick = i; break; }}
+    if (pick == BUMPARENA_MAX_EXTENTS ||
+        avail < g_reserved[pick] - g_cursors[pick]) pick = i;
   }}
-  return 0;   // no extent fits -- surfaces as an allocator OOM
+  if (pick == BUMPARENA_MAX_EXTENTS) return 0;   // no extent fits -- surfaces as an allocator OOM
+  void* p = reinterpret_cast<void*>(g_bases[pick] + g_cursors[pick]);
+  g_cursors[pick] += need;
+  return p;
 }}
 size_t bumparena_freed_{sfx}(void){{ std::lock_guard<std::mutex> lk(g_mu); return g_freed_bytes; }}
 void bumparena_free_{sfx}(void* ptr, size_t size, int device, void* stream){{
@@ -401,8 +410,8 @@ void bumparena_free_{sfx}(void* ptr, size_t size, int device, void* stream){{
 class BumpArenaStub:
     """JIT-built pluggable bump allocator over caller-provided device VA extents.
 
-    ``malloc`` first-fits an extent and hands out ``base + cursor``; ``free``
-    is a no-op. Plain ``torch.empty`` can thus be placed on externally managed
+    ``malloc`` picks an extent and hands out ``base + cursor``; ``free`` is a
+    no-op. Plain ``torch.empty`` can thus be placed on externally managed
     storage by wrapping ``allocator`` in a ``torch.cuda.MemPool``.
     ``set_extents`` re-points the arena and resets every cursor, letting one
     stub serve successive region sets.
@@ -462,6 +471,9 @@ class BumpArenaStub:
         self._fn_set_align = lib[f"bumparena_set_align_{self.sfx}"]
         self._fn_set_align.argtypes = [ctypes.c_size_t]
         self._fn_set_align.restype = None
+        self._fn_set_best_fit = lib[f"bumparena_set_best_fit_{self.sfx}"]
+        self._fn_set_best_fit.argtypes = [ctypes.c_int]
+        self._fn_set_best_fit.restype = None
         self._fn_cursor = lib[f"bumparena_cursor_{self.sfx}"]
         self._fn_cursor.argtypes = []
         self._fn_cursor.restype = ctypes.c_size_t
@@ -485,6 +497,9 @@ class BumpArenaStub:
 
     def set_align(self, nbytes: int) -> None:
         self._fn_set_align(ctypes.c_size_t(nbytes))
+
+    def set_best_fit(self, on: bool) -> None:
+        self._fn_set_best_fit(ctypes.c_int(1 if on else 0))
 
     @property
     def cursor_bytes(self) -> int:

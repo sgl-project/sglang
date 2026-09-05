@@ -9,6 +9,7 @@ the order of the imports below. ``test_model_override_split.py`` forbids the
 overlap, which is why this list needs no particular order.
 """
 
+from sglang.srt.arg_groups.model_overrides import cohere2_moe  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import deepseek_v2  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import deepseek_v4  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import exaone  # noqa: F401

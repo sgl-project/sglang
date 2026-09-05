@@ -114,17 +114,20 @@ framework-specific optimization workflow.
   check dtype, alignment, shape, BCG/compile context, and the one-time equality
   self-test before proposing another fusion.
 
-4. Request-scoped `quality=high` fusion gates
+4. Request-scoped fusion gates at `quality=extra-high` or `quality=high`
 - Locations: `quality_gate.py`, `fused_ln_modulate.py`, `denoising.py`,
   `decoding.py`, `fast_path_gate.py`, `flux2_vae_cuda_opt.py`, and
   `wan_vae_cuda_opt.py`.
 - Behavior: `quality="lossless"` is the default exact reference path.
-  `quality="high"` may mount model-owned, validated but non-bit-exact DiT
-  fusions and decode-scoped VAE rewrites. Mounting is all-or-nothing per
+  `quality="extra-high"` and `quality="high"` mount the same validated but
+  non-bit-exact DiT fusions and decode-scoped VAE rewrites. `high` is
+  cumulative and may additionally enable model-owned approximate paths.
+  Mounting is all-or-nothing per
   transformer/fusion family; VAE gates reset after every decode.
 - Current families include FLUX affine-folded LN+modulate / fused GELU sites,
-  GLM/Qwen/Hunyuan/LTX fused GELU sites, LTX RMSNorm+modulate, Hunyuan QK
-  RMSNorm, Ideogram gated RMSNorm, SANA-Video linear attention, generic KL VAE
+  Wan cublasLt/NVFP4 GELU, Qwen added-QKV, GLM/Qwen/Hunyuan/LTX fused GELU,
+  LTX RMSNorm+modulate, Hunyuan QK RMSNorm, Ideogram gated RMSNorm,
+  LingBot RMSNorm, SANA-Video linear attention, generic KL VAE
   decoder rewrites used by FLUX.1/FLUX.2/Z-Image/SD3, and Wan VAE
   RMSNorm+SiLU.
 - Do not confuse request `--quality` with `--output-quality`, which controls
@@ -218,7 +221,7 @@ framework-specific optimization workflow.
   one channels-last-3D pass, and fuse `main + DupUp3D(src)` without
   materializing `repeat_interleave + permute().contiguous()` intermediates.
 - Numerical contract: these are bit-exact data-movement / same-order-add
-  replacements and run independently of the `quality=high` Wan RMSNorm+SiLU
+  replacements and run independently of the request-gated Wan RMSNorm+SiLU
   path. Unsupported layouts or padding fall back to the aten chain.
 - Validation: `test/registered/kernels/ops/diffusion/test_wan_causal_cache.py`.
 
@@ -328,16 +331,16 @@ framework-specific optimization workflow.
 
 **Request-Scoped DiT Fusions with Breakable CUDA Graphs**
 
-- `quality=high` DiT sites are mounted at a request boundary. BCG warmup uses
+- DiT sites at `quality=extra-high` or `quality=high` are mounted at a request boundary. BCG warmup uses
   the model's lossless sampling default unless a quality-aware graph variant
   was captured explicitly.
-- A graph captured before the high-quality mount retains the lossless module
-  branches. Replaying it after the mount silently bypasses the requested high
+- A graph captured before the request-quality mount retains the lossless module
+  branches. Replaying it after the mount silently bypasses the requested fused
   kernels even when the tensor signature matches.
-- Workflow rule: a high+BCG cell is valid only when the model has no
+- Workflow rule: an extra-high/high+BCG cell is valid only when the model has no
   request-scoped DiT quality sites, or when logs prove those sites were mounted
   before the matching graph capture. A mount after `[Diffusion BCG] captured`
-  invalidates the row; do not use its latency or output as high-quality
+  invalidates the row; do not use its latency or output as request-quality
   evidence.
 
 **Recent Model Audit Boundaries**
@@ -363,10 +366,10 @@ framework-specific optimization workflow.
 - LingBot Video MoE's router implements sigmoid+bias grouped top-k in
   `multimodal_gen/runtime/layers/moe.py`. Check parameter and output-order
   compatibility with `srt/layers/moe/topk.py::biased_grouped_topk` before
-  writing a new router kernel. Its released eager path still expands RMSNorm
-  into `pow/mean/rsqrt` chains. #35969 is a measured `quality=high` candidate
-  that dispatches existing Triton row kernels by weight dtype and hidden size;
-  it is not current-main behavior until the PR merges.
+  writing a new router kernel. Current main mounts fused Triton RMSNorm row
+  kernels by weight dtype and hidden size for `quality=extra-high` and
+  `quality=high`; check the quality-site guards before treating an expanded
+  `pow/mean/rsqrt` chain as a new opportunity.
 - LTX-2.5 reuses the mature LTX-2 DiT paths. Treat the optional diffusion
   decoder separately: confirm NATTEN `na3d` is active, then inspect its
   per-block 3D RoPE construction and split QKV/SwiGLU projections.
@@ -379,7 +382,7 @@ framework-specific optimization workflow.
 - AdaLN modulation: `LayerNormScaleShift`, `RMSNormScaleShift`, `ScaleResidual*` in `layernorm.py`.
 - Bit-exact adaLN modulation / LayerNorm folding: `modulate_scale_shift` and
   `fused_layernorm_modulate` through `flux.py`, `glm_image.py`, and `sana.py`.
-- Request-scoped high-quality acceleration: `QualityGatedFusion` in
+- Request-scoped extra-high/high acceleration: `QualityGatedFusion` in
   `quality_gate.py`, `_maybe_toggle_quality_fusions` in `denoising.py`, and
   `use_vae_fast_path` in `decoding.py`.
 - Bit-exact first-sight verify/disable: `BitExactFusionGate` in
@@ -394,7 +397,7 @@ framework-specific optimization workflow.
 - QK norm: `apply_qk_norm` used in `flux.py`, `flux_2.py`, `qwen_image.py`, `zimage.py`, `wanvideo.py`, `ltx_2.py`, `hunyuanvideo.py`.
 - QK norm + RoPE: `apply_qk_norm_rope` in `layernorm.py`; use this path when the model wants fused attention prep instead of separate QK norm and RoPE calls.
 - LTX2 split RoPE: `apply_ltx2_split_rotary_emb` in `ltx_2.py`.
-- LTX2 RMSNorm+modulate and FFN GELU epilogue under `quality="high"`:
+- LTX2 RMSNorm+modulate and FFN GELU epilogue under `quality="extra-high"` and `quality="high"`:
   `mark_ltx2_rms_norm_modulate_site` / `fused_ltx2_rms_norm_modulate` in
   `kernels/ops/diffusion/sites/ltx2_rmsnorm_modulate_site.py` (mount-based
   `QualityGatedFusion`, not a first-sight `BitExactFusionGate` — the fused
@@ -468,8 +471,9 @@ relying on any file path, flag, or claim about whether the work has merged.
   - #34584 Wan TI2V modulation/RoPE; #34616 FLUX2; #34617 Hunyuan;
     #34619 GLM; #34620 ERNIE; #34928 SANA; #34932 Cosmos3; #35728
     SANA-Video linear attention.
-  - #35961 SANA-Video lossless shared-kernel reuse and #35969 LingBot
-    `quality=high` RMSNorm are open candidates, not current-main fast paths.
+  - SANA-Video shared-kernel reuse and LingBot request-gated RMSNorm are now
+    current-main fast paths; verify the source tree before treating their
+    historical PRs as open work.
 - VAE and decode-side acceleration:
   - #22531 LTX2 parallel VAE support and #20927 batched tiled VAE decode (draft).
 - Attention, communication, and runtime scheduling:
@@ -492,7 +496,7 @@ relying on any file path, flag, or claim about whether the work has merged.
 **Constraints and Fallbacks**
 - `scale_shift` Triton requires CUDA + contiguous `x`. NPU swaps to native.
 - Bit-exact BF16 LayerNorm+modulate requires the guarded aten-compatible shape
-  and a successful live equality check; `quality=high` affine folding is a
+  and a successful live equality check; request-gated affine folding is a
   separate non-bit-exact path.
 - CuTe DSL fused norms require `D % 256 == 0` and `D <= 8192`.
 - Triton norm kernels error on feature size >= 64KB.

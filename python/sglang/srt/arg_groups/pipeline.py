@@ -54,11 +54,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
         for field in dataclasses.fields(server_args)
     }
 
-    # Declaration stash for the override/post-process passes. Set before any
-    # short-circuit (none/dummy model paths) so run_post_process_pass and
-    # direct handler invocations can rely on it even when
-    # _handle_model_specific_adjustments never runs.
-    server_args._resolved_overrides = []
+    # Preserve launcher-stage declarations made before Engine starts. They are
+    # part of the same resolution result as the declarations accumulated below.
+    server_args._resolved_overrides = list(
+        getattr(server_args, "_resolved_overrides", ())
+    )
 
     cfg = resolving_view(server_args)
 
@@ -146,8 +146,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     handle_pd_disaggregation(server_args)
 
-    # Normalize deprecated CP aliases before validations or model-specific
-    # defaults inspect enable_prefill_cp/cp_strategy.
+    # Normalize protected-platform CP aliases before validations or
+    # model-specific defaults inspect enable_prefill_cp/cp_strategy.
     from sglang.srt.arg_groups.parallel_hook import (
         handle_context_parallelism,
         handle_data_parallelism,
@@ -156,10 +156,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_elastic_ep,
         handle_eplb_and_dispatch,
         handle_expert_distribution_metrics,
-        handle_legacy_cp_arguments,
+        handle_legacy_cp_runtime_compatibility,
+        handle_platform_cp_compatibility,
     )
 
-    handle_legacy_cp_arguments(server_args)
+    handle_platform_cp_compatibility(server_args)
     from sglang.srt.arg_groups.kv_cache_hook import (
         handle_cache_compatibility,
         handle_kv4_compatibility,
@@ -286,9 +287,9 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Normalize load balancing defaults.
     handle_load_balance_method(server_args)
 
-    # Re-apply after model-specific defaults resolve attention_backend so
-    # canonical CP mirrors to the right legacy runtime aliases.
-    handle_legacy_cp_arguments(server_args)
+    # The old runtime distinguishes DSA from other CP paths through legacy
+    # fields, so project only after attention_backend has been resolved.
+    handle_legacy_cp_runtime_compatibility(server_args)
 
     # Handle context parallelism.
     handle_context_parallelism(server_args)
@@ -317,6 +318,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
     handle_speculative_decoding(server_args)
+
+    # After the speculative hook so speculative_algorithm is final.
+    from sglang.srt.arg_groups.layernorm_sp_hook import handle_layernorm_sp
+
+    handle_layernorm_sp(server_args)
 
     # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
     validate_cutedsl_a2a_token_budget(server_args)

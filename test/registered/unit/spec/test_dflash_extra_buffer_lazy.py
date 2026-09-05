@@ -120,11 +120,14 @@ class TestDflashVerifyRunsMambaTrackHook(CustomTestCase):
             calls.append("init_new")
             return fake_forward_batch
 
-        with mock.patch(
-            "sglang.srt.speculative.spec_utils.prepare_mamba_track_for_verify",
-            side_effect=fake_hook,
-        ), mock.patch.object(
-            dflash_info.ForwardBatch, "init_new", side_effect=fake_init_new
+        with (
+            mock.patch(
+                "sglang.srt.speculative.spec_utils.prepare_mamba_track_for_verify",
+                side_effect=fake_hook,
+            ),
+            mock.patch.object(
+                dflash_info.ForwardBatch, "init_new", side_effect=fake_init_new
+            ),
         ):
             out, can_run_cuda_graph = self._spec_input().prepare_for_verify(
                 batch, target_worker

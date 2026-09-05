@@ -61,9 +61,9 @@ def test_splits_never_increase_with_token_count():
     for tokens in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]:
         splits = _kv_splits_heuristic(tokens, HEADS, BLOCK_H, num_cu=NUM_CU)
         if prev is not None:
-            assert (
-                splits <= prev
-            ), f"splits rose from {prev} to {splits} going to T={tokens}"
+            assert splits <= prev, (
+                f"splits rose from {prev} to {splits} going to T={tokens}"
+            )
         prev = splits
 
 
