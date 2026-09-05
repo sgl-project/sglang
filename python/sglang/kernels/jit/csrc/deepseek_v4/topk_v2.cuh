@@ -77,6 +77,14 @@ struct TopKPagedParams {
   const int32_t* __restrict__ page_table;
   int32_t* __restrict__ page_indices;
   const PlanItem* __restrict__ metadata;  // [0]=GlobalMetadata, [1+i]=PlanItem
+  // Both optional, and both null for the decode shape this kernel was written
+  // for (one row per request, scores starting at column 0). DSA extend packs
+  // every request's scores into one row-major buffer, so a row's window starts
+  // at a per-row column offset and many rows share one request's page-table
+  // row; these two indirections express that without materializing either a
+  // row-local score copy or a per-row expansion of the page table.
+  const int32_t* __restrict__ row_starts;    // per-row score column offset; null => 0
+  const int32_t* __restrict__ row_to_batch;  // per-row page-table row; null => identity
   int64_t score_stride;
   int64_t page_table_stride;
   uint32_t topk;
@@ -97,10 +105,16 @@ struct TopKPagedParams {
   }
   SGL_DEVICE TopKProblem problem(uint32_t batch_id, uint32_t seq_len) const {
     const auto k = static_cast<int64_t>(topk);
+    // Offsetting `in` makes the index the kernel selects row-local, which is
+    // what the page-table transform already expects, so the emit path needs no
+    // change.
+    const int64_t score_offset = row_starts != nullptr ? static_cast<int64_t>(row_starts[batch_id]) : 0;
+    const int64_t table_row =
+        row_to_batch != nullptr ? static_cast<int64_t>(row_to_batch[batch_id]) : static_cast<int64_t>(batch_id);
     return TopKProblem{
-        .in = scores + batch_id * score_stride,
+        .in = scores + batch_id * score_stride + score_offset,
         .out = page_indices + batch_id * k,
-        .page_table = page_table + batch_id * page_table_stride,
+        .page_table = page_table + table_row * page_table_stride,
         .topk = topk,
         .seq_len = seq_len,
         .page_bits = page_bits,
@@ -490,13 +504,16 @@ struct TopKKernel {
       const tvm::ffi::Optional<tvm::ffi::TensorView> page_table,
       const tvm::ffi::TensorView page_indices,
       const uint32_t page_size,
-      const tvm::ffi::TensorView metadata) {
+      const tvm::ffi::TensorView metadata,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> row_starts,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> row_to_batch) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto Bp1 = SymbolicSize{"batch_size_plus_1"};
     auto L = SymbolicSize{"max_seq_len"};
     auto S = SymbolicSize{"score_stride"};
     auto P = SymbolicSize{"page_table_stride"};
+    auto R = SymbolicSize{"page_table_rows"};
     auto K = SymbolicSize{"topk"};
     auto device_ = SymbolicDevice{};
     device_.set_options<kDLGPU>();
@@ -515,13 +532,20 @@ struct TopKKernel {
     const int32_t* page_table_ptr = nullptr;
     int64_t page_table_stride = 0;
     if (page_table.has_value()) {
-      TensorMatcher({B, -1})  // page_table
+      TensorMatcher({R, -1})  // page_table
           .with_strides({P, 1})
           .with_dtype<int32_t>()
           .with_device(device_)
           .verify(page_table.value());
       page_table_ptr = static_cast<const int32_t*>(page_table.value().data_ptr());
       page_table_stride = P.unwrap();
+      // Without the mapping the table is indexed by row, so it must have exactly
+      // one row per score row; with it, rows are requests and the caller owns the
+      // bound (an out-of-range entry reads another request's pages, so this is the
+      // one invariant the kernel cannot check).
+      RuntimeCheck(
+          row_to_batch.has_value() || R.unwrap() == B.unwrap(),
+          "page_table must have one row per score row unless row_to_batch is given");
     }
     TensorMatcher({B, K})  // page_indices
         .with_dtype<int32_t>()
@@ -531,6 +555,18 @@ struct TopKKernel {
         .with_dtype<int32_t>()
         .with_device(device_)
         .verify(metadata);
+
+    const int32_t* row_starts_ptr = nullptr;
+    if (row_starts.has_value()) {
+      TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(row_starts.value());
+      row_starts_ptr = static_cast<const int32_t*>(row_starts.value().data_ptr());
+    }
+
+    const int32_t* row_to_batch_ptr = nullptr;
+    if (row_to_batch.has_value()) {
+      TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(row_to_batch.value());
+      row_to_batch_ptr = static_cast<const int32_t*>(row_to_batch.value().data_ptr());
+    }
 
     RuntimeCheck(std::has_single_bit(page_size), "page_size must be power of 2");
     RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 (16-byte vectorized load)");
@@ -556,6 +592,8 @@ struct TopKKernel {
         .page_table = page_table_ptr,
         .page_indices = static_cast<int32_t*>(page_indices.data_ptr()),
         .metadata = static_cast<const PlanItem*>(metadata.data_ptr()),
+        .row_starts = row_starts_ptr,
+        .row_to_batch = row_to_batch_ptr,
         .score_stride = S.unwrap(),
         .page_table_stride = page_table_stride,
         .topk = topk,

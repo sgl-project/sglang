@@ -696,10 +696,12 @@ class DeepseekSparseAttnBackend(
         # Preprocess the folded top-k v2 plan once per forward (shared across
         # layers), at metadata-build time, from the same seqlens the transform
         # receives as `lengths` (dsa_seqlens_expanded). This must cover EVERY shape
-        # that dispatches to `_topk_transform_v2_paged` -- decode AND MTP
-        # target-verify / draft-extend, whose expanded row count is exactly what v2
-        # sees -- otherwise the helper's plan-present assertion fires. None only
-        # when the SGL v2 path is disabled; such metadata is never dispatched to v2.
+        # that dispatches to `_topk_transform_v2_paged` -- decode, MTP
+        # target-verify / draft-extend, and packed PAGED extend, whose expanded row
+        # count is exactly what v2 sees -- otherwise the helper's plan-present
+        # assertion fires. Extend is also the reason the row count, not the batch
+        # size, is what matters here. None only when the SGL v2 path is disabled;
+        # such metadata is never dispatched to v2.
         if not self.dsa_topk_backend.should_use_topk_v2():
             return None
         from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
