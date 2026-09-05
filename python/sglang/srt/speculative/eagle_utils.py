@@ -515,6 +515,7 @@ def eagle_prepare_for_verify(
     req_to_token_pool: ReqToTokenPool,
     batch: ScheduleBatch,
     target_worker: TpModelWorker,
+    overlap_plan_stream: bool = False,
 ):
     # Imports must stay lazy (import-cycle safety) but only need to resolve
     # once, not on every decode cycle of this hot path.
@@ -603,7 +604,13 @@ def eagle_prepare_for_verify(
             verify_forward_batch
         )
     )
-    if can_run_cuda_graph:
+    # Recurrent backends may defer graph metadata loading because it can mutate state still consumed by the draft.
+    defer_graph_load = overlap_plan_stream and not getattr(
+        target_worker.model_runner.attn_backend,
+        "supports_overlap_plan_stream_graph_load",
+        True,
+    )
+    if can_run_cuda_graph and not defer_graph_load:
         target_worker.model_runner.decode_cuda_graph_runner.load_batch(
             verify_forward_batch
         )

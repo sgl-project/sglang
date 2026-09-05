@@ -89,3 +89,53 @@ def fill_accept_out_cache_loc_func(
         accept_out_cache_loc,
         next_power_of_2(size),
     )
+
+
+@triton.jit
+def nextn_mamba_commit_prologue(
+    accept_lens_ptr,
+    seq_lens_ptr,
+    last_correct_ptr,
+    steps_to_track_ptr,
+    mamba_track_interval,
+    HAS_TRACK: tl.constexpr,
+):
+    # In topk=1 chains, accepted node indices equal per-request step indices, so the eager accept_index gathers are identities.
+    pid = tl.program_id(axis=0)
+    al = tl.load(accept_lens_ptr + pid).to(tl.int64)
+    # Eager accept_index gathers yield int32; draft-step bounds make this narrowing exact.
+    tl.store(last_correct_ptr + pid, (al - 1).to(tl.int32))
+    if HAS_TRACK:
+        pre = tl.load(seq_lens_ptr + pid).to(tl.int64)
+        post = pre + al
+        interval = mamba_track_interval.to(tl.int64)
+        crossed = (pre // interval) != (post // interval)
+        tracking_point = (post // interval) * interval
+        ith = tl.maximum(tracking_point - pre - 1, 0)
+        out = tl.where(crossed, ith, -1)
+        tl.store(steps_to_track_ptr + pid, out.to(tl.int32))
+
+
+def nextn_mamba_commit_prologue_func(
+    accept_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    mamba_track_interval: int,
+    has_track: bool,
+):
+    """Return int32 chain-step indices equivalent to the eager accept_index gathers."""
+    bs = accept_lens.shape[0]
+    last_correct = torch.empty(bs, dtype=torch.int32, device=accept_lens.device)
+    steps_to_track = (
+        torch.empty(bs, dtype=torch.int32, device=accept_lens.device)
+        if has_track
+        else last_correct  # unused dummy write target is never launched
+    )
+    nextn_mamba_commit_prologue[(bs,)](
+        accept_lens,
+        seq_lens,
+        last_correct,
+        steps_to_track,
+        mamba_track_interval,
+        HAS_TRACK=has_track,
+    )
+    return last_correct, (steps_to_track if has_track else None)

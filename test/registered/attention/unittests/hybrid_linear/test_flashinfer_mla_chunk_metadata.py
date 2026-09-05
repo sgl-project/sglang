@@ -103,7 +103,9 @@ def _build_hybrid_backend(testcase, case: MLAAttentionCase):
     # full_attn_layers=[0] routes layer 0 through the MLA backend, as a hybrid
     # model's full-attention layers do. The linear backend is unused here.
     hybrid = HybridLinearAttnBackend(
-        full_backend, SimpleNamespace(), full_attn_layers=[0]
+        full_backend,
+        SimpleNamespace(supports_overlap_plan_stream_graph_load=False),
+        full_attn_layers=[0],
     )
     return runner, full_backend, hybrid
 

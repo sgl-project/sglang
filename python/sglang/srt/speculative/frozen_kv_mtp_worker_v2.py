@@ -175,6 +175,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         # None so inherited probes (spec_v2_attn_backends, adaptive) stay typed.
         self.draft_extend_attn_backend = None
         self.cuda_graph_runner_for_draft_extend = None
+        self._init_handoff_events()
 
     def alloc_memory_pool(
         self,
@@ -512,7 +513,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             self.speculative_num_draft_tokens,
         )
 
-        return FrozenKVMTPVerifyInput(
+        verify_input = FrozenKVMTPVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
             positions=position,
@@ -527,6 +528,12 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             seq_lens_sum=batch.seq_lens_sum,
             seq_lens_cpu=batch.seq_lens_cpu,
         )
+        # Gate plan-stream GPU work on the forward-stream point that finalized
+        # the verify tree, matching the regular EAGLE draft worker contract.
+        self._pending_verify_handoff_event = self._record_handoff_event(
+            "verify", torch.get_device_module(self.device).current_stream()
+        )
+        return verify_input
 
     def draft_forward(self, forward_batch: ForwardBatch):
         spec_info = forward_batch.spec_info
