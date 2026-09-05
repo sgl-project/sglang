@@ -152,7 +152,7 @@ srt_musa = [
   "sglang[runtime_common]",
   "torch",
   "torch_musa",
-  "torchada>=0.1.74",
+  "torchada>=0.1.84",
 ]
 
 diffusion_musa = [
