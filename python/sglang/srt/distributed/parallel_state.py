@@ -222,7 +222,35 @@ def reg_reduce_scatter_tensor(
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
+    # Backend choice belongs inside the op: aiter's custom all-reduce resolves its
+    # JIT module on first use, which shells out to shutil.which -- untraceable, and
+    # only reachable at shapes small enough for the custom path, so tracing it
+    # blows up deep into a piecewise sweep rather than on the first shape.
+    if group._maybe_aiter_reduce_scatter(output, input):
+        return
     group._reduce_scatter_tensor(output, input)
+
+
+@register_custom_op(mutates_args=["output"])
+@register_split_op()
+def reg_reduce_scatterv(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    sizes: Optional[List[int]],
+    group_name: str,
+) -> None:
+    """Uneven reduce-scatter, kept opaque to Dynamo.
+
+    The pynccl path calls ncclReduce through a ctypes function pointer inside a
+    context manager, which Dynamo cannot trace and cannot break out of under
+    fullgraph. Split op as well: the loop trip count comes from `sizes` and the
+    arguments are raw data_ptr()s, so capturing it would bake in both.
+    """
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    group._reduce_scatterv(output, input, sizes)
 
 
 @register_custom_op(mutates_args=["output"])
@@ -1090,8 +1118,6 @@ class GroupCoordinator:
         if _is_npu or _is_cpu:
             # TODO: add optimized reduce_scatter_tensor kernel for cpu
             self._reduce_scatter_tensor(output, input)
-        elif self._maybe_aiter_reduce_scatter(output, input):
-            return
         else:
             reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
 
@@ -1168,38 +1194,45 @@ class GroupCoordinator:
         torch.distributed.reduce_scatter(output, input_list, group=self.device_group)
         return output
 
+    def _reduce_scatterv(
+        self,
+        output: torch.Tensor,
+        input_: torch.Tensor,
+        sizes: Optional[List[int]],
+    ) -> None:
+        pynccl_comm = self.pynccl_comm
+        with pynccl_comm.change_state(enable=True):
+            assert pynccl_comm is not None and not pynccl_comm.disabled, (
+                "pynccl is required for reduce_scatterv"
+            )
+            pynccl_comm.reduce_scatter(output, input_, sizes=sizes)
+
     def reduce_scatterv(
         self,
         input_: torch.Tensor,
         output: Optional[torch.Tensor] = None,
         sizes: Optional[List[int]] = None,
     ) -> torch.Tensor:
+        # Shape math and allocation stay here so the op itself only mutates a
+        # caller-owned output and needs no fake impl beyond the default.
         world_size = self.world_size
-        pynccl_comm = self.pynccl_comm
 
-        with pynccl_comm.change_state(enable=True):
-            assert pynccl_comm is not None and not pynccl_comm.disabled, (
-                "pynccl is required for reduce_scatterv"
-            )
+        if sizes is not None:
+            assert len(sizes) == world_size
+            assert input_.shape[0] == sum(sizes)
+            chunk_size = sizes[self.rank_in_group]
+        else:
+            assert input_.shape[0] % world_size == 0
+            chunk_size = input_.shape[0] // world_size
+        output_shape = (chunk_size,) + input_.shape[1:]
 
-            if sizes is not None:
-                assert len(sizes) == world_size
-                assert input_.shape[0] == sum(sizes)
-                chunk_size = sizes[self.rank_in_group]
-            else:
-                assert input_.shape[0] % world_size == 0
-                chunk_size = input_.shape[0] // world_size
-            output_shape = (chunk_size,) + input_.shape[1:]
+        if output is None:
+            output = torch.empty(output_shape, dtype=input_.dtype, device=input_.device)
+        else:
+            assert output.shape == output_shape
 
-            if output is None:
-                output = torch.empty(
-                    output_shape, dtype=input_.dtype, device=input_.device
-                )
-            else:
-                assert output.shape == output_shape
-
-            pynccl_comm.reduce_scatter(output, input_, sizes=sizes)
-            return output
+        reg_reduce_scatterv(output, input_, sizes, group_name=self.unique_name)
+        return output
 
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         # Aiter custom all-gather (ROCm). Set SGLANG_USE_AITER_AG=0 to disable.
