@@ -2079,7 +2079,7 @@ class TestBreakableCudaGraphMultimodalAllowlist(CustomTestCase):
 
     def test_multimodal_arch_disables_prefill_breakable(self):
         args = self._handled_args(
-            architectures=["Qwen3VLForConditionalGeneration"],
+            architectures=["Qwen2_5_VLForConditionalGeneration"],
             is_multimodal=True,
             allowlisted=False,
         )
@@ -2104,19 +2104,17 @@ class TestBreakableCudaGraphMultimodalAllowlist(CustomTestCase):
             is_multimodal_breakable_cuda_graph_supported,
         )
 
-        self.assertTrue(
-            is_multimodal_breakable_cuda_graph_supported(
-                ["Qwen3_5MoeForConditionalGeneration"]
-            )
-        )
-        self.assertTrue(
-            is_multimodal_breakable_cuda_graph_supported(
-                ["Qwen3_5ForConditionalGeneration"]
-            )
-        )
+        for arch in (
+            "Qwen3_5MoeForConditionalGeneration",
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3VLForConditionalGeneration",
+            "Qwen3VLMoeForConditionalGeneration",
+        ):
+            with self.subTest(arch=arch):
+                self.assertTrue(is_multimodal_breakable_cuda_graph_supported([arch]))
         self.assertFalse(
             is_multimodal_breakable_cuda_graph_supported(
-                ["Qwen3VLForConditionalGeneration"]
+                ["Qwen2_5_VLForConditionalGeneration"]
             )
         )
 
