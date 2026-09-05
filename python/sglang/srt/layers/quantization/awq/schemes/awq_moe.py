@@ -129,7 +129,10 @@ class AWQMoEScheme(AWQMoESchemeBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
-        assert get_moe_runner_backend().is_auto()
+        assert get_moe_runner_backend() in {
+            MoeRunnerBackend.AUTO,
+            MoeRunnerBackend.MARLIN,
+        }
         self.moe_runner_config = moe_runner_config
         self.kernel.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
 

@@ -290,7 +290,8 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
     """
     Automatically choose the dispatch output dtype for DeepEP.
 
-    The decision follows several checks in priority order:
+    A resolved Marlin runner requires BF16, regardless of its weight scales.
+    Other runners follow these checks in priority order:
     0. Parse server argument.
     1. Parse deprecated environment variables.
     2. If quant_config contains input_global_scale → NVFP4 path.
@@ -301,8 +302,20 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
     7. Otherwise → FP8 (the default for most models like DeepSeek-V3).
     """
 
-    # 0. Parse server argument.
+    # Marlin's activation contract is independent of the weight format and
+    # must use the resolved layer runner, including automatic selection.
     server_args = get_server_args()
+    runner_backend = getattr(self, "runner_backend", None)
+    if runner_backend is not None and runner_backend.is_marlin():
+        requested = get_exec().moe.deepep_dispatcher_output_dtype
+        if requested not in {"auto", "bf16"}:
+            raise ValueError(
+                "Marlin + DeepEP requires --deepep-dispatcher-output-dtype bf16 "
+                f"or auto, got {requested}."
+            )
+        return DispatcherOutputDtype.BF16
+
+    # 0. Parse server argument.
     if server_args and get_exec().moe.deepep_dispatcher_output_dtype != "auto":
         return DispatcherOutputDtype(get_exec().moe.deepep_dispatcher_output_dtype)
 

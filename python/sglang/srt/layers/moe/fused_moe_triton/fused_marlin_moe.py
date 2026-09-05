@@ -138,7 +138,7 @@ def fused_marlin_moe(
     w2: torch.Tensor,
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,
-    gating_output: torch.Tensor,
+    gating_output: Optional[torch.Tensor],
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     global_num_experts: int = -1,
@@ -162,6 +162,7 @@ def fused_marlin_moe(
     gemm1_alpha: Optional[float] = None,
     activation: str = "silu",
     is_gated: bool = True,
+    is_ep: bool = False,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -192,7 +193,14 @@ def fused_marlin_moe(
     """
     from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
-    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+    if gating_output is not None:
+        assert hidden_states.shape[0] == gating_output.shape[0], (
+            "Number of tokens mismatch"
+        )
+    assert hidden_states.shape[0] == topk_ids.shape[0] == topk_weights.shape[0], (
+        "Number of routed tokens mismatch"
+    )
+    is_ep = is_ep or expert_map is not None
     assert hidden_states.shape[1] == w1.shape[1] * 16, "Hidden size mismatch w1"
     assert hidden_states.shape[1] == w2.shape[2] // (num_bits // 2), (
         "Hidden size mismatch w2"
@@ -246,7 +254,7 @@ def fused_marlin_moe(
     if (
         M == 1
         and topk <= 32
-        and expert_map is None
+        and not is_ep
         # The JIT kernel is int32-only; torch-native topk emits int64 -- let
         # that (test-only) shape take the generic path instead of casting.
         and topk_ids.dtype == torch.int32
@@ -320,7 +328,7 @@ def fused_marlin_moe(
         moe_block_size=block_size_m,
         top_k=topk,
         mul_topk_weights=False,
-        is_ep=expert_map is not None,
+        is_ep=is_ep,
         b_q_type=scalar_type1,
         size_m=M,
         size_n=gemm1_n,
@@ -362,7 +370,9 @@ def fused_marlin_moe(
     else:
         raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
 
-    if expert_map is not None:
+    if is_ep:
+        # GEMM2 shares storage with GEMM1; skipped routes must not retain gate/up
+        # values (including bias) when their contributions are reduced.
         intermediate_cache3.zero_()
 
     intermediate_cache3 = moe_wna16_marlin_gemm(
@@ -383,7 +393,7 @@ def fused_marlin_moe(
         moe_block_size=block_size_m,
         top_k=1,
         mul_topk_weights=True,
-        is_ep=expert_map is not None,
+        is_ep=is_ep,
         b_q_type=scalar_type2,
         size_m=M * topk,
         size_n=K,
