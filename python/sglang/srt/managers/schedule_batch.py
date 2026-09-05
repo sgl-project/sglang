@@ -86,6 +86,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
+from sglang.srt.logprob_types import PerPositionTokenIds
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
@@ -2605,7 +2606,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.return_logprob:
             self.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
-            self.token_ids_logprobs = [r.logprob.token_ids_logprob for r in reqs]
+            self.token_ids_logprobs = [
+                (
+                    PerPositionTokenIds(
+                        r.logprob.token_ids_logprob.positions,
+                        prefix_lens[i] + extend_logprob_start_lens[i] + 1,
+                    )
+                    if isinstance(r.logprob.token_ids_logprob, PerPositionTokenIds)
+                    else r.logprob.token_ids_logprob
+                )
+                for i, r in enumerate(reqs)
+            ]
 
         self.extend_logprob_start_lens = extend_logprob_start_lens
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
