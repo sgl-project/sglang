@@ -7,15 +7,15 @@ import torch
 from sglang.srt.layers.cp.base import is_cp_enabled
 from sglang.srt.layers.cp.utils import (
     cp_materialize_global_token_order,
-    enable_cp_v2,
-    is_cp_v2_active,
+    is_cp_active,
+    supports_generic_prefill_cp,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_hip
 
 
 def uses_sharded_prefill_layout(forward_batch) -> bool:
-    if is_cp_v2_active(forward_batch):
+    if is_cp_active(forward_batch):
         return True
     if is_hip():
         from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
@@ -29,7 +29,7 @@ def resolve_model_attention_partition(
 ) -> Tuple[int, int]:
     if rank is not None and size is not None:
         return rank, size
-    if enable_cp_v2() and is_cp_enabled():
+    if supports_generic_prefill_cp() and is_cp_enabled():
         return 0, 1
     return get_parallel().attn_tp_rank, get_parallel().attn_tp_size
 

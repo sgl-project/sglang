@@ -21,6 +21,15 @@ def _imports_from(path: Path, module: str) -> set[str]:
     return imported
 
 
+def _references_any_name(path: Path, names: set[str]) -> bool:
+    tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+    return any(
+        (isinstance(node, ast.Name) and node.id in names)
+        or (isinstance(node, ast.alias) and node.name in names)
+        for node in ast.walk(tree)
+    )
+
+
 class TestPrefillCPPlatformCompatibility(CustomTestCase):
     def test_generic_modeling_does_not_import_legacy_prefill_cp(self):
         model_files = (
@@ -65,6 +74,45 @@ class TestPrefillCPPlatformCompatibility(CustomTestCase):
                 actual_consumers.add(path.relative_to(_REPO_ROOT).as_posix())
 
         self.assertEqual(actual_consumers, allowed_consumers)
+
+    def test_versioned_cp_api_is_rocm_compatibility_only(self):
+        allowed_consumers = {
+            "python/sglang/srt/layers/cp/utils.py",
+            "python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla_rocm.py",
+            "python/sglang/srt/models/deepseek_v4.py",
+        }
+        self.assertEqual(
+            self._consumers_of({"is_cp_v2_active"}),
+            allowed_consumers,
+        )
+
+    def test_round_robin_cp_api_is_platform_compatibility_only(self):
+        allowed_consumers = {
+            "python/sglang/srt/layers/attention/deepseek_v4_backend_hip_radix.py",
+            "python/sglang/srt/layers/attention/dsa/utils.py",
+            "python/sglang/srt/layers/utils/cp_utils.py",
+            "python/sglang/srt/models/deepseek_v4.py",
+        }
+        self.assertEqual(
+            self._consumers_of(
+                {
+                    "is_dsa_prefill_cp_round_robin_split",
+                    "can_dsa_prefill_cp_round_robin_split",
+                    "dsa_cp_round_robin_split_data",
+                    "dsa_cp_round_robin_split_q_seqs_cpu",
+                    "dsa_cp_round_robin_split_q_seqs",
+                }
+            ),
+            allowed_consumers,
+        )
+
+    def _consumers_of(self, names: set[str]) -> set[str]:
+        source_root = _REPO_ROOT / "python/sglang/srt"
+        return {
+            path.relative_to(_REPO_ROOT).as_posix()
+            for path in source_root.rglob("*.py")
+            if _references_any_name(path, names)
+        }
 
 
 if __name__ == "__main__":
