@@ -200,6 +200,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
+        # Share the target's embed/lm_head here rather than in
+        # alloc_memory_pool(): the scheduler only reaches that after
+        # init_target_memory_pool() has profiled free memory to size the KV
+        # cache, so the draft's own copies are still resident when the profile
+        # runs and are freed into a budget that is already fixed. On a large
+        # vocabulary that is several GB (248320 x 5120 fp16 is 2.54 GB each).
+        self.init_token_map()
+        self.init_lm_head()
+        # set_embed_and_head only drops the Parameter refs; without an explicit
+        # release the blocks stay in the caching allocator and still count as
+        # used.
+        torch.cuda.empty_cache()
+
     def alloc_memory_pool(
         self,
         memory_pool_config=None,
@@ -214,8 +227,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
-        self.init_token_map()
-        self.init_lm_head()
 
         if get_spec().speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size
