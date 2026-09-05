@@ -286,6 +286,23 @@ def _halve_num_frames(server_args: ServerArgs, num_frames: int) -> int:
     return ((latent_frames + 1) // 2 - 1) * ratio + 1
 
 
+def _lighter_valid_num_frames(server_args: ServerArgs, num_frames: int) -> int:
+    """Largest frame count at or below half that the model's frame contract accepts.
+
+    ``adjust_num_frames`` rounds up (LongLive2 maps 17 frames to 29), so the
+    halved count is walked down until it is a fixed point of the contract.
+    """
+    halved = _halve_num_frames(server_args, num_frames)
+    adjust = getattr(server_args.pipeline_config, "adjust_num_frames", None)
+    for candidate in range(halved, 0, -1):
+        adjusted = adjust(candidate) if callable(adjust) else candidate
+        if not isinstance(adjusted, int) or isinstance(adjusted, bool):
+            adjusted = candidate
+        if adjusted == candidate:
+            return candidate if candidate < num_frames else num_frames
+    return num_frames
+
+
 def lighten_warmup_req(server_args: ServerArgs, req: Req) -> Req | None:
     """Roughly halve a warmup probe, or None once it cannot shrink further.
 
@@ -299,7 +316,7 @@ def lighten_warmup_req(server_args: ServerArgs, req: Req) -> Req | None:
         return None
 
     num_frames = params.num_frames or 1
-    lighter_frames = _halve_num_frames(server_args, num_frames)
+    lighter_frames = _lighter_valid_num_frames(server_args, num_frames)
     if lighter_frames < num_frames:
         return _replace_warmup_workload(req, num_frames=lighter_frames)
 

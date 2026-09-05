@@ -61,6 +61,28 @@ class TestLightenWarmupReq:
     def test_a_probe_at_the_floor_cannot_shrink(self):
         assert lighten_warmup_req(_server_args(), _req(16, 16, 1)) is None
 
+    def test_frames_follow_the_model_frame_contract(self):
+        # LongLive2-style contract: latent frames come in causal blocks of 8,
+        # so with a temporal ratio of 4 only 29, 61, 93, ... frames are valid.
+        server_args = _server_args()
+
+        def adjust_num_frames(num_frames: int) -> int:
+            latent = (num_frames - 1) // 4 + 1
+            if latent % 8 == 0:
+                return num_frames
+            return (max(8, latent // 8 * 8) - 1) * 4 + 1
+
+        server_args.pipeline_config.adjust_num_frames = adjust_num_frames
+
+        lighter = lighten_warmup_req(server_args, _req(960, 928, 61))
+        assert lighter.num_frames == 29
+        assert (lighter.width, lighter.height) == (960, 928)
+
+        # At the smallest valid frame count the probe shrinks the area instead.
+        floor = lighten_warmup_req(server_args, lighter)
+        assert floor.num_frames == 29
+        assert floor.width * floor.height <= 960 * 928 // 2
+
 
 def _record(width: int, height: int, num_frames: int, *, peak_gib: float):
     from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
