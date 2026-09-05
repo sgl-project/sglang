@@ -319,12 +319,13 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Store head info for precomputing FA3 scheduler metadata
         self.head_dim = model_runner.model_config.head_dim
+        attention_tp_size = model_runner.ps.attn_tp_size
         self.num_attention_heads = (
             model_runner.model_config.hf_text_config.num_attention_heads
-            // model_runner.ps.tp_size
+            // attention_tp_size
         )
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            model_runner.ps.tp_size
+            attention_tp_size
         )
         _softcapping = getattr(
             model_runner.model_config.hf_text_config, "attn_logit_softcapping", None
@@ -404,6 +405,12 @@ class FlashAttentionBackend(AttentionBackend):
             has_softcap=self.has_softcap,
             num_splits=self.num_splits,
         )
+
+    def validate_elastic_cuda_graph_recapture(self) -> None:
+        if self.use_mla and self.fa_impl_ver != 3:
+            raise ValueError(
+                "Elastic EP CUDA graph recapture with MLA requires FlashAttention 3."
+            )
 
     def _mxfp8_sf_kwargs(self, layer, forward_batch, q_descale=None):
         """Block-scaled UE8M0 scale factors for the FA4 MXFP8 attention path.
@@ -2134,7 +2141,6 @@ class FlashAttentionBackend(AttentionBackend):
                 q_nope = q_all[:, :, : layer.v_head_dim]
                 q_rope = q_all[:, :, layer.v_head_dim :]
             max_seqlen_q = metadata.max_seq_len_q
-
             result = flash_attn_with_kvcache(
                 q=q_rope,
                 k_cache=k_rope_cache,

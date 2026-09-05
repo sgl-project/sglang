@@ -99,6 +99,7 @@ def init_torch_distributed(
         # Only initialize the distributed environment on the target model worker.
         _init_parallel_groups(
             backend=backend,
+            device=device,
             dist_init_method=dist_init_method,
             server_args=server_args,
             model_config=model_config,
@@ -224,6 +225,7 @@ def _init_cpu_threads_env(
 def _init_parallel_groups(
     *,
     backend: str,
+    device: str,
     dist_init_method: str,
     server_args: ServerArgs,
     model_config: ModelConfig,
@@ -272,9 +274,16 @@ def _init_parallel_groups(
             and get_parallel().enable_dsa_prefill_context_parallel
         ),
         enable_symm_mem=get_exec().comm.enable_symm_mem,
-        recovered_rank=is_ep_joiner,
+        # Mooncake owns the dynamically expandable WORLD group. Model-parallel
+        # groups remain fixed within each launch cohort.
+        backend=(
+            get_default_distributed_backend(device)
+            if server_args.elastic_ep_backend == "mooncake"
+            else None
+        ),
+        recovered_rank=is_ep_joiner and not is_scale_joiner,
         rank_offset=rank_offset,
-        max_world_size=get_parallel().max_ep_size,
+        max_world_size=None if is_scale_joiner else get_parallel().max_ep_size,
     )
     _tag_groups_for_flashinfer_allreduce_only()
     initialize_dp_attention(

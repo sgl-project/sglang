@@ -193,6 +193,9 @@ class AttentionBackend(ABC):
         """Init the global shared states for cuda graph."""
         raise NotImplementedError()
 
+    def validate_elastic_cuda_graph_recapture(self) -> None:
+        return
+
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self,
         forward_batch: ForwardBatch,

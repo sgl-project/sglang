@@ -1776,7 +1776,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
 
 def enable_num_token_non_padded():
-    return get_parallel().moe_ep_size > 1
+    # Elastic joiners also need graph padding masked after joining WORLD.
+    return get_parallel().moe_ep_size > 1 or world_dp_gather_enabled()
 
 
 def build_inner_fb_view(

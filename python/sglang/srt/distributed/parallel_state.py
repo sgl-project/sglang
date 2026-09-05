@@ -314,6 +314,7 @@ class GroupCoordinator:
         # by _tag_groups_for_flashinfer_allreduce_only() after group init.
         self._fi_workspace_hint: Optional[str] = None
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
+        use_local_synchronization = rank_offset > 0 and not recovered_rank
 
         if is_cuda_alike():
             device_id = (
@@ -371,6 +372,7 @@ class GroupCoordinator:
                     pg_options=dev_opts,
                     timeout=subgroup_timeout,
                     group_desc=f"{group_name}:device",
+                    use_local_synchronization=use_local_synchronization,
                 )
                 cpu_group = torch.distributed.new_group(
                     ranks,
@@ -378,6 +380,7 @@ class GroupCoordinator:
                     pg_options=cpu_opts,
                     timeout=subgroup_timeout,
                     group_desc=f"{group_name}:cpu",
+                    use_local_synchronization=use_local_synchronization,
                 )
             else:
                 active_ranks = torch.ones(
@@ -391,6 +394,7 @@ class GroupCoordinator:
                     pg_options=pg_options,
                     timeout=subgroup_timeout,
                     group_desc=f"{group_name}:device",
+                    use_local_synchronization=use_local_synchronization,
                 )
                 # a group with `gloo` backend, to allow direct coordination
                 # between processes through the CPU.
@@ -399,6 +403,7 @@ class GroupCoordinator:
                     backend="gloo",
                     timeout=gloo_timeout,
                     group_desc=f"{group_name}:cpu",
+                    use_local_synchronization=use_local_synchronization,
                 )
             if self.rank in ranks:
                 self.ranks = ranks
@@ -2415,7 +2420,7 @@ def initialize_model_parallel(
     # Joiners construct their local TP/PP layout in global rank space.
     world_size: int = (
         tensor_model_parallel_size * pipeline_model_parallel_size
-        if recovered_rank
+        if recovered_rank or rank_offset > 0
         else torch.distributed.get_world_size()
     )
 
@@ -2504,6 +2509,7 @@ def initialize_model_parallel(
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="dcp",
             recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
         )
         if get_tensor_model_parallel_rank() == 0:
             logger.info(
@@ -2732,6 +2738,8 @@ def initialize_model_parallel(
             backend,
             use_custom_allreduce=False,
             group_name="self_pp",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
         )
 
     get_parallel().stamp_derived_widths(**derived_widths)
