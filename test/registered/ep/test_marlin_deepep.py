@@ -113,6 +113,17 @@ def main():
                 def run():
                     dispatched = dispatcher.dispatch(x, topk)
                     result = fused_experts_deepep_to_marlin(dispatched, local, config)
+                    if not normal:
+                        # Communication padding is unspecified. Poison it to prove
+                        # that eager and captured combine read only valid rows.
+                        capacity = result.hidden_states.shape[1]
+                        padding = (
+                            torch.arange(capacity, device=x.device)[None, :]
+                            >= dispatched.masked_m[:, None]
+                        )
+                        result.hidden_states.masked_fill_(
+                            padding[..., None], float("nan")
+                        )
                     return dispatcher.combine(result)
 
                 with patch.object(

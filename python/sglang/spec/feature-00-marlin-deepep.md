@@ -47,11 +47,16 @@ Normal combine must accept Marlin results independently of DeepGEMM enablement.
 | Routing weights | Marlin applies received weights and reduces local contributions | Marlin computes unweighted expert outputs; DeepEP combine applies original weights |
 | Combine input | One locally reduced result per received token, in received order | Expert-major results in exactly the layout expected by low-latency combine |
 
-The low-latency adapter presents each valid expert row as a single-expert
-Marlin invocation entry with unit routing weight, then restores the
-expert-major output layout. Build IDs and masks on the GPU over fixed-capacity
-buffers; valid counts must not cause host reads or dynamic allocations during
-graph replay. Padding contributes zero and cannot index expert weights.
+The low-latency adapter compacts valid rows into contiguous expert segments
+on the GPU, with unit routing weights. Capacity is bounded by source capacity
+times top-k, rather than reserving source capacity for every expert. Build
+the Marlin block schedule directly from GPU expert counts and choose tiles
+from expected valid rows. The schedule contains only valid local experts;
+unused compact rows are never returned. Restore valid rows to the expert-major
+combine layout in one GPU pass. Communication padding is unspecified and
+must never be read; only rows covered by the dispatcher counts and handle
+contribute to combine. Valid counts must not cause
+host reads or dynamic allocations during graph replay.
 
 Apply each routing weight and the model's routed scaling factor exactly once.
 Preserve the checkpoint's activation, gate/up ordering, clamping, bias, scales,
@@ -61,9 +66,10 @@ the model's existing ownership and are added once.
 
 Weights and quantization metadata belong to the rank's local experts in the
 same order used by dispatch. Never apply a global-to-local expert mapping a
-second time. Empty ranks, empty experts, invalid routes, and zero-token batches
-produce the required empty or zero outputs and still participate in matching
-communication operations.
+second time. Standard EP dispatch also marks non-local routes invalid and
+must select a Marlin kernel that skips those routes. Empty ranks, empty experts, invalid routes, and zero-token batches
+produce the required empty or zero combined outputs and still participate in
+matching communication operations.
 
 Inputs and communication buffers must not be overwritten while in use.
 Marlin scratch storage must remain safe across layers, concurrent work, and
@@ -87,9 +93,12 @@ DeepEP event ordering and handle lifetime.
 
 Reproducible tests and component latency measurements live in
 [evidence/feature-00-marlin-deepep.md](evidence/feature-00-marlin-deepep.md).
-Validation uses deterministic quantized experts and two-rank H200 execution;
-the serving smoke uses a local dummy AWQ model. Pretrained checkpoint loading,
-language quality, and multi-node execution remain unmeasured.
+Validation includes deterministic quantized experts, two-rank H200 execution,
+and HTTP serving of a pinned Qwen3-Coder-30B-A3B AWQ checkpoint. Throughput
+comparisons hold hardware, parallelism, request lengths, and concurrency fixed
+within each pair. Performance remains workload-dependent; support does not
+promise that DeepEP is faster at every batch size. Multi-node execution and
+language-quality benchmarks remain unmeasured.
 
 ## Boundaries
 

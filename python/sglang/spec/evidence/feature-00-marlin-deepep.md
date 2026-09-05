@@ -2,8 +2,9 @@ Status: implemented
 
 # Marlin + DeepEP evidence
 
-TL;DR: Real two-rank H200 execution passes all five quantization families,
-including empty ranks and decode graph replay. Three TP=EP=2 server modes pass.
+TL;DR: Numerical and graph tests pass across five quantization families.
+Actual AWQ server throughput improves with DeepEP at eight-GPU EP scale;
+the two-GPU results remain workload-dependent. All repeated results are below.
 
 ## Environment
 
@@ -31,7 +32,7 @@ CUDA_VISIBLE_DEVICES=4,5 PYTHONPATH=python SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS
 ## Correctness
 
 - Host configuration, dispatcher dtype, and quantization wrappers: 22 passed.
-- Dispatch adapters: 24 passed, covering active one-token inputs, invalid
+- Dispatch adapters: 31 passed, covering active one-token inputs, invalid
   routes, biased experts, supported activations, and graph replay with changing
   valid counts (including all-zero counts).
 - Standard Marlin regressions: 6 passed (26 deselected) in 251.55 seconds,
@@ -40,7 +41,7 @@ CUDA_VISIBLE_DEVICES=4,5 PYTHONPATH=python SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS
   combinations passed. Twenty low-latency captures each replay twice,
   including uneven batches, rank-local expert skew, one empty rank, and
   both empty ranks. The same AUTO dispatcher switches modes.
-- Server normal, low_latency, auto: 3 passed in 148.09 seconds. Each uses
+- Original smoke server normal, low_latency, auto: 3 passed in 148.09 seconds. Each uses
   two tensor/expert-parallel ranks, prefill, and four decode tokens for
   single and unequal two-request batches with decode graphs enabled.
   Pytest reported 18 dependency/process-cleanup warnings, including a
@@ -54,9 +55,14 @@ scales. Reference comparisons use BF16 rounding at GEMM/activation boundaries:
 GPTQ/AWQ/MXFP4 rtol=0.04, atol=0.04; NVFP4 rtol=0.05, atol=0.25,
 plus relative L2 error below 2% for every nonempty comparison. Direct parity
 between two independently rounded kernel outputs allows twice the per-format
-absolute/relative error budget. Masked padding must be exactly zero.
+absolute/relative error budget. Standard masked routes produce zero outputs.
+Low-latency communication padding is unspecified: the adapter tests poison
+input padding, and distributed tests poison output padding with NaNs before
+both eager and captured combine, verifying that only valid rows contribute.
 
-## Component latency
+## Initial component latency (before throughput optimization)
+
+Recorded at `46d7a52a68`, before the valid-row optimizations.
 
 Rank-zero GPU event measurements, milliseconds, average of five iterations
 after one warmup. Synthetic inputs have 17/20 tokens per rank, hidden size
@@ -79,10 +85,100 @@ through combine, not an entire server request.
 | nvfp4 | normal | 0.115 | 0.264 | 0.084 | 0.462 |
 | nvfp4 | low_latency | 0.062 | 0.283 | 0.054 | 0.400 |
 
+## Actual HTTP serving throughput
+
+Checkpoint: [QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ](https://huggingface.co/QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ/tree/c58857a7f41c0920f73d1b56678640f9c02017d7),
+revision `c58857a7f41c0920f73d1b56678640f9c02017d7`. This loads real pretrained
+weights and tokenizer, not the dummy smoke model. It has 48 layers, hidden
+size 2048, MoE intermediate size 768, 128 experts, top-k eight, and AWQ4
+with group size 128 and zero points.
+
+Each pair runs sequentially on the same H200 GPUs in one host (NV18 links
+between every GPU pair). TP=EP=DP=GPU count, DP attention enabled, Marlin
+BF16, Triton attention, decode graphs enabled, prefill graphs disabled,
+normal scheduling overlap enabled, and DeepEP auto mode. The script records
+complete server commands and benchmark JSON, including resolved server args.
+Measured GPU pairs are reserved for their server. One short validation run
+on GPU 2 overlapped the end of the last two-GPU none repetition; that was
+the fastest none repetition, and its median comes from an uncontaminated
+run. The eight-GPU comparisons ran without concurrent validation work.
+
+Fixed random requests: 256 input tokens, 128 output tokens, seed 42,
+unlimited offered request rate, eight request waves, and eight warmup
+requests before each of three repetitions. Prefix cache is flushed after
+warmup by the benchmark client. Each repetition completes 128, 512, or
+1024 requests for concurrency 16, 64, or 128, with exactly the requested
+output token count. Throughput includes HTTP serving, scheduling, prefill,
+and decode. The primary metric is generated output tokens/second; total
+input-plus-output throughput is exactly three times this value here.
+
+Median of all three repetitions, output tokens/s:
+
+| GPUs | Concurrency | none | DeepEP | DeepEP change |
+| --- | ---: | ---: | ---: | ---: |
+| 2 | 16 | 2,132.9 | 2,036.6 | -4.5% |
+| 2 | 64 | 4,344.2 | 4,338.0 | -0.1% |
+| 2 | 128 | 5,496.6 | 5,650.1 | +2.8% |
+| 8 | 128 | 11,887.2 | 14,227.0 | +19.7% |
+
+All repetitions, in execution order (output tokens/s):
+
+| GPUs | Concurrency | Backend | Run 1 | Run 2 | Run 3 |
+| --- | ---: | --- | ---: | ---: | ---: |
+| 2 | 16 | none | 1,999.3 | 2,132.9 | 2,135.2 |
+| 2 | 16 | deepep | 1,892.7 | 2,036.6 | 2,040.2 |
+| 2 | 64 | none | 4,578.7 | 4,344.2 | 4,335.7 |
+| 2 | 64 | deepep | 4,608.4 | 4,325.0 | 4,338.0 |
+| 2 | 128 | none | 5,485.0 | 5,496.6 | 5,507.9 |
+| 2 | 128 | deepep | 5,650.1 | 5,648.0 | 5,655.9 |
+| 8 | 128 | none | 6,840.5 | 11,887.2 | 12,061.4 |
+| 8 | 128 | deepep | 7,478.2 | 14,227.0 | 14,293.4 |
+
+The first eight-GPU run is much slower for both backends, so the range must
+not be hidden behind the median. The two later eight-GPU runs show the same
+throughput advantage. These measurements do not establish a universal win
+at small batch sizes or on every EP configuration.
+
+Reproduce with the checked-in `benchmark/bench_marlin_deepep.py`. The exact
+model snapshot path used here is assigned below. Obtain that revision with
+`huggingface_hub.snapshot_download` if it is not already cached.
+
+```bash
+MARLIN_MODEL=/root/.cache/huggingface/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/snapshots/c58857a7f41c0920f73d1b56678640f9c02017d7
+PYTHONPATH=python /opt/sglang/bin/python benchmark/bench_marlin_deepep.py --model "$MARLIN_MODEL" --backends none --dp-attention --capacity 64 --results /tmp/marlin-throughput/none-final
+PYTHONPATH=python /opt/sglang/bin/python benchmark/bench_marlin_deepep.py --model "$MARLIN_MODEL" --gpus 0,1,2,3,4,5,6,7 --dp-attention --capacity 16 --concurrency 128 --results /tmp/marlin-throughput/eight-gpu
+PYTHONPATH=python /opt/sglang/bin/python benchmark/bench_marlin_deepep.py --model "$MARLIN_MODEL" --backends deepep --dp-attention --capacity 64 --results /tmp/marlin-throughput/deepep-valid-only
+```
+
+Use new result directories when rerunning; the script refuses to overwrite
+benchmark JSON. It starts and stops the HTTP servers itself. Defaults used
+above are concurrency 16/64/128, eight waves, three repetitions, and lengths
+256/128. The eight-GPU command explicitly selects concurrency 128.
+
+## Profiling and fixes
+
+Initial TP=EP=2 runs with TP attention and capacity 128 showed DeepEP behind
+none at every tested concurrency. Profiling identified unnecessary padded
+expert computation, buffer initialization, single-expert reduction, and
+invalid-block scans. The implementation now compacts valid expert segments,
+builds their block schedule directly from GPU counts, selects tiles from
+expected valid rows, and restores only valid output rows. NaN-poisoned
+padding tests verify the DeepEP handle's valid-row contract.
+
+The actual baseline also exposed standard Marlin EP passing non-local `-1`
+routes to a non-EP kernel during graph capture. Both measured backends use
+the corrected common runner; the baseline is not allowed to crash or skip
+valid work. Dedicated one-token and multi-token tests cover this fix.
+
+Three separate greedy sanity prompts (64 generated tokens each) produced
+matching text for none and DeepEP in the two-GPU server checks. This is a
+limited sanity check, not a language-quality evaluation or bitwise logit
+parity claim; selected-token log probabilities differed by up to 0.322.
+
 ## Boundaries
 
-These measurements establish execution and numerical correctness on H200,
-not production throughput or a speedup over another backend. Weights are
-synthetic; the server creates a small local Qwen3 MoE with dummy AWQ weights,
-so there is no external checkpoint revision or language-quality result.
-Full pretrained checkpoint loading and multi-node execution remain unmeasured.
+Results apply to this pinned AWQ model, fixed request lengths, concurrency,
+and single-host H200 setup. The earlier component measurements use synthetic
+weights and the original implementation, and must not be treated as current
+production throughput. Language-quality benchmarks, other pretrained weight
+formats, and multi-node performance remain unmeasured.

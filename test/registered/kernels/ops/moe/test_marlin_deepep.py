@@ -62,10 +62,29 @@ def test_normal(format, tokens):
     )
 
 
+@pytest.mark.parametrize("tokens", [1, 17])
+def test_standard_expert_parallel_masked_routes(tokens):
+    info, matrices = make_experts("awq")
+    config = MoeRunnerConfig(num_experts=8, num_local_experts=4)
+    x = torch.randn(tokens, 256, device="cuda", dtype=torch.bfloat16)
+    ids = torch.randint(0, 4, (tokens, 2), device="cuda", dtype=torch.int32)
+    ids[:, 1] = -1
+    weights = torch.rand(tokens, 2, device="cuda")
+    output = fused_experts_none_to_marlin(
+        StandardDispatchOutput(x, None, StandardTopKOutput(weights, ids, None)),
+        info,
+        config,
+    ).hidden_states
+    assert_reference_close(output, reference(x, ids, weights, matrices, config), "awq")
+
+
 @pytest.mark.parametrize("format", ["gptq4", "gptq8", "awq", "mxfp4", "nvfp4"])
-def test_low_latency_graph(format):
+@pytest.mark.parametrize("scaled", [False, True])
+def test_low_latency_graph(format, scaled):
     info, matrices = make_experts(format, bias=True)
-    config = MoeRunnerConfig(routed_scaling_factor=1.7 if format != "mxfp4" else None)
+    config = MoeRunnerConfig(
+        routed_scaling_factor=1.7 if scaled and format != "mxfp4" else None
+    )
     x = torch.randn(4, 17, 256, device="cuda", dtype=torch.bfloat16)
     counts = torch.tensor([1, 0, 17, 3], device="cuda", dtype=torch.int32)
     ids = torch.tensor([[0, 2]], device="cuda")
@@ -81,19 +100,30 @@ def test_low_latency_graph(format):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = run()
-    for new_counts in ([1, 0, 17, 3], [0, 7, 2, 17], [0, 0, 0, 0]):
+    for new_counts in (
+        [1, 0, 17, 3],
+        [0, 7, 2, 17],
+        [17, 17, 0, 0],
+        [0, 0, 17, 17],
+        [0, 0, 0, 0],
+    ):
         counts.copy_(torch.tensor(new_counts, device="cuda", dtype=torch.int32))
         x.normal_()
         graph.replay()
         eager = run()
-        torch.testing.assert_close(captured, eager, **reference_tolerances(format))
         local_ids = torch.arange(4, device="cuda").repeat_interleave(17).view(-1, 1)
         valid = torch.arange(17, device="cuda")[None, :] < counts[:, None]
         expected = reference(
             x.flatten(0, 1), local_ids, valid.reshape(-1, 1).float(), matrices, config
         ).view_as(x)
-        assert_reference_close(captured, expected, format)
-        assert torch.count_nonzero(captured[~valid]) == 0
+        torch.testing.assert_close(
+            captured[valid], eager[valid], **reference_tolerances(format)
+        )
+        assert_reference_close(captured[valid], expected[valid], format)
+        # Neither expert computation nor combine may depend on input padding.
+        x.masked_fill_(~valid[..., None], float("nan"))
+        graph.replay()
+        assert_reference_close(captured[valid], expected[valid], format)
 
 
 @pytest.mark.parametrize(

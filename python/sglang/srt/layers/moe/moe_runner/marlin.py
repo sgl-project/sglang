@@ -147,6 +147,12 @@ def fused_experts_none_to_marlin(
             topk_output.topk_weights,
             quant_info,
             runner_config,
+            # Standard EP dispatch already maps non-local routes to -1.
+            is_ep=(
+                runner_config.num_local_experts is not None
+                and runner_config.num_experts is not None
+                and runner_config.num_local_experts < runner_config.num_experts
+            ),
         )
     )
 
@@ -159,6 +165,8 @@ def _run_marlin(
     runner_config: MoeRunnerConfig,
     *,
     is_ep: bool = False,
+    expected_m: Optional[int] = None,
+    expert_num_tokens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
     from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
@@ -229,6 +237,8 @@ def _run_marlin(
         activation=runner_config.activation,
         is_gated=runner_config.is_gated,
         is_ep=is_ep,
+        expected_m=expected_m,
+        expert_num_tokens=expert_num_tokens,
     ).to(hidden_states.dtype)
 
     return output
@@ -282,37 +292,82 @@ def validate_deepep_marlin(
 
 
 @triton.jit
-def _deepep_ll_topk_kernel(
+def _deepep_ll_copy_kernel(
+    expert_rows,
+    compact_rows,
     counts,
     ids,
-    weights,
-    capacity: tl.constexpr,
-    BLOCK: tl.constexpr,
+    CAPACITY: tl.constexpr,
+    HIDDEN: tl.constexpr,
+    EXPERTS: tl.constexpr,
+    PACK: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_E: tl.constexpr,
 ):
     expert = tl.program_id(0)
-    row = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    valid = row < tl.load(counts + expert)
-    offset = expert * capacity + row
-    tl.store(ids + offset, tl.where(valid, expert, -1), row < capacity)
-    tl.store(weights + offset, tl.where(valid, 1.0, 0.0), row < capacity)
+    row = tl.program_id(1) * 8 + tl.arange(0, 8)
+    experts = tl.arange(0, BLOCK_E)
+    sizes = tl.load(counts + experts, experts < EXPERTS, 0)
+    start = tl.sum(tl.where(experts < expert, sizes, 0))
+    valid = (row < CAPACITY) & (row < tl.load(counts + expert))
+    col = tl.arange(0, BLOCK_H)
+    expert_offset = (expert * CAPACITY + row[:, None]) * HIDDEN + col[None, :]
+    compact_offset = (start + row[:, None]) * HIDDEN + col[None, :]
+    mask = valid[:, None] & (col[None, :] < HIDDEN)
+    if PACK:
+        value = tl.load(expert_rows + expert_offset, mask, 0)
+        tl.store(compact_rows + compact_offset, value, mask)
+        tl.store(ids + start + row, expert, valid)
+    else:
+        value = tl.load(compact_rows + compact_offset, mask, 0)
+        # DeepEP combine reads only dispatched rows through its handle.
+        tl.store(expert_rows + expert_offset, value, mask)
 
 
-def _deepep_ll_topk(hidden_states: torch.Tensor, masked_m: torch.Tensor):
-    """Describe expert-major rows without reading valid counts on the host."""
-    experts, capacity, _ = hidden_states.shape
-    ids = torch.empty(
-        (experts * capacity, 1), device=hidden_states.device, dtype=torch.int32
-    )
-    weights = torch.empty_like(ids, dtype=torch.float32)
+def _deepep_ll_pack(hidden_states: torch.Tensor, masked_m: torch.Tensor, topk: int):
+    """Compact valid expert rows into a graph-safe worst-case routing capacity."""
+    experts, capacity, hidden = hidden_states.shape
+    # Capacity already includes all source ranks. A source token visits at
+    # most topk experts, so allocating capacity for every expert wastes space.
+    rows = capacity * min(experts, topk)
+    compact = hidden_states.new_empty((rows, hidden))
+    ids = torch.full((rows, 1), -1, device=hidden_states.device, dtype=torch.int32)
+    weights = torch.ones((rows, 1), device=hidden_states.device, dtype=torch.float32)
     if capacity:
-        _deepep_ll_topk_kernel[(experts, triton.cdiv(capacity, 256))](
+        _deepep_ll_copy_kernel[(experts, triton.cdiv(capacity, 8))](
+            hidden_states,
+            compact,
             masked_m,
             ids,
-            weights,
             capacity,
-            BLOCK=256,
+            hidden,
+            experts,
+            True,
+            triton.next_power_of_2(hidden),
+            triton.next_power_of_2(experts),
         )
-    return ids, weights
+    return compact, ids, weights
+
+
+def _deepep_ll_unpack(
+    compact: torch.Tensor, hidden_states: torch.Tensor, counts: torch.Tensor
+):
+    output = torch.empty_like(hidden_states)
+    experts, capacity, hidden = hidden_states.shape
+    if capacity:
+        _deepep_ll_copy_kernel[(experts, triton.cdiv(capacity, 8))](
+            output,
+            compact,
+            counts,
+            counts,
+            capacity,
+            hidden,
+            experts,
+            False,
+            triton.next_power_of_2(hidden),
+            triton.next_power_of_2(experts),
+        )
+    return output
 
 
 @register_fused_func("deepep", "marlin")
@@ -352,21 +407,23 @@ def fused_experts_deepep_to_marlin(
             dispatch_output.topk_weights,
         )
     if dispatch_output.format == DispatchOutputFormat.DEEPEP_LL:
-        topk_ids, topk_weights = _deepep_ll_topk(
-            hidden_states, dispatch_output.masked_m
+        compact, topk_ids, topk_weights = _deepep_ll_pack(
+            hidden_states, dispatch_output.masked_m, dispatch_output.topk_ids.shape[1]
         )
         output = _run_marlin(
-            hidden_states.reshape(-1, hidden_states.shape[-1]),
+            compact,
             topk_ids,
             topk_weights,
             quant_info,
             runner_config,
             is_ep=True,
+            expected_m=dispatch_output.expected_m,
+            expert_num_tokens=dispatch_output.masked_m,
         )
         # DeepEP applies the original routing weights while combining. These
         # expert outputs were computed with unit weights, not the source top-k.
         return DeepEPLLCombineInput(
-            output.view(hidden_states.shape),
+            _deepep_ll_unpack(output, hidden_states, dispatch_output.masked_m),
             dispatch_output.topk_ids,
             dispatch_output.topk_weights,
         )
