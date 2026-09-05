@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from enum import Enum
 from functools import lru_cache, partial
 from typing import Callable, List, Optional, Tuple, Union
@@ -107,6 +108,18 @@ _FORCE_CK_W8A8: bool = False
 def set_force_ck_w8a8(enabled: bool = True) -> None:
     global _FORCE_CK_W8A8
     _FORCE_CK_W8A8 = enabled
+
+
+# Ask the per-group quant kernel to write bpreshuffle's scale layout directly
+# instead of transposing its output afterwards. The post-kernel transpose moves
+# only a few hundred scale elements but costs a full kernel launch, and it fired
+# 213 times per decode step. Gated so both paths live in one binary and can be
+# A/B'd by env var alone; the two layouts were verified bit-identical. Default
+# off pending isolated validation, including a non-DSV4 gfx95 smoke test since
+# this path also affects generic gfx95 AITER call sites; set to 1 to enable.
+_NATIVE_BPRESHUFFLE_SCALE: bool = (
+    os.environ.get("SGLANG_OPT_NATIVE_BPRESHUFFLE_SCALE", "0") == "1"
+)
 
 
 def materialize_bpreshuffle_fp8_scale(scale: torch.Tensor) -> torch.Tensor:

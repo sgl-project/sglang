@@ -73,6 +73,52 @@ def _jit_compress_norm_rope_module(
 
 
 @cache_once
+def _jit_fused_compress4_norm_rope_module(
+    head_dim: int,
+    dtype_buffer: torch.dtype,
+    dtype_in: torch.dtype,
+    dtype: torch.dtype,
+    page_size: int,
+    bf16_store: bool,
+) -> Module:
+    # dtype_in is the compute dtype and the dtype of `ape`.
+    if head_dim == 128:
+        # Indexer variant: head_dim is fixed in the kernel, and the store is
+        # always fp8 (bf16_store is a flashmla-only option).
+        args = make_cpp_args(
+            dtype_buffer,
+            dtype_in,
+            dtype,
+            page_size,
+            is_arch_support_pdl(),
+            (
+                INDEXER_K_CACHE_PRESHUFFLE_TILE
+                if aiter_can_use_preshuffle_paged_mqa()
+                else 0
+            ),
+        )
+        kernel_class = f"FusedCompress4NormRopeIndexerKernel<{args}>"
+    else:
+        args = make_cpp_args(
+            head_dim,
+            dtype_buffer,
+            dtype_in,
+            dtype,
+            page_size,
+            is_arch_support_pdl(),
+            bf16_store,
+        )
+        kernel_class = f"FusedCompress4NormRopeKernel<{args}>"
+    return load_jit(
+        make_name(f"fused_compress4_norm_rope_{head_dim}"),
+        *args,
+        cuda_files=["deepseek_v4/fused_compress4_norm_rope_hip.cuh"],
+        cuda_wrappers=[("decode", f"{kernel_class}::run_decode")],
+        extra_cuda_cflags=["-use_fast_math"],
+    )
+
+
+@cache_once
 def _jit_compress_module(
     head_dim: int,
     dtype_buffer: torch.dtype,
@@ -416,6 +462,54 @@ def compress_forward(
         ape = ape.to(dtype=kv_score_input.dtype)
     fn(kv_score_buffer, kv_score_input, out, ape, *plan[1:3])
     return out
+
+
+def compress_forward_norm_rope_store(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    ape: torch.Tensor,
+    plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
+    *,
+    head_dim: int,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    freq_cis: torch.Tensor,
+    out_loc: torch.Tensor,
+    kvcache: torch.Tensor,
+    page_size: int,
+    bf16_store: bool = False,
+) -> None:
+    """compress_forward + compress_norm_rope_store in a single launch.
+
+    Covers both c4 decode pairings: head_dim 512 (flashmla epilogue) and 128
+    (indexer epilogue). The compressed row they would otherwise write is a
+    temporary with no other consumer, so the fused kernel keeps it in registers
+    and the epilogue reads it from there. That also means the result is not
+    bit-identical to the two-kernel chain, which rounds that row to bf16 on the
+    way out: measured at up to ~1e-4 of fp8 codes differing, by one code.
+    """
+    assert plan.is_decode and plan.compress_ratio == 4 and head_dim in (128, 512)
+    freq_cis = torch.view_as_real(freq_cis).flatten(-2)
+    module = _jit_fused_compress4_norm_rope_module(
+        head_dim,
+        kv_score_buffer.dtype,
+        ape.dtype,
+        norm_weight.dtype,
+        page_size,
+        bf16_store,
+    )
+    module.decode(
+        kv_score_buffer,
+        kv_score_input,
+        ape,
+        plan[1],
+        norm_weight,
+        norm_eps,
+        freq_cis,
+        out_loc,
+        kvcache,
+        plan.compress_ratio,
+    )
 
 
 def compress_norm_rope_store(
