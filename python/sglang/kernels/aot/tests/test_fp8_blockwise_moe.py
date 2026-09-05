@@ -101,7 +101,7 @@ def is_sm90_supported(device=None) -> bool:
 
 @pytest.mark.skipif(
     not (is_blackwell_supported() or is_sm90_supported()),
-    reason="fp8_blockwise_scaled_grouped_mm at sgl-kernel is only supported on sm100 or sm90",
+    reason="fp8_blockwise_scaled_grouped_mm at sgl-kernel is only supported on sm90, sm100, or sm120",
 )
 @pytest.mark.parametrize("num_experts", [8, 16, 32, 64, 128])
 @pytest.mark.parametrize("out_dtype", [torch.half, torch.bfloat16])
