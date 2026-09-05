@@ -981,7 +981,10 @@ class DeepseekV4HipRadixBackend(
             indexer_metadata.c4_seq_lens,
             workspace=metadata.fp4_prefill_workspace,
         )
-        if self.use_aiter_fp4_streaming_topk:
+        if self.use_aiter_fp4_streaming_topk and forward_batch.forward_mode in (
+            ForwardMode.EXTEND,
+            ForwardMode.MIXED,
+        ):
             from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
                 prepare_fp4_streaming_topk_scratch,
             )

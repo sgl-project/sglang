@@ -856,7 +856,7 @@ def test_streaming_topk_writes_raw_and_physical_indices(topk: int) -> None:
         prefill_ws=workspace,
     ).clone()
 
-    aiter_fp4_paged_mqa_topk(
+    scratch = aiter_fp4_paged_mqa_topk(
         q_fp4=case["q_fp4"],
         q_scale=case["q_scale"],
         k_payload=case["payload"],
@@ -870,6 +870,34 @@ def test_streaming_topk_writes_raw_and_physical_indices(topk: int) -> None:
         prefill_workspace=workspace,
     )
     torch.cuda.synchronize()
+    scratch_ptrs = (
+        scratch.values.data_ptr(),
+        scratch.raw_indices.data_ptr(),
+        scratch.counts.data_ptr(),
+        scratch.workspace.candidate_values.data_ptr(),
+    )
+    reused = aiter_fp4_paged_mqa_topk(
+        q_fp4=case["q_fp4"],
+        q_scale=case["q_scale"],
+        k_payload=case["payload"],
+        k_scale=case["scale"],
+        weights=case["weights"],
+        page_table=case["page_table"],
+        c4_seq_lens=case["c4_seq_lens"],
+        weight_scale=case["weight_scale"],
+        out_page_indices=out_page_indices,
+        out_raw_indices=out_raw_indices,
+        prefill_workspace=workspace,
+        streaming_scratch=scratch,
+    )
+    torch.cuda.synchronize()
+    assert reused is scratch
+    assert scratch_ptrs == (
+        reused.values.data_ptr(),
+        reused.raw_indices.data_ptr(),
+        reused.counts.data_ptr(),
+        reused.workspace.candidate_values.data_ptr(),
+    )
 
     for row, context in enumerate(contexts):
         valid = min(context, topk)
