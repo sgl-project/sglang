@@ -186,7 +186,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         q_pe: torch.Tensor,
         k_nope: torch.Tensor,
         k_pe: torch.Tensor,
-        cos_sin_cache: torch.Tensor,
+        cos_sin_cache: Optional[torch.Tensor],
         positions: torch.Tensor,
         is_neox: bool,
         qk_nope_head_dim: int,
@@ -194,6 +194,11 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Fused RoPE + FP8 quantize that also packs nope+pe along the last
         dim, so FMHA consumes contig FP8 Q/K without an extra concat or cast.
+
+        ``cos_sin_cache`` is None for NoPE layers (models built with
+        ``skip_rope``, e.g. Kimi Linear / Kimi-K3 MLA). Those keep the FP8
+        quantize and the packed layout, only the rotation is dropped —
+        mirroring the ``cos_sin_cache is None`` branch in :meth:`forward_decode`.
         """
         num_heads = q_nope.shape[1]
         seq_len = q_nope.shape[0]
@@ -217,6 +222,14 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             k_pe_expanded = k_pe.expand(-1, num_heads, -1)
         else:
             k_pe_expanded = k_pe
+
+        if cos_sin_cache is None:
+            # NoPE layer: quantize straight into the packed buffers.
+            q_fp8[..., :qk_nope_head_dim].copy_(q_nope)
+            q_fp8[..., qk_nope_head_dim:].copy_(q_pe)
+            k_fp8[..., :qk_nope_head_dim].copy_(k_nope)
+            k_fp8[..., qk_nope_head_dim:].copy_(k_pe_expanded)
+            return q_fp8, k_fp8
 
         _flashinfer_rope.mla_rope_quantize_fp8(
             q_rope=q_pe,
@@ -262,7 +275,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             q_pe=q_pe,
             k_nope=k_nope,
             k_pe=k_pe,
-            cos_sin_cache=layer.rotary_emb.cos_sin_cache,
+            cos_sin_cache=getattr(layer.rotary_emb, "cos_sin_cache", None),
             positions=positions,
             is_neox=getattr(layer.rotary_emb, "is_neox_style", True),
             qk_nope_head_dim=layer.qk_nope_head_dim,
