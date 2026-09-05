@@ -278,6 +278,7 @@ class Gemma3Attention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         forward_batch: ForwardBatch,
+        is_last_layer: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
@@ -302,12 +303,109 @@ class Gemma3Attention(nn.Module):
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
 
-        attn_output = self.attn(q, k, v, forward_batch=forward_batch)
+        can_optimize = (
+            is_last_layer
+            and forward_batch.forward_mode.is_extend()
+            and forward_batch.extend_seq_lens is not None
+            and not forward_batch.return_logprob
+            and not (
+                forward_batch.capture_hidden_mode
+                and forward_batch.capture_hidden_mode.is_full()
+            )
+            and not (
+                forward_batch.spec_info
+                and getattr(forward_batch.spec_info, "is_ragged_verify", False)
+            )
+        )
 
-        # Compatible with triton backend which returns [1, s, h, head_dim]
-        if attn_output.dim() == 4 and attn_output.shape[0] == 1:
-            attn_output = attn_output.squeeze(0)
-            attn_output = attn_output.flatten(-2, -1)
+        if can_optimize:
+            # 1. Save KV cache into SGLang memory pool for subsequent decode steps
+            try:
+                self.attn.save_kv_cache_only(k, v, forward_batch)
+            except Exception:
+                _ = self.attn(q, k, v, forward_batch=forward_batch, save_kv_cache=True)
+
+            # 2. Compute Single-Query Attention on terminal token(s)
+            num_groups = self.num_heads // self.num_kv_heads
+            q_sq = q.squeeze(0) if q.dim() == 4 else q
+            k_sq = k.squeeze(0) if k.dim() == 4 else k
+            v_sq = v.view(-1, self.num_kv_heads, self.head_dim)
+
+            if forward_batch.extend_seq_lens.shape[0] == 1:
+                # Optimized fast path for single sequence (B=1)
+                q_b = (
+                    q_sq[-1:]
+                    .view(1, 1, self.num_heads, self.head_dim)
+                    .transpose(1, 2)
+                )
+                k_b = (
+                    k_sq.view(1, -1, self.num_kv_heads, self.head_dim).transpose(
+                        1, 2
+                    )
+                )
+                v_b = (
+                    v_sq.view(1, -1, self.num_kv_heads, self.head_dim).transpose(
+                        1, 2
+                    )
+                )
+                if num_groups > 1:
+                    k_b = k_b.repeat_interleave(num_groups, dim=1)
+                    v_b = v_b.repeat_interleave(num_groups, dim=1)
+                attn_output = (
+                    F.scaled_dot_product_attention(
+                        q_b, k_b, v_b, is_causal=False, scale=self.scaling
+                    )
+                    .transpose(1, 2)
+                    .reshape(1, -1)
+                )
+            else:
+                last_token_indices = (
+                    torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+                )
+                start_indices = torch.cat(
+                    [
+                        torch.zeros(1, dtype=torch.long, device=q.device),
+                        last_token_indices[:-1] + 1,
+                    ]
+                )
+                outs = []
+                for start_idx, end_idx in zip(
+                    start_indices, last_token_indices + 1
+                ):
+                    q_b = (
+                        q_sq[end_idx - 1 : end_idx]
+                        .view(1, 1, self.num_heads, self.head_dim)
+                        .transpose(1, 2)
+                    )
+                    k_b = (
+                        k_sq[start_idx:end_idx]
+                        .view(1, -1, self.num_kv_heads, self.head_dim)
+                        .transpose(1, 2)
+                    )
+                    v_b = (
+                        v_sq[start_idx:end_idx]
+                        .view(1, -1, self.num_kv_heads, self.head_dim)
+                        .transpose(1, 2)
+                    )
+                    if num_groups > 1:
+                        k_b = k_b.repeat_interleave(num_groups, dim=1)
+                        v_b = v_b.repeat_interleave(num_groups, dim=1)
+                    out_b = (
+                        F.scaled_dot_product_attention(
+                            q_b, k_b, v_b, is_causal=False, scale=self.scaling
+                        )
+                        .transpose(1, 2)
+                        .reshape(1, -1)
+                    )
+                    outs.append(out_b)
+                attn_output = torch.cat(outs, dim=0)
+        else:
+            attn_output = self.attn(q, k, v, forward_batch=forward_batch)
+
+            # Compatible with triton backend which returns [1, s, h, head_dim]
+            if attn_output.dim() == 4 and attn_output.shape[0] == 1:
+                attn_output = attn_output.squeeze(0)
+                attn_output = attn_output.flatten(-2, -1)
         # [s, h * head_dim]
 
         output, _ = self.o_proj(attn_output)
@@ -319,6 +417,7 @@ class Gemma3Attention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         forward_batch: ForwardBatch,
+        is_last_layer: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         if _is_cpu and _is_cpu_amx_available:
@@ -326,7 +425,12 @@ class Gemma3Attention(nn.Module):
                 positions, hidden_states, position_embeddings, forward_batch, **kwargs
             )
         return self.forward_native(
-            positions, hidden_states, position_embeddings, forward_batch, **kwargs
+            positions,
+            hidden_states,
+            position_embeddings,
+            forward_batch,
+            is_last_layer=is_last_layer,
+            **kwargs,
         )
 
 
@@ -378,6 +482,7 @@ class Gemma3DecoderLayer(nn.Module):
         position_embeddings_local: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor] = None,
+        is_last_layer: bool = False,
         **kwargs,
     ) -> tuple[
         torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]
@@ -402,9 +507,32 @@ class Gemma3DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
             forward_batch=forward_batch,
+            is_last_layer=is_last_layer,
             **kwargs,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
+
+        can_optimize = (
+            is_last_layer
+            and forward_batch.forward_mode.is_extend()
+            and forward_batch.extend_seq_lens is not None
+            and not forward_batch.return_logprob
+            and not (
+                forward_batch.capture_hidden_mode
+                and forward_batch.capture_hidden_mode.is_full()
+            )
+            and not (
+                forward_batch.spec_info
+                and getattr(forward_batch.spec_info, "is_ragged_verify", False)
+            )
+        )
+
+        if can_optimize:
+            last_token_indices = (
+                torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+            )
+            residual = residual[last_token_indices]
+
         hidden_states, residual = self.pre_feedforward_layernorm(
             hidden_states, residual
         )
@@ -641,6 +769,7 @@ class Gemma3TextModel(PreTrainedModel):
             for i, layer in enumerate(self.layers):
                 if i in self.layers_to_capture:
                     aux_hidden_states.append(hidden_states)
+                is_last_layer = i == num_layers - 1
                 hidden_states, residual = layer(
                     positions=positions,
                     position_embeddings_global=None,
@@ -648,6 +777,7 @@ class Gemma3TextModel(PreTrainedModel):
                     hidden_states=hidden_states,
                     forward_batch=forward_batch,
                     residual=residual,
+                    is_last_layer=is_last_layer,
                     **kwargs,
                 )
         else:
@@ -659,6 +789,7 @@ class Gemma3TextModel(PreTrainedModel):
             for i, layer in enumerate(self.layers):
                 if i in self.layers_to_capture:
                     aux_hidden_states.append(hidden_states)
+                is_last_layer = i == num_layers - 1
                 hidden_states, residual = layer(
                     positions=positions,
                     position_embeddings_global=position_embeddings_global,
@@ -666,6 +797,7 @@ class Gemma3TextModel(PreTrainedModel):
                     hidden_states=hidden_states,
                     forward_batch=forward_batch,
                     residual=residual,
+                    is_last_layer=is_last_layer,
                     **kwargs,
                 )
 
