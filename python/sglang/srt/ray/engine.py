@@ -242,6 +242,12 @@ class RayEngine(Engine):
         self._placement_group = kwargs.pop("placement_group", None)
         if "log_level" not in kwargs:
             kwargs["log_level"] = "error"
+        # Schedulers are separate Ray actors; default to the Ray-backed
+        # collectors so enable_metrics reaches Ray's Prometheus endpoint.
+        if kwargs.get("enable_metrics") and kwargs.get("stat_loggers") is None:
+            from sglang.srt.observability.ray_wrappers import build_ray_stat_loggers
+
+            kwargs["stat_loggers"] = build_ray_stat_loggers()
         super().__init__(server_args=ServerArgs(**kwargs))
 
     def shutdown(self):
