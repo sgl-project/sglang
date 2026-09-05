@@ -1442,6 +1442,7 @@ def init_unified_mamba_pools(
     use_mla_backend: bool,
     kv_lora_rank: Optional[int] = None,
     qk_rope_head_dim: Optional[int] = None,
+    fused_draft: Optional[FusedDraftPlacement] = None,
     mamba_layer_ids: List[int],
     full_attention_layer_ids: List[int],
     mamba2_cache_params,
@@ -1481,6 +1482,10 @@ def init_unified_mamba_pools(
             "init_unified_mamba_pools: draft workers (speculative decoding) are "
             "not supported with the MLA unified pool"
         )
+        assert fused_draft is None, (
+            "init_unified_mamba_pools: the MLA full sub-pool does not carry a "
+            "fused draft region yet"
+        )
         full_spec = MLASubPoolSpec(
             name="full",
             layer_num=len(full_attention_layer_ids),
@@ -1498,6 +1503,7 @@ def init_unified_mamba_pools(
             store_dtype=store_dtype,
             kv_cache_dtype=kv_cache_dtype,
             grow_direction="down",
+            draft_region=None if fused_draft is None else fused_draft.region,
         )
     cp = mamba2_cache_params
     mamba_spec = MambaSubPoolSpec(
@@ -1540,6 +1546,7 @@ def init_unified_mamba_pools(
         device=device,
         enable_memory_saver=enable_memory_saver,
         page_size=page_size,
+        fused_draft=fused_draft,
     )
     req_to_token_pool = UnifiedHybridReqToTokenPool(
         unified_buffer=shared_pool,
@@ -2167,6 +2174,7 @@ def init_unified_mamba_swa_pools(
     unified_total_bytes: Optional[int] = None,
     sliding_window_size: Optional[int] = None,
     decode_pre_alloc_size: int = 0,
+    fused_draft: Optional[FusedDraftPlacement] = None,
 ) -> UnifiedPoolBundle:
     """Build the TRI-pool unified-memory-pool stack for models with full KV +
     SWA KV + mamba/conv state (Inkling-class: `mambaish_config` AND
@@ -2182,7 +2190,8 @@ def init_unified_mamba_swa_pools(
 
     Sizing inputs are the same token counts the 2-pool factories take (ratio-
     fed until the byte configurator lands); the buffer budget is their byte
-    sum and the runtime split floats.
+    sum and the runtime split floats. With ``fused_draft``, every entry of the
+    "full" sub-pool carries the draft's parts, as in the 2-pool factories.
     """
     from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
         UnifiedMambaSWATokenToKVPoolAllocator,
@@ -2209,6 +2218,7 @@ def init_unified_mamba_swa_pools(
         store_dtype=store_dtype,
         kv_cache_dtype=kv_cache_dtype,
         grow_direction="down",
+        draft_region=None if fused_draft is None else fused_draft.region,
     )
     swa_spec = MHASubPoolSpec(
         name="swa",
@@ -2270,6 +2280,7 @@ def init_unified_mamba_swa_pools(
         device=device,
         enable_memory_saver=enable_memory_saver,
         page_size=page_size,
+        fused_draft=fused_draft,
     )
     token_to_kv_pool = UnifiedSWAKVPool(
         unified_buffer=shared_pool,
