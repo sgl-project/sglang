@@ -25,30 +25,20 @@ if is_npu():
 def resolve_npu_state_layout_draft_tokens(
     speculative_num_draft_tokens: Optional[int],
 ) -> Optional[int]:
-    """Resolve the draft width that controls persistent NPU state layout.
+    """Resolve the draft width for persistent NPU state layout.
 
-    PD prefill has no DSPARK worker, but its conv window and temporal layout
-    must match Decode. Infer Decode's verify width (gamma+1) from the shared
-    block-size knob without enabling DSPARK or allocating verify scratch.
+    PD prefill has no draft count, so infer Decode's verify width from the
+    shared DSPARK block size without enabling speculative execution.
     """
     if speculative_num_draft_tokens is not None:
         return speculative_num_draft_tokens
 
-    from sglang.srt.runtime_context import (
-        get_disagg,
-        get_spec,
-        max_speculative_num_draft_tokens,
-    )
+    from sglang.srt.runtime_context import get_disagg, get_spec
 
     if get_disagg().disaggregation_mode != "prefill":
         return None
-    n = max_speculative_num_draft_tokens()
-    if n is not None:
-        return n
     gamma = get_spec().speculative_dspark_block_size
-    if gamma is not None:
-        return int(gamma) + 1
-    return None
+    return int(gamma) + 1 if gamma is not None else None
 
 
 def _init_npu_conv_state(

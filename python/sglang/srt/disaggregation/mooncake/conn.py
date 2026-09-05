@@ -1374,11 +1374,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         "prefill and decode must both enable it and use equal "
                         "attention TP sizes."
                     )
-                if (
-                    target_rank_registration_info is not None
-                    and self.attn_tp_size
-                    != target_rank_registration_info.dst_attn_tp_size
-                ):
+                if need_tp_slice:
                     rc = (
                         self._send_mamba_state_slice(
                             req,

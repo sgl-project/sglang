@@ -15,7 +15,6 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
-from sglang.srt.disaggregation.utils import build_transfer_entry_pairs
 from sglang.srt.utils.network import get_local_ip_auto
 
 logger = logging.getLogger(__name__)
