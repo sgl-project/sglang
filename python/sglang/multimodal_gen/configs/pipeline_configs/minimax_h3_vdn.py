@@ -7,7 +7,10 @@ from dataclasses import dataclass
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 
 
 @dataclass
@@ -30,10 +33,14 @@ class VDNH3PipelineConfig(MiniMaxH3PipelineConfig):
                 "not apply. FL2VA and Ref2VA tasks were not trained; use "
                 "MiniMaxAI/MiniMax-H3 for those."
             )
-        # an unset backend would resolve to the platform default (dense FA)
-        if server_args.quantization == "fp8":
-            # online MXFP8 on cuBLASLt: 0.93 s/NFE on 8x B200 vs 1.05 per-channel
+        quantization = (server_args.quantization or "").lower()
+        if quantization in ("none", "bf16"):
+            server_args.quantization = None
+        elif current_platform.is_blackwell() and quantization in ("", "fp8"):
+            # the default: online MXFP8 on cuBLASLt, 0.93 s/NFE on 8x B200 against
+            # 1.05 per-channel fp8; the block-scaled GEMM needs SM100
             server_args.quantization = "mxfp8"
+        # an unset backend would resolve to the platform default (dense FA)
         if server_args.attention_backend is None and not (
             server_args.component_attention_backends or {}
         ).get("transformer"):

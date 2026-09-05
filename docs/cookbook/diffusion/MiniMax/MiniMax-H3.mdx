@@ -789,9 +789,10 @@ these weights would silently skip the linear branch and the softmax gates and
 produce the wrong model, so it is rejected. The window softmax runs as a union
 of dense FlashAttention varlen calls, exact to bf16 rounding. The
 linear branch runs on fused Triton kernels (temporal conv + SiLU + L2 norm,
-statistics prologue, gated RMSNorm epilogue). Online `--quantization fp8`
-quantizes the projections and feed-forward as for base H3; the gates, beta,
-alpha and the conv stay bf16. Ulysses sequence parallelism is supported;
+statistics prologue, gated RMSNorm epilogue). On Blackwell the transformer
+defaults to online MXFP8 (`--quantization fp8` selects it too, `--quantization
+bf16` opts out); the gates, beta, alpha and the conv stay bf16. Before SM100
+`--quantization fp8` is the per-channel fp8 path of base H3. Ulysses sequence parallelism is supported;
 `--model-variant`, `quality: "high"`, `--ring-degree` greater than 1,
 `torch.compile`, and breakable CUDA graph execution are rejected. See
 [Attention Backends](/docs/sglang-diffusion/attention_backends) for the
@@ -1393,9 +1394,9 @@ and the same clip length:
 | SGLang, BF16, 1× B200, DiT layerwise offload (auto policy) | 7.86 | 64.1 s | 9.5 s | 147,608 MB |
 | SGLang, FP8, 1× B200, DiT layerwise offload (auto policy) | 7.49 | 61.7 s | 9.4 s | 111,616 MB |
 | SGLang, FP8, 1× B200, DiT resident (`--layerwise-offload-components text_encoder`) | 7.49 | 61.1 s | 9.3 s | 63,922 MB |
-| SGLang, BF16, 4× B200 Ulysses4, `--performance-mode speed`, served-shape warmup | **2.53** | **20.3 s** | 3.5 s | 97,894 MB |
+| SGLang, `--quantization bf16`, 4× B200 Ulysses4, `--performance-mode speed`, served-shape warmup | **2.53** | **20.3 s** | 3.5 s | 97,894 MB |
 | SGLang, FP8, 4× B200 Ulysses4, `--performance-mode speed`, served-shape warmup | **2.34** | **18.7 s** | 3.4 s | 63,022 MB |
-| SGLang, `--quantization fp8` (mapped to online `mxfp8`), 8× B200 Ulysses8, `--performance-mode speed`, served-shape warmup | **0.93** | **7.45 s** | 1.5 s | 77,704 MB |
+| SGLang default (online `mxfp8`), 8× B200 Ulysses8, `--performance-mode speed`, served-shape warmup | **0.93** | **7.45 s** | 1.5 s | 77,704 MB |
 | SGLang, per-channel fp8 weight scales (the online `fp8` path of other models), 8× B200 Ulysses8 | 1.05 | 8.4 s | 1.5 s | 76,828 MB |
 
 On 8× B200 the SGLang Ulysses8 path runs the paper workload at 0.93 s/NFE
@@ -1409,8 +1410,8 @@ chunk boundaries), q/k/v and the per-head scalars travel as four async
 field-major all-to-alls that land contiguous (no relayout copies for the
 window K/V gathers or the branch's conv), only the 128-wide output-gate
 hidden crosses the fabric (the gate's `up` runs on the head shard), the frame
-mean is a reshape-sum instead of an atomic index_add, and `--quantization
-fp8` selects online `mxfp8` (e4m3 with one E8M0 scale per 32 elements into
+mean is a reshape-sum instead of an atomic index_add, and the transformer
+runs online `mxfp8` by default (e4m3 with one E8M0 scale per 32 elements into
 cuBLASLt's block-scaled GEMM; the activation quant is fused into the adaLN
 modulation and SwiGLU producers, so no standalone quant pass runs; the
 per-tensor fp8 variant measured 0.965 s/NFE). The prompt's text state joins

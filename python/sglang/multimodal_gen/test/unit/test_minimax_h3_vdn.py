@@ -117,11 +117,28 @@ def test_vdn_h3_pipeline_config_rejections() -> None:
         config.validate_server_args(_server_args(enable_breakable_cuda_graph=True))
     with pytest.raises(ValueError, match="no.*audited high-quality deployment"):
         config.validate_quality_deployment(server_args=None)
-    # defaults: the hybrid backend, and online mxfp8 for --quantization fp8
-    args = _server_args(quantization="fp8")
+    args = _server_args()
     config.validate_server_args(args)
     assert args.attention_backend == "hybrid_window_attn_h3"
-    assert args.quantization == "mxfp8"
+
+
+def test_vdn_h3_quantization_defaults_to_mxfp8_on_blackwell(monkeypatch) -> None:
+    """Online MXFP8 is the default on SM100+ and what `fp8` maps to there;
+    `bf16` opts out; before SM100 the block-scaled GEMM does not exist, so an
+    unset flag stays bf16 and `fp8` stays the per-channel path."""
+    from sglang.multimodal_gen.configs.pipeline_configs import minimax_h3_vdn as module
+
+    def resolved(quantization: str | None, blackwell: bool) -> str | None:
+        monkeypatch.setattr(module.current_platform, "is_blackwell", lambda: blackwell)
+        args = _server_args(quantization=quantization)
+        VDNH3PipelineConfig().validate_server_args(args)
+        return args.quantization
+
+    assert resolved(None, True) == "mxfp8"
+    assert resolved("fp8", True) == "mxfp8"
+    assert resolved("bf16", True) is None
+    assert resolved(None, False) is None
+    assert resolved("fp8", False) == "fp8"
 
 
 def test_hybrid_arch_config_from_transform_config_and_mapping() -> None:
