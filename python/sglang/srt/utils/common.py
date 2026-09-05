@@ -3077,6 +3077,8 @@ class SafeUnpickler(pickle.Unpickler):
         ("builtins", "eval"),
         ("builtins", "exec"),
         ("builtins", "compile"),
+        ("builtins", "__import__"),
+        ("builtins", "getattr"),
         ("os", "system"),
         ("subprocess", "Popen"),
         ("subprocess", "run"),
