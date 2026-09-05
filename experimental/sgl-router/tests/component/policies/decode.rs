@@ -9,7 +9,8 @@
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::admission::{resolve_decode, CandidateDomain, DecisionReason};
 use sgl_router::policies::decode::{
-    DecodePolicy, DecodePowerOfTwoPolicy, DecodeSelectionContext, LegacyHostAffinityDecodePolicy,
+    resolve_decode_with_capacity_fallback, DecodePolicy, DecodePowerOfTwoPolicy,
+    DecodeSelectionContext, LegacyHostAffinityDecodePolicy,
 };
 use sgl_router::policies::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
 use sgl_router::policies::SelectionProposal;
@@ -130,4 +131,23 @@ fn decode_guard_can_escape_a_primary_to_lower_dynamic_pressure_backup() {
 
     assert_eq!(decision.selected.id, backup.id);
     assert_eq!(decision.reason, DecisionReason::BackupPressureGuard);
+}
+
+#[test]
+fn decode_all_capacity_rejected_falls_back_to_power_of_two_within_domain() {
+    let primary = worker("primary");
+    let backup = worker("backup");
+    let workers = vec![Arc::clone(&primary), Arc::clone(&backup)];
+    let domain = CandidateDomain::global_decode(&workers);
+    let loads = snapshot(&[
+        (&primary, 0, 0, 1_000, 1_000),
+        (&backup, 0, 10, 1_000, 1_000),
+    ]);
+    let proposal = SelectionProposal::with_backup(Arc::clone(&primary), Arc::clone(&backup));
+
+    let decision = resolve_decode_with_capacity_fallback(&domain, &proposal, 64, &loads)
+        .expect("capacity exhaustion must degrade within the decode domain");
+
+    assert_eq!(decision.selected.id, primary.id);
+    assert_eq!(decision.reason, DecisionReason::CapacityFallbackPowerOfTwo);
 }

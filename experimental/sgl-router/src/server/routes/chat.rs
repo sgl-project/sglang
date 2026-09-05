@@ -4,11 +4,12 @@
 use crate::config::{PolicyKind, SessionAffinityMode};
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::admission::{
-    resolve_cache_candidates, resolve_decode, resolve_prefill, CandidateDomain, CandidateRange,
-    DecisionReason,
+    resolve_cache_candidates, resolve_prefill, CandidateDomain, CandidateRange, DecisionReason,
 };
 use crate::policies::buckets::BucketRequest;
-use crate::policies::decode::{build_decode_policy, DecodeSelectionContext};
+use crate::policies::decode::{
+    build_decode_policy, resolve_decode_with_capacity_fallback, DecodeSelectionContext,
+};
 use crate::policies::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::{
@@ -619,8 +620,12 @@ pub async fn chat_completions(
                     .with_prefill_url(&worker.url);
                 let decode_policy = build_decode_policy(ctx.config.model.decode_policy);
                 let decode_proposal = decode_policy.propose(decode_domain, &decode_ctx)?;
-                let decode_decision =
-                    resolve_decode(decode_domain, &decode_proposal, request_kv_tokens, snapshot)?;
+                let decode_decision = resolve_decode_with_capacity_fallback(
+                    decode_domain,
+                    &decode_proposal,
+                    request_kv_tokens,
+                    snapshot,
+                )?;
                 tracing::debug!(
                     model = %model_str,
                     policy = ?ctx.config.model.decode_policy,
