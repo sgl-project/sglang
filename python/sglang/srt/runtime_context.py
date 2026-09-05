@@ -297,25 +297,22 @@ class ParallelContext:
         return derive_parallel_widths(**leaves)
 
     def _derived_width(self, name):
-        """A width the leaves imply: the stamp, else the live group, else the
-        leaves themselves.
+        """A width the leaves imply: the stamp if there is one, else the leaves.
 
-        A quotient *is* a function of the configured leaves -- that is what it
-        is, and it is why the declaration in `arg_groups/fields/parallel.py`
-        names nothing but the field. The other two steps are how a value that
-        moved after publish reaches a reader: `initialize_model_parallel`
-        stamps all six as its last statement, and an elastic scale-up restamps
-        `attn_dp_size` through `update_dp_attention_post_scale`.
+        A quotient *is* a function of the configured leaves. Reading it back
+        off a group coordinator was a third source for the same answer, and one
+        that could never disagree: `initialize_model_parallel` stamps all six
+        as its last statement, unconditionally, and an elastic scale-up
+        restamps `attn_dp_size` through `update_dp_attention_post_scale`. So the
+        stamp is how a topology that moved after publish reaches a reader, and
+        the leaves are the topology that was configured -- nothing in this tree
+        builds a group without stamping, and nothing outside `srt` reads these.
 
-        The live-group step is kept below the stamp and above the leaves. On
-        every path in this tree a built group has already been stamped, so it
-        does not fire; `test_size_rank_delegate_to_canonical_getters` and the
-        DCP tests pin it for a process that installs groups some other way.
-        (`world_size` is not a quotient, is not derived here, and stays a live
-        read outright.)
+        (`world_size` is not a quotient. It is not derived here and stays a live
+        read outright, because it is not implied by anything.)
 
-        The leaf derivation answers where nothing has been stamped, which is
-        the case a test is in when it states a topology:
+        The leaf derivation answers where nothing has been stamped, which is the
+        case a test is in when it states a topology:
         `override(tp_size=8, attn_dp_size=2)` yields `attn_tp_size == 4`, so a
         caller can override the inputs rather than the answer.
         """
@@ -325,12 +322,6 @@ class ParallelContext:
         derived = self._derived
         if name in derived:
             return derived[name]
-        getter = _LIVE_WIDTH_READINGS.get(name)
-        if getter is not None:
-            try:
-                return getter(self)
-            except (AssertionError, AttributeError, RuntimeError):
-                pass
         try:
             return self._widths_from_leaves()[name]
         except (AssertionError, AttributeError, KeyError, ValueError) as exc:
@@ -443,23 +434,6 @@ class ParallelContext:
     @property
     def dcp_group(self) -> Any:
         return self._v("dcp_group", _ps().get_dcp_group)
-
-
-# How a built process group reports each quotient. This is a property of the
-# reading, not of the field: what `attn_tp_size` *is* is the quotient declared
-# in `arg_groups/fields/parallel.py`, which names nothing but itself.
-_LIVE_WIDTH_READINGS = {
-    "attn_tp_size": lambda ctx: _ps().get_attn_tensor_model_parallel_world_size(),
-    "attn_dp_size": lambda ctx: _dp().get_attention_dp_size(),
-    "attn_dcp_size": lambda ctx: _ps().get_dcp_world_size() if ctx.dcp_enabled else 1,
-    "moe_ep_size": lambda ctx: _ps().get_moe_expert_parallel_world_size(),
-    "moe_tp_size": lambda ctx: _ps().get_moe_tensor_parallel_world_size(),
-    "dcp_enabled": lambda ctx: (
-        False
-        if _ps().get_dcp_group_no_assert() is None
-        else _ps().get_dcp_world_size() > 1
-    ),
-}
 
 
 def _install_derived_widths() -> None:
@@ -1735,8 +1709,8 @@ def reset_context() -> None:
     ``server_args`` and install fresh ``Flags`` and ``Resources``.
 
     ``parallel`` holds the stamped derived widths, which go with the lifecycle
-    that stamped them: `_derived_width` prefers the stamp over the live group,
-    so leaving one behind lets the next test read the previous topology.
+    that stamped them: `_derived_width` prefers the stamp over the leaves, so
+    leaving one behind lets the next test read the previous topology.
     """
     _CONTEXT._server_args = None
     _CONTEXT._config_bags = None
