@@ -12,24 +12,17 @@ VDN_H3_SHORT_CONV_TARGETS = ("q", "k", "v")
 
 
 class VDNHybridAttentionArchConfig(msgspec.Struct):
-    """VDN-H3 hybrid attention (window softmax + frame-wise linear branch).
+    """VDN-H3 hybrid attention (window softmax + frame-wise linear branch); the
+    resolved ``hybrid_attention`` transform config the overlay copies into
+    ``transformer/config.json``. A dense checkpoint has none."""
 
-    Mirrors the resolved ``hybrid_attention`` transform config VDN stamps into
-    ``linear_branch/config.json`` (v2 layout). The materialized overlay copies
-    it into ``transformer/config.json``, so a plain MiniMax-H3 checkpoint
-    (no ``hybrid_attention`` key) keeps ``hybrid_attention=None`` and builds
-    exactly the dense model.
-    """
-
-    # softmax branch: frame t belongs to chunk t // chunk and attends to
-    # chunks [c - radius, c + radius]; chunk == 0 means a centered frame window.
+    # frame t is in chunk t // chunk and attends chunks [c - radius, c + radius];
+    # chunk 0 means a centered frame window
     chunk: int = 5
     radius: int = 1
-    # frames 0 and F-1 dense as softmax rows/columns; "both" makes the
-    # softmax/linear partition exact, so the branch skips those two frames
+    # "both": frames 0 and F-1 dense as rows and columns, so the branch skips them
     anchor_frames: str = "both"
     enable_softmax_gate: bool = True
-    # linear branch
     delta_rule: str = "vdn_solve"
     linear_head_dim: int = 128
     bridge: str = "alpha"

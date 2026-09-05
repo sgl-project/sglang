@@ -12,16 +12,9 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 @dataclass
 class VDNH3PipelineConfig(MiniMaxH3PipelineConfig):
-    """VDN-H3: hybrid window-softmax + Video Delta linear attention MiniMax-H3,
-    8-NFE DMD2 distill, t2va only.
-
-    The hybrid arch config comes from the materialized ``transformer/config.json``
-    (``hybrid_attention``), so this class only pins the deployment envelope:
-    the transformer must run the ``hybrid_window_attn_h3`` backend (a dense
-    backend on these weights would silently skip the linear branch and the
-    gates: wrong, not slow), one weight partition, no ring, no torch.compile,
-    no breakable CUDA graph yet.
-    """
+    """VDN-H3 (hybrid window-softmax + Video Delta linear attention, 8-NFE DMD2
+    distill, t2va only): the deployment envelope; the arch config comes from
+    the materialized ``transformer/config.json``."""
 
     def validate_quality_deployment(self, server_args) -> None:
         raise ValueError(
@@ -39,9 +32,7 @@ class VDNH3PipelineConfig(MiniMaxH3PipelineConfig):
             )
         # an unset backend would resolve to the platform default (dense FA)
         if server_args.quantization == "fp8":
-            # block scales into cuBLASLt with the quant fused into the adaLN and
-            # SwiGLU producers: 0.93 s/NFE on 8x B200 vs 1.05 per-channel,
-            # same block-level error
+            # online MXFP8 on cuBLASLt: 0.93 s/NFE on 8x B200 vs 1.05 per-channel
             server_args.quantization = "mxfp8"
         if server_args.attention_backend is None and not (
             server_args.component_attention_backends or {}
@@ -66,8 +57,7 @@ class VDNH3PipelineConfig(MiniMaxH3PipelineConfig):
                 "parallelism."
             )
         if server_args.enable_torch_compile or server_args.enable_breakable_cuda_graph:
-            # BCG capture at 104k rows keeps one memory pool per captured
-            # segment and exhausts 183 GB per GPU during warmup.
+            # BCG keeps one pool per captured segment and exhausts 183 GB at 104k rows
             raise ValueError(
                 "VDN-H3 hybrid attention is not validated under torch.compile or "
                 "the breakable CUDA graph yet; disable them."

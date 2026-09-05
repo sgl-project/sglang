@@ -1,25 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Hybrid window-softmax attention backend for VDN-H3 (MiniMax-H3 packed layout).
+"""VDN-H3 window-softmax backend on the MiniMax-H3 packed layout.
 
-VDN-H3 replaces every DiT block's dense self-attention with two branches. The
-SOFTMAX branch (this backend) is an exact softmax over a chunk-aligned frame
-window: video frame t belongs to chunk t // chunk and attends to whole chunks
-[c - radius, c + radius]; frames 0 and F-1 are "anchors" (dense as rows and
-as columns under ``anchor_frames="both"``); every pair involving a text or
-audio row stays dense in both directions; padding rows sit outside every mask.
-A per-(token, head) sigmoid gate scales the softmax output. The LINEAR branch
-(``runtime/models/dits/minimax_h3_vdn.py``) covers exactly the complement of
-the window and is driven by the attention module, not by this backend.
-
-The window is request-static, so the metadata (row-group plan, gather indices)
-is built once per request in the MiniMax-H3 denoising stage and installed
-through ``set_forward_context`` for every step and every block.
-
-The window runs as a union of dense varlen FlashAttention calls (what VDN
-ships on SM100): one call for the dense-query rows (text, audio, anchor
-frames) against all keys, then varlen calls over per-chunk gathered
-[globals | window frames | anchors] K/V for the remaining frames. Same math as
-a masked kernel; it differs from it by bf16 reduction order only.
+An exact softmax over a chunk-aligned frame window: frame t belongs to chunk
+t // chunk and attends to chunks [c - radius, c + radius]; frames 0 and F-1
+are dense anchors; text and audio rows are dense both ways; padding rows sit
+outside every mask; a per-(token, head) sigmoid gate scales the output. The
+linear branch (``minimax_h3_vdn.py``) covers the window's complement. The
+metadata is request-static and installed once per request through
+``set_forward_context``. The window runs as a union of dense varlen
+FlashAttention calls: the dense-query rows against all keys, then per-chunk
+gathered [globals | window | anchors] K/V; same math as a masked kernel up to
+bf16 reduction order.
 """
 
 from __future__ import annotations
@@ -155,8 +146,7 @@ def _window_passes(
     max_gather_rows: int,
     device: torch.device,
 ) -> list[dict]:
-    # one varlen call per pass; a pass holds consecutive chunk groups whose gathered
-    # K/V rows stay under max_gather_rows (bounds the transient, same arithmetic)
+    # one varlen call per pass; consecutive chunk groups fill up to max_gather_rows
     passes: list[dict] = []
     current: list[tuple] = []
     current_rows = 0
@@ -204,12 +194,9 @@ def _window_passes(
 
 
 class _DecomposedPlan:
-    """Query-row groups with identical kept key sets, as dense varlen calls.
-
-    dense-q rows (globals + anchor-row frames) attend to all ``used`` keys in
-    one call; every remaining chunk of frames attends to its gathered
-    [globals | window frames | anchor-column frames] keys in one varlen call.
-    """
+    """Query-row groups with identical kept key sets, as dense varlen calls:
+    the dense-q rows against all ``used`` keys, then each chunk of frames
+    against its gathered [globals | window | anchors] keys."""
 
     __slots__ = ("dense_q", "dense_cu_q", "dense_cu_k", "passes", "has_windows")
 
@@ -227,8 +214,7 @@ class _DecomposedPlan:
             layout.global_ranges + [layout.frame_rows(f) for f in sorted(dense_rows)]
         )
         self.dense_q = rows(dense_ranges)
-        # request-static varlen bounds: built once, not from Python lists (a
-        # pageable H2D copy + stream sync) in every block
+        # built once: a tensor from a Python list costs a pageable H2D copy + sync
         self.dense_cu_q = torch.tensor(
             [0, int(self.dense_q.numel())], dtype=torch.int32, device=device
         )
@@ -266,8 +252,7 @@ class HybridWindowAttentionH3Metadata(AttentionMetadata):
     # radius >= F: the window IS dense attention and the linear branch is off
     full_cover: bool
     decomposed: _DecomposedPlan | None = None
-    # (cos_sin [seq_len, rope_dim] bf16, positions [seq_len]) for QK-norm +
-    # RoPE on the head shard under Ulysses; None otherwise
+    # (cos_sin [seq_len, rope_dim] bf16, positions [seq_len]) under Ulysses, else None
     rope_cache_full: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
@@ -354,13 +339,8 @@ class HybridWindowAttentionH3Impl(AttentionImpl):
         self.prefix = prefix
         match = _DIT_BLOCK_PREFIX.match(prefix)
         self.layer_idx = int(match.group(1)) if match else None
-        # The token refiner (text only, no frame axis) and any other caller
-        # resolve the same backend object; they run the exact dense kernel.
-        from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
-            FlashAttentionImpl,
-        )
-
-        self._dense_fallback = FlashAttentionImpl(
+        # non-DiT callers (the token refiner) resolve this backend too: dense FA
+        self._dense_fallback = _flash_attn_backend.FlashAttentionImpl(
             num_heads=num_heads,
             head_size=head_size,
             causal=causal,
@@ -376,9 +356,7 @@ class HybridWindowAttentionH3Impl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        """Plain dense attention for layers that are not MiniMax-H3's packed
-        DiT blocks (the Qwen3-VL conditioner, VAE attention) when the global
-        CLI backend reaches them: exact FlashAttention, no window."""
+        """Dense FlashAttention for the non-DiT layers this backend reaches."""
         return self._dense_fallback.forward(query, key, value, attn_metadata)
 
     def dense_varlen(
@@ -492,8 +470,7 @@ class HybridWindowAttentionH3Impl(AttentionImpl):
                 scale=self.softmax_scale,
             )
         for p in plan.passes:
-            # index_select on the contiguous copies runs the vectorized gather;
-            # strided views or advanced indexing take the generic kernel
+            # index_select on contiguous copies takes the vectorized gather kernel
             kw = torch.index_select(key_used, 0, p["kv_gather"])
             vw = torch.index_select(value_used, 0, p["kv_gather"])
             if p["win_q_slice"] is not None:

@@ -30,8 +30,7 @@ requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="hybrid_window_attn_h3 kernels need CUDA"
 )
 
-# Ragged on purpose: text 70 and audio 100 are not tile multiples, F = 12 is
-# not a chunk multiple (chunks [0..4], [5..9], [10, 11]), S = 48 = 6 x 8.
+# ragged on purpose: 70 and 100 are not tile multiples, 12 frames is not a chunk multiple
 TEXT_LEN = 70
 AUDIO_ROWS = 100
 NUM_FRAMES = 12
@@ -85,8 +84,7 @@ def _masked_reference(q, k, v, mask: torch.Tensor, used: int) -> torch.Tensor:
 
 
 def _prepare_flash_attention() -> None:
-    # the platform resolver selects FA4 on Blackwell before the first forward;
-    # a direct construction has to pass the same gate
+    # the platform resolver runs this before the first forward; a direct impl must too
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
     current_platform._prepare_flash_attention_for_blackwell()
@@ -159,8 +157,7 @@ def test_mask_reference_partition_is_exact() -> None:
             continue
         lo, hi = max(bounds[qf][0], 0), min(bounds[qf][1], NUM_FRAMES - 1)
         expected_softmax = {f for f in range(lo, hi + 1)} | {0, NUM_FRAMES - 1}
-        # inner frames 1..F-2 minus the window: the branch's complement
-        # (prefix[lo-1] and suffix[hi+1] over the rebased frames)
+        # the branch covers the inner frames 1..F-2 outside the window
         expected_linear = {f for f in range(1, NUM_FRAMES - 1) if f < lo or f > hi}
         kept = {f for f in range(NUM_FRAMES) if frame_kept[f]}
         assert kept == expected_softmax

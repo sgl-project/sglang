@@ -1,10 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fused Triton kernels for the VDN-H3 (Video DeltaNet MiniMax-H3) linear branch.
-
-The branch is bandwidth-bound: every stage walks a ~1.4 GiB [T, H, d] bf16
-tensor at the paper workload (105k rows x 56 heads x 128). Eager, each stage
-is several full passes (the 5-tap temporal conv alone reads its input five
-times); these kernels read each operand once and round once at the store.
+"""Fused Triton kernels for the VDN-H3 (Video DeltaNet MiniMax-H3) linear branch;
+each reads its operands once and rounds once at the store.
 
     vdn_temporal_conv_act   5-tap depthwise temporal conv + SiLU [+ L2 norm]
                             (port of OpenVDN's _tconv_act_kernel)
@@ -17,14 +13,11 @@ times); these kernels read each operand once and round once at the store.
     vdn_linear_epilogue     RMSNorm(d) * gate with the [F, H, S, d] -> [F*S, H*d]
                             transpose folded into the store
 
-Numerical contract: vdn_frame_stats_prep and vdn_gather_linear_state are
-bitwise equal to the eager chains (widening casts, same products, fp32
-gather). The three activation kernels round once instead of once per op and
-sit within one bf16 ulp of the eager bf16 chains; they are the model's own
-inference kernels (OpenVDN ships the same contract), so the VDN-H3 branch
-mounts them unconditionally. Verified against the eager chains at the unit
-shapes in test/registered/kernels/ops/diffusion/test_vdn_linear_branch.py and
-at the paper workload on 8x B200 (head_dim 128, 1008 tokens per frame).
+Contract: vdn_frame_stats_prep and vdn_gather_linear_state are bitwise equal
+to the eager chains (widening casts, same products, fp32 gather). The three
+activation kernels round once instead of once per op and sit within one bf16
+ulp of the eager bf16 chains; OpenVDN ships the same contract, so the branch
+mounts them unconditionally.
 """
 
 from __future__ import annotations
@@ -509,7 +502,7 @@ def vdn_gather_linear_state(
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
     """The boundary gather of the linear branch as one kernel over the
-    [F, H, dv, dk] fp32 state banks (eager: ~7 passes over ~350 MB)."""
+    [F, H, dv, dk] fp32 state banks."""
     if not prefix.is_cuda:
         raise ValueError(
             "vdn_gather_linear_state is a Triton kernel; inputs must be on CUDA"

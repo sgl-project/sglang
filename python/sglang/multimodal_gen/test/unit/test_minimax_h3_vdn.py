@@ -339,8 +339,7 @@ def test_branch_forward_matches_reference(
         monkeypatch.setattr(module, "_FUSED_KERNELS_ENABLED", False)
     expected = branch(**kwargs)
     assert expected.abs().sum() > 0
-    # the fused kernels keep fp32 between the stages the eager chain rounds
-    # to bf16; the scans re-associate fp32 products only
+    # fused kernels skip the eager chain's bf16 roundings; the scans re-associate fp32
     tolerance = {"frame_chain_scans": 5e-3, "eager_kernels": 2e-2}[reference]
     rel = (fast.float() - expected.float()).norm() / expected.float().norm()
     assert rel < tolerance, rel
@@ -399,14 +398,10 @@ def test_gather_text_state_decays_over_skipped_frames() -> None:
         text_state=text_state,
         out_dtype=torch.float32,
     ).view(num_frames)
-    # frame 0: before-side reads text over [0..0] -> 0.5; after-side reads
-    # suffix[1] (zero) bridged (no text substitution since 1 < F)
+    # frame 0 reads the text state through alpha[0]; frame 3 through alpha[3]
     assert math.isclose(out[0].item(), 0.5, rel_tol=1e-6)
-    # frame 3 (last): after-side reads text over [3..3] -> 0.5; before-side
-    # reads prefix[2] = 0
     assert math.isclose(out[3].item(), 0.5, rel_tol=1e-6)
-    # frame 1: both neighbours in range and zero
-    assert out[1].item() == 0.0
+    assert out[1].item() == 0.0, "both neighbours in range and zero"
 
 
 def test_temporal_shift_features_match_conv1d() -> None:
@@ -521,8 +516,7 @@ def test_branch_head_slice_equals_full_run() -> None:
     assert torch.all(full[:tpf] == 0) and torch.all(full[-tpf:] == 0)
     assert full[tpf:-tpf].abs().sum() > 0
 
-    # the Ulysses contract: the same module on a head range of the full
-    # sequence (sliced q/k/v/beta/gate, per-head params sliced inside)
+    # the same module on a head range of the full sequence
     hs = slice(1, 3)
     part = branch(
         q_raw=q[:, hs],

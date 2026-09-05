@@ -20,8 +20,7 @@ def _check(rank: int) -> None:
     heads, head_dim, local_rows = 6, 32, 24
     local_heads = heads // world
     seq = local_rows * world
-    # every rank builds the same global tensors and exchanges its row shard, so
-    # the result can be checked against slicing the global tensor
+    # every rank builds the same global tensors, so a shard is checked by slicing
     g = torch.Generator(device="cpu").manual_seed(3)
     qkv = torch.randn(seq, 3 * heads * head_dim, generator=g).to(device, torch.bfloat16)
     q = qkv.view(seq, 3, heads, head_dim)[:, 0]  # strided, as the split qkv is

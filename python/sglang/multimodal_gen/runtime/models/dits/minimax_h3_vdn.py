@@ -18,12 +18,9 @@ see, for every video token, in five steps:
                        softmax window; ends read the text state)
     5. readout         q . S -> RMSNorm(head_dim) -> low-rank sigmoid gate
 
-Everything here is inference-only and eager (no autograd). The module keeps
-VDN's parameter names one level below ``blocks.N.attn.linear_attention`` so
-the linear-branch safetensors load through ``param_names_mapping`` untouched.
-Heads are sharded under tensor parallelism; ``alpha.down`` and
-``output_gate.down`` are replicated (they are per-token bottlenecks shared by
-every head).
+Inference-only and eager. Parameter names follow VDN one level below
+``blocks.N.attn.linear_attention``; heads shard under TP, the per-token
+``alpha.down`` and ``output_gate.down`` are replicated.
 """
 
 from __future__ import annotations
@@ -243,8 +240,7 @@ class VDNFrameAlpha(nn.Module):
         self.up = _head_sharded_linear(
             head_dim, heads * head_dim, bias=False, prefix=f"{prefix}.up"
         )
-        # fp32 islands: the scan multiplies alpha across ~100 frames, so a bf16
-        # gate compounds into tens of percent of retention error.
+        # fp32: the scan multiplies alpha over ~100 frames, so bf16 error compounds
         self.A_log = _make_param((local_heads,), dtype=_FP32, shard_dim=0)
         self.dt_bias = _make_param((local_heads * head_dim,), dtype=_FP32, shard_dim=0)
 
@@ -470,14 +466,10 @@ def frame_statistics(
     prepared: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
     | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """kf, vf [F, H, S, d]; beta [F, H, S] -> A [F, H, dk, dk] fp32 (symmetric),
-    B [F, H, dv, dk] fp32.
-
-    A is the matrix the scan inverts; computed in fp32 (bf16 breaks the
-    conditioning of I + A on real, strongly correlated frame tokens). B enters
-    the state linearly, so bf16 tensor cores are fine. ``prepared`` carries
-    the four GEMM operands from ``vdn_frame_stats_prep`` (one fused pass).
-    """
+    """kf, vf [F, H, S, d], beta [F, H, S] -> A [F, H, dk, dk] fp32 symmetric,
+    B [F, H, dv, dk] fp32; ``prepared`` carries the operands from
+    ``vdn_frame_stats_prep``. A is inverted downstream, so it needs fp32;
+    B enters the state linearly and takes bf16 tensor cores."""
     if prepared is not None:
         kf, kf32, scaled32, vf_b = prepared
     else:
@@ -488,8 +480,7 @@ def frame_statistics(
         if kf32 is None:
             kf32 = kf.float()
             scaled32 = (kf32 * beta.unsqueeze(-1).float()).contiguous()
-        # TF32 (10 mantissa bits) keeps I + A well conditioned where bf16
-        # does not, and runs the GEMM on tensor cores; scoped to this matmul.
+        # TF32 keeps I + A well conditioned where bf16 does not; scoped to this matmul
         prev = torch.backends.cuda.matmul.allow_tf32
         torch.backends.cuda.matmul.allow_tf32 = True
         try:
@@ -534,8 +525,7 @@ def delta_factor_apply(
     elif rule != "vdn_solve":
         raise ValueError(f"unknown delta rule {rule!r}")
     chol = torch.linalg.cholesky(A32 + eye)
-    # (I+A)^-1 = L^-T L^-1 as one triangular solve and a matmul (VDN's choice:
-    # a batched trsm at 128x128 is far slower than a batched GEMM).
+    # (I+A)^-1 = L^-T L^-1: a batched trsm at 128x128 is far slower than the GEMM
     linv = torch.linalg.solve_triangular(chol, eye, upper=False, left=True)
     inv = linv.transpose(-1, -2) @ linv
     transition = alpha.unsqueeze(-1) * inv
@@ -572,8 +562,7 @@ def run_scans(
 def _compose_chunk(
     transitions: torch.Tensor, injections: torch.Tensor, reverse: bool
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # fold each chunk's frames into one affine map S -> S @ M + C, batched over chunks;
-    # transitions [n, C, H, dk, dk], injections [n, C, H, dv, dk] -> (M, C) per chunk
+    # fold each chunk's frames into one affine map S -> S @ M + C, batched over chunks
     order = list(range(transitions.shape[0]))
     if reverse:
         order.reverse()
@@ -596,8 +585,7 @@ def _compose_chunk(
 def _boundary_frames(
     num_frames: int, chunk: int, frame_offset: int, device: str
 ) -> tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
-    # frames the chunked gather reads (prefix: chunk ends, suffix: chunk starts) with
-    # their chunk indices; frame f here is f + frame_offset on the clip the chunks align to
+    # the gather reads prefix at chunk ends and suffix at chunk starts, on the offset grid
     padded = frame_offset + num_frames
     num_chunks = -(-padded // chunk)
     ends = [
@@ -624,22 +612,17 @@ def run_boundary_scans(
     chunk: int,
     frame_offset: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """``run_scans`` restricted to what the chunked window gather reads:
-    prefix at every chunk's last frame, suffix at every chunk's first frame
-    (other frames are zero). ``frame_offset`` is the position of frame 0 on
-    the clip the chunks are aligned to (1 when the anchor frames were dropped).
-    Each chunk's frames fold into one affine map first (batched over all
-    chunks, ``chunk - 1`` steps), then one chain over the chunks with both
-    directions in each launch: a fifth of the frame chain's dependent
-    launches. Same fp32 math, the products are merely re-associated."""
+    """``run_scans`` restricted to what the chunked gather reads: prefix at each
+    chunk's last frame, suffix at each chunk's first frame, zero elsewhere.
+    ``frame_offset`` is frame 0's position on the chunk grid (1 when the anchor
+    frames were dropped). Same fp32 math, the products re-associated."""
     if chunk <= 1:
         return run_scans(transitions, injections, text_state)
     num_frames, heads, dv, dk = injections.shape
     num_chunks, ends, end_chunks, starts, start_chunks = _boundary_frames(
         num_frames, chunk, frame_offset, str(injections.device)
     )
-    # identity transitions / zero injections leave the state untouched: they
-    # fill the leading offset and the partial last chunk
+    # identity / zero padding fills the leading offset and the partial last chunk
     lead, tail = frame_offset, num_chunks * chunk - frame_offset - num_frames
     eye = torch.eye(dk, device=transitions.device, dtype=transitions.dtype)
     transitions = torch.cat(
@@ -652,8 +635,7 @@ def run_boundary_scans(
             injections.new_zeros(tail, heads, dv, dk),
         ]
     )
-    # frame-within-chunk leading: one relayout here instead of one strided
-    # copy per operand per composition step
+    # frame-major so each composition step reads contiguous operands
     T = transitions.view(num_chunks, chunk, heads, dk, dk).transpose(0, 1).contiguous()
     B = injections.view(num_chunks, chunk, heads, dv, dk).transpose(0, 1).contiguous()
     start = (
@@ -661,8 +643,7 @@ def run_boundary_scans(
         if text_state is None
         else text_state.to(injections.dtype)
     )
-    # step c advances the forward chain on chunk c and the reverse chain on
-    # chunk C-1-c in one batched launch
+    # step c: the forward chain on chunk c and the reverse chain on chunk C-1-c
     Mf, Cf = _compose_chunk(T, B, reverse=False)
     Mr, Cr = _compose_chunk(T, B, reverse=True)
     M2 = torch.stack([Mf, Mr.flip(0)], dim=1)  # [C, 2, H, dk, dk]
@@ -686,8 +667,7 @@ def run_boundary_scans(
 def _gather_indices(
     bounds: tuple[tuple[int, int], ...], num_frames: int, device: str
 ) -> tuple[torch.Tensor, ...]:
-    # built once per (bounds, F, device): rebuilding from Python lists per block
-    # costs two synchronizing H2D copies
+    # cached: rebuilding from Python lists per block costs two synchronizing H2D copies
     dev = torch.device(device)
     last_before = torch.tensor([lo for lo, _ in bounds], device=dev) - 1
     first_after = torch.tensor([hi for _, hi in bounds], device=dev) + 1
@@ -751,8 +731,7 @@ def gather_linear_state(
     if bridge == "alpha":
         log_alpha = torch.log(alpha.clamp_min(1e-12))
         log_prefix = torch.cat([torch.zeros_like(log_alpha[:1]), log_alpha.cumsum(0)])
-        # boundary rows decay the text state over the frames they really
-        # skipped: from virtual -1 that is [0..t], from virtual F it is [t..F-1]
+        # an out-of-range side decays the text state over [0..t] or [t..F-1]
         bridge_before = (last_before + 1).clamp(min=0)
         bridge_after = first_after.clamp(max=num_frames)
         alpha_from_before = torch.exp(
@@ -811,8 +790,7 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
     ) -> None:
         super().__init__()
         if hybrid.linear_head_dim != arch.attention_head_dim:
-            # The branch shares the softmax branch's raw q/k/v, so the linear
-            # head dim is the attention head dim by construction.
+            # the branch reads the attention projections, so the head dims must agree
             raise ValueError(
                 f"hybrid_attention.linear_head_dim={hybrid.linear_head_dim} != "
                 f"attention_head_dim={arch.attention_head_dim}"
@@ -877,9 +855,8 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         text_v_raw: torch.Tensor,
         text_beta: torch.Tensor,
     ) -> torch.Tensor:
-        """S_text [H, dv, dk] fp32: the whole prompt written into a zero state as
-        one delta-rule chunk (no conv, no causal scan; alpha plays no part
-        because the old state is zero), scaled by TEXT_STATE_SCALE."""
+        """S_text [H, dv, dk] fp32: the prompt written into a zero state as one
+        delta-rule chunk, scaled by TEXT_STATE_SCALE."""
         A, B, length = self.text_statistics(text_k_raw, text_v_raw, text_beta)
         heads, head_dim = A.shape[1], self.head_dim
         ones = torch.ones(1, heads, head_dim, device=A.device, dtype=_FP32)
@@ -905,19 +882,12 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         text_beta: torch.Tensor | None = None,
         heads: slice | None = None,
     ) -> torch.Tensor:
-        """Linear readout for every video row, [V, H * d] in q's dtype.
+        """Linear readout of the video rows, [V, H * d] in q's dtype.
 
-        ``heads``: under Ulysses each rank owns every head's weights but
-        processes one head range of the full sequence after the all-to-all;
-        the per-head parameters (alpha's up/dt_bias/A_log, the conv channels)
-        take that slice. beta / gate arrive already head-sharded.
-
-        q_raw/k_raw/v_raw: the VIDEO rows' raw (pre-QK-norm, pre-RoPE)
-        projections [V, H_local, d]; beta [V, H_local]; gate [V, H_local, d];
-        frame_mean [F, hidden] fp32 over the video rows of each frame; the
-        text_* arguments are the prompt rows (enable_text_state).
-        Under anchor_frames == "both" frames 0 and F-1 are exact in the softmax
-        branch, so they are dropped from the input and their rows read zero.
+        q/k/v/beta/gate are the video rows' raw (pre-norm, pre-RoPE) values on
+        this rank's heads; ``heads`` is the head range of the full sequence a
+        Ulysses rank processes, applied to the per-head parameters. Under
+        anchor_frames == "both" frames 0 and F-1 read zero.
         """
         hybrid = self.hybrid
         num_frames, per_frame = layout.num_frames, layout.tokens_per_frame
@@ -1000,7 +970,6 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         n_heads, head_dim = q_raw.shape[1], self.head_dim
         shape = (num_frames, per_frame, n_heads, head_dim)
         conv = self.short_conv
-        # 1. features (q frame-major for the bmm readout)
         query_by_frame = linear_features(
             q_raw,
             proj="q",
@@ -1029,7 +998,6 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         key_by_frame = key.view(shape).permute(0, 2, 1, 3)
         value_by_frame = value.view(shape).permute(0, 2, 1, 3)
         beta_by_frame = beta.view(num_frames, per_frame, n_heads).permute(0, 2, 1)
-        # 2. per-frame statistics
         fused = _use_fused_kernels()
         prepared = (
             vdn_frame_stats_prep(key, value, beta, num_frames, per_frame)
@@ -1045,7 +1013,6 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         )
         del prepared
         alpha = self.alpha(frame_mean, heads=heads)
-        # 3. scans
         if text_stats is not None:
             # the prompt leads as a virtual frame; alpha 1 since its old state is zero
             A = torch.cat([text_stats[0], A])
@@ -1067,7 +1034,6 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
             frame_offset=frame_offset,
         )
         del transitions, injections
-        # 4. boundary gather
         linear_state = gather_linear_state(
             prefix,
             suffix,
@@ -1078,7 +1044,6 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
             out_dtype=q_raw.dtype,
         )
         del prefix, suffix
-        # 5. readout
         readout = torch.matmul(query_by_frame, linear_state.transpose(-1, -2))
         if fused and can_use_vdn_linear_epilogue(readout):
             return vdn_linear_epilogue(readout, self.norm.weight, gate, self.norm.eps)

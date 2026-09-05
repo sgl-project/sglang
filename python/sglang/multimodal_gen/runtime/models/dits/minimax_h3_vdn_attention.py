@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_ctx,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_h3 import (
+    HybridWindowAttentionH3Metadata,
     HybridWindowAttentionH3MetadataBuilder,
 )
 from sglang.multimodal_gen.runtime.layers.linear import RowParallelLinear
@@ -164,8 +165,7 @@ def _vdn_frame_partial_sums(
     num_frames: int,
     tokens_per_frame: int,
 ) -> torch.Tensor:
-    # fp32 [F, hidden] sums of this rank's video rows: whole frames as one reduction,
-    # the two edge frames as row sums; deterministic, bf16 read once
+    # fp32 [F, hidden] sums of this rank's video rows; whole frames as one reduction
     hidden = x.shape[-1]
     sums = torch.zeros(num_frames, hidden, dtype=_FP32_DTYPE, device=x.device)
     lo = max(row_start, video_start)
@@ -195,8 +195,7 @@ def _vdn_frame_partial_sums(
 def _vdn_a2a_rows_to_heads(
     field: torch.Tensor, *, ulysses_ws: int, role: str, process_group
 ) -> tuple[torch.distributed.Work, torch.Tensor]:
-    # [L, H, d] row shard -> contiguous [S, H / ws, d] of this rank's heads (rank-ordered
-    # row shards need no relayout on receipt)
+    # [L, H, d] row shard -> contiguous [S, H / ws, d] of this rank's heads
     from sglang.multimodal_gen.runtime.layers.usp import _a2a_staging_buffer
 
     rows, total_heads, head_dim = field.shape
@@ -346,14 +345,6 @@ def _minimax_h3_hybrid_attention_core_impl(
     max_seqlen: int,
     ulysses_active: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Window softmax + linear branch on RAW (pre-norm, pre-RoPE) q/k/v.
-    ``gate_hidden`` is the 128-wide output_gate.down hidden of the rows. Returns
-    (gated softmax output [T_local, H, d], linear readout [T_local, H * d] or
-    None when the window covers the whole clip)."""
-    from sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_h3 import (
-        HybridWindowAttentionH3Metadata,
-    )
-
     meta = get_forward_context().attn_metadata
     if not isinstance(meta, HybridWindowAttentionH3Metadata):
         raise RuntimeError(
@@ -435,8 +426,7 @@ def _vdn_ulysses_hybrid_core(
     local_heads = q.shape[1] // ulysses_ws
     seq_len = local_rows * ulysses_ws
 
-    # the q/k/v exchange is in flight while the frame sums, the small per-head
-    # fields and the gate hidden go out
+    # the q/k/v exchange is in flight while the frame sums and the gate hidden go out
     inflight = [
         _vdn_a2a_rows_to_heads(
             field,
@@ -547,9 +537,8 @@ def prepare_hybrid_attention_metadata(
     server_args,
     device: torch.device,
 ) -> Callable[[int], Any] | None:
-    """Request-static hybrid attention metadata (window plan, packed layout,
-    full-sequence RoPE cache under Ulysses) for every step and block, or None
-    when the transformer runs another backend."""
+    """Request-static metadata (window plan, packed layout, full-sequence RoPE
+    cache under Ulysses) for every step and block; None for other backends."""
     model._resolve_attention_backend_once()
     if (
         model._resolved_attention_backend
@@ -585,8 +574,7 @@ def prepare_hybrid_attention_metadata(
     if ring_ws > 1:
         raise ValueError("VDN-H3 does not support ring parallelism")
     if ulysses_ws > 1:
-        # QK-norm + RoPE run after the Ulysses all-to-all on the head shard
-        # over the full sequence, so every rank needs the whole cache.
+        # QK-norm + RoPE run on the head shard after the all-to-all: full-sequence cache
         with torch.inference_mode():
             img_position_ids = (
                 packed["img_position_ids"][None].to(torch.float32).to(device)

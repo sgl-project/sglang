@@ -452,10 +452,7 @@ MODELS = {
         ],
         "force_eager": True,
     },
-    # VDN-H3 (hybrid window-softmax + Video Delta linear attention, 8 NFE).
-    # The paper workload: 1344x768, 345 frames = 14.375 s at 24 fps
-    # (17n+5 aligned -> latent_t 102), t2va, 8 NFE = 9 sigma grid points.
-    # OpenVDN/vdn-minimax-h3 paper workload: 1344x768, 14.375 s, 8 DiT forwards
+    # OpenVDN paper workload: 1344x768, 14.375 s (latent_t 102), t2va, 9 grid points = 8 NFE
     "vdn-h3": {
         "path": "OpenVDN/vdn-minimax-h3",
         "prompt": (
