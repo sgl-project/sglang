@@ -179,14 +179,21 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
             full_num_tokens = max(0, num_tokens - full_available_size)
             swa_num_tokens = max(0, num_tokens - swa_available_size)
             tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
+                EvictParams(
+                    num_tokens=full_num_tokens,
+                    swa_num_tokens=swa_num_tokens,
+                    reason="kv_allocation_pressure",
+                )
             )
     else:
         # Standard allocator: evict only the shortfall (mirrors the SWA arm)
         available_size = allocator.available_size()
         if available_size < num_tokens:
             tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=num_tokens - available_size)
+                EvictParams(
+                    num_tokens=num_tokens - available_size,
+                    reason="kv_allocation_pressure",
+                )
             )
 
 

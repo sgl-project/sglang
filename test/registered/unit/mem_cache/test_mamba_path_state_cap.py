@@ -298,6 +298,7 @@ class TestMambaPathCapWriteThroughOrdering(CustomTestCase):
         """The walked target's backup executes before commit hooks, so a mamba
         value re-stamped by the same insert stays out of the host backup."""
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        cache.metrics_collector = mock.Mock()
         mamba_comp = cache.components[ComponentType.MAMBA]
 
         self._insert(cache, allocator, req_to_token_pool, [1, 2])
@@ -308,6 +309,11 @@ class TestMambaPathCapWriteThroughOrdering(CustomTestCase):
         mamba_comp.mamba_max_states_per_path = 1
         self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4, 5, 6])
         self.assertIsNone(ancestor.component_data[ComponentType.MAMBA].value)
+        cache.metrics_collector.increment_hybrid_cache_evictions.assert_called_with(
+            full_attention_tokens=0,
+            recurrent_states=2,
+            reason="path_state_cap",
+        )
 
         # Re-inserting [1, 2] crosses the threshold and re-stamps the tombstone
         # in the same insert; the backup must not carry the fresh mamba state.

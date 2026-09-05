@@ -1227,6 +1227,14 @@ class Req(ReqDllmMixin):
         self.cached_tokens = 0
         self.already_computed = 0
 
+        # Hybrid-cache prefix-match accounting. These are populated only for
+        # caches with a recurrent-state component. ``full_attention`` is the
+        # raw Full-KV endpoint (A); ``recurrent_state`` is the latest checkpoint
+        # accepted by the component validators (C). The effective cached prefix
+        # reported by ``cached_tokens`` is U.
+        self.hybrid_cache_full_attention_cached_tokens: Optional[int] = None
+        self.hybrid_cache_recurrent_state_cached_tokens: Optional[int] = None
+
         # Detailed breakdown of cached tokens by source (for HiCache)
         self.cached_tokens_device = 0  # Tokens from device cache (GPU)
         self.cached_tokens_host = 0  # Tokens from host cache (CPU memory)
@@ -1533,6 +1541,13 @@ class Req(ReqDllmMixin):
                 match_result.mamba_host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
+            if tree_cache.supports_mamba():
+                self.hybrid_cache_full_attention_cached_tokens = (
+                    match_result.full_kv_hit_length
+                )
+                self.hybrid_cache_recurrent_state_cached_tokens = (
+                    len(match_result.device_indices) + match_result.host_hit_length
+                )
             if match_result.cache_protected_len is not None:
                 self.kv.cache_protected_len = match_result.cache_protected_len
             else:

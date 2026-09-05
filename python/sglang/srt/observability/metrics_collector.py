@@ -1640,6 +1640,14 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             labelnames=list(labels.keys()) + ["cache_source"],
         )
 
+        self.hybrid_cache_request_tokens_total = Counter(
+            name="sglang:hybrid_cache_request_tokens_total",
+            documentation="Per-request hybrid-cache token accounting by kind: "
+            "raw Full-attention hits, recurrent-state hits, usable hits, "
+            "trimmed Full-attention hits, recomputation, and replay.",
+            labelnames=list(labels.keys()) + ["kind"],
+        )
+
         self.num_requests_total = Counter(
             name="sglang:num_requests_total",
             documentation="Number of requests processed.",
@@ -1824,6 +1832,23 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
                 # Fallback for backward compatibility
                 labels_total = {**labels, "cache_source": "total"}
                 self.cached_tokens_total.labels(**labels_total).inc(cached_tokens)
+
+        if cached_tokens_details:
+            hybrid_fields = {
+                "full_attention_hit": "full_attention_cached_tokens",
+                "recurrent_state_hit": "recurrent_state_cached_tokens",
+                "usable_hit": "usable_cached_tokens",
+                "trimmed_full_attention": "trimmed_full_attention_tokens",
+                "full_attention_recomputed": "full_attention_recomputed_tokens",
+                "recurrent_recomputed": "recurrent_recomputed_tokens",
+                "recurrent_replayed": "recurrent_replayed_tokens",
+            }
+            for kind, field in hybrid_fields.items():
+                value = cached_tokens_details.get(field)
+                if value is not None and value > 0:
+                    self.hybrid_cache_request_tokens_total.labels(
+                        **labels, kind=kind
+                    ).inc(value)
 
         self.num_requests_total.labels(**stream_labels).inc(1)
         if has_grammar:
@@ -2182,6 +2207,20 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        self.hybrid_cache_evicted_full_attention_tokens = Counter(
+            name="sglang:hybrid_cache_evicted_full_attention_tokens_total",
+            documentation="Number of Full-attention KV token slots freed by "
+            "UnifiedRadixCache eviction, including cascaded frees.",
+            labelnames=list(labels.keys()) + ["reason"],
+        )
+
+        self.hybrid_cache_evicted_recurrent_states = Counter(
+            name="sglang:hybrid_cache_evicted_recurrent_states_total",
+            documentation="Number of recurrent checkpoint states freed by "
+            "UnifiedRadixCache eviction, including cascaded frees.",
+            labelnames=list(labels.keys()) + ["reason"],
+        )
+
         self.load_back_duration_seconds = Histogram(
             name="sglang:load_back_duration_seconds",
             documentation="GPU-stream span of a merged host-to-device load-back "
@@ -2249,6 +2288,18 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
+
+    def increment_hybrid_cache_evictions(
+        self, full_attention_tokens: int, recurrent_states: int, reason: str
+    ) -> None:
+        if full_attention_tokens > 0:
+            self.hybrid_cache_evicted_full_attention_tokens.labels(
+                **self.labels, reason=reason
+            ).inc(full_attention_tokens)
+        if recurrent_states > 0:
+            self.hybrid_cache_evicted_recurrent_states.labels(
+                **self.labels, reason=reason
+            ).inc(recurrent_states)
 
     def increment_load_back_num_tokens(self, num_tokens: int, pool: str) -> None:
         self.load_back_num_tokens.labels(**self.labels, pool=pool).inc(num_tokens)

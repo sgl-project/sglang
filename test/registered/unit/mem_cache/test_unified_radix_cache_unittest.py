@@ -1824,6 +1824,7 @@ class UnifiedRadixCacheSuite:
         if not self.cfg.has_mamba:
             self.skipTest("requires Mamba component")
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        cache.metrics_collector = mock.Mock()
         seq_short = self._make_seq(1, 2)
         seq_long = seq_short + self._make_seq(500, 2)
         self._insert(cache, allocator, req_to_token_pool, seq_short)
@@ -1832,6 +1833,11 @@ class UnifiedRadixCacheSuite:
 
         result = cache.evict(EvictParams(num_tokens=0, mamba_num=1))
         self.assertGreaterEqual(result.mamba_num_evicted, 1)
+        cache.metrics_collector.increment_hybrid_cache_evictions.assert_called_once_with(
+            full_attention_tokens=0,
+            recurrent_states=result.mamba_num_evicted,
+            reason="unspecified",
+        )
         self.assertGreaterEqual(cache.full_evictable_size(), 0)
         cache.sanity_check()
 
