@@ -20,7 +20,7 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
 from sglang.srt.disaggregation.kv_events import OffloadedState
 from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.srt.managers.schedule_batch import ReqKvInfo
-from sglang.srt.mem_cache.allocator import BaseKVAllocator
+from sglang.srt.mem_cache.allocator import BaseKVPool, SinglePoolKVAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -49,9 +49,9 @@ def _make_mock_req(
     return req
 
 
-class _RecordingAllocator(BaseKVAllocator):
-    """Single-pool double. Subclassing the base routes free_full / free_segment /
-    free_segments into free(), so a new free API cannot slip past the recorder."""
+class _RecordingPool(BaseKVPool):
+    """Pool double: the base routes free_segment / free_segments into free(),
+    so a new free API cannot slip past the recorder."""
 
     def __init__(self, page_size: int):
         super().__init__(
@@ -64,6 +64,9 @@ class _RecordingAllocator(BaseKVAllocator):
         )
         self.freed = []
 
+    def available_size(self):
+        return 0
+
     def clear(self):
         self.freed = []
 
@@ -72,6 +75,17 @@ class _RecordingAllocator(BaseKVAllocator):
 
     def free(self, free_index: torch.Tensor):
         self.freed.append(free_index.clone())
+
+
+class _RecordingAllocator(SinglePoolKVAllocator):
+    """Single-pool double over `_RecordingPool`."""
+
+    def __init__(self, page_size: int):
+        super().__init__(_RecordingPool(page_size))
+
+    @property
+    def freed(self):
+        return self.pool.freed
 
 
 def _make_manager(pool_size: int, page_size: int = 1):

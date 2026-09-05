@@ -6308,10 +6308,13 @@ class UnifiedRadixCacheSuite:
         req.kv.mamba_pool_idx = None
         avail_before = req_to_token_pool.mamba_allocator.available_size()
         # No device room and eviction frees nothing -> load-back bails after the
-        # mamba pre-alloc, which must still be freed.
+        # mamba pre-alloc, which must still be freed. Capacity is read off the
+        # FULL side, so that is what the stub starves.
         with (
             mock.patch.object(
-                cache.token_to_kv_pool_allocator, "available_size", return_value=0
+                cache.token_to_kv_pool_allocator.side(ComponentType.FULL),
+                "available_size",
+                return_value=0,
             ),
             mock.patch.object(
                 cache, "evict", return_value=mock.Mock(num_tokens_evicted=0)
