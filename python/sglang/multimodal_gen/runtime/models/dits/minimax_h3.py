@@ -653,27 +653,9 @@ def _minimax_h3_attention_core_impl(
             if attention.prefix.startswith("blocks.")
             else None
         )
-        if ulysses_active and gate_compress is not None:
-            out, out_compress = attention._attention_impl.forward_varlen(
-                q,
-                k,
-                v,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                cu_seqlens_host=cu_seqlens_host,
-                attn_metadata=attn_metadata,
-                return_compress=True,
-            )
-            out = _usp_output_all_to_all(out[None], head_dim=2)[0]
-            _, ulysses_rank = get_ulysses_ctx()
-            vsa_h3_fold_gate(
-                out,
-                gate_compress,
-                _usp_all_gather(out_compress),
-                attn_metadata,
-                row_start=ulysses_rank * out.shape[0],
-            )
-            return out
+        # under Ulysses the gate is folded on the row shard after the output
+        # all-to-all instead of exchanging the gate itself
+        fold_after_exchange = ulysses_active and gate_compress is not None
         out = attention._attention_impl.forward_varlen(
             q,
             k,
@@ -682,10 +664,22 @@ def _minimax_h3_attention_core_impl(
             max_seqlen=max_seqlen,
             cu_seqlens_host=cu_seqlens_host,
             attn_metadata=attn_metadata,
-            gate_compress=gate_compress,
+            gate_compress=None if fold_after_exchange else gate_compress,
+            return_compress=fold_after_exchange,
         )
+        if fold_after_exchange:
+            out, out_compress = out
         if ulysses_active:
             out = _usp_output_all_to_all(out[None], head_dim=2)[0]
+        if fold_after_exchange:
+            _, ulysses_rank = get_ulysses_ctx()
+            vsa_h3_fold_gate(
+                out,
+                gate_compress,
+                _usp_all_gather(out_compress),
+                attn_metadata,
+                row_start=ulysses_rank * out.shape[0],
+            )
         return out
 
     if ring_active:
