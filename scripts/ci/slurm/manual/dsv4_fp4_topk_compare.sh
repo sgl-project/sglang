@@ -1090,9 +1090,19 @@ host_main() {
     fi
     : "${SLURM_JOB_ID:?Submit this manual harness with sbatch}"
 
-    local script_dir repo_root
+    local script_dir repo_root=""
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    repo_root="$(git -C "$script_dir" rev-parse --show-toplevel)"
+    if [[ -n "${FUSED_SGLANG_SOURCE_DIR:-}" ]]; then
+        repo_root="$FUSED_SGLANG_SOURCE_DIR"
+    elif repo_root="$(git -C "$script_dir" rev-parse --show-toplevel 2>/dev/null)"; then
+        :
+    elif [[ -n "${SLURM_SUBMIT_DIR:-}" ]] &&
+        repo_root="$(git -C "$SLURM_SUBMIT_DIR" rev-parse --show-toplevel 2>/dev/null)"; then
+        :
+    else
+        echo "ERROR: cannot resolve the fused SGLang checkout; set FUSED_SGLANG_SOURCE_DIR" >&2
+        return 2
+    fi
     FUSED_SGLANG_SOURCE_DIR="${FUSED_SGLANG_SOURCE_DIR:-$repo_root}"
     LEGACY_SGLANG_SOURCE_DIR="${LEGACY_SGLANG_SOURCE_DIR:-$FUSED_SGLANG_SOURCE_DIR}"
     WORKSPACE_SGLANG_SOURCE_DIR="${WORKSPACE_SGLANG_SOURCE_DIR:-}"
