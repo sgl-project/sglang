@@ -201,6 +201,43 @@ def test_text_entry_wrapper_delegates_pre_capture_prepare():
     assert calls == [runner]
 
 
+def _make_text_entry_wrapper_for_dflash(num_layers=4):
+    captured_layer_ids = []
+    wrapper = SimpleNamespace(
+        pp_group=SimpleNamespace(world_size=1),
+        model=SimpleNamespace(
+            layers=[object()] * num_layers,
+            set_dflash_layers_to_capture=captured_layer_ids.append,
+        ),
+        capture_aux_hidden_states=False,
+    )
+    return wrapper, captured_layer_ids
+
+
+def test_text_entry_dflash_capture_maps_draft_layers_to_target_layers():
+    wrapper, captured_layer_ids = _make_text_entry_wrapper_for_dflash()
+
+    Qwen3_5ForCausalLM.set_dflash_layers_to_capture(wrapper, [0, 2])
+
+    assert wrapper.capture_aux_hidden_states is True
+    assert captured_layer_ids == [[1, 3]]
+
+
+@pytest.mark.parametrize("layer_ids", ([1, 0], [0, 0], [-1], [3]))
+def test_text_entry_dflash_capture_rejects_invalid_layer_ids(layer_ids):
+    wrapper, _ = _make_text_entry_wrapper_for_dflash()
+
+    with pytest.raises(ValueError, match="unique, strictly increasing"):
+        Qwen3_5ForCausalLM.set_dflash_layers_to_capture(wrapper, layer_ids)
+
+
+def test_text_entry_dflash_capture_rejects_pipeline_parallelism():
+    wrapper = SimpleNamespace(pp_group=SimpleNamespace(world_size=2))
+
+    with pytest.raises(NotImplementedError, match="requires PP=1"):
+        Qwen3_5ForCausalLM.set_dflash_layers_to_capture(wrapper, [0])
+
+
 if __name__ == "__main__":
     import sys
 
