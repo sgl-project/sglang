@@ -122,26 +122,71 @@ def test_usp_merge_heads_unsupported_inputs_use_exact_fallback():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_pack_qkv_destination_major_is_bit_exact(dtype):
-    torch.manual_seed(0)
-    rows, world_size, global_heads, head_size = 17, 4, 12, 64
-    q, k, v = (
-        torch.randn(rows, global_heads, head_size, device=DEVICE, dtype=dtype)
-        for _ in range(3)
-    )
-
+def _reference_pack_qkv(q, k, v, world_size):
+    rows, global_heads, head_size = q.shape
     local_heads = global_heads // world_size
-    expected = torch.empty(
-        world_size, rows, local_heads, 3 * head_size, device=DEVICE, dtype=dtype
+    return torch.cat(
+        [
+            tensor.reshape(rows, world_size, local_heads, head_size).permute(1, 0, 2, 3)
+            for tensor in (q, k, v)
+        ],
+        dim=-1,
     )
-    for index, tensor in enumerate((q, k, v)):
-        shards = tensor.view(rows, world_size, local_heads, head_size).permute(
-            1, 0, 2, 3
-        )
-        expected[..., index * head_size : (index + 1) * head_size].copy_(shards)
 
-    assert torch.equal(pack_qkv_destination_major(q, k, v, world_size), expected)
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_pack_qkv_destination_major_preserves_all_16bit_patterns(dtype):
+    # Exercise the large contiguous CUDA fast path with every NaN payload,
+    # infinity, signed zero, and subnormal without a floating-point comparison.
+    rows, world_size, global_heads, head_size = 2731, 4, 24, 128
+    total_elements = rows * global_heads * head_size
+    bits = torch.arange(-32768, 32768, device=DEVICE, dtype=torch.int32).to(torch.int16)
+    bits = bits.repeat((total_elements + bits.numel() - 1) // bits.numel())[
+        :total_elements
+    ]
+    qkv = tuple(
+        bits.roll(shift).reshape(rows, global_heads, head_size).view(dtype)
+        for shift in (0, 1, 17)
+    )
+
+    expected = _reference_pack_qkv(
+        *(tensor.view(torch.int16) for tensor in qkv), world_size
+    )
+    out = torch.empty(expected.shape, device=DEVICE, dtype=dtype)
+    actual = pack_qkv_destination_major(*qkv, world_size, out=out)
+
+    assert actual is out
+    assert torch.equal(actual.view(torch.int16), expected)
+
+
+def test_pack_qkv_destination_major_preserves_head_strides():
+    # Keep the shape large enough for the contiguous fast path, then make each
+    # input ineligible solely through its head stride.
+    rows, world_size, global_heads, head_size = 2731, 4, 24, 128
+    qkv = tuple(
+        torch.randn(
+            rows * global_heads * (head_size + padding),
+            device=DEVICE,
+            dtype=torch.bfloat16,
+        ).as_strided(
+            (rows, global_heads, head_size),
+            (global_heads * (head_size + padding), head_size + padding, 1),
+        )
+        for padding in (1, 2, 3)
+    )
+    assert qkv[0].numel() >= 1 << 23
+    assert all(tensor.stride(-1) == 1 for tensor in qkv)
+    assert all(tensor.stride(1) != head_size for tensor in qkv)
+    assert all(not tensor.is_contiguous() for tensor in qkv)
+
+    expected = _reference_pack_qkv(
+        *(tensor.view(torch.int16) for tensor in qkv), world_size
+    )
+    out = torch.empty(expected.shape, device=DEVICE, dtype=torch.bfloat16)
+    actual = pack_qkv_destination_major(*qkv, world_size, out=out)
+
+    assert actual is out
+    assert torch.equal(actual.view(torch.int16), expected)
 
 
 def test_pack_qkv_destination_major_validates_inputs():
