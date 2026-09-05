@@ -2356,8 +2356,7 @@ def main():
         args.breakable_cuda_graph or args.quality_bcg_matrix
     ):
         parser.error(
-            "--bcg-text-buckets requires --breakable-cuda-graph or "
-            "--quality-bcg-matrix"
+            "--bcg-text-buckets requires --breakable-cuda-graph or --quality-bcg-matrix"
         )
     if args.cleanup_model_cache and not args.model_cache_root:
         parser.error("--cleanup-model-cache requires --model-cache-root")

@@ -96,9 +96,9 @@ def _assert_topk_close(scores_cpu, ref_raw, our_raw, bs, seq_lens, k):
                 print(
                     f"b={i} L={L} k={k}: more={list(more)[:4]} less={list(less)[:4]} mv={mv[:3]} lv={lv[:3]}"
                 )
-        assert len(our) == min(
-            k, L
-        ), f"b={i} L={L} k={k}: {len(our)} valid != {min(k, L)}"
+        assert len(our) == min(k, L), (
+            f"b={i} L={L} k={k}: {len(our)} valid != {min(k, L)}"
+        )
     assert bad <= MAX_PERMIT_ERROR, f"{bad=} > {MAX_PERMIT_ERROR}"
 
 

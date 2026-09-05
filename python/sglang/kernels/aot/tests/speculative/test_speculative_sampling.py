@@ -116,15 +116,15 @@ def test_tree_speculative_sampling_target_only(
         deterministic=True,
     )
 
-    assert (
-        predicts.tolist() == expected_predicts
-    ), f"Predicts mismatch for thresholds ({threshold_single}, {threshold_acc})"
-    assert (
-        accept_index.tolist() == expected_accept_index
-    ), f"Accept index mismatch for thresholds ({threshold_single}, {threshold_acc})"
-    assert (
-        accept_token_num.tolist() == expected_accept_token_num
-    ), f"Accept token num mismatch for thresholds ({threshold_single}, {threshold_acc})"
+    assert predicts.tolist() == expected_predicts, (
+        f"Predicts mismatch for thresholds ({threshold_single}, {threshold_acc})"
+    )
+    assert accept_index.tolist() == expected_accept_index, (
+        f"Accept index mismatch for thresholds ({threshold_single}, {threshold_acc})"
+    )
+    assert accept_token_num.tolist() == expected_accept_token_num, (
+        f"Accept token num mismatch for thresholds ({threshold_single}, {threshold_acc})"
+    )
 
 
 if __name__ == "__main__":

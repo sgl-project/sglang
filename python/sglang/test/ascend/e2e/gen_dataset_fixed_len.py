@@ -164,7 +164,7 @@ def generate_custom_dataset(
         for item in output_data
     ]
     print(
-        f"Token count stats: min={min(token_counts)}, max={max(token_counts)}, avg={sum(token_counts)/len(token_counts):.1f}"
+        f"Token count stats: min={min(token_counts)}, max={max(token_counts)}, avg={sum(token_counts) / len(token_counts):.1f}"
     )
 
     return output_data
@@ -459,8 +459,8 @@ def generate_random_dataset(
             }
         )
 
-    print(f"#Input tokens: {np.sum(input_lens[:len(input_requests)])}")
-    print(f"#Output tokens: {np.sum(output_lens[:len(input_requests)])}")
+    print(f"#Input tokens: {np.sum(input_lens[: len(input_requests)])}")
+    print(f"#Output tokens: {np.sum(output_lens[: len(input_requests)])}")
 
     output_dir = os.path.dirname(output_file)
     if output_dir:

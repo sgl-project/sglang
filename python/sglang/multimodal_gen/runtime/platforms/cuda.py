@@ -381,10 +381,10 @@ class _VMOBAAttentionBackendResolver(_CudaAttentionBackendResolver):
 class _SubBlockSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
 
-    # Hopper uses SGLang's SM90 CuTe-DSL block-sparse kernel. Blackwell uses the
-    # FlashInfer blk64 kernel built specifically for sm_100a; 10.3 and 12.x do
-    # not have a compatible cubin and must still fail closed.
-    supported_capabilities = {(9, 0), (10, 0)}
+    # Hopper uses SGLang's SM90 CuTe-DSL block-sparse kernel. SM100 uses
+    # FlashInfer's architecture-specific sm_100a kernel; SM120 uses FlashInfer's
+    # CuTe-DSL SM120 blk64 kernel. Other capabilities still fail closed.
+    supported_capabilities = {(9, 0), (10, 0), (12, 0)}
 
     @classmethod
     def resolve(cls, platform) -> str:
@@ -395,8 +395,8 @@ class _SubBlockSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
         if capability_tuple not in cls.supported_capabilities:
             found = capability.as_version_str() if capability else "unknown"
             raise ValueError(
-                "SubBlock sparse attention needs compute capability 9.0 "
-                f"(Hopper) or 10.0 (B200 / GB200); this device reports {found}."
+                "SubBlock sparse attention needs compute capability 9.0, 10.0, "
+                f"or 12.0; this device reports {found}."
             )
         try:
             from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (  # noqa: F401
@@ -412,20 +412,31 @@ class _SubBlockSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
                 from sglang.kernels.ops.attention.flash_attn.cute.interface import (  # noqa: F401
                     flash_attn_func,
                 )
-            else:
+            elif capability_tuple == (10, 0):
                 from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (  # noqa: F401
                     load_bsa_attn_blk64_fwd,
                 )
 
                 load_bsa_attn_blk64_fwd()
+            else:
+                from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
+                    load_bsa_attn_sm120_blk64_fwd,
+                )
+
+                load_bsa_attn_sm120_blk64_fwd()
             return "sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn.SubBlockSparseAttentionBackend"
         except Exception as e:
             logger.error("Failed to import SubBlock sparse attention: %s", str(e))
             dependency = (
                 "SGLang's SM90 CuTe-DSL FlashAttention dependencies"
                 if capability_tuple == (9, 0)
-                else "FlashInfer with the blk64 block-sparse kernel "
-                "(flashinfer.cute_dsl.sparse.bsa_attn_blk64_fwd)"
+                else (
+                    "FlashInfer with the SM100 blk64 block-sparse kernel "
+                    "(flashinfer.cute_dsl.sparse.bsa_attn_blk64_fwd)"
+                    if capability_tuple == (10, 0)
+                    else "FlashInfer with the SM120 blk64 block-sparse kernel "
+                    "(flashinfer.cute_dsl.sparse.bsa_attn_sm120)"
+                )
             )
             raise ImportError(f"SubBlock sparse attention needs {dependency}.") from e
 

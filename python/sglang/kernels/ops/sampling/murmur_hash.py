@@ -102,12 +102,12 @@ def murmur_hash32_kernel(
 
 
 def murmur_hash32(seed, positions, col_indices):
-    assert (
-        seed.shape == positions.shape
-    ), "Seed and positions must have the same shape (n,)"
-    assert (
-        len(seed.shape) == 1 and len(col_indices.shape) == 1
-    ), f"Inputs must be 1D tensors {seed.shape=} {col_indices.shape=}"
+    assert seed.shape == positions.shape, (
+        "Seed and positions must have the same shape (n,)"
+    )
+    assert len(seed.shape) == 1 and len(col_indices.shape) == 1, (
+        f"Inputs must be 1D tensors {seed.shape=} {col_indices.shape=}"
+    )
     n = seed.shape[0]
     m = col_indices.shape[0]
     device = seed.device

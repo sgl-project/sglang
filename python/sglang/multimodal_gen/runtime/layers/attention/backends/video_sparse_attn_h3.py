@@ -393,7 +393,7 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         raise NotImplementedError(
-            "VSA-H3 serves MiniMax-H3's packed varlen attention; use " "forward_varlen."
+            "VSA-H3 serves MiniMax-H3's packed varlen attention; use forward_varlen."
         )
 
     def forward_varlen(

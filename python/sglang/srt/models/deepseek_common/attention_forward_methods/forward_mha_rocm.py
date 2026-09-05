@@ -53,7 +53,6 @@ if _use_aiter_gfx95:
 
 
 class DeepseekMHARocmForwardMixin:
-
     def forward_normal_rocm_prepare(
         self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,

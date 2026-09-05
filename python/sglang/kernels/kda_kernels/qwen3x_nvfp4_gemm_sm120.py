@@ -353,9 +353,9 @@ class _Qwen3xNvfp4Sm120Kernel:
             self.occupancy,
         )
 
-        assert (
-            self.epi_stage > 0
-        ), "epi_stage <= 0, not enough shared memory. This configuration will be skipped."
+        assert self.epi_stage > 0, (
+            "epi_stage <= 0, not enough shared memory. This configuration will be skipped."
+        )
 
         (
             self.a_smem_layout_staged,

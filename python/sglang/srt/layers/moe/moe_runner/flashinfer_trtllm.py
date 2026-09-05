@@ -799,9 +799,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         # during torch.compile for piecewise cuda graph.
         # Use custom op wrapper for torch.compile compatibility.
         if use_routed_topk:
-            assert (
-                runner_config.top_k is not None
-            ), "runner_config.top_k is required for flashinfer_trtllm_routed."
+            assert runner_config.top_k is not None, (
+                "runner_config.top_k is required for flashinfer_trtllm_routed."
+            )
             packed_topk_ids = _get_packed_topk_ids_for_flashinfer_routed(topk_output)
 
             trtllm_fp8_block_scale_routed_moe_out_wrapper(
@@ -1286,12 +1286,12 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
         f"got '{runner_config.activation}'."
     )
     if not use_routed_topk:
-        assert (
-            dispatch_output.topk_output.topk_config.renormalize
-        ), "Renormalize is required for flashinfer trtllm moe"
-    assert (
-        runner_config.num_fused_shared_experts == 0
-    ), "Fused shared experts are not supported for flashinfer trtllm moe"
+        assert dispatch_output.topk_output.topk_config.renormalize, (
+            "Renormalize is required for flashinfer trtllm moe"
+        )
+    assert runner_config.num_fused_shared_experts == 0, (
+        "Fused shared experts are not supported for flashinfer trtllm moe"
+    )
     activation_type = get_activation_type(
         runner_config.activation, is_gated=runner_config.is_gated
     )
@@ -1301,9 +1301,9 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
 
     with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
         if use_routed_topk:
-            assert (
-                runner_config.top_k is not None
-            ), "runner_config.top_k is required for flashinfer_trtllm_routed."
+            assert runner_config.top_k is not None, (
+                "runner_config.top_k is required for flashinfer_trtllm_routed."
+            )
             routing_method_type = runner_config.routing_method_type
             if routing_method_type is None:
                 routing_method_type = RoutingMethodType.Default

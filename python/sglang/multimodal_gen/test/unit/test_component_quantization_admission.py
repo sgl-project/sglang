@@ -101,8 +101,9 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
             component_precisions={},
             component_quantizations={},
             component_weights_paths={},
-            should_direct_gpu_weight_load_component=lambda component: component
-            == "vocoder",
+            should_direct_gpu_weight_load_component=lambda component: (
+                component == "vocoder"
+            ),
         )
 
         with self.assertRaisesRegex(
@@ -117,8 +118,9 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
             component_precisions={},
             component_quantizations={},
             component_weights_paths={},
-            should_direct_gpu_weight_load_component=lambda component: component
-            == "audio_vae",
+            should_direct_gpu_weight_load_component=lambda component: (
+                component == "audio_vae"
+            ),
         )
 
         with self.assertRaisesRegex(
