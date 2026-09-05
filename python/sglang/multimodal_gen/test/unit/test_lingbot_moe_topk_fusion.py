@@ -49,3 +49,21 @@ def test_group_limited_topk_handles_ties():
     assert fused.shape == (seq_len, top_k)
     assert (fused >= 0).all() and (fused < num_experts).all()
     assert torch.equal(ref.sort(dim=-1)[0], fused.sort(dim=-1)[0])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_group_limited_topk_handles_repeated_nonuniform_scores():
+    # Router logits can contain repeated, nonuniform values after rounding or
+    # saturation. This exercises duplicate maxima both within and across groups.
+    torch.manual_seed(123)
+    seq_len, num_experts, n_group, topk_group, top_k = 64, 64, 8, 3, 8
+    scores = torch.randint(
+        0,
+        4,
+        (seq_len, num_experts),
+        device="cuda",
+        dtype=torch.int32,
+    ).float()
+    ref = _ref_group_limited_topk(scores, num_experts, n_group, topk_group, top_k)
+    fused = group_limited_topk(scores, n_group, topk_group, top_k)
+    assert torch.equal(ref.sort(dim=-1)[0], fused.sort(dim=-1)[0])

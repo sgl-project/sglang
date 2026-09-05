@@ -50,8 +50,16 @@ def _group_limited_topk_kernel(
     g = tl.where(epg_mask, g, float("-inf"))
 
     # group score = sum of top-2 experts within each group.
+    group_e = tl.arange(0, BLOCK_EPG)[None, :]
     m1 = tl.max(g, axis=1)
-    g2 = tl.where(g == m1[:, None], float("-inf"), g)
+    # Remove exactly one copy of the first maximum. Masking every value equal
+    # to m1 would lose the second top-k entry when a group contains duplicate
+    # maxima, which changes both the group score and the selected experts.
+    m1_idx = tl.min(
+        tl.where(g == m1[:, None], group_e, BLOCK_EPG),
+        axis=1,
+    )
+    g2 = tl.where(group_e == m1_idx[:, None], float("-inf"), g)
     m2 = tl.max(g2, axis=1)
     group_scores = m1 + m2
 
@@ -59,15 +67,14 @@ def _group_limited_topk_kernel(
     # matching torch.topk).
     group_idx = tl.arange(0, BLOCK_G)
     gs_valid = tl.where(group_idx < N_GROUP, group_scores, float("-inf"))
-    # Break group-score ties in favour of the smaller group index (torch.topk
-    # first-max). 1e-12 is below f32 resolution, so only exact ties are split.
-    gs_valid = gs_valid + tl.where(
-        group_idx < N_GROUP, group_idx.to(tl.float32) * 1e-12, 0.0
-    )
     selected_group = tl.zeros((BLOCK_G,), dtype=tl.int1)
     for _ in tl.static_range(TOPK_GROUP):
-        gmax = tl.max(gs_valid, axis=0)
-        is_pick = gs_valid == gmax
+        picked_idx = tl.argmax(
+            gs_valid,
+            axis=0,
+            tie_break_left=True,
+        )
+        is_pick = group_idx == picked_idx
         selected_group = selected_group | is_pick
         gs_valid = tl.where(is_pick, float("-inf"), gs_valid)
 
@@ -75,15 +82,8 @@ def _group_limited_topk_kernel(
     masked = tl.where(selected_group[:, None], g, float("-inf"))
     flat = tl.reshape(masked, (BLOCK_E,), can_reorder=False)
     flat = tl.where(e_mask, flat, float("-inf"))
-    # Break ties in favour of the smaller expert index (matching torch.topk's
-    # first-max behaviour) and make each score unique so the selection pass
-    # emits distinct experts. The offset is far below bf16/f32 resolution of
-    # the routing logits (1e-12), so it never changes a non-tied comparison.
-    flat = flat + offs_e.to(tl.float32) * 1e-12
     for kk in tl.static_range(TOP_K):
-        vmax = tl.max(flat, axis=0)
-        is_pick = flat == vmax
-        idx = tl.min(tl.where(is_pick, offs_e, E), axis=0)
+        idx = tl.argmax(flat, axis=0, tie_break_left=True)
         tl.store(out_idx_ptr + t * TOP_K + kk, idx.to(tl.int64))
         flat = tl.where(offs_e == idx, float("-inf"), flat)
 
