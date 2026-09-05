@@ -1032,6 +1032,9 @@ class Envs:
     # it to trade that away for disk (1 keeps only the most recent build).
     SGLANG_JIT_CACHE_KEEP = EnvInt(None)
 
+    # Per-file overrides for packaged MoE LoRA plans, tiles, and base GEMM configs.
+    SGLANG_LORA_MOE_CONFIG_DIR = EnvStr(None)
+
     # ===================================================================
     # Expert-parallel dispatch and MoE execution
     # ===================================================================

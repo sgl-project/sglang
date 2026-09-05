@@ -897,9 +897,23 @@ def post_reorder_for_cutlass_moe(
     )
 
 
+def _check_out_buffer(tensor, shape, dtype, device, name: str) -> None:
+    if (
+        tuple(tensor.shape) != tuple(shape)
+        or tensor.dtype != dtype
+        or tensor.device != device
+        or not tensor.is_contiguous()
+    ):
+        raise ValueError(
+            f"{name} must be contiguous {dtype} {tuple(shape)} on {device}; got "
+            f"{tensor.dtype} {tuple(tensor.shape)} on {tensor.device}"
+        )
+
+
 @triton.jit
 def post_reorder_deepgemm_triton_kernel(
     down_output_ptr,
+    lora_delta_ptr,
     output_ptr,
     src2dst_ptr,
     topk_ids_ptr,
@@ -908,11 +922,14 @@ def post_reorder_deepgemm_triton_kernel(
     num_tokens,
     hidden_size,
     routed_scaling_factor: float,
+    HAS_LORA_DELTA: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_STAGES: tl.constexpr,
 ):
     """`expert_id >= 0` includes the shared expert at num_experts (padding=-1); don't
     switch to the cutlass `!= num_local_experts` gate. routed_scaling_factor is folded into the store.
+
+    lora_delta is unweighted per pair; add it before route weights and scaling.
     """
     OutDtype = output_ptr.dtype.element_ty
 
@@ -941,6 +958,10 @@ def post_reorder_deepgemm_triton_kernel(
                 weight_scale = tl.load(token_topk_weights_ptr + idx).to(tl.float32)
                 load_ptr_offs = down_output_ptr_offs + dst_idx * hidden_size
                 in_data = tl.load(load_ptr_offs, mask=mask).to(tl.float32)
+                if HAS_LORA_DELTA:
+                    slot_idx = src_idx * topk + idx
+                    delta_ptr_offs = lora_delta_ptr + slot_idx * hidden_size + offset
+                    in_data += tl.load(delta_ptr_offs, mask=mask).to(tl.float32)
                 sum_vec += in_data * weight_scale
         sum_vec *= routed_scaling_factor
         store_ptr_offs = output_ptr_offs + src_idx * hidden_size
@@ -957,10 +978,20 @@ def post_reorder_deepgemm(
     num_tokens,
     hidden_size,
     routed_scaling_factor: float,
+    lora_delta=None,
 ):
+    if lora_delta is not None:
+        _check_out_buffer(
+            lora_delta,
+            (num_tokens, topk, hidden_size),
+            lora_delta.dtype,
+            down_output.device,
+            "lora_delta",
+        )
     grid, block_dim = _get_launch_config_2d(down_output.device, num_tokens, hidden_size)
     post_reorder_deepgemm_triton_kernel[grid](
         down_output,
+        down_output if lora_delta is None else lora_delta,
         output,
         src2dst,
         topk_ids,
@@ -969,6 +1000,7 @@ def post_reorder_deepgemm(
         num_tokens,
         hidden_size,
         float(routed_scaling_factor),
+        HAS_LORA_DELTA=lora_delta is not None,
         BLOCK_SIZE=block_dim,
         NUM_STAGES=3,
     )

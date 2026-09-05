@@ -318,9 +318,7 @@ class LoRAMemoryPool:
         return any(isinstance(m, FusedMoE) for m in base_model.modules())
 
     def _get_num_local_experts(self, base_model: torch.nn.Module) -> int:
-        """Experts owned by this rank. Equals the global count when EP is
-        off, the runner keeps global IDs, or the split isn't even (all
-        three cases fold into `moe_use_local_expert_ids == False`)."""
+        """Resident factor count; new MoE LoRA providers use EP-local factors."""
         total = self._get_num_experts(base_model)
         if not self.moe_use_local_expert_ids:
             return total
