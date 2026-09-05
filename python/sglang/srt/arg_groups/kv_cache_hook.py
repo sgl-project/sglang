@@ -604,12 +604,6 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "fused inside the full-attention page envelope (or falls back "
             "to a private pool over the unified virtual id space)."
         )
-        assert cfg.speculative_eagle_topk in (None, 1), (
-            "--enable-unified-memory + EAGLE/EAGLE3 supports a linear "
-            "draft chain only (--speculative-eagle-topk in {None, 1}); "
-            "tree verify is not audited for the unified pool. Got "
-            f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
-        )
         # The translated MHA rails. A fused draft is MHA-shaped on every host
         # (its region holds dense K/V rows), and these three also serve a
         # draft that keeps an MLA pool of its own.
@@ -638,12 +632,6 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "Set --speculative-draft-attention-backend to one of them."
         )
     if cfg.speculative_algorithm == "DSPARK":
-        assert cfg.speculative_eagle_topk in (None, 1), (
-            "--enable-unified-memory + DSPARK supports a linear draft "
-            "chain only (--speculative-eagle-topk in {None, 1}); tree "
-            "verify is not audited for the unified pool. Got "
-            f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
-        )
         _assert_spec_verify_backends(server_args, algorithm="DSPARK")
     if cfg.speculative_algorithm == "DFLASH":
         _assert_spec_verify_backends(
