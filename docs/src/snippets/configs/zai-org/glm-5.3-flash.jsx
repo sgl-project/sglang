@@ -115,9 +115,9 @@ export const config = {
           id: "4",
           label: "DCP 4",
           disabled: (s) => s.hw !== "gb300",
-          disableReason: "DCP is validated only on 4x GB300 TP4/EP4 for now.",
+          disableReason: "DCP is validated only on 4x GB300 for now.",
           flags: ["--dcp-size 4", "--dcp-comm-backend a2a", "--dcp-replicate-q-proj"],
-          hints: ["Measured on 4x GB300 on the FP8 recipe with both KV/DSA pairings and on the NVFP4 recipe with BF16 KV + TileLang DSA, adaptive MTP 5/1/6, full decode graph."],
+          hints: ["Measured on 4x GB300 on the FP8 recipe (both KV/DSA pairings, full decode graph) and on the NVFP4 recipe (BF16 KV + TileLang DSA), adaptive MTP 5/1/6."],
         },
       ],
     },
@@ -154,8 +154,10 @@ python3 -m sglang.bench_serving \\
   --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
   --request-rate inf --temperature 0 --seed 42 \\
   --flush-cache`,
-    // num_prompts = 5 × concurrency (measured floor 16).
-    numPromptsByConc: { 1: 16, 16: 80, 64: 320, 256: 1280, 1024: 5120 },
+    // num_prompts = 5 × concurrency at c16 and above; every published c1 row
+    // was measured with 8. H/B-platform c16 rows used 32 (disclosed in their
+    // notes), gb300 rows used 80.
+    numPromptsByConc: { 1: 8, 16: 80, 64: 320, 256: 1280, 1024: 5120 },
     accuracy: {
       gsm8k_pct:
 `# To install sgl-eval: pip install sgl-eval
@@ -363,7 +365,7 @@ sgl-eval run gsm8k \\
       verificationStatus: (s) =>
         ["bf16-tilelang", "fp8-trtllm"].includes(s.kvDsaPair) &&
         s.mmTransport === "auto" &&
-        s.hicache === "off" &&
+        ["off", "l2"].includes(s.hicache) &&
         s.dcp === "off"
           ? "verified"
           : "unverified",
@@ -618,7 +620,7 @@ sgl-eval run gsm8k \\
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
-        ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
+        s.hicache === "off" ? "verified" : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -669,7 +671,7 @@ sgl-eval run gsm8k \\
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
-        ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
+        s.hicache === "off" ? "verified" : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -715,7 +717,7 @@ sgl-eval run gsm8k \\
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
-        ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
+        s.hicache === "off" ? "verified" : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -761,7 +763,7 @@ sgl-eval run gsm8k \\
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
-        ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
+        s.hicache === "off" ? "verified" : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
