@@ -411,6 +411,9 @@ class RuntimeHandle:
             "load_format": self.tokenizer_manager.config_value("load_format"),
             "reasoning_parser": self.tokenizer_manager.config_value("reasoning_parser"),
             "tool_call_parser": self.tokenizer_manager.config_value("tool_call_parser"),
+            "disaggregation_mode": self.tokenizer_manager.config_value(
+                "disaggregation_mode"
+            ),
             "model_type": getattr(model_config.hf_config, "model_type", None),
             "architectures": getattr(model_config.hf_config, "architectures", None),
         }
