@@ -79,6 +79,7 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    host_copies_are_redundant,
     host_copies_would_not_fit,
     host_memory_available_bytes,
 )
@@ -465,6 +466,12 @@ def _require_quantized_encoder_layers(
 
 def _keep_this_checkpoint_mapped(model_path: str) -> bool:
     """Whether this encoder's weights should stay on their file mapping."""
+    if host_copies_are_redundant():
+        logger.info(
+            "Text encoder stays on its checkpoint mapping: host and device "
+            "share one memory pool, so a copy would hold the same bytes twice."
+        )
+        return True
     weight_bytes = checkpoint_bytes(model_path)
     if not host_copies_would_not_fit(weight_bytes):
         return False

@@ -103,6 +103,15 @@ ESTIMATED_PINNED_H2D_BYTES_PER_SECOND = 24 * GIB_BYTES
 # overlap layer compute like the explicit pinned path. H200 measurements put
 # their effective layer-streaming cost near 3x the pinned path.
 PAGEABLE_H2D_COST_MULTIPLIER = 3
+# A mapped layer streamed from a page cache that cannot hold the request's
+# whole cycle is re-read from the drive: ~1 GiB/s against the 24 GiB/s the
+# transfer model assumes for pinned copies.
+DISK_MISS_COST_MULTIPLIER = 24
+# On a shared pool a stage-resident set is re-armed from its mapping on every
+# request, so it is only offered for a component small enough to arm cheaply
+# and re-streamed often enough per request for the arm to pay for itself.
+SHARED_POOL_STAGE_RESIDENT_MAX_BYTES = 16 * 1024**3
+SHARED_POOL_STAGE_RESIDENT_MIN_USES = 4
 AUTO_PLACEMENT_LATENCY_TOLERANCE_NS = 0
 # Allow normal measurement noise, but undo a round whose calibrated request is
 # materially slower than the original layout.
@@ -212,6 +221,10 @@ class ResidencyTarget(msgspec.Struct, frozen=True):
     current_placement: bool = False
     target_device_weight_bytes: int = 0
     target_pinned_host_bytes: int = 0
+    # Page cache a shared host/device pool gets back when this target no longer
+    # streams its layers from the checkpoint mapping. Credited against every
+    # phase's device budget: the pages are released for the whole request.
+    released_cache_bytes: int = 0
 
     def target_mode(self) -> str:
         if self.target_residency_mode is not None:
@@ -292,6 +305,9 @@ class RankResidencyReport(msgspec.Struct, frozen=True):
     current_device_weight_bytes_by_component: dict[str, int] = {}
     current_active_weight_bytes_by_component: dict[str, int] = {}
     node_rank: int = 0
+    # Host and device draw from one physical pool (GB10, Jetson): pinned host
+    # bytes are then device bytes the kernel no longer has.
+    host_shares_device_pool: bool = False
     pinned_host_bytes: int = 0
     host_pin_capacity_bytes: int = 0
     host_transition_headroom_bytes: int = 0
@@ -346,6 +362,16 @@ class AppliedResidencyChange(msgspec.Struct, frozen=True):
     previous_host_pin_budget_state: tuple[int, int] | None = None
     pinned_host_changed: bool = False
     applied_device_delta_bytes: int = 0
+
+
+def _pageable_h2d_cost_multiplier() -> int:
+    """Pageable copies cost extra across PCIe: the driver stages them and the
+    copy cannot run ahead of compute. On a shared host/device pool the device
+    reads host pages directly and the mapped courier overlaps them, so the
+    penalty is gone."""
+    if current_platform.device_shares_host_memory():
+        return 1
+    return PAGEABLE_H2D_COST_MULTIPLIER
 
 
 def residency_device_growth_bytes(candidate: ResidencyTarget) -> int:
@@ -1292,6 +1318,12 @@ def _resolve_layerwise_policies(
     return policies
 
 
+def _manager_mapped_layer_bytes(manager) -> dict[int, int]:
+    """Mapped bytes per layer; nothing for a store without a mapping (legacy managers, tests)."""
+    getter = getattr(manager, "mapped_layer_bytes", None)
+    return dict(getter()) if callable(getter) else {}
+
+
 def _layerwise_transfer_work_bytes(
     *,
     managers: Sequence,
@@ -1300,8 +1332,14 @@ def _layerwise_transfer_work_bytes(
     pinned_layers: tuple[tuple[int, ...], ...],
     uses_per_streamed_layer: int,
     layer_uses: tuple[tuple[int, ...], ...] | None = None,
+    mapped_stream_cost_multiplier: int = 0,
 ) -> int:
     """Relative transfer work for one request under a layerwise placement.
+
+    ``mapped_stream_cost_multiplier`` prices a mapped layer's stream on a
+    shared pool: zero while the page cache holds the whole request cycle (the
+    courier moves it at memory speed under compute), DISK_MISS_COST_MULTIPLIER
+    once it cannot, because every pass then re-reads the shortfall from disk.
 
     Pageable copies are weighted 2x: the CUDA driver stages them through an
     internal pinned buffer and the copy cannot run ahead of compute. This is a
@@ -1313,6 +1351,12 @@ def _layerwise_transfer_work_bytes(
         layer_uses=layer_uses,
         fallback_uses=uses_per_streamed_layer,
     )
+    # On a shared host/device pool a mapped layer moves at memory speed while
+    # the previous layer computes, whether it streams every step or is armed
+    # once: there is no transfer time for residency to save, and a resident
+    # set is re-armed on every request. Only bytes that are not on a mapping
+    # -- anonymous fused weights -- still count as transfer work there.
+    shared_pool = current_platform.device_shares_host_memory()
     total = 0
     for manager, resident_count, policy, pinned_indices, manager_uses in zip(
         managers, resident_layers, policies, pinned_layers, resolved_uses
@@ -1325,13 +1369,17 @@ def _layerwise_transfer_work_bytes(
             )
         )
         pinned = set(pinned_indices)
+        mapped = _manager_mapped_layer_bytes(manager) if shared_pool else {}
         for layer_idx, weight_bytes in manager.layer_weight_bytes().items():
             observed_uses = manager_uses[layer_idx]
             uses = observed_uses if layer_idx in streamed else min(1, observed_uses)
             transfer_multiplier = (
-                1 if layer_idx in pinned else PAGEABLE_H2D_COST_MULTIPLIER
+                1 if layer_idx in pinned else _pageable_h2d_cost_multiplier()
             )
-            total += uses * transfer_multiplier * weight_bytes
+            mapped_bytes = mapped.get(layer_idx, 0)
+            counted_bytes = max(0, weight_bytes - mapped_bytes)
+            total += uses * transfer_multiplier * counted_bytes
+            total += uses * mapped_stream_cost_multiplier * mapped_bytes
     return total
 
 
@@ -1393,6 +1441,119 @@ def _layerwise_active_peak_device_bytes(
         )
         if any(uses)
     )
+
+
+def _layerwise_streamed_mapped_bytes(
+    *,
+    managers: Sequence,
+    resident_layers: tuple[int, ...],
+    residency_policies: tuple[str, ...] | None = None,
+    layer_uses: tuple[tuple[int, ...], ...] | None = None,
+    repeated: bool = True,
+) -> int:
+    """Page cache a layerwise layout depends on: mapped bytes of the streamed
+    layers that are read on every step.
+
+    On a shared host/device pool this is the same memory the device draws on.
+    A resident layer holds its bytes on the device instead, so the two placements
+    of one layer cost the pool the same; only a layer both streamed and evicted
+    is cheaper, and it is paid for in disk reads on every step. A layer read
+    once per request is different: losing its pages costs one sequential read
+    per request, bounded and small next to the denoise loop, so it is not a
+    hard claim on the pool. ``layer_uses`` decides per layer when measured;
+    ``repeated`` stands in for it when it is not.
+    """
+    policies = _resolve_layerwise_policies(managers, residency_policies)
+    resolved_uses = (
+        _resolve_layerwise_uses(
+            managers=managers, layer_uses=layer_uses, fallback_uses=0
+        )
+        if layer_uses is not None
+        else None
+    )
+    total = 0
+    for group, (manager, resident_count, policy) in enumerate(
+        zip(managers, resident_layers, policies)
+    ):
+        mapped = _manager_mapped_layer_bytes(manager)
+        if not mapped:
+            continue
+        for layer_idx in compute_streamed_layers(
+            num_layers=manager.num_layers,
+            resident_layers=resident_count,
+            policy=policy,
+        ):
+            if resolved_uses is not None:
+                if resolved_uses[group][layer_idx] <= 1:
+                    continue
+            elif not repeated:
+                continue
+            total += mapped.get(layer_idx, 0)
+    return total
+
+
+def layerwise_mapped_bytes(modules: Mapping[str, object]) -> int:
+    """Mapped bytes of every enabled layerwise manager: the page cache a request
+    cycle touches when everything streams from its mapping."""
+    seen: set[int] = set()
+    total = 0
+    for module in modules.values():
+        if not isinstance(module, LayerwiseOffloadableModuleMixin):
+            continue
+        for manager in module.layerwise_offload_managers:
+            if id(manager) in seen or not manager.enabled:
+                continue
+            seen.add(id(manager))
+            total += sum(_manager_mapped_layer_bytes(manager).values())
+    return total
+
+
+def layerwise_streamed_mapped_bytes(modules: Mapping[str, object]) -> int:
+    """Mapped bytes the current layout streams on every step, across modules.
+
+    Without measurements the DiT is the component whose layers are re-read
+    per step; encoders and VAEs read theirs once per request.
+    """
+    seen: set[int] = set()
+    total = 0
+    for name, module in modules.items():
+        if not isinstance(module, LayerwiseOffloadableModuleMixin):
+            continue
+        for manager in module.layerwise_offload_managers:
+            if id(manager) in seen or not manager.enabled:
+                continue
+            seen.add(id(manager))
+            total += _layerwise_streamed_mapped_bytes(
+                managers=[manager],
+                resident_layers=(manager.resident_layers,),
+                residency_policies=(manager.residency_policy,),
+                repeated=is_dit_component_name(name),
+            )
+    return total
+
+
+def _shared_pool_resident_targets(
+    targets: Iterable[tuple[int, ...]],
+    current_resident_layers: tuple[int, ...] | None,
+    keep: Iterable[tuple[int, ...]] = (),
+) -> list[tuple[int, ...]]:
+    """Resident-layer layouts worth offering when host and device share one pool.
+
+    A stage-scoped resident set is re-armed from its mapping on every request:
+    a synchronous read of the whole set that replaces a layer stream the
+    courier was already hiding under compute. Measured on a GB10, 25 resident
+    DiT layers cost a 66 s first step and saved nothing per step. So only the
+    measured layout (the anchor for relative utility) and the fully streamed
+    layout remain; permanent residency is a separate, transition-budgeted
+    option.
+    """
+    keep = list(keep)
+    kept = []
+    for target in list(targets) + keep:
+        if target == current_resident_layers or not any(target) or target in keep:
+            if target not in kept:
+                kept.append(target)
+    return kept
 
 
 def _layerwise_pin_targets(
@@ -1892,6 +2053,11 @@ class _EstimatedLayerwiseManager:
     def layer_host_store_bytes(self) -> dict[int, int]:
         return self._layer_bytes
 
+    def mapped_layer_bytes(self) -> dict[int, int]:
+        # An estimated manager describes weights that are not yet layerwise;
+        # nothing of theirs sits on a checkpoint mapping.
+        return {}
+
     def pinned_host_weight_bytes(self) -> int:
         return 0
 
@@ -1991,6 +2157,8 @@ def _unconfigured_layerwise_targets(
     tune_residency_policy: bool,
     component_used: bool,
     layer_uses_by_name: Mapping[str, tuple[int, ...]] | None,
+    shared_memory_pool: bool = False,
+    mapped_stream_cost_multiplier: int = 0,
 ) -> tuple[list[ResidencyTarget], int]:
     """Virtual layerwise frontier for a component still using coarse offload.
 
@@ -2031,7 +2199,7 @@ def _unconfigured_layerwise_targets(
         layer_uses=layer_uses,
     )
     coarse_transfer_work = (
-        PAGEABLE_H2D_COST_MULTIPLIER * full_weight_bytes if component_used else 0
+        _pageable_h2d_cost_multiplier() * full_weight_bytes if component_used else 0
     )
     coarse_savings = max(0, maximum_transfer_work - coarse_transfer_work)
     current_resident = current_mode == RESIDENT
@@ -2047,7 +2215,14 @@ def _unconfigured_layerwise_targets(
         else max(layer_host_store_bytes, default=0)
     )
     targets = []
-    for resident_layers in _layerwise_resident_targets(managers, layer_uses=layer_uses):
+    resident_layer_targets = _layerwise_resident_targets(
+        managers, layer_uses=layer_uses
+    )
+    if shared_memory_pool:
+        resident_layer_targets = _shared_pool_resident_targets(
+            resident_layer_targets, None
+        )
+    for resident_layers in resident_layer_targets:
         for policies in _layerwise_policy_targets(
             managers=managers,
             resident_layers=resident_layers,
@@ -2090,6 +2265,7 @@ def _unconfigured_layerwise_targets(
                     pinned_layers=pinned_layers,
                     uses_per_streamed_layer=uses_per_request,
                     layer_uses=layer_uses,
+                    mapped_stream_cost_multiplier=mapped_stream_cost_multiplier,
                 )
                 targets.append(
                     ResidencyTarget(
@@ -2183,8 +2359,16 @@ def collect_residency_targets(
     host_pin_headroom_bytes: int | None = None,
     request_duration_ns: int = 0,
     latency_upper_bound_ns_by_component: Mapping[str, int] | None = None,
+    shared_memory_pool: bool = False,
+    mapped_stream_cost_multiplier: int = 0,
 ) -> list[ResidencyTarget]:
     """Build bounded target-state frontiers for auto-managed components.
+
+    ``shared_memory_pool`` says host and device are one physical pool. A
+    streamed layer then still costs the pool its mapped bytes (page cache the
+    stream depends on) and a coarse-offloaded component costs its full host
+    copy, so those bytes are charged to the device phases next to the resident
+    bytes they would otherwise appear to save.
 
     Every option is expressed relative to the currently measured placement,
     but its transfer utility is absolute within the component's frontier.
@@ -2332,6 +2516,8 @@ def collect_residency_targets(
                         tune_residency_policy=tune_residency_policy,
                         component_used=component_used,
                         layer_uses_by_name=component_layer_uses,
+                        shared_memory_pool=shared_memory_pool,
+                        mapped_stream_cost_multiplier=mapped_stream_cost_multiplier,
                     )
                 )
             uses_per_request = (
@@ -2340,7 +2526,7 @@ def collect_residency_targets(
                 else int(component_used)
             )
             component_transfer_work = (
-                PAGEABLE_H2D_COST_MULTIPLIER * weight_bytes if component_used else 0
+                _pageable_h2d_cost_multiplier() * weight_bytes if component_used else 0
             )
             candidates.extend(
                 [
@@ -2446,17 +2632,33 @@ def collect_residency_targets(
         current_pinned_bytes = sum(
             manager.pinned_host_weight_bytes() for manager in managers
         )
+        # Page cache the measured layout already holds for its streamed layers.
+        # Every target below is charged relative to it, so a layout that keeps
+        # streaming the same layers is free and one that makes them resident
+        # trades cache for device bytes instead of paying twice.
+        current_cache_bytes = (
+            0
+            if current_permanent or not shared_memory_pool
+            else _layerwise_streamed_mapped_bytes(
+                managers=managers,
+                resident_layers=current_resident_layers,
+                residency_policies=current_residency_policies,
+                layer_uses=layer_uses,
+                repeated=is_dit_component_name(name),
+            )
+        )
         layerwise_maximum_transfer_work = _layerwise_transfer_work_bytes(
             managers=managers,
             resident_layers=tuple(0 for _ in managers),
             pinned_layers=tuple(() for _ in managers),
             uses_per_streamed_layer=uses_per_request,
             layer_uses=layer_uses,
+            mapped_stream_cost_multiplier=mapped_stream_cost_multiplier,
         )
         full_weight_bytes = max(_module_weight_bytes(module), managed_weight_bytes)
         unmanaged_weight_bytes = max(0, full_weight_bytes - managed_weight_bytes)
         component_transfer_work = (
-            PAGEABLE_H2D_COST_MULTIPLIER * full_weight_bytes if component_used else 0
+            _pageable_h2d_cost_multiplier() * full_weight_bytes if component_used else 0
         )
         maximum_transfer_work = max(
             layerwise_maximum_transfer_work, component_transfer_work
@@ -2484,6 +2686,11 @@ def collect_residency_targets(
             target_pinned_layers=empty_pinned_layers,
         )
         if name not in mixed_dtype_names:
+            # Coarse offload keeps a complete anonymous host copy; on a shared
+            # pool that copy is pool memory for the whole request.
+            offload_pool_delta = (
+                full_weight_bytes - current_cache_bytes if shared_memory_pool else 0
+            )
             candidates.append(
                 ResidencyTarget(
                     component_name=name,
@@ -2501,24 +2708,49 @@ def collect_residency_targets(
                         -full_weight_bytes if current_permanent else 0
                     ),
                     active_device_delta_bytes=(
-                        managed_weight_bytes - current_peak_device_bytes
+                        managed_weight_bytes
+                        - current_peak_device_bytes
+                        + offload_pool_delta
                     ),
                     present_device_delta_bytes=(
-                        managed_weight_bytes - current_peak_device_bytes
+                        managed_weight_bytes
+                        - current_peak_device_bytes
+                        + offload_pool_delta
                     ),
-                    inactive_device_delta_bytes=-current_inactive_device_bytes,
+                    inactive_device_delta_bytes=(
+                        -current_inactive_device_bytes + offload_pool_delta
+                    ),
                     target_device_weight_bytes=0,
                     target_pinned_host_bytes=0,
                 )
             )
 
+        resident_layer_targets = _layerwise_resident_targets(
+            managers,
+            layer_uses=layer_uses,
+            current_resident_layers=current_resident_layers,
+        )
+        if shared_memory_pool:
+            # The exception to "no stage residency on a shared pool": a small
+            # component whose layers run many times per request (the H3 video
+            # VAE decodes ~200 tiles through its 36 layers) re-streams its
+            # whole mapping on every pass; arming it once per request costs
+            # its size and saves every pass but the first.
+            max_layer_uses = max(
+                (max(counts) for counts in (layer_uses or ()) if counts), default=0
+            )
+            keep_full = (
+                [tuple(manager.num_layers for manager in managers)]
+                if max_layer_uses >= SHARED_POOL_STAGE_RESIDENT_MIN_USES
+                and managed_weight_bytes <= SHARED_POOL_STAGE_RESIDENT_MAX_BYTES
+                else []
+            )
+            resident_layer_targets = _shared_pool_resident_targets(
+                resident_layer_targets, current_resident_layers, keep=keep_full
+            )
         layerwise_layouts = [
             (target_resident_layers, target_policies)
-            for target_resident_layers in _layerwise_resident_targets(
-                managers,
-                layer_uses=layer_uses,
-                current_resident_layers=current_resident_layers,
-            )
+            for target_resident_layers in resident_layer_targets
             for target_policies in _layerwise_policy_targets(
                 managers=managers,
                 resident_layers=target_resident_layers,
@@ -2542,6 +2774,14 @@ def collect_residency_targets(
                 residency_policies=target_policies,
                 layer_uses=layer_uses,
             )
+            # A stage-scoped resident layer is re-armed from its mapping on every
+            # request, so its page cache is as committed as a streamed layer's:
+            # residency moves the same bytes onto the device without giving the
+            # cache back. Only a permanent placement earns that credit (below),
+            # and its one-time materialization is bounded by the transition
+            # budget. Measured on a GB10: crediting stage residency made the
+            # planner arm all 50 DiT layers per request and the host ran out.
+            target_cache_delta = 0
             pin_targets = (
                 _layerwise_pin_targets(
                     managers=managers,
@@ -2585,6 +2825,7 @@ def collect_residency_targets(
                     pinned_layers=target_pinned_layers,
                     uses_per_streamed_layer=uses_per_request,
                     layer_uses=layer_uses,
+                    mapped_stream_cost_multiplier=mapped_stream_cost_multiplier,
                 )
                 unpin_scratch, pin_scratch = _layerwise_host_transition_bytes(
                     managers=managers,
@@ -2619,10 +2860,16 @@ def collect_residency_targets(
                             -managed_weight_bytes if current_permanent else 0
                         ),
                         active_device_delta_bytes=(
-                            target_peak_device_bytes - current_peak_device_bytes
+                            target_peak_device_bytes
+                            - current_peak_device_bytes
+                            + target_cache_delta
                         ),
-                        inactive_device_delta_bytes=(-current_inactive_device_bytes),
-                        present_device_delta_bytes=(-current_inactive_device_bytes),
+                        inactive_device_delta_bytes=(
+                            -current_inactive_device_bytes + target_cache_delta
+                        ),
+                        present_device_delta_bytes=(
+                            -current_inactive_device_bytes + target_cache_delta
+                        ),
                         current_placement=(
                             not current_permanent
                             and target_resident_layers == current_resident_layers
@@ -2677,26 +2924,43 @@ def collect_residency_targets(
                     ),
                     host_unpin_scratch_bytes=unpin_scratch,
                     host_pin_scratch_bytes=pin_scratch,
+                    # A layer-by-layer materialization on a shared pool gives
+                    # each source page back as its device copy lands, so the
+                    # transition costs the pool the net of the two, not both.
                     device_transition_delta_bytes=(
-                        0 if current_permanent else full_weight_bytes
+                        0
+                        if current_permanent
+                        else full_weight_bytes
+                        - (current_cache_bytes if shared_memory_pool else 0)
                     ),
                     permanent_residency=True,
+                    # A permanently resident layer needs no page cache, so the
+                    # streamed layout's cache comes back to a shared pool.
                     active_device_delta_bytes=(
-                        managed_weight_bytes - current_peak_device_bytes
+                        managed_weight_bytes
+                        - current_peak_device_bytes
+                        - current_cache_bytes
                     ),
                     # Stage-scoped resident layers are released after the use,
                     # so the complete managed footprint is new elsewhere.
                     inactive_device_delta_bytes=(
-                        managed_weight_bytes - current_inactive_device_bytes
+                        managed_weight_bytes
+                        - current_inactive_device_bytes
+                        - current_cache_bytes
                     ),
                     present_device_delta_bytes=(
-                        managed_weight_bytes - current_inactive_device_bytes
+                        managed_weight_bytes
+                        - current_inactive_device_bytes
+                        - current_cache_bytes
                     ),
                     current_placement=(
                         current_permanent and permanent_pins == current_pinned_layers
                     ),
                     target_device_weight_bytes=full_weight_bytes,
                     target_pinned_host_bytes=permanent_pinned_bytes,
+                    released_cache_bytes=(
+                        current_cache_bytes if shared_memory_pool else 0
+                    ),
                 )
             )
     return candidates
@@ -3346,11 +3610,16 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
                 elif rank_candidate.permanent_residency:
                     # This phase observed none of the component. A permanent
                     # target introduces its complete footprint, including the
-                    # unmanaged weights of a formerly layerwise component.
-                    phase_cost = max(
-                        rank_candidate.target_device_weight_bytes,
-                        rank_candidate.target_resident_weight_bytes,
-                        0,
+                    # unmanaged weights of a formerly layerwise component --
+                    # less the page cache its streamed layers give back to a
+                    # shared pool, which this phase was drawing on as well.
+                    phase_cost = (
+                        max(
+                            rank_candidate.target_device_weight_bytes,
+                            rank_candidate.target_resident_weight_bytes,
+                            0,
+                        )
+                        - rank_candidate.released_cache_bytes
                     )
                 else:
                     phase_cost = rank_candidate.inactive_device_delta_bytes
@@ -3381,6 +3650,19 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
                     resource_deltas.get(materialize_resource, 0)
                     + rank_candidate.host_materialize_scratch_bytes
                 )
+            if (
+                report.host_shares_device_pool
+                and rank_candidate.pinned_host_delta_bytes
+            ):
+                # One physical pool: what this option pins in host memory is
+                # taken from the same bytes every device phase of this rank
+                # draws on, so it is charged there as well.
+                rank_prefix = f"gpu:rank{report.rank}:"
+                for resource_name in list(resource_deltas):
+                    if resource_name.startswith(rank_prefix):
+                        resource_deltas[resource_name] += (
+                            rank_candidate.pinned_host_delta_bytes
+                        )
         estimated_latency_savings = (
             min(
                 report.candidate_latency_savings_ns.get(candidate.option_key(), 0)
@@ -3427,6 +3709,30 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
         len(options),
         len(resource_budgets),
     )
+    if any(report.host_shares_device_pool for report in reports):
+        # One pool means every placement decision is also a page-cache
+        # decision; log what the solver saw so a "changes=[none]" on a
+        # shared pool can be read back without a debugger.
+        logger.info(
+            "Auto residency options (shared pool): budgets_mib=%s",
+            {name: round(value / 1024**2) for name, value in resource_budgets.items()},
+        )
+        for option in options:
+            savings = option.estimated_latency_savings
+            logger.info(
+                "  %s: savings=%s deltas_mib=%s",
+                option.option_key,
+                (
+                    f"{savings / 1e9:.1f}s"
+                    if use_latency_utility
+                    else f"{savings / 1024**3:.1f}GiB-h2d"
+                ),
+                {
+                    name: round(value / 1024**2)
+                    for name, value in option.resource_delta_bytes.items()
+                    if value
+                },
+            )
     solve_started = time.perf_counter()
     try:
         placement = optimize_placement(
