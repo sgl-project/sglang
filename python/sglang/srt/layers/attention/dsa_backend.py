@@ -80,6 +80,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
     is_hip,
+    is_xpu,
     print_warning_once,
 )
 
@@ -135,6 +136,7 @@ def materialize_full_kv_cp(
 
 
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 
 if _is_hip:
     from sglang.kernels.ops.attention.dsa.triton_kernel import get_valid_kv_indices
@@ -153,6 +155,11 @@ if _is_hip:
         print(
             "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
         )
+elif _is_xpu:
+    from sgl_kernel.flash_attn import (
+        flash_attn_varlen_func,
+        flash_attn_with_kvcache,
+    )
 else:
     from sglang.kernels.ops.attention.flash_attention import (
         flash_attn_varlen_func,
@@ -283,6 +290,7 @@ _DSA_IMPL_T: TypeAlias = Literal[
     "fa3",
     "tilelang",
     "trtllm",
+    "intel_xpu",
 ]
 
 
@@ -400,7 +408,10 @@ class DeepseekSparseAttnBackend(
                 "Disabling fused DSA top-k for IndexShare under PD disaggregation."
             )
 
-        self.device_capability = torch.cuda.get_device_capability()
+        if _is_xpu:
+            self.device_capability = (0, 0)
+        else:
+            self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
@@ -471,7 +482,7 @@ class DeepseekSparseAttnBackend(
         self._q8kv8_born_q_buf: Optional[torch.Tensor] = None
         self._q8kv8_born_q_stash: Optional[Tuple[int, int]] = None
         self._q8kv8_born_q_sentinel: Optional[torch.Tensor] = None
-        self._q8kv8_born_q_tbo = model_runner.server_args.enable_two_batch_overlap
+        self._q8kv8_born_q_tbo = get_exec().overlap.enable_two_batch_overlap
 
         from sglang.kernels.ops.attention.flash_mla_sm120 import (
             _validate_flashinfer_sparse_mla_backend,
@@ -1053,7 +1064,7 @@ class DeepseekSparseAttnBackend(
                     cache_seqlens=dsa_cache_seqlens_int32,
                     seq_len_q=1,
                 )
-                if use_flashmla_kv
+                if use_flashmla_kv and not _is_xpu
                 else None
             ),
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
@@ -2182,6 +2193,15 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 layer=layer,
             )
+        elif dsa_impl == "intel_xpu":
+            return self._forward_intel_xpu_dense_prefill(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                v_head_dim=layer.v_head_dim,
+                sm_scale=layer.scaling,
+                metadata=metadata,
+            )
         else:
             raise ValueError(
                 f"Unsupported {dsa_impl = } for forward_extend. Consider using an other attention backend."
@@ -2360,6 +2380,15 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 bs=forward_batch.batch_size,
+            )
+        elif self.dsa_decode_impl == "intel_xpu":
+            return self._forward_intel_xpu_sparse_decode(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
             )
 
         else:
@@ -2961,6 +2990,123 @@ class DeepseekSparseAttnBackend(
             indices=page_table_1.unsqueeze(1),
             sm_scale=sm_scale,
             d_v=v_head_dim,
+        )
+
+    def _forward_intel_xpu_sparse_decode(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+        v_head_dim: int,
+    ) -> torch.Tensor:
+        """Sparse decode for XPU using flash_mla_decode with gathered KV.
+
+        Gathers the sparse KV tokens selected by the indexer into a contiguous
+        buffer organized as virtual pages, then runs flash_mla_decode on it.
+        """
+        from sgl_kernel import flash_mla_decode, flash_mla_get_workspace_size
+
+        B = q_nope.shape[0]
+        TOPK = page_table_1.shape[1]
+        D_ckv = kv_cache.shape[-1]
+        GATHER_PAGE_SIZE = 16
+        assert TOPK % GATHER_PAGE_SIZE == 0, (
+            f"TOPK {TOPK} must be a multiple of GATHER_PAGE_SIZE {GATHER_PAGE_SIZE}"
+        )
+        NUM_PAGES = TOPK // GATHER_PAGE_SIZE
+
+        # Count valid tokens per batch (non -1 entries)
+        valid_counts = (page_table_1 >= 0).sum(dim=1).to(torch.int32)
+
+        # Gather KV tokens: replace -1 with 0 for safe indexing, zero-fill after
+        safe_indices = page_table_1.clamp(min=0)
+        # kv_cache is [total_tokens, D_ckv], index with flat indices
+        gathered_kv = kv_cache[safe_indices.view(-1)].view(B, TOPK, D_ckv)
+        # Zero out invalid entries
+        invalid_mask = page_table_1 < 0  # [B, TOPK]
+        gathered_kv[invalid_mask] = 0
+
+        # Reshape to pages: [B * NUM_PAGES, GATHER_PAGE_SIZE, D_ckv]
+        gathered_kv_paged = gathered_kv.view(B * NUM_PAGES, GATHER_PAGE_SIZE, D_ckv)
+
+        # Identity page table: batch i → pages [i*NUM_PAGES, ..., (i+1)*NUM_PAGES-1]
+        identity_page_table = torch.arange(
+            B * NUM_PAGES, device=q_nope.device, dtype=torch.int32
+        ).view(B, NUM_PAGES)
+
+        # Workspace
+        ws_size = flash_mla_get_workspace_size(
+            TOPK, B, q_nope.shape[1], GATHER_PAGE_SIZE
+        )
+        if self.workspace_buffer is None:
+            self.workspace_buffer = torch.empty(
+                ws_size, device=q_nope.device, dtype=torch.uint8
+            )
+        elif self.workspace_buffer.numel() < ws_size:
+            self.workspace_buffer.resize_(ws_size)
+
+        o = flash_mla_decode(
+            q_nope,
+            q_rope,
+            gathered_kv_paged,
+            valid_counts,
+            identity_page_table,
+            self.workspace_buffer,
+            sm_scale,
+        )
+        return o
+
+    def _forward_intel_xpu_dense_prefill(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        sm_scale: float,
+        metadata: DSAMetadata,
+    ) -> torch.Tensor:
+        """Dense prefill for XPU using flash_mla_prefill.
+
+        Runs full causal MLA attention over all KV positions (no sparse top-K
+        selection).  This is the XPU equivalent of the CUDA flashmla_kv /
+        flashmla_sparse prefill paths.
+        """
+        from sgl_kernel import flash_mla_prefill, flash_mla_prefill_get_workspace_size
+
+        D_ckv = kv_cache.shape[-1]
+        # kv_cache: (N_tokens, 1, D_ckv) from MLATokenToKVPool → (N_pages, page_size, D_ckv)
+        kv_paged = kv_cache.view(-1, self.real_page_size, D_ckv)
+
+        block_table = metadata.real_page_table  # (B, max_pages), page-indexed int32
+        seq_lens_k = metadata.cache_seqlens_int32  # (B,) total KV lengths
+        cu_seqlens_q = metadata.cu_seqlens_q  # (B+1,) cumulative Q lengths
+        max_seqlen_q = metadata.max_seq_len_q
+
+        max_seq_len_k = int(seq_lens_k.max().item())
+        ws_size = flash_mla_prefill_get_workspace_size(
+            max_seq_len_k, seq_lens_k.shape[0]
+        )
+        if self.workspace_buffer is None:
+            self.workspace_buffer = torch.empty(
+                ws_size, device=q_nope.device, dtype=torch.uint8
+            )
+        elif self.workspace_buffer.numel() < ws_size:
+            self.workspace_buffer.resize_(ws_size)
+
+        return flash_mla_prefill(
+            q_nope,
+            q_rope,
+            kv_paged,
+            cu_seqlens_q,
+            seq_lens_k,
+            max_seqlen_q,
+            block_table,
+            self.workspace_buffer,
+            sm_scale,
+            causal=True,
+            num_kv_splits=1,
         )
 
     def _forward_aiter(
