@@ -53,6 +53,7 @@ dependencies = [
   "numba==0.65.1",
   "numpy",
   "nvidia-cutlass-dsl[cu13]==4.6.2",
+  "nvidia-cudnn-frontend==1.28.0",
   "nvidia-mathdx==25.6.0",
   "nvidia-ml-py",
   "openai==2.6.1",

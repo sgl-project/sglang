@@ -21,6 +21,12 @@ class LinearAttnKernelBase(ABC):
     # tracked batches loudly (NotImplementedError) keep the default False.
     supports_track_state_snapshot: bool = False
 
+    def prepare_state_checkpoint_plan(
+        self, forward_batch, forward_metadata, device
+    ) -> None:
+        """Adjust prefix-cache checkpoint metadata for this kernel's layout."""
+        del forward_batch, forward_metadata, device
+
     @abstractmethod
     def decode(
         self,
