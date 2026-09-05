@@ -51,6 +51,7 @@ from sglang.srt.utils import BumpAllocator, empty_context, get_bool_env_var, is_
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
+    from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
     from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
@@ -932,7 +933,10 @@ def model_forward_maybe_tbo(
     input_data_scatter_mode: ScatterMode,
     residual: Optional[torch.Tensor],
     zero_allocator: Optional[BumpAllocator] = None,
+    index_topk_share: Optional[IndexTopKShareState] = None,
 ):
+    # DSA topk indices are per-token: each TBO sub-batch must thread its own
+    # token-sliced carry, never the parent state.
     inputs = dict(
         positions=positions,
         hidden_states=hidden_states,
@@ -940,6 +944,8 @@ def model_forward_maybe_tbo(
         residual=residual,
         zero_allocator=zero_allocator,
     )
+    if index_topk_share is not None:
+        inputs["index_topk_share"] = index_topk_share
     layer_input_scatter_mode = layers[0].layer_scatter_modes.layer_input_mode
     operations_strategy = OperationsStrategy.init_new_tbo(
         layers, forward_batch.global_forward_mode
@@ -1000,6 +1006,7 @@ def _model_forward_tbo_split_inputs(
     zero_allocator: Optional[BumpAllocator],
     input_data_scatter_mode: ScatterMode,
     layer_input_scatter_mode: ScatterMode,
+    index_topk_share: Optional[IndexTopKShareState] = None,
 ) -> List[Dict]:
     tbo_splitter_scatter_mode = ScatterMode.TP_ATTN_FULL
     context = CommunicateContext.init_new()
@@ -1020,6 +1027,7 @@ def _model_forward_tbo_split_inputs(
         positions=positions,
         forward_batch=forward_batch,
         zero_allocator=zero_allocator,
+        index_topk_share=index_topk_share,
     )
 
     def _post_transform(hidden_states, residual, forward_batch, **kwargs):
@@ -1048,6 +1056,7 @@ def _model_forward_tbo_split_inputs_raw(
     positions: torch.Tensor,
     forward_batch: ForwardBatch,
     zero_allocator: Optional[BumpAllocator],
+    index_topk_share: Optional[IndexTopKShareState] = None,
 ) -> List[Dict]:
     return [
         dict(
@@ -1057,6 +1066,7 @@ def _model_forward_tbo_split_inputs_raw(
                 positions=positions,
                 output_forward_batch=output_forward_batch,
                 tbo_subbatch_index=tbo_subbatch_index,
+                index_topk_share=index_topk_share,
             ),
             **(
                 dict(zero_allocator=zero_allocator)
@@ -1076,6 +1086,7 @@ def _model_forward_filter_inputs(
     positions: torch.Tensor,
     output_forward_batch: ForwardBatch,
     tbo_subbatch_index: int,
+    index_topk_share: Optional[IndexTopKShareState] = None,
 ) -> Dict:
     token_slice = slice(*output_forward_batch.tbo_parent_token_range)
     hidden_states = hidden_states[token_slice]
@@ -1095,13 +1106,20 @@ def _model_forward_filter_inputs(
         res[: x.shape[0]] = x
         return res
 
-    return dict(
+    outputs = dict(
         hidden_states=_pad(hidden_states),
         residual=_pad(residual),
         positions=_pad(positions),
         forward_batch=output_forward_batch,
         tbo_subbatch_index=tbo_subbatch_index,
     )
+    if index_topk_share is not None:
+        outputs["index_topk_share"] = index_topk_share.for_tbo_child(
+            forward_batch=output_forward_batch,
+            token_range=output_forward_batch.tbo_parent_token_range,
+            padded_num_tokens=padded_len,
+        )
+    return outputs
 
 
 def _model_forward_tbo_merge_outputs(output_a, output_b, original_len):

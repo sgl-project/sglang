@@ -48,6 +48,34 @@ class IndexTopKShareState:
     def update(self, topk_indices: Optional[torch.Tensor]) -> None:
         self._topk_indices = topk_indices
 
+    def for_tbo_child(
+        self,
+        forward_batch: ForwardBatch,
+        token_range: tuple[int, int],
+        padded_num_tokens: int,
+    ) -> IndexTopKShareState:
+        topk_indices = self._topk_indices
+        if topk_indices is not None:
+            start, end = token_range
+            assert 0 <= start <= end <= topk_indices.shape[0], (
+                f"invalid TBO token range {token_range} for topk indices with "
+                f"{topk_indices.shape[0]} rows"
+            )
+            num_tokens = end - start
+            assert num_tokens <= padded_num_tokens, (
+                f"TBO child has {num_tokens} topk rows but its padded token "
+                f"length is only {padded_num_tokens}"
+            )
+            topk_indices = topk_indices[start:end]
+            if num_tokens < padded_num_tokens:
+                # -1 marks padded rows, the same sentinel the DSA backends use.
+                padded = topk_indices.new_full(
+                    (padded_num_tokens, *topk_indices.shape[1:]), -1
+                )
+                padded[:num_tokens] = topk_indices
+                topk_indices = padded
+        return IndexTopKShareState(forward_batch, topk_indices)
+
     def publish(self) -> None:
         if self._topk_indices is None or not self.should_publish:
             return

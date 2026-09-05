@@ -43,6 +43,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 )
 from sglang.srt.configs.model_config import (
     compute_mla_mscale_scaling,
+    dsa_has_index_topk_sharing,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_dsa_index_n_heads,
@@ -2046,22 +2047,30 @@ class DeepseekV2AttentionMLA(
         return resolve_rocm_forward_method(handler(self, forward_batch))
 
     def op_prepare(self, state):
+        index_topk_share = state.get("index_topk_share")
         state.attn_intermediate_state = self.forward_prepare(
             positions=state.positions,
             hidden_states=state.pop("hidden_states_after_comm_pre_attn"),
             forward_batch=state.forward_batch,
             zero_allocator=state.zero_allocator,
+            prev_topk_indices=(
+                None if index_topk_share is None else index_topk_share.topk_indices
+            ),
         )
 
     def op_core(self, state):
         result = self.forward_core(state.pop("attn_intermediate_state"))
         # forward_core may return (hidden_states, topk_indices) for DSA models
-        # with index cache enabled. In the TBO path, topk_indices is not
-        # propagated between layers, so we discard it here.
+        # with index cache enabled. The share state carries the indices to the
+        # next layer's op_prepare; a None result clears it so no stale rows leak.
         if isinstance(result, tuple):
-            state.hidden_states_after_attn = result[0]
+            hidden_states, topk_indices = result
         else:
-            state.hidden_states_after_attn = result
+            hidden_states, topk_indices = result, None
+        index_topk_share = state.get("index_topk_share")
+        if index_topk_share is not None:
+            index_topk_share.update(topk_indices)
+        state.hidden_states_after_attn = hidden_states
 
     def forward(
         self,
@@ -2574,6 +2583,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
         tbo_subbatch_index: Optional[int] = None,
+        index_topk_share: Optional[IndexTopKShareState] = None,
     ):
         state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
             self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
@@ -2588,6 +2598,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                 tbo_subbatch_index=tbo_subbatch_index,
             )
         )
+        if index_topk_share is not None:
+            state.index_topk_share = index_topk_share
 
     def op_comm_prepare_mlp(self, state):
         state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
@@ -2605,6 +2617,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             state.forward_batch,
         )
 
+        index_topk_share = state.get("index_topk_share")
         output = dict(
             positions=state.positions,
             hidden_states=hidden_states,
@@ -2613,15 +2626,17 @@ class DeepseekV2DecoderLayer(nn.Module):
             zero_allocator=state.zero_allocator,
             tbo_subbatch_index=state.tbo_subbatch_index,
         )
+        expected_state_keys = {
+            "positions",
+            "forward_batch",
+            "zero_allocator",
+            "tbo_subbatch_index",
+        }
+        if index_topk_share is not None:
+            output["index_topk_share"] = index_topk_share
+            expected_state_keys.add("index_topk_share")
 
-        state.clear(
-            expect_keys={
-                "positions",
-                "forward_batch",
-                "zero_allocator",
-                "tbo_subbatch_index",
-            }
-        )
+        state.clear(expect_keys=expected_state_keys)
         return output
 
 
@@ -2640,6 +2655,9 @@ class DeepseekV2Model(nn.Module):
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
+        self.dsa_index_share_active = self.use_dsa and dsa_has_index_topk_sharing(
+            config
+        )
         self.pp_group = get_pp_group()
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.mla_enable_prefill_cp = (
@@ -2912,6 +2930,9 @@ class DeepseekV2Model(nn.Module):
                     normal_end_layer - 1
                 ].layer_scatter_modes.layer_output_mode,
                 zero_allocator=zero_allocator,
+                index_topk_share=(
+                    index_topk_share if self.dsa_index_share_active else None
+                ),
             )
 
         if not self.pp_group.is_last_rank:

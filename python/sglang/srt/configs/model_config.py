@@ -253,6 +253,15 @@ def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
     return max(layer_id - 1, 0) % freq != 0
 
 
+def dsa_has_index_topk_sharing(config: PretrainedConfig) -> bool:
+    """Return whether any DSA layer reuses another layer's top-k indices."""
+    assert is_deepseek_dsa(config)
+    return any(
+        dsa_layer_skips_topk(config, layer_id)
+        for layer_id in range(config.num_hidden_layers)
+    )
+
+
 def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config)
     return config.index_n_heads
