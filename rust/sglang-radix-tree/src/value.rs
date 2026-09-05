@@ -28,7 +28,7 @@ pub trait RadixValue: Debug + Sized + 'static {
     /// View or copy a contiguous logical range.
     fn slice(&self, start: usize, len: usize) -> Self;
 
-    /// Split an owned value into non-overlapping logical ranges.
+    /// Split an owned value at an internal point (`0 < at < len`) into head and tail.
     fn split_owned(self, at: usize) -> (Self, Self);
 
     /// Concatenate values in path order.
@@ -77,13 +77,6 @@ impl<T> PageValue<T> {
     pub fn as_slice(&self) -> &[T] {
         &self.storage[self.range.clone()]
     }
-
-    pub fn into_vec(self) -> Vec<T>
-    where
-        T: Clone,
-    {
-        self.as_slice().to_vec()
-    }
 }
 
 impl<T> Default for PageValue<T> {
@@ -131,7 +124,7 @@ where
     }
 
     fn split_owned(self, at: usize) -> (Self, Self) {
-        assert!(at <= self.len(), "split point exceeds value length");
+        assert!(0 < at && at < self.len(), "split point must be internal");
         let middle = self.range.start + at;
         let head = Self {
             storage: Arc::clone(&self.storage),
@@ -148,13 +141,17 @@ where
         let Some(first) = values.first() else {
             return Self::default();
         };
+        // Adjacent views of one buffer concatenate to a wider view of it.
         let mut end = first.range.end;
-        if values.iter().skip(1).all(|value| {
-            let is_contiguous =
-                Arc::ptr_eq(&first.storage, &value.storage) && value.range.start == end;
+        let mut is_contiguous = true;
+        for value in &values[1..] {
+            if !Arc::ptr_eq(&first.storage, &value.storage) || value.range.start != end {
+                is_contiguous = false;
+                break;
+            }
             end = value.range.end;
-            is_contiguous
-        }) {
+        }
+        if is_contiguous {
             return Self {
                 storage: Arc::clone(&first.storage),
                 range: first.range.start..end,

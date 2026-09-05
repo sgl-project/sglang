@@ -3767,7 +3767,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     ) {
         let node_id = self.arena.resolve(node_id);
         let mut cache_actions: Vec<CacheAction<V>> = Vec::new();
-        if host_indices.len() > 0 {
+        if !host_indices.is_empty() {
             let kv_xfer = PoolTransfer {
                 name: PoolName::Kv,
                 host_indices: Some(host_indices),

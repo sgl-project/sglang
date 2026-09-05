@@ -166,7 +166,7 @@ impl SwaComponent {
         host_indices: V,
         cache_actions: &mut Vec<CacheAction<V>>,
     ) {
-        if host_indices.len() > 0 {
+        if !host_indices.is_empty() {
             cache_actions.push(CacheAction::FreeComponentHostSlot {
                 component_type: SWA,
                 host_indices: vec![host_indices],
