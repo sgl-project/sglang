@@ -2265,7 +2265,7 @@
             "expected_avg_denoise_ms": 32.68,
             "expected_median_denoise_ms": 30.2,
             "load_peak_vram_mb": 8264.0,
-            "runtime_peak_vram_mb": 15686.0,
+            "runtime_peak_vram_mb": 17946.0,
             "estimated_full_test_time_s": 420.1
         },
         "wan2_1_t2v_1.3b_frame_interp_2x": {
