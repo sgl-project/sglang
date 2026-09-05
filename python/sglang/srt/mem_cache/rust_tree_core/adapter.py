@@ -92,11 +92,14 @@ def _kv_event_from_tagged(event: tuple):
             lora_id=None,
             medium=StorageMedium(event[5]),
         )
-        if event[6] is None:
+        if event[6] is None and event[7] is None:
             return BlockStored(**event_args)
         return BlockStoredWithMetadata(
             **event_args,
-            metadata=BlockStoredMetadata(cache_salt=event[6]),
+            metadata=BlockStoredMetadata(
+                cache_salt=event[6],
+                session_id=event[7],
+            ),
         )
     if tag == "block_removed":
         return BlockRemoved(block_hashes=event[1], medium=StorageMedium(event[2]))
@@ -618,6 +621,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 value=value,
                 extra_key=key.extra_key,
                 cache_salt=key.cache_salt,
+                session_id=params.session_id,
                 mamba_value=params.mamba_value,
                 prev_prefix_len=params.prev_prefix_len,
                 swa_evicted_seqlen=params.swa_evicted_seqlen,

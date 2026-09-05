@@ -112,7 +112,9 @@ class KVCacheEventRecorder:
             return None
         return hash_str_to_int64(parent_hash_values[-1])
 
-    def record_store(self, node: Any, medium=None) -> None:
+    def record_store(
+        self, node: Any, medium=None, *, session_id: Optional[str] = None
+    ) -> None:
         # One BlockStored per ``page_size`` chunk.
         # ``medium`` defaults to StorageMedium.GPU but callers may override
         # for lower-tier insertions (e.g. StorageMedium.CPU for host/L2 cache).
@@ -148,12 +150,15 @@ class KVCacheEventRecorder:
                 "lora_id": None,
                 "medium": medium,
             }
-            if node.key.cache_salt is None:
+            if node.key.cache_salt is None and session_id is None:
                 event = BlockStored(**event_args)
             else:
                 event = BlockStoredWithMetadata(
                     **event_args,
-                    metadata=BlockStoredMetadata(cache_salt=node.key.cache_salt),
+                    metadata=BlockStoredMetadata(
+                        cache_salt=node.key.cache_salt,
+                        session_id=session_id,
+                    ),
                 )
             self.enqueue(event)
 

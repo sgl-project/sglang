@@ -97,6 +97,7 @@ fn insert_overlap_default_consumes_nothing() {
             swa_evicted_seqlen: 0,
             chunked: false,
             priority: 0,
+            session_id: None,
             track_adopted_ranges: false,
         },
         &mut InsertResult::default(),

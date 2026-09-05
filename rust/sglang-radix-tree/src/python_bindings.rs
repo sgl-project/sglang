@@ -508,6 +508,7 @@ pub struct InsertParamsBinding {
     pub value: Py<PyAny>,
     pub extra_key: Option<String>,
     pub cache_salt: Option<String>,
+    pub session_id: Option<String>,
     pub mamba_value: Option<Py<PyAny>>,
     pub prev_prefix_len: usize,
     pub swa_evicted_seqlen: usize,
@@ -519,13 +520,14 @@ pub struct InsertParamsBinding {
 #[pymethods]
 impl InsertParamsBinding {
     #[new]
-    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, chunked = false, priority = 0, mamba_value = None, track_adopted_ranges = false))]
+    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, chunked = false, priority = 0, mamba_value = None, track_adopted_ranges = false))]
     fn new(
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
         value: Py<PyAny>,
         extra_key: Option<String>,
         cache_salt: Option<String>,
+        session_id: Option<String>,
         prev_prefix_len: usize,
         swa_evicted_seqlen: usize,
         chunked: bool,
@@ -538,6 +540,7 @@ impl InsertParamsBinding {
             value,
             extra_key,
             cache_salt,
+            session_id,
             mamba_value,
             prev_prefix_len,
             swa_evicted_seqlen,
@@ -1002,6 +1005,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                 params.extra_key.as_deref(),
                 params.cache_salt.as_deref(),
             ),
+            session_id: params.session_id.as_deref(),
             value: value.0,
             mamba_value,
             prev_prefix_len: params.prev_prefix_len,
@@ -1037,6 +1041,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                 params.extra_key.as_deref(),
                 params.cache_salt.as_deref(),
             ),
+            session_id: params.session_id.as_deref(),
             value: value.0,
             mamba_value,
             prev_prefix_len: params.prev_prefix_len,
@@ -1774,6 +1779,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                     block_size,
                     medium,
                     cache_salt,
+                    session_id,
                 } => {
                     let item: Py<PyAny> = (
                         "block_stored",
@@ -1783,6 +1789,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                         block_size,
                         medium.as_str(),
                         cache_salt.map(|salt| salt.to_string()),
+                        session_id.map(|session_id| session_id.to_string()),
                     )
                         .into_py(py);
                     list.append(item)?;

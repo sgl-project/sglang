@@ -78,6 +78,7 @@ class InsertParams:
     # General
     chunked: bool = False
     priority: int = 0
+    session_id: Optional[str] = None
     track_adopted_ranges: bool = False
 
 
