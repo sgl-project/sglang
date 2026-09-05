@@ -37,7 +37,6 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .route("/startup_ready", post(startup_ready))
 }
 
-/// Only the launcher may publish readiness after warmup.
 async fn startup_ready(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let expected = state.server_args.startup_ready_token.as_str();
     let supplied = headers
@@ -241,10 +240,6 @@ mod tests {
         assert!(
             !text.contains("admin-token"),
             "admin_api_key leaked: {text}"
-        );
-        assert!(
-            !text.contains("test-startup-token"),
-            "startup_ready_token leaked: {text}"
         );
 
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();

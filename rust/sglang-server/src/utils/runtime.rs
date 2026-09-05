@@ -398,8 +398,6 @@ mod tests {
         );
     }
 
-    /// Regression: health probes must not report ready while the Python launcher
-    /// is still running startup warmup.
     #[test]
     fn health_generate_waits_for_startup_ready() {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

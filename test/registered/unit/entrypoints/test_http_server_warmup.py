@@ -9,7 +9,6 @@ from sglang.srt.entrypoints import http_server
 from sglang.srt.entrypoints.http_server import (
     _send_disaggregation_warmup_requests,
 )
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -124,7 +123,6 @@ class TestRustStartup(unittest.TestCase):
 
             with (
                 self.subTest(skip=skip, fail=fail, mode=mode),
-                envs.SGLANG_RUST_SERVER.override(True),
                 patch.object(http_server.requests, "post", side_effect=post),
                 patch.object(http_server, "ssl_verify_of", return_value=False),
                 patch.object(http_server, "kill_process_tree") as kill,
