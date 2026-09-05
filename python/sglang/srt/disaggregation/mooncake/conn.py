@@ -291,7 +291,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.start_decode_thread()
 
     def init_engine(self):
-        self.engine = get_mooncake_transfer_engine()
+        self.engine = get_mooncake_transfer_engine(self.kv_args.gpu_id)
 
     def _registerable_regions(self) -> List[Tuple[int, int]]:
         """(ptr, len) regions to (de)register, exact duplicates removed.
