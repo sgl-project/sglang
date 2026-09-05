@@ -99,10 +99,8 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         )
         disable_if_incompatible.assert_called_once()
 
-    def test_trtllm_mla_stays_on_breakable(self):
+    def _trtllm_mla_args(self):
         args = ServerArgs(model_path="dummy")
-        # trtllm_mla skips the tc_piecewise upgrade and keeps breakable, which
-        # now serves MLA by falling back to the flashinfer MLA impl for extend.
         args._model_config = SimpleNamespace(
             is_multimodal_piecewise_cuda_graph_supported=True,
             is_multimodal=False,
@@ -114,14 +112,42 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
             prefill=PhaseConfig(backend=Backend.BREAKABLE)
         )
         args._cuda_graph_config_locked = set()
+        return args
 
-        args.attention_backend = "trtllm_mla"
+    def _resolve_with_varlen(self, args, has_varlen):
+        with (
+            patch(
+                "sglang.srt.arg_groups.cuda_graph_hook"
+                ".disable_tc_piecewise_cudagraph_if_incompatible"
+            ),
+            patch(
+                "sglang.srt.arg_groups.overrides.attention_backends_of",
+                return_value=("trtllm_mla", "trtllm_mla"),
+            ),
+            patch(
+                "sglang.srt.arg_groups.cuda_graph_hook"
+                ".trtllm_mla_has_varlen_absorbed",
+                return_value=has_varlen,
+            ),
+        ):
+            apply_cuda_graph_compatibility(args)
+        return resolution_result(args, "cuda_graph_config").prefill.backend
 
-        apply_cuda_graph_compatibility(args)
-
+    def test_trtllm_mla_takes_the_upgrade_when_varlen_absorbed_is_available(self):
+        # The exclusion existed because a captured prefill graph forced trtllm_mla
+        # onto the FlashInfer paged-MLA fallback. Where the ragged absorbed path
+        # runs, that reason is gone and the upgrade proceeds.
+        args = self._trtllm_mla_args()
         self.assertEqual(
-            resolution_result(args, "cuda_graph_config").prefill.backend,
-            Backend.BREAKABLE,
+            self._resolve_with_varlen(args, has_varlen=True), Backend.TC_PIECEWISE
+        )
+
+    def test_trtllm_mla_keeps_the_exclusion_without_varlen_absorbed(self):
+        # FP4 KV / non-SM10: upgrading here would reinstate the paged fallback,
+        # so stay on breakable exactly as before.
+        args = self._trtllm_mla_args()
+        self.assertEqual(
+            self._resolve_with_varlen(args, has_varlen=False), Backend.BREAKABLE
         )
 
     def test_explicit_tc_piecewise_overrides_trtllm_mla_default(self):

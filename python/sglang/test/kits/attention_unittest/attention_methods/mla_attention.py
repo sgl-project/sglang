@@ -1,3 +1,4 @@
+import contextlib
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, List
@@ -976,10 +977,115 @@ def build_mla_attention_fixture(
     )
 
 
-def run_mla_fixture_eager(fixture: MLAAttentionFixture) -> torch.Tensor:
-    with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
+def run_mla_fixture_eager(
+    fixture: MLAAttentionFixture, *, piecewise: bool = False, breakable: bool = False
+) -> torch.Tensor:
+    """``piecewise=True``/``breakable=True`` set the corresponding process-global
+    capture-mode flag that backends branch on, without capturing a torch.compile
+    or segmented graph."""
+    assert not (
+        piecewise and breakable
+    ), "a captured prefill graph is either tc_piecewise or breakable, not both"
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        enable_breakable_cuda_graph,
+    )
+    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+        enable_tc_piecewise_cuda_graph,
+    )
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(torch.no_grad())
+        stack.enter_context(
+            forward_context(ForwardContext(attn_backend=fixture.backend))
+        )
+        if piecewise:
+            stack.enter_context(enable_tc_piecewise_cuda_graph())
+        if breakable:
+            stack.enter_context(enable_breakable_cuda_graph())
         fixture.backend.init_forward_metadata(fixture.forward_batch)
         return fixture.actual_module(fixture.input_hidden, fixture.forward_batch)
+
+
+def run_mla_fixture_captured(
+    fixture: MLAAttentionFixture, *, piecewise: bool = False, breakable: bool = False
+) -> torch.Tensor:
+    """Unlike run_mla_fixture_eager, actually captures a CUDA graph and
+    replays it, proving the varlen absorbed MLA metadata
+    (block_kv_indices/seq_lens_k) built by init_forward_metadata is safe to
+    read from a *replayed* graph, not just from a plain eager call.
+
+    The two modes capture through genuinely different mechanisms, matching
+    what each uses in production:
+
+    - breakable: attention is a graph-break point (see
+      radix_attention.breakable_unified_attention_with_output, wrapped with
+      eager_on_graph(True)), so it is never actually recorded into a CUDA
+      graph segment -- BreakableCUDAGraphCapture re-runs it eagerly on every
+      capture *and* every replay via its registered break function. This
+      exercises that real break/replay machinery instead of assuming it.
+    - tc_piecewise: production drives capture through torch.compile +
+      cudagraph-trees, which is out of scope for a single-module unit test.
+      A raw torch.cuda.graph() capture around the same call exercises the
+      property that actually matters here: the backend's static buffers
+      (block_kv_indices/seq_lens_k tensors) are captured and replay-safe.
+    """
+    assert not (
+        piecewise and breakable
+    ), "a captured prefill graph is either tc_piecewise or breakable, not both"
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        enable_breakable_cuda_graph,
+    )
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+        BreakableCUDAGraph,
+        BreakableCUDAGraphCapture,
+    )
+    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+        enable_tc_piecewise_cuda_graph,
+    )
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(torch.no_grad())
+        stack.enter_context(
+            forward_context(ForwardContext(attn_backend=fixture.backend))
+        )
+        # The capture-mode flag must be live *before* init_forward_metadata:
+        # the backend reads is_in_tc_piecewise_cuda_graph()/
+        # is_in_breakable_cuda_graph() while building the varlen metadata
+        # (block_kv_indices/seq_lens_k), so entering the mode context after
+        # metadata init would build metadata for the wrong path and forward
+        # would then fall back to the (here, unsupported) paged path.
+        if breakable:
+            stack.enter_context(enable_breakable_cuda_graph())
+        if piecewise:
+            stack.enter_context(enable_tc_piecewise_cuda_graph())
+        fixture.backend.init_forward_metadata(fixture.forward_batch)
+
+        if breakable:
+            cuda_graph = BreakableCUDAGraph()
+            # CUDA graphs must be captured on a non-default stream (replay is
+            # fine on the default stream, hence only here).
+            capture_stream = torch.cuda.Stream()
+            with BreakableCUDAGraphCapture(cuda_graph, stream=capture_stream):
+                output = fixture.actual_module(
+                    fixture.input_hidden, fixture.forward_batch
+                )
+            torch.cuda.current_stream().wait_stream(capture_stream)
+            cuda_graph.replay()
+            torch.cuda.synchronize()
+            return output
+
+        # Warm up once so the module's static buffers/allocator state settle
+        # before capture -- torch.cuda.graph() requires side effects from the
+        # first call (lazy init, allocator caching) to happen outside capture.
+        fixture.actual_module(fixture.input_hidden, fixture.forward_batch)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = fixture.actual_module(fixture.input_hidden, fixture.forward_batch)
+        graph.replay()
+        torch.cuda.synchronize()
+        return output
 
 
 def expected_mla_fixture_output(fixture: MLAAttentionFixture) -> torch.Tensor:
@@ -1197,6 +1303,8 @@ def run_mla_attention_case(
     atol: float = MLA_ATOL,
     rtol: float = MLA_RTOL,
     loc_layout: str = "shuffled_pages",
+    piecewise: bool = False,
+    breakable: bool = False,
 ):
     fixture = build_mla_attention_fixture(
         testcase,
@@ -1209,8 +1317,50 @@ def run_mla_attention_case(
         device=device,
         fp8_kv_cache=fp8_kv_cache,
         loc_layout=loc_layout,
+        disable_piecewise_cuda_graph=not piecewise,
     )
-    actual = run_mla_fixture_eager(fixture)
+    actual = run_mla_fixture_eager(fixture, piecewise=piecewise, breakable=breakable)
     expected = expected_mla_fixture_output(fixture)
 
     torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    return fixture
+
+
+def run_mla_attention_case_captured(
+    testcase,
+    case: MLAAttentionCase,
+    *,
+    kv_lora_rank: int = DEFAULT_KV_LORA_RANK,
+    qk_rope_head_dim: int = DEFAULT_QK_ROPE_HEAD_DIM,
+    hidden_size: int = DEFAULT_HIDDEN_SIZE,
+    max_context_len: int = DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = DEFAULT_DTYPE,
+    device: str = DEFAULT_DEVICE,
+    fp8_kv_cache: bool = False,
+    atol: float = MLA_ATOL,
+    rtol: float = MLA_RTOL,
+    loc_layout: str = "shuffled_pages",
+    piecewise: bool = False,
+    breakable: bool = False,
+):
+    """Same contract as run_mla_attention_case, but through
+    run_mla_fixture_captured -- a real CUDA graph capture + replay instead of
+    only setting the capture-mode flag."""
+    fixture = build_mla_attention_fixture(
+        testcase,
+        case,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        hidden_size=hidden_size,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+        fp8_kv_cache=fp8_kv_cache,
+        loc_layout=loc_layout,
+        disable_piecewise_cuda_graph=not piecewise,
+    )
+    actual = run_mla_fixture_captured(fixture, piecewise=piecewise, breakable=breakable)
+    expected = expected_mla_fixture_output(fixture)
+
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    return fixture
