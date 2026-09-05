@@ -95,6 +95,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_sm100_supported,
     is_xpu,
     log_info_on_rank0,
     mxfp8_block_convert_required,
