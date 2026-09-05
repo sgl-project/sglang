@@ -16,6 +16,9 @@ from sglang.multimodal_gen.configs.models.adapter.ltx_2_duration_head import (
     LTX2DurationHeadConfig,
 )
 from sglang.multimodal_gen.configs.models.base import ArchConfig, ModelConfig
+from sglang.multimodal_gen.configs.models.bridges.mova_dual_tower import (
+    MOVADualTowerConfig,
+)
 from sglang.multimodal_gen.configs.models.decoders.ltx_2_5_diffusion_decoder import (
     LTX25DiffusionDecoderConfig,
 )
@@ -31,6 +34,18 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 # real architectures with reduced widths; checkpoint names use the external layout
 CASES = [
+    (
+        "dual_tower_bridge",
+        "DualTowerConditionalBridge",
+        MOVADualTowerConfig,
+        {
+            "visual_layers": 1,
+            "audio_layers": 1,
+            "visual_hidden_dim": 16,
+            "audio_hidden_dim": 16,
+            "head_dim": 8,
+        },
+    ),
     (
         "duration_head",
         "LTX2DurationHead",
@@ -176,6 +191,33 @@ class _DecoderOnly(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.decoder = nn.Linear(config["width"], 2)
+
+
+class _WeightNormModule(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = torch.nn.utils.parametrizations.weight_norm(
+            nn.Linear(2, 4, bias=False)
+        )
+
+
+def test_plain_component_restores_folded_weight_norm(tmp_path):
+    expected = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    _write_checkpoint(
+        tmp_path, {"_class_name": "TestWeightNormModule"}, {"proj.weight": expected}
+    )
+    args = ServerArgs(
+        model_path="x",
+        component_precisions={"auxiliary": "fp32"},
+        component_residency={"auxiliary": "component-offload"},
+    )
+    with patch.dict(ModelRegistry.registered_models):
+        ModelRegistry.register_model("TestWeightNormModule", _WeightNormModule)
+        model, _ = PlainStateDictComponentLoader().load(
+            str(tmp_path), args, "auxiliary", "diffusers"
+        )
+    torch.testing.assert_close(model.proj.weight, expected, rtol=0, atol=0)
+    assert set(model.state_dict()) == {"proj.weight"}
 
 
 @dataclass

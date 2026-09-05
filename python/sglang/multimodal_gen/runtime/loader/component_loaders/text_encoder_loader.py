@@ -733,6 +733,9 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
             if isinstance(quant_config, QuantoInt8Config):
                 checkpoint_weights = normalize_quanto_int8_weights(checkpoint_weights)
             loaded_weights = model.load_weights(checkpoint_weights)
+            self.validate_checkpoint_keys(
+                weights_to_load - loaded_weights, [], component_name
+            )
 
             if quant_config is not None and not isinstance(quant_config, GGUFConfig):
                 postprocess_device: torch.device | None = local_torch_device
@@ -763,39 +766,5 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
                     model = model.to("cpu")
             else:
                 model = model.to(local_torch_device)
-            # We only enable strict check for non-quantized models
-            # that have loaded weights tracking currently.
-            # if loaded_weights is not None:
-            weights_not_loaded = weights_to_load - loaded_weights
-            if weights_not_loaded:
-                # NOTE:
-                # If we silently continue with uninitialized weights, the text encoder can
-                # produce NaNs/garbage embeddings that later fail stage verification in a
-                # hard-to-debug way (e.g., `prompt_embeds` fails the NaN check).
-                #
-                # We allow a small set of known-optional parameters to be missing, but
-                # default to strict behavior for the rest.
-                allowed_missing_patterns = (
-                    getattr(model, "_allowed_missing_weights_patterns", []) or []
-                )
-                unexpected_missing = {
-                    n
-                    for n in weights_not_loaded
-                    if not any(pat in n for pat in allowed_missing_patterns)
-                }
-                if unexpected_missing:
-                    raise ValueError(
-                        "Following text encoder weights were not initialized from checkpoint: "
-                        f"{sorted(unexpected_missing)}. "
-                        "This usually indicates a checkpoint/model-arch mismatch or a broken "
-                        "weight-name mapping. If these are truly optional, set "
-                        "`model._allowed_missing_weights_patterns` to whitelist patterns."
-                    )
-                logger.warning(
-                    "Following (allowed) text encoder weights were not initialized from "
-                    "checkpoint: %s (allowed patterns: %s)",
-                    sorted(weights_not_loaded),
-                    allowed_missing_patterns,
-                )
 
         return model

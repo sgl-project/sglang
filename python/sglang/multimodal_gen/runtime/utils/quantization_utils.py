@@ -33,11 +33,15 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_conf
 )
 from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
+    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.layers.linear import LinearBase as SrtLinearBase
 from sglang.srt.layers.modelopt_utils import canonicalize_modelopt_quant_algo
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedEmbeddingMethod as SrtUnquantizedEmbeddingMethod,
+)
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod as SrtUnquantizedLinearMethod,
 )
@@ -76,7 +80,13 @@ def process_model_weights_after_loading(
         if method is None:
             continue
         unquantized = isinstance(
-            method, (UnquantizedLinearMethod, SrtUnquantizedLinearMethod)
+            method,
+            (
+                UnquantizedLinearMethod,
+                SrtUnquantizedLinearMethod,
+                UnquantizedEmbeddingMethod,
+                SrtUnquantizedEmbeddingMethod,
+            ),
         )
         if quantized_only and unquantized:
             continue

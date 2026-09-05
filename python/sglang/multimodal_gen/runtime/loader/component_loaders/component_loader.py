@@ -7,6 +7,7 @@ import os
 import pkgutil
 import traceback
 from abc import ABC
+from collections.abc import Callable, Iterator
 from typing import Any, Type
 
 import torch
@@ -28,7 +29,9 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
     component_attn_backend_context_manager,
     get_component_attn_backend_context,
 )
+from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
 from sglang.multimodal_gen.runtime.loader.utils import (
+    _list_safetensors_files,
     _normalize_component_type,
     component_name_to_loader_cls,
     finalize_loaded_model,
@@ -37,7 +40,9 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     get_param_names_mapping,
     hf_to_custom_state_dict,
     initialize_model,
+    load_model_state_dict,
 )
+from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     checkpoint_weights_iterator,
 )
@@ -48,6 +53,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     is_fsdp_managed_module,
 )
+from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -690,6 +696,55 @@ class ComponentLoader(ABC):
 class WeightOverrideComponentLoader(ComponentLoader):
     """Base for loaders that consume an exact weights-only override."""
 
+    ignored_checkpoint_prefixes: tuple[str, ...] = ()
+
+    def load_state_dict_model(
+        self,
+        model_cls: type[nn.Module],
+        init_params: dict[str, Any],
+        weight_files: list[str],
+        server_args: ServerArgs,
+        component_name: str,
+        dtype: torch.dtype,
+        *,
+        component_starts_on_cpu: bool,
+        weight_load_plan: WeightLoadPlan | None = None,
+        checkpoint_key_filter: Callable[[str], bool] | None = None,
+        weights_iterator: Iterator[tuple[str, torch.Tensor]] | None = None,
+    ) -> nn.Module:
+        """Restore mapped model state with optional TP/FSDP materialization."""
+        return maybe_load_fsdp_model(
+            model_cls=model_cls,
+            init_params=init_params,
+            weight_dir_list=weight_files,
+            device=get_local_torch_device(),
+            hsdp_replicate_dim=server_args.hsdp_replicate_dim,
+            hsdp_shard_dim=server_args.hsdp_shard_dim,
+            component_starts_on_cpu=component_starts_on_cpu,
+            pin_cpu_memory=server_args.pin_cpu_memory,
+            fsdp_inference=server_args.should_use_fsdp_for_component(component_name),
+            param_dtype=dtype,
+            reduce_dtype=torch.float32,
+            strict=False,
+            weight_load_plan=weight_load_plan,
+            checkpoint_key_filter=checkpoint_key_filter,
+            weights_iterator=weights_iterator,
+        )
+
+    def validate_checkpoint_keys(
+        self, missing: list[str] | set[str], unexpected: list[str], component_name: str
+    ) -> None:
+        unexpected = [
+            name
+            for name in unexpected
+            if not name.startswith(self.ignored_checkpoint_prefixes)
+        ]
+        if missing or unexpected:
+            raise ComponentCheckpointUnsupportedError(
+                f"Checkpoint weights do not match {component_name!r}. "
+                f"Missing: {sorted(missing)}. Unexpected: {sorted(unexpected)}."
+            )
+
     def resolve_component_weight_override(
         self, server_args: ServerArgs, component_name: str
     ) -> str | None:
@@ -746,9 +801,26 @@ class PlainStateDictComponentLoader(WeightOverrideComponentLoader):
         model_cls, _ = ModelRegistry.resolve_model_cls(class_name)
         model_config = self.build_model_config(config, component_name)
         dtype = self.resolve_dtype(server_args, component_name)
-        target_device = self.target_device(
-            server_args.should_start_component_on_cpu(component_name)
+        component_starts_on_cpu = server_args.should_start_component_on_cpu(
+            component_name
         )
+        server_args.model_paths[component_name] = component_model_path
+        if issubclass(model_cls, BaseDiT):
+            weight_files = _list_safetensors_files(weights_path)
+            return self.load_state_dict_model(
+                model_cls,
+                {"config": model_config, "hf_config": config},
+                weight_files,
+                server_args,
+                component_name,
+                dtype,
+                component_starts_on_cpu=component_starts_on_cpu,
+                weights_iterator=(
+                    None if weight_files else checkpoint_weights_iterator(weights_path)
+                ),
+            )
+
+        target_device = self.target_device(component_starts_on_cpu)
         model = initialize_model(
             model_cls,
             model_config
@@ -768,13 +840,12 @@ class PlainStateDictComponentLoader(WeightOverrideComponentLoader):
                 valid_target_names=set(model.state_dict()),
                 strict=True,
             )
-            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            missing, unexpected = load_model_state_dict(model, state_dict, strict=False)
         except (RuntimeError, ValueError) as error:
             raise ComponentCheckpointUnsupportedError(
                 f"Cannot restore checkpoint for {component_name!r}: {error}"
             ) from error
         self.validate_checkpoint_keys(missing, unexpected, component_name)
-        server_args.model_paths[component_name] = component_model_path
         return model
 
     def build_model_config(
@@ -798,15 +869,6 @@ class PlainStateDictComponentLoader(WeightOverrideComponentLoader):
             )
         except AttributeError:
             return self.default_dtype
-
-    def validate_checkpoint_keys(
-        self, missing: list[str], unexpected: list[str], component_name: str
-    ) -> None:
-        if missing or unexpected:
-            raise ComponentCheckpointUnsupportedError(
-                f"Checkpoint weights do not match {component_name!r}. "
-                f"Missing: {sorted(missing)}. Unexpected: {sorted(unexpected)}."
-            )
 
     def component_load_precision(
         self, server_args: ServerArgs, component_name: str

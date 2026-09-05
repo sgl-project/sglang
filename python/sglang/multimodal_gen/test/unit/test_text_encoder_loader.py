@@ -5,11 +5,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 import torch
 import transformers
 from safetensors.torch import save_file
 from torch import nn
 
+from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
 from sglang.multimodal_gen.runtime.layers.linear import LinearBase
 from sglang.multimodal_gen.runtime.layers.quantization.comfy_nvfp4 import (
     ComfyFullPrecisionNvfp4LinearMethod,
@@ -51,10 +53,52 @@ from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLEncoder,
 )
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLTextModel
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     process_model_weights_after_loading,
 )
 from sglang.srt.layers.linear import LinearBase as SrtLinearBase
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_native_encoder_restoration_checks_checkpoint_before_fallback(
+    tmp_path, missing
+):
+    config = transformers.T5Config(
+        vocab_size=32,
+        d_model=8,
+        d_kv=4,
+        d_ff=16,
+        num_layers=1,
+        num_heads=2,
+        architectures=["T5EncoderModel"],
+    )
+    reference = transformers.T5EncoderModel(config)
+    config.save_pretrained(tmp_path)
+    weights = {name: tensor.clone() for name, tensor in reference.state_dict().items()}
+    required = "encoder.final_layer_norm.weight"
+    if missing:
+        weights.pop(required)
+    save_file(weights, tmp_path / "model.safetensors")
+    args = ServerArgs(
+        model_path="x",
+        component_precisions={"text_encoder": "fp32"},
+        component_residency={"text_encoder": "component-offload"},
+    )
+    args.pipeline_config.text_encoder_configs = (T5Config(),)
+    loader = TextEncoderLoader()
+    with mock.patch.object(
+        loader, "load_native", side_effect=AssertionError("fallback")
+    ):
+        if missing:
+            with pytest.raises(ComponentCheckpointUnsupportedError, match=required):
+                loader.load(str(tmp_path), args, "text_encoder", "transformers")
+        else:
+            model, _ = loader.load(str(tmp_path), args, "text_encoder", "transformers")
+            torch.testing.assert_close(
+                model.state_dict()[required], weights[required], rtol=0, atol=0
+            )
+            assert all(not parameter.requires_grad for parameter in model.parameters())
 
 
 class TestTextEncoderWeightDiscovery(unittest.TestCase):

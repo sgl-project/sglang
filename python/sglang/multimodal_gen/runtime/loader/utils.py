@@ -10,13 +10,14 @@ import json
 import os
 import re
 from collections import defaultdict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from itertools import chain
 from typing import Any, Dict, Type
 
 import torch
 from safetensors.torch import load_file as safetensors_load_file
 from torch import nn
+from torch.nn.utils import parametrize
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.weights.source import (
@@ -69,6 +70,53 @@ def finalize_loaded_model(model: nn.Module) -> nn.Module:
         if isinstance(tensor, nn.Parameter):
             tensor.requires_grad = False
     return model.eval()
+
+
+def adopt_plain_weight_norm_state(
+    module: nn.Module, loaded_names: Iterable[str]
+) -> int:
+    """Restore folded weights without recomputing their checkpoint values."""
+    state_names = set(module.state_dict())
+    module_by_name = dict(module.named_modules())
+    owners: set[str] = set()
+    for name in loaded_names:
+        if name == "weight":
+            owner_name = ""
+        elif name.endswith(".weight"):
+            owner_name = name.removesuffix(".weight")
+        else:
+            continue
+        state_prefix = f"{owner_name}." if owner_name else ""
+        if {
+            f"{state_prefix}parametrizations.weight.original0",
+            f"{state_prefix}parametrizations.weight.original1",
+        }.issubset(state_names):
+            owners.add(owner_name)
+
+    for owner_name in sorted(owners):
+        parametrize.remove_parametrizations(
+            module_by_name[owner_name], "weight", leave_parametrized=True
+        )
+    return len(owners)
+
+
+def load_model_state_dict(
+    model: nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    *,
+    strict: bool = True,
+    assign: bool = False,
+):
+    """Restore plain module state, preserving constructor-declared mixed dtypes."""
+    adopt_plain_weight_norm_state(model, state_dict)
+    if assign:
+        target_state = model.state_dict()
+        # assignment replaces storage; unlike copy loading it does not cast
+        for name, tensor in state_dict.items():
+            target = target_state.get(name)
+            if target is not None and tensor.dtype != target.dtype:
+                state_dict[name] = tensor.to(dtype=target.dtype)
+    return model.load_state_dict(state_dict, strict=strict, assign=assign)
 
 
 def get_param_names_mapping(
