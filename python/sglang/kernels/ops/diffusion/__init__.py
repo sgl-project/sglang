@@ -420,6 +420,7 @@ for _op, _backend, _target, _caps, _description in _SPECS:
 # then symbol; a new public kernel belongs here and nowhere else.
 # ---------------------------------------------------------------------------
 _EXPORTS: dict[str, str] = {
+    "group_limited_topk": "triton.group_limited_topk",
     "load_extension_with_recovery": "ext.loader",
     # Normalization: RMSNorm / LayerNorm / GroupNorm and their fused epilogues
     "can_defer_flux2_gated_residual": "norm.flux2_gated_resnorm_jit",

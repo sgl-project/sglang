@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from sglang.kernels.ops.diffusion.triton.group_limited_topk import group_limited_topk
+from sglang.kernels.ops.diffusion import group_limited_topk
 
 
 def _ref_group_limited_topk(scores_for_choice, num_experts, n_group, topk_group, top_k):

@@ -21,7 +21,7 @@ class LingBotVideoMLP(nn.Module):
 
 
 try:
-    from sglang.kernels.ops.diffusion.triton.group_limited_topk import (
+    from sglang.kernels.ops.diffusion import (
         group_limited_topk as _fused_group_limited_topk,
     )
 except Exception:  # pragma: no cover - triton/kernel unavailable
