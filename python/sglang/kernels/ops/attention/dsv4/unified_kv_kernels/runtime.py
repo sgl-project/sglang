@@ -1,15 +1,18 @@
 """Runtime glue for the unified_kv backend.
 
 Builds unified_kv-style flat ``kv_indices`` / ``kv_indptr`` from SGLang's already-computed
-DSV4 metadata, scatters SWA K into the bf16 ``unified_kv`` ring, and dispatches the
+DSV4 metadata, scatters SWA K into the ``unified_kv`` ring, and dispatches the
 vendored paged decode/prefill kernels.
 
-unified_kv[L] layout (page_size 1, bf16, row-major):
+unified_kv[L] layout (page_size 1, row-major):
   - rows ``[0, swa_pages)``    = SWA ring (``state_slot * win + pos % win``);
   - rows ``[swa_pages, ...)``  = compressed K (``swa_pages + page_index``), where
     SGLang metadata already encodes the compressed slot id:
       HCA (ratio 128): ``c128_page_indices``      (== phys_block, k_per_block=1)
       CSA (ratio   4): ``c4_sparse_page_indices``  (== phys_block*32 + slot)
+
+Under SGLANG_DSV4_UNIFIED_KV_FP8 each row is split over two pools (512 B packed fp8
+nope + 128 B bf16 rope); row indexing and every index builder below are unchanged.
 
 Index layout: RAGGED-PACKED. Each token's segment is tightly packed
 (``kv_indptr`` is a true prefix sum of per-token valid lengths) so the
@@ -24,6 +27,7 @@ on via ``topk_length``); the per-token compressed count is recovered from the
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
@@ -31,6 +35,9 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.layout import (
+    check_two_pool_pair,
+)
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode import (
     sparse_attn_v4_paged_decode,
 )
@@ -77,15 +84,32 @@ def _swa_scatter_kernel(
 
 def store_swa_into_unified(
     *,
-    kv: torch.Tensor,  # [T, head_dim] bf16
+    kv: torch.Tensor,  # [T, head_dim] bf16, or [T, nope_row_bytes] packed fp8
     state_slot: torch.Tensor,  # [T] int
     positions: torch.Tensor,  # [T] int
-    unified_kv: torch.Tensor,  # [pages, head_dim] bf16
+    unified_kv: torch.Tensor,  # [pages, ...] same dtype and row width as kv
     win: int,  # SWA attention window length
     ring_stride: int,  # SWA ring stride
     final_pos: Optional[torch.Tensor] = None,  # [T] req's last position
+    kv_rope: Optional[torch.Tensor] = None,  # [T, rope_dim] bf16, fp8 layout only
+    unified_kv_rope: Optional[torch.Tensor] = None,  # [pages, rope_dim] bf16
 ) -> None:
-    n_rows, D = kv.shape
+    """Scatter SWA K into ring row ``state_slot * ring_stride + pos % ring_stride``.
+
+    Under the fp8 layout the latent is split over two pools, so ``kv`` carries the
+    already-packed nope row (DSV4_FP8_NOPE_ROW_BYTES wide: values + E8M0 scales +
+    pad; nothing is quantized here) and ``kv_rope`` the bf16 rope half. That width
+    is a byte count that happens to equal the bf16 head_dim in elements -- the two
+    are not the same thing. The scatter itself takes the row width off the tensor;
+    only the pair check reads the constant.
+
+    Both scatters recompute the row index from the same ``state_slot`` /
+    ``positions``, so the two pools stay in lockstep with each other and with the
+    bf16 layout. What a caller can still get wrong is passing two pools that aren't
+    a pair, so the pair goes through ``check_two_pool_pair`` before the first launch
+    -- shared with the fused store, which has the same coupling.
+    """
+    n_rows = kv.shape[0]
     if n_rows == 0:
         return
 
@@ -94,20 +118,52 @@ def store_swa_into_unified(
     assert kv.is_contiguous() and kv.dtype == unified_kv.dtype
     assert state_slot.is_contiguous() and positions.is_contiguous()
     assert fp_arg.is_contiguous()
-    _swa_scatter_kernel[(n_rows,)](
-        kv,
-        state_slot,
-        positions,
-        fp_arg,
-        unified_kv,
-        n_rows,
-        ring_stride,
-        win=win,
-        D=D,
-        HAS_FINAL=has_final,
-        BLOCK_D=triton.next_power_of_2(D),
-        num_warps=8,
+    two_pool = kv_rope is not None
+    assert two_pool == (unified_kv_rope is not None), (
+        "kv_rope and unified_kv_rope come together"
     )
+    if two_pool:
+        assert kv_rope.is_contiguous(), (
+            f"kv_rope must be contiguous, got strides {kv_rope.stride()}"
+        )
+        assert kv_rope.shape[0] == n_rows, (
+            f"kv_rope holds {kv_rope.shape[0]} rows, kv holds {n_rows}"
+        )
+        check_two_pool_pair(
+            unified_kv,
+            unified_kv_rope,
+            rope_width=kv_rope.shape[1],
+            rope_dtype=kv_rope.dtype,
+        )
+
+    def _scatter(src: torch.Tensor, dst: torch.Tensor) -> None:
+        D = src.shape[1]
+        assert dst.shape[1] == D, f"row width {D} does not fit pool {dst.shape[1]}"
+        _swa_scatter_kernel[(n_rows,)](
+            src,
+            state_slot,
+            positions,
+            fp_arg,
+            dst,
+            n_rows,
+            ring_stride,
+            win=win,
+            D=D,
+            HAS_FINAL=has_final,
+            BLOCK_D=triton.next_power_of_2(D),
+            num_warps=8,
+        )
+
+    if kv.element_size() == 1:
+        # single-byte rows (any fp8 variant) are a pure byte move, and the E8M0
+        # scale bytes aren't floats -- uint8 avoids a triton convert for `other=`
+        assert unified_kv.is_contiguous()
+        _scatter(kv.view(torch.uint8), unified_kv.view(torch.uint8))
+    else:
+        _scatter(kv, unified_kv)
+
+    if two_pool:
+        _scatter(kv_rope, unified_kv_rope)
 
 
 @triton.jit
@@ -181,6 +237,116 @@ def decode(
     return sparse_attn_v4_paged_decode(
         q, unified_kv, kv_indices, kv_indptr, attn_sink, softmax_scale
     )
+
+
+@lru_cache(maxsize=None)
+def decode_qo_indptr(num_tokens: int, device: torch.device) -> torch.Tensor:
+    """``qo_indptr`` for the two-pool decode: one q token per sequence.
+
+    Not ``cu_seqlens_q`` -- that one is per-request and differs once MTP puts
+    several draft tokens in a batch. Cached unbounded like _token_identity_map:
+    all 61 layers ask for the same answer each step, and a captured graph holds
+    the address it got back.
+    """
+    return torch.arange(num_tokens + 1, dtype=torch.int32, device=device)
+
+
+# aiter sizes the split count off CU occupancy and over-splits just past 40
+# tokens, where the stage-2 merge starts to dominate. 4 rather than each shape's
+# own optimum -- neighbouring split counts swing ~1.5x either way.
+_DECODE_SPLIT_TAIL_MIN_TOKENS = 40
+_DECODE_SPLIT_TAIL_VALUE = 4
+
+
+def decode_fp8_2buff(
+    *,
+    q: torch.Tensor,  # [T, H, nope_row_bytes] fp8 packed nope + inline e8m0 scale
+    q_rope: torch.Tensor,  # [T, H, rope_dim] bf16
+    unified_kv: torch.Tensor,  # [rows, nope_row_bytes] fp8
+    unified_kv_rope: torch.Tensor,  # [rows, rope_dim] bf16
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    attn_sink: torch.Tensor,  # [H] fp32
+    v_head_dim: int,
+    qo_indptr: Optional[torch.Tensor] = None,
+    num_kv_splits: Optional[int] = None,
+) -> torch.Tensor:
+    """Decode over the two-pool fp8 unified_kv, through aiter's v4 nm asm kernel.
+
+    Q arrives in the same packed form as the pool rows (nope fp8 + duplicated
+    e8m0 tile scales) with its rope half beside it in bf16, which is why this
+    can't share ``decode``'s single bf16 tensor. The kernel takes the row stride
+    off ``kv_buffer.size(-1)`` and only requires Q to match it, so the 512 B row
+    is not baked into the reader.
+
+    ``v_head_dim`` is an element count (448 nope + 64 rope) that happens to equal
+    the row's byte width; it comes from the caller so that nothing here reads one
+    as the other.
+    """
+    from aiter.mla import mla_decode_fwd_v4_nm
+
+    T, H, row_bytes = q.shape
+    check_two_pool_pair(
+        unified_kv,
+        unified_kv_rope,
+        rope_width=q_rope.shape[-1],
+        rope_dtype=q_rope.dtype,
+    )
+    assert row_bytes == unified_kv.shape[-1], (
+        f"aiter derives the row stride from the kv pool ({unified_kv.shape[-1]} B) "
+        f"and reads Q with that same stride, but the q row is {row_bytes} B"
+    )
+    assert q_rope.shape[:2] == (T, H), (
+        f"q pair disagrees: packed {tuple(q.shape)[:2]} vs rope "
+        f"{tuple(q_rope.shape)[:2]}"
+    )
+    # the asm kernel walks all four as flat buffers, it has no stride arguments
+    assert q.is_contiguous(), f"q must be contiguous, strides {q.stride()}"
+    assert q_rope.is_contiguous(), (
+        f"q_rope must be contiguous, strides {q_rope.stride()}"
+    )
+    assert attn_sink.dtype == torch.float32 and attn_sink.numel() == H, (
+        f"sink must be {H} fp32 values, got {attn_sink.numel()} x {attn_sink.dtype}"
+    )
+
+    if qo_indptr is None:
+        qo_indptr = decode_qo_indptr(T, q.device)
+    # num_seqs comes from qo_indptr.numel()-1 and the kernel writes
+    # num_seqs * max_seqlen_q rows into `out`, so both have to be sized off q's
+    # own T. A qo_indptr built from a padded token count writes past `out`.
+    assert qo_indptr.shape[0] >= T + 1, (
+        f"qo_indptr holds {qo_indptr.shape[0]} entries, kernel reads {T + 1}"
+    )
+    assert kv_indptr.shape[0] >= T + 1, (
+        f"kv_indptr holds {kv_indptr.shape[0]} entries, kernel reads {T + 1}"
+    )
+    qo_indptr = qo_indptr[: T + 1]
+
+    rows = unified_kv.shape[0]
+    out = q_rope.new_empty((T, H, v_head_dim))
+    # Left None, the wrapper's occupancy heuristic picks it, folds the cross-split
+    # merge back into `out`, and leaves the final bf16 there whether or not it
+    # split. Pinning it to 1 costs 6.9x at bs=1 kv=2048.
+    if num_kv_splits is None and T > _DECODE_SPLIT_TAIL_MIN_TOKENS:
+        num_kv_splits = _DECODE_SPLIT_TAIL_VALUE
+    mla_decode_fwd_v4_nm(
+        q,
+        q_rope,
+        unified_kv.view(rows, 1, 1, row_bytes),
+        unified_kv_rope.view(rows, 1, 1, unified_kv_rope.shape[-1]),
+        out,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        1,  # max_seqlen_q; qo_indptr is per-token so every sequence is one token
+        sink=attn_sink,
+        num_kv_splits=num_kv_splits,
+    )
+    # No empty-segment mask: a CG-padded row gets seq_len 1 on the ring slot
+    # ReqToTokenPool reserves, so the builders can't emit a zero-length one, and
+    # the compare + masked_fill_ was costing a launch per layer for it. One would
+    # come back NaN now (all-sink denominator); the guard UT pins that.
+    return out
 
 
 @triton.jit
@@ -464,6 +630,115 @@ def build_prefill_indices(
         num_warps=4,
     )
     return kv_indices_prefix, kv_indptr_prefix, kv_indices_extend, kv_indptr_extend
+
+
+def prefill_fp8_2buff(
+    *,
+    q: torch.Tensor,  # [T, H, nope_row_bytes] fp8 packed nope + inline e8m0 scale
+    q_rope: torch.Tensor,  # [T, H, rope_dim] bf16
+    unified_kv: torch.Tensor,  # [rows, nope_row_bytes] fp8 prefix pool
+    unified_kv_rope: torch.Tensor,  # [rows, rope_dim] bf16 prefix pool
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv_extend: torch.Tensor,  # [tokens, nope_row_bytes] fp8 packed current chunk
+    kv_extend_rope: torch.Tensor,  # [tokens, rope_dim] bf16
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor,  # [H] fp32
+    softmax_scale: float,
+    v_head_dim: int,
+) -> torch.Tensor:
+    """Prefill over the two-pool fp8 unified_kv, through aiter's opus kernel.
+
+    Same two regions as ``prefill`` -- paged prefix plus this chunk's flat extend
+    -- but every latent arrives as a pair, so there are four buffers instead of
+    two. The extend pair is the packed K the fused norm+rope store hands back;
+    the ring write after attention consumes that same pair, which is why the
+    caller materialises it rather than this function quantizing here.
+
+    Unlike ``decode_fp8_2buff`` the scale is a real argument: this kernel takes
+    it, so nothing has to match a hardcoded 1/sqrt(512).
+
+    ``v_head_dim`` is an element count (448 nope + 64 rope) that happens to equal
+    the packed row's byte width; it comes from the caller so that nothing here
+    reads one as the other.
+
+    A token with neither region comes back zero rather than NaN, so unlike
+    ``decode_fp8_2buff`` there is nothing to mask off the result afterwards. An
+    empty prefix is the live case here, not a guard: chunk 0 has nothing
+    committed yet and every token's prefix segment is empty.
+    """
+    from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_fp8_opus
+
+    T, H, row_bytes = q.shape
+    check_two_pool_pair(
+        unified_kv,
+        unified_kv_rope,
+        rope_width=q_rope.shape[-1],
+        rope_dtype=q_rope.dtype,
+    )
+    # The kernel walks the prefix pool and the extend buffer with the same row
+    # layout, so a narrower extend row would read the next token's bytes as this
+    # one's scales instead of failing.
+    assert kv_extend.shape[-1] == row_bytes and kv_extend.dtype == unified_kv.dtype, (
+        f"extend nope row is {kv_extend.shape[-1]} x {kv_extend.dtype}, pool is "
+        f"{row_bytes} x {unified_kv.dtype}"
+    )
+    assert (
+        kv_extend_rope.shape[-1] == unified_kv_rope.shape[-1]
+        and kv_extend_rope.dtype == unified_kv_rope.dtype
+    ), (
+        f"extend rope row is {kv_extend_rope.shape[-1]} x {kv_extend_rope.dtype}, "
+        f"pool is {unified_kv_rope.shape[-1]} x {unified_kv_rope.dtype}"
+    )
+    assert kv_extend.shape[0] == kv_extend_rope.shape[0], (
+        f"extend pair disagrees: nope {kv_extend.shape[0]} rows vs rope "
+        f"{kv_extend_rope.shape[0]}"
+    )
+    assert row_bytes == unified_kv.shape[-1], (
+        f"the kernel reads Q with the kv row stride ({unified_kv.shape[-1]} B), "
+        f"but the q row is {row_bytes} B"
+    )
+    assert q_rope.shape[:2] == (T, H), (
+        f"q pair disagrees: packed {tuple(q.shape)[:2]} vs rope "
+        f"{tuple(q_rope.shape)[:2]}"
+    )
+    # no stride arguments anywhere in the op. The two pools got their
+    # is_contiguous() from check_two_pool_pair above; these are the rest.
+    for name, t in (
+        ("q", q),
+        ("q_rope", q_rope),
+        ("kv_extend", kv_extend),
+        ("kv_extend_rope", kv_extend_rope),
+    ):
+        assert t.is_contiguous(), f"{name} must be contiguous, strides {t.stride()}"
+    assert attn_sink.dtype == torch.float32 and attn_sink.numel() == H, (
+        f"sink must be {H} fp32 values, got {attn_sink.numel()} x {attn_sink.dtype}"
+    )
+    for name, indptr in (
+        ("prefix", kv_indptr_prefix),
+        ("extend", kv_indptr_extend),
+    ):
+        assert indptr.shape[0] >= T + 1, (
+            f"{name} indptr holds {indptr.shape[0]} entries, kernel reads {T + 1}"
+        )
+
+    out = q_rope.new_empty((T, H, v_head_dim))
+    return pa_sparse_prefill_fp8_opus(
+        q,
+        q_rope,
+        unified_kv,
+        unified_kv_rope,
+        kv_indices_prefix,
+        kv_indptr_prefix[: T + 1],
+        kv_extend,
+        kv_extend_rope,
+        kv_indices_extend,
+        kv_indptr_extend[: T + 1],
+        attn_sink,
+        softmax_scale,
+        out=out,
+    )
 
 
 def prefill(
