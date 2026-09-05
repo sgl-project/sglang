@@ -121,9 +121,8 @@ def _prepare_ple_batch(
 
     if forward_batch.tbo_parent_token_range is not None:
         raise NotImplementedError("Qwen4 PLE is not compatible with two-batch overlap")
-    spec_algorithm = forward_batch.spec_algorithm
-    if spec_algorithm is not None and spec_algorithm.is_ngram():
-        raise NotImplementedError("Qwen4 PLE does not support NGRAM speculation")
+    # NGRAM speculation runs on a forced linear draft chain (see
+    # ngram_worker._linearize_chain); the top-k guard below therefore holds for it.
     if (
         forward_batch.spec_info is not None
         and getattr(forward_batch.spec_info, "topk", 1) != 1
@@ -134,6 +133,31 @@ def _prepare_ple_batch(
     get_req_to_token_pool().ple_window_cache = None
     if mode.is_idle():
         return None
+    if mode.is_target_verify():
+        # Both PLE intermediates are allocated only when speculative_num_draft_tokens reaches
+        # HybridReqToTokenPool; if either is None the post-verify commit scatters nothing and
+        # the PLE history silently freezes.
+        _pool = get_req_to_token_pool()
+        _ngram_pool = getattr(_pool, "ngram_pool", None)
+        _conv_pool = getattr(_pool, "short_conv_pool", None)
+        if ngram_size is not None and (
+            _ngram_pool is None
+            or not _ngram_pool.enabled
+            or _ngram_pool.intermediate_context is None
+        ):
+            raise RuntimeError(
+                "Qwen4 PLE target verify: ngram_pool.intermediate_context is not allocated "
+                "(speculative_num_draft_tokens did not reach HybridReqToTokenPool)"
+            )
+        if (
+            _conv_pool is not None
+            and _conv_pool.enabled
+            and _conv_pool.intermediate_conv_state is None
+        ):
+            raise RuntimeError(
+                "Qwen4 PLE target verify: short_conv_pool.intermediate_conv_state is not allocated "
+                "(speculative_num_draft_tokens did not reach HybridReqToTokenPool)"
+            )
     use_decode_fast_path = (
         envs.SGLANG_ENABLE_QWEN4_PLE_FUSION.get() and mode.is_decode()
     )
