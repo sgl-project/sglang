@@ -1604,8 +1604,9 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                     last_device_node_id: Some(self.arena.node(prefix_node_idx).id),
                     inserted_host_node: None,
                     host_insert_dropped: false,
-                    mamba_exist: self.try_component_by_type_(MAMBA).is_none()
-                        || self.arena.has_device_value(prefix_node_idx, MAMBA),
+                    // Nothing was inserted, so a donated Mamba slot was not
+                    // adopted and the caller keeps (and frees) it.
+                    mamba_exist: true,
                     adopted_ranges: params.track_adopted_ranges.then(HashMap::new),
                     cache_actions: Vec::new(),
                 }),

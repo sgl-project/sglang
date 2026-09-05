@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use sglang_radix_tree::{
-    CacheInitParams, FULL, InsertParams, InsertResult, KeyNamespaceRef, MatchPrefixParams,
+    CacheInitParams, FULL, InsertParams, InsertResult, KeyNamespaceRef, MAMBA, MatchPrefixParams,
     PageValue, UnifiedTreeCore,
 };
 
@@ -100,6 +100,35 @@ fn page_value_core_supports_read_only_match_and_continuation_insert() {
         namespace: KeyNamespaceRef::default(),
     });
     assert_eq!(matched.device_indices.as_slice(), &[1, 2, 5, 6]);
+}
+
+#[test]
+fn empty_insert_leaves_the_donated_mamba_slot_with_the_caller() {
+    let mut tree = TestCore::new_with_empty(
+        CacheInitParams {
+            page_size: 2,
+            mamba_cache_chunk_size: Some(2),
+            ..Default::default()
+        },
+        vec![FULL, MAMBA],
+        PageValue::default(),
+    );
+    // One token under page_size 2 aligns to an empty key: nothing is inserted,
+    // so the caller must free its donated slot (mamba_exist == true).
+    let key = vec![10];
+    let result = tree.insert(&InsertParams {
+        key: &key,
+        namespace: KeyNamespaceRef::default(),
+        value: PageValue::from_vec(vec![1]),
+        prev_prefix_len: 0,
+        swa_evicted_seqlen: 0,
+        mamba_value: Some(PageValue::from_vec(vec![7])),
+        chunked: false,
+        priority: 0,
+        track_adopted_ranges: false,
+    });
+    assert_eq!(result.total_len, 0);
+    assert!(result.mamba_exist);
 }
 
 #[test]
