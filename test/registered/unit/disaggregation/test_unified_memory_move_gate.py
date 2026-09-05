@@ -136,7 +136,7 @@ class TestPrefillMoveGate(CustomTestCase):
 class TestGatedPeerHolesAreNotSchedulable(CustomTestCase):
     """`schedulable_available_size` credits holes a peer urgent-flush would
     release. While the move gate is closed that flush relocates nothing, so
-    crediting them lets the scheduler admit work `_flush_peer_for_alloc` cannot
+    crediting them lets the scheduler admit work `_relieve_for_alloc` cannot
     satisfy; the alloc then returns None and the decode prealloc path treats
     that as a memory-estimation bug and aborts the scheduler.
     """

@@ -309,6 +309,7 @@ async def generations(
             attention_backend_override=_get_extra_field(
                 request, "attention_backend_override"
             ),
+            skip_softmax_params=_get_extra_field(request, "skip_softmax_params"),
             quality=_runtime_sampling_quality(request.quality),
             output_compression=request.output_compression,
             output_quality=request.output_quality,

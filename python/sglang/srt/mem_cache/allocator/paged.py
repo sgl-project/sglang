@@ -15,11 +15,6 @@ limitations under the License.
 
 from __future__ import annotations
 
-"""
-Page-aligned memory pool.
-"""
-
-
 from typing import TYPE_CHECKING
 
 import torch

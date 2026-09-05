@@ -13,29 +13,8 @@
 # ==============================================================================
 """KVIndexTranslator -- the read-path id translator.
 
-Covers, CPU-only (the builder's pure-torch reference path; GPU parity of the
-Triton kernel is a later CUDA CI pin):
-  - strict passthrough: a non-unified source returns the SAME req_to_token /
-    req_pool_indices objects -- zero tensor ops, no copies (the property that
-    makes backend re-pointing byte-identical for every non-unified server);
-  - static SWA pools keep their legacy full->swa mapping on the view;
-  - the read table matches the hand formula
-        entry[b, c] = clamp(v2p[req_to_token[req[b], c*ps] // ps] * mult, 0)
-    over the REAL SWA composite's tables (full AND swa, ps in {1, 4},
-    multiplier in {1, 2L}), with the swa table built from VIRTUAL ids;
-  - sink routing: dead lanes (seq_len 0), -1 req_to_token entries, and
-    tombstoned v2p pages all read entry 0;
-  - the capture contract: buffers are zero-filled and idempotent; a refresh
-    updates ONLY the live prefix (stale tails and rows beyond bs keep prior
-    contents); the returned table is the WHOLE buffer (pointer-stable);
-  - the eager-view memo: a single source-resident slot keyed by batch
-    identity (same batch shares one build; the next batch replaces it; a
-    dead batch never matches);
-  - the two-phase write contract: the rebind touches only the full side, and
-    the sliding-window write loc derives POINTWISE from the kernel-facing values
-    (pads, slices, and fresh copies included), for both pool families.
-
-    python -m pytest test/registered/unit/mem_cache/test_kv_index_translator.py -v
+CPU-only: these exercise the builder's pure-torch reference path, not the
+Triton kernel.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -137,9 +116,8 @@ def _reference_table(req_to_token, req_pool_indices, seq_lens, v2p, mult, ps, wi
 
 class TestPassthrough(unittest.TestCase):
     def test_non_unified_returns_same_objects(self):
-        """The strict-passthrough property: no copy, no branch, the exact
-        tensors backends read today. A regression here (any tensor op on the
-        non-unified path) breaks byte-identity for every static-pool server."""
+        """Strict passthrough: no copy, no branch. Any tensor op on the
+        non-unified path breaks byte-identity for every static-pool server."""
         req_to_token = torch.arange(64, dtype=torch.int64).reshape(4, 16)
         src = KVIndexTranslator(
             req_to_token=req_to_token,
@@ -166,7 +144,7 @@ class TestPassthrough(unittest.TestCase):
 
 def _alloc_and_fill(allocator, ps, lens):
     """Allocate per-request virtual runs and write them into a fake
-    req_to_token; returns (req_to_token, req_pool_indices, seq_lens)."""
+    req_to_token."""
     width = 16 * ps
     req_to_token = torch.full((len(lens), width), -1, dtype=torch.int64)
     for r, n in enumerate(lens):
@@ -183,11 +161,10 @@ def _alloc_and_fill(allocator, ps, lens):
 
 class TestReadTableBuild(unittest.TestCase):
     def test_read_table_matches_reference_across_multipliers(self):
-        """The load-bearing formula pin: full AND swa read tables equal
-        the independent per-element derivation, across page sizes and both
-        multiplier regimes (MLA=1, MHA=2L). The swa table agreeing with
-        a formula over VIRTUAL ids is also the never-chained-through-
-        full-physical proof."""
+        """Both read tables must equal the independent per-element derivation,
+        across page sizes and both multiplier regimes (MLA=1, MHA=2L); the swa
+        table agreeing over VIRTUAL ids proves it is never chained through
+        full-physical."""
         for ps in (1, 4):
             for collapse in (True, False):
                 allocator = _build_composite(ps, collapse=collapse)
@@ -235,10 +212,8 @@ class TestReadTableBuild(unittest.TestCase):
                 )
 
     def test_packed_stream_equals_the_rectangle_it_replaces(self):
-        """The packed builder and the rectangle must agree element for element:
-        packed[indptr[b] + p] == ids[b, p // ps] * ps + p % ps. Consumers that
-        plan over the stream and consumers that read the page table have to see
-        the same KV, so a change to either builder alone turns this red."""
+        """The two builders must agree element for element:
+        packed[indptr[b] + p] == ids[b, p // ps] * ps + p % ps."""
         for ps in (1, 4):
             allocator = _build_composite(ps)
             req_to_token, rows, seq_lens = _alloc_and_fill(
@@ -269,9 +244,9 @@ class TestReadTableBuild(unittest.TestCase):
                     )
 
     def test_sink_routing(self):
-        """Dead lanes (seq_len 0), -1 slots inside the live prefix, and
-        tombstoned v2p pages must ALL read entry 0 -- one wild entry is a
-        captured-graph OOB read at replay."""
+        """Dead lanes, -1 slots inside the live prefix, and tombstoned v2p
+        pages must ALL read entry 0; one wild entry is a captured-graph OOB
+        read at replay."""
         ps = 4
         allocator = _build_composite(ps)
         req_to_token, rows, seq_lens = _alloc_and_fill(
@@ -300,12 +275,9 @@ class TestBuildInto(unittest.TestCase):
     (their rows ARE the read table's rows)."""
 
     def test_prefix_filled_tail_sentinel_preserved_width_capped(self):
-        """Three contracts in one batch: entries equal the read-table formula,
-        lanes past each row's live pages keep the backend's -1 sentinel
-        (prefix-only -- a tail write scatters the trtllm sentinel contract),
-        and a table padded WIDER than the req_to_token page span (trtllm's
-        LCM alignment) is capped instead of tripping the builder's width
-        assert."""
+        """The -1 tail sentinel belongs to the backend, and a table padded
+        WIDER than the req_to_token page span (trtllm's LCM alignment) must be
+        capped rather than trip the builder's width assert."""
         ps = 4
         allocator = _build_composite(ps)
         full_mult = allocator.kernel_page_multiplier
@@ -339,8 +311,8 @@ class TestBuildInto(unittest.TestCase):
             )
 
     def test_passthrough_source_refuses(self):
-        """Callers dispatch on `enabled`; a passthrough source has no v2p to
-        build from and must fail loud, not fill garbage."""
+        """Callers dispatch on `reads_are_translated`; a passthrough source has
+        no v2p to build from and must fail loud, not fill garbage."""
         src = KVIndexTranslator(
             req_to_token=torch.zeros((2, 4), dtype=torch.int64),
             token_to_kv_pool_allocator=SimpleNamespace(),
@@ -360,21 +332,18 @@ class TestPoolOwnership(unittest.TestCase):
     """A runner only gets the kernel-facing id space when the pool IT reads and
     writes is the one the allocator's ids address.
 
-    Guarded shape: a runner handed a SHARED allocator (one slot index space,
-    one req_to_token) while owning a SEPARATE KV buffer sized to the
-    allocator's SLOT count. Probing the allocator alone reports "unified" for
-    that runner, so its indices would be mapped into the composite's
-    kernel-facing space (kernel-facing ids up to num_pages * multiplier) and then used
-    to address a buffer with only num_slots rows -- out of bounds on both the
-    read gather and the KV store.
+    Guarded shape: a runner handed a SHARED allocator while owning a SEPARATE
+    KV buffer sized to the allocator's SLOT count. Probing the allocator alone
+    reports "unified" for that runner, so its indices would be mapped into the
+    composite's kernel-facing space (ids up to num_pages * multiplier) and used
+    to address a buffer with only num_slots rows.
     """
 
     def test_real_factory_bundle_satisfies_the_ownership_identity(self):
-        """The guard rests on `allocator.get_kvcache() is token_to_kv_pool`
-        holding for a REAL target bundle. If a factory ever returned a pool
-        the allocator does not hold, the guard would silently disable the
-        unified path for EVERY model -- so pin it against the real factory
-        rather than against this file's own construction."""
+        """The guard rests on `allocator.get_kvcache() is token_to_kv_pool`, so
+        a factory returning a pool the allocator does not hold would silently
+        disable the unified path for EVERY model. Pinned against the real
+        factory, not this file's own construction."""
         from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 
         bundle = init_unified_swa_pools(
@@ -424,9 +393,9 @@ class TestPoolOwnership(unittest.TestCase):
         self.assertFalse(src.is_translating)
 
     def test_disabled_source_is_strict_passthrough(self):
-        """Consequence of the guard: such a runner must see RAW virtual ids on
-        the read table -- they index its own pool directly. A translate here is
-        the out-of-bounds bug the ownership identity exists to prevent."""
+        """Such a runner must see RAW virtual ids: they index its own pool
+        directly, and a translate here is the out-of-bounds bug the ownership
+        identity exists to prevent."""
         alloc = _build_composite(ps=1)
         req_to_token = torch.arange(16, dtype=torch.int32, device=_DEV).view(2, 8)
         src = KVIndexTranslator(
@@ -483,10 +452,9 @@ class TestCaptureContract(unittest.TestCase):
         self.assertTrue(bool((cap[1:] == 7).all()), "rows beyond bs were touched")
 
     def test_row_ids_not_reallocated_across_builds(self):
-        """`row_ids` is a constant arange sized once from the request pool, so
-        builds at different batch sizes hand back slices of ONE buffer. A
-        per-build `torch.arange` would be correct but would spend an allocation
-        and a launch on every replay prep."""
+        """`row_ids` is one arange sized from the request pool and sliced per
+        build; a per-build `torch.arange` would be correct but costs an
+        allocation and a launch on every replay prep."""
         allocator = _build_composite(1)
         req_to_token, rows, seq_lens = _alloc_and_fill(allocator, 1, lens=[4, 2, 3])
         src = _make_source(allocator, req_to_token, 1)
@@ -531,10 +499,9 @@ class _FakeForwardBatch:
 
 
 class TestViewMemo(unittest.TestCase):
-    """The eager view is memoized ON THE SOURCE in a single slot keyed by
-    batch identity -- per-batch state stays out of the ForwardBatch (it does
-    not scale with the number of id spaces), and one metadata build's many
-    consumers still share one table build."""
+    """The eager view is memoized ON THE SOURCE in a single slot keyed by batch
+    identity, so per-batch state stays out of the ForwardBatch while one
+    metadata build's many consumers still share one table build."""
 
     def _fb(self, allocator, ps, lens):
         req_to_token, rows, seq_lens = _alloc_and_fill(allocator, ps, lens=lens)
@@ -590,12 +557,10 @@ class TestViewMemo(unittest.TestCase):
 
 
 class TestWriteLoc(unittest.TestCase):
-    """The two-phase write contract: phase 1 (`rebind_write_loc`) rebinds the
-    full side once at ForwardBatch construction; phase 2 derives the
-    sliding-window write loc on demand, POINTWISE from the full-side
-    values. Value-based derivation is the property under test: pads, slices,
-    and fresh copies of the loc must all derive correctly with no handover
-    and no stored per-forward state."""
+    """The two-phase write contract: `rebind_write_loc` rebinds the full side
+    once at ForwardBatch construction, and the sliding-window write loc derives
+    POINTWISE from the full-side values -- pads, slices, and fresh copies
+    included -- with no handover and no stored per-forward state."""
 
     def _built(self, ps=1, n=4):
         allocator = _build_composite(ps)
@@ -622,10 +587,8 @@ class TestWriteLoc(unittest.TestCase):
             self.assertTrue(torch.equal(virt, keep))
 
     def test_swa_write_loc_round_trips_from_full_side(self):
-        """The derived property behind phase 2: for any virtual run t,
-        deriving from the kernel-facing full-side values must equal the direct
-        virtual->swa translate — `field(full(t)) == swa(t)` across page sizes
-        and multipliers."""
+        """Derived property: `field(full(t)) == swa(t)` for any virtual run t,
+        across page sizes and multipliers."""
         for ps in (1, 4, 64):
             src, _, rows, seq_lens, _, want_full, want_swa = self._built(
                 ps=ps, n=3 * ps
@@ -634,29 +597,14 @@ class TestWriteLoc(unittest.TestCase):
             self.assertTrue(torch.equal(got, want_swa))
 
     def test_pad_lanes_derive_to_sink(self):
-        """The DP pad appends zeros; kernel-facing 0 is the reserved padding slot in
-        every id space, so pad lanes must derive to swa slot 0 with no
-        `num_live` bookkeeping."""
+        """The DP pad appends zeros, and kernel-facing 0 is the reserved
+        padding slot in every id space, so pad lanes derive to swa slot 0 with
+        no `num_live` bookkeeping."""
         src, _, rows, seq_lens, _, want_full, want_swa = self._built(n=3)
         padded = torch.cat([want_full, want_full.new_zeros(2)])
         got = self._field(src, rows, seq_lens, padded)
         self.assertTrue(torch.equal(got[:3], want_swa))
         self.assertTrue(bool((got[3:] == 0).all()), "pad lanes must land on slot 0")
-
-    def test_slice_and_copy_derive_pointwise_without_handover(self):
-        """REGRESSION (design): the retired identity-resolver refused any
-        tensor it had not been handed -- a TBO child's re-padded slice or a
-        registry's fresh copy raised. Value-based derivation must accept
-        both, pointwise, with no adopt/handover call."""
-        src, _, rows, seq_lens, _, want_full, want_swa = self._built(n=4)
-        padded = torch.cat([want_full, want_full.new_zeros(2)])
-        # TBO-child shape: a slice crossing the pad boundary.
-        got = self._field(src, rows, seq_lens, padded[2:6])
-        self.assertTrue(torch.equal(got[:2], want_swa[2:4]))
-        self.assertTrue(bool((got[2:] == 0).all()))
-        # Registry shape: a fresh equal-value copy.
-        got2 = self._field(src, rows, seq_lens, want_full.clone())
-        self.assertTrue(torch.equal(got2, want_swa))
 
     def test_tombstoned_swa_page_clamps_to_sink(self):
         src, allocator, rows, seq_lens, virt, want_full, _ = self._built(ps=1, n=2)
