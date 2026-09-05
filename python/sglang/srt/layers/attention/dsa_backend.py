@@ -348,6 +348,7 @@ class DeepseekSparseAttnBackend(
             # Keep original head count if it exceeds current padded variants.
             self.flashmla_kv_num_q_heads = self.num_q_heads
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
+        self._sink_pad_cache: dict[tuple[int, int], torch.Tensor] = {}
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
 
@@ -1885,6 +1886,7 @@ class DeepseekSparseAttnBackend(
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
@@ -1899,6 +1901,10 @@ class DeepseekSparseAttnBackend(
             )
             else self.dsa_prefill_impl
         )
+        if attn_sink is not None and dsa_impl != "flashmla_sparse":
+            raise RuntimeError(
+                f"Learnable attention sinks require flashmla_sparse, got {dsa_impl}"
+            )
 
         if dsa_impl == "trtllm" and not self.use_mha:
             return self._forward_trtllm(
@@ -2124,6 +2130,7 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
                 topk_length=metadata.dsa_cache_seqlens_int32,
+                attn_sink=attn_sink,
             )
         elif dsa_impl == "flashinfer_sparse_mla":
             if q_rope is not None:
@@ -2195,11 +2202,18 @@ class DeepseekSparseAttnBackend(
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
+
+        if attn_sink is not None and self.dsa_decode_impl != "flashmla_sparse":
+            raise RuntimeError(
+                "Learnable attention sinks require flashmla_sparse, got "
+                f"{self.dsa_decode_impl}"
+            )
 
         if self.dsa_decode_impl == "trtllm":
             return self._forward_trtllm(
@@ -2281,6 +2295,7 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
                 topk_length=metadata.dsa_cache_seqlens_int32,
+                attn_sink=attn_sink,
             )
         elif self.dsa_decode_impl == "flashinfer_sparse_mla":
             if q_all is None:
@@ -2396,6 +2411,7 @@ class DeepseekSparseAttnBackend(
         page_table_1: torch.Tensor,
         sm_scale: float,
         topk_length: Optional[torch.Tensor] = None,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
@@ -2421,6 +2437,15 @@ class DeepseekSparseAttnBackend(
         else:
             q_input = q_all
 
+        sink_input = attn_sink
+        if need_padding and attn_sink is not None:
+            key = (attn_sink.data_ptr(), required_padding)
+            sink_input = self._sink_pad_cache.get(key)
+            if sink_input is None:
+                sink_input = attn_sink.new_zeros(required_padding)
+                self._sink_pad_cache[key] = sink_input
+            sink_input[:num_heads].copy_(attn_sink)
+
         # indices shape must be (s_q, h_kv=1, topk), keep h_kv=1 unchanged
         indices_input = page_table_1.unsqueeze(1)
 
@@ -2442,6 +2467,7 @@ class DeepseekSparseAttnBackend(
             indices=indices_input,
             sm_scale=sm_scale,
             d_v=v_head_dim,
+            attn_sink=sink_input,
             topk_length=topk_length,
         )
 
@@ -3437,6 +3463,7 @@ class DeepseekSparseAttnMultiStepBackend:
     ):
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
+        self._sink_pad_cache: dict[tuple[int, int], torch.Tensor] = {}
         self.attn_backends = []
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
