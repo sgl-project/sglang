@@ -256,6 +256,71 @@ class TestDeepSeekV4Detector(CustomTestCase):
         self.assertTrue(result.normal_text.startswith("<｜DSML｜tool_calls>"))
 
 
+class TestDanglingThinkEnd(CustomTestCase):
+    """Hybrid models (thinks_internally=True) keep the opening <think> in the
+    chat template, so a model that enters thinking on its own emits only
+    ``reasoning</think>answer``. Without special handling the whole thought
+    leaks into normal_text with the dangling tag embedded (observed live on
+    DeepSeek-V4-Flash behind a proxy that surfaces content verbatim)."""
+
+    def _detector(self):
+        return ReasoningParser(model_type="deepseek-v4").detector
+
+    def test_detect_and_parse_dangling_end_splits(self):
+        result = self._detector().detect_and_parse(
+            "Let me reason it out.</think>The answer is 42."
+        )
+        self.assertEqual(result.reasoning_text, "Let me reason it out.")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_detect_and_parse_without_thinks_internally_unchanged(self):
+        detector = BaseReasoningFormatDetector("<think>", "</think>")
+        text = "The tag is spelled </think> in that format."
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.normal_text, text)
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_detect_and_parse_second_closer_after_real_block_stays_content(self):
+        detector = self._detector()
+        result = detector.detect_and_parse("<think>plan</think>use </think> here")
+        self.assertEqual(result.reasoning_text, "plan")
+        self.assertEqual(result.normal_text, "use </think> here")
+
+    def test_streaming_dangling_end_single_chunk(self):
+        result = self._detector().parse_streaming_increment(
+            "Let me reason it out.</think>The answer is 42."
+        )
+        self.assertEqual(result.reasoning_text, "Let me reason it out.")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_streaming_dangling_end_tag_split_across_chunks(self):
+        detector = self._detector()
+        first = detector.parse_streaming_increment("reasoning tail</thi")
+        # The possible tag prefix is held back, everything before it flushes.
+        self.assertEqual(first.normal_text, "reasoning tail")
+        self.assertEqual(first.reasoning_text, "")
+        second = detector.parse_streaming_increment("nk>The answer.")
+        self.assertEqual(second.reasoning_text, "")
+        self.assertEqual(second.normal_text, "The answer.")
+        self.assertNotIn("</think>", first.normal_text + second.normal_text)
+
+    def test_streaming_closer_after_reasoning_closed_stays_content(self):
+        detector = self._detector()
+        detector.parse_streaming_increment("<think>plan")
+        detector.parse_streaming_increment("</think>")
+        result = detector.parse_streaming_increment("use </think> here")
+        self.assertEqual(result.normal_text, "use </think> here")
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_streaming_heldback_partial_flushes_on_finish(self):
+        detector = self._detector()
+        result = detector.parse_streaming_increment("ends with </thi")
+        self.assertEqual(result.normal_text, "ends with ")
+        tail = detector.finish()
+        self.assertEqual(tail.normal_text, "</thi")
+        self.assertEqual(tail.reasoning_text, "")
+
+
 class TestInklingDetector(CustomTestCase):
     def test_streaming_routes_blocks_across_all_string_boundaries(self):
         detector = InklingDetector()
