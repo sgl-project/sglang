@@ -479,7 +479,14 @@ class MoEGate(nn.Module):
         self.is_nextn = is_nextn
         self.is_deepseek_v4 = is_deepseek_v4
         self.weight = nn.Parameter(
-            torch.empty((config.n_routed_experts, config.hidden_size))
+            torch.empty(
+                (config.n_routed_experts, config.hidden_size),
+                dtype=(
+                    torch.float32
+                    if getattr(config, "router_fp32", False)
+                    else torch.get_default_dtype()
+                ),
+            )
         )
         if config.topk_method == "noaux_tc" and not is_hash_moe:
             correction_bias_dtype = torch.float32
@@ -515,6 +522,9 @@ class MoEGate(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         forward_batch: ForwardBatch = None,
     ):
+        if self.weight.dtype == torch.float32:
+            return F.linear(hidden_states.float(), self.weight)
+
         if use_intel_amx_backend(self):
             return torch.ops.sgl_kernel.weight_packed_linear(
                 hidden_states,
@@ -777,6 +787,7 @@ class DeepseekV2MoE(nn.Module):
                     ModelOptFp4LinearMethod,
                 )
                 and fc1_n % 128 == 0
+                and self.shared_experts.swiglu_limit is None
                 and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
             ):
                 self.shared_experts.gate_up_proj._interleave_for_swiglu_fusion = True
