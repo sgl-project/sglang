@@ -176,6 +176,10 @@ class RouterArgs:
     tcp_keepalive_secs: int = 30
     # Enable WebAssembly support
     enable_wasm: bool = False
+    # Directories WASM modules may be loaded from. Required when enable_wasm is
+    # set; the router refuses to start otherwise rather than allowing a module to
+    # be loaded from anywhere on the filesystem.
+    wasm_module_roots: List[str] = dataclasses.field(default_factory=list)
 
     @staticmethod
     def add_cli_args(
@@ -765,6 +769,19 @@ class RouterArgs:
             action="store_true",
             default=RouterArgs.enable_wasm,
             help="Enable WebAssembly support",
+        )
+        backend_group.add_argument(
+            f"--{prefix}wasm-module-root",
+            dest=f"{prefix.replace('-', '_')}wasm_module_roots",
+            type=str,
+            nargs="+",
+            default=[],
+            help=(
+                "Directory WASM modules may be loaded from; repeat or pass several "
+                "to allow more than one. Required with --enable-wasm: module "
+                "registration takes a caller-supplied path, and these roots are "
+                "what confine it."
+            ),
         )
 
         # Oracle configuration
