@@ -839,12 +839,30 @@ class ServerArgs:
                 "The eviction policy of radix trees. 'lru' stands for Least "
                 "Recently Used, 'lfu' stands for Least Frequently Used, 'slru' "
                 "stands for Segmented Least Recently Used, and 'priority' evicts "
-                "lower-priority requests first."
+                "lower-priority requests first. See "
+                "https://docs.sglang.io/docs/advanced_features/radix_eviction_policy "
+                "for what each policy optimizes for."
             ),
             choices=RADIX_EVICTION_POLICY_CHOICES,
         ),
         NS("memory"),
     ] = "lru"
+    radix_eviction_policy_config: A[
+        Optional[Dict[str, Any]],
+        Arg(
+            help=(
+                "Tuning parameters for --radix-eviction-policy, as a json object "
+                "passed to the policy as keyword arguments. Only 'slru' takes any "
+                "today: protected_threshold (int, default 2), e.g. "
+                "'{\"protected_threshold\": 4}'. An unrecognized key fails at "
+                "startup, naming the key and the policy. See "
+                "https://docs.sglang.io/docs/advanced_features/radix_eviction_policy#policy-parameters "
+                "for the full parameter list."
+            ),
+            type_parser=json.loads,
+        ),
+        NS("memory"),
+    ] = None
     prefill_only_disable_kv_cache: A[
         bool,
         "Skip the physical KV cache allocation for embedding-mode prefill-only workloads. Currently only valid with --is-embedding, --chunked-prefill-size=-1, --disable-radix-cache, an FA prefill backend, and non-FP4 KV cache so the fa_skip_kv_cache path is active (no layer reads or writes the cache). Other prefill-only workloads such as scoring/MIS may benefit from this later once their attention paths stop using paged KV. Scheduler admission accounting is unchanged; per-layer K/V tensors are sized to (page_size, head_num, head_dim) placeholders so GPU memory is not wasted.",
