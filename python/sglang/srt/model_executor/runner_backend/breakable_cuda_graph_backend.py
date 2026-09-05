@@ -77,6 +77,12 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._debug_eager = debug_eager
         self._shared_output_buffer: Optional[Any] = None
+        self._shape_output_buffers: Dict[Any, Any] = {}
+        # Ragged KDA/DSA experiments may capture several request-axis shapes
+        # in one runner.  Keep their CUDA graph pools disjoint: CUDA's shared
+        # pool can legally alias allocations across graphs, but BCG break
+        # bridges are eager between segments and need per-shape addresses.
+        self._shape_pools: Dict[Any, Any] = {}
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
@@ -96,6 +102,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         self._shared_output_buffer = None
+        self._shape_output_buffers.clear()
         self.begin_cuda_graph_capture()
         try:
             with self.replay_session():
@@ -126,19 +133,39 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
         )
         size = shape_key.size
-        if self._shared_output_buffer is None:
-            self._shared_output_buffer = self._alloc_full_buffer(warmup_out, size)
+        is_ragged_variant = isinstance(shape_key.variant_label, str) and shape_key.variant_label.startswith(
+            "bcg_bs_"
+        )
+        capture_pool = self._pool
+        if is_ragged_variant:
+            capture_pool = self._device_module.graph_pool_handle()
+            self._shape_pools[shape_key] = capture_pool
+            # Allocate the per-shape output buffer from the same pool that
+            # owns this graph; otherwise the buffer can alias an earlier
+            # shape's capture allocation.
+            set_graph_pool_id(capture_pool)
+        if is_ragged_variant:
+            # Each ragged request-axis graph has its own final output buffer.
+            # The graph pool is also per-shape; sharing this buffer across
+            # captures would record later graphs against an earlier pool's
+            # allocation and invalidate the earlier graph's bridge.
+            output_buffer = self._alloc_full_buffer(warmup_out, size)
+            self._shape_output_buffers[shape_key] = output_buffer
+        else:
+            if self._shared_output_buffer is None:
+                self._shared_output_buffer = self._alloc_full_buffer(warmup_out, size)
+            output_buffer = self._shared_output_buffer
         with graph_pool_capture_scope(), BreakableCUDAGraphCapture(
             cuda_graph=graph,
-            pool=self._pool,
+            pool=capture_pool,
             stream=self._capture_stream,
             barrier_fn=self._tp_group.barrier,
         ):
             out = captured_fn()
             out_rows = self._output_rows(out, size)
-            self._copy_output_to_buffer(out, self._shared_output_buffer, out_rows)
+            self._copy_output_to_buffer(out, output_buffer, out_rows)
 
-        stored = self._slice_output(self._shared_output_buffer, out_rows)
+        stored = self._slice_output(output_buffer, out_rows)
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = stored
         # CUDA graphs retain tensor addresses, not Python tensor lifetimes.
@@ -258,3 +285,5 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._capture_inputs.clear()
         self._pool = None
         self._shared_output_buffer = None
+        self._shape_output_buffers.clear()
+        self._shape_pools.clear()

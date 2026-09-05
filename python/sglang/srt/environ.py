@@ -1210,6 +1210,12 @@ class Envs:
     # CUDA graphs and execution buffers
     # ===================================================================
     SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
+    # Opt-in ragged request-axis captures for hybrid KDA/DSA prefill.
+    SGLANG_BCG_RAGGED_SHAPES = EnvBool(False)
+    SGLANG_BCG_RAGGED_MAX_BS = EnvInt(16)
+    # Use an independent capture session for each ragged shape (recommended
+    # with DeepGEMM, whose capture workspace is process-global).
+    SGLANG_BCG_SEPARATE_CAPTURE_SESSIONS = EnvBool(False)
     # Guards CUDA graph executable dedup via cudaGraphExecUpdate.
     SGLANG_ENABLE_CUDA_GRAPH_DEDUP = EnvBool(False)
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)

@@ -85,6 +85,13 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
@@ -133,6 +140,61 @@ if _use_aiter_gfx95:
     )
 
 logger = logging.getLogger(__name__)
+
+
+@eager_on_graph(True)
+def _bcg_eager_mla_attention_block(
+    communicator,
+    attn,
+    hidden_states,
+    residual,
+    positions,
+    forward_batch,
+    zero_allocator,
+    layer_scatter_modes,
+    prev_topk_indices,
+    mla_cp_wrap,
+    attn_cp_size,
+):
+    """Execute MLA preparation and attention as one BCG eager region.
+
+    The communicator stores qkv-latent inputs in Python-side context; replaying
+    only the attention module after a captured prepare_attn graph leaves that
+    context unset. Keeping both operations in one bridge makes the replay
+    state complete. The nested MLA/DSA graph breaks are suppressed by the
+    outer eager region and their bodies execute eagerly inside it.
+    """
+    # The eager break is replayed without re-running the enclosing model
+    # forward. Resolve the live static batch from the piecewise context so
+    # request-dependent metadata (cache locations, sequence lengths, CP
+    # descriptors) is refreshed for every replay instead of retaining the
+    # capture-only ForwardBatch object passed through the graph closure.
+    runtime_context = get_tc_piecewise_forward_context()
+    runtime_batch = (
+        runtime_context.forward_batch
+        if runtime_context is not None and runtime_context.forward_batch is not None
+        else forward_batch
+    )
+    hidden_states, residual = communicator.prepare_attn(
+        hidden_states, residual, runtime_batch
+    )
+    if mla_cp_wrap:
+        hidden_states = cp_plain_to_scattered(
+            hidden_states, runtime_batch, attn_cp_size
+        )
+        # MLA attention fetches the latent inputs from this context.  The
+        # regular path installs the scattered view before entering MLA; the
+        # eager bridge must preserve that ordering as well.
+        get_attn_tp_context().set_hidden_states_local(hidden_states)
+    hidden_states = attn(
+        positions=positions,
+        hidden_states=hidden_states,
+        forward_batch=runtime_batch,
+        zero_allocator=zero_allocator,
+        layer_scatter_modes=layer_scatter_modes,
+        prev_topk_indices=prev_topk_indices,
+    )
+    return hidden_states, residual
 
 
 @torch.compile
@@ -843,32 +905,57 @@ class Glm5NextDecoderLayer(nn.Module):
     ):
         hidden_states_orig = hidden_states
 
-        # Attn-input prep, MHC attn_split, and (DSA-CP) scatter all happen inside
-        # the communicator; it also stores the AttentionInputs for fetch_qkv_latent.
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states,
-            residual,
-            forward_batch,
-        )
-
         # MLA's CP attention consumes the scattered (round-robin/zigzag)
         # layout while the cross-layer contract is plain (block-contiguous,
         # see Glm5NextModel.forward). KDA handles its own CP gather/scatter
         # inside Glm5NextLinearAttention, so only MLA layers need this wrap.
-        # NOTE: prepare_attn already stored an AttentionInputs referencing the
-        # plain hidden_states for fetch_qkv_latent(); rebind that ref to the
-        # scattered tensor so q/kv latent and positions stay token-aligned.
         mla_cp_wrap = not self.is_linear_attn and (
             dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
             or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
         )
-        if mla_cp_wrap:
+
+        # Attn-input prep, MHC attn_split, and (DSA-CP) scatter all happen inside
+        # the communicator; it also stores the AttentionInputs for fetch_qkv_latent.
+        # MLA's qkv latent inputs are stored in Python-side runtime context by
+        # prepare_attn. A captured prepare_attn segment cannot recreate that
+        # context during replay, so keep prepare_attn and the MLA call in one
+        # eager BCG region for hybrid GLM-5 layers. KDA layers have no such
+        # communicator qkv-latent contract and retain their existing breaks.
+        attention_eager = False
+        if not self.is_linear_attn and is_in_breakable_cuda_graph():
+            hidden_states, residual = _bcg_eager_mla_attention_block(
+                self.layer_communicator,
+                self.self_attn,
+                hidden_states,
+                residual,
+                positions,
+                forward_batch,
+                zero_allocator,
+                self.layer_scatter_modes,
+                prev_topk_indices,
+                mla_cp_wrap,
+                get_parallel().attn_cp_size,
+            )
+            attention_eager = True
+        else:
+            hidden_states, residual = self.layer_communicator.prepare_attn(
+                hidden_states,
+                residual,
+                forward_batch,
+            )
+
+        # NOTE: prepare_attn already stored an AttentionInputs referencing the
+        # plain hidden_states for fetch_qkv_latent(); rebind that ref to the
+        # scattered tensor so q/kv latent and positions stay token-aligned.
+        # The BCG eager bridge performs this before MLA itself; do it here only
+        # for the ordinary (non-bridged) path.
+        if mla_cp_wrap and not attention_eager:
             hidden_states = cp_plain_to_scattered(
                 hidden_states, forward_batch, get_parallel().attn_cp_size
             )
             get_attn_tp_context().set_hidden_states_local(hidden_states)
 
-        hidden_states = self.self_attn(
+        attn_kwargs = dict(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
@@ -876,6 +963,8 @@ class Glm5NextDecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             prev_topk_indices=prev_topk_indices,
         )
+        if not attention_eager:
+            hidden_states = self.self_attn(**attn_kwargs)
         if isinstance(hidden_states, tuple):
             hidden_states, topk_indices = hidden_states
         else:

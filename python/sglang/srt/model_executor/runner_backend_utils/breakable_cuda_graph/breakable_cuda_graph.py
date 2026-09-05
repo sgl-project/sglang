@@ -68,6 +68,10 @@ _current_stream_var: ContextVar[torch.Stream | None] = ContextVar(
 _forked_streams_var: ContextVar[set[torch.Stream] | None] = ContextVar(
     "forked_streams", default=None
 )
+# An eager BCG bridge may contain operations that are themselves marked as
+# eager breaks.  Track nesting so an inner marker executes eagerly without
+# attempting to end the already-ended outer capture segment.
+_eager_break_depth_var: ContextVar[int] = ContextVar("eager_break_depth", default=0)
 
 
 def get_current_stream(device: torch.device | None = None) -> torch.Stream:
@@ -222,7 +226,7 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
 
         def wrapper(*args, **kwargs):
             capture = _current_capture_var.get()
-            if capture is None:
+            if capture is None or _eager_break_depth_var.get() > 0:
                 return inner(*args, **kwargs)
 
             # End the segment that captured up to this break point.
@@ -239,10 +243,16 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
             # addresses recorded. A capture_stub replaces the body during
             # capture (contents are never consumed; warmup and replay run
             # the real inner), letting rank-coupled bodies skip the work.
-            if capture_stub is not None:
-                output = capture_stub(*args, **kwargs)
-            else:
-                output = inner(*args, **kwargs)
+            depth_token = _eager_break_depth_var.set(
+                _eager_break_depth_var.get() + 1
+            )
+            try:
+                if capture_stub is not None:
+                    output = capture_stub(*args, **kwargs)
+                else:
+                    output = inner(*args, **kwargs)
+            finally:
+                _eager_break_depth_var.reset(depth_token)
 
             # Weak-ref captured inputs produced by graph segments. Their storage
             # is pinned by the segment CUDAGraphs' mempool use-count, so Python

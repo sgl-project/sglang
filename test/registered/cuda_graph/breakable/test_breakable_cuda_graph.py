@@ -115,6 +115,30 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         torch.cuda.synchronize()
         self.assertTrue(torch.allclose(y, torch.full((4,), 16.0, device=self.device)))
 
+    def test_nested_breaks_stay_inside_outer_eager_bridge(self):
+        """Nested BCG breaks must not split an already-ended outer segment."""
+        x = torch.zeros(4, device=self.device)
+        y = torch.zeros(4, device=self.device)
+
+        @self.eager_on_graph(enable=True)
+        def inner(src):
+            return src * 2.0
+
+        @self.eager_on_graph(enable=True)
+        def outer(src):
+            return inner(src) + 1.0
+
+        graph = self.BreakableCUDAGraph()
+        stream = torch.cuda.Stream(self.device)
+        with self.BreakableCUDAGraphCapture(graph, stream=stream):
+            y.copy_(outer(x))
+
+        x.fill_(3.0)
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertTrue(torch.allclose(y, torch.full((4,), 7.0, device=self.device)))
+        self.assertEqual(len(graph._segments), 2)
+
     def test_eager_on_graph_disabled(self):
         """@eager_on_graph(enable=False) should be a no-op passthrough."""
 

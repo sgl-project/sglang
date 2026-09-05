@@ -517,6 +517,41 @@ If you set only one of `--prefill-attention-backend` or `--decode-attention-back
 If both are specified and differ, SGLang automatically enables a hybrid wrapper to dispatch to the chosen backend per phase.
 </Tip>
 
+### Breakable CUDA Graph for GLM-5 hybrid KDA/DSA prefill (Experimental)
+
+GLM-5 models combine KDA linear-attention layers with DSA/MLA layers. On
+supported CUDA platforms, prefill can be captured with the breakable CUDA graph
+backend while decode remains eager. The KDA path is request-axis (ragged), so
+each request count must have its own capture. Enable the opt-in path with:
+
+```bash Command
+export SGLANG_BCG_RAGGED_SHAPES=1
+export SGLANG_BCG_RAGGED_MAX_BS=2
+export SGLANG_BCG_SEPARATE_CAPTURE_SESSIONS=1
+
+python3 -m sglang.launch_server \
+  --model-path /path/to/GLM-5.3-Flash \
+  --tp-size 4 \
+  --ep-size 4 \
+  --dsa-prefill-backend tilelang \
+  --dsa-decode-backend tilelang \
+  --kv-cache-dtype bfloat16 \
+  --moe-runner-backend deep_gemm \
+  --disable-shared-experts-fusion \
+  --cuda-graph-backend-prefill breakable \
+  --cuda-graph-backend-decode disabled \
+  --cuda-graph-bs-prefill 8192 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+`SGLANG_BCG_RAGGED_MAX_BS` must cover the largest request count that should be
+captured; requests above it fall back to eager execution. Set
+`SGLANG_BCG_SEPARATE_CAPTURE_SESSIONS=1` when using multiple ragged shapes with
+DeepGEMM so each shape has independent graph-pool and capture state. This path
+is experimental and should be validated for output accuracy on the target
+model before production use.
+
 ## Attention Backend Selection Guide (CUDA)
 
 If the `--attention-backend` argument is not specified, SGLang automatically selects the best backend based on the hardware (CUDA) and model architecture.

@@ -5059,7 +5059,11 @@ class ServerArgs:
         rules = [
             (
                 "KDA hybrid linear attention",
-                lambda: uses_kda_attention(self.get_model_config().hf_config),
+                # The experimental ragged-shape path captures one graph per
+                # request count and is the only mode that can safely replay
+                # KDA+DSA prefill. Keep the historical safety gate otherwise.
+                lambda: uses_kda_attention(self.get_model_config().hf_config)
+                and not envs.SGLANG_BCG_RAGGED_SHAPES.get(),
             ),
             # DSV4 is BCG-compatible but introduces heavy memory pressure: the
             # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.

@@ -344,6 +344,30 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.has_mha_companion_layers = any(
             layer is not None for layer in self.mha_companion_layers
         )
+        # Hybrid KDA/GDN prefill has a real request-axis shape. A graph
+        # captured for one ragged row cannot safely be replayed for a batch
+        # with a different number of rows: DSA/MLA kernels may bake that row
+        # count into their launch geometry. Keep this experimental path
+        # opt-in; uncovered request counts fall back to eager.
+        self._bcg_ragged_shapes = (
+            self.prefill_backend_name == Backend.BREAKABLE
+            and self.has_mha_companion_layers
+            and envs.SGLANG_BCG_RAGGED_SHAPES.get()
+        )
+        if self._bcg_ragged_shapes:
+            configured_max_bs = envs.SGLANG_BCG_RAGGED_MAX_BS.get()
+            self._bcg_ragged_max_bs = max(1, min(configured_max_bs, self.max_bs))
+        else:
+            self._bcg_ragged_max_bs = 1
+        # DeepGEMM keeps process-global shape/workspace state.  Capturing
+        # several ragged BCG variants inside one breakable capture session
+        # can leave later captures mutating state used by earlier graphs.
+        # An opt-in per-shape session gives each capture a fresh backend
+        # capture context while retaining all graph artifacts for replay.
+        self._bcg_separate_capture_sessions = (
+            self._bcg_ragged_shapes
+            and envs.SGLANG_BCG_SEPARATE_CAPTURE_SESSIONS.get()
+        )
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
         self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
@@ -502,7 +526,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
         else:
             self.use_captured_attn_metadata = False
-        self.attn_metadata_buffers: Optional[Dict[int, object]] = (
+        # Ragged BCG variants can share the same token bucket while having
+        # different request-axis metadata (e.g. bs=1 and bs=2 both map to an
+        # 8-token bucket).  Keep one captured metadata object per variant;
+        # indexing only by num_tokens lets the last capture overwrite the
+        # earlier object's static pointers and makes the earlier graph replay
+        # with the wrong KDA/DSA metadata.
+        self.attn_metadata_buffers: Optional[Dict[Any, object]] = (
             {} if self.use_captured_attn_metadata else None
         )
 
@@ -846,6 +876,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _shape_key(self, num_tokens: int, forward_batch: ForwardBatch) -> ShapeKey:
         variant = None
+        if self._bcg_ragged_shapes:
+            variant = f"bcg_bs_{forward_batch.batch_size}"
         if self._capture_chunked_prefix and self._has_prefix_hit(forward_batch):
             captured_n = self._select_prefix_capture_chunks(
                 forward_batch.extend_prefix_lens_cpu
@@ -853,6 +885,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             assert captured_n is not None, "prefix batch has no captured FullCG variant"
             variant = _chunked_prefix_variant(captured_n)
         return ShapeKey(size=num_tokens, variant_label=variant)
+
+    def _capture_shape_variant(self, capture_bs: Optional[int]) -> Optional[str]:
+        if not self._bcg_ragged_shapes:
+            return None
+        assert capture_bs is not None
+        return f"bcg_bs_{capture_bs}"
 
     def _create_chunked_prefix_buffers(self) -> _ChunkedPrefixCaptureBuffers:
         """Allocate the stable chunk-metadata tensors shared by all variants."""
@@ -1005,7 +1043,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 )
             )
             assert self.attn_metadata_buffers is not None
-            self.attn_metadata_buffers[num_tokens] = metadata
+            metadata_key = self._attn_metadata_key(num_tokens, forward_batch)
+            self.attn_metadata_buffers[metadata_key] = metadata
+
+    def _attn_metadata_key(self, num_tokens: int, forward_batch: ForwardBatch):
+        """Return the metadata cache key for a captured BCG shape.
+
+        For ordinary BCG there is one request-axis shape per token bucket.
+        Experimental ragged BCG intentionally captures multiple request-axis
+        shapes in the same bucket, so batch size must participate in the key.
+        """
+        if self._bcg_ragged_shapes:
+            return (num_tokens, forward_batch.batch_size)
+        return num_tokens
 
     def _prepare_forward_metadata_for_replay(
         self,
@@ -1043,7 +1093,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend.init_forward_metadata(forward_batch)
             return
         assert self.attn_metadata_buffers is not None
-        metadata = self.attn_metadata_buffers[num_tokens]
+        metadata = self.attn_metadata_buffers[
+            self._attn_metadata_key(num_tokens, static_forward_batch)
+        ]
         attn_backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
             metadata,
             forward_batch,
@@ -1115,6 +1167,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return True
         if num_tokens > self.max_num_tokens:
             return False
+        if self._bcg_ragged_shapes:
+            if batch_size > self._bcg_ragged_max_bs:
+                return False
         # No exact-shape check: load_batch bucket-pads; only reject
         # disproportionate padding waste.
         padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
@@ -1155,6 +1210,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ),
         ):
             return False
+        if self._bcg_ragged_shapes:
+            static_num_tokens = self._pad_to_bucket(
+                len(forward_batch.input_ids), self.capture_num_tokens
+            )
+            if not self.backend.can_run(
+                forward_batch, self._shape_key(static_num_tokens, forward_batch)
+            ):
+                return False
         if getattr(self, "enable_cp_v2_bcg_capture", False) and is_cp_v2_active(
             forward_batch
         ):
@@ -1184,7 +1247,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_states=self.static_draft_hidden_states[:num_tokens],
         )
 
-    def capture_prepare(self, num_tokens: int) -> tuple[ForwardBatch, AttentionBackend]:
+    def capture_prepare(
+        self, num_tokens: int, capture_bs: Optional[int] = None
+    ) -> tuple[ForwardBatch, AttentionBackend]:
         """Build a dummy prefill ForwardBatch for capture/warmup at this shape.
 
         Default tensor inputs are fresh literals; under a Breakable
@@ -1198,10 +1263,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # A prefill bucket is an aggregate token count. Capture it as the
         # fewest synthetic requests, with every request containing no more
         # than context_length tokens.
-        capture_seq_lens = [
-            min(context_length, num_tokens - start)
-            for start in range(0, num_tokens, context_length)
-        ]
+        if capture_bs is None:
+            capture_seq_lens = [
+                min(context_length, num_tokens - start)
+                for start in range(0, num_tokens, context_length)
+            ]
+        else:
+            if not self._bcg_ragged_shapes:
+                raise ValueError("capture_bs is only valid for ragged BCG capture")
+            capture_bs = min(capture_bs, num_tokens)
+            quotient, remainder = divmod(num_tokens, capture_bs)
+            capture_seq_lens = [quotient + 1] * remainder + [quotient] * (
+                capture_bs - remainder
+            )
         if self.prefill_backend_name == Backend.FULL:
             # Full captures a fixed request-axis shape; unused slots are
             # zero-length sentinels after the context-bounded real requests.
@@ -1337,8 +1411,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             with graph_capture() as graph_capture_context:
                 self.stream = graph_capture_context.stream
-                with self.backend.capture_session(self.stream):
+                if self._bcg_separate_capture_sessions:
                     self._capture_one_stream()
+                else:
+                    with self.backend.capture_session(self.stream):
+                        self._capture_one_stream()
 
     def _capture_one_stream(self) -> None:
         avail_mem = get_available_gpu_memory(
@@ -1361,17 +1438,42 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 capture_range.set_description(
                     f"Capturing num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
                 )
-            self.capture_one_shape(num_tokens)
+            if self._bcg_ragged_shapes:
+                capture_bs_values = range(
+                    1, min(self._bcg_ragged_max_bs, num_tokens) + 1
+                )
+            else:
+                capture_bs_values = (None,)
+            for capture_bs in capture_bs_values:
+                if self._bcg_separate_capture_sessions:
+                    with self.backend.capture_session(self.stream):
+                        self.capture_one_shape(num_tokens, capture_bs=capture_bs)
+                else:
+                    self.capture_one_shape(num_tokens, capture_bs=capture_bs)
             if self._capture_chunked_prefix:
                 for captured_n in self._prefix_capture_variants:
-                    self.capture_one_shape(num_tokens, prefix_num_chunks=captured_n)
+                    if self._bcg_separate_capture_sessions:
+                        with self.backend.capture_session(self.stream):
+                            self.capture_one_shape(
+                                num_tokens, prefix_num_chunks=captured_n
+                            )
+                    else:
+                        self.capture_one_shape(
+                            num_tokens, prefix_num_chunks=captured_n
+                        )
 
-    def capture_one_shape(self, size: int, *, prefix_num_chunks: int = 0) -> None:
+    def capture_one_shape(
+        self,
+        size: int,
+        *,
+        prefix_num_chunks: int = 0,
+        capture_bs: Optional[int] = None,
+    ) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
         """
         num_tokens = size
-        forward_batch, attn_backend = self.capture_prepare(num_tokens)
+        forward_batch, attn_backend = self.capture_prepare(num_tokens, capture_bs)
         if self.enable_cp_v2_bcg_capture:
             assert self.prefill_cp_bcg_input is not None
             self.prefill_cp_bcg_input.prepare(
@@ -1395,7 +1497,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             variant_label=(
                 _chunked_prefix_variant(prefix_num_chunks)
                 if prefix_num_chunks
-                else None
+                else self._capture_shape_variant(capture_bs)
             ),
         )
         if prefix_num_chunks:
@@ -1435,7 +1537,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             shape_key,
             run_once,
             # DP padding can install capture-only tensors on this dummy batch;
-            # BCG retains it so their recorded addresses remain valid.
+            # retain it so their recorded addresses remain valid.
             capture_inputs=(
                 forward_batch
                 if forward_batch.global_num_tokens_gpu is not None
@@ -1792,8 +1894,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
             shape_key = self._shape_key(static_num_tokens, forward_batch)
-            # The only variants this runner records are chunked-prefix ones.
-            if shape_key.variant_label is not None:
+            # Select a request-axis BCG variant when ragged capture is enabled;
+            # otherwise this is the ordinary chunked-prefix selection.
+            if (
+                shape_key.variant_label is not None
+                and self._capture_chunked_prefix
+                and self._has_prefix_hit(forward_batch)
+            ):
                 self._prepare_chunked_prefix_replay(shape_key, forward_batch)
             # Replay prep, including the optional chunked-prefix gather above,
             # has finished every scheduler-shared read.
