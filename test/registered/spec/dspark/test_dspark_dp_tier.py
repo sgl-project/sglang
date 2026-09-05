@@ -10,6 +10,9 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     dp_global_verify_tier_num_tokens,
     local_verify_tier_num_tokens,
 )
+from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+    DSparkWorkerV2,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -51,6 +54,35 @@ class TestDpGlobalVerifyTierNumTokens(CustomTestCase):
         self.assertIsNone(
             dp_global_verify_tier_num_tokens(global_tier_num_tokens=[100, -1, 50, 0])
         )
+
+
+class TestIdleVerifyRaggedLayout(CustomTestCase):
+    def test_idle_rank_uses_one_dummy_request_for_compact_replay(self):
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker._verify_planner = SimpleNamespace(is_compact_mode=True)
+        worker._dp_verify_tier_num_tokens = lambda _batch: 40
+        worker.device = torch.device("cpu")
+        worker.verify_num_draft_tokens = 6
+        worker.model_runner = object()
+        sentinel = object()
+
+        for global_num_tokens in ([0], [], None):
+            batch = SimpleNamespace(global_num_tokens=global_num_tokens)
+            with (
+                self.subTest(global_num_tokens=global_num_tokens),
+                patch(
+                    "sglang.srt.speculative.dspark_components.dspark_worker_v2.idle_ragged_layout",
+                    return_value=sentinel,
+                ) as idle_layout,
+            ):
+                self.assertIs(worker._idle_verify_ragged_layout(batch), sentinel)
+                idle_layout.assert_called_once_with(
+                    tier_num_reqs=1,
+                    dp_tier_num_tokens=40,
+                    device=torch.device("cpu"),
+                    verify_num_draft_tokens=6,
+                    model_runner=worker.model_runner,
+                )
 
 
 class TestDraftDpSyncMetadata(CustomTestCase):
