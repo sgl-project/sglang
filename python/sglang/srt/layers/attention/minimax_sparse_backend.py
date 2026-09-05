@@ -1423,12 +1423,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 disable_index_value=disable_value,
                 use_msa=self.use_msa,
                 seqlens_cpu=forward_batch.extend_seq_lens_cpu,
+                # K-side host lens (prefix + chunk) for the Gluon prefill path's
+                # scratch-page sizing; None simply disables that path.
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
                 q_scale=layer.q_scale_float,
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
                 idx_q_scale=layer.idx_q_scale_float,
                 idx_k_scale=layer.idx_k_scale_float,
                 idx_v_scale=layer.idx_v_scale_float,
+                page_size=self.page_size,
             )
         if actual_num_tokens < original_num_tokens:
             pad_len = original_num_tokens - actual_num_tokens
