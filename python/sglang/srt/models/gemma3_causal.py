@@ -261,13 +261,14 @@ class Gemma3Attention(nn.Module):
         k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
 
+        # RadixAttention expects token-major q/k tensors.
+        q = q.squeeze(0)
+        k = k.squeeze(0)
+
         attn_output = self.attn(q, k, v, forward_batch=forward_batch)
 
-        # Compatible with triton backend which returns [1, s, h, head_dim]
-        if attn_output.dim() == 4 and attn_output.shape[0] == 1:
-            attn_output = attn_output.squeeze(0)
-            attn_output = attn_output.flatten(-2, -1)
         # [s, h * head_dim]
+        attn_output = attn_output.reshape(-1, self.q_size)
 
         output, _ = self.o_proj(attn_output)
         return output
@@ -298,17 +299,14 @@ class Gemma3Attention(nn.Module):
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # [b, h, s, head_dim] ->  [b, s, h, head_dim]
-        q = q.permute(0, 2, 1, 3)
-        k = k.permute(0, 2, 1, 3)
+        # [1, h, s, head_dim] -> [s, h, head_dim]
+        q = q.permute(0, 2, 1, 3).squeeze(0)
+        k = k.permute(0, 2, 1, 3).squeeze(0)
 
         attn_output = self.attn(q, k, v, forward_batch=forward_batch)
 
-        # Compatible with triton backend which returns [1, s, h, head_dim]
-        if attn_output.dim() == 4 and attn_output.shape[0] == 1:
-            attn_output = attn_output.squeeze(0)
-            attn_output = attn_output.flatten(-2, -1)
         # [s, h * head_dim]
+        attn_output = attn_output.reshape(-1, self.q_size)
 
         output, _ = self.o_proj(attn_output)
         return output
