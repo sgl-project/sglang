@@ -25,10 +25,13 @@ included explicitly, across k in {512,1024,2048} and identity/perm page tables.
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
 
+import sglang.kernels.ops.attention.dsv4.topk as dsv4_topk
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
@@ -268,6 +271,97 @@ def test_topk_v2_output_indices(batch: int, seq: int, k: int) -> None:
     our_raw = _run_raw(scores, seq_lens, k)
     ref_raw = _reference(scores, seq_lens, k)
     _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k)
+
+
+@pytest.mark.parametrize("k", [512, 1024, 2048])
+@pytest.mark.parametrize(
+    "batch,seq",
+    [
+        (4, 256),  # trivial
+        (8, 4096),  # register
+        (8, 8193),  # Register4
+        (4, 16385),  # streaming
+        (2, 65537),  # CUDA small cluster / ROCm streaming
+        (31, 131072),  # CUDA persistent cluster / ROCm streaming
+    ],
+)
+@torch.inference_mode()
+def test_topk_v2_paged_and_raw_outputs(batch: int, seq: int, k: int) -> None:
+    """One selection produces aligned raw and page-transformed outputs."""
+    torch.manual_seed(batch * 100003 + seq * 7 + k + 2)
+    device = "cuda"
+    width = (seq + 3) & ~3
+    scores = torch.randn(batch, width, dtype=torch.float32, device=device)[:, :seq]
+    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
+    seq_lens[0] = 0  # DP-idle row: both outputs must be fully padded
+    if batch > 1:
+        scores[1].zero_()  # outputs must stay aligned even at a tie boundary
+        seq_lens[-1] = max(1, seq - 17)
+    num_pages = (seq + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, inv_cpu = _make_page_table(
+        batch, num_pages, "perm", device, per_row=True
+    )
+    page_out = torch.full((batch, k), -2, dtype=torch.int32, device=device)
+    raw_out = torch.full_like(page_out, -2)
+    metadata = _plan(seq_lens)
+
+    topk_transform_paged_v2(
+        scores,
+        seq_lens,
+        page_table,
+        page_out,
+        PAGE_SIZE,
+        metadata,
+        raw_out,
+    )
+    torch.cuda.synchronize()
+
+    page_cpu = page_out.cpu().tolist()
+    page_as_raw = [_invert(page_cpu[i], inv_cpu[i]) for i in range(batch)]
+    raw = [[v for v in row if v != -1] for row in raw_out.cpu().tolist()]
+    assert page_as_raw == raw
+
+    ref_raw = _reference(scores, seq_lens, k)
+    _assert_topk_close(scores.cpu(), ref_raw, raw, batch, seq_lens.cpu(), k)
+
+
+def test_topk_v2_xpu_dual_output_uses_one_selection(monkeypatch) -> None:
+    xpu_ops = SimpleNamespace(
+        topk_transform=MagicMock(),
+        topk_transform_paged=MagicMock(),
+    )
+    monkeypatch.setattr(dsv4_topk, "is_xpu", lambda: True)
+    monkeypatch.setattr(
+        dsv4_topk.torch,
+        "ops",
+        SimpleNamespace(sgl_kernel=xpu_ops),
+    )
+    scores = object()
+    seq_lens = object()
+    page_table = object()
+    page_out = object()
+    metadata = object()
+    raw_out = object()
+
+    dsv4_topk.topk_transform_paged_v2(
+        scores,
+        seq_lens,
+        page_table,
+        page_out,
+        PAGE_SIZE,
+        metadata,
+        raw_out,
+    )
+
+    xpu_ops.topk_transform.assert_called_once_with(
+        scores,
+        seq_lens,
+        page_table,
+        page_out,
+        PAGE_SIZE,
+        raw_out,
+    )
+    xpu_ops.topk_transform_paged.assert_not_called()
 
 
 # --- ragged entry point ------------------------------------------------------

@@ -136,17 +136,19 @@ def topk_transform_paged_v2(
     out_page_indices: torch.Tensor,
     page_size: int,
     metadata: torch.Tensor,
+    out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
     """Fused top-k + optional page-table transform (DeepSeek-V4 top-k v2 kernel).
 
-    Two output modes, chosen by whether ``page_tables`` is given and resolved to
-    a device-side template parameter, so an unused page-table gather is compiled
-    out rather than skipped at runtime:
+    Output modes are resolved to device-side template parameters, so unused
+    page-table gathers and raw-output stores are compiled out rather than
+    skipped at runtime:
 
     * ``page_tables=None`` -- ``out_page_indices`` receives the raw selected
       indices and no page table is read.
     * ``page_tables`` given -- ``out_page_indices`` receives the page-table
-      transform of them.
+      transform of them. If ``out_raw_indices`` is also given, the same kernel
+      writes the selected raw indices there without repeating top-k selection.
 
     IMPORTANT: every entry of ``seq_lens`` must be NON-NEGATIVE, and
     ``metadata`` must come from :func:`plan_topk_v2` over the same ``seq_lens``
@@ -157,15 +159,27 @@ def topk_transform_paged_v2(
     the valid way to express "no tokens": the row takes the trivial path and
     the output is all -1.
     """
+    if out_raw_indices is not None and page_tables is None:
+        raise ValueError("out_raw_indices requires page_tables")
     if is_xpu():
-        torch.ops.sgl_kernel.topk_transform_paged(
-            scores,
-            seq_lens,
-            page_tables,
-            out_page_indices,
-            page_size,
-            metadata,
-        )
+        if out_raw_indices is not None:
+            torch.ops.sgl_kernel.topk_transform(
+                scores,
+                seq_lens,
+                page_tables,
+                out_page_indices,
+                page_size,
+                out_raw_indices,
+            )
+        else:
+            torch.ops.sgl_kernel.topk_transform_paged(
+                scores,
+                seq_lens,
+                page_tables,
+                out_page_indices,
+                page_size,
+                metadata,
+            )
         return
     module = _jit_topk_v2_module()
     module.topk_transform_paged(
@@ -175,4 +189,5 @@ def topk_transform_paged_v2(
         out_page_indices,
         page_size,
         metadata,
+        out_raw_indices,
     )

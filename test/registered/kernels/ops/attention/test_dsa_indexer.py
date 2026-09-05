@@ -26,7 +26,10 @@ from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
     DSAMetadata,
 )
-from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
+from sglang.srt.layers.attention.dsv4.indexer import (
+    C4IndexerBackendMixin,
+    _run_c4_topk_transform,
+)
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -268,6 +271,44 @@ class MockModelRunner:
             },
         )()
         self.hisparse_coordinator = None
+
+
+def test_c4_raw_indices_keep_sgl_backend_on_topk_v2():
+    tensor = torch.empty(0)
+    raw_indices = torch.empty(0, dtype=torch.int32)
+    flashinfer_topk = MagicMock()
+    with (
+        envs.SGLANG_OPT_USE_TOPK_V2.override(True),
+        patch(
+            "sglang.srt.layers.attention.dsv4.indexer.topk_transform_paged_v2"
+        ) as topk_v2,
+        patch(
+            "sglang.srt.layers.attention.dsv4.indexer.topk_transform_paged"
+        ) as topk_v1,
+    ):
+        _run_c4_topk_transform(
+            dsa_topk_backend=DSATopKBackend.SGL_KERNEL,
+            flashinfer_topk_transform=flashinfer_topk,
+            logits=tensor,
+            c4_seq_lens=tensor,
+            page_table=tensor,
+            c4_sparse_page_indices=tensor,
+            page_size=64,
+            topk_metadata=tensor,
+            raw_indices=raw_indices,
+        )
+
+    topk_v2.assert_called_once_with(
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        64,
+        tensor,
+        raw_indices,
+    )
+    topk_v1.assert_not_called()
+    flashinfer_topk.assert_not_called()
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
