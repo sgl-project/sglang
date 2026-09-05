@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt import runtime_context as rc
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=5, suite="base-a-test-1-npu-a2")
@@ -33,8 +34,14 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnMaskBuilder,
     AscendAttnMultiStepDraftBackend,
     ForwardMetadata,
+    ForwardMode,
     _expand_dsa_sparse_indices,
+    _normalize_mla_k_rope_cache,
     _reshape_kv_for_fia_nz,
+)
+from sglang.srt.hardware_backend.npu.attention.dcp import (
+    mask_empty_mla_dcp_shards_npu,
+    merge_mla_dcp_output_npu,
 )
 
 
@@ -110,6 +117,24 @@ class TestReshapeKvForFiaNz(unittest.TestCase):
         self.assertEqual(result.data_ptr(), tensor.data_ptr())
 
 
+class TestNormalizeMlaKRoPECache(unittest.TestCase):
+    def test_dcp_token_major_cache_preserves_singleton_head(self):
+        cache = torch.randn(8192, 1, 64)
+        result = _normalize_mla_k_rope_cache(cache, 64)
+        self.assertEqual(result.shape, (8192, 1, 64))
+        self.assertEqual(result.data_ptr(), cache.data_ptr())
+
+    def test_paged_cache_flattens_block_and_page_only(self):
+        cache = torch.randn(2, 128, 1, 64)
+        result = _normalize_mla_k_rope_cache(cache, 64)
+        self.assertEqual(result.shape, (256, 1, 64))
+        self.assertTrue(torch.equal(result.flatten(), cache.flatten()))
+
+    def test_rejects_wrong_rope_dimension(self):
+        with self.assertRaisesRegex(RuntimeError, "Invalid MLA RoPE KV cache shape"):
+            _normalize_mla_k_rope_cache(torch.empty(8, 1, 32), 64)
+
+
 class TestForwardMetadata(unittest.TestCase):
     def test_is_dataclass(self):
         self.assertTrue(is_dataclass(ForwardMetadata))
@@ -155,11 +180,151 @@ class TestForwardMetadata(unittest.TestCase):
             "actual_seq_lengths_q_pa",
             "actual_seq_lengths_q_pa_cpu",
             "actual_seq_lengths_kv",
+            "dcp_mtp_attn_mask",
             "swa_mask",
             "prefix_lens",
             "flatten_prefix_block_tables",
         }
         self.assertEqual(names, expected)
+
+    def test_dspark_target_verify_builds_local_dcp_metadata(self):
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.use_mla = True
+        backend.is_draft_worker = False
+        backend.page_size = 4
+        backend.device = "cpu"
+        backend.is_hybrid_swa = False
+        backend.use_sliding_window_kv_pool = False
+
+        # One widened virtual page (physical page 7, DCP=2).
+        req_to_token = torch.arange(56, 64, dtype=torch.int64).view(1, 8)
+        backend.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
+
+        spec_info = SimpleNamespace(draft_token_num=3)
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            spec_info=spec_info,
+            spec_algorithm=SimpleNamespace(is_dspark=lambda: True),
+            seq_lens=torch.tensor([5], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([8], dtype=torch.int64),
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            extend_seq_lens=None,
+            extend_seq_lens_cpu=None,
+            out_cache_loc=None,
+        )
+
+        with rc.get_parallel().override(dcp_enabled=True, dcp_size=2, dcp_rank=1):
+            backend.init_forward_metadata(forward_batch)
+
+        self.assertEqual(backend.forward_metadata.seq_lens.tolist(), [4])
+        self.assertEqual(backend.forward_metadata.seq_lens_cpu_int.tolist(), [4])
+        self.assertEqual(backend.forward_metadata.block_tables.tolist(), [[7]])
+        mask = backend.forward_metadata.dcp_mtp_attn_mask
+        self.assertEqual(mask.shape, (1, 3, 4))
+        # Local positions are [1, 3, 5, 7]; global queries are [5, 6, 7].
+        self.assertEqual(
+            mask[0].tolist(),
+            [
+                [False, False, False, True],
+                [False, False, False, True],
+                [False, False, False, False],
+            ],
+        )
+
+    def test_dspark_graph_metadata_is_fixed_shape_and_rank_local(self):
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.use_mla = True
+        backend.is_draft_worker = False
+        backend.page_size = 4
+        backend.device = "cpu"
+        backend.max_context_len = 8
+        backend.speculative_num_draft_tokens = 3
+        backend.q_head_num_padding = None
+        backend.is_hybrid_swa = False
+        backend.use_sliding_window_kv_pool = False
+        backend.req_to_token = torch.arange(56, 88, dtype=torch.int64).view(2, 16)
+
+        with rc.get_parallel().override(dcp_enabled=True, dcp_size=2, dcp_rank=1):
+            backend.init_cuda_graph_state(max_bs=2, max_num_tokens=6)
+            metadata = backend._init_cuda_graph_metadata(
+                2,
+                ForwardMode.TARGET_VERIFY,
+                torch.ones(2, dtype=torch.int32),
+            )
+            seq_lens_ptr = metadata.seq_lens.data_ptr()
+            mask_ptr = metadata.dcp_mtp_attn_mask.data_ptr()
+            backend._apply_cuda_graph_metadata(
+                bs=2,
+                req_pool_indices=torch.tensor([0, 1]),
+                seq_lens=torch.tensor([5, 0]),
+                seq_lens_cpu=torch.tensor([5, 0]),
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                spec_info=None,
+                num_padding=1,
+                in_capture=True,
+            )
+
+        self.assertEqual(metadata.block_tables.shape, (2, 2))
+        self.assertEqual(metadata.seq_lens.tolist(), [4, 0])
+        self.assertEqual(metadata.seq_lens_cpu_list, [4, 0])
+        self.assertTrue(metadata.dcp_mtp_attn_mask[1].all())
+        self.assertEqual(metadata.seq_lens.data_ptr(), seq_lens_ptr)
+        self.assertEqual(metadata.dcp_mtp_attn_mask.data_ptr(), mask_ptr)
+
+
+class TestEmptyDcpTargetVerify(unittest.TestCase):
+    def test_empty_shard_mask_is_dynamic_and_graph_padding_safe(self):
+        output = torch.arange(24, dtype=torch.float32).view(4, 2, 3)
+        lse = torch.arange(8, dtype=torch.float32).view(4, 2, 1)
+
+        masked_output, masked_lse = mask_empty_mla_dcp_shards_npu(
+            output, lse, torch.tensor([4, 0])
+        )
+
+        torch.testing.assert_close(masked_output[:2], output[:2])
+        torch.testing.assert_close(masked_lse[:2], lse[:2])
+        torch.testing.assert_close(masked_output[2:], torch.zeros_like(output[2:]))
+        self.assertTrue(torch.isneginf(masked_lse[2:]).all())
+
+    def test_forward_mtp_returns_empty_without_calling_fia(self):
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.use_mla = True
+        backend.is_draft_worker = False
+        backend.graph_mode = False
+        backend.use_fia = True
+        backend.kv_lora_rank = 16
+        backend.forward_metadata = SimpleNamespace(
+            dcp_mtp_attn_mask=torch.empty((0, 8, 0), dtype=torch.bool)
+        )
+        layer = SimpleNamespace(tp_q_head_num=8)
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            num_token_non_padded_cpu=0,
+            spec_info=SimpleNamespace(draft_token_num=8),
+        )
+
+        with rc.get_parallel().override(dcp_enabled=True, dcp_size=2, dcp_rank=0):
+            output, lse = backend.forward_mtp(
+                torch.empty((0, 8, 16)),
+                None,
+                None,
+                layer,
+                forward_batch,
+                save_kv_cache=False,
+                return_softmax_lse=True,
+            )
+
+        self.assertEqual(output.shape, (0, 128))
+        self.assertEqual(lse.shape, (0, 8, 1))
+
+    def test_merge_returns_empty_local_heads_without_collective(self):
+        partial_output = torch.empty((0, 8, 16))
+        partial_lse = torch.empty((0, 8, 1))
+
+        with rc.get_parallel().override(dcp_enabled=True, dcp_size=2, dcp_rank=0):
+            output = merge_mla_dcp_output_npu(partial_output, partial_lse)
+
+        self.assertEqual(output.shape, (0, 4, 16))
 
 
 class TestGenerateMaskFlag(unittest.TestCase):

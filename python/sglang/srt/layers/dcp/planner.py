@@ -28,6 +28,86 @@ from sglang.srt.layers.dcp.layout import update_local_kv_lens_for_dcp
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_device, get_parallel
+from sglang.srt.utils import is_npu
+
+
+def _prepare_decode_context_parallel_metadata_torch(
+    seq_lens: torch.Tensor,
+    extend_prefix_lens_cpu,
+    extend_seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    seq_lens_sum: int,
+    kv_cache_dtype,
+    kv_cache_device,
+) -> DecodeContextParallelMetadata:
+    """PyTorch metadata builder used where the Triton launch is unavailable.
+
+    Ascend only consumes the prefix owner indices from this metadata today; it
+    builds its decode page table in ``AscendAttnBackend``.  Keep the complete
+    prefix/extend indirection contract here so this path can be compared with
+    the existing GPU builder and extended without changing scheduler metadata.
+    """
+    parallel = get_parallel()
+    device = req_to_token.device
+    prefix_lens_cpu = [int(x) for x in extend_prefix_lens_cpu]
+    extend_lens_cpu = [int(x) for x in extend_seq_lens.to("cpu").tolist()]
+
+    prefix_parts = []
+    for batch_idx, prefix_len in enumerate(prefix_lens_cpu):
+        if prefix_len == 0:
+            continue
+        req_idx = int(req_pool_indices[batch_idx].item())
+        prefix_parts.append(req_to_token[req_idx, :prefix_len])
+    if prefix_parts:
+        dcp_prefix_kv_indices = torch.cat(prefix_parts).to(torch.int32)
+    else:
+        dcp_prefix_kv_indices = torch.empty(0, dtype=torch.int32, device=device)
+
+    dcp_kv_indptr = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=device)
+    dcp_kv_indptr[1:] = seq_lens.to(torch.int32).cumsum(dim=0)
+    dcp_kv_indices = torch.zeros(seq_lens_sum, dtype=torch.int32, device=device)
+
+    prefix_offset = 0
+    extend_offset = sum(prefix_lens_cpu)
+    request_offset = 0
+    current_extend_offset = 0
+    for prefix_len, extend_len in zip(prefix_lens_cpu, extend_lens_cpu):
+        if prefix_len:
+            dcp_kv_indices[request_offset : request_offset + prefix_len] = torch.arange(
+                prefix_offset,
+                prefix_offset + prefix_len,
+                dtype=torch.int32,
+                device=device,
+            )
+        if extend_len:
+            dcp_kv_indices[
+                request_offset + prefix_len : request_offset + prefix_len + extend_len
+            ] = torch.arange(
+                extend_offset + current_extend_offset,
+                extend_offset + current_extend_offset + extend_len,
+                dtype=torch.int32,
+                device=device,
+            )
+        prefix_offset += prefix_len
+        current_extend_offset += extend_len
+        request_offset += prefix_len + extend_len
+
+    dcp_local_prefix_kv_indices = (
+        dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
+        // parallel.dcp_size
+    )
+
+    # The Ascend prefill path gathers the two physical NPU buffers directly;
+    # unlike the CUDA MLA path it does not consume the combined dcp_kv_buffer.
+    dcp_kv_buffer = torch.empty(0, dtype=kv_cache_dtype, device=kv_cache_device)
+    return DecodeContextParallelMetadata(
+        dcp_kv_indptr=dcp_kv_indptr,
+        dcp_kv_buffer=dcp_kv_buffer,
+        dcp_kv_indices=dcp_kv_indices,
+        dcp_local_prefix_kv_indices=dcp_local_prefix_kv_indices,
+        dcp_extend_prefix_lens_sum=sum(prefix_lens_cpu),
+    )
 
 
 def prepare_decode_context_parallel_metadata(
@@ -46,6 +126,17 @@ def prepare_decode_context_parallel_metadata(
     parallel = get_parallel()
     if not parallel.dcp_enabled:
         return None
+    if is_npu():
+        return _prepare_decode_context_parallel_metadata_torch(
+            seq_lens=seq_lens,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens=extend_seq_lens,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            seq_lens_sum=seq_lens_sum,
+            kv_cache_dtype=kv_cache_dtype,
+            kv_cache_device=kv_cache_device,
+        )
     # dcp_kv_buffer tokens' layout
     # [ rank0_r1.prefix_tokens, rank1_r1.prefix_tokens, ..., rank7_r1.prefix_tokens,
     #   ...,

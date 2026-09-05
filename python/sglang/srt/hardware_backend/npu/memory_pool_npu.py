@@ -4,6 +4,7 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.layers.dcp.layout import remap_dcp_write_locations_fixed_shape
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
@@ -12,6 +13,7 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.common import is_npu
 
@@ -535,6 +537,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         index_head_dim: Optional[int] = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        dcp_sharded: bool = True,
     ):
         super(MLATokenToKVPool, self).__init__(
             size=size,
@@ -550,6 +553,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
+        # Target KV is DCP-sharded.  A speculative draft worker intentionally
+        # keeps a complete replica and indexes the widened virtual loc space
+        # directly, matching the existing CUDA draft-pool contract.
+        self.dcp_sharded = dcp_sharded
 
         self.custom_mem_pool = None
 
@@ -680,6 +687,26 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
+        if cache_v is None:
+            cache_k, cache_v = cache_k.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
+
+        parallel = get_parallel()
+        if parallel.dcp_enabled and self.dcp_sharded:
+            # Preserve the row count and redirect non-owned rows to the
+            # allocator-reserved dummy slot.  Boolean compaction here lowers to
+            # aclnnNonzeroV2 on Ascend and crashes the 64-rank DSpark
+            # target-verify path with an AICore MTE out-of-range fault.
+            loc = remap_dcp_write_locations_fixed_shape(
+                loc,
+                parallel.dcp_size,
+                parallel.dcp_rank,
+            )
+
+        if loc.numel() == 0:
+            return
+
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
@@ -687,11 +714,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
-
-        if cache_v is None:
-            cache_k, cache_v = cache_k.split(
-                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-            )
 
         torch_npu.npu_scatter_nd_update_(
             self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_lora_rank),
@@ -705,6 +727,25 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             loc.view(-1, 1),
             cache_v.view(-1, 1, self.qk_rope_head_dim),
         )
+
+    def get_mla_kv_buffer(
+        self,
+        layer: "RadixAttention",
+        loc: torch.Tensor,
+        dst_dtype: Optional[torch.dtype] = None,
+    ):
+        """Read token-level MLA KV rows from the physical NPU paged layout."""
+        layer_id = layer.layer_id
+        dst_dtype = dst_dtype or self.dtype
+        loc = loc.to(dtype=torch.long)
+        cache_k = self.get_key_buffer(layer_id).view(-1, 1, self.kv_lora_rank)
+        cache_v = self.get_value_buffer(layer_id).view(-1, 1, self.qk_rope_head_dim)
+        cache_k = torch.index_select(cache_k, 0, loc)
+        cache_v = torch.index_select(cache_v, 0, loc)
+        if cache_k.dtype != dst_dtype:
+            cache_k = cache_k.to(dst_dtype)
+            cache_v = cache_v.to(dst_dtype)
+        return cache_k, cache_v
 
     def set_index_k_buffer(
         self,
