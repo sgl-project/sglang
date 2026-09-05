@@ -80,6 +80,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_mm,
     get_parallel,
+    get_platform,
     get_schedule,
     get_spec,
     mamba_extra_buffer_enabled,
@@ -2438,7 +2439,22 @@ def calculate_mla_kv_cache_dim(
         get_exec().kernel.dsa_prefill_backend == "trtllm"
         or get_exec().kernel.dsa_decode_backend == "trtllm"
     ):
-        return kv_cache_dim
+        # On SM120/SM121 (consumer Blackwell) the "trtllm" dsa backend does
+        # NOT dispatch to the datacenter trtllm-gen kernel; DeepseekSparseAttn
+        # Backend._forward_trtllm instead routes it to flashinfer's native
+        # sparse-MLA kernel (backend="auto"), which consumes the 656-byte
+        # packed inline-scale layout (512 fp8 nope + 4x fp32 tile scales + 64
+        # bf16 rope) computed below -- the same layout quantize_k_cache
+        # already writes for the non-trtllm dsa backends. So do not early-
+        # return the plain layout on SM12x. Datacenter Blackwell (SM100/103)
+        # keeps the early return: trtllm-gen dequants via a scalar bmm1
+        # k_scale and expects the plain kv_lora_rank + qk_rope_head_dim
+        # layout. Checked live via get_platform().is_sm120 (not cached at
+        # module import time), matching the platform-facts convention
+        # dsa_backend.py uses for is_sm100 (get_platform() replaced the old
+        # is_sm100_supported()/is_sm120_supported() utils helpers upstream).
+        if not get_platform().is_sm120:
+            return kv_cache_dim
 
     # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
     # nope(512 fp8) + rope(64 fp8), without extra per-block scales.
