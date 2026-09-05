@@ -47,11 +47,13 @@ void Trie::insert(const int32_t* tokens, size_t len) {
         node->global_lru_pos = --global_lru_.end();
         node->freq = 1;
         cursor->sorted_children.insert(node);
+        ++cursor->outgoing_freq_sum;
       } else {
         auto node = iter->second;
         cursor->sorted_children.erase(node);
         node->freq++;
         cursor->sorted_children.insert(node);
+        ++cursor->outgoing_freq_sum;
         cursor->lru.splice(cursor->lru.begin(), cursor->lru, node->parent_lru_pos);
       }
       cursor = iter->second;
@@ -85,6 +87,7 @@ void Trie::squeeze(size_t count) {
 
     last->parent->lru.erase(last->parent_lru_pos);
     last->parent->sorted_children.erase(last);
+    last->parent->outgoing_freq_sum -= static_cast<uint64_t>(last->freq);
     last->parent->child.erase(last->token);
     retireNode(last);
 
@@ -189,20 +192,19 @@ bool Trie::advanceMatchState_(MatchState& state, const int32_t* tokens, size_t l
   return true;
 }
 
-std::vector<std::pair<const TrieNode*, int32_t>> Trie::getExpandableAnchors_(const MatchState& state) const {
-  std::vector<std::pair<const TrieNode*, int32_t>> result;
+std::vector<TrieAnchor> Trie::getExpandableAnchors_(const MatchState& state) const {
+  std::vector<TrieAnchor> result;
   result.reserve(state.anchors.size());
   for (size_t depth = state.anchors.size(); depth > 0; --depth) {
     const auto node = resolve(state, state.anchors[depth - 1]);
     if (node != nullptr && !node->child.empty()) {
-      result.emplace_back(node, static_cast<int32_t>(depth));
+      result.push_back(TrieAnchor{this, node, static_cast<int32_t>(depth)});
     }
   }
   return result;
 }
 
-std::vector<std::pair<const TrieNode*, int32_t>>
-Trie::match(const int32_t* context, size_t len, MatchState& state, size_t total_len) const {
+std::vector<TrieAnchor> Trie::match(const int32_t* context, size_t len, MatchState& state, size_t total_len) const {
   const bool has_forward_progress = total_len >= state.processed_total_len;
   const auto appended_len = has_forward_progress ? total_len - state.processed_total_len : 0;
   const auto expected_prev_depth = std::min(state.processed_total_len, param_.max_trie_depth);
@@ -215,6 +217,32 @@ Trie::match(const int32_t* context, size_t len, MatchState& state, size_t total_
 
   rebuildMatchState_(context, len, state, total_len);
   return getExpandableAnchors_(state);
+}
+
+std::optional<TrieAnchor>
+Trie::longestExpandableMatch(const int32_t* context, size_t len, MatchState& state, size_t total_len) const {
+  auto anchors = match(context, len, state, total_len);
+  if (anchors.empty()) {
+    return std::nullopt;
+  }
+  return anchors.front();
+}
+
+uint64_t Trie::frequencyTransitions(
+    const TrieNode* state, size_t max_breadth, std::vector<TrieFrequencyTransition>& ranked) const {
+  ranked.clear();
+  if (state == nullptr || max_breadth == 0 || state->outgoing_freq_sum == 0) {
+    return 0;
+  }
+
+  ranked.reserve(std::min(max_breadth, state->sorted_children.size()));
+  for (const auto* child : state->sorted_children) {
+    ranked.push_back(TrieFrequencyTransition{child->token, child, static_cast<uint64_t>(child->freq)});
+    if (ranked.size() >= max_breadth) {
+      break;
+    }
+  }
+  return state->outgoing_freq_sum;
 }
 
 Result Trie::buildRecency(
@@ -233,9 +261,10 @@ Result Trie::buildRecency(
   int root = 0;
   int cursor = 1;
 
-  for (auto [node, depth] : anchors) {
+  for (const auto& anchor : anchors) {
     std::queue<std::tuple<int32_t, double, const TrieNode*>> queue;
-    queue.push({root, (max_match_depth - depth) * bfs_breadth_scale + param.min_bfs_breadth, node});
+    queue.push(
+        {root, (max_match_depth - anchor.matched_length) * bfs_breadth_scale + param.min_bfs_breadth, anchor.state});
     while (queue.size() && cursor <= static_cast<int>(draft_token_num)) {
       auto front = queue.front();
       queue.pop();
@@ -308,8 +337,8 @@ Result Trie::buildFrequency(
     }
   };
 
-  for (auto [node, _] : anchors) {
-    addToHeap(root, node, 1.0);
+  for (const auto& anchor : anchors) {
+    addToHeap(root, anchor.state, 1.0);
 
     while (!heap.empty() && cursor <= static_cast<int>(draft_token_num)) {
       auto [parent, trie_node, prob] = heap.top();

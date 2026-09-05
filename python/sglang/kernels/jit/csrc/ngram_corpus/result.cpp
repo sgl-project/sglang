@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <queue>
+#include <stdexcept>
 #include <tuple>
 
 namespace sglang {
@@ -48,6 +49,55 @@ Result fillResult(int last_token, int draft_token_num, std::vector<Node>& tree, 
   }
 
   return info;
+}
+
+Result fillResultWithParentArray(
+    int32_t last_token,
+    size_t result_length,
+    const std::vector<int32_t>& proposal_tokens,
+    const std::vector<int32_t>& proposal_parents) {
+  if (result_length == 0) {
+    throw std::runtime_error("result_length must be positive");
+  }
+  if (proposal_tokens.size() != proposal_parents.size()) {
+    throw std::runtime_error("proposal tokens and parents must have the same size");
+  }
+  if (proposal_tokens.size() + 1 > result_length) {
+    throw std::runtime_error("proposal tree exceeds the fixed result length");
+  }
+
+  Result result;
+  std::vector<int32_t> parents;
+  result.token.reserve(result_length);
+  parents.reserve(result_length);
+  result.token.push_back(last_token);
+  parents.push_back(-1);
+  for (size_t i = 0; i < proposal_tokens.size(); ++i) {
+    const auto output_index = static_cast<int32_t>(i + 1);
+    if (proposal_parents[i] < 0 || proposal_parents[i] >= output_index) {
+      throw std::runtime_error("proposal parent must precede its child");
+    }
+    result.token.push_back(proposal_tokens[i]);
+    parents.push_back(proposal_parents[i]);
+  }
+
+  while (result.token.size() < result_length) {
+    result.token.push_back(0);
+    parents.push_back(0);
+  }
+
+  result.mask.assign(result_length * result_length, 0);
+  for (size_t i = 0; i < result_length; ++i) {
+    const auto parent = parents[i];
+    if (parent >= 0) {
+      std::memcpy(
+          &result.mask[i * result_length],
+          &result.mask[static_cast<size_t>(parent) * result_length],
+          (static_cast<size_t>(parent) + 1) * sizeof(result.mask[0]));
+    }
+    result.mask[i * result_length + i] = 1;
+  }
+  return result;
 }
 
 std::vector<std::vector<int32_t>> extractLeafPaths_(const Result& result) {
