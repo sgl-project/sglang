@@ -345,9 +345,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     ):
         if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
             return
-        assert not getattr(
-            self, "_is_dummy", False
-        ), "load on a dummy (non-src MLA) host pool"
+        assert not getattr(self, "_is_dummy", False), (
+            "load on a dummy (non-src MLA) host pool"
+        )
         host_indices = self.maybe_dcp_kernel_indices(host_indices)
         device_indices = self.maybe_dcp_kernel_indices(device_indices)
         # MTP draft layers do not participate in CP layer sharding.
@@ -444,9 +444,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         *,
         is_draft: bool = False,
     ):
-        assert not getattr(
-            self, "_is_dummy", False
-        ), "backup on a dummy (non-src MLA) host pool"
+        assert not getattr(self, "_is_dummy", False), (
+            "backup on a dummy (non-src MLA) host pool"
+        )
         # Indices arrive already translated by backup_from_device_all_layer.
         # MTP draft layers do not participate in CP layer sharding.
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
@@ -515,9 +515,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
-        assert not getattr(
-            self, "_is_dummy", False
-        ), "backup on a dummy (non-src MLA) host pool"
+        assert not getattr(self, "_is_dummy", False), (
+            "backup on a dummy (non-src MLA) host pool"
+        )
         host_indices = self.maybe_dcp_kernel_indices(host_indices)
         device_indices = self.maybe_dcp_kernel_indices(device_indices)
         if self._is_device_layer_sharded(device_pool):

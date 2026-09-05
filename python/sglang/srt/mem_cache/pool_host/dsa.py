@@ -244,9 +244,9 @@ class DSAIndexerPoolHost(HostKVCache):
     ):
         if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
             return
-        assert not getattr(
-            self, "_is_dummy", False
-        ), "load on a dummy (non-src DSA) host pool"
+        assert not getattr(self, "_is_dummy", False), (
+            "load on a dummy (non-src DSA) host pool"
+        )
         # MTP draft layers do not participate in CP layer sharding.
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
         device_layer_id = 0 if is_draft else layer_id
@@ -309,9 +309,9 @@ class DSAIndexerPoolHost(HostKVCache):
         *,
         is_draft: bool = False,
     ):
-        assert not getattr(
-            self, "_is_dummy", False
-        ), "backup on a dummy (non-src DSA) host pool"
+        assert not getattr(self, "_is_dummy", False), (
+            "backup on a dummy (non-src DSA) host pool"
+        )
         # MTP draft layers do not participate in CP layer sharding.
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
         device_layer_id = 0 if is_draft else layer_id
@@ -356,9 +356,9 @@ class DSAIndexerPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
-        assert not getattr(
-            self, "_is_dummy", False
-        ), "backup on a dummy (non-src DSA) host pool"
+        assert not getattr(self, "_is_dummy", False), (
+            "backup on a dummy (non-src DSA) host pool"
+        )
         if self._is_device_layer_sharded(device_pool):
             for layer_id in self._owned_device_layer_ids(device_pool):
                 self._backup_from_device_per_layer(
