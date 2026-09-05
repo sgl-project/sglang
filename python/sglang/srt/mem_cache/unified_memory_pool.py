@@ -1516,12 +1516,12 @@ class UnifiedSWAKVPool(SWAKVPool):
         return  # no-op in shared mode (the swa-side v2p IS the mapping)
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
-        """Virtual token ids -> swa kernel-facing ids (int64)."""
+        """Virtual token ids -> swa-physical token ids (int64)."""
         assert self._swa_allocator is not None, (
             "UnifiedSWAKVPool.translate_loc_from_full_to_swa called before "
             "attach_allocators"
         )
-        return self._swa_allocator.translate_kv_loc_for_kernel(kv_indices)
+        return self._swa_allocator.translate_kv_loc(kv_indices)
 
     def get_state_buf_infos(self):
         return self.swa_kv_pool.get_contiguous_buf_infos()

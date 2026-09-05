@@ -58,11 +58,10 @@ register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-small")
 
 _HAS_CUDA = torch.cuda.is_available()
 _DEV = "cuda"
-_MULT = 1  # kernel-facing ids are the physical ones
 
 
 def _fill_block_table(
-    req_to_token, req_pool_indices, seq_lens, page_size, *, v2p, mult
+    req_to_token, req_pool_indices, seq_lens, page_size, *, v2p
 ):
     """The unified route: canonical builder into a -1-filled block table
     (exactly what KVIndexTranslator.build_into does for trtllm_mla/flashmla)."""
@@ -76,7 +75,6 @@ def _fill_block_table(
         req_pool_indices=req_pool_indices,
         seq_lens=seq_lens.to(torch.int64),
         v2p=v2p,
-        multiplier=mult,
         page_size=page_size,
         max_pages=max_blocks,
         out=out,
@@ -108,7 +106,7 @@ def _fill_block_table_static(req_to_token, req_pool_indices, seq_lens, page_size
     return out
 
 
-def _reference(req_to_token, req_pool_indices, seq_lens, page_size, *, v2p, mult):
+def _reference(req_to_token, req_pool_indices, seq_lens, page_size, *, v2p):
     """Python reference: virtual token -> virtual page -> physical page -> kernel id."""
     bs = req_pool_indices.shape[0]
     max_blocks = (int(seq_lens.max().item()) + page_size - 1) // page_size
@@ -118,7 +116,7 @@ def _reference(req_to_token, req_pool_indices, seq_lens, page_size, *, v2p, mult
         row = req_to_token[int(req_pool_indices[r].item())]
         virt_pages = row[: n_pages * page_size : page_size] // page_size
         pages = v2p[virt_pages.long()] if v2p is not None else virt_pages.long()
-        ref[r, :n_pages] = pages * mult
+        ref[r, :n_pages] = pages
     return ref
 
 
@@ -155,7 +153,7 @@ class TestBlockTable(unittest.TestCase):
         for page_size in (1, 32, 64):
             rt, rpi, sl, _ = self._make_batch(page_size)
             got = _fill_block_table_static(rt, rpi, sl, page_size)
-            want = _reference(rt, rpi, sl, page_size, v2p=None, mult=1)
+            want = _reference(rt, rpi, sl, page_size, v2p=None)
             self.assertTrue(
                 torch.equal(got.long(), want), f"page_size={page_size}: {got} != {want}"
             )
@@ -163,8 +161,8 @@ class TestBlockTable(unittest.TestCase):
     def test_block_table_matches_reference(self):
         for page_size in (1, 32, 64):
             rt, rpi, sl, v2p = self._make_batch(page_size)
-            got = _fill_block_table(rt, rpi, sl, page_size, v2p=v2p, mult=_MULT)
-            want = _reference(rt, rpi, sl, page_size, v2p=v2p, mult=_MULT)
+            got = _fill_block_table(rt, rpi, sl, page_size, v2p=v2p)
+            want = _reference(rt, rpi, sl, page_size, v2p=v2p)
             self.assertTrue(
                 torch.equal(got.long(), want),
                 f"page_size={page_size}:\ngot ={got}\nwant={want}",
@@ -179,12 +177,12 @@ class TestBlockTable(unittest.TestCase):
         """
         for page_size in (1, 64):
             rt, rpi, sl, v2p = self._make_batch(page_size)
-            got = _fill_block_table(rt, rpi, sl, page_size, v2p=v2p, mult=1).long()
-            want = _reference(rt, rpi, sl, page_size, v2p=v2p, mult=1)
+            got = _fill_block_table(rt, rpi, sl, page_size, v2p=v2p).long()
+            want = _reference(rt, rpi, sl, page_size, v2p=v2p)
             self.assertTrue(torch.equal(got, want), f"page_size={page_size}")
             # ... and the v2p permutation is non-trivial here, so a skipped
             # translation would be visibly different rather than accidentally equal.
-            virtual = _reference(rt, rpi, sl, page_size, v2p=None, mult=1)
+            virtual = _reference(rt, rpi, sl, page_size, v2p=None)
             self.assertFalse(
                 torch.equal(want, virtual),
                 "test batch degenerated: v2p is the identity on the pages used",
@@ -196,7 +194,7 @@ class TestBlockTable(unittest.TestCase):
         trtllm/flashmla block-table contract)."""
         page_size = 64
         rt, rpi, sl, v2p = self._make_batch(page_size)
-        got = _fill_block_table(rt, rpi, sl, page_size, v2p=v2p, mult=_MULT)
+        got = _fill_block_table(rt, rpi, sl, page_size, v2p=v2p)
         for r in range(got.shape[0]):
             n_pages = (int(sl[r].item()) + page_size - 1) // page_size
             self.assertTrue(
@@ -205,21 +203,20 @@ class TestBlockTable(unittest.TestCase):
             )
 
     def test_agrees_with_token_level_translate(self):
-        """The flashinfer updaters translate TOKEN ids with
-        `translate_kv_loc_for_kernel`; the trtllm path builds PAGE ids in-kernel. Both
-        must address the same kernel-facing page block."""
+        """The flashinfer updaters translate TOKEN ids with `translate_kv_loc`;
+        the trtllm path builds PAGE ids in-kernel. Both must address the same
+        physical page."""
         page_size = 64
         rt, rpi, sl, v2p = self._make_batch(page_size)
         block_table = _fill_block_table(
-            rt, rpi, sl, page_size, v2p=v2p, mult=_MULT
+            rt, rpi, sl, page_size, v2p=v2p
         ).long()
         for r in range(rt.shape[0]):
             n = int(sl[r].item())
             virt_tokens = rt[r, :n].long()
-            # translate_kv_loc_for_kernel's formula, applied to token ids.
+            # translate_kv_loc's formula, applied to token ids.
             kernel_tokens = (
-                v2p[virt_tokens // page_size] * (page_size * _MULT)
-                + virt_tokens % page_size
+                v2p[virt_tokens // page_size] * page_size + virt_tokens % page_size
             )
             # The block-table entry scaled by page_size must be the kernel-facing id of
             # each page's first token.
@@ -243,7 +240,7 @@ class TestFa3MetadataBlockTable(unittest.TestCase):
     (no source flag) stays byte-identical to the pre-translator kernel.
     """
 
-    def _run(self, page_size, *, v2p, mult, bs=5, max_ctx=2048):
+    def _run(self, page_size, *, v2p, bs=5, max_ctx=2048):
         from sglang.kernels.ops.attention.metadata import normal_decode_set_metadata
         from sglang.kernels.ops.kvcache.kv_read_table import (
             build_kv_read_table,
@@ -281,7 +278,6 @@ class TestFa3MetadataBlockTable(unittest.TestCase):
                 req_pool_indices=rpi,
                 seq_lens=cache_seqlens,
                 v2p=v2p_full,
-                multiplier=mult,
                 page_size=page_size,
                 max_pages=max_pages,
                 out=page_table,
@@ -302,7 +298,7 @@ class TestFa3MetadataBlockTable(unittest.TestCase):
             )
         torch.cuda.synchronize()
         want = _reference(
-            rt, rpi, sl, page_size, v2p=(v2p_full if v2p else None), mult=mult
+            rt, rpi, sl, page_size, v2p=(v2p_full if v2p else None)
         )
         return page_table, want, sl
 
@@ -320,27 +316,26 @@ class TestFa3MetadataBlockTable(unittest.TestCase):
     def test_identity_when_hooks_absent(self):
         """Static pool: no v2p, multiplier 1 -> byte-identical to pre-change."""
         for page_size in (1, 64):
-            got, want, sl = self._run(page_size, v2p=False, mult=1)
+            got, want, sl = self._run(page_size, v2p=False)
             self._assert_live_prefix(got, want, sl, page_size)
 
     def test_translated_mapping_ps1_fast_path(self):
-        got, want, sl = self._run(1, v2p=True, mult=_MULT)
+        got, want, sl = self._run(1, v2p=True)
         self._assert_live_prefix(got, want, sl, 1)
 
     def test_translated_mapping_general_path(self):
-        got, want, sl = self._run(64, v2p=True, mult=_MULT)
+        got, want, sl = self._run(64, v2p=True)
         self._assert_live_prefix(got, want, sl, 64)
 
     def test_single_full_attention_layer(self):
         """multiplier 1 with a real v2p: the gather alone is the translation."""
         for page_size in (1, 64):
-            got, want, sl = self._run(page_size, v2p=True, mult=1)
+            got, want, sl = self._run(page_size, v2p=True)
             self._assert_live_prefix(got, want, sl, page_size)
             virtual = _reference(
                 *TestBlockTable._make_batch(self, page_size)[:3],
                 page_size,
                 v2p=None,
-                mult=1,
             )
             self.assertFalse(
                 torch.equal(want, virtual),

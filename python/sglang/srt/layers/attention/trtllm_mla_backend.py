@@ -396,7 +396,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             v2p,
             self.req_to_token.stride(0),
             block_kv_indices.stride(0),
-            self.kv_index_translator.full_page_multiplier,
             PHYSICAL_PAGE_SIZE=self.page_size,
             DCP_SIZE=parallel.dcp_size,
             DCP_RANK=parallel.dcp_rank,

@@ -516,11 +516,8 @@ class TestFactoryViews(unittest.TestCase):
             need_sort=False,
         )
 
-    def test_factory_pins_unit_multipliers(self):
+    def test_factory_builds_per_layer_views(self):
         b = self._bundle()
-        alloc = b.token_to_kv_pool_allocator
-        self.assertEqual(alloc.kernel_page_multiplier, 1)
-        self.assertEqual(alloc.swa_kernel_page_multiplier, 1)
         # Sub-pools expose stock 3-D per-layer views.
         self.assertEqual(b.token_to_kv_pool.full_kv_pool.k_buffer[0].dim(), 3)
         self.assertEqual(b.token_to_kv_pool.swa_kv_pool.k_buffer[0].dim(), 3)

@@ -304,10 +304,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         return self.swa_attn_allocator.translate_kv_loc_for_kernel(kv_indices, out=out)
 
     @property
-    def kernel_page_multiplier(self) -> int:
-        return self.full_attn_allocator.kernel_page_multiplier
-
-    @property
     def full_v2p_page_table(self) -> torch.Tensor:
         """Page-level virtual->physical table of the full sub-pool."""
         return self.full_attn_allocator.virtual_to_physical
@@ -316,15 +312,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def full_p2v_page_table(self) -> torch.Tensor:
         """Page-level physical->virtual table of the full sub-pool."""
         return self.full_attn_allocator.physical_to_virtual
-
-    def translate_kv_loc_for_kernel(
-        self,
-        loc: torch.Tensor,
-        *,
-        out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Full-pool virtual TOKEN ids -> kernel-facing ids."""
-        return self.full_attn_allocator.translate_kv_loc_for_kernel(loc, out=out)
 
     def translate_write_loc_for_kernel(
         self,
@@ -338,10 +325,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         return self.full_attn_allocator.translate_write_loc_for_kernel(
             loc, out=out, out_width=out_width
         )
-
-    @property
-    def swa_kernel_page_multiplier(self) -> int:
-        return self.swa_attn_allocator.kernel_page_multiplier
 
     @property
     def swa_v2p_page_table(self) -> torch.Tensor:

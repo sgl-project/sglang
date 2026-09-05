@@ -160,7 +160,7 @@ class TestUnifiedSWATombstoneClamp(unittest.TestCase):
     buffer base.
     """
 
-    def _make_bare_pool(self, page_size, v2p, multiplier=1):
+    def _make_bare_pool(self, page_size, v2p):
         from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
         from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
 
@@ -172,23 +172,21 @@ class TestUnifiedSWATombstoneClamp(unittest.TestCase):
         swa_allocator.page_size = page_size
         swa_allocator.pool_page_size = page_size
         swa_allocator.virtual_to_physical = v2p
-        swa_allocator.kernel_page_multiplier = multiplier
         pool = object.__new__(UnifiedSWAKVPool)
         pool._swa_allocator = swa_allocator
         return pool
 
     def test_tombstoned_id_lands_on_sink(self):
-        for ps, mult in ((1, 1), (4, 1)):
+        for ps in (1, 4):
             v2p = torch.tensor([0, -1, 2], dtype=torch.int64)
-            pool = self._make_bare_pool(ps, v2p, multiplier=mult)
+            pool = self._make_bare_pool(ps, v2p)
             # Virtual ids covering the tombstoned page (index 1) and a live one.
             kv_indices = torch.tensor([0, ps, 2 * ps], dtype=torch.int64)
             out = pool.translate_loc_from_full_to_swa(kv_indices)
             self.assertEqual(out.dtype, torch.int64)
             self.assertTrue(
                 bool((out >= 0).all().item()),
-                f"tombstoned swa id stayed negative at page_size={ps}, "
-                f"multiplier={mult}: {out}",
+                f"tombstoned swa id stayed negative at page_size={ps}: {out}",
             )
             self.assertEqual(int(out[1].item()), 0)
 

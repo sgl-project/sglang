@@ -230,7 +230,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         need_sort: bool = False,
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
-        kernel_page_multiplier: Optional[int] = None,
     ):
         spec = unified_buffer.spec(sub_pool_name)
         max_slots = unified_buffer.max_slots(sub_pool_name)
@@ -254,14 +253,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.entry_bytes = spec.entry_bytes()
         self.min_slot_index = unified_buffer.min_slot_index(sub_pool_name)
         self.is_id_owner = is_id_owner
-        # Kernel-facing ids are the physical token ids: the token-major views
-        # step slots by the whole entry, so there is no per-page block scale.
-        # The kwarg is accepted (and must be 1) until the plumbing is removed.
-        assert kernel_page_multiplier in (None, 1), (
-            f"kernel_page_multiplier must be 1 (token-major views); got "
-            f"{kernel_page_multiplier}"
-        )
-        self.kernel_page_multiplier = 1
         # Zero page envelopes on hand-out — see _maybe_zero_pages.
         self._zero_pages_on_alloc = isinstance(kvcache, UnifiedMLATokenToKVPool)
         # Overlap mode: `free` drops a wait_stream(forward_stream) barrier so its
@@ -918,6 +909,16 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
     # -- translate (virtual TOKEN ids -> physical TOKEN ids) --
 
+    # TODO(unified-memory): fold this onto the fused path. Under the token-major
+    # views `translate_kv_loc`, `translate_kv_loc_for_kernel` and
+    # `_translate_loc_fused(dcp_size=1)` all compute the same id; only the
+    # implementation differs (one Triton launch vs several torch ops). Two things
+    # stop it being a rename: `write_loc_to_kernel_ids` flat-addresses and asserts
+    # contiguity, while callers pass strided slices (flashattention_backend hands
+    # `page_table[:bs, :max_seq_len]`); and the fused path sends a negative loc to
+    # the page-0 sink where this one lets the v2p index wrap, so the swap is a fix
+    # and needs a red-first test. Retarget `translate_kv_loc_for_kernel`'s caller
+    # only AFTER that -- first would strip the -1 handling the SWA path relies on.
     def translate_kv_loc(
         self,
         virt_tokens: torch.Tensor,
@@ -949,33 +950,26 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         virt_tokens: torch.Tensor,
         out: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        # Tombstone-safety clamp: a tombstoned v2p entry (-1) must not reach
-        # `k_buffer[-1]` (illegal access under captured graph replay). Clamping to
-        # 0 routes it to physical slot 0, reserved sink space holding no real data.
+        # Tombstoned v2p entries (-1) clamp to physical slot 0.
         ps = self.pool_page_size
-        if ps == 1:
-            if out is not None:
-                # `index_select(out=out)` forbids index/out aliasing, but the
-                # canonical caller passes `out=kv_indices` in place.
-                tmp = torch.index_select(self.virtual_to_physical, 0, virt_tokens)
-                tmp = torch.clamp_min(tmp, 0)
-                out.copy_(tmp)
-                return out
-            result = torch.index_select(self.virtual_to_physical, 0, virt_tokens)
-            return torch.clamp_min(result, 0)
-        # ps > 1: page math. `virt_pages`/`offsets` are fresh, so they
-        # cannot alias `out` -- `index_select(out=out)` is safe.
-        virt_pages = virt_tokens // ps
-        offsets = virt_tokens % ps
-        if out is not None:
-            torch.index_select(self.virtual_to_physical, 0, virt_pages, out=out)
+        pages = virt_tokens if ps == 1 else virt_tokens // ps
+        offsets = None if ps == 1 else virt_tokens % ps
+        if out is None:
+            phys = self.virtual_to_physical[pages]
+            ids = phys if offsets is None else phys * ps + offsets
+            return ids.clamp_(min=0)
+        if pages.dtype != torch.int64:
+            pages = pages.to(torch.int64)
+        if pages is virt_tokens:
+            # `take(out=out)` forbids index/out aliasing, but the canonical
+            # caller translates in place: translate(loc, out=loc).
+            out.copy_(torch.take(self.virtual_to_physical, pages))
+        else:
+            torch.take(self.virtual_to_physical, pages, out=out)
+        if offsets is not None:
             out.mul_(ps)
             out.add_(offsets)
-            out.clamp_(min=0)  # tombstoned page: -1*ps + offset in [-ps, -1]
-            return out
-        phys_pages = self.virtual_to_physical[virt_pages]
-        result = phys_pages * ps + offsets
-        return torch.clamp_min(result, 0)
+        return out.clamp_(min=0)
 
     def translate_kv_loc_for_kernel(
         self,
@@ -988,8 +982,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
             kernel_id(t) = v2p[t // ps] * ps + t % ps
 
-        (`kernel_page_multiplier` is pinned to 1, so this equals
-        `translate_kv_loc`.) Tombstones (-1) clamp to id 0, the page-0 sink.
+        (Identical to `translate_kv_loc`: the kernel id IS the physical id.) Tombstones (-1) clamp to id 0, the page-0 sink.
         int64 out; a consumer whose kernel ABI wants int32 narrows where it
         fills that buffer.
         """
@@ -1021,7 +1014,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             loc=loc,
             v2p=self.virtual_to_physical,
             page_size=self.pool_page_size,
-            stride=self.pool_page_size * self.kernel_page_multiplier,
+            stride=self.pool_page_size,
             dcp_size=dcp_size,
             dcp_rank=dcp_rank,
             out=out,

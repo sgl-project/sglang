@@ -2248,9 +2248,10 @@ class TestO3FusedAllocBind(unittest.TestCase):
 
 
 class TestSWACompositeKernelIdSurface(unittest.TestCase):
-    """The SWA composite's kernel-facing id surface. Attention backends probe for
-    `translate_kv_loc_for_kernel` / `full_v2p_page_table`, and every id must
-    follow `kernel_id(t) = v2p[t // ps] * (ps * mult) + t % ps`."""
+    """The SWA composite's id surface: both translates follow
+    `phys(t) = v2p[t // ps] * ps + t % ps` over their own side's v2p table,
+    and the raw v2p tables are exposed unwrapped.
+    """
 
     def setUp(self):
         # The code under test reads its config from the bags.
@@ -2300,58 +2301,52 @@ class TestSWACompositeKernelIdSurface(unittest.TestCase):
             forward_stream=None,
         )
 
-    def test_full_kernel_translate_matches_formula(self):
-        """Kernel-facing ids ARE the physical token ids under the token-major
-        views, so both sides pin at multiplier 1 and the id follows
-        v2p[t // ps] * ps + t % ps."""
+    def test_composite_exposes_raw_v2p_tables(self):
         a = self._build()
-        self.assertEqual(a.kernel_page_multiplier, 1)
-        self.assertEqual(a.swa_kernel_page_multiplier, 1)
+        self.assertIs(a.full_v2p_page_table, a.full_attn_allocator.virtual_to_physical)
+        self.assertIs(a.swa_v2p_page_table, a.swa_attn_allocator.virtual_to_physical)
+
+    def test_full_translate_matches_formula(self):
+        a = self._build()
         v = a.alloc(3 * self.PS)
         self.assertIsNotNone(v)
         v2p = a.full_attn_allocator.virtual_to_physical
         expected = v2p[v // self.PS] * self.PS + v % self.PS
-        self.assertTrue(torch.equal(a.translate_kv_loc_for_kernel(v), expected))
-        # The PHYSICAL translate must stay unscaled -- compaction and the byte
-        # machinery depend on it staying in physical space.
-        phys = v2p[v // self.PS] * self.PS + v % self.PS
-        self.assertTrue(torch.equal(a.translate_kv_loc(v), phys))
+        self.assertTrue(torch.equal(a.translate_kv_loc(v), expected))
 
-    def test_kernel_translate_accepts_an_int32_page_table(self):
-        """Regression: fa3 passes its own page table, which is int32 and 2-D, so
-        the gather must not require an int64 index."""
+    def test_translate_accepts_an_int32_page_table(self):
+        """REGRESSION: fa3 translates its own page table, which is int32 and
+        2-D. A gather that requires an int64 index (`torch.take`) crashes the
+        scheduler there while every int64 caller stays green. Both page sizes:
+        at ps == 1 the index IS the caller's tensor, at ps > 1 it is derived."""
         for ps in (1, 4):
             with self.subTest(page_size=ps):
                 self.PS = ps
-                mult = 2 * self.FULL_L
                 a = self._build()
                 v = a.alloc(4 * ps)
                 self.assertIsNotNone(v)
                 v2p = a.full_attn_allocator.virtual_to_physical
-                expected = v2p[v // ps] * (ps * mult) + v % ps
+                expected = v2p[v // ps] * ps + v % ps
                 page_table = v.to(torch.int32).view(2, -1)
-                got = a.translate_kv_loc_for_kernel(page_table)
+                got = a.translate_kv_loc(page_table)
                 self.assertEqual(got.shape, page_table.shape)
                 self.assertTrue(torch.equal(got.reshape(-1), expected))
                 # `out=` takes the same int32 index; the buffer stays int64.
                 dst = torch.empty(page_table.shape, dtype=torch.int64, device=_DEV)
-                a.translate_kv_loc_for_kernel(page_table, out=dst)
+                a.translate_kv_loc(page_table, out=dst)
                 self.assertTrue(torch.equal(dst.reshape(-1), expected))
 
-    def test_swa_translate_scales_page_stride(self):
-        mult = 2 * self.SWA_L
+    def test_swa_translate_matches_formula(self):
         a = self._build()
         v = a.alloc(3 * self.PS)
         self.assertIsNotNone(v)
         v2p_swa = a.swa_attn_allocator.virtual_to_physical
-        expected = v2p_swa[v // self.PS] * (self.PS * mult) + v % self.PS
+        expected = v2p_swa[v // self.PS] * self.PS + v % self.PS
         self.assertTrue(torch.equal(a.translate_loc_from_full_to_swa(v), expected))
 
-    def test_swa_kernel_tombstone_still_lands_on_sink(self):
-        """The scaled stride must not break the tombstone clamp: a tombstoned
-        page's ids (v2p == -1 -> -stride + offset, negative for every in-page
-        offset) still land on the sink, never negative."""
-        mult = 2 * self.SWA_L
+    def test_swa_tombstone_still_lands_on_sink(self):
+        """A tombstoned page's ids (v2p == -1 -> -ps + offset, negative for
+        every in-page offset) still land on the sink, never negative."""
         a = self._build()
         v = a.alloc(2 * self.PS)
         self.assertIsNotNone(v)
@@ -2425,8 +2420,6 @@ class TestPs64MLACompositeFeasibility(unittest.TestCase):
 
     def test_construction_alloc_and_kernel_formula(self):
         a = self._build()
-        # Token-major views: the kernel id is the physical token id.
-        self.assertEqual(a.kernel_page_multiplier, 1)
         v = a.alloc(2 * self.PS)
         self.assertIsNotNone(v, "2-page alloc infeasible at ps=64")
         # Page-aligned virtual run (page-granular allocator invariant).
@@ -2435,7 +2428,7 @@ class TestPs64MLACompositeFeasibility(unittest.TestCase):
         # fits int32 (the canonical narrows on store).
         v2p = a.full_v2p_page_table
         want = v2p[v // self.PS] * self.PS + v % self.PS
-        got = a.translate_kv_loc_for_kernel(v)
+        got = a.translate_kv_loc(v)
         self.assertTrue(torch.equal(got, want), "kernel-facing formula broke at ps=64")
         self.assertTrue(bool((got < 2**31).all().item()))
 
@@ -3030,7 +3023,7 @@ class TestDcpWidening(unittest.TestCase):
                 self.assertTrue(
                     torch.equal(
                         written[owned],
-                        a.translate_kv_loc_for_kernel(ids[owned] // dcp_size),
+                        a.translate_kv_loc(ids[owned] // dcp_size),
                     )
                 )
                 # ...and the rest go to the sink the write kernels skip.

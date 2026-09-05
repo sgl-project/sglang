@@ -231,29 +231,16 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return result
 
     @property
-    def kernel_page_multiplier(self) -> int:
-        return self.full_attn_allocator.kernel_page_multiplier
-
-    @property
     def full_v2p_page_table(self) -> torch.Tensor:
         """Page-level virtual->physical table of the full sub-pool. Kernels that
         build the MLA block table straight from req_to_token gather through this,
-        then scale by `kernel_page_multiplier` to reach the per-page block."""
+        The kernel id is the physical token id; there is no per-page scale."""
         return self.full_attn_allocator.virtual_to_physical
 
     @property
     def full_p2v_page_table(self) -> torch.Tensor:
         """Page-level physical->virtual table of the full sub-pool."""
         return self.full_attn_allocator.physical_to_virtual
-
-    def translate_kv_loc_for_kernel(
-        self,
-        loc: torch.Tensor,
-        *,
-        out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Full-pool virtual TOKEN ids -> kernel-facing ids."""
-        return self.full_attn_allocator.translate_kv_loc_for_kernel(loc, out=out)
 
     def translate_write_loc_for_kernel(
         self,
