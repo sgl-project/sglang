@@ -1,5 +1,7 @@
 import weakref
 
+from typing import Optional
+
 import torch
 
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
@@ -355,7 +357,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def swa_available_size(self):
         return self.logical_attn_allocator.swa_available_size()
 
-    def free_swa(self, free_indices: torch.Tensor):
+    def free_swa(self, free_indices: torch.Tensor, *, start_pos: Optional[int] = None):
         self.logical_attn_allocator.free_swa(free_indices)
 
     def free_full(self, free_indices: torch.Tensor):
