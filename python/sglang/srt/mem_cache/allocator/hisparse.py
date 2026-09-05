@@ -112,11 +112,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,
         extend_num_tokens: int,
     ):
-        """Allocate only logical indices without hisparse device indices.
-
-        Used in the direct-to-host transfer path where KV data is written
-        directly to host memory by the prefill node, skipping GPU staging.
-        """
+        """Allocate only logical indices without hisparse device indices."""
         return self.logical_attn_allocator.alloc_extend(
             prefix_lens,
             prefix_lens_cpu,
@@ -131,9 +127,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # clear original reference and isolate the buffer from outside addressing, allocate new buffer if needed
         hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
         self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
-        # Filter valid (non-zero) hisparse indices.
-        # In the direct-to-host path, mapping is all zeros since no hisparse
-        # device indices were pre-allocated.
+        # Zero means unmapped; after alloc_logical_only the mapping is all zeros.
         hisparse_indices = hisparse_indices[hisparse_indices > 0]
         if len(hisparse_indices) >= need_size:
             buffer_indices = hisparse_indices[:need_size]
@@ -241,7 +235,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def clear(self):
         self.logical_attn_allocator.clear()
         self.hisparse_attn_allocator.clear()
-        # Note: the last item is -1, we don't clear it, see the comment in __init__
+        # Keep the trailing -1: it is what a last_loc of -1 translates to.
         self.full_to_hisparse_device_index_mapping[:-1].fill_(0)
         self.free_group = None
 

@@ -42,6 +42,7 @@ class TestCheckTreeCacheGate(CustomTestCase):
             pool_stats_observer=MagicMock(),
             get_last_batch=lambda: None,
             get_running_batch=lambda: None,
+            scheduler_stage_metrics=None,
         )
 
     def test_disabled_by_default(self):
