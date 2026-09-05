@@ -105,7 +105,13 @@ class PleFilePrefetcher:
             except OSError:
                 return
 
-    def enqueue(self, flat_ids: torch.Tensor) -> bool:
+    def enqueue(
+        self,
+        flat_ids: torch.Tensor,
+        *,
+        vocab_start: int = 0,
+        vocab_end: Optional[int] = None,
+    ) -> bool:
         """Queue the hint for ``flat_ids``. Returns whether anything was queued."""
         if flat_ids.numel() < self._min_rows:
             return False
@@ -113,7 +119,14 @@ class PleFilePrefetcher:
             return False
         # The .cpu() syncs the stream; acceptable for prefill chunks (~1 s) and
         # it is what lets the page set be computed without touching the kernel.
-        pages = self.pages_for_rows(flat_ids.detach().cpu(), self._row_bytes)
+        row_ids = flat_ids.detach().cpu()
+        if vocab_end is not None:
+            # The file contains only this rank's vocabulary shard.
+            row_ids = row_ids[(row_ids >= vocab_start) & (row_ids < vocab_end)]
+        row_ids = row_ids - vocab_start
+        if row_ids.numel() == 0:
+            return False
+        pages = self.pages_for_rows(row_ids, self._row_bytes)
         self._pool.submit(self._advise, pages)
         return True
 

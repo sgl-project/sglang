@@ -866,7 +866,11 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         flat_ids = input_ids.reshape(-1).long()
         if flat_ids.numel():
             if self._file_prefetcher is not None:
-                self._file_prefetcher.enqueue(flat_ids)
+                self._file_prefetcher.enqueue(
+                    flat_ids,
+                    vocab_start=self.shard_indices.org_vocab_start_index,
+                    vocab_end=self.shard_indices.org_vocab_end_index,
+                )
             _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
                 self.weight.data_ptr(),
                 flat_ids,
