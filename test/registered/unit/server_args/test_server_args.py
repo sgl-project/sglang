@@ -2,6 +2,7 @@ import argparse
 import dataclasses
 import json
 import os
+import shutil
 import socket
 import tempfile
 import unittest
@@ -2931,6 +2932,95 @@ class TestDcpKvEventContract(CustomTestCase):
 
         args = ServerArgs(model_path="dummy", tp_size=8, dcp_size=8, page_size=1)
         self.assertEqual(kv_event_block_size_of(resolving_view(args)), 8)
+
+
+class TestNoneMeansUnset(CustomTestCase):
+    """A valued field the resolution rewrites carries `None` for "not set".
+
+    `mamba_full_memory_ratio` used to default to 0.9, so a model family asking
+    "did the operator leave this alone?" had to compare against the class
+    default -- which stops being true the moment anything declares the field
+    first, and says nothing at all if the operator happens to pass 0.9. `None`
+    answers both, and the generic value lands during resolution instead.
+    """
+
+    def _resolved(self, **kwargs):
+        server_args = ServerArgs(model_path=self._checkpoint(), device="cuda", **kwargs)
+        server_args.resolve_once()
+        return resolution_result(server_args, "mamba_full_memory_ratio")
+
+    def _checkpoint(self) -> str:
+        directory = tempfile.mkdtemp(prefix="none_means_unset_")
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        with open(os.path.join(directory, "config.json"), "w") as handle:
+            json.dump(
+                {
+                    "architectures": ["LlamaForCausalLM"],
+                    "model_type": "llama",
+                    "hidden_size": 16,
+                    "intermediate_size": 32,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 2,
+                    "num_hidden_layers": 2,
+                    "vocab_size": 128,
+                    "max_position_embeddings": 2048,
+                },
+                handle,
+            )
+        return directory
+
+    def test_the_record_keeps_none_and_resolution_supplies_the_value(self):
+        server_args = ServerArgs(model_path=self._checkpoint(), device="cuda")
+        self.assertIsNone(server_args.mamba_full_memory_ratio)
+        server_args.resolve_once()
+        # The record still carries what the operator typed; the value is the
+        # resolution's.
+        self.assertIsNone(server_args.mamba_full_memory_ratio)
+        self.assertEqual(resolution_result(server_args, "mamba_full_memory_ratio"), 0.9)
+
+    def test_an_explicit_value_is_never_overwritten(self):
+        self.assertEqual(self._resolved(mamba_full_memory_ratio=0.5), 0.5)
+
+    def test_the_swa_ratio_behaves_the_same_way(self):
+        server_args = ServerArgs(model_path=self._checkpoint(), device="cuda")
+        self.assertIsNone(server_args.swa_full_tokens_ratio)
+        server_args.resolve_once()
+        self.assertEqual(resolution_result(server_args, "swa_full_tokens_ratio"), 0.8)
+
+        explicit = ServerArgs(
+            model_path=self._checkpoint(), device="cuda", swa_full_tokens_ratio=0.3
+        )
+        explicit.resolve_once()
+        self.assertEqual(resolution_result(explicit, "swa_full_tokens_ratio"), 0.3)
+
+    def test_the_swa_ratio_is_still_range_checked(self):
+        """The check reads the resolved value, so `None` must be gone by then."""
+        with self.assertRaisesRegex(ValueError, "swa-full-tokens-ratio"):
+            ServerArgs(
+                model_path=self._checkpoint(),
+                device="cuda",
+                swa_full_tokens_ratio=0.0,
+            ).resolve_once()
+
+    def test_a_dummy_model_still_gets_the_generic_values(self):
+        """The dummy short circuit returns long before the normal fill slot.
+
+        The families it skips are exactly the ones that would have claimed
+        these fields, so the generic values have to land on the way out --
+        otherwise every bag on this path holds None where it used to hold a
+        ratio.
+        """
+        server_args = ServerArgs(model_path="dummy", device="cuda")
+        server_args.resolve_once()
+        self.assertEqual(resolution_result(server_args, "swa_full_tokens_ratio"), 0.8)
+        self.assertEqual(resolution_result(server_args, "mamba_full_memory_ratio"), 0.9)
+
+    def test_an_explicit_value_equal_to_the_generic_one_still_reads_as_set(self):
+        """The case the class-default comparison could never see."""
+        server_args = ServerArgs(
+            model_path=self._checkpoint(), device="cuda", mamba_full_memory_ratio=0.9
+        )
+        self.assertIsNotNone(server_args.mamba_full_memory_ratio)
 
 
 if __name__ == "__main__":
