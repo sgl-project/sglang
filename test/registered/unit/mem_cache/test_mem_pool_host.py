@@ -325,6 +325,12 @@ class TestHostPoolGroup(CustomTestCase):
         self.assertIsNone(transfers[0].host_indices)
         self.assertEqual(group.available_size(PoolName.SWA), 2)
 
+    def test_forwards_dtype_from_anchor(self):
+        # cache_controller reads mem_pool_host.dtype; the facade must forward it
+        # from the flagged anchor, not the positional first entry (swa is first).
+        group = self._group(swa=2, kv=4)
+        self.assertIs(group.dtype, group.anchor_entry.host_pool.dtype)
+
 
 if __name__ == "__main__":
     unittest.main()
