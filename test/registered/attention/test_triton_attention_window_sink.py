@@ -38,8 +38,9 @@ ATOL = 2e-2
 RTOL = 2e-2  # bf16 inputs with fp32 accumulation
 
 
-def ref_varlen_attention(q, k, v, cu_seqlens, sm_scale, window_size=(-1, -1), sinks=None,
-                         causal=False):
+def ref_varlen_attention(
+    q, k, v, cu_seqlens, sm_scale, window_size=(-1, -1), sinks=None, causal=False
+):
     """Non-causal varlen attention with optional sliding window and per-head sinks.
 
     q:          [total_tokens, Hq, D]
@@ -89,8 +90,12 @@ def ref_varlen_attention(q, k, v, cu_seqlens, sm_scale, window_size=(-1, -1), si
 
 
 def make_varlen_inputs(
-    seq_lens, num_heads=8, num_kv_heads=None, head_dim=64,
-    dtype=torch.bfloat16, seed=0,
+    seq_lens,
+    num_heads=8,
+    num_kv_heads=None,
+    head_dim=64,
+    dtype=torch.bfloat16,
+    seed=0,
 ):
     """Random varlen-packed q/k/v plus matching cu_seqlens / seq_lens."""
     num_kv_heads = num_kv_heads or num_heads
@@ -101,15 +106,21 @@ def make_varlen_inputs(
 
     def rnd(shape, scale):
         return (
-            torch.randn(shape, generator=gen, device=device, dtype=torch.float32) * scale
-        ).to(dtype).contiguous()
+            (
+                torch.randn(shape, generator=gen, device=device, dtype=torch.float32)
+                * scale
+            )
+            .to(dtype)
+            .contiguous()
+        )
 
     q = rnd((total, num_heads, head_dim), 0.5)
     k = rnd((total, num_kv_heads, head_dim), 0.5)
     v = rnd((total, num_kv_heads, head_dim), 1.0)
     cu = torch.tensor(
         [0, *torch.cumsum(torch.tensor(seq_lens), 0).tolist()],
-        device=device, dtype=torch.int32,
+        device=device,
+        dtype=torch.int32,
     )
     seq_lens_t = cu[1:] - cu[:-1]
     return q, k, v, cu, seq_lens_t, max(seq_lens)
@@ -152,7 +163,8 @@ class TestTritonAttentionWindowSink(CustomTestCase):
         torch.testing.assert_close(
             torch.softmax(torch.tensor([1.0, 2.0, 3.0]), -1),
             torch.tensor([0.090031, 0.244728, 0.665241]),
-            atol=1e-5, rtol=1e-5,
+            atol=1e-5,
+            rtol=1e-5,
         )
 
         # full attention, no sink: softmax over [1, 2, 3]
@@ -219,7 +231,15 @@ class TestTritonAttentionWindowSink(CustomTestCase):
         scale = 1.0 / math.sqrt(q.shape[-1])
         o = torch.empty_like(q)
         context_attention_fwd(
-            q, k, v, o, cu, seq_lens, max_len, is_causal=False, sm_scale=scale,
+            q,
+            k,
+            v,
+            o,
+            cu,
+            seq_lens,
+            max_len,
+            is_causal=False,
+            sm_scale=scale,
             window_size=self.WINDOW,
         )
         ref = ref_varlen_attention(q, k, v, cu.tolist(), scale, window_size=self.WINDOW)
@@ -232,7 +252,15 @@ class TestTritonAttentionWindowSink(CustomTestCase):
         sinks = rand_sinks(q.shape[1])
         o = torch.empty_like(q)
         context_attention_fwd(
-            q, k, v, o, cu, seq_lens, max_len, is_causal=False, sm_scale=scale,
+            q,
+            k,
+            v,
+            o,
+            cu,
+            seq_lens,
+            max_len,
+            is_causal=False,
+            sm_scale=scale,
             sinks=sinks,
         )
         ref = ref_varlen_attention(q, k, v, cu.tolist(), scale, sinks=sinks)
@@ -245,8 +273,17 @@ class TestTritonAttentionWindowSink(CustomTestCase):
         sinks = rand_sinks(q.shape[1])
         o = torch.empty_like(q)
         context_attention_fwd(
-            q, k, v, o, cu, seq_lens, max_len, is_causal=False, sm_scale=scale,
-            window_size=self.WINDOW, sinks=sinks,
+            q,
+            k,
+            v,
+            o,
+            cu,
+            seq_lens,
+            max_len,
+            is_causal=False,
+            sm_scale=scale,
+            window_size=self.WINDOW,
+            sinks=sinks,
         )
         ref = ref_varlen_attention(
             q, k, v, cu.tolist(), scale, window_size=self.WINDOW, sinks=sinks
@@ -264,8 +301,17 @@ class TestTritonAttentionWindowSink(CustomTestCase):
         sinks = rand_sinks(q.shape[1], seed=5678)
         o = torch.empty_like(q)
         context_attention_fwd(
-            q, k, v, o, cu, seq_lens, max_len, is_causal=False, sm_scale=scale,
-            window_size=self.WINDOW, sinks=sinks,
+            q,
+            k,
+            v,
+            o,
+            cu,
+            seq_lens,
+            max_len,
+            is_causal=False,
+            sm_scale=scale,
+            window_size=self.WINDOW,
+            sinks=sinks,
         )
         ref = ref_varlen_attention(
             q, k, v, cu.tolist(), scale, window_size=self.WINDOW, sinks=sinks
@@ -289,8 +335,17 @@ class TestTritonAttentionWindowSink(CustomTestCase):
             with self.subTest(window=window):
                 o = torch.empty_like(q)
                 context_attention_fwd(
-                    q, k, v, o, cu, seq_lens, max_len, is_causal=False,
-                    sm_scale=scale, window_size=window, sinks=sinks,
+                    q,
+                    k,
+                    v,
+                    o,
+                    cu,
+                    seq_lens,
+                    max_len,
+                    is_causal=False,
+                    sm_scale=scale,
+                    window_size=window,
+                    sinks=sinks,
                 )
                 ref = ref_varlen_attention(
                     q, k, v, cu.tolist(), scale, window_size=window, sinks=sinks
@@ -299,7 +354,10 @@ class TestTritonAttentionWindowSink(CustomTestCase):
                     torch.isnan(o.float()).any(), f"NaN leaked with window {window}"
                 )
                 torch.testing.assert_close(
-                    o.float(), ref.float(), atol=ATOL, rtol=RTOL,
+                    o.float(),
+                    ref.float(),
+                    atol=ATOL,
+                    rtol=RTOL,
                     msg=f"mismatch for window {window}",
                 )
 
@@ -313,8 +371,16 @@ class TestTritonAttentionWindowSink(CustomTestCase):
             with self.subTest(window=window):
                 o = torch.empty_like(q)
                 context_attention_fwd(
-                    q, k, v, o, cu, seq_lens, max_len, is_causal=False,
-                    sm_scale=scale, window_size=window,
+                    q,
+                    k,
+                    v,
+                    o,
+                    cu,
+                    seq_lens,
+                    max_len,
+                    is_causal=False,
+                    sm_scale=scale,
+                    window_size=window,
                 )
                 ref = ref_varlen_attention(
                     q, k, v, cu.tolist(), scale, window_size=window
@@ -323,7 +389,10 @@ class TestTritonAttentionWindowSink(CustomTestCase):
                     torch.isnan(o.float()).any(), f"NaN leaked with window {window}"
                 )
                 torch.testing.assert_close(
-                    o.float(), ref.float(), atol=ATOL, rtol=RTOL,
+                    o.float(),
+                    ref.float(),
+                    atol=ATOL,
+                    rtol=RTOL,
                     msg=f"mismatch for window {window}",
                 )
 
@@ -336,8 +405,16 @@ class TestTritonAttentionWindowSink(CustomTestCase):
         window = (16, 16)
         o = torch.empty_like(q)
         context_attention_fwd(
-            q, k, v, o, cu, seq_lens, max_len,
-            is_causal=True, sm_scale=scale, window_size=window,
+            q,
+            k,
+            v,
+            o,
+            cu,
+            seq_lens,
+            max_len,
+            is_causal=True,
+            sm_scale=scale,
+            window_size=window,
         )
         ref = ref_varlen_attention(
             q, k, v, cu.tolist(), scale, window_size=window, causal=True
@@ -351,7 +428,15 @@ class TestTritonAttentionWindowSink(CustomTestCase):
         o = torch.empty_like(q)
         with self.assertRaises(ValueError):
             context_attention_fwd(
-                q, k, v, o, cu, seq_lens, max_len, is_causal=False, sm_scale=scale,
+                q,
+                k,
+                v,
+                o,
+                cu,
+                seq_lens,
+                max_len,
+                is_causal=False,
+                sm_scale=scale,
                 sinks=torch.zeros(q.shape[1] + 1, device=q.device),
             )
 
@@ -378,7 +463,9 @@ class TestTritonAttentionWindowSink(CustomTestCase):
 
         backend = VisionTritonAttention(use_data_parallel=True)
         out = backend(
-            q, k, v,
+            q,
+            k,
+            v,
             cu_seqlens=cu,
             bsz=2,
             seq_len=64,
@@ -391,9 +478,12 @@ class TestTritonAttentionWindowSink(CustomTestCase):
             q, k, v, cu.tolist(), scale, window_size=window, sinks=sinks
         )
         torch.testing.assert_close(
-            out.float(), ref.float(), atol=ATOL, rtol=RTOL,
+            out.float(),
+            ref.float(),
+            atol=ATOL,
+            rtol=RTOL,
             msg="VisionTritonAttention silently dropped window_size/s_aux "
-                "(issue #37983): output equals full attention without sinks",
+            "(issue #37983): output equals full attention without sinks",
         )
 
     @requires_cuda
@@ -415,10 +505,16 @@ class TestTritonAttentionWindowSink(CustomTestCase):
 
         def run(window, sinks):
             return backend(
-                q, k, v,
-                cu_seqlens=cu, bsz=2, seq_len=64,
-                softmax_scale=scale, max_seqlen=max_len,
-                window_size=window, s_aux=sinks,
+                q,
+                k,
+                v,
+                cu_seqlens=cu,
+                bsz=2,
+                seq_len=64,
+                softmax_scale=scale,
+                max_seqlen=max_len,
+                window_size=window,
+                s_aux=sinks,
             )
 
         out_a = run((16, 16), sinks_a)
@@ -463,10 +559,16 @@ class TestTritonAttentionWindowSink(CustomTestCase):
 
         try:
             out = backend(
-                q, k, v,
-                cu_seqlens=cu, bsz=2, seq_len=64,
-                softmax_scale=scale, max_seqlen=max_len,
-                window_size=window, s_aux=sinks,
+                q,
+                k,
+                v,
+                cu_seqlens=cu,
+                bsz=2,
+                seq_len=64,
+                softmax_scale=scale,
+                max_seqlen=max_len,
+                window_size=window,
+                s_aux=sinks,
             )
         except (NotImplementedError, RuntimeError, TypeError) as e:
             self.skipTest(f"FA3 sinks/window unavailable in this build: {e}")

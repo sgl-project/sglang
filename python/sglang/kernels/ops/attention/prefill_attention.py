@@ -245,9 +245,7 @@ def context_attention_fwd(
         if not sinks.is_contiguous():
             raise ValueError("sinks must be contiguous")
         if sinks.device != q.device:
-            raise ValueError(
-                f"sinks on {sinks.device} but q on {q.device}"
-            )
+            raise ValueError(f"sinks on {sinks.device} but q on {q.device}")
 
     grid = (batch, head, triton.cdiv(max_input_len, BLOCK))
     num_warps = 8 if Lk > 64 else 4
