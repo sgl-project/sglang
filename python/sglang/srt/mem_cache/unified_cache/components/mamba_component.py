@@ -553,7 +553,15 @@ class MambaComponent(TreeComponent):
 
         if is_finished:
             if cache_len is None:
-                cache_len = 0
+                # No new mamba state was tracked for the final extend chunk (it
+                # was shorter than mamba_cache_chunk_size). Fall back to the
+                # prefix already committed by the chunked inserts so the
+                # finish-time insert still re-touches it: an empty key would
+                # skip the write-through trigger that chunked=True deferred,
+                # leaving a chunk-boundary prefix unbacked forever. That prefix
+                # is already in the tree, so the insert is a pure re-touch and
+                # the prepared mamba value is discarded (mamba_exist=True).
+                cache_len = req.cache_protected_len
             if self.cache.enable_mamba_extra_buffer:
                 keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_keep_idx(
                     req
