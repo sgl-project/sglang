@@ -88,10 +88,30 @@ class TestMamba(unittest.TestCase):
             pool.use_mla = False
             self.assertEqual(pool.get_kv_layer_ids(), [3, 7, 3, 7])
 
-        # NPU MLA exposes separate latent KV and RoPE key buffers per layer.
+        # Use the real NPU buffer accessor, with CPU tensors and no NPU allocation.
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+            NPUMLATokenToKVPool,
+        )
+
+        backing = object.__new__(NPUMLATokenToKVPool)
+        backing.layer_num = 2
+        backing.k_buffer = torch.zeros(2, 3, 4)
+        backing.v_buffer = torch.zeros(2, 3, 2)
+        pool.full_kv_pool = backing
         with patch("sglang.srt.mem_cache.memory_pool._is_npu", True):
             pool.use_mla = True
-            self.assertEqual(pool.get_kv_layer_ids(), [3, 7, 3, 7])
+            for index_head_dim in (None, 4):
+                with self.subTest(index_head_dim=index_head_dim):
+                    backing.index_head_dim = index_head_dim
+                    backing.index_k_buffer = (
+                        torch.zeros(2, 3, index_head_dim)
+                        if index_head_dim is not None
+                        else None
+                    )
+                    ptrs, _, _ = pool.get_contiguous_buf_infos()
+                    ids = pool.get_kv_layer_ids()
+                    self.assertEqual(ids, [3, 7] * (3 if index_head_dim else 2))
+                    self.assertEqual(len(ids), len(ptrs))
 
     def test_mamba_pool(self):
         max_num_reqs = 10

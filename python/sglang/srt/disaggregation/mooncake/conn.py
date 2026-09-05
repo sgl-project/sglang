@@ -1519,25 +1519,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         )
         for i, j in pairs:
             dst_state_ptr = dst_state_data_ptrs[j]
-            src_item_len = src_state_item_lens[i]
-            dst_item_len = (
-                dst_state_item_lens[j]
-                if dst_state_item_lens and j < len(dst_state_item_lens)
-                else src_item_len
-            )
-            if dst_item_len > 0 and src_item_len != dst_item_len:
+            length = src_state_item_lens[i]
+            if dst_state_item_lens and length != dst_state_item_lens[j]:
                 raise RuntimeError(
-                    "Prefill/Decode mamba slot size mismatch "
-                    f"(src item_len={src_item_len}, dst item_len={dst_item_len}). "
-                    "NPU KDA + DSPARK needs the same conv window on both sides; "
-                    "set the same --speculative-dspark-block-size on Prefill and "
-                    "Decode, without enabling DSPARK on Prefill."
+                    "Prefill/Decode Mamba slot size mismatch "
+                    f"(src={length}, dst={dst_state_item_lens[j]}). "
+                    "Configure matching persistent state layouts on both peers."
                 )
-            src_addr = src_state_data_ptrs[i] + src_item_len * int(
-                prefill_mamba_index[0]
-            )
-            dst_addr = dst_state_ptr + dst_item_len * int(dst_mamba_index[0])
-            transfer_blocks.append((src_addr, dst_addr, src_item_len))
+            src_addr = src_state_data_ptrs[i] + length * int(prefill_mamba_index[0])
+            dst_addr = dst_state_ptr + length * int(dst_mamba_index[0])
+            transfer_blocks.append((src_addr, dst_addr, length))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
