@@ -666,20 +666,12 @@ def run_boundary_scans(
     Mf, Cf = _compose_chunk(T, B, reverse=False)
     Mr, Cr = _compose_chunk(T, B, reverse=True)
     M2 = torch.stack([Mf, Mr.flip(0)], dim=1)  # [C, 2, H, dk, dk]
-    C2 = torch.stack([Cf, Cr.flip(0)], dim=1)  # [C, 2, H, dv, dk]
-    state = torch.stack([start, start], dim=0)  # [2, H, dv, dk]
-    boundary = torch.empty(
-        num_chunks, 2, heads, dv, dk, dtype=injections.dtype, device=injections.device
-    )
+    boundary = torch.stack([Cf, Cr.flip(0)], dim=1)  # [C, 2, H, dv, dk]
     flat = boundary.view(num_chunks, 2 * heads, dv, dk)
+    state = torch.stack([start, start], dim=0).view(2 * heads, dv, dk)
     for c in range(num_chunks):
-        torch.baddbmm(
-            C2[c].view(2 * heads, dv, dk),
-            state.view(2 * heads, dv, dk),
-            M2[c].view(2 * heads, dk, dk),
-            out=flat[c],
-        )
-        state = boundary[c]
+        flat[c].baddbmm_(state, M2[c].view(2 * heads, dk, dk))
+        state = flat[c]
     prefix = torch.zeros(
         num_frames, heads, dv, dk, dtype=injections.dtype, device=injections.device
     )
@@ -858,15 +850,13 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
 
     # ---- the text state -----------------------------------------------------
 
-    def text_state(
+    def text_statistics(
         self,
         text_k_raw: torch.Tensor,
         text_v_raw: torch.Tensor,
         text_beta: torch.Tensor,
-    ) -> torch.Tensor:
-        """S_text [H, dv, dk] fp32: the whole prompt written into a zero state as
-        one delta-rule chunk (no conv, no causal scan; alpha plays no part
-        because the old state is zero), scaled by TEXT_STATE_SCALE."""
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """(A [1, H, dk, dk], B [1, H, dv, dk]) fp32 of the prompt rows, no conv."""
         length = text_k_raw.shape[0]
         heads, head_dim = text_k_raw.shape[1], self.head_dim
         key = linear_features(
@@ -879,6 +869,19 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         value = value.view(1, length, heads, head_dim).permute(0, 2, 1, 3)
         beta = text_beta.view(1, length, heads).permute(0, 2, 1)
         A, B = frame_statistics(key, value, beta, a_fp32=self.hybrid.a_fp32)
+        return A, B, length
+
+    def text_state(
+        self,
+        text_k_raw: torch.Tensor,
+        text_v_raw: torch.Tensor,
+        text_beta: torch.Tensor,
+    ) -> torch.Tensor:
+        """S_text [H, dv, dk] fp32: the whole prompt written into a zero state as
+        one delta-rule chunk (no conv, no causal scan; alpha plays no part
+        because the old state is zero), scaled by TEXT_STATE_SCALE."""
+        A, B, length = self.text_statistics(text_k_raw, text_v_raw, text_beta)
+        heads, head_dim = A.shape[1], self.head_dim
         ones = torch.ones(1, heads, head_dim, device=A.device, dtype=_FP32)
         _, injection = delta_factor_apply(
             self.hybrid.delta_rule, ones, A, B, tokens_per_frame=length
@@ -920,11 +923,19 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         num_frames, per_frame = layout.num_frames, layout.tokens_per_frame
         bounds = hybrid.window_bounds(num_frames)
         text_state = None
+        text_stats = None
         if hybrid.enable_text_state:
             if text_k_raw is None or text_v_raw is None or text_beta is None:
                 raise ValueError("enable_text_state needs the prompt rows' k/v/beta")
             if text_k_raw.shape[0] > 0:
-                text_state = self.text_state(text_k_raw, text_v_raw, text_beta)
+                if hybrid.delta_rule == "vdn_solve":
+                    # vdn_solve ignores tokens_per_frame, so the prompt joins the batch
+                    A_text, B_text, _ = self.text_statistics(
+                        text_k_raw, text_v_raw, text_beta
+                    )
+                    text_stats = (A_text, B_text)
+                else:
+                    text_state = self.text_state(text_k_raw, text_v_raw, text_beta)
 
         skip_ends = hybrid.anchor_frames == "both"
         n_heads = q_raw.shape[1]
@@ -942,6 +953,7 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
                 layout.frame_size,
                 text_state,
                 heads,
+                text_stats=text_stats,
             )
         out = q_raw.new_empty(num_frames * per_frame, n_heads * self.head_dim)
         if num_frames <= 2:
@@ -961,6 +973,7 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
             text_state,
             heads,
             frame_offset=1,
+            text_stats=text_stats,
         )
         out[:per_frame].zero_()
         out[(num_frames - 1) * per_frame :].zero_()
@@ -982,6 +995,7 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         text_state: torch.Tensor | None,
         heads: slice | None,
         frame_offset: int = 0,
+        text_stats: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         n_heads, head_dim = q_raw.shape[1], self.head_dim
         shape = (num_frames, per_frame, n_heads, head_dim)
@@ -1032,9 +1046,19 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         del prepared
         alpha = self.alpha(frame_mean, heads=heads)
         # 3. scans
+        if text_stats is not None:
+            # the prompt leads as a virtual frame; alpha 1 since its old state is zero
+            A = torch.cat([text_stats[0], A])
+            B = torch.cat([text_stats[1], B])
+            alpha_all = torch.cat([alpha.new_ones((1,) + alpha.shape[1:]), alpha])
+        else:
+            alpha_all = alpha
         transitions, injections = delta_factor_apply(
-            self.hybrid.delta_rule, alpha, A, B, tokens_per_frame=per_frame
+            self.hybrid.delta_rule, alpha_all, A, B, tokens_per_frame=per_frame
         )
+        if text_stats is not None:
+            text_state = TEXT_STATE_SCALE * injections[0]
+            transitions, injections = transitions[1:], injections[1:]
         prefix, suffix = run_boundary_scans(
             transitions,
             injections,
