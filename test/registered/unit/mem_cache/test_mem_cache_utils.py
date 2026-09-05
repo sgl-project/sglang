@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.evict_policy import (
     SLRUStrategy,
 )
 from sglang.srt.mem_cache.utils import (
+    chain_prior_hash,
     compute_node_event_hash_values,
     compute_node_hash_values,
     get_eviction_strategy,
@@ -56,10 +57,11 @@ def _legacy_page_hashes(key, page_size, prior_hash=None):
 
 
 class _HashKey:
-    def __init__(self, token_ids, is_bigram=False, cache_salt=None):
+    def __init__(self, token_ids, is_bigram=False, cache_salt=None, extra_key=None):
         self.token_ids = token_ids
         self.is_bigram = is_bigram
         self.cache_salt = cache_salt
+        self.extra_key = extra_key
 
     def __len__(self):
         if self.is_bigram:
@@ -75,8 +77,13 @@ class _HashKey:
                     self.token_ids[start : stop + 1],
                     is_bigram=True,
                     cache_salt=self.cache_salt,
+                    extra_key=self.extra_key,
                 )
-            return _HashKey(self.token_ids[start:stop], cache_salt=self.cache_salt)
+            return _HashKey(
+                self.token_ids[start:stop],
+                cache_salt=self.cache_salt,
+                extra_key=self.extra_key,
+            )
         if self.is_bigram:
             return (self.token_ids[index], self.token_ids[index + 1])
         return self.token_ids[index]
@@ -333,16 +340,58 @@ class TestComputeNodeHashValues(unittest.TestCase):
             compute_node_event_hash_values(self._make_node(key), page_size=8),
             _legacy_page_hashes(key, page_size=8, prior_hash=seed),
         )
-        self.assertEqual(
-            compute_node_hash_values(self._make_node(key), page_size=8),
-            _legacy_page_hashes(key, page_size=8),
-        )
 
         other = _HashKey(array("q", range(1, 17)), cache_salt="tenant-b")
         self.assertNotEqual(
             compute_node_event_hash_values(self._make_node(key), page_size=8),
             compute_node_event_hash_values(self._make_node(other), page_size=8),
         )
+
+    def test_storage_hash_chain_is_namespaced(self):
+        """Requests whose extra_key or cache_salt differ must not name the same
+        L3 storage page even when their token ids are identical (#26747). The
+        ('a', 'bc') / ('ab', 'c') pair additionally pins that the two parts stay
+        distinguishable once concatenated."""
+        tokens = array("q", range(1, 17))
+        namespaced = [
+            _HashKey(tokens, extra_key="tenant-a"),
+            _HashKey(tokens, extra_key="tenant-b"),
+            _HashKey(tokens, cache_salt="tenant-a"),
+            _HashKey(tokens, extra_key="tenant-a", cache_salt="tenant-a"),
+            _HashKey(tokens, extra_key="a", cache_salt="bc"),
+            _HashKey(tokens, extra_key="ab", cache_salt="c"),
+        ]
+
+        hashes = [
+            tuple(compute_node_hash_values(self._make_node(key), page_size=8))
+            for key in namespaced
+        ]
+        default = tuple(
+            compute_node_hash_values(self._make_node(_HashKey(tokens)), page_size=8)
+        )
+
+        self.assertEqual(len(set(hashes)), len(hashes))
+        self.assertNotIn(default, set(hashes))
+
+    def test_extra_key_stays_out_of_event_hashes(self):
+        """extra_key has no field in the KV-event schema, so a published chain
+        seeded with it emits block hashes that a token-based routing consumer
+        cannot recompute. It still seeds the storage chain, with or without a
+        cache_salt alongside."""
+        tokens = array("q", range(1, 17))
+        for cache_salt in (None, "tenant-a"):
+            with self.subTest(cache_salt=cache_salt):
+                plain = _HashKey(tokens, cache_salt=cache_salt)
+                keyed = _HashKey(tokens, extra_key="lora-a", cache_salt=cache_salt)
+
+                self.assertEqual(
+                    compute_node_event_hash_values(self._make_node(plain), page_size=8),
+                    compute_node_event_hash_values(self._make_node(keyed), page_size=8),
+                )
+                self.assertNotEqual(
+                    compute_node_hash_values(self._make_node(plain), page_size=8),
+                    compute_node_hash_values(self._make_node(keyed), page_size=8),
+                )
 
     def test_cache_salt_event_hashes_are_memoized(self):
         node = self._make_node(
@@ -417,6 +466,67 @@ class TestComputeNodeHashValues(unittest.TestCase):
                     _legacy_page_hashes(
                         child_key, page_size=8, prior_hash=expected_prior
                     ),
+                )
+
+
+class TestStorageWriteLookupParity(unittest.TestCase):
+    """The L3 write side (radix node insert) and the lookup side
+    (``HiCacheController._storage_hit_query``) must name the same page for the
+    same namespace, whether the chain starts fresh or continues from a prefix."""
+
+    _NAMESPACES = [
+        ("default", None, None),
+        ("extra_key", "tenant-a", None),
+        ("cache_salt", None, "tenant-a"),
+        ("both", "tenant-a", "tenant-b"),
+    ]
+
+    def _write_side(self, key, page_size, parent_hash_values=None):
+        node = MagicMock()
+        node.key = key
+        node.event_hash_value = None
+        if parent_hash_values is None:
+            node.parent = None
+        else:
+            parent = MagicMock()
+            parent.key = key
+            parent.hash_value = parent_hash_values
+            node.parent = parent
+        return compute_node_hash_values(node, page_size=page_size)
+
+    def _lookup_side(self, key, page_size, last_hash=None):
+        prior_hash = chain_prior_hash(
+            last_hash, extra_key=key.extra_key, cache_salt=key.cache_salt
+        )
+        return get_hash_str(key, prior_hash, page_size=page_size)
+
+    def test_fresh_chain_matches(self):
+        tokens = array("q", range(1, 33))
+        for name, extra_key, cache_salt in self._NAMESPACES:
+            with self.subTest(name=name):
+                key = _HashKey(tokens, extra_key=extra_key, cache_salt=cache_salt)
+                self.assertEqual(
+                    self._write_side(key, page_size=8),
+                    self._lookup_side(key, page_size=8),
+                )
+
+    def test_continued_chain_matches(self):
+        for name, extra_key, cache_salt in self._NAMESPACES:
+            with self.subTest(name=name):
+                prefix = _HashKey(
+                    array("q", range(1, 17)), extra_key=extra_key, cache_salt=cache_salt
+                )
+                suffix = _HashKey(
+                    array("q", range(17, 33)),
+                    extra_key=extra_key,
+                    cache_salt=cache_salt,
+                )
+                prefix_hashes = self._write_side(prefix, page_size=8)
+                self.assertEqual(
+                    self._write_side(
+                        suffix, page_size=8, parent_hash_values=prefix_hashes
+                    ),
+                    self._lookup_side(suffix, page_size=8, last_hash=prefix_hashes[-1]),
                 )
 
 

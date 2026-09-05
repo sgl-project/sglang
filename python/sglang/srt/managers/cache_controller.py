@@ -544,9 +544,10 @@ class HiCacheController:
         # Rollback-safe init: if creation fails, keep controller state consistent
         # for future attach attempts.
         self.storage_backend_type = storage_backend
-        from sglang.srt.mem_cache.utils import get_hash_str
+        from sglang.srt.mem_cache.utils import chain_prior_hash, get_hash_str
 
         self.get_hash_str = get_hash_str
+        self.chain_prior_hash = chain_prior_hash
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
         )
@@ -1172,7 +1173,13 @@ class HiCacheController:
         storage_query_count = 0
         hash_value = []
         page_hashes = self.get_hash_str(
-            tokens_to_fetch, last_hash, page_size=self.page_size
+            tokens_to_fetch,
+            self.chain_prior_hash(
+                last_hash,
+                extra_key=tokens_to_fetch.extra_key,
+                cache_salt=tokens_to_fetch.cache_salt,
+            ),
+            page_size=self.page_size,
         )
         operation.all_hash_values = page_hashes
 
