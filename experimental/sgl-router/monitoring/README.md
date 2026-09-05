@@ -34,6 +34,10 @@ The dashboard graphs every family the router emits:
 | `sgl_router_decode_affinity_total` | Counter | PD decode-affinity outcomes |
 | `sgl_router_sticky_total` | Counter | Sticky-session selection outcomes |
 
+The legacy `sgl_router_overlap_blocks` metric was removed with the
+`cache_aware_zmq` policy and has no direct replacement. Remove queries, alerts,
+and dashboard panels that depend on this metric before upgrading.
+
 The `sgl_router_workers` / `sgl_router_worker_*` gauges are sampled from the
 live worker registry on every scrape, so a removed worker stops emitting
 series immediately rather than leaving a stale value.

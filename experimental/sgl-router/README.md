@@ -68,6 +68,17 @@ The Indexer replaces the Router-local radix tree as the native Cache-Aware
 signal. Query timeouts and local concurrency are bounded by the two Indexer
 options, which default to 100 ms and 32 respectively.
 
+## Upgrading from `cache_aware_zmq`
+
+The `cache_aware_zmq` policy has been removed. Configurations using it should
+select `--policy cache_aware` and choose a native cache-prefix source: the
+Router-local radix tree (the default), or the external Indexer shown above.
+
+The legacy `--cache-threshold`, `--balance-abs-threshold`, and
+`--balance-rel-threshold` flags have also been removed. They do not have
+one-to-one replacements; remove them and review the current `sgl-router
+--help` output when tuning Cache-Aware routing.
+
 ## License
 
 Apache-2.0.
