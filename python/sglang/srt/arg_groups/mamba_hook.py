@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
+    _no_buffer_overlap_ok,
     resolving_view,
     supports_mamba_cache_extra_buffer,
 )
@@ -142,7 +143,11 @@ def validate_mamba_extra_buffer(view, model_arch: str, *, mamba_cache_chunk_size
 
 def validate_mamba_no_buffer(view, model_arch: str):
     assert view.page_size in (1, None), "no_buffer only supports page_size=1."
-    assert view.disable_overlap_schedule, (
+    # Overlap is normally unsafe with no_buffer because the radix donates the
+    # live mamba slot via copy_from; the archs in _NO_BUFFER_OVERLAP_ARCHS are
+    # whitelisted because their windowed conv state cannot race the in-flight
+    # forward (see overrides._no_buffer_overlap_ok).
+    assert view.disable_overlap_schedule or _no_buffer_overlap_ok(model_arch), (
         "no_buffer do not support overlap schedule. Try to set disable_overlap_schedule=True."
     )
     assert view.attention_backend != "trtllm_mha", (
