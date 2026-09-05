@@ -346,8 +346,8 @@ class EmbeddingCacheController:
         self,
         tp_rank,
         tp_size,
-        embedding_store: EmbeddingStore,
-        max_pool_size_gb=4.0,
+        max_pool_size_gb: float,
+        embedding_store: Optional[EmbeddingStore] = None,
         hidden_dims: dict = None,
         tp_group=None,
         all_rank_get=False,
@@ -375,8 +375,9 @@ class EmbeddingCacheController:
             "vision": self.vision_pool,
             "audio": self.audio_pool,
         }
-        self._register_pool_buffer(self.vision_pool)
-        self._register_pool_buffer(self.audio_pool)
+        if self.embedding_store is not None:
+            self._register_pool_buffer(self.vision_pool)
+            self._register_pool_buffer(self.audio_pool)
 
         self.entries = {}
         # self.lock protects entries, pool allocators, entry state/pins,
@@ -399,20 +400,15 @@ class EmbeddingCacheController:
 
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
-        self.io_thread = threading.Thread(target=self._io_loop, daemon=True)
-        self.io_thread.start()
+        self.io_thread = None
+        if self.embedding_store is not None:
+            self.io_thread = threading.Thread(target=self._io_loop, daemon=True)
+            self.io_thread.start()
 
-        if self.tp_world_size > 1:
+        if self.all_rank_get and self.tp_world_size > 1:
             if self.tp_group is None:
                 raise ValueError("tp_group must be provided when tp_size > 1")
-            from sglang.srt.distributed.parallel_state import (
-                create_custom_parallel_group,
-            )
-
-            group_ranks = torch.distributed.get_process_group_ranks(self.tp_group)
-            self.prefetch_tp_group = create_custom_parallel_group(
-                group_ranks=group_ranks, backend="gloo"
-            )
+            self.prefetch_tp_group = self.tp_group
         else:
             self.prefetch_tp_group = None
 
@@ -568,6 +564,9 @@ class EmbeddingCacheController:
         modality=None,
     ):
         """Issues ONE batch GET for cache-hit embeddings that are not local yet."""
+        if self.embedding_store is None:
+            return
+
         pool = self._get_pool(modality)
         if pool is None:
             logger.warning(f"prefetch: unknown modality {modality}; skipping.")
@@ -632,6 +631,9 @@ class EmbeddingCacheController:
         If an entry was never stored (e.g. store_to_pool_async allocation failed),
         it is silently skipped.
         """
+        if self.embedding_store is None:
+            return
+
         pool = self._get_pool(modality)
         if pool is None:
             logger.warning(f"insert_batch: unknown modality {modality}; skipping.")
@@ -1063,7 +1065,7 @@ class EmbeddingCacheController:
         local_hit_count = sum(local_results)
 
         global_hit_count = 0
-        if not all(local_results):
+        if self.embedding_store is not None and not all(local_results):
             missing_indices = [i for i, res in enumerate(local_results) if not res]
             missing_hashes = [mm_hashes[i] for i in missing_indices]
 

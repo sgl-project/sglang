@@ -252,6 +252,41 @@ class TestPrepareServerArgs(CustomTestCase):
             )
         )
 
+    def test_mm_global_cache_args(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        base_args = ["--model-path", DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN]
+
+        default_args = parser.parse_args(base_args)
+        self.assertIsNone(default_args.mm_global_cache_backend)
+        self.assertEqual(default_args.mm_global_cache_size_gb, 4.0)
+
+        configured_args = parser.parse_args(
+            [
+                *base_args,
+                "--mm-global-cache-backend",
+                "mooncake",
+                "--mm-global-cache-size-gb",
+                "0.5",
+            ]
+        )
+        self.assertEqual(
+            configured_args.mm_global_cache_backend,
+            "mooncake",
+        )
+        self.assertEqual(configured_args.mm_global_cache_size_gb, 0.5)
+
+    def test_mm_global_cache_size_validation(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mm_global_cache_size_gb=0,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "mm_global_cache_size_gb must be positive"
+        ):
+            serving_hook.handle_multimodal(server_args)
+
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write("mm-process-config:\n  image:\n    resize: 128\n")
