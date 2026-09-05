@@ -111,18 +111,15 @@ def run_skip_softmax(
     max_seqlen_kv: int,
     softmax_scale: float,
     causal: bool,
-    threshold_scale_factor: float,
+    threshold_scale_factor: float | None,
     q_seq_lens_cpu: torch.Tensor | None = None,
     kv_seq_lens_cpu: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run FlashInfer's BLASST kernel on packed [T, H, D] Q/K/V."""
+    """Run FlashInfer TRTLLM attention, optionally with BLASST sparsity."""
     _validate_inputs(query, key, value)
     capability = torch.cuda.get_device_capability(query.device)
     workspace = _get_workspace(query.device)
-    query, key, value = (
-        tensor if tensor.stride(-1) == 1 else tensor.contiguous()
-        for tensor in (query, key, value)
-    )
+    query, key, value = (tensor.contiguous() for tensor in (query, key, value))
 
     common_kwargs = dict(
         seq_lens=seq_lens,

@@ -9,6 +9,12 @@ from unittest.mock import patch
 import torch
 
 from sglang.multimodal_gen.runtime.layers.attention import layer as layer_module
+from sglang.multimodal_gen.runtime.layers.attention.backends import (
+    flash_attn as flash_attn_module,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
+    FlashAttentionImpl,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     denoising as denoising_module,
 )
@@ -47,6 +53,32 @@ def _fake_layer(
         dtype=torch.bfloat16,
         is_cross_attention=is_cross_attention,
     )
+
+
+class TestSkipSoftmaxDispatch(unittest.TestCase):
+    def test_dense_trtllm_precedes_skip_threshold(self):
+        impl = FlashAttentionImpl(
+            num_heads=2,
+            head_size=128,
+            causal=False,
+            softmax_scale=128**-0.5,
+        )
+        params = SimpleNamespace(start_step=14, threshold_scale_factor=500.0)
+        with patch.object(
+            flash_attn_module, "get_request_skip_softmax_params", return_value=params
+        ):
+            with patch.object(
+                flash_attn_module,
+                "get_forward_context",
+                return_value=SimpleNamespace(current_timestep=13),
+            ):
+                self.assertEqual(impl._request_skip_softmax_threshold(), (True, None))
+            with patch.object(
+                flash_attn_module,
+                "get_forward_context",
+                return_value=SimpleNamespace(current_timestep=14),
+            ):
+                self.assertEqual(impl._request_skip_softmax_threshold(), (True, 500.0))
 
 
 class TestMaybeOverrideAttentionBackend(unittest.TestCase):

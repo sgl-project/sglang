@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     AttentionMetadata,
     AttentionMetadataBuilder,
+    trailing_padding_used_len,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.skip_softmax import (
     get_fixed_sequence_metadata,
@@ -382,12 +383,15 @@ class FlashAttentionImpl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.is_cross_attention = is_cross_attention
+        self.packed_trailing_padding = extra_impl_args.get(
+            "packed_trailing_padding", False
+        )
         self.attention_metadata = FlashAttentionMetadata()
 
-    def _active_skip_softmax_threshold(self) -> float | None:
+    def _request_skip_softmax_threshold(self) -> tuple[bool, float | None]:
         params = get_request_skip_softmax_params()
         if params is None or self.is_cross_attention:
-            return None
+            return False, None
         current_step = get_forward_context().current_timestep
         if not isinstance(current_step, Integral):
             raise RuntimeError(
@@ -395,8 +399,8 @@ class FlashAttentionImpl(AttentionImpl):
                 f"step index, got {current_step!r}."
             )
         if current_step < params.start_step:
-            return None
-        return params.threshold_scale_factor
+            return True, None
+        return True, params.threshold_scale_factor
 
     def forward(
         self,
@@ -407,8 +411,8 @@ class FlashAttentionImpl(AttentionImpl):
         *,
         return_softmax_lse: bool = False,
     ):
-        skip_threshold = self._active_skip_softmax_threshold()
-        if skip_threshold is not None:
+        use_trtllm, skip_threshold = self._request_skip_softmax_threshold()
+        if use_trtllm:
             if return_softmax_lse:
                 raise NotImplementedError(
                     "Skip Softmax does not support the LSE output required by "
@@ -513,8 +517,41 @@ class FlashAttentionImpl(AttentionImpl):
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
-        skip_threshold = self._active_skip_softmax_threshold()
-        if skip_threshold is not None:
+        use_trtllm, skip_threshold = self._request_skip_softmax_threshold()
+        if use_trtllm:
+            bounds = cu_seqlens_host
+            used = (
+                trailing_padding_used_len(
+                    total_tokens=query.shape[0],
+                    max_seqlen=max_seqlen,
+                    bounds=bounds,
+                )
+                if self.packed_trailing_padding and bounds is not None
+                else None
+            )
+            if used is not None:
+                live_cu_seqlens = cu_seqlens[:2]
+                live_output = run_skip_softmax(
+                    query[:used],
+                    key[:used],
+                    value[:used],
+                    seq_lens=live_cu_seqlens[1:] - live_cu_seqlens[:-1],
+                    cu_seqlens_q=live_cu_seqlens,
+                    cu_seqlens_kv=live_cu_seqlens,
+                    max_seqlen_q=used,
+                    max_seqlen_kv=used,
+                    softmax_scale=self.softmax_scale,
+                    causal=self.causal,
+                    threshold_scale_factor=skip_threshold,
+                    q_seq_lens_cpu=get_host_sequence_lengths(bounds[:2]),
+                    kv_seq_lens_cpu=get_host_sequence_lengths(bounds[:2]),
+                )
+                output = live_output.new_zeros(
+                    query.shape[0], query.shape[1], value.shape[2]
+                )
+                output[:used] = live_output
+                return output
+
             seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
             seq_lens_cpu = (
                 get_host_sequence_lengths(cu_seqlens_host)
