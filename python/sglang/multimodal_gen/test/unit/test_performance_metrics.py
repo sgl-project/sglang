@@ -35,6 +35,18 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _discrete_host_for_worker_tests(monkeypatch):
+    # The worker's budget is the device's free memory on a discrete GPU; on a
+    # shared host/device pool it is the pool's available share instead (see
+    # test_shared_memory_pool). These tests describe the discrete case.
+    monkeypatch.setattr(
+        type(current_platform),
+        "device_shares_host_memory",
+        classmethod(lambda cls: False),
+    )
+
+
 def _perf_record(memory_snapshots: dict[str, dict]) -> RequestPerfRecord:
     return RequestPerfRecord(
         request_id="request",
