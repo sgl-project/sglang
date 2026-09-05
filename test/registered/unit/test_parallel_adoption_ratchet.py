@@ -43,6 +43,10 @@ _SWEPT_DIRS = ("",)
 _EXEMPT = (
     "distributed/",  # parallel_state: defines the canonical getters
     "runtime_context.py",  # delegates DCP reads to canonical getters
+    # Where `get_parallel().<dim>` is defined: each derived width is
+    # declared beside its leaves with the live reading a built group
+    # gives, so naming the canonical getter here is the point.
+    "arg_groups/fields/parallel.py",
     "layers/dp_attention.py",  # delegation substrate for the attn-DP dims
     "layers/dcp/comm.py",  # deprecated out-of-tree DCP compatibility shims
     # The dumper's megatron plugin calls third-party getters that share the
