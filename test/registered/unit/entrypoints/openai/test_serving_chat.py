@@ -506,6 +506,41 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
 
+    def _convert_with_stubbed_messages(self, request):
+        """Run _convert_to_internal_request with message processing stubbed out."""
+        with (
+            patch(
+                "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+            ) as conv_mock,
+            patch.object(self.chat, "_process_messages") as proc_mock,
+        ):
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_ins.image_data = conv_ins.audio_data = None
+            conv_ins.modalities = []
+            conv_ins.stop_str = ["</s>"]
+            conv_mock.return_value = conv_ins
+            proc_mock.return_value = MessageProcessingResult(
+                "Test prompt",
+                [1, 2, 3],
+                None,
+                None,
+                [],
+                ["</s>"],
+                None,
+            )
+            adapted, _ = self.chat._convert_to_internal_request(request)
+            return adapted
+
+    def test_convert_to_internal_request_forwards_max_thinking_tokens(self):
+        self.basic_req.max_thinking_tokens = 1024
+        adapted = self._convert_with_stubbed_messages(self.basic_req)
+        self.assertEqual(adapted.max_thinking_tokens, 1024)
+
+    def test_convert_to_internal_request_leaves_thinking_budget_unset(self):
+        adapted = self._convert_with_stubbed_messages(self.basic_req)
+        self.assertIsNone(adapted.max_thinking_tokens)
+
     def test_chat_applies_pd_header_overrides(self):
         request = ChatCompletionRequest(
             model="x",
