@@ -26,6 +26,7 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2CacheParams,
     Mamba2StateShape,
 )
+from sglang.srt.configs.qwen3_vl import Qwen3VLMoeVisionConfig
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.get_logger(__name__)
@@ -225,3 +226,52 @@ class BailingHybridConfig(PretrainedConfig):
         )
 
         return Mamba2CacheParams(shape=shape, layers=self.linear_layer_ids)
+
+
+class BailingMoeV3VLConfig(PretrainedConfig):
+    model_type = "bailing_moe_v3_vl"
+
+    def __init__(
+        self,
+        text_config=None,
+        vision_config=None,
+        image_token_id=157157,
+        video_token_id=156909,
+        vision_start_token_id=157158,
+        vision_end_token_id=157159,
+        tie_word_embeddings=False,
+        mrope_section=None,
+        **kwargs,
+    ):
+        if isinstance(vision_config, dict):
+            vision_config = Qwen3VLMoeVisionConfig(**vision_config)
+        elif vision_config is None:
+            vision_config = Qwen3VLMoeVisionConfig()
+
+        if isinstance(text_config, dict):
+            text_config = BailingHybridConfig(**text_config)
+        elif text_config is None:
+            text_config = BailingHybridConfig()
+
+        self.vision_config = vision_config
+        self.text_config = text_config
+        self.image_token_id = image_token_id
+        self.video_token_id = video_token_id
+        self.vision_start_token_id = vision_start_token_id
+        self.vision_end_token_id = vision_end_token_id
+
+        if mrope_section is None:
+            mrope_section = text_config.rope_parameters.get(
+                "mrope_section", [8, 12, 12]
+            )
+        self.mrope_section = mrope_section
+        text_config.rope_parameters.update(
+            rope_type="default",
+            mrope_section=mrope_section,
+            video_rope=True,
+        )
+
+        if self.text_config.architectures is None:
+            self.text_config.architectures = ["BailingMoeV3ForCausalLM"]
+
+        super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)

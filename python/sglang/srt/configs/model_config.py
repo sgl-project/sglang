@@ -1135,15 +1135,20 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_config.v_head_dim
             self._init_mla_scaling(self.hf_config.rope_scaling)
-        elif "BailingMoeV3ForCausalLM" in self.hf_config.architectures:
+        elif (
+            "BailingMoeV3ForCausalLM" in self.hf_config.architectures
+            or "BailingMoeV3VLForConditionalGeneration" in self.hf_config.architectures
+        ):
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
-            self.kv_lora_rank = self.hf_config.kv_lora_rank
+            self.kv_lora_rank = self.hf_text_config.kv_lora_rank
             self.qk_rope_head_dim = (
-                0 if self.hf_config.use_mla_nope else self.hf_config.qk_rope_head_dim
+                0
+                if getattr(self.hf_text_config, "use_mla_nope", False)
+                else self.hf_text_config.qk_rope_head_dim
             )
-            self.v_head_dim = self.hf_config.v_head_dim
-            self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
+            self.v_head_dim = self.hf_text_config.v_head_dim
+            self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
             self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
         elif (
             "SarvamMLAForCausalLM" in self.hf_config.architectures
@@ -2084,6 +2089,9 @@ multimodal_model_archs = [
     "StepVLForConditionalGeneration",
     "Step3p7ForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
+    "BailingMMNativeForConditionalGeneration",
+    "BailingMM2NativeForConditionalGeneration",
+    "BailingMoeV3VLForConditionalGeneration",
 ]
 
 piecewise_cuda_graph_disabled_model_archs = [
