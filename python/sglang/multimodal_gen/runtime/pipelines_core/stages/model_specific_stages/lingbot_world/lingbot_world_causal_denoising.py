@@ -109,15 +109,45 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             for _ in range(self.num_transformer_blocks)
         ]
 
+    def _lingbot_local_token_scale(self) -> int:
+        """Rows this rank holds per N global rows: N for token-sharded, else 1."""
+        from sglang.multimodal_gen.runtime.models.dits.lingbot_world import (
+            lingbot_sp_strategy,
+        )
+
+        try:
+            ws = get_ulysses_parallel_world_size()
+        except AssertionError:
+            # no sequence-parallel group -> nothing is sharded
+            return 1
+        if ws > 1 and lingbot_sp_strategy() in ("kvgather_sharded", "ring"):
+            return ws
+        return 1
+
+    def _get_causal_sink_tokens(self) -> int:
+        return super()._get_causal_sink_tokens() // self._lingbot_local_token_scale()
+
+    def _causal_kv_cache_global_sink_tokens_for_batch(self, batch) -> int:
+        return (
+            super()._causal_kv_cache_global_sink_tokens_for_batch(batch)
+            // self._lingbot_local_token_scale()
+        )
+
     def _get_causal_kv_cache_size(
         self,
         *,
         sequence_shard_enabled: bool = False,
     ) -> int:
         if self.local_attn_size != -1:
-            return self.local_attn_size * self.num_token_per_frame
+            tokens = self.local_attn_size * self.num_token_per_frame
+        else:
+            tokens = self.sliding_window_num_frames * self.num_token_per_frame
 
-        return self.sliding_window_num_frames * self.num_token_per_frame
+        if sequence_shard_enabled:
+            # kvgather_sharded and ring hold their slice of the window
+            # rather than all of it.
+            tokens //= self._lingbot_local_token_scale()
+        return tokens
 
     def _causal_sequence_shard_enabled(self, batch: Req) -> bool:
         return bool(
@@ -132,6 +162,15 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
     ) -> int:
         num_attention_heads = self.transformer.num_attention_heads
         if not sequence_shard_enabled:
+            return num_attention_heads
+
+        from sglang.multimodal_gen.runtime.models.dits.lingbot_world import (
+            lingbot_sp_strategy,
+        )
+
+        # Only ulysses splits the cache by head; every other strategy shards the
+        # queries instead and therefore needs every head resident.
+        if lingbot_sp_strategy() != "ulysses":
             return num_attention_heads
 
         ulysses_world_size = get_ulysses_parallel_world_size()
