@@ -139,7 +139,8 @@ class SchedulerBatchResultProcessor:
         the full sequence.
 
         Logs a soft warning if the resulting tensor's row count differs from
-        the expected `seqlen - 1 - start_len`, to catch silent regressions.
+        the expected `seqlen - 1 - start_len`, or if the whole tape read back
+        is zero, to catch silent regressions.
         """
         if not req.return_routed_experts:
             return
@@ -171,6 +172,27 @@ class SchedulerBatchResultProcessor:
                 req.seqlen,
                 req.cached_tokens,
                 req.routed_experts_start_len,
+            )
+
+        # The row count above is the length of the slice `get_topk` just took,
+        # so it can only see a truncated `req_to_token` row -- never a tape that
+        # was never written. A forward path that drops the capture handle leaves
+        # the host cache at its zero-initialised contents, and capture only runs
+        # for MoE models, whose router does not pick expert 0 in every layer of
+        # every token. This does NOT catch a tape written into the wrong slots;
+        # that failure is prevented at the source, by the state captures
+        # following the KV through the accepted-path move.
+        if (
+            req.routed_experts is not None
+            and expected_rows > 0
+            and not req.routed_experts.any()
+        ):
+            logger.warning(
+                "routed_experts is entirely zero for req %s (%d rows): the "
+                "capture was never finalized for these KV slots. Check that the "
+                "forward path propagates routed_experts_output.",
+                req.rid,
+                req.routed_experts.shape[0],
             )
 
     def _maybe_collect_indexer_topk(self, req: Req):
