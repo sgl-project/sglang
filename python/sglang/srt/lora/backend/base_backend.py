@@ -1,11 +1,15 @@
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 import triton
 import triton.language as tl
 
 from sglang.srt.lora.backend.lmhead_mixing import LoRABackendLmHeadMixing
-from sglang.srt.lora.utils import LoRABatchInfo, MoELoRABatchInfo
+from sglang.srt.lora.utils import (
+    LoRABatchInfo,
+    MoELoRABatchInfo,
+    get_batch_token_counts,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -19,11 +23,45 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         device: the device where the backend runs.
     """
 
+    supports_lora_a_overlap = False
+    skip_inactive_lora_batches = False
+
+    # Supporting backends implement init_prefill_cuda_graph_batch_info() and
+    # honor use_prefill_cuda_graph in prepare_lora_batch().
+    supports_prefill_cuda_graph: bool = False
+
     def __init__(self, max_loras_per_batch: int, device: torch.device):
         self.max_loras_per_batch = max_loras_per_batch
         self.device = device
+        # Set by prepare_lora_batch() before each forward; cleared by
+        # reset_batch_state() on DP-attention idle forwards. None means "no
+        # batch prepared" — the LoRA layers read it to skip LoRA application.
+        self.batch_info: Optional[LoRABatchInfo] = None
         self.init_lm_head_config()
         self._is_moe_lora = False
+        # Static metadata read by prefill-CUDA-graph kernels, refreshed in
+        # place every prefill batch.
+        self.prefill_cuda_graph_batch_info: LoRABatchInfo | None = None
+        # Request/token caps for serving a batch from the static metadata.
+        self.prefill_cuda_graph_max_bs: int | None = None
+        self.prefill_cuda_graph_max_tokens: int | None = None
+
+    def reset_batch_state(self):
+        """Idle-forward counterpart of prepare_lora_batch(): clears all
+        per-batch metadata. batch_info=None is the master "no batch
+        prepared" signal that the layer guards (lora_active) read."""
+        self.batch_info = None
+        self.lm_head_batch_info = None
+        self.lm_head_pass_batch_infos = None
+        self._lm_head_pass_idx = None
+
+    def validate_lora_targets(
+        self,
+        base_model: torch.nn.Module,
+        target_modules: set[str],
+    ) -> None:
+        """Raise before wrapping when this backend cannot execute its targets."""
+        pass
 
     def run_lora_a_embedding(
         self,
@@ -149,7 +187,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
     def init_cuda_graph_batch_info(
         self,
         max_bs_in_cuda_graph: int,
-        num_tokens_per_bs: int,
+        num_tokens_per_req: int,
     ):
         """Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
 
@@ -157,9 +195,16 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
 
         Args:
             max_bs_in_cuda_graph: maximum batch size for CUDA Graph mode
-            num_tokens_per_bs: number of tokens per sequence (1 for decoding, >1 for target_verify)
+            num_tokens_per_req: number of tokens per sequence (1 for decoding, >1 for target_verify)
         """
         pass
+
+    def init_prefill_cuda_graph_batch_info(self, max_num_tokens: int):
+        """Allocate static LoRA batch metadata for the prefill CUDA graph,
+        sized for the largest captured token bucket. Called before capture."""
+        raise NotImplementedError(
+            f"LoRA backend {type(self).__name__} does not support the prefill CUDA graph."
+        )
 
     @property
     def is_moe_lora(self) -> bool:
@@ -266,16 +311,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
             adapter_enabled = None
             token_lora_mapping = None
 
-        num_tokens = (
-            sum(forward_batch.extend_seq_lens_cpu)
-            if forward_batch.forward_mode.is_extend()
-            else forward_batch.batch_size
-        )
-        max_len = (
-            max(forward_batch.extend_seq_lens_cpu)
-            if forward_batch.forward_mode.is_extend()
-            else 1
-        )
+        num_tokens, max_len = get_batch_token_counts(forward_batch)
 
         if (
             batch_info.req_seg_indptr is not None
@@ -317,20 +353,28 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         lora_ranks: list[int],
         scalings: list[float],
         use_cuda_graph: bool,
+        use_prefill_cuda_graph: bool = False,
     ):
         """Prepare the lora weights and batch info for current forward batch.
 
-        This method provides a hook for each backend to conduct its own preparation
-        logic for each forward batch.
-
-        Args:
-            forward_batch: the ForwardBatch object for current forward pass
-            weight_indices: list of indices of lora weights to be applied for current batch
-            lora_ranks: list of lora ranks corresponding to weight_indices
-            scalings: list of scaling factors corresponding to weight_indices
-            use_cuda_graph: whether to use CUDA Graph for this batch
+        use_cuda_graph / use_prefill_cuda_graph select in-place updates of the
+        static decode / prefill CUDA graph batch info respectively.
         """
         pass
+
+    def prepare_lora_token_segments(
+        self,
+        *,
+        segment_lens: list[int],
+        weight_indices: list[int],
+        lora_ranks: list[int],
+        scalings: list[float],
+    ) -> None:
+        """Prepare explicit eager token-row LoRA segments."""
+        raise NotImplementedError(
+            f"LoRA backend {type(self).__name__} does not support explicit "
+            "token segments."
+        )
 
 
 @triton.jit
@@ -375,9 +419,9 @@ def _compute_moe_lora_info(
     max_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if token_lora_mapping is not None:
-        assert (
-            num_tokens <= token_lora_mapping.shape[0]
-        ), "num_tokens must be less than or equal to the shape of token_lora_mapping"
+        assert num_tokens <= token_lora_mapping.shape[0], (
+            "num_tokens must be less than or equal to the shape of token_lora_mapping"
+        )
         token_lora_mapping = token_lora_mapping[:num_tokens]
     else:
         token_lora_mapping = torch.empty(
@@ -385,9 +429,9 @@ def _compute_moe_lora_info(
         )
 
     if adapter_enabled is not None:
-        assert (
-            len(lora_ranks) <= adapter_enabled.shape[0]
-        ), "lora_ranks must be less than or equal to the shape of adapter_enabled"
+        assert len(lora_ranks) <= adapter_enabled.shape[0], (
+            "lora_ranks must be less than or equal to the shape of adapter_enabled"
+        )
     else:
         adapter_enabled = torch.empty(
             len(lora_ranks), dtype=torch.int32, device=lora_ranks.device

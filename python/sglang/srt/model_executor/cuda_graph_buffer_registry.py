@@ -32,7 +32,10 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.model_executor.input_buffers import share_input_buffer
+from sglang.srt.model_executor.input_buffers import (
+    INDEX_SEMANTIC_BUFFERS,
+    share_input_buffer,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -100,7 +103,7 @@ class FillContext:
 
     Carries both the bs-axis and tokens-axis raw/padded counts so a hook can
     derive values regardless of its own slot's axis — e.g. the padded token
-    count (``padded_num_tokens`` == padded_bs * num_tokens_per_bs), which the
+    count (``padded_num_tokens`` == padded_bs * num_tokens_per_req), which the
     global-num-tokens fill and the local-num-token-non-padded transform need.
     """
 
@@ -514,10 +517,13 @@ def build_decode_registry(
     enable_mamba_track: bool = False,
     is_encoder_decoder: bool = False,
     encoder_len_fill_value: int = 0,
+    encoder_lens_dtype: torch.dtype = torch.int32,
     enable_num_token_non_padded: bool = False,
     require_gathered_buffer: bool = False,
     enable_prefill_cp: bool = False,
     require_mlp_tp_gather: bool = False,
+    # Per-bucket attn-TP sharded (SP) predicate; defaults to replicated.
+    attn_tp_sharded_fn: Callable[[int], bool] = lambda num_tokens: False,
     dp_size: int = 1,
     register_global_num_tokens: bool = True,
     share_pool: bool = True,
@@ -632,7 +638,7 @@ def build_decode_registry(
             GraphSlot(
                 "encoder_lens",
                 _bs,
-                torch.int32,
+                encoder_lens_dtype,
                 axis="bs",
                 padding_policy=PaddingPolicy.FILL_ONCE,
                 pad_value=encoder_len_fill_value,
@@ -644,15 +650,24 @@ def build_decode_registry(
         )
 
         def _num_token_non_padded_post_fill(buf, fb, ctx):
-            # Gathered (DP) path overwrites the plain FB copy with this rank's
-            # local count; the non-gathered path keeps the copied value.
-            if require_gathered_buffer and not enable_prefill_cp:
-                buf.copy_(
-                    compute_local_num_token_non_padded(
-                        global_num_token_non_padded=fb.num_token_non_padded,
-                        num_tokens_per_dp=ctx.padded_num_tokens,
-                    )
+            # init_new batches localize from the invariant GLOBAL scalar (a
+            # replicated / CP forward keeps the full count; sharded=False is a
+            # passthrough). The dense SBD draft and TBO sub-batches bypass
+            # init_new -- they leave the GLOBAL None and set the replicated LOCAL
+            # count directly, so carry that through.
+            if fb.global_num_token_non_padded is None:
+                buf.copy_(fb.num_token_non_padded)
+                return
+            sharded = not enable_prefill_cp and attn_tp_sharded_fn(
+                ctx.padded_num_tokens
+            )
+            buf.copy_(
+                compute_local_num_token_non_padded(
+                    global_num_token_non_padded=fb.global_num_token_non_padded,
+                    num_tokens_per_dp=ctx.padded_num_tokens,
+                    sharded=sharded,
                 )
+            )
 
         slots.append(
             GraphSlot(
@@ -660,6 +675,7 @@ def build_decode_registry(
                 lambda _bs, _mt: (1,),
                 torch.int32,
                 axis="none",
+                copy_from_fb=False,
                 post_fill=_num_token_non_padded_post_fill,
             )
         )
@@ -774,6 +790,22 @@ def build_decode_registry(
                     bind=canary,
                 )
 
+    # ZERO covers replay; a mid-serving recapture is covered by
+    # ForwardInputBuffers.reset_index_buffers, which keys off
+    # INDEX_SEMANTIC_BUFFERS. Diverge and one of the two skips a buffer.
+    registered = set(reg.slot_names())
+    zero_slots = {
+        name
+        for name in registered
+        if reg.get_slot(name).padding_policy is PaddingPolicy.ZERO
+    }
+    expected_zero = INDEX_SEMANTIC_BUFFERS & registered
+    assert zero_slots == expected_zero, (
+        "ZERO-policy slots and INDEX_SEMANTIC_BUFFERS disagree: "
+        f"zero_but_unlisted={sorted(zero_slots - expected_zero)}, "
+        f"listed_but_not_zero={sorted(expected_zero - zero_slots)}"
+    )
+
     return reg
 
 
@@ -787,12 +819,17 @@ def build_prefill_registry(
     hidden_size: int = 0,
     embed_dtype: Optional[torch.dtype] = None,
     enable_mamba_track: bool = False,
+    enable_num_token_non_padded: bool = False,
+    require_gathered_buffer: bool = False,
+    enable_prefill_cp: bool = False,
+    # Per-bucket attn-TP sharded (SP) predicate; defaults to replicated.
+    attn_tp_sharded_fn: Callable[[int], bool] = lambda num_tokens: False,
     register_input_embeds: bool = True,
     share_pool: bool = True,
     source: Optional[Any] = None,
 ) -> CudaGraphBufferRegistry:
     """Registry mirroring the **token-axis** FB-shared buffers for the
-    piecewise / breakable (prefill) cuda-graph runners.
+    piecewise / breakable / full (prefill) cuda-graph runners.
 
     ``register_input_embeds`` (default ``True``) registers the multimodal
     ``input_embeds`` slot; the eager extend path passes ``False`` so it is
@@ -875,6 +912,43 @@ def build_prefill_registry(
         slots.append(GraphSlot("mamba_track_indices", _bs, torch.int64, axis="bs"))
         slots.append(GraphSlot("mamba_track_mask", _bs, torch.bool, axis="bs"))
         slots.append(GraphSlot("mamba_track_seqlens", _bs, torch.int32, axis="bs"))
+    if enable_num_token_non_padded:
+        from sglang.srt.model_executor.forward_batch_info import (
+            compute_local_num_token_non_padded_cpu,
+        )
+
+        def _prefill_num_token_non_padded_post_fill(buf, fb, ctx):
+            # LOCAL count for the PADDED bucket, derived from the invariant
+            # GLOBAL host int: replay pads rows up to the capture bucket, which
+            # moves the shard boundary, so the count must be recomputed against
+            # the bucket rather than copied. A replicated / CP forward keeps the
+            # full count (sharded=False is a passthrough).
+            if fb.global_num_token_non_padded_cpu is not None:
+                sharded = not enable_prefill_cp and attn_tp_sharded_fn(
+                    ctx.padded_num_tokens
+                )
+                buf.fill_(
+                    compute_local_num_token_non_padded_cpu(
+                        global_num_token_non_padded=fb.global_num_token_non_padded_cpu,
+                        num_tokens_per_dp=ctx.padded_num_tokens,
+                        sharded=sharded,
+                    )
+                )
+            else:
+                # Non-gathered FullCG still needs the live boundary rather
+                # than a stale/absent ForwardBatch value.
+                buf.fill_(ctx.raw_num_tokens)
+
+        slots.append(
+            GraphSlot(
+                "num_token_non_padded",
+                lambda _bs2, _mt: (1,),
+                torch.int32,
+                axis="none",
+                copy_from_fb=False,
+                post_fill=_prefill_num_token_non_padded_post_fill,
+            )
+        )
 
     for slot in slots:
         bind = None
@@ -886,6 +960,38 @@ def build_prefill_registry(
                     "prefill registry; cannot adopt."
                 )
         reg.register_slot(slot, bind=bind)
+
+    # PP stage inputs live outside ForwardBatch; adopt runner-owned buffers for
+    # stable addresses and clear padding because prefill executes every bucket row.
+    if source is not None:
+        pp = getattr(source, "pp_proxy_tensors", None)
+        if pp is not None:
+
+            def _pp_source(key):
+                def _fn(_fb, ctx):
+                    ppx = ctx.pp_proxy_tensors
+                    # Proxy contracts vary by model. The capture buffers are a
+                    # stable-address superset; only copy fields present in the
+                    # live proxy for this model.
+                    return None if ppx is None else ppx.tensors.get(key)
+
+                return _fn
+
+            for _key, _backing in pp.items():
+                reg.register_slot(
+                    GraphSlot(
+                        name=f"pp_proxy_tensors.{_key}",
+                        shape_fn=lambda _bs, mt, _tail=tuple(_backing.shape[1:]): (
+                            mt,
+                            *_tail,
+                        ),
+                        dtype=_backing.dtype,
+                        axis="tokens",
+                        padding_policy=PaddingPolicy.ZERO,
+                        source_fn=_pp_source(_key),
+                    ),
+                    bind=_backing,
+                )
     return reg
 
 
@@ -898,6 +1004,7 @@ def build_eager_registry(
     enable_mamba_track: bool = False,
     is_encoder_decoder: bool = False,
     encoder_len_fill_value: int = 0,
+    encoder_lens_dtype: torch.dtype = torch.int32,
     dp_size: int = 1,
 ) -> CudaGraphBufferRegistry:
     """One fixed-max input registry for the ``EagerRunner``, serving BOTH eager
@@ -924,6 +1031,7 @@ def build_eager_registry(
         enable_mamba_track=enable_mamba_track,
         is_encoder_decoder=is_encoder_decoder,
         encoder_len_fill_value=encoder_len_fill_value,
+        encoder_lens_dtype=encoder_lens_dtype,
         enable_num_token_non_padded=False,
         register_global_num_tokens=False,
         require_gathered_buffer=False,

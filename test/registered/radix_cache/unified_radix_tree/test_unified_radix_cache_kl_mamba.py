@@ -3,11 +3,11 @@ import shutil
 import tempfile
 import unittest
 
-from test_unified_radix_cache_kl_nightly import AccuracyTwoPassMixin
-
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
+from sglang.test.kits.unified_radix_cache_kit import (
+    AccuracyTwoPassMixin,
+    UnifiedRadixTreeTestMixin,
+)
 from sglang.test.kl_multiturn_utils import (
     get_input_ids,
     make_mamba_decode_assert,
@@ -18,6 +18,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=800, stage="extra-b", runner_config="4-gpu-h100")
@@ -59,6 +60,8 @@ class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "extra_buffer",
                 "--mamba-track-interval",
                 str(MAMBA_TRACK_INTERVAL),
+                "--mamba-max-states-per-path",
+                "3",
             ],
             env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
@@ -66,7 +69,7 @@ class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
 
 # ─── Mamba + HiCache L2 ──────────────────────────────────────────────────────
@@ -125,7 +128,7 @@ class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
 
 # ─── Mamba + HiCache L3 (file backend) ───────────────────────────────────────
@@ -177,6 +180,14 @@ class TestUnifiedMambaHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
                 "--max-mamba-cache-size",
                 "500",
                 "--weight-loader-prefetch-checkpoints",
+                "--speculative-algorithm",
+                "NEXTN",
+                "--speculative-num-steps",
+                "3",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "4",
             ],
             env={
                 "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
@@ -186,7 +197,7 @@ class TestUnifiedMambaHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
         if os.path.isdir(cls.hicache_dir):
             shutil.rmtree(cls.hicache_dir, ignore_errors=True)
 

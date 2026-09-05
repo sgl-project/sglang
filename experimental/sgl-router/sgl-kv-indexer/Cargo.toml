@@ -1,0 +1,35 @@
+[package]
+name = "sgl-kv-indexer"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "In-memory KV cache indexer with a SGLang KV-event bridge"
+publish = false  # experimental crate; not published to crates.io
+
+[lib]
+name = "sgl_kv_indexer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kv-indexer-server"
+path = "src/bin/kv-indexer-server.rs"
+
+[[bin]]
+name = "kv-indexer-bridge"
+path = "src/bin/kv-indexer-bridge.rs"
+
+[dependencies]
+bytes = "1"
+prost = "0.14"
+rmpv = "1.3.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tonic = { version = "0.14.6", features = ["transport"] }
+tonic-prost = "0.14.6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# Must mirror the router's feature set: Cargo unifies features across the
+# workspace, so enabling more transports here also enlarges the router binary.
+zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14.6"

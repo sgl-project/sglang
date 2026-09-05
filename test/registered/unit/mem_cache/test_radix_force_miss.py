@@ -12,6 +12,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 import unittest
 import unittest.mock
 from array import array
+from types import SimpleNamespace
 
 import torch
 
@@ -31,14 +32,15 @@ class _StubReq:
         self.origin_input_ids = array("q", token_ids)
         self.output_ids = array("q")
         self.extra_key = None
+        self.cache_salt = None
         self.prefix_indices = None
         self.last_node = None
         self.last_host_node = None
         self.best_match_node = None
         self.host_hit_length = None
         self.num_matched_prefix_tokens = 0
-        self.mamba_branching_seqlen = None
-        self.cache_protected_len = None
+        self.swa_branching_seqlen = None
+        self.kv = SimpleNamespace(cache_protected_len=None)
 
     def _compute_max_prefix_len(self, input_len):
         return max(input_len - 1, 0)
@@ -78,6 +80,28 @@ class TestZeroMatchResult(unittest.TestCase):
 
 
 class TestMatchPrefixForReqForceMiss(unittest.TestCase):
+    def test_swa_branching_seqlen_is_cleared_without_new_branch(self):
+        class _StubTreeCache:
+            def swa_reprefill_tail_tokens(self):
+                return 0
+
+            def match_prefix(self, params):
+                return MatchResult(
+                    device_indices=torch.empty((0,), dtype=torch.int64),
+                    last_device_node=None,
+                    last_host_node=None,
+                    best_match_node=None,
+                    host_hit_length=0,
+                    swa_branching_seqlen=None,
+                )
+
+        req = _StubReq([1, 2, 3, 4])
+        req.swa_branching_seqlen = 8
+
+        match_prefix_for_req(_StubTreeCache(), req)
+
+        self.assertIsNone(req.swa_branching_seqlen)
+
     def test_force_miss_zeros_req_prefix(self):
         tree = RadixCache.create_simulated()
         tree.insert(

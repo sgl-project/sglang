@@ -7,6 +7,9 @@ import json
 
 import torch
 
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -16,7 +19,6 @@ logger = init_logger(__name__)
 
 
 class PromptEnhancementStage(PipelineStage):
-
     def __init__(self, pe_model, pe_tokenizer):
         super().__init__()
         self.pe_model = pe_model
@@ -60,7 +62,7 @@ class PromptEnhancementStage(PipelineStage):
         else:
             batch.prompt = enhanced
 
-        logger.info("PE enhanced prompt: %s", batch.prompt)
+        logger.debug("PE enhanced prompt: %s", batch.prompt)
         return batch
 
     def _enhance_single_prompt(
@@ -96,3 +98,10 @@ class PromptEnhancementStage(PipelineStage):
         )
 
         return output["text"].strip()
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        if not isinstance(self.pe_model, torch.nn.Module):
+            return []
+        return [ComponentUse(self._component_stage_name(stage_name), "pe")]

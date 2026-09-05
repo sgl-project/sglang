@@ -10,7 +10,7 @@ import unittest
 import torch
 
 import sglang as sgl
-from sglang.bench_offline_throughput import BenchArgs, throughput_test
+from sglang.benchmark.offline_throughput import BenchArgs, throughput_test
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -25,7 +25,6 @@ register_amd_ci(est_time=261, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestSRTEngine(CustomTestCase):
-
     def test_1_engine_runtime_consistency(self):
         prompt = "Today is a sunny day and I like"
         model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST

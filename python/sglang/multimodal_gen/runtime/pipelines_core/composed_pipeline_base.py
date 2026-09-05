@@ -9,7 +9,7 @@ This module defines the base class for pipelines that are composed of multiple s
 
 import os
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Literal, cast
+from typing import Any, Callable, Iterator, Literal, cast
 
 import torch
 from tqdm import tqdm
@@ -18,12 +18,10 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import (
     RoleType,
     filter_modules_for_role,
 )
-from sglang.multimodal_gen.runtime.layers.attention.selector import (
-    component_attn_backend_context_manager,
-)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
 )
+from sglang.multimodal_gen.runtime.loader.utils import _normalize_component_type
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_loading_order import (
     ComponentLoadSpec,
     order_component_load_specs,
@@ -56,6 +54,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model,
+    prepare_diffusers_component_path_for_loading,
     verify_model_config_and_directory,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -75,6 +74,7 @@ class ComposedPipelineBase(ABC):
     is_video_pipeline: bool = False  # To be overridden by video pipelines
     # should contains only the modules to be loaded
     _required_config_modules: list[str] = []
+    _unfiltered_required_config_modules: tuple[str, ...] = ()
     _extra_config_module_map: dict[str, str] = {}
     server_args: ServerArgs | None = None
     modules: dict[str, Any] = {}
@@ -82,6 +82,7 @@ class ComposedPipelineBase(ABC):
 
     # the name of the pipeline it associated with, in diffusers
     pipeline_name: str
+    default_model_subfolder: str | None = None
 
     def is_lora_effective(self):
         return False
@@ -119,7 +120,8 @@ class ComposedPipelineBase(ABC):
         )
         if base_required_config_modules is None:
             raise NotImplementedError("Subclass must set _required_config_modules")
-        self._required_config_modules = list(base_required_config_modules)
+        self._unfiltered_required_config_modules = tuple(base_required_config_modules)
+        self._required_config_modules = list(self._unfiltered_required_config_modules)
         self._extra_config_module_map = dict(self._extra_config_module_map)
 
         # Filter modules based on disaggregation role
@@ -132,6 +134,7 @@ class ComposedPipelineBase(ABC):
                 extra_allowed_modules=self._get_extra_allowed_modules_for_role(
                     self._disagg_role, task_name
                 ),
+                structural_component_names=self._extra_config_module_map,
             )
             skipped = set(original_modules) - set(self._required_config_modules)
             if skipped:
@@ -172,7 +175,35 @@ class ComposedPipelineBase(ABC):
         self.modules[module_name] = module
 
     def _load_config(self) -> dict[str, Any]:
-        model_path = maybe_download_model(self.model_path, force_diffusers_model=True)
+        model_subfolder = self.server_args.model_subfolder
+        if model_subfolder is None and not os.path.isfile(
+            os.path.join(self.model_path, "model_index.json")
+        ):
+            model_subfolder = self.default_model_subfolder
+
+        if model_subfolder is None:
+            model_path = maybe_download_model(
+                self.model_path,
+                force_diffusers_model=True,
+                revision=self.server_args.revision,
+            )
+        else:
+            model_subfolder = os.path.normpath(model_subfolder)
+            if (
+                os.path.isabs(model_subfolder)
+                or model_subfolder == ".."
+                or model_subfolder.startswith(f"..{os.sep}")
+            ):
+                raise ValueError(
+                    f"model_subfolder must stay inside the model repository: {model_subfolder!r}"
+                )
+            model_root = maybe_download_model(
+                self.model_path,
+                allow_patterns=[f"{model_subfolder}/**"],
+                revision=self.server_args.revision,
+            )
+            model_path = os.path.join(model_root, model_subfolder)
+
         self.model_path = model_path
         logger.info("Model path: %s", model_path)
         config = verify_model_config_and_directory(model_path)
@@ -230,6 +261,7 @@ class ComposedPipelineBase(ABC):
                 "QwenImageEditPipeline": {"vae"},
                 "QwenImageEditPlusPipeline": {"vae"},
                 "QwenImageLayeredPipeline": {"vae", "transformer"},
+                "LongCatImageEditPipeline": {"vae"},
                 "GlmImagePipeline": {"vae", "transformer"},
                 "WanImageToVideoPipeline": {"vae"},
                 "WanImageToVideoDmdPipeline": {"vae"},
@@ -242,6 +274,12 @@ class ComposedPipelineBase(ABC):
         extra_allowed_modules = set(
             role_to_pipeline_modules.get(role, {}).get(self.pipeline_name, set())
         )
+        if (
+            role == RoleType.DENOISER
+            and self.pipeline_name == "GlmImagePipeline"
+            and getattr(self.server_args, "srt_encoder_url", None) is not None
+        ):
+            extra_allowed_modules.update({"text_encoder", "tokenizer", "vae"})
 
         if role == RoleType.DENOISER and task_name == "ti2v":
             if self.pipeline_name in {
@@ -274,11 +312,36 @@ class ComposedPipelineBase(ABC):
             get_diffusers_component_config,
         )
 
-        required = set(self.required_config_modules)
-        for module_name in full_model_index:
-            if module_name in required:
-                continue  # will be loaded normally
-            cfg_attr = self._CONFIG_ATTR_MAP.get(module_name)
+        loaded_components = set(self.required_config_modules)
+        loaded_structural_components = {
+            self._extra_config_module_map.get(name, name)
+            for name in self.required_config_modules
+        }
+        skipped_components: list[tuple[str, str]] = []
+        seen_component_keys = loaded_components | loaded_structural_components
+        for component_name in self._unfiltered_required_config_modules:
+            structural_name = self._extra_config_module_map.get(
+                component_name, component_name
+            )
+            if (
+                component_name in seen_component_keys
+                or structural_name in seen_component_keys
+                or (
+                    component_name not in full_model_index
+                    and structural_name not in full_model_index
+                )
+            ):
+                continue
+            skipped_components.append((component_name, structural_name))
+            seen_component_keys.update((component_name, structural_name))
+        for structural_name in full_model_index:
+            if structural_name not in seen_component_keys:
+                skipped_components.append((structural_name, structural_name))
+
+        for component_name, structural_name in skipped_components:
+            cfg_attr = self._CONFIG_ATTR_MAP.get(
+                _normalize_component_type(structural_name)
+            )
             if cfg_attr is None:
                 continue  # not a config we need to patch
 
@@ -288,7 +351,7 @@ class ComposedPipelineBase(ABC):
 
             try:
                 component_path = self._resolve_component_path(
-                    server_args, module_name, module_name
+                    server_args, component_name, structural_name
                 )
                 hf_config = get_diffusers_component_config(
                     component_path=component_path
@@ -302,7 +365,7 @@ class ComposedPipelineBase(ABC):
                     "Disagg role=%s: initialized %s config from HF JSON "
                     "(spatial_compression_ratio=%s)",
                     self._disagg_role.value,
-                    module_name,
+                    component_name,
                     getattr(
                         getattr(pipeline_cfg, "arch_config", None),
                         "spatial_compression_ratio",
@@ -314,7 +377,7 @@ class ComposedPipelineBase(ABC):
                     "Disagg role=%s: failed to read HF config for skipped "
                     "component %s: %s",
                     self._disagg_role.value,
-                    module_name,
+                    component_name,
                     e,
                 )
 
@@ -323,13 +386,30 @@ class ComposedPipelineBase(ABC):
     ) -> str:
         override_path = server_args.component_paths.get(module_name)
         if override_path is not None:
-            # overridden with args like --vae-path
-            component_model_path = maybe_download_model(override_path)
+            component_model_path = prepare_diffusers_component_path_for_loading(
+                override_path
+            )
         else:
             component_model_path = os.path.join(self.model_path, load_module_name)
 
         logger.debug("Resolved component path: %s", component_model_path)
         return component_model_path
+
+    @staticmethod
+    def _validate_direct_gpu_component_selection(
+        model_index: dict[str, Any], server_args: ServerArgs
+    ) -> None:
+        unavailable = sorted(
+            component_name
+            for component_name in server_args.component_direct_gpu_weight_loading
+            if component_name not in model_index or model_index[component_name] is None
+        )
+        if unavailable:
+            raise ValueError(
+                "--component-direct-gpu-weight-loading selects component(s) "
+                "that are not available in this pipeline: "
+                f"{', '.join(unavailable)}"
+            )
 
     def load_modules(
         self,
@@ -397,20 +477,23 @@ class ComposedPipelineBase(ABC):
         model_index.pop("boundary_ratio", None)
         # used by Wan2.2 ti2v
         model_index.pop("expand_timesteps", None)
+        self._validate_direct_gpu_component_selection(model_index, server_args)
 
         # some sanity checks
-        assert (
-            len(model_index) > 1
-        ), "model_index.json must contain at least one pipeline module"
+        assert len(model_index) > 1, (
+            "model_index.json must contain at least one pipeline module"
+        )
 
         # In disagg mode, read HF config for skipped components (e.g., VAE)
         # so that update_model_arch + post_init can derive pipeline_config.
         if self._disagg_role != RoleType.MONOLITHIC:
             self._init_skipped_component_configs(model_index, server_args)
 
+        declared_modules = model_index
         model_index = {
             required_module: model_index[required_module]
             for required_module in self.required_config_modules
+            if required_module in model_index
         }
 
         for module_name in self.required_config_modules:
@@ -425,15 +508,17 @@ class ComposedPipelineBase(ABC):
                     module_name,
                     extra_module_value,
                 )
-                if extra_module_value in model_index:
+                if extra_module_value in declared_modules:
                     logger.info(
                         "Using module %s for %s", extra_module_value, module_name
                     )
-                    model_index[module_name] = model_index[extra_module_value]
+                    model_index[module_name] = declared_modules[extra_module_value]
                     continue
                 else:
                     raise ValueError(
-                        f"Required module key: {module_name} value: {model_index.get(module_name)} was not found in loaded modules {model_index.keys()}"
+                        f"Required module key: {module_name} value: "
+                        f"{declared_modules.get(module_name)} was not found in "
+                        f"declared modules {declared_modules.keys()}"
                     )
 
         # all the component models used by the pipeline
@@ -444,13 +529,26 @@ class ComposedPipelineBase(ABC):
         component_load_specs: list[ComponentLoadSpec] = []
 
         # enqueue only real weight loads (e.g., scheduler, tokenizer is excluded); skipped/provided modules keep old handling
-        for index, (
-            module_name,
-            (
-                transformers_or_diffusers,
-                architecture,
-            ),
-        ) in enumerate(model_index.items()):
+        for index, (module_name, component_spec) in enumerate(model_index.items()):
+            # Diffusers uses JSON null for unavailable optional components.
+            # Check before unpacking the normal [library, architecture] pair.
+            if component_spec is None:
+                logger.warning(
+                    "Module %s in model_index.json has null value, removing from required_config_modules",
+                    module_name,
+                )
+                if module_name in self.required_config_modules:
+                    self.required_config_modules.remove(module_name)
+                continue
+            if (
+                not isinstance(component_spec, (list, tuple))
+                or len(component_spec) != 2
+            ):
+                raise ValueError(
+                    f"Module {module_name!r} in model_index.json must be null or "
+                    f"a [library, architecture] pair, got {component_spec!r}"
+                )
+            transformers_or_diffusers, architecture = component_spec
             if transformers_or_diffusers is None:
                 logger.warning(
                     "Module %s in model_index.json has null value, removing from required_config_modules",
@@ -515,18 +613,18 @@ class ComposedPipelineBase(ABC):
                     attn_backend.name.lower(),
                     matched_backend_key,
                 )
-            with component_attn_backend_context_manager(
-                attn_backend, component_name=matched_backend_key or module_name
-            ):
-                module, memory_usage = PipelineComponentLoader.load_component(
-                    component_name=load_module_name,
-                    component_model_path=component_model_path,
-                    transformers_or_diffusers=transformers_or_diffusers,
-                    server_args=server_args,
-                    component_architecture=architecture,
-                )
+            module, memory_usage = PipelineComponentLoader.load_component(
+                component_name=module_name,
+                component_type=load_module_name,
+                component_model_path=component_model_path,
+                transformers_or_diffusers=transformers_or_diffusers,
+                server_args=server_args,
+                component_architecture=architecture,
+                component_attn_backend=attn_backend,
+                component_attn_name=matched_backend_key or module_name,
+            )
 
-            self.memory_usages[load_module_name] = memory_usage
+            self.memory_usages[module_name] = memory_usage
 
             if module_name in loaded_components:
                 logger.warning("Overwriting module %s", module_name)
@@ -979,7 +1077,12 @@ class ComposedPipelineBase(ABC):
 
         # Execute each stage
         if not batch.is_warmup and not batch.suppress_logs:
-            logger.info(
+            stage_logger = (
+                logger.debug
+                if server_args.pipeline_config.task_type.is_action_gen()
+                else logger.info
+            )
+            stage_logger(
                 "Running pipeline stages: %s",
                 list(self._stage_name_mapping.keys()),
                 main_process_only=True,
@@ -1007,12 +1110,45 @@ class ComposedPipelineBase(ABC):
             )
 
         if not batches[0].is_warmup and not batches[0].suppress_logs:
-            logger.info(
+            stage_logger = (
+                logger.debug
+                if server_args.pipeline_config.task_type.is_action_gen()
+                else logger.info
+            )
+            stage_logger(
                 "Running grouped pipeline stages: %s",
                 list(self._stage_name_mapping.keys()),
                 main_process_only=True,
             )
 
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager
         return self.executor.execute_group_with_profiling(
             self.stages, batches, server_args
+        )
+
+    @torch.no_grad()
+    def forward_batch_sequentially(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+    ) -> Iterator[OutputBatch]:
+        """Yield grouped outputs as each terminal-stage invocation completes."""
+        if len(batches) == 1 and (
+            not server_args.pipeline_config.supports_sequential_multi_output_inference()
+            or max(1, int(batches[0].num_outputs_per_prompt or 1)) == 1
+        ):
+            yield self.forward(batches[0], server_args)
+            return
+
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager
+        yield from self.executor.execute_group_sequentially_with_profiling(
+            self.stages,
+            batches,
+            server_args,
         )

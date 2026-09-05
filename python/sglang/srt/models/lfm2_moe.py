@@ -12,11 +12,16 @@ Key MoE characteristics:
 - Post-hoc normalization of top-k weights
 """
 
-from typing import Iterable, Optional, Set, Tuple
+from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
 from torch import nn
 
+from sglang.kernels.ops.mamba.lfm_short_conv import (
+    can_dispatch_fused_lfm_short_conv,
+    fused_lfm_short_conv_decode,
+    fused_lfm_short_conv_prefill,
+)
 from sglang.srt.configs.lfm2_moe import Lfm2MoeConfig
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
@@ -42,10 +47,14 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_req_to_token_pool
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
+)
+from sglang.srt.models.lfm2 import (
+    register_shortconv_verify_buffers,
+    shortconv_target_verify,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
@@ -320,6 +329,8 @@ class Lfm2MoeShortConv(nn.Module):
         else:
             self.register_parameter("conv_bias", None)
 
+        register_shortconv_verify_buffers(self)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -328,57 +339,82 @@ class Lfm2MoeShortConv(nn.Module):
         if forward_batch.forward_mode.is_idle():
             return hidden_states
 
-        layer_cache = get_req_to_token_pool().mamba2_layer_cache(self.layer_idx)
-        conv_state = layer_cache.conv[0]
-        req_pool_indices = forward_batch.req_pool_indices
-        mamba_indices = get_req_to_token_pool().get_mamba_indices(req_pool_indices)
+        # The backend owns the per-request conv-state plumbing (slot indices,
+        # prefix mask, cu-seqlens, cuda-graph buffers); this layer just runs its
+        # depthwise conv against the returned handle.
+        meta = get_attn_backend().conv_state_metadata(self.layer_idx, forward_batch)
+        conv_state = meta.layer_cache.conv[0]
 
         proj, _ = self.in_proj(hidden_states)
         B_gate, C_gate, x = proj.chunk(3, dim=-1)
-        Bx = B_gate * x
+        use_fused = can_dispatch_fused_lfm_short_conv(
+            B_gate,
+            C_gate,
+            x,
+            self.conv_weight,
+            self.conv_bias,
+            conv_state,
+        )
 
-        if forward_batch.forward_mode.is_decode():
+        if forward_batch.forward_mode.is_decode() and use_fused:
+            gated_conv_out = fused_lfm_short_conv_decode(
+                B_gate,
+                C_gate,
+                x,
+                self.conv_weight,
+                conv_state,
+                meta.cache_indices,
+            )
+        elif forward_batch.forward_mode.is_decode():
+            Bx = B_gate * x
             conv_out = causal_conv1d_update(
                 Bx,
                 conv_state,
                 self.conv_weight,
                 self.conv_bias,
                 activation=None,
-                conv_state_indices=mamba_indices.to(torch.int32),
+                conv_state_indices=meta.cache_indices,
+            )
+            gated_conv_out = C_gate * conv_out
+        elif forward_batch.forward_mode.is_target_verify():
+            Bx = B_gate * x
+            conv_out = shortconv_target_verify(
+                self, Bx, meta, forward_batch.spec_info.draft_token_num, "LFM2-MoE"
+            )
+            gated_conv_out = C_gate * conv_out
+        elif (
+            use_fused
+            and meta.query_start_loc is not None
+            and meta.has_initial_state is not None
+            and forward_batch.extend_seq_lens_cpu
+        ):
+            gated_conv_out = fused_lfm_short_conv_prefill(
+                B_gate,
+                C_gate,
+                x,
+                self.conv_weight,
+                conv_state,
+                meta.query_start_loc,
+                meta.cache_indices,
+                meta.has_initial_state,
+                max(forward_batch.extend_seq_lens_cpu),
             )
         else:
-            T = hidden_states.shape[0]
+            Bx = B_gate * x
             Bx_t = Bx.transpose(0, 1).contiguous()
-
-            # Build query_start_loc for variable-length sequences
-            # causal_conv1d_fn expects [start0, start1, ..., startN, T]
-            extend_start_loc = forward_batch.extend_start_loc
-            if extend_start_loc is not None and len(extend_start_loc) > 1:
-                # Multiple sequences: append T to extend_start_loc
-                # Allocate and fill to avoid torch.cat overhead
-                query_start_loc = extend_start_loc.new_empty(len(extend_start_loc) + 1)
-                query_start_loc[:-1] = extend_start_loc
-                query_start_loc[-1] = T
-                cache_indices = mamba_indices.to(torch.int32)
-                has_initial_state = forward_batch.extend_prefix_lens > 0
-            else:
-                # Single sequence: [0, T]
-                query_start_loc = hidden_states.new_tensor([0, T], dtype=torch.int32)
-                cache_indices = mamba_indices[:1].to(torch.int32)
-                has_initial_state = forward_batch.extend_prefix_lens[:1] > 0
-
             conv_out = causal_conv1d_fn(
                 Bx_t,
                 self.conv_weight,
                 self.conv_bias,
-                query_start_loc=query_start_loc,
-                cache_indices=cache_indices,
-                has_initial_state=has_initial_state,
+                query_start_loc=meta.query_start_loc,
+                cache_indices=meta.cache_indices,
+                has_initial_state=meta.has_initial_state,
                 conv_states=conv_state,
                 activation=None,
             ).transpose(0, 1)
+            gated_conv_out = C_gate * conv_out
 
-        output, _ = self.out_proj(C_gate * conv_out)
+        output, _ = self.out_proj(gated_conv_out)
         return output
 
 
@@ -400,6 +436,8 @@ class Lfm2MoeDecoderLayer(nn.Module):
         super().__init__()
         self.layer_type = config.layer_types[layer_id]
         self.is_attention_layer = self.layer_type == "full_attention"
+        # Set by Lfm2MoeModel.set_dflash_layers_to_capture for DFlash aux capture.
+        self._is_layer_to_capture = False
 
         self.operator_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.ffn_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
@@ -442,9 +480,13 @@ class Lfm2MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
+        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if not forward_batch.forward_mode.is_idle():
+            if captured_last_layer_outputs is not None:
+                captured_last_layer_outputs.append(hidden_states)
+
             residual = hidden_states
             normed = self.operator_norm(hidden_states)
 
@@ -495,6 +537,15 @@ class Lfm2MoeModel(nn.Module):
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
         self.embedding_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
+        self.layers_to_capture: List[int] = []
+
+    def set_dflash_layers_to_capture(self, layers_to_capture: List[int]):
+        self.layers_to_capture = list(layers_to_capture)
+        for layer_id in self.layers_to_capture:
+            # A tap on the final layer (layer_id == len(self.layers)) is
+            # captured after the loop in forward(); only mark real layers.
+            if layer_id < len(self.layers):
+                self.layers[layer_id]._is_layer_to_capture = True
 
     def forward(
         self,
@@ -508,16 +559,30 @@ class Lfm2MoeModel(nn.Module):
         )
 
         residual = None
+        aux_hidden_states: List[torch.Tensor] = []
         for i in range(len(self.layers)):
-            hidden_states, residual = self.layers[i](
+            layer = self.layers[i]
+            hidden_states, residual = layer(
                 layer_id=i,
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
                 forward_batch=forward_batch,
+                captured_last_layer_outputs=(
+                    aux_hidden_states if layer._is_layer_to_capture else None
+                ),
             )
 
-        return self.embedding_norm(hidden_states)
+        if (
+            not forward_batch.forward_mode.is_idle()
+            and len(self.layers) in self.layers_to_capture
+        ):
+            aux_hidden_states.append(hidden_states)
+
+        hidden_states = self.embedding_norm(hidden_states)
+        if not aux_hidden_states:
+            return hidden_states
+        return hidden_states, aux_hidden_states
 
 
 class Lfm2MoeForCausalLM(nn.Module):
@@ -553,6 +618,25 @@ class Lfm2MoeForCausalLM(nn.Module):
     def get_num_kv_cache_layers(self) -> int:
         return self.num_attention_layers
 
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
+
+    @property
+    def capture_aux_hidden_states(self) -> bool:
+        return bool(self.model.layers_to_capture)
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        # Mark layer L to capture its input, which is the output of layer L-1.
+        self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
+
     @torch.no_grad()
     def forward(
         self,
@@ -563,8 +647,14 @@ class Lfm2MoeForCausalLM(nn.Module):
         **kwargs,
     ):
         hidden_states = self.model(input_ids, positions, forward_batch, inputs_embeds)
+        aux_hidden_states = None
+        # Capture-enabled idle batches return a bare tensor (layers skip the
+        # append on IDLE), so narrow on the actual return shape.
+        if isinstance(hidden_states, tuple):
+            hidden_states, aux_hidden_states = hidden_states
+
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
 
     def load_weights(
@@ -612,6 +702,82 @@ class Lfm2MoeForCausalLM(nn.Module):
             # Handle dense MLP w2 -> down_proj
             if "feed_forward.w2" in name and "experts" not in name:
                 name = name.replace("feed_forward.w2", "feed_forward.down_proj")
+
+            # Transformers >= v5.0 packs MoE expert weights into a single 3D tensor
+            # per projection (experts.gate_up_proj / experts.down_proj) instead of
+            # per-expert weights (experts.{i}.w{1,2,3}.weight). This is the layout an
+            # in-memory Transformers model exposes -- e.g. the update_weights_from_tensor
+            # / RLHF weight-sync path -- so map the packed tensors onto the fused
+            # FusedMoE params (w13_weight / w2_weight) per expert. LFM2-MoE packs
+            # out-features-major (gate_up_proj as [num_experts, 2 * intermediate,
+            # hidden], down_proj as [num_experts, hidden, intermediate]), matching the
+            # FusedMoE layout, so no transpose is needed.
+            if "feed_forward.experts.gate_up_proj" in name:
+                fused_name = name
+                if fused_name.endswith(".weight"):
+                    fused_name = fused_name[: -len(".weight")]
+                fused_name = fused_name.replace(
+                    "feed_forward.experts.gate_up_proj",
+                    "feed_forward.experts.w13_weight",
+                )
+                if fused_name in params_dict:
+                    if loaded_weight.dim() != 3:
+                        raise ValueError(
+                            f"Expected a 3D packed tensor for {name}, got "
+                            f"{loaded_weight.dim()}D {tuple(loaded_weight.shape)}"
+                        )
+                    param = params_dict[fused_name]
+                    weight_loader = param.weight_loader
+                    if loaded_weight.shape[1] % 2 != 0:
+                        raise ValueError(
+                            f"Invalid gate_up_proj shape for {name}: "
+                            f"{tuple(loaded_weight.shape)}"
+                        )
+                    w1, w3 = loaded_weight.chunk(2, dim=1)
+                    for expert_id in range(w1.shape[0]):
+                        weight_loader(
+                            param,
+                            w1[expert_id],
+                            fused_name,
+                            shard_id="w1",
+                            expert_id=expert_id,
+                        )
+                        weight_loader(
+                            param,
+                            w3[expert_id],
+                            fused_name,
+                            shard_id="w3",
+                            expert_id=expert_id,
+                        )
+                    loaded_params.add(fused_name)
+                    continue
+
+            if "feed_forward.experts.down_proj" in name:
+                fused_name = name
+                if fused_name.endswith(".weight"):
+                    fused_name = fused_name[: -len(".weight")]
+                fused_name = fused_name.replace(
+                    "feed_forward.experts.down_proj",
+                    "feed_forward.experts.w2_weight",
+                )
+                if fused_name in params_dict:
+                    if loaded_weight.dim() != 3:
+                        raise ValueError(
+                            f"Expected a 3D packed tensor for {name}, got "
+                            f"{loaded_weight.dim()}D {tuple(loaded_weight.shape)}"
+                        )
+                    param = params_dict[fused_name]
+                    weight_loader = param.weight_loader
+                    for expert_id in range(loaded_weight.shape[0]):
+                        weight_loader(
+                            param,
+                            loaded_weight[expert_id],
+                            fused_name,
+                            shard_id="w2",
+                            expert_id=expert_id,
+                        )
+                    loaded_params.add(fused_name)
+                    continue
 
             # Handle stacked params (QKV, dense MLP gate_up)
             for param_name, weight_name, shard_id in stacked_params_mapping:

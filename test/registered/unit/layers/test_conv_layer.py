@@ -1,7 +1,6 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cuda_ci(est_time=7, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=7, suite="stage-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 import unittest
 
@@ -20,7 +19,6 @@ def _copy_weights(src, dst_nn):
 
 
 class TestConv2dLayer(unittest.TestCase):
-
     def test_basic_patch_embedding(self):
         layer = Conv2dLayer(3, 768, kernel_size=14, stride=14, bias=False)
         ref = nn.Conv2d(3, 768, kernel_size=14, stride=14, bias=False)
@@ -60,10 +58,6 @@ class TestConv2dLayer(unittest.TestCase):
 
     def test_groups_disable_linear(self):
         layer = Conv2dLayer(4, 8, kernel_size=2, stride=2, groups=2)
-        self.assertFalse(layer.enable_linear)
-
-    def test_default_disables_linear(self):
-        layer = Conv2dLayer(3, 768, kernel_size=14, stride=14)
         self.assertFalse(layer.enable_linear)
 
     def test_dilation_disables_linear(self):
@@ -155,7 +149,6 @@ class TestConv2dLayer(unittest.TestCase):
 
 
 class TestConvValidation(unittest.TestCase):
-
     def test_in_channels_not_divisible_by_groups(self):
         with self.assertRaises(ValueError):
             Conv2dLayer(3, 64, kernel_size=3, stride=1, groups=2)
@@ -209,7 +202,6 @@ class TestConvValidation(unittest.TestCase):
 
 
 class TestConv3dLayer(unittest.TestCase):
-
     def test_basic_temporal_patch_embedding(self):
         layer = Conv3dLayer(
             3, 1152, kernel_size=[2, 14, 14], stride=[2, 14, 14], bias=False

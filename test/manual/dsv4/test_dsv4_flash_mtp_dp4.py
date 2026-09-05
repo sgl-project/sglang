@@ -37,7 +37,7 @@ DSV4_FLASH_ENV = {
     "SGLANG_DSV4_FP4_EXPERTS": "0",
     # MTP runs ~num_draft_tokens forward passes per step, so the deepep
     # dispatch input size scales by that factor. Default 256 (used by the
-    # plain server) overflows once cuda-graph-max-bs * num_draft_tokens
+    # plain server) overflows once cuda-graph-max-bs-decode * num_draft_tokens
     # > 256. 1024 covers bs=128 * 4 draft tokens with headroom.
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
 }
@@ -66,7 +66,7 @@ class DSV4FlashMTPServerBase(CustomTestCase):
             "--enable-dp-attention",
             "--moe-a2a-backend",
             "deepep",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "128",
             "--max-running-requests",
             "256",

@@ -8,11 +8,10 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
-from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils import is_hip
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 _is_hip = is_hip()
-_is_npu = is_npu()
 
 
 def _lcm(a: int, b: int) -> int:
@@ -74,9 +73,9 @@ class KVAndScore:
         assert len(tensors) > 0, "At least one tensor is required for concatenation."
         item_size = tensors[0]._item_size
         for v in tensors:
-            assert (
-                v._item_size == item_size
-            ), "All tensors must have the same item size."
+            assert v._item_size == item_size, (
+                "All tensors must have the same item size."
+            )
 
         return KVAndScore(torch.cat([v.kv_score for v in tensors], dim=dim))
 
@@ -95,11 +94,14 @@ class CompressStatePool:
         online: bool = False,
         swa_page_size: int = 0,
         online_mtp_max_draft_tokens: int = 0,
+        state_cache_page_size: int = 1,
     ):
         self.ratio = ratio
         self.ring_size = ring_size
         self.swa_page_size = swa_page_size
+        self.page_size = state_cache_page_size
         self.enable_memory_saver = enable_memory_saver
+        self.online = online
         self.online_mtp_state_slot_offset = 0
         self.online_mtp_max_draft_tokens = 0
 
@@ -115,11 +117,12 @@ class CompressStatePool:
             last_dim = 3 * head_dim
         else:
             self._size = size + self.ring_size + 1
-            # Pad to lcm(ratio, page_size) so the flat buffer reshapes cleanly into
-            # [block_num, page_size, last_dim] for the fused compressor op; page_size=1 falls back to ratio-only padding.
-            pad_to = (
-                _lcm(ratio, swa_page_size) if (swa_page_size > 1 and _is_npu) else ratio
-            )
+            # The common GPU pool is flat by default. A backend that also needs
+            # a physical 3-D cache view can request its second-axis page size;
+            # allocation and ring ownership still stay in this shared class.
+            pad_to = ratio
+            if state_cache_page_size > 1:
+                pad_to = _lcm(pad_to, state_cache_page_size)
             self._size = (self._size + pad_to - 1) // pad_to * pad_to
             self._logical_size = self._size
             last_dim = 2 * (1 + overlap) * head_dim
@@ -129,7 +132,16 @@ class CompressStatePool:
             dtype=dtype, device=device, enable_memory_saver=enable_memory_saver
         )
         if not online:
-            self.kv_score_buffer[-1].clear()
+            if _is_hip and ratio == 128:
+                # Request-scoped C128 state is addressed by req_pool_idx (or a
+                # per-request ring).  The pool is allocated with torch.empty(),
+                # so a cold server can otherwise read uninitialized partial
+                # states before a request slot has been written for the first
+                # time.  Initialize all C128 rows to the empty-state sentinel;
+                # C4 keeps the historical last-row sentinel behavior.
+                self.kv_score_buffer.clear()
+            else:
+                self.kv_score_buffer[-1].clear()
 
     def _alloc_kv_score_buffer(
         self, *, dtype: torch.dtype, device: str, enable_memory_saver: bool
@@ -139,35 +151,29 @@ class CompressStatePool:
         :class:`KVAndScore`. Sets ``self.memory_saver_adapter``,
         ``self.custom_mem_pool`` and ``self.kv_score_buffer``.
 
-        Subclasses (e.g. :class:`NPUCompressStatePool`) that compute a
-        different ``self._size`` reuse this instead of duplicating the
-        allocation boilerplate. Requires ``self._size`` and ``self.last_dim``
-        to be set already.
+        The shared constructor computes ``self._size`` and ``self.last_dim``
+        before entering this helper. Backend subclasses should normally call
+        that constructor instead of duplicating this allocation path.
         """
-        if _is_hip:
-            self.kv_score_buffer = KVAndScore(
-                torch.empty((self._size, self.last_dim), dtype=dtype, device=device)
-            )
-        else:
-            self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-                enable=enable_memory_saver
-            )
-            self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
-                maybe_init_custom_mem_pool(device=device)
-            )
-            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-                with (
-                    torch.cuda.use_mem_pool(self.custom_mem_pool)
-                    if self.custom_mem_pool
-                    else nullcontext()
-                ):
-                    self.kv_score_buffer = KVAndScore(
-                        torch.empty(
-                            (self._size, self.last_dim),
-                            dtype=dtype,
-                            device=device,
-                        )
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
+        )
+        self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
+            maybe_init_custom_mem_pool(device=device)
+        )
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                self.kv_score_buffer = KVAndScore(
+                    torch.empty(
+                        (self._size, self.last_dim),
+                        dtype=dtype,
+                        device=device,
                     )
+                )
 
     @property
     def state_cache_3d(self) -> torch.Tensor:
@@ -195,6 +201,13 @@ class CompressStatePool:
         swa_pages = swa_loc // self.swa_page_size
         state_loc = swa_pages * self.ring_size + (swa_loc % self.ring_size)
         state_loc = torch.where(swa_loc < 0, -1, state_loc)
+        return state_loc
+
+    def translate_from_req_position_to_state_loc(
+        self, req_pool_indices: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        state_loc = req_pool_indices * self.ring_size + positions % self.ring_size
+        state_loc = torch.where(positions < 0, -1, state_loc)
         return state_loc
 
     def get_state_by_state_loc(self, state_loc: torch.Tensor) -> KVAndScore:

@@ -5,20 +5,47 @@
 Denoising stage for diffusion pipelines.
 """
 
+import gc
 import inspect
 import math
-import os
 import time
 import weakref
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
+from enum import Enum
 from functools import lru_cache
 from typing import Any
 
 import torch
 import torch.nn as nn
 
-from sglang.jit_kernel.nvfp4 import prewarm_nvfp4_jit_modules
+from sglang.kernels.ops.diffusion import (
+    mount_flux2_nvfp4_swiglu_quant,
+    mount_fused_gate_rmsnorm,
+    mount_fused_linear_gelu,
+    mount_fused_ln_modulate,
+    mount_helios_gated_residual,
+    mount_hunyuan_qknorm,
+    mount_lingbot_video_gated_residual,
+    mount_lingbot_video_rmsnorm,
+    mount_ltx2_rms_norm_modulate,
+    mount_nvfp4_bias_gelu,
+    mount_qwen_image_added_qkv,
+    mount_sana_video_linear_attention,
+    unmount_flux2_nvfp4_swiglu_quant,
+    unmount_fused_gate_rmsnorm,
+    unmount_fused_linear_gelu,
+    unmount_fused_ln_modulate,
+    unmount_helios_gated_residual,
+    unmount_hunyuan_qknorm,
+    unmount_lingbot_video_gated_residual,
+    unmount_lingbot_video_rmsnorm,
+    unmount_ltx2_rms_norm_modulate,
+    unmount_nvfp4_bias_gelu,
+    unmount_qwen_image_added_qkv,
+    unmount_sana_video_linear_attention,
+)
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
@@ -26,13 +53,23 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     FluxPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    quality_allows_kernel_fusions,
+    resolve_skip_softmax_params,
+)
+from sglang.multimodal_gen.runtime.breakable_cuda_graph import (
+    prompt_padding as bcg_utils,
+)
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
+    cache_dit_overrides_key,
+    disable_cache_on_transformer,
     enable_cache_on_dual_transformer,
     enable_cache_on_transformer,
     get_scm_mask,
     refresh_context_on_dual_transformer,
     refresh_context_on_transformer,
+    resolve_cache_dit_request_overrides,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import (
@@ -60,17 +97,32 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
     world_group_is_initialized,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.skip_softmax import (
+    set_request_skip_softmax_params,
+)
+from sglang.multimodal_gen.runtime.layers.attention.layer import (
+    LocalAttention,
+    UlyssesAttention,
+    USPAttention,
+    apply_attention_backend_override,
+    prepare_attention_backend_override,
+    supports_skip_softmax,
+)
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
     save_mask_search_results,
 )
-from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
-    TransformerLoader,
-)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
+    is_fsdp_managed_module,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+    is_layerwise_offloaded_module,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -98,9 +150,16 @@ from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import 
     RolloutDenoisingMixin,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.component_load import (
+    load_transformer_if_needed,
+    register_loaded_transformer,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_context as precision_autocast_context,
+)
 from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_enabled as precision_autocast_enabled,
 )
@@ -108,10 +167,79 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     resolve_precision,
 )
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
-from sglang.multimodal_gen.utils import dict_to_3d_list
-from sglang.srt.utils.common import get_compiler_backend
+from sglang.multimodal_gen.runtime.utils.torch_compile import (
+    CompiledModuleRegistry,
+    build_torch_compile_kwargs,
+    maybe_enable_inductor_compute_comm_overlap,
+    resolve_torch_compile_mode,
+)
 
 logger = init_logger(__name__)
+
+_QUALITY_FUSION_HANDLERS: tuple[
+    tuple[str, Callable[[nn.Module], bool], Callable[[nn.Module], None]], ...
+] = (
+    (
+        "FLUX.2 NVFP4 FC1+SwiGLU+quant",
+        mount_flux2_nvfp4_swiglu_quant,
+        unmount_flux2_nvfp4_swiglu_quant,
+    ),
+    (
+        "fused linear+GELU (cublasLt epilogue)",
+        mount_fused_linear_gelu,
+        unmount_fused_linear_gelu,
+    ),
+    (
+        "Wan NVFP4 fused bias+GELU",
+        mount_nvfp4_bias_gelu,
+        unmount_nvfp4_bias_gelu,
+    ),
+    (
+        "Qwen-Image fused added-QKV",
+        mount_qwen_image_added_qkv,
+        unmount_qwen_image_added_qkv,
+    ),
+    (
+        "fused LN+modulate (affine folding)",
+        mount_fused_ln_modulate,
+        unmount_fused_ln_modulate,
+    ),
+    (
+        "LTX-2 fused RMSNorm+modulate",
+        mount_ltx2_rms_norm_modulate,
+        unmount_ltx2_rms_norm_modulate,
+    ),
+    (
+        "fused gate RMSNorm (BF16-native Triton)",
+        mount_fused_gate_rmsnorm,
+        unmount_fused_gate_rmsnorm,
+    ),
+    (
+        "HunyuanVideo strided QK RMSNorm",
+        mount_hunyuan_qknorm,
+        unmount_hunyuan_qknorm,
+    ),
+    (
+        "LingBot Video fused RMSNorm",
+        mount_lingbot_video_rmsnorm,
+        unmount_lingbot_video_rmsnorm,
+    ),
+    (
+        "LingBot Video per-token gated residual",
+        mount_lingbot_video_gated_residual,
+        unmount_lingbot_video_gated_residual,
+    ),
+    (
+        "Helios per-token gated residual",
+        mount_helios_gated_residual,
+        unmount_helios_gated_residual,
+    ),
+    (
+        "SANA-Video BF16-input linear attention",
+        mount_sana_video_linear_attention,
+        unmount_sana_video_linear_attention,
+    ),
+)
 
 
 def _ensure_tensor_model_output(model_output):
@@ -171,6 +299,29 @@ class DenoisingStepState:
     attn_metadata: Any | None
 
 
+# Only exact/drop-in dense kernels: the sparse family needs per-model mask
+# configs and per-step metadata, and stays a server-level choice.
+REQUEST_SWITCHABLE_ATTENTION_BACKENDS = frozenset(
+    {
+        AttentionBackendEnum.FA,
+        AttentionBackendEnum.TORCH_SDPA,
+        AttentionBackendEnum.SAGE_ATTN,
+        AttentionBackendEnum.SAGE_ATTN_3,
+    }
+)
+
+
+class DualTransformerExecutionMode(str, Enum):
+    """How a denoising stage uses a second DiT.
+
+    BOUNDARY_EXPERTS means one transformer is selected per timestep.
+    PAIRED_PER_STEP means both transformers participate in each denoising step.
+    """
+
+    BOUNDARY_EXPERTS = "boundary_experts"
+    PAIRED_PER_STEP = "paired_per_step"
+
+
 class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     """
     Stage for running the denoising loop in diffusion pipelines.
@@ -192,17 +343,34 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # cache-dit state (for delayed mounting and idempotent control)
         self._cache_dit_enabled = False
         self._cached_num_steps = None
-        self._torch_compiled_module_ids: set[int] = set()
+        # Per-request Cache-DiT overrides for the batch being executed
+        # (stashed by _maybe_enable_cache_dit; read by the config builders).
+        self._cache_dit_request_overrides: dict[str, Any] = {}
+        # Overrides key the mounted hooks were built from; None when unmounted.
+        self._cache_dit_active_key: tuple | None = None
+        # Whether request-scoped extra-high-or-higher fusions are mounted.
+        self._quality_fusions_mounted = False
+        self._torch_compile_registry = CompiledModuleRegistry()
+        # Breakable CUDA graph runners, one per transformer module (lazy).
+        self._bcg_runners: dict[int, Any] = {}
 
         hidden_size = self.server_args.pipeline_config.dit_config.hidden_size
         num_attention_heads = (
             self.server_args.pipeline_config.dit_config.num_attention_heads
         )
-        attn_head_size = hidden_size // num_attention_heads
+        attn_head_size = getattr(
+            self.server_args.pipeline_config.dit_config,
+            "attention_head_dim",
+            hidden_size // num_attention_heads,
+        )
 
         # torch compile
+        # list of offloaded dit modules if torch compile is enabled. cleared after compile and warmup
+        self._offloaded_dit_modules_for_compile: list[torch.nn.Module] = []
+        # layerwise-offload and then compile to avoid OOM
         for transformer in filter(None, [self.transformer, self.transformer_2]):
-            self._maybe_enable_torch_compile(transformer)
+            self._maybe_offload_during_compile(transformer)
+            self._maybe_torch_compile(transformer)
 
         self.scheduler = scheduler
         self.vae = vae
@@ -216,6 +384,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             dtype=torch.float16,
             selected_attention_backend=selected_attention_backend,
         )
+        # head size kept so the metadata backend can be re-resolved per batch
+        self._attn_backend_default = self.attn_backend
+        self._attn_metadata_head_size = attn_head_size
+        self._attention_backend_active_override: AttentionBackendEnum | None = None
+        self._skip_softmax_forced_fa = False
 
         # cfg
         self.guidance = None
@@ -298,116 +471,578 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 return name
         return default_name
 
-    def _maybe_enable_torch_compile(self, module: object) -> None:
+    def _maybe_offload_during_compile(self, module: object) -> None:
+        """
+        Layerwise-offload the DiT so the compile warmup autotunes each layer
+        with only itself resident; forward() restores it after the warmup.
+        """
+        args = self.server_args
+        if (
+            not args.enable_torch_compile
+            or not args.offload_during_compile
+            or args.warmup_mode == "off"
+            or not self._owns_compile_warmup_lifecycle()
+            or args.use_fsdp_inference
+            or self._cache_dit_requested()
+            or not isinstance(module, LayerwiseOffloadableModuleMixin)
+            or is_layerwise_offloaded_module(module)
+        ):
+            return
+        module.configure_layerwise_offload(args)
+        if is_layerwise_offloaded_module(module):
+            self._offloaded_dit_modules_for_compile.append(module)
+
+    def _owns_compile_warmup_lifecycle(self) -> bool:
+        """Whether ``forward`` enters ``_offload_for_torch_compile_warmup``.
+
+        Custom denoising loops opt in explicitly after wiring the same restore
+        lifecycle. This keeps the safety guard without silently disabling the
+        optimization solely because a model overrides ``forward``.
+        """
+        return type(self).forward is DenoisingStage.forward
+
+    def _move_resident_components_for_warmup(self) -> list[torch.nn.Module]:
+        """Move resident non-DiT components off-device while the warmup
+        denoising (the compile/autotune peak) runs; forward() moves them back."""
+        pipeline = self.pipeline() if self.pipeline is not None else None
+        if pipeline is None:
+            return []
+        dit_ids = {id(self.transformer), id(self.transformer_2)}
+        moved = []
+        for module in pipeline.modules.values():
+            if (
+                isinstance(module, torch.nn.Module)
+                and id(module) not in dit_ids
+                and not is_fsdp_managed_module(module)
+                and not is_layerwise_offloaded_module(module)
+            ):
+                param = next(module.parameters(), None)
+                if param is not None and param.device.type != "cpu":
+                    module.to("cpu")
+                    moved.append(module)
+        return moved
+
+    def _maybe_torch_compile(self, module: object) -> None:
         """
         Compile a module with torch.compile, and enable inductor overlap tweak if available.
         No-op if torch compile is disabled or the object is not a nn.Module.
         """
-        if not self.server_args.enable_torch_compile or not isinstance(
-            module, nn.Module
-        ):
+        if self.server_args.enable_breakable_cuda_graph:
+            # BCG captures the eager kernel stream itself; compiling first
+            # would capture inductor's own cudagraph trees / guards.
             return
-        if envs.SGLANG_CACHE_DIT_ENABLED and not self._cache_dit_enabled:
+        if not getattr(
+            self.server_args, "enable_torch_compile", False
+        ) or not isinstance(module, nn.Module):
+            return
+        if self._cache_dit_requested() and not self._cache_dit_enabled:
             logger.debug("Deferring torch.compile until cache-dit is enabled")
             return
-        module_id = id(module)
-        if module_id in self._torch_compiled_module_ids:
+        if self._torch_compile_registry.is_compiled(module):
             return
 
-        compile_kwargs: dict[str, Any] = {"fullgraph": False, "dynamic": None}
-
         if current_platform.is_npu():
-            backend = get_compiler_backend()
-            compile_kwargs["backend"] = backend
-            compile_kwargs["dynamic"] = False
+            compile_kwargs = build_torch_compile_kwargs(mode=None)
             logger.info("Compiling transformer with torchair backend on NPU")
         else:
-            try:
-                import torch._inductor.config as _inductor_cfg
-
-                _inductor_cfg.reorder_for_compute_comm_overlap = True
-            except ImportError:
-                pass
+            maybe_enable_inductor_compute_comm_overlap()
             dit_config = getattr(self.server_args.pipeline_config, "dit_config", None)
-            mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE") or getattr(
-                dit_config,
-                "torch_compile_mode",
-                "max-autotune-no-cudagraphs",
+            mode = resolve_torch_compile_mode(
+                "SGLANG_TORCH_COMPILE_MODE",
+                config=dit_config,
+                default="max-autotune-no-cudagraphs",
             )
-            compile_kwargs["mode"] = mode
+            compile_kwargs = build_torch_compile_kwargs(mode=mode, module=module)
             logger.info(f"Compiling transformer with mode: {mode}")
 
-        if self._needs_nvfp4_jit_prewarm(module):
-            logger.info(
-                "Prewarming NVFP4 JIT modules before torch.compile to avoid "
-                "Dynamo tracing JIT initialization."
+        if getattr(self.server_args, "regional_compile", False):
+            compiled_count = self._torch_compile_registry.compile_regions_once(
+                module,
+                compile_kwargs=compile_kwargs,
             )
-            prewarm_nvfp4_jit_modules()
-
-        # TODO(triple-mu): support customized fullgraph and dynamic in the future
-        module.compile(**compile_kwargs)
-        self._torch_compiled_module_ids.add(module_id)
+            logger.info(
+                "Enabled regional torch.compile for %d submodules in %s",
+                compiled_count,
+                type(module).__name__,
+            )
+        else:
+            # TODO(triple-mu): support customized fullgraph and dynamic in the future
+            self._torch_compile_registry.compile_once(
+                module,
+                compile_kwargs=compile_kwargs,
+            )
 
     def _maybe_enable_cache_dit_and_torch_compile(
         self, num_inference_steps: int | tuple[int, int], batch: Req
     ) -> None:
         """Apply request-dependent transformer acceleration in trace-safe order."""
+        skip_softmax_params = resolve_skip_softmax_params(
+            batch.sampling_params.skip_softmax_params
+        )
+        if skip_softmax_params is not None:
+            capability = current_platform.get_device_capability()
+            capability_tuple = (
+                (capability.major, capability.minor) if capability is not None else None
+            )
+            if capability_tuple not in ((9, 0), (10, 0), (10, 3), (10, 7)):
+                found = capability.as_version_str() if capability else "unknown"
+                raise ValueError(
+                    "skip_softmax_params requires Hopper SM90 or Blackwell "
+                    f"SM100/SM103/SM107; found {found}."
+                )
+            if (self.server_args.ring_degree or 1) > 1:
+                raise ValueError(
+                    "skip_softmax_params does not support Ring Attention because "
+                    "the ring merge requires dense per-hop softmax statistics."
+                )
+        set_request_skip_softmax_params(batch, skip_softmax_params)
+        self._maybe_override_attention_backend(
+            batch, force_fa_for_self_attention=skip_softmax_params is not None
+        )
+        self._maybe_toggle_quality_fusions(batch)
         self._maybe_enable_cache_dit(num_inference_steps, batch)
         for transformer in filter(None, [self.transformer, self.transformer_2]):
-            self._maybe_enable_torch_compile(transformer)
+            self._maybe_torch_compile(transformer)
 
-    @staticmethod
-    def _needs_nvfp4_jit_prewarm(module: nn.Module) -> bool:
-        for submodule in module.modules():
-            quant_method = getattr(submodule, "quant_method", None)
-            if quant_method is None:
-                continue
-            if type(quant_method).__name__ == "ModelOptFp4LinearMethod":
-                return True
+    def _maybe_override_attention_backend(
+        self, batch: Req, *, force_fa_for_self_attention: bool = False
+    ) -> None:
+        """Two-phase per-request backend switch: prepare all layers (may
+        raise, mutates nothing), then flip all — a rejected request leaves the
+        transformers untouched. Safe at this batch boundary because the field
+        is in the dynamic-batch signature."""
+        target = self._parse_attention_backend_override(
+            batch.sampling_params.attention_backend_override
+        )
+        if force_fa_for_self_attention and target not in (
+            None,
+            AttentionBackendEnum.FA,
+        ):
+            raise ValueError(
+                "skip_softmax_params requires the FA attention backend; "
+                f"attention_backend_override={target.name.lower()!r} is incompatible."
+            )
+        if (
+            target == self._attention_backend_active_override
+            and force_fa_for_self_attention == self._skip_softmax_forced_fa
+        ):
+            return
+        layers = self._request_switchable_attention_layers()
+        stage_backend = self._attn_backend_default
+        layer_targets: list[tuple[nn.Module, AttentionBackendEnum | None]]
+        if target is not None:
+            stage_backend = self._validate_attention_backend_override(target, layers)
+            layer_targets = [(layer, target) for layer in layers]
+        elif force_fa_for_self_attention:
+            self_attention_layers = [
+                layer for layer in layers if supports_skip_softmax(layer)
+            ]
+            if self_attention_layers:
+                stage_backend = self._validate_attention_backend_override(
+                    AttentionBackendEnum.FA, self_attention_layers
+                )
+            elif layers or self.attn_backend.get_enum() is not AttentionBackendEnum.FA:
+                self._validate_attention_backend_override(
+                    AttentionBackendEnum.FA, self_attention_layers
+                )
+            layer_targets = [
+                (
+                    layer,
+                    (AttentionBackendEnum.FA if supports_skip_softmax(layer) else None),
+                )
+                for layer in layers
+            ]
+        else:
+            layer_targets = [(layer, None) for layer in layers]
+
+        for layer, layer_target in layer_targets:
+            if layer_target is not None:
+                prepare_attention_backend_override(layer, layer_target)
+        for layer, layer_target in layer_targets:
+            apply_attention_backend_override(layer, layer_target)
+        self.attn_backend = stage_backend
+        self._attention_backend_active_override = target
+        self._skip_softmax_forced_fa = force_fa_for_self_attention
+        logger.debug(
+            "Attention backend for this batch: %s%s (%d layers considered)",
+            target.name.lower() if target else "server default",
+            "; FA for self-attention" if force_fa_for_self_attention else "",
+            len(layers),
+        )
+
+    def _parse_attention_backend_override(
+        self, name: str | None
+    ) -> AttentionBackendEnum | None:
+        if name is None:
+            return None
+        try:
+            target = AttentionBackendEnum[name.upper()]
+        except KeyError:
+            raise ValueError(
+                f"Unknown attention_backend_override {name!r}. Valid values: "
+                f"{sorted(b.name.lower() for b in REQUEST_SWITCHABLE_ATTENTION_BACKENDS)}."
+            ) from None
+        if target not in REQUEST_SWITCHABLE_ATTENTION_BACKENDS:
+            raise ValueError(
+                f"attention_backend_override {name!r} is not switchable per "
+                f"request. Valid values: "
+                f"{sorted(b.name.lower() for b in REQUEST_SWITCHABLE_ATTENTION_BACKENDS)}."
+            )
+        return target
+
+    def _request_switchable_attention_layers(self) -> list[nn.Module]:
+        return [
+            module
+            for transformer in filter(None, [self.transformer, self.transformer_2])
+            for module in transformer.modules()
+            if isinstance(module, (LocalAttention, UlyssesAttention, USPAttention))
+        ]
+
+    def _validate_attention_backend_override(
+        self, target: AttentionBackendEnum, layers: list[nn.Module]
+    ) -> type:
+        """Reject incompatible server settings; returns the resolved backend cls."""
+        args = self.server_args
+        reasons: list[str] = []
+        if args.enable_breakable_cuda_graph:
+            reasons.append("breakable CUDA graphs bake the attention kernel in")
+        if args.enable_torch_compile:
+            reasons.append("torch.compile traces the attention kernel in")
+        if not layers:
+            reasons.append("this model exposes no switchable attention layers")
+        sparse_defaults = sorted(
+            {
+                layer._default_attn_backend.name.lower()
+                for layer in layers
+                if layer._default_attn_backend.is_sparse
+            }
+        )
+        if sparse_defaults:
+            reasons.append(
+                f"the server-selected sparse backend(s) {sparse_defaults} cannot "
+                "be mixed with per-request dense switching"
+            )
+        stage_backend = None
+        if not reasons:
+            try:
+                stage_backend = get_attn_backend(
+                    head_size=self._attn_metadata_head_size,
+                    dtype=torch.float16,
+                    selected_attention_backend=target,
+                )
+            except ValueError as exc:
+                reasons.append(str(exc))
+        if stage_backend is not None:
+            if (
+                args.ring_degree or 1
+            ) > 1 and not stage_backend.supports_ring_rotation():
+                reasons.append(
+                    f"ring parallelism requires a ring-capable backend; "
+                    f"{target.name.lower()} is not"
+                )
+        if reasons:
+            message = (
+                f"Rejecting attention_backend_override={target.name.lower()!r}: "
+                + "; ".join(reasons)
+                + "."
+            )
+            logger.warning(message)
+            raise ValueError(message)
+        return stage_backend
+
+    def _maybe_toggle_quality_fusions(self, batch: Req) -> None:
+        """Mount/unmount request-gated kernel fusions for this batch.
+
+        These fusions are numerically equivalent only at half-precision
+        rounding level (not bit-exact), so they are mounted for both
+        ``quality="extra-high"`` and ``quality="high"``. The ``"lossless"``
+        default runs the reference path bit-for-bit. ``quality`` participates
+        in the dynamic-batch signature, making this transition safe at the
+        batch boundary. Mounting is all-or-nothing per transformer and fusion
+        family; models without marked sites are no-ops.
+        """
+        quality = getattr(batch.sampling_params, "quality", "lossless")
+        want = quality_allows_kernel_fusions(quality)
+        if want == self._quality_fusions_mounted:
+            return
+        mounted_fusions: set[str] = set()
+        for transformer in filter(None, [self.transformer, self.transformer_2]):
+            for description, mount, unmount in _QUALITY_FUSION_HANDLERS:
+                if want:
+                    if mount(transformer):
+                        mounted_fusions.add(description)
+                else:
+                    unmount(transformer)
+
+        if want and mounted_fusions and self.server_args.enable_breakable_cuda_graph:
+            for transformer in filter(None, [self.transformer, self.transformer_2]):
+                for _, _, unmount in _QUALITY_FUSION_HANDLERS:
+                    unmount(transformer)
+            descriptions = ", ".join(sorted(mounted_fusions))
+            raise ValueError(
+                f"quality={quality!r} cannot be used with breakable CUDA graphs for "
+                f"this model because its request-scoped DiT fusions "
+                f"({descriptions}) do not match the lossless warmup graphs. "
+                "Disable breakable CUDA graphs or use quality='lossless'."
+            )
+
+        self._quality_fusions_mounted = want
+        for description in sorted(mounted_fusions):
+            logger.debug("Mounted %s for quality=%s", description, quality)
+
+    def _cache_dit_dual_model_name(self) -> str:
+        return "wan2.2"
+
+    def _cache_dit_requested(self) -> bool:
+        """Request-independent server default (init-time decisions only)."""
+        return envs.SGLANG_CACHE_DIT_ENABLED
+
+    def _cache_dit_requested_for_batch(self, batch: Req) -> bool:
+        """Per-request Cache-DiT switch; the server default applies when unset."""
+        enable = batch.sampling_params.enable_cache_dit
+        if enable is None:
+            return self._cache_dit_requested()
+        return enable
+
+    def _unmount_cache_dit(self) -> None:
+        """Remove Cache-DiT hooks so subsequent batches run the native forward."""
+        for transformer in filter(None, [self.transformer, self.transformer_2]):
+            disable_cache_on_transformer(transformer)
+        self._cache_dit_enabled = False
+        self._cached_num_steps = None
+        self._cache_dit_active_key = None
+
+    def _cache_dit_secondary_uses_primary_config(self) -> bool:
         return False
+
+    def _dual_transformer_execution_mode(self) -> DualTransformerExecutionMode | None:
+        if self.transformer_2 is None:
+            return None
+        return DualTransformerExecutionMode.BOUNDARY_EXPERTS
+
+    def _cache_dit_step_counts(
+        self, num_inference_steps: int | tuple[int, int]
+    ) -> tuple[int, int | None]:
+        if isinstance(num_inference_steps, tuple):
+            primary_steps, secondary_steps = num_inference_steps
+            return int(primary_steps), int(secondary_steps)
+        steps = int(num_inference_steps)
+        mode = self._dual_transformer_execution_mode()
+        if mode is None:
+            return steps, None
+        if mode == DualTransformerExecutionMode.PAIRED_PER_STEP:
+            return steps, steps
+        raise ValueError("Boundary-expert dual transformers require split step counts.")
+
+    def _parse_cache_dit_scm_bins(
+        self,
+    ) -> tuple[list[int] | None, list[int] | None, str]:
+        overrides = self._cache_dit_request_overrides
+        scm_preset = overrides.get("scm_preset", envs.SGLANG_CACHE_DIT_SCM_PRESET)
+        request_compute_bins = overrides.get("scm_compute_bins")
+        request_cache_bins = overrides.get("scm_cache_bins")
+        if request_compute_bins is not None or request_cache_bins is not None:
+            if request_compute_bins is None or request_cache_bins is None:
+                raise ValueError(
+                    "cache_dit_params SCM custom bins require both "
+                    "scm_compute_bins and scm_cache_bins."
+                )
+            compute_bins = [int(x) for x in request_compute_bins]
+            cache_bins = [int(x) for x in request_cache_bins]
+            return compute_bins, cache_bins, scm_preset
+        compute_bins_str = envs.SGLANG_CACHE_DIT_SCM_COMPUTE_BINS
+        cache_bins_str = envs.SGLANG_CACHE_DIT_SCM_CACHE_BINS
+        compute_bins = None
+        cache_bins = None
+        if compute_bins_str and cache_bins_str:
+            try:
+                compute_bins = [int(x.strip()) for x in compute_bins_str.split(",")]
+                cache_bins = [int(x.strip()) for x in cache_bins_str.split(",")]
+            except ValueError as exc:
+                logger.warning("Failed to parse SCM bins: %s. SCM disabled.", exc)
+                scm_preset = "none"
+        elif compute_bins_str or cache_bins_str:
+            logger.warning(
+                "SCM custom bins require both compute_bins and cache_bins. "
+                "Only one was provided (compute=%s, cache=%s). Falling back to preset '%s'.",
+                compute_bins_str,
+                cache_bins_str,
+                scm_preset,
+            )
+        return compute_bins, cache_bins, scm_preset
+
+    def _cache_dit_scm_masks(
+        self, primary_num_steps: int, secondary_num_steps: int | None = None
+    ) -> tuple[str, str, list[int] | None, list[int] | None]:
+        scm_compute_bins, scm_cache_bins, scm_preset = self._parse_cache_dit_scm_bins()
+        scm_policy = self._cache_dit_request_overrides.get(
+            "scm_policy", envs.SGLANG_CACHE_DIT_SCM_POLICY
+        )
+        steps_computation_mask = get_scm_mask(
+            preset=scm_preset,
+            num_inference_steps=primary_num_steps,
+            compute_bins=scm_compute_bins,
+            cache_bins=scm_cache_bins,
+        )
+
+        steps_computation_mask_2 = None
+        if secondary_num_steps is not None:
+            if (
+                self._cache_dit_secondary_uses_primary_config()
+                and secondary_num_steps == primary_num_steps
+            ):
+                steps_computation_mask_2 = steps_computation_mask
+            else:
+                steps_computation_mask_2 = get_scm_mask(
+                    preset=scm_preset,
+                    num_inference_steps=secondary_num_steps,
+                    compute_bins=scm_compute_bins,
+                    cache_bins=scm_cache_bins,
+                )
+        return scm_preset, scm_policy, steps_computation_mask, steps_computation_mask_2
+
+    def _cache_dit_knob(
+        self, key: str, env_value: Any, env_secondary_value: Any, *, secondary: bool
+    ) -> Any:
+        """One DBCache knob: request > env; secondary inherits request primary."""
+        overrides = self._cache_dit_request_overrides
+        if not secondary:
+            return overrides.get(key, env_value)
+        secondary_overrides = overrides.get("secondary") or {}
+        if key in secondary_overrides:
+            return secondary_overrides[key]
+        return overrides.get(key, env_secondary_value)
+
+    def _build_cache_dit_config(
+        self,
+        num_inference_steps: int,
+        steps_computation_mask: list[int] | None,
+        scm_policy: str,
+        *,
+        secondary: bool = False,
+    ) -> CacheDitConfig:
+        knob = self._cache_dit_knob
+        return CacheDitConfig(
+            enabled=True,
+            Fn_compute_blocks=knob(
+                "Fn_compute_blocks",
+                envs.SGLANG_CACHE_DIT_FN,
+                envs.SGLANG_CACHE_DIT_SECONDARY_FN,
+                secondary=secondary,
+            ),
+            Bn_compute_blocks=knob(
+                "Bn_compute_blocks",
+                envs.SGLANG_CACHE_DIT_BN,
+                envs.SGLANG_CACHE_DIT_SECONDARY_BN,
+                secondary=secondary,
+            ),
+            max_warmup_steps=knob(
+                "max_warmup_steps",
+                envs.SGLANG_CACHE_DIT_WARMUP,
+                envs.SGLANG_CACHE_DIT_SECONDARY_WARMUP,
+                secondary=secondary,
+            ),
+            residual_diff_threshold=knob(
+                "residual_diff_threshold",
+                envs.SGLANG_CACHE_DIT_RDT,
+                envs.SGLANG_CACHE_DIT_SECONDARY_RDT,
+                secondary=secondary,
+            ),
+            max_continuous_cached_steps=knob(
+                "max_continuous_cached_steps",
+                envs.SGLANG_CACHE_DIT_MC,
+                envs.SGLANG_CACHE_DIT_SECONDARY_MC,
+                secondary=secondary,
+            ),
+            enable_taylorseer=knob(
+                "enable_taylorseer",
+                envs.SGLANG_CACHE_DIT_TAYLORSEER,
+                envs.SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER,
+                secondary=secondary,
+            ),
+            taylorseer_order=knob(
+                "taylorseer_order",
+                envs.SGLANG_CACHE_DIT_TS_ORDER,
+                envs.SGLANG_CACHE_DIT_SECONDARY_TS_ORDER,
+                secondary=secondary,
+            ),
+            num_inference_steps=num_inference_steps,
+            steps_computation_mask=steps_computation_mask,
+            steps_computation_policy=scm_policy,
+        )
 
     def _maybe_enable_cache_dit(
         self, num_inference_steps: int | tuple[int, int], batch: Req
     ) -> None:
-        """Enable cache-dit on the transformers if configured (idempotent).
+        """Enable cache-dit on the transformers for this batch (idempotent).
 
-        This method should be called after the transformer is fully loaded
-        and before torch.compile is applied.
-
-        For dual-transformer models (e.g., Wan2.2), this enables cache-dit on both
-        transformers with (potentially) different configurations.
-
+        Must run after the transformer is fully loaded and before
+        torch.compile. Per-request switch/knobs (env values are the defaults);
+        both fields are in the dynamic-batch signature, so mount/unmount
+        transitions are safe at this batch boundary. Dual-transformer models
+        (e.g. Wan2.2) get per-transformer configs.
         """
-        if isinstance(num_inference_steps, tuple):
-            num_high_noise_steps, num_low_noise_steps = num_inference_steps
-
+        requested = self._cache_dit_requested_for_batch(batch)
+        if self.server_args.enable_breakable_cuda_graph:
+            # Cache-DiT wraps transformer.forward with step-skipping control
+            # flow that must not be baked into a captured CUDA graph.
+            if requested:
+                logger.warning_once(
+                    "Cache-DiT was requested but is disabled because breakable "
+                    "CUDA graphs are enabled."
+                )
+            return
+        self._cache_dit_request_overrides = resolve_cache_dit_request_overrides(
+            batch.sampling_params.cache_dit_params
+        )
+        desired_key = (
+            cache_dit_overrides_key(self._cache_dit_request_overrides)
+            if requested
+            else None
+        )
+        # opt-out or knob change: unmount, then remount below (or return)
+        if self._cache_dit_enabled and desired_key != self._cache_dit_active_key:
+            self._unmount_cache_dit()
         # NOTE: When a new request arrives, we need to refresh the cache-dit context.
         if self._cache_dit_enabled:
-            scm_preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
-            scm_preset = None if scm_preset == "none" else scm_preset
-            if isinstance(num_inference_steps, tuple):
+            primary_num_steps, secondary_num_steps = self._cache_dit_step_counts(
+                num_inference_steps
+            )
+            scm_preset, scm_policy, steps_computation_mask, steps_computation_mask_2 = (
+                self._cache_dit_scm_masks(primary_num_steps, secondary_num_steps)
+            )
+            if self.transformer_2 is not None:
+                assert secondary_num_steps is not None
                 refresh_context_on_dual_transformer(
                     self.transformer,
                     self.transformer_2,
-                    num_high_noise_steps,
-                    num_low_noise_steps,
-                    scm_preset=scm_preset,
+                    primary_num_steps,
+                    secondary_num_steps,
+                    steps_computation_mask=steps_computation_mask,
+                    steps_computation_mask_2=steps_computation_mask_2,
+                    steps_computation_policy=scm_policy,
                 )
             else:
+                scm_preset = None if scm_preset == "none" else scm_preset
                 refresh_context_on_transformer(
                     self.transformer,
-                    num_inference_steps,
+                    primary_num_steps,
                     scm_preset=scm_preset,
                 )
             return
 
+        if not requested:
+            return
         # Keep cache-dit disabled for ordinary warmup, but allow torch.compile
         # warmup to mount cache-dit before Dynamo traces the transformer.
-        if not envs.SGLANG_CACHE_DIT_ENABLED:
-            return
-        if batch.is_warmup and not self.server_args.enable_torch_compile:
+        if batch.is_warmup and not getattr(
+            self.server_args, "enable_torch_compile", False
+        ):
             return
 
+        primary_num_steps, secondary_num_steps = self._cache_dit_step_counts(
+            num_inference_steps
+        )
         world_size = get_world_size()
         parallelized = world_size > 1
 
@@ -432,93 +1067,29 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 has_sp,
                 has_tp,
             )
-        # === Parse SCM configuration from envs ===
-        # SCM is shared between primary and secondary transformers
-        scm_preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
-        scm_compute_bins_str = envs.SGLANG_CACHE_DIT_SCM_COMPUTE_BINS
-        scm_cache_bins_str = envs.SGLANG_CACHE_DIT_SCM_CACHE_BINS
-        scm_policy = envs.SGLANG_CACHE_DIT_SCM_POLICY
-
-        # parse custom bins if provided (both must be set together)
-        scm_compute_bins = None
-        scm_cache_bins = None
-        if scm_compute_bins_str and scm_cache_bins_str:
-            try:
-                scm_compute_bins = [
-                    int(x.strip()) for x in scm_compute_bins_str.split(",")
-                ]
-                scm_cache_bins = [int(x.strip()) for x in scm_cache_bins_str.split(",")]
-            except ValueError as e:
-                logger.warning("Failed to parse SCM bins: %s. SCM disabled.", e)
-                scm_preset = "none"
-        elif scm_compute_bins_str or scm_cache_bins_str:
-            # Only one of the bins was provided - warn user
-            logger.warning(
-                "SCM custom bins require both compute_bins and cache_bins. "
-                "Only one was provided (compute=%s, cache=%s). Falling back to preset '%s'.",
-                scm_compute_bins_str,
-                scm_cache_bins_str,
-                scm_preset,
-            )
-
-        # generate SCM mask using cache-dit's steps_mask()
-        # cache-dit handles step count validation and scaling internally
-        steps_computation_mask = get_scm_mask(
-            preset=scm_preset,
-            num_inference_steps=(
-                num_inference_steps
-                if isinstance(num_inference_steps, int)
-                else num_high_noise_steps
-            ),
-            compute_bins=scm_compute_bins,
-            cache_bins=scm_cache_bins,
+        _, scm_policy, steps_computation_mask, steps_computation_mask_2 = (
+            self._cache_dit_scm_masks(primary_num_steps, secondary_num_steps)
         )
-
-        if isinstance(num_inference_steps, tuple):
-            steps_computation_mask_2 = get_scm_mask(
-                preset=scm_preset,
-                num_inference_steps=num_low_noise_steps,
-                compute_bins=scm_compute_bins,
-                cache_bins=scm_cache_bins,
-            )
-
-        # build config for primary transformer (high-noise expert)
-        primary_config = CacheDitConfig(
-            enabled=True,
-            Fn_compute_blocks=envs.SGLANG_CACHE_DIT_FN,
-            Bn_compute_blocks=envs.SGLANG_CACHE_DIT_BN,
-            max_warmup_steps=envs.SGLANG_CACHE_DIT_WARMUP,
-            residual_diff_threshold=envs.SGLANG_CACHE_DIT_RDT,
-            max_continuous_cached_steps=envs.SGLANG_CACHE_DIT_MC,
-            enable_taylorseer=envs.SGLANG_CACHE_DIT_TAYLORSEER,
-            taylorseer_order=envs.SGLANG_CACHE_DIT_TS_ORDER,
-            num_inference_steps=(
-                num_inference_steps
-                if isinstance(num_inference_steps, int)
-                else num_high_noise_steps
-            ),
-            # SCM fields
+        primary_config = self._build_cache_dit_config(
+            primary_num_steps,
             steps_computation_mask=steps_computation_mask,
-            steps_computation_policy=scm_policy,
+            scm_policy=scm_policy,
         )
 
         if self.transformer_2 is not None:
             # dual transformer
             # build config for secondary transformer (low-noise expert)
             # uses secondary parameters which inherit from primary if not explicitly set
-            secondary_config = CacheDitConfig(
-                enabled=True,
-                Fn_compute_blocks=envs.SGLANG_CACHE_DIT_SECONDARY_FN,
-                Bn_compute_blocks=envs.SGLANG_CACHE_DIT_SECONDARY_BN,
-                max_warmup_steps=envs.SGLANG_CACHE_DIT_SECONDARY_WARMUP,
-                residual_diff_threshold=envs.SGLANG_CACHE_DIT_SECONDARY_RDT,
-                max_continuous_cached_steps=envs.SGLANG_CACHE_DIT_SECONDARY_MC,
-                enable_taylorseer=envs.SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER,
-                taylorseer_order=envs.SGLANG_CACHE_DIT_SECONDARY_TS_ORDER,
-                num_inference_steps=num_low_noise_steps,
-                # SCM fields - shared with primary
-                steps_computation_mask=steps_computation_mask_2,
-                steps_computation_policy=scm_policy,
+            assert secondary_num_steps is not None
+            secondary_config = (
+                primary_config
+                if self._cache_dit_secondary_uses_primary_config()
+                else self._build_cache_dit_config(
+                    secondary_num_steps,
+                    steps_computation_mask=steps_computation_mask_2,
+                    scm_policy=scm_policy,
+                    secondary=True,
+                )
             )
 
             # for dual transformers, must use BlockAdapter to enable cache on both simultaneously.
@@ -528,14 +1099,14 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 self.transformer_2,
                 primary_config,
                 secondary_config,
-                model_name="wan2.2",
+                model_name=self._cache_dit_dual_model_name(),
                 sp_group=sp_group,
                 tp_group=tp_group,
             )
             logger.info(
                 "cache-dit enabled on dual transformers (steps=%d, %d)",
-                num_high_noise_steps,
-                num_low_noise_steps,
+                primary_num_steps,
+                secondary_num_steps,
             )
         else:
             # single transformer
@@ -545,17 +1116,19 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 model_name="transformer",
                 sp_group=sp_group,
                 tp_group=tp_group,
+                has_separate_cfg=batch.do_classifier_free_guidance,
             )
             logger.info(
                 "cache-dit enabled on transformer (steps=%d, Fn=%d, Bn=%d, rdt=%.3f)",
-                num_inference_steps,
-                envs.SGLANG_CACHE_DIT_FN,
-                envs.SGLANG_CACHE_DIT_BN,
-                envs.SGLANG_CACHE_DIT_RDT,
+                primary_num_steps,
+                primary_config.Fn_compute_blocks,
+                primary_config.Bn_compute_blocks,
+                primary_config.residual_diff_threshold,
             )
 
         self._cache_dit_enabled = True
         self._cached_num_steps = num_inference_steps
+        self._cache_dit_active_key = desired_key
 
     @lru_cache(maxsize=8)
     def _build_guidance(self, batch_size, target_dtype, device, guidance_val):
@@ -626,14 +1199,20 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         Returns:
             A context object containing the invariant state for the denoising loop.
         """
+        batch = server_args.pipeline_config.expand_conditioning_to_sample_batch(batch)
+
         assert self.transformer is not None
         pipeline = self.pipeline() if self.pipeline else None
         scheduler = batch.scheduler
         assert scheduler is not None
 
+        dual_transformer_mode = self._dual_transformer_execution_mode()
+        uses_boundary_transformer_2 = (
+            dual_transformer_mode == DualTransformerExecutionMode.BOUNDARY_EXPERTS
+        )
         boundary_timestep = (
             self._handle_boundary_ratio(server_args, batch, scheduler)
-            if self.transformer_2 is not None
+            if uses_boundary_transformer_2
             else None
         )
         # Get timesteps and calculate warmup steps
@@ -641,7 +1220,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         num_inference_steps = batch.num_inference_steps
         num_warmup_steps = len(timesteps) - num_inference_steps * scheduler.order
 
-        if self.transformer_2 is not None:
+        if uses_boundary_transformer_2:
             assert boundary_timestep is not None, "boundary_timestep must be provided"
             num_high_noise_steps = (timesteps >= boundary_timestep).sum().item()
             num_low_noise_steps = num_inference_steps - num_high_noise_steps
@@ -649,22 +1228,14 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         else:
             cache_dit_num_inference_steps = num_inference_steps
 
-        transformer_was_loaded = server_args.model_loaded["transformer"]
-        if not transformer_was_loaded:
-            # FIXME: reuse more code
-            loader = TransformerLoader()
-            self.transformer = loader.load(
-                server_args.model_paths["transformer"], server_args, "transformer"
-            )
+        freshly_loaded = load_transformer_if_needed(self, server_args)
 
         self._maybe_enable_cache_dit_and_torch_compile(
             cache_dit_num_inference_steps, batch
         )
 
-        if not transformer_was_loaded:
-            if pipeline:
-                pipeline.add_module("transformer", self.transformer)
-            server_args.model_loaded["transformer"] = True
+        if freshly_loaded:
+            register_loaded_transformer(self, server_args, pipeline)
 
         if batch.rollout:
             self._maybe_prepare_rollout(batch)
@@ -741,8 +1312,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             )
         else:
             reserved_frames_mask_sp, z_sp = (
-                reserved_frames_masks[0] if reserved_frames_masks is not None else None
-            ), z
+                (
+                    reserved_frames_masks[0]
+                    if reserved_frames_masks is not None
+                    else None
+                ),
+                z,
+            )
 
         guidance = self.get_or_build_guidance(
             # TODO: replace with raw_latent_shape?
@@ -754,9 +1330,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         image_kwargs = self.prepare_extra_func_kwargs(
             getattr(self.transformer, "forward", self.transformer),
             {
+                # Pass None (not []) so T2V paths whose transformer has no
+                # image_embedder skip the branch; diffusers guards on
+                # `is not None` only.
                 # TODO: make sure on-device
-                "encoder_hidden_states_image": image_embeds,
-                "mask_strategy": dict_to_3d_list(None, t_max=50, l_max=60, h_max=24),
+                "encoder_hidden_states_image": image_embeds if image_embeds else None,
             },
         )
 
@@ -765,7 +1343,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             {
                 "encoder_hidden_states_2": batch.clip_embedding_pos,
                 "encoder_attention_mask": batch.prompt_attention_mask,
-                "encoder_hidden_states_mask": batch.prompt_attention_mask,
+                "encoder_hidden_states_mask": (
+                    batch.prompt_embeds_mask
+                    if batch.prompt_embeds_mask is not None
+                    else batch.prompt_attention_mask
+                ),
             }
             | server_args.pipeline_config.prepare_pos_cond_kwargs(
                 batch,
@@ -786,7 +1368,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 {
                     "encoder_hidden_states_2": batch.clip_embedding_neg,
                     "encoder_attention_mask": batch.negative_attention_mask,
-                    "encoder_hidden_states_mask": batch.negative_attention_mask,
+                    "encoder_hidden_states_mask": (
+                        batch.negative_prompt_embeds_mask
+                        if batch.negative_prompt_embeds_mask is not None
+                        else batch.negative_attention_mask
+                    ),
                 }
                 | server_args.pipeline_config.prepare_neg_cond_kwargs(
                     batch,
@@ -859,11 +1445,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self, ctx: DenoisingContext, batch: Req, server_args: ServerArgs
     ) -> None:
         """Initialize optional CFG residual reuse for the current denoising loop."""
-        fraction = envs.SGLANG_DIFFUSION_CFG_GATE_STEP
+        fraction = batch.sampling_params.cfg_gate_step
+        if fraction is None:
+            fraction = envs.SGLANG_DIFFUSION_CFG_GATE_STEP
         if not 0.0 <= fraction <= 1.0:
             raise ValueError(
-                "SGLANG_DIFFUSION_CFG_GATE_STEP must be between 0.0 and 1.0, "
-                f"got {fraction}."
+                "cfg_gate_step (SGLANG_DIFFUSION_CFG_GATE_STEP) must be between "
+                f"0.0 and 1.0, got {fraction}."
             )
 
         num_steps = len(ctx.timesteps)
@@ -1015,9 +1603,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # 1. Prepare latent inputs in the model's compute dtype.
         latent_model_input = ctx.latents.to(ctx.target_dtype)
         if batch.image_latent is not None:
-            assert (
-                not server_args.pipeline_config.task_type == ModelTaskType.TI2V
-            ), "image latents should not be provided for TI2V task"
+            assert not server_args.pipeline_config.task_type == ModelTaskType.TI2V, (
+                "image latents should not be provided for TI2V task"
+            )
             latent_model_input = torch.cat(
                 [latent_model_input, batch.image_latent], dim=1
             ).to(ctx.target_dtype)
@@ -1059,13 +1647,17 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # 5. Advance the scheduler state with the predicted noise.
         with maybe_nvtx_range("scheduler_step", use_nvtx):
-            ctx.latents = ctx.scheduler.step(
+            latents_dtype = ctx.latents.dtype
+            latents = ctx.scheduler.step(
                 model_output=noise_pred,
                 timestep=step.t_device,
                 sample=ctx.latents,
                 **ctx.extra_step_kwargs,
                 return_dict=False,
             )[0]
+            if latents.dtype != latents_dtype and latents.device.type == "mps":
+                latents = latents.to(latents_dtype)
+            ctx.latents = latents
 
         # 6. Re-apply any model-specific latent constraints after the update.
         ctx.latents = self.post_forward_for_ti2v_task(
@@ -1181,19 +1773,24 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # deallocate transformer if on mps
         pipeline = self.pipeline() if self.pipeline else None
-        if torch.backends.mps.is_available() and not is_warmup:
+        if (
+            torch.backends.mps.is_available()
+            and not is_warmup
+            and not is_layerwise_offloaded_module(self.transformer)
+        ):
             logger.info(
                 "Memory before deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),
             )
             if self._component_residency_manager is not None:
-                self._component_residency_manager.remove_nvtx_hooks_for_module(
-                    self.transformer
-                )
+                self._component_residency_manager.finish_active_use(prefetch_next=False)
+                self._component_residency_manager.forget_module(self.transformer)
             del self.transformer
             if pipeline is not None and "transformer" in pipeline.modules:
                 del pipeline.modules["transformer"]
             server_args.model_loaded["transformer"] = False
+            gc.collect()
+            torch.mps.empty_cache()
             logger.info(
                 "Memory after deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),
@@ -1282,12 +1879,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         batch: Req,
     ) -> None:
         """
-        manage dit's residency by reporting the active sequential use
-
-        only applicable for dual-dit architecture like Wan
+        manage dit residency by reporting the active sequential use
 
         Args:
-            current_model: the next active dit, transformer_1 or transformer_2
+            current_model: the next active dit
         """
         manager = self._component_residency_manager
 
@@ -1362,8 +1957,45 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         return latents
 
-    @torch.no_grad()
+    @contextmanager
+    def _offload_for_torch_compile_warmup(self, batch: Req):
+        """wrap a denoise so the torch.compile warmup has spare VRAM.
+
+        No-op unless the DiT was layerwise-offloaded for compile.
+        Warmup: move resident non-DiT components off-device for the autotune window, restore
+        after.
+        """
+        if not self._offloaded_dit_modules_for_compile:
+            yield
+            return
+        # if the dits have been layerwise-offloaded in preparation stage
+        if batch.is_warmup:
+            # if warmup is enabled, for warmup request, offload components to ensure sufficient VRAM headroom for torch compile
+            moved = self._move_resident_components_for_warmup()
+            try:
+                yield
+            finally:
+                device = get_local_torch_device()
+                for module in moved:
+                    module.to(device)
+            return
+        # prepare for first real request: restore the user-configured residency
+        for module in self._offloaded_dit_modules_for_compile:
+            module.disable_offload()
+        # clear the list for avoid overhead during real request
+        self._offloaded_dit_modules_for_compile.clear()
+        yield
+
     def forward(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> Req:
+        with self._offload_for_torch_compile_warmup(batch):
+            return self._denoise(batch, server_args)
+
+    @torch.no_grad()
+    def _denoise(
         self,
         batch: Req,
         server_args: ServerArgs,
@@ -1392,9 +2024,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         use_nvtx = self._apply_nvtx_gate(ctx.is_warmup)
 
         with (
-            torch.autocast(
-                device_type=current_platform.device_type,
-                dtype=ctx.target_dtype,
+            precision_autocast_context(
+                ctx.target_dtype,
+                server_args.disable_autocast,
                 enabled=ctx.autocast_enabled,
             ),
             maybe_nvtx_range("denoising_loop", use_nvtx),
@@ -1458,6 +2090,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 (denoising_end_time - denoising_start_time) / len(ctx.timesteps),
             )
 
+        if "step" in locals():
+            del step
         self._finish_active_component_use()
 
         # Rollout postprocessing must run BEFORE _finalize_denoising_loop so
@@ -1817,13 +2451,108 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             getattr(current_model, "forward", current_model),
             {"guidance": guidance},
         )
-        model_output = current_model(
+        call_kwargs = dict(
             hidden_states=latent_model_input,
             timestep=timestep,
             **guidance_kwargs,
             **kwargs,
         )
+        runner = self._maybe_get_bcg_runner(current_model)
+        if runner is not None:
+            model_output = self._bcg_run(runner, call_kwargs, current_model)
+        else:
+            model_output = current_model(**call_kwargs)
         return _ensure_tensor_model_output(model_output)
+
+    @staticmethod
+    def _bcg_is_warmup() -> bool:
+        """True when the current forward is a warmup request."""
+        from sglang.multimodal_gen.runtime.managers.forward_context import (
+            get_forward_context,
+        )
+
+        try:
+            forward_batch = get_forward_context().forward_batch
+        except Exception:
+            return False
+        return bool(getattr(forward_batch, "is_warmup", False))
+
+    def _bcg_run(self, runner, call_kwargs: dict, current_model):
+        """Run the DiT through the BCG runner.
+
+        During warmup we proactively capture one graph per text bucket (in
+        addition to the request's own bucket) so that serving never records a
+        fresh graph for a different prompt length — every bucket is already
+        captured. Serving just replays (or runs eager for an uncaptured
+        signature, never capturing).
+        """
+        if self._bcg_is_warmup():
+            for bucket in self._bcg_text_buckets():
+                runner.capture(
+                    **self._bcg_pad_prompt_kwargs(
+                        call_kwargs, current_model=current_model, force_bucket=bucket
+                    )
+                )
+        return runner(
+            **self._bcg_pad_prompt_kwargs(call_kwargs, current_model=current_model)
+        )
+
+    @staticmethod
+    def _bcg_text_buckets() -> tuple[int, ...]:
+        """Prompt sequence-length buckets, from --bcg-text-buckets."""
+        from sglang.multimodal_gen.runtime.server_args import (
+            DEFAULT_BCG_TEXT_BUCKETS,
+            get_global_server_args,
+        )
+
+        try:
+            resolver = get_global_server_args().resolved_bcg_text_buckets
+            return resolver()
+        except Exception:
+            return DEFAULT_BCG_TEXT_BUCKETS
+
+    def _bcg_pad_prompt_kwargs(
+        self, call_kwargs: dict, current_model=None, force_bucket: int | None = None
+    ):
+        """Bucket prompt-conditioning inputs so BCG signatures ignore prompt length.
+
+        Generic padding lives in ``breakable_cuda_graph.prompt_padding``;
+        model-specific padders register from ``breakable_cuda_graph.model_padders``.
+
+        ``force_bucket`` pads to exactly that bucket (used by warmup to capture
+        every bucket); a prompt already longer than ``force_bucket`` is left
+        unchanged, exactly as the normal bucket selection would do.
+        """
+        buckets = (
+            (force_bucket,) if force_bucket is not None else self._bcg_text_buckets()
+        )
+        padder = bcg_utils.select_prompt_padder(current_model, call_kwargs)
+        if padder is not None:
+            return padder(call_kwargs, current_model, buckets)
+        return bcg_utils.pad_masked_prompt_kwargs(call_kwargs, buckets)
+
+    def _maybe_get_bcg_runner(self, current_model):
+        """Return (lazily creating) the breakable CUDA graph runner for
+        ``current_model``, or ``None`` if BCG is disabled / inapplicable.
+        """
+        if not self.server_args.enable_breakable_cuda_graph:
+            return None
+        if not isinstance(current_model, nn.Module):
+            return None
+        key = id(current_model)
+        runner = self._bcg_runners.get(key)
+        if runner is None:
+            from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+                DiffusionBreakableCudaGraphRunner,
+            )
+
+            # DenoisingStage can switch between transformer and transformer_2;
+            # each module owns separate graph state and static input buffers.
+            runner = DiffusionBreakableCudaGraphRunner(
+                current_model, get_local_torch_device()
+            )
+            self._bcg_runners[key] = runner
+        return runner
 
     def prepare_sta_param(self, batch: Req, server_args: ServerArgs):
         """

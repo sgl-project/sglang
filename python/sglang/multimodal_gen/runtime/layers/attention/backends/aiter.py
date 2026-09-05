@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
+import importlib
 import logging
 import os
 
@@ -15,7 +16,10 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadataBuilder,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.srt.models.deepseek_common.utils import _use_aiter_gfx95
+from sglang.multimodal_gen.runtime.platforms.aiter import (
+    USE_AITER_GFX95,
+    USE_AITER_GFX942,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +42,7 @@ def _can_use_fmha_fp8_prefill(
     num_kv_heads: int,
 ) -> bool:
     """True if MHA q/k/v head_dim==128 on a gfx950-class arch."""
-    if not _use_aiter_gfx95:
+    if not USE_AITER_GFX95:
         return False
     if num_kv_heads != num_heads:
         return False
@@ -124,9 +128,14 @@ class AITerImpl(AttentionImpl):
         dropout_p: float = 0.0,
         **extra_impl_args,
     ) -> None:
-        if num_kv_heads is not None and num_kv_heads != num_heads:
-            raise NotImplementedError(
-                "AITer backend does not support Grouped Query Attention yet."
+        # aiter's mha entry points take GQA/MQA K/V directly (they broadcast
+        # each KV head across its group of query heads), so the only
+        # requirement is an even split. The FP8 ASM path is MHA-only and
+        # already routes grouped shapes back to BF16 below.
+        if num_kv_heads is not None and num_heads % num_kv_heads != 0:
+            raise ValueError(
+                f"AITer backend requires num_heads ({num_heads}) to be a "
+                f"multiple of num_kv_heads ({num_kv_heads})."
             )
         self.causal = causal
         self.dropout_p = dropout_p
@@ -195,13 +204,48 @@ class AITerImpl(AttentionImpl):
             )
 
         # BF16 path
-        output, _ = aiter.flash_attn_func(
+        output = aiter.flash_attn_func(
             query,
             key,
             value,
             dropout_p=self.dropout_p,
             causal=self.causal,
             return_attn_probs=False,
-            return_lse=True,
+            return_lse=False,
         )
         return output
+
+    @torch.compiler.disable
+    def forward_varlen(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        cu_seqlens_host: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        del cu_seqlens_host
+        if USE_AITER_GFX942:
+            # The grouped-varlen ASM kernel hangs on H3's ~64K packed
+            # sequences on gfx942; AITER's Triton path handles this shape.
+            attention_func = importlib.import_module(
+                "aiter.ops.triton.attention.mha"
+            ).flash_attn_varlen_func
+        else:
+            attention_func = aiter.flash_attn_varlen_func
+
+        cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int32).contiguous()
+        output = attention_func(
+            q=query.contiguous(),
+            k=key.contiguous(),
+            v=value.contiguous(),
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=self.softmax_scale,
+            causal=self.causal,
+        )
+        return output[0] if isinstance(output, tuple) else output

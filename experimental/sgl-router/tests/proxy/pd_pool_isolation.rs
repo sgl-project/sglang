@@ -13,7 +13,7 @@
 //!   (existing code path; pinned here so a future PD wiring change
 //!   doesn't silently swap codes).
 //! * A PD-disagg model with both pools healthy → request flows to the
-//!   prefill worker (smoke; the decode worker MUST NOT be selected for
+//!   prefill worker (sanity check; the decode worker MUST NOT be selected for
 //!   the chat route).
 
 use axum::body::Body;
@@ -48,6 +48,9 @@ fn config() -> Config {
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,
+            affinity: None,
+            fused: None,
+            eligibility: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],

@@ -118,10 +118,12 @@ class PerFrameAttentionPooling(nn.Module):
         """
         B, L, D = x.shape
         T, H, W = grid_size
-        assert (
-            D == self.dim
-        ), f"Input dimension D={D} does not match module dim={self.dim}"
-        assert L == T * H * W, f"Flattened length L={L} does not match T*H*W={T*H*W}"
+        assert D == self.dim, (
+            f"Input dimension D={D} does not match module dim={self.dim}"
+        )
+        assert L == T * H * W, (
+            f"Flattened length L={L} does not match T*H*W={T * H * W}"
+        )
 
         S = H * W
         x_bt_s_d = x.view(B, T, S, D).contiguous().view(B * T, S, D)  # [B*T, S, D]
@@ -222,7 +224,7 @@ class ConditionalCrossAttention(nn.Module):
             head_size=self.head_dim,
             causal=False,
             softmax_scale=None,
-            # is_cross_attention=True,
+            is_cross_attention=True,
         )
 
     def forward(
@@ -397,6 +399,10 @@ class ConditionalCrossAttentionBlock(nn.Module):
         return self.inner(x=x, y=y, x_freqs=x_freqs, y_freqs=y_freqs)
 
 
+def _is_conditioner_block(_name: str, module: nn.Module) -> bool:
+    return isinstance(module, ConditionalCrossAttentionBlock)
+
+
 class DualTowerConditionalBridge(
     CachableDiT,
     LayerwiseOffloadableModuleMixin,
@@ -411,9 +417,8 @@ class DualTowerConditionalBridge(
 
     layerwise_offload_dit_group_enabled = False
 
-    _fsdp_shard_conditions = MOVADualTowerConfig()._fsdp_shard_conditions
-    _compile_conditions = MOVADualTowerConfig()._compile_conditions
-    _supported_attention_backends = MOVADualTowerConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [_is_conditioner_block]
+    _compile_conditions = [_is_conditioner_block]
     param_names_mapping = MOVADualTowerConfig().param_names_mapping
     reverse_param_names_mapping = MOVADualTowerConfig().reverse_param_names_mapping
     lora_param_names_mapping = MOVADualTowerConfig().lora_param_names_mapping
@@ -536,7 +541,6 @@ class DualTowerConditionalBridge(
             A tuple of ((cos_v, sin_v), (cos_a, sin_a)).
         """
         f_v, h, w = grid_size
-        L_v = f_v * h * w
         L_a = int(audio_steps)
 
         device = device or next(self.parameters()).device

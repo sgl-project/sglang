@@ -3,14 +3,24 @@
 from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
-register_cpu_ci(est_time=7, suite="base-b-test-cpu")
+register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 register_xpu_ci(est_time=10, suite="stage-a-test-1-gpu-xpu")
 
+import copy
+import re
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock
+
+import msgspec
 
 from sglang.srt.sampling.sampling_params import (
     MAX_LEN,
+    MAX_REQUEST_REASONING_END_TOKEN_IDS,
+    MAX_STOP_COUNT,
+    MAX_STOP_REGEX_COUNT,
+    MAX_STOP_REGEX_LEN,
+    REQUEST_REASONING_END_TOKEN_IDS_KEY,
     TOP_K_ALL,
     SamplingParams,
     get_max_seq_length,
@@ -19,7 +29,6 @@ from sglang.test.test_utils import CustomTestCase
 
 
 class TestSamplingParamsInit(CustomTestCase):
-
     def test_zero_temperature_becomes_greedy(self):
         """Test greedy conversion when temperature is 0."""
         sp = SamplingParams(temperature=0.0)
@@ -70,10 +79,25 @@ class TestSamplingParamsInit(CustomTestCase):
         sp = SamplingParams(stop_token_ids=[])
         self.assertIsNone(sp.stop_token_ids)
 
+    def test_empty_grammar_constraint_becomes_none(self):
+        """An empty grammar string means "unset", not "constrain to nothing".
+        Left as "" it reads as set to the is-not-None checks downstream while
+        the constraint selection skips it.
+        """
+        for field in ("json_schema", "regex", "ebnf", "structural_tag"):
+            with self.subTest(field=field):
+                sp = SamplingParams(**{field: ""})
+                self.assertIsNone(getattr(sp, field))
+
 
 class TestSamplingParamsVerify(CustomTestCase):
-
     VOCAB_SIZE = 32000
+    GRAMMAR_VALUES = {
+        "json_schema": '{"type":"object"}',
+        "regex": "abc",
+        "ebnf": 'root ::= "abc"',
+        "structural_tag": '{"structures":[],"triggers":[]}',
+    }
 
     def _make(self, **kwargs):
         """Helper: create SamplingParams with safe defaults, override with kwargs."""
@@ -85,6 +109,28 @@ class TestSamplingParamsVerify(CustomTestCase):
         """Default valid params should pass verify() without raising."""
         sp = self._make()
         sp.verify(self.VOCAB_SIZE)
+
+    def test_request_reasoning_end_token_ids_are_vocab_bounded_integers(self):
+        self._make(
+            custom_params={REQUEST_REASONING_END_TOKEN_IDS_KEY: [17, 18]}
+        ).verify(self.VOCAB_SIZE)
+
+        invalid_values = [
+            [],
+            [-1],
+            [True],
+            [self.VOCAB_SIZE],
+            "17",
+            list(range(MAX_REQUEST_REASONING_END_TOKEN_IDS + 1)),
+        ]
+        for value in invalid_values:
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "request reasoning end token IDs"),
+            ):
+                self._make(
+                    custom_params={REQUEST_REASONING_END_TOKEN_IDS_KEY: value}
+                ).verify(self.VOCAB_SIZE)
 
     def test_negative_temperature_raises(self):
         """Test that verify() rejects negative temperature (must be >= 0)."""
@@ -270,31 +316,34 @@ class TestSamplingParamsVerify(CustomTestCase):
         sp.verify(self.VOCAB_SIZE)
 
     def test_multiple_grammars_raises(self):
-        """Test that verify() rejects setting both json_schema and regex (mutually exclusive)."""
-        sp = self._make(json_schema='{"type":"object"}', regex="abc")
-        with self.assertRaises(ValueError):
-            sp.verify(self.VOCAB_SIZE)
+        """Reject structural_tag combined with any other grammar constraint.
+
+        Constraint selection is a fixed if/elif chain, so a constraint left out of
+        this check is silently dropped with no error to the caller.
+        """
+        for other in ("json_schema", "regex", "ebnf"):
+            with self.subTest(other=other):
+                sp = self._make(
+                    structural_tag=self.GRAMMAR_VALUES["structural_tag"],
+                    **{other: self.GRAMMAR_VALUES[other]},
+                )
+                with self.assertRaisesRegex(ValueError, "Only one of"):
+                    sp.verify(self.VOCAB_SIZE)
 
     def test_single_grammar_valid(self):
-        """Test that setting only one grammar type is accepted."""
-        sp = self._make(json_schema='{"type":"object"}')
-        sp.verify(self.VOCAB_SIZE)
-
-    def test_all_three_grammars_set_raises(self):
-        """Test that verify() rejects setting json_schema, regex, and ebnf together."""
-        sp = self._make(json_schema="{}", regex="a", ebnf="rule")
-        with self.assertRaises(ValueError):
-            sp.verify(self.VOCAB_SIZE)
+        """Test that each grammar constraint is valid on its own."""
+        for grammar, value in self.GRAMMAR_VALUES.items():
+            with self.subTest(grammar=grammar):
+                self._make(**{grammar: value}).verify(self.VOCAB_SIZE)
 
 
 class TestSamplingParamsNormalize(CustomTestCase):
-
     def _mock_tokenizer(self, encode_map=None):
         """Create a mock tokenizer that returns predetermined token lists."""
         tokenizer = MagicMock()
         if encode_map:
-            tokenizer.encode.side_effect = (
-                lambda s, add_special_tokens=False: encode_map.get(s, [1])
+            tokenizer.encode.side_effect = lambda s, add_special_tokens=False: (
+                encode_map.get(s, [1])
             )
         else:
             tokenizer.encode.return_value = [1]  # Default: 1 token
@@ -320,6 +369,17 @@ class TestSamplingParamsNormalize(CustomTestCase):
         tokenizer = self._mock_tokenizer()
         sp.normalize(tokenizer=tokenizer)
         self.assertEqual(sp.stop_strs, ["stop1", "stop2"])
+
+    def test_stop_count_limit(self):
+        tokenizer = self._mock_tokenizer()
+        SamplingParams(stop=["x"] * MAX_STOP_COUNT).normalize(tokenizer)
+
+        with self.assertRaises(ValueError) as cm:
+            SamplingParams(stop=["x"] * (MAX_STOP_COUNT + 1)).normalize(tokenizer)
+        self.assertEqual(
+            str(cm.exception),
+            f"at most {MAX_STOP_COUNT} stop strings are allowed, got {MAX_STOP_COUNT + 1}",
+        )
 
     def test_stop_str_max_len_uses_encoded_length(self):
         """Test that max_len is based on encoded token count, not character count."""
@@ -362,9 +422,126 @@ class TestSamplingParamsNormalize(CustomTestCase):
         sp.normalize(tokenizer=tokenizer)
         self.assertEqual(sp.stop_regex_max_len, 3)
 
+    def test_stop_regex_count_limit(self):
+        tokenizer = self._mock_tokenizer()
+        SamplingParams(stop_regex=["x"] * MAX_STOP_REGEX_COUNT).normalize(tokenizer)
+
+        with self.assertRaises(ValueError) as cm:
+            SamplingParams(stop_regex=["x"] * (MAX_STOP_REGEX_COUNT + 1)).normalize(
+                tokenizer
+            )
+        self.assertEqual(
+            str(cm.exception),
+            f"at most {MAX_STOP_REGEX_COUNT} stop_regex patterns are allowed, "
+            f"got {MAX_STOP_REGEX_COUNT + 1}",
+        )
+
+    def test_stop_regex_byte_length_limit(self):
+        tokenizer = self._mock_tokenizer()
+        pattern = "é" * (MAX_STOP_REGEX_LEN // 2)
+        SamplingParams(stop_regex=pattern).normalize(tokenizer)
+
+        with self.assertRaises(ValueError) as cm:
+            SamplingParams(stop_regex=pattern + "a").normalize(tokenizer)
+        self.assertEqual(
+            str(cm.exception),
+            f"stop_regex is {MAX_STOP_REGEX_LEN + 1} bytes, over the "
+            f"{MAX_STOP_REGEX_LEN}-byte limit",
+        )
+
+
+class TestSamplingParamsMsgspecStruct(CustomTestCase):
+    def test_rust_sampling_schema_stays_in_lockstep(self):
+        """Compare Rust fields with the imported Python wire schema."""
+        rust_path = (
+            Path(__file__).resolve().parents[4]
+            / "rust/sglang-server/src/message/sampling.rs"
+        )
+        source = rust_path.read_text()
+        start = source.index("pub struct SamplingParams {")
+        end = source.index("\n}\n\n/// The `/generate`", start)
+        rust_fields = tuple(
+            re.findall(
+                r"^\s*pub ([a-z][a-z0-9_]*):",
+                source[start:end],
+                re.MULTILINE,
+            )
+        )
+
+        self.assertEqual(SamplingParams.__struct_fields__, rust_fields)
+
+    def test_copy_remains_mutable_and_independent(self):
+        sp = SamplingParams(max_new_tokens=8, custom_params={"a": 1})
+
+        copied = copy.copy(sp)
+        copied.max_new_tokens = 16
+        copied.custom_params = {"b": 2}
+
+        self.assertEqual(sp.max_new_tokens, 8)
+        self.assertEqual(sp.custom_params, {"a": 1})
+        self.assertEqual(copied.max_new_tokens, 16)
+        self.assertEqual(copied.custom_params, {"b": 2})
+
+    def test_none_values_still_use_constructor_defaults(self):
+        sp = SamplingParams(
+            temperature=None,
+            top_p=None,
+            top_k=None,
+            min_p=None,
+            frequency_penalty=None,
+            presence_penalty=None,
+            repetition_penalty=None,
+            min_new_tokens=None,
+            n=None,
+            ignore_eos=None,
+            skip_special_tokens=None,
+            spaces_between_special_tokens=None,
+            no_stop_trim=None,
+        )
+
+        self.assertEqual(sp.temperature, 1.0)
+        self.assertEqual(sp.top_p, 1.0)
+        self.assertEqual(sp.top_k, TOP_K_ALL)
+        self.assertEqual(sp.min_p, 0.0)
+        self.assertEqual(sp.frequency_penalty, 0.0)
+        self.assertEqual(sp.presence_penalty, 0.0)
+        self.assertEqual(sp.repetition_penalty, 1.0)
+        self.assertEqual(sp.min_new_tokens, 0)
+        self.assertEqual(sp.n, 1)
+        self.assertFalse(sp.ignore_eos)
+        self.assertTrue(sp.skip_special_tokens)
+        self.assertTrue(sp.spaces_between_special_tokens)
+        self.assertFalse(sp.no_stop_trim)
+
+    def test_msgpack_round_trip_preserves_normalized_state(self):
+        tokenizer = MagicMock()
+        tokenizer.encode.side_effect = lambda s, add_special_tokens=False: {
+            "hello": [101, 102],
+            "world": [201],
+        }[s]
+        sp = SamplingParams(
+            stop=["hello", "world"],
+            stop_regex=r"[a-z]{3}",
+            stop_token_ids=[1, 2],
+            temperature=0.5,
+        )
+        sp.normalize(tokenizer)
+
+        encoder = msgspec.msgpack.Encoder()
+        decoder = msgspec.msgpack.Decoder(SamplingParams)
+        rebuilt = decoder.decode(encoder.encode(sp))
+
+        self.assertIsInstance(rebuilt, SamplingParams)
+        self.assertTrue(rebuilt.is_normalized)
+        self.assertEqual(rebuilt.stop_strs, ["hello", "world"])
+        self.assertEqual(rebuilt.stop_str_max_len, 2)
+        self.assertEqual(rebuilt.stop_regex_strs, [r"[a-z]{3}"])
+        self.assertEqual(rebuilt.stop_regex_max_len, 3)
+        self.assertEqual(rebuilt.stop_token_ids, {1, 2})
+        self.assertEqual(rebuilt.temperature, 0.5)
+
 
 class TestRegexMaxLength(CustomTestCase):
-
     def test_literal_string(self):
         """Test that plain string 'abc' gives max length 3."""
         self.assertEqual(get_max_seq_length("abc"), 3)

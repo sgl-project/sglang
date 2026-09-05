@@ -60,16 +60,46 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
         foreach_copy(group_dsts, group_srcs)
 
 
+def _allocate_pp_proxy_tensors(
+    *,
+    max_num_tokens: int,
+    max_hidden_tokens: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    hc_hidden_size: Optional[int] = None,
+    pp_proxy_topk_size: Optional[int] = None,
+    pp_proxy_residual_num_blocks: Optional[int] = None,
+) -> Dict[str, torch.Tensor]:
+    """Allocate the stable buffers consumed by an incoming PP proxy."""
+    is_mhc = hc_hidden_size is not None
+    pp_hidden_size = hc_hidden_size if is_mhc else hidden_size
+    pp_proxy_tensors = {
+        "hidden_states": torch.zeros((max_hidden_tokens, pp_hidden_size), dtype=dtype),
+    }
+    if not is_mhc:
+        # Only Kimi K3 supplies num_blocks: its PP bank is token-major
+        # [T, blocks, H]. Other models use the phase-specific hidden-token bound.
+        residual_shape = (
+            (max_num_tokens, pp_proxy_residual_num_blocks, hidden_size)
+            if pp_proxy_residual_num_blocks is not None
+            else (max_hidden_tokens, hidden_size)
+        )
+        pp_proxy_tensors["residual"] = torch.zeros(residual_shape, dtype=dtype)
+    if pp_proxy_topk_size is not None:
+        pp_proxy_tensors["topk_indices"] = torch.zeros(
+            (max_num_tokens, pp_proxy_topk_size), dtype=torch.int32
+        )
+    return pp_proxy_tensors
+
+
 @dataclass
 class DecodeInputBuffers(ForwardInputBuffers):
-
     input_ids: torch.Tensor
     input_embeds: torch.Tensor
     req_pool_indices: torch.Tensor
     seq_lens: torch.Tensor
     seq_lens_cpu: torch.Tensor
     out_cache_loc: torch.Tensor
-    out_cache_loc_swa: Optional[torch.Tensor]
     positions: torch.Tensor
     mrope_positions: torch.Tensor
     num_token_non_padded: torch.Tensor
@@ -93,7 +123,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         max_bs: int,
         max_num_token: int,
         hidden_size: int,
-        vocab_size: int,
+        next_token_logits_buffer: torch.Tensor,
         dtype: torch.dtype,
         dp_size: int,
         pp_size: int,
@@ -101,13 +131,13 @@ class DecodeInputBuffers(ForwardInputBuffers):
         require_mlp_tp_gather: bool,
         seq_len_fill_value: int,
         encoder_len_fill_value: int,
-        num_tokens_per_bs: int,
+        num_tokens_per_req: int,
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
         ne_token_table: Optional[torch.Tensor] = None,
-        is_hybrid_swa: bool = False,
         hc_hidden_size: Optional[int] = None,
         pp_proxy_topk_size: Optional[int] = None,
+        pp_proxy_residual_num_blocks: Optional[int] = None,
     ) -> DecodeInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -115,21 +145,12 @@ class DecodeInputBuffers(ForwardInputBuffers):
             req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
             seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int64)
             out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
-            out_cache_loc_swa = (
-                torch.zeros((max_num_token,), dtype=torch.int64)
-                if is_hybrid_swa
-                else None
-            )
             positions = torch.zeros((max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
             num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
             custom_mask = torch.ones(
-                (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs,
+                (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_req,
                 dtype=torch.bool,
-            )
-            next_token_logits_buffer = torch.zeros(
-                (max_num_token, vocab_size),
-                dtype=torch.float,
             )
             mamba_track_indices = (
                 torch.zeros((max_bs,), dtype=torch.int64)
@@ -140,22 +161,19 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 torch.zeros((max_bs,), dtype=torch.bool) if enable_mamba_track else None
             )
 
-            if pp_size > 1:
-                is_mhc = hc_hidden_size is not None
-                hs = hc_hidden_size if is_mhc else hidden_size
-                pp_proxy_tensors = {
-                    "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
-                }
-                if not is_mhc:
-                    pp_proxy_tensors["residual"] = torch.zeros(
-                        (max_bs, hidden_size), dtype=dtype
-                    )
-                if pp_proxy_topk_size is not None:
-                    pp_proxy_tensors["topk_indices"] = torch.zeros(
-                        (max_num_token, pp_proxy_topk_size), dtype=torch.int32
-                    )
-            else:
-                pp_proxy_tensors = None
+            pp_proxy_tensors = (
+                _allocate_pp_proxy_tensors(
+                    max_num_tokens=max_num_token,
+                    max_hidden_tokens=max_num_token,
+                    hidden_size=hidden_size,
+                    dtype=dtype,
+                    hc_hidden_size=hc_hidden_size,
+                    pp_proxy_topk_size=pp_proxy_topk_size,
+                    pp_proxy_residual_num_blocks=pp_proxy_residual_num_blocks,
+                )
+                if pp_size > 1
+                else None
+            )
 
             if is_encoder_decoder:
                 encoder_lens = torch.full(
@@ -180,6 +198,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
                     req_lens=torch.ones([max_bs], dtype=torch.int32),
                     out_column_starts=torch.zeros([max_bs], dtype=torch.int32),
                     out_req_lens=torch.ones([max_bs], dtype=torch.int32),
+                    skip_token_table_update=torch.zeros([max_bs], dtype=torch.bool),
                 )
                 if ne_token_table is not None
                 else None
@@ -206,7 +225,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             out_cache_loc=out_cache_loc,
-            out_cache_loc_swa=out_cache_loc_swa,
             positions=positions,
             mrope_positions=mrope_positions,
             num_token_non_padded=num_token_non_padded,
@@ -232,7 +250,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         bs: int,
         seq_len_fill_value: int,
         require_gathered_buffer: bool,
-        num_tokens_per_bs: int,
+        num_tokens_per_req: int,
         dsa_enable_prefill_cp: bool,
         enable_num_token_non_padded_flag: bool,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
@@ -302,15 +320,16 @@ class DecodeInputBuffers(ForwardInputBuffers):
             srcs.append(forward_batch.bootstrap_room_ids_int)
 
         if require_gathered_buffer:
-            self.global_num_tokens_gpu.fill_(bs * num_tokens_per_bs)
-            self.global_num_tokens_for_logprob_gpu.fill_(bs * num_tokens_per_bs)
+            self.global_num_tokens_gpu.fill_(bs * num_tokens_per_req)
+            self.global_num_tokens_for_logprob_gpu.fill_(bs * num_tokens_per_req)
 
         if enable_num_token_non_padded_flag:
             if require_gathered_buffer and not dsa_enable_prefill_cp:
-                num_tokens_per_dp = bs * num_tokens_per_bs
+                num_tokens_per_dp = bs * num_tokens_per_req
                 local = compute_local_num_token_non_padded(
                     global_num_token_non_padded=forward_batch.num_token_non_padded,
                     num_tokens_per_dp=num_tokens_per_dp,
+                    sharded=forward_batch.attn_tp_sequence_sharded,
                 )
                 dsts.append(self.num_token_non_padded)
                 srcs.append(local)
@@ -326,14 +345,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 dsts.append(buf[:dim])
                 srcs.append(src)
 
-        # SWA cache location (int32, separate from the int64 batch above).
-        if (
-            self.out_cache_loc_swa is not None
-            and forward_batch.out_cache_loc_swa is not None
-        ):
-            dsts.append(self.out_cache_loc_swa[:raw_num_token])
-            srcs.append(forward_batch.out_cache_loc_swa[:raw_num_token])
-
         # Batch all GPU copies, grouped by dtype pair.
         _grouped_foreach_copy_(dsts, srcs)
 
@@ -347,13 +358,14 @@ class DecodeInputBuffers(ForwardInputBuffers):
 class PrefillInputBuffers(ForwardInputBuffers):
     input_ids: torch.Tensor
     out_cache_loc: torch.Tensor
-    out_cache_loc_swa: Optional[torch.Tensor]
+    num_token_non_padded: torch.Tensor
     mamba_track_indices: Optional[torch.Tensor]
     mamba_track_mask: Optional[torch.Tensor]
     mamba_track_seqlens: Optional[torch.Tensor]
     positions: torch.Tensor
     input_embeds: Optional[torch.Tensor]
     mrope_positions: Optional[torch.Tensor]
+    pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
 
     @classmethod
     def create(
@@ -363,20 +375,20 @@ class PrefillInputBuffers(ForwardInputBuffers):
         max_bs: int,
         max_num_tokens: int,
         cache_loc_dtype: torch.dtype,
-        is_hybrid_swa: bool,
         is_multimodal: bool,
         hidden_size: int,
         dtype: torch.dtype,
         enable_mamba_track: bool,
+        pp_size: int = 1,
+        is_first_pp_rank: bool = False,
+        hc_hidden_size: Optional[int] = None,
+        pp_proxy_topk_size: Optional[int] = None,
+        pp_proxy_residual_num_blocks: Optional[int] = None,
     ) -> PrefillInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_tokens,), dtype=torch.int64)
             out_cache_loc = torch.zeros((max_num_tokens,), dtype=cache_loc_dtype)
-            out_cache_loc_swa = (
-                torch.zeros((max_num_tokens,), dtype=torch.int64)
-                if is_hybrid_swa
-                else None
-            )
+            num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
             mamba_track_indices = (
                 torch.zeros((max_bs,), dtype=torch.int64)
                 if enable_mamba_track
@@ -399,16 +411,31 @@ class PrefillInputBuffers(ForwardInputBuffers):
                 input_embeds = None
                 mrope_positions = None
 
+            pp_proxy_tensors = (
+                _allocate_pp_proxy_tensors(
+                    max_num_tokens=max_num_tokens,
+                    max_hidden_tokens=max_num_tokens,
+                    hidden_size=hidden_size,
+                    dtype=dtype,
+                    hc_hidden_size=hc_hidden_size,
+                    pp_proxy_topk_size=pp_proxy_topk_size,
+                    pp_proxy_residual_num_blocks=pp_proxy_residual_num_blocks,
+                )
+                if pp_size > 1 and not is_first_pp_rank
+                else None
+            )
+
         return cls(
             input_ids=input_ids,
             out_cache_loc=out_cache_loc,
-            out_cache_loc_swa=out_cache_loc_swa,
+            num_token_non_padded=num_token_non_padded,
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,
             mamba_track_seqlens=mamba_track_seqlens,
             positions=positions,
             input_embeds=input_embeds,
             mrope_positions=mrope_positions,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
     def populate_from_forward_batch(
@@ -438,21 +465,20 @@ class PrefillInputBuffers(ForwardInputBuffers):
         self.positions[:raw_num_tokens].copy_(forward_batch.positions)
         self.out_cache_loc[:raw_num_tokens].copy_(forward_batch.out_cache_loc)
 
-        if (
-            self.mamba_track_indices is not None
-            and forward_batch.mamba_track_indices is not None
-        ):
-            self.mamba_track_indices[:bs].copy_(forward_batch.mamba_track_indices)
-        if (
-            self.mamba_track_mask is not None
-            and forward_batch.mamba_track_mask is not None
-        ):
-            self.mamba_track_mask[:bs].copy_(forward_batch.mamba_track_mask)
-        if (
-            self.mamba_track_seqlens is not None
-            and forward_batch.mamba_track_seqlens is not None
-        ):
-            self.mamba_track_seqlens[:bs].copy_(forward_batch.mamba_track_seqlens)
+        if self.mamba_track_indices is not None:
+            if forward_batch.mamba_track_indices is not None:
+                self.mamba_track_indices[:bs].copy_(forward_batch.mamba_track_indices)
+            self.mamba_track_indices[bs:].zero_()
+        if self.mamba_track_mask is not None:
+            if forward_batch.mamba_track_mask is not None:
+                self.mamba_track_mask[:bs].copy_(forward_batch.mamba_track_mask)
+            else:
+                self.mamba_track_mask[:bs].zero_()
+            self.mamba_track_mask[bs:].zero_()
+        if self.mamba_track_seqlens is not None:
+            if forward_batch.mamba_track_seqlens is not None:
+                self.mamba_track_seqlens[:bs].copy_(forward_batch.mamba_track_seqlens)
+            self.mamba_track_seqlens[bs:].zero_()
 
         if forward_batch.mrope_positions is not None:
             self.mrope_positions[:, :raw_num_tokens].copy_(

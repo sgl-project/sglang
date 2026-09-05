@@ -12,12 +12,14 @@ mod common;
 
 mod cache_aware_input_ids;
 mod chat_routing;
+mod external_indexer_routing;
 mod failover;
 mod graceful_shutdown;
 mod header_forwarding;
 mod pd_bootstrap_injection;
 mod pd_pool_isolation;
 mod roundrobin_input_ids;
+mod shared_prefill_admission;
 mod sticky_input_ids;
 mod sticky_routing;
 mod timeout;

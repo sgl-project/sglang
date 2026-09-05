@@ -19,6 +19,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 import zmq
 
@@ -29,6 +30,7 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.codec import (
     send_tensors,
+    unpack_tensors,
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.engine import (
     create_transfer_engine,
@@ -43,10 +45,12 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     TransferMsgType,
     TransferPushedMsg,
     TransferRegisterMsg,
+    TransferStagedMsg,
     decode_transfer_msg,
     encode_transfer_msg,
     is_transfer_message,
 )
+from sglang.multimodal_gen.runtime.entrypoints.utils import expand_request_outputs
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     clone_scheduler_runtime,
@@ -62,6 +66,44 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 
 logger = init_logger(__name__)
+
+
+def _advertised_pool_work_endpoint(server_args) -> str:
+    host = server_args.disagg_p2p_hostname or server_args.host or "127.0.0.1"
+    if host == "0.0.0.0":
+        host = server_args.disagg_p2p_hostname or "127.0.0.1"
+    return server_args.pool_work_endpoint.replace("0.0.0.0", host)
+
+
+def _expand_glm_distributed_outputs(req: Req) -> list[Req]:
+    """Split external-AR tokens into requests for sequential denoising."""
+    output_count = max(1, int(req.num_outputs_per_prompt or 1))
+    if output_count == 1:
+        return [req]
+
+    prior_token_ids = req.prior_token_id
+    if not isinstance(prior_token_ids, torch.Tensor) or (
+        prior_token_ids.shape[0] != output_count
+    ):
+        actual_count = (
+            prior_token_ids.shape[0]
+            if isinstance(prior_token_ids, torch.Tensor)
+            else type(prior_token_ids).__name__
+        )
+        raise RuntimeError(
+            "Cannot split GLM-Image AR output for distributed inference: "
+            f"expected {output_count} token rows, got {actual_count}."
+        )
+
+    usage_by_output = req.extra.get("usage_by_output")
+    output_reqs = expand_request_outputs(req)
+    for output_index, output_req in enumerate(output_reqs):
+        output_req.prior_token_id = prior_token_ids[output_index : output_index + 1]
+        output_req.extra.pop("usage_by_output", None)
+        if usage_by_output is not None and output_index < len(usage_by_output):
+            output_req.usage = usage_by_output[output_index]
+    return output_reqs
+
 
 # ---------------------------------------------------------------------------
 # Field extraction: split Req into tensors (transfer buffer) and scalars (JSON)
@@ -105,15 +147,7 @@ _EXCLUDE_FIELDS = frozenset(
     }
 )
 
-# Sampling-params fields that should never be transferred across roles:
-#   - data_type / supported_resolutions: enums / non-JSON classvars reconstructed on the receiver
-#   - teacache_params: model-specific object, not JSON-safe
-#   - output_* / save_output / return_*: output-side concerns owned by the decoder role
-#
-# Everything else on SamplingParams is forwarded automatically via a field-walk
-# below; this keeps new request-level features (e.g. Qwen-Image's
-# true_cfg_scale, guidance_rescale, cfg_normalization, ...) from silently
-# getting dropped just because nobody remembered to add them to a whitelist.
+# SamplingParams fields that are reconstructed locally or not JSON-safe.
 _SAMPLING_PARAMS_EXCLUDE_FIELDS = frozenset(
     {
         "data_type",
@@ -122,10 +156,8 @@ _SAMPLING_PARAMS_EXCLUDE_FIELDS = frozenset(
     }
 )
 
-_BASE_SP_DEFAULTS: dict[str, Any] = {}
-for _f in dataclasses.fields(SamplingParams):
-    if _f.default is not dataclasses.MISSING:
-        _BASE_SP_DEFAULTS[_f.name] = _f.default
+# Receivers reconstruct base SamplingParams, so only base defaults can be omitted.
+_BASE_SAMPLING_PARAM_FIELDS = {f.name: f for f in dataclasses.fields(SamplingParams)}
 
 
 def _is_tensor_like(value) -> bool:
@@ -137,13 +169,17 @@ def _is_tensor_like(value) -> bool:
 
 
 def _to_json_serializable(value):
-    if isinstance(value, torch.Tensor):
+    if isinstance(value, (torch.Tensor, np.ndarray)):
         return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
     if isinstance(value, (list, tuple)):
         converted = []
         for item in value:
-            if isinstance(item, torch.Tensor):
+            if isinstance(item, (torch.Tensor, np.ndarray)):
                 converted.append(item.tolist())
+            elif isinstance(item, np.generic):
+                converted.append(item.item())
             else:
                 converted.append(item)
         return converted
@@ -152,7 +188,17 @@ def _to_json_serializable(value):
 
 def _is_default(value, field_info) -> bool:
     if field_info.default is not dataclasses.MISSING:
-        return value == field_info.default
+        # ``value == default`` may be element-wise for array/tensor-valued
+        # fields (numpy ndarray, torch.Tensor) or even raise for list-of-array
+        # values. Only treat the field as default when the comparison reduces
+        # to a real boolean; otherwise it is not equal to a scalar default.
+        try:
+            eq = value == field_info.default
+            if isinstance(eq, (bool, np.bool_)):
+                return bool(eq)
+        except (ValueError, RuntimeError):
+            pass
+        return False
     if field_info.default_factory is not dataclasses.MISSING:
         if isinstance(value, (list, dict)) and len(value) == 0:
             return True
@@ -171,10 +217,7 @@ def _extract_extra_fields(extra: dict, scalar_fields: dict) -> None:
             pass
 
 
-def _init_request_scheduler_from_template(
-    scheduler_template: Any, req: Req, device: torch.device
-) -> None:
-    scheduler = clone_scheduler_runtime(scheduler_template)
+def _init_request_scheduler(scheduler: Any, req: Req, device: torch.device) -> None:
     extra_kwargs = {}
     mu = req.extra.get("mu") if hasattr(req, "extra") else None
     if mu is not None:
@@ -202,12 +245,33 @@ def _init_request_scheduler_from_template(
     req.timesteps = scheduler.timesteps
 
 
+def _init_request_scheduler_from_template(
+    scheduler_template: Any, req: Req, device: torch.device
+) -> None:
+    scheduler = clone_scheduler_runtime(scheduler_template)
+    _init_request_scheduler(scheduler, req, device)
+
+
 def _init_disagg_request_scheduler(self: Scheduler, req: Req) -> None:
-    scheduler_template = self.worker.pipeline.get_module("scheduler")
-    if scheduler_template is None:
+    serving_scheduler = self.worker.pipeline.get_module("scheduler")
+    if serving_scheduler is None:
         return
     device = torch.device(f"{current_platform.device_type}:{self.worker.local_rank}")
-    _init_request_scheduler_from_template(scheduler_template, req, device)
+
+    if not req.rollout:
+        _init_request_scheduler_from_template(serving_scheduler, req, device)
+        return
+
+    from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
+        get_or_create_rollout_request_scheduler,
+    )
+
+    scheduler = get_or_create_rollout_request_scheduler(
+        req,
+        serving_scheduler,
+        isolate=True,
+    )
+    _init_request_scheduler(scheduler, req, device)
 
 
 def extract_transfer_fields(req) -> tuple[dict, dict]:
@@ -257,8 +321,8 @@ def extract_transfer_fields(req) -> tuple[dict, dict]:
             value = getattr(sp, name, None)
             if value is None:
                 continue
-            base_default = _BASE_SP_DEFAULTS.get(name, dataclasses.MISSING)
-            if base_default is not dataclasses.MISSING and value == base_default:
+            base_field = _BASE_SAMPLING_PARAM_FIELDS.get(name)
+            if base_field is not None and _is_default(value, base_field):
                 continue
             try:
                 scalar_fields[name] = _to_json_serializable(value)
@@ -438,6 +502,23 @@ class SchedulerDisaggMixin:
 
         sa = self.server_args
 
+        if self._is_glm_distributed_mode():
+            self._preallocated_slots = {}
+            register_msg = TransferRegisterMsg(
+                role=self._disagg_role.value,
+                work_endpoint=_advertised_pool_work_endpoint(sa),
+            )
+            self._pool_result_push.send_multipart(encode_transfer_msg(register_msg))
+            self._compute_ready_queue = queue.Queue(maxsize=4)
+            self._recv_prefetch_thread = threading.Thread(
+                target=self._recv_prefetch_loop,
+                daemon=True,
+                name="recv-prefetch-glm-distributed-denoiser",
+            )
+            self._recv_prefetch_thread.start()
+            logger.info("GLM distributed denoiser registered")
+            return
+
         # Pool size: configurable, default 256 MiB
         pool_size = getattr(sa, "disagg_transfer_pool_size", 256 * 1024 * 1024)
 
@@ -502,7 +583,7 @@ class SchedulerDisaggMixin:
             session_id=self._transfer_manager.session_id,
             pool_ptr=self._transfer_manager.pool_data_ptr,
             pool_size=self._transfer_manager.pool_size,
-            work_endpoint=sa.pool_work_endpoint,
+            work_endpoint=_advertised_pool_work_endpoint(sa),
             preallocated_slots=preallocated_slot_info,
         )
         self._pool_result_push.send_multipart(encode_transfer_msg(register_msg))
@@ -603,6 +684,10 @@ class SchedulerDisaggMixin:
                 raw_frames = self._pool_work_pull.recv_multipart()
                 frames = [bytes(f) for f in raw_frames]
 
+                if not is_transfer_message(frames):
+                    self._compute_ready_queue.put(("relay_compute", frames))
+                    continue
+
                 msg = decode_transfer_msg(frames)
                 msg_type = msg.get("msg_type", "")
 
@@ -636,12 +721,11 @@ class SchedulerDisaggMixin:
         Called from the recv prefetch thread. Loads on _transfer_stream
         and builds the Req, so the main thread can start compute immediately.
 
-        Returns (req, load_event, request_id, role_name, prealloc_slot_id).
+        Returns (req, load_event, request_id, prealloc_slot_id).
         """
         request_id = msg["request_id"]
         manifest = msg.get("manifest", {})
         scalar_fields = msg.get("scalar_fields", {})
-        role_name = self._disagg_role.value.upper()
 
         if self._disagg_metrics:
             self._disagg_metrics.record_request_start(request_id)
@@ -677,7 +761,7 @@ class SchedulerDisaggMixin:
         # running denoising loop on the main thread. Deferred to main thread
         # in _disagg_prefetch_event_loop, right before compute.
 
-        return (req, load_event, request_id, role_name, prealloc_slot_id, scalar_fields)
+        return req, load_event, request_id, prealloc_slot_id
 
     # ------------------------------------------------------------------
     # Broadcast
@@ -832,11 +916,7 @@ class SchedulerDisaggMixin:
           - queue timeout: broadcast "skip"
           - shutdown: broadcast None
         """
-        is_multi_rank = (
-            self.server_args.sp_degree != 1
-            or self.server_args.tp_size > 1
-            or self.server_args.enable_cfg_parallel
-        )
+        is_multi_rank = self._is_multi_rank()
 
         while self._running:
             try:
@@ -849,9 +929,7 @@ class SchedulerDisaggMixin:
 
                 if msg_type == "transfer_compute":
                     # Load already done by recv thread
-                    req, load_event, request_id, rn, prealloc_slot_id, scalar_fields = (
-                        data
-                    )
+                    req, load_event, request_id, prealloc_slot_id = data
                     # Wait for load to complete on compute stream
                     if load_event is not None:
                         torch.get_device_module().current_stream().wait_event(
@@ -880,15 +958,27 @@ class SchedulerDisaggMixin:
                         _init_disagg_request_scheduler(self, req)
                     # Run compute
                     if self._disagg_role == RoleType.DENOISER:
-                        self._disagg_denoiser_compute(req, request_id, rn)
+                        self._disagg_denoiser_compute(req, request_id)
                     elif self._disagg_role == RoleType.DECODER:
-                        self._disagg_decoder_compute(req, request_id, rn)
+                        self._disagg_decoder_compute(req, request_id)
 
                 elif msg_type == "transfer_control":
                     # alloc, push messages — handle on main thread (rank 0 only)
                     if is_multi_rank:
                         self._broadcast_to_all_ranks(("skip",))
                     self._handle_transfer_msg(data)
+
+                elif msg_type == "relay_compute":
+                    local_device = (
+                        f"{current_platform.device_type}:{self.worker.local_rank}"
+                    )
+                    tensors, scalar_fields = unpack_tensors(data, device=local_device)
+                    request_id = scalar_fields.get("request_id", "unknown")
+                    req = self._build_disagg_req(scalar_fields, tensors)
+                    if is_multi_rank:
+                        self._broadcast_to_all_ranks(("compute",))
+                        self._broadcast_req_to_all_ranks(req)
+                    self._execute_glm_distributed_denoiser_request(req, request_id)
 
                 self._consecutive_error_count = 0
 
@@ -993,7 +1083,7 @@ class SchedulerDisaggMixin:
         )
         use_prefetch = self._compute_ready_queue is not None
         logger.info(
-            "Pool mode %s rank %d event loop started " "(multi_rank=%s, prefetch=%s)",
+            "Pool mode %s rank %d event loop started (multi_rank=%s, prefetch=%s)",
             role_name,
             self.gpu_id,
             is_multi_rank,
@@ -1216,8 +1306,6 @@ class SchedulerDisaggMixin:
         request_id = msg["request_id"]
         manifest = msg.get("manifest", {})
         scalar_fields = msg.get("scalar_fields", {})
-        role_name = self._disagg_role.value.upper()
-
         if self._disagg_metrics:
             self._disagg_metrics.record_request_start(request_id)
 
@@ -1266,9 +1354,9 @@ class SchedulerDisaggMixin:
 
         # 7. Run compute
         if self._disagg_role == RoleType.DENOISER:
-            self._disagg_denoiser_compute(req, request_id, role_name)
+            self._disagg_denoiser_compute(req, request_id)
         elif self._disagg_role == RoleType.DECODER:
-            self._disagg_decoder_compute(req, request_id, role_name)
+            self._disagg_decoder_compute(req, request_id)
 
     # ------------------------------------------------------------------
     # Compute
@@ -1287,11 +1375,16 @@ class SchedulerDisaggMixin:
         (:meth:`_disagg_non_rank0_event_loop`).
         """
         if self._disagg_role == RoleType.DENOISER:
-            # Initialize scheduler timesteps (same as rank 0)
-            _init_disagg_request_scheduler(self, req)
+            if not self._is_glm_distributed_mode():
+                _init_disagg_request_scheduler(self, req)
 
             with self._disagg_trace_dispatch(req):
-                self.worker.execute_forward([req], return_req=True)
+                if self._is_glm_distributed_mode():
+                    req.save_output = False
+                    req.return_file_paths_only = False
+                    self.worker.execute_forward([req])
+                else:
+                    self.worker.execute_forward([req], return_req=True)
 
         elif self._disagg_role == RoleType.DECODER:
             req.save_output = False
@@ -1374,9 +1467,7 @@ class SchedulerDisaggMixin:
         with trace_slice(ctx, DiffStage.SCHEDULER_DISPATCH, thread_finish_flag=True):
             yield
 
-    def _disagg_denoiser_compute(
-        self: Scheduler, req: Req, request_id: str, role_name: str
-    ) -> None:
+    def _disagg_denoiser_compute(self: Scheduler, req: Req, request_id: str) -> None:
         """Run denoiser compute in transfer mode, then stage output for decoder.
 
         Note: Scheduler timestep init is done in _handle_transfer_ready
@@ -1447,9 +1538,65 @@ class SchedulerDisaggMixin:
             duration_s,
         )
 
-    def _disagg_decoder_compute(
-        self: Scheduler, req: Req, request_id: str, role_name: str
+    def _is_glm_distributed_mode(self: Scheduler) -> bool:
+        """Return whether this scheduler is a GLM distributed denoiser."""
+        return (
+            self._disagg_role == RoleType.DENOISER
+            and self.worker.pipeline.pipeline_name == "GlmImagePipeline"
+            and self.server_args.srt_encoder_url is not None
+        )
+
+    def _execute_glm_distributed_denoiser_request(
+        self: Scheduler, req: Req, request_id: str
     ) -> None:
+        """Run local preparation, DiT, and VAE, then return decoded pixels."""
+        req.save_output = False
+        start_time = time.monotonic()
+        with self._disagg_trace_dispatch(req):
+            if (
+                self.server_args.pipeline_config.supports_sequential_multi_output_inference()
+                and max(1, int(req.num_outputs_per_prompt or 1)) > 1
+            ):
+                output_reqs = _expand_glm_distributed_outputs(req)
+                output_batches = list(
+                    self.worker.execute_forward_sequentially(output_reqs)
+                )
+                output_batch = self.worker._merge_expanded_output_batches(
+                    output_batches
+                )
+            else:
+                output_batch = self.worker.execute_forward([req])
+
+        tensor_fields = {}
+        scalar_fields = {"request_id": request_id}
+        if output_batch.output is not None:
+            tensor_fields["output"] = output_batch.output
+        if output_batch.error is not None:
+            scalar_fields["error"] = output_batch.error
+        if output_batch.usage is not None:
+            scalar_fields["usage"] = output_batch.usage
+        if output_batch.metrics is not None:
+            scalar_fields["metrics"] = output_batch.metrics.to_dict()
+        if output_batch.metrics_list is not None:
+            scalar_fields["metrics_list"] = [
+                metrics.to_dict() if metrics is not None else None
+                for metrics in output_batch.metrics_list
+            ]
+        scalar_fields["peak_memory_mb"] = output_batch.peak_memory_mb
+        send_tensors(self._pool_result_push, tensor_fields, scalar_fields)
+
+        if self._disagg_metrics:
+            if output_batch.error:
+                self._disagg_metrics.record_request_failed(request_id)
+            else:
+                self._disagg_metrics.record_request_complete(request_id)
+        logger.debug(
+            "GLM distributed denoiser: processed %s in %.2f s",
+            request_id,
+            time.monotonic() - start_time,
+        )
+
+    def _disagg_decoder_compute(self: Scheduler, req: Req, request_id: str) -> None:
         """Run decoder compute in transfer mode, send result to DS.
 
         Decoder result is sent as raw ZMQ multipart frames (same format as
@@ -1589,22 +1736,20 @@ class SchedulerDisaggMixin:
                 self._disagg_metrics.record_request_failed(request_id)
             return
 
-        # 2. Build transfer metadata dict while staging runs (CPU work, overlapped)
-        staged_data = {
-            "msg_type": "transfer_staged",
-            "request_id": request_id,
-            "data_size": staged.slot.size if staged.slot else 0,
-            "manifest": staged.manifest,
-            "session_id": self._transfer_manager.session_id,
-            "pool_ptr": self._transfer_manager.pool_data_ptr,
-            "slot_offset": staged.slot.offset if staged.slot else 0,
-            "scalar_fields": staged.scalar_fields,
-        }
-        msg_bytes = json.dumps(staged_data, separators=(",", ":")).encode("utf-8")
+        # 2. Build transfer metadata while staging runs (CPU work, overlapped)
+        staged_msg = TransferStagedMsg(
+            request_id=request_id,
+            data_size=staged.slot.size if staged.slot else 0,
+            manifest=staged.manifest,
+            session_id=self._transfer_manager.session_id,
+            pool_ptr=self._transfer_manager.pool_data_ptr,
+            slot_offset=staged.slot.offset if staged.slot else 0,
+            scalar_fields=staged.scalar_fields,
+        )
 
         # 3. Wait for staging to complete before sending (buffer must be ready)
         if stage_event is not None:
             stage_event.synchronize()
 
         # 4. Send transfer staged message
-        self._pool_result_push.send_multipart([TRANSFER_MAGIC, msg_bytes])
+        self._pool_result_push.send_multipart(encode_transfer_msg(staged_msg))

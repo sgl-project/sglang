@@ -12,7 +12,8 @@ Public API:
   - BaseCudaGraphRunner — abstract cuda-graph base; bucket padding +
     capture-loop scaffolding on top of BaseRunner.
   - DecodeCudaGraphRunner — concrete decode-phase runner.
-  - PrefillCudaGraphRunner — concrete prefill-phase runner.
+  - PrefillCudaGraphRunner — concrete prefill-phase runner (extend family;
+    MIXED batches replay the EXTEND-captured graphs).
   - EagerRunner — no-cuda-graph runner; runs model.forward live (the
     eager dual of the cuda-graph runners), mode-dispatched over decode +
     extend + idle.
@@ -38,7 +39,7 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (  # noqa
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey  # noqa: F401
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (  # noqa: F401
-    TC_PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG,
+    TCPCG_FAILURE_HINT,
 )
 from sglang.srt.model_executor.runner_utils import (  # noqa: F401
     DecodeInputBuffers,

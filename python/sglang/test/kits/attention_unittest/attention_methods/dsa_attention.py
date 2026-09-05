@@ -5,6 +5,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, ReqToTokenPool
@@ -16,10 +17,8 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import set_global_server_args_for_scheduler
+from sglang.srt.runtime_context import get_context, get_parallel
 
-from ..mock_server_args import make_mock_server_args
 from .dense_attention import (
     DEFAULT_DEVICE,
     DEFAULT_HEAD_DIM,
@@ -242,6 +241,7 @@ class TinyDSAModelConfig:
         self.is_encoder_decoder = False
         self.is_multimodal = False
         self.is_generation = True
+        self.quantization = None
         self.is_hybrid_swa = False
         self.attention_chunk_size = None
         self.sliding_window_size = None
@@ -259,7 +259,12 @@ class TinyDSAModelConfig:
             index_topk=index_topk,
             num_hidden_layers=1,
         )
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
+        self.linear_attn_registry_result = None
+
+    def get_max_num_attention_heads(self) -> int:
+        return self.num_attention_heads
 
 
 class DSAMockModelRunner(ModelRunner):
@@ -287,6 +292,13 @@ class DSAMockModelRunner(ModelRunner):
         # 656 bytes/token while the model still projects K/V in BF16;
         # `set_mla_kv_buffer` does the quantize on the way in.
         self.kv_cache_dtype = torch.float8_e4m3fn if fp8_kv_cache else dtype
+        self.kv_cache_dtype_str = "auto"
+        # This runner's own resolved backends (production stamps these in
+        # ModelRunner.initialize); a draft runner would carry its own.
+        self.prefill_attention_backend_str = case.backend
+        self.decode_attention_backend_str = case.backend
+        self.draft_attention_backend = None
+        self.is_draft_worker = False
         # For TARGET_VERIFY / DRAFT_EXTEND, the DSA backend uses
         # `self.speculative_num_draft_tokens` to size `seqlens_expanded`
         # (`dsa_backend.py:482-486,510-515`). When zero, deep_gemm's
@@ -309,7 +321,8 @@ class DSAMockModelRunner(ModelRunner):
         self._kernel_warmed_up = True
         self.dp_size = 1
         self.pp_size = 1
-        self.server_args = make_mock_server_args(
+        self.ps = ParallelState.trivial()
+        self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
             cuda_graph_config=CudaGraphConfig(
@@ -340,7 +353,6 @@ class DSAMockModelRunner(ModelRunner):
             kv_cache_dtype="auto",
             max_running_requests=None,
             mem_fraction_static=0.8,
-            model_path=None,
             pp_size=1,
             revision=None,
             speculative_algorithm=None,
@@ -351,7 +363,8 @@ class DSAMockModelRunner(ModelRunner):
             triton_attention_num_kv_splits=8,
             triton_attention_split_tile_size=None,
         )
-        set_global_server_args_for_scheduler(self.server_args)
+        self.server_args = self._server_args_override.install()
+        self.max_running_requests = pool_batch_size
         self.req_to_token_pool = ReqToTokenPool(
             size=pool_batch_size,
             max_context_len=max_context_len,
@@ -391,6 +404,7 @@ class DSAMockModelRunner(ModelRunner):
             kv_cache_dim=pool_kv_cache_dim,
         )
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
+        self.init_kv_index_translator()
         self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
@@ -1130,11 +1144,14 @@ def dsa_impl_capability(impl: str) -> tuple[bool, str]:
 
     if impl == "fa3":
         try:
-            from sglang.jit_kernel.flash_attention import (  # noqa: F401
+            from sglang.kernels.ops.attention.flash_attention import (  # noqa: F401
                 flash_attn_with_kvcache,
             )
         except ImportError as exc:
-            return False, f"sglang.jit_kernel.flash_attention unavailable: {exc}"
+            return (
+                False,
+                f"sglang.kernels.ops.attention.flash_attention unavailable: {exc}",
+            )
         # sgl-kernel flash_attn is compiled for SM9.x (Hopper) only;
         # it raises NotImplementedError on Blackwell (SM10.x+).
         if major < 9 or major >= 10:
@@ -1143,7 +1160,7 @@ def dsa_impl_capability(impl: str) -> tuple[bool, str]:
 
     if impl == "tilelang":
         try:
-            from sglang.srt.layers.attention.dsa.tilelang_kernel import (  # noqa: F401
+            from sglang.kernels.ops.attention.dsa.tilelang_kernel import (  # noqa: F401
                 tilelang_sparse_fwd,
             )
         except ImportError as exc:
@@ -1439,8 +1456,7 @@ def run_dsa_sparse_cuda_graph_decode_impl_variant_case(
         )
     if not case.forward_mode.is_decode():
         raise ValueError(
-            "run_dsa_sparse_cuda_graph_decode_impl_variant_case expects a "
-            "DECODE case."
+            "run_dsa_sparse_cuda_graph_decode_impl_variant_case expects a DECODE case."
         )
     from ..runner_modes.cuda_graph_decode_runner import (
         run_dsa_sparse_cuda_graph_decode_case,
@@ -1613,7 +1629,7 @@ def run_dsa_forward(
     input_hidden = inputs["input_hidden"]
     # `input_hidden` may have trailing padding for split-op static-token
     # contracts; project only the live token rows for QKV. The kernel
-    # respects `num_token_non_padded_cpu` via the metadata.
+    # respects `global_num_token_non_padded_cpu` via the metadata.
     live_input_hidden = input_hidden[: case.num_input_tokens]
     input_parts = _split_by_lens(live_input_hidden, case.input_lens)
     kv_hidden = torch.cat(
@@ -1652,7 +1668,7 @@ def expected_dsa_output_from_inputs(
 def dsa_attention_layers(fixture: DSAAttentionFixture) -> list:
     """Return the RadixAttention layers the backend forwards through. The
     split-op runner uses this to install per-layer
-    `num_token_non_padded_cpu` metadata before forward."""
+    `global_num_token_non_padded_cpu` metadata before forward."""
     return [fixture.actual_module.attn]
 
 

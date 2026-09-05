@@ -1,6 +1,10 @@
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -8,10 +12,34 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_common.utils import _is_hip
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import use_intel_amx_backend
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_platform,
+)
+from sglang.srt.utils import (
+    is_gfx95_supported,
+    use_intel_amx_backend,
+)
 
 MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla"]
+
+# ROCm runs dedicated MHA/MLA implementations (forward_mha_rocm.py /
+# forward_mla_rocm.py) so the shared CUDA paths carry no AMD branches. Backend
+# handlers keep returning the generic method; the platform swap happens here.
+# MHA_CHUNKED_KV deliberately stays generic on ROCm. Its shared implementation
+# selects the ROCm prepare/fetch helpers and the portable merge_state wrapper.
+_ROCM_FORWARD_METHODS = {
+    AttnForwardMethod.MHA: AttnForwardMethod.MHA_ROCM,
+    AttnForwardMethod.MHA_ONE_SHOT: AttnForwardMethod.MHA_ONE_SHOT_ROCM,
+    AttnForwardMethod.MLA: AttnForwardMethod.MLA_ROCM,
+}
+
+
+def resolve_rocm_forward_method(method: AttnForwardMethod) -> AttnForwardMethod:
+    if not _is_hip:
+        return method
+    return _ROCM_FORWARD_METHODS.get(method, method)
 
 
 class AttentionBackendRegistry:
@@ -28,7 +56,11 @@ class AttentionBackendRegistry:
 
 def _dispatch_mla_subtype(attn, forward_batch):
     if _is_hip:
-        if attn.rocm_fused_decode_mla and forward_batch.forward_mode.is_decode():
+        if (
+            attn.rocm_fused_decode_mla
+            and forward_batch.forward_mode.is_decode()
+            and attn.current_attention_backend == "aiter"
+        ):
             return AttnForwardMethod.MLA_FUSED_ROPE_ROCM
         else:
             return AttnForwardMethod.MLA
@@ -73,7 +105,10 @@ def _support_mha_one_shot(attn, forward_batch, backend_name):
 
 
 def _handle_attention_backend(attn, forward_batch, backend_name):
-    if is_in_tc_piecewise_cuda_graph():
+    # Captured prefill (tc_piecewise or breakable) must keep a single attention
+    # path: pin the absorbed MLA method — MHA one-shot/chunked shapes vary with
+    # kv-len and cannot be captured.
+    if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return AttnForwardMethod.MLA
 
     # MLA prefill CP forces absorbed MLA regardless of prefix length: the
@@ -111,7 +146,7 @@ def handle_attention_flashinfer(attn, forward_batch):
 
 def handle_attention_fa3(attn, forward_batch):
     # when deterministic inference is enabled, use MLA
-    if get_global_server_args().enable_deterministic_inference:
+    if get_exec().deterministic.enable_deterministic_inference:
         return _dispatch_mla_subtype(attn, forward_batch)
     else:
         return _handle_attention_backend(attn, forward_batch, "fa3")
@@ -126,12 +161,19 @@ def handle_attention_cutlass_mla(attn, forward_batch):
 
 
 def handle_attention_fa4(attn, forward_batch):
-    # TODO(cicirori): use FA4 MHA for DeepSeekV3 for now
-    return AttnForwardMethod.MHA_CHUNKED_KV
+    # FA4 absorbed MLA feeds q_nope through the qv argument, which
+    # flash_attn.cute only implements on SM100/SM110 (not SM120); keep the
+    # pre-existing MHA chunked-KV path elsewhere. Deterministic inference
+    # requires MLA and rejects fa4 on other archs at startup (server_args).
+    if not get_platform().is_sm100_or_sm110:
+        return AttnForwardMethod.MHA_CHUNKED_KV
+    if get_exec().deterministic.enable_deterministic_inference:
+        return _dispatch_mla_subtype(attn, forward_batch)
+    return _handle_attention_backend(attn, forward_batch, "fa4")
 
 
 def handle_attention_trtllm_mla(attn, forward_batch):
-    if is_in_tc_piecewise_cuda_graph():
+    if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return AttnForwardMethod.MLA
 
     sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
@@ -150,6 +192,11 @@ def handle_attention_tokenspeed_mla(attn, forward_batch):
 
 
 def handle_attention_aiter(attn, forward_batch):
+    # During PCG/BCG capture on ROCm, aiter fp8 MLA prefill has no capture
+    # kernels; route through the MHA path (radix_attention swaps attn_mqa for
+    # its attn_mha companion) so capture/replay use valid head/dim metadata.
+    if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
+        return AttnForwardMethod.MHA
     if forward_batch.forward_mode.is_extend_without_speculative():
         return AttnForwardMethod.MHA
     else:
@@ -170,21 +217,46 @@ def handle_attention_dsa(attn, forward_batch):
     return AttnForwardMethod.MLA
 
 
+def _can_use_triton_dense_fp8_prefill(attn, forward_batch) -> bool:
+    prefix_lens = forward_batch.extend_prefix_lens_cpu
+    return (
+        _is_hip
+        and is_gfx95_supported()
+        and envs.SGLANG_TRITON_FP8_PREFILL_ATTN.get()
+        and attn.kv_cache_dtype == "fp8_e4m3"
+        and attn.num_local_heads == 12
+        and attn.qk_nope_head_dim == 128
+        and attn.qk_rope_head_dim == 64
+        and attn.v_head_dim == 128
+        and attn.kv_lora_rank == 512
+        and not get_parallel().dcp_enabled
+        and not mla_use_prefill_cp(forward_batch)
+        and forward_batch.forward_mode.is_extend_without_speculative()
+        and prefix_lens is not None
+        and any(prefix_lens)
+    )
+
+
 def handle_attention_triton(attn, forward_batch):
-    if is_in_tc_piecewise_cuda_graph():
+    if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return AttnForwardMethod.MLA
 
     # when deterministic inference is enabled, use MLA
-    if get_global_server_args().enable_deterministic_inference:
+    if get_exec().deterministic.enable_deterministic_inference:
         return _dispatch_mla_subtype(attn, forward_batch)
+
+    # Kimi-K3 with an FP8 latent cache uses dense 192/128 K/V for cached
+    # prefixes. Always select chunked-KV here: its fast path packs the prefix
+    # once and fuses it with the current chunk in the normal extend kernel.
+    if _can_use_triton_dense_fp8_prefill(attn, forward_batch):
+        return AttnForwardMethod.MHA_CHUNKED_KV
 
     if (
         forward_batch.forward_mode.is_extend_without_speculative()
         and sum(forward_batch.extend_prefix_lens_cpu) == 0
     ):
         return AttnForwardMethod.MHA
-    else:
-        return _dispatch_mla_subtype(attn, forward_batch)
+    return _dispatch_mla_subtype(attn, forward_batch)
 
 
 def handle_attention_intel_xpu(attn, forward_batch):

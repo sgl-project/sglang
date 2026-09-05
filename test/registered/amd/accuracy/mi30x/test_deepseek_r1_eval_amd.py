@@ -138,7 +138,7 @@ DEEPSEEK_R1_MODELS = [
             "131072",
             "--mem-fraction-static",
             "0.70",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "8",
             "--enable-torch-compile",
             "--disable-cuda-graph",
@@ -246,9 +246,9 @@ class TestDeepSeekR1EvalAMD(unittest.TestCase):
         for config in self.models:
             display_name = config.get_display_name()
             with self.subTest(model=display_name):
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(f"Testing: {display_name}")
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
                 env = os.environ.copy()
                 for key, value in config.env_vars.items():

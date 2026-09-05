@@ -38,6 +38,7 @@ def _recv(rid, input_ids, max_new_tokens=8):
         return_logprob=False,
         top_logprobs_num=0,
         token_ids_logprob=None,
+        return_sampling_mask=False,
         require_reasoning=False,
         return_hidden_states=False,
         return_routed_experts=False,
@@ -45,13 +46,13 @@ def _recv(rid, input_ids, max_new_tokens=8):
         priority=None,
         routing_key=None,
         extra_key=None,
+        cache_salt=None,
         http_worker_ipc=None,
         time_stats=None,
     )
 
 
 class TestSessionTokenShare(CustomTestCase):
-
     def setUp(self):
         self.session = Session(capacity_of_str_len=0, session_id="s", streaming=True)
 

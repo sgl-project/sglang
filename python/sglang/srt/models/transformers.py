@@ -65,8 +65,7 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import AutoWeightsLoader, WeightsMapper
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_device
 from sglang.srt.utils.common import direct_register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_hf_text_config
@@ -118,7 +117,9 @@ def _getattr_first(obj, names, default=None):
 
 
 def _resolve_attention_backend_model_cls(config: PretrainedConfig):
-    model_cls = getattr(transformers, getattr(config, "architectures", [""])[0], None)
+    model_cls = getattr(
+        transformers, (getattr(config, "architectures", None) or [""])[0], None
+    )
     if model_cls is not None:
         return model_cls
 
@@ -351,7 +352,7 @@ class TransformersFusedMoE(nn.Module):
         expert_mapping: list,
     ) -> None:
         super().__init__()
-        num_redundant = get_global_server_args().ep_num_redundant_experts
+        num_redundant = get_exec().moe.ep_num_redundant_experts
         experts_cls = get_moe_impl_class(quant_config)
         self.experts = experts_cls(
             num_experts=num_experts + num_redundant,
@@ -543,6 +544,8 @@ class TransformersBase(nn.Module):
             "model.score.": "classifier.",
             "model.classifier.": "classifier.",
             "transformer.": "model.",
+            "gpt_neox.": "model.",
+            "embed_out.": "lm_head.",
             "model.": "model.",
             "lm_head.": "lm_head.",
             "score.": "classifier.",
@@ -580,7 +583,9 @@ class TransformersBase(nn.Module):
         self.skip_substrs: list[str] = []
         self.ignore_unexpected_prefixes: list[str] = []
         self.ignore_unexpected_suffixes: list[str] = []
-        self.skip_substrs.extend([".attn.bias", ".attn.masked_bias", ".masked_bias"])
+        self.skip_substrs.extend(
+            [".attn.bias", ".attn.masked_bias", ".attention.bias", ".masked_bias"]
+        )
         self.ignore_unexpected_prefixes.extend(["classifier.", "score."])
 
         if self.quant_config is not None:
@@ -1072,9 +1077,9 @@ class TransformersBase(nn.Module):
             )
 
         if get_embedding:
-            assert (
-                self.pooler is not None
-            ), "pooling is not enabled for this model class"
+            assert self.pooler is not None, (
+                "pooling is not enabled for this model class"
+            )
             return self.pooler(hidden_states, forward_batch)
 
         assert self.logits_processor is not None and self.lm_head is not None
@@ -1095,7 +1100,6 @@ class TransformersBase(nn.Module):
 
 
 class CausalMixin:
-
     def __init__(self, *args, prefix: str = "", **kwargs):
         super().__init__(*args, prefix=prefix, **kwargs)
 
@@ -1123,7 +1127,6 @@ class CausalMixin:
 
 
 class EmbeddingMixin:
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.ignore_unexpected_prefixes.append("lm_head.")
@@ -1136,7 +1139,6 @@ class EmbeddingMixin:
 
 
 class MoEMixin:
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -1230,7 +1232,7 @@ class MoEMixin:
         expert_mapping = self._get_expert_mapping(num_experts)
 
         # EPLB / EP tracking
-        num_redundant = get_global_server_args().ep_num_redundant_experts
+        num_redundant = get_exec().moe.ep_num_redundant_experts
         ep_size = get_parallel().moe_ep_size
 
         self.mlp_moe_layers: list[nn.Module] = []
@@ -1343,6 +1345,22 @@ class MultiModalMixin:
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._mm_padding_pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+
+        # transformers v5 flattened SigLIP/CLIP (dropped the "vision_model"
+        # wrapper); older checkpoints still ship "vision_tower.vision_model.*"
+        # keys, so remap them when the live model lacks that sub-module.
+        vt = getattr(self.model, "vision_tower", None)
+        if vt is not None and not any(
+            name == "vision_model" for name, _ in vt.named_children()
+        ):
+            self.weight_mapper = (
+                WeightsMapper(
+                    orig_to_new_prefix={
+                        "vision_tower.vision_model.": "model.vision_tower.",
+                    }
+                )
+                | self.weight_mapper
+            )
 
     def _uses_mrope_positions(self) -> bool:
         rope_scaling = getattr(self.text_config, "rope_scaling", None)
@@ -1496,6 +1514,14 @@ class MultiModalMixin:
         ):
             mm_inputs = forward_batch.mm_inputs
             target_device = next(self.model.parameters()).device
+            # 5D features (num_images, num_patches, C, H, W) can't be flattened
+            # here: anyres models pad num_patches per HF processor call, so a
+            # flattened concat would leave stray padding rows once items with
+            # different tile counts are combined. Defer them and pad to the
+            # batch-wide max instead -- the model's own get_image_features
+            # re-derives each image's real patch count from image_sizes and
+            # slices the padding back out.
+            pending_5d_features: dict = {}
 
             for batch_idx in range(len(mm_inputs or [])):
                 mm_input = mm_inputs[batch_idx]
@@ -1518,6 +1544,11 @@ class MultiModalMixin:
                         feature = item.feature
                         if isinstance(feature, torch.Tensor):
                             feature = feature.to(device=target_device)
+                            if feature.dim() == 5:
+                                pending_5d_features.setdefault(feature_key, []).append(
+                                    feature
+                                )
+                                continue
                         if feature_key not in kwargs:
                             kwargs[feature_key] = feature
                         elif isinstance(feature, torch.Tensor) and isinstance(
@@ -1526,6 +1557,24 @@ class MultiModalMixin:
                             kwargs[feature_key] = torch.cat(
                                 [kwargs[feature_key], feature], dim=0
                             )
+
+            for feature_key, tensors in pending_5d_features.items():
+                max_patches = max(t.shape[1] for t in tensors)
+                padded = []
+                for t in tensors:
+                    if t.shape[1] < max_patches:
+                        pad = t.new_zeros(
+                            (t.shape[0], max_patches - t.shape[1], *t.shape[2:])
+                        )
+                        t = torch.cat([t, pad], dim=1)
+                    padded.append(t)
+                combined = torch.cat(padded, dim=0)
+                if feature_key in kwargs:
+                    kwargs[feature_key] = torch.cat(
+                        [kwargs[feature_key], combined], dim=0
+                    )
+                else:
+                    kwargs[feature_key] = combined
 
         return kwargs
 

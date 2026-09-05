@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import get_device_sm, kill_process_tree
+from sglang.srt.utils import get_device_sm
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -21,6 +21,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 GSM_DATASET_PATH = None
@@ -28,7 +29,7 @@ GSM_DATASET_PATH = None
 # Default server arguments shared across all hybrid-attn-backend tests
 DEFAULT_HYBRID_ATTN_SERVER_ARGS = [
     "--trust-remote-code",
-    "--cuda-graph-max-bs",
+    "--cuda-graph-max-bs-decode",
     "8",
     "--prefill-attention-backend",
     "fa3",
@@ -39,7 +40,6 @@ DEFAULT_HYBRID_ATTN_SERVER_ARGS = [
 
 @unittest.skipIf(get_device_sm() < 90, "Test requires CUDA SM 90 or higher")
 class TestHybridAttnBackendBase(CustomTestCase):
-
     model = DEFAULT_MODEL_NAME_FOR_TEST
     base_url = DEFAULT_URL_FOR_TEST
     accuracy_threshold = 0.65  # derived tests need to override this
@@ -73,7 +73,7 @@ class TestHybridAttnBackendBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def test_gsm8k(self):
         requests.get(self.base_url + "/flush_cache")

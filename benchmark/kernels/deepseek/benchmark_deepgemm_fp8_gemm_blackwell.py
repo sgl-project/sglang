@@ -7,7 +7,7 @@ from deep_gemm import ceil_div
 from flashinfer.gemm import gemm_fp8_nt_groupwise
 
 from sglang.benchmark.bench_utils import run_bench
-from sglang.srt.layers.quantization.fp8_kernel import (
+from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
     w8a8_block_fp8_matmul_deepgemm,
 )
@@ -224,7 +224,7 @@ def _benchmark(m, n, k, tp_size, provider):
     tflops = flops / (ms * 1e-3) / 1e12
 
     # Print shape-specific results with TFLOPS
-    print(f"Time: {ms*1000:.2f} us, TFLOPS: {tflops:.2f}")
+    print(f"Time: {ms * 1000:.2f} us, TFLOPS: {tflops:.2f}")
     return ms, max_ms, min_ms
 
 

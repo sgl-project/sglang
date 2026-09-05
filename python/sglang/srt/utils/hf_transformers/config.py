@@ -16,6 +16,7 @@
 from pathlib import Path
 from typing import Optional
 
+from transformers import PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sglang.srt.configs.model_config_parser_registry import (
@@ -36,8 +37,10 @@ from .common import (
     _override_v_head_dim_if_zero,
     check_gguf_file,
     get_hf_text_config,
+    gguf_sidecar_dir,
     resolve_runai_obj_uri,
 )
+from .gguf_native import build_gguf_config, has_native_gguf_support
 from .mistral_utils import is_mistral_model, load_mistral_config
 
 
@@ -51,6 +54,26 @@ def _apply_deepseek_ocr_overrides(config, model):
     config._name_or_path = model
 
 
+_LONGCAT_ARCHS = {
+    "LongcatCausalLM",
+    "LongcatFlashForCausalLM",
+    "LongcatFlashNgramForCausalLM",
+}
+
+
+def _try_load_longcat_config(model, revision: Optional[str], **kwargs):
+    config_dict, _ = PretrainedConfig.get_config_dict(
+        model, revision=revision, **kwargs
+    )
+    architectures = config_dict.get("architectures") or []
+    if not any(arch in _LONGCAT_ARCHS for arch in architectures):
+        return None
+
+    return _CONFIG_REGISTRY["longcat_flash"].from_pretrained(
+        model, revision=revision, **kwargs
+    )
+
+
 @register_model_config_parser("hf")
 class HfModelConfigParser(ModelConfigParserBase):
     def parse(
@@ -60,32 +83,14 @@ class HfModelConfigParser(ModelConfigParserBase):
         revision: Optional[str] = None,
         **kwargs,
     ):
-        config = AutoConfig.from_pretrained(
-            model,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            **kwargs,
-        )
-
-        if (
-            config.architectures is not None
-            and config.architectures[0] == "GlmMoeDsaForCausalLM"
-        ):
-            # GlmMoeDsaConfig drops/clobbers raw checkpoint fields the DSA path
-            # needs, so re-read them from config.json and restore. Fixed upstream
-            # by https://github.com/huggingface/transformers/pull/46338; remove
-            # this block once SGLang requires transformers >= 5.10.
-            from transformers import PretrainedConfig
-
-            raw_config, _ = PretrainedConfig.get_config_dict(model, revision=revision)
-            for key in (
-                "qk_rope_head_dim",
-                "index_topk_freq",
-            ):
-                if key in raw_config:
-                    setattr(config, key, raw_config[key])
-            if hasattr(config, "qk_head_dim") and hasattr(config, "qk_nope_head_dim"):
-                config.qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+        config = _try_load_longcat_config(model, revision, **kwargs)
+        if config is None:
+            config = AutoConfig.from_pretrained(
+                model,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
 
         if (
             config.architectures is not None
@@ -221,6 +226,7 @@ def get_config(
     **kwargs,
 ):
     is_gguf = check_gguf_file(model)
+    gguf_has_sidecar_config = False
     if is_gguf:
         if model_config_parser not in ("auto", "hf"):
             raise ValueError(
@@ -228,7 +234,14 @@ def get_config(
                 "with GGUF inputs; only 'hf' (or 'auto') is supported."
             )
         _ensure_gguf_version()
-        kwargs["gguf_file"] = model
+        gguf_has_sidecar_config = gguf_sidecar_dir(model, "config.json") is not None
+        if not gguf_has_sidecar_config and has_native_gguf_support(model):
+            config = build_gguf_config(model)
+            if model_override_args:
+                config.update(model_override_args)
+            return config
+        if not gguf_has_sidecar_config:
+            kwargs["gguf_file"] = model
         model = Path(model).parent
         # Skip auto-resolution for GGUF: the name-based Mistral heuristic
         # would misfire on the rewritten parent dir.
@@ -251,11 +264,23 @@ def get_config(
     )
 
     if model_override_args:
-        config.update(model_override_args)
+        # A plain update() setattrs a dict-valued override straight onto the
+        # config, so '{"text_config": {...}}' on a VLM would replace the whole
+        # sub-config with a dict and break attribute access downstream.
+        for key, value in model_override_args.items():
+            current = getattr(config, key, None)
+            if isinstance(value, dict) and isinstance(current, PretrainedConfig):
+                current.update(value)
+            else:
+                setattr(config, key, value)
 
-    if is_gguf:
+    if is_gguf and not gguf_has_sidecar_config:
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
-            raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
+            raise RuntimeError(
+                f"Can't get gguf config for {config.model_type}. Place a "
+                "config.json next to the .gguf file to load the config from "
+                "there instead."
+            )
         _set_architectures(config, MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type])
 
     return config

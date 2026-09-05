@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import functools
 import logging
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
-from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_distribution import (
+    _ExpertDistributionRecorderNoop,
+    get_global_expert_distribution_recorder,
+)
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -36,7 +40,7 @@ from functools import lru_cache
 
 import torch
 
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 
 # Blockwise quantization group sizes: number of elements sharing one scale factor
 FP8_BLOCK_SIZE = 128
@@ -53,11 +57,41 @@ logger = logging.getLogger(__name__)
 
 def _should_record_expert_distribution() -> bool:
     recorder = get_global_expert_distribution_recorder()
-    return recorder.recording or torch.get_device_module().is_current_stream_capturing()
+    if recorder.recording:
+        return True
+    # While capturing, only bake in the count kernel if a recorder is actually
+    # configured (non-Noop); otherwise it would replay as dead work every decode
+    # step. Configured recorders still bake it in, so start_record() works after
+    # capture.
+    if torch.get_device_module().is_current_stream_capturing():
+        return not isinstance(recorder, _ExpertDistributionRecorderNoop)
+    return False
+
+
+@functools.lru_cache(maxsize=1)
+def _aiter_supports_mxfp8_dispatch() -> bool:
+    """Whether this aiter can consume fp8 activations with group-32 e8m0 scales.
+
+    Probed rather than assumed, because the failure is silent in the worst way:
+    an older per_1x32 quant still returns fp8, but with continuous fp32 scales,
+    which the MoE then reads as e8m0 bytes and produces garbage rather than an
+    exception. Checking the signature keeps this a startup-time fallback instead
+    of a runtime corruption.
+    """
+    try:
+        import inspect
+
+        from aiter import get_hip_quant
+
+        return "scale_type" in inspect.signature(get_hip_quant).parameters or any(
+            "scale_type" in inspect.signature(f).parameters
+            for f in (get_hip_quant(QuantType.per_1x32),)
+        )
+    except Exception:
+        return False
 
 
 class MoriEPPDispatchHooks(DeepEPPDispatchHooks):
-
     def __call__(self, dispatcher: BaseDispatcher):
         for hook_fun in self.hook_dict.values():
             hook_fun(dispatcher)
@@ -139,12 +173,14 @@ class DispatchDtype(Enum):
     bf16 = "bfloat16"
     fp8 = "float8_blockwise"
     fp4 = "mxfp4_blockwise"
+    mxfp8 = "mxfp8_blockwise"
 
 
 class CombineDtype(Enum):
     bf16 = "bfloat16"
     fp8 = "float8_blockwise"
     fp8_direct_cast = "float8_direct_cast"
+    fp4 = "fp4_blockwise"  # packed E2M1, blockwise-scaled; ~half the combine transport of fp8
 
 
 @dataclass(frozen=True)
@@ -210,6 +246,7 @@ def init_mori_op(
     dispatch_dtype=DispatchDtype.bf16,
     combine_dtype=CombineDtype.bf16,
     enable_sdma=False,
+    use_external_inp_buf=True,
 ):
 
     import mori
@@ -259,6 +296,11 @@ def init_mori_op(
         scale_dim = 0
     elif dispatch_dtype == DispatchDtype.fp8:
         scale_dim = hidden_size // FP8_BLOCK_SIZE
+    elif dispatch_dtype == DispatchDtype.mxfp8:
+        # fp8 payload with group-32 e8m0 microscales: exactly what the per_1x32
+        # MoE kernels consume, so the receive side needs no quant at all.
+        scale_dim = hidden_size // MXFP4_BLOCK_SIZE
+        scale_type_size = torch.float8_e8m0fnu.itemsize
     elif dispatch_dtype == DispatchDtype.fp4:
         # FP4 kernel still takes the original hidden size and do quantization
         # internally, so hidden_dim is not reduced. The reason is that for FP4
@@ -285,11 +327,14 @@ def init_mori_op(
         combine_quant_type = "fp8_blockwise"
     elif combine_dtype == CombineDtype.fp8_direct_cast:
         combine_quant_type = "fp8_direct_cast"
+    elif combine_dtype == CombineDtype.fp4:
+        combine_quant_type = "fp4_blockwise"
 
     logger.info(
         f"[MORI init] {world_size=} {rank=} {hidden_size=} {params_dtype=} "
         f"{num_max_dispatch_tokens_per_rank=} {num_local_experts=} "
         f"{router_topk=} {mode=} {dispatch_dtype=} {combine_dtype=} "
+        f"{use_external_inp_buf=} "
     )
 
     def check_mori_compatibility(kwargs: dict) -> None:
@@ -321,6 +366,7 @@ def init_mori_op(
         max_total_recv_tokens=get_int_env_var(
             "SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS", 0
         ),
+        use_external_inp_buf=use_external_inp_buf,
         kernel_type=kernel_type,
         gpu_per_node=gpu_per_node,
         rdma_block_num=rdma_block_num,
@@ -389,6 +435,7 @@ class _MoriEPDispatcherImplBase:
         )
 
         self.enable_sdma = get_bool_env_var("MORI_ENABLE_SDMA", "false")
+        self.use_external_inp_buf = True
 
         self._mori_op = None
         self.dispatch_dtype = DispatchDtype.bf16
@@ -418,6 +465,7 @@ class _MoriEPDispatcherImplBase:
                 self.dispatch_dtype,
                 self.combine_dtype,
                 self.enable_sdma,
+                self.use_external_inp_buf,
             )
         return self._mori_op
 
@@ -432,6 +480,19 @@ class _MoriEPDispatcherImplBase:
                     self.dispatch_dtype = DispatchDtype.fp8
                 elif dispatch_dtype == "fp4":
                     self.dispatch_dtype = DispatchDtype.fp4
+                elif dispatch_dtype == "mxfp8":
+                    if _aiter_supports_mxfp8_dispatch():
+                        self.dispatch_dtype = DispatchDtype.mxfp8
+                    else:
+                        logger.warning_once(
+                            "SGLANG_MORI_DISPATCH_DTYPE=mxfp8 requires an aiter "
+                            "build whose per_1x32 quant accepts scale_type "
+                            "(for the group-32 e8m0 byte layout the MoE kernels "
+                            "consume). This aiter does not, so the send-side "
+                            "quant would emit continuous fp32 scales and the "
+                            "MoE would read them as e8m0 bytes. Falling back to "
+                            "bf16 dispatch."
+                        )
         elif (
             "SGLANG_MORI_FP8_DISP" in os.environ or "SGLANG_MORI_FP4_DISP" in os.environ
         ):
@@ -455,12 +516,14 @@ class _MoriEPDispatcherImplBase:
                     self.combine_dtype = CombineDtype.bf16
                 elif combine_dtype == "fp8_direct_cast":
                     self.combine_dtype = CombineDtype.fp8_direct_cast
+                elif combine_dtype == "fp4":
+                    self.combine_dtype = CombineDtype.fp4
         elif "SGLANG_MORI_FP8_COMB" in os.environ:
             # Deprecated: will be removed in a future release
             logger.warning_once(
                 "SGLANG_MORI_FP8_COMB is deprecated "
                 "and will be removed in a future release. "
-                "Use SGLANG_MORI_COMBINE_DTYPE=auto|bf16|fp8|fp8_direct_cast instead."
+                "Use SGLANG_MORI_COMBINE_DTYPE=auto|bf16|fp8|fp4|fp8_direct_cast instead."
             )
             if get_bool_env_var("SGLANG_MORI_FP8_COMB", "False"):
                 self.combine_dtype = CombineDtype.fp8
@@ -512,6 +575,9 @@ class _MoriEPDispatcherImplBase:
         self.overlap_args = None
         self.meta_overlap_args = None
 
+    def _combine_kwargs(self, hidden_states: torch.Tensor) -> dict:
+        return {}
+
 
 class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
     def __init__(self, async_finish: bool, **kwargs):
@@ -521,6 +587,8 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         self.quant_config = {}
         self.fp8_quant_func = get_hip_quant(QuantType.per_1x128)
         self.fp4_quant_func = get_hip_quant(QuantType.per_1x32)
+        # Same MX entry point; quant_dtype selects fp4x2 vs fp8.
+        self.mxfp8_quant_func = get_hip_quant(QuantType.per_1x32)
         self.enable_dual_stream = is_tbo_enabled()
         self._comm_stream = None
         if self.enable_dual_stream:
@@ -545,7 +613,28 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         output_dtype = hidden_states.dtype
         scale = None
 
-        if self.dispatch_dtype == DispatchDtype.fp8:
+        if self.dispatch_dtype == DispatchDtype.mxfp8:
+            # MXFP8 quant on live tokens, before the wire.
+            if num_token > 0:
+                # scale_type must be set explicitly: per_1x32_mx_quant_hip still
+                # defaults fp8 output to continuous fp32 scales for backward
+                # compatibility, but the MoE kernels (and the 1-byte scale_dim
+                # configured above) need the e8m0 byte layout.
+                hidden_states, scale = self.mxfp8_quant_func(
+                    hidden_states,
+                    quant_dtype=fp8_dtype,
+                    scale_type=torch.float8_e8m0fnu,
+                )
+            else:
+                hidden_states = torch.empty(
+                    hidden_states.shape, dtype=fp8_dtype, device=hidden_states.device
+                )
+                scale = torch.empty(
+                    (0, self.hidden_size // MXFP4_BLOCK_SIZE),
+                    dtype=torch.float8_e8m0fnu,
+                    device=hidden_states.device,
+                )
+        elif self.dispatch_dtype == DispatchDtype.fp8:
             # FP8 quant
             if num_token > 0:
                 # NOTE: aiter is able to handle token=0 case in UT. But for some
@@ -645,10 +734,15 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
             compute_stream = torch.cuda.current_stream()
             comm_stream = self._comm_stream  # comm stream
 
-            for t in (hidden_states, topk_weights, topk_ids):
-                t.record_stream(comm_stream)
-            if scale is not None:
-                scale.record_stream(comm_stream)
+            # Deliberately no `record_stream(comm_stream)`: it would hold every
+            # dispatch/combine block in the allocator's deferred-free list until
+            # the comm event retires, and with `async_finish` the compute stream
+            # never blocks, so `reserved` churns until ROCr runs out of scratch
+            # (HSA_STATUS_ERROR_OUT_OF_RESOURCES) -- the failure the non-EP DP
+            # TBO path already hit, see `_TBO_PERSIST_BUF` in dp_attention.py.
+            # Dropping it outright (rather than a keep-alive as in DeepseekV4
+            # op_combine_a) is safe because dispatch_b / combine_b wait_event on
+            # the compute stream in the same call, with no TBO yield between.
 
             with torch.cuda.stream(comm_stream):
                 # if (previous_event) stream_wait(comm_stream, previous_event)
@@ -686,16 +780,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                 else:
                     compute_stream.wait_stream(comm_stream)
 
-            for t in (
-                packed_recv_hidden,
-                recv_topk_weights,
-                recv_scales,
-                recv_topk_ids,
-            ):
-                if t is not None:
-                    t.record_stream(comm_stream)
         else:
-
             (
                 packed_recv_hidden,
                 recv_topk_weights,
@@ -759,8 +844,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
             compute_stream = torch.cuda.current_stream()
             comm_stream = self._comm_stream
 
-            for t in (hidden_states, topk_ids, topk_weights):
-                t.record_stream(comm_stream)
+            # No `record_stream(comm_stream)` -- see `_dispatch_core`.
 
             with torch.cuda.stream(comm_stream):
                 if previous_event is not None:
@@ -773,7 +857,10 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                     if self.enable_sdma
                     else self.mori_op.combine
                 )
-                combined_hidden_states = combine_fn(hidden_states, None, topk_ids)[0]
+                combine_kwargs = self._combine_kwargs(hidden_states)
+                combined_hidden_states = combine_fn(
+                    hidden_states, None, topk_ids, **combine_kwargs
+                )[0]
                 if self.enable_sdma:
                     self.mori_op.combine_recv()
 
@@ -783,11 +870,10 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                 else:
                     compute_stream.wait_stream(comm_stream)
 
-            combined_hidden_states.record_stream(comm_stream)
-
         else:
+            combine_kwargs = self._combine_kwargs(hidden_states)
             combined_hidden_states = self.mori_op.combine(
-                hidden_states, None, topk_ids
+                hidden_states, None, topk_ids, **combine_kwargs
             )[0]
 
         return combined_hidden_states, done_event
@@ -802,6 +888,8 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
         self.quant_config = {}
         self.fp8_quant_func = get_hip_quant(QuantType.per_1x128)
         self.fp4_quant_func = get_hip_quant(QuantType.per_1x32)
+        # Same MX entry point; quant_dtype selects fp4x2 vs fp8.
+        self.mxfp8_quant_func = get_hip_quant(QuantType.per_1x32)
 
     def dispatch_a(
         self,
@@ -819,7 +907,28 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
         output_dtype = hidden_states.dtype
         scale = None
 
-        if self.dispatch_dtype == DispatchDtype.fp8:
+        if self.dispatch_dtype == DispatchDtype.mxfp8:
+            # MXFP8 quant on live tokens, before the wire.
+            if num_tokens > 0:
+                # scale_type must be set explicitly: per_1x32_mx_quant_hip still
+                # defaults fp8 output to continuous fp32 scales for backward
+                # compatibility, but the MoE kernels (and the 1-byte scale_dim
+                # configured above) need the e8m0 byte layout.
+                hidden_states, scale = self.mxfp8_quant_func(
+                    hidden_states,
+                    quant_dtype=fp8_dtype,
+                    scale_type=torch.float8_e8m0fnu,
+                )
+            else:
+                hidden_states = torch.empty(
+                    hidden_states.shape, dtype=fp8_dtype, device=hidden_states.device
+                )
+                scale = torch.empty(
+                    (0, self.hidden_size // MXFP4_BLOCK_SIZE),
+                    dtype=torch.float8_e8m0fnu,
+                    device=hidden_states.device,
+                )
+        elif self.dispatch_dtype == DispatchDtype.fp8:
             # FP8 quant
             if num_tokens > 0:
                 # NOTE: aiter is able to handle token=0 case in UT. But for some

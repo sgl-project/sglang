@@ -66,7 +66,7 @@ class TestReturnRoutedExperts(CustomTestCase):
             "deepep",
             # Force normal-mode dispatch: deepep auto routes decode through
             # low_latency mode whose buffer (num_max_dispatch_tokens_per_rank)
-            # is undersized for cuda graph capture at default --cuda-graph-max-bs.
+            # is undersized for cuda graph capture at default --cuda-graph-max-bs-decode.
             "--deepep-mode",
             "normal",
         ]
@@ -160,14 +160,14 @@ class TestReturnRoutedExperts(CustomTestCase):
             captured_baseline_experts, captured_reference_experts
         )
         logger.info(
-            f"Total mismatches report: {num_mismatches} out of {num_baseline_topks} ({num_mismatches/num_baseline_topks:.4%})"
+            f"Total mismatches report: {num_mismatches} out of {num_baseline_topks} ({num_mismatches / num_baseline_topks:.4%})"
         )
         print(
-            f"Total mismatches report: {num_mismatches} out of {num_baseline_topks} ({num_mismatches/num_baseline_topks:.4%})"
+            f"Total mismatches report: {num_mismatches} out of {num_baseline_topks} ({num_mismatches / num_baseline_topks:.4%})"
         )
-        assert (
-            num_mismatches / num_baseline_topks < 0.10
-        ), f"Too many mismatches: {num_mismatches} out of {num_baseline_topks} ({num_mismatches/num_baseline_topks:.4%})"
+        assert num_mismatches / num_baseline_topks < 0.10, (
+            f"Too many mismatches: {num_mismatches} out of {num_baseline_topks} ({num_mismatches / num_baseline_topks:.4%})"
+        )
 
     @classmethod
     def _collect_results(

@@ -27,19 +27,211 @@ from abc import ABC, abstractmethod
 from collections import deque
 from itertools import count
 from queue import Queue
-from typing import Any, Callable, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
 import msgspec
 import zmq
 from pydantic import BaseModel
 
+from sglang.srt.utils.network import NetworkAddress
+
+if TYPE_CHECKING:
+    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+
 logger = logging.getLogger(__name__)
+
+
+def select_kv_publisher_dp_rank(
+    attn_dp_size: int, attn_dp_rank: int, dp_rank: Optional[int]
+) -> int:
+    """Index used to offset this scheduler's KV-event publisher port.
+
+    Each independent KV cache must publish on its own port so a consumer can
+    subscribe per replica. There are always ``dp_size`` such publishers; which
+    rank distinguishes them depends on the parallelism mode:
+
+    - DP-attention (``attn_dp_size > 1``): each attention-DP rank owns a KV
+      cache shard, so distinguish by ``attn_dp_rank``.
+    - Pure DP (``attn_dp_size == 1``): every worker has ``attn_dp_rank == 0``,
+      so distinguish by ``dp_rank`` (the data-parallel replica index).
+
+    Both span ``0..dp_size-1``, matching the ``dp_size`` advertised in
+    ``/server_info`` and the per-rank ports the router subscribes to.
+    """
+    if attn_dp_size > 1:
+        return attn_dp_rank
+    return dp_rank or 0
+
+
+def is_kv_publisher_rank(kv_events_config: Optional[str], ps: "ParallelState") -> bool:
+    """Whether this scheduler owns a KV-event publisher slot: one per
+    independent KV cache (pp/attn-TP/attn-CP rank 0). Shared by
+    `SchedulerKvEventsPublisher` and `SchedulerLoadPublisher`, which must
+    gate identically or their /server_info-derived ports disagree.
+    """
+    return bool(
+        kv_events_config
+        and ps.pp_rank == 0
+        and ps.attn_tp_rank == 0
+        and ps.attn_cp_rank == 0
+    )
+
+
+# Advertised as `load_topic` in /server_info; the load socket carries only
+# load, so subscribers can subscribe-all.
+LOAD_TOPIC = "load"
+
+# Hosts a PUB socket binds rather than connects to. Matched on the parsed
+# host, not a substring: "::" appears inside every IPv6 address, so a
+# substring test would wrongly call a concrete remote host bindable.
+_BIND_WILDCARD_HOSTS = frozenset({"*", "0.0.0.0", "::"})
+
+
+def parse_tcp_port(endpoint: Optional[str]) -> Optional[int]:
+    """Legal port of a tcp:// endpoint regardless of host, or None.
+
+    Host-agnostic: answers "which ports does something else occupy" for the
+    collision checks (the replay ROUTER binds any host spelling).
+    """
+    if not endpoint or not endpoint.startswith("tcp://"):
+        return None
+    try:
+        port = NetworkAddress.parse(endpoint[len("tcp://") :]).port
+    except ValueError:
+        return None
+    return port if 0 < port <= 65535 else None
+
+
+def parse_advertisable_tcp(endpoint: Optional[str]) -> Optional[tuple[str, int]]:
+    """``(host, port)`` of a tcp:// endpoint fit for /server_info, else None.
+
+    Any host (KV events work connect-style); IPv6 re-bracketed so consumers
+    can splice ``tcp://{host}:{port}``. Bare unbracketed IPv6 is rejected —
+    same parse as the resolver, so descriptor and bind agree.
+    """
+    if not endpoint or not endpoint.startswith("tcp://"):
+        return None
+    try:
+        addr = NetworkAddress.parse(endpoint[len("tcp://") :])
+    except ValueError:
+        return None
+    if not addr.host or not (0 < addr.port <= 65535):
+        return None
+    host = f"[{addr.host}]" if addr.is_ipv6 else addr.host
+    return host, addr.port
+
+
+def parse_bindable_tcp(endpoint: Optional[str]) -> Optional[tuple[str, int]]:
+    """``(host, port)`` if a PUB socket can BIND this tcp:// endpoint, else
+    None. A concrete host is connect-style here, so a load PUB there would
+    reach nobody while reporting no error."""
+    if not endpoint or not endpoint.startswith("tcp://"):
+        return None
+    try:
+        addr = NetworkAddress.parse(endpoint[len("tcp://") :])
+    except ValueError:
+        return None
+    if addr.host not in _BIND_WILDCARD_HOSTS or not (0 < addr.port <= 65535):
+        return None
+    return addr.host, addr.port
+
+
+def resolve_load_pub_range(
+    *,
+    kv_endpoint: Optional[str],
+    replay_endpoint: Optional[str],
+    dp_size: int,
+    load_publish_endpoint: Optional[str] = None,
+) -> tuple[Optional[tuple[str, int]], Optional[str]]:
+    """``((host, base), reason)`` for the load PUB range — exactly one is None.
+
+    Rank ``r`` binds ``base + r`` and ``/server_info`` advertises ``base``.
+    Single source of truth for both the bind (`SchedulerLoadPublisher`) and
+    the advertisement (`describe_kv_events_publisher`), so they cannot drift.
+
+    Opt-in via ``--load-publish-endpoint``: unset (or ``off``) disables it, so
+    an upgrade never reserves a port a co-hosted neighbor's KV publisher would
+    bind. ``auto`` packs the range after the KV-event range, bumping past an
+    overlapping replay ROUTER range (with the conventional replay = kv + 1,
+    always); an explicit ``tcp://`` address sets it outright.
+
+    ``reason`` is set when an operator would want to know why publishing is
+    off (unusable endpoint, collision, u16 overflow) and None when the decline
+    is unremarkable (feature off). Callers log it once; /server_info calls
+    this per request, so it must not log here.
+
+    Two inherited limits, both from the KV-event discovery structure: with
+    ``page_size`` <= 0 `describe_kv_events_publisher` suppresses the whole
+    block, so the range binds unadvertised; and with DP-attention across
+    ``nnodes`` > 1 the single advertised base is paired with one worker-URL
+    host, so ranks on other nodes are unreachable at that host.
+    """
+    # Opt-in: off unless the operator sets `auto` (derive) or an address, so an
+    # upgrade never claims a port a co-hosted neighbor's KV publisher binds.
+    mode = (load_publish_endpoint or "").strip()
+    if dp_size < 1 or not mode or mode.lower() == "off":
+        return None, None
+
+    if mode.lower() == "auto":
+        resolved = parse_bindable_tcp(kv_endpoint)
+        if resolved is None:
+            why = (
+                "--kv-events-config is not set"
+                if kv_endpoint is None
+                else f"{kv_endpoint!r} is not one"
+            )
+            return None, (
+                f"--load-publish-endpoint=auto needs a bindable wildcard-host "
+                f"tcp:// --kv-events-config endpoint to pack after; {why}"
+            )
+        host, kv_base = resolved
+        base = kv_base + dp_size
+        replay_base = parse_tcp_port(replay_endpoint)
+        if (
+            replay_base is not None
+            and base < replay_base + dp_size
+            and replay_base < base + dp_size
+        ):
+            # Overlap implies kv < replay < kv + 2*dp_size, so packing after
+            # the replay range also clears the KV range.
+            base = replay_base + dp_size
+    else:
+        # Explicit address. Discovery still needs the kv_events block, absent
+        # for a non-tcp KV endpoint — so the range would bind but never
+        # advertise.
+        if parse_tcp_port(kv_endpoint) is None:
+            absent = (
+                "without --kv-events-config"
+                if kv_endpoint is None
+                else f"for endpoint {kv_endpoint!r}"
+            )
+            return None, (
+                f"--load-publish-endpoint={mode!r} needs a routable tcp:// "
+                f"--kv-events-config endpoint: routers discover the load range "
+                f"through /server_info's kv_events block, absent {absent}, so "
+                f"the socket would be bound but never advertised"
+            )
+        resolved = parse_bindable_tcp(mode)
+        if resolved is None:
+            return None, (
+                f"--load-publish-endpoint={mode!r} is not a bindable tcp:// "
+                f"address (a concrete host would be connected to, not bound)"
+            )
+        host, base = resolved
+        for port in (parse_tcp_port(kv_endpoint), parse_tcp_port(replay_endpoint)):
+            if port is not None and base < port + dp_size and port < base + dp_size:
+                return None, (
+                    f"--load-publish-endpoint range [{base}, {base + dp_size}) "
+                    f"overlaps the kv-events range [{port}, {port + dp_size})"
+                )
+    if base + dp_size - 1 > 65535:
+        return None, f"load port range from {base} would run past the u16 ceiling"
+    return (host, base), None
 
 
 class EventBatch(
     msgspec.Struct,
     array_like=True,  # type: ignore[call-arg]
-    omit_defaults=True,  # type: ignore[call-arg]
     gc=False,  # type: ignore[call-arg]
 ):
     ts: float
@@ -50,7 +242,6 @@ class EventBatch(
 class KVCacheEvent(
     msgspec.Struct,
     array_like=True,  # type: ignore[call-arg]
-    omit_defaults=True,  # type: ignore[call-arg]
     gc=False,  # type: ignore[call-arg]
     tag=True,
 ):
@@ -66,21 +257,19 @@ class StorageMedium(str, enum.Enum):
     EXTERNAL = "EXTERNAL"  # L4: shared / remote pool (e.g. Mooncake)
 
 
-class OffloadedState:
-    """
-    OffloadedState represents the state of a KV cache block offloaded to the hicache.
+class BlockStoredMetadata(msgspec.Struct, omit_defaults=True, gc=False):
+    """Typed request metadata attached to a stored KV block."""
 
-    - prefill_len (int): The length of the prefill part of the KV cache block.
-    - inc_len (int): The length of the incremental part of the KV cache block.
-    - last_hash (Optional[str]): The hash of the last token in the KV cache block.
-    """
+    cache_salt: str
 
-    def __init__(
-        self, prefill_len: int, inc_len: int = 0, last_hash: Optional[str] = None
-    ):
-        self.prefill_len = prefill_len
-        self.inc_len = inc_len
-        self.last_hash = last_hash
+
+class OffloadedState(msgspec.Struct):
+    """Decode-side offload progress for one request, keyed by Req in the manager."""
+
+    # Decode-incremental length already submitted for D2H offload.
+    inc_len: int = 0
+    # Tail of the page hash chain, extended as each offloaded chunk is backed up.
+    last_hash: Optional[str] = None
 
 
 class BlockStored(KVCacheEvent):
@@ -90,6 +279,16 @@ class BlockStored(KVCacheEvent):
     block_size: int
     lora_id: Optional[int]
     medium: Optional[str] = None
+
+
+class BlockStoredWithMetadata(BlockStored, tag="BlockStored", kw_only=True):
+    """BlockStored wire extension used only when typed metadata is present.
+
+    A separate struct keeps unsalted events at their legacy array length; an
+    optional field on BlockStored would still serialize a trailing null.
+    """
+
+    metadata: BlockStoredMetadata
 
 
 class BlockRemoved(KVCacheEvent):
@@ -102,6 +301,10 @@ class AllBlocksCleared(KVCacheEvent):
 
 
 class KVEventBatch(EventBatch):
+    # BlockStoredWithMetadata deliberately stays out of this tagged union.
+    # Existing typed consumers decode its shared "BlockStored" tag as the base
+    # type and ignore the trailing metadata; adding both types would give
+    # msgspec duplicate tags and make the union invalid.
     events: list[Union[BlockStored, BlockRemoved, AllBlocksCleared]]
 
 

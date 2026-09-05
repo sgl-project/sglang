@@ -17,7 +17,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.input_buffers import _forward_input_buffer_pool
 from sglang.srt.model_executor.runner import set_global_graph_memory_pool
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import set_global_server_args_for_scheduler
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -188,15 +187,7 @@ class _EagleDraftWorkerHarness:
         self._topk1_parents_prealloc = None
         self._topk1_score_indices_prealloc = None
         EagleDraftWorker._rebuild_topk1_chain_buffers(self)
-        # draft_forward reads this (set in EagleDraftWorker.__init__, skipped here).
-        self.index_share_for_mtp_iteration = (
-            getattr(
-                self.model_config.hf_config,
-                "index_share_for_mtp_iteration",
-                False,
-            )
-            and self.topk == 1
-        )
+        EagleDraftWorker._init_dsa_index_share_state(self)
 
     @property
     def draft_model_runner(self):
@@ -287,9 +278,10 @@ def _seeded_rng(seed: int, *, device: str | torch.device):
 
 
 @contextmanager
-def _single_rank_graph_capture():
-    stream = torch.cuda.Stream()
-    yield SimpleNamespace(stream=stream)
+def _single_rank_graph_capture(stream=None):
+    # Mirrors `graph_capture(stream=None)`: capture runs on the caller's stream
+    # when it leases one, so the shim stays valid for both call shapes.
+    yield SimpleNamespace(stream=stream if stream is not None else torch.cuda.Stream())
 
 
 def _reset_cuda_graph_test_buffers() -> None:
@@ -304,7 +296,6 @@ def _configure_runner_for_eagle_draft(
     *,
     speculative_attention_mode: str = "decode",
 ) -> None:
-    server_args = runner.server_args
     updates = {
         "attention_backend": case.backend,
         "cuda_graph_config": CudaGraphConfig(
@@ -335,8 +326,11 @@ def _configure_runner_for_eagle_draft(
         "torch_compile_max_bs": 0,
         "use_mla_backend": runner.use_mla_backend,
     }
-    for key, value in updates.items():
-        setattr(server_args, key, value)
+    from sglang.srt.runtime_context import get_context
+    from sglang.test.test_utils import server_args_variant
+
+    runner.server_args = server_args_variant(runner.server_args, **updates)
+    get_context().set_server_args(runner.server_args)
 
     runner.spec_algorithm = SpeculativeAlgorithm.EAGLE
     runner.is_draft_worker = True
@@ -347,7 +341,6 @@ def _configure_runner_for_eagle_draft(
     runner.model_config.dtype = runner.dtype
     runner.model_config.vocab_size = settings.vocab_size
     runner.model_config.hf_config.vocab_size = settings.vocab_size
-    set_global_server_args_for_scheduler(server_args)
 
 
 def _build_eagle_draft_fixture(
@@ -367,7 +360,6 @@ def _build_eagle_draft_fixture(
     )
     _configure_runner_for_eagle_draft(fixture.runner, case, settings)
     draft_attn_backend = DraftBackendFactory(
-        fixture.runner.server_args,
         fixture.runner,
         settings.topk,
         settings.speculative_num_steps,
@@ -398,7 +390,13 @@ def _build_frozen_kv_mtp_fixture(
         runner_batch_size=settings.capture_batch_size,
     )
     _configure_runner_for_eagle_draft(fixture.runner, case, settings)
-    fixture.runner.server_args.speculative_algorithm = "FROZEN_KV_MTP"
+    from sglang.srt.runtime_context import get_context
+    from sglang.test.test_utils import server_args_variant
+
+    fixture.runner.server_args = server_args_variant(
+        fixture.runner.server_args, speculative_algorithm="FROZEN_KV_MTP"
+    )
+    get_context().set_server_args(fixture.runner.server_args)
     fixture.runner.spec_algorithm = SpeculativeAlgorithm.FROZEN_KV_MTP
     fixture.runner.draft_attn_backend = fixture.backend
     fixture.runner.attn_backend = fixture.backend
@@ -444,14 +442,10 @@ def _capture_eagle_draft_graph_runner(
             _single_rank_graph_capture,
         ),
         patch(
-            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_tensor_model_parallel_rank",
-            lambda: 0,
-        ),
-        patch(
             "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
-        get_parallel().override(attn_cp_size=1),
+        get_parallel().override(attn_cp_size=1, tp_rank=0),
     ):
         _reset_cuda_graph_test_buffers()
         return EAGLEDraftCudaGraphRunner(
@@ -470,14 +464,10 @@ def _capture_frozen_kv_mtp_graph_runner(
             _single_rank_graph_capture,
         ),
         patch(
-            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_tensor_model_parallel_rank",
-            lambda: 0,
-        ),
-        patch(
             "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
-        get_parallel().override(attn_cp_size=1),
+        get_parallel().override(attn_cp_size=1, tp_rank=0),
     ):
         _reset_cuda_graph_test_buffers()
         return FrozenKVMTPCudaGraphRunner(worker)
@@ -616,9 +606,9 @@ class _DenseEagleDraftForward:
         )
 
     def __call__(self, forward_batch: ForwardBatch):
-        assert (
-            forward_batch.forward_metadata_ready
-        ), "draft-loop forward reached the runner without a pre-planned batch"
+        assert forward_batch.forward_metadata_ready, (
+            "draft-loop forward reached the runner without a pre-planned batch"
+        )
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -655,9 +645,9 @@ class _FrozenKVMTPDenseDraftForward:
         )
 
     def __call__(self, forward_batch: ForwardBatch):
-        assert (
-            forward_batch.forward_metadata_ready
-        ), "draft-loop forward reached the runner without a pre-planned batch"
+        assert forward_batch.forward_metadata_ready, (
+            "draft-loop forward reached the runner without a pre-planned batch"
+        )
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -1044,9 +1034,9 @@ class _MLAEagleDraftForward:
         )
 
     def __call__(self, forward_batch: ForwardBatch):
-        assert (
-            forward_batch.forward_metadata_ready
-        ), "draft-loop forward reached the runner without a pre-planned batch"
+        assert forward_batch.forward_metadata_ready, (
+            "draft-loop forward reached the runner without a pre-planned batch"
+        )
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -1302,9 +1292,9 @@ class _DSV4EagleDraftForward:
         )
 
     def __call__(self, forward_batch: ForwardBatch):
-        assert (
-            forward_batch.forward_metadata_ready
-        ), "draft-loop forward reached the runner without a pre-planned batch"
+        assert forward_batch.forward_metadata_ready, (
+            "draft-loop forward reached the runner without a pre-planned batch"
+        )
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -1501,6 +1491,7 @@ def run_dsv4_eagle_draft_cuda_graph_runner_case(
     vocab_size: int = 64,
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    force_gpu_only_seq_lens: bool = False,
 ):
     settings = EagleDraftRunnerSettings(
         topk=topk,
@@ -1515,12 +1506,20 @@ def run_dsv4_eagle_draft_cuda_graph_runner_case(
         atol=DSV4_ATOL,
         rtol=DSV4_RTOL,
     )
+
+    def _make_forward_batch(case, draft_inputs, settings):
+        batch = _make_dsv4_eagle_draft_forward_batch(case, draft_inputs, settings)
+        if force_gpu_only_seq_lens:
+            batch.seq_lens_cpu = None
+            batch.seq_lens_sum = None
+        return batch
+
     adapter = EagleDraftCudaGraphRunnerAdapter(
         build_fixture=build_dsv4_attention_fixture,
         make_model_forward=_make_dsv4_model_forward,
         make_draft_inputs=_make_dsv4_draft_inputs,
         prepare_replay_state=_prepare_dsv4_draft_replay_state,
-        make_forward_batch=_make_dsv4_eagle_draft_forward_batch,
+        make_forward_batch=_make_forward_batch,
         check_case=_check_dsv4_draft_cache_layout,
         init_eager_metadata=_init_dsv4_eager_metadata,
     )
@@ -1604,9 +1603,9 @@ class _DSAEagleDraftForward:
         )
 
     def __call__(self, forward_batch: ForwardBatch):
-        assert (
-            forward_batch.forward_metadata_ready
-        ), "draft-loop forward reached the runner without a pre-planned batch"
+        assert forward_batch.forward_metadata_ready, (
+            "draft-loop forward reached the runner without a pre-planned batch"
+        )
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:

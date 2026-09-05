@@ -22,10 +22,11 @@ from __future__ import annotations
 
 """Attention backend for the tokenspeed-mla CuTe DSL kernels on Blackwell.
 
-Subclasses :class:`TRTLLMMLABackend` and overrides only ``_run_decode_kernel``
-and ``_run_prefill_kernel``. All metadata, KV-cache layout, CUDA-graph
-plumbing, FP8 quantize/rope, draft-extend padding, and chunked-prefix
-dispatch are inherited unchanged from the parent.
+Subclasses :class:`TRTLLMMLABackend` to share its MLA data preparation, prefill
+plumbing, and DCP metadata (rank-local KV lengths and page table). The decode
+forward lives here because the TokenSpeed decode kernel natively accepts CP
+rank/world metadata and returns the partial log-sum-exp needed by the cross-rank
+merge.
 """
 
 import logging
@@ -33,12 +34,25 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.fp8_quantize import fp8_quantize
-from sglang.jit_kernel.mla_kv_pack_quantize_fp8 import mla_kv_pack_quantize_fp8
-from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
+from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
+    mla_kv_pack_quantize_fp8,
+)
+from sglang.kernels.ops.attention.utils import (
+    mla_quantize_and_rope_for_fp8,
+    mla_quantize_without_rope_for_fp8,
+)
+from sglang.kernels.ops.quantization.fp8_quantize import fp8_quantize
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLAMultiStepDraftBackend,
+)
+from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_resources,
+    max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils import is_flashinfer_available, is_tokenspeed_mla_available
 
@@ -59,28 +73,35 @@ logger = logging.getLogger(__name__)
 
 # Workspace upper bound for tokenspeed_mla_decode:
 #   num_sms * num_heads * max_q_len * (kv_lora_rank + 1) * sizeof(float32)
-# MAX_Q_LEN=8 covers EAGLE3 num_draft_tokens=4 plus headroom.
+# MAX_Q_LEN=8 covers EAGLE3 num_draft_tokens=4 plus headroom. Larger
+# speculative widths grow the bound at backend initialization.
 _TOKENSPEED_MAX_Q_LEN = 8
-
-_g_tokenspeed_workspace: dict[torch.device, torch.Tensor] = {}
 
 
 def _get_tokenspeed_workspace(
-    device: torch.device, num_heads: int, kv_lora_rank: int
+    device: torch.device,
+    num_heads: int,
+    kv_lora_rank: int,
+    max_q_len: int = _TOKENSPEED_MAX_Q_LEN,
 ) -> torch.Tensor:
+
+    # DCP target verification gathers Q to the full head count before launching
+    # TokenSpeed; size for that launch shape, not the rank-local head count.
+    num_heads *= get_parallel().attn_dcp_size
+    max_q_len = max(max_q_len, _TOKENSPEED_MAX_Q_LEN)
     needed = (
         tokenspeed_mla.get_num_sm(device)
         * num_heads
-        * _TOKENSPEED_MAX_Q_LEN
+        * max_q_len
         * (kv_lora_rank + 1)
         * 4
     )
-    existing = _g_tokenspeed_workspace.get(device)
+    buffers = get_resources().buffers
+    key = f"tokenspeed_mla_workspace:{device}"
+    existing = buffers.get(key)
     if existing is None or existing.numel() < needed:
-        _g_tokenspeed_workspace[device] = torch.empty(
-            needed, dtype=torch.int8, device=device
-        )
-    return _g_tokenspeed_workspace[device]
+        buffers[key] = torch.empty(needed, dtype=torch.int8, device=device)
+    return buffers[key]
 
 
 # TODO(Qiaolin-Yu): Merge this attention backend into trtllm_mla_backend.py
@@ -117,7 +138,10 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         self._tokenspeed_workspace: Optional[torch.Tensor] = None
         if is_tokenspeed_mla_available():
             self._tokenspeed_workspace = _get_tokenspeed_workspace(
-                self.device, self.num_q_heads, self.kv_lora_rank
+                self.device,
+                self.num_q_heads,
+                self.kv_lora_rank,
+                max_q_len=(max_speculative_num_draft_tokens() or 1),
             )
 
             # Pre-JIT the prefill kernel variants. Each cute.compile takes 1-2
@@ -279,7 +303,12 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         seq_lens: torch.Tensor,
         max_seq_len: int,
         layer: RadixAttention,
-    ) -> torch.Tensor:
+        *,
+        causal_seqs: Optional[torch.Tensor] = None,
+        cp_world: int = 1,
+        cp_rank: int = 0,
+        return_lse: bool = False,
+    ):
         k_scale = getattr(layer, "k_scale_float", None)
         if k_scale is None:
             k_scale = 1.0
@@ -301,7 +330,113 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             softmax_scale=softmax_scale,
             output_scale=output_scale,
             enable_pdl=is_arch_support_pdl(),
+            return_lse=return_lse,
+            causal_seqs=causal_seqs,
+            cp_world=cp_world,
+            cp_rank=cp_rank,
         )
+
+    def forward_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        is_neox: Optional[bool] = False,
+        llama_4_scaling: Optional[torch.Tensor] = None,
+    ):
+        parallel = get_parallel()
+        if parallel.dcp_enabled and get_in_autotune_dummy_run():
+            return self._dummy_dcp_decode_for_autotune(q, layer)
+
+        if not parallel.dcp_enabled:
+            return super().forward_decode(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+                q_rope,
+                k_rope,
+                cos_sin_cache,
+                is_neox,
+                llama_4_scaling,
+            )
+
+        assert q_rope is not None and k_rope is not None
+        if cos_sin_cache is None:
+            q, k, k_rope = mla_quantize_without_rope_for_fp8(
+                q, q_rope, k.squeeze(1), k_rope.squeeze(1)
+            )
+        else:
+            q, k, k_rope = mla_quantize_and_rope_for_fp8(
+                q,
+                q_rope,
+                k.squeeze(1),
+                k_rope.squeeze(1),
+                forward_batch.positions,
+                cos_sin_cache,
+                is_neox,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+            )
+
+        if save_kv_cache:
+            self.token_to_kv_pool.set_mla_kv_buffer(
+                layer, self._kv_write_loc(forward_batch), k, k_rope
+            )
+
+        query = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+        if llama_4_scaling is not None:
+            query = (query.to(self.q_data_type) * llama_4_scaling).to(self.data_type)
+        if query.dim() == 3:
+            query = query.unsqueeze(1)
+
+        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
+        metadata = (
+            getattr(forward_batch, "decode_trtllm_mla_metadata", None)
+            or self.forward_decode_metadata
+        )
+        metadata_batch_size = getattr(metadata, "batch_size", None)
+        if (
+            metadata_batch_size is not None
+            and metadata_batch_size < forward_batch.batch_size
+        ):
+            self.init_forward_metadata(forward_batch)
+            metadata = forward_batch.decode_trtllm_mla_metadata
+
+        global_seq_lens = forward_batch.seq_lens[: forward_batch.batch_size]
+        local_seq_lens = self._get_dcp_local_seq_lens(global_seq_lens)
+        raw_out, lse = self._run_decode_kernel(
+            query=query,
+            kv_cache=kv_cache,
+            block_tables=metadata.block_kv_indices,
+            seq_lens=local_seq_lens,
+            max_seq_len=metadata.max_seq_len_k,
+            layer=layer,
+            causal_seqs=global_seq_lens,
+            cp_world=parallel.dcp_size,
+            cp_rank=parallel.dcp_rank,
+            return_lse=True,
+        )
+
+        output = raw_out.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+        lse = lse.view(-1, layer.tp_q_head_num)
+        fixup_zero_kv_rows(
+            output,
+            lse,
+            local_seq_lens,
+            self.q_indptr_decode[: forward_batch.batch_size + 1],
+            1,
+        )
+        return output.flatten(1), lse
 
     def _run_prefill_kernel(
         self,
@@ -321,6 +456,14 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         o_sf_scale: float = 1.0,
     ):  # Q/K/V arrive already in FP8 via the model-side fused path
         # (prepare_prefill_qkv / pack_prefix_chunk_kv); no quantize here.
+        # Hybrid MLA models resolve the model-side hook through the outer
+        # HybridLinearAttnBackend, so their fallback MHA path can pass V as a
+        # last-dimension slice of kv_b_proj (stride(-2) > size(-1)).  The
+        # TokenSpeed prefill kernel requires dense Q/K/V layouts even though
+        # the public wrapper accepts arbitrary torch tensors.
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
         return tokenspeed_mla.tokenspeed_mla_prefill(
             query=q,
             key=k,

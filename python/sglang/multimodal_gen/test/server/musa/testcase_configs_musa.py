@@ -46,6 +46,11 @@ ONE_GPU_MUSA_CASES: list[DiffusionTestCase] = [
             model_path=hf_cached_model("Wan-AI/Wan2.1-T2V-1.3B-Diffusers"),
             modality="video",
             custom_validator="video",
+            # Server warmup caps videos at 17 frames, while this test's
+            # one-second request resolves to 24. Reuse the first real request
+            # shape for an unmeasured warmup so first-shape initialization
+            # stays outside the denoising performance metrics.
+            extras=["--warmup-mode", "request"],
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import VerifyPlan
+from sglang.kernels.ops.kv_canary.verify import VerifyPlan
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.buffer_group import PoolKind
 from sglang.srt.kv_canary.runner import swa_divergence as swa_div_module
@@ -447,16 +447,18 @@ class TestSwaDivergenceLogFindAll(CustomTestCase):
 
 class TestCanaryManagerSwaDivergenceWiring(CanaryManagerTestCase):
     def test_swa_divergence_report_is_none_when_env_disabled(self) -> None:
-        with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL.override(
-            0
-        ), envs.SGLANG_KV_CANARY_PERTURB_TARGET_GROUP.override("full"):
+        with (
+            envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL.override(0),
+            envs.SGLANG_KV_CANARY_PERTURB_TARGET_GROUP.override("full"),
+        ):
             manager = make_manager(device=self.device)
         self.assertIsNone(manager._swa_divergence_report)
 
     def test_swa_divergence_report_present_when_env_enabled(self) -> None:
-        with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL.override(
-            20
-        ), envs.SGLANG_KV_CANARY_PERTURB_TARGET_GROUP.override("full"):
+        with (
+            envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL.override(20),
+            envs.SGLANG_KV_CANARY_PERTURB_TARGET_GROUP.override("full"),
+        ):
             manager = make_manager(device=self.device)
         self.assertIsNotNone(manager._swa_divergence_report)
         self.assertIsInstance(manager._swa_divergence_report, SwaDivergenceReporter)

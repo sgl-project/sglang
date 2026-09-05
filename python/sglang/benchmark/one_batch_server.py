@@ -5,20 +5,22 @@ This script launches a server and uses the HTTP interface.
 It accepts server arguments (the same as launch_server.py) and benchmark arguments (e.g., batch size, input lengths).
 
 Usage:
-python3 -m sglang.bench_one_batch_server --model meta-llama/Meta-Llama-3.1-8B --batch-size 1 16 64 --input-len 1024 --output-len 8
+python3 -m sglang.benchmark.one_batch_server --model meta-llama/Meta-Llama-3.1-8B --batch-size 1 16 64 --input-len 1024 --output-len 8
 
-python3 -m sglang.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8
-python3 -m sglang.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8 --show-report --profile --profile-by-stage
-python3 -m sglang.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8 --result-filename results.jsonl --profile
+python3 -m sglang.benchmark.one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8
+python3 -m sglang.benchmark.one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8 --show-report --profile --profile-by-stage
+python3 -m sglang.benchmark.one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8 --result-filename results.jsonl --profile
 """
 
 import argparse
 import dataclasses
 import itertools
 import json
+import os
 import random
 import re
 import time
+from functools import lru_cache
 from types import SimpleNamespace
 from typing import Callable, List, Optional, Tuple
 
@@ -30,8 +32,14 @@ from transformers import AutoProcessor, PreTrainedTokenizer
 
 from sglang.benchmark.datasets import get_dataset
 from sglang.benchmark.endpoint import acquire_endpoint
+from sglang.benchmark.stream_metrics import (
+    BatchStreamRecorder,
+    SteadyStateWindow,
+    validate_finish_reason,
+)
 from sglang.benchmark.utils import get_processor, get_tokenizer
 from sglang.profiler import run_profile
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
@@ -40,6 +48,10 @@ from sglang.test.nightly_bench_utils import save_results_as_pydantic_models
 from sglang.test.test_utils import is_in_ci, write_github_step_summary
 
 DEFAULT_TIMEOUT = 600
+
+# Replay recorded text prompts (encoded client-side); recorded completion
+# lens are ignored -- --output-len caps every request.
+REPLAY_TEXT_DATASETS = ("sharegpt", "custom")
 
 
 def get_cache_tokens_from_metrics(url: str) -> Optional[tuple]:
@@ -105,6 +117,7 @@ class BenchArgs:
     input_len: Tuple[int] = (1024,)
     output_len: Tuple[int] = (16,)
     temperature: float = 0.0
+    disable_ignore_eos: bool = False
     return_logprob: bool = False
     client_stream_interval: int = 1
     input_len_step_percentage: float = 0.0
@@ -121,6 +134,8 @@ class BenchArgs:
     profile_output_dir: Optional[str] = None
     dataset_path: str = ""
     dataset_name: str = "random"
+    fixed_prompt_file: str = ""
+    apply_chat_template: bool = False
     gsp_num_groups: int = 1
     gsp_system_prompt_len: int = 2048
     gsp_question_len: int = 128
@@ -152,6 +167,23 @@ class BenchArgs:
             "--output-len", type=int, nargs="+", default=BenchArgs.output_len
         )
         parser.add_argument("--temperature", type=float, default=BenchArgs.temperature)
+        parser.add_argument(
+            "--disable-ignore-eos",
+            action="store_true",
+            help=(
+                "Let requests finish at EOS/stop tokens instead of sending "
+                "ignore_eos=true. Use when benchmarking with real prompts "
+                "(e.g. --dataset-name sharegpt/custom), where forcing decode "
+                "past EOS shifts the output distribution toward gibberish. "
+                "Requests then early-stop, so the whole-run output_throughput "
+                "(actual tokens generated after the last request's first "
+                "token, divided by the time since then) still includes the "
+                "decaying-batch tail; read the steady-state metrics instead, "
+                "which cover only the window where every request is still "
+                "decoding (from the last request's first token to the first "
+                "request's finish)."
+            ),
+        )
         parser.add_argument("--return-logprob", action="store_true")
         parser.add_argument(
             "--client-stream-interval",
@@ -215,8 +247,33 @@ class BenchArgs:
             "--dataset-name",
             type=str,
             default=BenchArgs.dataset_name,
-            choices=["mmmu", "random", "random-ids", "generated-shared-prefix"],
-            help="Name of the dataset to benchmark on.",
+            choices=[
+                "mmmu",
+                "random",
+                "random-ids",
+                "generated-shared-prefix",
+                "sharegpt",
+                "custom",
+            ],
+            help="Name of the dataset to benchmark on. sharegpt/custom replay "
+            "recorded text prompts (custom reads --dataset-path JSONL); their "
+            "recorded output lens are ignored in favor of --output-len. For "
+            "OpenAI-format traces with per-request parameters, use "
+            "sglang.benchmark.serving instead.",
+        )
+        parser.add_argument(
+            "--fixed-prompt-file",
+            type=str,
+            default=BenchArgs.fixed_prompt_file,
+            help="Use this file's prompt for every request in the batch, "
+            "bypassing --dataset-name.",
+        )
+        parser.add_argument(
+            "--apply-chat-template",
+            action="store_true",
+            help="Encode each prompt as a single user message through the "
+            "model's chat template. Requires --fixed-prompt-file or a replay "
+            "text dataset (sharegpt/custom).",
         )
         parser.add_argument(
             "--gsp-num-groups",
@@ -309,7 +366,7 @@ class BenchArgs:
             default=BenchArgs.lora_request_distribution,
             choices=["uniform", "distinct", "skewed"],
             help="How to sample a LoRA adapter per prompt when more than one "
-            "is listed in --lora-name. Mirrors bench_serving.py. "
+            "is listed in --lora-name. Mirrors serving.py. "
             "'uniform' picks uniformly at random, 'distinct' round-robins so "
             "consecutive prompts get different adapters, 'skewed' samples "
             "from a Zipf distribution over --lora-name (alpha controls the "
@@ -360,6 +417,10 @@ class BenchOneCaseResult(BaseModel):
     last_ttft: float
     last_gen_throughput: float
     acc_length: float
+    total_output_tokens: Optional[int] = None
+    num_early_stopped: Optional[int] = None
+    steady_state_output_throughput: Optional[float] = None
+    steady_state_window_s: Optional[float] = None
     cache_hit_rate: Optional[float] = None
     profile_link: Optional[str] = None
 
@@ -377,6 +438,18 @@ class BenchOneCaseResult(BaseModel):
                 "last_ttft": round(self.last_ttft, 4),
                 "last_gen_throughput": round(self.last_gen_throughput, 2),
                 "acc_length": round(self.acc_length, 2),
+                "total_output_tokens": self.total_output_tokens,
+                "num_early_stopped": self.num_early_stopped,
+                "steady_state_output_throughput": (
+                    round(self.steady_state_output_throughput, 2)
+                    if self.steady_state_output_throughput is not None
+                    else None
+                ),
+                "steady_state_window_s": (
+                    round(self.steady_state_window_s, 4)
+                    if self.steady_state_window_s is not None
+                    else None
+                ),
                 "cache_hit_rate": (
                     round(self.cache_hit_rate, 4)
                     if self.cache_hit_rate is not None
@@ -413,7 +486,7 @@ def _warmup_cache(
         return
 
     print(
-        f"Warming up cache with {cache_hit_rate*100:.1f}% hit rate "
+        f"Warming up cache with {cache_hit_rate * 100:.1f}% hit rate "
         f"({cached_token_len} tokens per request)"
     )
     # Create prefix input_ids for cache warming
@@ -467,12 +540,54 @@ def _flush_cache_with_retry(url: str, endpoint: str, max_retries: int = 3):
         time.sleep(2)
 
 
+@lru_cache(maxsize=None)
+def _load_hf_config(name_or_path: str):
+    if not name_or_path:
+        return None
+
+    from transformers import AutoConfig
+
+    try:
+        return AutoConfig.from_pretrained(name_or_path, trust_remote_code=True)
+    except Exception as e:
+        print(
+            f"Warning: could not load config for {name_or_path!r} ({e}); "
+            "falling back to the HF chat template for --apply-chat-template."
+        )
+        return None
+
+
+def _encode_fixed_prompt(
+    tok_inner, prompt_text: str, apply_chat_template: bool
+) -> List[int]:
+    if not apply_chat_template:
+        return tok_inner.encode(prompt_text)
+
+    from sglang.srt.entrypoints.openai.chat_encoding import (
+        encode_simple_chat,
+        resolve_chat_encoding_spec,
+    )
+
+    hf_config = _load_hf_config(getattr(tok_inner, "name_or_path", "") or "")
+    spec = (
+        resolve_chat_encoding_spec(hf_config=hf_config, tokenizer=tok_inner)
+        if hf_config is not None
+        else None
+    )
+    return encode_simple_chat(
+        tokenizer=tok_inner,
+        spec=spec,
+        messages=[{"role": "user", "content": prompt_text}],
+    )
+
+
 def run_one_case(
     url: str,
     batch_size: int,
     input_len: int,
     output_len: int,
     temperature: float,
+    ignore_eos: bool,
     return_logprob: bool,
     stream_interval: int,
     input_len_step_percentage: float,
@@ -500,6 +615,8 @@ def run_one_case(
     lora_name: Optional[List[str]] = None,
     lora_request_distribution: str = BenchArgs.lora_request_distribution,
     lora_zipf_alpha: float = BenchArgs.lora_zipf_alpha,
+    fixed_prompt_file: str = "",
+    apply_chat_template: bool = False,
 ):
     if backend == "vllm":
         # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
@@ -507,51 +624,79 @@ def run_one_case(
     else:
         _flush_cache_with_retry(url, "/flush_cache")
 
-    # Load input token ids via bench_serving.get_dataset
-    supported_datasets = ("random", "random-ids", "mmmu", "generated-shared-prefix")
-    if dataset_name not in supported_datasets:
-        raise ValueError(
-            f"Unsupported dataset for batch benchmark: {dataset_name}. "
-            f"Supported: {supported_datasets}"
-        )
-
-    actual_gsp_groups = min(gsp_num_groups, batch_size)
-    dataset_args = SimpleNamespace(
-        dataset_name=dataset_name,
-        num_prompts=batch_size,
-        random_input_len=input_len,
-        random_output_len=output_len,
-        random_range_ratio=1.0,
-        dataset_path=dataset_path,
-        tokenize_prompt=dataset_name not in ("mmmu", "generated-shared-prefix"),
-        backend=backend,
-        seed=BenchArgs.seed,
-        gsp_num_groups=actual_gsp_groups,
-        gsp_prompts_per_group=(batch_size + actual_gsp_groups - 1) // actual_gsp_groups,
-        gsp_system_prompt_len=gsp_system_prompt_len,
-        gsp_question_len=gsp_question_len,
-        gsp_output_len=gsp_output_len,
-        # The generated-shared-prefix dataset's from_args requires these; the
-        # batch-bench path only ever uses the uniform group distribution.
-        gsp_group_distribution="uniform",
-        gsp_zipf_alpha=None,
-    )
-    tok_inner = getattr(tokenizer, "tokenizer", tokenizer)
-    dataset_model_id = model_name or getattr(tok_inner, "name_or_path", None)
-    input_requests = get_dataset(dataset_args, tokenizer, model_id=dataset_model_id)
-
-    if dataset_name == "generated-shared-prefix":
-        input_requests = input_requests[:batch_size]
-        input_ids = [tokenizer.encode(req.prompt) for req in input_requests]
-        input_len = sum(len(ids) for ids in input_ids) // len(input_ids)
-        output_len = gsp_output_len
+    if fixed_prompt_file:
+        tok_inner = getattr(tokenizer, "tokenizer", tokenizer)
+        with open(fixed_prompt_file) as f:
+            prompt_ids = _encode_fixed_prompt(tok_inner, f.read(), apply_chat_template)
+        input_ids = [list(prompt_ids) for _ in range(batch_size)]
+        input_len = len(prompt_ids)
         image_data = None
-    elif dataset_name == "mmmu":
-        input_ids = [tok_inner.encode(req.prompt) for req in input_requests]
-        image_data = [req.image_data for req in input_requests]
     else:
-        input_ids = [req.prompt for req in input_requests]
-        image_data = None
+        # Load input token ids via benchmark.datasets.get_dataset
+        supported_datasets = (
+            "random",
+            "random-ids",
+            "mmmu",
+            "generated-shared-prefix",
+        ) + REPLAY_TEXT_DATASETS
+        if dataset_name not in supported_datasets:
+            raise ValueError(
+                f"Unsupported dataset for batch benchmark: {dataset_name}. "
+                f"Supported: {supported_datasets}"
+            )
+
+        actual_gsp_groups = min(gsp_num_groups, batch_size)
+        dataset_args = SimpleNamespace(
+            dataset_name=dataset_name,
+            num_prompts=batch_size,
+            random_input_len=input_len,
+            random_output_len=output_len,
+            random_range_ratio=1.0,
+            dataset_path=dataset_path,
+            tokenize_prompt=dataset_name in ("random", "random-ids"),
+            backend=backend,
+            sharegpt_output_len=None,
+            sharegpt_context_len=None,
+            prompt_suffix="",
+            apply_chat_template=apply_chat_template,
+            seed=BenchArgs.seed,
+            gsp_num_groups=actual_gsp_groups,
+            gsp_prompts_per_group=(batch_size + actual_gsp_groups - 1)
+            // actual_gsp_groups,
+            gsp_system_prompt_len=gsp_system_prompt_len,
+            gsp_question_len=gsp_question_len,
+            gsp_output_len=gsp_output_len,
+            # The generated-shared-prefix dataset's from_args requires these; the
+            # batch-bench path only ever uses the uniform group distribution.
+            gsp_group_distribution="uniform",
+            gsp_zipf_alpha=None,
+        )
+        tok_inner = getattr(tokenizer, "tokenizer", tokenizer)
+        dataset_model_id = model_name or getattr(tok_inner, "name_or_path", None)
+        input_requests = get_dataset(dataset_args, tokenizer, model_id=dataset_model_id)
+
+        if dataset_name == "generated-shared-prefix":
+            input_requests = input_requests[:batch_size]
+            input_ids = [tokenizer.encode(req.prompt) for req in input_requests]
+            input_len = sum(len(ids) for ids in input_ids) // len(input_ids)
+            output_len = gsp_output_len
+            image_data = None
+        elif dataset_name == "mmmu":
+            input_ids = [tok_inner.encode(req.prompt) for req in input_requests]
+            image_data = [req.image_data for req in input_requests]
+        elif dataset_name in REPLAY_TEXT_DATASETS:
+            if len(input_requests) < batch_size:
+                raise ValueError(
+                    f"{dataset_name} produced only {len(input_requests)} usable "
+                    f"prompts for batch size {batch_size}; use a smaller batch "
+                    f"size or a larger dataset."
+                )
+            input_ids = [tok_inner.encode(req.prompt) for req in input_requests]
+            input_len = sum(len(ids) for ids in input_ids) // len(input_ids)
+            image_data = None
+        else:
+            input_ids = [req.prompt for req in input_requests]
+            image_data = None
 
     # Build payload based on backend
     if backend == "vllm":
@@ -561,7 +706,7 @@ def run_one_case(
             "max_tokens": output_len,
             "temperature": temperature,
             "stream": True,
-            "ignore_eos": True,
+            "ignore_eos": ignore_eos,
         }
         if return_logprob:
             payload["logprobs"] = 1
@@ -585,7 +730,7 @@ def run_one_case(
             "sampling_params": {
                 "temperature": temperature,
                 "max_new_tokens": output_len,
-                "ignore_eos": True,
+                "ignore_eos": ignore_eos,
                 "json_schema": json_schema,
                 "stream_interval": stream_interval,
             },
@@ -656,6 +801,7 @@ def run_one_case(
     metrics_before = get_cache_tokens_from_metrics(url)
 
     # Run the request
+    recorder: Optional[BatchStreamRecorder] = None
     tic = time.perf_counter()
     with requests.post(
         gen_url,
@@ -686,6 +832,8 @@ def run_one_case(
                             if len(first_token_indices) == batch_size:
                                 last_ttft = time.perf_counter() - tic
         else:
+            # mmmu can silently return fewer prompts than requested.
+            recorder = BatchStreamRecorder(batch_size=len(input_ids))
             for chunk in response.iter_lines(decode_unicode=False):
                 chunk = chunk.decode("utf-8")
                 if chunk and chunk.startswith("data:"):
@@ -695,18 +843,67 @@ def run_one_case(
                     if "error" in data:
                         raise RuntimeError(f"Request has failed. {data}.")
 
-                    assert (
-                        data["meta_info"]["finish_reason"] is None
-                        or data["meta_info"]["finish_reason"]["type"] == "length"
+                    finish_reason = data["meta_info"]["finish_reason"]
+                    if finish_reason is not None:
+                        validate_finish_reason(finish_reason, ignore_eos=ignore_eos)
+                    recorder.record_chunk(
+                        index=data["index"],
+                        completion_tokens=data["meta_info"]["completion_tokens"],
+                        finish_type=(
+                            finish_reason["type"] if finish_reason is not None else None
+                        ),
+                        now=time.perf_counter(),
                     )
-                    if data["meta_info"]["completion_tokens"] == 1:
-                        last_ttft = time.perf_counter() - tic
+            missing = recorder.missing_indices()
+            if missing:
+                raise RuntimeError(
+                    f"No stream chunk received for request indices {missing}."
+                )
+            last_ttft = recorder.all_started_time - tic
 
     # Compute metrics
     latency = time.perf_counter() - tic
-    input_throughput = batch_size * input_len / last_ttft
-    output_throughput = batch_size * output_len / (latency - last_ttft)
-    overall_throughput = batch_size * (input_len + output_len) / latency
+    if recorder is None:
+        # vllm chunks carry no token counts; assume the requested lengths.
+        total_output_tokens = batch_size * output_len
+        decode_window_tokens = float(total_output_tokens)
+        num_early_stopped = None
+        steady_state_window: Optional[SteadyStateWindow] = None
+    else:
+        total_output_tokens = recorder.total_output_tokens
+        num_early_stopped = recorder.num_early_stopped
+        steady_state_window = recorder.steady_state_window()
+        if ignore_eos and dataset_name not in REPLAY_TEXT_DATASETS:
+            # Historical numerator; CI throughput floors are calibrated to it.
+            decode_window_tokens = float(total_output_tokens)
+        else:
+            # Count only tokens generated inside the denominator's window.
+            decode_window_tokens = (
+                total_output_tokens - recorder.tokens_before_all_started
+            )
+    steady_state_output_throughput = (
+        steady_state_window.output_throughput
+        if steady_state_window is not None
+        else None
+    )
+    if (
+        ignore_eos
+        and recorder is not None
+        and total_output_tokens != batch_size * output_len
+    ):
+        print(
+            f"WARNING: generated {total_output_tokens} tokens but requested "
+            f"{batch_size * output_len}; the server clamped max_new_tokens or "
+            f"served fewer prompts, so throughput uses the actual count."
+        )
+
+    if dataset_name in REPLAY_TEXT_DATASETS:
+        total_input_tokens = sum(len(ids) for ids in input_ids)
+    else:
+        total_input_tokens = batch_size * input_len
+    input_throughput = total_input_tokens / last_ttft
+    output_throughput = decode_window_tokens / (latency - last_ttft)
+    overall_throughput = (total_input_tokens + total_output_tokens) / latency
 
     if backend == "vllm":
         # vLLM does not expose these metrics via API
@@ -717,9 +914,15 @@ def run_one_case(
         response.raise_for_status()
         server_info = response.json()
         internal_states = server_info.get("internal_states", [])
-        internal_state = internal_states[0] if internal_states else {}
-        last_gen_throughput = internal_state.get("last_gen_throughput", None) or -1
-        acc_length = internal_state.get("avg_spec_accept_length", None) or -1
+        acc_length = -1
+        last_gen_throughput = -1
+        for internal_state in internal_states:
+            val_acc = internal_state.get("avg_spec_accept_length")
+            if val_acc is not None:
+                acc_length = val_acc
+            val_thr = internal_state.get("last_gen_throughput")
+            if val_thr is not None:
+                last_gen_throughput = val_thr
 
     # Calculate cache hit rate from before/after metrics delta
     metrics_after = get_cache_tokens_from_metrics(url)
@@ -739,6 +942,24 @@ def run_one_case(
         print(f"acc_length: {acc_length:.2f} ")
     if metrics_cache_hit_rate is not None:
         print(f"cache hit rate: {metrics_cache_hit_rate:.4f}")
+    if not ignore_eos and recorder is not None:
+        print(
+            f"total output tokens: {total_output_tokens} "
+            f"(requested {batch_size * output_len})"
+        )
+        print(f"early-stopped requests: {num_early_stopped}/{batch_size}")
+        if steady_state_window is not None:
+            print(
+                f"steady-state output throughput: "
+                f"{steady_state_output_throughput:.2f} tok/s "
+                f"over a {steady_state_window.duration:.2f} s full-batch window"
+            )
+        else:
+            print(
+                "WARNING: no steady-state full-batch window (a request finished "
+                "before the last one started decoding); steady-state metrics "
+                "are n/a."
+            )
 
     # Dump results
     result = BenchOneCaseResult(
@@ -753,6 +974,12 @@ def run_one_case(
         last_ttft=last_ttft,
         last_gen_throughput=last_gen_throughput,
         acc_length=acc_length,
+        total_output_tokens=total_output_tokens,
+        num_early_stopped=num_early_stopped,
+        steady_state_output_throughput=steady_state_output_throughput,
+        steady_state_window_s=(
+            steady_state_window.duration if steady_state_window is not None else None
+        ),
         cache_hit_rate=metrics_cache_hit_rate,
         profile_link=profile_link,
     )
@@ -797,7 +1024,7 @@ def get_report_summary(
         f"\nInput lens: {bench_args.input_len}. Output lens: {bench_args.output_len}."
     )
     if bench_args.cache_hit_rate > 0.0:
-        summary += f" Cache hit rate: {bench_args.cache_hit_rate*100:.1f}%."
+        summary += f" Cache hit rate: {bench_args.cache_hit_rate * 100:.1f}%."
     summary += "\n"
 
     if is_blackwell():
@@ -821,15 +1048,25 @@ def get_report_summary(
         "output cost ($/1M)",
         "cache hit rate",
     ]
+    if bench_args.disable_ignore_eos:
+        headers += [
+            "steady output throughput (tok/s)",
+            "steady ITL (ms)",
+            "early stops",
+        ]
     if bench_args.profile:
         headers.append("profile")
 
     for res in results:
         hourly_cost = hourly_cost_per_gpu * server_args.tp_size
         accept_length = f"{res.acc_length:.2f}" if res.acc_length > 0 else "n/a"
-        itl_ms = 1000 * res.batch_size / res.output_throughput
+        # 0 when every request's first chunk is also its finish chunk.
+        if res.output_throughput > 0:
+            itl_ms = f"{1000 * res.batch_size / res.output_throughput:.2f}"
+            output_cost = f"{1e6 / res.output_throughput / 3600 * hourly_cost:.2f}"
+        else:
+            itl_ms = output_cost = "n/a"
         input_cost = 1e6 / (res.input_throughput * input_util) / 3600 * hourly_cost
-        output_cost = 1e6 / res.output_throughput / 3600 * hourly_cost
         cache_hit_rate = (
             f"{res.cache_hit_rate:.4f}" if res.cache_hit_rate is not None else "n/a"
         )
@@ -841,11 +1078,24 @@ def get_report_summary(
             f"{res.input_throughput:.2f}",
             f"{res.output_throughput:.2f}",
             accept_length,
-            f"{itl_ms:.2f}",
+            itl_ms,
             f"{input_cost:.2f}",
-            f"{output_cost:.2f}",
+            output_cost,
             cache_hit_rate,
         ]
+        if bench_args.disable_ignore_eos:
+            if res.steady_state_output_throughput is not None:
+                steady_tput = f"{res.steady_state_output_throughput:.2f}"
+                steady_itl = (
+                    f"{1000 * res.batch_size / res.steady_state_output_throughput:.2f}"
+                )
+            else:
+                steady_tput = steady_itl = "n/a"
+            row += [
+                steady_tput,
+                steady_itl,
+                f"{res.num_early_stopped}/{res.batch_size}",
+            ]
         if bench_args.profile:
             if res.profile_link:
                 row.append(f"[Profile]({res.profile_link})")
@@ -864,6 +1114,58 @@ def run_benchmark_internal(
     bench_args: BenchArgs,
     launch_server_func: Callable = launch_server,
 ):
+    # Validate flags that depend only on bench_args before launching a server.
+    if bench_args.disable_ignore_eos:
+        if bench_args.backend == "vllm":
+            raise ValueError(
+                "--disable-ignore-eos requires the sglang backend: vllm stream "
+                "chunks carry no cumulative token counts, so early-stop-aware "
+                "accounting is impossible."
+            )
+        if bench_args.fake_prefill:
+            raise ValueError(
+                "--disable-ignore-eos is incompatible with --fake-prefill: "
+                "decode conditions on uninitialized KV, so EOS timing is "
+                "meaningless."
+            )
+        if bench_args.client_stream_interval != 1:
+            raise ValueError(
+                "--disable-ignore-eos requires --client-stream-interval 1: the "
+                "steady-state window needs per-token cumulative counts, and "
+                "larger intervals quantize them by up to interval-1 tokens per "
+                "request."
+            )
+
+    if bench_args.dataset_name in REPLAY_TEXT_DATASETS:
+        if bench_args.backend == "vllm":
+            raise ValueError(
+                "Replay datasets require the sglang backend: vllm stream "
+                "chunks carry no token counts, so the decode-window token "
+                "accounting replay throughput relies on is impossible."
+            )
+        if bench_args.fixed_prompt_file:
+            raise ValueError(
+                "--fixed-prompt-file bypasses --dataset-name; drop one of them."
+            )
+        if bench_args.dataset_name == "custom" and not os.path.isfile(
+            bench_args.dataset_path
+        ):
+            raise ValueError(
+                "--dataset-name custom requires --dataset-path pointing at a "
+                f"JSONL conversation file; got {bench_args.dataset_path!r}."
+            )
+        if len(bench_args.input_len) > 1:
+            raise ValueError(
+                "Replay datasets take prompt lengths from the recorded data; "
+                "sweeping --input-len is meaningless. Pass at most one value "
+                "(used only by the token-capacity skip guard)."
+            )
+        print(
+            "NOTE: replay prompts have recorded lengths; the token-capacity "
+            f"skip guard assumes --input-len ({bench_args.input_len[0]}) per "
+            "prompt, so set it near the trace's mean length."
+        )
+
     # set random seed
     random.seed(bench_args.seed)
     np.random.seed(bench_args.seed)
@@ -928,10 +1230,21 @@ def run_benchmark_internal(
                 "token_capacity", 1000000000
             )
 
-        assert (
-            max_running_requests_per_dp > 0
-        ), f"effective_max_running_requests_per_dp is not set, {max_running_requests_per_dp=}"
-        skip_max_running_requests_threshold = max_running_requests_per_dp * dp_size
+        # Router /get_server_info responses carry "router_manager"; worker
+        # responses never do, so its presence confirms a router by design.
+        if not internal_states and server_info.get("router_manager"):
+            print(
+                "WARNING: base_url points at a PD router; worker internal "
+                "states are unavailable, so the max-running-requests and "
+                "token-capacity skip guards are disabled."
+            )
+            skip_max_running_requests_threshold = float("inf")
+            skip_token_capacity_threshold = float("inf")
+        else:
+            assert max_running_requests_per_dp > 0, (
+                f"effective_max_running_requests_per_dp is not set, {max_running_requests_per_dp=}"
+            )
+            skip_max_running_requests_threshold = max_running_requests_per_dp * dp_size
 
         print(f"{max_running_requests_per_dp=}")
         print(f"{dp_size=}")
@@ -968,16 +1281,26 @@ def run_benchmark_internal(
                     f"to actually exercise multi-batch."
                 )
 
-    # LoRA distribution args: mirror bench_serving.py semantics so multi-LoRA
+    # LoRA distribution args: mirror serving.py semantics so multi-LoRA
     # benchmarks behave consistently across harnesses.
     if bench_args.lora_request_distribution in ("distinct", "skewed"):
         assert bench_args.lora_name is not None and len(bench_args.lora_name) > 1, (
             "--lora-request-distribution=distinct/skewed requires more than "
             "one adapter via --lora-name."
         )
-    assert (
-        bench_args.lora_zipf_alpha > 1
-    ), f"--lora-zipf-alpha must be > 1, got {bench_args.lora_zipf_alpha}"
+    assert bench_args.lora_zipf_alpha > 1, (
+        f"--lora-zipf-alpha must be > 1, got {bench_args.lora_zipf_alpha}"
+    )
+
+    if bench_args.apply_chat_template and not (
+        bench_args.fixed_prompt_file or bench_args.dataset_name in REPLAY_TEXT_DATASETS
+    ):
+        raise ValueError(
+            "--apply-chat-template requires --fixed-prompt-file or a replay "
+            "text dataset (sharegpt/custom): the other datasets generate "
+            "token ids directly, so there is no prompt text to run through a "
+            "chat template."
+        )
 
     gsp_kwargs = dict(
         gsp_num_groups=bench_args.gsp_num_groups,
@@ -998,6 +1321,7 @@ def run_benchmark_internal(
                 input_len=1024,
                 output_len=16,
                 temperature=bench_args.temperature,
+                ignore_eos=True,
                 return_logprob=bench_args.return_logprob,
                 stream_interval=bench_args.client_stream_interval,
                 input_len_step_percentage=bench_args.input_len_step_percentage,
@@ -1013,6 +1337,8 @@ def run_benchmark_internal(
                 lora_name=bench_args.lora_name,
                 lora_request_distribution=bench_args.lora_request_distribution,
                 lora_zipf_alpha=bench_args.lora_zipf_alpha,
+                fixed_prompt_file=bench_args.fixed_prompt_file,
+                apply_chat_template=bench_args.apply_chat_template,
                 **gsp_kwargs,
             )
         print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
@@ -1040,6 +1366,7 @@ def run_benchmark_internal(
                     il,
                     ol,
                     temperature=bench_args.temperature,
+                    ignore_eos=not bench_args.disable_ignore_eos,
                     return_logprob=bench_args.return_logprob,
                     stream_interval=bench_args.client_stream_interval,
                     input_len_step_percentage=bench_args.input_len_step_percentage,
@@ -1056,6 +1383,8 @@ def run_benchmark_internal(
                     lora_name=bench_args.lora_name,
                     lora_request_distribution=bench_args.lora_request_distribution,
                     lora_zipf_alpha=bench_args.lora_zipf_alpha,
+                    fixed_prompt_file=bench_args.fixed_prompt_file,
+                    apply_chat_template=bench_args.apply_chat_template,
                     **gsp_kwargs,
                 )
             )
@@ -1087,6 +1416,7 @@ def run_benchmark_internal(
                             il,
                             ol,
                             temperature=bench_args.temperature,
+                            ignore_eos=not bench_args.disable_ignore_eos,
                             return_logprob=bench_args.return_logprob,
                             stream_interval=bench_args.client_stream_interval,
                             input_len_step_percentage=bench_args.input_len_step_percentage,
@@ -1110,6 +1440,8 @@ def run_benchmark_internal(
                             lora_name=bench_args.lora_name,
                             lora_request_distribution=bench_args.lora_request_distribution,
                             lora_zipf_alpha=bench_args.lora_zipf_alpha,
+                            fixed_prompt_file=bench_args.fixed_prompt_file,
+                            apply_chat_template=bench_args.apply_chat_template,
                             **gsp_kwargs,
                         )
                     )
@@ -1138,6 +1470,7 @@ def run_benchmark_internal(
 
 
 def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
+    cfg = resolving_view(server_args)
     results, server_info = run_benchmark_internal(server_args, bench_args)
 
     # Save results as pydantic models in the JSON format
@@ -1145,24 +1478,25 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
         save_results_as_pydantic_models(
             results,
             pydantic_result_filename=bench_args.pydantic_result_filename,
-            model_path=server_args.model_path,
+            model_path=cfg.model_path,
             server_args=bench_args.server_args_for_metrics,
         )
 
     return results, server_info
 
 
-def main():
+def cli_main():
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
     args = parser.parse_args()
 
     server_args = ServerArgs.from_cli_args(args)
+    server_args.resolve_once()
     bench_args = BenchArgs.from_cli_args(args)
 
     run_benchmark(server_args, bench_args)
 
 
 if __name__ == "__main__":
-    main()
+    cli_main()

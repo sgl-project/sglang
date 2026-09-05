@@ -26,6 +26,7 @@ flex_attention = torch.compile(
 import torch.distributed as dist
 
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_sp_world_size,
@@ -183,46 +184,20 @@ class CausalWanSelfAttention(nn.Module):
                 block_mask=block_mask,
             )[:, :, :-padded_length].transpose(2, 1)
         else:
-            head_slice = None
-            if kv_cache.k.shape[2] != roped_key.shape[2]:
-                head_slice = slice(self.head_start, self.head_start + self.num_heads)
-                cache_key = roped_key.new_zeros(
-                    roped_key.shape[0],
-                    roped_key.shape[1],
-                    kv_cache.k.shape[2],
-                    roped_key.shape[3],
-                )
-                cache_value = v.new_zeros(
-                    v.shape[0],
-                    v.shape[1],
-                    kv_cache.v.shape[2],
-                    v.shape[3],
-                )
-                cache_key[:, :, head_slice, :] = roped_key
-                cache_value[:, :, head_slice, :] = v
-            else:
-                cache_key = roped_key
-                cache_value = v
+            if kv_cache.can_direct_current_attention(roped_key.shape[1]):
+                return self.attn(roped_query, roped_key, v)
+
             cache_view = kv_cache.update_and_get_attention_kv(
-                key=cache_key,
-                value=cache_value,
+                key=roped_key,
+                value=v,
                 current_chunk_start=current_start,
+                cache_head_start=self.head_start,
                 debug_name="CausalWan KV cache",
-            )
-            key = (
-                cache_view.k[:, :, head_slice, :]
-                if head_slice is not None
-                else cache_view.k
-            )
-            value = (
-                cache_view.v[:, :, head_slice, :]
-                if head_slice is not None
-                else cache_view.v
             )
             x = self.attn(
                 roped_query,
-                key,
-                value,
+                cache_view.k,
+                cache_view.v,
             )
 
         return x
@@ -285,6 +260,7 @@ class CausalWanTransformerBlock(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("to_out", prefix),
             )
+            # megatron-style tp shards the weight (qkv) column-wise, effectively splitting the attention heads
             tp_size = get_tp_world_size()
             self.local_num_heads = divide(num_heads, tp_size)
             head_start = get_tp_rank() * self.local_num_heads
@@ -437,9 +413,10 @@ class CausalWanTransformerBlock(nn.Module):
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
             hidden_states, attn_output, gate_msa, null_shift, null_scale
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         # 2. Cross-attention
         attn_output = self.attn2(
@@ -451,9 +428,10 @@ class CausalWanTransformerBlock(nn.Module):
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         # 3. Feed-forward
         ff_output = self.ffn(norm_hidden_states)
@@ -464,9 +442,8 @@ class CausalWanTransformerBlock(nn.Module):
 
 
 class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
-    _fsdp_shard_conditions = WanVideoConfig()._fsdp_shard_conditions
-    _compile_conditions = WanVideoConfig()._compile_conditions
-    _supported_attention_backends = WanVideoConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [is_block]
+    _compile_conditions = [is_block]
     param_names_mapping = WanVideoConfig().param_names_mapping
     reverse_param_names_mapping = WanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = WanVideoConfig().lora_param_names_mapping
@@ -545,8 +522,10 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
 
         # Causal-specific
         self.block_mask = None
-        self.num_frame_per_block = config.arch_config.num_frames_per_block
-        assert self.num_frame_per_block <= 3
+        self.num_frame_per_block = self.config.num_frames_per_block
+        # Block size is bounded only by the causal block-mask construction, which
+        # supports any positive value.
+        assert self.num_frame_per_block >= 1
         self.independent_first_frame = False
 
         self.__post_init__()

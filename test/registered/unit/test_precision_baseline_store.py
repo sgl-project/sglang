@@ -62,12 +62,17 @@ class TestHfStoreConfig(CustomTestCase):
             cfg = hfs.HfStoreConfig.from_env()
         self.assertEqual(cfg.revision, "dev")
 
-    def test_from_env_default_revision(self):
+    def test_from_env_reads_read_only_mode(self):
         with patch.dict(
-            os.environ, {"SGLANG_PRECISION_HF_REPO": "my/repo"}, clear=False
+            os.environ,
+            {
+                "SGLANG_PRECISION_HF_REPO": "my/repo",
+                "SGLANG_PRECISION_HF_READ_ONLY": "1",
+            },
+            clear=False,
         ):
             cfg = hfs.HfStoreConfig.from_env()
-        self.assertEqual(cfg.revision, "main")
+        self.assertTrue(cfg.read_only)
 
     def test_from_env_raises_when_missing(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -157,6 +162,72 @@ class TestSelectLatestRun(CustomTestCase):
             hfs._select_latest_run(rows, model="org/m", capture_signature="zzz")
         )
 
+    def test_prefers_older_passed_over_newer_failed(self):
+        # A failed run must not shadow an older good baseline, or a persistent
+        # regression is masked after one night.
+        rows = [
+            {
+                "model": "org/m",
+                "run_path": "good",
+                "pass_label": "passed",
+                "push_index": 1,
+            },
+            {
+                "model": "org/m",
+                "run_path": "bad",
+                "pass_label": "failed",
+                "push_index": 2,
+            },
+        ]
+        self.assertEqual(hfs._select_latest_run(rows, model="org/m"), "good")
+
+    def test_prefers_baseline_established_over_newer_failed(self):
+        rows = [
+            {
+                "model": "org/m",
+                "run_path": "seed",
+                "pass_label": "baseline_established",
+                "push_index": 1,
+            },
+            {
+                "model": "org/m",
+                "run_path": "bad",
+                "pass_label": "failed",
+                "push_index": 2,
+            },
+        ]
+        self.assertEqual(hfs._select_latest_run(rows, model="org/m"), "seed")
+
+    def test_falls_back_to_failed_when_only_failed(self):
+        rows = [
+            {
+                "model": "org/m",
+                "run_path": "bad1",
+                "pass_label": "failed",
+                "push_index": 1,
+            },
+            {
+                "model": "org/m",
+                "run_path": "bad2",
+                "pass_label": "failed",
+                "push_index": 2,
+            },
+        ]
+        self.assertEqual(hfs._select_latest_run(rows, model="org/m"), "bad2")
+
+    def test_missing_pass_label_treated_as_usable(self):
+        # Legacy rows without pass_label stay usable as baselines.
+        rows = [
+            {"model": "org/m", "run_path": "legacy", "push_index": 1},
+            {
+                "model": "org/m",
+                "run_path": "bad",
+                "pass_label": "failed",
+                "push_index": 2,
+            },
+        ]
+        self.assertEqual(hfs._select_latest_run(rows, model="org/m"), "legacy")
+
 
 class TestReadManifest(CustomTestCase):
     @patch("sglang.test.precision_baseline_store.hf_hub_download")
@@ -221,23 +292,32 @@ class TestFetchLatestBaseline(CustomTestCase):
             (tensors / "layer0.pt").write_bytes(b"\x00")
             mock_snapshot.return_value = snap_dir
 
-            with tempfile.TemporaryDirectory() as target:
+            with tempfile.TemporaryDirectory() as target_root:
+                target = Path(target_root) / "tensors"
+                target.mkdir()
+                (target / "stale.pt").write_bytes(b"\xff")
                 result = hfs.fetch_latest_baseline(
                     config=_make_config(),
                     model="org/m",
-                    target_tensors_dir=Path(target),
+                    target_tensors_dir=target,
                 )
+                self.assertEqual((target / "layer0.pt").read_bytes(), b"\x00")
+                self.assertFalse((target / "stale.pt").exists())
             self.assertEqual(result, "org__m/2025/01/01/run-abc")
 
     @patch.object(hfs, "_read_manifest")
     def test_returns_none_when_no_runs(self, mock_manifest):
         mock_manifest.return_value = ([], "")
-        with tempfile.TemporaryDirectory() as target:
+        with tempfile.TemporaryDirectory() as target_root:
+            target = Path(target_root) / "tensors"
+            target.mkdir()
+            (target / "stale.pt").write_bytes(b"\xff")
             result = hfs.fetch_latest_baseline(
                 config=_make_config(),
                 model="org/m",
-                target_tensors_dir=Path(target),
+                target_tensors_dir=target,
             )
+            self.assertFalse(target.exists())
         self.assertIsNone(result)
 
     @patch("sglang.test.precision_baseline_store.snapshot_download")
@@ -279,6 +359,19 @@ class TestPushRun(CustomTestCase):
     """push_run deletes its temp manifest file in a finally block, so tests
     that inspect the manifest content must capture it via a side_effect on
     the mock upload_file *before* push_run cleans up."""
+
+    def test_read_only_store_rejects_push_before_api_access(self):
+        config = hfs.HfStoreConfig(repo="test/repo", read_only=True)
+        with tempfile.TemporaryDirectory() as td, patch.object(hfs, "HfApi") as api:
+            with self.assertRaisesRegex(PermissionError, "read-only"):
+                hfs.push_run(
+                    config=config,
+                    model="org/model",
+                    sglang_commit="abc1234",
+                    today_tensors_dir=Path(td),
+                    meta={},
+                )
+        api.assert_not_called()
 
     @staticmethod
     def _make_push_mocks(mock_manifest, mock_api_cls):
@@ -556,19 +649,6 @@ class TestWithRetries(CustomTestCase):
         exc_429 = HfHubHTTPError("rate limited", response=resp_429)
 
         mock_op = MagicMock(side_effect=[exc_429, "ok"])
-        result = hfs._with_retries(mock_op, what="test", base_delay=0.01)
-        self.assertEqual(result, "ok")
-        mock_time.sleep.assert_called_once()
-
-    @patch("sglang.test.precision_baseline_store.time")
-    def test_retries_on_5xx(self, mock_time):
-        from huggingface_hub.errors import HfHubHTTPError
-
-        resp_500 = MagicMock()
-        resp_500.status_code = 500
-        exc_500 = HfHubHTTPError("server error", response=resp_500)
-
-        mock_op = MagicMock(side_effect=[exc_500, "ok"])
         result = hfs._with_retries(mock_op, what="test", base_delay=0.01)
         self.assertEqual(result, "ok")
         mock_time.sleep.assert_called_once()

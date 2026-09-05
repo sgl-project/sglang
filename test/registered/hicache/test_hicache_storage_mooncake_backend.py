@@ -279,9 +279,10 @@ class TestMooncakeBackendQwen330BCP2(
                 "--tp-size": 2,
                 "--moe-dp-size": 2,
                 "--attn-cp-size": 2,
-                "--enable-prefill-context-parallel": True,
+                "--enable-prefill-cp": True,
+                "--cp-strategy": "zigzag",
                 "--trust-remote-code": True,
-                "--cuda-graph-max-bs": 32,
+                "--cuda-graph-max-bs-decode": 32,
                 "--max-running-requests": 32,
                 "--max-total-tokens": 8192,
                 "--model-loader-extra-config": (

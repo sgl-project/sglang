@@ -21,6 +21,7 @@ import asyncio
 import dataclasses
 import logging
 import os
+import ssl
 import tempfile
 import threading
 import time
@@ -28,6 +29,7 @@ import uuid
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import (
+    Annotated,
     Any,
     AsyncGenerator,
     AsyncIterator,
@@ -38,11 +40,14 @@ from typing import (
     Union,
 )
 
+import aiohttp
 import numpy as np
+import orjson
 import requests
 import uvicorn
 import uvloop
 from fastapi import (
+    Body,
     Depends,
     FastAPI,
     File,
@@ -56,7 +61,10 @@ from fastapi import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+from fastapi.routing import APIRoute
 
+from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
@@ -102,6 +110,7 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
 from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
+from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -124,7 +133,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
-    ProfileReqInput,
+    ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     SendWeightsToRemoteInstanceReqInput,
@@ -143,10 +152,10 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
     TokenizerWorker,
     get_main_process_id,
+    get_tokenizer_worker_class,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
 )
-from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.trace import (
@@ -155,6 +164,7 @@ from sglang.srt.observability.trace import (
     trace_set_thread_info,
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_prometheus_middleware,
@@ -171,6 +181,7 @@ from sglang.srt.utils.json_response import (
     dumps_json,
     orjson_response,
 )
+from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
@@ -217,10 +228,12 @@ async def init_multi_tokenizer() -> ServerArgs:
     server_args: ServerArgs
     port_args: PortArgs
 
+    publish(server_args, role="tokenizer")
+
     # API key authentication is not supported in multi-tokenizer mode
-    assert (
-        server_args.api_key is None
-    ), "API key is not supported in multi-tokenizer mode"
+    assert get_serving().api_key is None, (
+        "API key is not supported in multi-tokenizer mode"
+    )
 
     # Create a new ipc name for the current process
     port_args.tokenizer_ipc_name = (
@@ -232,16 +245,18 @@ async def init_multi_tokenizer() -> ServerArgs:
     )
 
     # Launch multi-tokenizer manager process
-    tokenizer_manager = TokenizerWorker(server_args, port_args)
+    tokenizer_worker_class = get_tokenizer_worker_class(server_args)
+    tokenizer_manager = tokenizer_worker_class(server_args, port_args)
     template_manager = TemplateManager()
     template_manager.initialize_templates(
         tokenizer_manager=tokenizer_manager,
-        model_path=server_args.model_path,
+        model_path=get_model().model_path,
         chat_template=server_args.chat_template,
         completion_template=server_args.completion_template,
     )
 
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+    tokenizer_manager.set_startup_time(scheduler_info["startup_time"])
 
     set_global_state(
         _GlobalState(
@@ -256,6 +271,9 @@ async def init_multi_tokenizer() -> ServerArgs:
 
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
+    grpc_handle = None
+    sidecar = None
+    warmup_thread = None
     if getattr(fast_api_app, "is_single_tokenizer_mode", False):
         server_args = fast_api_app.server_args
         warmup_thread_kwargs = fast_api_app.warmup_thread_kwargs
@@ -267,7 +285,7 @@ async def lifespan(fast_api_app: FastAPI):
         thread_label = f"MultiTokenizer-{_global_state.tokenizer_manager.worker_id}"
 
     # Add prometheus middleware
-    if server_args.enable_metrics:
+    if get_observability().enable_metrics:
         add_prometheus_middleware(app)
         enable_func_timer()
 
@@ -278,9 +296,9 @@ async def lifespan(fast_api_app: FastAPI):
             "sglang",
             trace_modules=server_args.trace_modules,
         )
-        if server_args.disaggregation_mode == "prefill":
+        if get_disagg().disaggregation_mode == "prefill":
             thread_label = "Prefill" + thread_label
-        elif server_args.disaggregation_mode == "decode":
+        elif get_disagg().disaggregation_mode == "decode":
             thread_label = "Decode" + thread_label
         trace_set_thread_info(thread_label)
 
@@ -334,6 +352,10 @@ async def lifespan(fast_api_app: FastAPI):
 
         tool_server = MCPToolServer()
         await tool_server.add_tool_server(server_args.tool_server)
+    elif envs.EXA_API_KEY.get():
+        from sglang.srt.entrypoints.openai.tool_server import NativeToolServer
+
+        tool_server = NativeToolServer()
 
     try:
         from sglang.srt.entrypoints.openai.serving_responses import (
@@ -361,31 +383,84 @@ async def lifespan(fast_api_app: FastAPI):
     # Execute custom warmups
     if server_args.warmups is not None:
         await execute_warmups(
-            server_args.disaggregation_mode,
+            get_disagg().disaggregation_mode,
             server_args.warmups.split(","),
             _global_state.tokenizer_manager,
         )
         logger.info("Warmup ended")
 
-    # Execute the general warmup
-    warmup_thread = threading.Thread(
-        target=_wait_and_warmup,
-        kwargs=warmup_thread_kwargs,
-    )
-    warmup_thread.start()
-
-    # Start the HTTP server
+    # Start the native gRPC server and warmup inside the try so a failure in
+    # either still runs the finally cleanup below. Native gRPC is enabled via
+    # --grpc-port / SGLANG_GRPC_PORT; only the single-tokenizer process is
+    # gRPC-capable (__post_init__ rejects --tokenizer-worker-num > 1).
     try:
+        if (
+            getattr(fast_api_app, "is_single_tokenizer_mode", False)
+            and get_serving().grpc_port is not None
+            and not (get_serving().smg_grpc_mode or server_args.grpc_mode)
+        ):
+            grpc_handle = _start_native_grpc_server_for_runtime(
+                server_args=server_args,
+                tokenizer_manager=_global_state.tokenizer_manager,
+                template_manager=_global_state.template_manager,
+                scheduler_info=_global_state.scheduler_info,
+                grpc_port=get_serving().grpc_port,
+            )
+            if server_args.sidecar is not None:
+                from sglang.srt.entrypoints.sidecar import start_sidecar
+
+                sidecar = start_sidecar()
+
+        # Execute the general warmup
+        warmup_thread = threading.Thread(
+            target=_wait_and_warmup,
+            kwargs=warmup_thread_kwargs,
+        )
+        warmup_thread.start()
+
+        # Start the HTTP server
         yield
     finally:
-        warmup_thread.join()
+        if sidecar is not None:
+            try:
+                sidecar.stop()
+            except Exception:
+                logger.exception("Failed to stop sidecar")
+        _shutdown_native_grpc_server(grpc_handle)
+        if tool_server is not None and hasattr(tool_server, "aclose"):
+            await tool_server.aclose()
+        if warmup_thread is not None:
+            warmup_thread.join()
 
 
 # Fast API
+class ORJSONRequest(Request):
+    """Request whose ``json()`` uses orjson, for the tens-of-MB multimodal
+    bodies FastAPI would otherwise hand to stdlib json. Stricter than stdlib
+    on bare NaN/Infinity and >64-bit ints: those now 400 instead of parsing.
+    """
+
+    async def json(self) -> Any:
+        if not hasattr(self, "_json"):
+            self._json = orjson.loads(await self.body())
+        return self._json
+
+
+class ORJSONRoute(APIRoute):
+    def get_route_handler(self):
+        original_handler = super().get_route_handler()
+
+        async def custom_handler(request: Request):
+            return await original_handler(ORJSONRequest(request.scope, request.receive))
+
+        return custom_handler
+
+
 app = FastAPI(
     lifespan=lifespan,
     openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
 )
+app.router.route_class = ORJSONRoute
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -394,10 +469,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
+    from sglang.srt.entrypoints.http_request_decompression import (
+        RequestDecompressionMiddleware,
+    )
+
+    app.add_middleware(RequestDecompressionMiddleware)
+
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 
+# route_class is per-router, so included routers need it set too.
+v1_loads_router.route_class = ORJSONRoute
 app.include_router(v1_loads_router)
+
+from sglang.srt.arg_groups.serving_hook import ssl_verify_of
+from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
+from sglang.srt.runtime_context import (
+    describe_kv_events_publisher,
+    get_disagg,
+    get_exec,
+    get_lora,
+    get_model,
+    get_observability,
+    get_parallel,
+    get_serving,
+    publish,
+)
+
+elastic_ep_router.route_class = ORJSONRoute
+app.include_router(elastic_ep_router)
 
 
 def _anthropic_validation_message(raw_errors) -> str:
@@ -575,6 +676,13 @@ async def health_generate(request: Request) -> Response:
     if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
         return Response(status_code=503)
 
+    # Let an external E2E driver establish a balanced DP batch before health traffic.
+    if envs.SGLANG_DIAG_BYPASS_HEALTH_GENERATE.get() and request.url.path in (
+        "/health",
+        "/health_generate",
+    ):
+        return Response(status_code=200)
+
     if (
         not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.get()
         and request.url.path == "/health"
@@ -593,10 +701,7 @@ async def health_generate(request: Request) -> Response:
             sampling_params=sampling_params,
             log_metrics=False,
         )
-        if (
-            _global_state.tokenizer_manager.server_args.disaggregation_mode
-            != DisaggregationMode.NULL.value
-        ):
+        if get_disagg().disaggregation_mode != DisaggregationMode.NULL.value:
             gri.bootstrap_host = FAKE_BOOTSTRAP_HOST
             gri.bootstrap_room = 0
     else:
@@ -651,17 +756,35 @@ async def model_info():
     model_config = _global_state.tokenizer_manager.model_config
     result = {
         "model_path": _global_state.tokenizer_manager.model_path,
-        "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
+        # Manager-owned, and moved by a weight update alongside `model_path`:
+        # this is where a client reads the identity the server answers under.
+        "served_model_name": _global_state.tokenizer_manager.served_model_name,
+        "tokenizer_path": get_serving().tokenizer_path,
         "is_generation": _global_state.tokenizer_manager.is_generation,
-        "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
-        "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
+        "preferred_sampling_params": get_serving().preferred_sampling_params,
+        "weight_version": _global_state.tokenizer_manager.config_value(
+            "weight_version"
+        ),
+        "load_format": _global_state.tokenizer_manager.config_value("load_format"),
+        "reasoning_parser": _global_state.tokenizer_manager.config_value(
+            "reasoning_parser"
+        ),
+        "tool_call_parser": _global_state.tokenizer_manager.config_value(
+            "tool_call_parser"
+        ),
         "has_image_understanding": model_config.is_image_understandable_model,
         "has_audio_understanding": model_config.is_audio_understandable_model,
         "model_type": getattr(model_config.hf_config, "model_type", None),
         "architectures": getattr(model_config.hf_config, "architectures", None),
-        "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
         # "hf_config": model_config.hf_config.to_dict(),
     }
+    embedding_model_spec = getattr(model_config, "embedding_model_spec", None)
+    if embedding_model_spec is not None:
+        result["embedding"] = resolved_embedding_plan(
+            embedding_model_spec,
+            config=resolving_view(_global_state.tokenizer_manager.server_args),
+            model_config=model_config,
+        )
     return result
 
 
@@ -687,32 +810,41 @@ async def get_server_info():
 
 @app.get("/server_info")
 async def server_info():
-    """Get the server information."""
+    """The startup configuration, plus live scheduler state.
+
+    The values here are the resolution result: what the launcher was given,
+    with every decision resolution made applied over it. Fields the control plane changes
+    after publication -- the model a weight update swapped in, its load format,
+    an operator-set weight version -- are reported by `/model_info`, and the
+    HiCache mirror by `GET /hicache/storage-backend`.
+    """
     # Returns internal states per DP.
-    internal_states: List[Dict[Any, Any]] = (
-        await _global_state.tokenizer_manager.get_internal_state()
-    )
+    internal_states: List[
+        Dict[Any, Any]
+    ] = await _global_state.tokenizer_manager.get_internal_state()
 
     server_args = _global_state.tokenizer_manager.server_args
 
-    # server_args.model_config is not serializable but should be excluded by asdict.
-    return {
-        **dataclasses.asdict(server_args),
-        **_global_state.scheduler_info,
-        "internal_states": internal_states,
-        "version": __version__,
-        # Structured KV-event publisher descriptor for KV-aware routers.
-        # `None` when publishing is disabled or misconfigured; see
-        # `ServerArgs.describe_kv_events_publisher` for the precise contract.
-        "kv_events": server_args.describe_kv_events_publisher(),
-    }
+    return msgspec_to_builtins(
+        {
+            **server_args.resolved_dict(),
+            **_global_state.scheduler_info,
+            "startup_time": _global_state.tokenizer_manager.startup_time,
+            "internal_states": internal_states,
+            "version": __version__,
+            # Structured KV-event publisher descriptor for KV-aware routers.
+            # `None` when publishing is disabled or misconfigured; see
+            # `runtime_context.describe_kv_events_publisher` for the contract.
+            "kv_events": describe_kv_events_publisher(server_args),
+        }
+    )
 
 
 @app.get("/get_load")
 async def get_load():
     """Get load metrics (deprecated - use /v1/loads instead).
 
-    Legacy shim backed by /v1/loads. Projects GetLoadsReqOutput down to the
+    Legacy shim backed by /v1/loads. Projects the load snapshot down to the
     historical field shape (dp_rank, num_reqs, num_waiting_reqs, num_tokens,
     num_pending_tokens, ts_tic) so existing clients keep working.
     """
@@ -739,7 +871,9 @@ async def get_load():
 # curl -s -X POST http://localhost:30000/set_internal_state -H "Content-Type: application/json" -d '{"server_args": {"pp_max_micro_batch_size": 8}}'
 @app.api_route("/set_internal_state", methods=["POST", "PUT"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def set_internal_state(obj: SetInternalStateReq, request: Request):
+async def set_internal_state(
+    obj: Annotated[SetInternalStateReq, Body()], request: Request
+):
     res = await _global_state.tokenizer_manager.set_internal_state(obj)
     return res
 
@@ -752,6 +886,11 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
     async def _dumper_control_handler(method: str, request: Request):
         body_bytes = await request.body()
         body = await request.json() if body_bytes else {}
+        if not isinstance(body, dict):
+            return ORJSONResponse(
+                status_code=400,
+                content={"error": "Request body must be a JSON object."},
+            )
         obj = DumperControlReqInput(method=method, body=body)
         results = await _global_state.tokenizer_manager.dumper_control(obj)
         if any(not r.success for r in results):
@@ -768,6 +907,8 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
 )
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
+    if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
+        apply_header_overrides(obj, request.headers)
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
@@ -788,7 +929,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                     "error": {
                         "message": str(e),
                         "type": "invalid_request_error",
-                        "code": 400,
+                        "code": getattr(e, "status_code", 400),
                         "retryable": False,
                     }
                 }
@@ -950,7 +1091,9 @@ async def clear_hicache_storage_backend():
 #   }'
 @app.api_route("/hicache/storage-backend", methods=["PUT"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def attach_hicache_storage_backend(obj: AttachHiCacheStorageReqInput):
+async def attach_hicache_storage_backend(
+    obj: Annotated[AttachHiCacheStorageReqInput, Body()],
+):
     """Attach (enable) HiCache storage backend at runtime.
 
     Only allowed when there are NO running / queued requests.
@@ -964,7 +1107,7 @@ async def attach_hicache_storage_backend(obj: AttachHiCacheStorageReqInput):
         hicache_storage_prefetch_policy=obj.hicache_storage_prefetch_policy,
         hicache_write_policy=obj.hicache_write_policy,
     )
-    msg = getattr(ret, "message", "")
+    msg = ret.message
     return Response(
         content=(
             (
@@ -991,7 +1134,7 @@ async def detach_hicache_storage_backend():
         return _admin_api_key_missing_response()
 
     ret = await _global_state.tokenizer_manager.detach_hicache_storage()
-    msg = getattr(ret, "message", "")
+    msg = ret.message
     return Response(
         content=(
             (
@@ -1015,32 +1158,21 @@ async def hicache_storage_backend_status():
         return _admin_api_key_missing_response()
 
     return {
-        "hicache_storage_backend": _global_state.tokenizer_manager.server_args.hicache_storage_backend,
-        "hicache_storage_backend_extra_config": _global_state.tokenizer_manager.server_args.hicache_storage_backend_extra_config,
-        "hicache_storage_prefetch_policy": _global_state.tokenizer_manager.server_args.hicache_storage_prefetch_policy,
-        "hicache_write_policy": _global_state.tokenizer_manager.server_args.hicache_write_policy,
+        name: _global_state.tokenizer_manager.config_value(name)
+        for name in (
+            "hicache_storage_backend",
+            "hicache_storage_backend_extra_config",
+            "hicache_storage_prefetch_policy",
+            "hicache_write_policy",
+        )
     }
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def start_profile_async(obj: Optional[ProfileReqInput] = None):
+async def start_profile_async(obj: Annotated[Optional[ProfileReq], Body()] = None):
     """Start profiling."""
-    if obj is None:
-        obj = ProfileReqInput()
-
-    await _global_state.tokenizer_manager.start_profile(
-        output_dir=obj.output_dir,
-        start_step=obj.start_step,
-        num_steps=obj.num_steps,
-        activities=obj.activities,
-        with_stack=obj.with_stack,
-        record_shapes=obj.record_shapes,
-        profile_by_stage=obj.profile_by_stage,
-        merge_profiles=obj.merge_profiles,
-        profile_prefix=obj.profile_prefix,
-        profile_stages=obj.profile_stages,
-    )
+    await _global_state.tokenizer_manager.start_profile(obj or ProfileReq())
     return Response(
         content="Start profiling.\n",
         status_code=200,
@@ -1116,7 +1248,9 @@ async def dump_expert_distribution_record_async():
 
 @app.post("/update_weights_from_disk")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
+async def update_weights_from_disk(
+    obj: Annotated[UpdateWeightFromDiskReqInput, Body()], request: Request
+):
     """Update the weights from disk inplace without re-launching the server."""
     (
         success,
@@ -1144,7 +1278,8 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
 @app.post("/init_weights_send_group_for_remote_instance")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def init_weights_send_group_for_remote_instance(
-    obj: InitWeightsSendGroupForRemoteInstanceReqInput, request: Request
+    obj: Annotated[InitWeightsSendGroupForRemoteInstanceReqInput, Body()],
+    request: Request,
 ):
     (
         success,
@@ -1162,7 +1297,7 @@ async def init_weights_send_group_for_remote_instance(
 @app.post("/send_weights_to_remote_instance")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def send_weights_to_remote_instance(
-    obj: SendWeightsToRemoteInstanceReqInput, request: Request
+    obj: Annotated[SendWeightsToRemoteInstanceReqInput, Body()], request: Request
 ):
     (
         success,
@@ -1218,7 +1353,7 @@ async def remote_instance_transfer_engine_info(rank: int = None):
 @app.post("/init_weights_update_group")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def init_weights_update_group(
-    obj: InitWeightsUpdateGroupReqInput, request: Request
+    obj: Annotated[InitWeightsUpdateGroupReqInput, Body()], request: Request
 ):
     """Initialize the parameter update group."""
     success, message = await _global_state.tokenizer_manager.init_weights_update_group(
@@ -1234,7 +1369,7 @@ async def init_weights_update_group(
 @app.post("/destroy_weights_update_group")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def destroy_weights_update_group(
-    obj: DestroyWeightsUpdateGroupReqInput, request: Request
+    obj: Annotated[DestroyWeightsUpdateGroupReqInput, Body()], request: Request
 ):
     """Destroy the parameter update group."""
     (
@@ -1250,7 +1385,7 @@ async def destroy_weights_update_group(
 @app.post("/update_weights_from_tensor")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_tensor(
-    obj: UpdateWeightsFromTensorReqInput, request: Request
+    obj: Annotated[UpdateWeightsFromTensorReqInput, Body()], request: Request
 ):
     """Update the weights from tensor inplace without re-launching the server.
     Notes:
@@ -1272,7 +1407,7 @@ async def update_weights_from_tensor(
 @app.post("/update_weights_from_distributed")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_distributed(
-    obj: UpdateWeightsFromDistributedReqInput, request: Request
+    obj: Annotated[UpdateWeightsFromDistributedReqInput, Body()], request: Request
 ):
     """Update model parameter from distributed online."""
     (
@@ -1291,7 +1426,9 @@ async def update_weights_from_distributed(
 
 @app.post("/update_weights_from_ipc")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Request):
+async def update_weights_from_ipc(
+    obj: Annotated[UpdateWeightsFromIPCReqInput, Body()], request: Request
+):
     """Update the weights from IPC (Inter-Process Communication) for checkpoint-engine integration."""
     success, message = await _global_state.tokenizer_manager.update_weights_from_ipc(
         obj, request
@@ -1308,7 +1445,9 @@ async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Re
 
 @app.post("/update_weight_version")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Request):
+async def update_weight_version(
+    obj: Annotated[UpdateWeightVersionReqInput, Body()], request: Request
+):
     """Update the weight version. This operation requires no active requests."""
     if obj.abort_all_requests:
         _global_state.tokenizer_manager.abort_request(abort_all=True)
@@ -1316,8 +1455,7 @@ async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Reque
     # Use a simple approach without the complex lock mechanism for now
     # since weight_version update is a simple operation that doesn't affect model weights
     try:
-        # Update the weight version in server args (the single source of truth)
-        _global_state.tokenizer_manager.server_args.weight_version = obj.new_version
+        await _global_state.tokenizer_manager.update_weight_version(obj)
 
         return ORJSONResponse(
             {
@@ -1339,7 +1477,9 @@ async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Reque
 
 @app.api_route("/get_weights_by_name", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
+async def get_weights_by_name(
+    obj: Annotated[GetWeightsByNameReqInput, Body()], request: Request
+):
     """Get model parameter by name."""
     try:
         ret = await _global_state.tokenizer_manager.get_weights_by_name(obj, request)
@@ -1354,7 +1494,7 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
 @app.api_route("/release_memory_occupation", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def release_memory_occupation(
-    obj: ReleaseMemoryOccupationReqInput, request: Request
+    obj: Annotated[ReleaseMemoryOccupationReqInput, Body()], request: Request
 ):
     """Release GPU memory occupation temporarily."""
     try:
@@ -1366,7 +1506,7 @@ async def release_memory_occupation(
 @app.api_route("/resume_memory_occupation", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def resume_memory_occupation(
-    obj: ResumeMemoryOccupationReqInput, request: Request
+    obj: Annotated[ResumeMemoryOccupationReqInput, Body()], request: Request
 ):
     """Resume GPU memory occupation."""
     try:
@@ -1378,13 +1518,17 @@ async def resume_memory_occupation(
 @app.api_route("/weights_checker", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def check_weights(
-    obj: Optional[CheckWeightsReqInput] = None, request: Request = None
+    obj: Annotated[Optional[CheckWeightsReqInput], Body()] = None,
+    request: Request = None,
 ):
     if obj is None:
         obj = CheckWeightsReqInput()
-    success, message, ranks, per_engine_checksum = (
-        await _global_state.tokenizer_manager.check_weights(obj, request)
-    )
+    (
+        success,
+        message,
+        ranks,
+        per_engine_checksum,
+    ) = await _global_state.tokenizer_manager.check_weights(obj, request)
     body = {"success": success, "message": message}
     if ranks is not None:
         body["ranks"] = ranks
@@ -1395,7 +1539,7 @@ async def check_weights(
 
 @app.api_route("/slow_down", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def slow_down(obj: SlowDownReqInput, request: Request):
+async def slow_down(obj: Annotated[SlowDownReqInput, Body()], request: Request):
     """Slow down the system deliberately. Only for testing. Example scenario:
     when we want to test performance of D in large-scale PD disaggregation and have no enough nodes for P,
     we can use this to slow down D to let it have enough running sequences, and then disable slowdown
@@ -1409,57 +1553,40 @@ async def slow_down(obj: SlowDownReqInput, request: Request):
 
 @app.api_route("/load_lora_adapter", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def load_lora_adapter(obj: LoadLoRAAdapterReqInput, request: Request):
+async def load_lora_adapter(
+    obj: Annotated[LoadLoRAAdapterReqInput, Body()], request: Request
+):
     """Load a new LoRA adapter without re-launching the server."""
     result = await _global_state.tokenizer_manager.load_lora_adapter(obj, request)
-
-    if result.success:
-        return ORJSONResponse(
-            result,
-            status_code=HTTPStatus.OK,
-        )
-    else:
-        return ORJSONResponse(
-            result,
-            status_code=HTTPStatus.BAD_REQUEST,
-        )
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 
 
 @app.api_route("/load_lora_adapter_from_tensors", methods=["POST"])
 async def load_lora_adapter_from_tensors(
-    obj: LoadLoRAAdapterFromTensorsReqInput, request: Request
+    obj: Annotated[LoadLoRAAdapterFromTensorsReqInput, Body()], request: Request
 ):
     """Load a new LoRA adapter from tensors without re-launching the server."""
     result = await _global_state.tokenizer_manager.load_lora_adapter_from_tensors(
         obj, request
     )
-
-    if result.success:
-        return ORJSONResponse(result, status_code=HTTPStatus.OK)
-    else:
-        return ORJSONResponse(result, status_code=HTTPStatus.BAD_REQUEST)
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 
 
 @app.api_route("/unload_lora_adapter", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def unload_lora_adapter(obj: UnloadLoRAAdapterReqInput, request: Request):
+async def unload_lora_adapter(
+    obj: Annotated[UnloadLoRAAdapterReqInput, Body()], request: Request
+):
     """Load a new LoRA adapter without re-launching the server."""
     result = await _global_state.tokenizer_manager.unload_lora_adapter(obj, request)
-
-    if result.success:
-        return ORJSONResponse(
-            result,
-            status_code=HTTPStatus.OK,
-        )
-    else:
-        return ORJSONResponse(
-            result,
-            status_code=HTTPStatus.BAD_REQUEST,
-        )
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 
 
 @app.api_route("/open_session", methods=["GET", "POST"])
-async def open_session(obj: OpenSessionReqInput, request: Request):
+async def open_session(obj: Annotated[OpenSessionReqInput, Body()], request: Request):
     """Open a session, and return its unique session id."""
     try:
         session_id = await _global_state.tokenizer_manager.open_session(obj, request)
@@ -1473,7 +1600,7 @@ async def open_session(obj: OpenSessionReqInput, request: Request):
 
 
 @app.api_route("/close_session", methods=["GET", "POST"])
-async def close_session(obj: CloseSessionReqInput, request: Request):
+async def close_session(obj: Annotated[CloseSessionReqInput, Body()], request: Request):
     """Close the session."""
     try:
         await _global_state.tokenizer_manager.close_session(obj, request)
@@ -1484,7 +1611,9 @@ async def close_session(obj: CloseSessionReqInput, request: Request):
 
 @app.api_route("/configure_logging", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def configure_logging(obj: ConfigureLoggingReq, request: Request):
+async def configure_logging(
+    obj: Annotated[ConfigureLoggingReq, Body()], request: Request
+):
     """Configure the request logging options."""
     _global_state.tokenizer_manager.configure_logging(obj)
     return Response(status_code=200)
@@ -1492,7 +1621,7 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
 
 @app.post("/abort_request")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def abort_request(obj: AbortReq, request: Request):
+async def abort_request(obj: Annotated[AbortReq, Body()], request: Request):
     """Abort a request."""
     try:
         _global_state.tokenizer_manager.abort_request(
@@ -1504,12 +1633,18 @@ async def abort_request(obj: AbortReq, request: Request):
 
 
 @app.post("/parse_function_call")
-async def parse_function_call_request(obj: ParseFunctionCallReq, request: Request):
+async def parse_function_call_request(
+    obj: Annotated[ParseFunctionCallReq, Body()], request: Request
+):
     """
     A native API endpoint to parse function calls from a text.
     """
     # 1) Initialize the parser based on the request body
-    parser = FunctionCallParser(tools=obj.tools, tool_call_parser=obj.tool_call_parser)
+    parser = FunctionCallParser(
+        tools=obj.tools,
+        tool_call_parser=obj.tool_call_parser,
+        tokenizer=get_global_state().tokenizer_manager.tokenizer,
+    )
 
     # 2) Call the non-stream parsing method (non-stream)
     normal_text, calls = parser.parse_non_stream(obj.text)
@@ -1526,15 +1661,21 @@ async def parse_function_call_request(obj: ParseFunctionCallReq, request: Reques
 
 
 @app.post("/separate_reasoning")
-async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Request):
+async def separate_reasoning_request(
+    obj: Annotated[SeparateReasoningReqInput, Body()], request: Request
+):
     """
     A native API endpoint to separate reasoning from a text.
     """
     # 1) Initialize the parser based on the request body
-    parser = ReasoningParser(model_type=obj.reasoning_parser, request=request)
+    parser = ReasoningParser(
+        model_type=obj.reasoning_parser,
+        request=request,
+        tokenizer=get_global_state().tokenizer_manager.tokenizer,
+    )
 
     # 2) Call the non-stream parsing method (non-stream)
-    if getattr(obj, "return_blocks", False):
+    if obj.return_blocks:
         blocks = parser.parse_non_stream_blocks(obj.text)
         reasoning_blocks = [b["text"] for b in blocks if b["type"] == "reasoning"]
         text_blocks = [b["text"] for b in blocks if b["type"] == "text"]
@@ -1548,7 +1689,7 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
         "reasoning_text": reasoning_text,
         "text": normal_text,
     }
-    if getattr(obj, "return_blocks", False):
+    if obj.return_blocks:
         response_data["reasoning_blocks"] = reasoning_blocks
         response_data["text_blocks"] = text_blocks
         response_data["blocks"] = blocks
@@ -1558,7 +1699,9 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
 
 @app.post("/pause_generation")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def pause_generation(obj: PauseGenerationReqInput, request: Request):
+async def pause_generation(
+    obj: Annotated[PauseGenerationReqInput, Body()], request: Request
+):
     """Pause generation."""
     await _global_state.tokenizer_manager.pause_generation(obj)
     return ORJSONResponse(
@@ -1569,7 +1712,9 @@ async def pause_generation(obj: PauseGenerationReqInput, request: Request):
 
 @app.post("/continue_generation")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def continue_generation(obj: ContinueGenerationReqInput, request: Request):
+async def continue_generation(
+    obj: Annotated[ContinueGenerationReqInput, Body()], request: Request
+):
     """Continue generation."""
     await _global_state.tokenizer_manager.continue_generation(obj)
     return ORJSONResponse(
@@ -1727,7 +1872,7 @@ async def available_models():
         )
 
     # Add loaded LoRA adapters
-    if _global_state.tokenizer_manager.server_args.enable_lora:
+    if get_lora().enable_lora:
         lora_registry = _global_state.tokenizer_manager.lora_registry
         for _, lora_ref in lora_registry.get_all_adapters().items():
             model_cards.append(
@@ -1908,7 +2053,9 @@ async def sagemaker_chat_completions(
 
 ## Vertex AI API
 @app.post(os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate"))
-async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Request):
+async def vertex_generate(
+    vertex_req: Annotated[VertexGenerateReqInput, Body()], raw_request: Request
+):
     if not vertex_req.instances:
         return []
     inputs = {}
@@ -1929,14 +2076,17 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
         **(vertex_req.parameters or {}),
     )
     ret = await generate_request(req, raw_request)
-    if isinstance(ret, Response):
-        return ret
+    if isinstance(ret, Response) and ret.status_code == 200 and hasattr(ret, "body"):
+        return ORJSONResponse({"predictions": orjson.loads(ret.body)})
+    return ret
+
     return ORJSONResponse({"predictions": ret})
 
 
 def _create_error_response(e):
     return ORJSONResponse(
-        {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+        {"error": {"message": str(e)}},
+        status_code=getattr(e, "status_code", HTTPStatus.BAD_REQUEST),
     )
 
 
@@ -1964,6 +2114,88 @@ def _admin_api_key_missing_response(
 # Minimal 32x32 black PNG (base64, GLM4v requires at least 32x32 sized image)
 MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
 
+# Kimi K2.5/K2.7 runs its MoonViT position interpolation through torch.compile.
+# The minimal image above does not exercise a representative image shape and
+# leaves the first client request paying the compilation cost. Keep this
+# narrowly scoped: a larger default warmup image would unnecessarily lengthen
+# startup for VLMs whose encoders do not have this behavior.
+KIMI_VLM_WARMUP_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAIAAAB7GkOtAAADEUlEQVR42u3BgQAAAADDoPlTX+EAVQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMBvArQAAf/YBFAAAAAASUVORK5CYII="
+
+# Kimi K3's native vision preprocessing uses a 14x14 spatial patch size. A
+# 448x448 image exercises a representative 32x32 patch grid without padding.
+KIMI_K3_VLM_WARMUP_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAcAAAAHACAIAAAC6Ry8kAAACX0lEQVR42u3BMQEAAADCoPVPbQwfoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAtwEyRwAB32QPDQAAAABJRU5ErkJggg=="
+
+
+def _get_vlm_warmup_image_base64(model_info: dict) -> str:
+    """Choose the VLM image used by the startup warmup request.
+
+    A 512x512 image triggers Kimi K2.5/K2.7's representative compiled
+    position-interpolation path during startup. Kimi K3 uses a 448x448 image
+    matching its native vision patch grid. This keeps one-time vision setup
+    work out of the first external image request.
+    Other VLMs retain the minimal image to avoid changing their startup cost.
+    """
+
+    architectures = model_info.get("architectures") or []
+    if (
+        "KimiK3ForConditionalGeneration" in architectures
+        or model_info.get("model_type") == "kimi_k3"
+    ):
+        logger.info(
+            "Using a 448x448 image for Kimi K3 VLM startup warmup to exercise "
+            "its native 32x32 vision patch grid."
+        )
+        return KIMI_K3_VLM_WARMUP_PNG_PICTURE_BASE64
+    if "KimiK25ForConditionalGeneration" in architectures:
+        logger.info(
+            "Using a 512x512 image for Kimi VLM startup warmup to compile "
+            "MoonViT position interpolation."
+        )
+        return KIMI_VLM_WARMUP_PNG_PICTURE_BASE64
+    return MINIMUM_PNG_PICTURE_BASE64
+
+
+async def _send_disaggregation_warmup_requests(
+    url: str,
+    headers: Dict[str, str],
+    ssl_verify: Union[bool, str],
+    timeout: int,
+) -> List[int]:
+    ssl_context = (
+        ssl_verify
+        if isinstance(ssl_verify, bool)
+        else ssl.create_default_context(cafile=ssl_verify)
+    )
+
+    async def send_request(session: aiohttp.ClientSession, dp_rank: int) -> int:
+        json_data = {
+            "sampling_params": {
+                "temperature": 0.0,
+                "max_new_tokens": 8,
+                "ignore_eos": True,
+            },
+            "bootstrap_host": FAKE_BOOTSTRAP_HOST,
+            "bootstrap_room": dp_rank,
+            "input_ids": [10, 11, 12, 13],
+            "routed_dp_rank": dp_rank,
+        }
+        async with session.post(
+            url + "/generate", json=json_data, ssl=ssl_context
+        ) as response:
+            await response.read()
+            return response.status
+
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=timeout),
+        headers=headers,
+    ) as session:
+        return await asyncio.gather(
+            *(
+                send_request(session, dp_rank)
+                for dp_rank in range(get_parallel().dp_size)
+            )
+        )
+
 
 def _execute_server_warmup(server_args: ServerArgs):
     headers = {}
@@ -1971,7 +2203,7 @@ def _execute_server_warmup(server_args: ServerArgs):
     if server_args.api_key:
         headers["Authorization"] = f"Bearer {server_args.api_key}"
 
-    ssl_verify = server_args.ssl_verify()
+    ssl_verify = ssl_verify_of(server_args)
 
     # Wait until the server is launched
     success = False
@@ -1996,7 +2228,14 @@ def _execute_server_warmup(server_args: ServerArgs):
     model_info = res.json()
 
     # Construct a warmup request (MLX: text warmup for VLM-advertising models; TODO: enable image warmup).
-    is_vlm = bool(model_info.get("has_image_understanding", False)) and not is_mps()
+    # A language-only worker may advertise VLM capability for encoder
+    # disaggregation, but its local warmup must stay on the text path.
+    is_vlm = (
+        bool(model_info.get("has_image_understanding", False))
+        and not server_args.language_only
+        and not server_args.language_model_only
+        and not is_mps()
+    )
     if model_info["is_generation"]:
         if is_vlm and not server_args.skip_tokenizer_init:
             request_name = "/v1/chat/completions"
@@ -2012,19 +2251,29 @@ def _execute_server_warmup(server_args: ServerArgs):
         },
     }
     if server_args.skip_tokenizer_init:
-        json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
+        json_data["input_ids"] = [[10, 11, 12] for _ in range(get_parallel().dp_size)]
         # TODO Workaround the bug that embedding errors for list of size 1
-        if server_args.dp_size == 1:
+        if get_parallel().dp_size == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
     elif (
         is_vlm
-        and server_args.disaggregation_mode == "null"
+        and get_disagg().disaggregation_mode == "null"
         and model_info["is_generation"]
     ):
+        served_model_name = ""
+        if not envs.SGLANG_RUST_SERVER.get():
+            served_model_name = _global_state.tokenizer_manager.served_model_name
+        else:
+            # _global_state.tokenizer_manager is not initialized in the rust server,
+            # so we need to get the model name from the model_info
+            served_model_name = model_info.get(
+                "model_path", get_serving().served_model_name
+            )
+            served_model_name = served_model_name or get_model().model_path
         # TODO: ChatCompletionRequest does not have bootstrap info required by disaggregation mode, disable image-warmup for now
         # Only use chat completions format for generation models, not embedding models
         json_data = {
-            "model": _global_state.tokenizer_manager.served_model_name,
+            "model": served_model_name,
             "messages": [
                 {
                     "role": "user",
@@ -2032,7 +2281,8 @@ def _execute_server_warmup(server_args: ServerArgs):
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": f"data:image/png;base64,{MINIMUM_PNG_PICTURE_BASE64}"
+                                "url": "data:image/png;base64,"
+                                f"{_get_vlm_warmup_image_base64(model_info)}"
                             },
                         },
                         {
@@ -2047,9 +2297,9 @@ def _execute_server_warmup(server_args: ServerArgs):
             "temperature": 0.0,
         }
     else:
-        json_data["text"] = ["The capital city of France is"] * server_args.dp_size
+        json_data["text"] = ["The capital city of France is"] * get_parallel().dp_size
         # TODO Workaround the bug that embedding errors for list of size 1
-        if server_args.dp_size == 1:
+        if get_parallel().dp_size == 1:
             json_data["text"] = json_data["text"][0]
 
     # Config debug dumping
@@ -2063,7 +2313,7 @@ def _execute_server_warmup(server_args: ServerArgs):
     # Send a warmup request
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
     try:
-        if server_args.disaggregation_mode == "null":
+        if get_disagg().disaggregation_mode == "null":
             res = requests.post(
                 url + request_name,
                 json=json_data,
@@ -2072,48 +2322,41 @@ def _execute_server_warmup(server_args: ServerArgs):
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
-            _global_state.tokenizer_manager.server_status = ServerStatus.Up
+            # Skip server_status update for Rust server
+            if not envs.SGLANG_RUST_SERVER.get():
+                _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
-            request_name = "/generate"
-            json_data = {
-                "sampling_params": {
-                    "temperature": 0.0,
-                    "max_new_tokens": 8,
-                    "ignore_eos": True,
-                },
-                "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
-                # This is a hack to ensure fake transfer is enabled during prefill warmup
-                # ensure each dp rank has a unique bootstrap_room during prefill warmup
-                "bootstrap_room": [
-                    i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
-                    for i in range(server_args.dp_size)
-                ],
-                "input_ids": [[10, 11, 12, 13]] * server_args.dp_size,
-            }
-            res = requests.post(
-                url + request_name,
-                json=json_data,
-                headers=headers,
-                timeout=(
-                    warmup_timeout if warmup_timeout > 0 else 1800
-                ),  # because of deep gemm precache is very long if not precache.
-                verify=ssl_verify,
+            status_codes = asyncio.run(
+                _send_disaggregation_warmup_requests(
+                    url=url,
+                    headers=headers,
+                    ssl_verify=ssl_verify,
+                    timeout=warmup_timeout if warmup_timeout > 0 else 1800,
+                )
             )
-            if res.status_code == 200:
+            failed_status_codes = [code for code in status_codes if code != 200]
+            if not failed_status_codes:
                 logger.info(
-                    f"Disaggregation warmup request completed with status {res.status_code}, resp: {res.json()}"
+                    "Disaggregation warmup requests completed for all %s DP ranks",
+                    get_parallel().dp_size,
                 )
                 logger.info("End of disaggregation warmup")
-                _global_state.tokenizer_manager.server_status = ServerStatus.Up
             else:
                 logger.info(
-                    "Disaggregation warmup failed (mode=%s), status code: %s",
-                    server_args.disaggregation_mode,
-                    res.status_code,
+                    "Disaggregation warmup failed (mode=%s), status codes: %s",
+                    get_disagg().disaggregation_mode,
+                    failed_status_codes,
                 )
-                _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+            # In rust-server mode there is no TokenizerManager (readiness is
+            # the Rust server's own /health), so skip the status update.
+            if not envs.SGLANG_RUST_SERVER.get():
+                _global_state.tokenizer_manager.server_status = (
+                    ServerStatus.Up
+                    if not failed_status_codes
+                    else ServerStatus.UnHealthy
+                )
 
     except Exception:
         last_traceback = get_exception_traceback()
@@ -2121,9 +2364,26 @@ def _execute_server_warmup(server_args: ServerArgs):
         kill_process_tree(os.getpid())
         return False
 
-    # Debug print
-    # logger.info(f"warmup request returns: {res.json()=}")
     return success
+
+
+def _freeze_gc_after_server_warmup(server_args: ServerArgs):
+    # Freeze GC after server warmup so static objects skip future GC gen2 collection.
+    # Use /freeze_gc to freeze scheduler and detokenizer as well.
+    freeze_key = server_args.admin_api_key or server_args.api_key
+    freeze_headers = {}
+    if freeze_key:
+        freeze_headers["Authorization"] = f"Bearer {freeze_key}"
+    try:
+        res = requests.post(
+            server_args.url() + "/freeze_gc",
+            headers=freeze_headers,
+            timeout=10,
+            verify=ssl_verify_of(server_args),
+        )
+        res.raise_for_status()
+    except requests.exceptions.RequestException:
+        logger.warning("post-warmup freeze_gc failed", exc_info=True)
 
 
 def _wait_and_warmup(
@@ -2134,18 +2394,27 @@ def _wait_and_warmup(
     if server_args.checkpoint_engine_wait_weights_before_ready:
         _wait_weights_ready()
 
-    # Send a warmup request
-    if not server_args.skip_server_warmup:
+    # Joiner schedulers are served through the primary after adoption.
+    skip_elastic_joiner_warmup = server_args.is_ep_scale_joiner
+    if skip_elastic_joiner_warmup:
+        logger.debug(
+            "[Elastic EP] Skipping server warmup for elastic joiner (ep_join_mode=%s)",
+            get_exec().moe.ep_join_mode,
+        )
+
+    if not get_serving().skip_server_warmup and not skip_elastic_joiner_warmup:
         if not execute_warmup_func(server_args):
             return
     else:
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
+    _freeze_gc_after_server_warmup(server_args)
+
     # The server is ready for requests
     logger.info("The server is fired up and ready to roll!")
 
     if server_args.delete_ckpt_after_loading:
-        delete_directory(server_args.model_path)
+        delete_directory(get_model().model_path)
 
     if server_args.debug_tensor_dump_input_file:
         kill_process_tree(os.getpid())
@@ -2179,6 +2448,8 @@ def _run_granian_server(
     host,
     port,
     log_level,
+    http2_max_concurrent_streams,
+    http2_initial_connection_window_size,
     tokenizer_worker_num=1,
     ssl_certfile=None,
     ssl_keyfile=None,
@@ -2202,6 +2473,7 @@ def _run_granian_server(
 
     from granian import Granian
     from granian.constants import HTTPModes, Interfaces, Loops
+    from granian.http import HTTP2Settings
     from granian.server.embed import Server as GranianEmbeddedServer
 
     Server = GranianEmbeddedServer if tokenizer_worker_num == 1 else Granian
@@ -2214,6 +2486,10 @@ def _run_granian_server(
         port=port,
         interface=Interfaces.ASGI,
         http=HTTPModes.auto,
+        http2_settings=HTTP2Settings(
+            initial_connection_window_size=http2_initial_connection_window_size,
+            max_concurrent_streams=http2_max_concurrent_streams,
+        ),
         log_level=log_level,
         ssl_cert=ssl_certfile,
         ssl_key=ssl_keyfile,
@@ -2275,7 +2551,7 @@ def _setup_and_run_http_server(
     if tokenizer_manager is not None:
         tokenizer_manager._subprocess_watchdog = subprocess_watchdog
 
-    if server_args.enable_metrics:
+    if get_observability().enable_metrics:
         add_prometheus_track_response_middleware(app)
 
     # Pass additional arguments to the lifespan function.
@@ -2314,7 +2590,12 @@ def _setup_and_run_http_server(
         # for other worker processes to read.
         app.is_single_tokenizer_mode = False
         multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
-            port_args, server_args, scheduler_infos[0]
+            port_args,
+            server_args,
+            {
+                **scheduler_infos[0],
+                "startup_time": tokenizer_manager.startup_time,
+            },
         )
 
     try:
@@ -2332,12 +2613,19 @@ def _setup_and_run_http_server(
             if server_args.enable_http2:
                 logger.info(
                     f"Starting embedded Granian HTTP/2 server on "
-                    f"{server_args.host}:{server_args.port}"
+                    f"{get_serving().host}:{get_serving().port}"
                 )
                 _run_granian_server(
-                    host=server_args.host,
-                    port=server_args.port,
-                    log_level=server_args.log_level_http or server_args.log_level,
+                    host=get_serving().host,
+                    port=get_serving().port,
+                    log_level=get_observability().log_level_http
+                    or get_observability().log_level,
+                    http2_max_concurrent_streams=(
+                        server_args.http2_max_concurrent_streams
+                    ),
+                    http2_initial_connection_window_size=(
+                        server_args.http2_initial_connection_window_size
+                    ),
                     ssl_certfile=server_args.ssl_certfile,
                     ssl_keyfile=server_args.ssl_keyfile,
                     ssl_ca_certs=server_args.ssl_ca_certs,
@@ -2348,10 +2636,11 @@ def _setup_and_run_http_server(
                 # Use Config/Server API for access to the SSLContext.
                 config = uvicorn.Config(
                     app,
-                    host=server_args.host,
-                    port=server_args.port,
+                    host=get_serving().host,
+                    port=get_serving().port,
                     root_path=server_args.fastapi_root_path,
-                    log_level=server_args.log_level_http or server_args.log_level,
+                    log_level=get_observability().log_level_http
+                    or get_observability().log_level,
                     timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
                     loop="uvloop",
                     ssl_keyfile=server_args.ssl_keyfile,
@@ -2385,10 +2674,11 @@ def _setup_and_run_http_server(
                 # Default case, one tokenizer process
                 uvicorn.run(
                     app,
-                    host=server_args.host,
-                    port=server_args.port,
+                    host=get_serving().host,
+                    port=get_serving().port,
                     root_path=server_args.fastapi_root_path,
-                    log_level=server_args.log_level_http or server_args.log_level,
+                    log_level=get_observability().log_level_http
+                    or get_observability().log_level,
                     timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
                     loop="uvloop",
                     ssl_keyfile=server_args.ssl_keyfile,
@@ -2416,12 +2706,19 @@ def _setup_and_run_http_server(
             if server_args.enable_http2:
                 logger.info(
                     f"Starting embedded Granian HTTP/2 server on "
-                    f"{server_args.host}:{server_args.port}"
+                    f"{get_serving().host}:{get_serving().port}"
                 )
                 _run_granian_server(
-                    host=server_args.host,
-                    port=server_args.port,
-                    log_level=server_args.log_level_http or server_args.log_level,
+                    host=get_serving().host,
+                    port=get_serving().port,
+                    log_level=get_observability().log_level_http
+                    or get_observability().log_level,
+                    http2_max_concurrent_streams=(
+                        server_args.http2_max_concurrent_streams
+                    ),
+                    http2_initial_connection_window_size=(
+                        server_args.http2_initial_connection_window_size
+                    ),
                     tokenizer_worker_num=server_args.tokenizer_worker_num,
                     ssl_certfile=server_args.ssl_certfile,
                     ssl_keyfile=server_args.ssl_keyfile,
@@ -2431,10 +2728,11 @@ def _setup_and_run_http_server(
             else:
                 uvicorn.run(
                     "sglang.srt.entrypoints.http_server:app",
-                    host=server_args.host,
-                    port=server_args.port,
+                    host=get_serving().host,
+                    port=get_serving().port,
                     root_path=server_args.fastapi_root_path,
-                    log_level=server_args.log_level_http or server_args.log_level,
+                    log_level=get_observability().log_level_http
+                    or get_observability().log_level,
                     timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
                     timeout_worker_healthcheck=envs.SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT.get(),
                     loop="uvloop",
@@ -2450,6 +2748,44 @@ def _setup_and_run_http_server(
                 multi_tokenizer_args_shm.unlink()
             if _global_state is not None:
                 _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
+
+
+def _start_native_grpc_server_for_runtime(
+    server_args,
+    tokenizer_manager,
+    template_manager,
+    scheduler_info,
+    grpc_port,
+):
+    from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
+    from sglang.srt.rust_extensions import load_rust_extension
+
+    grpc_native = load_rust_extension("sglang.srt.rust_extensions._grpc")
+
+    runtime_handle = RuntimeHandle(
+        tokenizer_manager=tokenizer_manager,
+        template_manager=template_manager,
+        server_args=server_args,
+        scheduler_info=scheduler_info or {},
+    )
+
+    grpc_handle = grpc_native.start_server(
+        host=get_serving().host,
+        port=grpc_port,
+        runtime_handle=runtime_handle,
+        worker_threads=get_serving().grpc_worker_threads,
+    )
+    logger.info(f"Native gRPC server started on {get_serving().host}:{grpc_port}")
+    return grpc_handle
+
+
+def _shutdown_native_grpc_server(grpc_handle) -> None:
+    if grpc_handle is None:
+        return
+    try:
+        grpc_handle.shutdown()
+    except Exception as e:
+        logger.warning(f"Failed to shut down native gRPC server: {e}")
 
 
 def launch_server(
@@ -2482,6 +2818,7 @@ def launch_server(
         port_args,
         scheduler_init_result,
         subprocess_watchdog,
+        _weight_cache_daemon_procs,
     ) = Engine._launch_subprocesses(
         server_args=server_args,
         init_tokenizer_manager_func=init_tokenizer_manager_func,
@@ -2489,13 +2826,27 @@ def launch_server(
         run_detokenizer_process_func=run_detokenizer_process_func,
     )
 
-    _setup_and_run_http_server(
-        server_args,
-        tokenizer_manager,
-        template_manager,
-        port_args,
-        scheduler_init_result.scheduler_infos,
-        subprocess_watchdog,
-        execute_warmup_func=execute_warmup_func,
-        launch_callback=launch_callback,
-    )
+    if envs.SGLANG_RUST_SERVER.get():
+        # The Rust server serves api-server, tokenizer, and detokenizer, so the
+        # main process has no Python HTTP server / tokenizer manager to run.
+        # Run a warmup /generate before advertising readiness: the Rust /health
+        # and /get_model_info endpoints are static (200 as soon as the server
+        # binds, before any forward pass), so without this the first real request
+        # pays the cold-start cost (observed as a >60s first generation).
+        if not get_serving().skip_server_warmup:
+            _execute_server_warmup(server_args)
+        logger.info("The server is fired up and ready to roll!")
+        if launch_callback is not None:
+            launch_callback()
+        scheduler_init_result.block_until_scheduler_exits()
+    else:
+        _setup_and_run_http_server(
+            server_args,
+            tokenizer_manager,
+            template_manager,
+            port_args,
+            scheduler_init_result.scheduler_infos,
+            subprocess_watchdog,
+            execute_warmup_func=execute_warmup_func,
+            launch_callback=launch_callback,
+        )

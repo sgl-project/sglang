@@ -2,22 +2,25 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.fla.cumsum import chunk_local_cumsum
-from sglang.srt.layers.attention.fla.fused_recurrent import (
+from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
+from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_kda_packed_decode,
 )
-from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
-from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
-from sglang.srt.layers.attention.fla.kda import (
+from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
+from sglang.kernels.ops.attention.fla.kda import (
+    chunk_kda,
     fused_recurrent_kda,
     kda_gate_chunk_cumsum,
 )
 from sglang.srt.utils.common import get_device
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=12, stage="stage-b", runner_config="1-gpu-large-amd")
 
 
 @unittest.skipIf(
@@ -245,6 +248,142 @@ class TestKDAGateChunkCumsum(unittest.TestCase):
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+class TestKDAChunkExponentDomain(CustomTestCase):
+    """Guard KDA prefill against mixing natural-log gates with exp2 kernels."""
+
+    @staticmethod
+    def _naive_recurrent(q, k, v, g, beta, initial_state, lengths):
+        q, k, v, g, beta = (tensor.float() for tensor in (q, k, v, g, beta))
+        scale = q.shape[-1] ** -0.5
+        output = torch.empty_like(v)
+        final_state = initial_state.float().clone()
+
+        offset = 0
+        for sequence_index, length in enumerate(lengths):
+            state = final_state[sequence_index]
+            for token_index in range(offset, offset + length):
+                state = state * g[0, token_index].exp().unsqueeze(-2)
+                residual = v[0, token_index] - torch.einsum(
+                    "hvk,hk->hv", state, k[0, token_index]
+                )
+                state = state + torch.einsum(
+                    "hv,hk->hvk",
+                    residual * beta[0, token_index, :, None],
+                    k[0, token_index],
+                )
+                output[0, token_index] = (
+                    torch.einsum("hvk,hk->hv", state, q[0, token_index]) * scale
+                )
+            final_state[sequence_index] = state
+            offset += length
+        return output, final_state
+
+    @staticmethod
+    def _relative_rmse(actual, expected):
+        error = (actual.float() - expected.float()).square().mean().sqrt()
+        baseline = expected.float().square().mean().sqrt().clamp_min(1e-8)
+        return (error / baseline).item()
+
+    @torch.inference_mode()
+    def test_chunk_prefill_matches_natural_exp_recurrence(self):
+        device = get_device()
+        dtype = torch.bfloat16
+        num_heads, head_dim = 2, 64
+
+        cases = (
+            ([129], False, False),
+            ([15, 16, 17, 63, 65], True, True),
+            # 129 chunks x 2 heads = 258 CTAs > 256 -> _small_grid=False: exercises
+            # the standalone (non-fused) diagonal and recompute kernels.
+            ([2] * 129, True, False),
+        )
+        for lengths, use_varlen, fuse_gate in cases:
+            with self.subTest(
+                lengths=lengths, use_varlen=use_varlen, fuse_gate=fuse_gate
+            ):
+                torch.manual_seed(42)
+                total_tokens = sum(lengths)
+                shape = (1, total_tokens, num_heads, head_dim)
+                q = torch.nn.functional.normalize(
+                    torch.randn(shape, dtype=torch.float32, device=device), dim=-1
+                ).to(dtype)
+                k = torch.nn.functional.normalize(
+                    torch.randn(shape, dtype=torch.float32, device=device), dim=-1
+                ).to(dtype)
+                v = torch.randn(shape, dtype=dtype, device=device) * 0.1
+                raw_gate = (
+                    torch.randn(shape, dtype=torch.float32, device=device) * 0.5 - 2.0
+                ).to(dtype)
+                A_log = torch.randn(num_heads, dtype=torch.float32, device=device) * 0.1
+                dt_bias = (
+                    torch.randn(
+                        num_heads * head_dim,
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    * 0.1
+                )
+                activated_gate = -torch.exp(
+                    A_log.view(1, 1, num_heads, 1)
+                ) * torch.nn.functional.softplus(
+                    raw_gate.float() + dt_bias.view(1, 1, num_heads, head_dim)
+                )
+                kernel_gate = raw_gate if fuse_gate else activated_gate.to(dtype)
+                reference_gate = activated_gate if fuse_gate else kernel_gate.float()
+                beta = torch.rand(
+                    1, total_tokens, num_heads, dtype=dtype, device=device
+                ).sigmoid()
+                initial_state = (
+                    torch.randn(
+                        len(lengths),
+                        num_heads,
+                        head_dim,
+                        head_dim,
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    * 0.05
+                )
+
+                expected_output, expected_state = self._naive_recurrent(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=reference_gate,
+                    beta=beta,
+                    initial_state=initial_state,
+                    lengths=lengths,
+                )
+                actual_state = initial_state.clone()
+                cu_seqlens = None
+                if use_varlen:
+                    cu_seqlens = torch.tensor(
+                        [0, *torch.tensor(lengths).cumsum(0).tolist()],
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                actual_output = chunk_kda(
+                    q=q.clone(),
+                    k=k.clone(),
+                    v=v.clone(),
+                    g=kernel_gate.clone(),
+                    beta=beta.clone(),
+                    initial_state=actual_state,
+                    initial_state_indices=torch.arange(
+                        len(lengths), dtype=torch.int32, device=device
+                    ),
+                    cu_seqlens=cu_seqlens,
+                    A_log=A_log if fuse_gate else None,
+                    dt_bias=dt_bias if fuse_gate else None,
+                )
+
+                output_error = self._relative_rmse(actual_output, expected_output)
+                state_error = self._relative_rmse(actual_state, expected_state)
+                self.assertLess(output_error, 1e-2, f"output error={output_error:.3%}")
+                self.assertLess(state_error, 1e-2, f"state error={state_error:.3%}")
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestKDAPackedDecode(unittest.TestCase):
     """Verify ``fused_recurrent_kda_packed_decode`` matches the existing decode
     path (split + unflatten + ``fused_sigmoid_gating_delta_rule_update``)."""
@@ -270,7 +409,18 @@ class TestKDAPackedDecode(unittest.TestCase):
 
     @staticmethod
     def _run_baseline(
-        mixed_qkv, a, b, A_log, dt_bias, ssm_states, cache_indices, H, HV, K, V
+        mixed_qkv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        ssm_states,
+        cache_indices,
+        H,
+        HV,
+        K,
+        V,
+        lower_bound=None,
     ):
         B = mixed_qkv.shape[0]
         q_flat, k_flat, v_flat = torch.split(mixed_qkv, [H * K, H * K, HV * V], dim=-1)
@@ -297,11 +447,22 @@ class TestKDAPackedDecode(unittest.TestCase):
             scale=K**-0.5,
             use_qk_l2norm_in_kernel=True,
             is_kda=True,
+            lower_bound=lower_bound,
         )
 
     @staticmethod
     def _run_packed(
-        mixed_qkv, a, b, A_log, dt_bias, ssm_states, cache_indices, HV, K, V
+        mixed_qkv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        ssm_states,
+        cache_indices,
+        HV,
+        K,
+        V,
+        lower_bound=None,
     ):
         B = mixed_qkv.shape[0]
         out = mixed_qkv.new_empty(B, 1, HV, V)
@@ -316,10 +477,11 @@ class TestKDAPackedDecode(unittest.TestCase):
             out=out,
             ssm_state_indices=cache_indices,
             use_qk_l2norm_in_kernel=True,
+            lower_bound=lower_bound,
         )
         return out.transpose(0, 1)
 
-    def _check(self, B, H, HV, K, V):
+    def _check(self, B, H, HV, K, V, lower_bound=None):
         device = get_device()
         dtype = torch.bfloat16
         pool_size = B + 4
@@ -330,10 +492,31 @@ class TestKDAPackedDecode(unittest.TestCase):
         s_baseline = ssm_states.clone()
 
         o_packed = self._run_packed(
-            mixed_qkv, a, b, A_log, dt_bias, s_packed, cache_indices, HV, K, V
+            mixed_qkv,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            s_packed,
+            cache_indices,
+            HV,
+            K,
+            V,
+            lower_bound=lower_bound,
         )
         o_baseline = self._run_baseline(
-            mixed_qkv, a, b, A_log, dt_bias, s_baseline, cache_indices, H, HV, K, V
+            mixed_qkv,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            s_baseline,
+            cache_indices,
+            H,
+            HV,
+            K,
+            V,
+            lower_bound=lower_bound,
         )
 
         torch.testing.assert_close(
@@ -361,6 +544,9 @@ class TestKDAPackedDecode(unittest.TestCase):
     def test_asymmetric_heads(self):
         # Common KDA config with HV > H (grouped query).
         self._check(B=8, H=8, HV=16, K=128, V=128)
+
+    def test_safe_gate_lower_bound(self):
+        self._check(B=8, H=16, HV=16, K=128, V=128, lower_bound=-5.0)
 
     def test_pad_slot(self):
         """Entries with state_idx == -1 must produce zero output and skip state writeback."""
@@ -405,6 +591,7 @@ class TestKDAPackedDecode(unittest.TestCase):
         device = get_device()
         dtype = torch.bfloat16
         B, H, HV, K, V = 4, 16, 16, 128, 128
+        lower_bound = -5.0
         pool_size = B + 4
         mixed_qkv, a, b, A_log, dt_bias, ssm_states, cache_indices = self._make_inputs(
             B, H, HV, K, V, pool_size, dtype, device
@@ -429,11 +616,23 @@ class TestKDAPackedDecode(unittest.TestCase):
             cache_indices=cache_indices,
             num_v_heads=HV,
             head_v_dim=V,
+            lower_bound=lower_bound,
         )
 
         s_baseline = ssm_states.clone()
         o_baseline = self._run_baseline(
-            mixed_qkv, a, b, A_log, dt_bias, s_baseline, cache_indices, H, HV, K, V
+            mixed_qkv,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            s_baseline,
+            cache_indices,
+            H,
+            HV,
+            K,
+            V,
+            lower_bound=lower_bound,
         )
 
         # Dispatcher returns [1, B, HV, V], same layout as the baseline.

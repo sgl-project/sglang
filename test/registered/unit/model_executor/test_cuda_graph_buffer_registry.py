@@ -26,6 +26,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     GraphSlot,
     PaddingPolicy,
 )
+from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -45,6 +46,8 @@ class _MiniForwardBatch:
     encoder_lens: Optional[torch.Tensor] = None
     mrope_positions: Optional[torch.Tensor] = None
     num_token_non_padded: Optional[torch.Tensor] = None
+    global_num_token_non_padded: Optional[torch.Tensor] = None
+    global_num_token_non_padded_cpu: Optional[int] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
     ngram_embedding_info: Optional[object] = None
@@ -56,6 +59,12 @@ class _MiniForwardBatch:
     mamba_track_seqlens: Optional[torch.Tensor] = None
     forward_mode: Optional[str] = None
     spec_info: Optional[object] = None
+
+
+@dataclasses.dataclass
+class _PoolInputBuffers(ForwardInputBuffers):
+    input_ids: torch.Tensor
+    select_index: torch.Tensor
 
 
 def _make_registry(max_bs: int = 8, max_num_tokens: int = 16):
@@ -76,16 +85,6 @@ class TestGraphSlot(unittest.TestCase):
                 axis="garbage",
             )
 
-    def test_slice_for_before_buffer_alloc_raises(self):
-        slot = GraphSlot(
-            name="x",
-            shape_fn=lambda bs, mt: (bs,),
-            dtype=torch.int32,
-            axis="bs",
-        )
-        with self.assertRaises(RuntimeError):
-            slot.slice_for(padded_bs=1, padded_num_tokens=1)
-
 
 class TestRegistryRegister(unittest.TestCase):
     def test_register_allocates_zero_buffer(self):
@@ -101,22 +100,6 @@ class TestRegistryRegister(unittest.TestCase):
         self.assertEqual(slot.buffer.shape, (16,))
         self.assertEqual(slot.buffer.dtype, torch.int64)
         self.assertTrue(torch.equal(slot.buffer, torch.zeros(16, dtype=torch.int64)))
-
-    def test_register_fill_sentinel_init(self):
-        r = _make_registry()
-        slot = r.register_slot(
-            GraphSlot(
-                name="seq_lens",
-                shape_fn=lambda bs, mt: (bs,),
-                dtype=torch.int32,
-                axis="bs",
-                padding_policy=PaddingPolicy.FILL_SENTINEL,
-                pad_value=7,
-            )
-        )
-        self.assertTrue(
-            torch.equal(slot.buffer, torch.full((8,), 7, dtype=torch.int32))
-        )
 
     def test_register_duplicate_raises(self):
         r = _make_registry()
@@ -152,22 +135,6 @@ class TestRegistryRegister(unittest.TestCase):
         self.assertIsNone(slot.buffer)
         self.assertFalse(r.has_slot("off"))
         self.assertNotIn("off", r.slot_names())
-
-    def test_cpu_device_override(self):
-        r = _make_registry()
-        slot = r.register_slot(
-            GraphSlot(
-                name="seq_lens_cpu",
-                shape_fn=lambda bs, mt: (bs,),
-                dtype=torch.int32,
-                axis="bs",
-                device=torch.device("cpu"),
-                padding_policy=PaddingPolicy.FILL_SENTINEL,
-                pad_value=11,
-            )
-        )
-        self.assertEqual(slot.buffer.device.type, "cpu")
-        self.assertEqual(int(slot.buffer[0].item()), 11)
 
 
 class TestFillFromAndExtract(unittest.TestCase):
@@ -232,35 +199,6 @@ class TestFillFromAndExtract(unittest.TestCase):
             )
         )
         return r
-
-    def test_basic_fill_no_padding(self):
-        r = self._build_registry()
-        fb = _MiniForwardBatch(
-            batch_size=4,
-            input_ids=torch.arange(8, dtype=torch.int64),
-            req_pool_indices=torch.tensor([3, 1, 4, 2], dtype=torch.int64),
-            seq_lens=torch.tensor([10, 11, 12, 13], dtype=torch.int32),
-            out_cache_loc=torch.arange(8, dtype=torch.int64) + 100,
-            positions=torch.arange(8, dtype=torch.int64),
-            seq_lens_cpu=torch.tensor([10, 11, 12, 13], dtype=torch.int32),
-        )
-        r.fill_from(
-            fb,
-            raw_bs=4,
-            padded_bs=4,
-            raw_num_tokens=8,
-            padded_num_tokens=8,
-        )
-        self.assertTrue(torch.equal(r.get_slot("input_ids").buffer, fb.input_ids))
-        self.assertTrue(
-            torch.equal(r.get_slot("req_pool_indices").buffer, fb.req_pool_indices)
-        )
-        self.assertTrue(torch.equal(r.get_slot("seq_lens").buffer, fb.seq_lens))
-        self.assertTrue(
-            torch.equal(r.get_slot("out_cache_loc").buffer, fb.out_cache_loc)
-        )
-        self.assertTrue(torch.equal(r.get_slot("positions").buffer, fb.positions))
-        self.assertTrue(torch.equal(r.get_slot("seq_lens_cpu").buffer, fb.seq_lens_cpu))
 
     def test_fill_with_padding_resets_zero_and_sentinel(self):
         r = self._build_registry()
@@ -404,39 +342,6 @@ class TestFillFromAndExtract(unittest.TestCase):
 
 
 class TestMissingAndOptionalSlots(unittest.TestCase):
-    def test_missing_fb_attr_is_skipped(self):
-        r = _make_registry()
-        r.register_slot(
-            GraphSlot(
-                name="encoder_lens",
-                shape_fn=lambda bs, mt: (bs,),
-                dtype=torch.int32,
-                axis="bs",
-                padding_policy=PaddingPolicy.FILL_SENTINEL,
-                pad_value=0,
-            )
-        )
-        fb = _MiniForwardBatch(
-            batch_size=2,
-            input_ids=torch.arange(4, dtype=torch.int64),
-            encoder_lens=None,  # FB doesn't carry this for this request.
-        )
-        # Should NOT raise; encoder_lens buffer stays at the FILL_SENTINEL
-        # init value.
-        r.fill_from(
-            fb,
-            raw_bs=2,
-            padded_bs=4,
-            raw_num_tokens=4,
-            padded_num_tokens=8,
-        )
-        self.assertTrue(
-            torch.equal(
-                r.get_slot("encoder_lens").buffer,
-                torch.zeros(8, dtype=torch.int32),
-            )
-        )
-
     def test_extract_carries_none_for_absent_plain_slot(self):
         # A plain copy slot absent this iter (mrope on a non-multimodal batch)
         # must be carried as None, not exposed as the stale/zero buffer.
@@ -467,6 +372,35 @@ class TestMissingAndOptionalSlots(unittest.TestCase):
             fb_view.input_ids.data_ptr(), r.get_slot("input_ids").buffer.data_ptr()
         )
         self.assertIsNone(fb_view.mrope_positions)
+
+    def test_plain_slot_with_missing_fb_attr_keeps_sentinel(self):
+        # A plain copy slot whose FB field is None must be skipped, leaving its
+        # buffer at the FILL_SENTINEL init value rather than raising.
+        r = _make_registry()
+        slot = r.register_slot(
+            GraphSlot(
+                "encoder_lens",
+                lambda bs, mt: (bs,),
+                torch.int32,
+                axis="bs",
+                padding_policy=PaddingPolicy.FILL_SENTINEL,
+                pad_value=0,
+            )
+        )
+        fb = _MiniForwardBatch(
+            batch_size=2,
+            input_ids=torch.arange(4, dtype=torch.int64),
+            encoder_lens=None,
+        )
+        r.fill_from(
+            fb,
+            raw_bs=2,
+            padded_bs=4,
+            raw_num_tokens=4,
+            padded_num_tokens=8,
+        )
+        # Buffer untouched by the copy; stays at the sentinel pad value.
+        self.assertTrue(torch.equal(slot.buffer, torch.zeros_like(slot.buffer)))
 
     def test_extract_exposes_computed_slot_even_when_fb_field_none(self):
         # A computed slot (copy_from_fb=False) is always exposed, even when its
@@ -635,40 +569,6 @@ class TestSourceFnSlots(unittest.TestCase):
         r.fill_from(fb, raw_bs=3, padded_bs=8, raw_num_tokens=3, padded_num_tokens=16)
         self.assertTrue(torch.all(buf == 7))  # untouched
 
-    def test_side_input_source_via_fill_context(self):
-        r = _make_registry(max_bs=8, max_num_tokens=16)
-        r.register_slot(
-            GraphSlot(
-                name="pp_proxy_tensors.hidden_states",
-                shape_fn=lambda _bs, mt: (mt,),
-                dtype=torch.int32,
-                axis="none",
-                padding_policy=PaddingPolicy.KEEP_PAD,
-                source_fn=lambda fb, ctx: (
-                    None
-                    if ctx.pp_proxy_tensors is None
-                    else ctx.pp_proxy_tensors.tensors["hidden_states"]
-                ),
-            )
-        )
-        buf = r.get_slot("pp_proxy_tensors.hidden_states").buffer
-        buf.zero_()
-        fb = _MiniForwardBatch(batch_size=4)
-        pp = SimpleNamespace(
-            tensors={"hidden_states": torch.tensor([5, 6, 7, 8], dtype=torch.int32)}
-        )
-        r.fill_from(
-            fb,
-            raw_bs=4,
-            padded_bs=8,
-            raw_num_tokens=4,
-            padded_num_tokens=16,
-            pp_proxy_tensors=pp,
-        )
-        self.assertTrue(
-            torch.equal(buf[:4], torch.tensor([5, 6, 7, 8], dtype=torch.int32))
-        )
-
     def test_extract_buffer_skips_dotted_slots(self):
         r = _make_registry(max_bs=8, max_num_tokens=16)
         r.register_slot(
@@ -725,31 +625,6 @@ class TestPoolBackedAlloc(unittest.TestCase):
             r2.get_slot("ids").buffer.data_ptr(),
         )
 
-    def test_same_size_shares_one_allocation(self):
-        a = self._reg(max_num_tokens=16, share_pool=True)
-        b = self._reg(max_num_tokens=16, share_pool=True)
-        a.register_slot(self._ids_slot("ids"))
-        b.register_slot(self._ids_slot("ids"))
-        # Identical (name, size, dtype, device) -> one shared allocation.
-        self.assertEqual(
-            a.get_slot("ids").buffer.data_ptr(),
-            b.get_slot("ids").buffer.data_ptr(),
-        )
-
-    def test_different_sizes_do_not_share(self):
-        big = self._reg(max_num_tokens=32, share_pool=True)
-        small = self._reg(max_num_tokens=16, share_pool=True)
-        big.register_slot(self._ids_slot("ids"))
-        small.register_slot(self._ids_slot("ids"))
-        # Different sizes -> different pool keys -> independent storage (no
-        # aliasing a smaller request onto a larger buffer).
-        self.assertEqual(tuple(small.get_slot("ids").buffer.shape), (16,))
-        self.assertEqual(tuple(big.get_slot("ids").buffer.shape), (32,))
-        self.assertNotEqual(
-            small.get_slot("ids").buffer.data_ptr(),
-            big.get_slot("ids").buffer.data_ptr(),
-        )
-
     def test_sharing_is_independent_of_registration_order(self):
         from sglang.srt.model_executor import input_buffers
 
@@ -774,6 +649,27 @@ class TestPoolBackedAlloc(unittest.TestCase):
         self.assertNotEqual(big_first.data_ptr(), small_after.data_ptr())
         small_first, big_after = _ptrs(16, 32)
         self.assertNotEqual(small_first.data_ptr(), big_after.data_ptr())
+
+    def test_forward_input_buffers_can_exclude_width_specific_fields(self):
+        first = _PoolInputBuffers(
+            input_ids=torch.zeros(4, dtype=torch.int64),
+            select_index=torch.tensor([1, 3], dtype=torch.int64),
+        )
+        second = _PoolInputBuffers(
+            input_ids=torch.ones(4, dtype=torch.int64),
+            select_index=torch.tensor([3, 7], dtype=torch.int64),
+        )
+
+        first.share_buffers()
+        second.share_buffers(exclude={"select_index"})
+
+        self.assertEqual(first.input_ids.data_ptr(), second.input_ids.data_ptr())
+        self.assertNotEqual(
+            first.select_index.data_ptr(), second.select_index.data_ptr()
+        )
+        torch.testing.assert_close(
+            second.select_index, torch.tensor([3, 7], dtype=torch.int64)
+        )
 
 
 class TestBuildDecodeRegistry(unittest.TestCase):
@@ -923,8 +819,9 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
             global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
         )
-        # Gathered (DP) path: post_fill overwrites the FB copy with the local
-        # count. Pin attn-TP (size=2, rank=0) so the result is deterministic.
+        # Sharded (SP-on) forward: post_fill derives the LOCAL count from the
+        # invariant GLOBAL scalar. Pin attn-TP (size=2, rank=0) so the result
+        # is deterministic.
         with get_parallel().override(attn_tp_size=2, attn_tp_rank=0):
             reg = build_decode_registry(
                 device=torch.device("cpu"),
@@ -934,17 +831,66 @@ class TestBuildDecodeRegistry(unittest.TestCase):
                 cache_loc_dtype=torch.int64,
                 enable_num_token_non_padded=True,
                 require_gathered_buffer=True,
+                attn_tp_sharded_fn=lambda num_tokens: True,
                 source=src,
             )
             fb = _MiniForwardBatch(
-                num_token_non_padded=torch.tensor([100], dtype=torch.int32),
+                global_num_token_non_padded=torch.tensor([100], dtype=torch.int32),
             )
             reg.fill_from(
                 fb, raw_bs=4, padded_bs=4, raw_num_tokens=4, padded_num_tokens=8
             )
         # tokens_per_rank = padded_num_tokens(8) // attn_tp_size(2) = 4;
-        # local = clamp(100 - rank*4, 0, 4) = 4  (NOT the raw FB copy of 100).
+        # local = clamp(global(100) - rank*4, 0, 4) = 4.
         self.assertEqual(int(src.num_token_non_padded.item()), 4)
+
+    def test_num_token_non_padded_bypass_carries_local_count(self):
+        # Regression: the dense SBD draft and TBO sub-batches bypass
+        # ForwardBatch.init_new -- they leave global_num_token_non_padded None and
+        # set the replicated LOCAL count directly. The decode post_fill must carry
+        # that value through verbatim, not derive from the absent global (which
+        # crashed on None - rank_offset).
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_decode_registry,
+        )
+        from sglang.srt.runtime_context import get_parallel
+
+        ntnp = torch.full((1,), 99, dtype=torch.int32)  # poisoned static buffer
+        src = SimpleNamespace(
+            input_ids=torch.zeros(8, dtype=torch.int64),
+            positions=torch.zeros(8, dtype=torch.int64),
+            out_cache_loc=torch.zeros(8, dtype=torch.int64),
+            req_pool_indices=torch.zeros(4, dtype=torch.int64),
+            seq_lens=torch.full((4,), 5, dtype=torch.int64),
+            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int64),
+            mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
+            num_token_non_padded=ntnp,
+            global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
+            global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
+        )
+        # attn_tp_sharded_fn=True pins rank 1: were shard math applied it would
+        # clamp to 3; carrying the local count verbatim proves the bypass
+        # short-circuits before any sharding.
+        with get_parallel().override(attn_tp_size=2, attn_tp_rank=1):
+            reg = build_decode_registry(
+                device=torch.device("cpu"),
+                max_bs=4,
+                max_num_token=8,
+                seq_len_fill_value=5,
+                cache_loc_dtype=torch.int64,
+                enable_num_token_non_padded=True,
+                require_gathered_buffer=True,
+                attn_tp_sharded_fn=lambda num_tokens: True,
+                source=src,
+            )
+            fb = _MiniForwardBatch(
+                num_token_non_padded=torch.tensor([7], dtype=torch.int32),
+                global_num_token_non_padded=None,
+            )
+            reg.fill_from(
+                fb, raw_bs=4, padded_bs=4, raw_num_tokens=4, padded_num_tokens=8
+            )
+        self.assertEqual(int(src.num_token_non_padded.item()), 7)
 
     def test_register_global_num_tokens_false_carries_fb_values(self):
         # register_global_num_tokens=False (eager) excludes the computed
@@ -1053,6 +999,7 @@ class TestBuildDecodeRegistry(unittest.TestCase):
     def test_source_with_pp_registers_proxy_slots(self):
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,
+            build_prefill_registry,
         )
 
         hs = torch.zeros((8, 2), dtype=torch.int32)
@@ -1096,6 +1043,25 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         )
         self.assertTrue(torch.all(hs[:3] == 1))
         self.assertTrue(torch.all(hs[3:] == 0))  # tail untouched
+
+        hs.fill_(2)
+        reg = build_prefill_registry(
+            device=torch.device("cpu"),
+            max_bs=4,
+            max_num_token=8,
+            cache_loc_dtype=torch.int64,
+            source=src,
+        )
+        reg.fill_from(
+            fb,
+            raw_bs=3,
+            padded_bs=4,
+            raw_num_tokens=3,
+            padded_num_tokens=8,
+            pp_proxy_tensors=pp,
+        )
+        self.assertTrue(torch.all(hs[:3] == 1))
+        self.assertTrue(torch.all(hs[3:] == 0))
 
     def test_source_with_canary_registers_bs_slots(self):
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
@@ -1192,6 +1158,56 @@ class TestBuildPrefillRegistry(unittest.TestCase):
         self.assertTrue(torch.all(ids[3:8] == 0))  # padded tail reset
         self.assertTrue(torch.all(ids[8:] == 7))  # beyond the bucket: untouched
 
+    def test_num_token_non_padded_prefill_buffer_adoption(self):
+        # The prefill num_token_non_padded slot adopts the source's static
+        # buffer (shared storage), and its post_fill writes the LOCAL count
+        # derived from the invariant global host int in place — so the static
+        # buffer exposed by extract_buffer is the same storage.
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_prefill_registry,
+        )
+
+        src = self._src(num_token_non_padded=torch.zeros((1,), dtype=torch.int32))
+        reg = build_prefill_registry(
+            device=torch.device("cpu"),
+            max_bs=1,
+            max_num_token=16,
+            cache_loc_dtype=torch.int64,
+            enable_num_token_non_padded=True,
+            source=src,
+        )
+        self.assertTrue(reg.has_slot("num_token_non_padded"))
+        self.assertEqual(
+            reg.get_slot("num_token_non_padded").buffer.data_ptr(),
+            src.num_token_non_padded.data_ptr(),
+        )
+
+        fb = _MiniForwardBatch(
+            input_ids=torch.tensor([1, 2, 3], dtype=torch.int64),
+            positions=torch.tensor([4, 5, 6], dtype=torch.int64),
+            out_cache_loc=torch.tensor([8, 9, 10], dtype=torch.int64),
+            global_num_token_non_padded_cpu=3,
+        )
+        reg.fill_from(fb, raw_bs=1, padded_bs=1, raw_num_tokens=3, padded_num_tokens=8)
+        # Not sequence-sharded (default predicate): passthrough of the global
+        # count into the adopted static buffer.
+        self.assertTrue(
+            torch.equal(
+                reg.get_slot("num_token_non_padded").buffer,
+                torch.tensor([3], dtype=torch.int32),
+            )
+        )
+
+        static_fb = reg.extract_buffer(
+            padded_bs=1,
+            padded_num_tokens=8,
+            forward_batch_template=fb,
+        )
+        self.assertEqual(
+            static_fb.num_token_non_padded.data_ptr(),
+            src.num_token_non_padded.data_ptr(),
+        )
+
     def test_multimodal_input_embeds_reset_only(self):
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             build_prefill_registry,
@@ -1263,6 +1279,76 @@ class TestBuildPrefillRegistry(unittest.TestCase):
         )
         reg.fill_from(fb, raw_bs=2, padded_bs=2, raw_num_tokens=3, padded_num_tokens=8)
         self.assertTrue(torch.equal(idx, torch.tensor([3, 4], dtype=torch.int64)))
+
+    def test_pp_proxy_token_slots_copy_head_and_zero_bucket_tail(self):
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_prefill_registry,
+        )
+        from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+
+        hidden = torch.full((16, 4), 7.0)
+        residual = torch.full((16, 4), 7.0)
+        src = self._src(
+            pp_proxy_tensors={
+                "hidden_states": hidden,
+                "residual": residual,
+            }
+        )
+        reg = build_prefill_registry(
+            device=torch.device("cpu"),
+            max_bs=1,
+            max_num_token=16,
+            cache_loc_dtype=torch.int64,
+            source=src,
+        )
+        self.assertTrue(reg.has_slot("pp_proxy_tensors.hidden_states"))
+        fb = _MiniForwardBatch(
+            input_ids=torch.zeros(3, dtype=torch.int64),
+            positions=torch.zeros(3, dtype=torch.int64),
+            out_cache_loc=torch.zeros(3, dtype=torch.int64),
+        )
+        pp_proxy = PPProxyTensors(
+            {
+                "hidden_states": torch.ones((3, 4)),
+                "residual": torch.full((3, 4), 2.0),
+            }
+        )
+        reg.fill_from(
+            fb,
+            raw_bs=1,
+            padded_bs=1,
+            raw_num_tokens=3,
+            padded_num_tokens=8,
+            pp_proxy_tensors=pp_proxy,
+        )
+        self.assertTrue(torch.all(hidden[:3] == 1.0))
+        self.assertTrue(torch.all(residual[:3] == 2.0))
+        self.assertTrue(torch.all(hidden[3:8] == 0.0))
+        self.assertTrue(torch.all(residual[3:8] == 0.0))
+        self.assertTrue(torch.all(hidden[8:] == 7.0))
+
+    def test_prefill_input_buffers_allocate_pp_proxy_by_token(self):
+        from sglang.srt.model_executor.runner_utils.buffers import (
+            PrefillInputBuffers,
+        )
+
+        buffers = PrefillInputBuffers.create(
+            device=torch.device("cpu"),
+            max_bs=4,
+            max_num_tokens=16,
+            cache_loc_dtype=torch.int64,
+            is_multimodal=False,
+            hidden_size=8,
+            dtype=torch.bfloat16,
+            enable_mamba_track=False,
+            pp_size=2,
+            pp_proxy_topk_size=3,
+        )
+        self.assertEqual(
+            tuple(buffers.pp_proxy_tensors["hidden_states"].shape), (16, 8)
+        )
+        self.assertEqual(tuple(buffers.pp_proxy_tensors["residual"].shape), (16, 8))
+        self.assertEqual(tuple(buffers.pp_proxy_tensors["topk_indices"].shape), (16, 3))
 
     def test_source_none_owns_allocated_buffers(self):
         # source=None -> the registry allocates (owns) every slot.
@@ -1338,6 +1424,91 @@ class TestBuildPrefillRegistry(unittest.TestCase):
         self.assertIs(fb_view.input_embeds, embeds)
 
 
+class TestPrefillNumTokenNonPaddedPostFill(unittest.TestCase):
+    """The prefill registry must re-derive the attn-TP-local pad boundary from
+    the CAPTURE BUCKET, not trust the FB tensor.
+
+    Bug regression: breakable-graph replay pads ``raw`` tokens up to the
+    capture bucket, moving the attn-TP shard boundary to ``bucket/attn_tp``
+    rows — but the FB ``num_token_non_padded`` tensor was localized against
+    the RAW length on the eager prep path. Copying it verbatim made every
+    ``raw < bucket`` replay mask the last ``(bucket - raw)/attn_tp`` shard
+    rows of attn-TP rank 0 — REAL tokens — zeroing their MoE output
+    in-graph. The slot's post_fill must instead recompute the local count
+    against ``ctx.padded_num_tokens`` from the batch's un-adjusted global
+    count (``global_num_token_non_padded_cpu``), exactly like the decode registry's
+    post_fill does.
+
+    Localization is gated solely on the per-forward sharding decision
+    (``attn_tp_sharded_fn``): a sharded bucket re-derives the rank-local
+    count; a replicated one passes the global count through. The cases below
+    drive that predicate directly via ``sharded``.
+    """
+
+    def _fill(self, *, attn_tp_rank, attn_tp_size, sharded=True, global_count=1018):
+        from unittest import mock
+
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_prefill_registry,
+        )
+
+        reg = build_prefill_registry(
+            device=torch.device("cpu"),
+            max_bs=4,
+            max_num_token=2048,
+            cache_loc_dtype=torch.int64,
+            enable_num_token_non_padded=True,
+            attn_tp_sharded_fn=lambda num_tokens: sharded,
+        )
+        # FB tensor carries the RAW-length-localized (stale) value; the CPU
+        # field carries the un-adjusted global count.
+        fb = _MiniForwardBatch(
+            batch_size=1,
+            num_token_non_padded=torch.tensor([509], dtype=torch.int32),
+            global_num_token_non_padded_cpu=global_count,
+        )
+        with mock.patch(
+            "sglang.srt.model_executor.forward_batch_info.get_parallel",
+            return_value=SimpleNamespace(
+                attn_tp_rank=attn_tp_rank, attn_tp_size=attn_tp_size
+            ),
+        ):
+            reg.fill_from(
+                fb,
+                raw_bs=1,
+                padded_bs=1,
+                raw_num_tokens=1018,
+                padded_num_tokens=1024,
+            )
+        return int(reg.get_slot("num_token_non_padded").buffer.item())
+
+    def test_rank0_uses_bucket_shard_not_raw_localized_value(self):
+        # bucket 1024 / attn_tp 2 -> 512-row shards. Rank 0's shard is fully
+        # real (global rows [0, 512)); the raw-localized FB value (509) would
+        # mask 3 real rows.
+        self.assertEqual(self._fill(attn_tp_rank=0, attn_tp_size=2), 512)
+
+    def test_rank1_masks_exactly_the_true_pads(self):
+        # Rank 1's shard holds global rows [512, 1024): 506 real + 6 bucket
+        # pads. local = clamp(1018 - 512, 0, 512).
+        self.assertEqual(self._fill(attn_tp_rank=1, attn_tp_size=2), 506)
+
+    def test_not_sharded_passes_through_global_count(self):
+        # A replicated forward owns every row, so the global count is kept.
+        self.assertEqual(
+            self._fill(attn_tp_rank=0, attn_tp_size=2, sharded=False),
+            1018,
+        )
+
+    def test_absent_global_count_falls_back_to_raw_tokens(self):
+        # Full prefill graphs still need the live raw boundary when the batch
+        # carries no global count, so layers can discard the bucket tail.
+        self.assertEqual(
+            self._fill(attn_tp_rank=0, attn_tp_size=2, global_count=None),
+            1018,
+        )
+
+
 class TestFillOncePolicy(unittest.TestCase):
     """FILL_ONCE initializes the whole buffer at alloc and never resets the
     padded tail per iter (unlike FILL_SENTINEL)."""
@@ -1369,10 +1540,10 @@ class TestFillOncePolicy(unittest.TestCase):
 
 
 class TestComputedSlots(unittest.TestCase):
-    """num_token_non_padded (copy_from_fb + post_fill) and global_num_tokens
+    """num_token_non_padded and global_num_tokens are both computed slots
     (copy_from_fb=False + post_fill fill)."""
 
-    def test_num_token_non_padded_copy_path(self):
+    def test_num_token_non_padded_passthrough_path(self):
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,
         )
@@ -1389,10 +1560,11 @@ class TestComputedSlots(unittest.TestCase):
         self.assertTrue(reg.has_slot("num_token_non_padded"))
         fb = _MiniForwardBatch(
             batch_size=2,
-            num_token_non_padded=torch.tensor([7], dtype=torch.int32),
+            global_num_token_non_padded=torch.tensor([7], dtype=torch.int32),
         )
-        reg.fill_from(fb, raw_bs=2, padded_bs=2, raw_num_tokens=2, padded_num_tokens=2)
-        # Non-gathered: plain FB copy, post_fill is a no-op.
+        reg.fill_from(fb, raw_bs=2, padded_bs=2, raw_num_tokens=7, padded_num_tokens=8)
+        # Not sequence-sharded (default predicate): post_fill passes the global
+        # scalar (7) through to the local buffer unchanged (clamped to bucket 8).
         self.assertTrue(
             torch.equal(
                 reg.get_slot("num_token_non_padded").buffer,

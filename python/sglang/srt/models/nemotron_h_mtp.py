@@ -21,7 +21,6 @@ from sglang.srt.configs import NemotronHConfig
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
-    get_attention_tp_group,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -40,7 +39,6 @@ from sglang.srt.models.nemotron_h import (
 )
 from sglang.srt.models.nemotron_h_utils import is_attn_layer
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
 
@@ -105,7 +103,7 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
             )
             hidden_states, _ = self.eh_proj(fused)
             if is_dp_attention_enabled():
-                hidden_states = get_attention_tp_group().all_gather(
+                hidden_states = get_parallel().attn_tp_group.all_gather(
                     hidden_states, dim=-1
                 )
 
@@ -191,7 +189,7 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
             )
             hidden_states, _ = self.eh_proj(fused)
             if is_dp_attention_enabled():
-                hidden_states = get_attention_tp_group().all_gather(
+                hidden_states = get_parallel().attn_tp_group.all_gather(
                     hidden_states, dim=-1
                 )
 
@@ -233,9 +231,9 @@ class NemotronHMultiTokenPredictor(nn.Module):
 
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = getattr(config, "num_nextn_predict_layers", 1)
-        assert (
-            self.num_mtp_layers == 1
-        ), "Only one MTP layer is supported for NemotronH-MTP"
+        assert self.num_mtp_layers == 1, (
+            "Only one MTP layer is supported for NemotronH-MTP"
+        )
 
         self.pattern_str = config.mtp_hybrid_override_pattern
         self.pattern_len = len(self.pattern_str)
@@ -282,21 +280,22 @@ class NemotronHMultiTokenPredictor(nn.Module):
                 )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        assert (
-            self.embed_tokens is not None
-        ), "embed_tokens not initialized - must be shared from target model"
+        assert self.embed_tokens is not None, (
+            "embed_tokens not initialized - must be shared from target model"
+        )
         return self.embed_tokens(input_ids)
 
     def forward(
         self,
         input_ids: torch.Tensor,
-        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
         forward_batch: ForwardBatch,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings(input_ids)
 
+        hidden_states = forward_batch.spec_info.hidden_states
         residual = None
 
         for i in range(self.pattern_len):
@@ -340,7 +339,7 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
             self.config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
 
         self.logits_processor = LogitsProcessor(config)
@@ -354,11 +353,9 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
         input_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        hidden_states = forward_batch.spec_info.hidden_states
-
         hidden_states = self.model(
             input_ids,
-            hidden_states,
+            positions,
             forward_batch,
             input_embeds,
         )
@@ -370,6 +367,11 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
         super().load_weights(weights, is_mtp=True)
+
+    def set_lm_head_from_target(self, target_lm_head: nn.Module) -> None:
+        if self.config.tie_word_embeddings:
+            return
+        self.lm_head = target_lm_head
 
 
 EntryClass = [NemotronHForCausalLMMTP]

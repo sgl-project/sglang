@@ -11,6 +11,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_rust_server_built,
     popen_launch_server,
 )
 
@@ -62,7 +63,9 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
     def test_function_calling_format(self):
         """
         Test: Whether the function call format returned by the AI is correct.
-        When returning a tool call, message.content should be None, and tool_calls should be a list.
+        Require a tool call so this tests the response format rather than the
+        model's stochastic decision to call a tool. message.content should be
+        None, and tool_calls should be a list.
         """
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
@@ -102,13 +105,14 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             top_p=0.8,
             stream=False,
             tools=tools,
+            tool_choice="required",
         )
 
         tool_calls = response.choices[0].message.tool_calls
 
-        assert (
-            isinstance(tool_calls, list) and len(tool_calls) > 0
-        ), "tool_calls should be a non-empty list"
+        assert isinstance(tool_calls, list) and len(tool_calls) > 0, (
+            "tool_calls should be a non-empty list"
+        )
 
         function_name = tool_calls[0].function.name
         assert function_name == "add", "Function name should be 'add'"
@@ -187,9 +191,9 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             tools=tools,
         )
 
-        assert (
-            "8" in final_response.choices[0].message.content
-        ), "tool_call response should have the sum 8 in the content"
+        assert "8" in final_response.choices[0].message.content, (
+            "tool_call response should have the sum 8 in the content"
+        )
 
     def test_function_calling_streaming_simple(self):
         """
@@ -912,6 +916,54 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
             "get_weather" in found_names or "get_tourist_attractions" in found_names,
             f"Function name '{found_names}' should container either 'get_weather' or 'get_tourist_attractions'",
         )
+
+
+@unittest.skipUnless(
+    is_rust_server_built(),
+    "embedded rust server extension not built",
+)
+class TestOpenAIFunctionCallingWithRust(TestOpenAIServerFunctionCalling):
+    """Run the registered unary/streaming function-call suite through Rust."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=["--tool-call-parser", "llama3"],
+            env={"SGLANG_RUST_SERVER": "1"},
+        )
+        cls.base_url += "/v1"
+        cls.tokenizer = get_tokenizer(cls.model)
+
+
+@unittest.skipUnless(
+    is_rust_server_built(),
+    "embedded rust server extension not built",
+)
+class TestOpenAIPythonicFunctionCallingWithRust(TestOpenAIPythonicFunctionCalling):
+    """Run Pythonic unary/streaming tool calls through Rust."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=["--tool-call-parser", "pythonic"],
+            env={"SGLANG_RUST_SERVER": "1"},
+        )
+        cls.base_url += "/v1"
+        cls.tokenizer = get_tokenizer(cls.model)
 
 
 # Skip for ci test

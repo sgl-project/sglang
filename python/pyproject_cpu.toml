@@ -30,8 +30,8 @@ dependencies = [
   "intel-openmp; platform_machine == 'x86_64'",
   "interegular",
   "IPython",
-  "llguidance>=0.7.11,<0.8.0",
-  "mistral_common>=1.11.0",
+  "llguidance>=1.7.6,<2.0.0",
+  "mistral_common>=1.11.5",
   "modelscope",
   "msgspec",
   "ninja",
@@ -49,6 +49,7 @@ dependencies = [
   "pybase64",
   "pydantic",
   "python-multipart",
+  "pytest",
   "pyzmq>=25.1.2",
   "requests",
   "scipy",
@@ -60,15 +61,16 @@ dependencies = [
   "tiktoken",
   "timm==1.0.16",
   "torch==2.12.0",
-  "torchao==0.17.0",
   "torchaudio==2.11.0",
   "torchvision==0.27.0",
   "tqdm",
-  "transformers==5.8.1",
+  "transformers==5.12.1",
   "triton==3.7.0",
   "uvicorn",
   "uvloop",
+  "xxhash",
   "xgrammar==0.2.1",
+  "zstandard",
 ]
 
 [project.optional-dependencies]
@@ -100,13 +102,14 @@ tracing = [
 ]
 test = [
   "accelerate",
+  "pymupdf",
   "expecttest",
   "jsonlines",
   "matplotlib",
   "pandas",
   "peft>=0.18.0",
-  "pytest",
   "sentence_transformers",
+  "sgl-eval==0.1.0",
 ]
 all = []
 dev = ["sglang[test]"]
@@ -121,7 +124,7 @@ sglang = "sglang.cli.main:main"
 [tool.setuptools.package-data]
 "sglang" = [
   "srt/**/*",
-  "jit_kernel/**/*"
+  "kernels/**/*"
 ]
 
 [tool.setuptools.packages.find]
@@ -149,6 +152,6 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-git_describe_command = ["python3", "python/tools/get_version_tag.py"]
+git_describe_command = ["python3", "scripts/release/get_version_tag.py"]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"

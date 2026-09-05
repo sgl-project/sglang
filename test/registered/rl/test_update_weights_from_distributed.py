@@ -334,7 +334,7 @@ def init_process_sgl(
                 str(base_gpu_id),
                 "--tp-size",
                 str(tp_size),
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 2,
             ),
         )
@@ -396,7 +396,8 @@ def init_process_sgl(
             return response.json()
 
         with ThreadPoolExecutor(32) as executor:
-            futures = [executor.submit(run_decode, 1000) for _ in range(32)]
+            for _ in range(32):
+                executor.submit(run_decode, 1000)
             time.sleep(2)
 
     # The last parameter is lm_head.weight, which is tied
@@ -573,7 +574,7 @@ def test_update_weights_from_distributed(
         try:
             key, value = param_queue.get(timeout=5)
             results[key] = value
-        except Exception as e:
+        except Exception:
             if all(not p.is_alive() for p in context.processes):
                 break
 
@@ -635,9 +636,9 @@ def test_update_weights_from_distributed(
                 f"sgl_dp_2_instruct_params rank {i}",
             )
 
-    assert len(params["hf_instruct"]) == len(
-        params["hf_base"]
-    ), "hf_instruct_params and hf_base_params have different lengths"
+    assert len(params["hf_instruct"]) == len(params["hf_base"]), (
+        "hf_instruct_params and hf_base_params have different lengths"
+    )
 
     # Check if the weights of lm_head are tied with embed_tokens.
     params_to_check = [
@@ -687,18 +688,18 @@ def test_update_weights_from_distributed(
     # On local H100, it's 1 / 2
     time_limit = 3 if model_name == DEFAULT_SMALL_MODEL_NAME_FOR_TEST else 6
 
-    assert (
-        params["broadcast_time"] < time_limit
-    ), f"broadcast_time exceeds time limit {time_limit}s"
+    assert params["broadcast_time"] < time_limit, (
+        f"broadcast_time exceeds time limit {time_limit}s"
+    )
 
-    assert (
-        params["update_sgl_dp_1_time"] < time_limit
-    ), f"update_sgl_dp_one_time exceeds time limit {time_limit}s"
+    assert params["update_sgl_dp_1_time"] < time_limit, (
+        f"update_sgl_dp_one_time exceeds time limit {time_limit}s"
+    )
 
     if dp_size == 2:
-        assert (
-            params["update_sgl_dp_2_time"] < time_limit
-        ), f"update_sgl_dp_two_time exceeds time limit {time_limit}s"
+        assert params["update_sgl_dp_2_time"] < time_limit, (
+            f"update_sgl_dp_two_time exceeds time limit {time_limit}s"
+        )
 
     # Delete the context and close the parameter queue.
     del context
@@ -709,7 +710,6 @@ def test_update_weights_from_distributed(
 
 
 class TestUpdateWeightsFromDistributed(CustomTestCase):
-
     def test_update_weights_from_distributed(self):
 
         assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"

@@ -8,43 +8,54 @@ on:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    env:
+      MINT_VERSION: 4.2.559
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Reject changes under legacy docs/
-        if: github.event_name == 'pull_request'
+      # Fail-fast gate: docs_new/ was renamed to docs/ (#32123). git's rename
+      # detection silently re-adds NEW files under docs_new/ on merge without a
+      # conflict, which would resurrect the directory. We check the checked-out
+      # tree directly (git ls-files) rather than diffing against the base ref —
+      # a presence check needs no merge-base and sidesteps the shallow-checkout
+      # / silent-diff failures that plagued the old legacy-docs/ gate.
+      - name: Forbid docs_new/ (renamed to docs/)
         run: |
           set -euo pipefail
-          BASE_REF="${{ github.base_ref }}"
-          # Refresh origin/<base_ref> with full history; --depth=1 would
-          # shallow the ref and break the merge-base used by `...`.
-          git fetch --no-tags origin "$BASE_REF"
-          # First, verify the diff itself succeeds and check whether any
-          # files changed. A silent failure here would let docs/ changes
-          # through, so the explicit `if !` guard is important.
-          if ! CHANGED=$(git diff --name-only --diff-filter=ACMRDTUXB "origin/${BASE_REF}...HEAD"); then
-            echo "git diff origin/${BASE_REF}...HEAD failed; aborting." >&2
-            exit 2
+          matches="$(git ls-files -- docs_new)"
+          if [ -n "$matches" ]; then
+            echo "::error::docs_new/ was renamed to docs/. Move these files under docs/ instead:"
+            echo "$matches"
+            exit 1
           fi
-          if [ -z "$CHANGED" ]; then
-            echo "No changed files vs origin/${BASE_REF}; skipping."
-            exit 0
-          fi
-          # Re-emit with -z so xargs can safely handle whitespace in paths.
-          git diff -z --name-only --diff-filter=ACMRDTUXB "origin/${BASE_REF}...HEAD" \
-            | xargs -0 python3 scripts/ci/check_no_docs_changes.py
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: .pre-commit-config.yaml
 
       - name: Install pre-commit hook
         run: |
           python -m pip install pre-commit
           pre-commit install
+
+      - name: Cache pre-commit environments
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-3|${{ env.pythonLocation }}|${{ hashFiles('.pre-commit-config.yaml') }}
+
+      # The clippy-rust-workspace pre-commit hook compiles the rust/ workspace
+      # (debug profile); cache cargo registry + target across runs.
+      - name: Rust cache (rust/ workspace)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          shared-key: "rust-workspace-lint"
 
       - name: Run pre-commit checks
         run: SKIP=no-commit-to-branch pre-commit run --all-files --show-diff-on-failure
@@ -52,12 +63,33 @@ jobs:
       - name: Run lychee docs checks (offline references)
         uses: lycheeverse/lychee-action@8646ba30535128ac92d33dfc9133794bfdd9b411 # v2
         with:
-          args: --config .github/linters/lychee.toml README.md "docs/**/*.md" "docs/**/*.rst" "docs/**/*.ipynb"
+          args: --config .github/linters/lychee.toml README.md
 
-      - name: Run sgl-kernel clang-format checks
-        uses: DoozyX/clang-format-lint-action@v0.20
+      # docs/ (Mintlify) internal-link check. Runs only in CI — contributors
+      # are NOT required to install `mint` for local pre-commit. External links
+      # are covered separately by the nightly lychee job (no --check-external here).
+      - name: Set up Node
+        uses: actions/setup-node@v4
         with:
-          source: sgl-kernel
-          extensions: h,c,cpp,hpp,cu,cuh,cc
-          clangFormatVersion: 20
-          style: file
+          node-version: "20"
+
+      - name: Check cookbook authoring contracts
+        run: node docs/scripts/check_cookbook_configs.mjs
+
+      - name: Cache mint
+        uses: actions/cache@v4
+        with:
+          path: ~/.mint-cli
+          key: mint-${{ runner.os }}-${{ env.MINT_VERSION }}
+
+      # Hard gate: docs internal links/anchors/redirects must resolve.
+      # mint is pinned for reproducibility (its heading-slug rules are
+      # version-sensitive); bump deliberately after re-verifying locally.
+      - name: Check docs links (Mintlify broken-links)
+        run: |
+          if [ ! -x "$HOME/.mint-cli/node_modules/.bin/mint" ]; then
+            npm install --prefix "$HOME/.mint-cli" "mint@${MINT_VERSION}"
+          fi
+          export PATH="$HOME/.mint-cli/node_modules/.bin:$PATH"
+          cd docs
+          mint broken-links --check-anchors --check-redirects

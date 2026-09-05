@@ -1,0 +1,384 @@
+---
+title: FLUX
+metatags:
+    description: "Deploy FLUX diffusion models with SGLang - 12B/32B rectified flow transformers for high-quality text-to-image generation."
+---
+
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+import { FluxDeployment } from '/src/snippets/diffusion/flux-deployment.jsx';
+
+<DiffusionModelTags tags={["image", "text-to-image", "image editing", "multi-reference", "rectified flow"]} />
+
+## 1. Model Introduction
+
+[FLUX](https://blackforestlabs.ai/) is Black Forest Labs' rectified-flow image model family. [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) is the smaller 12B text-to-image checkpoint; [FLUX.2-dev](https://huggingface.co/black-forest-labs/FLUX.2-dev) is a 32B model that adds instruction-based editing plus single- and multi-reference composition.
+
+FLUX is a strong default when prompt adherence, polished image quality, or reference consistency matters. The tradeoff is deployment weight: FLUX.2 needs substantially more memory than FLUX.1, and the dev checkpoints use the FLUX non-commercial license, so review the model license before production use.
+
+| Checkpoint | Best fit | Main limitation |
+| --- | --- | --- |
+| `black-forest-labs/FLUX.1-dev` | High-quality text-to-image with the lighter FLUX deployment | No native multi-reference editing path |
+| `black-forest-labs/FLUX.2-dev` | Text-to-image, editing, and reference-guided composition in one model | 32B model with a larger memory footprint |
+
+## 2. SGLang-diffusion Installation
+
+SGLang-diffusion offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+Please refer to the [official SGLang-diffusion installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for installation instructions.
+
+## 3. Model Deployment
+
+This section provides deployment configurations optimized for different hardware platforms and use cases.
+
+### 3.1 Basic Configuration
+
+FLUX models are optimized for high-quality image generation. The recommended launch configurations vary by hardware and model version.
+
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and model version. SGLang supports serving FLUX on NVIDIA B200, H200, H100, and AMD MI355X, MI325X, MI300X GPUs and Ascend A2, A3 NPUs.
+
+<FluxDeployment />
+
+### 3.2 Configuration Tips
+
+See [Performance Optimization](/docs/sglang-diffusion/performance-optimization) for acceleration features and their runtime requirements.
+
+- `--vae-path`: Path to a custom VAE model or HuggingFace model ID (e.g., fal/FLUX.2-Tiny-AutoEncoder). If not specified, the VAE will be loaded from the main model path.
+- `--num-gpus`: Number of GPUs to use
+- `--tp-size`: Tensor parallelism size (only for the encoder; should not be larger than 1 if text encoder offload is enabled, as layer-wise offload plus prefetch is faster)
+- `--sp-degree`: Sequence parallelism size (typically should match the number of GPUs)
+- `--ulysses-degree`: The degree of DeepSpeed-Ulysses-style SP in USP
+- `--ring-degree`: The degree of ring attention-style SP in USP
+
+## 4. API Usage
+
+For complete API documentation, please refer to the [official API usage guide](/docs/sglang-diffusion/api/openai_api).
+
+### 4.1 Generate an Image
+
+```python Example
+import base64
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:3000/v1")
+
+response = client.images.generate(
+    model="black-forest-labs/FLUX.1-dev",
+    prompt="A cat holding a sign that says hello world",
+    size="1024x1024",
+    n=1,
+    response_format="b64_json",
+)
+
+# Save the generated image
+image_bytes = base64.b64decode(response.data[0].b64_json)
+with open("output.png", "wb") as f:
+    f.write(image_bytes)
+```
+
+### 4.2 Advanced Usage
+
+#### 4.2.1 Cache-DiT Acceleration
+
+SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching acceleration engine for Diffusion Transformers (DiT), to achieve up to 7.4x inference speedup with minimal quality loss. You can set `SGLANG_CACHE_DIT_ENABLED=True` to enable it. For more details, please refer to the SGLang Cache-DiT [documentation](/docs/sglang-diffusion/cache_dit).
+
+**Basic Usage**
+
+```bash Command
+SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path black-forest-labs/FLUX.1-dev
+```
+
+**Advanced Usage**
+
+- DBCache Parameters: DBCache controls block-level caching behavior:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Env Variable</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Default</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Fn</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_FN`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of first blocks to always compute</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Bn</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_BN`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of last blocks to always compute</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>W</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_WARMUP`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Warmup steps before caching starts</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>R</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_RDT`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.24</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Residual difference threshold</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MC</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_MC`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum continuous cached steps</td>
+    </tr>
+  </tbody>
+</table>
+- TaylorSeer Configuration: TaylorSeer improves caching accuracy using Taylor expansion:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Env Variable</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Default</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Enable</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_TAYLORSEER`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>false</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable TaylorSeer calibrator</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Order</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_TS_ORDER`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Taylor expansion order (1 or 2)</td>
+    </tr>
+  </tbody>
+</table>
+
+  Combined Configuration Example:
+
+```bash Command
+SGLANG_CACHE_DIT_ENABLED=true \
+SGLANG_CACHE_DIT_FN=2 \
+SGLANG_CACHE_DIT_BN=1 \
+SGLANG_CACHE_DIT_WARMUP=4 \
+SGLANG_CACHE_DIT_RDT=0.4 \
+SGLANG_CACHE_DIT_MC=4 \
+SGLANG_CACHE_DIT_TAYLORSEER=true \
+SGLANG_CACHE_DIT_TS_ORDER=2 \
+sglang serve --model-path black-forest-labs/FLUX.1-dev
+```
+
+#### 4.2.2 CPU Offload
+
+- `--dit-cpu-offload`: Use CPU offload for DiT inference. Enable if run out of memory.
+- `--text-encoder-cpu-offload`: Use CPU offload for text encoder inference.
+- `--vae-cpu-offload`: Use CPU offload for VAE.
+- `--pin-cpu-memory`: Pin memory for CPU offload. Only added as a temp workaround if it throws "CUDA error: invalid argument".
+
+#### 4.2.3 Known LoRA examples
+
+Use `--lora-path` at startup or the [LoRA management API](/docs/sglang-diffusion/api/openai_api#lora-management) to load an adapter. Known FLUX examples include:
+
+- [`dvyio/flux-lora-simple-illustration`](https://huggingface.co/dvyio/flux-lora-simple-illustration)
+- [`XLabs-AI/flux-furry-lora`](https://huggingface.co/XLabs-AI/flux-furry-lora)
+- [`XLabs-AI/flux-RealismLora`](https://huggingface.co/XLabs-AI/flux-RealismLora)
+
+## 5. Benchmark
+
+### 5.1 Speedup Benchmark
+
+#### 5.1.1 Generate a image
+
+Test Environment:
+
+- Hardware: NVIDIA B200 GPU (1x)
+- Model: black-forest-labs/FLUX.1-dev
+- sglang diffusion version: 0.5.6.post2
+
+<Tabs>
+  <Tab title="NVIDIA B200">
+    **Server Command**:
+
+    ```shell Command
+    sglang serve --model-path black-forest-labs/FLUX.1-dev --port 30000
+    ```
+
+    **Benchmark Command**:
+
+    ```shell Command
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+        --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
+    ```
+
+    **Result**:
+
+    ```text Output
+    ================= Serving Benchmark Result =================
+    Model:                                   black-forest-labs/FLUX.1-dev
+    Dataset:                                 vbench
+    Task:                                    text-to-image
+    --------------------------------------------------
+    Benchmark duration (s):                  50.97
+    Request rate:                            inf
+    Max request concurrency:                 1
+    Successful requests:                     1/1
+    --------------------------------------------------
+    Request throughput (req/s):              0.02
+    Latency Mean (s):                        50.9681
+    Latency Median (s):                      50.9681
+    Latency P99 (s):                         50.9681
+    --------------------------------------------------
+    Peak Memory Max (MB):                    27905.19
+    Peak Memory Mean (MB):                   27905.19
+    Peak Memory Median (MB):                 27905.19
+    ============================================================
+    ```
+  </Tab>
+  <Tab title="Ascend A3">
+    **Server Command**:
+
+    ```shell Command
+    #One A3 card has 2 npu chips
+    sglang serve --tp-size 2 --sp-degree 1 --model-path black-forest-labs/FLUX.1-dev --num-gpus 2
+    ```
+
+    **Benchmark Command**:
+
+    ```shell Command
+    python -m sglang.multimodal_gen.benchmarks.bench_serving --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
+    ```
+
+    **Result**:
+
+    ```text Output
+    ================= Serving Benchmark Result =================
+    Task:                                         text-to-image
+    Model:                                        black-forest-labs/FLUX.1-dev
+    Dataset:                                      vbench
+    --------------------------------------------------
+    Benchmark duration (s):                       16.30
+    Request rate:                                 inf
+    Max request concurrency:                      1
+    Successful requests:                          1/1
+    Completed outputs:                            1
+    Outputs per prompt:                           1
+    --------------------------------------------------
+    Request throughput (req/s):                   0.06
+    Output throughput (outputs/s):                0.06
+    Latency Mean (s):                             16.30
+    Latency Median (s):                           16.30
+    Latency P90 (s):                              16.30
+    Latency P95 (s):                              16.30
+    Latency P99 (s):                              16.30
+    --------------------------------------------------
+    Peak Memory Max (MB):                         19972.00
+    Peak Memory Mean (MB):                        19972.00
+    Peak Memory Median (MB):                      19972.00
+    ------------------------------------------------------------
+    ```
+  </Tab>
+</Tabs>
+
+#### 5.1.2 Generate images with high concurrency
+
+<Tabs>
+  <Tab title="NVIDIA B200">
+    **Server Command** :
+
+    ```shell Command
+    sglang serve --model-path black-forest-labs/FLUX.1-dev --port 30000
+    ```
+
+    **Benchmark Command** :
+
+    ```shell Command
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+        --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
+    ```
+
+    **Result** :
+
+    ```text Output
+    ================= Serving Benchmark Result =================
+    Model:                                   black-forest-labs/FLUX.1-dev
+    Dataset:                                 vbench
+    Task:                                    text-to-image
+    --------------------------------------------------
+    Benchmark duration (s):                  111.79
+    Request rate:                            inf
+    Max request concurrency:                 20
+    Successful requests:                     20/20
+    --------------------------------------------------
+    Request throughput (req/s):              0.18
+    Latency Mean (s):                        67.0646
+    Latency Median (s):                      66.9691
+    Latency P99 (s):                         110.8949
+    --------------------------------------------------
+    Peak Memory Max (MB):                    27917.19
+    Peak Memory Mean (MB):                   27916.59
+    Peak Memory Median (MB):                 27917.19
+    ============================================================
+    ```
+  </Tab>
+  <Tab title="Ascend A3">
+    **Server Command** :
+
+    ```shell Command
+    #One A3 card has 2 npu chips
+    sglang serve --tp-size 2 --sp-degree 1 --model-path black-forest-labs/FLUX.1-dev --num-gpus 2
+    ```
+
+    **Benchmark Command** :
+
+    ```shell Command
+    python -m sglang.multimodal_gen.benchmarks.bench_serving --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
+    ```
+
+    **Result** :
+
+    ```text Output
+    ================= Serving Benchmark Result =================
+    Task:                                         text-to-image
+    Model:                                        black-forest-labs/FLUX.1-dev
+    Dataset:                                      vbench
+    --------------------------------------------------
+    Benchmark duration (s):                       300.85
+    Request rate:                                 inf
+    Max request concurrency:                      20
+    Successful requests:                          18/20
+    Completed outputs:                            18
+    Outputs per prompt:                           1
+    --------------------------------------------------
+    Request throughput (req/s):                   0.06
+    Output throughput (outputs/s):                0.06
+    Latency Mean (s):                             155.16
+    Latency Median (s):                           155.11
+    Latency P90 (s):                              266.30
+    Latency P95 (s):                              280.15
+    Latency P99 (s):                              291.23
+    --------------------------------------------------
+    Peak Memory Max (MB):                         19972.00
+    Peak Memory Mean (MB):                        19972.00
+    Peak Memory Median (MB):                      19972.00
+    ------------------------------------------------------------
+    ```
+  </Tab>
+</Tabs>

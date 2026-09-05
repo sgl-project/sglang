@@ -53,6 +53,8 @@ def apply_all():
         return
     _applied = True
 
+    _mute_diffusers_torchao_probe()
+
     # v5.4 patches
     _patch_flash_attn_availability()
     _patch_rope_parameters_validation()
@@ -69,6 +71,23 @@ def apply_all():
     patch_is_base_mistral_in_ci()
 
     logger.debug("transformers compatibility patches applied")
+
+
+def _mute_diffusers_torchao_probe():
+    """Silence diffusers' torchao-Tensor-subclass probe warning.
+
+    diffusers lazily imports its torchao quantizer and warns when the installed
+    torchao has moved the optional Tensor subclasses it probes for. It only
+    affects loading torchao-serialized diffusers checkpoints, which no sglang
+    path does. Set here rather than in ``configure_logger`` because the import
+    can land before logging is configured, and the level sticks whenever the
+    lazy import happens.
+    """
+    import logging
+
+    logging.getLogger("diffusers.quantizers.torchao.torchao_quantizer").setLevel(
+        logging.ERROR
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -203,15 +222,22 @@ def _patch_removed_symbols():
 
         # Importing modeling_llama triggers a deep import chain:
         #   modeling_llama -> modeling_utils -> quantizers -> torchao
-        # torchao emits a noisy warning about incompatible torch versions
-        # that is irrelevant here — suppress it during this import.
-        _torchao_logger = logging.getLogger("torchao")
-        _prev_level = _torchao_logger.level
-        _torchao_logger.setLevel(logging.ERROR)
+        # torchao emits a noisy warning about incompatible torch versions, and
+        # its register_as_pytree_constant() calls on Enum types make
+        # torch.utils._pytree log a deprecation warning once per Enum and per
+        # rank. Neither is actionable here — suppress both during this import.
+        _muted = [
+            logging.getLogger("torchao"),
+            logging.getLogger("torch.utils._pytree"),
+        ]
+        _prev_levels = [lg.level for lg in _muted]
+        for lg in _muted:
+            lg.setLevel(logging.ERROR)
         try:
             from transformers.models.llama import modeling_llama
         finally:
-            _torchao_logger.setLevel(_prev_level)
+            for lg, level in zip(_muted, _prev_levels):
+                lg.setLevel(level)
 
         if not hasattr(modeling_llama, "LlamaFlashAttention2"):
             if hasattr(modeling_llama, "LlamaAttention"):
@@ -228,8 +254,8 @@ def _patch_removed_symbols():
 
         if not hasattr(_u, "is_flash_attn_greater_or_equal_2_10"):
             if hasattr(_u, "is_flash_attn_greater_or_equal"):
-                _u.is_flash_attn_greater_or_equal_2_10 = (
-                    lambda: _u.is_flash_attn_greater_or_equal("2.10.0")
+                _u.is_flash_attn_greater_or_equal_2_10 = lambda: (
+                    _u.is_flash_attn_greater_or_equal("2.10.0")
                 )
             else:
                 _u.is_flash_attn_greater_or_equal_2_10 = lambda: False
@@ -248,8 +274,10 @@ def _patch_image_processor_kwargs():
     (e.g. KimiVL) that defines ``preprocess()`` without ``**kwargs`` will
     crash with ``TypeError``.
 
-    Fix: wrap ``__call__`` to catch ``TypeError`` and retry with only the
-    kwargs that ``preprocess()`` actually accepts.
+    Fix: wrap ``__call__`` and filter unsupported kwargs before invoking
+    ``preprocess()``.  The accepted-kwargs set is cached per processor class:
+    apart from avoiding the exception/logging slow path, this matters for VLM
+    requests that preprocess many images on the request critical path.
 
     TODO(upstream): KimiVL image_processing_kimi_vl.py needs ``**kwargs``.
     """
@@ -257,30 +285,40 @@ def _patch_image_processor_kwargs():
         from transformers.image_processing_utils import BaseImageProcessor
 
         original = BaseImageProcessor.__call__
+        accepted_kwargs_cache = {}
+        warned_unsupported_kwargs = set()
 
         def safe_call(self, images, *args, **kwargs):
-            try:
-                return original(self, images, *args, **kwargs)
-            except TypeError as e:
-                if "unexpected keyword argument" not in str(e):
-                    raise
+            processor_type = type(self)
+            accepted_kwargs = accepted_kwargs_cache.get(processor_type)
+            if accepted_kwargs is None and processor_type not in accepted_kwargs_cache:
                 sig = inspect.signature(self.preprocess)
                 params = sig.parameters
                 if any(
                     p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
                 ):
-                    raise
-                dropped = {k for k in kwargs if k not in params}
-                if dropped:
+                    accepted_kwargs = None
+                else:
+                    accepted_kwargs = frozenset(params)
+                accepted_kwargs_cache[processor_type] = accepted_kwargs
+
+            if accepted_kwargs is None:
+                return original(self, images, *args, **kwargs)
+
+            dropped = frozenset(kwargs) - accepted_kwargs
+            if dropped:
+                warning_key = (processor_type, dropped)
+                if warning_key not in warned_unsupported_kwargs:
                     logger.warning(
                         "Image processor %s.preprocess() does not accept %s; "
-                        "retrying without them. Update the model's image processor "
-                        "to accept **kwargs.",
-                        type(self).__name__,
-                        dropped,
+                        "filtering them before preprocessing. Update the model's image "
+                        "processor to accept **kwargs.",
+                        processor_type.__name__,
+                        sorted(dropped),
                     )
-                valid = {k: v for k, v in kwargs.items() if k in params}
-                return original(self, images, *args, **valid)
+                    warned_unsupported_kwargs.add(warning_key)
+                kwargs = {k: v for k, v in kwargs.items() if k in accepted_kwargs}
+            return original(self, images, *args, **kwargs)
 
         BaseImageProcessor.__call__ = safe_call
     except ImportError:

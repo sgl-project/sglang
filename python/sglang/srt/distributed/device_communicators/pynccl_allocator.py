@@ -6,16 +6,14 @@ import traceback
 from contextlib import nullcontext
 
 import torch
-from torch.cuda.memory import (
-    CUDAPluggableAllocator,
-    _cuda_beginAllocateCurrentThreadToPool,
-    _cuda_endAllocateToPool,
-    _cuda_releasePool,
-)
+
+# The private _cuda_* pool APIs are absent before torch 2.8; the call sites below
+# reach them via torch._C.<name> so torch 2.7 (Ascend NPU) can still import this.
+from torch.cuda.memory import CUDAPluggableAllocator
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils.common import torch_release
 
 after_2_8_0 = torch_release >= (2, 8)
@@ -159,7 +157,7 @@ _register_func = None
 
 def is_symmetric_memory_enabled():
     try:
-        return get_global_server_args().enable_symm_mem
+        return get_exec().comm.enable_symm_mem
     except ValueError:
         return False
 
@@ -189,6 +187,11 @@ def get_nccl_mem_pool() -> torch.cuda.MemPool:
     All groups share the same pool to avoid memory fragmentation.
     Comm registration is handled at context exit time.
     """
+    assert after_2_8_0, (
+        "--enable-symm-mem requires torch>=2.8 "
+        "(torch._C._cuda_beginAllocateCurrentThreadToPool was added there)."
+    )
+
     global _allocator, _mem_pool, _cur_device, _register_func
     if _allocator is None:
         import torch.utils.cpp_extension
@@ -263,14 +266,14 @@ class SymmetricMemoryContext:
         self._comm_ptr = self.group_coordinator.pynccl_comm.comm.value
 
     def __enter__(self):
-        assert (
-            self.group_coordinator.pynccl_comm is not None
-        ), f"Symmetric memory requires pynccl to be enabled in group '{self.group_coordinator.unique_name}'"
+        assert self.group_coordinator.pynccl_comm is not None, (
+            f"Symmetric memory requires pynccl to be enabled in group '{self.group_coordinator.unique_name}'"
+        )
 
         if self.is_graph_capture:
-            assert (
-                _graph_pool_id is not None
-            ), "graph_pool_id is not set under graph capture"
+            assert _graph_pool_id is not None, (
+                "graph_pool_id is not set under graph capture"
+            )
             # Pause graph memory pool to use symmetric memory with cuda graph
             if after_2_8_0:
                 torch._C._cuda_endAllocateToPool(_cur_device, _graph_pool_id)
@@ -279,7 +282,9 @@ class SymmetricMemoryContext:
                     _cur_device, _graph_pool_id
                 )
 
-        _cuda_beginAllocateCurrentThreadToPool(self._device_index, self._pool_id)
+        torch._C._cuda_beginAllocateCurrentThreadToPool(
+            self._device_index, self._pool_id
+        )
 
         global _active_symmetric_memory_context
         _active_symmetric_memory_context = self
@@ -287,8 +292,8 @@ class SymmetricMemoryContext:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        _cuda_endAllocateToPool(self._device_index, self._pool_id)
-        _cuda_releasePool(self._device_index, self._pool_id)
+        torch._C._cuda_endAllocateToPool(self._device_index, self._pool_id)
+        torch._C._cuda_releasePool(self._device_index, self._pool_id)
         # Register all unregistered segments
         # with the current comm
         self._register_segments_for_comm()
@@ -317,9 +322,9 @@ class SymmetricMemoryContext:
         # Call C++ API to register all segments with this comm
         # C++ layer tracks per-comm registration state internally
         result = _register_func(self._comm_ptr)
-        assert (
-            result == 0
-        ), f"nccl_allocator_register_segments_with_comm failed with return code: {result}"
+        assert result == 0, (
+            f"nccl_allocator_register_segments_with_comm failed with return code: {result}"
+        )
 
 
 def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = False):
@@ -334,6 +339,7 @@ def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = F
 # --- Debug mode for symmetric memory validation ---
 
 _symm_mem_logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 _debug_seen_traces: set = set()
 
 
@@ -403,4 +409,34 @@ def debug_check_symmetric_mempool(
                 len(bad_names),
                 "\n".join(bad_details),
                 stack,
+            )
+
+
+def prealloc_symmetric_memory_pool(
+    *,
+    is_draft_worker: bool,
+    enable_symm_mem: bool,
+    device: str,
+    forward_stream: torch.cuda.Stream,
+):
+    # PyTorch mempools never de-fragment memory in OOM scenarios, so we need to pre-allocate a large chunk of memory to limit fragmentation.
+    if (
+        is_draft_worker
+        or not enable_symm_mem
+        or envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get() <= 0
+    ):
+        return
+
+    from sglang.srt.distributed import get_tp_group
+
+    # Memory allocation is tied to a cuda stream, use the forward stream
+    with torch.get_device_module(device).stream(forward_stream):
+        logger.info(
+            f"Pre-allocating symmetric memory pool with {envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get()} GiB"
+        )
+        with use_symmetric_memory(get_tp_group()):
+            torch.empty(
+                (envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get() * 1024 * 1024 * 1024,),
+                dtype=torch.uint8,
+                device=device,
             )
