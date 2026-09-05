@@ -340,6 +340,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         super().__init__()
         self.transformer = transformer
         self.transformer_2 = transformer_2
+        # Tag MoE experts (Wan2.2) so TeaCache picks per-expert coefficients.
+        if transformer_2 is not None:
+            transformer._teacache_expert_tag = "high"
+            transformer_2._teacache_expert_tag = "low"
         # cache-dit state (for delayed mounting and idempotent control)
         self._cache_dit_enabled = False
         self._cached_num_steps = None
@@ -601,7 +605,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         )
         self._maybe_toggle_quality_fusions(batch)
         self._maybe_enable_cache_dit(num_inference_steps, batch)
+        # Reset per request: the MoE low-noise expert never sees step 0 to self-reset.
         for transformer in filter(None, [self.transformer, self.transformer_2]):
+            reset = getattr(transformer, "reset_teacache_state", None)
+            if reset is not None:
+                reset()
             self._maybe_torch_compile(transformer)
 
     def _maybe_override_attention_backend(

@@ -23,6 +23,14 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 
+from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.cache.teacache_calibrate import (
+    SINGLE_EXPERT,
+    TeaCacheCalibrator,
+    get_active_calibrator,
+    set_active_calibrator,
+)
+
 if TYPE_CHECKING:
     from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 
@@ -122,9 +130,14 @@ class TeaCacheMixin:
         accumulated_rel_l1_distance_negative: L1 distance for negative branch.
     """
 
-    # Models that support CFG cache separation (wan/hunyuan/zimage)
-    # Models not in this set (flux/qwen) auto-disable TeaCache when CFG is enabled
-    _CFG_SUPPORTED_PREFIXES: set[str] = {"wan", "hunyuan", "zimage"}
+    # Models that separate the CFG pos/neg cache; others auto-disable TeaCache
+    # under CFG. Named distinctly from SpectrumMixin's set to avoid MRO shadowing.
+    _TEACACHE_CFG_SUPPORTED_PREFIXES: set[str] = {
+        "wan",
+        "hunyuan",
+        "zimage",
+        "longcat_image",
+    }
     prefix: str
 
     def _init_teacache_state(self) -> None:
@@ -133,7 +146,12 @@ class TeaCacheMixin:
         self.cnt = 0
         self.enable_teacache = True
         # Flag indicating if this model supports CFG cache separation
-        self._supports_cfg_cache = self.prefix.lower() in self._CFG_SUPPORTED_PREFIXES
+        self._supports_cfg_cache = (
+            self.prefix.lower() in self._TEACACHE_CFG_SUPPORTED_PREFIXES
+        )
+
+        # "single" unless a MoE model tags its transformers (Wan2.2 "high"/"low").
+        self._teacache_expert_tag = SINGLE_EXPERT
 
         # Always initialize positive cache fields (used in all modes)
         self.previous_modulated_input: torch.Tensor | None = None
@@ -283,8 +301,8 @@ class TeaCacheMixin:
         do_cfg = forward_batch.do_classifier_free_guidance
         is_cfg_negative = forward_batch.is_cfg_negative
 
-        # Reset at first timestep
-        if current_timestep == 0 and not self.is_cfg_negative:
+        # Use the fresh is_cfg_negative (self.is_cfg_negative lags one request).
+        if current_timestep == 0 and not is_cfg_negative:
             self.reset_teacache_state()
 
         return TeaCacheContext(
@@ -296,6 +314,46 @@ class TeaCacheMixin:
             coefficients=teacache_params.get_coefficients(),
             teacache_params=teacache_params,
         )
+
+    def maybe_record_calibration(
+        self, modulated_inp: torch.Tensor, output: torch.Tensor
+    ) -> None:
+        """Record one step's tensors for TeaCache calibration.
+
+        Gated by ``SGLANG_TEACACHE_CALIBRATE``. The DiT runs in a worker
+        subprocess, so the calibrator lives here and dumps rows to
+        ``SGLANG_TEACACHE_CALIBRATE_OUT`` for the tool to fit afterwards.
+        """
+        if not envs.SGLANG_TEACACHE_CALIBRATE:
+            return
+        from sglang.multimodal_gen.runtime.managers.forward_context import (
+            get_forward_context,
+        )
+
+        forward_context = get_forward_context()
+        forward_batch = forward_context.forward_batch
+        if forward_batch is None:
+            return
+        # Rank 0 only: output is sharded and one writer avoids racing the file.
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+            return
+
+        calibrator = get_active_calibrator()
+        if calibrator is None:
+            calibrator = TeaCacheCalibrator()
+            set_active_calibrator(calibrator)
+        calibrator.record(
+            modulated_inp,
+            output,
+            step_index=forward_context.current_timestep,
+            is_cfg_negative=forward_batch.is_cfg_negative,
+            expert=self._teacache_expert_tag,
+        )
+        out_path = envs.SGLANG_TEACACHE_CALIBRATE_OUT
+        if out_path:
+            calibrator.dump_rows(out_path)
 
     def maybe_cache_states(
         self, hidden_states: torch.Tensor, original_hidden_states: torch.Tensor

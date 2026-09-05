@@ -53,10 +53,11 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
-from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -755,7 +756,7 @@ class _TimestepEmbeddings(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class LongCatImageTransformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
+class LongCatImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """SGLang implementation of the LongCat-Image transformer.
 
     Accepts raw scheduler timesteps (in [0, 1000]) and feeds them directly to
@@ -874,25 +875,40 @@ class LongCatImageTransformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         cos_sin_cache = torch.cat((cos, sin), dim=-1).contiguous()
         positions = torch.arange(cos.shape[0], device=cos.device, dtype=torch.int64)
 
-        for block in self.transformer_blocks:
-            encoder_hidden_states, hidden_states = block(
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                temb=temb,
-                image_rotary_emb=image_rotary_emb,
-                cos_sin_cache=cos_sin_cache,
-                positions=positions,
-            )
+        # Bind TeaCache to this request (the DiT flag defaults on and is sticky).
+        _fb = get_forward_context().forward_batch
+        self.enable_teacache = _fb is not None and _fb.enable_teacache
 
-        for block in self.single_transformer_blocks:
-            encoder_hidden_states, hidden_states = block(
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                temb=temb,
-                image_rotary_emb=image_rotary_emb,
-                cos_sin_cache=cos_sin_cache,
-                positions=positions,
-            )
+        # TeaCache: reuse the cached residual when temb barely changed.
+        if self.should_skip_forward_for_cached_states(temb=temb):
+            hidden_states = self.retrieve_cached_states(hidden_states)
+        else:
+            if self.enable_teacache:
+                original_hidden_states = hidden_states.clone()
+            for block in self.transformer_blocks:
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                    cos_sin_cache=cos_sin_cache,
+                    positions=positions,
+                )
+
+            for block in self.single_transformer_blocks:
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                    cos_sin_cache=cos_sin_cache,
+                    positions=positions,
+                )
+
+            if self.enable_teacache:
+                self.maybe_cache_states(hidden_states, original_hidden_states)
+            self.maybe_record_calibration(temb, hidden_states)
+        self.cnt += 1
 
         hidden_states = self.norm_out(hidden_states, temb)
         output, _ = self.proj_out(hidden_states)
@@ -902,6 +918,44 @@ class LongCatImageTransformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
 
             return Transformer2DModelOutput(sample=output)
         return output
+
+    def should_skip_forward_for_cached_states(self, **kwargs) -> bool:
+        """TeaCache decision: True to reuse the cached residual this step."""
+        if not self.enable_teacache:
+            return False
+        ctx = self._get_teacache_context()
+        if ctx is None:
+            return False
+
+        start_skipping, end_skipping = ctx.teacache_params.get_skip_boundaries(
+            ctx.num_inference_steps, ctx.do_cfg
+        )
+        is_boundary_step = self.cnt < start_skipping or self.cnt >= end_skipping
+        self.is_cfg_negative = ctx.is_cfg_negative
+
+        should_calc = self._compute_teacache_decision(
+            modulated_inp=kwargs["temb"],
+            is_boundary_step=is_boundary_step,
+            coefficients=ctx.coefficients,
+            teacache_thresh=ctx.teacache_thresh,
+        )
+        return not should_calc
+
+    def maybe_cache_states(
+        self, hidden_states: torch.Tensor, original_hidden_states: torch.Tensor
+    ) -> None:
+        """Cache the block-stack residual, separated by CFG branch."""
+        residual = hidden_states - original_hidden_states
+        if not self.is_cfg_negative:
+            self.previous_residual = residual
+        else:
+            self.previous_residual_negative = residual
+
+    def retrieve_cached_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Reuse the cached residual, separated by CFG branch."""
+        if not self.is_cfg_negative:
+            return hidden_states + self.previous_residual
+        return hidden_states + self.previous_residual_negative
 
 
 EntryClass = LongCatImageTransformer2DModel
