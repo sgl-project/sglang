@@ -56,6 +56,12 @@ def _hpc_ihc_available(op_name: str, hc_mult: int, hidden_size: int) -> bool:
 
 
 def permute_hyv4_indexer_weight(name, loaded_weight, config):
+    # Block-FP8 scales describe complete 128-row blocks. They must stay in
+    # block order and, unlike the corresponding weights, do not contain an
+    # index_head_dim axis to rotate.
+    if name.endswith((".weight_scale", ".weight_scale_inv")):
+        return loaded_weight
+
     if ".self_attn.indexer.wq_b." in name:
         group_count = config.index_n_heads
     elif any(

@@ -12,6 +12,22 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
+def test_indexer_block_fp8_scales_are_not_permuted():
+    config = SimpleNamespace(
+        index_n_heads=32,
+        index_head_dim=128,
+        qk_rope_head_dim=64,
+    )
+    tensors = {
+        "model.layers.0.self_attn.indexer.wk.weight_scale": torch.empty(1, 48),
+        "model.layers.0.self_attn.indexer.wq_b.weight_scale": torch.empty(32, 16),
+    }
+
+    for name, tensor in tensors.items():
+        result = hunyuan_v4.permute_hyv4_indexer_weight(name, tensor, config)
+        assert result is tensor
+
+
 def test_attention_gate_uses_attention_tp(monkeypatch):
     attn_tp_size = 2
     parallel = SimpleNamespace(
@@ -146,7 +162,8 @@ def test_non_last_pp_stage_forwards_flattened_hidden_and_shared_topk():
         {"hidden_states": initial_hidden, "topk_indices": initial_topk}
     )
 
-    result = model(None, None, object(), pp_proxy_tensors=proxy)
+    forward_batch = SimpleNamespace(reuse_dsa_topk_indices=False, spec_info=None)
+    result = model(None, None, forward_batch, pp_proxy_tensors=proxy)
 
     assert result["hidden_states"].shape == (2, 64)
     assert result["topk_indices"] is next_topk
