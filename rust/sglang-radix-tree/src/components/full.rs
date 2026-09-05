@@ -413,7 +413,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for FullComponent {
         Ok(match phase {
             // Full KV backup is handled by the main flow
             // (cache_controller.write on host_value directly).
-            // No extra PoolTransfer<V> needed.
+            // No extra PoolTransfer needed.
             CacheTransferPhase::BackupHost => None,
             CacheTransferPhase::LoadBack => {
                 // `node` is best_match_node. FULL device evict only from leaves,
@@ -433,7 +433,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for FullComponent {
                 } else {
                     V::concat(&backed_up)
                 };
-                Some(vec![PoolTransfer::<V> {
+                Some(vec![PoolTransfer {
                     name: PoolName::Kv,
                     host_indices: Some(host_indices),
                     nodes_to_load: Some(nodes_to_load),

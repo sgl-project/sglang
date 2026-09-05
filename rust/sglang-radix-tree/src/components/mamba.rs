@@ -74,7 +74,7 @@ impl MambaComponent {
         if self.mamba_max_states_per_path.is_none() {
             return;
         }
-        cache_actions.push(CacheAction::<V>::MambaEvictExcessPathStates { tail_node_id });
+        cache_actions.push(CacheAction::MambaEvictExcessPathStates { tail_node_id });
     }
 }
 
@@ -521,7 +521,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for MambaComponent {
                     return Ok(None);
                 }
                 node.try_device_value(MAMBA).map(|value| {
-                    vec![PoolTransfer::<V> {
+                    vec![PoolTransfer {
                         name: PoolName::Mamba,
                         device_indices: Some(value.shallow_clone()),
                         ..Default::default()
@@ -536,7 +536,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for MambaComponent {
                 let mut transfers = Vec::new();
                 // restore single node if host_value exists
                 if let Some(host_value) = node.try_host_value(MAMBA) {
-                    transfers.push(PoolTransfer::<V> {
+                    transfers.push(PoolTransfer {
                         name: PoolName::Mamba,
                         host_indices: Some(host_value.shallow_clone()),
                         nodes_to_load: Some(vec![node.id]),
@@ -548,7 +548,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for MambaComponent {
                 if let (Some(mamba_pool_idx), Some(host_value)) =
                     (mamba_pool_idx, node.try_host_value(MAMBA))
                 {
-                    transfers.push(PoolTransfer::<V> {
+                    transfers.push(PoolTransfer {
                         name: PoolName::Mamba,
                         host_indices: Some(host_value.shallow_clone()),
                         device_indices: Some(mamba_pool_idx.to_mamba_device_indices()),
@@ -569,7 +569,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for MambaComponent {
                 let Some(hash_value) = node.hash_value.as_ref().filter(|h| !h.is_empty()) else {
                     return Ok(None);
                 };
-                Some(vec![PoolTransfer::<V> {
+                Some(vec![PoolTransfer {
                     name: PoolName::Mamba,
                     host_indices: Some(host_value.shallow_clone()),
                     keys: Some(vec![hash_value[hash_value.len() - 1].clone()]),
@@ -580,7 +580,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for MambaComponent {
             CacheTransferPhase::Prefetch => {
                 let host_indices =
                     host_indices.expect("Mamba PREFETCH build requires host indices");
-                Some(vec![PoolTransfer::<V> {
+                Some(vec![PoolTransfer {
                     name: PoolName::Mamba,
                     host_indices: Some(host_indices),
                     keys: Some(vec!["__placeholder__".to_string()]),
@@ -660,7 +660,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for MambaComponent {
                 let Some(target) = attach_target else {
                     // The buffer cannot attach: free it and let the caller keep
                     // its own donated slot bookkeeping.
-                    cache_actions.push(CacheAction::<V>::FreeComponentHostSlot {
+                    cache_actions.push(CacheAction::FreeComponentHostSlot {
                         component_type: MAMBA,
                         host_indices: host_indices
                             .map(|host| vec![host.shallow_clone()])

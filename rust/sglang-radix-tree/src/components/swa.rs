@@ -167,7 +167,7 @@ impl SwaComponent {
         cache_actions: &mut Vec<CacheAction<V>>,
     ) {
         if host_indices.len() > 0 {
-            cache_actions.push(CacheAction::<V>::FreeComponentHostSlot {
+            cache_actions.push(CacheAction::FreeComponentHostSlot {
                 component_type: SWA,
                 host_indices: vec![host_indices],
             });
@@ -411,7 +411,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
             // Branch 1: entire value_slice is within SWA window — recover
             result.record_adopted_range(SWA, total_prefix_len, total_prefix_len + prefix_len);
             if node.device_lock_ref(FULL) > 0 {
-                cache_actions.push(CacheAction::<V>::RecoverSwaWithLockedFull {
+                cache_actions.push(CacheAction::RecoverSwaWithLockedFull {
                     node_id: node.id,
                     kept_full: node.device_value(FULL).shallow_clone(),
                     incoming_full: value_slice,
@@ -421,8 +421,8 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
             result.record_adopted_range(FULL, total_prefix_len, total_prefix_len + prefix_len);
             let old_full = node.take_device_value(FULL);
             node.set_device_value(FULL, value_slice.copy_for_adoption());
-            cache_actions.push(CacheAction::<V>::FreeDeviceKVFullOnly(vec![old_full]));
-            cache_actions.push(CacheAction::<V>::SwaRebuild {
+            cache_actions.push(CacheAction::FreeDeviceKVFullOnly(vec![old_full]));
+            cache_actions.push(CacheAction::SwaRebuild {
                 node_id: node.id,
                 source_value: value_slice,
             });
@@ -443,7 +443,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
             }
             let new_full = value_slice.slice(start_idx, prefix_len - start_idx);
             if is_locked {
-                cache_actions.push(CacheAction::<V>::RecoverSwaWithLockedFull {
+                cache_actions.push(CacheAction::RecoverSwaWithLockedFull {
                     node_id: node_ext_id,
                     kept_full: old_full,
                     incoming_full: new_full,
@@ -454,8 +454,8 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
             let node = tree_core.arena.node_mut(node_id);
             let _ = node.take_device_value(FULL);
             node.set_device_value(FULL, new_full.copy_for_adoption());
-            cache_actions.push(CacheAction::<V>::FreeDeviceKVFullOnly(vec![old_full]));
-            cache_actions.push(CacheAction::<V>::SwaRebuild {
+            cache_actions.push(CacheAction::FreeDeviceKVFullOnly(vec![old_full]));
+            cache_actions.push(CacheAction::SwaRebuild {
                 node_id: node_ext_id,
                 source_value: new_full,
             });
@@ -511,7 +511,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
             total_prefix_len.max(swa_evicted_seqlen),
             total_prefix_len + prefix_len,
         );
-        cache_actions.push(CacheAction::<V>::SwaRebuild {
+        cache_actions.push(CacheAction::SwaRebuild {
             node_id: tree_core.arena.node(node_id).id,
             source_value: tree_core.arena.device_value(node_id, FULL).shallow_clone(),
         });
@@ -552,7 +552,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
         // the in-window tail lands more-MRU.
         let capped_parent = self.maybe_split_leaf_for_swa_lock_(tree_core, node_id);
         if let Some(capped_parent) = capped_parent {
-            cache_actions.push(CacheAction::<V>::SwaRebuild {
+            cache_actions.push(CacheAction::SwaRebuild {
                 node_id: tree_core.arena.node(capped_parent).id,
                 source_value: tree_core
                     .arena
@@ -560,7 +560,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
                     .shallow_clone(),
             });
         }
-        cache_actions.push(CacheAction::<V>::SwaRebuild {
+        cache_actions.push(CacheAction::SwaRebuild {
             node_id: tree_core.arena.node(node_id).id,
             source_value: tree_core.arena.device_value(node_id, FULL).shallow_clone(),
         });
@@ -850,7 +850,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
                 // cd.value already holds SWA-pool indices (translated at insert time).
                 // Host pool indexing wants int64.
                 node.try_device_value(SWA).map(|value| {
-                    vec![PoolTransfer::<V> {
+                    vec![PoolTransfer {
                         name: PoolName::Swa,
                         device_indices: Some(value.to_swa_host_indices()),
                         ..Default::default()
@@ -885,7 +885,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
                 }
                 backed_up.reverse();
                 nodes_to_load.reverse();
-                Some(vec![PoolTransfer::<V> {
+                Some(vec![PoolTransfer {
                     name: PoolName::Swa,
                     host_indices: Some(V::concat(&backed_up)),
                     nodes_to_load: Some(nodes_to_load),
@@ -906,7 +906,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
                     return Ok(None);
                 }
                 let host_len = host_value.len();
-                Some(vec![PoolTransfer::<V> {
+                Some(vec![PoolTransfer {
                     name: PoolName::Swa,
                     host_indices: Some(
                         host_value.slice(host_len - num_pages * page_size, num_pages * page_size),
@@ -919,7 +919,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
             CacheTransferPhase::Prefetch => {
                 let host_indices = host_indices.expect("SWA PREFETCH build requires host indices");
                 let sw_pages = host_indices.len() / tree_core.page_size;
-                Some(vec![PoolTransfer::<V> {
+                Some(vec![PoolTransfer {
                     name: PoolName::Swa,
                     host_indices: Some(host_indices),
                     keys: Some(vec!["__placeholder__".to_string(); sw_pages]),
@@ -987,7 +987,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
                 assert_eq!(offset, host_indices.len());
                 // Rebuild the full->swa mapping for the loaded chunks at the orchestration layer.
                 if !full_chunks.is_empty() {
-                    cache_actions.push(CacheAction::<V>::RebuildFullToSwaMapping {
+                    cache_actions.push(CacheAction::RebuildFullToSwaMapping {
                         full_indices: full_chunks,
                         swa_indices: swa_chunks,
                     });

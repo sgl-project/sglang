@@ -333,7 +333,7 @@ impl PoolHitPolicy {
     }
 }
 
-/// Well-known pool names used as `PoolTransfer<V>` identifiers.
+/// Well-known pool names used as `PoolTransfer` identifiers.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Default)]
 pub enum PoolName {
     #[default]
@@ -948,7 +948,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     /// tail's root path; the mamba component drives the walk.
     pub fn evict_excess_path_states(&mut self, tail_node_id: NodeId) -> EvictionStepResult<V> {
         let tail_node_id = self.arena.resolve(tail_node_id);
-        let mut result = EvictionStepResult::<V>::default();
+        let mut result = EvictionStepResult::default();
         let component = self.component_by_type_(MAMBA);
         component.evict_excess_path_states(
             self,
@@ -1212,7 +1212,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         )
     }
 
-    /// Assemble the `MatchResult<V>` from the walk outputs.
+    /// Assemble the `MatchResult` from the walk outputs.
     pub(crate) fn match_post_processor_(
         &mut self,
         params: &MatchPrefixParams<'_, K>,
@@ -1262,7 +1262,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         } else {
             self.empty_device_indices.shallow_clone()
         };
-        let mut result = MatchResult::<V> {
+        let mut result = MatchResult {
             device_indices,
             last_device_node_id: self.arena.node(best_match_device_node_id).id,
             last_host_node_id: self.arena.node(last_host_node_id).id,
@@ -1291,7 +1291,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     /// An empty match: no device indices, every boundary anchored at the root.
     pub fn empty_match_result(&self) -> MatchResult<V> {
         let root_id = self.arena.node(self.arena.root()).id;
-        MatchResult::<V> {
+        MatchResult {
             device_indices: self.empty_device_indices.shallow_clone(),
             last_device_node_id: root_id,
             last_host_node_id: root_id,
@@ -1542,9 +1542,9 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 let node = self.arena.node_mut(prefix_node_idx);
                 node.priority = node.priority.max(params.priority);
             }
-            return Ok(InsertStepResult::<V> {
+            return Ok(InsertStepResult {
                 actions: Vec::new(),
-                result: Some(InsertResult::<V> {
+                result: Some(InsertResult {
                     prefix_len,
                     total_len: aligned_key_len,
                     last_device_node_id: Some(self.arena.node(prefix_node_idx).id),
@@ -1582,10 +1582,10 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             total_prefix_length: prefix_len,
             is_new_leaf: false,
             target_node_id: None,
-            result: Some(InsertResult::<V> {
+            result: Some(InsertResult {
                 total_len: aligned_key_len,
                 adopted_ranges: params.track_adopted_ranges.then(HashMap::new),
-                ..InsertResult::<V>::default()
+                ..InsertResult::default()
             }),
             pending_actions: Vec::new(),
         });
@@ -1633,7 +1633,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 InsertPhase::Commit => self.insert_commit_step_(&mut state),
                 InsertPhase::Tail => {
                     self.insert_tail_step_(&mut state);
-                    return InsertStepResult::<V> {
+                    return InsertStepResult {
                         actions: state.pending_actions,
                         result: state.result,
                     };
@@ -1644,7 +1644,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             if !new_actions.is_empty() && !new_actions.iter().all(Self::is_deferrable_action_) {
                 let flushed = std::mem::take(&mut state.pending_actions);
                 self.ongoing_insert_walk_state = Some(state);
-                return InsertStepResult::<V> {
+                return InsertStepResult {
                     actions: flushed,
                     result: None,
                 };
@@ -1656,9 +1656,9 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     fn is_deferrable_action_(action: &CacheAction<V>) -> bool {
         matches!(
             action,
-            CacheAction::<V>::FreeDeviceKV(_)
-                | CacheAction::<V>::FreeDeviceKVFullOnly(_)
-                | CacheAction::<V>::ReplaceWriteThroughOnNodeSplit { .. }
+            CacheAction::FreeDeviceKV(_)
+                | CacheAction::FreeDeviceKVFullOnly(_)
+                | CacheAction::ReplaceWriteThroughOnNodeSplit { .. }
         )
     }
 
@@ -1769,17 +1769,15 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 if swa_already_freed > 0 {
                     state
                         .pending_actions
-                        .push(CacheAction::<V>::FreeDeviceKVFullOnly(vec![
+                        .push(CacheAction::FreeDeviceKVFullOnly(vec![
                             value_slice.slice(dup_start, swa_already_freed),
                         ]));
                 }
                 if swa_already_freed < dup_len {
-                    state
-                        .pending_actions
-                        .push(CacheAction::<V>::FreeDeviceKV(vec![value_slice.slice(
-                            dup_start + swa_already_freed,
-                            dup_len - swa_already_freed,
-                        )]));
+                    state.pending_actions.push(CacheAction::FreeDeviceKV(vec![
+                        value_slice
+                            .slice(dup_start + swa_already_freed, dup_len - swa_already_freed),
+                    ]));
                 }
             }
         }
@@ -1787,9 +1785,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         if self.inc_hit_count_and_check_(node_id, state.chunked) {
             let backup = self
                 .build_backup_kv_action_(self.arena.node(node_id), /* write_back = */ false);
-            state
-                .pending_actions
-                .push(CacheAction::<V>::BackupKV(backup));
+            state.pending_actions.push(CacheAction::BackupKV(backup));
         }
         state.node_id = node_id;
         state.total_prefix_length += prefix_len;
@@ -1912,9 +1908,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 self.arena.node(target_node_id),
                 /* write_back = */ false,
             );
-            state
-                .pending_actions
-                .push(CacheAction::<V>::BackupKV(backup));
+            state.pending_actions.push(CacheAction::BackupKV(backup));
         }
     }
 
@@ -1996,7 +1990,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         // A split of a backuped node tells the cache to fix its publish list.
         let action = if let Some(ack_id) = self.arena.node(child_id).write_through_pending_id {
             self.arena.node_mut(new_node_id).write_through_pending_id = Some(ack_id);
-            Some(CacheAction::<V>::ReplaceWriteThroughOnNodeSplit {
+            Some(CacheAction::ReplaceWriteThroughOnNodeSplit {
                 ack_id,
                 old_node_id: self.arena.node(child_id).id,
                 new_node_id: self.arena.node(new_node_id).id,
@@ -2218,7 +2212,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         let mut tracker = baseline.clone();
         // The walk gates on the walked component's entry, so seed it.
         tracker.entry(component_type).or_insert(0);
-        let mut result = EvictionStepResult::<V>::default();
+        let mut result = EvictionStepResult::default();
         let node_id = self
             .component_by_type_(component_type)
             .evict_device_next_node(
@@ -2251,7 +2245,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         is_write_back: bool,
     ) -> (Option<BackupKV>, EvictionStepResult<V>) {
         let node_id = self.arena.resolve(node_id);
-        let mut result = EvictionStepResult::<V>::default();
+        let mut result = EvictionStepResult::default();
         {
             let node = self.arena.node(node_id);
             assert!(
@@ -2290,7 +2284,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     /// unevictable until host space frees up.
     pub fn drop_subtree_no_host(&mut self, node_id: NodeId) -> (bool, EvictionStepResult<V>) {
         let node_id = self.arena.resolve(node_id);
-        let mut result = EvictionStepResult::<V>::default();
+        let mut result = EvictionStepResult::default();
         {
             let node = self.arena.node(node_id);
             assert!(
@@ -2402,7 +2396,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         component_type: ComponentType,
         num_tokens: usize,
     ) -> EvictionStepResult<V> {
-        let mut result = EvictionStepResult::<V>::default();
+        let mut result = EvictionStepResult::default();
         if let Some(component) = self.try_component_by_type_(component_type) {
             // The drive gates on the driven component's entry, so seed it.
             result.tracker.insert(component_type, 0);
@@ -2510,7 +2504,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     /// tree, now host-only.
     pub fn demote(&mut self, node_id: NodeId) -> EvictionStepResult<V> {
         let node_id = self.arena.resolve(node_id);
-        let mut result = EvictionStepResult::<V>::default();
+        let mut result = EvictionStepResult::default();
         // Skip a deferred demote when a load-back now pins the device indices.
         if self.arena.node(node_id).is_load_back_pending() {
             return result;
@@ -2530,7 +2524,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         node_id: NodeId,
     ) -> Result<EvictionStepResult<V>, TreeCoreRuntimeError> {
         let node_id = self.try_resolve_node_handle_(node_id)?;
-        let mut result = EvictionStepResult::<V>::default();
+        let mut result = EvictionStepResult::default();
         // Skip a deferred demote when a load-back now pins the device indices.
         if self.arena.node(node_id).is_load_back_pending() {
             return Ok(result);
@@ -3155,7 +3149,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         }
         self.touch_node_(node_id);
         if total_len == 0 {
-            return Ok(InsertResult::<V> {
+            return Ok(InsertResult {
                 prefix_len: 0,
                 total_len: 0,
                 last_device_node_id: None,
@@ -3194,7 +3188,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             }
         }
 
-        let mut result = InsertResult::<V> {
+        let mut result = InsertResult {
             prefix_len: matched_length,
             total_len,
             last_device_node_id: None,
@@ -3342,7 +3336,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 comp_xfers.insert(component_type, transfers);
             }
         }
-        Some(StorageBackupSpec::<V> {
+        Some(StorageBackupSpec {
             host_value: node.host_value(FULL).shallow_clone(),
             token_ids: K::raw_token_ids(node.key.as_ref()).into_owned(),
             hash_value: node.hash_value.clone(),
@@ -3423,7 +3417,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     > {
         let anchor_id = node_id;
         let node_id = self.try_resolve_node_handle_(node_id)?;
-        // Component hooks take primitives, not Req<V>: extract its fields here.
+        // Component hooks take primitives, not Req: extract its fields here.
         let mamba_pool_idx = req.and_then(|r| r.mamba_pool_idx.as_ref());
         let mut kv_transfers = self
             .component_by_type_(BASE_COMPONENT_TYPE)
@@ -3480,7 +3474,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                     .is_some_and(|id| id != anchor_id)
             });
         if any_foreign_pin {
-            let empty_kv = PoolTransfer::<V> {
+            let empty_kv = PoolTransfer {
                 name: PoolName::Kv,
                 host_indices: Some(V::empty()),
                 nodes_to_load: Some(Vec::new()),
@@ -3774,7 +3768,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         let node_id = self.arena.resolve(node_id);
         let mut cache_actions: Vec<CacheAction<V>> = Vec::new();
         if host_indices.len() > 0 {
-            let kv_xfer = PoolTransfer::<V> {
+            let kv_xfer = PoolTransfer {
                 name: PoolName::Kv,
                 host_indices: Some(host_indices),
                 ..Default::default()
@@ -4769,7 +4763,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     ) -> EvictionStepResult<V> {
         self.assert_component_enabled_(component_type);
         let node_id = self.arena.resolve(node_id);
-        let mut result = EvictionStepResult::<V>::default();
+        let mut result = EvictionStepResult::default();
         self.evict_component_and_detach_lru_(
             node_id,
             component_type,
@@ -4819,7 +4813,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         node_id: NodeId,
     ) -> EvictionStepResult<V> {
         let node_id = self.arena.resolve(node_id);
-        let mut result = EvictionStepResult::<V>::default();
+        let mut result = EvictionStepResult::default();
         self.iteratively_delete_tombstone_leaf_(
             node_id,
             &mut result.tracker,
