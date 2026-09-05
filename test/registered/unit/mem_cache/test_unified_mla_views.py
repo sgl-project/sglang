@@ -41,11 +41,11 @@ import unittest
 
 import torch
 
+from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
 from sglang.srt.mem_cache.layout.page_major import (
     build_mla_views,
     mla_entry_bytes,
 )
-from sglang.srt.mem_cache.multi_ended_allocator import MultiEndedAllocator
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
     MLASubPoolSpec,

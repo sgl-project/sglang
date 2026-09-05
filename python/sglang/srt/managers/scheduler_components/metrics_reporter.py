@@ -22,6 +22,9 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerStats,
     compute_routing_key_stats,
 )
+from sglang.srt.observability.scheduler_stage_metrics import (
+    SchedulerStageMetricsRecorder,
+)
 from sglang.srt.runtime_context import (
     exports_expert_balancedness_to_prometheus,
     get_context,
@@ -258,6 +261,9 @@ class SchedulerMetricsReporter:
         self.fwd_occupancy = float("nan")
         self._scheduler_time_accounting: Optional[_SchedulerTimeAccountingSnapshot] = (
             None
+        )
+        self.scheduler_stage_metrics = SchedulerStageMetricsRecorder(
+            enabled=self.enable_metrics
         )
 
         self.forward_pass_device_timer: Optional[DeviceTimer] = None
@@ -1242,9 +1248,11 @@ class SchedulerMetricsReporter:
     def start_scheduler_time_accounting(self) -> None:
         if not self.enable_metrics:
             return
+        now_wall_ns = time.monotonic_ns()
         self._scheduler_time_accounting = _SchedulerTimeAccountingSnapshot.init(
-            time.monotonic_ns(), time.process_time_ns(), True
+            now_wall_ns, time.process_time_ns(), True
         )
+        self.scheduler_stage_metrics.start(now_wall_ns)
 
     def record_scheduler_active(self) -> None:
         self._record_scheduler_time(is_idle=False)
@@ -1262,6 +1270,7 @@ class SchedulerMetricsReporter:
             self._scheduler_time_accounting = _SchedulerTimeAccountingSnapshot.init(
                 now_wall_ns, time.process_time_ns(), is_idle
             )
+            self.scheduler_stage_metrics.start(now_wall_ns)
             return
 
         accounting.sample(now_wall_ns, is_idle)
@@ -1277,6 +1286,12 @@ class SchedulerMetricsReporter:
         self.metrics_collector.increment_scheduler_process_cpu_seconds(
             elapsed_process_cpu_ns / 1e9
         )
+        for stage, elapsed_wall_ns in self.scheduler_stage_metrics.drain(
+            now_wall_ns
+        ).items():
+            self.metrics_collector.increment_scheduler_stage_seconds(
+                stage=stage, seconds=elapsed_wall_ns / 1e9
+            )
         accounting.reset(now_wall_ns, now_process_cpu_ns, is_idle)
 
     def _reset_device_timer_window(self):

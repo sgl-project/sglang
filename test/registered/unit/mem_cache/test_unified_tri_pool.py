@@ -39,11 +39,11 @@ import unittest
 
 import torch
 
-import sglang.srt.mem_cache.multi_ended_allocator as mea
-from sglang.srt.mem_cache.multi_ended_allocator import (
-    FloatMultiEndedAllocator,
+import sglang.srt.mem_cache.allocator.unified_sub_pool as mea
+from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaSWATokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.allocator.unified_sub_pool import FloatMultiEndedAllocator
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
     MHASubPoolSpec,
@@ -349,7 +349,7 @@ class TestUnifiedTriPool(unittest.TestCase):
         sa = allocator.swa_attn_allocator
         holes = sa._hole_pages()
         self.assertGreater(holes, 0)
-        from sglang.srt.mem_cache.multi_ended_allocator import _relieve_for_alloc
+        from sglang.srt.mem_cache.allocator.unified_sub_pool import _relieve_for_alloc
 
         _relieve_for_alloc(allocator, 1)
         self.assertEqual(sa._hole_pages(), holes)  # holes are assets, not backlog
@@ -864,7 +864,7 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         alloc.free_swa(v[6 * self.PS :], start_pos=6 * self.PS)
         self.assertGreater(sa._hole_pages(), 0)
         moves_before = len(sa._inverse_history)
-        from sglang.srt.mem_cache.multi_ended_allocator import _relieve_for_alloc
+        from sglang.srt.mem_cache.allocator.unified_sub_pool import _relieve_for_alloc
 
         _relieve_for_alloc(alloc, 1)  # the ladder
         self.assertEqual(sa._hole_pages(), 0)  # rung 0 ran
