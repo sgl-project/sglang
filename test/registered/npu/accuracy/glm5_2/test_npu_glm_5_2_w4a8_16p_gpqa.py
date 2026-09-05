@@ -46,9 +46,9 @@ GLM_5_2_W4A8_16P_TWO_NODE_OTHER_ARGS = [
     8,
     "--enable-dp-attention",
     "--chunked-prefill-size",
-    65536,
+    8192,
     "--max-prefill-tokens",
-    280000,
+    16384,
     "--trust-remote-code",
     "--mem-fraction-static",
     0.76,
@@ -59,7 +59,7 @@ GLM_5_2_W4A8_16P_TWO_NODE_OTHER_ARGS = [
     "--cuda-graph-max-bs",
     4,
     "--max-running-requests",
-    32,
+    64,
     "--quantization",
     "modelslim",
     "--moe-a2a-backend",
@@ -98,6 +98,10 @@ class TestNPUGLM_5_2_W4A8_16P_GPQA(TestNpuAccuracyMultiNodePdMixTestCaseBase):
     model_config = GLM_5_2_W4A8_16P_TWO_NODE_MODEL_CONFIG
     accuracy = 0.912
     datasets = ["gpqa_diamond"]
+    # Avoid re-running the full dataset when the accuracy is far below the
+    # threshold; the retry only doubles the wall time and trips the nightly
+    # 3-hour timeout.
+    max_retries = 1
     # eval_batch_size = 16
     # generation_config = {"max_tokens": 131072, "temperature": 1.0}
     eval_batch_size = 32

@@ -580,7 +580,7 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
         port = parsed_url.port
         if self.benchmark_tool == EVALSCOPE:
             model_name = os.path.basename(self.model_config.get("model_path"))
-            max_retries = get_max_retries(self.datasets)
+            max_retries = getattr(self, "max_retries", get_max_retries(self.datasets))
             best_metrics = None
             for attempt in range(max_retries):
                 metrics = run_evalscope(
