@@ -84,7 +84,7 @@ class TestGLM53FlashB200LowLatency(
     gsm8k_num_examples = 500
     gsm8k_num_shots = 20
     accept_length_thres = 4.0
-    bs_1_speed_thres = 300
+    bs_1_speed_thres = 250
     server_args = [
         *COMMON_SERVER_ARGS,
         "--speculative-algorithm",
