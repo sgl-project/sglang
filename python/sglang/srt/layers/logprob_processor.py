@@ -164,7 +164,7 @@ def get_token_ids_logprobs_raw(
     if stage == LogprobStage.DECODE:
         for i, token_ids in enumerate(token_ids_logprobs_list):
             if token_ids is None or isinstance(token_ids, PerPositionTokenIds):
-                vals.append([])
+                vals.append(logprobs.new_empty(0) if no_copy_to_cpu else [])
                 idxs.append([])
             else:
                 token_ids_tensor = torch.tensor(token_ids, dtype=torch.long).to(
