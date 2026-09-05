@@ -677,6 +677,10 @@ class Sm100ChunkUWKernel:
                 if stage_id == 0:
                     parity ^= 1
 
+                # Order this iteration's phase-4 s_beta/s_g_cu_exp loads before the
+                # next iteration's phase-1 stores (cross-iteration WAR).
+                cute.arch.barrier(barrier_id=1, number_of_threads=128)
+
         elif warp_id < 4:
             # epi warps
             stage_id = 0
