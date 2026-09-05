@@ -20,7 +20,6 @@ TORCH_DTYPES = [torch.float32]
 
 
 class TestCrossEncoderModels(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         mp.set_start_method("spawn", force=True)
@@ -55,9 +54,9 @@ class TestCrossEncoderModels(CustomTestCase):
         for i in range(len(srt_scores)):
             score_difference = abs(hf_scores[i] - srt_scores[i])
 
-            assert (
-                score_difference < score_tolerance
-            ), "cross encoder scores are not all close"
+            assert score_difference < score_tolerance, (
+                "cross encoder scores are not all close"
+            )
 
     def preprocess_prompts(self, prompt):
         processed_prompts = []

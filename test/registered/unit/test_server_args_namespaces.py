@@ -72,10 +72,9 @@ class TestServerArgsNamespaces(CustomTestCase):
         accessors = {
             node.name
             for node in context_module.body
-            if isinstance(node, ast.FunctionDef)
-            and (node.name.startswith("get_") or node.name.startswith("configured_"))
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("get_")
         }
-        self.assertGreater(len(accessors), 20, "the accessor derivation broke")
+        self.assertGreater(len(accessors), 15, "the accessor derivation broke")
 
         shadowed = []
         for path in sorted(srt.rglob("*.py")):
@@ -184,6 +183,10 @@ class TestServerArgsNamespaces(CustomTestCase):
                     continue
                 sites += 1
                 read = [cursor.func.id[len("get_") :]] + chain[:-1]
+                if read[:2] == ["parallel", "config"]:
+                    # `config` on `get_parallel()` is the tier hop, not a
+                    # sub-namespace: bare names there are the live topology.
+                    del read[1]
                 if mapping[field].split(".") != read:
                     disagreements.append(
                         f"{path.relative_to(srt)}:{node.lineno} reads "

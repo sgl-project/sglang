@@ -7,6 +7,7 @@ import torch
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -31,10 +32,6 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         disaggregation_mode=None,
         enable_overlap=False,
         enable_overlap_mlx=False,
-        server_args=SimpleNamespace(
-            enable_metrics=False,
-            enable_hisparse=False,
-        ),
         model_config=SimpleNamespace(think_end_ids=None),
         token_to_kv_pool_allocator=Mock(),
         tree_cache=None,
@@ -47,6 +44,7 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         model_worker=Mock(),
         logprob_result_processor=None,
         output_streamer=Mock(),
+        beam_coordinator=Mock(),
         abort_request=lambda *args, **kwargs: None,
     )
 
@@ -65,6 +63,7 @@ class _PrefillReq:
         self.grammar = None
         self.require_reasoning = False
         self.customized_info = None
+        self.beam_group = None
 
     def finished(self):
         return False
@@ -83,6 +82,7 @@ class _DecodeReq:
         self.return_logprob = False
         self.return_sampling_mask = False
         self.grammar = None
+        self.beam_group = None
         self.time_stats = Mock()
 
     def finished(self):
@@ -179,17 +179,8 @@ class TestDecodeHiddenStateRetention(CustomTestCase):
         second_step = torch.arange(16, dtype=torch.float32).view(8, 2)[4:]
 
         def result(hidden_states):
-            return SimpleNamespace(
-                copy_done=None,
-                auxiliary_host_output=None,
-                routed_experts_output=None,
-                indexer_topk_output=None,
+            return GenerationBatchResult(
                 logits_output=SimpleNamespace(hidden_states=hidden_states),
-                next_token_ids=None,
-                can_run_cuda_graph=False,
-                num_correct_drafts=0,
-                num_block_accept_tokens=0,
-                num_cap_tokens=0,
                 speculative_num_draft_tokens=4,
             )
 

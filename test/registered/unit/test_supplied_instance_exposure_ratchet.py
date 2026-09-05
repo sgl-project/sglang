@@ -134,73 +134,12 @@ _ENV_MATRIX = (({}, {"SGLANG_IS_IN_CI": "true"}),)
 # are step-12 exposure like any other pair.
 _PASSED = frozenset({"model_path", "device", "random_seed"})
 
-_EXPOSED = {
-    ("dllm/config.py", "max_running_requests"),
-    ("dllm/config.py", "model_path"),
-    ("multimodal/processors/base_processor.py", "image_processor_backend"),
-    ("speculative/spec_registry.py", "disable_overlap_schedule"),
-    ("disaggregation/encoder/server.py", "model_loader_extra_config"),
-    ("layers/moe/utils.py", "deepep_mode"),
-    ("layers/moe/utils.py", "disable_shared_experts_fusion"),
-    ("layers/moe/utils.py", "moe_a2a_backend"),
-    ("layers/moe/utils.py", "moe_runner_backend"),
-    ("layers/moe/utils.py", "quantization"),
-    ("layers/moe/utils.py", "speculative_moe_runner_backend"),
-    ("configs/embedding_model_spec.py", "chunked_prefill_size"),
-    ("configs/embedding_model_spec.py", "cuda_graph_config"),
-    ("configs/embedding_model_spec.py", "disable_radix_cache"),
-    ("configs/embedding_model_spec.py", "is_embedding"),
-    ("configs/embedding_model_spec.py", "prefill_only_disable_kv_cache"),
-    ("configs/model_config.py", "_speculative_draft_quantization_explicitly_set"),
-    ("configs/model_config.py", "disable_hybrid_swa_memory"),
-    ("configs/model_config.py", "dtype"),
-    ("configs/model_config.py", "enable_multi_layer_eagle"),
-    ("configs/model_config.py", "is_embedding"),
-    ("configs/model_config.py", "model_path"),
-    ("configs/model_config.py", "quantization"),
-    ("configs/model_config.py", "speculative_algorithm"),
-    ("configs/model_config.py", "speculative_draft_model_quantization"),
-    ("entrypoints/engine.py", "enable_symm_mem"),
-    ("entrypoints/engine.py", "reasoning_parser"),
-    ("entrypoints/engine.py", "tool_call_parser"),
-    ("eplb/eplb_manager.py", "ep_dispatch_algorithm"),
-    ("eplb/eplb_manager.py", "expert_distribution_recorder_buffer_size"),
-    ("layers/cp/base.py", "attn_cp_size"),
-    ("layers/cp/base.py", "cp_strategy"),
-    ("layers/cp/base.py", "enable_prefill_cp"),
-    ("layers/cp/bcg.py", "cp_strategy"),
-    ("layers/cp/bcg.py", "enable_prefill_cp"),
-    ("layers/flashinfer_comm_fusion.py", "flashinfer_allreduce_fusion_backend"),
-    ("lora/lora_manager.py", "enable_lora_overlap_loading"),
-    ("lora/marlin_lora_temp/policy.py", "lora_paths"),
-    ("model_loader/expert_pack_runtime.py", "model_path"),
-    ("model_loader/expert_pack_runtime.py", "tokenizer_path"),
-    ("parser/template_detection.py", "model_path"),
-    ("speculative/adaptive_spec_params.py", "speculative_algorithm"),
-    ("speculative/adaptive_spec_params.py", "speculative_eagle_topk"),
-    ("speculative/draft_worker_common.py", "speculative_draft_attention_backend"),
-    ("speculative/spec_info.py", "enable_multi_layer_eagle"),
-    ("utils/common.py", "speculative_num_draft_tokens"),
-    ("utils/common.py", "speculative_num_steps"),
-    ("utils/hf_transformers/processor.py", "image_processor_backend"),
-    # The daemon command and constructor snapshot the resolved startup layout
-    # before the daemon's loading lifecycle can apply any runtime overrides.
-    ("weight_cache/daemon.py", "attn_cp_size"),
-    ("weight_cache/daemon.py", "deepep_mode"),
-    ("weight_cache/daemon.py", "dp_size"),
-    ("weight_cache/daemon.py", "dtype"),
-    ("weight_cache/daemon.py", "enable_dp_attention"),
-    ("weight_cache/daemon.py", "enable_dp_lm_head"),
-    ("weight_cache/daemon.py", "ep_size"),
-    ("weight_cache/daemon.py", "load_format"),
-    ("weight_cache/daemon.py", "model_loader_extra_config"),
-    ("weight_cache/daemon.py", "model_path"),
-    ("weight_cache/daemon.py", "moe_a2a_backend"),
-    ("weight_cache/daemon.py", "moe_dense_tp_size"),
-    ("weight_cache/daemon.py", "moe_dp_size"),
-    ("weight_cache/daemon.py", "pp_size"),
-    ("weight_cache/daemon.py", "quantization"),
-}
+# Empty. A pair belongs here when a reader has no bag to read -- it runs before
+# its process publishes -- and cannot use `resolving_view` either. The launcher's
+# pre-publish reads (`_set_envs_and_config`, the auto-parser gate) and the
+# late-resolution detection it calls all read the declarations now, so nothing
+# qualifies. A new entry needs that kind of reason next to it.
+_EXPOSED: frozenset = frozenset()
 
 # Pairs whose resolution write only happens on a CUDA host (capability or
 # `is_cuda()` gated): asserted on the CUDA registration, invisible to the CPU
@@ -213,28 +152,7 @@ _EXPOSED_CUDA_ONLY: frozenset = frozenset()
 # Axis two: (file, field) pairs where a supplied-instance read names a field that
 # some code overrides post-publish. Each needs an ordering judgment, not a blanket
 # conversion; the list exists so a new one is a decision made when it is written.
-_OVERRIDDEN_AND_READ = {
-    ("dllm/config.py", "model_path"),
-    ("entrypoints/engine.py", "reasoning_parser"),
-    ("entrypoints/engine.py", "tool_call_parser"),
-    ("model_loader/expert_pack_runtime.py", "model_path"),
-    ("weight_cache/daemon.py", "dp_size"),
-    ("weight_cache/daemon.py", "dtype"),
-    ("weight_cache/daemon.py", "ep_size"),
-    ("weight_cache/daemon.py", "load_format"),
-    ("weight_cache/daemon.py", "model_path"),
-    ("configs/model_config.py", "dtype"),
-    ("configs/model_config.py", "model_path"),
-    ("mem_cache/pool_host/common.py", "hicache_storage_backend"),
-    ("mem_cache/pool_host/common.py", "hicache_storage_backend_extra_config"),
-    ("mem_cache/unified_radix_cache.py", "hicache_storage_backend"),
-    ("mem_cache/unified_radix_cache.py", "hicache_storage_backend_extra_config"),
-    ("mem_cache/unified_radix_cache.py", "hicache_storage_prefetch_policy"),
-    ("mem_cache/unified_radix_cache.py", "hicache_write_policy"),
-    ("parser/template_detection.py", "model_path"),
-    ("utils/common.py", "speculative_num_draft_tokens"),
-    ("utils/common.py", "speculative_num_steps"),
-}
+_OVERRIDDEN_AND_READ: frozenset = frozenset()
 
 
 def _expanded_override_keys(rel, tree, call, kw) -> set:
@@ -288,17 +206,17 @@ def _expanded_override_keys(rel, tree, call, kw) -> set:
         return values
 
     def dict_keys(node) -> set:
-        assert isinstance(
-            node, ast.Dict
-        ), f"non-literal dict in override expansion at {rel}:{call.lineno}"
+        assert isinstance(node, ast.Dict), (
+            f"non-literal dict in override expansion at {rel}:{call.lineno}"
+        )
         keys = set()
         for key in node.keys:
             if isinstance(key, ast.Constant):
                 keys.add(key.value)
                 continue
-            assert isinstance(
-                key, ast.Name
-            ), f"non-literal dict key in override expansion at {rel}:{call.lineno}"
+            assert isinstance(key, ast.Name), (
+                f"non-literal dict key in override expansion at {rel}:{call.lineno}"
+            )
             bound = loop_variable_values(key.id)
             assert bound, (
                 f"dict key {key.id!r} at {rel}:{call.lineno} is not bound by a "
@@ -321,9 +239,9 @@ def _expanded_override_keys(rel, tree, call, kw) -> set:
                     f"unresolvable override expansion at {rel}:{call.lineno}"
                 )
         return keys
-    assert isinstance(
-        kw.value, ast.Name
-    ), f"unresolvable override expansion at {rel}:{call.lineno}"
+    assert isinstance(kw.value, ast.Name), (
+        f"unresolvable override expansion at {rel}:{call.lineno}"
+    )
     name = kw.value.id
     enclosing = None
     for fn in ast.walk(tree):
@@ -335,9 +253,9 @@ def _expanded_override_keys(rel, tree, call, kw) -> set:
             ):
                 if enclosing is None or fn.lineno > enclosing.lineno:
                     enclosing = fn
-    assert (
-        enclosing is not None
-    ), f"override expansion outside any function at {rel}:{call.lineno}"
+    assert enclosing is not None, (
+        f"override expansion outside any function at {rel}:{call.lineno}"
+    )
     keys = set()
     found = False
     for node in ast.walk(enclosing):
@@ -565,8 +483,8 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                 tgts = [node.target]
             elif (
                 isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "_declare"
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "declare_resolution"
             ):
                 targets |= {
                     kw.arg
@@ -593,12 +511,28 @@ class TestSuppliedInstanceExposure(CustomTestCase):
             "prefill_attention_backend",
             "speculative_draft_attention_backend",
         }
-        deprecated = next(
-            node
-            for node in ast.walk(sa_class)
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "_handle_deprecated_args"
-        )
+
+        # The handler lives in `arg_groups/serving_hook.py`, reached either as a
+        # record method or as a bare-name call, so look the loop up by both.
+        def _deprecated_alias_handler():
+            for node in ast.walk(sa_class):
+                if (
+                    isinstance(node, ast.FunctionDef)
+                    and node.name == "_handle_deprecated_args"
+                    and any(isinstance(n, ast.For) for n in ast.walk(node))
+                ):
+                    return node
+            for path in sorted((_PACKAGE_ROOT / "arg_groups").glob("*.py")):
+                tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+                for node in tree.body:
+                    if (
+                        isinstance(node, ast.FunctionDef)
+                        and node.name == "handle_deprecated_args"
+                    ):
+                        return node
+            raise AssertionError("the deprecated-alias handler was not found")
+
+        deprecated = _deprecated_alias_handler()
         found_tuples = [
             {elt.value for elt in node.iter.elts if isinstance(elt, ast.Constant)}
             for node in ast.walk(deprecated)
@@ -617,9 +551,9 @@ class TestSuppliedInstanceExposure(CustomTestCase):
 
         ``MODEL_OVERRIDES`` maps arch -> {field: value}, and the
         ``@register_model_override``(-``_predicate``) providers return (or
-        build by subscript) {field: value} dicts; ``materialize_declarations``
-        applies them all via setattr, so no assignment scan sees these writes
-        and a llama-only matrix never triggers them. Keys must be
+        build by subscript) {field: value} dicts, which go straight into the
+        declaration stash, so no assignment scan sees these writes and a
+        llama-only matrix never triggers them. Keys must be
         string literals; anything else fails loudly.
         """
         tree = ast.parse(
@@ -688,7 +622,7 @@ class TestSuppliedInstanceExposure(CustomTestCase):
         for path in sorted(root.rglob("*.py")):
             rel = path.relative_to(root).as_posix()
             source = path.read_text(encoding="utf-8-sig")
-            if "_late_resolution" not in source:
+            if "declare_late_resolution" not in source:
                 continue
             try:
                 tree = ast.parse(source)

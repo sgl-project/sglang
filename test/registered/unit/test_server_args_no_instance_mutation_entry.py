@@ -6,9 +6,9 @@ resolution the fields are the record the config bags were projected from, so a
 write desyncs every namespace reader, and a copy invites publishing stale
 variants. Both are gone: post-publish changes go to the bags
 (``get_context().override``), a value one runner or worker owns travels as a
-constructor argument, and late launcher-stage resolution writes in place
-through ``arg_groups.overrides.declare_late_resolution``, which refuses the
-published instance.
+constructor argument, and late launcher-stage resolution declares through
+``arg_groups.overrides.declare_late_resolution``, which writes no field and
+refuses the published instance.
 
 The textual half of this guard matters because the resolution pipeline's own file
 is exempt from the mutation ratchet: a ``self.override(...)`` there — exactly
@@ -98,7 +98,10 @@ class TestNoServerArgsMutationEntry(CustomTestCase):
         )
 
     def test_late_resolution_refuses_the_published_config(self):
-        from sglang.srt.arg_groups.overrides import declare_late_resolution
+        from sglang.srt.arg_groups.overrides import (
+            declare_late_resolution,
+            resolution_result,
+        )
         from sglang.srt.runtime_context import get_context
 
         override = get_context().override_server_args(tp_size=2)
@@ -107,7 +110,9 @@ class TestNoServerArgsMutationEntry(CustomTestCase):
 
         with self.assertRaises(ValueError):
             declare_late_resolution(published, "test", tp_size=4)
-        self.assertEqual(published.tp_size, 2)
+        # The refusal left the resolution alone: the hook's declaration stands,
+        # and the record still carries the operator's input.
+        self.assertEqual(resolution_result(published, "tp_size"), 2)
 
 
 if __name__ == "__main__":

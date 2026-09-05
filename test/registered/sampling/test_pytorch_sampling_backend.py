@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -24,11 +24,15 @@ class TestPyTorchSamplingBackend(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = ["--sampling-backend", "pytorch", "--disable-radix-cache"]
+        if is_hip():
+            other_args.extend(["--max-running-requests", "64"])
+
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--sampling-backend", "pytorch", "--disable-radix-cache"],
+            other_args=other_args,
         )
 
     @classmethod

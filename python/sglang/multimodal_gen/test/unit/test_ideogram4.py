@@ -186,6 +186,7 @@ def _fake_server_args(cfg=None):
         disable_autocast=False,
         enable_cfg_parallel=False,
         attention_backend_config=None,
+        component_precisions={},
         kv_gather_degree=1,
         sp_split_auto=False,
     )

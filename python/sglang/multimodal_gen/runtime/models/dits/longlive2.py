@@ -128,9 +128,10 @@ class LongLive2CausalWanTransformerBlock(CausalWanTransformerBlock):
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
             hidden_states, attn_output, gate_msa, null_shift, null_scale
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         attn_output = self._cross_attn_with_cache(
             norm_hidden_states,
@@ -140,9 +141,10 @@ class LongLive2CausalWanTransformerBlock(CausalWanTransformerBlock):
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         ff_output = self.ffn(norm_hidden_states)
         hidden_states = self.mlp_residual(ff_output, c_gate_msa, hidden_states)

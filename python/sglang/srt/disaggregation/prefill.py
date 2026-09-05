@@ -43,6 +43,8 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    build_kv_layer_ids,
+    build_staging_slot_metadata,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
@@ -68,14 +70,20 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
+from sglang.srt.observability.scheduler_stage_metrics import (
+    SCHEDULER_STAGE_GET_NEXT_BATCH,
+    SCHEDULER_STAGE_PROCESS_QUEUE,
+    SchedulerStageMetricsRecorder,
+    scheduler_stage_method,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
     get_schedule,
 )
 from sglang.srt.utils import is_npu
-from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -97,6 +105,16 @@ def should_force_retry(req: Req) -> bool:
 
     digest = hashlib.sha256(str(req.rid).encode()).digest()
     return int.from_bytes(digest[:8], "big") < retry_prob * 2**64
+
+
+def _transfer_start_layer(*, pool, hf_text_config) -> int:
+    # Hybrid pools count all layers in start_layer, but peer KV lists contain only
+    # full-attention layers, so translate to a full-attention-relative offset.
+    if not isinstance(pool, HybridLinearKVPool):
+        return pool.start_layer
+    return sum(
+        1 for lid in hf_text_config.full_attention_layer_ids if lid < pool.start_layer
+    )
 
 
 def maybe_release_metadata_buffer(
@@ -134,6 +152,7 @@ class PrefillBootstrapQueue:
         gloo_group: ProcessGroup,
         max_total_num_tokens: int,
         scheduler: Scheduler,
+        scheduler_stage_metrics: SchedulerStageMetricsRecorder,
         pp_rank: int,
         pp_size: int,
         transfer_backend: TransferBackend,
@@ -152,6 +171,7 @@ class PrefillBootstrapQueue:
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
         self.scheduler = scheduler
+        self.scheduler_stage_metrics = scheduler_stage_metrics
         self.max_total_num_tokens = (
             self.scheduler.tp_worker.model_runner.effective_max_total_num_tokens
         )
@@ -212,7 +232,10 @@ class PrefillBootstrapQueue:
                 self.token_to_kv_pool.start_layer,
             )
             if layer_shard_enabled
-            else self.token_to_kv_pool.start_layer
+            else _transfer_start_layer(
+                pool=self.token_to_kv_pool,
+                hf_text_config=self.scheduler.model_config.hf_text_config,
+            )
         )
         kv_args.mla_compression_ratios = None
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
@@ -224,24 +247,27 @@ class PrefillBootstrapQueue:
             else getattr(self.token_to_kv_pool, "end_layer", None)
         )
 
-        if self.draft_token_to_kv_pool is not None and transfer_draft_cache:
+        draft_kv_pool = self.draft_token_to_kv_pool if transfer_draft_cache else None
+        num_draft_entries = 0
+        if draft_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
+                draft_kv_pool.get_contiguous_buf_infos()
             )
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
+            num_draft_entries = len(draft_kv_data_ptrs)
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        kv_args.kv_layer_ids = (
-            self.token_to_kv_pool.get_kv_layer_ids()
-            if self.draft_token_to_kv_pool is None
-            and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
-            else []
+        kv_args.kv_layer_ids = build_kv_layer_ids(
+            token_to_kv_pool=self.token_to_kv_pool,
+            draft_token_to_kv_pool=draft_kv_pool,
+            num_draft_entries=num_draft_entries,
+            num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
         )
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
@@ -288,11 +314,19 @@ class PrefillBootstrapQueue:
             kv_pool = self.token_to_kv_pool
             if hasattr(kv_pool, "full_kv_pool"):
                 kv_pool = kv_pool.full_kv_pool
-            if hasattr(kv_pool, "k_buffer") and hasattr(kv_pool, "v_buffer"):
+            staging_slots = build_staging_slot_metadata(
+                kv_layer_ids=kv_args.kv_layer_ids,
+                num_draft_entries=num_draft_entries,
+                kv_pool=kv_pool,
+                draft_kv_pool=draft_kv_pool,
+            )
+            if staging_slots is not None:
+                k_buffers, v_buffers, slot_layer_ids = staging_slots
                 kv_manager.set_kv_buffer_tensors(
-                    kv_pool.k_buffer,
-                    kv_pool.v_buffer,
+                    k_buffers,
+                    v_buffers,
                     kv_pool.page_size,
+                    slot_layer_ids=slot_layer_ids,
                 )
         return kv_manager
 
@@ -380,6 +414,7 @@ class PrefillBootstrapQueue:
         """
         req.sampling_params.max_new_tokens = 1
 
+    @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def pop_bootstrapped(
         self,
         return_failed_reqs: bool = False,
@@ -497,6 +532,7 @@ class SchedulerDisaggregationPrefillMixin:
             if room is not None and room in kv_mgr.transfer_infos:
                 prefetch(room)
 
+    @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def resolve_waiting_queue_bootstrap(self: Scheduler) -> None:
         """Resolve bootstrap status for waiting prefill requests before admission.
 
@@ -538,7 +574,7 @@ class SchedulerDisaggregationPrefillMixin:
             for req in self.waiting_queue
         )
 
-    @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
+    @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
         running_batch: ScheduleBatch,
@@ -572,6 +608,7 @@ class SchedulerDisaggregationPrefillMixin:
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                self._record_scheduler_state_for_paused_engine()
                 continue
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
@@ -611,6 +648,7 @@ class SchedulerDisaggregationPrefillMixin:
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                self._record_scheduler_state_for_paused_engine()
                 continue
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
@@ -693,6 +731,16 @@ class SchedulerDisaggregationPrefillMixin:
         logprob_pt = 0
         assert batch.spec_info is result.next_draft_input
         draft_input = result.next_draft_input
+        draft_hidden_states_cpu = None
+        draft_dsa_topk_indices_cpu = None
+        if self.spec_algorithm.is_eagle() and draft_input is not None:
+            draft_hidden_states_cpu = draft_input.hidden_states.to(
+                "cpu", non_blocking=False
+            )
+            if batch.spec_info.dsa_topk_indices is not None:
+                draft_dsa_topk_indices_cpu = batch.spec_info.dsa_topk_indices.to(
+                    "cpu", non_blocking=False
+                )
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         next_token_ids = result.next_token_ids.tolist()
         self.batch_result_processor.move_logprobs_to_cpu(
@@ -727,12 +775,11 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]
                     req.output_topk_index = draft_input.topk_index[i]
-                    req.hidden_states_tensor = (
-                        draft_input.hidden_states[i].cpu().clone()
-                    )
-                    dsa_topk_indices = batch.spec_info.dsa_topk_indices
-                    if dsa_topk_indices is not None:
-                        req.output_dsa_topk_indices = dsa_topk_indices[i].cpu().clone()
+                    req.hidden_states_tensor = draft_hidden_states_cpu[i].clone()
+                    if draft_dsa_topk_indices_cpu is not None:
+                        req.output_dsa_topk_indices = draft_dsa_topk_indices_cpu[
+                            i
+                        ].clone()
                     else:
                         req.output_dsa_topk_indices = None
                 else:
@@ -816,9 +863,9 @@ class SchedulerDisaggregationPrefillMixin:
                 # In non-overlap-mode, KV is sent in process_prefill_chunk
                 # Only send when req's sender is initialized
                 if self.enable_overlap and not req.pending_bootstrap:
-                    assert (
-                        req.metadata_buffer_index >= 0
-                    ), f"Req {req.rid} does not have metadata buffer allocated"
+                    assert req.metadata_buffer_index >= 0, (
+                        f"Req {req.rid} does not have metadata buffer allocated"
+                    )
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
@@ -837,6 +884,7 @@ class SchedulerDisaggregationPrefillMixin:
             dp_cooperation_info=batch.dp_cooperation_info,
         )
 
+    @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None
     ) -> List[Req]:
@@ -1000,11 +1048,7 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        if (
-            req.req_pool_idx is not None
-            or req.kv is not None
-            or req.mamba_pool_idx is not None
-        ):
+        if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache)
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
@@ -1183,7 +1227,7 @@ class SchedulerDisaggregationPrefillMixin:
                 return [
                     self.req_to_token_pool.translate_mamba_indices(
                         self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                            req.req_pool_idx
+                            req.kv.req_pool_idx
                         ]
                     )
                     .cpu()
@@ -1195,7 +1239,7 @@ class SchedulerDisaggregationPrefillMixin:
                 window_start = max(req.disagg_decode_prefix_len, seq_len - window_size)
                 window_start = (window_start // page_size) * page_size
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, window_start:seq_len
+                    req.kv.req_pool_idx, window_start:seq_len
                 ]
                 window_kv_indices_swa = (
                     self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
@@ -1206,7 +1250,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             def _full_kv_pages_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, :seq_len
+                    req.kv.req_pool_idx, :seq_len
                 ]
                 return kv_to_page_indices(kv_indices_full, page_size)
 
@@ -1219,7 +1263,7 @@ class SchedulerDisaggregationPrefillMixin:
                 window_size = _pool.unified_swa_window
                 window_start = max(0, seq_len - window_size)
                 positions = np.arange(window_start, seq_len, dtype=np.int64)
-                state_slot = int(req.req_pool_idx)
+                state_slot = int(req.kv.req_pool_idx)
                 ring_rows = state_slot * ring_stride + (positions % ring_stride)
                 return ring_rows.astype(np.int32)
 
@@ -1233,7 +1277,7 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                 )
                 return get_dsv4_c128_state_indices(
-                    int(req.req_pool_idx),
+                    int(req.kv.req_pool_idx),
                     c128_seq_len,
                     online=online,
                     ring_size=ring_size,
@@ -1263,7 +1307,7 @@ class SchedulerDisaggregationPrefillMixin:
                 payloads.update(
                     dsv4_state_payloads(
                         self.req_to_token_pool,
-                        req.req_pool_idx,
+                        req.kv.req_pool_idx,
                         seq_len,
                         page_size,
                         prefix_len=req.disagg_decode_prefix_len,
@@ -1289,7 +1333,7 @@ class SchedulerDisaggregationPrefillMixin:
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, seg_start:seg_end
+                req.kv.req_pool_idx, seg_start:seg_end
             ]
             # Unified memory: req_to_token holds VIRTUAL ids; the transfer needs
             # physical ones. Per segment, since each is its own gather.

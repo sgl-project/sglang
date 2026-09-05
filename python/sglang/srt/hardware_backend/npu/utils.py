@@ -6,8 +6,13 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 
-from sglang.srt.arg_groups.overrides import declare_resolution
+from sglang.srt.arg_groups.overrides import (
+    declare_resolution,
+    resolving_view,
+    use_mla_backend,
+)
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
 from sglang.srt.utils import get_npu_memory_capacity, is_npu
 
 if TYPE_CHECKING:
@@ -44,6 +49,8 @@ def set_default_server_args(args: "ServerArgs"):
     Set default server arguments for NPU backend.
     """
 
+    cfg = resolving_view(args)
+
     # NPU only works with "ascend" attention backend for now
     declare_resolution(
         args,
@@ -60,7 +67,7 @@ def set_default_server_args(args: "ServerArgs"):
         "set_default_server_args",
         decode_attention_backend="ascend",
     )
-    if args.page_size is None:
+    if cfg.page_size is None:
         declare_resolution(
             args,
             "set_default_server_args",
@@ -68,36 +75,67 @@ def set_default_server_args(args: "ServerArgs"):
         )
 
     # NPU memory settings
-    decode = args.cuda_graph_config.decode
     npu_mem = get_npu_memory_capacity()
     if npu_mem <= 32 * 1024:
         # Ascend 910B4,910B4_1
         # (chunked_prefill_size 4k, max_bs 16 if tp < 4 else 64)
-        if args.chunked_prefill_size is None:
+        if cfg.chunked_prefill_size is None:
             declare_resolution(
                 args,
                 "set_default_server_args",
                 chunked_prefill_size=4 * 1024,
             )
-        if decode.max_bs is None:
-            if args.tp_size < 4:
-                decode.max_bs = 16
+        if cfg.cuda_graph_config.decode.max_bs is None:
+            if cfg.tp_size < 4:
+                declare_resolution(
+                    args,
+                    "set_default_server_args",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config,
+                        Phase.DECODE,
+                        max_bs=16,
+                    ),
+                )
             else:
-                decode.max_bs = 64
+                declare_resolution(
+                    args,
+                    "set_default_server_args",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config,
+                        Phase.DECODE,
+                        max_bs=64,
+                    ),
+                )
     elif npu_mem <= 64 * 1024:
         # Ascend 910B1,910B2,910B2C,910B3,910_9391,910_9392,910_9381,910_9382,910_9372,910_9362
         # (chunked_prefill_size 8k, max_bs 64 if tp < 4 else 256)
-        if args.chunked_prefill_size is None:
+        if cfg.chunked_prefill_size is None:
             declare_resolution(
                 args,
                 "set_default_server_args",
                 chunked_prefill_size=8 * 1024,
             )
-        if decode.max_bs is None:
-            if args.tp_size < 4:
-                decode.max_bs = 64
+        if cfg.cuda_graph_config.decode.max_bs is None:
+            if cfg.tp_size < 4:
+                declare_resolution(
+                    args,
+                    "set_default_server_args",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config,
+                        Phase.DECODE,
+                        max_bs=64,
+                    ),
+                )
             else:
-                decode.max_bs = 256
+                declare_resolution(
+                    args,
+                    "set_default_server_args",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config,
+                        Phase.DECODE,
+                        max_bs=256,
+                    ),
+                )
 
     # NPU does not support CustomAllReduce
     declare_resolution(
@@ -107,13 +145,13 @@ def set_default_server_args(args: "ServerArgs"):
     )
 
     # handles hierarchical cache configs
-    if args.enable_hierarchical_cache:
+    if cfg.enable_hierarchical_cache:
         declare_resolution(
             args,
             "set_default_server_args",
             hicache_io_backend="kernel_ascend",
         )
-        if args.use_mla_backend():
+        if use_mla_backend(args):
             declare_resolution(
                 args,
                 "set_default_server_args",

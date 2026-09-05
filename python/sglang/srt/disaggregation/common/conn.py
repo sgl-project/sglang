@@ -37,7 +37,6 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
 )
 from sglang.srt.runtime_context import (
-    configured_pp_size,
     get_disagg,
     get_parallel,
     get_serving,
@@ -168,6 +167,7 @@ class CommonKVManager(BaseKVManager):
         self.enable_deferred_decode_kv_release = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
         )
+        self._dcp_pack_buffers = None
         # for p/d multi node infer
         self.bootstrap_host = get_serving().host
         self.bootstrap_port = get_disagg().disaggregation_bootstrap_port
@@ -187,7 +187,7 @@ class CommonKVManager(BaseKVManager):
         self.system_dp_rank = (
             self.kv_args.system_dp_rank if self.kv_args.system_dp_rank else 0
         )
-        self.pp_size = configured_pp_size()
+        self.pp_size = get_parallel().pp_size
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
         cp_sharded_prefill = self.attn_cp_size > 1 and (
@@ -339,6 +339,25 @@ class CommonKVManager(BaseKVManager):
                 f"src={src_token_lens}, dst={dst_token_lens}"
             )
         return src_token_lens
+
+    def _register_staging_memory(self, ptr: int, size: int) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support staging memory registration"
+        )
+
+    def _init_dcp_pack_buffers_once(self, dcp_size: int) -> None:
+        if self._dcp_pack_buffers is not None:
+            return
+        if not self.kv_args.kv_item_lens:
+            return
+        from sglang.srt.disaggregation.common.dcp_pack import init_dcp_pack_buffers
+
+        self._dcp_pack_buffers = init_dcp_pack_buffers(
+            self._register_staging_memory,
+            self.kv_args,
+            len(self.transfer_queues),
+            dcp_size,
+        )
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
@@ -991,9 +1010,9 @@ class CommonKVManager(BaseKVManager):
         """
         start_layer = self.kv_args.prefill_start_layer
         end_layer = getattr(self.kv_args, "prefill_end_layer", None)
-        assert (
-            end_layer is not None
-        ), "KVArgs.prefill_end_layer must be set when using compressed-MLA PD with PP"
+        assert end_layer is not None, (
+            "KVArgs.prefill_end_layer must be set when using compressed-MLA PD with PP"
+        )
 
         c4_full = sum(1 for r in mla_ratios if r == 4)
         c128_full = sum(1 for r in mla_ratios if r == 128)
@@ -1047,8 +1066,7 @@ class CommonKVManager(BaseKVManager):
             list(dst_kv_ptrs[swa_s:swa_e])
             + list(
                 dst_kv_ptrs[
-                    compress_section_start
-                    + c4_off_s : compress_section_start
+                    compress_section_start + c4_off_s : compress_section_start
                     + c4_off_e
                 ]
             )
@@ -1650,6 +1668,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.app = web.Application()
         self.store = dict()
         self.lock = asyncio.Lock()
+        # The event loop only keeps weak references to tasks, so a long-lived
+        # task needs a strong reference to survive garbage collection.
+        self._background_tasks: Set[asyncio.Task] = set()
         self._setup_routes()
         self.pp_size = None
         self.attn_tp_size = None
@@ -1897,7 +1918,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
 
-            self._loop.create_task(self._cleanup_expired_entries())
+            cleanup_task = self._loop.create_task(self._cleanup_expired_entries())
+            self._background_tasks.add(cleanup_task)
+            cleanup_task.add_done_callback(self._background_tasks.discard)
 
             access_log = None
             if logging.getLogger(__name__).getEffectiveLevel() <= logging.DEBUG:

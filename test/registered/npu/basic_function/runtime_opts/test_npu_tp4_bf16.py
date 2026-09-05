@@ -25,7 +25,6 @@ TEST_MODEL_MATRIX = {
 
 
 class TestAscendTp4Bf16(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.models = TEST_MODEL_MATRIX.keys()

@@ -12,7 +12,6 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import ForwardMode
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_schedule
-from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -33,7 +32,6 @@ class NgramEmbeddingManager:
         model: torch.nn.Module,
         model_config: ModelConfig,
         req_to_token_pool: ReqToTokenPool,
-        server_args: ServerArgs,
         max_running_requests: int,
         device: str,
     ):
@@ -52,9 +50,9 @@ class NgramEmbeddingManager:
                 device=device,
             )
             chunked_prefill_size = get_schedule().chunked_prefill_size
-            assert (
-                chunked_prefill_size is not None and chunked_prefill_size > 0
-            ), "Ngram embedding requires chunked prefill to be enabled (chunked_prefill_size > 0)"
+            assert chunked_prefill_size is not None and chunked_prefill_size > 0, (
+                "Ngram embedding requires chunked prefill to be enabled (chunked_prefill_size > 0)"
+            )
             for module in model.modules():
                 if isinstance(module, NgramEmbedding):
                     module.init_buffers(

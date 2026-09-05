@@ -84,7 +84,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
                 server_args=server_args,
                 gpu_id=gpu_id,
                 # spec workers don't support pipeline parallelism
-                ps=replace(ps, pp_rank=0),
+                ps=replace(ps, pp_rank=0, pp_size=1),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 # The draft runs at absolute target positions.
@@ -150,7 +150,6 @@ class StandaloneDraftWorker(EagleDraftWorker):
 
 
 class StandaloneWorkerV2(EAGLEWorkerV2):
-
     def __init__(
         self,
         server_args: ServerArgs,

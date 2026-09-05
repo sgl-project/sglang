@@ -12,6 +12,10 @@ import math
 from functools import cached_property
 from typing import TYPE_CHECKING
 
+from sglang.srt.arg_groups.overrides import (
+    resolved_view,
+    resolving_view,
+)
 from sglang.srt.utils import log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -49,19 +53,17 @@ DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
 
 def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     """Return why adaptive spec cannot run under the given server args, or None if supported."""
-    from sglang.srt.arg_groups.overrides import resolved_view
 
-    if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+    cfg = resolving_view(server_args)
+
+    if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3"):
         return (
-            f"speculative_algorithm={server_args.speculative_algorithm} "
+            f"speculative_algorithm={cfg.speculative_algorithm} "
             "(only EAGLE/EAGLE3 are supported)"
         )
-    if (
-        server_args.speculative_eagle_topk is not None
-        and server_args.speculative_eagle_topk != 1
-    ):
+    if cfg.speculative_eagle_topk is not None and cfg.speculative_eagle_topk != 1:
         return (
-            f"speculative_eagle_topk={server_args.speculative_eagle_topk} "
+            f"speculative_eagle_topk={cfg.speculative_eagle_topk} "
             "(only topk=1 is supported)"
         )
     if resolved_view(server_args).enable_dp_attention:
@@ -74,12 +76,12 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
             "enable_multi_layer_eagle=True is not supported "
             "(MultiLayerEagleWorkerV2 does not implement adaptive)"
         )
-    if server_args.enable_two_batch_overlap:
+    if cfg.enable_two_batch_overlap:
         return (
             "enable_two_batch_overlap=True is not supported "
             "(adaptive state swap would discard the TboAttnBackend wrapper)"
         )
-    if server_args.enable_pdmux:
+    if cfg.enable_pdmux:
         return (
             "enable_pdmux=True is not supported "
             "(adaptive state swap does not update decode_attn_backend_group)"

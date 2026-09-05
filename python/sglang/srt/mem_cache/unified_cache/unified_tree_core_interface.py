@@ -35,17 +35,27 @@ class BaseEvictionResult(msgspec.Struct):
 
     def __del__(self) -> None:
         # Drop tripwire: every returned value must be drained before disposal.
-        assert (
-            not self.device_frees and not self.host_frees
-        ), "BaseEvictionResult dropped with undrained values"
+        assert not self.device_frees and not self.host_frees, (
+            "BaseEvictionResult dropped with undrained values"
+        )
 
 
 class EvictDeviceNextNodeResult(BaseEvictionResult):
+    """One device-walk step.
+
+    ``node_id`` selects a leaf for the Controller to evict. ``made_progress``
+    also covers an internal tombstone that returned no leaf, distinguishing it
+    from true walk exhaustion.
+    """
+
     node_id: Optional[NodeId] = None
+    made_progress: bool = False
+    unbacked_tokens: int = 0
 
 
 class EvictDeviceLeafResult(BaseEvictionResult):
     backup_kv: Optional[BackupKV] = None
+    unbacked_tokens: int = 0
 
 
 class DemoteResult(BaseEvictionResult):
@@ -70,6 +80,22 @@ class RadixCacheWalkResult(msgspec.Struct, frozen=True, kw_only=True):
     slot_indices: torch.Tensor
     positions: torch.Tensor
     prev_slot_indices: torch.Tensor
+
+
+class BufferBackupSnapshot(msgspec.Struct, frozen=True):
+    node_id: NodeId
+    parent_node_id: NodeId
+    parent_is_root: bool
+    parent_last_hash: Optional[str]
+    hash_values: list[str]
+    key: RadixKey
+    prefix_keys: Optional[list[str]]
+
+
+class BufferBackupState(msgspec.Struct, frozen=True):
+    parent_node_id: NodeId
+    parent_is_root: bool
+    parent_last_hash: Optional[str]
 
 
 class InsertStepResult(msgspec.Struct, frozen=True):
@@ -174,6 +200,20 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def snapshot_buffer_backup(
+        self, node_id: NodeId, pass_prefix_keys: bool
+    ) -> Optional[BufferBackupSnapshot]:
+        """Snapshot an eligible buffer-only backup node."""
+        ...
+
+    @abstractmethod
+    def validate_buffer_backup(
+        self, node_id: NodeId, expected_key_length: int
+    ) -> Optional[BufferBackupState]:
+        """Validate a queued backup and return its current parent state."""
+        ...
+
+    @abstractmethod
     def backfill_missing_hash_values(self) -> int:
         """Hash every node built while storage was disabled; return how many.
 
@@ -186,6 +226,11 @@ class UnifiedTreeCoreInterface(ABC):
     @abstractmethod
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The NodeId anchoring matches for the namespace."""
+        ...
+
+    @abstractmethod
+    def dfs_weight_order(self, node_ids: Sequence[NodeId]) -> list[int]:
+        """Return input indices in depth-first, subtree-weight order."""
         ...
 
     @abstractmethod
@@ -230,8 +275,11 @@ class UnifiedTreeCoreInterface(ABC):
     def evict_device_next_node(
         self, component_type: ComponentType, tracker: dict[ComponentType, int]
     ) -> EvictDeviceNextNodeResult:
-        """The next evictable node (None node_id when the walk is exhausted);
-        tracker is the caller's running totals, read for the doneness check."""
+        """Advance one eviction step.
+
+        A missing ``node_id`` is exhausted only when ``made_progress`` is also
+        false. ``tracker`` is the caller's running totals, read for doneness.
+        """
         ...
 
     @abstractmethod
@@ -322,6 +370,10 @@ class UnifiedTreeCoreInterface(ABC):
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Match a key against the tree; returns device indices + boundary NodeIds."""
         ...
+
+    def supports_fast_match_prefix(self) -> bool:
+        """Whether matching every waiting request is cheap enough for scheduling."""
+        return False
 
     @property
     @abstractmethod
@@ -485,8 +537,11 @@ class UnifiedTreeCoreInterface(ABC):
     write_back_duplicate_reclaim_digest: int = 0
 
     @abstractmethod
-    def mark_write_through_pending(self, node_id: NodeId) -> None:
-        """Mark a node as having an in-flight write-through backup."""
+    def mark_write_through_pending(
+        self, node_ids: list[NodeId], ack_id: NodeId
+    ) -> list[NodeId]:
+        """Mark every node covered by one in-flight write-through backup, and return
+        them ancestors first: publish links each host store event to its parent."""
         ...
 
     @abstractmethod

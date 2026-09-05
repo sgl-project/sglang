@@ -18,8 +18,8 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 def _make_req():
     return types.SimpleNamespace(
         decode_batch_idx=0,
-        kv_committed_len=3,
-        kv_allocated_len=3,
+        kv=types.SimpleNamespace(kv_committed_len=3, kv_allocated_len=3),
+        beam_group=None,
     )
 
 
