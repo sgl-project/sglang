@@ -292,11 +292,7 @@ class SchedulerBatchResultProcessor:
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()
             self.move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
-            if (
-                logits_output is not None
-                and logits_output.sampling_mask_output is not None
-            ):
-                self.materialize_sampling_mask_output(batch.reqs, logits_output)
+            self.materialize_sampling_mask_output(batch.reqs, logits_output)
 
             self._validate_pp_skip_output_comm(batch, result)
 
@@ -943,8 +939,7 @@ class SchedulerBatchResultProcessor:
             result.next_token_ids,
             result.can_run_cuda_graph,
         )
-        if logits_output.sampling_mask_output is not None:
-            self.materialize_sampling_mask_output(batch.reqs, logits_output)
+        self.materialize_sampling_mask_output(batch.reqs, logits_output)
 
         next_token_ids, next_token_logprobs = self._normalize_decode_outputs(
             batch=batch,

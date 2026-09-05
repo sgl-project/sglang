@@ -215,6 +215,37 @@ class TestPrefillSkippedOutput(CustomTestCase):
         )
 
 
+class TestDecodeWithoutLogits(CustomTestCase):
+    def test_pipeline_result_commits_token_without_sampling_metadata(self):
+        processor = _make_processor(self)
+        req = _DecodeReq()
+        req.return_hidden_states = False
+        batch = SimpleNamespace(
+            reqs=[req],
+            return_logprob=False,
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            batch_size=lambda: 1,
+        )
+        result = GenerationBatchResult(
+            logits_output=None,
+            next_token_ids=torch.tensor([8]),
+        )
+
+        with (
+            patch.object(
+                SchedulerBatchResultProcessor, "_maybe_update_reasoning_tokens"
+            ),
+            patch.object(
+                SchedulerBatchResultProcessor, "_handle_finish_state_updated_req"
+            ),
+        ):
+            processor.process_batch_result_decode(batch, result)
+
+        self.assertEqual(req.output_ids, [8])
+        self.assertEqual(processor.metrics_reporter.num_generated_tokens, 1)
+        processor.output_streamer.stream_output.assert_called_once_with([req], False)
+
+
 class TestSamplingMaskStatusErrors(CustomTestCase):
     def test_decode_abort_releases_cache_without_committing_token(self):
         processor = _make_processor(self)

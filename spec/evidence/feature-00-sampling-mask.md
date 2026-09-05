@@ -29,6 +29,31 @@ mixed opt-in rows, overflow and invalid support, synchronized-token logprobs,
 batch filtering/merging, abort cleanup, pipeline payload reconstruction, and
 disaggregation metadata transport.
 
+### Pipeline decode without sampling metadata
+
+The [AMD two-GPU CI job](https://github.com/sgl-project/sglang/actions/runs/33957402761/job/101283699801)
+on `76bac722f43640f004b7d1083e175940891ad227` exposed an absent-logits
+dereference in decode result processing. Pipeline results may omit logits when
+no sampling metadata is requested. Prefill and decode now use the shared
+materialization helper's existing absent-output guard.
+
+The checked-in `TestDecodeWithoutLogits` regression reproduces the same
+`AttributeError` before the fix and verifies that the received token is committed
+and streamed after the fix. Run the regression and neighboring result-processing
+coverage from the repository root:
+
+```bash
+PATH="$PWD/.venv/bin:$PATH" PYTHONPATH="$PWD/python" .venv/bin/python -m pytest -q \
+  test/registered/unit/managers/test_batch_result_processor_hidden_states.py \
+  test/registered/unit/managers/test_batch_result_processor_mamba_boundary.py \
+  test/registered/unit/managers/test_generation_auxiliary_output.py \
+  test/registered/sampling/test_sampling_mask.py::TestSamplingMaskPacking \
+  --disable-warnings --tb=short
+```
+
+Result on 2026-09-05: **40 passed, 6 subtests passed**, 15 warnings, in
+**11.90 seconds**. The isolated checkout excludes the local sampler edit.
+
 ## Server integration matrix
 
 ```bash

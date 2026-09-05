@@ -39,6 +39,8 @@ and stream-lifetime protection. Overlap result processing waits for that copy
 before building Python response data. Pipeline stages relay the tensor result
 even when ordinary logprobs were not requested. Disaggregated prefill validates
 the result before transferring the first token and mask to decode.
+Pipeline results that omit logits and request no sampling metadata still commit
+their output tokens normally.
 
 ## Capacity and failures
 
