@@ -1413,8 +1413,8 @@ hidden crosses the fabric (the gate's `up` runs on the head shard), the frame
 mean is a reshape-sum instead of an atomic index_add, and the transformer
 runs online `mxfp8` by default (e4m3 with one E8M0 scale per 32 elements into
 cuBLASLt's block-scaled GEMM; the activation quant is fused into the adaLN
-modulation and SwiGLU producers, so no standalone quant pass runs; the
-per-tensor fp8 variant measured 0.965 s/NFE). The prompt's text state joins
+modulation and SwiGLU producers, so no standalone quant pass runs). The
+prompt's text state joins
 the frames' Cholesky batch as a virtual frame. OpenVDN's branch-parallel layout was measured slower here (1.39
 s/NFE at 5+3, 1.49 at 6+2): with 11 to 12 heads per softmax rank the window
 attention and its gathers grow faster than the linear ranks shrink; splitting
