@@ -7695,7 +7695,15 @@ class ServerArgs:
         except Exception:
             return False
 
-    LANGUAGE_MODEL_ONLY_ARCHITECTURES = ("MuseGlimmerForConditionalGeneration",)
+    LANGUAGE_MODEL_ONLY_ARCHITECTURES = (
+        "MuseGlimmerForConditionalGeneration",
+        # Qwen4ExpForConditionalGeneration inherits from
+        # Qwen3VLForConditionalGeneration, where language_model_only is already
+        # implemented (qwen3_vl.py:1243/1309/1441). Only the entry here was
+        # missing. For text-only use this saves the vision tower (0.84 GiB of
+        # weights) plus the multimodal reservation inside the KV budget.
+        "Qwen4ExpForConditionalGeneration",
+    )
 
     def _handle_language_model_only(self):
         if not self.language_model_only:
