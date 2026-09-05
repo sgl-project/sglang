@@ -98,7 +98,7 @@ from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.utils import get_device
+from sglang.srt.utils import get_device, is_cuda, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -120,6 +120,12 @@ def _session_radix_cache_test_values() -> tuple[bool, ...]:
     if _selected_tree_core_test_backend() == "rust":
         return (False,)
     return False, True
+
+
+# The pool-host modules import transfer_kv_* (sgl_kernel.kvcacheio) only under
+# `if _is_cuda or _is_hip`, so a real backup / load-back raises NameError
+# elsewhere (e.g. XPU) instead of reporting the feature as absent.
+_HICACHE_KV_TRANSFER_AVAILABLE = is_cuda() or is_hip()
 
 
 @dataclass(frozen=True)
@@ -1034,6 +1040,11 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         return leaf
 
     def _init_hicache(self, cache, *, write_policy: str = "write_through"):
+        if not _HICACHE_KV_TRANSFER_AVAILABLE:
+            self.skipTest(
+                "HiCache device<->host KV-transfer kernels require CUDA or HIP"
+            )
+
         # Production config: kernel IO backend + page_first layout with
         # PINNED host pools (kernel GPU DMA requires them). Pools track their
         # cudaHostRegister'd pointers and unregister on destroy()/GC, so the
@@ -4839,6 +4850,10 @@ class UnifiedRadixCacheSuite:
         cache.sanity_check()
 
     def _skip_unsupported_hicache_test(self):
+        if not _HICACHE_KV_TRANSFER_AVAILABLE:
+            self.skipTest(
+                "HiCache device<->host KV-transfer kernels require CUDA or HIP"
+            )
         if self.cfg.has_swa and self.cfg.has_mamba:
             self.skipTest("HiCache unit fixture does not support SWA + Mamba stacks")
         return False
@@ -4880,6 +4895,11 @@ class UnifiedRadixCacheSuite:
         storage_extra: Optional[dict] = None,
         context_length: Optional[int] = None,
     ):
+        if not _HICACHE_KV_TRANSFER_AVAILABLE:
+            self.skipTest(
+                "HiCache device<->host KV-transfer kernels require CUDA or HIP"
+            )
+
         storage_extra_config = None
         if storage_backend == "file":
             from sglang.srt.runtime_context import get_parallel
