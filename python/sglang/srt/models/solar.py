@@ -434,6 +434,7 @@ class SolarForCausalLM(nn.Module):
                 org_num_embeddings=config.vocab_size,
                 padding_size=DEFAULT_VOCAB_PADDING_SIZE,
                 quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
             )
             if config.tie_word_embeddings and self.pp_group.is_first_rank:
                 self.lm_head.weight = self.model.embed_tokens.weight
