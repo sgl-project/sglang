@@ -1422,7 +1422,10 @@ class OpenAIServingChat(OpenAIServingBase):
             if messages[0]["role"] != "system":
                 # insert an empty system prompt to help render tool system prompt
                 messages.insert(0, {"role": "system", "content": ""})
-            if request.tools:
+            if request.tool_choice == "none":
+                for message in messages:
+                    message.pop("tools", None)
+            elif request.tools:
                 messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
 
             # Default encoding (dsv4/dsv32)

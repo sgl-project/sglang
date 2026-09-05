@@ -1549,6 +1549,71 @@ class ServingChatTestCase(unittest.TestCase):
 
                 self.chat._process_messages(req, is_multimodal=False)
 
+    def test_dsv_encoders_omit_tools_when_tool_choice_is_none(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat._dsv4_reasoning_effort_profile = "preview"
+        self.chat.tool_call_parser = None
+
+        def make_tool(name):
+            return {
+                "type": "function",
+                "function": {"name": name, "parameters": {"type": "object"}},
+            }
+
+        for chat_encoding_spec in ("dsv4", "dsv32"):
+            with self.subTest(chat_encoding_spec=chat_encoding_spec):
+                self.chat.chat_encoding_spec = chat_encoding_spec
+                self.tm.tokenizer.encode.reset_mock()
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[
+                        {
+                            "role": "developer",
+                            "content": "Follow the request.",
+                            "tools": [make_tool("message_tool")],
+                        },
+                        {"role": "user", "content": "Answer directly."},
+                    ],
+                    tools=[make_tool("request_tool")],
+                    tool_choice="none",
+                )
+
+                self.chat._process_messages(req, is_multimodal=False)
+
+                prompt = self.tm.tokenizer.encode.call_args.args[0]
+                self.assertNotIn("## Tools", prompt)
+                self.assertNotIn("request_tool", prompt)
+                self.assertNotIn("message_tool", prompt)
+                self.assertEqual(req.tools[0].function.name, "request_tool")
+                self.assertEqual(req.messages[0].tools[0].function.name, "message_tool")
+
+    def test_dsv_encoders_keep_tools_when_tool_choice_is_auto(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat._dsv4_reasoning_effort_profile = "preview"
+        self.chat.tool_call_parser = None
+        self.chat.chat_encoding_spec = "dsv4"
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "request_tool",
+                "parameters": {"type": "object"},
+            },
+        }
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Use the tool."}],
+            tools=[tool],
+            tool_choice="auto",
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        prompt = self.tm.tokenizer.encode.call_args.args[0]
+        self.assertIn("## Tools", prompt)
+        self.assertIn("request_tool", prompt)
+
     def test_stop_str_isolation_between_requests(self):
         """Test that stop strings from one request don't affect subsequent requests.
 
