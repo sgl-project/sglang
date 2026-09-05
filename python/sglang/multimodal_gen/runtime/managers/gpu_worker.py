@@ -1069,12 +1069,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         req.sampling_params = fitted.sampling_params
 
     def _release_warmup_pool(self, req: Req) -> None:
-        """Drop the allocator pool warmup left behind before the first real request.
+        """Drop the allocator pool the full-shape probe left behind.
 
-        Warmup probes run shapes serving never sees; their cached blocks would
-        otherwise become the floor of every runtime peak measurement.
+        The probe runs a shape serving never sees; its cached blocks would
+        otherwise become the floor of every runtime peak measurement. The
+        request after the probe (the bounded re-warm) regrows the pool at a
+        serving-sized shape.
         """
-        if req.is_warmup:
+        if req.is_warmup and req.extra.get("auto_residency_full_shape_probe"):
             self._release_warmup_pool_before_serving = True
             return
         if not self._release_warmup_pool_before_serving:

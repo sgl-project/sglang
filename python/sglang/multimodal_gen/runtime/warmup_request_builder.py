@@ -603,8 +603,12 @@ def build_warmup_reqs(
     ]
     if auto_residency_warmup_shape is not None:
         # The bounded warmup runs first: its measurement lets the worker size
-        # the full-shape probe to the memory the card actually has left.
+        # the full-shape probe to the memory the card actually has left. The
+        # bounded shape then runs once more so the allocator pool and kernel
+        # caches serving starts from are shaped by a serving-sized request,
+        # not by the probe (the worker drops the probe's pool before it).
         shapes.append((*auto_residency_warmup_shape, True))
+        shapes.append(shapes[0])
 
     # build warmup reqs
     warmup_reqs = []
