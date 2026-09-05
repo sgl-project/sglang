@@ -14,7 +14,8 @@ Sliding window and attention sink features are supported.
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from functools import lru_cache
+from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
 
@@ -53,6 +54,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.ragged_verify import (
     build_ragged_target_verify_geometry,
+    ragged_verify_compact_enabled,
     resolve_ragged_verify_layout,
 )
 from sglang.srt.utils import is_flashinfer_available
@@ -72,6 +74,122 @@ if TYPE_CHECKING:
 # Default workspace size in MB for TRTLLM MHA
 # Can be configured via SGLANG_FLASHINFER_WORKSPACE_SIZE environment variable
 DEFAULT_WORKSPACE_SIZE_MB = 512
+
+TRTLLM_MHA_DECODE_MAX_SPLITS = 8
+TRTLLM_MHA_DECODE_SHAPE_COST_SLACK = 1.06
+TRTLLM_MHA_DECODE_MAX_SPLIT_COST = 0.85
+TRTLLM_MHA_DECODE_MIN_REORDER_SPEEDUP = 1.02
+
+
+@dataclass(frozen=True)
+class TRTLLMMHACudaGraphVariant:
+    seq_len_splits: int = 1
+    reorder_requests: bool = False
+
+
+def _cta_cost(
+    ordered_seq_lens: Sequence[int], num_splits: int, num_sms: int
+) -> float:
+    cost = 0.0
+    group_size, remainder = divmod(len(ordered_seq_lens), num_splits)
+    group_end = 0
+    for split_index in range(num_splits):
+        group_start = group_end
+        group_end += group_size + (split_index < remainder)
+        current_size = group_end - group_start
+        ctas_per_request = max(1, num_sms // current_size)
+        waves = (current_size * ctas_per_request + num_sms - 1) // num_sms
+        cost += ordered_seq_lens[group_end - 1] * waves / ctas_per_request
+    return cost
+
+
+@lru_cache(maxsize=None)
+def get_trtllm_mha_decode_split_candidate(num_requests: int, num_sms: int) -> int:
+    """Choose the smallest split within 6% of the best CTA-shape cost."""
+    if num_requests <= 1 or num_sms <= 0:
+        return 1
+
+    unit_work = (1,) * num_requests
+    candidates = range(
+        1, min(num_requests, TRTLLM_MHA_DECODE_MAX_SPLITS) + 1
+    )
+    costs = [_cta_cost(unit_work, num_splits, num_sms) for num_splits in candidates]
+    cost_limit = min(costs) * TRTLLM_MHA_DECODE_SHAPE_COST_SLACK
+    return next(
+        num_splits for num_splits, cost in zip(candidates, costs) if cost <= cost_limit
+    )
+
+
+def _normalize_seq_lens(
+    seq_lens: Sequence[int], padded_batch_size: Optional[int], padding_seq_len: int
+) -> tuple[list[int], int]:
+    values = [max(0, int(seq_len)) for seq_len in seq_lens]
+    padded_batch_size = padded_batch_size or len(values)
+    if padded_batch_size < len(values):
+        raise ValueError(
+            f"padded_batch_size={padded_batch_size} is smaller than "
+            f"num_requests={len(values)}"
+        )
+    values.extend([max(0, padding_seq_len)] * (padded_batch_size - len(values)))
+    return values, padded_batch_size
+
+
+def select_trtllm_mha_decode_seq_len_splits(
+    seq_lens: Sequence[int],
+    num_sms: int,
+    *,
+    padded_batch_size: Optional[int] = None,
+    padding_seq_len: int = 1,
+) -> int:
+    """Select NoSplit or a CTA-aware split without a device sync."""
+    num_requests = len(seq_lens)
+    values, padded_batch_size = _normalize_seq_lens(
+        seq_lens, padded_batch_size, padding_seq_len
+    )
+    if not values or max(values) == 0 or padded_batch_size > num_sms:
+        return 1
+
+    candidate = get_trtllm_mha_decode_split_candidate(padded_batch_size, num_sms)
+    if candidate == 1 or (
+        padded_batch_size == num_requests and min(values) == max(values)
+    ):
+        return 1
+
+    ordered = sorted(values)
+    unsplit_cost = _cta_cost(ordered, 1, num_sms)
+    split_cost = _cta_cost(ordered, candidate, num_sms)
+    return (
+        candidate
+        if split_cost <= unsplit_cost * TRTLLM_MHA_DECODE_MAX_SPLIT_COST
+        else 1
+    )
+
+
+def should_reorder_trtllm_mha_decode_requests(
+    seq_lens: Sequence[int],
+    num_sms: int,
+    *,
+    padded_batch_size: Optional[int] = None,
+    padding_seq_len: int = 1,
+) -> bool:
+    """Whether descending lengths improve the persistent scheduler proxy."""
+    values, padded_batch_size = _normalize_seq_lens(
+        seq_lens, padded_batch_size, padding_seq_len
+    )
+    if padded_batch_size <= num_sms or num_sms <= 0 or not values:
+        return False
+    if min(values) == max(values):
+        return False
+
+    def cyclic_makespan(ordered: Sequence[int]) -> int:
+        return max(
+            sum(ordered[index::num_sms])
+            for index in range(min(num_sms, len(ordered)))
+        )
+
+    current_cost = cyclic_makespan(values)
+    reordered_cost = cyclic_makespan(sorted(values, reverse=True))
+    return current_cost >= reordered_cost * TRTLLM_MHA_DECODE_MIN_REORDER_SPEEDUP
 
 # Reuse this workspace buffer across all TRTLLM MHA wrappers
 
@@ -102,6 +220,17 @@ class TRTLLMMHAMetadata:
     encoder_cache_seqlens: torch.Tensor = None
     encoder_page_table: torch.Tensor = None
     encoder_row_map: torch.Tensor = None
+    # Decode/verify request order and read-only metadata shared by every
+    # attention layer in one forward. Preparing these once avoids repeating
+    # the same sort and page-table gathers in each layer.
+    decode_seq_len_order: torch.Tensor = None
+    decode_sorted_seq_lens: torch.Tensor = None
+    decode_sorted_page_table: torch.Tensor = None
+    decode_sorted_swa_page_table: torch.Tensor = None
+    # Host-selected execution variant; this is a Python capture/eager scalar,
+    # not device metadata.
+    decode_seq_len_splits: int = 1
+    decode_reorder_requests: bool = False
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -283,6 +412,122 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 "SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS must be at least 1, "
                 f"got {self.decode_seq_len_splits}"
             )
+        adaptive_scheduler_env = (
+            envs.SGLANG_TRTLLM_MHA_DECODE_ADAPTIVE_SCHEDULER
+        )
+        if adaptive_scheduler_env.is_set():
+            adaptive_scheduler_enabled = adaptive_scheduler_env.get()
+        else:
+            adaptive_scheduler_enabled = (
+                torch.cuda.get_device_capability(model_runner.device) == (10, 3)
+                and self.decode_seq_len_splits == 1
+                and not model_runner.server_args.enable_two_batch_overlap
+                and not model_runner.server_args.disable_cuda_graph
+                and not model_runner.server_args.disable_decode_cuda_graph
+            )
+        # Draft CUDA-graph runners do not key graphs by this target-attention
+        # variant. Keep their established static path and adapt only the target
+        # decode/verify graphs that own the producer bottleneck.
+        self.decode_adaptive_scheduler = (
+            adaptive_scheduler_enabled and not model_runner.is_draft_worker
+        )
+        if self.decode_adaptive_scheduler and self.decode_seq_len_splits != 1:
+            raise ValueError(
+                "SGLANG_TRTLLM_MHA_DECODE_ADAPTIVE_SCHEDULER cannot be "
+                "combined with an explicit split count above one"
+            )
+        if (
+            self.decode_adaptive_scheduler
+            and model_runner.server_args.enable_two_batch_overlap
+        ):
+            raise ValueError(
+                "SGLANG_TRTLLM_MHA_DECODE_ADAPTIVE_SCHEDULER does not yet "
+                "support --enable-two-batch-overlap"
+            )
+        self._decode_graph_variant = TRTLLMMHACudaGraphVariant(
+            seq_len_splits=self.decode_seq_len_splits
+        )
+        self._decode_num_sms = (
+            torch.cuda.get_device_properties(model_runner.device).multi_processor_count
+            if self.decode_adaptive_scheduler
+            else 0
+        )
+
+    def get_cuda_graph_variant_manager(
+        self, forward_mode: ForwardMode
+    ) -> Optional[TRTLLMHAAttnBackend]:
+        enabled = self.decode_adaptive_scheduler and (
+            forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
+        )
+        return self if enabled else None
+
+    def get_cuda_graph_capture_variants(
+        self, batch_size: int, forward_mode: ForwardMode
+    ) -> tuple[TRTLLMMHACudaGraphVariant | None, ...]:
+        if not self.decode_adaptive_scheduler:
+            return (None,)
+        if forward_mode.is_target_verify() and ragged_verify_compact_enabled():
+            return (TRTLLMMHACudaGraphVariant(),)
+        if batch_size > self._decode_num_sms:
+            return (
+                TRTLLMMHACudaGraphVariant(),
+                TRTLLMMHACudaGraphVariant(reorder_requests=True),
+            )
+        candidate = get_trtllm_mha_decode_split_candidate(
+            batch_size, self._decode_num_sms
+        )
+        if candidate == 1:
+            return (TRTLLMMHACudaGraphVariant(),)
+        return (
+            TRTLLMMHACudaGraphVariant(),
+            TRTLLMMHACudaGraphVariant(seq_len_splits=candidate),
+        )
+
+    def select_cuda_graph_variant(
+        self, forward_batch: ForwardBatch, padded_batch_size: int
+    ) -> TRTLLMMHACudaGraphVariant | None:
+        if not self.decode_adaptive_scheduler:
+            return None
+        if padded_batch_size <= 16:
+            return TRTLLMMHACudaGraphVariant()
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and resolve_ragged_verify_layout(forward_batch) is not None
+        ):
+            return TRTLLMMHACudaGraphVariant()
+        if forward_batch.seq_lens_cpu is not None:
+            seq_lens = forward_batch.seq_lens_cpu.tolist()
+        else:
+            return TRTLLMMHACudaGraphVariant()
+        if padded_batch_size > self._decode_num_sms:
+            return TRTLLMMHACudaGraphVariant(
+                reorder_requests=should_reorder_trtllm_mha_decode_requests(
+                    seq_lens,
+                    self._decode_num_sms,
+                    padded_batch_size=padded_batch_size,
+                    padding_seq_len=self.get_cuda_graph_seq_len_fill_value(),
+                )
+            )
+        return TRTLLMMHACudaGraphVariant(
+            seq_len_splits=select_trtllm_mha_decode_seq_len_splits(
+                seq_lens,
+                self._decode_num_sms,
+                padded_batch_size=padded_batch_size,
+                padding_seq_len=self.get_cuda_graph_seq_len_fill_value(),
+            )
+        )
+
+    def set_cuda_graph_variant(self, variant) -> None:
+        if variant is None:
+            variant = TRTLLMMHACudaGraphVariant(
+                seq_len_splits=self.decode_seq_len_splits
+            )
+        if not isinstance(variant, TRTLLMMHACudaGraphVariant):
+            raise TypeError(f"Invalid TRT-LLM MHA CUDA graph variant: {variant!r}")
+        self._decode_graph_variant = variant
+        if self.forward_metadata is not None:
+            self.forward_metadata.decode_seq_len_splits = variant.seq_len_splits
+            self.forward_metadata.decode_reorder_requests = variant.reorder_requests
 
     def _check_decode_kv_access(self) -> None:
         supported_kinds = {
@@ -403,6 +648,107 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 return swa_pt
         return self.forward_metadata.page_table
 
+    def _get_sorted_layer_page_table(
+        self, layer: RadixAttention
+    ) -> Optional[torch.Tensor]:
+        """Return the pre-sorted page table for the given layer, if prepared."""
+        metadata = self.forward_metadata
+        if metadata.swa_page_table is not None:
+            _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
+            if is_swa:
+                return metadata.decode_sorted_swa_page_table
+        return metadata.decode_sorted_page_table
+
+    def _prepare_decode_request_order(self, metadata: TRTLLMMHAMetadata) -> None:
+        """Build request ordering and sorted read metadata once per forward."""
+        if (
+            (
+                metadata.decode_seq_len_splits == 1
+                and not metadata.decode_reorder_requests
+            )
+            or metadata.is_ragged_verify
+            or metadata.cache_seqlens_int32 is None
+            or metadata.page_table is None
+        ):
+            return
+        if metadata.cache_seqlens_int32.shape[0] <= 1:
+            return
+        if metadata.decode_seq_len_order is None:
+            sorted_seq_lens, order = torch.sort(
+                metadata.cache_seqlens_int32,
+                descending=metadata.decode_reorder_requests,
+            )
+            metadata.decode_seq_len_order = order
+            metadata.decode_sorted_seq_lens = sorted_seq_lens
+            metadata.decode_sorted_page_table = metadata.page_table.index_select(
+                0, order
+            )
+        else:
+            torch.sort(
+                metadata.cache_seqlens_int32,
+                descending=metadata.decode_reorder_requests,
+                out=(
+                    metadata.decode_sorted_seq_lens,
+                    metadata.decode_seq_len_order,
+                ),
+            )
+            torch.index_select(
+                metadata.page_table,
+                0,
+                metadata.decode_seq_len_order,
+                out=metadata.decode_sorted_page_table,
+            )
+        if metadata.swa_page_table is not None:
+            if metadata.decode_sorted_swa_page_table is None:
+                metadata.decode_sorted_swa_page_table = (
+                    metadata.swa_page_table.index_select(
+                        0, metadata.decode_seq_len_order
+                    )
+                )
+            else:
+                torch.index_select(
+                    metadata.swa_page_table,
+                    0,
+                    metadata.decode_seq_len_order,
+                    out=metadata.decode_sorted_swa_page_table,
+                )
+
+    def _add_decode_variant_graph_buffers(
+        self, source: dict, max_bs: int, max_num_pages: int
+    ) -> None:
+        if (
+            self.decode_seq_len_splits == 1
+            and not getattr(self, "decode_adaptive_scheduler", False)
+        ):
+            return
+        source["decode_seq_len_order"] = torch.empty(
+            max_bs, dtype=torch.int64, device=self.device
+        )
+        source["decode_sorted_seq_lens"] = torch.empty(
+            max_bs, dtype=torch.int32, device=self.device
+        )
+        source["decode_sorted_page_table"] = torch.empty(
+            max_bs, max_num_pages, dtype=torch.int32, device=self.device
+        )
+        if self.use_sliding_window_kv_pool:
+            source["decode_sorted_swa_page_table"] = torch.empty(
+                max_bs, max_num_pages, dtype=torch.int32, device=self.device
+            )
+
+    @staticmethod
+    def _bind_decode_split_graph_buffers(
+        metadata: TRTLLMMHAMetadata, source: dict, bs: int
+    ) -> None:
+        order = source.get("decode_seq_len_order")
+        if order is None:
+            return
+        metadata.decode_seq_len_order = order[:bs]
+        metadata.decode_sorted_seq_lens = source["decode_sorted_seq_lens"][:bs]
+        metadata.decode_sorted_page_table = source["decode_sorted_page_table"][:bs, :]
+        sorted_swa = source.get("decode_sorted_swa_page_table")
+        if sorted_swa is not None:
+            metadata.decode_sorted_swa_page_table = sorted_swa[:bs, :]
+
     def _maybe_build_cp_zigzag_page_tables(
         self,
         metadata: TRTLLMMHAMetadata,
@@ -479,6 +825,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ),
             "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
         }
+        self._add_decode_variant_graph_buffers(
+            self.decode_cuda_graph_metadata, max_bs, max_num_pages
+        )
 
         # SWA write-target buffer; bound as a [:num_tokens] view in
         # _build_cuda_graph_metadata and refilled by the fused metadata kernel.
@@ -534,6 +883,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 ),
                 "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
             }
+            self._add_decode_variant_graph_buffers(
+                self.target_verify_metadata, max_bs, max_num_pages
+            )
             if self.expand_encoder_only_verify:
                 max_verify_rows = max_bs * self.speculative_num_draft_tokens
                 self.target_verify_metadata["encoder_cache_seqlens"] = torch.zeros(
@@ -599,6 +951,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     "swa_page_table_draft_decode",
                     bs,
                 )
+                self._bind_decode_split_graph_buffers(
+                    metadata, self.decode_cuda_graph_metadata, bs
+                )
                 self.decode_cuda_graph_metadata[bs] = metadata
             else:
                 # Normal Decode
@@ -619,6 +974,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     self.decode_cuda_graph_metadata,
                     "swa_page_table",
                     bs,
+                )
+                self._bind_decode_split_graph_buffers(
+                    metadata, self.decode_cuda_graph_metadata, bs
                 )
                 self.decode_cuda_graph_metadata[bs] = metadata
         elif forward_mode.is_target_verify():
@@ -646,6 +1004,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 self.target_verify_metadata,
                 "swa_page_table",
                 bs,
+            )
+            self._bind_decode_split_graph_buffers(
+                metadata, self.target_verify_metadata, bs
             )
             if self._needs_encoder_only_expand(forward_mode, metadata):
                 verify_rows = bs * metadata.max_seq_len_q
@@ -733,14 +1094,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             if spec_info is not None:
                 # Draft Decode
                 # Here we only support topk = 1 for now.
-                metadata = self.decode_cuda_graph_metadata[bs]
+                metadata = self.forward_metadata
                 seqlen_offset = self.speculative_step_id + 1
             else:
                 # Normal Decode
-                metadata = self.decode_cuda_graph_metadata[bs]
+                metadata = self.forward_metadata
         elif forward_mode.is_target_verify():
             # Here we only support topk = 1 for now.
-            metadata = self.target_verify_metadata[bs]
+            metadata = self.forward_metadata
             if spec_info is not None and spec_info.ragged_verify_layout is not None:
                 # Ragged verify: the per-request k-extension is not a
                 # uniform scalar seqlen_offset, so the fused kernel cannot
@@ -871,16 +1232,35 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         ):
             self._assert_ragged_verify_supported()
 
-        if in_capture:
-            num_tokens = forward_batch.positions.numel()
-            self._build_cuda_graph_metadata(
-                bs, num_tokens, forward_mode, spec_info, forward_batch.seq_lens.device
+        if forward_mode.is_decode_or_idle():
+            metadata_store = self.decode_cuda_graph_metadata
+        elif forward_mode.is_target_verify():
+            metadata_store = self.target_verify_metadata
+        elif forward_mode.is_draft_extend_v2():
+            metadata_store = self.draft_extend_metadata
+        else:
+            raise ValueError(
+                f"Invalid forward mode: {forward_mode=} for CUDA Graph replay."
             )
 
-        if forward_mode.is_decode_or_idle():
-            self.forward_metadata = self.decode_cuda_graph_metadata[bs]
-        elif forward_mode.is_target_verify():
-            self.forward_metadata = self.target_verify_metadata[bs]
+        if in_capture and bs not in metadata_store:
+            num_tokens = forward_batch.positions.numel()
+            self._build_cuda_graph_metadata(
+                bs,
+                num_tokens,
+                forward_mode,
+                spec_info,
+                forward_batch.seq_lens.device,
+            )
+
+        self.forward_metadata = metadata_store[bs]
+        self.forward_metadata.decode_seq_len_splits = (
+            self._decode_graph_variant.seq_len_splits
+        )
+        self.forward_metadata.decode_reorder_requests = (
+            self._decode_graph_variant.reorder_requests
+        )
+        if forward_mode.is_target_verify():
             ragged_layout = resolve_ragged_verify_layout(forward_batch)
             if ragged_layout is not None:
                 self._write_ragged_verify_graph_metadata(
@@ -890,12 +1270,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     bs,
                     in_capture=in_capture,
                 )
-        elif forward_mode.is_draft_extend_v2():
-            self.forward_metadata = self.draft_extend_metadata[bs]
-        else:
-            raise ValueError(
-                f"Invalid forward mode: {forward_mode=} for CUDA Graph replay."
-            )
 
         if self.kv_index_translator.is_translating:
             # Unified pool: refill this mode's own page table (this runs
@@ -990,11 +1364,26 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
         )
+        if forward_batch.forward_mode.is_decode_or_idle() or (
+            forward_batch.forward_mode.is_target_verify()
+            and not self.forward_metadata.is_ragged_verify
+        ):
+            self._prepare_decode_request_order(self.forward_metadata)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
 
-        metadata = TRTLLMMHAMetadata()
+        if self.get_cuda_graph_variant_manager(forward_batch.forward_mode) is not None:
+            self.set_cuda_graph_variant(
+                self.select_cuda_graph_variant(
+                    forward_batch, forward_batch.batch_size
+                )
+            )
+        variant = self._decode_graph_variant
+        metadata = TRTLLMMHAMetadata(
+            decode_seq_len_splits=variant.seq_len_splits,
+            decode_reorder_requests=variant.reorder_requests,
+        )
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
@@ -1104,6 +1493,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
         self._maybe_build_cp_zigzag_page_tables(metadata, forward_batch)
 
+        if forward_batch.forward_mode.is_decode_or_idle() or (
+            forward_batch.forward_mode.is_target_verify()
+            and not metadata.is_ragged_verify
+        ):
+            self._prepare_decode_request_order(metadata)
+
         if self._needs_encoder_only_expand(forward_batch.forward_mode, metadata):
             row_map = (
                 torch.arange(batch_size * metadata.max_seq_len_q, device=device)
@@ -1159,6 +1554,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         sinks: Optional[torch.Tensor],
         q_len_per_req: int = 1,
         kv_cache_sf=None,
+        request_order: Optional[torch.Tensor] = None,
+        sorted_block_tables: Optional[torch.Tensor] = None,
+        sorted_seq_lens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run decode, optionally sorting and splitting requests by KV length."""
 
@@ -1185,32 +1583,60 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
         num_requests = seq_lens.shape[0]
-        num_splits = min(self.decode_seq_len_splits, num_requests)
-        if num_splits == 1:
+        num_splits = min(self.forward_metadata.decode_seq_len_splits, num_requests)
+        reorder_requests = self.forward_metadata.decode_reorder_requests
+        if num_splits == 1 and not reorder_requests:
             return run_group(query, block_tables, seq_lens)
 
-        order = torch.argsort(seq_lens)
+        order = request_order
+        if order is None:
+            order = torch.argsort(seq_lens)
+            sorted_block_tables = block_tables.index_select(0, order)
+            sorted_seq_lens = seq_lens.index_select(0, order)
+        else:
+            assert sorted_block_tables is not None
+            assert sorted_seq_lens is not None
         query_by_request = query.view(
             num_requests, q_len_per_req, query.shape[-2], query.shape[-1]
         )
+        query_by_request = query_by_request.index_select(0, order)
         output_by_request = torch.empty(
             query_by_request.shape,
             dtype=self.q_data_type,
             device=query.device,
         )
-        for indices in torch.tensor_split(order, num_splits):
+        if num_splits == 1:
             group_output = run_group(
-                query_by_request.index_select(0, indices).reshape(
+                query_by_request.reshape(-1, query.shape[-2], query.shape[-1]),
+                sorted_block_tables,
+                sorted_seq_lens,
+            )
+            output_by_request.index_copy_(
+                0,
+                order,
+                group_output.view(
+                    -1, q_len_per_req, query.shape[-2], query.shape[-1]
+                ),
+            )
+            return output_by_request.view(-1, query.shape[-2], query.shape[-1])
+        base_size, remainder = divmod(num_requests, num_splits)
+        start = 0
+        for split_index in range(num_splits):
+            end = start + base_size + (split_index < remainder)
+            indices = order[start:end]
+            group_output = run_group(
+                query_by_request[start:end].reshape(
                     -1, query.shape[-2], query.shape[-1]
                 ),
-                block_tables.index_select(0, indices),
-                seq_lens.index_select(0, indices),
+                sorted_block_tables[start:end],
+                sorted_seq_lens[start:end],
             )
             output_by_request.index_copy_(
                 0,
                 indices,
                 group_output.view(-1, q_len_per_req, query.shape[-2], query.shape[-1]),
             )
+            start = end
         return output_by_request.view(-1, query.shape[-2], query.shape[-1])
 
     def _get_nvfp4_decode_kv_cache(
@@ -1300,6 +1726,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         attention_sink = kwargs.get("sinks", None)
 
         page_table = self._get_layer_page_table(layer, forward_batch)
+        sorted_page_table = self._get_sorted_layer_page_table(layer)
 
         o = self._run_fixed_q_len_decode(
             q,
@@ -1311,6 +1738,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             window_left=layer.sliding_window_size,
             sinks=attention_sink,
             kv_cache_sf=kv_cache_block_scales,
+            request_order=self.forward_metadata.decode_seq_len_order,
+            sorted_block_tables=sorted_page_table,
+            sorted_seq_lens=self.forward_metadata.decode_sorted_seq_lens,
         )
         if self.is_nvfp4_kvcache and o.dtype != self.q_data_type:
             o = o.to(self.q_data_type)
@@ -1469,6 +1899,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                 )
             else:
+                sorted_page_table = self._get_sorted_layer_page_table(layer)
                 o = self._run_fixed_q_len_decode(
                     q,
                     kv_cache,
@@ -1479,6 +1910,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     window_left=layer.sliding_window_size,
                     sinks=attention_sink,
                     q_len_per_req=self.forward_metadata.max_seq_len_q,
+                    request_order=self.forward_metadata.decode_seq_len_order,
+                    sorted_block_tables=sorted_page_table,
+                    sorted_seq_lens=self.forward_metadata.decode_sorted_seq_lens,
                 )
         elif self.use_fmha_v2 and not cp_v2_active:
             # CP-v2 must go through cp_strategy.run_attention (per-shard

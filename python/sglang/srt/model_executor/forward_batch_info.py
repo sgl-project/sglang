@@ -791,6 +791,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # copy by Scheduler.run_batch under overlap mode (see save/restore
         # block there). Use it directly.
         seq_lens_cpu = batch.seq_lens_cpu
+        if (
+            seq_lens_cpu is None
+            and model_runner.attn_backend.get_cuda_graph_variant_manager(
+                batch.forward_mode
+            )
+            is not None
+        ):
+            seq_lens_cpu = torch.tensor(
+                [req.kv.kv_committed_len for req in batch.reqs], dtype=torch.int64
+            )
 
         # TODO(seq-lens-removal): the whole ScheduleBatch seq_lens family
         # (incl. seq_lens_sum) is slated for removal in favor of kv-committed

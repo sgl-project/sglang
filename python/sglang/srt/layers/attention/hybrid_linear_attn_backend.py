@@ -18,6 +18,7 @@ from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
+    CudaGraphVariantManager,
     SharedReadEnds,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
@@ -1167,6 +1168,11 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self.full_attn_backend.get_cuda_graph_seq_len_fill_value()
+
+    def get_cuda_graph_variant_manager(
+        self, forward_mode: ForwardMode
+    ) -> Optional[CudaGraphVariantManager]:
+        return self.full_attn_backend.get_cuda_graph_variant_manager(forward_mode)
 
     def get_cpu_graph_seq_len_fill_value(self):
         return self.full_attn_backend.get_cpu_graph_seq_len_fill_value()
