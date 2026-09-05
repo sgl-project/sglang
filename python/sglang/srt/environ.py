@@ -1163,6 +1163,11 @@ class Envs:
     # Blackwell MegaMoE uses a whole-grid software barrier. Keep a small
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
+    # Requantize block-FP8 routed experts to MXFP4 (e2m1 + ue8m0 g32) while
+    # loading, so a plain FP8 checkpoint (e.g. Qwen3.5-397B-A17B-FP8) can drive
+    # the fp8xfp4 / mxf4xmxf4 expert kernels (MegaMoE, DeepGEMM W4A8 grouped
+    # GEMM) without an offline MXFP4 conversion. Lossy: round-to-nearest.
+    SGLANG_FP8_MOE_EXPERTS_REQUANT_MXFP4 = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels

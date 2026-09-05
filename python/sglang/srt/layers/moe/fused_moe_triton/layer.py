@@ -848,7 +848,7 @@ class FusedMoE(torch.nn.Module):
         else:
             expert_data.copy_(loaded_weight)
 
-    def _maybe_load_fp8_shared_expert_as_fp4(
+    def _maybe_load_fp8_expert_as_fp4(
         self,
         param: torch.nn.Parameter,
         loaded_weight: torch.Tensor,
@@ -858,13 +858,20 @@ class FusedMoE(torch.nn.Module):
         shard_dim: int,
         tp_rank: int,
     ) -> bool:
+        # Block-FP8 shard -> MXFP4 params. Reached by the fused shared expert of
+        # a mixed FP8/MXFP4 checkpoint and, with requant_fp8_experts_to_mxfp4,
+        # by every routed expert of a plain block-FP8 checkpoint.
         if (
-            not self._has_fused_shared
-            or expert_id < self._num_local_routed
-            or self.quant_config is None
+            self.quant_config is None
             or not getattr(self.quant_config, "is_fp4_experts", False)
             or shard_id not in ("w1", "w2", "w3")
         ):
+            return False
+        is_shared_slot = self._has_fused_shared and expert_id >= self._num_local_routed
+        requant_routed = getattr(
+            self.quant_config, "requant_fp8_experts_to_mxfp4", False
+        )
+        if not is_shared_slot and not requant_routed:
             return False
 
         is_weight = (
@@ -872,9 +879,12 @@ class FusedMoE(torch.nn.Module):
             and "scale" not in weight_name
             and loaded_weight.dtype == torch.float8_e4m3fn
         )
+        # Block-FP8 scale_inv is fp32 in DSV4-style files and bf16 in Qwen3.5's.
         is_scale = "weight_scale_inv" in weight_name and loaded_weight.dtype in (
             torch.float8_e8m0fnu,
             torch.float32,
+            torch.bfloat16,
+            torch.float16,
         )
         if not is_weight and not is_scale:
             return False
@@ -901,20 +911,22 @@ class FusedMoE(torch.nn.Module):
                 return True
 
         logging.getLogger(__name__).warning_once(
-            "Loading FP8 shared expert weights into FP4 fused MoE weights. "
-            "The shared expert is quantized at load time and may differ "
-            "slightly from a checkpoint that stores shared experts directly "
-            "in FP4."
+            "Loading FP8 expert weights into FP4 fused MoE weights. "
+            "The expert is requantized to MXFP4 at load time and may differ "
+            "slightly from a checkpoint that stores it directly in FP4."
         )
 
         weight_block_size = getattr(self.quant_config, "weight_block_size", None)
         if weight_block_size is None:
             raise ValueError(
-                "Loading FP8 shared expert weights into FP4 fused MoE weights "
+                "Loading FP8 expert weights into FP4 fused MoE weights "
                 "requires block-FP8 weight_block_size."
             )
+        # Dequant + RTN requant on the target device: the CPU path over
+        # hundreds of experts per rank adds minutes to model load.
+        device = weight_param.data.device
         fp4_weight, fp4_scale = quantize_block_fp8_weight_to_mxfp4(
-            fp8_weight, fp8_scale, weight_block_size
+            fp8_weight.to(device), fp8_scale.to(device), weight_block_size
         )
 
         weight_data = weight_param.data[expert_id]
@@ -1214,7 +1226,7 @@ class FusedMoE(torch.nn.Module):
         if is_transposed:
             shard_dim = int(not shard_dim)
 
-        if self._maybe_load_fp8_shared_expert_as_fp4(
+        if self._maybe_load_fp8_expert_as_fp4(
             param=param,
             loaded_weight=loaded_weight,
             weight_name=weight_name,
