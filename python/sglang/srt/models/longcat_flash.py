@@ -32,6 +32,7 @@
 
 import concurrent.futures
 import logging
+import re
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -330,9 +331,6 @@ class LongcatFlashMoE(nn.Module):
         final_hidden_states = self.experts(hidden_states, topk_output)
         final_hidden_states *= self.routed_scaling_factor
 
-        if self.zero_expert_type is not None and hidden_states.shape[0] > 0:
-            final_hidden_states += zero_expert_result.to(final_hidden_states.device)
-
         # LONGCAT_MOE_A2A_SKIP_ALLREDUCE: skip the post-experts TP all-reduce when a
         # real EP a2a backend is active -- self.experts (DeepEPMoE) already combined
         # expert outputs across EP ranks, so an extra all-reduce double-counts.
@@ -340,6 +338,9 @@ class LongcatFlashMoE(nn.Module):
 
         if self.tp_size > 1 and _lc_gab().is_none():
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        if self.zero_expert_type is not None and hidden_states.shape[0] > 0:
+            final_hidden_states += zero_expert_result.to(final_hidden_states.device)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -992,6 +993,20 @@ class LongcatFlashForCausalLM(nn.Module):
                 if self.use_ngram_embedding:
                     if ".embed_tokens." in name:
                         name = "model.embed_tokens.word_embeder.weight"
+                    for src_pattern, dst_prefix in (
+                        (
+                            r"oe_embed_tokens(\d+)\.weight",
+                            "model.ngram_embeddings.embedders",
+                        ),
+                        (
+                            r"oe_embed_proj(\d+)\.weight",
+                            "model.ngram_embeddings.post_projs",
+                        ),
+                    ):
+                        match = re.search(src_pattern, name)
+                        if match:
+                            name = f"{dst_prefix}.{match.group(1)}.weight"
+                            break
                     if ".ngram_embeddings" in name:
                         self.model.embed_tokens.load_weight(None, name, loaded_weight)
                         continue
