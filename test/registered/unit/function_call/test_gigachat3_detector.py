@@ -8,7 +8,7 @@ from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(1.0, "base-a-test-cpu")
+register_cpu_ci(est_time=1.0, suite="base-a-test-cpu")
 
 
 def make_tools_weather():
