@@ -215,8 +215,8 @@ def apply_dflash_verify_logits_adjustments(
     """Apply sampling-time logit adjustments for DFlash verify in place.
 
     This keeps v1 and v2 verify semantics aligned while letting overlap scheduling
-    use the cheaper precomputed `acc_linear_penalties` path instead of allocating a
-    repeated `[bs * draft_token_num, vocab]` penalty tensor every step.
+    use the cheaper precomputed `acc_additive_penalties` path instead of allocating
+    a repeated `[bs * draft_token_num, vocab]` penalty tensor every step.
     """
     if sampling_info is None:
         return
@@ -241,7 +241,7 @@ def apply_dflash_verify_logits_adjustments(
             num_tokens_in_batch=draft_token_num,
         )
 
-    acc_linear_penalties = getattr(sampling_info, "acc_linear_penalties", None)
+    acc_additive_penalties = getattr(sampling_info, "acc_additive_penalties", None)
     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
     grammar_mask = getattr(sampling_info, "grammar_mask", None)
     logit_bias = getattr(sampling_info, "logit_bias", None)
@@ -255,32 +255,34 @@ def apply_dflash_verify_logits_adjustments(
         return logits_3d
 
     # Dense fallback only when we need live penalizer application or a vocab mask.
-    # In overlap scheduling the common path is `acc_linear_penalties`, which can be
-    # broadcast over the verify block without materializing a repeated buffer.
+    # In overlap scheduling the common path is `acc_additive_penalties`, which can
+    # be broadcast over the verify block without materializing a repeated buffer.
     if (
-        penalizer is not None and penalizer.is_required and acc_linear_penalties is None
+        penalizer is not None
+        and penalizer.is_required
+        and acc_additive_penalties is None
     ) or grammar_mask is not None:
-        linear_penalty = torch.zeros(
+        additive_adjustment = torch.zeros(
             (bs, next_token_logits.shape[1]),
             dtype=torch.float32,
             device=next_token_logits.device,
         )
-        sampling_info.apply_logits_bias(linear_penalty)
+        sampling_info.apply_logits_bias(additive_adjustment)
         get_logits_3d().add_(
-            linear_penalty[:, None, :].to(dtype=next_token_logits.dtype)
+            additive_adjustment[:, None, :].to(dtype=next_token_logits.dtype)
         )
         return
 
-    if acc_linear_penalties is not None:
+    if acc_additive_penalties is not None:
         if (
-            acc_linear_penalties.device != next_token_logits.device
-            or acc_linear_penalties.dtype != next_token_logits.dtype
+            acc_additive_penalties.device != next_token_logits.device
+            or acc_additive_penalties.dtype != next_token_logits.dtype
         ):
-            acc_linear_penalties = acc_linear_penalties.to(
+            acc_additive_penalties = acc_additive_penalties.to(
                 device=next_token_logits.device,
                 dtype=next_token_logits.dtype,
             )
-        get_logits_3d().add_(acc_linear_penalties[:, None, :])
+        get_logits_3d().add_(acc_additive_penalties[:, None, :])
 
     if logit_bias is not None:
         if (
