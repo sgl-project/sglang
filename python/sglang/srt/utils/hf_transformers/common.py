@@ -517,10 +517,10 @@ def get_hf_text_config(config: PretrainedConfig):
                 _sub.dtype = parent_dtype
 
     # Priority: thinker_config > llm_config > language_config > text_config
-    if hasattr(config, "thinker_config"):
+    if getattr(config, "thinker_config", None) is not None:
         # qwen2.5 omni
         thinker_config = config.thinker_config
-        if hasattr(thinker_config, "text_config"):
+        if getattr(thinker_config, "text_config", None) is not None:
             setattr(
                 thinker_config.text_config,
                 "dtype",
@@ -529,13 +529,13 @@ def get_hf_text_config(config: PretrainedConfig):
             text_config = thinker_config.text_config
         else:
             text_config = thinker_config
-    elif hasattr(config, "llm_config"):
+    elif getattr(config, "llm_config", None) is not None:
         # PointsV1.5 Chat Model
         assert hasattr(config.llm_config, "num_attention_heads")
         text_config = config.llm_config
-    elif hasattr(config, "language_config"):
+    elif getattr(config, "language_config", None) is not None:
         text_config = config.language_config
-    elif hasattr(config, "text_config"):
+    elif getattr(config, "text_config", None) is not None:
         # The code operates under the assumption that text_config should have
         # `num_attention_heads` (among others). Assert here to fail early
         # if transformers config doesn't align with this assumption.
