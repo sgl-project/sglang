@@ -411,14 +411,17 @@ class SchedulerProfilerManager:
             return
 
         if self.profile_by_stage:
-            if batch.forward_mode.is_prefill():
+            is_decode_stage = (
+                batch.forward_mode.is_decode() or batch.forward_mode.is_target_verify()
+            )
+            if batch.forward_mode.is_prefill() and not is_decode_stage:
                 if self.profiler_prefill_ct == 0:
                     self._start_profile(batch.forward_mode)
                 self.profiler_prefill_ct += 1
                 if self.profiler_prefill_ct > self.profiler_target_prefill_ct:
                     if self.profile_in_progress:
                         self._stop_profile(stage=ForwardMode.EXTEND)
-            elif batch.forward_mode.is_decode():
+            elif is_decode_stage:
                 if self.profiler_decode_ct == 0:
                     if self.profile_in_progress:
                         # force trace flush (a prefill capture must not absorb decode steps)
