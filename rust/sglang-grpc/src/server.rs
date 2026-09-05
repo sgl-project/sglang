@@ -494,14 +494,12 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         }
 
         // Fallback to Python
-        let json_str = tokio::task::spawn_blocking({
-            let bridge = self.bridge.clone();
-            let text = req.text.clone();
-            move || bridge.tokenize_py(&text, add_special)
-        })
-        .await
-        .map_err(|e| Status::internal(format!("Task join error: {}", e)))?
-        .map_err(|e| pyerr_to_status(e, "Tokenize failed"))?;
+        let text = req.text.clone();
+        let json_str = self
+            .blocking_bridge_call("Tokenize failed", move |bridge| {
+                bridge.tokenize_py(&text, add_special)
+            })
+            .await?;
 
         let v: serde_json::Value = serde_json::from_str(&json_str)
             .map_err(|e| Status::internal(format!("Failed to parse JSON response: {}", e)))?;
@@ -539,14 +537,11 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         }
 
         // Fallback to Python
-        let json_str = tokio::task::spawn_blocking({
-            let bridge = self.bridge.clone();
-            let tokens = req.tokens;
-            move || bridge.detokenize_py(tokens)
-        })
-        .await
-        .map_err(|e| Status::internal(format!("Task join error: {}", e)))?
-        .map_err(|e| pyerr_to_status(e, "Detokenize failed"))?;
+        let json_str = self
+            .blocking_bridge_call("Detokenize failed", move |bridge| {
+                bridge.detokenize_py(req.tokens)
+            })
+            .await?;
 
         let v: serde_json::Value = serde_json::from_str(&json_str)
             .map_err(|e| Status::internal(format!("Failed to parse JSON response: {}", e)))?;
@@ -561,28 +556,34 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         &self,
         _request: Request<proto::HealthCheckRequest>,
     ) -> Result<Response<proto::HealthCheckResponse>, Status> {
-        let healthy = tokio::task::spawn_blocking({
-            let bridge = self.bridge.clone();
-            move || bridge.health_check()
-        })
-        .await
-        .map_err(|e| Status::internal(format!("Task join error: {}", e)))?
-        .map_err(|e| pyerr_to_status(e, "Health check failed"))?;
+        let healthy = self
+            .blocking_bridge_call("Health check failed", PyBridge::health_check)
+            .await?;
 
         Ok(Response::new(proto::HealthCheckResponse { healthy }))
+    }
+
+    async fn get_is_ready(
+        &self,
+        _request: Request<proto::GetIsReadyRequest>,
+    ) -> Result<Response<proto::GetIsReadyResponse>, Status> {
+        let is_ready = self
+            .blocking_bridge_call("Failed to get readiness", PyBridge::get_is_ready)
+            .await?;
+
+        Ok(Response::new(proto::GetIsReadyResponse {
+            is_ready,
+            metadata: HashMap::new(),
+        }))
     }
 
     async fn get_model_info(
         &self,
         _request: Request<proto::GetModelInfoRequest>,
     ) -> Result<Response<proto::GetModelInfoResponse>, Status> {
-        let json_info = tokio::task::spawn_blocking({
-            let bridge = self.bridge.clone();
-            move || bridge.get_model_info()
-        })
-        .await
-        .map_err(|e| Status::internal(format!("Task join error: {}", e)))?
-        .map_err(|e| pyerr_to_status(e, "Failed to get model info"))?;
+        let json_info = self
+            .blocking_bridge_call("Failed to get model info", PyBridge::get_model_info)
+            .await?;
 
         Ok(Response::new(proto::GetModelInfoResponse {
             model_path: extract_model_path(&json_info),
@@ -594,13 +595,9 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         &self,
         _request: Request<proto::GetServerInfoRequest>,
     ) -> Result<Response<proto::GetServerInfoResponse>, Status> {
-        let json_info = tokio::task::spawn_blocking({
-            let bridge = self.bridge.clone();
-            move || bridge.get_server_info()
-        })
-        .await
-        .map_err(|e| Status::internal(format!("Task join error: {}", e)))?
-        .map_err(|e| pyerr_to_status(e, "Failed to get server info"))?;
+        let json_info = self
+            .blocking_bridge_call("Failed to get server info", PyBridge::get_server_info)
+            .await?;
 
         Ok(Response::new(proto::GetServerInfoResponse { json_info }))
     }
@@ -609,13 +606,9 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         &self,
         _request: Request<proto::ListModelsRequest>,
     ) -> Result<Response<proto::ListModelsResponse>, Status> {
-        let json_str = tokio::task::spawn_blocking({
-            let bridge = self.bridge.clone();
-            move || bridge.list_models()
-        })
-        .await
-        .map_err(|e| Status::internal(format!("Task join error: {}", e)))?
-        .map_err(|e| pyerr_to_status(e, "Failed to list models"))?;
+        let json_str = self
+            .blocking_bridge_call("Failed to list models", PyBridge::list_models)
+            .await?;
 
         let models_arr: Vec<serde_json::Value> = serde_json::from_str(&json_str)
             .map_err(|e| Status::internal(format!("Failed to parse models JSON: {}", e)))?;
@@ -847,8 +840,20 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
     }
 }
 
-// Helper methods for OpenAI pass-through RPCs.
+// Shared RPC helpers.
 impl SglangServiceImpl {
+    async fn blocking_bridge_call<T, F>(&self, context: &str, call: F) -> Result<T, Status>
+    where
+        T: Send + 'static,
+        F: FnOnce(&PyBridge) -> Result<T, PyErr> + Send + 'static,
+    {
+        let bridge = self.bridge.clone();
+        tokio::task::spawn_blocking(move || call(&bridge))
+            .await
+            .map_err(|e| Status::internal(format!("Task join error: {}", e)))?
+            .map_err(|e| pyerr_to_status(e, context))
+    }
+
     async fn openai_streaming_rpc(
         &self,
         request: Request<proto::OpenAiRequest>,
