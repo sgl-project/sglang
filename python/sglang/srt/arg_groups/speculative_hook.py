@@ -22,6 +22,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_MULTI_LAYER_EAGLE_ARCHITECTURES = frozenset(
+    {
+        "InklingForConditionalGeneration",
+        "MiMoV2ForCausalLM",
+        "MiMoV2FlashForCausalLM",
+        "Step3p5ForCausalLM",
+        "Step3p7ForConditionalGeneration",
+    }
+)
+
 
 def _disable_overlap_schedule_for_cpu(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
@@ -849,6 +859,16 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         )
 
     model_arch = model_config_of(server_args).hf_config.architectures[0]
+    if (
+        resolved_view(server_args).enable_multi_layer_eagle
+        and model_arch not in _MULTI_LAYER_EAGLE_ARCHITECTURES
+    ):
+        raise ValueError(
+            "--enable-multi-layer-eagle requires a model with embedded MTP "
+            "draft layers; it is not supported for "
+            f"{model_arch}."
+        )
+
     if model_arch in [
         "DeepseekV32ForCausalLM",
         "DeepseekV3ForCausalLM",

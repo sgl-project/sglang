@@ -1681,6 +1681,52 @@ class TestDecoupledSpecArgs(CustomTestCase):
 
 
 class TestAdaptiveSpecArgs(CustomTestCase):
+    def test_multi_layer_eagle_rejects_non_mtp_llama_before_autofill(self):
+        args = ServerArgs(model_path="dummy")
+        args.speculative_algorithm = "EAGLE"
+        args.enable_multi_layer_eagle = True
+        args.device = "cuda"
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["LlamaForCausalLM"],
+                get_text_config=lambda: SimpleNamespace(),
+            )
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "--enable-multi-layer-eagle requires a model with embedded MTP "
+            "draft layers; it is not supported for LlamaForCausalLM",
+        ):
+            handle_speculative_decoding(args)
+
+    def test_multi_layer_eagle_accepts_supported_architectures(self):
+        for model_arch in (
+            "InklingForConditionalGeneration",
+            "MiMoV2ForCausalLM",
+            "MiMoV2FlashForCausalLM",
+            "Step3p5ForCausalLM",
+            "Step3p7ForConditionalGeneration",
+        ):
+            with self.subTest(model_arch=model_arch):
+                args = ServerArgs(
+                    model_path="dummy",
+                    speculative_algorithm="EAGLE",
+                    enable_multi_layer_eagle=True,
+                    speculative_num_steps=3,
+                    speculative_eagle_topk=1,
+                    speculative_num_draft_tokens=4,
+                    device="cuda",
+                )
+                args._model_config = SimpleNamespace(
+                    hf_config=SimpleNamespace(
+                        architectures=[model_arch],
+                        get_text_config=lambda: SimpleNamespace(),
+                    )
+                )
+
+                handle_speculative_decoding(args)
+
     def test_adaptive_defaults_to_config_step_when_spec_params_omitted(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
             json.dump(
