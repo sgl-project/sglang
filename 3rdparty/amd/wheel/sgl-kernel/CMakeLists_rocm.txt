@@ -104,7 +104,7 @@ ${PROJ_ROOT}/csrc/allreduce/quick_all_reduce.hip
 ${PROJ_ROOT}/csrc/common_extension_rocm.cc
 ${PROJ_ROOT}/csrc/elementwise/activation.hip
 ${PROJ_ROOT}/csrc/elementwise/pos_enc.hip
-${PROJ_ROOT}/csrc/elementwise/topk_rocm.hip
+${PROJ_ROOT}/csrc/elementwise/topk.hip
 ${PROJ_ROOT}/csrc/grammar/apply_token_bitmask_inplace_hip.hip
 ${PROJ_ROOT}/csrc/kvcacheio/transfer.hip
 ${PROJ_ROOT}/csrc/memory/weak_ref_tensor.cpp

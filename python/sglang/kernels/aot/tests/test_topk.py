@@ -391,7 +391,7 @@ def test_topk_uses_score_device_and_rejects_mixed_devices() -> None:
 @pytest.mark.skipif(
     torch.version.hip is None,
     reason="the CUDA kernel in csrc/elementwise/topk.cu shares this limitation; only "
-    "the ROCm one (csrc/elementwise/topk_rocm.hip) is exact on these distributions",
+    "the ROCm one (csrc/elementwise/topk.hip) is exact on these distributions",
 )
 @pytest.mark.parametrize("kind", ["diffuse", "banded", "narrow", "subnormal"])
 @pytest.mark.parametrize("bs", [1, 4, 64])
