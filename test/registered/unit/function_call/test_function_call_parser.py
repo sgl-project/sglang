@@ -955,6 +955,23 @@ class TestLlama32Detector(unittest.TestCase):
         self.assertEqual(result.calls[0].name, "get_weather")
         self.assertEqual(result.normal_text, "Some follow-up text")
 
+    def test_python_dict_with_immediate_trailing_text(self):
+        text = "{'name': 'get_weather', 'parameters': {}}Some follow-up text"
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.normal_text, "Some follow-up text")
+
+    def test_python_dict_with_spaced_separator(self):
+        text = (
+            "{'name': 'get_weather', 'parameters': {}}  ;"
+            "{'name': 'get_tourist_attractions', 'parameters': {}}Follow-up"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[1].name, "get_tourist_attractions")
+        self.assertEqual(result.normal_text, "Follow-up")
+
     def test_invalid_then_valid_json(self):
         text = (
             '{"name": "get_weather", "parameters": {'  # malformed

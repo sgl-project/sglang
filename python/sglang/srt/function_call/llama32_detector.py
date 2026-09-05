@@ -65,19 +65,22 @@ class Llama32Detector(BaseFormatDetector):
         safe_idx = idx  # the index of the last valid JSON object
         all_actions = []
         action_text_len = len(action_text)
+
+        def skip_separator(index: int) -> int:
+            non_ws_index = index
+            while (
+                non_ws_index < action_text_len and action_text[non_ws_index].isspace()
+            ):
+                non_ws_index += 1
+            if action_text.startswith(self.tool_call_separator, non_ws_index):
+                return non_ws_index + len(self.tool_call_separator)
+            return index
+
         while idx < action_text_len:
             try:
                 obj, end = decoder.raw_decode(action_text[idx:])
                 all_actions.append(obj)
-                idx += end
-                # Only consume a separator when one is actually present.
-                # Blindly skipping ``len(self.tool_call_separator)`` characters
-                # truncates the first character of any free-form text that
-                # follows the final tool call (e.g. ``{...}}Hello`` -> ``ello``).
-                rest = action_text[idx:]
-                stripped = rest.lstrip()
-                if stripped.startswith(self.tool_call_separator):
-                    idx += (len(rest) - len(stripped)) + len(self.tool_call_separator)
+                idx = skip_separator(idx + end)
                 safe_idx = idx
             except json.JSONDecodeError:
                 # Try Python dict conversion as fallback
@@ -99,7 +102,7 @@ class Llama32Detector(BaseFormatDetector):
                         if json_version != potential_dict:
                             obj, _ = decoder.raw_decode(json_version)
                             all_actions.append(obj)
-                            idx = dict_end + len(self.tool_call_separator)
+                            idx = skip_separator(dict_end)
                             safe_idx = idx
                             continue
                 except:
