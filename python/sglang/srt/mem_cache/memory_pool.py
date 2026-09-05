@@ -2265,7 +2265,7 @@ class MHATokenToKVPool(KVCache):
         )
         self.data_strides = torch.tensor(
             [
-                np.prod(x.shape[1:]) * x.dtype.itemsize
+                x.stride(0) * x.dtype.itemsize  # slot stride: views may be strided
                 for x in slot_move_pointer_buffers
             ],
             device=self.device,
@@ -2634,6 +2634,8 @@ class MHATokenToKVPool(KVCache):
                 cache_k.stride(1),
                 cache_v.stride(0),
                 cache_v.stride(1),
+                self.k_buffer[layer_id - self.start_layer].stride(0),
+                self.v_buffer[layer_id - self.start_layer].stride(0),
             )
             return
 
@@ -3197,7 +3199,7 @@ class NoOpMHATokenToKVPool(MHATokenToKVPool):
         self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
         self.data_strides = torch.tensor(
             [
-                np.prod(x.shape[1:]) * x.dtype.itemsize
+                x.stride(0) * x.dtype.itemsize  # slot stride: views may be strided
                 for x in self.k_buffer + self.v_buffer
             ],
             device=self.device,
@@ -3583,7 +3585,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
         self.data_strides = torch.tensor(
             [
-                np.prod(x.shape[1:]) * x.dtype.itemsize
+                x.stride(0) * x.dtype.itemsize  # slot stride: views may be strided
                 for x in self.k_buffer + self.v_buffer
             ],
             device=self.device,
@@ -5283,6 +5285,8 @@ def masked_set_kv_buffer_kernel(
     k_stride_H: tl.constexpr,
     v_stride_B: tl.constexpr,
     v_stride_H: tl.constexpr,
+    k_buffer_stride: tl.constexpr,
+    v_buffer_stride: tl.constexpr,
 ):
     pid = tl.program_id(0)
     if pid >= N:
@@ -5304,10 +5308,10 @@ def masked_set_kv_buffer_kernel(
         col = idx % D
 
         key = tl.load(k_ptr + pid * k_stride_B + row * k_stride_H + col, mask=mask)
-        tl.store(k_buffer_ptr + loc * H * D + idx, key, mask=mask)
+        tl.store(k_buffer_ptr + loc * k_buffer_stride + idx, key, mask=mask)
 
         value = tl.load(v_ptr + pid * v_stride_B + row * v_stride_H + col, mask=mask)
-        tl.store(v_buffer_ptr + loc * H * D + idx, value, mask=mask)
+        tl.store(v_buffer_ptr + loc * v_buffer_stride + idx, value, mask=mask)
 
 
 class MHATokenToKOnlyPool(KVCache):

@@ -24,6 +24,8 @@ struct FusedQkvParams {
   int64_t q_stride;
   int64_t k_stride;
   int64_t v_stride;
+  int64_t k_cache_stride;  // elements between consecutive cache slots
+  int64_t v_cache_stride;
   uint32_t num_tokens;
   uint32_t q_dim;
   uint32_t kv_dim;
@@ -76,12 +78,12 @@ __global__ void fused_fp8_qkv_kv_cache_kernel(const __grid_constant__ FusedQkvPa
   }
   quant_row<T, kVecN>(
       static_cast<const T*>(params.k) + static_cast<size_t>(token) * params.k_stride,
-      static_cast<fp8_e4m3_t*>(params.k_cache) + static_cast<size_t>(slot) * params.kv_dim,
+      static_cast<fp8_e4m3_t*>(params.k_cache) + static_cast<size_t>(slot) * params.k_cache_stride,
       params.kv_dim,
       inv_k);
   quant_row<T, kVecN>(
       static_cast<const T*>(params.v) + static_cast<size_t>(token) * params.v_stride,
-      static_cast<fp8_e4m3_t*>(params.v_cache) + static_cast<size_t>(slot) * params.kv_dim,
+      static_cast<fp8_e4m3_t*>(params.v_cache) + static_cast<size_t>(slot) * params.v_cache_stride,
       params.kv_dim,
       inv_v);
 
@@ -133,7 +135,10 @@ struct FusedFp8QkvKvCache {
 
     TensorMatcher({N, Dkv}).with_strides({SK, 1}).with_dtype<T>().with_device(device).verify(k);
     TensorMatcher({N, Dkv}).with_strides({SV, 1}).with_dtype<T>().with_device(device).verify(v);
-    TensorMatcher({S, Dkv}).with_dtype<fp8_e4m3_t>().with_device(device).verify(k_cache).verify(v_cache);
+    auto SKC = SymbolicSize{"k_cache_stride"};
+    auto SVC = SymbolicSize{"v_cache_stride"};
+    TensorMatcher({S, Dkv}).with_strides({SKC, 1}).with_dtype<fp8_e4m3_t>().with_device(device).verify(k_cache);
+    TensorMatcher({S, Dkv}).with_strides({SVC, 1}).with_dtype<fp8_e4m3_t>().with_device(device).verify(v_cache);
     TensorMatcher({N}).with_dtype<int32_t, int64_t>(idx_dtype).with_device(device).verify(cache_loc);
     TensorMatcher({1}).with_dtype<fp32_t>().with_device(device).verify(k_scale).verify(v_scale);
 
@@ -156,12 +161,16 @@ struct FusedFp8QkvKvCache {
     const uint32_t kv_dim = static_cast<uint32_t>(Dkv.unwrap());
     const int64_t k_stride = SK.unwrap();
     const int64_t v_stride = SV.unwrap();
+    const int64_t k_cache_stride = SKC.unwrap();
+    const int64_t v_cache_stride = SVC.unwrap();
     RuntimeCheck(num_tokens > 0, "fused_fp8_qkv_kv_cache: num_tokens must be > 0, got ", num_tokens);
 
     auto fits = [&](int vec) {
       const int in_bytes = vec * static_cast<int>(sizeof(T));
       bool ok = kv_dim % vec == 0 && k_stride % vec == 0 && v_stride % vec == 0 && aligned(k.data_ptr(), in_bytes) &&
                 aligned(v.data_ptr(), in_bytes);
+      ok = ok && k_cache_stride % vec == 0 && v_cache_stride % vec == 0 && aligned(k_cache.data_ptr(), vec) &&
+           aligned(v_cache.data_ptr(), vec);
       if (quantize_q) {
         ok = ok && q_dim % vec == 0 && q_stride % vec == 0 && aligned(q_ptr, in_bytes);
       }
@@ -182,6 +191,8 @@ struct FusedFp8QkvKvCache {
         .q_stride = q_stride,
         .k_stride = k_stride,
         .v_stride = v_stride,
+        .k_cache_stride = k_cache_stride,
+        .v_cache_stride = v_cache_stride,
         .num_tokens = num_tokens,
         .q_dim = q_dim,
         .kv_dim = kv_dim,
