@@ -1,9 +1,22 @@
 """Unit tests for the fused group-limited top-k used by the LingBot MoE router."""
 
+import sys
+
 import pytest
 import torch
 
-from sglang.kernels.ops.diffusion import group_limited_topk
+from sglang.kernels.ops.diffusion import (
+    can_use_group_limited_topk,
+    group_limited_topk,
+)
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires NVIDIA CUDA",
+)
 
 
 def _ref_group_limited_topk(scores_for_choice, num_experts, n_group, topk_group, top_k):
@@ -21,10 +34,16 @@ def _ref_group_limited_topk(scores_for_choice, num_experts, n_group, topk_group,
     return torch.topk(masked, k=top_k, dim=-1, sorted=False)[1]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "num_experts,n_group,topk_group,top_k",
-    [(64, 8, 3, 8), (128, 8, 3, 8), (256, 8, 3, 8), (64, 8, 3, 4), (32, 4, 2, 4)],
+    [
+        (128, 4, 2, 8),  # LingBot Video production configuration
+        (64, 8, 3, 8),
+        (128, 8, 3, 8),
+        (256, 8, 3, 8),
+        (64, 8, 3, 4),
+        (32, 4, 2, 4),
+    ],
 )
 @pytest.mark.parametrize("seq_len", [1, 17, 128, 1024])
 def test_group_limited_topk_matches_reference(
@@ -38,7 +57,6 @@ def test_group_limited_topk_matches_reference(
     assert torch.equal(ref.sort(dim=-1)[0], fused.sort(dim=-1)[0])
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_group_limited_topk_handles_ties():
     # Uniform scores => every group/expert ties. Selection must stay in-range and
     # match the reference (both use first-max tie-breaking).
@@ -51,7 +69,6 @@ def test_group_limited_topk_handles_ties():
     assert torch.equal(ref.sort(dim=-1)[0], fused.sort(dim=-1)[0])
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_group_limited_topk_handles_repeated_nonuniform_scores():
     # Router logits can contain repeated, nonuniform values after rounding or
     # saturation. This exercises duplicate maxima both within and across groups.
@@ -67,3 +84,22 @@ def test_group_limited_topk_handles_repeated_nonuniform_scores():
     ref = _ref_group_limited_topk(scores, num_experts, n_group, topk_group, top_k)
     fused = group_limited_topk(scores, n_group, topk_group, top_k)
     assert torch.equal(ref.sort(dim=-1)[0], fused.sort(dim=-1)[0])
+
+
+def test_group_limited_topk_rejects_unsupported_group_layout():
+    scores = torch.randn(1, 30, device="cuda", dtype=torch.float32)
+    assert not can_use_group_limited_topk(scores, 3, 2, 4)
+    with pytest.raises(ValueError, match="power-of-two experts per group"):
+        group_limited_topk(scores, 3, 2, 4)
+
+
+def test_group_limited_topk_torch_compile_fullgraph():
+    scores = torch.randn(17, 128, device="cuda", dtype=torch.float32)
+    ref = _ref_group_limited_topk(scores, 128, 4, 2, 8)
+    compiled = torch.compile(lambda x: group_limited_topk(x, 4, 2, 8), fullgraph=True)
+    fused = compiled(scores)
+    assert torch.equal(ref.sort(dim=-1)[0], fused.sort(dim=-1)[0])
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

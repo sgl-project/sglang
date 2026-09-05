@@ -1,18 +1,20 @@
 """Fused group-limited MoE top-k index selection for diffusion routers.
 
 The reference LingBot Video router builds the group-limited top-k with a chain
-of ~8 small kernels (two ``topk`` over the group dim, a ``scatter_`` into a
+of small kernels: per-group top-2 and sum, group top-k, a ``scatter_`` into a
 zero mask, an ``expand``/``reshape`` broadcast, a ``masked_fill`` with
-``-inf``, and a final ``topk`` plus a ``gather``). On a launch-bound single GPU
-that chain is pure overhead: every intermediate tensor is tiny and the whole
-computation is bandwidth- and launch-bound.
+``-inf``, and the final expert top-k. On a launch-bound single GPU that chain
+is pure overhead: every intermediate tensor is tiny and the whole computation
+is bandwidth- and launch-bound. The later score gather remains in the caller.
 
 This module fuses the entire selection into a single Triton kernel: one
 program per token loads its score row once, reduces the per-group sums in
 registers, masks non-selected groups with ``-inf``, and writes the top-k
-expert ids. It reproduces the reference selection exactly (same tie-breaking:
-``torch.topk`` picks the first-max index on ties, which a single ascending
-selection pass with strict mask updates also yields).
+expert ids. The selected expert-id set matches the reference CUDA
+``torch.topk`` chain for the guarded layouts, including the production
+128-expert / 4-group / 2-selected-group / top-8 configuration. The output
+order is intentionally unspecified, matching the reference's ``sorted=False``
+contract.
 """
 
 from __future__ import annotations
@@ -20,6 +22,8 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+
+from sglang.srt.utils.custom_op import register_custom_op
 
 
 @triton.jit
@@ -63,8 +67,9 @@ def _group_limited_topk_kernel(
     m2 = tl.max(g2, axis=1)
     group_scores = m1 + m2
 
-    # Select TOPK_GROUP groups by descending group score (first-max tie-break,
-    # matching torch.topk).
+    # Select TOPK_GROUP groups by descending group score with an explicit
+    # left tie-break. Correctness tests compare the selected set because the
+    # reference uses torch.topk(..., sorted=False).
     group_idx = tl.arange(0, BLOCK_G)
     gs_valid = tl.where(group_idx < N_GROUP, group_scores, float("-inf"))
     selected_group = tl.zeros((BLOCK_G,), dtype=tl.int1)
@@ -92,24 +97,53 @@ def _next_pow2(n: int) -> int:
     return 1 << (n - 1).bit_length()
 
 
-def group_limited_topk(
+def can_use_group_limited_topk(
+    scores_for_choice: torch.Tensor,
+    n_group: int,
+    topk_group: int,
+    top_k: int,
+) -> bool:
+    """Return whether the fused CUDA path supports this routing problem."""
+    if not scores_for_choice.is_cuda or torch.version.hip is not None:
+        return False
+    if scores_for_choice.ndim != 2 or scores_for_choice.dtype != torch.float32:
+        return False
+    if not scores_for_choice.is_contiguous() or scores_for_choice.shape[0] == 0:
+        return False
+
+    num_experts = scores_for_choice.shape[1]
+    if n_group <= 1 or num_experts == 0 or num_experts % n_group != 0:
+        return False
+    experts_per_group = num_experts // n_group
+    if experts_per_group < 2 or experts_per_group & (experts_per_group - 1):
+        return False
+    return 0 < topk_group <= n_group and 0 < top_k <= topk_group * experts_per_group
+
+
+def _fake_group_limited_topk(
     scores_for_choice: torch.Tensor,
     n_group: int,
     topk_group: int,
     top_k: int,
 ) -> torch.Tensor:
-    """Fused group-limited top-k expert ids.
+    del n_group, topk_group
+    return scores_for_choice.new_empty(
+        (scores_for_choice.shape[0], top_k), dtype=torch.int64
+    )
 
-    ``scores_for_choice`` is the per-token expert score used for selection
-    (already includes the correction bias), shape ``[T, E]`` float32. Returns
-    the selected expert ids as ``[T, top_k]`` int64, matching the reference
-    two-stage group-limited selection.
-    """
-    if scores_for_choice.dtype != torch.float32:
-        scores_for_choice = scores_for_choice.float()
-    scores_for_choice = scores_for_choice.contiguous()
+
+@register_custom_op(
+    op_name="diffusion_group_limited_topk",
+    mutates_args=[],
+    fake_impl=_fake_group_limited_topk,
+)
+def _group_limited_topk_cuda(
+    scores_for_choice: torch.Tensor,
+    n_group: int,
+    topk_group: int,
+    top_k: int,
+) -> torch.Tensor:
     t, e = scores_for_choice.shape
-    assert e % n_group == 0, "num_experts must divide n_group"
     epg = e // n_group
     out = torch.empty((t, top_k), dtype=torch.int64, device=scores_for_choice.device)
     _group_limited_topk_kernel[(t,)](
@@ -127,3 +161,27 @@ def group_limited_topk(
         num_warps=4,
     )
     return out
+
+
+def group_limited_topk(
+    scores_for_choice: torch.Tensor,
+    n_group: int,
+    topk_group: int,
+    top_k: int,
+) -> torch.Tensor:
+    """Fused group-limited top-k expert ids.
+
+    ``scores_for_choice`` is the per-token expert score used for selection
+    (already includes the correction bias), shape ``[T, E]`` float32. Returns
+    the selected expert ids as ``[T, top_k]`` int64. The selected set matches
+    the reference two-stage group-limited selection; output order is not part
+    of the contract.
+    """
+    if not can_use_group_limited_topk(scores_for_choice, n_group, topk_group, top_k):
+        raise ValueError(
+            "group_limited_topk requires a nonempty contiguous CUDA float32 "
+            "[tokens, experts] tensor, at least two power-of-two experts per "
+            "group, 1 < n_group, 0 < topk_group <= n_group, and top_k no "
+            "larger than the selected-group capacity"
+        )
+    return _group_limited_topk_cuda(scores_for_choice, n_group, topk_group, top_k)
