@@ -481,4 +481,8 @@ def init_threads_binding(
                 f"in this case the available memory amount of each rank cannot be determined in prior. "
                 f"Please set proper `--max-total-tokens` to avoid the out-of-memory error."
             )
+    logger.info(
+        f"init_threads_binding: numa_index={numa_index}, world_size={world_size}, "
+        f"local_omp_cpuid={local_omp_cpuid}"
+    )
     return local_omp_cpuid
