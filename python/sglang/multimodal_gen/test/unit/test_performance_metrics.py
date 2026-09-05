@@ -87,11 +87,12 @@ def test_worker_records_replica_load_and_runtime_peaks():
     worker.is_output_rank = True
     worker._load_peak_reserved_mb = 4096.0
     worker._runtime_peak_reserved_mb = 0.0
+    worker._warmup_peak_reserved_mb = 0.0
     output = OutputBatch()
     metrics = RequestMetrics("request")
     replica_group = Mock()
     replica_group.all_reduce.return_value = torch.tensor(
-        [5120.0, 3584.0], dtype=torch.float64
+        [5120.0, 3584.0, 6144.0], dtype=torch.float64
     )
     snapshots = [
         MemorySnapshot(0.0, 0.0, 2048.0, 3072.0),
@@ -117,6 +118,7 @@ def test_worker_records_replica_load_and_runtime_peaks():
     assert worker._runtime_peak_reserved_mb == 3072.0
     assert metrics.memory_snapshots["load_peak"].peak_reserved_mb == 5120.0
     assert metrics.memory_snapshots["runtime_peak"].peak_reserved_mb == 3584.0
+    assert metrics.memory_snapshots["warmup_peak"].peak_reserved_mb == 6144.0
 
 
 def test_server_warmup_preserves_peak_after_managed_stage_timeline():
@@ -518,3 +520,27 @@ def test_stage_without_a_formula_records_nothing():
     stage = SimpleNamespace(default_workload_iterations=lambda batch, steps: None)
     record_default_workload_iterations(stage, batch)
     assert batch.metrics.stage_iterations == {}
+
+
+def test_warmup_peak_stays_out_of_the_runtime_peak():
+    from unittest import mock
+
+    worker = gpu_worker_module.GPUWorker.__new__(gpu_worker_module.GPUWorker)
+    worker._runtime_peak_reserved_mb = 0.0
+    worker._warmup_peak_reserved_mb = 0.0
+    worker.is_output_rank = False
+    peaks = iter([40000.0, 20000.0])
+    with (
+        mock.patch.object(
+            gpu_worker_module.current_platform, "is_cpu", return_value=False
+        ),
+        mock.patch.object(
+            gpu_worker_module,
+            "capture_memory_snapshot",
+            side_effect=lambda: SimpleNamespace(peak_reserved_mb=next(peaks)),
+        ),
+    ):
+        worker._record_output_peak_memory(SimpleNamespace(), is_warmup=True)
+        worker._record_output_peak_memory(SimpleNamespace(), is_warmup=False)
+    assert worker._warmup_peak_reserved_mb == 40000.0
+    assert worker._runtime_peak_reserved_mb == 20000.0
