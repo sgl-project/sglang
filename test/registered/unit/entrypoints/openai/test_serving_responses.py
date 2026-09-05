@@ -955,6 +955,29 @@ class EnginePassthroughTestCase(CustomTestCase):
 
         self.assertTrue(parser_cls.call_args.kwargs["force_reasoning"])
 
+    def test_skipped_think_answer_is_a_message_item_on_stop(self):
+        """Mirrors the chat path: GLM output that ends on EOS without closing
+        the template-opened <think> is the answer, not a reasoning item."""
+        serving = make_serving()
+        serving.reasoning_parser = "glm45"
+        serving.tool_call_parser = None
+        answer = '```json\n{"kind": "tool", "operation": "alerts"}\n```'
+        for finish, item_type in (
+            ({"type": "stop", "matched": 154827}, "message"),
+            ({"type": "length", "length": 20}, "reasoning"),
+            ({"type": "stop", "matched": "\n\n"}, "reasoning"),
+        ):
+            with self.subTest(finish_reason=finish):
+                items = serving._make_response_output_items(
+                    ResponsesRequest(model="x", input="hi", store=False),
+                    answer,
+                    tokenizer=Mock(),
+                    require_reasoning=True,
+                    finish_reason=finish,
+                )
+                self.assertEqual(items[0].type, item_type)
+                self.assertEqual(items[0].content[0].text, answer)
+
     def test_require_reasoning_false_without_reasoning_parser(self):
         serving = make_serving()
         serving.reasoning_parser = None

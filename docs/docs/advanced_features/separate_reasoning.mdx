@@ -60,6 +60,12 @@ SGLang supports parsing reasoning content out from "normal" content for reasonin
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Uses special thinking delimiters. Also requires `--tool-call-parser kimi_k2` for tool use.</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>[GLM-4.5 / 4.6 / 5.x](https://huggingface.co/zai-org/GLM-5.2)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`<think>` … `</think>`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`glm45`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The chat template opens `<think>` for the model. Output that ends on EOS without `</think>` is returned as content (see below). For tool use, also specify `--tool-call-parser glm45` or `glm47`.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>[GPT OSS](https://huggingface.co/openai/gpt-oss-120b)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`&lt;|channel|&gt;analysis&lt;|message|&gt;` … `&lt;|end|&gt;`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`gpt-oss`</td>
@@ -89,6 +95,11 @@ SGLang supports parsing reasoning content out from "normal" content for reasonin
 
 **GPT OSS:**
 - GPT OSS: Uses special `<|channel|>analysis<|message|>` and `<|end|>` tags
+
+**GLM-4.5 Family (GLM-4.5 / 4.6 / 5.x):**
+- The chat template opens `<think>` for the model, so the output normally starts inside the reasoning block and closes it with `</think>` before the answer.
+- When the model skips thinking, it writes the answer straight away and ends on EOS without ever emitting `</think>`. The `glm45` parser returns that output as `content` (`finish_reason` is `stop`), while a block cut by `max_tokens` (`finish_reason` is `length`) stays `reasoning_content`. In streaming mode the text is streamed as `reasoning_content` and re-emitted as `content` once the stream finishes.
+- Set `"chat_template_kwargs": {"skipped_think_as_content": false}` to disable this per request (or server-wide via `--default-chat-template-kwargs`); `true` enables it for other parsers built on the same `<think>` framing.
 
 
 ## Usage

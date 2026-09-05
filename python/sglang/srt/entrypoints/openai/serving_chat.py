@@ -2130,7 +2130,9 @@ class OpenAIServingChat(OpenAIServingBase):
                         tokenizer=self.tokenizer_manager.tokenizer,
                         tool_call_parser_active=self._tool_call_parsing_active(request),
                     )
-                    reasoning_text, text = parser.parse_non_stream(text)
+                    reasoning_text, text = parser.parse_non_stream(
+                        text, finish_reason=finish_reason
+                    )
                 except Exception as e:
                     logger.error(f"Reasoning parsing error: {e}")
                     return self.create_error_response(
@@ -2473,7 +2475,9 @@ class OpenAIServingChat(OpenAIServingBase):
         reasoning_parser = reasoning_parser_dict[index]
         reasoning_text, normal_text = reasoning_parser.parse_stream_chunk(delta)
         if finish_reason_type is not None and finish_reason_type != "abort":
-            end_reasoning_text, end_normal_text = reasoning_parser.parse_stream_end()
+            end_reasoning_text, end_normal_text = reasoning_parser.parse_stream_end(
+                content["meta_info"]["finish_reason"]
+            )
             if end_reasoning_text:
                 reasoning_text = (reasoning_text or "") + end_reasoning_text
             if end_normal_text:
