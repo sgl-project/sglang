@@ -1150,27 +1150,32 @@ class TestDerivedPredicatesAgreeAcrossTiers(_IsolatedServerArgs):
 
     _STRATEGIES = ("auto", "no_buffer", "extra_buffer", "extra_buffer_lazy")
 
-    def test_mamba_extra_buffer_matches_the_member(self):
-        from sglang.srt.runtime_context import (
-            mamba_extra_buffer_enabled,
-            mamba_extra_buffer_lazy_enabled,
-        )
-
+    def test_the_mamba_extra_buffer_predicate_has_one_answer(self):
+        """It used to be asserted that two spellings agreed. There is one now:
+        the declaration computes it at publish, and the bag carries it."""
         for disable_radix_cache in (False, True):
             for strategy in self._STRATEGIES:
                 with self.subTest(radix=disable_radix_cache, strategy=strategy):
-                    args = _FakeResolvedArgs(
-                        disable_radix_cache=disable_radix_cache,
-                        mamba_radix_cache_strategy=strategy,
+                    reset_context()
+                    publish(
+                        ServerArgs(
+                            model_path="dummy",
+                            disable_radix_cache=disable_radix_cache,
+                            mamba_radix_cache_strategy=strategy,
+                        ),
+                        role="engine",
                     )
-                    get_context().set_server_args(args)
-                    self.assertEqual(
-                        ServerArgs.enable_mamba_extra_buffer(args),
-                        mamba_extra_buffer_enabled(),
+                    expected = disable_radix_cache is False and strategy in (
+                        "extra_buffer",
+                        "extra_buffer_lazy",
                     )
                     self.assertEqual(
-                        ServerArgs.enable_mamba_extra_buffer_lazy(args),
-                        mamba_extra_buffer_lazy_enabled(),
+                        get_exec().mamba.enable_mamba_extra_buffer, expected
+                    )
+                    self.assertEqual(
+                        get_exec().mamba.enable_mamba_extra_buffer_lazy,
+                        disable_radix_cache is False
+                        and strategy == "extra_buffer_lazy",
                     )
 
     def test_prefill_buffer_ceiling_matches_the_member(self):

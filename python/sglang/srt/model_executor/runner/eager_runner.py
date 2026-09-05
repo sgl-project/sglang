@@ -58,9 +58,9 @@ from sglang.srt.model_executor.runner_utils import (
     maybe_publish_prefill_shared_read_done,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_parallel,
     get_spec,
-    mamba_extra_buffer_enabled,
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
 )
@@ -138,7 +138,8 @@ class EagerRunner(BaseRunner):
             max_num_token=max_num_token,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=(
-                mamba_extra_buffer_enabled() and mr.spec_algorithm.is_none()
+                get_exec().mamba.enable_mamba_extra_buffer
+                and mr.spec_algorithm.is_none()
             ),
             is_encoder_decoder=is_encoder_decoder,
             encoder_len_fill_value=(

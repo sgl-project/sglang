@@ -581,7 +581,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.raw_bs = 0
 
     def _is_mamba_track_enabled(self) -> bool:
-        return self.model_runner.server_args.enable_mamba_extra_buffer() and (
+        return get_exec().mamba.enable_mamba_extra_buffer and (
             not get_memory().disable_radix_cache
         )
 
