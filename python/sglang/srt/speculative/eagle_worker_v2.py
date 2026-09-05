@@ -200,6 +200,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
+        # Initialize the token map and (optionally) share the target
+        # embed/lm_head with the draft model here, i.e. before the KV cache
+        # pools are sized. ``init_lm_head`` may drop the draft-side duplicate
+        # ``embed_tokens``/``lm_head`` tensors and release them back to the
+        # driver. When it ran later, inside ``alloc_memory_pool``, the freed
+        # memory was only reclaimed *after* the main KV pool had already been
+        # sized, leaving it permanently unused. For MTP (NEXTN) drafts the
+        # duplicates are ~2.5GB on a 27B model, which shrinks the max
+        # available KV tokens by roughly 100K.
+        self.init_token_map()
+        self.init_lm_head()
+
     def alloc_memory_pool(
         self,
         memory_pool_config=None,
@@ -214,8 +226,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
-        self.init_token_map()
-        self.init_lm_head()
+        # init_token_map/init_lm_head are called in __init__ so that the
+        # embed/lm_head dedup happens before KV pool sizing; see above.
 
         if get_spec().speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size
