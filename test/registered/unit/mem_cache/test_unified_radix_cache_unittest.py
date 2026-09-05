@@ -516,15 +516,18 @@ def build_fixture(
             full_attention_layer_ids=cfg.full_attention_layer_ids,
             device=device,
         )
-        allocator = SWATokenToKVPoolAllocator(
-            size=cfg.kv_size,
-            size_swa=cfg.kv_size,
-            page_size=cfg.page_size,
-            dtype=cfg.dtype,
-            device=device,
-            kvcache=kv_pool,
-            need_sort=False,
-        )
+        # Tree values reach the allocator as start_pos=0 segments, so only the
+        # debug cross-check against torch.unique catches a mis-aligned value.
+        with envs.SGLANG_DEBUG_MEMORY_POOL.override(True):
+            allocator = SWATokenToKVPoolAllocator(
+                size=cfg.kv_size,
+                size_swa=cfg.kv_size,
+                page_size=cfg.page_size,
+                dtype=cfg.dtype,
+                device=device,
+                kvcache=kv_pool,
+                need_sort=False,
+            )
     elif cfg.has_mamba:
         kv_pool = HybridLinearKVPool(
             size=cfg.kv_size,
@@ -3676,6 +3679,8 @@ class UnifiedRadixCacheSuite:
             self.cfg, enable_kv_cache_events=True
         )
         self._init_buffer_hicache(cons, storage_dir)
+        cons.enable_storage_metrics = True
+        cons.storage_metrics_collector = mock.Mock()
         cons.take_events()
         avail0 = self._host_avail_sizes(cons)
         dev_avail0 = cons.token_to_kv_pool_allocator.available_size()
@@ -3783,8 +3788,14 @@ class UnifiedRadixCacheSuite:
             and e.medium == StorageMedium.CPU
         ]
         self.assertEqual(cpu_events, [])
+        cons.storage_metrics_collector.log_storage_prefetch_hit_tokens.assert_called_once_with(
+            len(seq)
+        )
+        cons.storage_metrics_collector.log_prefetched_tokens.assert_called_once_with(
+            len(seq)
+        )
+        cons.storage_metrics_collector.log_storage_prefetch_unfulfilled_tokens.assert_not_called()
 
-        self.assertIn("occupancy_ratio", cons.prefetch_outcome_stats_snapshot())
         cons.sanity_check()
 
     def test_buffer_only_cache_salt_uses_the_request_namespace(self):
@@ -4062,11 +4073,8 @@ class UnifiedRadixCacheSuite:
         # for an un-charged gate to accept.
         extend_need = 2 * ps + 1
         max_new = 8
-        self.assertIsNotNone(
-            cons_alloc.swa_attn_allocator.alloc(
-                cons_alloc.swa_available_size() - (window + extend_need - 1)
-            )
-        )
+        hold = cons_alloc.swa_available_size() - (window + extend_need - 1)
+        self.assertIsNotNone(cons_alloc.swa_attn_allocator.alloc(hold // ps * ps))
 
         # The adder's SWA gate for this request (_swa_budget_for_req).
         surfaced_swa_hit = cons.staged_prefetch_swa_tokens(req_id)
@@ -4148,6 +4156,8 @@ class UnifiedRadixCacheSuite:
 
         cons, cons_alloc, cons_rtp = build_fixture(self.cfg)
         self._init_buffer_hicache(cons, storage_dir)
+        cons.enable_storage_metrics = True
+        cons.storage_metrics_collector = mock.Mock()
         avail0 = self._host_avail_sizes(cons)
 
         req_id = "sibling-publish"
@@ -4188,6 +4198,7 @@ class UnifiedRadixCacheSuite:
         k, v = self._snapshot_full_kv(cons_alloc, m.device_indices)
         self.assertTrue(torch.equal(k, sib_kv[0]))
         self.assertTrue(torch.equal(v, sib_kv[1]))
+        cons.storage_metrics_collector.log_storage_prefetch_unfulfilled_tokens.assert_not_called()
         cons.sanity_check()
 
     def test_buffer_only_load_back_drops_on_full_overlap_masked_by_swa_tombstone(
@@ -4971,10 +4982,9 @@ class UnifiedRadixCacheSuite:
     def _fill_full_kv(self, allocator, indices, marker):
         kv_pool = self._get_full_kv_pool(allocator)
         layer_id = kv_pool.start_layer
-        k_buf = kv_pool.get_key_buffer(layer_id)
-        v_buf = kv_pool.get_value_buffer(layer_id)
-        k_buf[indices].fill_(marker)
-        v_buf[indices].fill_(marker + 1)
+        # `buf[indices]` is an advanced-index copy — assign, never `fill_()`.
+        kv_pool.get_key_buffer(layer_id)[indices] = marker
+        kv_pool.get_value_buffer(layer_id)[indices] = marker + 1
 
     def _snapshot_full_kv(self, allocator, indices):
         kv_pool = self._get_full_kv_pool(allocator)
@@ -4989,9 +4999,9 @@ class UnifiedRadixCacheSuite:
             return
         mamba_indices = indices.reshape(-1)
         mamba_cache = req_to_token_pool.mamba_pool.mamba_cache
-        mamba_cache.temporal[:, mamba_indices].fill_(marker)
+        mamba_cache.temporal[:, mamba_indices] = marker
         for offset, conv_buf in enumerate(mamba_cache.conv, start=1):
-            conv_buf[:, mamba_indices].fill_(marker + offset)
+            conv_buf[:, mamba_indices] = marker + offset
 
     def _snapshot_mamba_state(self, req_to_token_pool, indices):
         mamba_indices = indices.reshape(-1)
@@ -7514,6 +7524,19 @@ def _component_with_cache(component_type, cache):
 class TestUnifiedRadixCacheActionRouting(CustomTestCase):
     """CacheAction routing: each type forwards to the right Controller API."""
 
+    def test_backup_publish_node_ids_collects_component_nodes_once(self):
+        comp_xfers = {
+            ComponentType.SWA: [PoolTransfer(name=PoolName.SWA, nodes_to_load=[3, 4])],
+            ComponentType.MAMBA: [
+                PoolTransfer(name=PoolName.MAMBA, nodes_to_load=[4, 5])
+            ],
+        }
+
+        self.assertEqual(
+            UnifiedRadixCache._backup_publish_node_ids(7, comp_xfers),
+            [3, 4, 5, 7],
+        )
+
     def test_apply_cache_action_routes_replace_write_through(self):
         cache = mock.MagicMock()
         action = ReplaceWriteThroughOnNodeSplit(
@@ -7548,8 +7571,8 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         _component_with_cache(ComponentType.FULL, cache).apply_component_action(
             FreeComponentDeviceSlot([indices], component_type=ComponentType.FULL)
         )
-        cache.token_to_kv_pool_allocator.full_attn_allocator.free.assert_called_once_with(
-            indices
+        cache.token_to_kv_pool_allocator.full_attn_allocator.free_segment.assert_called_once_with(
+            indices, start_pos=0
         )
 
     def test_apply_component_action_device_kv_swa_uses_free_swa(self):
@@ -7670,7 +7693,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         alloc.set_full_to_swa_mapping.assert_called_once_with(kept_full, swa_value)
         # the incoming full's stale mapping is cleared, then its slot freed (full-only)
         alloc.clear_full_to_swa_mapping.assert_called_once_with(incoming_full)
-        alloc.free_full.assert_called_once_with(incoming_full)
+        alloc.free_full_segment.assert_called_once_with(incoming_full, start_pos=0)
         # Never by indexing the tensor: the unified composite has no
         # `full_to_swa_index_mapping` to index into.
         alloc.full_to_swa_index_mapping.__setitem__.assert_not_called()
@@ -7982,6 +8005,27 @@ class TestResumableInsertWalk(_InsertWalkSuite):
             with self.assertRaises(RuntimeError):
                 cache.evict(EvictParams(num_tokens=8))
         self.assertEqual(allocator.available_size(), available + 4)
+
+    def test_write_through_publish_list_is_ordered_ancestors_first(self):
+        """One ack spanning several nodes publishes a parent before its children,
+        whatever order the component transfers listed them in."""
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
+        (parent,) = _node_children(cache, cache.root_node_handle())
+        self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4, 5, 6])
+        (child,) = _node_children(cache, parent)
+
+        cache._track_write_through_node(
+            child, lock_params=None, publish_node_ids=[child, parent]
+        )
+
+        self.assertEqual(
+            cache.ongoing_write_through[child].publish_node_ids, [parent, child]
+        )
+        cache._finish_write_through_ack(child)
+        self.assertIsNone(cache.tree_core.get_write_through_pending_id(parent))
+        self.assertIsNone(cache.tree_core.get_write_through_pending_id(child))
+        cache.sanity_check()
 
     def test_match_split_relocation_survives_finalizer_failure(self):
         """A match-walk split's pending write-through relocation applies before
@@ -8448,6 +8492,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         cache.tree_core.insert_host.return_value = insert_result
         operation = mock.MagicMock()
         operation.request_id = "req"
+        operation.completed_tokens = 8
         cache.ongoing_prefetch = {
             operation.request_id: (
                 7,
@@ -8588,6 +8633,8 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         """The caller owns every completed buffer when host insertion drops."""
         cache, allocator, _ = build_fixture(self.cfg)
         self._init_hicache(cache)
+        cache.enable_storage_metrics = True
+        cache.storage_metrics_collector = mock.Mock()
 
         parent_id = self._insert_device(
             cache, allocator, list(range(1, 1 + 3 * self.ps))
@@ -8633,6 +8680,7 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
             anchor_lock_params,
             comp_xfers,
         )
+        cache._record_storage_prefetch_hit(req_id, completed_tokens)
         cache.cache_controller.prefetch_tokens_occupied = completed_tokens
         hashes = [f"h{i}" for i in range(completed_tokens // self.ps)]
         operation.hash_value = hashes
@@ -8681,7 +8729,36 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         )
         self.assertIs(drop_releases[0].kwargs["extra_pools"][0], swa_transfer)
         self.assertIs(drop_releases[0].kwargs["extra_pools"][1], mamba_transfer)
+        cache.storage_metrics_collector.log_storage_prefetch_hit_tokens.assert_called_once_with(
+            completed_tokens
+        )
+        cache.storage_metrics_collector.log_storage_prefetch_unfulfilled_tokens.assert_called_once_with(
+            completed_tokens, "dropped"
+        )
 
+        cache.sanity_check()
+
+    def test_write_through_eviction_counts_unbacked_tokens(self):
+        if _selected_tree_core_test_backend() == "rust":
+            # The unbacked-eviction tracker is a Python tree-core feature;
+            # UnifiedRadixCache only enables it for that backend.
+            self.skipTest(
+                "write-through unbacked-eviction tracking is Python-core only"
+            )
+        cache, allocator, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+        cache.metrics_collector = mock.Mock()
+
+        seq = list(range(1, 1 + 2 * self.ps))
+        self._insert_device(cache, allocator, seq)
+        result = cache.evict(EvictParams(num_tokens=len(seq)))
+
+        self.assertGreaterEqual(result.num_tokens_evicted, len(seq))
+        cache.metrics_collector.increment_dropped_tokens.assert_called_once_with(
+            num_tokens=len(seq),
+            reason="write_through_unbacked_eviction",
+            pool=PoolName.KV.value,
+        )
         cache.sanity_check()
 
     def test_prefetch_refill_leaves_eviction_path_uncorrupted(self):
@@ -8945,6 +9022,20 @@ class TestAnchorLockOutcomePolicy(CustomTestCase):
         self.assertEqual(pipeline.try_lock_anchor(self._REQ), "anchor_lost")
         self.assertEqual(pipeline.anchor_locks, {})
         self.assertEqual(pipeline.anchor_locked_tokens_, 0)
+
+    def test_positive_hit_with_lost_anchor_is_reported_as_shrunk(self):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache._storage_prefetch_missed_rids = set()
+        cache._finish_storage_prefetch = mock.Mock()
+        cache.revoke_pending_prefetch = mock.Mock()
+
+        cache._handle_storage_prefetch_anchor_loss(self._REQ)
+
+        cache._finish_storage_prefetch.assert_called_once_with(
+            self._REQ, fulfilled_tokens=0, reason="shrunk"
+        )
+        self.assertIn(self._REQ, cache._storage_prefetch_missed_rids)
+        cache.revoke_pending_prefetch.assert_called_once_with(self._REQ)
 
     def test_over_cap_reports_cap_skip_before_matching(self):
         cache = self._make_cache(live_match_len=len(self._PREFIX))

@@ -44,6 +44,18 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 
+def _rocm_fp8_wo_a_supported() -> bool:
+    """True when ROCm can run the DeepSeek-V4 fp8 wo_a GEMM (gfx950 + aiter)."""
+    try:
+        from sglang.srt.models.deepseek_common.amd.deepseek_v4_wo_a_fp8 import (
+            is_wo_a_fp8_mxscale_supported,
+        )
+
+        return is_wo_a_fp8_mxscale_supported()
+    except Exception:  # pragma: no cover - env-dependent
+        return False
+
+
 def handle_model_specific_adjustments(server_args: Any):
 
     cfg = resolving_view(server_args)
@@ -361,7 +373,11 @@ def handle_model_specific_adjustments(server_args: Any):
                 envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
         elif get_platform().is_hip:
             envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
-            envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+            # The fp8 wo_a GEMM is DeepGEMM-based on CUDA. ROCm has an aiter
+            # e8m0 block-scale equivalent, but only on gfx950 -- everywhere else
+            # keeps the bf16 absorb GEMM.
+            if not _rocm_fp8_wo_a_supported():
+                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
             envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
             envs.SGLANG_OPT_USE_TOPK_V2.set(True)
             envs.SGLANG_OPT_USE_AITER_INDEXER.set(True)
