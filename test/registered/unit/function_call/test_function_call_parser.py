@@ -2655,6 +2655,72 @@ null
         params = json.loads(result.calls[0].parameters)
         self.assertEqual(params["location"], "")
 
+    def test_empty_nonstring_parameter_skipped(self):
+        """Empty tags on NON-string params must not leak "".
+
+        The XML tool-call format cannot express null, so an empty tag on an
+        optional int/list/object/bool param means "not provided". Leaking ""
+        into strict schemas (e.g. openai-agents pydantic) would break the tool
+        call, so the parameter is dropped and the tool default is used instead.
+        """
+        text = """<tool_call>
+<function=get_current_weather>
+<parameter=location>Tokyo</parameter>
+<parameter=days></parameter>
+</function>
+</tool_call>"""
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["location"], "Tokyo")
+        self.assertNotIn("days", params)
+        self.assertTrue(all(v != "" for v in params.values()))
+
+    def test_empty_nonstring_parameter_skipped_streaming(self):
+        """Empty tags on non-string params are dropped in streaming too."""
+        text = """<tool_call>
+<function=get_current_weather>
+<parameter=location>Tokyo</parameter>
+<parameter=days>
+
+</parameter>
+</function>
+</tool_call>"""
+        detector = Qwen3CoderDetector()
+        fragments = []
+        for ch in text:
+            res = detector.parse_streaming_increment(ch, self.tools)
+            fragments.extend(item.parameters or "" for item in (res.calls or []))
+        params_str = "".join(fragments)
+        self.assertIn('"location": "Tokyo"', params_str)
+        # the empty non-string parameter must not be emitted at all
+        self.assertNotIn('"days"', params_str)
+
+    def test_none_text_normalization_only_for_nonstring(self):
+        """Literal 'None'/'none' becomes null for NON-string params, but stays
+        a plain string for string params (where "none" can be a legit value)."""
+        int_text = """<tool_call>
+<function=get_current_weather>
+<parameter=location>Tokyo</parameter>
+<parameter=days>None</parameter>
+</function>
+</tool_call>"""
+        params = json.loads(
+            self.detector.detect_and_parse(int_text, self.tools).calls[0].parameters
+        )
+        self.assertEqual(params["days"], None)
+
+        str_text = """<tool_call>
+<function=get_current_weather>
+<parameter=unit>none</parameter>
+</function>
+</tool_call>"""
+        params = json.loads(
+            self.detector.detect_and_parse(str_text, self.tools).calls[0].parameters
+        )
+        self.assertEqual(params["unit"], "none")
+
     def test_parameter_with_special_characters(self):
         """
         Test handling of parameters with special characters.
