@@ -28,6 +28,7 @@ from typing import List
 
 from sglang.kernels.jit.utils.compile import toolchain
 from sglang.kernels.jit.utils.compile.spec import BuildSpec
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -169,7 +170,36 @@ def build(*, spec: BuildSpec, build_dir: pathlib.Path, build_file: str) -> pathl
             f"Failed to build JIT module {spec.module_name} in {build_dir}\n"
             f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
         )
+    if envs.SGLANG_JIT_LOG_RESOURCE_USAGE.get():
+        _log_resource_usage(
+            spec.module_name, (completed.stdout or "") + (completed.stderr or "")
+        )
     return build_dir / f"{spec.module_name}.so"
+
+
+# What the two device compilers call their resource report. nvcc routes it
+# through ptxas; hipcc emits clang remarks naming the analysis pass.
+_RESOURCE_MARKERS = ("ptxas info", "spill", "kernel-resource-usage")
+
+
+def _log_resource_usage(module_name: str, output: str) -> None:
+    """Replay the compiler's per-kernel resource report.
+
+    The build runs with `capture_output=True` and replays only on failure, so
+    without this the report is produced and then dropped. Ninja forwards each
+    subcommand's diagnostics onto its own stdout, so that is where this lands
+    regardless of which stream the compiler wrote to.
+    """
+    report = [
+        line.rstrip()
+        for line in output.splitlines()
+        # The echoed compile command also contains the flag that asked for the
+        # report, so match on the output's own markers, not on the flag.
+        if not line.startswith("[") and any(m in line for m in _RESOURCE_MARKERS)
+    ]
+    if not report:
+        return
+    logger.info("JIT resource usage for %s:\n%s", module_name, "\n".join(report))
 
 
 def scan_dependencies(build_dir: pathlib.Path) -> List[pathlib.Path]:

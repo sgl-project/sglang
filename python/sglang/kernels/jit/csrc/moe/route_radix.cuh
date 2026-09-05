@@ -60,7 +60,7 @@ SGL_DEVICE void bar_sync(uint32_t id, uint32_t num_threads) {
 // smem_warp_sum[kNumWarps]; syncs on entry (so the workspace can be reused
 // across calls) and before the cross-warp read.
 SGL_DEVICE uint32_t block_exclusive_sum(uint32_t cnt, uint32_t lane_id, uint32_t warp_id, uint32_t* smem_warp_sum) {
-  const uint32_t inc = device::warp::inclusive_sum(lane_id, cnt);
+  const uint32_t inc = device::warp::inclusive_sum(cnt, lane_id);
   if (lane_id == 31) smem_warp_sum[warp_id] = inc;
   __syncthreads();
   // TODO: replace `__reduce_add_sync` with `warp::reduce_sum`
@@ -134,12 +134,12 @@ SGL_DEVICE void route_radix_block(const RouteRadixParams& params, typename Large
 
   // ---- Load + key transform: thread tx owns experts [4*tx, 4*tx+4) ----
   uint32_t keys[kVecSize];
-  float act[kVecSize];  // raw sigmoid (weight source) — never NaN-sanitized
+  float act[kVecSize];  // raw sigmoid (weight source) -- never NaN-sanitized
   {
     const auto scores = static_cast<const TScore*>(params.scores) + bx * params.scores_stride;
     AlignedVector<fp32x2_t, kVecSize / 2> bias_vec;
     // bf16: 2x bf16x2 (8B row loads); fp32: 2x fp32x2 (16B row loads). The
-    // radix math below is fp32 either way — only the load width differs.
+    // radix math below is fp32 either way -- only the load width differs.
     AlignedVector<packed_t<TScore>, kVecSize / 2> scores_vec;
 
     // prefetch bias (frozen weight) before the PDL wait
@@ -207,7 +207,7 @@ SGL_DEVICE void route_radix_block(const RouteRadixParams& params, typename Large
         AlignedVector<uint32_t, 2> hist;
         hist.load(smem.histogram, tx);
         const auto local_val = hist[0] + hist[1];
-        const auto warp_inc = device::warp::inclusive_sum(lane_id, local_val);
+        const auto warp_inc = device::warp::inclusive_sum(local_val, lane_id);
         if (lane_id == kWarpThreads - 1) smem.warp_sum[0][warp_id] = warp_inc;
         moe::radix::bar_sync(BAR_SUM, kRadixLanes);
         const auto inter = __reduce_add_sync(0xFFFFFFFF, lane_id < warp_id ? smem.warp_sum[0][lane_id] : 0u);
@@ -315,7 +315,7 @@ SGL_DEVICE void route_radix_block(const RouteRadixParams& params, typename Large
     params.out_w[bx * params.out_w_stride + rank] = w;
     params.out_i[bx * params.out_i_stride + rank] = id;
     if (params.out_packed != nullptr) {
-      // (id << 16) | bf16(w) bits — RN float->bf16 matches the triton pack.
+      // (id << 16) | bf16(w) bits -- RN float->bf16 matches the triton pack.
       const auto bits = static_cast<uint32_t>(__bfloat16_as_ushort(__float2bfloat16_rn(w)));
       params.out_packed[bx * params.out_packed_stride + rank] =
           static_cast<int32_t>((static_cast<uint32_t>(id) << 16) | bits);
@@ -457,7 +457,7 @@ SGL_DEVICE void fgt_select_topk(
         device::AlignedVector<uint32_t, 2> hist;
         hist.load(smem.histogram, tx);
         const auto local_val = hist[0] + hist[1];
-        const auto warp_inc = device::warp::inclusive_sum(lane_id, local_val);
+        const auto warp_inc = device::warp::inclusive_sum(local_val, lane_id);
         if (lane_id == 31) smem.warp_sum[0][warp_id] = warp_inc;
         moe::radix::bar_sync(BAR_SUM, kRadixLanes);
         const auto inter = __reduce_add_sync(0xFFFFFFFF, lane_id < warp_id ? smem.warp_sum[0][lane_id] : 0u);

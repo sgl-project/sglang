@@ -247,7 +247,7 @@ SGL_DEVICE CTAWork get_work(const SituMulQuantVarlenParams& params) {
   const uint32_t val = tx < params.num_experts ? params.masked_m[tx] : 0u;
 
   // Per-warp inclusive scan of masked_m.
-  const uint32_t warp_inclusive = device::warp::inclusive_sum(lane_id, val);
+  const uint32_t warp_inclusive = device::warp::inclusive_sum(val, lane_id);
   const uint32_t warp_exclusive = warp_inclusive - val;
 
   // Write each warp total.
