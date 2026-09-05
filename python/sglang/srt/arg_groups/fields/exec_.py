@@ -600,6 +600,16 @@ class ExecMoe:
     """Namespace ``exec.moe``."""
 
     _NS_PATH = "exec.moe"
+
+    # ---- derived: computed at publish from the leaves below.
+    is_ep_joiner = Derived(
+        fn="sglang.srt.arg_groups.model_override_base.ep_joiner_of",
+        doc="Whether this process was launched as an elastic-EP joiner (scale or recover).",
+    )
+    is_ep_scale_joiner = Derived(
+        fn="sglang.srt.arg_groups.model_override_base.ep_scale_joiner_of",
+        doc="Whether it is a scale-up joiner specifically.",
+    )
     enable_fused_moe_sum_all_reduce: A[
         bool,
         "Enable fused moe triton and sum all reduce.",

@@ -52,6 +52,7 @@ from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreTrueAction,
     LoRAPathAction,
 )
+from sglang.srt.arg_groups.model_override_base import ep_joiner_of, ep_scale_joiner_of
 from sglang.srt.arg_groups.overrides import (
     remote_instance_transfer_engine_of,
     resolution_projection,
@@ -674,25 +675,6 @@ class ServerArgs:
     def engine_info_bootstrap_url(self):
         return self.url(port=self.engine_info_bootstrap_port)
 
-    @property
-    def is_ep_joiner(self) -> bool:
-        """True for processes launched as elastic-EP joiners."""
-        cfg = resolving_view(self)
-
-        return cfg.ep_join_mode in ("scale", "recover")
-
-    @property
-    def is_ep_scale_joiner(self) -> bool:
-        cfg = resolving_view(self)
-
-        return cfg.ep_join_mode == "scale"
-
-    @property
-    def is_startup_weight_load_overlap(self) -> bool:
-        cfg = resolving_view(self)
-
-        return cfg.startup_weight_load_mode == "overlap"
-
     def __setattr__(self, name, value):
         # The record holds the operator's input. It is writable while the
         # caller is still assembling it and sealed from the moment resolution
@@ -1049,7 +1031,7 @@ class PortArgs:
             # overflow.
             is_rust_server = envs.SGLANG_RUST_SERVER.get()
             NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + cfg.dp_size
-            if server_args.is_ep_scale_joiner:
+            if ep_scale_joiner_of(resolving_view(server_args)):
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
                     port_base = server_args.port - ZMQ_TCP_PORT_DELTA
@@ -1073,7 +1055,7 @@ class PortArgs:
                 assert worker_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]
 
-            is_joiner = server_args.is_ep_joiner
+            is_joiner = ep_joiner_of(resolving_view(server_args))
             # Under SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE, SGLang never binds
             # dist_init_port / nccl_port (rendezvous uses the externally-managed
             # store; see distributed/bootstrap.py:_resolve_dist_init_method), so
