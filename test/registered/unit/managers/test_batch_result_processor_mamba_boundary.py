@@ -153,6 +153,7 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
                     # disagg reads are served by the same publish at their
                     # defaults.
                     get_context().override_server_args(
+                        uses_mamba_radix_cache=True,
                         mamba_radix_cache_strategy="extra_buffer",
                         mamba_track_interval=TRACK_INTERVAL,
                         _mamba_cache_chunk_size=TRACK_INTERVAL,

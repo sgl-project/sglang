@@ -263,10 +263,13 @@ def mamba_extra_buffer_of(cfg: Any) -> bool:
 
     This is the one definition of the predicate: ``ServerArgs`` delegates its
     member to it, and the runtime_context accessor is its post-publish sibling
-    (which cannot reuse it, because the two leaves land in different bags)."""
-    return cfg.disable_radix_cache is False and cfg.mamba_radix_cache_strategy in (
-        "extra_buffer",
-        "extra_buffer_lazy",
+    (which cannot reuse it, because the leaves land in different bags).
+    ``uses_mamba_radix_cache`` is arch-derived, so an explicit strategy stays
+    inert for models without mamba state."""
+    return (
+        cfg.disable_radix_cache is False
+        and cfg.uses_mamba_radix_cache
+        and cfg.mamba_radix_cache_strategy in ("extra_buffer", "extra_buffer_lazy")
     )
 
 

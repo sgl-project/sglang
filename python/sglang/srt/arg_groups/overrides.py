@@ -405,6 +405,7 @@ def mamba_extra_buffer_lazy_of(cfg: Any) -> bool:
     """The lazy variant of :func:`mamba_extra_buffer_of`."""
     return (
         cfg.disable_radix_cache is False
+        and cfg.uses_mamba_radix_cache
         and cfg.mamba_radix_cache_strategy == "extra_buffer_lazy"
     )
 
@@ -539,6 +540,12 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         # KDA backend's track-snapshot writes (decode + extend) so donated
         # slots hold real states for prefix-cache restores.
         "KimiK3ForConditionalGeneration",
+        # Inkling requires extra_buffer (models/inkling.py asserts
+        # mamba_extra_buffer_enabled()); _inkling_overrides pins the strategy
+        # and the uses_mamba_radix_cache leaf, so _validate_mamba_extra_buffer
+        # must accept these archs.
+        "InklingForConditionalGeneration",
+        "InklingForConditionalGenerationMTP",
     }
 )
 
