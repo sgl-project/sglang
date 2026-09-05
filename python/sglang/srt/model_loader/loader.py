@@ -132,7 +132,6 @@ from sglang.srt.utils import (
     rank0_log,
     set_weight_attrs,
 )
-from sglang.srt.utils.common import temp_set_env
 
 if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig
@@ -1016,15 +1015,11 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         if is_nvfp4_online or is_modelopt_fp4_online:
-            # Scope exact FP4 quantization math to load-time conversion only;
-            # restore the original environment before serving starts.
-            with temp_set_env(
-                FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
-                FLASHINFER_NVFP4_4OVER6="1",
-                FLASHINFER_NVFP4_4OVER6_E4M3_USE_256="0",
-                FLASHINFER_NVFP4_4OVER6_ERR_MODE="MSE",
-                FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH="1",
-            ):
+            from sglang.srt.layers.quantization.nvfp4_online import (
+                exact_nvfp4_quant_math,
+            )
+
+            with exact_nvfp4_quant_math():
                 model.load_weights(weights)
             if target_device.type == "cuda":
                 torch.cuda.synchronize()
