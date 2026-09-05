@@ -17,6 +17,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_decode,
     maybe_write_dsv4_extend,
 )
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.common import (
     MAMBA_STATE_PER_REQ_NO_CACHE,
@@ -181,13 +182,24 @@ def alloc_paged_token_slots_extend(
     req_pool_indices: Optional[torch.Tensor] = None,
     batch=None,
 ):
-    # Over estimate the number of tokens: assume each request needs a new page.
+    # Over estimate the number of tokens: assume each request needs a new page
+    # (one page per CLASS per request under sharding — the min-class
+    # availability floor must cover every request's ceil(K_i/N) rounding,
+    # matching the N*ps per-request admission reserve).
     allocator = tree_cache.token_to_kv_pool_allocator
-    num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
+    num_tokens = extend_num_tokens + len(seq_lens_cpu) * (
+        allocator.page_size * page_interleave_shard_size(allocator)
+    )
     evict_from_tree_cache(tree_cache, num_tokens)
 
     is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c128_attn_allocator")
     extra_alloc_kwargs = {}
+    kv_shard_rotation_bases = None
+    if page_interleave_shard_size(allocator) > 1:
+        kv_shard_rotation_bases = _kv_shard_rotation_bases(
+            batch=batch, prefix_lens_cpu=prefix_lens_cpu
+        )
+        extra_alloc_kwargs["rotation_bases"] = kv_shard_rotation_bases
     if is_dsv4:
         extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
         # Per-call per-req table for the C128 KV last_loc lookup.
@@ -223,7 +235,54 @@ def alloc_paged_token_slots_extend(
             tree_cache.pretty_print()
         raise RuntimeError(error_msg)
 
+    if kv_shard_rotation_bases is not None:
+        # The allocator resolved None entries (new chains) in place from the
+        # least-full class at each request's turn; record the bases for the
+        # radix insert to stamp onto new tree nodes (TreeNode.rotation_base).
+        for req, base in zip(batch.reqs, kv_shard_rotation_bases):
+            req.kv_rotation_base = base
+
     return out_cache_loc
+
+
+def _kv_shard_rotation_bases(
+    batch: ScheduleBatch, prefix_lens_cpu: torch.Tensor
+) -> list:
+    """Per-request rotation bases ``b_i`` of the batch's chains, host-only.
+
+    The owner class of position-page P is ``(b_i + P) % shard_size``. Rules:
+
+    - Read through ``req.last_node`` at alloc time, never a value cached on
+      the request: ``cache_unfinished_req`` can rebind a chunked request onto
+      another chain's canonical locs between chunks, changing the base.
+    - A request without a cached prefix starts a new chain: None here — the
+      allocator draws from the least-full class at that request's turn (so
+      the draw sees earlier requests' pops in the same batch) and resolves
+      the entry in place.
+    - ChunkCache has no tree nodes (``last_node`` is None); its chunked
+      continuations fall back to the base recorded on the request at the
+      previous chunk's alloc (no cross-request reuse, no rebind there).
+    """
+    from sglang.srt.mem_cache.radix_cache import TreeNode
+
+    assert batch is not None and len(batch.reqs) == len(prefix_lens_cpu)
+    bases = []
+    for i, req in enumerate(batch.reqs):
+        if int(prefix_lens_cpu[i]) == 0:
+            bases.append(None)
+        elif (
+            isinstance(req.last_node, TreeNode)
+            and req.last_node.rotation_base is not None
+        ):
+            bases.append(req.last_node.rotation_base)
+        else:
+            assert req.kv_rotation_base is not None, (
+                "sharded extend with a cached prefix but no rotation base: "
+                "req.last_node carries none and the request recorded none "
+                "at a previous alloc"
+            )
+            bases.append(req.kv_rotation_base)
+    return bases
 
 
 def alloc_req_slots(
@@ -273,7 +332,9 @@ def alloc_req_slots(
 def _alloc_page_size(batch: ScheduleBatch) -> int:
     # DCP swaps in an allocator whose page_size is the configured page_size *
     # dcp_size, so it can be > 1 even when tree_cache.page_size is 1; branch on
-    # the real allocator's page_size there. Elsewhere the two are equal.
+    # the real allocator's page_size there. Elsewhere the two are equal --
+    # including under KV sharding, which widens the index space but keeps the
+    # allocator page at the physical page.
     if (_is_hip or _is_cuda) and get_parallel().dcp_enabled:
         return batch.tree_cache.token_to_kv_pool_allocator.page_size
     return batch.tree_cache.page_size
