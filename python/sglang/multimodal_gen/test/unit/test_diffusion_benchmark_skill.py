@@ -100,6 +100,7 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
                 "lingbot-world-v2",
                 "fastwan21-t2v-1.3b",
                 "fasth3-t2va-vsa",
+                "vdn-h3",
                 "wan22-t2v-nvfp4",
                 "krea2-turbo",
                 "krea2-raw",

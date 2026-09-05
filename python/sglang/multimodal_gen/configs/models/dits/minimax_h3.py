@@ -2,6 +2,9 @@
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
+from sglang.multimodal_gen.configs.models.dits.minimax_h3_vdn import (
+    VDNHybridAttentionArchConfig,
+)
 
 MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT = 64
 MINIMAX_H3_ADALN_MODALITY_NUM = 3
@@ -47,6 +50,8 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
             ),
             r"^transformer_blocks\.(\d+)\.attn\.to_out\.0\.(.*)$": r"blocks.\1.attn.out_proj.\2",
             r"^transformer_blocks\.(\d+)\.attn\.to_gate_compress\.(.*)$": r"blocks.\1.attn.to_gate_compress.\2",
+            # VDN-H3 hybrid attention module (see minimax_h3_vdn_attention)
+            r"^transformer_blocks\.(\d+)\.attn\.(linear_attention|softmax_gate|to_out_linear)\.(.*)$": r"blocks.\1.attn.hybrid.\2.\3",
             r"^transformer_blocks\.(\d+)\.attn\.norm_q\.(.*)$": r"blocks.\1.attn.q_norm.\2",
             r"^transformer_blocks\.(\d+)\.attn\.norm_k\.(.*)$": r"blocks.\1.attn.k_norm.\2",
             r"^transformer_blocks\.(\d+)\.ff\.net\.0\.proj\.(.*)$": r"blocks.\1.mlp.fc1.\2",
@@ -101,6 +106,8 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
     checkpoint_uses_diffusers_layout: bool = False
     adaln_affine_input_dim: int | None = None
     has_gate_compress: bool = False
+    # VDN-H3: None for the dense model; set from transformer/config.json
+    hybrid_attention: VDNHybridAttentionArchConfig | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -109,6 +116,10 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
         if len(self.patch_size) != 3:
             raise ValueError(f"patch_size must have 3 values, got {self.patch_size}.")
         self.num_channels_latents = self.latents_dim
+        if isinstance(self.hybrid_attention, dict):
+            self.hybrid_attention = VDNHybridAttentionArchConfig.from_transform_config(
+                self.hybrid_attention
+            )
 
 
 @dataclass
@@ -132,6 +143,11 @@ class MiniMaxH3DiTConfig(DiTConfig):
             model_dict["adaln_affine_input_dim"] = source_model_dict["time_embed_dim"]
             model_dict["time_embed_dim"] = source_model_dict["adaln_rank"]
             model_dict["adaln_curve_grid"] = source_model_dict["time_table_size"]
+        hybrid = model_dict.get("hybrid_attention")
+        if isinstance(hybrid, dict):
+            model_dict["hybrid_attention"] = (
+                VDNHybridAttentionArchConfig.from_transform_config(hybrid)
+            )
         super().update_model_arch(model_dict)
 
 

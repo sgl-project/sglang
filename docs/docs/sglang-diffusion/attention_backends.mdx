@@ -85,6 +85,11 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Video Sparse Attention for MiniMax-H3 / FastH3 (VSA-H3). In-tree Triton block-sparse kernel (SM90 / SM100 / SM103); no external package. Configure via <code>--attention-backend-config</code>.</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`hybrid_window_attn_h3`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>`HYBRID_WINDOW_ATTN_H3`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>VDN-H3 hybrid attention: chunk-aligned window softmax (exact, gated) plus the Video Delta linear branch over the window complement. The window runs as a union of FlashAttention varlen calls (SM90 / SM100 / SM103 / SM120). Configure via <code>--attention-backend-config</code>.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`vmoba_attn`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>`VMOBA_ATTN`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Requires <code>kernel.attn.vmoba_attn.vmoba</code>. Configure via <code>--attention-backend-config</code>.</td>
@@ -302,6 +307,56 @@ VSA-H3 constraints:
 - Uses the checkpoint's trained `to_gate_compress` compression branch. Base
   MiniMax-H3 weights load zero gates and run pure sparse.
 - Ulysses sequence parallelism is supported; `--ring-degree` greater than 1,
+  `torch.compile`, and breakable CUDA graph execution are rejected.
+
+**Hybrid window attention for VDN-H3 (`hybrid_window_attn_h3`)**
+
+[VDN-H3](/cookbook/diffusion/MiniMax/MiniMax-H3#7-vdn-h3-hybrid-attention-8-step-distill)
+replaces every DiT block's dense self-attention with two branches. The
+softmax branch is an exact softmax over a chunk-aligned frame window (frame
+`t` belongs to chunk `t // 5` and attends to chunks `c - 1 .. c + 1`; frames
+0 and F-1 are dense as rows and columns; every text / audio pair stays dense)
+scaled by a per-head sigmoid gate. The linear branch (a frame-wise Video Delta
+rule recurrence, forward and reverse over frames) covers exactly the window's
+complement and is driven by the attention module. The mask is request-static,
+so the metadata is built once per request. The checkpoint's
+`transformer/config.json` carries the window geometry; the backend reads it.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "24%"}} />
+    <col style={{width: "14%"}} />
+    <col style={{width: "44%"}} />
+    <col style={{width: "18%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Type</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Default</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`vdn_h3_dense_smoke`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`bool`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Allows a dense transformer backend (`fa`) on the VDN-H3 weights for the base-H3 + LoRA equivalence smoke. The gates and the linear branch are skipped: a study, not a sample.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`false`</td>
+    </tr>
+  </tbody>
+</table>
+
+Hybrid window attention constraints:
+
+- VDN-H3 requires this backend for the transformer; a dense backend on these
+  weights would silently skip the linear branch and the gates, so it is
+  rejected unless `vdn_h3_dense_smoke` is set. The token refiner, text
+  encoder, and VAEs keep dense attention.
+- Base MiniMax-H3 and FastH3 checkpoints have no linear branch and are
+  rejected by this backend.
+- Ulysses sequence parallelism is supported (QK-norm + RoPE run after the
+  all-to-all on the head shard); `--ring-degree` greater than 1,
   `torch.compile`, and breakable CUDA graph execution are rejected.
 
 **V-MoBA (`vmoba_attn`)**
