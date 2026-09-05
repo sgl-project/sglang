@@ -4,9 +4,9 @@ import asyncio
 import unittest
 from collections import deque
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
-from sglang.srt.disaggregation.encoder.receiver import MMReceiverBase
+from sglang.srt.disaggregation.encoder.receiver import MMReceiverHTTP
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -46,32 +46,61 @@ class TestSchedulerLifecycle(unittest.TestCase):
 
 
 class TestEncoderCleanup(unittest.IsolatedAsyncioTestCase):
-    async def test_cancellation_joins_task_then_releases_buffer(self):
-        started = asyncio.Event()
-        finished = asyncio.Event()
+    def make_receiver(self):
+        receiver = MMReceiverHTTP.__new__(MMReceiverHTTP)
+        receiver.encode_urls = ["http://encoder"]
+        receiver.context = object()
+        receiver.host = "127.0.0.1"
+        receiver.recv_timeout = 60
+        receiver._extract_url_data = MagicMock(return_value=[{"modality": "image"}])
+        started = [asyncio.Event(), asyncio.Event()]
+        finished = [asyncio.Event(), asyncio.Event()]
 
-        async def encode():
-            started.set()
+        async def pending(index):
+            started[index].set()
             try:
                 await asyncio.Event().wait()
             finally:
-                finished.set()
+                finished[index].set()
 
-        task = asyncio.create_task(encode())
-        await started.wait()
-        cleanup = MagicMock(side_effect=lambda _: self.assertTrue(finished.is_set()))
-        receiver = SimpleNamespace(_cleanup_mooncake_buffer=cleanup)
-        await MMReceiverBase._abort_encode_and_cleanup(receiver, task, "request-1")
+        receiver.encode = lambda *args, **kwargs: pending(0)
+        receiver._recv_mm_data = lambda *args, **kwargs: pending(1)
+        socket = MagicMock()
+        socket.close.side_effect = lambda **kwargs: self.assertTrue(
+            all(event.is_set() for event in finished)
+        )
+        return receiver, socket, started, finished
+
+    async def test_timeout_joins_both_tasks_before_closing_socket(self):
+        receiver, socket, _, finished = self.make_receiver()
+        receiver.recv_timeout = 0.01
+        with patch(
+            "sglang.srt.disaggregation.encoder.receiver.get_zmq_socket_on_host",
+            return_value=(12345, socket),
+        ):
+            result = await receiver.recv_mm_data(object(), object(), "prompt")
+        self.assertIsNone(result)
+        self.assertTrue(all(event.is_set() for event in finished))
+        socket.close.assert_called_once_with(linger=0)
+
+    async def test_cancellation_propagates_after_join_and_socket_close(self):
+        receiver, socket, started, finished = self.make_receiver()
+        with patch(
+            "sglang.srt.disaggregation.encoder.receiver.get_zmq_socket_on_host",
+            return_value=(12345, socket),
+        ):
+            task = asyncio.create_task(
+                receiver.recv_mm_data(object(), object(), "prompt")
+            )
+            await asyncio.wait_for(
+                asyncio.gather(*(event.wait() for event in started)), timeout=1
+            )
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
         self.assertTrue(task.cancelled())
-        cleanup.assert_called_once_with("request-1")
-
-    async def test_missing_task_still_releases_request_buffer(self):
-        receiver = SimpleNamespace(_cleanup_mooncake_buffer=MagicMock())
-        await MMReceiverBase._abort_encode_and_cleanup(receiver, None, "request-2")
-        receiver._cleanup_mooncake_buffer.assert_called_once_with("request-2")
-        receiver._cleanup_mooncake_buffer.reset_mock()
-        await MMReceiverBase._abort_encode_and_cleanup(receiver, None, None)
-        receiver._cleanup_mooncake_buffer.assert_not_called()
+        self.assertTrue(all(event.is_set() for event in finished))
+        socket.close.assert_called_once_with(linger=0)
 
 
 if __name__ == "__main__":
