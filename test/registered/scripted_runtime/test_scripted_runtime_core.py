@@ -7,6 +7,7 @@ from sglang.test.scripted_runtime.http_server import ScriptedHttpServer
 from sglang.test.scripted_runtime.req_handle import ScriptedReqHandle
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
+    DEFAULT_MAX_STEPS,
     advance_to_decode_step,
     advance_to_nth_chunk,
     base_engine_kwargs,
@@ -130,6 +131,95 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         yield from run_until_finished(r)
         assert not r.is_chunking, "handle.is_chunking still True after finish"
         assert not t.is_chunking(r.rid), "context.is_chunking still True after finish"
+
+    def test_abort_at_last_chunk_does_not_append_output(self):
+        self.server.execute_script(
+            self._script_abort_at_last_chunk_does_not_append_output
+        )
+
+    @staticmethod
+    def _script_abort_at_last_chunk_does_not_append_output(
+        t: ScriptedContext,
+    ):
+        assert t.scheduler.is_fully_idle()
+        assert not t.scheduler.result_queue
+        baseline_kv_capacity = (
+            t.engine_stats()["kv_pool_free"] + t.scheduler.tree_cache.evictable_size()
+        )
+        baseline_req_slots = t.scheduler.req_to_token_pool.available_size()
+        r = t.start_req(prompt_len=_LONG_PROMPT_LEN, max_new_tokens=64, ignore_eos=True)
+        req = None
+        saw_chunked_prefill = False
+        for _ in range(DEFAULT_MAX_STEPS):
+            req = req or r.req
+            last_batch = t.scheduler.last_batch
+            saw_chunked_prefill = saw_chunked_prefill or (
+                req is not None and t.scheduler.chunked_req is req
+            )
+            if (
+                saw_chunked_prefill
+                and req is not None
+                and last_batch is not None
+                and last_batch.forward_mode.is_extend()
+                and req in last_batch.reqs
+                and t.scheduler.chunked_req is None
+                and req.inflight_middle_chunks == 0
+            ):
+                break
+            yield
+        else:
+            raise AssertionError("last prefill chunk was not launched before abort")
+
+        assert len(req.output_ids) == 0
+        assert t.scheduler.result_queue, (
+            "last prefill result was not pending when abort arrived"
+        )
+        prefill_kv_end = req.extend_range.end
+        assert prefill_kv_end == len(req.origin_input_ids)
+        assert req.kv_committed_len == prefill_kv_end
+        assert req.kv is not None and req.kv.kv_allocated_len == prefill_kv_end
+        decode_batch_idx = req.decode_batch_idx
+        assert decode_batch_idx == 0
+
+        t.abort(r)
+        yield from run_until_finished(r)
+
+        assert isinstance(req.finished_reason, FINISH_ABORT)
+        assert len(req.output_ids) == 0, (
+            "chunked-prefill result appended a token after abort: "
+            f"{list(req.output_ids)!r}"
+        )
+        assert not t.is_chunking(r.rid), "aborted req remained chunked"
+        assert req.req_pool_idx is None, "aborted req kept its request-pool slot"
+        assert req.kv is None, "aborted req kept its KV allocation"
+        assert req.decode_batch_idx == decode_batch_idx, (
+            "aborted final-prefill req was scheduled for optimistic decode: "
+            f"{decode_batch_idx} -> {req.decode_batch_idx}"
+        )
+        assert req.kv_committed_len == prefill_kv_end, (
+            "abort retained the optimistic decode KV watermark: "
+            f"{req.kv_committed_len} != {prefill_kv_end}"
+        )
+
+        for _ in range(DEFAULT_MAX_STEPS):
+            if t.scheduler.is_fully_idle() and not t.scheduler.result_queue:
+                break
+            yield
+        else:
+            raise AssertionError("scheduler did not drain after final-prefill abort")
+
+        final_req_slots = t.scheduler.req_to_token_pool.available_size()
+        assert final_req_slots == baseline_req_slots, (
+            "final-prefill abort leaked a request-pool slot: "
+            f"{baseline_req_slots} -> {final_req_slots}"
+        )
+        final_kv_capacity = (
+            t.engine_stats()["kv_pool_free"] + t.scheduler.tree_cache.evictable_size()
+        )
+        assert final_kv_capacity == baseline_kv_capacity, (
+            "final-prefill abort leaked KV: "
+            f"{baseline_kv_capacity} -> {final_kv_capacity}"
+        )
 
     def test_pause_retract_parks_in_waiting_queue_then_resumes(self):
         self.server.execute_script(self._script_pause_retract_parks_then_resumes)
