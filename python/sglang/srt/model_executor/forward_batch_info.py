@@ -1298,9 +1298,31 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     :,
                     extend_prefix_len : extend_prefix_len + extend_seq_len,
                 ]
-                if mrope_positions.numel() == 0:
-                    mrope_positions = self._expand_mrope_from_input(
-                        mm_input, seq_lens_cpu[batch_idx]
+                if mrope_positions.shape[1] < extend_seq_len:
+                    # A continuation of a held request (e.g. a session) can
+                    # extend past the precomputed table; the uncovered span is
+                    # text after the last mm item, whose positions continue
+                    # sequentially from mrope_position_delta, the same rule
+                    # the decode path applies. This also covers the fully
+                    # uncovered case, where the previous fallback returned a
+                    # single-column tensor for a multi-token extend.
+                    if mm_input.mrope_position_delta_repeated_cache is None:
+                        mm_input.mrope_position_delta_repeated_cache = (
+                            (mm_input.mrope_position_delta - 1)
+                            .flatten()
+                            .unsqueeze(0)
+                            .repeat(3, 1)
+                        )
+                    covered = mrope_positions.shape[1]
+                    lengths = torch.arange(
+                        extend_prefix_len + covered + 1,
+                        extend_prefix_len + extend_seq_len + 1,
+                    ).unsqueeze(0)
+                    tail = (
+                        mm_input.mrope_position_delta_repeated_cache[:, :1] + lengths
+                    )
+                    mrope_positions = torch.cat(
+                        [mrope_positions.to(tail.dtype), tail], dim=1
                     )
             mrope_positions_list[batch_idx] = mrope_positions
 
