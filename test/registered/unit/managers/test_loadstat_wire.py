@@ -1,16 +1,17 @@
 """Wire contract and port/rank gating for the LoadStat load snapshot.
 
-Locks the msgpack array shape the sgl-router `cache_aware_zmq` policy will
-decode positionally (that consumer lands with the router PR; it is not yet
-in this tree, so this pins only the Python side):
+Locks the msgpack array shape the sgl-router Engine Load subscriber decodes
+positionally:
 
     ["LoadStat", num_running_reqs, num_waiting_reqs, num_tokens,
-     max_total_num_tokens, attn_dp_rank]
+     max_total_num_tokens, attn_dp_rank,
+     num_waiting_uncached_tokens, num_total_tokens, max_running_requests,
+     total_prefill_uncached_tokens, total_prefill_busy_us]
 
 carried as the payload of a three-frame message ``[b"load", BE-i64 seq,
 payload]``. A field reorder or rename is a silent cross-language break, so
-`test_loadstat_golden_bytes` pins the exact encoding — assert the same hex
-on the Rust side when that PR lands to actually close the loop.
+`test_loadstat_golden_bytes` pins the exact encoding used by the Rust decoder
+tests as well.
 TestLoadPublisherGating pins which schedulers publish and on which port.
 CPU-only: the socket bind is stubbed at the `_open_pub_socket` seam.
 """
@@ -34,9 +35,9 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 class TestLoadStatWire(CustomTestCase):
     def test_loadstat_golden_bytes(self):
-        # Exact on-the-wire encoding. Assert the identical hex from the Rust
-        # decoder's test when the router PR lands — that is what actually pins
-        # a cross-language format; the decode-round-trip below only pins Python.
+        # Exact on-the-wire encoding. The matching Rust decoder test and this
+        # test jointly pin the cross-language format; the decode round-trip
+        # below alone would only pin Python.
         raw = msgspec.msgpack.Encoder().encode(
             LoadStat(
                 num_running_reqs=7,
@@ -46,7 +47,7 @@ class TestLoadStatWire(CustomTestCase):
                 attn_dp_rank=2,
             )
         )
-        self.assertEqual(raw.hex(), "96a84c6f6164537461740703cd0400cd200002")
+        self.assertEqual(raw.hex(), "9ba84c6f6164537461740703cd0400cd2000020000000000")
 
     def test_loadstat_msgpack_array_shape(self):
         raw = msgspec.msgpack.Encoder().encode(
@@ -59,10 +60,10 @@ class TestLoadStatWire(CustomTestCase):
             )
         )
         # tag=True + array_like → [tag, *fields] in declaration order; the
-        # router reads the tag + four counts and ignores the trailing field.
+        # Router reads the tag and four base fields, then the native suffix.
         self.assertEqual(
             msgspec.msgpack.Decoder().decode(raw),
-            ["LoadStat", 7, 3, 1024, 8192, 2],
+            ["LoadStat", 7, 3, 1024, 8192, 2, 0, 0, 0, 0, 0],
         )
 
     def test_loadstat_tag_is_class_name(self):
@@ -77,9 +78,9 @@ class TestLoadStatWire(CustomTestCase):
             )
         )
         decoded = msgspec.msgpack.Decoder().decode(raw)
-        # LoadStat sets no omit_defaults, so the trailing field is always
-        # emitted (null when unset); a decoder must tolerate it.
-        self.assertEqual(decoded, ["LoadStat", 0, 0, 0, 0, None])
+        # LoadStat sets no omit_defaults, so the presence marker and native
+        # extension are always emitted; a legacy router can safely ignore it.
+        self.assertEqual(decoded, ["LoadStat", 0, 0, 0, 0, None, 0, 0, 0, 0, 0])
 
 
 ZMQ_ENDPOINT = '{"publisher": "zmq", "endpoint": "tcp://*:5557"}'
@@ -336,6 +337,11 @@ class TestLoadPublisherGating(CustomTestCase):
                 num_waiting_reqs=2,
                 num_used_tokens=3,
                 max_total_num_tokens=4,
+                num_waiting_uncached_tokens=5,
+                num_total_tokens=6,
+                max_running_requests=7,
+                total_prefill_uncached_tokens=8,
+                total_prefill_busy_us=9,
             )
         )
 
@@ -356,6 +362,11 @@ class TestLoadPublisherGating(CustomTestCase):
             num_waiting_reqs=2,
             num_used_tokens=3,
             max_total_num_tokens=4,
+            num_waiting_uncached_tokens=5,
+            num_total_tokens=6,
+            max_running_requests=7,
+            total_prefill_uncached_tokens=8,
+            total_prefill_busy_us=9,
         )
         pub.publish_load_stat(provider, force=True, snapshot=snap)
         provider.assert_not_called()
@@ -372,7 +383,7 @@ class TestLoadPublisherGating(CustomTestCase):
         self.assertEqual(seq, (0).to_bytes(8, "big"))
         self.assertEqual(
             msgspec.msgpack.Decoder().decode(payload),
-            ["LoadStat", 1, 2, 3, 4, 0],
+            ["LoadStat", 1, 2, 3, 4, 0, 5, 6, 7, 8, 9],
         )
 
     def test_unchanged_stat_is_deduped_to_the_heartbeat(self):
@@ -475,6 +486,11 @@ class TestLoadStatIntegration(CustomTestCase):
             num_waiting_reqs=3,
             num_used_tokens=1024,
             max_total_num_tokens=8192,
+            num_waiting_uncached_tokens=512,
+            num_total_tokens=4096,
+            max_running_requests=64,
+            total_prefill_uncached_tokens=20_000,
+            total_prefill_busy_us=2_000_000,
         )
         # PUB/SUB drops messages sent before the subscription propagates, so
         # re-publish until one lands (heartbeat reset each pass).
@@ -492,7 +508,7 @@ class TestLoadStatIntegration(CustomTestCase):
         self.assertEqual(len(seq), 8)
         self.assertEqual(
             msgspec.msgpack.Decoder().decode(payload),
-            ["LoadStat", 7, 3, 1024, 8192, 0],
+            ["LoadStat", 7, 3, 1024, 8192, 0, 512, 4096, 64, 20_000, 2_000_000],
         )
 
 
