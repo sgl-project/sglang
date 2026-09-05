@@ -82,8 +82,8 @@ class TestSharedVirtualIdSpace(unittest.TestCase):
         for full_layers, swa_layers in ((1, 5), (5, 1), (2, 2)):
             with self.subTest(full_layers=full_layers, swa_layers=swa_layers):
                 alloc = _build(200, 20, full_layers, swa_layers)
-                owner = alloc.full_attn_allocator
-                swa = alloc.swa_attn_allocator
+                owner = alloc.full.pool
+                swa = alloc.swa.pool
                 self.assertGreaterEqual(
                     int(swa.virtual_to_physical.shape[0]),
                     owner.num_virtual_ids + 1,
@@ -99,7 +99,7 @@ class TestSharedVirtualIdSpace(unittest.TestCase):
         side's page count, which is where the narrow table used to be written
         off the end."""
         alloc = _build(200, 20, full_layers=1, swa_layers=5)
-        swa_pages = alloc.swa_attn_allocator.num_pages
+        swa_pages = alloc.swa.pool.num_pages
         highest = 0
         for _ in range(40):
             v = alloc.alloc(4)

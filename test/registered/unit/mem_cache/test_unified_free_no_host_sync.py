@@ -33,7 +33,11 @@ from unittest import mock
 import torch
 from test_multi_ended_allocator import TestPagedMultiEndedKVAllocator as _PagedFixture
 
-from sglang.srt.mem_cache.allocator import unified_hybrid_swa, unified_mamba
+from sglang.srt.mem_cache.allocator import (
+    unified_hybrid_swa,
+    unified_mamba,
+    unified_side,
+)
 from sglang.srt.mem_cache.allocator import unified_sub_pool as mea
 from sglang.srt.mem_cache.allocator.base import BaseKVAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -340,13 +344,12 @@ class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
                 )
 
     def test_composites_buffer_reps_not_tokens_in_a_group(self):
-        """Every allocator that can receive a segment free needs the group
-        buffer, or `free_segment` raises inside a group. The unified SWA
-        composite fans out to its sides, so the buffer is checked there."""
+        """Every free path that buffers segment frees in a group needs the
+        buffer, or `free_segment` raises inside a group. The composites fan
+        out to their sides, so the buffer is checked on the side that owns it."""
         for cls, buffer in (
             (mea.MultiEndedKVAllocator, "free_page_reps_group"),
-            (unified_mamba.UnifiedMambaKVAllocator, "free_page_reps_group"),
-            (unified_hybrid_swa._VirtualSWASide, "_pending_reps"),
+            (unified_side.VirtualSWAKVPoolSide, "_pending_reps"),
         ):
             with self.subTest(cls=cls.__name__):
                 self.assertIn(buffer, inspect.getsource(cls))
@@ -473,23 +476,28 @@ class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
                 a2.swa.free(v2[: 4 * self.PS])  # fallback (radix shape)
                 self.assertTrue(
                     torch.equal(
-                        a1.swa_attn_allocator.virtual_to_physical,
-                        a2.swa_attn_allocator.virtual_to_physical,
+                        a1.swa.pool.virtual_to_physical,
+                        a2.swa.pool.virtual_to_physical,
                     )
                 )
                 self.assertEqual(a1.available_size(), a2.available_size())
                 self.assertEqual(
-                    a1.swa_attn_allocator.schedulable_available_size(),
-                    a2.swa_attn_allocator.schedulable_available_size(),
+                    a1.swa.pool.schedulable_available_size(),
+                    a2.swa.pool.schedulable_available_size(),
                 )
 
-    def test_double_ratchet_is_filtered_not_crashed(self):
-        """Freeing an already-tombstoned range again must no-op through the
-        liveness filter (radix eviction and the ratchet can overlap)."""
+    def test_double_ratchet_is_flagged(self):
+        """Freeing an already-tombstoned range again breaks the release
+        contract; the side flags it instead of filtering it away."""
+        from sglang.srt.environ import InvariantCheckLevel, envs
+
         alloc = self._swa_composite(lazy=True)
         v = alloc.alloc(4 * self.PS)
         alloc.swa.free_segment(v, start_pos=0)
-        alloc.swa.free_segment(v, start_pos=0)  # all tombstoned -> filtered to empty
+        with envs.SGLANG_INVARIANT_CHECK.override(int(InvariantCheckLevel.STRICT)):
+            with mock.patch.object(torch, "_assert_async") as assert_async:
+                alloc.swa.free_segment(v, start_pos=0)
+        self.assertFalse(bool(assert_async.call_args.args[0].all()))
 
 
 @unittest.skipUnless(

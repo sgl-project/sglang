@@ -2,9 +2,9 @@ import weakref
 
 import torch
 
-from sglang.srt.mem_cache.allocator.base import BaseKVAllocator, KVFreeSide
-from sglang.srt.mem_cache.allocator.hybrid import BaseHybridSWAKVAllocator
+from sglang.srt.mem_cache.allocator.base import BaseKVAllocator, BaseKVPoolSide
 from sglang.srt.mem_cache.allocator.paged import PagedKVAllocator
+from sglang.srt.mem_cache.allocator.swa import HybridSWAKVAllocator
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
     HiSparseC4DevicePool,
@@ -60,8 +60,6 @@ class HiSparseKVAllocator(BaseKVAllocator):
             ]
         )
 
-        self.free_pages = None
-        self.release_pages = None
         self.free_group = None
         self.clear()
         self._kvcache.register_mapping(
@@ -81,6 +79,10 @@ class HiSparseKVAllocator(BaseKVAllocator):
             self.logical_attn_allocator.available_size(),
             self.hisparse_attn_allocator.available_size(),
         )
+
+    def logical_available_size(self) -> int:
+        """The logical pool alone: a decode prealloc binds no hisparse pages."""
+        return self.logical_attn_allocator.available_size()
 
     def get_kvcache(self):
         return self._kvcache
@@ -262,12 +264,13 @@ class HiSparseKVAllocator(BaseKVAllocator):
         )
 
 
-class _HiSparseFullSide(KVFreeSide):
-    """The wrapped hybrid's full side, with capacity also bounded by the C4
-    hisparse pool that every full slot needs a compressed slot in."""
+class _HiSparseFullSide(BaseKVPoolSide):
+    """The hybrid's full side, with capacity also bounded by the C4 hisparse
+    pool that every full slot needs a compressed slot in."""
 
-    def __init__(self, inner: KVFreeSide, hisparse_pool, compress_ratio: int):
+    def __init__(self, inner: BaseKVPoolSide, hisparse_pool, compress_ratio: int):
         self.inner = inner
+        self.pool = inner.pool
         self.hisparse_pool = hisparse_pool
         self.compress_ratio = compress_ratio
         self.page_size = inner.page_size
@@ -277,6 +280,18 @@ class _HiSparseFullSide(KVFreeSide):
         return min(
             self.inner.available_size(),
             self.hisparse_pool.available_size() * self.compress_ratio,
+        )
+
+    def conserve_available_size(self) -> int:
+        return min(
+            self.inner.conserve_available_size(),
+            self.hisparse_pool.conserve_available_size() * self.compress_ratio,
+        )
+
+    def schedulable_available_size(self) -> int:
+        return min(
+            self.inner.schedulable_available_size(),
+            self.hisparse_pool.schedulable_available_size() * self.compress_ratio,
         )
 
     def free(self, free_index: torch.Tensor):
@@ -292,102 +307,63 @@ class _HiSparseFullSide(KVFreeSide):
         self.inner.free_group_end()
 
 
-class HiSparseHybridSWAKVAllocator(BaseHybridSWAKVAllocator):
+class HiSparseHybridSWAKVAllocator(HybridSWAKVAllocator):
+    """DeepSeek V4: the static hybrid plus a C4 hisparse pool holding one
+    compressed slot per `compress_ratio` full slots."""
+
     def __init__(
         self,
-        logical_attn_allocator: BaseKVAllocator,
+        size: int,
+        size_swa: int,
+        page_size: int,
+        dtype: torch.dtype,
+        device: str,
+        kvcache: DeepSeekV4TokenToKVPool,
+        need_sort: bool,
     ):
-        assert isinstance(logical_attn_allocator._kvcache, DeepSeekV4TokenToKVPool)
-        assert isinstance(
-            logical_attn_allocator._kvcache.c4_kv_pool, HiSparseC4DevicePool
-        )
+        assert isinstance(kvcache, DeepSeekV4TokenToKVPool)
+        assert isinstance(kvcache.c4_kv_pool, HiSparseC4DevicePool)
         self.compress_ratio = 4
-
-        self.hisparse_kvcache = logical_attn_allocator._kvcache.c4_kv_pool
-        self._size_full = logical_attn_allocator.size_full
+        self.hisparse_kvcache = kvcache.c4_kv_pool
         self._size_hisparse = self.hisparse_kvcache.size
-
-        self.dtype = self.hisparse_kvcache.dtype
-        self.device = self.hisparse_kvcache.device
-        # Keep the public page_size as the logical DSV4 full/SWA page size.
-        # C4 HiSparse allocation/device-buffer code must use the compressed page size.
-        self.page_size = logical_attn_allocator.page_size
+        # The public page_size stays the logical DSV4 full/SWA page size; the C4
+        # pool allocates in its own compressed page size.
         self.hisparse_page_size = self.hisparse_kvcache.page_size
-
-        self.logical_attn_allocator = logical_attn_allocator
-        self._kvcache = logical_attn_allocator._kvcache
         self.hisparse_attn_allocator = PagedKVAllocator(
             self._size_hisparse,
             self.hisparse_page_size,
-            self.dtype,
-            self.device,
+            self.hisparse_kvcache.dtype,
+            self.hisparse_kvcache.device,
             self.hisparse_kvcache,
-            logical_attn_allocator.need_sort,
+            need_sort,
         )
-
         self.full_to_hisparse_device_index_mapping = torch.cat(
             [
                 torch.zeros(
-                    self._kvcache.c4_logical_size + self.hisparse_page_size,
+                    kvcache.c4_logical_size + self.hisparse_page_size,
                     dtype=torch.int64,
-                    device=self.device,
+                    device=device,
                 ),
-                torch.tensor([-1], dtype=torch.int64, device=self.device),
+                torch.tensor([-1], dtype=torch.int64, device=device),
             ]
         )
-
-        self.need_sort = logical_attn_allocator.need_sort
-        self.free_pages = None
-        self.release_pages = None
-        self.free_group = None
-        # The swa side is the wrapped hybrid's; the full side is too, bounded
-        # by the hisparse pool that is ours.
+        # Base init calls clear(), which needs the hisparse pool above.
+        super().__init__(size, size_swa, page_size, dtype, device, kvcache, need_sort)
         self.full = _HiSparseFullSide(
-            logical_attn_allocator.full,
-            self.hisparse_attn_allocator,
-            self.compress_ratio,
+            self.full, self.hisparse_attn_allocator, self.compress_ratio
         )
-        self.swa = logical_attn_allocator.swa
-        self.clear()
-
         self.hisparse_kvcache.register_mapping(
             weakref.proxy(self.full_to_hisparse_device_index_mapping)
         )
 
-    @property
-    def size_full(self) -> int:
-        return self._size_full
-
-    @property
-    def size(self) -> int:
-        return self.logical_attn_allocator.size
-
-    @property
-    def size_swa(self) -> int:
-        return self.logical_attn_allocator.size_swa
-
-    @property
-    def full_to_swa_index_mapping(self):
-        return self.logical_attn_allocator.full_to_swa_index_mapping
+    def logical_available_size(self) -> int:
+        """The full/swa pools alone: a decode prealloc binds no C4 pages."""
+        return min(self.full.pool.available_size(), self.swa.available_size())
 
     def debug_print(self) -> str:
-        msg = self.logical_attn_allocator.debug_print()
-        msg += (
+        return super().debug_print() + (
             f"#hisparse-available-size: "
             f"{self.hisparse_attn_allocator.available_size()}, "
-        )
-        return msg
-
-    def get_kvcache(self):
-        return self._kvcache
-
-    def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
-        return self.logical_attn_allocator.translate_loc_from_full_to_swa(kv_indices)
-
-    def available_size(self) -> int:
-        return min(
-            self.logical_attn_allocator.available_size(),
-            self.hisparse_attn_allocator.available_size() * self.compress_ratio,
         )
 
     def alloc(self, need_size: int):
@@ -406,33 +382,13 @@ class HiSparseHybridSWAKVAllocator(BaseHybridSWAKVAllocator):
         extend_num_tokens: int,
     ):
         """Allocate decode logical indices without allocating C4 hisparse device pages."""
-        return self.logical_attn_allocator.alloc_extend(
+        return super().alloc_extend(
             prefix_lens,
             prefix_lens_cpu,
             seq_lens,
             seq_lens_cpu,
             last_loc,
             extend_num_tokens,
-        )
-
-    def alloc_extend_swa_tail(
-        self,
-        prefix_lens: torch.Tensor,
-        prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-        extend_num_tokens: int,
-        swa_tail_len: int,
-    ):
-        return self.logical_attn_allocator.alloc_extend_swa_tail(
-            prefix_lens=prefix_lens,
-            prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
-            last_loc=last_loc,
-            extend_num_tokens=extend_num_tokens,
-            swa_tail_len=swa_tail_len,
         )
 
     def alloc_device_buffer(self, allocated_indices, need_size: int):
@@ -508,26 +464,18 @@ class HiSparseHybridSWAKVAllocator(BaseHybridSWAKVAllocator):
     ):
         assert self.page_size > 1
 
-        num_new_pages_logical = get_num_new_pages(
-            seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
-        )
         num_new_pages_hisparse = get_num_new_pages(
             seq_lens=seq_lens_cpu // self.compress_ratio,
             page_size=self.hisparse_page_size,
             prefix_lens=prefix_lens_cpu // self.compress_ratio,
         )
         if (
-            num_new_pages_logical
-            > self.logical_attn_allocator.available_size() // self.page_size
-        ):
-            return None
-        if (
             num_new_pages_hisparse
             > self.hisparse_attn_allocator.available_size() // self.hisparse_page_size
         ):
             return None
 
-        logical_indices = self.logical_attn_allocator.alloc_extend(
+        logical_indices = super().alloc_extend(
             prefix_lens,
             prefix_lens_cpu,
             seq_lens,
@@ -535,7 +483,8 @@ class HiSparseHybridSWAKVAllocator(BaseHybridSWAKVAllocator):
             last_loc,
             extend_num_tokens,
         )
-        assert logical_indices is not None, "Logical allocation failed in alloc_extend"
+        if logical_indices is None:
+            return None
 
         compressed_logical_indices = (
             self.hisparse_kvcache.translate_loc_from_full_to_compressed(logical_indices)
@@ -558,16 +507,6 @@ class HiSparseHybridSWAKVAllocator(BaseHybridSWAKVAllocator):
         )
         return logical_indices
 
-    def alloc_decode(
-        self,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-    ):
-        return self.logical_attn_allocator.alloc_decode(
-            seq_lens, seq_lens_cpu, last_loc
-        )
-
     def free_compressed(self, compressed_indices: torch.Tensor):
         hisparse_indices = self.hisparse_kvcache.translate_loc_to_hisparse_device(
             compressed_indices
@@ -583,8 +522,7 @@ class HiSparseHybridSWAKVAllocator(BaseHybridSWAKVAllocator):
         self.free_compressed(compressed_indices)
 
     def clear(self):
-        self.logical_attn_allocator.clear()
+        super().clear()
         self.hisparse_attn_allocator.clear()
-
+        # Keep the trailing -1: it is what a last_loc of -1 translates to.
         self.full_to_hisparse_device_index_mapping[:-1].fill_(0)
-        self.free_group = None

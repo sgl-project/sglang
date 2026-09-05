@@ -292,11 +292,12 @@ class SchedulerPoolStatsObserver:
         # `*_num_used` is `static_cap - (available + evictable)`, so the
         # available term must match the static cap's denomination: the conserve
         # view, never the byte-coordinated one (see
-        # `conserve_full_available_size`). Measured ~25-90x inflated otherwise.
+        # `VirtualFullKVPoolSide.conserve_available_size`). Measured ~25-90x
+        # inflated otherwise.
         allocator = self.token_to_kv_pool_allocator
         if isinstance(allocator, UnifiedMambaHybridSWAKVAllocator):
-            full_available_size = allocator.conserve_full_available_size()
-            swa_available_size = allocator.conserve_swa_available_size()
+            full_available_size = allocator.full.conserve_available_size()
+            swa_available_size = allocator.swa.conserve_available_size()
         elif isinstance(allocator, BaseHybridSWAKVAllocator):
             full_available_size = allocator.full.available_size()
             swa_available_size = allocator.swa.available_size()

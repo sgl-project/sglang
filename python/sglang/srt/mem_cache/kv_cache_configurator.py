@@ -1935,7 +1935,11 @@ class KVCacheConfigurator:
                         need_sort=need_sort,
                     )
                 elif self.is_hybrid_swa:
-                    token_to_kv_pool_allocator = HybridSWAKVAllocator(
+                    if get_memory().enable_hisparse and is_dsv4_model:
+                        hybrid_allocator_cls = HiSparseHybridSWAKVAllocator
+                    else:
+                        hybrid_allocator_cls = HybridSWAKVAllocator
+                    token_to_kv_pool_allocator = hybrid_allocator_cls(
                         sizes.full_max_total_num_tokens,
                         sizes.swa_max_total_num_tokens,
                         page_size=get_schedule().page_size,
@@ -1983,9 +1987,6 @@ class KVCacheConfigurator:
 
             if get_memory().enable_hisparse and is_dsv4_model:
                 assert self.is_hybrid_swa, "DeepSeek V4 HiSparse requires SWA mode."
-                token_to_kv_pool_allocator = HiSparseHybridSWAKVAllocator(
-                    token_to_kv_pool_allocator
-                )
 
             # DSV4-NPU: wire allocator back-ref into req_to_token_pool so its
             # free(req) can release c4/c128 pool pages alongside the slot.
@@ -1995,15 +1996,8 @@ class KVCacheConfigurator:
         else:
             assert self.is_draft_worker
             if self.is_hybrid_swa:
-                if isinstance(
-                    token_to_kv_pool_allocator,
-                    HiSparseHybridSWAKVAllocator,
-                ):
-                    swa_allocator = token_to_kv_pool_allocator.logical_attn_allocator
-                else:
-                    swa_allocator = token_to_kv_pool_allocator
                 uses_unified_virtual_ids = isinstance(
-                    swa_allocator, UnifiedHybridSWAKVAllocator
+                    token_to_kv_pool_allocator, UnifiedHybridSWAKVAllocator
                 )
                 has_draft_swa_layers = (
                     not self.is_hybrid_swa_mtp_draft or self.draft_swa_full_capacity
@@ -2023,11 +2017,11 @@ class KVCacheConfigurator:
                     token_to_kv_pool.register_mapping(identity_mapping)
                 elif not uses_unified_virtual_ids:
                     assert isinstance(
-                        swa_allocator,
+                        token_to_kv_pool_allocator,
                         (HybridSWAKVAllocator, PureSWAKVAllocator),
                     )
                     token_to_kv_pool.register_mapping(
-                        swa_allocator.full_to_swa_index_mapping
+                        token_to_kv_pool_allocator.full_to_swa_index_mapping
                     )
         return token_to_kv_pool_allocator
 

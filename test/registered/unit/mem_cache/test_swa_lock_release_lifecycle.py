@@ -100,12 +100,12 @@ def _swa_alloc(allocator, need_size):
         f"page_size > 1 requires page-aligned alloc, got {need_size=} "
         f"with {allocator.page_size=}"
     )
-    if need_size > allocator.full_attn_allocator.available_size():
+    if need_size > allocator.full.pool.available_size():
         return None
-    if need_size > allocator.swa_attn_allocator.available_size():
+    if need_size > allocator.swa.pool.available_size():
         return None
-    full_indices = allocator.full_attn_allocator.alloc(need_size)
-    swa_indices = allocator.swa_attn_allocator.alloc(need_size)
+    full_indices = allocator.full.pool.alloc(need_size)
+    swa_indices = allocator.swa.pool.alloc(need_size)
     assert full_indices is not None and swa_indices is not None
     allocator.full_to_swa_index_mapping[full_indices] = swa_indices
     return full_indices

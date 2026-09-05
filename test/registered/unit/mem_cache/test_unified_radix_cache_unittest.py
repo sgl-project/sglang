@@ -1305,12 +1305,12 @@ class UnifiedRadixCacheSuite:
         # Replicate alloc_extend's core logic here.
         ps = self.cfg.page_size
         aligned = ((need_size + ps - 1) // ps) * ps
-        if aligned > allocator.full_attn_allocator.available_size():
+        if aligned > allocator.full.pool.available_size():
             return None
-        if aligned > allocator.swa_attn_allocator.available_size():
+        if aligned > allocator.swa.pool.available_size():
             return None
-        full_indices = allocator.full_attn_allocator.alloc(aligned)
-        swa_indices = allocator.swa_attn_allocator.alloc(aligned)
+        full_indices = allocator.full.pool.alloc(aligned)
+        swa_indices = allocator.swa.pool.alloc(aligned)
         assert full_indices is not None and swa_indices is not None
         allocator.full_to_swa_index_mapping[full_indices] = swa_indices
         return full_indices[:need_size]
@@ -1929,12 +1929,12 @@ class UnifiedRadixCacheSuite:
         req.extra_key = None
         req.kv.swa_evicted_seqlen = 0
 
-        full_available_before_insert = allocator.full_attn_allocator.available_size()
+        full_available_before_insert = allocator.full.pool.available_size()
 
         cache.cache_unfinished_req(req)
 
         self.assertEqual(
-            allocator.full_attn_allocator.available_size(),
+            allocator.full.pool.available_size(),
             full_available_before_insert + len(tokens),
         )
         self.assertTrue(
@@ -1974,7 +1974,7 @@ class UnifiedRadixCacheSuite:
         value = self._alloc(allocator, len(tokens))
         if value is None:
             self.skipTest("insufficient pool for this config")
-        full_available_before = allocator.full_attn_allocator.available_size()
+        full_available_before = allocator.full.pool.available_size()
 
         cache.insert(
             InsertParams(
@@ -1985,9 +1985,7 @@ class UnifiedRadixCacheSuite:
             )
         )
 
-        self.assertEqual(
-            allocator.full_attn_allocator.available_size(), full_available_before
-        )
+        self.assertEqual(allocator.full.pool.available_size(), full_available_before)
         (node,) = _node_children(cache, cache.root_node_handle())
         self.assertTrue(
             torch.equal(_device_value(cache, node, ComponentType.FULL), value)
@@ -2551,7 +2549,7 @@ class UnifiedRadixCacheSuite:
         req.swa_uuid_for_lock = None
         req.extra_key = None
 
-        swa_avail_before = allocator.swa_attn_allocator.available_size()
+        swa_avail_before = allocator.swa.pool.available_size()
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
             cache.cache_unfinished_req(req)
@@ -2565,7 +2563,7 @@ class UnifiedRadixCacheSuite:
             f"{expected_evicted}, got {req.kv.swa_evicted_seqlen}",
         )
 
-        swa_avail_after = allocator.swa_attn_allocator.available_size()
+        swa_avail_after = allocator.swa.pool.available_size()
         self.assertGreaterEqual(
             swa_avail_after - swa_avail_before,
             expected_evicted,
@@ -4074,7 +4072,7 @@ class UnifiedRadixCacheSuite:
         extend_need = 2 * ps + 1
         max_new = 8
         hold = cons_alloc.swa.available_size() - (window + extend_need - 1)
-        self.assertIsNotNone(cons_alloc.swa_attn_allocator.alloc(hold // ps * ps))
+        self.assertIsNotNone(cons_alloc.swa.pool.alloc(hold // ps * ps))
 
         # The adder's SWA gate for this request (_swa_budget_for_req).
         surfaced_swa_hit = cons.staged_prefetch_swa_tokens(req_id)
@@ -6864,9 +6862,9 @@ class UnifiedRadixCacheSuite:
 
         # Allocate SWA device slots from the inner allocator (mirrors how
         # _resolve_device_transfers routes via device_alloc_fn ->
-        # swa_attn_allocator.alloc on the load-back path).
+        # swa.pool.alloc on the load-back path).
         n_swa = int(xfer.host_indices.numel())
-        new_swa = allocator.swa_attn_allocator.alloc(n_swa)
+        new_swa = allocator.swa.pool.alloc(n_swa)
         self.assertIsNotNone(new_swa)
         xfer.device_indices = new_swa
 
@@ -7055,7 +7053,7 @@ class UnifiedRadixCacheSuite:
         xfer = cache.tree_core.build_hicache_transfers(
             ComponentType.SWA, leaf, CacheTransferPhase.LOAD_BACK
         )[0]
-        new_swa = allocator.swa_attn_allocator.alloc(int(xfer.host_indices.numel()))
+        new_swa = allocator.swa.pool.alloc(int(xfer.host_indices.numel()))
         self.assertIsNotNone(new_swa)
         xfer.device_indices = new_swa
         load_actions = []
@@ -7085,7 +7083,7 @@ class UnifiedRadixCacheSuite:
         if self.cfg.has_mamba:
             self.skipTest("SWA-only path")
         if self.cfg.page_size > 1:
-            self.skipTest("page_size==1 for direct swa_attn_allocator access")
+            self.skipTest("page_size==1 for direct swa.pool access")
 
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
 
@@ -7118,24 +7116,22 @@ class UnifiedRadixCacheSuite:
 
         # Make raw SWA availability smaller than both load-back transfers.
         target_swa_avail = sw - 1
-        swa_avail = allocator.swa_attn_allocator.available_size()
+        swa_avail = allocator.swa.pool.available_size()
         self.assertGreaterEqual(swa_avail, target_swa_avail)
         if swa_avail > target_swa_avail:
-            external_swa = allocator.swa_attn_allocator.alloc(
-                swa_avail - target_swa_avail
-            )
+            external_swa = allocator.swa.pool.alloc(swa_avail - target_swa_avail)
             self.assertIsNotNone(external_swa)
 
         self.assertGreaterEqual(
-            allocator.full_attn_allocator.available_size(),
+            allocator.full.pool.available_size(),
             int(kv_xfer.host_indices.numel()),
         )
         self.assertLess(
-            allocator.swa_attn_allocator.available_size(),
+            allocator.swa.pool.available_size(),
             int(kv_xfer.host_indices.numel()),
         )
         self.assertLess(
-            allocator.swa_attn_allocator.available_size(),
+            allocator.swa.pool.available_size(),
             int(swa_xfer.host_indices.numel()),
         )
 
@@ -7973,17 +7969,16 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
                 incoming_full=incoming_full,
             ),
         )
-        # keep the locked full, remap it onto the incoming full's SWA translation
-        alloc.translate_loc_from_full_to_swa.assert_called_once_with(incoming_full)
-        alloc.set_full_to_swa_mapping.assert_called_once_with(kept_full, swa_value)
-        # the incoming full's stale mapping is cleared, then its slot freed (full-only)
-        alloc.clear_full_to_swa_mapping.assert_called_once_with(incoming_full)
+        # The kept full takes the incoming full's swa peers through the pairing,
+        # then the incoming full is freed on its side alone.
+        alloc.pairing.transfer.assert_called_once_with(kept_full, incoming_full)
         alloc.full.free_segment.assert_called_once_with(incoming_full, start_pos=0)
+        alloc.translate_loc_from_full_to_swa.assert_called_once_with(kept_full)
         # Never by indexing the tensor: the unified composite has no
         # `full_to_swa_index_mapping` to index into.
         alloc.full_to_swa_index_mapping.__setitem__.assert_not_called()
         # not the inner allocator (skips the free-group defer) and not both halves
-        alloc.full_attn_allocator.free.assert_not_called()
+        alloc.full.pool.free.assert_not_called()
         alloc.free.assert_not_called()
         cache.tree_core.set_component_device_value.assert_called_once_with(
             5, ComponentType.SWA, swa_value
@@ -8389,16 +8384,16 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         allocator.swa.free(evicted[:sw])
         cache.insert(InsertParams(key=key, value=evicted, swa_evicted_seqlen=sw))
         value = self._alloc(allocator, len(seq))
-        full_available = allocator.full_attn_allocator.available_size()
-        swa_available = allocator.swa_attn_allocator.available_size()
+        full_available = allocator.full.pool.available_size()
+        swa_available = allocator.swa.pool.available_size()
         cache.insert(InsertParams(key=key, value=value, swa_evicted_seqlen=0))
 
         self.assertEqual(
-            allocator.full_attn_allocator.available_size(),
+            allocator.full.pool.available_size(),
             full_available + len(seq),
         )
         self.assertEqual(
-            allocator.swa_attn_allocator.available_size(),
+            allocator.swa.pool.available_size(),
             swa_available + sw,
         )
         cache.sanity_check()
@@ -9098,8 +9093,8 @@ class TestSWAWindowUnderBigramKey(CustomTestCase):
     def _alloc_paged(self, allocator, need_size):
         ps = self.cfg.page_size
         aligned = ((need_size + ps - 1) // ps) * ps
-        full_indices = allocator.full_attn_allocator.alloc(aligned)
-        swa_indices = allocator.swa_attn_allocator.alloc(aligned)
+        full_indices = allocator.full.pool.alloc(aligned)
+        swa_indices = allocator.swa.pool.alloc(aligned)
         self.assertIsNotNone(full_indices)
         self.assertIsNotNone(swa_indices)
         allocator.full_to_swa_index_mapping[full_indices] = swa_indices

@@ -195,6 +195,9 @@ class _RecordingBaseAllocator(BaseKVAllocator):
     """Base-fallback allocator: free_segment inherits the default (ignore
     start_pos, call free()), free() records what it received."""
 
+    def available_size(self):
+        return 0
+
     def __init__(self):
         super().__init__(
             size=NUM_PAGES * PAGE_SIZE,

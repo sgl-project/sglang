@@ -23,7 +23,7 @@ from sglang.kernels.ops.memory.allocator import (
     alloc_decode_kernel,
     alloc_extend_kernel,
 )
-from sglang.srt.mem_cache.allocator.base import BaseKVAllocator
+from sglang.srt.mem_cache.allocator.base import BaseFreeListKVAllocator
 from sglang.srt.utils import (
     get_bool_env_var,
     get_num_new_pages,
@@ -113,7 +113,7 @@ def alloc_extend_naive(
     out_indices.copy_(out)
 
 
-class PagedKVAllocator(BaseKVAllocator):
+class PagedKVAllocator(BaseFreeListKVAllocator):
     """Same interface as `TokenedKVAllocator`, but the indices handed to one
     request are always page-aligned.
 

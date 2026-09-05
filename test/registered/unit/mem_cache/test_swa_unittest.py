@@ -154,8 +154,8 @@ def _swa_alloc(allocator, need_size):
         return allocator.alloc(need_size)
 
     assert need_size % allocator.page_size == 0
-    full_indices = allocator.full_attn_allocator.alloc(need_size)
-    swa_indices = allocator.swa_attn_allocator.alloc(need_size)
+    full_indices = allocator.full.pool.alloc(need_size)
+    swa_indices = allocator.swa.pool.alloc(need_size)
     assert full_indices is not None and swa_indices is not None
     allocator.full_to_swa_index_mapping[full_indices] = swa_indices
     return full_indices
@@ -284,7 +284,7 @@ class TestSWA(unittest.TestCase):
 
         # Warm up outside the window: a first-time cudaMalloc can synchronize on
         # its own, which the detector would report as this call's fault.
-        allocator.clear_full_to_swa_mapping(full_indices)
+        allocator.pairing.clear(full_indices)
 
         # Gate on the pre-fix form: a detector blind to this sync class would pass
         # the assert below no matter how the mapping is cleared.
@@ -294,9 +294,7 @@ class TestSWA(unittest.TestCase):
         if pre_fix_error is None:
             self.skipTest("sync debug mode does not flag a blocking H2D copy here")
 
-        self.assertIsNone(
-            _sync_error(lambda: allocator.clear_full_to_swa_mapping(full_indices))
-        )
+        self.assertIsNone(_sync_error(lambda: allocator.pairing.clear(full_indices)))
 
     def test_free_swa_group_owns_deferred_indices(self):
         _, allocator, _ = _build_swa_tree(
@@ -351,19 +349,15 @@ class TestSWA(unittest.TestCase):
         # Cache reconciliation can transfer a different SWA slot onto the same
         # full slot before the group flushes. The deferred free still owns the
         # mapping observed above, not this replacement mapping.
-        allocator.set_full_to_swa_mapping(old_full, new_swa)
-        allocator.clear_full_to_swa_mapping(new_full)
+        allocator.pairing.set(old_full, new_swa)
+        allocator.pairing.clear(new_full)
         allocator.free_group_end()
 
         torch.testing.assert_close(
             allocator.full_to_swa_index_mapping[old_full], new_swa
         )
-        self.assertTrue(
-            torch.isin(old_swa, allocator.swa_attn_allocator.free_pages).item()
-        )
-        self.assertFalse(
-            torch.isin(new_swa, allocator.swa_attn_allocator.free_pages).item()
-        )
+        self.assertTrue(torch.isin(old_swa, allocator.swa.pool.free_pages).item())
+        self.assertFalse(torch.isin(new_swa, allocator.swa.pool.free_pages).item())
 
     def _build_two_mapped_slots(self, page_size=1):
         _, allocator, _ = _build_swa_tree(
@@ -383,7 +377,7 @@ class TestSWA(unittest.TestCase):
         # free_pages holds page ids for page_size > 1 and token ids otherwise,
         # so compare in page space (a no-op divide when page_size == 1).
         swa_pages = swa_index // allocator.page_size
-        free_pages = allocator.swa_attn_allocator.free_pages
+        free_pages = allocator.swa.pool.free_pages
         return bool(torch.isin(swa_pages, free_pages).all().item())
 
     def _run_remap_during_free_group(self, allocator, old_full, new_full, new_swa):
@@ -391,8 +385,8 @@ class TestSWA(unittest.TestCase):
         full slot before the group flushes -- what tombstone recovery does."""
         allocator.free_group_begin()
         allocator.free(old_full)
-        allocator.set_full_to_swa_mapping(old_full, new_swa)
-        allocator.clear_full_to_swa_mapping(new_full)
+        allocator.pairing.set(old_full, new_swa)
+        allocator.pairing.clear(new_full)
         allocator.free_group_end()
 
     def test_free_group_owns_mapping_at_enqueue_time(self):
@@ -421,16 +415,13 @@ class TestSWA(unittest.TestCase):
                 # Everything still in use stays reachable through the mapping.
                 mapped = allocator.full_to_swa_index_mapping[:-1]
                 num_mapped = int((mapped > 0).sum().item())
-                num_in_use = (
-                    allocator.swa_attn_allocator.size - allocator.swa.available_size()
-                )
+                num_in_use = allocator.swa.pool.size - allocator.swa.available_size()
                 self.assertEqual(num_mapped, num_in_use)
 
     def test_pure_swa_has_no_pairing_to_edit(self):
         allocator = _build_pure_swa_allocator()
         indices = allocator.alloc(2)
-        self.assertFalse(hasattr(allocator, "clear_full_to_swa_mapping"))
-        self.assertFalse(hasattr(allocator, "set_full_to_swa_mapping"))
+        self.assertFalse(hasattr(allocator, "pairing"))
         torch.testing.assert_close(
             allocator.full_to_swa_index_mapping[indices], indices
         )
@@ -960,6 +951,9 @@ class _SinglePoolAllocator(BaseKVAllocator):
     """Minimal single-pool allocator: no full side, so the part below the
     eviction floor was already released by the window ratchet."""
 
+    def available_size(self):
+        return 0
+
     def __init__(self):
         super().__init__(
             size=16,
@@ -1077,7 +1071,7 @@ class TestFreeKvRow(CustomTestCase):
 
         # Both rows [0, 4) and [4, 8) sit below the floor: full side only.
         with patch.object(
-            allocator.full_attn_allocator,
+            allocator.full.pool,
             "free",
             side_effect=AssertionError("full side took the unique path"),
         ):
@@ -1096,7 +1090,7 @@ class TestFreeKvRow(CustomTestCase):
         after_alloc = allocator.full.available_size()
 
         with patch.object(
-            allocator.full_attn_allocator,
+            allocator.full.pool,
             "free",
             side_effect=AssertionError("full side took the unique path"),
         ):
@@ -1154,7 +1148,7 @@ class TestSWAPeerMappedContract(CustomTestCase):
         live = _swa_alloc(allocator, 4)
         stale = _swa_alloc(allocator, 4)
         # Whoever released the peer left the mapping reading as the padding slot.
-        allocator.clear_full_to_swa_mapping(stale)
+        allocator.pairing.clear(stale)
 
         self.assertTrue(self._condition_checked_by(allocator, live))
         self.assertFalse(self._condition_checked_by(allocator, stale))

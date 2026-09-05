@@ -1891,7 +1891,7 @@ def test_recover_with_locked_full_applies_through_the_python_allocator():
         allocator.swa.free(freed)
     assert cache.tree_core.get_component_device_value(node, ComponentType.SWA) is None
     incoming = allocator.alloc(2)
-    before_free = allocator.full_attn_allocator.available_size()
+    before_free = allocator.full.pool.available_size()
     cache.components[ComponentType.SWA].apply_component_action(
         RecoverSWAWithLockedFull(node_id=node, kept_full=kept, incoming_full=incoming)
     )
@@ -1900,9 +1900,7 @@ def test_recover_with_locked_full_applies_through_the_python_allocator():
     stored = cache.tree_core.get_component_device_value(node, ComponentType.SWA)
     assert stored.tolist() == allocator.translate_loc_from_full_to_swa(kept).tolist()
     assert (allocator.full_to_swa_index_mapping[incoming.to(torch.int64)] == 0).all()
-    assert (
-        allocator.full_attn_allocator.available_size() == before_free + incoming.numel()
-    )
+    assert allocator.full.pool.available_size() == before_free + incoming.numel()
 
 
 # ==== Bigram (EAGLE) wiring ====

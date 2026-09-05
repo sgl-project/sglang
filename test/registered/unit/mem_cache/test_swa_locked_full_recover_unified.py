@@ -32,6 +32,7 @@ import unittest
 import torch
 from test_multi_ended_allocator import _FakeUnifiedSWAKVPool  # sibling fixture
 
+from sglang.srt.mem_cache.allocator.pairing import paired_pages
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedHybridSWAKVAllocator,
 )
@@ -109,9 +110,9 @@ class _Probe(SWAComponent):
 
 
 class _StaticAllocRecorder:
-    """Stands in for the STATIC HybridSWAKVAllocator: has the mapping
-    tensor and a real `set_full_to_swa_mapping`, so the handler must keep
-    routing static pools through the original recipe."""
+    """Stands in for the STATIC HybridSWAKVAllocator: a mapping tensor behind
+    a recording pairing, so the handler is seen re-pointing the kept ids and
+    tombstoning the incoming ones through the pairing API."""
 
     def __init__(self, n=16):
         self.full_to_swa_index_mapping = torch.arange(n, dtype=torch.int64)
@@ -119,8 +120,13 @@ class _StaticAllocRecorder:
         self.clear_calls = []
         self.freed_full = []
         self.freed_via_inner = []
-        self.full_attn_allocator = self
+        self.pairing = self
         self.full = self
+        self.pool = self
+
+    def transfer(self, kept, incoming):
+        self.set_full_to_swa_mapping(kept, self.full_to_swa_index_mapping[incoming])
+        self.clear_full_to_swa_mapping(incoming)
 
     def set_full_to_swa_mapping(self, full, swa):
         # The handler routes every mapping write THROUGH the API, so the fake
@@ -163,30 +169,29 @@ class TestPagePairing(_RecoverTestBase):
         """Allocation hands out virtual ids in no particular order, so a
         `torch.unique` dedup (which sorts) would bind the node's page k to an
         unrelated incoming page."""
-        probe, _ = self._probe()
         kept = torch.tensor([9, 7, 5], dtype=torch.int64)  # descending
         incoming = torch.tensor([2, 4, 6], dtype=torch.int64)  # ascending
-        kept_pages, incoming_pages = probe._page_pairs(kept, incoming)
+        kept_pages, incoming_pages = paired_pages(kept, incoming, 1)
         self.assertEqual(kept_pages.tolist(), [9, 7, 5])
         self.assertEqual(incoming_pages.tolist(), [2, 4, 6])
 
     def test_length_mismatch_is_rejected(self):
-        probe, _ = self._probe()
         with self.assertRaises(AssertionError):
-            probe._page_pairs(
+            paired_pages(
                 torch.tensor([1, 2, 3], dtype=torch.int64),
                 torch.tensor([4, 5], dtype=torch.int64),
+                1,
             )
 
 
 class TestOwnershipTransfer(_RecoverTestBase):
     def test_node_ids_end_up_owning_the_incoming_physical_pages(self):
         probe, allocator = self._probe()
-        swa = allocator.swa_attn_allocator
+        swa = allocator.swa.pool
         kept, incoming = self._two_ranges(allocator)
         donated = swa.virtual_to_physical[incoming.to(torch.int64)].clone()
 
-        probe._transfer_swa_pages(allocator, kept, incoming)
+        allocator.pairing.transfer(kept, incoming)
 
         self.assertEqual(
             swa.virtual_to_physical[kept.to(torch.int64)].tolist(),
@@ -209,7 +214,7 @@ class TestOwnershipTransfer(_RecoverTestBase):
         kept, incoming = self._two_ranges(allocator)
         allocator.swa.free(incoming)  # donor no longer owns anything
         with self.assertRaises(AssertionError):
-            probe._transfer_swa_pages(allocator, kept, incoming)
+            allocator.pairing.transfer(kept, incoming)
 
 
 class TestRecoverActionHandler(_RecoverTestBase):
@@ -218,7 +223,7 @@ class TestRecoverActionHandler(_RecoverTestBase):
         return only the incoming ids' FULL side, allocating and freeing no swa
         page of its own."""
         probe, allocator = self._probe()
-        swa = allocator.swa_attn_allocator
+        swa = allocator.swa.pool
         kept, incoming = self._two_ranges(allocator)
         allocator.swa.free(kept)  # what eviction does when it tombstones
         self.assertTrue(
@@ -228,7 +233,7 @@ class TestRecoverActionHandler(_RecoverTestBase):
         # Snapshot AFTER the setup traffic: the invariant under test is that
         # the recovery handler itself moves ownership without moving capacity.
         swa_live = swa.allocated_count()
-        full_avail = allocator.full_attn_allocator.available_size()
+        full_avail = allocator.full.pool.available_size()
 
         probe.apply_component_action(
             RecoverSWAWithLockedFull(node_id=7, kept_full=kept, incoming_full=incoming)
@@ -247,7 +252,7 @@ class TestRecoverActionHandler(_RecoverTestBase):
             "no swa page may be released or gained — ownership only moved",
         )
         self.assertEqual(
-            allocator.full_attn_allocator.available_size(),
+            allocator.full.pool.available_size(),
             full_avail + len(incoming),
             "the incoming ids' FULL side must come back",
         )

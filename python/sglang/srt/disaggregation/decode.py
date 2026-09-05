@@ -1630,15 +1630,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
 
         if self.scheduler.enable_hisparse:
-            logical_allocator = self.token_to_kv_pool_allocator.logical_attn_allocator
+            alloc = self.token_to_kv_pool_allocator
             if self._uses_swa_tail_prealloc() and isinstance(
-                logical_allocator, BaseHybridSWAKVAllocator
+                alloc, BaseHybridSWAKVAllocator
             ):
-                available_size = logical_allocator.full.available_size()
+                available_size = alloc.full.pool.available_size()
             else:
                 # HiSparse pre-alloc only allocates logical indices, so the
                 # logical pool is the binding constraint for admission control.
-                available_size = logical_allocator.available_size()
+                available_size = alloc.logical_available_size()
         elif self._uses_swa_tail_prealloc():
             available_size = self.token_to_kv_pool_allocator.full.available_size()
             if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:

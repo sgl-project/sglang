@@ -6,7 +6,7 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.mem_cache.allocator import (
     BaseHybridSWAKVAllocator,
     BaseKVAllocator,
-    KVFreeSide,
+    BaseKVPoolSide,
 )
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
@@ -18,6 +18,9 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 class _FakeAllocator(BaseKVAllocator):
     """Single-pool double. Subclassing the base routes free_full / free_segment /
     free_segments into free(), so a new free API cannot slip past the recorder."""
+
+    def available_size(self):
+        return 0
 
     def __init__(self, page_size: int = 1):
         super().__init__(
@@ -40,7 +43,7 @@ class _FakeAllocator(BaseKVAllocator):
         self.freed.append(free_index.clone())
 
 
-class _FakeSide(KVFreeSide):
+class _FakeSide(BaseKVPoolSide):
     """One side of the hybrid double: records what reaches it."""
 
     def __init__(self, page_size: int):
@@ -57,6 +60,10 @@ class _FakeSide(KVFreeSide):
 
 class _FakeHybridAllocator(BaseHybridSWAKVAllocator):
     """Hybrid double: a floor split is visible as full-only vs both-sides frees."""
+
+    @property
+    def size_swa(self):
+        return 0
 
     def __init__(self, page_size: int = 1):
         BaseKVAllocator.__init__(

@@ -79,8 +79,8 @@ def _build_composite(ps, collapse=False, n_full_pages=16, n_swa_pages=8):
     if collapse:
         # The multiplier-1 arm, where kernel-facing ids ARE the physical ones.
         # No unified sub-pool reports 1 today, so pin the regime here.
-        allocator.full_attn_allocator.kernel_page_multiplier = 1
-        allocator.swa_attn_allocator.kernel_page_multiplier = 1
+        allocator.full.pool.kernel_page_multiplier = 1
+        allocator.swa.pool.kernel_page_multiplier = 1
     # The fake IS the runner's token_to_kv_pool, and the real UnifiedSWAKVPool
     # carries the pool-level full->swa translate, so the fake must too.
     kvcache.translate_loc_from_full_to_swa = allocator.translate_loc_from_full_to_swa

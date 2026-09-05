@@ -100,7 +100,7 @@ class TestDriftReportsLoudly(unittest.TestCase):
         the swa band's watermark outside the buffer."""
         inst, allocator, kvcache = _swa_composite()
         inst._alloc(allocator, kvcache, 8)
-        swa = allocator.swa_attn_allocator
+        swa = allocator.swa.pool
         # grow-down member: low frontier = (wm+1)*bytes; wm == num_pages puts
         # it past the buffer top.
         self.assertEqual(swa.grow_direction, "down")

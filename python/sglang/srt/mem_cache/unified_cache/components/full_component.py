@@ -431,7 +431,7 @@ class FullComponent(TreeComponent):
     def _full_allocator(self):
         """The allocator that owns the full-attention pool alone."""
         allocator = self.cache.token_to_kv_pool_allocator
-        return allocator.full_attn_allocator if self.cache.is_swa_enabled else allocator
+        return allocator.full.pool if self.cache.is_swa_enabled else allocator
 
     def build_external_linker_transfer(
         self,

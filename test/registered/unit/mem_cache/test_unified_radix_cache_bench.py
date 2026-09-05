@@ -313,12 +313,12 @@ def _alloc(env, n):
     if env.has_swa and env.page_size > 1:
         ps = env.page_size
         aligned = ((n + ps - 1) // ps) * ps
-        if aligned > env.alloc.full_attn_allocator.available_size():
+        if aligned > env.alloc.full.pool.available_size():
             return None
-        if aligned > env.alloc.swa_attn_allocator.available_size():
+        if aligned > env.alloc.swa.pool.available_size():
             return None
-        full_indices = env.alloc.full_attn_allocator.alloc(aligned)
-        swa_indices = env.alloc.swa_attn_allocator.alloc(aligned)
+        full_indices = env.alloc.full.pool.alloc(aligned)
+        swa_indices = env.alloc.swa.pool.alloc(aligned)
         assert full_indices is not None and swa_indices is not None
         env.alloc.full_to_swa_index_mapping[full_indices] = swa_indices
         return full_indices[:n]
