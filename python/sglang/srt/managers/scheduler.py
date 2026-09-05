@@ -1995,6 +1995,7 @@ class Scheduler(
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
+                self.cache_extend_batch_at_launch(batch)
             else:
                 batch_result = None
                 self._sched_idled = True
@@ -2055,6 +2056,30 @@ class Scheduler(
         # whatever result is still pending in the queue — including the
         # extend->decode boundary — so no grammar-specific overlap disable is needed.
         return disable_overlap_for_batch or need_grammar_sync
+
+    def cache_extend_batch_at_launch(self, batch: ScheduleBatch):
+        # Overlap runs a request's first decode step before its prefill result;
+        # the radix dedup in that result path would repoint prefix slots under step 1.
+        if (
+            not self.is_generation
+            or self.disaggregation_mode != DisaggregationMode.NULL
+            or not batch.forward_mode.is_extend()
+            or not self.tree_cache.supports_cache_unfinished_at_launch()
+        ):
+            return
+        decoding_reqs = batch.decoding_reqs or ()
+        for req in batch.reqs:
+            if (
+                req is self.chunked_req
+                or req in decoding_reqs
+                or req.finished()
+                or req.is_retracted
+                or req.beam_group is not None
+                or req.is_dllm()
+            ):
+                continue
+            maybe_cache_unfinished_req(req, self.tree_cache)
+            req.kv.radix_inserted_at_launch = True
 
     def _advance_pending_grammar(self):
         """Grammar barrier (spec-v2 overlap): advance the FSM over any not-yet

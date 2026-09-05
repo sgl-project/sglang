@@ -878,6 +878,8 @@ class ReqKvInfo:
     cache_protected_len: int = 0  # Tree cache owns [0, here) (matched or inserted)
     kv_committed_len: int = 0  # KV content committed up to here, <= kv_allocated_len
     kv_allocated_len: int = 0
+    # Overlap inserted the running extend at launch; the result path skips it.
+    radix_inserted_at_launch: bool = False
 
     # SWA slots in [swa_dead_lo(page_size), swa_evicted_seqlen) are already freed.
     swa_evict_floor: int = 0  # [0, here) never window-evicted (prefill-aware SWA)
@@ -1820,6 +1822,7 @@ class Req(ReqDllmMixin):
         self.indexer_topk = None
         self.last_node = None
         self.kv.cache_protected_len = 0
+        self.kv.radix_inserted_at_launch = False
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
