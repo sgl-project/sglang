@@ -1,13 +1,13 @@
 import asyncio
 import json
 import math
-from typing import List, Union
+from typing import List, Tuple, Union
 
 import numpy as np
 import torch
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
 from sglang.srt.models.glm4v_moe import Glm4vMoeForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
@@ -481,6 +481,37 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             # Note: For GLM4v videos, it uses the video token before tokenization but uses image token after tokenization
             video_token_id=self.IM_TOKEN_ID,
         ).build(_processor)
+
+    def get_mm_item_offsets(
+        self,
+        input_ids: torch.Tensor,
+        mm_tokens: MultimodalSpecialTokens,
+        modality: Modality,
+    ) -> List[Tuple[int, int]]:
+        """Disambiguate image and video spans sharing ``IM_TOKEN_ID``."""
+        if (
+            modality not in (Modality.IMAGE, Modality.VIDEO)
+            or mm_tokens.image_token_id != mm_tokens.video_token_id
+        ):
+            return super().get_mm_item_offsets(input_ids, mm_tokens, modality)
+
+        all_offsets = self.get_mm_items_offset(input_ids, self.IM_TOKEN_ID)
+        video_ranges = self.get_mm_items_offset_by_pair(
+            input_ids,
+            self.VIDEO_START_TOKEN_ID,
+            self.VIDEO_END_TOKEN_ID,
+        )
+
+        def is_video_offset(offset: Tuple[int, int]) -> bool:
+            start, end = offset
+            return any(
+                video_start <= start and end <= video_end
+                for video_start, video_end in video_ranges
+            )
+
+        if modality == Modality.VIDEO:
+            return [offset for offset in all_offsets if is_video_offset(offset)]
+        return [offset for offset in all_offsets if not is_video_offset(offset)]
 
     def compute_mrope_positions(self, input_ids, mm_items):
         image_grid_thw = None
