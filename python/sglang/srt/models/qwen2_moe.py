@@ -383,6 +383,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         or get_moe_a2a_backend().is_mori()
                         or get_moe_a2a_backend().is_deepep_v2()
                         or get_moe_a2a_backend().is_flashinfer()
+                        or get_moe_a2a_backend().is_megamoe()
                     )
                     else {}
                 ),
@@ -412,6 +413,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
             self.top_k = config.num_experts_per_tok
         self.is_nextn = is_nextn
+        # DeepGEMM MegaMoE: fused EP dispatch + grouped GEMMs + combine over the
+        # EP symmetric buffer, replacing the FusedMoE call. Needs MXFP4 routed
+        # experts (checkpoint or SGLANG_FP8_MOE_EXPERTS_REQUANT_MXFP4) and the
+        # per-rank token cap SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.
+        self._use_mega_moe = get_moe_a2a_backend().is_megamoe()
+        self._mega_top_k = config.num_experts_per_tok + self.num_fused_shared_experts
+        self._mega_intermediate_size = config.moe_intermediate_size
+        self._mega_hidden_size = config.hidden_size
 
     def get_moe_weights(self):
         return [
@@ -631,6 +640,71 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         return final_hidden_states
 
+    def _forward_mega_moe(
+        self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch]
+    ) -> torch.Tensor:
+        # Same contract as _forward_deepep: rows are this rank's tokens, the
+        # routed output comes back fully combined, no TP all-reduce afterwards.
+        from sglang.srt.layers.moe.mega_moe import (
+            is_mega_moe_experts_ready,
+            run_mega_routed_experts,
+        )
+
+        if not is_mega_moe_experts_ready(self.experts):
+            raise RuntimeError(
+                "moe_a2a_backend=megamoe needs MegaMoE expert weights on this "
+                "model: on SM100 load an MXFP4-expert checkpoint or set "
+                "SGLANG_FP8_MOE_EXPERTS_REQUANT_MXFP4=1 on a block-FP8 checkpoint; "
+                "on SM90 load a block-FP8 checkpoint with a DeepGEMM that ships "
+                "fp8_mega_moe."
+            )
+
+        num_tokens = hidden_states.shape[0]
+        shared_output = None
+        topk_ids = None
+        topk_weights = None
+        if num_tokens > 0:
+            router_logits, _ = self.gate(hidden_states)
+            shared_output = self._forward_shared_experts(hidden_states)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=(
+                    forward_batch.num_token_non_padded
+                    if forward_batch is not None
+                    else None
+                ),
+                expert_location_dispatch_info=(
+                    ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+                    if not self.is_nextn
+                    else None
+                ),
+            )
+            if self.enable_shared_expert_fusion:
+                topk_output = self._append_shared_to_topk_output(
+                    topk_output, hidden_states
+                )
+            assert TopKOutputChecker.format_is_standard(topk_output), (
+                "MegaMoE pre-dispatch consumes raw topk ids/weights; "
+                "pick a MoE runner backend that emits standard TopK output"
+            )
+            topk_ids = topk_output.topk_ids
+            topk_weights = topk_output.topk_weights
+
+        final_hidden_states = run_mega_routed_experts(
+            self.experts,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            hidden_size=self._mega_hidden_size,
+            intermediate_size=self._mega_intermediate_size,
+            top_k=self._mega_top_k,
+            num_tokens=num_tokens,
+        )
+        if shared_output is not None:
+            final_hidden_states.add_(shared_output)
+        return final_hidden_states
+
     @property
     def supports_deferred_finalize(self) -> bool:
         return bool(
@@ -748,6 +822,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         if defer_finalize and num_tokens == 0:
             raise RuntimeError("Qwen deferred finalize does not support M=0")
+
+        if self._use_mega_moe:
+            return self._forward_mega_moe(hidden_states, forward_batch)
 
         if (
             get_moe_a2a_backend().is_deepep()
