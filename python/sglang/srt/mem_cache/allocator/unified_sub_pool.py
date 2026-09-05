@@ -361,8 +361,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
         # Per-call move cap on NON-urgent `_flush`: bounds work per `on_idle()` so
         # a large backlog doesn't block ZMQ IPC. Urgent retries are uncapped.
-        self._lazy_max_moves_per_call = int(
-            os.environ.get("SGLANG_LAZY_COMPACTION_MAX_MOVES_PER_CALL", "4096")
+        self._lazy_max_moves_per_call = (
+            envs.SGLANG_LAZY_COMPACTION_MAX_MOVES_PER_CALL.get()
         )
 
         # Epoch-keyed memos for the capacity views: pure between mutations, but
