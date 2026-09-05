@@ -1844,6 +1844,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             if commit_lens.dtype != torch.int32:
                 commit_lens = commit_lens.to(torch.int32)
 
+        translator = self.draft_model_runner.kv_index_translator
+        cache_loc = translator.translate_full_attn_ids(cache_loc)
+        if cache_loc_2d is not None:
+            cache_loc_2d = translator.translate_full_attn_ids(cache_loc_2d)
+
         with (
             torch.inference_mode(),
             draft_tp_context(self.draft_owns_attention),
@@ -1990,6 +1995,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     attn.v_scale,
                 )
             else:
+                # Translated above (physical by allocation on a plain pool).
                 token_to_kv_pool.set_kv_buffer(
                     attn,
                     KVWriteLoc(ctx_cache_loc, physical=True),
