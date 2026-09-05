@@ -471,7 +471,9 @@ class FusedMoE(torch.nn.Module):
             # copy (flashinfer#2703).
             or (
                 envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get()
-                and type(self.quant_method).__name__ == "Fp8MoEMethod"
+                and isinstance(self.quant_method, Fp8MoEMethod)
+                and self.quant_method.block_quant
+                and not self.quant_method.use_mxfp8
             )
         )
         global _deferred_finalize_info_logged
