@@ -93,6 +93,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_dsa_seed_metadata_dim,
+    is_aborted,
     prepare_abort,
     unified_memory_disagg_move_gate,
 )
@@ -3121,12 +3122,16 @@ class Scheduler(
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if self._abort_disagg_request_before_queue(req):
+                return
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
             )
             req.time_stats.set_prefill_bootstrap_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            if not is_retracted and self._abort_disagg_request_before_queue(req):
+                return
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
             if not is_retracted:
                 req.time_stats.set_decode_prealloc_queue_entry_time()
@@ -3134,6 +3139,54 @@ class Scheduler(
                 req.time_stats.set_retract_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
+
+    def _abort_disagg_request_before_queue(self, req: Req) -> bool:
+        """Finish an already-aborted PD request before it enters a KV queue."""
+        if not is_aborted(req):
+            return False
+
+        has_bootstrap = (
+            req.bootstrap_room is not None and req.bootstrap_host is not None
+        )
+        if (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and req.disagg_kv_sender is None
+            and has_bootstrap
+        ):
+            if not self.disagg_prefill_bootstrap_queue.create_sender(
+                req, self.model_config.num_key_value_heads
+            ):
+                return True
+
+        abort_reason = req.to_finish or req.finished_reason
+        sender = req.disagg_kv_sender
+        if sender is not None and hasattr(sender, "abort"):
+            kv_mgr = getattr(sender, "kv_mgr", None)
+            record_failure = getattr(kv_mgr, "record_failure", None)
+            if isinstance(abort_reason, FINISH_ABORT) and record_failure is not None:
+                record_failure(
+                    req.bootstrap_room,
+                    abort_reason.message,
+                    abort_reason.status_code,
+                )
+            sender.abort()
+            notify_decode = getattr(kv_mgr, "try_notify_decode_failure_and_clear", None)
+            if notify_decode is not None:
+                try:
+                    notify_decode(req.bootstrap_room)
+                except Exception as error:
+                    logger.warning(
+                        "Failed to notify decode about pre-queue abort for room %s: %s",
+                        req.bootstrap_room,
+                        error,
+                    )
+
+        if req.finished_reason is None and req.to_finish is not None:
+            req.finished_reason = req.to_finish
+            req.to_finish = None
+        req.time_stats.set_completion_time()
+        self.output_streamer.stream_output([req], req.return_logprob)
+        return True
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
