@@ -777,6 +777,13 @@ class TestToolCallParserDetection(unittest.TestCase):
         self.assertLess(tool_index["step3"], tool_index["deepseek_v3"])
         self.assertLess(tool_index["qwen3_coder"], tool_index["qwen"])
 
+        # ``mimo`` keys only on ``enable_thinking | default(false)``, an idiom
+        # many templates carry, so every marker-based rule must precede it.
+        for name in ("minimax_m3", "minimax", "step3p5", "step3", "deepseek_v4"):
+            with self.subTest(rule=name):
+                self.assertLess(reasoning_index[name], reasoning_index["mimo"])
+        self.assertLess(tool_index["qwen3_coder"], tool_index["mimo"])
+
     def test_xml_kv_requires_both_arg_tokens(self):
         template = "Hello {{ user }}"
         force, config = detect_reasoning_pattern(template)
@@ -805,6 +812,41 @@ class TestToolCallParserDetection(unittest.TestCase):
         for rules in (REASONING_PARSER_RULES, TOOL_CALL_PARSER_RULES):
             names = [rule.name for rule in rules]
             self.assertLess(names.index("minimax_m3"), names.index("minimax"))
+
+    def test_marker_rules_survive_enable_thinking_default_false(self):
+        # A template can carry both a model-specific marker and
+        # ``enable_thinking | default(false)``. The marker must win: ``mimo``
+        # matches on the toggle alone and would otherwise mask the parser.
+        toggle = "{%- set enable_thinking = enable_thinking | default(false) -%}\n"
+        cases = (
+            ("<mm:think>{{ content }}", "minimax-m3", "minimax-m3"),
+            ("<minimax:tool_call>", "minimax", "minimax-m2"),
+            ("Step-3.5 assistant", "step3p5", "step3p5"),
+            ('<steptml:invoke name="{{ tool.name }}">', "step3", "step3"),
+            ("<｜DSML｜tool_calls>", "deepseek-v4", "deepseekv4"),
+        )
+        for body, expected_reasoning, expected_tool in cases:
+            with self.subTest(marker=body):
+                template = toggle + body
+                force, config = detect_reasoning_pattern(template)
+                self.assertEqual(
+                    detect_reasoning_parser(template, None, config, force),
+                    expected_reasoning,
+                )
+                self.assertEqual(
+                    detect_tool_call_parser(template, None, config, force),
+                    expected_tool,
+                )
+
+    def test_qwen3_coder_not_masked_by_enable_thinking_default_false(self):
+        template = (
+            "{%- set enable_thinking = enable_thinking | default(false) -%}\n"
+            "<function={{ tool.name }}><parameter={{ param.name }}>"
+        )
+        force, config = detect_reasoning_pattern(template)
+        self.assertEqual(
+            detect_tool_call_parser(template, None, config, force), "qwen3_coder"
+        )
 
     def test_minicpm5_not_misclassified_as_qwen(self):
         template = (

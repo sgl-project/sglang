@@ -489,7 +489,6 @@ REASONING_PARSER_RULES = (
     DetectionRule(name="glm45", value="glm45", predicate=_is_glm45),
     DetectionRule(name="hunyuan", value="hunyuan", predicate=_is_hunyuan),
     DetectionRule(name="poolside_v1", value="poolside_v1", predicate=_is_poolside_v1),
-    DetectionRule(name="mimo", value="mimo", predicate=_is_mimo),
     DetectionRule(name="minimax_m3", value="minimax-m3", predicate=_is_minimax_m3),
     DetectionRule(name="minimax", value="minimax", predicate=_is_minimax),
     DetectionRule(name="step3p5", value="step3p5", predicate=_is_step3p5),
@@ -497,6 +496,7 @@ REASONING_PARSER_RULES = (
     DetectionRule(name="qwen3", value="qwen3", predicate=_is_qwen3),
     DetectionRule(name="deepseek_v4", value="deepseek-v4", predicate=_is_deepseek_v4),
     DetectionRule(name="deepseek_v3", value="deepseek-v3", predicate=_is_deepseek_v3),
+    DetectionRule(name="mimo", value="mimo", predicate=_is_mimo),
     DetectionRule(
         name="deepseek_r1_force", value="deepseek-r1", predicate=_is_deepseek_r1
     ),
@@ -535,8 +535,8 @@ TOOL_CALL_PARSER_RULES = (
     DetectionRule(
         name="xml_kv_tool_call", value="glm45", predicate=_is_xml_kv_tool_call
     ),
-    DetectionRule(name="mimo", value="mimo", predicate=_is_mimo),
     DetectionRule(name="qwen3_coder", value="qwen3_coder", predicate=_is_qwen3_coder),
+    DetectionRule(name="mimo", value="mimo", predicate=_is_mimo),
     DetectionRule(name="qwen", value="qwen", predicate=_is_qwen3),
     DetectionRule(name="deepseek_v3", value="deepseekv3", predicate=_is_deepseek_v3),
     DetectionRule(name="deepseek_r1", value="deepseekv3", predicate=_is_deepseek_r1),
