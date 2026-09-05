@@ -84,6 +84,7 @@ def get_model_config(
         "Qwen3VLMoeForConditionalGeneration",
         "Qwen3_5MoeForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
+        "Qwen4ExpForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "MellumForCausalLM",
     ]:
