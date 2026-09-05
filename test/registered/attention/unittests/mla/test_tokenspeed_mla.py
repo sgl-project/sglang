@@ -1,8 +1,10 @@
 import importlib.util
 import unittest
+from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.kits.attention_unittest.attention_methods.mla_attention import (
     MLAAttentionCase,
@@ -179,6 +181,97 @@ class TestTokenspeedMLAAttentionBackendCorrectness(CustomTestCase):
                     rtol=2e-1,
                     **MLA_SHAPE_KWARGS,
                 )
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
+class TestTokenspeedMLANoPEPrefill(CustomTestCase):
+    """prepare_prefill_qkv with rotary_emb=None (skip_rope, e.g. Kimi Linear)."""
+
+    T = 37  # not a multiple of any kernel block size
+    NUM_HEADS = 4
+    QK_NOPE_HEAD_DIM = 128
+    QK_ROPE_HEAD_DIM = 64
+    V_HEAD_DIM = 128
+    KV_LORA_RANK = 512
+
+    def _assert_fp8_equal(self, out: torch.Tensor, ref_bf16: torch.Tensor):
+        fp8 = torch.float8_e4m3fn
+        self.assertEqual(out.dtype, fp8)
+        self.assertEqual(out.shape, ref_bf16.shape)
+        self.assertTrue(
+            torch.equal(out.view(torch.uint8), ref_bf16.to(fp8).view(torch.uint8))
+        )
+
+    def test_nope_prefill_skips_rope_and_packs_fp8(self):
+        device = torch.device("cuda")
+        bf16 = torch.bfloat16
+        T, H = self.T, self.NUM_HEADS
+        nope, rope = self.QK_NOPE_HEAD_DIM, self.QK_ROPE_HEAD_DIM
+        v_dim, lora = self.V_HEAD_DIM, self.KV_LORA_RANK
+        torch.manual_seed(0)
+
+        # Same shapes and views forward_normal_prepare passes to the hook.
+        q = torch.randn(T, H, nope + rope, dtype=bf16, device=device)
+        q_pe = q[..., nope:]
+        latent_cache = torch.randn(T, 1, lora + rope, dtype=bf16, device=device)
+        kv_a = latent_cache[:, 0, :lora].contiguous()
+        k_pe = latent_cache[:, :, lora:]
+        kv_b_weight = 0.05 * torch.randn(
+            H * (nope + v_dim), lora, dtype=bf16, device=device
+        )
+        positions = torch.arange(T, device=device)
+        out_cache_loc = torch.randperm(4 * T, device=device)[:T]
+
+        layer = SimpleNamespace(
+            kv_b_proj=lambda x: (x @ kv_b_weight.t(), None),
+            num_local_heads=H,
+            qk_nope_head_dim=nope,
+            qk_rope_head_dim=rope,
+            v_head_dim=v_dim,
+            rotary_emb=None,
+            attn_mha=SimpleNamespace(layer_id=0),
+        )
+
+        kv_writes = []
+        backend = TokenspeedMLABackend.__new__(TokenspeedMLABackend)
+        backend.token_to_kv_pool = SimpleNamespace(
+            set_mla_kv_buffer=lambda *args: kv_writes.append(args)
+        )
+
+        def _no_rope(**_):
+            self.fail("NoPE layer must not enter the fused RoPE path")
+
+        backend._fused_rope_fp8_quantize = _no_rope
+
+        q_fp8, k_fp8, v_fp8 = backend.prepare_prefill_qkv(
+            q=q,
+            q_pe=q_pe,
+            kv_a=kv_a,
+            k_pe=k_pe,
+            positions=positions,
+            layer=layer,
+            forward_batch=SimpleNamespace(out_cache_loc=out_cache_loc),
+        )
+
+        kv = layer.kv_b_proj(kv_a)[0].view(T, H, nope + v_dim)
+        k_ref = torch.cat([kv[..., :nope], k_pe.expand(-1, H, -1)], dim=-1)
+        v_ref = kv[..., nope:]
+        for name, out, ref in (
+            ("q", q_fp8, q),
+            ("k", k_fp8, k_ref),
+            ("v", v_fp8, v_ref),
+        ):
+            with self.subTest(tensor=name):
+                self.assertTrue(out.is_contiguous())
+                self._assert_fp8_equal(out, ref)
+
+        # KV cache receives the FP8 latent and the unrotated k_pe.
+        self.assertEqual(len(kv_writes), 1)
+        attn_layer, loc, cache_k_nope, cache_k_rope = kv_writes[0]
+        self.assertIs(attn_layer, layer.attn_mha)
+        self.assertIs(loc, out_cache_loc)
+        self._assert_fp8_equal(cache_k_nope, kv_a.unsqueeze(1))
+        self._assert_fp8_equal(cache_k_rope, k_pe)
 
 
 if __name__ == "__main__":
