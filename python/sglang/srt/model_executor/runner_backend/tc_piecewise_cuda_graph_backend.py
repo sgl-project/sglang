@@ -53,7 +53,6 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
 )
-from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -185,28 +184,22 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                 )
 
                 with enable_torch_compile_warmup():
-                    if is_hip():
-                        # AMD: single Dynamo trace is sufficient; the capture
-                        # phase does per-shape JIT kernel warmup before each
-                        # CUDA graph recording.  The N-iteration loop is
-                        # redundant and extremely slow on ROCm (~30 min).
-                        cuda_graph_runner._run_dummy_forward(
-                            num_tokens=cuda_graph_runner.capture_num_tokens[-1]
-                        )
-                    else:
-                        compile_range = (
-                            tqdm.tqdm(
-                                list(reversed(cuda_graph_runner.capture_num_tokens))
+                    # Every captured shape gets its own trace, on AMD too: tracing
+                    # once at the largest shape and relying on dynamic shapes does not
+                    # hold, since the guard specializes to the traced shape and a
+                    # recompile inside the capture window leaves the captured graphs
+                    # unreplayable.
+                    compile_range = (
+                        tqdm.tqdm(list(reversed(cuda_graph_runner.capture_num_tokens)))
+                        if get_parallel().tp_rank == 0
+                        else reversed(cuda_graph_runner.capture_num_tokens)
+                    )
+                    for num_tokens in compile_range:
+                        if get_parallel().tp_rank == 0:
+                            compile_range.set_description(
+                                f"Compiling num tokens ({num_tokens=})"
                             )
-                            if get_parallel().tp_rank == 0
-                            else reversed(cuda_graph_runner.capture_num_tokens)
-                        )
-                        for num_tokens in compile_range:
-                            if get_parallel().tp_rank == 0:
-                                compile_range.set_description(
-                                    f"Compiling num tokens ({num_tokens=})"
-                                )
-                            cuda_graph_runner._run_dummy_forward(num_tokens=num_tokens)
+                        cuda_graph_runner._run_dummy_forward(num_tokens=num_tokens)
 
                 # Qwen3-VL deepstack embeddings are produced only after
                 # visual encoding. First trace the tensor branch above, then

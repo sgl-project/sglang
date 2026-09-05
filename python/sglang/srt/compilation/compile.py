@@ -210,6 +210,18 @@ def install_torch_compiled(
                     _mark_dynamic_on_value(val, dims)
         _mark_dynamic_forward_batch(ba.arguments.get("forward_batch"))
 
+        # The prefill runner compiles once per captured shape (dozens of buckets),
+        # well past Dynamo's default limit of 8, and capture then aborts with
+        # FailOnRecompileLimitHit. 1024 matches what torch_compile_decoration.py
+        # already sets on the full-torch-compile path.
+        torch._dynamo.config.accumulated_cache_size_limit = max(
+            getattr(torch._dynamo.config, "accumulated_cache_size_limit", 0), 1024
+        )
+        if hasattr(torch._dynamo.config, "cache_size_limit"):
+            torch._dynamo.config.cache_size_limit = max(
+                torch._dynamo.config.cache_size_limit, 1024
+            )
+
         # Avoid cross-instance cache reuse
         torch._dynamo.eval_frame.remove_from_cache(unbound_fwd.__code__)
 
