@@ -151,6 +151,27 @@ class MemoryPoolConfigurator:
     ) -> MemoryPoolConfig:
         return config
 
+    @staticmethod
+    def validate_swa_pool_size(
+        swa_tokens: int, sliding_window_size: Optional[int], page_size: int
+    ) -> None:
+        """Reject an SWA pool too small to ever admit a request.
+
+        Prefill charges min(extend + decode, window) + page_size of SWA headroom
+        per request, so a pool at or below that floor rejects every request no
+        matter how far it drains: the scheduler spins in the waiting queue and
+        the server hangs at warmup instead of failing here.
+        """
+        if sliding_window_size is None:
+            return
+        if sliding_window_size + page_size >= swa_tokens:
+            raise ValueError(
+                f"SWA pool ({swa_tokens} tokens) cannot hold even one request: "
+                f"the prefill admission floor is sliding_window_size "
+                f"({sliding_window_size}) + page_size ({page_size}). "
+                f"Increase --swa-full-tokens-ratio or the total KV budget."
+            )
+
 
 class DefaultPoolConfigurator(MemoryPoolConfigurator):
     """Configurator for standard models: MHA, MLA, DSA, FP4.
@@ -658,16 +679,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         full_tokens = align_page_size(max_total_num_tokens)
         swa_tokens = align_page_size(int(full_tokens * self._swa_full_tokens_ratio))
 
-        if (
-            self._sliding_window_size is not None
-            and self._sliding_window_size + self._page_size >= swa_tokens
-        ):
-            raise ValueError(
-                f"SWA pool ({swa_tokens} tokens) cannot hold even one request: "
-                f"the prefill admission floor is sliding_window_size "
-                f"({self._sliding_window_size}) + page_size ({self._page_size}). "
-                f"Increase --swa-full-tokens-ratio or the total KV budget."
-            )
+        self.validate_swa_pool_size(
+            swa_tokens, self._sliding_window_size, self._page_size
+        )
 
         logger.info(
             f"Use sliding window memory pool. "
@@ -860,6 +874,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"local={len(self.compression_ratios)}/{len(cfg.compress_ratios)}"
             )
         self.swa_page_size = cfg.window_size
+        self.sliding_window_size = kvc.sliding_window_size
         self.swa_ratio = get_schedule().swa_full_tokens_ratio
         self.is_speculative = get_spec().speculative_algorithm is not None
         self.online_c128_mtp_max_draft_tokens = max_speculative_num_draft_tokens() or 0
@@ -995,6 +1010,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
         full_token = full_token // page_size * page_size
         swa_tokens = int(full_token * self.swa_ratio) // page_size * page_size
+        self.validate_swa_pool_size(swa_tokens, self.sliding_window_size, page_size)
         return _DSV4PoolSizes(
             full_max_total_num_tokens=full_token,
             swa_max_total_num_tokens=swa_tokens,
