@@ -618,9 +618,9 @@ class KimiK3MoE(nn.Module):
         # (TP8/EP8 MegaMoE + SP-MoE): +4~5% output tok/s and −5% ITL over
         # bs 1–32, GSM8K unchanged — so it is on whenever the shape allows,
         # no flag.
-        # In NPU attention-TP compatibility mode, the all-gather and
-        # reduce-scatter remain on the current stream while only the shared
-        # MLP runs on the side stream.
+        # NPU attention-TP compatibility mode can also overlap the shared
+        # collectives using SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM. Otherwise
+        # the collectives stay on the current stream.
         self._sbo_shared_overlap = (
             self._ep_a2a
             and self.shared_experts is not None
@@ -1022,6 +1022,36 @@ class KimiK3MoE(nn.Module):
         attn_tp_reduce_scatter_tensor(shared_output, gathered_shared_output)
         return shared_output
 
+    def _can_overlap_shared_experts_npu(self, hidden_states: torch.Tensor) -> bool:
+        if not (
+            _is_npu
+            and envs.SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM.get()
+            and self._sbo_shared_overlap
+            and self._shared_experts_attn_tp_comm
+            and self.use_latent_moe
+            and hidden_states.shape[0] > 0
+            and get_moe_a2a_backend().is_deepep()
+            # Per-forward hook registration is not traceable by Dynamo.
+            and not torch.compiler.is_compiling()
+        ):
+            return False
+
+        from sglang.srt.batch_overlap.two_batch_overlap import (
+            MaybeTboDeepEPDispatcher,
+        )
+        from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+            is_in_tc_piecewise_cuda_graph,
+        )
+
+        # The hooks must surround the complete dispatch, including its receive
+        # wait. Fused EP bypasses these hooks. An eager/piecewise graph break
+        # must not split the side-stream event record from its wait.
+        return (
+            isinstance(self.experts.dispatcher, MaybeTboDeepEPDispatcher)
+            and not is_in_breakable_cuda_graph()
+            and not is_in_tc_piecewise_cuda_graph()
+        )
+
     def _forward_unfused(
         self,
         hidden_states: torch.Tensor,
@@ -1034,16 +1064,32 @@ class KimiK3MoE(nn.Module):
         # side stream and are joined at the tail (see _sbo_shared_overlap).
         #
         # CUDA issues this after the front so the shared experts overlap the
-        # routed a2a rather than the front GEMMs. NPU issues it before the front:
-        # this starts the attention-TP all-gather as soon as the post-attention
-        # RMSNorm output is available and lets the shared branch finish its
-        # lightweight DynamicQuant before the routed GroupedMatmul starts.
+        # routed a2a rather than the front GEMMs. NPU starts the shared branch
+        # before the front. Fine-grained NPU overlap splits it at the complete
+        # dispatch boundaries:
+        #   current: front ---------- dispatch ---------- routed GEMMs -- tail
+        #   alt:     all-gather ----- shared MLP -------- reduce-scatter
+        # Shared and routed GEMMs wait for each other at phase boundaries;
+        # each can run beside the other branch's communication.
+        fine_grained_overlap = self._can_overlap_shared_experts_npu(hidden_states)
+        shared_input = None
         shared_output = None
         shared_event = None
+        shared_compute_event = None
 
         def issue_shared():
-            nonlocal shared_output, shared_event
+            nonlocal shared_input, shared_output, shared_event
             if self.shared_experts is None or hidden_states.shape[0] == 0:
+                return
+            if fine_grained_overlap:
+                # Fork before the routed front so HCCL's completion wait is
+                # queued on the side stream, leaving the front free to run.
+                self.alt_stream.wait_stream(torch.cuda.current_stream())
+                hidden_states.record_stream(self.alt_stream)
+                with torch.cuda.stream(self.alt_stream):
+                    shared_input = get_local_dp_buffer(get_parallel().attn_tp_group)
+                    shared_input.record_stream(self.alt_stream)
+                    attn_tp_all_gather_into_tensor(shared_input, hidden_states)
                 return
             if self._sbo_shared_overlap:
                 current_stream = torch.cuda.current_stream()
@@ -1062,14 +1108,60 @@ class KimiK3MoE(nn.Module):
             else:
                 shared_output = self._forward_shared_experts(hidden_states)
 
+        def run_experts(expert_input, topk_output):
+            if not fine_grained_overlap:
+                return (
+                    self._forward_mega_experts(expert_input, topk_output)
+                    if self._use_mega_moe
+                    else self.experts(expert_input, topk_output)
+                )
+
+            def pre_dispatch(dispatcher, dispatch_input, dispatch_topk):
+                nonlocal shared_output, shared_compute_event
+                # AllGather is already queued. Delay shared GEMMs until the
+                # gate, TopK and latent down projection finish on current.
+                self.alt_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self.alt_stream):
+                    shared_output = self.shared_experts(shared_input)
+                    shared_compute_event = self.alt_stream.record_event()
+
+            def post_dispatch(dispatcher, dispatch_output):
+                nonlocal shared_output, shared_event
+                current_stream = torch.cuda.current_stream()
+                # Dispatch has queued its receive wait. RS waits for that
+                # communication and the shared MLP, while routed GEMMs wait
+                # only for the MLP (not for RS).
+                self.alt_stream.wait_stream(current_stream)
+                with torch.cuda.stream(self.alt_stream):
+                    gathered_shared_output = shared_output
+                    shared_output = torch.empty_like(hidden_states)
+                    attn_tp_reduce_scatter_tensor(shared_output, gathered_shared_output)
+                    shared_event = self.alt_stream.record_event()
+                current_stream.wait_event(shared_compute_event)
+
+            dispatcher = self.experts.dispatcher
+            pre_handle = dispatcher.register_pre_dispatch_hook(pre_dispatch)
+            try:
+                post_handle = dispatcher.register_post_dispatch_hook(post_dispatch)
+                try:
+                    return self.experts(expert_input, topk_output)
+                finally:
+                    post_handle.remove()
+            finally:
+                # Remove outside hook iteration, including on dispatch/GEMM
+                # failures, so closures cannot leak into the next forward.
+                pre_handle.remove()
+
         def wait_and_finalize_shared_experts():
             nonlocal shared_output
             if shared_event is None:
                 return
-            # Join as late as possible, then keep the attention-TP collective
-            # on the current stream before the shared output is consumed.
-            torch.cuda.current_stream().wait_event(shared_event)
-            if self._shared_experts_attn_tp_comm:
+            # Join just before consuming the shared result. The legacy path
+            # still needs to reduce-scatter its TP-partial MLP output here.
+            current_stream = torch.cuda.current_stream()
+            current_stream.wait_event(shared_event)
+            shared_output.record_stream(current_stream)
+            if self._shared_experts_attn_tp_comm and not fine_grained_overlap:
                 gathered_shared_output = shared_output
                 shared_output = torch.empty_like(hidden_states)
                 attn_tp_reduce_scatter_tensor(shared_output, gathered_shared_output)
@@ -1084,7 +1176,7 @@ class KimiK3MoE(nn.Module):
         # merged-weight strategies compute both in one GEMM; see
         # kernels/ops/moe/moe_front.py for the strategy table.
         routed_input = self._ep_front(hidden_states)
-        if routed_input is None:
+        if routed_input is None and not fine_grained_overlap:
             routed_input = self._ep_front_overlap(hidden_states)
         topk_output = None
         if routed_input is not None:
@@ -1125,11 +1217,7 @@ class KimiK3MoE(nn.Module):
                 routed_input = hidden_states.new_empty((0, self.moe_hidden_size))
             else:
                 routed_input, _ = self.routed_expert_down_proj(hidden_states)
-        expert_output = (
-            self._forward_mega_experts(routed_input, topk_output)
-            if self._use_mega_moe
-            else self.experts(routed_input, topk_output)
-        )
+        expert_output = run_experts(routed_input, topk_output)
         if expert_output.shape[0] == 0:
             # The EP combine returns one row per source token.  Keep the
             # source-side empty result while avoiding empty RMSNorm/up-proj
@@ -1476,9 +1564,7 @@ class KimiK3DeltaAttention(nn.Module):
         # For the full-rank gate (K3) the checkpoint quantizes only the MoE
         # experts; attention linears resolve to UnquantizedLinearMethod, so a
         # non-None quant_config is fine for the merged projection.
-        self.do_fuse_qkvbfg = (
-            quant_config is None and self.attn_tp_size == self.tp_size
-        )
+        self.do_fuse_qkvbfg = quant_config is None and self.attn_tp_size == self.tp_size
 
         if self.use_full_rank_gate:
             # Fuse only the alignment-friendly wide projections [q, k, v, g]
