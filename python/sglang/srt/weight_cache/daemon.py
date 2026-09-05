@@ -249,32 +249,16 @@ class WeightCacheDaemon:
             f"world_size={self.tp_size * self.pp_size})"
         )
 
-    def load(self):
-        """Full loading pipeline: disk → TP shard → quantize → export IPC handles."""
-        # CUDA IPC weight sharing relies on torch's _share_cuda_ handle export,
-        # which only exists on CUDA-alike platforms (CUDA / ROCm). Fail loud here
-        # instead of dying deep inside the export with an opaque error.
-        if not current_platform.is_cuda_alike():
-            raise RuntimeError(
-                f"[WeightCacheDaemon] the weight cache daemon requires a CUDA-alike "
-                f"platform (CUDA or ROCm) for CUDA IPC weight sharing, but the "
-                f"active platform device type is {current_platform.device_type!r}. "
-                f"Disable the weight cache (--weight-cache-mode off)."
-            )
-        # expandable_segments makes torch's caching allocator hand out memory
-        # that cannot be exported via _share_cuda_, so the IPC export below would
-        # die mid-way with an opaque CUDA error. Fail fast with an actionable
-        # message before touching the device.
-        self._assert_ipc_compatible_allocator()
+    def _prepare_load(self):
+        """Engine-equivalent setup shared by load() and the parity harness;
+        returns (model_config, load_config)."""
         current_platform.set_device(current_platform.get_device(self.gpu_id))
 
         # Reduce thread contention during multi-process loading
         torch.set_num_threads(1)
 
         # Lazy imports to avoid circular dependencies and speed up startup
-        from sglang.srt.configs.device_config import DeviceConfig
         from sglang.srt.configs.model_config import ModelConfig
-        from sglang.srt.model_loader.loader import get_model_loader
 
         server_args = self.server_args
         publish(server_args, role="weight_cache_daemon")
@@ -345,15 +329,39 @@ class WeightCacheDaemon:
             **compute_env_stamp(),
         )
 
-        current_platform.empty_cache()
-        memory_before_load = torch.cuda.memory_reserved(self.gpu_id)
-
         # Build load config
         load_config = LoadConfig(
             load_format=self.load_format,
             model_loader_extra_config=self.model_loader_extra_config,
             tp_rank=self.tp_rank,
         )
+        return model_config, load_config
+
+    def load(self):
+        """Full loading pipeline: disk → TP shard → quantize → export IPC handles."""
+        # CUDA IPC weight sharing relies on torch's _share_cuda_ handle export,
+        # which only exists on CUDA-alike platforms (CUDA / ROCm). Fail loud here
+        # instead of dying deep inside the export with an opaque error.
+        if not current_platform.is_cuda_alike():
+            raise RuntimeError(
+                f"[WeightCacheDaemon] the weight cache daemon requires a CUDA-alike "
+                f"platform (CUDA or ROCm) for CUDA IPC weight sharing, but the "
+                f"active platform device type is {current_platform.device_type!r}. "
+                f"Disable the weight cache (--weight-cache-mode off)."
+            )
+        # expandable_segments makes torch's caching allocator hand out memory
+        # that cannot be exported via _share_cuda_, so the IPC export below would
+        # die mid-way with an opaque CUDA error. Fail fast with an actionable
+        # message before touching the device.
+        self._assert_ipc_compatible_allocator()
+
+        from sglang.srt.configs.device_config import DeviceConfig
+        from sglang.srt.model_loader.loader import get_model_loader
+
+        model_config, load_config = self._prepare_load()
+
+        current_platform.empty_cache()
+        memory_before_load = torch.cuda.memory_reserved(self.gpu_id)
 
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
@@ -446,6 +454,12 @@ class WeightCacheDaemon:
 
         self.transport_backend = choose_daemon_transport_backend(state_tensors)
         self.state_entries = self.transport_backend.prepare_export(state_tensors)
+
+        # Persistence must survive the round trip: without it the client
+        # registers non-persistent buffers (e.g. rotary cos_sin_cache) as
+        # persistent, changing the loaded model's state_dict shape.
+        for name, entry in self.state_entries.items():
+            entry["persistent"] = name in state_dict_names
 
         # Log approximate serialized metadata size (not payload-backed bytes).
         # Only the handle blob carries real weight, so measure it directly:
