@@ -780,37 +780,45 @@ export const config = {
     //
     // Both cells are the model card's recipe (modelopt_fp4, flashinfer_cutlass
     // FP4 GEMM and MoE runner, page 64, track interval 64, 4096-token prefill
-    // chunks, 262k context) with the concurrency pinned explicitly. With the
-    // stock radix strategy (5 fp32 state slots per request, 0.109 GiB each) the
-    // scheduler caps the card at 3 requests with MTP and 12 without, so the
-    // cells use --disable-radix-cache (1 slot per request) and
-    // --mamba-ssm-dtype bfloat16 (halves the slot) and pin
-    // --max-mamba-cache-size = requests x 1. --linear-attn-decode-backend
-    // triton keeps the same GDN decode kernel the fp32 runs used (bf16 state
-    // would otherwise be routed to the FlashInfer GDN decode on SM100+).
+    // chunks, 262k context) with prefix caching on and the concurrency pinned
+    // explicitly. With the stock radix strategy (5 fp32 state slots per
+    // request, 0.109 GiB each) the scheduler caps the card at 3 requests with
+    // MTP and 12 without, so the cells use extra_buffer_lazy plus
+    // SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1 (3 slots per request: the running
+    // request's prefix state is no longer pinned in the radix tree during
+    // decode, a cache-retention trade, not a numerics change),
+    // --mamba-ssm-dtype bfloat16 (halves the slot to 0.055 GiB), and pin
+    // --max-mamba-cache-size = requests x 3. --linear-attn-decode-backend
+    // triton keeps the GDN decode kernel the fp32 runs and the DGX Spark cells
+    // use; the FlashInfer GDN decode also runs on SM120 and measured the same
+    // TPOT and accuracy, so the pin is there to keep the bf16-state auto-default
+    // from switching kernels silently.
+    //
     // With the state pool pinned, the KV pool takes whatever is left of the
     // static budget, so --mem-fraction-static is what sets the activation
     // headroom: 4096-token prefill chunks of real (ShareGPT-length) prompts
-    // peak ~1.3-1.5 GB above the post-graph-capture level, and a cell left
-    // with 2.4 GB OOMed in the GDN short-conv during prefill. The values
-    // below keep >= 3.5 GB free after graph capture and were driven through
-    // both a 1024-in/256-out random benchmark and a ShareGPT chat sweep.
+    // peak 1.5-2.6 GB above the post-graph-capture level, and cells left with
+    // 2.4 GB OOMed in the GDN short-conv during prefill. The values below keep
+    // >= 4 GB free after graph capture (>= 2.3 GB at the measured peak) and
+    // were driven through a 1024-in/256-out random benchmark and a ShareGPT
+    // chat sweep at every concurrency up to the pin.
     // Verified 2026-09-05 on the qwen38flashnext image (SGLang 593134d17a):
-    // GSM8K (chat API, thinking off, n=200) 97.5% low latency / 97.0% high
-    // throughput, inside the 95-98% band of the datacenter runs.
+    // GSM8K (chat API, thinking off, n=200) 97.0% / 97.5% on two runs of the
+    // low-latency cell, 98.0% / 97.0% on the high-throughput cell — inside the
+    // 95-98% band of the datacenter runs.
     //
-    // Low latency: in-checkpoint MTP head (NEXTN 3/1/4), 24 concurrent
-    // requests. The D=4 draft tokens each carry an intermediate SSM state per
-    // request, which is what limits MTP concurrency on this card (~31 is the
-    // ceiling); at 0.96 the KV pool is ~61k tokens (2.5k per request when
-    // full) with ~3.6 GB free after graph capture. MTP accept length 3.3 of 4
-    // on non-thinking output; 1024-in/256-out: 6.0 ms TPOT at 1 request,
-    // 19 ms at 16, 24 ms at 24 (vs 11 / 25 / - without MTP).
+    // Low latency: in-checkpoint MTP head (NEXTN 3/1/4), 16 concurrent
+    // requests (48 state slots + 17 x 4 intermediate draft states, 6.4 GiB).
+    // The draft states are what limit MTP concurrency on this card; at 0.96 the
+    // KV pool is ~78k tokens (~4.9k per request when full) with 4.2 GB free
+    // after graph capture. 1024-in/256-out: 5.9 ms TPOT at 1 request, 14.3 ms
+    // at 8, 19.3 ms at 16 (vs 11.4 / - / 25.6 without MTP); MTP accept length
+    // 3.3 of 4 on GSM8K / random prompts, 2.9 on long-form ShareGPT answers.
     {
       match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
       verified: true,
-      warn: "Single RTX PRO 6000 (96 GB). The FP8 N-gram table lives in pinned host RAM: keep >= 64 GB of host memory free and run Docker with --ulimit memlock=-1. 24 concurrent requests is close to the MTP ceiling on this card (~31), and the KV pool is ~61k tokens (~2.5k per request when full) — lower --max-running-requests for long-context work. See [RTX PRO 6000 notes](#rtx6000-note).",
-      env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"],
+      warn: "Single RTX PRO 6000 (96 GB). The FP8 N-gram table lives in pinned host RAM: keep >= 64 GB of host memory free and run Docker with --ulimit memlock=-1. The KV pool is ~78k tokens (~4.9k per request at 16 concurrent) — lower --max-running-requests for long-context work. See [RTX PRO 6000 notes](#rtx6000-note).",
+      env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True", "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
@@ -825,9 +833,9 @@ export const config = {
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
-        "--disable-radix-cache",
-        "--max-running-requests 24",
-        "--max-mamba-cache-size 24",
+        "--mamba-radix-cache-strategy extra_buffer_lazy",
+        "--max-running-requests 16",
+        "--max-mamba-cache-size 48",
         "--mamba-ssm-dtype bfloat16",
         "--linear-attn-decode-backend triton",
         "--reasoning-parser qwen3",
@@ -836,16 +844,18 @@ export const config = {
         "--port {{PORT}}",
       ],
     },
-    // High throughput: speculation off, 96 concurrent requests (96 bf16 state
-    // slots, 5.3 GiB). At 0.93 the KV pool is ~320k tokens (3.3k per request
-    // when full) with ~5 GB free after graph capture. 1024-in/256-out at
-    // 96-way: 1,020 output tok/s, 4.0 req/s, 69 ms TPOT; ShareGPT chat at
-    // 96-way: 1,507 output tok/s.
+    // High throughput: speculation off, 64 concurrent requests (192 bf16 state
+    // slots, 10.7 GiB). At 0.93 the KV pool is ~98k tokens (~1.5k per request
+    // when full) with 5.3 GB free after graph capture (3.2 GB at the measured
+    // peak). 1024-in/256-out at 64-way: 861 output tok/s, 3.4 req/s, 55 ms
+    // TPOT; ShareGPT chat at 64-way: 1,258 output tok/s. (0.94 also passed
+    // every check with a 138k-token pool and 2.3 GB at peak, if more KV per
+    // request matters than headroom.)
     {
       match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
-      warn: "Single RTX PRO 6000 (96 GB). The FP8 N-gram table lives in pinned host RAM: keep >= 64 GB of host memory free and run Docker with --ulimit memlock=-1. At 96 concurrent requests the KV pool is ~320k tokens (~3.3k per request when full); lower --max-running-requests for long-context workloads. See [RTX PRO 6000 notes](#rtx6000-note).",
-      env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"],
+      warn: "Single RTX PRO 6000 (96 GB). The FP8 N-gram table lives in pinned host RAM: keep >= 64 GB of host memory free and run Docker with --ulimit memlock=-1. At 64 concurrent requests the KV pool is ~98k tokens (~1.5k per request when full); lower --max-running-requests for long-context workloads. See [RTX PRO 6000 notes](#rtx6000-note).",
+      env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True", "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
@@ -856,9 +866,9 @@ export const config = {
         "--mamba-track-interval 64",
         "--chunked-prefill-size 4096",
         "--context-length 262144",
-        "--disable-radix-cache",
-        "--max-running-requests 96",
-        "--max-mamba-cache-size 96",
+        "--mamba-radix-cache-strategy extra_buffer_lazy",
+        "--max-running-requests 64",
+        "--max-mamba-cache-size 192",
         "--mamba-ssm-dtype bfloat16",
         "--linear-attn-decode-backend triton",
         "--reasoning-parser qwen3",

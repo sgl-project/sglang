@@ -85,12 +85,12 @@ export const benchmarks = [
   {
     match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "qwen38flashnext image @ 593134d17a",
-    accuracy: { gsm8k_pct: 97.5 },
+    accuracy: { gsm8k_pct: 97.0 },
   },
   {
     match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "qwen38flashnext image @ 593134d17a",
-    accuracy: { gsm8k_pct: 97.0 },
+    accuracy: { gsm8k_pct: 98.0 },
   },
   { match: { hw: "mi350x", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
   { match: { hw: "mi350x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" } },
