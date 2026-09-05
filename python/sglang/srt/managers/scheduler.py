@@ -2342,6 +2342,7 @@ class Scheduler(
             send_metrics_from_scheduler=self.ipc_channels.send_metrics_from_scheduler,
             max_running_requests=self.max_running_requests,
             max_total_num_tokens=self.max_total_num_tokens,
+            page_size=self.page_size,
             get_stats=lambda: self.metrics_reporter.stats,
         )
 
