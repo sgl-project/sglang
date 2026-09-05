@@ -92,6 +92,10 @@ def _with_mtp_layer_mapping(
         for depth in range(draft_layer_num)
     }
 
+def _resolve_mtp_full_kv_pool(pool: Any) -> Any:
+    return getattr(pool, "full_kv_pool", pool)
+
+
 
 class _DeepSeekV4LayerMappings(NamedTuple):
     transfer_layer_num: int
@@ -789,7 +793,8 @@ def build_hybrid_mamba_stack(
     transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
     mamba_allocator = params.req_to_token_pool.mamba_allocator
     mtp_draft_device_pools = tuple(
-        pool.full_kv_pool for pool in params.mtp_draft_device_pools
+        _resolve_mtp_full_kv_pool(pool)
+        for pool in params.mtp_draft_device_pools
     )
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:

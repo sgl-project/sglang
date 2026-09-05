@@ -10,6 +10,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _evict_swa_for_device_alloc,
     _split_hicache_size,
     build_full_draft_pools,
+    _resolve_mtp_full_kv_pool,
 )
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -77,6 +78,17 @@ class TestSplitHicacheSize(CustomTestCase):
 
 
 class TestDraftSidecarPoolDispatch(CustomTestCase):
+    def test_mtp_pool_preserves_direct_dsa_style_pool(self):
+        draft_kv_pool = SimpleNamespace(layer_num=1)
+
+        self.assertIs(_resolve_mtp_full_kv_pool(draft_kv_pool), draft_kv_pool)
+
+    def test_mtp_pool_unwraps_hybrid_linear_pool(self):
+        full_kv_pool = SimpleNamespace(layer_num=1)
+        draft_kv_pool = SimpleNamespace(full_kv_pool=full_kv_pool)
+
+        self.assertIs(_resolve_mtp_full_kv_pool(draft_kv_pool), full_kv_pool)
+
     def test_full_builder_unwraps_empty_hybrid_linear_pool(self):
         draft_kv_pool = object.__new__(HybridLinearKVPool)
         draft_kv_pool.full_kv_pool = SimpleNamespace(layer_num=0)
