@@ -5765,14 +5765,7 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(result.host_hit_length, 0)
         self.assertEqual(result.swa_host_hit_length, _node_key_length(cache, leaf))
 
-    def _skip_swa_branching_on_rust(self) -> None:
-        # TODO(alphabetc1): drop this gate once #37584 ports SWA branching-point
-        # caching to the Rust tree core.
-        if _selected_tree_core_test_backend() == "rust":
-            self.skipTest("SWA branching-point caching is Python-core only")
-
     def test_swa_branching_seqlen_uses_device_full_hit(self):
-        self._skip_swa_branching_on_rust()
         if (
             not self.cfg.has_swa
             or self.cfg.has_mamba
@@ -5788,20 +5781,13 @@ class UnifiedRadixCacheSuite:
         self._insert(cache, allocator, req_to_token_pool, prefix)
         self._insert(cache, allocator, req_to_token_pool, tokens)
 
-        leaf = cache.resolve_node_handle(
-            cache.match_prefix(
-                MatchPrefixParams(key=RadixKey(array("q", tokens)))
-            ).last_device_node
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        ).last_device_node
+        evicted = cache.tree_core.evict_component(
+            leaf, ComponentType.SWA, EvictLayer.DEVICE
         )
-        device_frees = defaultdict(list)
-        cache.tree_core._evict_component_and_detach_lru(
-            leaf,
-            cache.components[ComponentType.SWA],
-            device_frees=device_frees,
-            host_frees=defaultdict(list),
-            target=EvictLayer.DEVICE,
-        )
-        cache._drain_device_frees(device_frees)
+        cache._free_values(evicted.device_frees, evicted.host_frees)
 
         result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
 
@@ -5824,7 +5810,6 @@ class UnifiedRadixCacheSuite:
         self.assertIsNone(rematch.swa_branching_seqlen)
 
     def test_swa_branching_seqlen_uses_host_full_hit(self):
-        self._skip_swa_branching_on_rust()
         if (
             not self.cfg.has_swa
             or self.cfg.has_mamba
@@ -5839,24 +5824,21 @@ class UnifiedRadixCacheSuite:
         self._insert(cache, allocator, req_to_token_pool, prefix)
         self._insert(cache, allocator, req_to_token_pool, tokens)
 
-        leaf = cache.resolve_node_handle(
-            cache.match_prefix(
-                MatchPrefixParams(key=RadixKey(array("q", tokens)))
-            ).last_device_node
-        )
-        parent = leaf.parent
-        self._backup_node(cache, leaf.id)
-        lock_result = cache.inc_lock_ref(parent.id)
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        ).last_device_node
+        leaf_len = _node_key_length(cache, leaf)
+        parent = _node_parent(cache, leaf)
+        self._backup_node(cache, leaf)
+        lock_result = cache.inc_lock_ref(parent)
         try:
-            cache.evict(EvictParams(num_tokens=len(leaf.key)))
+            cache.evict(EvictParams(num_tokens=leaf_len))
         finally:
-            cache.dec_lock_ref(parent.id, lock_result.to_dec_params())
-        device_frees = defaultdict(list)
-        host_frees = defaultdict(list)
-        cache.components[ComponentType.SWA].evict_component(
-            leaf, device_frees, host_frees, target=EvictLayer.HOST
+            cache.dec_lock_ref(parent, lock_result.to_dec_params())
+        evicted = cache.tree_core.evict_component(
+            leaf, ComponentType.SWA, EvictLayer.HOST
         )
-        cache._free_values(device_frees, host_frees)
+        cache._free_values(evicted.device_frees, evicted.host_frees)
         full_host_pool = cache.cache_controller.mem_pool_host
         swa_host_pool = cache.components[ComponentType.SWA]._swa_kv_pool_host
         full_available_before = full_host_pool.available_size()
@@ -5878,7 +5860,7 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(full_host_pool.available_size(), full_available_before)
         self.assertEqual(
             swa_host_pool.available_size(),
-            swa_available_before - len(leaf.key),
+            swa_available_before - leaf_len,
         )
 
         rematch = cache.match_prefix(
@@ -6693,7 +6675,6 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(comp_xfers[ComponentType.SWA][0].nodes_to_load, [a, b])
 
     def test_hicache_swa_backup_window_stops_at_pending_ancestor(self):
-        self._skip_swa_branching_on_rust()
         if (
             not self.cfg.has_swa
             or self.cfg.has_mamba
@@ -6717,10 +6698,7 @@ class UnifiedRadixCacheSuite:
             cache._execute_and_commit_kv_backup(BackupKV(node_ids=[c])),
             0,
         )
-        self.assertEqual(
-            cache.tree_core.node_by_id(c).write_through_pending_id,
-            c,
-        )
+        self.assertEqual(cache.tree_core.get_write_through_pending_id(c), c)
         self.assertIsNotNone(_host_value(cache, c, ComponentType.FULL))
         self.assertIsNone(_host_value(cache, c, ComponentType.SWA))
 
@@ -6737,20 +6715,14 @@ class UnifiedRadixCacheSuite:
         d = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", next_tokens)))
         ).last_device_node
-        self.assertEqual(
-            cache.tree_core.node_by_id(c).write_through_pending_id,
-            c,
-        )
-        self.assertEqual(
-            cache.tree_core.node_by_id(d).write_through_pending_id,
-            d,
-        )
+        self.assertEqual(cache.tree_core.get_write_through_pending_id(c), c)
+        self.assertEqual(cache.tree_core.get_write_through_pending_id(d), d)
         self.assertIsNone(_host_value(cache, c, ComponentType.SWA))
         self.assertIsNotNone(_host_value(cache, d, ComponentType.SWA))
 
         cache.writing_check(write_back=True)
-        self.assertIsNone(cache.tree_core.node_by_id(c).write_through_pending_id)
-        self.assertIsNone(cache.tree_core.node_by_id(d).write_through_pending_id)
+        self.assertIsNone(cache.tree_core.get_write_through_pending_id(c))
+        self.assertIsNone(cache.tree_core.get_write_through_pending_id(d))
 
     def _swa_finalize_setup(self):
         """Build a SWA chain long enough to fill at least the window

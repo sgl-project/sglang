@@ -64,6 +64,7 @@ fn insert_params_mamba<'k>(
         mamba_value: mamba_slot.map(|slot| Tensor::from_slice(&[slot])),
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
+        swa_branching_seqlen: None,
         chunked: false,
         priority: 0,
         track_adopted_ranges: false,
@@ -552,6 +553,25 @@ fn reinsert_full_backed_target_schedules_mamba_only_backup() {
     let pending = tc.insert(&insert_params_mamba(&key, &[30, 31], Some(9)));
     assert!(
         !pending
+            .cache_actions
+            .iter()
+            .any(|action| matches!(action, CacheAction::BackupKV(_)))
+    );
+}
+
+#[test]
+fn write_back_reinsert_defers_the_mamba_backup_to_eviction() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    tc.set_hicache_enabled();
+    tc.is_write_back = true;
+    let key = vec![1, 2];
+    tc.insert(&insert_params_mamba(&key, &[10, 11], Some(7)));
+    let leaf = tc.match_prefix(&match_params(&key)).best_match_node_id;
+    tc.commit_backup(leaf, Tensor::from_slice(&[100i64, 101]), HashMap::new());
+
+    let result = tc.insert(&insert_params_mamba(&key, &[20, 21], Some(8)));
+    assert!(
+        !result
             .cache_actions
             .iter()
             .any(|action| matches!(action, CacheAction::BackupKV(_)))
