@@ -60,6 +60,82 @@ def test_sm120_runtime_policy_delegates_decode_shapes():
     assert not future_policy.decode_uses_static_max_seqlen_k
 
 
+@pytest.mark.parametrize(("q_len", "q_heads"), [(2, 6), (8, 16)])
+def test_sm120_short_query_auto_split_matches_unsplit_graph(
+    monkeypatch, q_len, q_heads
+):
+    sm120_forward_host.clear_launch_plans()
+    resolved_plans = []
+    original_resolve_plan = Sm120ForwardHost.resolve_plan
+
+    def recording_resolve_plan(**kwargs):
+        plan = original_resolve_plan(**kwargs)
+        resolved_plans.append((kwargs["requested_num_splits"], plan))
+        return plan
+
+    monkeypatch.setattr(
+        Sm120ForwardHost,
+        "resolve_plan",
+        staticmethod(recording_resolve_plan),
+    )
+    torch.manual_seed(20260904 + q_len)
+    kv_len, page_size, head_dim = 1024, 64, 128
+    q = torch.randn(
+        q_len, q_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        kv_len // page_size,
+        page_size,
+        1,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v = torch.randn_like(k)
+    page_table = torch.arange(
+        kv_len // page_size, device="cuda", dtype=torch.int32
+    )[None]
+    cache_seqlens = torch.tensor([kv_len], device="cuda", dtype=torch.int32)
+    cu_seqlens_q = torch.tensor([0, q_len], device="cuda", dtype=torch.int32)
+
+    def run(num_splits, out):
+        return flash_attn_with_kvcache(
+            q,
+            k,
+            v,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=q_len,
+            max_seqlen_k=kv_len,
+            causal=True,
+            num_splits=num_splits,
+            pack_gqa=True,
+            out=out,
+        )
+
+    unsplit_out = torch.empty_like(q)
+    eager_auto_out = torch.empty_like(q)
+    graph_auto_out = torch.empty_like(q)
+    run(1, unsplit_out)
+    run(0, eager_auto_out)
+    torch.cuda.synchronize()
+
+    auto_plans = [plan for requested, plan in resolved_plans if requested == 0]
+    assert auto_plans
+    assert all(plan.num_splits > 1 for plan in auto_plans)
+    torch.testing.assert_close(eager_auto_out, unsplit_out, atol=2e-3, rtol=0.0)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run(0, graph_auto_out)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert captured.data_ptr() == graph_auto_out.data_ptr()
+    torch.testing.assert_close(graph_auto_out, unsplit_out, atol=2e-3, rtol=0.0)
+
+
 def test_sm120_preallocated_output_contract_is_validated_before_launch():
     q = torch.empty((1, 1, 1, 32), device="cuda", dtype=torch.bfloat16)
     k = torch.empty((1, 1, 1, 32), device="cuda", dtype=torch.bfloat16)
