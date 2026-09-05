@@ -434,6 +434,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                         else {}
                     )
 
+                    effective_routed_dp_rank = self.extract_routed_dp_rank_from_header(
+                        raw_request, request.routed_dp_rank
+                    )
+
                     adapted_request = GenerateReqInput(
                         **prompt_kwargs,
                         **logprob_kwargs,
@@ -463,6 +467,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                         session_id=request.session_id,
                         extra_key=request.extra_key,
                         cache_salt=request.cache_salt,
+                        bootstrap_host=request.bootstrap_host,
+                        bootstrap_port=request.bootstrap_port,
+                        bootstrap_room=request.bootstrap_room,
+                        routed_dp_rank=effective_routed_dp_rank,
+                        disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
                         # background+stream streams on this connection, so don't detach.
                         background=request.background and not request.stream,
                         require_reasoning=require_reasoning,
