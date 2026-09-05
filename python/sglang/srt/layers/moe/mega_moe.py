@@ -45,7 +45,11 @@ if TYPE_CHECKING:
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 
 
-def _mega_moe_mma_type() -> str:
+def _mega_moe_mma_type(experts=None) -> str:
+    # NVFP4 (e2m1 + UE4M3 g16 + per-tensor alphas) is a checkpoint property of
+    # the expert layer; the MXFP4 W4A8 / W4A4 choice is a server-wide flag.
+    if experts is not None and getattr(experts, "_mega_moe_nvfp4", False):
+        return "nvfp4xnvfp4"
     return "mxf4xmxf4" if get_exec().moe.enable_w4a4_mxfp4_megamoe else "fp8xfp4"
 
 
@@ -109,10 +113,12 @@ def _get_mega_moe_symm_buffer(
     num_topk: int,
     hidden: int,
     intermediate_hidden: int,
+    mma_type: Optional[str] = None,
 ) -> SymmBuffer:
     import deep_gemm
 
-    mma_type = _mega_moe_mma_type()
+    if mma_type is None:
+        mma_type = _mega_moe_mma_type()
     key = (
         id(group),
         num_max_tokens_per_rank,
@@ -281,8 +287,9 @@ def run_mega_routed_experts(
         f"cuda_graph_max_bs / chunked_prefill_size accordingly"
     )
 
+    mma_type = _mega_moe_mma_type(experts)
     if _device_sm != 90:
-        _check_mega_moe_shapes(hidden_size, intermediate_size, _mega_moe_mma_type())
+        _check_mega_moe_shapes(hidden_size, intermediate_size, mma_type)
     buf = _get_mega_moe_symm_buffer(
         ep_group,
         num_experts=num_experts,
@@ -290,6 +297,7 @@ def run_mega_routed_experts(
         num_topk=top_k,
         hidden=hidden_size,
         intermediate_hidden=intermediate_size,
+        mma_type=mma_type,
     )
 
     if num_tokens > 0:
@@ -312,8 +320,32 @@ def run_mega_routed_experts(
             routed_scaling_factor=routed_scaling_factor,
         )
 
-    mma_type = _mega_moe_mma_type()
-    if mma_type == "mxf4xmxf4":
+    mega_kwargs = {"recipe": (1, 1, 32)}
+    if mma_type == "nvfp4xnvfp4":
+        # Per-token FP32 outer scale lands in buf.x_scales; the kernel applies
+        # it with the per-expert weight alphas in the L1 epilogue and the
+        # (input_scale * weight_scale_2) alpha in the L2 epilogue.
+        deep_gemm.mega_moe_pre_dispatch(
+            hidden_states,
+            topk_ids_in,
+            topk_weights_in,
+            buf.x,
+            buf.x_sf,
+            buf.topk_idx,
+            buf.topk_weights,
+            num_tokens=num_tokens,
+            group_size=16,
+            mma_type=mma_type,
+            buf_x_scales=buf.x_scales,
+        )
+        mega_kwargs = {
+            "recipe": (1, 1, 16),
+            "use_x_scales": True,
+            "l1_alphas": experts.mega_l1_alphas,
+            "l2_alphas": experts.mega_l2_alphas,
+            "l2_act_scales": experts.mega_l2_act_scales,
+        }
+    elif mma_type == "mxf4xmxf4":
         # FP4 path goes through DeepGEMM's mega_moe_pre_dispatch which
         # handles the E2M1 packing variant. The jit implementation
         # only emits FP8.
@@ -354,10 +386,10 @@ def run_mega_routed_experts(
             experts.mega_l1_weights,
             experts.mega_l2_weights,
             buf,
-            recipe=(1, 1, 32),
             activation="swiglu",
             activation_clamp=activation_clamp,
             fast_math=True,
+            **mega_kwargs,
         )
     y = y[:num_tokens]
 
