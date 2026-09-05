@@ -1429,10 +1429,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
         if is_checkpoint_nvfp4_serialized:
-            logger.warning(
-                "Detected nvfp4 checkpoint. Please note that the "
-                "format is experimental and subject to change."
-            )
+            logger.info("Detected nvfp4 checkpoint.")
         self.is_awq = is_awq
         self.is_w4a16 = False
         self.group_size = group_size
