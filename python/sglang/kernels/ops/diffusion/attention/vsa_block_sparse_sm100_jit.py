@@ -1,10 +1,9 @@
 """FastVideo's native Blackwell block-sparse VSA forward (64-token tiles).
 
 A warp-specialized tcgen05 pipeline in which a CTA owns two adjacent query tiles
-with their own key lists. It reaches ~1.06 PFLOPS on B300 against ~0.62 for the
-Triton tile-64 kernel on the same inputs; outputs differ from it at bf16
-rounding level (max one ulp, ~50% of elements bit-exact). Requires sm_100a or
-sm_103a, bf16, head_dim 128, an even tile count and contiguous [B, H, S, D].
+with their own key lists; outputs sit within one bf16 ulp of the Triton tile-64
+kernel. Requires sm_100a or sm_103a, bf16, head_dim 128, an even tile count and
+contiguous [B, H, S, D].
 """
 
 from __future__ import annotations
