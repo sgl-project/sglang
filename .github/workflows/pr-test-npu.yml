@@ -201,6 +201,12 @@ jobs:
           # copy gsm8k dataset from cache
           cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
 
+      - name: Prefetch consistency GT
+        env:
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+        run: |
+          python3 scripts/ci/utils/diffusion/prefetch_consistency_gt.py
+
       - name: Run test
         timeout-minutes: 60
         env:
@@ -264,6 +270,12 @@ jobs:
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy gsm8k dataset
           cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
+
+      - name: Prefetch consistency GT
+        env:
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+        run: |
+          python3 scripts/ci/utils/diffusion/prefetch_consistency_gt.py
 
       - name: Run test
         timeout-minutes: 60
