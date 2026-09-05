@@ -1075,18 +1075,27 @@ class KVCacheConfigurator:
         max_num_reqs: int,
         extra_max_context_len: int,
     ) -> ReqToTokenPool:
-        # DSPARK/DFLASH commit routes through the backend fold (KDA-only); a
-        # non-KDA model there would scatter a None intermediate_ssm and crash.
+        # DFLASH and DSPARK route GDN ReplaySSM through the common
+        # fold-every-commit hook. DSPARK's compact/cap-accept layouts are ragged,
+        # while the GDN ring-write currently requires a dense fixed-width window.
         _algo = (get_spec().speculative_algorithm or "").upper()
         if (
             get_exec().mamba.enable_linear_replayssm_spec
-            and _algo in ("DSPARK", "DFLASH")
-            and kimi_linear_config(self.model_config) is None
+            and _algo == "DSPARK"
+            and self.hybrid_gdn_config is not None
         ):
-            raise ValueError(
-                "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
-                "(kimi_linear) model; got a non-KDA model."
+            from sglang.srt.speculative.ragged_verify import (
+                RaggedVerifyMode,
+                read_ragged_verify_mode,
             )
+
+            ragged_mode = read_ragged_verify_mode()
+            if ragged_mode is not RaggedVerifyMode.STATIC:
+                raise ValueError(
+                    "--enable-linear-replayssm-spec with DSPARK + GDN currently "
+                    "requires SGLANG_RAGGED_VERIFY_MODE=static; got "
+                    f"{ragged_mode.value!r}."
+                )
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
