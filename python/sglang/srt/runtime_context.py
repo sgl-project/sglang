@@ -868,7 +868,47 @@ def _build_config_bags(server_args: Any) -> dict:
                 "clashes with a subgroup of the same name"
             )
         bag._set(field, value)
+    _install_derived_leaves(tops, server_args)
     return tops
+
+
+def _install_derived_leaves(tops: dict, server_args: Any) -> None:
+    """Compute the declared config-derived fields into their bags.
+
+    A `Derived(fn=...)` is a pure function of the published configuration, so it
+    is computed once, here, and stored as an ordinary leaf: readers get a plain
+    attribute load, and there is one answer rather than a pre-publish spelling
+    and a post-publish one that have to be kept saying the same thing.
+
+    The function is handed the whole resolved config, not the bag it lands in.
+    A derivation is free to span namespaces and they do -- the mamba
+    extra-buffer predicate reads `memory.disable_radix_cache` alongside its own
+    `exec.mamba` strategy -- which is exactly why it cannot be written as a
+    method on either bag.
+    """
+    import importlib
+
+    from sglang.srt.arg_groups.arg_utils import Derived
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    namespaces = getattr(type(server_args), "_NAMESPACES", None)
+    if not namespaces:
+        return
+    view = resolved_view(server_args)
+    for source in namespaces:
+        path = getattr(source, "_NS_PATH", None)
+        if path is None:
+            continue
+        for name, decl in vars(source).items():
+            if not isinstance(decl, Derived) or not decl.fn:
+                continue
+            module, _, attr = decl.fn.rpartition(".")
+            bag = tops.get(path.split(".")[0])
+            for segment in path.split(".")[1:]:
+                bag = bag and getattr(bag, segment, None)
+            if bag is None:
+                continue
+            bag._set(name, getattr(importlib.import_module(module), attr)(view))
 
 
 def _resolved_or_field(server_args: Any, name: str, default: Any) -> Any:
@@ -1692,29 +1732,6 @@ def reset_context() -> None:
     _CONTEXT.resources = Resources()
     _CONTEXT.forward = ForwardFlags()
     set_global_dwdp_manager(None)
-
-
-def mamba_extra_buffer_enabled() -> bool:
-    """Whether the mamba radix cache keeps its extra state buffer.
-
-    A predicate over two published leaves (``memory.disable_radix_cache`` and
-    ``exec.mamba.mamba_radix_cache_strategy``), so it reads the bags rather
-    than the startup record — the ``ServerArgs`` member of the same name is the
-    pre-publish equivalent used inside the resolution pipeline.
-    """
-    return (
-        get_memory().disable_radix_cache is False
-        and get_exec().mamba.mamba_radix_cache_strategy
-        in ("extra_buffer", "extra_buffer_lazy")
-    )
-
-
-def mamba_extra_buffer_lazy_enabled() -> bool:
-    """The lazy variant of :func:`mamba_extra_buffer_enabled`."""
-    return (
-        get_memory().disable_radix_cache is False
-        and get_exec().mamba.mamba_radix_cache_strategy == "extra_buffer_lazy"
-    )
 
 
 def remote_instance_transfer_engine_enabled(load_format: str | None = None) -> bool:
