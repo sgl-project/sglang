@@ -48,14 +48,9 @@ def _launch_server_target(launch_server_func: Callable, server_args: ServerArgs)
 
 
 def launch_or_reuse_server(launch_server_func: Callable, server_args: ServerArgs):
-    # Resolve in the parent, before the fork. The pipeline probes the device
-    # (the default attention backend reads the CUDA capability), and a forked
-    # child cannot re-initialize CUDA once this process has.
-    server_args.resolve_once()
-
     base_url = resolve_base_url("", server_args.host, server_args.port)
 
-    # Reuse an already-running server instead of forking a second one onto the
+    # Reuse an already-running server instead of launching a second one onto the
     # occupied port, where it would orphan, compete for the GPU, and OOM.
     if server_is_up(base_url, timeout=5):
         print(
@@ -64,7 +59,14 @@ def launch_or_reuse_server(launch_server_func: Callable, server_args: ServerArgs
         )
         return None, base_url
 
-    proc = multiprocessing.Process(
+    # Launch in a fresh *spawn* process. The parent CLI may have already
+    # initialized the accelerator (CUDA/XPU) while resolving ``ServerArgs``; a
+    # forked child would inherit that dead device context and fail with
+    # "Cannot re-initialize CUDA in forked subprocess" the moment it touches the
+    # device (e.g. image preprocessing during a multimodal warmup). Spawn gives
+    # the child a clean process that initializes its own device context. See #34709.
+    ctx = multiprocessing.get_context("spawn")
+    proc = ctx.Process(
         target=_launch_server_target,
         args=(
             launch_server_func,
