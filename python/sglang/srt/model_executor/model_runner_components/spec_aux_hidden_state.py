@@ -172,7 +172,6 @@ def _resolve_dflash_aux_hidden_state(
 
         target_layer_ids = dflash_draft_config.resolve_target_layer_ids(
             target_num_layers=int(target_num_layers),
-            draft_num_layers=int(draft_num_layers),
         )
 
         # These Muse drafts use HF layer-output ids, while the Muse target captures

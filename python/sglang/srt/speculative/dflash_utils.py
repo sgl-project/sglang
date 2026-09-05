@@ -353,46 +353,6 @@ def _get_or_create_chain_verify_buffers(
     )
 
 
-def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> List[int]:
-    """Select target layer indices used to build DFlash context features.
-
-    Args:
-        num_target_layers: Number of transformer layers in the runtime target model.
-        num_draft_layers: Number of layers in the DFlash draft model.
-
-    Returns:
-        A list of 0-based target layer indices of length `num_draft_layers`.
-
-    Notes:
-        - DFlash uses hidden states after each selected target layer (HF-style).
-        - SGLang captures "before layer i", so the model hook will typically add +1
-          when mapping to capture points.
-    """
-    if num_target_layers <= 0:
-        raise ValueError(
-            f"num_target_layers must be positive, got {num_target_layers}."
-        )
-    if num_draft_layers <= 0:
-        raise ValueError(f"num_draft_layers must be positive, got {num_draft_layers}.")
-
-    if num_draft_layers == 1:
-        return [num_target_layers // 2]
-
-    start = 1
-    end = num_target_layers - 3
-    if end < start:
-        raise ValueError(
-            "DFlash layer selection requires num_target_layers >= 4. "
-            f"Got num_target_layers={num_target_layers}."
-        )
-
-    span = end - start
-    return [
-        int(round(start + (i * span) / (num_draft_layers - 1)))
-        for i in range(num_draft_layers)
-    ]
-
-
 def get_dflash_layer_types(config: Any) -> Optional[Sequence[str]]:
     text_config = _get_text_config(config)
     layer_types = _cfg_get(text_config, "layer_types", _cfg_get(config, "layer_types"))
@@ -554,7 +514,6 @@ class DFlashDraftConfig:
         self,
         *,
         target_num_layers: int,
-        draft_num_layers: Optional[int] = None,
     ) -> List[int]:
         target_num_layers = int(target_num_layers)
         if target_num_layers <= 0:
@@ -563,9 +522,14 @@ class DFlashDraftConfig:
             )
 
         if self.target_layer_ids is None:
-            if draft_num_layers is None:
-                draft_num_layers = self.require_num_layers()
-            return build_target_layer_ids(target_num_layers, int(draft_num_layers))
+            # The tap layers are a training-time choice baked into the
+            # checkpoint (fc input width and which layers were trained on),
+            # so no load-time guess can be correct; see z-lab/dflash#156.
+            raise ValueError(
+                "DFLASH requires dflash_config.target_layer_ids in the draft "
+                "config. Every published DFlash checkpoint sets this key; a "
+                "guessed layer list can silently read the wrong target layers."
+            )
 
         resolved = list(self.target_layer_ids)
         if len(resolved) <= 0:
