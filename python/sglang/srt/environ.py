@@ -443,6 +443,9 @@ class Envs:
     SGLANG_ENABLE_NVTX_OPERATIONS = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_OPERATIONS_ENABLE_PROFILE"
     )
+    # NVTX ranges for the logical-page KV sharding forward path (plan
+    # capture, layer-ahead prefix gather, compute-side slot waits).
+    SGLANG_ENABLE_NVTX_KV_SHARD = EnvBool(False)
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
     # Opt-in: emit one CUDA-graph capture trace per captured batch size (per-bs).
