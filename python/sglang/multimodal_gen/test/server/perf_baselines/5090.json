@@ -61,7 +61,7 @@
             "expected_avg_denoise_ms": 338.78,
             "expected_median_denoise_ms": 345.95,
             "load_peak_vram_mb": 1126.0,
-            "runtime_peak_vram_mb": 13180.0,
+            "runtime_peak_vram_mb": 20064.0,
             "estimated_full_test_time_s": 94.0
         },
         "wan2_1_t2v_1.3b": {
@@ -85,7 +85,7 @@
             "expected_avg_denoise_ms": 426.59,
             "expected_median_denoise_ms": 427.94,
             "load_peak_vram_mb": 4934.0,
-            "runtime_peak_vram_mb": 18246.0,
+            "runtime_peak_vram_mb": 30428.0,
             "estimated_full_test_time_s": 160.9
         },
         "turbo_wan2_1_t2v_1.3b": {
@@ -134,7 +134,7 @@
             "expected_avg_denoise_ms": 241.53,
             "expected_median_denoise_ms": 265.1,
             "load_peak_vram_mb": 13120.0,
-            "runtime_peak_vram_mb": 17776.0,
+            "runtime_peak_vram_mb": 24372.0,
             "estimated_full_test_time_s": 329.8
         },
         "flux_image_t2i_layerwise_cpu_offload_5090": {

@@ -1,7 +1,7 @@
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -48,10 +48,57 @@ def _make_pipeline(layer: BaseLayerWithLoRA) -> _TestLoRAPipeline:
     pipeline.lora_layers_transformer_2 = {}
     pipeline.lora_layers_critic = {}
     pipeline.is_lora_merged = {}
+    pipeline.component_residency_manager = None
 
     pipeline.lora_adapters["adapter"]["linear.lora_A"] = torch.ones(1, 2)
     pipeline.lora_adapters["adapter"]["linear.lora_B"] = torch.ones(2, 1)
     return pipeline
+
+
+def test_temporary_offload_materialization_is_reported_to_residency_manager():
+    pipeline = _make_pipeline(_make_layer())
+    module = Mock()
+    pipeline.modules = {"transformer": module}
+    residency_manager = Mock()
+    residency_manager.full_weight_transition.return_value = nullcontext()
+    pipeline.component_residency_manager = residency_manager
+
+    with patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline."
+        "is_layerwise_offloaded_module",
+        return_value=True,
+    ):
+        with pipeline._temporarily_disable_offload(
+            target="transformer", use_module_names_only=True
+        ):
+            pass
+
+    residency_manager.full_weight_transition.assert_called_once_with(["transformer"])
+    module.disable_offload.assert_called_once_with()
+    module.enable_offload.assert_called_once_with()
+
+
+def test_component_offload_weight_update_is_reported_without_disabling_offload():
+    pipeline = _make_pipeline(_make_layer())
+    module = Mock()
+    pipeline.modules = {"transformer": module}
+    residency_manager = Mock()
+    residency_manager.full_weight_transition.return_value = nullcontext()
+    pipeline.component_residency_manager = residency_manager
+
+    with patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline."
+        "is_layerwise_offloaded_module",
+        return_value=False,
+    ):
+        with pipeline._temporarily_disable_offload(
+            target="transformer", use_module_names_only=True
+        ):
+            pass
+
+    residency_manager.full_weight_transition.assert_called_once_with(["transformer"])
+    module.disable_offload.assert_not_called()
+    module.enable_offload.assert_not_called()
 
 
 def test_merge_cache_only_accepts_cpu_backed_weights():
