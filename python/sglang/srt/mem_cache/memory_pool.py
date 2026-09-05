@@ -1704,6 +1704,9 @@ class KVCache(abc.ABC):
             maybe_init_custom_mem_pool(device=self.device)
         )
 
+    def get_kv_layer_ids(self) -> List[int]:
+        return list(range(self.start_layer, self.end_layer))
+
     def _finalize_allocation_log(self, num_tokens: int):
         """Common logging and mem_usage computation for KV cache allocation.
         Supports both tuple (K, V) size returns and single KV size returns.
