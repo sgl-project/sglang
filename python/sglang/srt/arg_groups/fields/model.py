@@ -21,6 +21,7 @@ from typing import (
 from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
+    Derived,
 )
 from sglang.srt.arg_groups.choices import (
     LOAD_FORMAT_CHOICES,
@@ -38,6 +39,12 @@ class Model:
     """Namespace ``model``."""
 
     _NS_PATH = "model"
+
+    # ---- derived: computed at publish from the leaves below.
+    is_startup_weight_load_overlap = Derived(
+        fn="sglang.srt.arg_groups.model_override_base.startup_weight_load_overlap_of",
+        doc="Whether weight loading overlaps startup.",
+    )
 
     # -------------------------------------------------------------------------
     # Model and tokenizer
