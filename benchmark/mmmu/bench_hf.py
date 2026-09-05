@@ -1,4 +1,5 @@
 import argparse
+import re
 
 import PIL
 import torch
@@ -12,6 +13,32 @@ from eval_utils import (
 )
 from tqdm import tqdm
 from transformers import AutoModel, AutoProcessor, GenerationConfig
+
+_IMAGE_TAG_RE = re.compile(r"<image\s+(\d+)>")
+
+
+def _walk_prompt(prompt, image_paths):
+    """Yield ``("text", str)`` and ``("image", path)`` parts in order by
+    resolving each ``<image N>`` placeholder against ``image_paths``. If the
+    prompt has no placeholders, the first image is anchored at the front."""
+    parts = []
+    last = 0
+    used = 0
+    for m in _IMAGE_TAG_RE.finditer(prompt):
+        if m.start() > last:
+            parts.append(("text", prompt[last : m.start()]))
+        idx = int(m.group(1)) - 1
+        if 0 <= idx < len(image_paths):
+            parts.append(("image", image_paths[idx]))
+            used += 1
+        else:
+            parts.append(("text", m.group(0)))
+        last = m.end()
+    if last < len(prompt):
+        parts.append(("text", prompt[last:]))
+    if used == 0 and image_paths:
+        parts.insert(0, ("image", image_paths[0]))
+    return parts
 
 
 @torch.no_grad()
@@ -79,23 +106,22 @@ def eval_mmmu(args):
     answer_dict = {}
     for sample in tqdm(samples):
         prompt = sample["final_input_prompt"]
-        image = sample["image"]
-        prefix = prompt.split("<")[0]
-        suffix = prompt.split(">")[1]
-        assert image is not None
+        image_paths = sample.get("image_paths") or [sample["image_path"]]
+        assert image_paths and image_paths[0] is not None
+        parts = _walk_prompt(prompt, image_paths)
 
         if "InternVL" in args.model_path:
-            image = PIL.Image.open(sample["image_path"]).convert("RGB")
-            pixel_values = image_to_pixel_values(
-                image, input_size=448, max_num=12, use_thumbnail=True
+            images = [PIL.Image.open(p).convert("RGB") for p in image_paths]
+            pv = [
+                image_to_pixel_values(
+                    im, input_size=448, max_num=12, use_thumbnail=True
+                )
+                for im in images
+            ]
+            pixel_values = torch.cat(pv, dim=0).to(device="cuda", dtype=torch.bfloat16)
+            contents = "".join(
+                "<image>\n" if kind == "image" else val for kind, val in parts
             )
-            pixel_values = pixel_values.to(device="cuda", dtype=torch.bfloat16)
-            contents = ""
-            if prefix:
-                contents += prefix
-            contents += "<image>\n"
-            if suffix:
-                contents += suffix
             response = model.chat(
                 tokenizer, pixel_values, contents, generation_config_internvl
             )
@@ -103,17 +129,14 @@ def eval_mmmu(args):
             process_result(response, sample, answer_dict, out_samples)
             continue
 
-        contents = []
-        if prefix:
-            contents += [{"type": "text", "text": prefix}]
-        contents += [
-            {
-                "type": "image",
-                "image": sample["image_path"],
-            }
+        contents = [
+            (
+                {"type": "image", "image": val}
+                if kind == "image"
+                else {"type": "text", "text": val}
+            )
+            for kind, val in parts
         ]
-        if suffix:
-            contents += [{"type": "text", "text": suffix}]
         messages = [{"role": "user", "content": contents}]
         try:
             model_inputs = processor.tokenizer.apply_chat_template(
@@ -130,13 +153,9 @@ def eval_mmmu(args):
             generation = generation[0][input_len:]
             response = processor.decode(generation, skip_special_tokens=True)
         except:
-            contents = []
-            if prefix:
-                contents += [prefix]
-            image = PIL.Image.open(sample["image_path"])
-            contents += [image]
-            if suffix:
-                contents += [suffix]
+            contents = [
+                PIL.Image.open(val) if kind == "image" else val for kind, val in parts
+            ]
             messages = [{"role": "user", "content": contents}]
             response = model.chat(
                 msgs=messages,
