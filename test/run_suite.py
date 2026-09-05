@@ -527,7 +527,18 @@ def main():
             )
 
     exit_code = run_a_suite(args)
-    sys.exit(exit_code)
+
+    # run_a_suite has already printed every per-file result, the summary and
+    # the TIMINGS block, so nothing after this point is worth blocking on.
+    # sys.exit would unwind into interpreter shutdown, which joins lingering
+    # threads and reaps child processes -- either can wedge behind a test
+    # process that refuses to die and burn the rest of the job's budget with
+    # no further output, which reads as an infra hang rather than a finished
+    # suite. os._exit skips that, so flush the streams it won't.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # & 0xFF matches what sys.exit() reported: 0 stays 0, -1 becomes 255.
+    os._exit(exit_code & 0xFF)
 
 
 if __name__ == "__main__":
