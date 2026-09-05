@@ -768,13 +768,11 @@ pub enum TreeCoreRuntimeError {
     /// host-only tombstone would put device data under an evicted parent.
     #[error("insert continuation anchor {node_id} has no device Full KV")]
     InsertAnchorNotDeviceResident { node_id: NodeId },
-    /// Device indices must cover the aligned key span consumed by the insert API.
-    #[error(
-        "insert value length {value_len} is shorter than required aligned span {aligned_key_len}"
-    )]
+    /// The value must cover every atom the insert adds past its retained prefix.
+    #[error("insert value length {value_len} is shorter than the {required_len} atoms inserted")]
     InsertValueTooShort {
         value_len: usize,
-        aligned_key_len: usize,
+        required_len: usize,
     },
 }
 

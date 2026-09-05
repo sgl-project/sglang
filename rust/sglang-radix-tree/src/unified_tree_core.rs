@@ -1397,28 +1397,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         prefix_len: usize,
         params: &InsertParams<'_, K, V>,
     ) -> Result<InsertResult<V>, TreeCoreRuntimeError> {
-        let aligned_key_len = params.key.atom_len() / self.page_size * self.page_size;
-        if !prefix_len.is_multiple_of(self.page_size) {
-            return Err(TreeCoreRuntimeError::InsertPrefixNotPageAligned {
-                prefix_len,
-                page_size: self.page_size,
-            });
-        }
-        if prefix_len > aligned_key_len {
-            return Err(TreeCoreRuntimeError::InsertPrefixExceedsKey {
-                prefix_len,
-                aligned_key_len,
-            });
-        }
-        let suffix_len = aligned_key_len - prefix_len;
-        if params.value.len() < suffix_len {
-            return Err(TreeCoreRuntimeError::InsertValueTooShort {
-                value_len: params.value.len(),
-                aligned_key_len: suffix_len,
-            });
-        }
         let prefix_node_idx = self.try_resolve_node_handle_(prefix_node_id)?;
-        self.validate_insert_anchor_(prefix_node_idx, prefix_len, params)?;
         self.try_insert_at_(prefix_node_idx, prefix_len, params)
     }
 
@@ -1540,9 +1519,10 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         if params.value.len() < value_len {
             return Err(TreeCoreRuntimeError::InsertValueTooShort {
                 value_len: params.value.len(),
-                aligned_key_len: value_len,
+                required_len: value_len,
             });
         }
+        self.validate_insert_anchor_(prefix_node_idx, prefix_len, params)?;
         if aligned_key_len == prefix_len {
             // An empty suffix still touches its retained boundary.
             self.touch_node_(prefix_node_idx);
