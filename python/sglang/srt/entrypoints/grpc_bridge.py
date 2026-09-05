@@ -444,6 +444,7 @@ class RuntimeHandle:
     def tokenize(self, text: str, add_special_tokens: bool = True) -> str:
         tokenizer = self.tokenizer_manager.tokenizer
         tokens = tokenizer.encode(text, add_special_tokens=add_special_tokens)
+        tokens = self.tokenizer_manager.normalize_dllm_prompt_token_ids(tokens)
         result = {
             "tokens": tokens,
             "count": len(tokens),

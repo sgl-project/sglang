@@ -1297,6 +1297,15 @@ class OpenAIServingChat(OpenAIServingBase):
         else:
             result = self._apply_conversation_template(request, is_multimodal)
 
+        if (
+            request.input_ids is None
+            and getattr(self.tokenizer_manager, "dllm_mask_id", None) is not None
+            and isinstance(result.prompt_ids, list)
+        ):
+            result.prompt_ids = self.tokenizer_manager.normalize_dllm_prompt_token_ids(
+                result.prompt_ids
+            )
+
         if tool_call_stop is not None:
             if isinstance(result.stop, str):
                 result.stop = [result.stop]

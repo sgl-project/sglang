@@ -709,6 +709,35 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.assertTrue(processed.require_reasoning)
 
+    def test_process_messages_normalizes_text_derived_dllm_prompt_ids(self):
+        self.tm.dllm_mask_id = 156895
+        self.tm.normalize_dllm_prompt_token_ids = Mock(
+            return_value=[156899, 31, 32, 33, 156900]
+        )
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "before <|mask|> after"}],
+        )
+        rendered = MessageProcessingResult(
+            prompt="prompt",
+            prompt_ids=[156899, 156895, 156900],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+        )
+
+        with patch.object(
+            self.chat, "_apply_conversation_template", return_value=rendered
+        ):
+            processed = self.chat._process_messages(request, is_multimodal=False)
+
+        self.assertEqual(processed.prompt_ids, [156899, 31, 32, 33, 156900])
+        self.tm.normalize_dllm_prompt_token_ids.assert_called_once_with(
+            [156899, 156895, 156900]
+        )
+
     def test_kimi_tool_call_respects_explicit_reasoning_disable(self):
         self.template_manager.reasoning_config = ReasoningToggleConfig(
             toggle_param="thinking", default_enabled=True
