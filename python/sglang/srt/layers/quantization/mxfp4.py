@@ -1037,6 +1037,30 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 b_mx_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
             )
 
+            MXFP4_BLOCK_SIZE = 32
+
+            def check_block_size(weight, scale):
+                assert len(weight.shape) == len(scale.shape)
+                mxfp4_block_size = 0
+                for i in range(len(weight.shape)):
+                    if weight.shape[i] != scale.shape[i]:
+                        assert mxfp4_block_size == 0
+                        mxfp4_block_size = weight.shape[i] // scale.shape[i]
+                assert mxfp4_block_size == MXFP4_BLOCK_SIZE
+
+            if (
+                hasattr(self.w13_precision_config, "b_microblock_size")
+                and self.w13_precision_config.b_microblock_size is None
+            ):
+                check_block_size(w13_weight, w13_scale)
+                self.w13_precision_config.b_microblock_size = MXFP4_BLOCK_SIZE
+            if (
+                hasattr(self.w2_precision_config, "b_microblock_size")
+                and self.w2_precision_config.b_microblock_size is None
+            ):
+                check_block_size(w2_weight, w2_scale)
+                self.w2_precision_config.b_microblock_size = MXFP4_BLOCK_SIZE
+
             self.w13_weight_triton_tensor = w13_weight
             self.w2_weight_triton_tensor = w2_weight
             del layer.w13_weight
@@ -1104,7 +1128,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             del layer.w2_weight_scale
             layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
             layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
-        torch.cuda.empty_cache()
+        torch.get_device_module().empty_cache()
 
     def _process_weights_for_sm90_cutlass(self, layer):
         """De-interleave + pad + halving-swap + byte-interleave MXFP4 weights

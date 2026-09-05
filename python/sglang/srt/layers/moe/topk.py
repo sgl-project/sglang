@@ -793,22 +793,58 @@ class TopK(BaseFusedOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
-        self.topk_config.torch_native = True
-        # [NOTE] XPU device support for topk kernels
-        #   - support 'topk_softmax' and 'topk_sigmoid'
-        #   - support up to 8 top-k and 256 experts
-        self.topk_config.torch_native = not (
-            self.topk_config.top_k <= 8 and router_logits.shape[1] <= 256
-        )
+        if self.topk_config.output_format is not None:
+            output_format = self.topk_config.output_format
+        elif get_moe_runner_backend().is_triton_kernels():
+            output_format = TopKOutputFormat.TRITON_KERNEL
+        else:
+            output_format = TopKOutputFormat.STANDARD
 
-        return select_experts(
-            hidden_states=hidden_states,
-            layer_id=self.layer_id,
-            router_logits=router_logits,
-            topk_config=self.topk_config,
-            num_token_non_padded=num_token_non_padded,
-            expert_location_dispatch_info=expert_location_dispatch_info,
-        )
+        if output_format == TopKOutputFormat.TRITON_KERNEL:
+            # renormalize=True is equivalent to sm_first=False
+            (
+                a_ragged_metadata,
+                gather_idx,
+                scatter_idx,
+                gate_scal,
+                n_expts_act,
+            ) = routing(
+                router_logits,
+                self.topk_config.top_k,
+                sm_first=not self.topk_config.renormalize,
+            )
+            return TritonKernelTopKOutput(
+                a_ragged_metadata,
+                gather_idx,
+                scatter_idx,
+                gate_scal,
+                n_expts_act,
+            )
+        elif output_format == TopKOutputFormat.BYPASSED:
+            return BypassedTopKOutput(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                topk_config=self.topk_config,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+            )
+        else:
+            self.topk_config.torch_native = True
+            # [NOTE] XPU device support for topk kernels
+            #   - support 'topk_softmax' and 'topk_sigmoid'
+            #   - support up to 8 top-k and 256 experts
+            self.topk_config.torch_native = not (
+                self.topk_config.top_k <= 8 and router_logits.shape[1] <= 256
+            )
+
+            return select_experts(
+                hidden_states=hidden_states,
+                layer_id=self.layer_id,
+                router_logits=router_logits,
+                topk_config=self.topk_config,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+            )
 
 
 # ------------------------------- TopK implementation -------------------------------------
