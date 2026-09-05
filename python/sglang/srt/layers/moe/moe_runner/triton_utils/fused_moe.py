@@ -117,6 +117,7 @@ def inplace_fused_experts(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    use_int2_w2a16: bool = False,
     per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
@@ -150,6 +151,7 @@ def inplace_fused_experts(
         use_int8_w8a8,
         use_int8_w8a16,
         use_int4_w4a16,
+        use_int2_w2a16,
         per_channel_quant,
         w1_scale,
         w2_scale,
@@ -186,6 +188,7 @@ def outplace_fused_experts(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    use_int2_w2a16: bool = False,
     per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
@@ -220,6 +223,7 @@ def outplace_fused_experts(
         use_int8_w8a8,
         use_int8_w8a16,
         use_int4_w4a16,
+        use_int2_w2a16,
         per_channel_quant,
         w1_scale,
         w2_scale,
@@ -252,6 +256,7 @@ def fused_experts(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    use_int2_w2a16: bool = False,
     per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
@@ -285,6 +290,7 @@ def fused_experts(
             use_int8_w8a8,
             use_int8_w8a16,
             use_int4_w4a16,
+            use_int2_w2a16,
             per_channel_quant,
             w1_scale,
             w2_scale,
@@ -319,6 +325,7 @@ def fused_experts(
             use_int8_w8a8,
             use_int8_w8a16,
             use_int4_w4a16,
+            use_int2_w2a16,
             per_channel_quant,
             w1_scale,
             w2_scale,
@@ -387,6 +394,7 @@ def _prepare_fused_moe_run(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
+    use_int2_w2a16: bool,
     per_channel_quant: bool,
     block_shape: Optional[List[int]],
 ):
@@ -406,12 +414,23 @@ def _prepare_fused_moe_run(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        use_int2_w2a16=use_int2_w2a16,
         dtype=hidden_states.dtype,
     )
 
+    # Config lookup keys on (E, N, K/pack). In the N-contiguous int32-word layout
+    # ([E, K/16, N], see moe_wna16.process_weights_after_loading) present the shapes
+    # as (E, N, K/4) so the tuned JSON names stay the same as for the byte layout.
+    _ncontig = use_int2_w2a16 and w1.dtype == torch.int32
+    if _ncontig:
+        _w1s = (w1.shape[0], w1.shape[2], w1.shape[1] * 4)
+        _w2s = (w2.shape[0], w2.shape[2], w2.shape[1] * 4 - padded_size)
+    else:
+        _w1s = w1.shape
+        _w2s = (w2.shape[0], w2.shape[1], w2.shape[2] - padded_size)
     config, (down_config, _) = try_get_optimal_moe_config(
-        w1.shape,
-        (w2.shape[0], w2.shape[1], w2.shape[2] - padded_size),
+        _w1s,
+        _w2s,
         topk_ids.shape[1],
         config_dtype,
         num_tokens,
@@ -475,6 +494,7 @@ def _fused_moe_kernel_sequence(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
+    use_int2_w2a16: bool,
     per_channel_quant: bool,
     w1_scale: Optional[torch.Tensor],
     w2_scale: Optional[torch.Tensor],
@@ -511,7 +531,10 @@ def _fused_moe_kernel_sequence(
     still used for output dtype/shape and the inplace combine.
     """
     num_tokens = hidden_states.shape[0]
-    E, N, _ = w1.shape
+    _ncontig = use_int2_w2a16 and w1.dtype == torch.int32
+    E = w1.shape[0]
+    N = w1.shape[2] if _ncontig else w1.shape[1]
+    _w2_hidden = w2.shape[2] if _ncontig else w2.shape[1]
     topk = topk_ids.shape[1]
     compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
 
@@ -542,7 +565,7 @@ def _fused_moe_kernel_sequence(
     if no_combine:
         assert not inplace
         out_hidden_states = torch.empty(
-            (num_tokens, topk, w2.shape[1]),
+            (num_tokens, topk, _w2_hidden),
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
@@ -564,6 +587,7 @@ def _fused_moe_kernel_sequence(
         and (topk > 2)
         and (not use_int8_w8a16)
         and (not use_int4_w4a16)
+        and (not use_int2_w2a16)
     )
 
     if fuse_swiglu_interleaved:
@@ -578,7 +602,13 @@ def _fused_moe_kernel_sequence(
             and gemm1_limit is None
             and swiglu_limit is None
             and b1 is None
-            and not (use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
+            and not (
+                use_fp8_w8a8
+                or use_int8_w8a8
+                or use_int8_w8a16
+                or use_int4_w4a16
+                or use_int2_w2a16
+            )
             and not apply_router_weight_on_input
             # LoRA injects its gate_up delta into the full-width pre-activation
             # buffer that this path eliminates.
@@ -622,6 +652,7 @@ def _fused_moe_kernel_sequence(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        use_int2_w2a16=use_int2_w2a16,
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
         c_sorted=down_moe_use_tma,
@@ -797,7 +828,7 @@ def _fused_moe_kernel_sequence(
     del intermediate_cache1
 
     intermediate_cache3 = torch.empty(
-        (num_tokens, topk, w2.shape[1]),
+        (num_tokens, topk, _w2_hidden),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
@@ -840,6 +871,7 @@ def _fused_moe_kernel_sequence(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        use_int2_w2a16=use_int2_w2a16,
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
         a_use_tma=down_moe_use_tma,
@@ -952,6 +984,7 @@ def fused_experts_impl(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    use_int2_w2a16: bool = False,
     per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
@@ -975,7 +1008,14 @@ def fused_experts_impl(
         padded_size = 0
 
     # Check constraints.
-    if use_int4_w4a16:
+    if use_int2_w2a16:
+        # 2-bit: 4 values per byte, hence k/4 columns in the packed tensor; in the
+        # N-contiguous int32-word layout K/16 words sit in dim 1 instead
+        if w1.dtype == torch.int32:
+            assert hidden_states.shape[1] == w1.shape[1] * 16, "Hidden size mismatch"
+        else:
+            assert hidden_states.shape[1] // 4 == w1.shape[2], "Hidden size mismatch"
+    elif use_int4_w4a16:
         assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
     else:
         assert (
@@ -1004,6 +1044,7 @@ def fused_experts_impl(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        use_int2_w2a16=use_int2_w2a16,
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
     )
@@ -1027,6 +1068,7 @@ def fused_experts_impl(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        use_int2_w2a16=use_int2_w2a16,
         per_channel_quant=per_channel_quant,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
@@ -1064,6 +1106,7 @@ def fused_moe(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    use_int2_w2a16: bool = False,
     per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
@@ -1146,6 +1189,7 @@ def fused_moe(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        use_int2_w2a16=use_int2_w2a16,
         per_channel_quant=per_channel_quant,
         w1_scale=w1_scale,
         w2_scale=w2_scale,

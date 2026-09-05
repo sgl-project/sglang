@@ -688,15 +688,26 @@ class ServerArgs:
                 'by the FA4 backend. "nvfp4" selects '
                 'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
                 "selects the MX-style block-size-16 FP4 E2M1 KV cache "
-                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+"
+                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+. "
+                '"int8_g64" and "int4_g32" are group-quantized KV caches (one '
+                "fp16 absmax scale per token, kv-head and 64- or 32-channel "
+                "group) that the Qwen sparse attention backend dequantizes on "
+                'gather; "int8ring_int4" keeps an INT8-G64 ring of the most '
+                "recent SGLANG_KV_TIERS_W (default 8192) tokens over an "
+                "INT4-G32 full-context pool. The three are read by the Qwen "
+                "sparse attention backend only and are validated with "
+                "--page-size 1."
             ),
             choices=[
                 "auto",
                 "fp8_e5m2",
                 "fp8_e4m3",
                 "mxfp8",
+                "int8_g64",
+                "int4_g32",
                 "bf16",
                 "bfloat16",
+                "int8ring_int4",
                 "nvfp4",
                 "fp4_mx_block16",
                 "fp4_e2m1",
@@ -7695,7 +7706,15 @@ class ServerArgs:
         except Exception:
             return False
 
-    LANGUAGE_MODEL_ONLY_ARCHITECTURES = ("MuseGlimmerForConditionalGeneration",)
+    LANGUAGE_MODEL_ONLY_ARCHITECTURES = (
+        "MuseGlimmerForConditionalGeneration",
+        # Qwen4ExpForConditionalGeneration inherits from
+        # Qwen3VLForConditionalGeneration, where language_model_only is already
+        # implemented (qwen3_vl.py:1243/1309/1441). Only the entry here was
+        # missing. For text-only use this saves the vision tower (0.84 GiB of
+        # weights) plus the multimodal reservation inside the KV budget.
+        "Qwen4ExpForConditionalGeneration",
+    )
 
     def _handle_language_model_only(self):
         if not self.language_model_only:

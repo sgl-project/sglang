@@ -1,6 +1,8 @@
 """Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
 
+import json
 import math
+import os
 from contextlib import nullcontext
 from typing import Any, Iterable, Optional, Set, Tuple
 
@@ -493,18 +495,25 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             and get_attention_dp_size() > 1
             and not self.use_attn_tp_ngram
         )
-        self.ngram_embedding = VocabParallelEmbedding(
-            padded_vocab_size,
-            self.head_dim_per_ngram,
-            params_dtype=(
-                torch.float8_e4m3fn
-                if (quant_config is not None and quant_config.get_name() == "fp8")
-                or getattr(config, "ple_embedding_dtype", None) == "float8_e4m3fn"
-                else torch.bfloat16
-            ),
-            output_dtype=torch.bfloat16,
-            use_attn_tp_group=self.use_attn_tp_ngram,
-        )
+        # In mmap mode, create the table on "meta": it then costs no memory
+        # and is replaced by Qwen4ExpMmapEmbedding immediately afterwards.
+        # Without this, 51.2 GB (fp8) or 97.7 GB (bf16) would be allocated
+        # here before any offload can take effect.
+        _ple_mmap_dir = os.environ.get("SGLANG_QWEN4_PLE_MMAP")
+        _alloc_ctx = torch.device("meta") if _ple_mmap_dir else nullcontext()
+        with _alloc_ctx:
+            self.ngram_embedding = VocabParallelEmbedding(
+                padded_vocab_size,
+                self.head_dim_per_ngram,
+                params_dtype=(
+                    torch.float8_e4m3fn
+                    if (quant_config is not None and quant_config.get_name() == "fp8")
+                    or getattr(config, "ple_embedding_dtype", None) == "float8_e4m3fn"
+                    else torch.bfloat16
+                ),
+                output_dtype=torch.bfloat16,
+                use_attn_tp_group=self.use_attn_tp_ngram,
+            )
         self.ngram_embedding.register_buffer(
             "weight_scale", torch.ones(1, dtype=torch.bfloat16), persistent=True
         )
@@ -752,6 +761,163 @@ def _gather_ple_embedding_from_pinned_kernel(
     )
 
 
+class Qwen4ExpMmapEmbedding(nn.Module):
+    """PLE table read from NVMe via mmap, without pinned host memory.
+
+    Why this exists: Qwen4ExpPinnedHostEmbedding places the full table in
+    page-locked host memory. For Qwen3.8-Flash-Next that is 51.2 GB (fp8) or
+    97.7 GB (bf16) - impossible on a 30 GiB machine, and the table has already
+    been allocated once by VocabParallelEmbedding before that.
+
+    This variant allocates nothing. It reads the required rows from a mapped
+    file on each access; the kernel page cache handles reloads from SSD.
+    Measured: 16 rows per token, 2560 bytes - negligible for an NVMe.
+
+    Enabled via SGLANG_QWEN4_PLE_MMAP, pointing at the directory holding
+    ple.f8_e4m3.bin and ple.json. weight_scale lives in ple.json because it no
+    longer survives into the quantized checkpoint.
+    """
+
+    _COPIED = (
+        "quant_config",
+        "enable_tp",
+        "use_attn_tp_group",
+        "tp_size",
+        "num_embeddings",
+        "org_vocab_size",
+        "padding_size",
+        "num_added_embeddings",
+        "use_presharded_weights",
+        "org_vocab_size_padded",
+        "num_embeddings_padded",
+        "shard_indices",
+        "embedding_dim",
+        "num_embeddings_per_partition",
+        "num_org_embeddings_per_partition",
+        "num_added_embeddings_per_partition",
+    )
+
+    _DTYPES = {
+        "F8_E4M3": torch.float8_e4m3fn,
+        "BF16": torch.bfloat16,
+    }
+
+    def __init__(self, embedding: VocabParallelEmbedding, directory: str) -> None:
+        nn.Module.__init__(self)
+        import numpy as np
+
+        for name in self._COPIED:
+            setattr(self, name, getattr(embedding, name))
+        self.quant_method = None
+
+        meta = json.load(open(os.path.join(directory, "ple.json")))
+        path = os.path.join(directory, meta["file"])
+        self._rows = int(meta["rows"])
+        self._dim = int(meta["dim"])
+        self._dtype = self._DTYPES[meta["dtype"]]
+        itemsize = torch.empty(0, dtype=self._dtype).element_size()
+        expected = self._rows * self._dim * itemsize
+        actual = os.path.getsize(path)
+        if actual != expected:
+            raise ValueError(
+                f"{path}: {actual} bytes, expected {expected} "
+                f"({self._rows} x {self._dim} x {itemsize})"
+            )
+        if self._dim != self.embedding_dim:
+            raise ValueError(
+                f"ple.json dim={self._dim} does not match embedding_dim="
+                f"{self.embedding_dim}"
+            )
+        # uint8 view: numpy has no fp8; torch reinterprets it later.
+        self._mm = np.memmap(
+            path, dtype=np.uint8, mode="r", shape=(self._rows, self._dim * itemsize)
+        )
+        try:  # rows are 160 B at random offsets: no read-around
+            import mmap as _mmap
+
+            self._mm._mmap.madvise(_mmap.MADV_RANDOM)
+        except Exception as _ex:  # pragma: no cover
+            logger.warning("Qwen4 PLE: madvise(MADV_RANDOM) failed: %s", _ex)
+        self._itemsize = itemsize
+        # Parallel pread path for decode: one 160-byte read per row, GIL released.
+        self._fd = os.open(path, os.O_RDONLY)
+        try:
+            os.posix_fadvise(self._fd, 0, 0, os.POSIX_FADV_RANDOM)
+        except Exception as _ex:  # pragma: no cover
+            logger.warning("Qwen4 PLE: posix_fadvise(RANDOM) failed: %s", _ex)
+        from concurrent.futures import ThreadPoolExecutor
+
+        self._pool = ThreadPoolExecutor(max_workers=16)
+        self._row_bytes = self._dim * itemsize
+
+        scale = torch.tensor([float(meta["weight_scale"])], dtype=torch.bfloat16)
+        self.register_buffer("weight_scale", scale, persistent=True)
+        if hasattr(embedding, "weight"):
+            del embedding.weight
+        logger.info(
+            "Qwen4 PLE: mmap from %s (%d rows x %d, %s, %.2f GB) - "
+            "no pinned host memory",
+            path,
+            self._rows,
+            self._dim,
+            meta["dtype"],
+            actual / 1e9,
+        )
+
+    def allocate_output(self, shape, device: torch.device) -> torch.Tensor:
+        with torch.inference_mode(False):
+            return torch.empty(shape, dtype=torch.bfloat16, device=device)
+
+    def gather(
+        self, input_ids: torch.Tensor, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        expected_shape = (*input_ids.shape, self.embedding_dim)
+        output = (
+            self.allocate_output(expected_shape, input_ids.device)
+            if out is None
+            else out
+        )
+        flat = input_ids.reshape(-1)
+        if not flat.numel():
+            return output
+        start = self.shard_indices.org_vocab_start_index
+        end = self.shard_indices.org_vocab_end_index
+        ids = flat.to("cpu", torch.int64)
+        inside = (ids >= start) & (ids < end)
+        local = torch.where(inside, ids - start, torch.zeros_like(ids))
+        if local.numel() <= 64:
+            rb = self._row_bytes
+
+            def _rd(r):
+                return os.pread(self._fd, rb, int(r) * rb)
+
+            buf = b"".join(self._pool.map(_rd, local.tolist()))
+            rows = torch.frombuffer(bytearray(buf), dtype=torch.uint8).view(-1, rb)
+        else:
+            rows = torch.from_numpy(self._mm[local.numpy()])  # uint8, (N, dim*b)
+            if local.numel() >= 512:
+                try:
+                    os.posix_fadvise(self._fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                except Exception:  # pragma: no cover
+                    pass
+        vals = rows.view(self._dtype).to(torch.bfloat16)  # (N, dim)
+        vals = torch.where(
+            inside.unsqueeze(1), vals, torch.zeros((), dtype=torch.bfloat16)
+        )
+        output.copy_(vals.reshape(expected_shape).to(output.device, non_blocking=True))
+        return output
+
+    def reduce(self, output: torch.Tensor) -> torch.Tensor:
+        if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
+            if self.use_attn_tp_group:
+                return attn_tp_all_reduce(output)
+            return tensor_model_parallel_all_reduce(output)
+        return output
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.reduce(self.gather(input_ids))
+
+
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     """PLE table read directly from host memory (pinned, or a file-backed mmap).
 
@@ -916,7 +1082,12 @@ class Qwen4ExpPLELayer(nn.Module):
             ple_layer_index=ple_layer_index,
             quant_config=quant_config,
         )
-        if config.ple_offload_embedding:
+        _ple_mmap_dir = os.environ.get("SGLANG_QWEN4_PLE_MMAP")
+        if _ple_mmap_dir:
+            self.ple_embedding.ngram_embedding = Qwen4ExpMmapEmbedding(
+                self.ple_embedding.ngram_embedding, _ple_mmap_dir
+            )
+        elif config.ple_offload_embedding:
             self.ple_embedding.ngram_embedding = Qwen4ExpPinnedHostEmbedding(
                 self.ple_embedding.ngram_embedding,
                 backend=getattr(config, "ple_offload_backend", "pinned"),
@@ -1603,6 +1774,13 @@ class Qwen4ExpAttentionDecoderLayer(
 ALL_DECODER_LAYER_TYPES = {
     "attention": Qwen4ExpAttentionDecoderLayer,
     "full_attention": Qwen4ExpAttentionDecoderLayer,
+    # transformers renames "full_attention" to "qwen_sparse_attention" on
+    # load, because those layers actually use an indexer
+    # (configuration_qwen4_exp.py). Every checkpoint saved through
+    # transformers - after quantization, for instance - therefore carries this
+    # name. Without the entry, loading fails with
+    # KeyError: 'qwen_sparse_attention'.
+    "qwen_sparse_attention": Qwen4ExpAttentionDecoderLayer,
     "linear_attention": Qwen4ExpLinearDecoderLayer,
 }
 
@@ -1751,6 +1929,17 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         prefix: str = "",
         language_model_cls=Qwen4ExpVLModel,
     ) -> None:
+        # Without this line AutoRoundConfig.packed_modules_mapping stays
+        # empty and get_layer_config() cannot map fused names back to their
+        # parts. Concretely: in_proj_ba = in_proj_b (48) + in_proj_a (48).
+        # Both are bf16 in the checkpoint, but the fused name only matches the
+        # general regex and lands at 8 bits ->
+        #   gptq_marlin_repack.cuh: size_n = 96 is not divisible by tile_n_size = 64
+        # deepseek_v2.py does the same (there for Quark).
+        if quant_config is not None and hasattr(
+            quant_config, "update_packed_modules_mapping"
+        ):
+            quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
         super().__init__(config, quant_config, prefix, language_model_cls)
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
             self.config, "rope_scaling", {}
@@ -2157,3 +2346,14 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
 
 EntryClass = [Qwen4ExpForConditionalGeneration]
+
+
+# --- Breakable CUDA Graph: the mmap PLE lookup is the one eager break on the decode path.
+try:
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        eager_on_graph as _eog,
+    )
+
+    Qwen4ExpMmapEmbedding.forward = _eog(True)(Qwen4ExpMmapEmbedding.forward)
+except Exception as _e:  # pragma: no cover
+    logger.warning("BCG wrap of Qwen4ExpMmapEmbedding.forward failed: %s", _e)

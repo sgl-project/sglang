@@ -342,6 +342,26 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 )
                 # FP4 prefill uses one shared FP8 dequant workspace across layers.
                 cell_size += n * k * 2 * kv_size
+            elif self.kv_cache_dtype_str in (
+                "int4_g32",
+                "int8ring_int4",
+            ):  # tiered: int4 rows + a fixed-size int8 ring
+                # two 4-bit channels per byte (the uint8 itemsize above counts one byte per channel)
+                # plus one fp16 absmax scale per (token, kv-head, 32-channel group) for K and V
+                cell_size = cell_size // 2 + (
+                    n
+                    * ((model_config.head_dim + model_config.v_head_dim) // 32)
+                    * 2
+                    * num_layers
+                )
+            elif self.kv_cache_dtype_str == "int8_g64":
+                # fp16 absmax scale per (token, kv-head, 64-channel group) for K and V
+                cell_size += (
+                    n
+                    * ((model_config.head_dim + model_config.v_head_dim) // 64)
+                    * 2
+                    * num_layers
+                )
             elif self.kv_cache_dtype_str == "mxfp8":
                 scale_block_size = 32
                 cell_size += (

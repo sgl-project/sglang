@@ -20,7 +20,7 @@ def quantize_weights(
     zero_points: bool = False,
     ref_zero_points_after_scales: bool = False,
 ):
-    assert quant_type in ["w4a16", "w4a16b8", "w8a16", "w8a16b128"]
+    assert quant_type in ["w2a16", "w2a16b2", "w4a16", "w4a16b8", "w8a16", "w8a16b128"]
     assert not zero_points or group_size is not None, (
         "to have group zero points, group_size must be provided "
         "(-1 group_size is channelwise)"
@@ -45,7 +45,14 @@ def quantize_weights(
     max_val = torch.max(w, 0, keepdim=True).values
     min_val = torch.min(w, 0, keepdim=True).values
 
-    if quant_type == "w4a16":
+    if quant_type == "w2a16":
+        max_q_val = 3
+        min_q_val = 0
+    elif quant_type == "w2a16b2":
+        # symmetric: q + 2 is stored, the kernel subtracts b_zp_num = 2
+        max_q_val = 1
+        min_q_val = -2
+    elif quant_type == "w4a16":
         max_q_val = 15
         min_q_val = 0
     elif quant_type == "w4a16b8":
@@ -87,7 +94,9 @@ def quantize_weights(
     else:
         w_ref = (w_q - (maybe_w_zp if zero_points else 0)).to(orig_type) * w_s
 
-    if quant_type == "w4a16b8":
+    if quant_type == "w2a16b2":
+        w_q += 2
+    elif quant_type == "w4a16b8":
         w_q += 8
     elif quant_type == "w8a16b128":
         w_q += 128
@@ -145,7 +154,7 @@ def torch_moe(a, w1, w2, score, topk):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("group_size", [64, 128])
 @pytest.mark.parametrize("has_zp", [True, False])
-@pytest.mark.parametrize("weight_bits", [8])  # [4, 8])
+@pytest.mark.parametrize("weight_bits", [2, 8])  # [2, 4, 8])
 def test_fused_moe_wn16(
     m: int,
     n: int,
@@ -164,7 +173,10 @@ def test_fused_moe_wn16(
     w2 = torch.randn((e, k, n), device=get_device(), dtype=dtype) / 10
     score = torch.randn((m, e), device=get_device(), dtype=dtype)
 
-    if weight_bits == 4:
+    if weight_bits == 2:
+        pack_factor = 4
+        quant_type = "w2a16" if has_zp else "w2a16b2"
+    elif weight_bits == 4:
         pack_factor = 2
         quant_type = "w4a16" if has_zp else "w4a16b8"
     elif weight_bits == 8:
@@ -218,7 +230,22 @@ def test_fused_moe_wn16(
         scales = scales.T
         if has_zp:
             qzeros = qzeros.T.contiguous().to(torch.uint8)
-        if weight_bits == 4:
+        if weight_bits == 2:
+            # 4 values per byte, ascending along K from the low bits
+            qweight = (
+                qweight[:, 3::4] * 64
+                + qweight[:, 2::4] * 16
+                + qweight[:, 1::4] * 4
+                + qweight[:, ::4]
+            )
+            if has_zp:
+                qzeros = (
+                    qzeros[3::4, :] * 64
+                    + qzeros[2::4, :] * 16
+                    + qzeros[1::4, :] * 4
+                    + qzeros[::4, :]
+                )
+        elif weight_bits == 4:
             qweight = qweight[:, 1::2] * 16 + qweight[:, ::2]
             if has_zp:
                 qzeros = qzeros[1::2, :] * 16 + qzeros[::2, :]
@@ -242,6 +269,7 @@ def test_fused_moe_wn16(
         topk_output,
         use_int4_w4a16=weight_bits == 4,
         use_int8_w8a16=weight_bits == 8,
+        use_int2_w2a16=weight_bits == 2,
         w1_scale=w1_scales,
         w2_scale=w2_scales,
         w1_zp=w1_qzeros if has_zp else None,

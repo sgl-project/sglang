@@ -345,9 +345,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
 
-        conv_weights = self.conv1d.weight.view(
-            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
-        )
+        # Pass the module, NOT a view: --cpu-offload-gb replaces param.data
+        # on every on/offload, so a .view() taken at construction time ends up
+        # pointing at old, uninitialized memory. Symptom: conv_weights with
+        # magnitudes around 1e-38, GDN output exactly zero, NaN logits. This
+        # never shows on datacenter GPUs, where nobody needs offload.
+        # RadixLinearAttention now derives the view fresh on each access.
+        conv_weights = self.conv1d
         self.attn = RadixLinearAttention(
             layer_id=layer_id,
             num_q_heads=self.num_k_heads // self.attn_tp_size,

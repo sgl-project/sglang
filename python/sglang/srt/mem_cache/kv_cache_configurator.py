@@ -47,6 +47,8 @@ from sglang.srt.mem_cache.allocator.swa import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+from sglang.srt.mem_cache.int4_kv_pool import MHATokenToKVPoolInt4
+from sglang.srt.mem_cache.int8_kv_pool import MHATokenToKVPoolInt8
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,
@@ -63,6 +65,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.tiered_kv_pool import MHATokenToKVPoolTiered
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     configured_pp_size,
@@ -1543,9 +1546,22 @@ class KVCacheConfigurator:
         # MXFP8 KV cache needs the block-scaled pool (data + UE8M0 scale
         # buffers) for the full-attention layers, same as the SWA branch.
         full_pool_class = (
-            MHATokenToKVPoolMXFP8
-            if self.kv_cache_dtype_str == "mxfp8" and not self.use_mla_backend
-            else mha_pool_class
+            MHATokenToKVPoolTiered
+            if self.kv_cache_dtype_str == "int8ring_int4"
+            else (
+                MHATokenToKVPoolInt4
+                if self.kv_cache_dtype_str == "int4_g32"
+                else (
+                    MHATokenToKVPoolInt8
+                    if self.kv_cache_dtype_str == "int8_g64"
+                    else (
+                        MHATokenToKVPoolMXFP8
+                        if self.kv_cache_dtype_str == "mxfp8"
+                        and not self.use_mla_backend
+                        else mha_pool_class
+                    )
+                )
+            )
         )
         from sglang.srt.layers.attention.qsa.config import (
             QSA_VARIANT_TOKENWISE,
@@ -1900,6 +1916,24 @@ class KVCacheConfigurator:
         If constraints change the value, the configurator re-runs and re-aligns.
         """
         user_limit = get_schedule().max_total_tokens
+        _env = __import__("os").environ
+        _lazy_tokens = (
+            int(_env.get("SGLANG_KV_LAZY_TOKENS", "0"))
+            if _env.get("SGLANG_KV_LAZY") == "1"
+            else 0
+        )
+        if _lazy_tokens > 0:
+            # The profiled capacity is what the free VRAM at startup could back physically; with the
+            # headroom rule (1.5 GB kept free for prefill working memory) the practical limit measured
+            # 0.85 x profiled (84k of 106k tokens at bf16). Longer prompts are rejected at admission
+            # instead of crashing the scheduler mid-prefill.
+            _safety = float(_env.get("SGLANG_KV_LAZY_SAFETY", "0.85"))
+            _new = min(_lazy_tokens, int(token_capacity * _safety))
+            logging.warning(
+                f"KV lazy backing: token capacity {token_capacity} (profiled) -> {_new} "
+                f"(requested {_lazy_tokens}, safety {_safety})"
+            )
+            token_capacity = _new
 
         # Apply user-specified upper bound
         if user_limit is not None:

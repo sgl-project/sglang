@@ -88,8 +88,9 @@ def write_zeros_to_output(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
+# [ncontig] word-load int2 branch
 @triton.jit
-def fused_moe_kernel_gptq_awq(
+def fused_moe_kernel_gptq_awq_word(
     # Pointers to matrices
     a_ptr,
     b_ptr,
@@ -134,6 +135,7 @@ def fused_moe_kernel_gptq_awq(
     has_zp: tl.constexpr,
     use_int4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
+    use_int2_w2a16: tl.constexpr,
     even_Ks: tl.constexpr,
     filter_expert: tl.constexpr,
 ):
@@ -213,7 +215,22 @@ def fused_moe_kernel_gptq_awq(
         offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
     )
 
-    if use_int4_w4a16:
+    if use_int2_w2a16:
+        # STAGE-1.5: b_ptr is the int32 view of the uint8 tensor ([E, N, K//16] words,
+        # strides in words). One word = 16 consecutive K values, value k at bits 2*(k%16).
+        tl.static_assert(even_Ks, "int2 word path needs K % BLOCK_SIZE_K == 0")
+        tl.static_assert(
+            BLOCK_SIZE_K % 16 == 0, "BLOCK_SIZE_K must be a multiple of 16"
+        )
+        offs_kw = tl.arange(0, BLOCK_SIZE_K // 16)
+        b_ptrs = (
+            b_ptr
+            + off_experts * stride_be
+            + offs_kw[:, None] * stride_bk
+            + offs_bn[None, :] * stride_bn
+        )
+        b_shifter = (tl.arange(0, 16) * 2)[None, :, None]
+    elif use_int4_w4a16:
         b_ptrs = (
             b_ptr
             + off_experts * stride_be
@@ -229,10 +246,14 @@ def fused_moe_kernel_gptq_awq(
             + offs_bn[None, :] * stride_bn
         )
 
+    if not has_zp and use_int2_w2a16:
+        b_zp_num = 2
     if not has_zp and use_int4_w4a16:
         b_zp_num = 8
     if not has_zp and use_int8_w8a16:
         b_zp_num = 128
+    elif has_zp and use_int2_w2a16:
+        b_zp_shifter = (offs_bn[None, :] % 4) * 2
     elif has_zp and use_int4_w4a16:
         b_zp_shifter = (offs_bn[None, :] % 2) * 4
 
@@ -259,19 +280,67 @@ def fused_moe_kernel_gptq_awq(
             other=0.0,
         )
         b = tl.load(b_ptrs)
-        if use_int4_w4a16:
+        if use_int2_w2a16:
+            # [BK//16, BN] int32 -> [BK//16, 16, BN] -> [BK, BN]; row index 16*word + i == k
+            b = (b[:, None, :] >> b_shifter) & 0x3
+            b = tl.reshape(b, [BLOCK_SIZE_K, BLOCK_SIZE_N])
+        elif use_int4_w4a16:
             b = (b >> b_shifter) & 0xF
 
-        b_scale_ptrs = (
-            b_scale_ptr
-            + off_experts * stride_bse
-            + offs_bn[None, :] * stride_bsn
-            + ((offs_k[:, None] + BLOCK_SIZE_K * k) // group_size) * stride_bsk
-        )
-        b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
-        b_scale = b_scale.to(tl.float32)
+        if use_int2_w2a16:
+            if BLOCK_SIZE_K <= group_size:
+                tl.static_assert(
+                    group_size % BLOCK_SIZE_K == 0,
+                    "group_size must be a multiple of BLOCK_SIZE_K",
+                )
+                # one scale per column for the whole K tile
+                b_scale = tl.load(
+                    b_scale_ptr
+                    + off_experts * stride_bse
+                    + offs_bn * stride_bsn
+                    + ((BLOCK_SIZE_K * k) // group_size) * stride_bsk
+                ).to(tl.float32)[None, :]
+            else:
+                tl.static_assert(
+                    BLOCK_SIZE_K % group_size == 0,
+                    "BLOCK_SIZE_K must be a multiple of group_size",
+                )
+                offs_g = tl.arange(0, BLOCK_SIZE_K // group_size)
+                b_scale = tl.load(
+                    b_scale_ptr
+                    + off_experts * stride_bse
+                    + offs_bn[None, :] * stride_bsn
+                    + ((BLOCK_SIZE_K * k) // group_size + offs_g[:, None]) * stride_bsk
+                ).to(tl.float32)
+                b_scale = tl.reshape(
+                    tl.broadcast_to(
+                        b_scale[:, None, :],
+                        [BLOCK_SIZE_K // group_size, group_size, BLOCK_SIZE_N],
+                    ),
+                    [BLOCK_SIZE_K, BLOCK_SIZE_N],
+                )
+        else:
+            b_scale_ptrs = (
+                b_scale_ptr
+                + off_experts * stride_bse
+                + offs_bn[None, :] * stride_bsn
+                + ((offs_k[:, None] + BLOCK_SIZE_K * k) // group_size) * stride_bsk
+            )
+            b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
+            b_scale = b_scale.to(tl.float32)
 
-        if has_zp and use_int4_w4a16:
+        if has_zp and use_int2_w2a16:
+            offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
+            b_zp_ptrs = (
+                b_zp_ptr
+                + off_experts * stride_bze
+                + (offs_bn[None, :] // 4) * stride_bzn
+                + offs_k_true * stride_bzk
+            )
+            b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
+            b_zp = (b_zp >> b_zp_shifter) & 0x3
+            b_zp = b_zp.to(tl.float32)
+        elif has_zp and use_int4_w4a16:
             offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
             b_zp_ptrs = (
                 b_zp_ptr
@@ -302,7 +371,273 @@ def fused_moe_kernel_gptq_awq(
 
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
-        if use_int4_w4a16:
+        if use_int2_w2a16:
+            b_ptrs += (BLOCK_SIZE_K // 16) * stride_bk
+        elif use_int4_w4a16:
+            b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
+        else:
+            b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    if MUL_ROUTED_WEIGHT:
+        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
+        accumulator = accumulator * moe_weight[:, None]
+
+    accumulator = accumulator.to(compute_type)
+    # -----------------------------------------------------------
+    # Write back the block of the output
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
+@triton.jit
+def fused_moe_kernel_gptq_awq(
+    # Pointers to matrices
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    b_scale_ptr,
+    b_zp_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    # Matrix dimensions
+    N: tl.constexpr,
+    K: tl.constexpr,
+    EM,
+    num_valid_tokens,
+    # The stride variables represent how much to increase the ptr by when
+    # moving by 1 element in a particular dimension. E.g. `stride_am` is
+    # how much to increase `a_ptr` by to get the element one row down
+    # (A has M rows).
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_bse,
+    stride_bsk,
+    stride_bsn,
+    stride_bze,
+    stride_bzk,
+    stride_bzn,
+    group_size: tl.constexpr,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    top_k: tl.constexpr,
+    compute_type: tl.constexpr,
+    has_zp: tl.constexpr,
+    use_int4_w4a16: tl.constexpr,
+    use_int8_w8a16: tl.constexpr,
+    use_int2_w2a16: tl.constexpr,
+    even_Ks: tl.constexpr,
+    filter_expert: tl.constexpr,
+):
+    """
+    Implements the fused computation for a Mixture of Experts (MOE) using
+    token and expert matrices.
+    Key Parameters:
+    - A: The input tensor representing tokens with shape (*, K), where '*' can
+        be any shape representing batches and K is the feature dimension of
+        each token.
+    - B: The stacked MOE weight tensor with shape (E, N, K), where E is
+        the number of experts, K is the input feature dimension, and N is
+        the output feature dimension.
+    - C: The output cache tensor with shape (M, topk, N), where M is the
+        total number of tokens post padding, topk is the number of times
+        each token is repeated, and N is the output feature dimension.
+    - sorted_token_ids: A tensor containing the sorted indices of tokens,
+        repeated topk times and arranged by the expert index they are
+        assigned to.
+    - expert_ids: A tensor containing the indices of the expert for each
+        block. It determines which expert matrix from B should be used for
+        each block in A.
+    This kernel performs the multiplication of a token by its corresponding
+    expert matrix as determined by `expert_ids`. The sorting of
+    `sorted_token_ids` by expert index and padding ensures divisibility by
+    BLOCK_SIZE_M, which is necessary to maintain consistency in block matrix
+    multiplication across different blocks processed by the same expert.
+    """
+    # -----------------------------------------------------------
+    # Map program ids `pid` to the block of C it should compute.
+    # This is done in a grouped ordering to promote L2 data reuse.
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # ----------------------------------------------------------
+    # Create pointers for the first blocks of A and B.
+    # We will advance this pointer as we move in the K direction
+    # and accumulate
+    # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
+    # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+    token_mask = offs_token < num_valid_tokens
+
+    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    if filter_expert and off_experts == -1:
+        # -----------------------------------------------------------
+        # Write back zeros to the output when the expert is not
+        # in the current expert parallel rank.
+        write_zeros_to_output(
+            c_ptr,
+            stride_cm,
+            stride_cn,
+            pid_n,
+            N,
+            offs_token,
+            token_mask,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            compute_type,
+        )
+        return
+
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = a_ptr + (
+        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
+    )
+
+    if use_int2_w2a16:
+        # 2-bit: 16 values per int32, so after .T.contiguous().view(uint8)
+        # that is 4 values per byte. Byte index = offs_k // 4, shift =
+        # (offs_k % 4) * 2. Verified against real AutoRound tensors: values
+        # 0..3, mean 1.95 (symmetric zero point 2 = 2^(bits-1)).
+        b_ptrs = (
+            b_ptr
+            + off_experts * stride_be
+            + (offs_k[:, None] // 4) * stride_bk
+            + offs_bn[None, :] * stride_bn
+        )
+        b_shifter = (offs_k[:, None] % 4) * 2
+    elif use_int4_w4a16:
+        b_ptrs = (
+            b_ptr
+            + off_experts * stride_be
+            + (offs_k[:, None] // 2) * stride_bk
+            + offs_bn[None, :] * stride_bn
+        )
+        b_shifter = (offs_k[:, None] % 2) * 4
+    elif use_int8_w8a16:
+        b_ptrs = (
+            b_ptr
+            + off_experts * stride_be
+            + offs_k[:, None] * stride_bk
+            + offs_bn[None, :] * stride_bn
+        )
+
+    if not has_zp and use_int2_w2a16:
+        b_zp_num = 2
+    if not has_zp and use_int4_w4a16:
+        b_zp_num = 8
+    if not has_zp and use_int8_w8a16:
+        b_zp_num = 128
+    elif has_zp and use_int2_w2a16:
+        b_zp_shifter = (offs_bn[None, :] % 4) * 2
+    elif has_zp and use_int4_w4a16:
+        b_zp_shifter = (offs_bn[None, :] % 2) * 4
+
+    # -----------------------------------------------------------
+    # Iterate to compute a block of the C matrix.
+    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
+    # of fp32 values for higher accuracy.
+    # `accumulator` will be converted back to fp16 after the loop.
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        # Load the next block of A and B, generate a mask by checking the
+        # K dimension.
+
+        if not even_Ks:
+            k_mask = offs_k[:, None] < K - k * BLOCK_SIZE_K
+            k_other = 0.0
+        else:
+            k_mask = None
+            k_other = None
+
+        a = tl.load(
+            a_ptrs,
+            mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+            other=0.0,
+        )
+        b = tl.load(b_ptrs)
+        if use_int2_w2a16:
+            b = (b >> b_shifter) & 0x3
+        elif use_int4_w4a16:
+            b = (b >> b_shifter) & 0xF
+
+        b_scale_ptrs = (
+            b_scale_ptr
+            + off_experts * stride_bse
+            + offs_bn[None, :] * stride_bsn
+            + ((offs_k[:, None] + BLOCK_SIZE_K * k) // group_size) * stride_bsk
+        )
+        b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
+        b_scale = b_scale.to(tl.float32)
+
+        if has_zp and use_int2_w2a16:
+            offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
+            b_zp_ptrs = (
+                b_zp_ptr
+                + off_experts * stride_bze
+                + (offs_bn[None, :] // 4) * stride_bzn
+                + offs_k_true * stride_bzk
+            )
+            b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
+            b_zp = (b_zp >> b_zp_shifter) & 0x3
+            b_zp = b_zp.to(tl.float32)
+        elif has_zp and use_int4_w4a16:
+            offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
+            b_zp_ptrs = (
+                b_zp_ptr
+                + off_experts * stride_bze
+                + (offs_bn[None, :] // 2) * stride_bzn
+                + offs_k_true * stride_bzk
+            )
+            b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
+            b_zp = (b_zp >> b_zp_shifter) & 0xF
+            b_zp = b_zp.to(tl.float32)
+        elif has_zp and use_int8_w8a16:
+            offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
+            b_zp_ptrs = (
+                b_zp_ptr
+                + off_experts * stride_bze
+                + offs_bn[None, :] * stride_bzn
+                + offs_k_true * stride_bzk
+            )
+            b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
+            b_zp = b_zp.to(tl.float32)
+
+        # We accumulate along the K dimension.
+        if has_zp:
+            b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
+        else:
+            b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
+        accumulator = tl.dot(a, b, acc=accumulator)
+
+        # Advance the ptrs to the next K block.
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        if use_int2_w2a16:
+            b_ptrs += (BLOCK_SIZE_K // 4) * stride_bk
+        elif use_int4_w4a16:
             b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
         else:
             b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -789,6 +1124,7 @@ def invoke_fused_moe_kernel(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
+    use_int2_w2a16: bool,
     per_channel_quant: bool,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
@@ -812,7 +1148,13 @@ def invoke_fused_moe_kernel(
         # plain half-width output; every other output flavor is out of scope.
         # In particular the LoRA output paths (fuse_add_to_output / mask_output)
         # address C at full width N and would corrupt the half-width buffer.
-        assert not (use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
+        assert not (
+            use_fp8_w8a8
+            or use_int8_w8a8
+            or use_int8_w8a16
+            or use_int4_w4a16
+            or use_int2_w2a16
+        )
         assert bias is None
         assert not mul_routed_weight
         assert not (fuse_add_to_output or mask_output or fuse_sum_all_reduce)
@@ -870,19 +1212,23 @@ def invoke_fused_moe_kernel(
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
-    elif use_int8_w8a16 or use_int4_w4a16:
+    elif use_int8_w8a16 or use_int4_w4a16 or use_int2_w2a16:
         assert B_scale is not None
         assert block_shape is None or block_shape[0] == 0
     else:
         assert A_scale is None
         assert B_scale is None
 
+    # int2 in the N-contiguous int32-word layout ([E, K/16, N]): N is dim 2 and the
+    # K used for the even_Ks check is the activation width, not the packed dim
+    _ncontig = use_int2_w2a16 and B.dtype == torch.int32
+    _n_dim = B.shape[2] if _ncontig else B.shape[1]
     grid = lambda META: (
         triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
-        * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
+        * triton.cdiv(_n_dim, META["BLOCK_SIZE_N"]),
     )
 
-    K = B.shape[2] - padded_size
+    K = A.shape[1] if _ncontig else (B.shape[2] - padded_size)
     if K % config["BLOCK_SIZE_K"] == 0:
         even_Ks = True
     else:
@@ -911,7 +1257,7 @@ def invoke_fused_moe_kernel(
     # ===== END TO BE REFACTORED ====
 
     if (
-        (use_int8_w8a16 or use_int4_w4a16)
+        (use_int8_w8a16 or use_int4_w4a16 or use_int2_w2a16)
         and block_shape is not None
         and block_shape[1] > 0
     ):
@@ -921,7 +1267,9 @@ def invoke_fused_moe_kernel(
         assert B_scale is not None and B_scale.ndim == 3
         assert B_zp is None or B_zp.ndim == 3
         assert bias is None
-        fused_moe_kernel_gptq_awq[grid](
+        (fused_moe_kernel_gptq_awq_word if _ncontig else fused_moe_kernel_gptq_awq)[
+            grid
+        ](
             A,
             B,
             C,
@@ -931,20 +1279,20 @@ def invoke_fused_moe_kernel(
             sorted_token_ids,
             expert_ids,
             num_tokens_post_padded,
-            B.shape[1],
+            B.shape[2] if _ncontig else B.shape[1],
             A.shape[1],
             sorted_token_ids.shape[0],
             topk_ids.numel(),
             A.stride(0),
             A.stride(1),
             B.stride(0),
-            B.stride(2),
-            B.stride(1),
+            B.stride(1) if _ncontig else B.stride(2),
+            B.stride(2) if _ncontig else B.stride(1),
             C.stride(-2),
             C.stride(-1),
             B_scale.stride(0),
-            B_scale.stride(2),
-            B_scale.stride(1),
+            B_scale.stride(1) if _ncontig else B_scale.stride(2),
+            B_scale.stride(2) if _ncontig else B_scale.stride(1),
             B_zp.stride(0) if B_zp is not None else 0,
             B_zp.stride(2) if B_zp is not None else 0,
             B_zp.stride(1) if B_zp is not None else 0,
@@ -955,6 +1303,7 @@ def invoke_fused_moe_kernel(
             has_zp=B_zp is not None,
             use_int4_w4a16=use_int4_w4a16,
             use_int8_w8a16=use_int8_w8a16,
+            use_int2_w2a16=use_int2_w2a16,
             even_Ks=even_Ks,
             filter_expert=filter_expert,
             **config,

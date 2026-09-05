@@ -2056,6 +2056,20 @@ class MHATokenToKVPool(KVCache):
             self.dq_v_buffer = None
             if self.post_capture_active:
                 self._alloc_post_capture_buffers()
+            elif os.environ.get("SGLANG_KV_LAZY") == "1":
+                self._alloc_post_capture_buffers()
+                self._lazy_floor = min(
+                    self.size, int(os.environ.get("SGLANG_KV_LAZY_FLOOR", "4096"))
+                )
+                self._lazy_margin = int(os.environ.get("SGLANG_KV_LAZY_MARGIN", "2048"))
+                self._post_capture_owner.ensure_prefix(self._lazy_floor)
+                logger.info(
+                    "KV lazy backing: %d tokens reserved as VA, %d backed (floor), margin %d, %.1f KB/token",
+                    self.size,
+                    self._lazy_floor,
+                    self._lazy_margin,
+                    self._post_capture_owner.bytes_per_token() / 1024,
+                )
             else:
                 self._create_buffers_normal()
         self._kv_buffer_descs = self._build_kv_buffer_descs()
@@ -2261,6 +2275,97 @@ class MHATokenToKVPool(KVCache):
         """Map owner tensors (in ``_build_kv_buffer_descs`` order) to k/v_buffer."""
         self.k_buffer = tensors[: self.layer_num]
         self.v_buffer = tensors[self.layer_num :]
+
+    def lazy_ensure(self, num_tokens: int) -> None:
+        """Back KV slots [0, num_tokens + margin). A failed commit first shrinks the elastic
+        expert cache, then retries once."""
+        o = getattr(self, "_post_capture_owner", None)
+        if o is None or not hasattr(self, "_lazy_floor"):
+            return
+        m = self._lazy_margin  # commit in margin-sized steps
+        want = min(
+            self.size + self.page_size, -(-(int(num_tokens) + m) // m) * m
+        )  # slot index == size exists
+        if want <= o.backed_tokens:
+            return
+        # watermark: after the commit at least SGLANG_KV_LAZY_HEADROOM_MB must stay driver-free for
+        # the prefill's working memory; otherwise the elastic expert cache gives way first.
+        headroom = int(os.environ.get("SGLANG_KV_LAZY_HEADROOM_MB", "1536")) << 20
+        delta = (want - o.backed_tokens) * o.bytes_per_token()
+        if torch.cuda.mem_get_info()[0] - delta < headroom:
+            from sglang.srt.layers.moe.expert_elastic import ExpertElastic
+
+            el = ExpertElastic.inst
+            # Below the watermark for the whole tail of a long prefill, empty_cache() on every 2048-token
+            # commit forces torch to cudaMalloc its working set again each time (periodic ~1 s spikes).
+            # Only do the expensive part when the expert cache still has rows to give back, else rate-limit.
+            can_shrink = el is not None and any(
+                st.S > el.s_floor() for st in el.layers.values()
+            )
+            now = __import__("time").time()
+            last = getattr(self, "_lazy_last_empty", 0.0)
+            if can_shrink or now - last > 30.0:
+                torch.cuda.empty_cache()
+                self._lazy_last_empty = now
+                if can_shrink and torch.cuda.mem_get_info()[0] - delta < headroom:
+                    el.free(((headroom + delta) >> 20) + 64)
+                if torch.cuda.mem_get_info()[0] - delta < headroom // 2:
+                    raise RuntimeError(
+                        f"KV lazy backing: no headroom for {want} tokens "
+                        f"(free {torch.cuda.mem_get_info()[0] >> 20} MB, need {(delta + headroom) >> 20} MB)"
+                    )
+        try:
+            try:
+                o.ensure_prefix(want)
+            except Exception:
+                torch.cuda.empty_cache()  # torch-cached blocks are not driver-free
+                o.ensure_prefix(want)
+            _free = torch.cuda.mem_get_info()[0]
+            logger.info(
+                "KV lazy commit: tokens %d -> %d (owner backed %.0f MB, torch reserved %.2f GB, driver free %.2f GB, capturing=%s)",
+                num_tokens,
+                want,
+                o.backed_bytes / 2**20,
+                torch.cuda.memory_reserved() / 2**30,
+                _free / 2**30,
+                torch.cuda.is_current_stream_capturing(),
+            )
+        except Exception as ex:
+            from sglang.srt.layers.moe.expert_elastic import ExpertElastic
+
+            el = ExpertElastic.inst
+            if el is None:
+                raise
+            need_mb = (
+                (want - o.backed_tokens) * o.bytes_per_token() >> 20
+            ) + 1024  # + prefill working memory
+            logger.warning(
+                "KV lazy commit failed (%s); shrinking expert cache to free %d MB",
+                ex,
+                need_mb,
+            )
+            el.free(need_mb)
+            o.ensure_prefix(want)
+
+    def lazy_release(self) -> None:
+        o = getattr(self, "_post_capture_owner", None)
+        if o is None or not hasattr(self, "_lazy_floor"):
+            return
+        freed = o.release_beyond(self._lazy_floor)
+        if freed:
+            logger.info(
+                "KV lazy backing: released %.0f MB beyond the %d-token floor",
+                freed / 2**20,
+                self._lazy_floor,
+            )
+        try:  # pool idle = no forward in flight: safe point to regrow experts
+            from sglang.srt.layers.moe.expert_elastic import ExpertElastic
+
+            el = ExpertElastic.inst
+            if el is not None and el.pending_regrow:
+                el.regrow()
+        except Exception as ex:
+            logger.warning("elastic regrow after KV release failed: %s", ex)
 
     def _alloc_post_capture_buffers(self):
         dev = torch.device(self.device)
@@ -2473,10 +2578,19 @@ class MHATokenToKVPool(KVCache):
             return
 
         if cache_k.dtype != self.dtype:
-            if k_scale is not None:
+            if k_scale is not None and not (
+                isinstance(k_scale, (int, float)) and k_scale == 1
+            ):
                 cache_k.div_(k_scale)
-            if v_scale is not None:
+            if v_scale is not None and not (
+                isinstance(v_scale, (int, float)) and v_scale == 1
+            ):
                 cache_v.div_(v_scale)
+            if (
+                self.dtype == torch.float8_e4m3fn
+            ):  # fp32/bf16 -> e4m3fn returns NaN beyond +-448
+                cache_k = cache_k.clamp(-448.0, 448.0)
+                cache_v = cache_v.clamp(-448.0, 448.0)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
 
@@ -2846,10 +2960,19 @@ class MHATokenToKVPool(KVCache):
             )
 
         if cache_k.dtype != self.dtype:
-            if k_scale is not None:
+            if k_scale is not None and not (
+                isinstance(k_scale, (int, float)) and k_scale == 1
+            ):
                 cache_k.div_(k_scale)
-            if v_scale is not None:
+            if v_scale is not None and not (
+                isinstance(v_scale, (int, float)) and v_scale == 1
+            ):
                 cache_v.div_(v_scale)
+            if (
+                self.dtype == torch.float8_e4m3fn
+            ):  # fp32/bf16 -> e4m3fn returns NaN beyond +-448
+                cache_k = cache_k.clamp(-448.0, 448.0)
+                cache_v = cache_v.clamp(-448.0, 448.0)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
 
@@ -3924,11 +4047,28 @@ class HybridLinearKVPool(KVCache):
             layer, *args, layer_id_override=local_layer_id, **kwargs
         )
 
+    def get_kv_smooth_buffer(self, layer_id: int):
+        # int8_g64 full_kv_pool exposes per-channel smoothing constants (plumbed
+        # but identity; a static smoothing A/B was not adopted).
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_kv_smooth_buffer(layer_id)
+
     def get_kv_scale_buffer(self, layer_id: int):
         # MXFP8 full_kv_pool exposes per-32 UE8M0 K/V scale buffers.
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_kv_scale_buffer(layer_id)
+
+    def get_kv_ring_buffer(self, layer_id: int):
+        # int8ring_int4 full_kv_pool exposes the per-layer int8 ring (K, V, K scales, V scales).
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_kv_ring_buffer(layer_id)
+
+    def get_kv_ring_owner(self):
+        # int8ring_int4 full_kv_pool: ring-row owner table (shared by all layers).
+        return self.full_kv_pool.get_kv_ring_owner()
 
     @contextmanager
     def _transfer_id_context(self, layer: RadixAttention):

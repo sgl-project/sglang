@@ -33,6 +33,9 @@ from sglang.srt.layers.attention.qsa.metadata import (
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
+    qwen_sparse_prefix_gather_dequant_int4,
+    qwen_sparse_prefix_gather_dequant_int8,
+    qwen_sparse_prefix_gather_dequant_tiered,
     qwen_sparse_valid_counts_triton,
     sparse_gqa_fwd_interface_triton,
     sparse_gqa_fwd_interface_triton_ck,
@@ -1414,6 +1417,13 @@ class QwenSparseAttnBackend(AttentionBackend):
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
             pool = self.token_to_kv_pool
+            if (
+                pool.get_key_buffer(layer.layer_id).dtype == torch.int8
+                or self._kv_bits() == 4
+            ):
+                raise NotImplementedError(
+                    "int8_g64 / int4_g32 KV cache has no CPU attention fallback"
+                )
             output = qsa_sparse_attention(
                 q,
                 pool.get_key_buffer(layer.layer_id),
@@ -1451,27 +1461,85 @@ class QwenSparseAttnBackend(AttentionBackend):
         k_buffer = pool.get_key_buffer(layer.layer_id)
         v_buffer = pool.get_value_buffer(layer.layer_id)
         req_to_token = self.req_to_token_pool.req_to_token
-        req_indices = forward_batch.req_pool_indices.tolist()
-        k_parts = [
-            k_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
-            for i in range(len(sequence_lens))
-        ]
-        v_parts = [
-            v_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
-            for i in range(len(sequence_lens))
-        ]
         sequence_lens_tensor = torch.tensor(
             sequence_lens, dtype=torch.int32, device=q.device
         )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
+        kv_bits = self._kv_bits()
+        if (
+            k_buffer.dtype == torch.int8 or kv_bits == 4
+        ):  # int8_g64 / int4_g32 pool: row gather + dequant kernel
+            assert (
+                q.dtype == torch.bfloat16
+            ), "quantized KV prefix gather needs bf16 queries"
+            k_sf, v_sf = pool.get_kv_scale_buffer(layer.layer_id)
+            sm_k, sm_v = pool.get_kv_smooth_buffer(layer.layer_id)
+            # Per-call temporaries (this path is never graph-captured): freed after the layer like the
+            # cat temporaries below, so no prefill-sized buffer outlives the request (2 KB/token bf16).
+            packed_shape = (
+                sum(sequence_lens),
+                k_buffer.shape[1],
+                self._kv_head_dim(k_buffer),
+            )
+            packed_k = torch.empty(
+                packed_shape, dtype=torch.bfloat16, device=k_buffer.device
+            )
+            packed_v = torch.empty(
+                packed_shape, dtype=torch.bfloat16, device=k_buffer.device
+            )
+            tier_kwargs = self._kv_tier_kwargs(layer)
+            gather_dequant = (
+                qwen_sparse_prefix_gather_dequant_tiered
+                if tier_kwargs
+                else (
+                    qwen_sparse_prefix_gather_dequant_int4
+                    if kv_bits == 4
+                    else qwen_sparse_prefix_gather_dequant_int8
+                )
+            )
+            gather_dequant(
+                k_buffer,
+                v_buffer,
+                k_sf,
+                v_sf,
+                sm_k,
+                sm_v,
+                req_to_token,
+                forward_batch.req_pool_indices,
+                sequence_lens_tensor,
+                cu_seqlens_k,
+                packed_k,
+                packed_v,
+                len(sequence_lens),
+                max(sequence_lens),
+                **tier_kwargs,
+            )
+        else:
+            req_indices = forward_batch.req_pool_indices.tolist()
+            _fp8 = k_buffer.dtype == torch.float8_e4m3fn
+            k_src = k_buffer.view(torch.uint8) if _fp8 else k_buffer
+            v_src = v_buffer.view(torch.uint8) if _fp8 else v_buffer
+            k_parts = [
+                k_src.index_select(
+                    0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+                )
+                for i in range(len(sequence_lens))
+            ]
+            v_parts = [
+                v_src.index_select(
+                    0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+                )
+                for i in range(len(sequence_lens))
+            ]
+            if _fp8:  # fp8 pool: dequantize the gathered prefix
+                k_parts = [p.view(torch.float8_e4m3fn).to(q.dtype) for p in k_parts]
+                v_parts = [p.view(torch.float8_e4m3fn).to(q.dtype) for p in v_parts]
+            packed_k = torch.cat(k_parts)
+            packed_v = torch.cat(v_parts)
         output = sparse_gqa_fwd_interface_triton_ck(
             q.contiguous(),
-            torch.cat(k_parts),
-            torch.cat(v_parts),
+            packed_k,
+            packed_v,
             topk_indices,
             cu_seqlens_q,
             cu_seqlens_k,
@@ -1512,6 +1580,59 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             self._fa2_scratch[key] = buffers
         return buffers[0][:capacity], buffers[1][:capacity]
+
+    def _kv_bits(self):
+        """Quantized-pool bit width from the pool (8 = int8_g64, 4 = int4_g32, None otherwise).  The
+        fp8 pool stores uint8 too (viewed as float8), so dispatch is keyed on the pool, not the dtype.
+        """
+        pool = self.token_to_kv_pool
+        return getattr(getattr(pool, "full_kv_pool", pool), "kv_bits", None)
+
+    def _kv_head_dim(self, k_buffer: torch.Tensor) -> int:
+        """Logical head_dim of the KV rows (the int4 pool packs two channels per byte)."""
+        return k_buffer.shape[2] * 2 if self._kv_bits() == 4 else k_buffer.shape[2]
+
+    def _kv_scratch_dtype(self, k_buffer: torch.Tensor) -> torch.dtype:
+        """FA2 / trtllm scratch dtype: bf16 for every quantized pool (fp8, int8_g64, int4_g32)."""
+        if k_buffer.dtype in (torch.float8_e4m3fn, torch.int8) or self._kv_bits() == 4:
+            return torch.bfloat16
+        return k_buffer.dtype
+
+    def _int8_gather_kwargs(self, k_buffer: torch.Tensor, layer) -> dict:
+        """Scale + smoothing tensors (+ kv_bits) for the int8_g64 / int4_g32 gather-dequant kernels
+        ({} for other dtypes)."""
+        kv_bits = self._kv_bits()
+        if k_buffer.dtype != torch.int8 and kv_bits != 4:
+            return {}
+        pool = self.token_to_kv_pool
+        k_sf, v_sf = pool.get_kv_scale_buffer(layer.layer_id)
+        sm_k, sm_v = pool.get_kv_smooth_buffer(layer.layer_id)
+        return dict(
+            k_scale=k_sf,
+            v_scale=v_sf,
+            sm_k=sm_k,
+            sm_v=sm_v,
+            kv_bits=kv_bits,
+            **self._kv_tier_kwargs(layer),
+        )
+
+    def _kv_tier_kwargs(self, layer) -> dict:
+        """Ring buffers + owner table + mask of the tiered pool (int8 ring over int4 rows; {} otherwise).
+        The tensors are fixed for the pool's lifetime (allocated before capture): capture-safe.
+        """
+        pool = self.token_to_kv_pool
+        full_pool = getattr(pool, "full_kv_pool", pool)
+        if not getattr(full_pool, "kv_tiered", False):
+            return {}
+        ring_k, ring_v, ring_ks, ring_vs = pool.get_kv_ring_buffer(layer.layer_id)
+        return dict(
+            ring_k=ring_k,
+            ring_v=ring_v,
+            ring_ks=ring_ks,
+            ring_vs=ring_vs,
+            owner=pool.get_kv_ring_owner(),
+            ring_mask=full_pool.ring_mask,
+        )
 
     def _get_trtllm_sparse_tables(self, batch, pages_per_row, page, device):
         key = (batch, pages_per_row, device)
@@ -1565,8 +1686,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         packed_k, packed_v = self._get_fa2_scratch(
             max(capacity_rows, batch) * stride,
             k_buffer.shape[1],
-            k_buffer.shape[2],
-            k_buffer.dtype,
+            self._kv_head_dim(k_buffer),
+            self._kv_scratch_dtype(k_buffer),
             k_buffer.device,
         )
         qwen_sparse_kv_extraction_compact_triton(
@@ -1585,9 +1706,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             packed_v,
             batch,
             topk,
+            **self._int8_gather_kwargs(k_buffer, layer),
         )
         num_kv_heads = k_buffer.shape[1]
-        head_dim = k_buffer.shape[2]
+        head_dim = self._kv_head_dim(k_buffer)
         kc = (
             packed_k[: batch * stride]
             .view(-1, page, num_kv_heads, head_dim)
@@ -1647,6 +1769,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         if not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
+            if k_buffer.dtype == torch.int8 or self._kv_bits() == 4:
+                raise NotImplementedError(
+                    "int8_g64 / int4_g32 KV cache has no CPU attention fallback"
+                )
             output = qsa_sparse_attention(q, k_buffer, v_buffer, slots, layer.scaling)
             return output.reshape(q.shape[0], -1)
 
@@ -1694,8 +1820,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         packed_k, packed_v = self._get_fa2_scratch(
             scratch_capacity,
             k_buffer.shape[1],
-            k_buffer.shape[2],
-            k_buffer.dtype,
+            self._kv_head_dim(k_buffer),
+            self._kv_scratch_dtype(k_buffer),
             k_buffer.device,
         )
         qwen_sparse_kv_extraction_compact_triton(
@@ -1714,6 +1840,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             packed_v,
             batch,
             topk,
+            **self._int8_gather_kwargs(k_buffer, layer),
         )
         output = flash_attn_varlen_func(
             q=q,
