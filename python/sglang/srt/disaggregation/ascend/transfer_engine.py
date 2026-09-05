@@ -64,6 +64,10 @@ class AscendTransferEngine(MooncakeTransferEngine):
         transfer_protocol = self._get_transfer_protocol()
         if transfer_protocol is None or transfer_protocol == "sdma":
             trans_op_type = TransferEngine.TransDataOpType.SDMA
+        elif transfer_protocol == "device_urma":
+            trans_op_type = TransferEngine.TransDataOpType.DEVICE_URMA
+        elif transfer_protocol == "device_uboe":
+            trans_op_type = TransferEngine.TransDataOpType.DEVICE_UBOE
         else:
             trans_op_type = TransferEngine.TransDataOpType.DEVICE_RDMA
             """with device RDMA for PD transfer"""
@@ -95,7 +99,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
     @staticmethod
     def _get_transfer_protocol():
         protocol = os.getenv("ASCEND_MF_TRANSFER_PROTOCOL")
-        allowed_protocols = {"device_rdma", "sdma"}
+        allowed_protocols = {"device_rdma", "sdma", "device_urma", "device_uboe"}
         if protocol and protocol.lower() in allowed_protocols:
             return protocol.lower()
         else:

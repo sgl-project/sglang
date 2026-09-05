@@ -268,9 +268,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             if self.require_mlp_tp_gather:
                 _padded_num_tokens = bs * self.captured_req_width
                 self.buffers.global_num_tokens_gpu.fill_(_padded_num_tokens)
-                self.buffers.global_num_tokens_for_logprob_gpu.fill_(
-                    _padded_num_tokens
-                )
+                self.buffers.global_num_tokens_for_logprob_gpu.fill_(_padded_num_tokens)
             if (
                 enable_num_token_non_padded()
                 and self.require_gathered_buffer
@@ -312,9 +310,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             self.buffers.seq_lens[: self.raw_bs].copy_(
                 forward_batch.seq_lens_cpu[: self.raw_bs]
             )
-            self.buffers.seq_lens[self.raw_bs : self.bs].fill_(
-                self.seq_len_fill_value
-            )
+            self.buffers.seq_lens[self.raw_bs : self.bs].fill_(self.seq_len_fill_value)
             self.buffers.seq_lens_cpu[: self.raw_bs].copy_(
                 forward_batch.seq_lens_cpu[: self.raw_bs]
             )

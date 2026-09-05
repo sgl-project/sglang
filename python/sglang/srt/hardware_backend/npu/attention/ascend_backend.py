@@ -2044,9 +2044,7 @@ class AscendAttnBackend(AttentionBackend):
                 # batchSize (TND layout). Only target_verify has a uniform
                 # per-request width; draft_extend_v2 keeps padded rows.
                 if forward_batch.forward_mode.is_target_verify():
-                    real_bs = (
-                        query.shape[0] // self.speculative_num_draft_tokens
-                    )
+                    real_bs = query.shape[0] // self.speculative_num_draft_tokens
 
             if self.forward_metadata.seq_lens_cpu_int is None:
                 # Graph-mode target_verify path: the v2 operator's

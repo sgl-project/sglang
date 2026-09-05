@@ -1639,9 +1639,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     name = name.replace(weight_name, param_name)
                     # mxfp4 ckpts store expert scales without the `_inv` suffix,
                     # while Fp8MoEMethod registers them as *_weight_scale_inv.
-                    if name.endswith("weight_scale") and (
-                        name + "_inv" in params_dict
-                    ):
+                    if name.endswith("weight_scale") and (name + "_inv" in params_dict):
                         name = name + "_inv"
                     param = params_dict[name]
                     weight_loader = param.weight_loader
