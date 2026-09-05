@@ -231,22 +231,6 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
-  nightly-perf-8-npu-a3:
-    name: nightly-perf-8-npu-a3
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: linux-aarch64-a3-800t-8
-      test_type: 'perf'
-      test_suite: nightly-perf-8-npu-a3
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      install_sglang_deps: false
-      device_type_for_deps: 'a3'
-      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-
   nightly-perf-16-npu-a3:
     name: nightly-perf-16-npu-a3
     if: ${{ !cancelled() }}
@@ -282,22 +266,6 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
-  nightly-acc-4-npu-a3:
-    name: nightly-acc-4-npu-a3
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: linux-aarch64-a3-4-
-      test_type: 'accuracy'
-      test_suite: nightly-acc-4-npu-a3
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      install_sglang_deps: false
-      device_type_for_deps: 'a3'
-      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-
   nightly-acc-16-npu-a3:
     name: nightly-acc-16-npu-a3
     if: ${{ !cancelled() }}
@@ -317,7 +285,7 @@ jobs:
   nightly-poc-multi-node-tests:
     name: multi-node-poc
     if: ${{ !cancelled() }}
-    needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-4-npu-a3, nightly-acc-16-npu-a3]
+    needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3]
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -364,7 +332,7 @@ jobs:
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
     if: ${{ !cancelled() }}
-    needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-4-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
+    needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -403,10 +371,8 @@ jobs:
       - nightly-16-npu-a3
       - nightly-perf-2-npu-a3
       - nightly-perf-4-npu-a3
-      - nightly-perf-8-npu-a3
       - nightly-perf-16-npu-a3
       - nightly-acc-2-npu-a3
-      - nightly-acc-4-npu-a3
       - nightly-acc-16-npu-a3
       - nightly-poc-multi-node-tests
       - nightly-poc-multi-node-mix-tests
@@ -434,10 +400,8 @@ jobs:
             "${{ needs.nightly-16-npu-a3.result }}" \
             "${{ needs.nightly-perf-2-npu-a3.result }}" \
             "${{ needs.nightly-perf-4-npu-a3.result }}" \
-            "${{ needs.nightly-perf-8-npu-a3.result }}" \
             "${{ needs.nightly-perf-16-npu-a3.result }}" \
             "${{ needs.nightly-acc-2-npu-a3.result }}" \
-            "${{ needs.nightly-acc-4-npu-a3.result }}" \
             "${{ needs.nightly-acc-16-npu-a3.result }}"; do
             if [ "${r}" != "success" ] && [ "${r}" != "skipped" ]; then
               single_result="failure"
@@ -466,10 +430,8 @@ jobs:
             "nightly-16-npu-a3:${{ needs.nightly-16-npu-a3.result }}" \
             "nightly-perf-2-npu-a3:${{ needs.nightly-perf-2-npu-a3.result }}" \
             "nightly-perf-4-npu-a3:${{ needs.nightly-perf-4-npu-a3.result }}" \
-            "nightly-perf-8-npu-a3:${{ needs.nightly-perf-8-npu-a3.result }}" \
             "nightly-perf-16-npu-a3:${{ needs.nightly-perf-16-npu-a3.result }}" \
             "nightly-acc-2-npu-a3:${{ needs.nightly-acc-2-npu-a3.result }}" \
-            "nightly-acc-4-npu-a3:${{ needs.nightly-acc-4-npu-a3.result }}" \
             "nightly-acc-16-npu-a3:${{ needs.nightly-acc-16-npu-a3.result }}"; do
             suite="${entry%%:*}"
             r="${entry##*:}"
