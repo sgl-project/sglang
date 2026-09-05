@@ -109,6 +109,25 @@ class Arg:
 
 
 @dataclasses.dataclass(frozen=True)
+class Derived:
+    """Metadata for a field the configuration implies, not one anyone types.
+
+    The other half of a namespace. An ``Arg`` field is the operator's input and
+    is collected into ``ServerArgs``; a ``Derived`` field carries no annotation,
+    so it is not a dataclass field and never reaches the record -- which is
+    right, because it has no input to preserve and the record is what crosses a
+    process boundary.
+
+    It carries only a name and a reason. What computes it belongs with the
+    other fields of its namespace: for the parallel quotients that is
+    ``derive_parallel_widths``, which produces all six from the leaves declared
+    beside them.
+    """
+
+    doc: str = ""
+
+
+@dataclasses.dataclass(frozen=True)
 class NS:
     """Namespace-path marker for a ServerArgs field, attached alongside the
     field's metadata in ``Annotated``:
