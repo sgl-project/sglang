@@ -3726,8 +3726,9 @@ class Scheduler(
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
-                        if batch.spec_algorithm.is_none():
-                            self.future_map.publish(future_indices, batch.seq_lens + 1)
+                        # Non-spec decode owns its lengths on ScheduleBatch.
+                        # Only speculative workers consume the sequence-length
+                        # relay, published by their on_publish callback above.
                         # Park any refs the worker wants kept alive 2 iters
                         # (cross-stream tensor lifetime; pinned in the same
                         # ring slot as the SB attr snapshot).
