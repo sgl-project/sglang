@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.srt.utils import is_sm100_supported, kill_process_tree
+from sglang.srt.utils import is_sm100_supported, is_xpu, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.basic_api_contract_kit import BasicAPIContractMixin
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
@@ -21,8 +21,12 @@ register_cuda_ci(est_time=180, stage="base-b", runner_config="1-gpu-large")
 TARGET_MODEL = "Qwen/Qwen3-14B"
 DRAFT_MODEL = "deepseek-ai/dspark_qwen3_14b_block7"
 
+# XPU: use the Triton attention backend for both target and draft for now.
 # trtllm_mha prefill requires SM100 (Blackwell); use the Hopper-native pair elsewhere.
-if is_sm100_supported():
+if is_xpu():
+    ATTENTION_BACKEND = "triton"
+    DRAFT_ATTENTION_BACKEND = "triton"
+elif is_sm100_supported():
     ATTENTION_BACKEND = "trtllm_mha"
     DRAFT_ATTENTION_BACKEND = "fa4"
 else:
@@ -82,7 +86,9 @@ class TestBasicSanityDSpark(
                 "1",
                 "--enable-metrics",
                 "--disable-piecewise-cuda-graph",
-            ],
+            ]
+            # XPU: run TP=2, and fp16 overflows on the attention backend so force bf16.
+            + (["--tp", "2", "--dtype", "bfloat16"] if is_xpu() else []),
             env={
                 "SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1",
                 "SGLANG_RAGGED_VERIFY_MODE": "compact",
