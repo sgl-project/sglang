@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import HybridSWAKVAllocator
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -39,19 +39,19 @@ register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 def _swa_alloc(allocator, need_size):
     """Allocate from SWA allocator for any page_size.
 
-    SWATokenToKVPoolAllocator.alloc() asserts page_size == 1. For page_size > 1,
+    HybridSWAKVAllocator.alloc() asserts page_size == 1. For page_size > 1,
     allocate from the underlying paged allocators directly and set up the mapping.
     """
     if allocator.page_size == 1:
         return allocator.alloc(need_size)
 
-    if need_size > allocator.full_attn_allocator.available_size():
+    if need_size > allocator.full.pool.available_size():
         return None
-    if need_size > allocator.swa_attn_allocator.available_size():
+    if need_size > allocator.swa.pool.available_size():
         return None
 
-    full_indices = allocator.full_attn_allocator.alloc(need_size)
-    swa_indices = allocator.swa_attn_allocator.alloc(need_size)
+    full_indices = allocator.full.pool.alloc(need_size)
+    swa_indices = allocator.swa.pool.alloc(need_size)
     assert full_indices is not None and swa_indices is not None
     allocator.full_to_swa_index_mapping[full_indices] = swa_indices
     return full_indices
@@ -78,7 +78,7 @@ def _build_swa_tree(page_size, sliding_window_size, kv_size=1024, kv_size_swa=51
         full_attention_layer_ids=full_ids,
         device=device,
     )
-    allocator = SWATokenToKVPoolAllocator(
+    allocator = HybridSWAKVAllocator(
         size=kv_size,
         size_swa=kv_size_swa,
         page_size=page_size,
@@ -480,7 +480,7 @@ class TestSWAEvictionBoundary(unittest.TestCase):
         )
 
         # Manually free SWA as _evict_swa would
-        allocator.free_swa(pool.req_to_token[0, :old_evicted])
+        allocator.swa.free(pool.req_to_token[0, :old_evicted])
 
         req = _make_req(0, list(range(seq_len)), 0, tree)
         req.kv.swa_evicted_seqlen = old_evicted

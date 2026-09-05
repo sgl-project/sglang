@@ -10,16 +10,17 @@ from sglang.kernels.ops.memory.common import (
     _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
 )
 from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.hybrid import BaseHybridSWAKVAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.allocator import BaseKVAllocator
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 # Needs 2 + 1 slots for mamba request with prefix cache. 2 for ping pong cache, 1 for running mamba state.
@@ -58,7 +59,7 @@ def free_swa_out_of_window_slots(
     sliding_window_size: int,
     page_size: int,
     req_to_token_pool: ReqToTokenPool,
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    token_to_kv_pool_allocator: BaseKVAllocator,
     is_chunk_cache: bool = False,
     retain_floor: int | None = None,
 ) -> None:
@@ -101,26 +102,16 @@ def free_swa_out_of_window_slots(
         free_slots = req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
         ]
-        # Local import: the unified allocators import this module lazily for
-        # eviction; a module-level import here would be a cycle hazard.
-        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-            UnifiedSWATokenToKVPoolAllocator,
+        # One contiguous, page-aligned range with host-int bounds: the segment
+        # form, so a side that can derive pages by stride math never dedups.
+        token_to_kv_pool_allocator.swa.free_segment(
+            free_slots, start_pos=req.kv.swa_evicted_seqlen
         )
-
-        if isinstance(token_to_kv_pool_allocator, UnifiedSWATokenToKVPoolAllocator):
-            # Contiguous range with host-int bounds: hand the composite its
-            # start position so the free stays host-sync-free (`free_segment`
-            # derives page reps by stride math instead of `torch.unique`).
-            token_to_kv_pool_allocator.free_swa(
-                free_slots, start_pos=req.kv.swa_evicted_seqlen
-            )
-        else:
-            token_to_kv_pool_allocator.free_swa(free_slots)
         req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 
 def free_kv_row_segments(
-    allocator: BaseTokenToKVPoolAllocator,
+    allocator: BaseKVAllocator,
     segments: list[tuple[torch.Tensor, int]],
     *,
     swa_evicted_seqlen: int,
@@ -148,8 +139,9 @@ def free_kv_row_segments(
             f"SWA eviction floor {swa_evicted_seqlen} splits a page "
             f"(page_size {allocator.page_size})"
         )
-    if swa_dead:
-        allocator.free_full_segments(swa_dead)
+    if swa_dead and ComponentType.FULL in allocator.sides:
+        # A pure-SWA pool has no full side left to release: the ratchet took it.
+        allocator.full.free_segments(swa_dead)
     if swa_alive:
         allocator.free_segments(swa_alive)
 
@@ -170,10 +162,9 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
 
     allocator = tree_cache.token_to_kv_pool_allocator
 
-    if isinstance(allocator, SWATokenToKVPoolAllocator):
-        # Hybrid allocator
-        full_available_size = allocator.full_available_size()
-        swa_available_size = allocator.swa_available_size()
+    if isinstance(allocator, BaseHybridSWAKVAllocator):
+        full_available_size = allocator.full.available_size()
+        swa_available_size = allocator.swa.available_size()
 
         if full_available_size < num_tokens or swa_available_size < num_tokens:
             full_num_tokens = max(0, num_tokens - full_available_size)
@@ -194,7 +185,7 @@ def retraction_backup(
     req: Req,
     tree_cache: BasePrefixCache,
     req_to_token_pool: ReqToTokenPool,
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    token_to_kv_pool_allocator: BaseKVAllocator,
     backend: str,
 ) -> bool:
     """Returns False when the host pool cannot hold the backup; the caller
@@ -216,7 +207,7 @@ def retraction_restore(
     req: Req,
     tree_cache: BasePrefixCache,
     req_to_token_pool: ReqToTokenPool,
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    token_to_kv_pool_allocator: BaseKVAllocator,
     backend: str,
 ) -> None:
     if backend == "cpu_tensor":

@@ -1,6 +1,6 @@
 """Regression for SWA alloc_extend page estimation.
 
-Old gate in SWATokenToKVPoolAllocator.alloc_extend added one full page_size
+Old gate in HybridSWAKVAllocator.alloc_extend added one full page_size
 per request unconditionally, refusing extends that fit inside the request's
 last partial page. Fix replaces with get_num_new_pages-based gating.
 """
@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import HybridSWAKVAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -36,23 +36,23 @@ def _make_self(*, page_size: int, full_available: int, swa_available: int):
 
     return SimpleNamespace(
         page_size=page_size,
-        full_attn_allocator=SimpleNamespace(
+        full=SimpleNamespace(
             available_size=lambda: full_available,
-            alloc_extend=MagicMock(return_value=full_indices),
+            pool=SimpleNamespace(alloc_extend=MagicMock(return_value=full_indices)),
         ),
-        swa_attn_allocator=SimpleNamespace(
+        swa=SimpleNamespace(
             available_size=lambda: swa_available,
-            alloc_extend=MagicMock(return_value=swa_indices),
+            pool=SimpleNamespace(alloc_extend=MagicMock(return_value=swa_indices)),
         ),
         translate_loc_from_full_to_swa=lambda last_loc: last_loc,
         new_pages_available=new_pages_available,
-        set_full_to_swa_mapping=set_full_to_swa_mapping,
+        pairing=SimpleNamespace(set=set_full_to_swa_mapping),
         full_to_swa_index_mapping=full_to_swa_index_mapping,
     )
 
 
 def _call(stub, *, prefix_lens_cpu, seq_lens_cpu, extend_num_tokens):
-    return SWATokenToKVPoolAllocator.alloc_extend(
+    return HybridSWAKVAllocator.alloc_extend(
         stub,
         prefix_lens=prefix_lens_cpu,
         prefix_lens_cpu=prefix_lens_cpu,
@@ -77,8 +77,8 @@ class TestSWAAllocExtendPageEstimation(CustomTestCase):
             extend_num_tokens=2,
         )
         self.assertIsNotNone(result)
-        stub.full_attn_allocator.alloc_extend.assert_called_once()
-        stub.swa_attn_allocator.alloc_extend.assert_called_once()
+        stub.full.pool.alloc_extend.assert_called_once()
+        stub.swa.pool.alloc_extend.assert_called_once()
 
     def test_one_new_page_fits(self):
         # Old: 6 + 2*8 = 22 > 16. New: 2 new pages == 16 // 8.
@@ -100,7 +100,7 @@ class TestSWAAllocExtendPageEstimation(CustomTestCase):
             extend_num_tokens=5,
         )
         self.assertIsNone(result)
-        stub.full_attn_allocator.alloc_extend.assert_not_called()
+        stub.full.pool.alloc_extend.assert_not_called()
 
     def test_swa_pool_genuinely_insufficient(self):
         stub = _make_self(page_size=8, full_available=64, swa_available=8)
@@ -111,7 +111,7 @@ class TestSWAAllocExtendPageEstimation(CustomTestCase):
             extend_num_tokens=5,
         )
         self.assertIsNone(result)
-        stub.swa_attn_allocator.alloc_extend.assert_not_called()
+        stub.swa.pool.alloc_extend.assert_not_called()
 
     def test_exactly_at_capacity_succeeds(self):
         stub = _make_self(page_size=8, full_available=16, swa_available=16)

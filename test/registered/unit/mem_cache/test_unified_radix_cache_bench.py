@@ -23,7 +23,7 @@ import torch
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import SinglePoolKVAllocator, TokenedKVPool
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -182,7 +182,7 @@ def create_bench_cache(
 
     # --- KV pool + allocator ---
     if has_swa:
-        from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+        from sglang.srt.mem_cache.allocator.swa import HybridSWAKVAllocator
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         pool = SWAKVPool(
@@ -196,7 +196,7 @@ def create_bench_cache(
             full_attention_layer_ids=_full_attention_layer_ids(),
             device=device,
         )
-        allocator = SWATokenToKVPoolAllocator(
+        allocator = HybridSWAKVAllocator(
             size=kv_size,
             size_swa=kv_size,
             page_size=page_size,
@@ -217,12 +217,14 @@ def create_bench_cache(
             enable_memory_saver=False,
             mamba_pool=req_to_token_pool.mamba_pool if has_mamba else None,
         )
-        allocator = TokenToKVPoolAllocator(
-            size=kv_size,
-            dtype=_DTYPE,
-            device=device,
-            kvcache=pool,
-            need_sort=False,
+        allocator = SinglePoolKVAllocator(
+            TokenedKVPool(
+                size=kv_size,
+                dtype=_DTYPE,
+                device=device,
+                kvcache=pool,
+                need_sort=False,
+            )
         )
 
     # --- tree ---
@@ -313,12 +315,12 @@ def _alloc(env, n):
     if env.has_swa and env.page_size > 1:
         ps = env.page_size
         aligned = ((n + ps - 1) // ps) * ps
-        if aligned > env.alloc.full_attn_allocator.available_size():
+        if aligned > env.alloc.full.pool.available_size():
             return None
-        if aligned > env.alloc.swa_attn_allocator.available_size():
+        if aligned > env.alloc.swa.pool.available_size():
             return None
-        full_indices = env.alloc.full_attn_allocator.alloc(aligned)
-        swa_indices = env.alloc.swa_attn_allocator.alloc(aligned)
+        full_indices = env.alloc.full.pool.alloc(aligned)
+        swa_indices = env.alloc.swa.pool.alloc(aligned)
         assert full_indices is not None and swa_indices is not None
         env.alloc.full_to_swa_index_mapping[full_indices] = swa_indices
         return full_indices[:n]

@@ -1,6 +1,6 @@
 """DSV4-NPU SWA + c128 paged KV allocator.
 
-Subclasses :class:`SWATokenToKVPoolAllocator` and adds paged allocation for the
+Subclasses :class:`HybridSWAKVAllocator` and adds paged allocation for the
 C128 compressed-KV pool alongside the parent's full + SWA pools. C4 KV slots
 are derived from full slots. Compressor state is fixed ring storage owned by
 the KV pool and never enters this token allocator.
@@ -25,12 +25,12 @@ from typing import Optional
 import torch
 
 from sglang.srt.configs.model_config import is_deepseek_v4
-from sglang.srt.hardware_backend.npu.allocator_npu import NPUPagedTokenToKVPoolAllocator
+from sglang.srt.hardware_backend.npu.allocator_npu import NPUPagedKVPool
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_extend,
 )
 from sglang.srt.mem_cache.allocation import alloc_paged_token_slots_extend
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import HybridSWAKVAllocator
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc
 
 
@@ -96,7 +96,7 @@ def alloc_paged_token_slots_reserve_extend(
     return out_cache_loc
 
 
-class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
+class NPUDSV4HybridSWAKVAllocator(HybridSWAKVAllocator):
     """SWA allocator + C128 KV allocator and full-derived C4 locations."""
 
     def __init__(
@@ -122,7 +122,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         def mk(pool_size, pool):
             # C128 KV sub-pool implements KVCache, so it drops into the standard
             # paged allocator. pool_size is in compressed-token units.
-            return NPUPagedTokenToKVPoolAllocator(
+            return NPUPagedKVPool(
                 pool_size,
                 page_size=pool.kernel_page_size,
                 dtype=dtype,
@@ -209,13 +209,13 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             f"DSV4 c{ratio} {kind} pool exhausted: need {need} new slots, "
             f"available={available}. Raise --mem-fraction-static, lower "
             f"--max-running-requests, or check that "
-            f"DSV4NPUTokenToKVPoolAllocator.free(req=...) releases {kind} slots "
+            f"NPUDSV4HybridSWAKVAllocator.free(req=...) releases {kind} slots "
             f"on req finish."
         )
 
     def _alloc_c_extend(
         self,
-        allocator: NPUPagedTokenToKVPoolAllocator,
+        allocator: NPUPagedKVPool,
         prefix_lens: torch.Tensor,
         prefix_lens_cpu: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -285,7 +285,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     ) -> DSV4OutCacheLoc:
         """Allocate C128 KV and derive C4 KV, then bundle all KV locations."""
         assert req_pool_indices is not None, (
-            "DSV4NPUTokenToKVPoolAllocator requires req_pool_indices "
+            "NPUDSV4HybridSWAKVAllocator requires req_pool_indices "
             "(forwarded from batch.req_pool_indices)."
         )
         out_c4_loc = self._derive_c4_loc_from_full(out_full_loc)

@@ -27,7 +27,8 @@ from sglang.srt.layers.dcp.layout import (
     get_dcp_lens,
 )
 from sglang.srt.layers.linear import QKVParallelLinear
-from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import SinglePoolKVAllocator
+from sglang.srt.mem_cache.allocator.paged import PagedKVPool
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -298,13 +299,15 @@ class TestGetDcpLens(CustomTestCase):
         real_kv_size = 1024
         dcp_size = 4
         physical_page_size = 64
-        allocator = PagedTokenToKVPoolAllocator(
-            size=real_kv_size * dcp_size,
-            page_size=physical_page_size * dcp_size,
-            dtype=torch.bfloat16,
-            device="cpu",
-            kvcache=object(),
-            need_sort=False,
+        allocator = SinglePoolKVAllocator(
+            PagedKVPool(
+                size=real_kv_size * dcp_size,
+                page_size=physical_page_size * dcp_size,
+                dtype=torch.bfloat16,
+                device="cpu",
+                kvcache=object(),
+                need_sort=False,
+            )
         )
 
         allocations = [allocator.alloc(physical_page_size * dcp_size) for _ in range(4)]
@@ -313,7 +316,7 @@ class TestGetDcpLens(CustomTestCase):
 
         self.assertEqual(allocator.size, real_kv_size * dcp_size)
         self.assertEqual(allocator.page_size, physical_page_size * dcp_size)
-        self.assertEqual(allocator.num_pages, real_kv_size // physical_page_size)
+        self.assertEqual(allocator.pool.num_pages, real_kv_size // physical_page_size)
         self.assertEqual(
             len(torch.unique(virtual_indices // dcp_size)),
             len(virtual_indices) // dcp_size,
@@ -435,10 +438,10 @@ class TestGetDcpLens(CustomTestCase):
         self.assertIs(dcp4_allocator.get_kvcache(), physical_kv_cache)
         self.assertEqual(dcp1_allocator.size, 1024)
         self.assertEqual(dcp1_allocator.page_size, 64)
-        self.assertEqual(dcp1_allocator.num_pages, 16)
+        self.assertEqual(dcp1_allocator.pool.num_pages, 16)
         self.assertEqual(dcp4_allocator.size, 4096)
         self.assertEqual(dcp4_allocator.page_size, 256)
-        self.assertEqual(dcp4_allocator.num_pages, 16)
+        self.assertEqual(dcp4_allocator.pool.num_pages, 16)
 
     def test_live_cell_and_page_ownership_formulas(self):
         dcp_size = 4

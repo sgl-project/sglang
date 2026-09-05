@@ -27,6 +27,8 @@ stale capacity is silent over-/under-admission, not a crash.
 import random
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
@@ -36,13 +38,13 @@ def _build(lazy: bool):
     # Function-scope import: the fixture is a TestCase subclass, and a
     # module-scope binding would make pytest collect its tests AGAIN here.
     from test_multi_ended_allocator import (
-        TestUnifiedSWATokenToKVPoolAllocator as _SwaFixture,
+        TestUnifiedHybridSWAKVAllocator as _SwaFixture,
     )
 
     inst = _SwaFixture([m for m in dir(_SwaFixture) if m.startswith("test_")][0])
     pool, allocator, kvcache = inst._build()
-    allocator.full_attn_allocator.lazy_compaction = lazy
-    allocator.swa_attn_allocator.lazy_compaction = lazy
+    allocator.full.pool.lazy_compaction = lazy
+    allocator.swa.pool.lazy_compaction = lazy
     allocator.lazy_compaction = lazy
     return inst, allocator, kvcache
 
@@ -51,11 +53,12 @@ class TestCapacityMemoCoherence(unittest.TestCase):
     def _assert_memos_fresh(self, allocator):
         """Every memoized capacity view must equal a fresh recompute."""
         self.assertEqual(
-            allocator.available_size(), allocator._compute_available_size()
+            allocator.available_size(),
+            allocator.chain._compute_joint_available_tokens(),
         )
         for band in (
-            allocator.full_attn_allocator,
-            allocator.swa_attn_allocator,
+            allocator.full.pool,
+            allocator.swa.pool,
         ):
             self.assertEqual(
                 band.available_size(),
@@ -81,7 +84,7 @@ class TestCapacityMemoCoherence(unittest.TestCase):
                 self.assertIsNotNone(v1)
                 self._assert_memos_fresh(allocator)
 
-                allocator.free_swa(v1[2:6])  # swa-side tombstones
+                allocator.swa.free(v1[2:6])  # swa-side tombstones
                 self._assert_memos_fresh(allocator)
 
                 inst._free(allocator, kvcache, v1)  # both-side free
@@ -95,7 +98,7 @@ class TestCapacityMemoCoherence(unittest.TestCase):
                 self._assert_memos_fresh(allocator)
 
                 if lazy:
-                    allocator.full_attn_allocator._flush(urgent=True)
+                    allocator.full.pool._flush(urgent=True)
                     self._assert_memos_fresh(allocator)
 
                 allocator.clear()
@@ -120,10 +123,10 @@ class TestCapacityMemoCoherence(unittest.TestCase):
                     elif op == "free_swa" and live:
                         v = live[-1]
                         if v.numel() > 1:
-                            allocator.free_swa(v[: v.numel() // 2])
+                            allocator.swa.free(v[: v.numel() // 2])
                     elif op == "flush":
-                        allocator.full_attn_allocator._flush(urgent=True)
-                        allocator.swa_attn_allocator._flush(urgent=True)
+                        allocator.full.pool._flush(urgent=True)
+                        allocator.swa.pool._flush(urgent=True)
                     elif op == "clear":
                         allocator.clear()
                         live.clear()
@@ -133,7 +136,7 @@ class TestCapacityMemoCoherence(unittest.TestCase):
         inst, allocator, kvcache = _build(lazy=False)
         v = inst._alloc(allocator, kvcache, 8)
         self.assertIsNotNone(v)
-        fa = allocator.full_attn_allocator
+        fa = allocator.full.pool
         # Prime every memo at the current epoch.
         allocator.available_size()
         fa.available_size()
@@ -155,10 +158,10 @@ class TestCapacityMemoCoherence(unittest.TestCase):
         (the span flips transparency, walling off their gaps) keep serving
         pre-move values. Exercised on a hand-wired end+float+end chain so no
         end-pool descriptor write can mask a missing span bump."""
-        from test_multi_ended_allocator import TestFloatMultiEndedAllocator
+        from test_multi_ended_allocator import TestFloatMultiEndedKVPool
 
-        inst = TestFloatMultiEndedAllocator(
-            [m for m in dir(TestFloatMultiEndedAllocator) if m.startswith("test_")][0]
+        inst = TestFloatMultiEndedKVPool(
+            [m for m in dir(TestFloatMultiEndedKVPool) if m.startswith("test_")][0]
         )
         _pool, sa, fla, da, _kv = inst._build_tri()
         self.assertEqual(fla._hole_pages(), 0)  # hole-free extension path
@@ -200,11 +203,12 @@ class TestTriCapacityMemoCoherence(unittest.TestCase):
 
     def _assert_memos_fresh(self, allocator):
         self.assertEqual(
-            allocator.available_size(), allocator._compute_available_size()
+            allocator.available_size(),
+            allocator.chain._compute_joint_available_tokens(),
         )
         for band in (
-            allocator.full_attn_allocator,
-            allocator.swa_attn_allocator,
+            allocator.full.pool,
+            allocator.swa.pool,
             allocator.mamba_allocator,
         ):
             self.assertEqual(
@@ -229,10 +233,11 @@ class TestTriCapacityMemoCoherence(unittest.TestCase):
                 self.assertIsNotNone(s1)
                 self._assert_memos_fresh(allocator)
 
-                allocator.free_swa(v1[2:6])  # interior float holes
+                allocator.swa.free(v1[2:6])  # interior float holes
                 self._assert_memos_fresh(allocator)
 
-                allocator.free(v1)  # both-side free
+                allocator.full.free(v1[2:6])  # full-only: the swa side is gone
+                allocator.free(torch.cat([v1[:2], v1[6:]]))  # both-side free
                 self._assert_memos_fresh(allocator)
 
                 ma.free(s1)  # mamba free

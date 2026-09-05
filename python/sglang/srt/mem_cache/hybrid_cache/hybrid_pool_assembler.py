@@ -51,7 +51,7 @@ def _get_allocator_type() -> str:
 def _evict_swa_for_device_alloc(cache: UnifiedRadixCache, required_size: int) -> None:
     from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
-    available_size = cache.token_to_kv_pool_allocator.swa_available_size()
+    available_size = cache.token_to_kv_pool_allocator.swa.available_size()
     shortfall = max(0, required_size - available_size)
     if shortfall > 0:
         cache.evict_for_alloc(EvictParams(swa_num_tokens=shortfall))
@@ -410,7 +410,7 @@ def build_hybrid_swa_stack(
         host_swa_evict_fn=host_swa_evict_fn,
         device_swa_evict_fn=device_swa_evict_fn,
         # For SWA hybrid, device allocation goes through the inner allocator.
-        swa_attn_allocator=params.token_to_kv_pool_allocator.swa_attn_allocator,
+        swa_attn_allocator=params.token_to_kv_pool_allocator.swa.pool,
         mtp_swa_device_pools=mtp_swa_device_pools,
     )
     cache_controller = HybridCacheController(
@@ -621,7 +621,7 @@ def build_deepseek_v4_hicache_stack(
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
         )
-        swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
+        swa_attn_allocator = params.token_to_kv_pool_allocator.swa.pool
         entries.append(
             build_pool_entry(
                 name=PoolName.SWA,
@@ -890,7 +890,7 @@ def build_hybrid_mamba_swa_stack(
     transfer_layer_num = len(
         full_layer_mapping | swa_layer_mapping | mamba_layer_mapping
     )
-    swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
+    swa_attn_allocator = params.token_to_kv_pool_allocator.swa.pool
     mamba_allocator = params.req_to_token_pool.mamba_allocator
     kv_host_size, swa_host_size, mamba_host_size = None, None, 0
     if get_memory().hicache_size > 0:

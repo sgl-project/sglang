@@ -1,7 +1,7 @@
 """MLX model runner for Apple Silicon.
 
 Slot allocation and radix-trie prefix matching are handled by the
-scheduler (``TokenToKVPoolAllocator`` / ``RadixCache``).  This runner
+scheduler (``TokenedKVPool`` / ``RadixCache``).  This runner
 reads cached attention KV from ``MlxAttentionKVPool``, restores any
 native auxiliary layer state, runs the forward pass, and writes the new
 cache state back.  Each request keeps model-shaped cache entries:

@@ -17,7 +17,7 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     unified_memory_disagg_move_gate,
 )
-from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -161,12 +161,12 @@ class TestGatedPeerHolesAreNotSchedulable(CustomTestCase):
             self.high_peer = peer
             self.low_peer = None
 
-        _growth_side_neighbor = MultiEndedAllocator._growth_side_neighbor
+        _growth_side_neighbor = MultiEndedKVPool._growth_side_neighbor
 
     def _credit(self, gate):
         peer = self._Peer(gate)
         owner = self._Owner(peer)
-        return MultiEndedAllocator._peer_drainable_hole_bytes(owner)
+        return MultiEndedKVPool._peer_drainable_hole_bytes(owner)
 
     def test_credit_follows_the_gate(self):
         # No PD gate installed (non-disagg): holes are realizable as before.

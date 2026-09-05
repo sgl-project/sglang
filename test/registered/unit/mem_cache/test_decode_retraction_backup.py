@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import SinglePoolKVAllocator, TokenedKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import retraction_backup
 from sglang.srt.mem_cache.hicache_storage import PoolName
@@ -91,12 +91,14 @@ class TestDecodeRetractionBackup(unittest.TestCase):
             enable_memory_saver=False,
         )
         target_pool = self._make_pool(layer_num=2)
-        allocator = TokenToKVPoolAllocator(
-            size=self.pool_size,
-            dtype=self.dtype,
-            device=self.device,
-            kvcache=target_pool,
-            need_sort=False,
+        allocator = SinglePoolKVAllocator(
+            TokenedKVPool(
+                size=self.pool_size,
+                dtype=self.dtype,
+                device=self.device,
+                kvcache=target_pool,
+                need_sort=False,
+            )
         )
         params = CacheInitParams(
             disable=True,

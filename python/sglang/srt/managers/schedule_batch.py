@@ -105,7 +105,7 @@ from sglang.srt.mem_cache.allocation import (
     alloc_for_extend,
 )
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import BaseKVAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     MatchPrefixParams,
@@ -2089,7 +2089,7 @@ def release_req(
     req: Req,
     remaing_req_count: int,
     req_to_token_pool: ReqToTokenPool,
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    token_to_kv_pool_allocator: BaseKVAllocator,
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
@@ -2125,7 +2125,7 @@ def retract_all(
     *,
     reqs: List[Req],
     req_to_token_pool: ReqToTokenPool,
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    token_to_kv_pool_allocator: BaseKVAllocator,
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
@@ -2188,7 +2188,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # === Global config and shared resources (engine-lifetime; identical across batches) ===
     # Memory pool and cache
     req_to_token_pool: ReqToTokenPool = None
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
+    token_to_kv_pool_allocator: BaseKVAllocator = None
     tree_cache: BasePrefixCache = None
 
     # Batch configs
@@ -2270,7 +2270,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
     # DSV4-NPU: KV-only per-pool slot bundle from
-    # DSV4NPUTokenToKVPoolAllocator (None elsewhere).
+    # NPUDSV4HybridSWAKVAllocator (None elsewhere).
     out_cache_loc_dsv4: Optional[Any] = None
 
     # For hybrid GDN prefix cache
@@ -2378,7 +2378,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         cls,
         reqs: List[Req],
         req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+        token_to_kv_pool_allocator: BaseKVAllocator,
         tree_cache: BasePrefixCache,
         model_config: ModelConfig,
         enable_overlap: bool,

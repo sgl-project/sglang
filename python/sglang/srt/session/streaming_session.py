@@ -526,7 +526,7 @@ class StreamingSession(BasePrefixCache):
 
     def _free_kv_aligned(self, kv: ReqKvInfo, target: int, end: int) -> None:
         """Free the record's kv row over [ceil_align(target), end). Page-aligned
-        because PagedTokenToKVPoolAllocator.free returns whole pages
+        because PagedKVPool.free returns whole pages
         (free_index // page_size), so partial-page free would corrupt pages
         still holding committed tokens. The range [target, ceil_align(target))
         stays attached until release_session frees the whole page.

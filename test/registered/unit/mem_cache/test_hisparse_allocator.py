@@ -8,8 +8,10 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.hisparse import (
-    DeepSeekV4HiSparseTokenToKVPoolAllocator,
+    HiSparseHybridSWAKVAllocator,
 )
+from sglang.srt.mem_cache.allocator.hybrid import BaseHybridSWAKVAllocator
+from sglang.srt.mem_cache.allocator.swa import HybridSWAKVAllocator
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -18,52 +20,30 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
-    def test_forwards_swa_tail_allocation_to_logical_allocator(self):
-        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
-        logical_allocator = MagicMock(spec=["alloc_extend_swa_tail"])
-        allocator.logical_attn_allocator = logical_allocator
-
-        expected = torch.tensor([8, 9, 10], dtype=torch.int64)
-        logical_allocator.alloc_extend_swa_tail.return_value = expected
-
-        prefix_lens = torch.tensor([0], dtype=torch.int64)
-        prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
-        seq_lens = torch.tensor([512], dtype=torch.int64)
-        seq_lens_cpu = torch.tensor([512], dtype=torch.int64)
-        last_loc = torch.tensor([-1], dtype=torch.int64)
-
-        result = allocator.alloc_extend_swa_tail(
-            prefix_lens=prefix_lens,
-            prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
-            last_loc=last_loc,
-            extend_num_tokens=512,
-            swa_tail_len=128,
+    def test_swa_tail_allocation_binds_no_c4_pages(self):
+        # The disagg-decode prealloc allocates full + swa tail only; the hisparse
+        # allocator must not add a C4 allocation on top.
+        self.assertIs(
+            HiSparseHybridSWAKVAllocator.alloc_extend_swa_tail,
+            HybridSWAKVAllocator.alloc_extend_swa_tail,
         )
-
-        self.assertIs(result, expected)
-        logical_allocator.alloc_extend_swa_tail.assert_called_once()
-        _, kwargs = logical_allocator.alloc_extend_swa_tail.call_args
-        self.assertIs(kwargs["prefix_lens"], prefix_lens)
-        self.assertIs(kwargs["prefix_lens_cpu"], prefix_lens_cpu)
-        self.assertIs(kwargs["seq_lens"], seq_lens)
-        self.assertIs(kwargs["seq_lens_cpu"], seq_lens_cpu)
-        self.assertIs(kwargs["last_loc"], last_loc)
-        self.assertEqual(kwargs["extend_num_tokens"], 512)
-        self.assertEqual(kwargs["swa_tail_len"], 128)
+        self.assertIs(
+            HiSparseHybridSWAKVAllocator.alloc_decode,
+            HybridSWAKVAllocator.alloc_decode,
+        )
 
     def test_hisparse_budget_uses_full_logical_capacity_for_swa_tail(self):
         from sglang.srt.disaggregation.decode import DecodePreallocQueue
 
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
-        logical_allocator = SimpleNamespace(
-            available_size=MagicMock(return_value=32),
-            full_available_size=MagicMock(return_value=512),
+        allocator = MagicMock()
+        allocator.__class__ = BaseHybridSWAKVAllocator
+        allocator.logical_available_size = MagicMock(return_value=32)
+        allocator.full = SimpleNamespace(
+            available_size=MagicMock(return_value=16),
+            pool=SimpleNamespace(available_size=MagicMock(return_value=512)),
         )
-        queue.token_to_kv_pool_allocator = SimpleNamespace(
-            logical_attn_allocator=logical_allocator
-        )
+        queue.token_to_kv_pool_allocator = allocator
         queue.scheduler = SimpleNamespace(enable_hisparse=True, last_batch=None)
         queue.retracted_queue = []
         queue.num_reserved_decode_tokens = 0
@@ -74,8 +54,8 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         budget = queue._allocatable_token_budgets()
 
         self.assertEqual(budget, 512)
-        logical_allocator.full_available_size.assert_called_once_with()
-        logical_allocator.available_size.assert_not_called()
+        allocator.full.pool.available_size.assert_called_once_with()
+        allocator.logical_available_size.assert_not_called()
 
     def test_hisparse_prealloc_uses_swa_tail_for_direct_host_path(self):
         from sglang.srt.disaggregation.decode import DecodePreallocQueue
@@ -117,7 +97,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             device=torch.device("cpu"),
             page_size=256,
             available_size=MagicMock(return_value=fill_len),
-            swa_available_size=MagicMock(return_value=swa_tail_len),
+            swa=SimpleNamespace(available_size=MagicMock(return_value=swa_tail_len)),
             alloc_extend_swa_tail=MagicMock(return_value=kv_loc),
             alloc_logical_only=MagicMock(return_value=kv_loc),
         )

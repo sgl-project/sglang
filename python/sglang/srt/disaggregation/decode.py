@@ -72,7 +72,8 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import BaseKVAllocator
+from sglang.srt.mem_cache.allocator.hybrid import BaseHybridSWAKVAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -92,6 +93,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
@@ -326,7 +328,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+        token_to_kv_pool_allocator: BaseKVAllocator,
         draft_token_to_kv_pool: Optional[KVCache],
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
         metadata_buffers: MetadataBuffers,
@@ -427,12 +429,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     ) -> Optional[str]:
         page_size = self.token_to_kv_pool_allocator.page_size
         required = ceil_align(swa_tail_len, page_size)
-        available = self.token_to_kv_pool_allocator.swa_available_size()
+        available = self.token_to_kv_pool_allocator.swa.available_size()
         if available < required:
             self.tree_cache.evict_for_alloc(
                 EvictParams(swa_num_tokens=required - available)
             )
-            available = self.token_to_kv_pool_allocator.swa_available_size()
+            available = self.token_to_kv_pool_allocator.swa.available_size()
 
         if available < required:
             return (
@@ -454,9 +456,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return self.tree_cache.protected_size()
 
     def _radix_full_available(self) -> int:
-        if self.scheduler.tp_worker.is_hybrid_swa:
-            return self.token_to_kv_pool_allocator.full_available_size()
-        return self.token_to_kv_pool_allocator.available_size()
+        return self.token_to_kv_pool_allocator.side(ComponentType.FULL).available_size()
 
     def _swa_tail_len(self, seq_len: int) -> int:
         if not self._uses_swa_tail_prealloc() or seq_len <= 0:
@@ -1628,17 +1628,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
 
         if self.scheduler.enable_hisparse:
-            logical_allocator = self.token_to_kv_pool_allocator.logical_attn_allocator
-            if self._uses_swa_tail_prealloc() and hasattr(
-                logical_allocator, "full_available_size"
+            alloc = self.token_to_kv_pool_allocator
+            if self._uses_swa_tail_prealloc() and isinstance(
+                alloc, BaseHybridSWAKVAllocator
             ):
-                available_size = logical_allocator.full_available_size()
+                available_size = alloc.full.pool.available_size()
             else:
                 # HiSparse pre-alloc only allocates logical indices, so the
                 # logical pool is the binding constraint for admission control.
-                available_size = logical_allocator.available_size()
+                available_size = alloc.logical_available_size()
         elif self._uses_swa_tail_prealloc():
-            available_size = self.token_to_kv_pool_allocator.full_available_size()
+            available_size = self.token_to_kv_pool_allocator.full.available_size()
             if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
                 available_size += self._radix_full_evictable()
         else:
@@ -1704,8 +1704,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # pool) over-reserves SWA in steady state. Cap by the actual
         # remaining headroom up to per-req window cap.
         window_size = self.scheduler.sliding_window_size or 0
-        swa_total = self.token_to_kv_pool_allocator.size_swa
-        swa_available = self.token_to_kv_pool_allocator.swa_available_size()
+        alloc = self.token_to_kv_pool_allocator
+        swa_total = alloc.size_swa
+        swa_available = alloc.swa.available_size()
         swa_evictable = self.tree_cache.swa_evictable_size()
         swa_used = swa_total - swa_available - swa_evictable
         swa_growth_potential = max(0, n_active * window_size - swa_used)
@@ -1890,7 +1891,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
 
 def alloc_for_decode_prealloc_hisparse(
-    allocator: BaseTokenToKVPoolAllocator,
+    allocator: BaseKVAllocator,
     *,
     req: Req,
     fill_len: int,
@@ -1930,7 +1931,7 @@ def alloc_for_decode_prealloc_hisparse(
 
 
 def alloc_for_decode_prealloc(
-    allocator: BaseTokenToKVPoolAllocator,
+    allocator: BaseKVAllocator,
     *,
     req: Req,
     fill_len: int,

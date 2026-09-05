@@ -8,7 +8,7 @@ namespace canary {
 
 constexpr uint64_t kCanaryChainAnchor = 0xC0FFEE1234567890ULL;
 
-// Mirrors SGLang's TokenToKVPoolAllocator contract: token-to-KV slot 0 is reserved for padded-token dummy
+// Mirrors SGLang's TokenedKVPool contract: token-to-KV slot 0 is reserved for padded-token dummy
 // writes. Since req_to_token stores token-to-KV slot ids and is zero-initialized, canary slot 0 is skipped
 // instead of treating unfilled entries as real KV slots.
 constexpr int64_t kTokenToKvSlotPadding = 0;

@@ -27,7 +27,7 @@ from sglang.srt.utils.common import get_device_module
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.distributed.parallel_state import GroupCoordinator
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.allocator import BaseKVAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -46,7 +46,7 @@ class DynamicChunkSizer:
         model_config: ModelConfig,
         tree_cache: BasePrefixCache,
         req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+        token_to_kv_pool_allocator: BaseKVAllocator,
         spec_algorithm: SpeculativeAlgorithm,
         chunked_prefill_size: int,
         max_prefill_tokens: int,

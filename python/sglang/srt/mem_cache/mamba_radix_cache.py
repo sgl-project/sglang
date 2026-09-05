@@ -27,12 +27,9 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 from numpy import float64
 
-from sglang.srt.mem_cache.allocator import (
-    PagedTokenToKVPoolAllocator,
-    TokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.allocator import SinglePoolKVAllocator
 from sglang.srt.mem_cache.allocator.unified_mamba import (
-    UnifiedMambaTokenToKVPoolAllocator,
+    UnifiedMambaKVAllocator,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -441,14 +438,9 @@ class LRUList:
 
 class MambaRadixCache(BasePrefixCache):
     def __init__(self, params: CacheInitParams):
-        assert (
-            isinstance(params.token_to_kv_pool_allocator, TokenToKVPoolAllocator)
-            or isinstance(
-                params.token_to_kv_pool_allocator, PagedTokenToKVPoolAllocator
-            )
-            or isinstance(
-                params.token_to_kv_pool_allocator, UnifiedMambaTokenToKVPoolAllocator
-            )
+        assert isinstance(
+            params.token_to_kv_pool_allocator,
+            (SinglePoolKVAllocator, UnifiedMambaKVAllocator),
         )
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator

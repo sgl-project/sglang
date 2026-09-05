@@ -27,6 +27,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         capacity = {"available": 30}
         allocator = MagicMock()
         allocator.available_size.side_effect = lambda: capacity["available"]
+        allocator.side.return_value = allocator  # one side: the pool itself
         cache.token_to_kv_pool_allocator = allocator
         cache.req_to_token_pool = MagicMock()
 
@@ -91,6 +92,9 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         cache.metrics_collector = None
         cache.tree_core = MagicMock()
         cache.token_to_kv_pool_allocator = MagicMock()
+        cache.token_to_kv_pool_allocator.side.return_value = (
+            cache.token_to_kv_pool_allocator
+        )
 
         capacity = {"available": 0}
         mamba_allocator = MagicMock()

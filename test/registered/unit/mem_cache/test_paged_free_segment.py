@@ -1,6 +1,6 @@
 """free_segment / free_segments vs the torch.unique reference: page-aligned
 starts over every tail alignment, the page-disjoint contract, and free-group
-deferral. See PagedTokenToKVPoolAllocator.free_segment for why unique is avoided.
+deferral. See PagedKVPool.free_segment for why unique is avoided.
 
     python -m pytest test/registered/unit/mem_cache/test_paged_free_segment.py -v
 """
@@ -12,8 +12,8 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
-from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.base import BaseKVPool
+from sglang.srt.mem_cache.allocator.paged import PagedKVPool
 from sglang.srt.mem_cache.common import _release_overallocated_kv_indices
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -24,7 +24,7 @@ NUM_PAGES = 64
 
 
 def _make_allocator(need_sort=False):
-    return PagedTokenToKVPoolAllocator(
+    return PagedKVPool(
         size=NUM_PAGES * PAGE_SIZE,
         page_size=PAGE_SIZE,
         dtype=torch.float16,
@@ -191,9 +191,12 @@ class TestFreeSegments(unittest.TestCase):
                 self._freed_by_segments(11, spans)
 
 
-class _RecordingBaseAllocator(BaseTokenToKVPoolAllocator):
+class _RecordingBaseAllocator(BaseKVPool):
     """Base-fallback allocator: free_segment inherits the default (ignore
     start_pos, call free()), free() records what it received."""
+
+    def available_size(self):
+        return 0
 
     def __init__(self):
         super().__init__(

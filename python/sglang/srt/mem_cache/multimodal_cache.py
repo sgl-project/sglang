@@ -5,7 +5,7 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import BaseKVAllocator
 
 
 class MultimodalCache(abc.ABC):
@@ -38,7 +38,7 @@ class MultimodalCache(abc.ABC):
         self,
         mm_hash: int,
         embedding: torch.Tensor,
-        mm_embedding_allocator: BaseTokenToKVPoolAllocator,
+        mm_embedding_allocator: BaseKVAllocator,
     ) -> bool:
         """
         Set the embedding to the pre-allocated locations with a hash id
@@ -50,9 +50,7 @@ class MultimodalCache(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def free(
-        self, mm_hash: int, mm_embedding_allocator: BaseTokenToKVPoolAllocator
-    ) -> bool:
+    def free(self, mm_hash: int, mm_embedding_allocator: BaseKVAllocator) -> bool:
         raise NotImplementedError()
 
     @abc.abstractmethod
@@ -130,9 +128,7 @@ class MultiModalStaticCache(MultimodalCache):
     def has(self, mm_hash: int) -> bool:
         return mm_hash in self.mm_cache
 
-    def free(
-        self, mm_hash: int, mm_embedding_allocator: BaseTokenToKVPoolAllocator
-    ) -> bool:
+    def free(self, mm_hash: int, mm_embedding_allocator: BaseKVAllocator) -> bool:
         if mm_hash not in self.mm_cache:
             return False
         old_embedding = self.mm_cache.pop(mm_hash)

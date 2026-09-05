@@ -1089,14 +1089,14 @@ class BufferModePipeline:
         # Evict-before-alloc (mirrors _load_back_transfers): the budget gate
         # counts evictable pages, but cc.load draws from free slots only.
         if cache.supports_swa():
-            avail = cache.token_to_kv_pool_allocator.full_available_size()
+            avail = cache.token_to_kv_pool_allocator.full.available_size()
         else:
             avail = cache.token_to_kv_pool_allocator.available_size()
         if avail < splice_tokens:
             needed = splice_tokens - avail
             cache.evict_for_alloc(EvictParams(num_tokens=needed))
             if cache.supports_swa():
-                avail = cache.token_to_kv_pool_allocator.full_available_size()
+                avail = cache.token_to_kv_pool_allocator.full.available_size()
             else:
                 avail = cache.token_to_kv_pool_allocator.available_size()
             if avail < splice_tokens:

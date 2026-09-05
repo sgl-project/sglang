@@ -67,8 +67,8 @@ class TestPrefillAdder(CustomTestCase):
         size_swa: int = 1_000_000,
     ) -> MagicMock:
         allocator = MagicMock()
-        allocator.full_available_size.return_value = full_available_size
-        allocator.swa_available_size.return_value = swa_available_size
+        allocator.full.available_size.return_value = full_available_size
+        allocator.swa.available_size.return_value = swa_available_size
         allocator.available_size.return_value = available_size
         allocator.size_swa = size_swa
         return allocator
@@ -186,7 +186,7 @@ class TestPrefillAdder(CustomTestCase):
 
         self.assertEqual(adder.rem_total_token_offset, 225)
 
-        self.mock_token_allocator.full_available_size.return_value = (
+        self.mock_token_allocator.full.available_size.return_value = (
             225  # full occupation of GRam
         )
         self.mock_token_allocator.available_size.return_value = 225
@@ -216,7 +216,7 @@ class TestPrefillAdder(CustomTestCase):
 
         self.assertEqual(adder.rem_total_token_offset, 225)
 
-        self.mock_token_allocator.full_available_size.return_value = (
+        self.mock_token_allocator.full.available_size.return_value = (
             225  # full occupation of GRam
         )
         self.mock_token_allocator.available_size.return_value = 225
@@ -246,7 +246,7 @@ class TestPrefillAdder(CustomTestCase):
 
         self.assertEqual(adder.rem_total_token_offset, 225)
 
-        self.mock_token_allocator.full_available_size.return_value = (
+        self.mock_token_allocator.full.available_size.return_value = (
             225  # full occupation of GRam
         )
         self.mock_token_allocator.available_size.return_value = 225
@@ -284,7 +284,7 @@ class TestPrefillAdder(CustomTestCase):
 
         self.assertEqual(adder.rem_total_token_offset, 225)
 
-        self.mock_token_allocator.full_available_size.return_value = (
+        self.mock_token_allocator.full.available_size.return_value = (
             225  # full occupation of GRam
         )
         self.mock_token_allocator.available_size.return_value = 225
@@ -322,7 +322,7 @@ class TestPrefillAdder(CustomTestCase):
 
         self.assertEqual(adder.rem_total_token_offset, 225)
 
-        self.mock_token_allocator.full_available_size.return_value = 225
+        self.mock_token_allocator.full.available_size.return_value = 225
         self.mock_token_allocator.available_size.return_value = 225
 
         # New request preempts req_prio_0
@@ -365,7 +365,7 @@ class TestPrefillAdder(CustomTestCase):
 
         self.assertEqual(adder.rem_total_token_offset, 475)
 
-        self.mock_token_allocator.full_available_size.return_value = (
+        self.mock_token_allocator.full.available_size.return_value = (
             475  # full occupation of GRam
         )
         self.mock_token_allocator.available_size.return_value = 475
@@ -398,7 +398,7 @@ class TestPrefillAdder(CustomTestCase):
 
         self.assertEqual(adder.rem_total_token_offset, 475)
 
-        self.mock_token_allocator.full_available_size.return_value = (
+        self.mock_token_allocator.full.available_size.return_value = (
             475  # full occupation of GRam
         )
         self.mock_token_allocator.available_size.return_value = 475
@@ -511,8 +511,8 @@ class TestPrefillAdder(CustomTestCase):
         is_hybrid_swa=True,
         full_available=100_000,
     ):
-        self.mock_token_allocator.swa_available_size.return_value = rem_swa
-        self.mock_token_allocator.full_available_size.return_value = full_available
+        self.mock_token_allocator.swa.available_size.return_value = rem_swa
+        self.mock_token_allocator.full.available_size.return_value = full_available
         self.mock_token_allocator.available_size.return_value = full_available
         self.mock_tree_cache.sliding_window_size = 128
         adder = self.create_adder(
@@ -612,8 +612,8 @@ class TestPrefillAdder(CustomTestCase):
         # min(extend + decode, window) admits it.
         WINDOW, PAGE, REM_SWA = 128, 8, 100
         PREFIX, EXTEND = 200, 16  # cached prefix > window; short uncached tail
-        self.mock_token_allocator.swa_available_size.return_value = REM_SWA
-        self.mock_token_allocator.full_available_size.return_value = 100_000
+        self.mock_token_allocator.swa.available_size.return_value = REM_SWA
+        self.mock_token_allocator.full.available_size.return_value = 100_000
         self.mock_token_allocator.available_size.return_value = 100_000
         self.mock_tree_cache.sliding_window_size = WINDOW
         self.mock_tree_cache.is_tree_cache.return_value = False
@@ -779,7 +779,7 @@ class TestPrefillAdder(CustomTestCase):
 
     def _create_delayer_adder(self, *, available_tokens, delayer, **kwargs):
         self.mock_token_allocator.available_size.return_value = available_tokens
-        self.mock_token_allocator.full_available_size.return_value = available_tokens
+        self.mock_token_allocator.full.available_size.return_value = available_tokens
         return self.create_adder(
             self.create_running_batch(),
             prefill_delayer_single_pass=delayer,

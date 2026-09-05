@@ -23,7 +23,7 @@ from sglang.kernels.ops.memory.allocator import (
     alloc_decode_kernel,
     alloc_extend_kernel,
 )
-from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.base import BaseFreeListKVPool
 from sglang.srt.utils import (
     get_bool_env_var,
     get_num_new_pages,
@@ -113,8 +113,8 @@ def alloc_extend_naive(
     out_indices.copy_(out)
 
 
-class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
-    """Same interface as `TokenToKVPoolAllocator`, but the indices handed to one
+class PagedKVPool(BaseFreeListKVPool):
+    """Same interface as `TokenedKVPool`, but the indices handed to one
     request are always page-aligned.
 
     TODO: fuse last_loc into the kernel.

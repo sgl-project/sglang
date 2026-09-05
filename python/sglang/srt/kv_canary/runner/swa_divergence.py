@@ -13,7 +13,7 @@ from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.runner.future_tensor import DelayedDeviceHostHandler
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+    from sglang.srt.mem_cache.allocator.swa import HybridSWAKVAllocator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -32,7 +32,7 @@ class SwaDivergenceReporter:
         device: torch.device,
         d2h_stream: torch.cuda.Stream,
         interval: int,
-        swa_allocator: Optional[SWATokenToKVPoolAllocator] = None,
+        swa_allocator: Optional[HybridSWAKVAllocator] = None,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
     ) -> None:
         self._interval = interval
@@ -159,7 +159,7 @@ class SwaDivergenceLog:
 
 def compute_swa_out_of_window_tokens(
     *,
-    swa_allocator: SWATokenToKVPoolAllocator,
+    swa_allocator: HybridSWAKVAllocator,
     req_to_token_pool: ReqToTokenPool,
     maybe_inaccurate_forward_batch: ForwardBatch,
 ) -> torch.Tensor:
@@ -180,7 +180,7 @@ def compute_swa_out_of_window_tokens(
 
 def compute_swa_full_idx_divergence(
     *,
-    swa_allocator: SWATokenToKVPoolAllocator,
+    swa_allocator: HybridSWAKVAllocator,
     req_to_token_pool: ReqToTokenPool,
     maybe_inaccurate_forward_batch: ForwardBatch,
 ) -> torch.Tensor:
@@ -199,7 +199,7 @@ def compute_swa_full_idx_divergence(
     mask = positions[None, :] < seq_lens[:, None]
     swa_indices = full_to_swa_index_mapping[rows]
     # FULL pool slots beyond the sliding window have their SWA mapping written
-    # to 0 (see SWATokenToKVPoolAllocator.alloc_extend); skip those so they
+    # to 0 (see HybridSWAKVAllocator.alloc_extend); skip those so they
     # don't get counted as divergence.
     return (
         ((swa_indices != rows) & mask & (swa_indices != 0))

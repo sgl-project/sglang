@@ -46,18 +46,13 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     split_cached_prefix_by_tier,
 )
-from sglang.srt.mem_cache.allocator.hisparse import (
-    DeepSeekV4HiSparseTokenToKVPoolAllocator,
-)
-from sglang.srt.mem_cache.allocator.swa import (
-    PureSWATokenToKVPoolAllocator,
-    SWATokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.allocator.hybrid import BaseHybridSWAKVAllocator
+from sglang.srt.mem_cache.allocator.swa import PureSWAKVAllocator
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedMambaSWATokenToKVPoolAllocator,
+    UnifiedMambaHybridSWAKVAllocator,
 )
 from sglang.srt.mem_cache.allocator.unified_mamba import (
-    UnifiedMambaTokenToKVPoolAllocator,
+    UnifiedMambaKVAllocator,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -69,7 +64,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.allocator import BaseKVAllocator
 
 # Clip the estimation of max_new_tokens for the request whose max_new_tokens is very large.
 # This can prevent the server from being too conservative.
@@ -483,7 +478,7 @@ class PrefillAdder:
         self,
         page_size: int,
         tree_cache: BasePrefixCache,
-        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+        token_to_kv_pool_allocator: BaseKVAllocator,
         running_batch: ScheduleBatch,
         new_token_ratio: float,
         rem_input_tokens: int,
@@ -538,14 +533,12 @@ class PrefillAdder:
                 ]
             )
 
-        # DeepSeek V4 HiSparse wraps an SWATokenToKVPoolAllocator internally and
-        # exposes the full SWA allocator interface.
-        self.is_hybrid_swa = isinstance(
-            self.token_to_kv_pool_allocator,
-            (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator),
-        )
+        # Both carry an SWA window budget; only the hybrid has two sides.
         self.is_all_swa = isinstance(
-            self.token_to_kv_pool_allocator, PureSWATokenToKVPoolAllocator
+            self.token_to_kv_pool_allocator, PureSWAKVAllocator
+        )
+        self.is_hybrid_swa = self.is_all_swa or isinstance(
+            self.token_to_kv_pool_allocator, BaseHybridSWAKVAllocator
         )
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
 
@@ -559,12 +552,12 @@ class PrefillAdder:
         if isinstance(
             self.token_to_kv_pool_allocator,
             (
-                UnifiedMambaTokenToKVPoolAllocator,
-                UnifiedMambaSWATokenToKVPoolAllocator,
+                UnifiedMambaKVAllocator,
+                UnifiedMambaHybridSWAKVAllocator,
             ),
         ):
             self._mamba_slot_cost = (
-                self.token_to_kv_pool_allocator.mamba_slot_full_token_cost()
+                self.token_to_kv_pool_allocator.chain.mamba_slot_full_token_cost()
             )
 
         # `mamba_gap_reserve` is charged to `rem_total_tokens`, which INCLUDES
@@ -641,12 +634,12 @@ class PrefillAdder:
     def rem_total_tokens(self):
         if self.is_all_swa:
             available_and_evictable = (
-                self.token_to_kv_pool_allocator.swa_available_size()
+                self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.swa_evictable_size()
             )
         elif self.is_hybrid_swa:
             available_and_evictable = (
-                self.token_to_kv_pool_allocator.full_available_size()
+                self.token_to_kv_pool_allocator.full.available_size()
                 + self.tree_cache.full_evictable_size()
             )
         elif self.is_hybrid_ssm_cache:
@@ -664,7 +657,7 @@ class PrefillAdder:
     @property
     def rem_swa_tokens(self):
         return (
-            self.token_to_kv_pool_allocator.swa_available_size()
+            self.token_to_kv_pool_allocator.swa.available_size()
             + self.tree_cache.swa_evictable_size()
             - self.rem_swa_token_offset
         )
@@ -673,12 +666,12 @@ class PrefillAdder:
     def cur_rem_tokens(self):
         if self.is_all_swa:
             available_and_evictable = (
-                self.token_to_kv_pool_allocator.swa_available_size()
+                self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.swa_evictable_size()
             )
         elif self.is_hybrid_swa:
             available_and_evictable = (
-                self.token_to_kv_pool_allocator.full_available_size()
+                self.token_to_kv_pool_allocator.full.available_size()
                 + self.tree_cache.full_evictable_size()
             )
         elif self.is_hybrid_ssm_cache:

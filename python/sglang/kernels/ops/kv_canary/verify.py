@@ -266,7 +266,7 @@ def launch_canary_verify_kernel(
             health counters, and real KV fingerprint sources.
         plan: Pre-allocated VerifyPlan; addresses baked into cuda-graph capture.
 
-    Token-to-KV slot 0 is unconditionally skipped by the verify kernel: SGLang's TokenToKVPoolAllocator
+    Token-to-KV slot 0 is unconditionally skipped by the verify kernel: SGLang's TokenedKVPool
     reserves it for padded-token dummy writes, and zero-initialized req_to_token entries therefore point to
     a non-real KV slot. Canary-attached pools mirror that contract by reserving canary slot 0.
 
