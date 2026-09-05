@@ -134,10 +134,26 @@ class SamplingBatchInfo:
         logit_bias = None
         if any(r.sampling_params.logit_bias is not None for r in reqs):
             logit_bias = torch.zeros(len(reqs), vocab_size, device=device)
+            # Preserve scalar-assignment conversion semantics before batching device writes.
+            value_cpu = torch.empty((), dtype=logit_bias.dtype, device="cpu")
+            canonical = {}
             for i, r in enumerate(reqs):
-                if r.sampling_params.logit_bias is not None:
-                    for key, value in r.sampling_params.logit_bias.items():
-                        logit_bias[i, int(key)] = value
+                bias = r.sampling_params.logit_bias
+                if not bias:
+                    continue
+                for key, value in bias.items():
+                    token_id = int(key)
+                    value_cpu[...] = value
+                    canonical[(i, token_id)] = value_cpu.item()
+
+            if canonical:
+                indices = torch.tensor(list(canonical.keys()), device=device)
+                logit_bias[
+                    indices[:, 0],
+                    indices[:, 1],
+                ] = torch.tensor(
+                    list(canonical.values()), dtype=logit_bias.dtype, device=device
+                )
 
         # Check if any request has custom logit processor
         has_custom_logit_processor = (

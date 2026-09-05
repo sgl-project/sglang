@@ -589,17 +589,70 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertTrue(info.is_all_greedy)
 
     def test_logit_bias_construction(self):
-        """Test that logit_bias dict is converted to a tensor with correct values."""
+        """Test that logit_bias dicts are converted to a dense tensor."""
 
-        reqs = [self._make_req(logit_bias={"5": 2.0, "10": -1.0})]
+        reqs = [
+            self._make_req(logit_bias={"5": 2.0, "10": -1.0}),
+            self._make_req(),
+            self._make_req(logit_bias={"3": 1.5, "7": -0.5}),
+        ]
         batch = MagicMock()
         batch.reqs = reqs
         batch.device = DEVICE
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
         self.assertIsNotNone(info.logit_bias)
-        self.assertAlmostEqual(info.logit_bias[0, 5].item(), 2.0)
-        self.assertAlmostEqual(info.logit_bias[0, 10].item(), -1.0)
-        self.assertAlmostEqual(info.logit_bias[0, 0].item(), 0.0)
+        expected = torch.zeros(len(reqs), VOCAB_SIZE)
+        expected[0, 5] = 2.0
+        expected[0, 10] = -1.0
+        expected[2, 3] = 1.5
+        expected[2, 7] = -0.5
+        self.assertTrue(torch.equal(info.logit_bias, expected))
+
+    def test_logit_bias_duplicate_canonical_token_ids_last_write_wins(self):
+        """Test last-write-wins after integer token-ID canonicalization."""
+
+        reqs = [
+            self._make_req(logit_bias={"1": -1.0, "01": -2.0}),
+            self._make_req(logit_bias={"01": -2.0, "1": -1.0}),
+        ]
+        batch = MagicMock()
+        batch.reqs = reqs
+        batch.device = DEVICE
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        self.assertAlmostEqual(info.logit_bias[0, 1].item(), -2.0)
+        self.assertAlmostEqual(info.logit_bias[1, 1].item(), -1.0)
+
+    def test_logit_bias_value_conversion_matches_scalar_assignment(self):
+        """Test overflow and infinity behavior matches scalar tensor assignment."""
+
+        for value in [1e40, float("inf"), float("-inf")]:
+            expected = torch.zeros(1, VOCAB_SIZE)
+            batch = MagicMock()
+            batch.reqs = [self._make_req(logit_bias={"1": value})]
+            batch.device = DEVICE
+
+            try:
+                expected[0, 1] = value
+            except RuntimeError as expected_error:
+                with self.assertRaises(type(expected_error)):
+                    SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+            else:
+                info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+                self.assertTrue(torch.equal(info.logit_bias, expected))
+
+    def test_logit_bias_key_conversion_precedes_value_conversion(self):
+        """Test malformed token IDs fail before value conversion."""
+
+        expected = torch.zeros(1, VOCAB_SIZE)
+        with self.assertRaises(ValueError):
+            expected[0, int("not-an-int")] = 1e40
+
+        batch = MagicMock()
+        batch.reqs = [self._make_req(logit_bias={"not-an-int": 1e40})]
+        batch.device = DEVICE
+
+        with self.assertRaises(ValueError):
+            SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
 
     def test_deterministic_seed(self):
         """Test that explicit seed=123 is kept and missing seed defaults to 42."""
