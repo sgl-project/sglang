@@ -1,9 +1,11 @@
+import os
 import types
 import unittest
 from unittest.mock import patch
 
 import torch
 
+import sglang.srt.mem_cache as mem_cache_pkg
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     PoolName,
@@ -54,6 +56,12 @@ def _fake_pool_host_mla_module():
 
 def _fake_pool_host_module():
     pool_host = types.ModuleType("sglang.srt.mem_cache.pool_host")
+    # Give the stub the real package's search path. A bare ModuleType is a
+    # module, not a package, so `from ...pool_host.<sub> import X` in the code
+    # under test fails with "is not a package" for any submodule that is not
+    # itself faked below. Submodules that ARE faked in sys.modules still win,
+    # since the import system consults sys.modules before this path.
+    pool_host.__path__ = [os.path.join(p, "pool_host") for p in mem_cache_pkg.__path__]
 
     class HostKVCache:
         pass

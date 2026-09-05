@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
+from sglang.srt.mem_cache.pool_host.unified_layout import UnifiedKVLayoutHostMixin
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -48,7 +49,9 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 
-class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
+class MLATokenToKVPoolHost(
+    HiSparseHostPoolMixin, UnifiedKVLayoutHostMixin, HostKVCache
+):
     device_pool: MLATokenToKVPool
     mtp_draft_device_pools: tuple[MLATokenToKVPool, ...] = ()
 
@@ -629,6 +632,23 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
+
+    def _unified_page_view(self, index: int):
+        """One page's latent KV as a (1, layer, page_size, 1, dim) view.
+
+        MLA has no kv-head axis to cut, so its page blocks are never permuted;
+        the layout only decides how many byte runs a chunk takes. See
+        MHATokenToKVPoolHost._unified_page_view for the per-layout shapes.
+        """
+        if self.layout == "page_first_direct":
+            return self.kv_buffer[index // self.page_size].unsqueeze(0)
+        if self.layout == "page_first":
+            page = self.kv_buffer[index : index + self.page_size]
+            return page.permute(1, 0, 2, 3).unsqueeze(0)
+        raise ValueError(
+            f"the unified key scheme does not support the {self.layout!r} host "
+            f"layout; use page_first or page_first_direct."
+        )
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
         """Return True if per-page strides are multiples of *page_size_bytes*.
