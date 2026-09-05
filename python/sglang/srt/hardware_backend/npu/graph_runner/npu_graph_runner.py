@@ -239,13 +239,18 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
-            if forward_batch.forward_mode.is_target_verify():
-                seq_lens_cpu = forward_batch.seq_lens.cpu() + self.captured_req_width
-                seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
+            # Speculative decoding already relays a CPU mirror of seq_lens for
+            # the NPU attention backends. Reuse it here instead of introducing
+            # another blocking D2H copy on every graph replay. Keep the device
+            # fallback for callers that do not publish the host mirror.
+            seq_lens_cpu = forward_batch.seq_lens_cpu
+            if seq_lens_cpu is None:
+                seq_lens_cpu = forward_batch.seq_lens[: self.raw_bs].cpu()
             else:
-                seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
-                    self.bs - self.raw_bs
-                )
+                seq_lens_cpu = seq_lens_cpu[: self.raw_bs]
+            if forward_batch.forward_mode.is_target_verify():
+                seq_lens_cpu = seq_lens_cpu + self.captured_req_width
+            seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
             output = self.backend.replay_with_input_update(
                 graph_key,
                 seq_lens=seq_lens,
