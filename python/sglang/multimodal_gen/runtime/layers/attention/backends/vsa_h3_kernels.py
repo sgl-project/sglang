@@ -260,9 +260,10 @@ def vsa_h3_pack_tiles(
     """Gather packed [T, H, D] rows into ``tiled`` [3|4, H, S_pad, D] and write
     fp32 per-tile means of q/k/v into ``pooled`` [3, H, n_tiles, D].
     ``src_index`` maps each padded position to its packed row, or -1 (pad -> 0).
+    S_pad may hold one extra empty tile past ``n_tiles``; it is left untouched.
     """
     _, heads, seq_pad, head_dim = tiled.shape
-    n_tiles = seq_pad // VSA_H3_KERNEL_BLOCK
+    n_tiles = pooled.shape[2]
     has_gate = gate is not None
     g = gate if has_gate else q
     assert all(t.stride(-1) == 1 for t in (q, k, v, g))
@@ -344,6 +345,8 @@ def vsa_h3_untile(
     heads, seq_pad, head_dim = out_tiled.shape
     total = result.shape[0]
     has_gate = gate_tiled is not None
+    # S_pad may carry one padded tile; the compression output does not
+    n_tiles = out_compress.shape[1] if has_gate else seq_pad // VSA_H3_KERNEL_BLOCK
     _untile_kernel[(triton.cdiv(total, VSA_H3_KERNEL_BLOCK), heads)](
         out_tiled,
         gate_tiled if has_gate else out_tiled,
@@ -353,7 +356,7 @@ def vsa_h3_untile(
         used,
         total,
         seq_pad,
-        seq_pad // VSA_H3_KERNEL_BLOCK,
+        n_tiles,
         HAS_GATE=has_gate,
         HEAD_DIM=head_dim,
         BLOCK=VSA_H3_KERNEL_BLOCK,

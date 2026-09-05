@@ -293,6 +293,7 @@ class _Workspace:
         device: torch.device,
     ) -> None:
         n_tiles = meta.num_tiles
+        self.n_tiles = n_tiles
         self.native = can_use_vsa_block_sparse_sm100(device.index, dtype, head_dim)
         n_alloc = n_tiles + (n_tiles % 2 if self.native else 0)
         seq_pad = n_alloc * VSA_H3_TILE_ELEMS
@@ -322,8 +323,8 @@ class _Workspace:
         self, video_lists: torch.Tensor, num_prefix_tiles: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
         width = video_lists.shape[-1]
-        self.q2k_index[:, num_prefix_tiles:, :width] = video_lists
-        self.q2k_num[:, num_prefix_tiles:] = width
+        self.q2k_index[:, num_prefix_tiles : self.n_tiles, :width] = video_lists
+        self.q2k_num[:, num_prefix_tiles : self.n_tiles] = width
         return self.q2k_index, self.q2k_num
 
 
