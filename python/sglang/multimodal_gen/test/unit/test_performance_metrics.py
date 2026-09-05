@@ -6,6 +6,7 @@ import pytest
 import torch
 
 import sglang.multimodal_gen.runtime.managers.gpu_worker as gpu_worker_module
+import sglang.multimodal_gen.runtime.managers.memory_managers.component_manager as component_manager_module
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
     GIB_BYTES,
@@ -30,6 +31,16 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     ScenarioConfig,
     ToleranceConfig,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_global_component_residency_manager(monkeypatch):
+    # Worker paths exercised here create the process-global residency manager
+    # for their fake pipeline; leaving it behind hands its modules to later
+    # tests (the worker prefers the global manager's placement modules).
+    monkeypatch.setattr(
+        component_manager_module, "_GLOBAL_COMPONENT_RESIDENCY_MANAGER", None
+    )
 
 
 def _perf_record(memory_snapshots: dict[str, dict]) -> RequestPerfRecord:
