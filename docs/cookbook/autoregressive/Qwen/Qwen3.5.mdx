@@ -1029,6 +1029,73 @@ python3 -m sglang.launch_server \
   --hicache-write-policy write_through_selective
 ```
 
+#### 5.2.4 Agentic Long-Context with HiCache DRAM Offload (MI355X MXFP4, MTP)
+
+The MI355X counterpart of the recipe above, using the MXFP4 checkpoint and the AITER attention backend.
+
+Container image (pinned for reproducibility):
+`lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260818`.
+
+Server Launch Command (TP4, EP1):
+```bash Command
+SGLANG_USE_AITER=1 \
+SGLANG_USE_AITER_UNIFIED_ATTN=1 \
+AITER_FLYDSL_FORCE=1 \
+SGLANG_MAMBA_SSM_DTYPE=bfloat16 \
+SGLANG_TIMEOUT_KEEP_ALIVE=1800 \
+python3 -m sglang.launch_server \
+  --model-path amd/Qwen3.5-397B-A17B-MXFP4 \
+  --served-model-name amd/Qwen3.5-397B-A17B-MXFP4 \
+  --trust-remote-code \
+  --tp 4 \
+  --dp 1 \
+  --ep-size 1 \
+  --attention-backend aiter \
+  --page-size 16 \
+  --kv-cache-dtype fp8_e4m3 \
+  --mem-fraction-static 0.80 \
+  --max-prefill-tokens 32768 \
+  --chunked-prefill-size 32768 \
+  --cuda-graph-max-bs 64 \
+  --max-running-requests 128 \
+  --scheduler-recv-interval 30 \
+  --stream-interval 50 \
+  --tokenizer-worker-num 6 \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder \
+  --model-loader-extra-config '{"enable_multithread_load": true}' \
+  --watchdog-timeout 1200 \
+  --enable-metrics \
+  --enable-cache-report \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --enable-hierarchical-cache \
+  --hicache-ratio 1.5 \
+  --hicache-write-policy write_through \
+  --hicache-io-backend direct \
+  --hicache-mem-layout page_first_direct
+```
+
+For the TP2 arm, set `--tp 2` and drop `--tokenizer-worker-num 6`, which is only applied from TP4 up.
+
+`--cuda-graph-max-bs` tracks the client concurrency and is capped at 64; `--max-running-requests` is twice the concurrency. The command above is the top of the sweep, concurrency 64.
+
+The host tier is what extends the sweep. With device KV only, TP4 tops out at concurrency 40 and TP2 at 20; the HiCache arms cover 40 to 64 and 20 to 32 respectively. Each HiCache arm deliberately repeats its device-only neighbor's last concurrency so the host tier's contribution is read at a fixed operating point instead of across a concurrency step. Keep `--page-size 16` identical between the two arms so they differ only in the cache tier.
+
+`--hicache-ratio 1.5` sizes the host tier at 1.5x the device KV cache, so the node needs that much free CPU DRAM per server on top of the model weights. It is the first knob to retune if the host pool is oversubscribed or the hit rate is poor.
+
+For throughput measurement, pin the acceptance length instead of letting it drift between runs:
+
+```bash Command
+export SGLANG_SIMULATE_ACC_LEN=3.39
+export SGLANG_SIMULATE_ACC_METHOD=match-expected
+export SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token
+```
+
+Leave these unset for accuracy runs so the draft tokens are verified against the target model.
+
 ### 5.3 Vision Speed Benchmark
 
 We use SGLang's built-in benchmarking tool to conduct performance evaluation with random images. Each request has 128 input tokens, two 720p images, and 1024 output tokens.
