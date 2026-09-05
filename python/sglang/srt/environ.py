@@ -623,7 +623,7 @@ class Envs:
     # read-done fastpath event.
     SGLANG_FORCE_COARSE_WAR_BARRIER = EnvBool(False)
     # Enable prefill read-done publication after compliant metadata initialization.
-    SGLANG_ENABLE_PREFILL_WAR_READ_DONE = EnvBool(False)
+    SGLANG_ENABLE_PREFILL_WAR_READ_DONE = EnvBool(True)
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
