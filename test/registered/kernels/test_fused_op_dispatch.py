@@ -462,7 +462,7 @@ def test_trace_labels_platform_and_backend(monkeypatch):
 
 
 def test_deprecated_alias_contract(monkeypatch):
-    from sglang.srt.layers.utils import MultiPlatformOp
+    from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 
     assert issubclass(MultiPlatformOp, BaseFusedOp)
 
@@ -492,7 +492,7 @@ def test_deprecated_alias_keeps_legacy_platform_defaults(monkeypatch):
     """Old MultiPlatformOp defined per-platform default methods (hip/musa ->
     cuda, npu/xpu/cpu -> native); plugin code may call them directly, and a
     subclass without forward_cuda must still raise on CUDA like before."""
-    from sglang.srt.layers.utils import MultiPlatformOp
+    from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)

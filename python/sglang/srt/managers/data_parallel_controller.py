@@ -49,6 +49,7 @@ from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
 from sglang.srt.observability.startup_time import aggregate_scheduler_startup_times
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
@@ -825,6 +826,7 @@ def run_data_parallel_controller_process(
     kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
 
+    load_plugins()
     # This process reads the config namespaces before spawning schedulers.
     publish(server_args, role="dp_controller")
     configure_logger(server_args)

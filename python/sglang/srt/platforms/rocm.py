@@ -8,7 +8,7 @@ only overrides identity (``_enum``, ``device_name``).
 
 from sglang.srt.platforms.cuda import CudaDeviceMixin
 from sglang.srt.platforms.device_mixin import PlatformEnum
-from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
 
 
 class RocmDeviceMixin(CudaDeviceMixin):
@@ -21,11 +21,11 @@ class RocmDeviceMixin(CudaDeviceMixin):
 
 
 class RocmSRTPlatform(RocmDeviceMixin, SRTPlatform):
-    """Default in-tree ROCm SRT platform.
+    """Default in-tree ROCm SRT platform."""
 
-    Capability flags (supports_fp8, support_cuda_graph, support_piecewise_cuda_graph)
-    keep the conservative SRTPlatform defaults rather than mirroring CudaSRTPlatform.
-    They are currently only consulted in OOT branches gated on is_out_of_tree(),
-    so the defaults are behaviorally inert for the in-tree ROCm path. A follow-up
-    that migrates AMD-specific gating off legacy is_hip() should set these here.
-    """
+    capabilities = PlatformCapabilities(
+        supports_triton=True,
+        graph_capture=True,
+        piecewise_graph=True,
+        hicache_device_kernels=True,
+    )

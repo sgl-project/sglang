@@ -25,6 +25,8 @@ scheduler.
 import ast
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 from sglang.srt.runtime_context import attention_backends, get_context
 from sglang.srt.server_args import ServerArgs
@@ -185,11 +187,16 @@ class TestSplitBackendsReachTheDecisions(CustomTestCase):
         self.assertIn("flashinfer", attention_backends_of(resolved_view(args)))
 
     def test_support_triton_is_the_regression_being_guarded(self):
+        from sglang.srt.platforms.interface import PlatformCapabilities
         from sglang.srt.utils.common import support_triton
 
         # This is why a base-only read is not merely imprecise: the unset field
         # reads as "supported".
-        self.assertTrue(support_triton(None))
+        with mock.patch(
+            "sglang.srt.utils.common.current_platform",
+            SimpleNamespace(capabilities=PlatformCapabilities(supports_triton=True)),
+        ):
+            self.assertTrue(support_triton(None))
 
     def test_no_listed_decision_reads_the_base_field_alone(self):
         offenders = []

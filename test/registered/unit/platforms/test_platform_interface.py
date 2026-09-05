@@ -251,9 +251,9 @@ class TestCudaDeviceMixin(CustomTestCase):
 
     def test_cuda_srt_platform_capabilities(self):
         base = CudaSRTPlatform()
-        self.assertTrue(base.supports_fp8())
-        self.assertTrue(base.support_cuda_graph())
-        self.assertTrue(base.support_piecewise_cuda_graph())
+        self.assertTrue(base.capabilities.graph_capture)
+        self.assertTrue(base.capabilities.piecewise_graph)
+        self.assertTrue(base.capabilities.supports_triton)
 
 
 class TestXpuDeviceMixin(CustomTestCase):
@@ -303,9 +303,8 @@ class TestXpuDeviceMixin(CustomTestCase):
 
     def test_xpu_srt_platform_capabilities(self):
         base = XpuSRTPlatform()
-        self.assertFalse(base.supports_fp8())
-        self.assertTrue(base.support_cuda_graph())
-        self.assertTrue(base.support_piecewise_cuda_graph())
+        self.assertTrue(base.capabilities.graph_capture)
+        self.assertTrue(base.capabilities.piecewise_graph)
 
 
 class TestCpuDeviceMixin(CustomTestCase):
@@ -365,9 +364,9 @@ class TestCpuDeviceMixin(CustomTestCase):
 
     def test_cpu_srt_platform_capabilities(self):
         base = CpuSRTPlatform()
-        self.assertFalse(base.supports_fp8())
-        self.assertFalse(base.support_cuda_graph())
-        self.assertFalse(base.support_piecewise_cuda_graph())
+        self.assertTrue(base.capabilities.graph_capture)
+        self.assertFalse(base.capabilities.piecewise_graph)
+        self.assertFalse(base.capabilities.supports_triton)
         # CPU has no GPU to pin host memory to.
         self.assertFalse(base.is_pin_memory_available())
         self.assertFalse(base.is_pin_memory_available(device="cpu"))

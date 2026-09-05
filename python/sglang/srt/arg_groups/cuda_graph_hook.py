@@ -195,7 +195,7 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
             "OOT platform without piecewise support",
             lambda: (
                 current_platform.is_out_of_tree()
-                and not current_platform.support_piecewise_cuda_graph()
+                and not current_platform.capabilities.piecewise_graph
             ),
         ),
         (
