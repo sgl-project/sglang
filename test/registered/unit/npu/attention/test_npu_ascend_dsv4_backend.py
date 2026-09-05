@@ -331,7 +331,7 @@ class TestC4StateTransferLayout(unittest.TestCase):
 
 class TestC4IndexerInitialization(unittest.TestCase):
     @patch(
-        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_npu_arch35",
+        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.is_npu_arch35",
         return_value=True,
     )
     def test_arch35_indexer_uses_float8_kv(self, _):
@@ -476,7 +476,7 @@ class TestCompressorStateTableABI(unittest.TestCase):
             _build_cycle_state_block_table(torch.zeros((2, 8), dtype=torch.int32))
 
     @patch(
-        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_npu_arch35",
+        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.is_npu_arch35",
         return_value=True,
     )
     def test_arch35_eager_metadata_builds_cycle_table(self, _):
@@ -508,7 +508,7 @@ class TestCompressorStateTableABI(unittest.TestCase):
         self.assertEqual(table.dtype, torch.int32)
 
     @patch(
-        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_npu_arch35",
+        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.is_npu_arch35",
         return_value=True,
     )
     def test_arch35_graph_replay_slices_static_req_pool_buffer_to_graph_bs(self, _):
@@ -542,7 +542,7 @@ class TestCompressorStateTableABI(unittest.TestCase):
         self.assertEqual(table.tolist(), [7])
 
     @patch(
-        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_npu_arch35",
+        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.is_npu_arch35",
         return_value=True,
     )
     def test_arch35_graph_capture_allocates_cycle_table_buffer(self, _):
@@ -577,7 +577,7 @@ class TestCompressorStateTableABI(unittest.TestCase):
         self.assertEqual(table.dtype, torch.int32)
 
     @patch(
-        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_npu_arch35",
+        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.is_npu_arch35",
         return_value=True,
     )
     def test_arch35_forward_reuses_batch_cycle_table(self, _):
@@ -649,7 +649,7 @@ class TestCompressorStateTableABI(unittest.TestCase):
 
 class TestArch35SparseAttentionDispatch(unittest.TestCase):
     _ARCH35_PATCH_TARGET = (
-        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_npu_arch35"
+        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.is_npu_arch35"
     )
 
     @patch(_ARCH35_PATCH_TARGET, return_value=True)
@@ -680,7 +680,7 @@ class TestArch35SparseAttentionDispatch(unittest.TestCase):
 
 class TestSparseAttentionMetadata(unittest.TestCase):
     _ARCH35_PATCH_TARGET = (
-        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_npu_arch35"
+        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.is_npu_arch35"
     )
 
     def test_device_metadata_receives_sequence_lengths(self):
