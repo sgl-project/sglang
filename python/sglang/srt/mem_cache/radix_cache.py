@@ -516,6 +516,25 @@ class RadixCache(BasePrefixCache):
             result = self.insert(
                 InsertParams(key=radix_key, value=values, priority=priority)
             )
+            # A request that was never cached while unfinished can add its
+            # whole prompt and generated output as one leaf. Split that leaf at
+            # the prompt boundary so LRU eviction can discard output KV without
+            # also losing the reusable prompt KV. Reinserting a prefix only
+            # changes radix topology; it reuses the indices inserted above.
+            prompt_key = RadixKey(
+                token_ids[: len(req.origin_input_ids)],
+                req.extra_key,
+                is_bigram=self.is_eagle,
+                cache_salt=req.cache_salt,
+            ).page_aligned(self.page_size)
+            if 0 < len(prompt_key) < key_len:
+                self.insert(
+                    InsertParams(
+                        key=prompt_key,
+                        value=values[: len(prompt_key)],
+                        priority=priority + 1,
+                    )
+                )
             freed_end = result.prefix_len
         else:
             freed_end = key_len

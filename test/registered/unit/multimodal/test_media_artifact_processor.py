@@ -15,6 +15,7 @@ from sglang.srt.multimodal.media_artifacts import (
     MediaArtifactInput,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -88,7 +89,7 @@ class _Processor(MediaArtifactCacheMixin):
         self.io_executor.shutdown()
 
 
-class TestMediaArtifactProcessor(unittest.TestCase):
+class TestMediaArtifactProcessor(CustomTestCase):
     def test_default_image_decoder_rejects_lazy_pil_failure(self):
         malformed_png = base64.b64decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLJSwAAAABJRU5ErkJggg=="
@@ -252,6 +253,39 @@ class TestMediaArtifactProcessor(unittest.TestCase):
         self.assertEqual(artifacts[0].content_digest, digest)
         self.assertEqual(artifacts[0].feature, b"fresh")
         self.assertEqual(len(processor.batches), 1)
+
+    def test_without_cache_builds_request_local_artifacts_and_does_not_retain(self):
+        processor = _Processor()
+        digest = snapshot_media(b"image").content_digest
+        key = processor._artifact_key(digest, b"image")
+        cached = _Artifact(digest, key, 1, b"cached")
+        processor.mm_preprocess_cache.put(key, cached)
+
+        try:
+            artifacts = asyncio.run(
+                processor.prepare_media_artifacts_without_cache([b"image", b"image"])
+            )
+            cached_after = asyncio.run(processor.prepare_media_artifacts([b"image"]))
+        finally:
+            processor.close()
+
+        self.assertEqual([artifact.feature for artifact in artifacts], [b"image"] * 2)
+        self.assertEqual(len(processor.batches), 1)
+        self.assertEqual(len(processor.batches[0]), 2)
+        self.assertIs(cached_after[0], cached)
+
+    def test_without_cache_still_validates_caller_content_hash(self):
+        processor = _Processor()
+        try:
+            with self.assertRaisesRegex(ValueError, "content hash mismatch"):
+                asyncio.run(
+                    processor.prepare_media_artifacts_without_cache(
+                        [b"image"],
+                        content_hashes=[snapshot_media(b"different").content_digest],
+                    )
+                )
+        finally:
+            processor.close()
 
 
 if __name__ == "__main__":

@@ -156,10 +156,17 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
         if decode_cuda_graph_config.max_bs is None:
             decode_cuda_graph_config.max_bs = 160
 
+    from sglang.srt.arg_groups.model_overrides.qwen3_vl import (
+        expand_multimodal_decode_graph_to_running_limit,
+    )
+
+    expand_multimodal_decode_graph_to_running_limit(
+        server_args, decode_cuda_graph_config, gpu_mem
+    )
+
     # ------------------------------------------------------------------
     # CUDA graph batch-size materialization
     # ------------------------------------------------------------------
-
     if cfg.device != "cpu":
         if decode_cuda_graph_config.bs is None:
             decode_cuda_graph_config.bs = generate_decode_cuda_graph_batch_sizes(
