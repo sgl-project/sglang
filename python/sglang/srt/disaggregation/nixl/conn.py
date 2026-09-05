@@ -993,7 +993,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             peer_info.dst_homogeneous_mem_kind = dst_mem_kind
             peer_info.dcp_token_item_lens = self.prepare_dcp_token_item_lens(
-                dst_kv_item_lens
+                dst_kv_item_lens,
+                peer_info.dst_dcp_size,
             )
             return
 
@@ -1254,15 +1255,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 packed_src = self._pack_dcp_rank_once(
                                     pack_buffer,
                                     dst_info,
-                                    plan.src_token_indices,
+                                    plan.target_src_token_indices,
                                     packed_source_by_dcp_rank,
                                 )
-                                kv_xfer_handle = self.send_kvcache_dcp(
-                                    req.agent_name,
-                                    dst_info,
-                                    plan,
-                                    notif,
-                                    packed_src,
+                                handles.extend(
+                                    self.send_kvcache_dcp(
+                                        req.agent_name,
+                                        dst_info,
+                                        plan,
+                                        notif,
+                                        packed_src,
+                                    )
                                 )
                             elif (
                                 self.is_mla_backend
@@ -1701,12 +1704,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         token_item_lens = dst_info.dcp_token_item_lens
         assert token_item_lens is not None
+        num_target = len(self.kv_args.kv_data_ptrs) - self.kv_args.num_draft_entries
         rank_stride = pack_buffer.get_size() // dst_info.dst_dcp_size
         packed_source_by_dcp_rank[rank] = try_pack_dcp_src(
             pack_buffer=pack_buffer,
-            kv_data_ptrs=self.kv_args.kv_data_ptrs,
+            kv_data_ptrs=self.kv_args.kv_data_ptrs[:num_target],
             src_token_indices=src_token_indices,
-            token_item_lens=token_item_lens[: len(self.kv_args.kv_data_ptrs)],
+            token_item_lens=token_item_lens[:num_target],
             pack_offset_bytes=rank * rank_stride,
         )
         return packed_source_by_dcp_rank[rank]
@@ -1723,35 +1727,73 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             raise RuntimeError("Missing NIXL source KV memory kind")
         if dst_info.dst_homogeneous_mem_kind is None:
             raise RuntimeError("Missing NIXL destination KV memory kind")
-        if plan.src_token_indices.size == 0:
-            self.agent.send_notif(peer_name, notif.encode("ascii"))
-            return None
 
         token_item_lens = dst_info.dcp_token_item_lens
         assert token_item_lens is not None
+        num_draft = self.kv_args.num_draft_entries
+        num_target = len(self.kv_args.kv_data_ptrs) - num_draft
         dst_kv_ptrs = [
             dst_info.dst_kv_ptrs[dst_idx] for dst_idx in dst_info.dcp_dst_region_indices
         ]
-        src_kv_ptrs = self.kv_args.kv_data_ptrs
-        src_token_indices = plan.src_token_indices
-        if packed_src is not None:
-            src_kv_ptrs, src_token_indices = packed_src
-            token_item_lens = token_item_lens[: len(src_kv_ptrs)]
 
-        return self._send_kvcache_generic(
-            peer_name=peer_name,
-            src_data_ptrs=src_kv_ptrs,
-            dst_data_ptrs=dst_kv_ptrs,
-            item_lens=token_item_lens,
-            prefill_data_indices=src_token_indices,
-            dst_data_indices=plan.dst_token_indices,
-            dst_gpu_id=dst_info.gpu_id,
-            notif=notif,
-            src_mem_kind=self.src_mem_kind,
-            dst_mem_kind=dst_info.dst_homogeneous_mem_kind,
-            force_flat=True,
-            bypass_prepped=True,
-        )
+        parts = []
+        if plan.target_src_token_indices.size:
+            src_kv_ptrs = self.kv_args.kv_data_ptrs[:num_target]
+            src_token_indices = plan.target_src_token_indices
+            if packed_src is not None:
+                src_kv_ptrs, src_token_indices = packed_src
+            parts.append(
+                (
+                    src_kv_ptrs,
+                    dst_kv_ptrs[:num_target],
+                    token_item_lens[:num_target],
+                    src_token_indices,
+                    plan.target_dst_token_indices,
+                )
+            )
+        if num_draft > 0 and plan.draft_src_token_indices.size:
+            parts.append(
+                (
+                    self.kv_args.kv_data_ptrs[num_target:],
+                    dst_kv_ptrs[num_target:],
+                    token_item_lens[num_target:],
+                    plan.draft_src_token_indices,
+                    plan.draft_dst_token_indices,
+                )
+            )
+
+        if not parts:
+            self.agent.send_notif(peer_name, notif.encode("ascii"))
+            return []
+
+        handles = []
+        for part_idx, (
+            src_ptrs,
+            part_dst_ptrs,
+            part_item_lens,
+            src_indices,
+            dst_indices,
+        ) in enumerate(parts):
+            part_notif = (
+                notif if len(parts) == 1 else f"{notif}_part_{part_idx}_{len(parts)}"
+            )
+            handles.append(
+                self._send_kvcache_generic(
+                    peer_name=peer_name,
+                    src_data_ptrs=src_ptrs,
+                    dst_data_ptrs=part_dst_ptrs,
+                    item_lens=part_item_lens,
+                    prefill_data_indices=src_indices,
+                    dst_data_indices=dst_indices,
+                    dst_gpu_id=dst_info.gpu_id,
+                    notif=part_notif,
+                    src_mem_kind=self.src_mem_kind,
+                    dst_mem_kind=dst_info.dst_homogeneous_mem_kind,
+                    force_flat=True,
+                    bypass_prepped=True,
+                )
+            )
+        return handles
 
     def send_kvcache_mixed(
         self,
