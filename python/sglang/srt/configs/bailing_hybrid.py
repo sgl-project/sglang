@@ -244,9 +244,13 @@ class BailingMoeV3VLConfig(PretrainedConfig):
         **kwargs,
     ):
         if isinstance(vision_config, dict):
+            vision_config = dict(vision_config)
+            # The public Bailing checkpoint omits deepstack entirely. Do not
+            # inherit Qwen3-VL's architecture-specific deepstack defaults.
+            vision_config.setdefault("deepstack_visual_indexes", [])
             vision_config = Qwen3VLMoeVisionConfig(**vision_config)
         elif vision_config is None:
-            vision_config = Qwen3VLMoeVisionConfig()
+            vision_config = Qwen3VLMoeVisionConfig(deepstack_visual_indexes=[])
 
         if isinstance(text_config, dict):
             text_config = BailingHybridConfig(**text_config)

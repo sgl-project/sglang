@@ -42,6 +42,19 @@ from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
+_PUBLIC_VISION_PARAMETER_PREFIXES = (
+    "visual.patch_embed.",
+    "visual.pos_embed.",
+    "visual.blocks.",
+    "visual.merger.",
+)
+_NON_TEXT_PREFIX_MAPPING = (
+    ("model.visual.", "visual."),
+    ("linear_proj.", "linear_proj."),
+    # Compatibility with the private training-checkpoint wrapper.
+    ("model.linear_proj.", "linear_proj."),
+)
+
 
 class BailingMoeV3VLForConditionalGeneration(nn.Module):
     """Bailing MoE V3 language model with Qwen3 vision encoding."""
@@ -84,6 +97,9 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
 
         self.disable_merger_proj = getattr(
             config.vision_config, "disable_merger_proj", False
+        )
+        self.deepstack_visual_indexes = tuple(
+            getattr(config.vision_config, "deepstack_visual_indexes", None) or ()
         )
         self.vision_out_dim = (
             config.vision_config.hidden_size
@@ -134,9 +150,9 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
         else:
             vision_embeds = self.visual(pixel_values, grid_thw=grid_thw)
 
-        if self.config.vision_config.deepstack_visual_indexes:
+        if self.deepstack_visual_indexes:
             expected_dim = (
-                len(self.config.vision_config.deepstack_visual_indexes) + 1
+                len(self.deepstack_visual_indexes) + 1
             ) * self.vision_out_dim
             if vision_embeds.shape[-1] != expected_dim:
                 raise ValueError(
@@ -190,10 +206,14 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
         loaded_weight: torch.Tensor,
         params_dict: dict,
     ) -> Optional[str]:
-        if name.startswith("model.visual."):
-            name = name.replace("model.visual.", "visual.", 1)
-        elif name.startswith("model.linear_proj."):
-            name = name.replace("model.linear_proj.", "linear_proj.", 1)
+        # Public layout: model.visual.* for the encoder and top-level
+        # linear_proj.* for the bridge. Keep the private nested bridge alias.
+        for checkpoint_prefix, parameter_prefix in _NON_TEXT_PREFIX_MAPPING:
+            if name.startswith(checkpoint_prefix):
+                name = parameter_prefix + name[len(checkpoint_prefix) :]
+                break
+        else:
+            return None
         if name.startswith("visual."):
             name = name.replace("attn.qkv.", "attn.qkv_proj.")
         if name not in params_dict:
@@ -203,6 +223,29 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
         weight_loader(param, loaded_weight)
         return name
 
+    def _required_non_text_weights(self, params_dict: dict) -> Set[str]:
+        required_prefixes = list(_PUBLIC_VISION_PARAMETER_PREFIXES)
+        if self.deepstack_visual_indexes:
+            required_prefixes.append("visual.deepstack_merger_list.")
+        required_prefixes.append("linear_proj.")
+        return {
+            name
+            for name in params_dict
+            if self._build_mm_encoders and name.startswith(tuple(required_prefixes))
+        }
+
+    @staticmethod
+    def _map_text_weight_name(name: str) -> Optional[str]:
+        if name == "lm_head.weight":
+            return name
+        if not name.startswith("model.") or name.startswith(
+            ("model.visual.", "model.linear_proj.")
+        ):
+            return None
+        # The public checkpoint is already model.layers/model.norm/
+        # model.word_embeddings; retain the private model.model alias.
+        return name.replace("model.model.", "model.", 1)
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_non_text: Set[str] = set()
@@ -210,13 +253,9 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
 
         def dispatch_text_weights():
             for name, loaded_weight in weights:
-                is_text = (
-                    name.startswith("model.")
-                    and not name.startswith("model.visual.")
-                    and not name.startswith("model.linear_proj.")
-                ) or name == "lm_head.weight"
-                if is_text:
-                    yield name.replace("model.model.", "model.", 1), loaded_weight
+                text_name = self._map_text_weight_name(name)
+                if text_name is not None:
+                    yield text_name, loaded_weight
                     continue
                 loaded_name = self._load_non_text_weight(
                     name, loaded_weight, params_dict
@@ -227,12 +266,7 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
                     loaded_non_text.add(loaded_name)
 
         loaded_text = self.model.load_weights(dispatch_text_weights())
-        required_non_text = {
-            name
-            for name in params_dict
-            if self._build_mm_encoders
-            and (name.startswith("visual.") or name.startswith("linear_proj."))
-        }
+        required_non_text = self._required_non_text_weights(params_dict)
         missing_non_text = required_non_text - loaded_non_text
         if missing_non_text:
             raise RuntimeError(
