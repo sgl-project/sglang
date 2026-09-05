@@ -476,6 +476,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         context,
                         raw_request=raw_request,
                         priority=request.priority,
+                        max_tool_calls=request.max_tool_calls,
                     )
                     generators.append(generator)
             except ValueError as e:
@@ -2549,10 +2550,12 @@ class OpenAIServingResponses(OpenAIServingChat):
         context: ConversationContext,
         raw_request: Optional[Request] = None,
         priority: Optional[int] = None,
+        max_tool_calls: Optional[int] = None,
         **kwargs,
     ) -> AsyncGenerator[Any, None]:
         """Generate with builtin tool support for harmony-based models."""
         orig_priority = priority or 0
+        tool_call_count = 0
 
         while True:
             # Generate using SGLang's tokenizer manager
@@ -2568,9 +2571,12 @@ class OpenAIServingResponses(OpenAIServingChat):
             if not context.need_builtin_tool_call():
                 # The model did not ask for a tool call, so we're done.
                 break
+            if max_tool_calls is not None and tool_call_count >= max_tool_calls:
+                break
 
             # Call the tool and update the context with the result.
             tool_output = await context.call_tool()
+            tool_call_count += 1
             context.append_output(tool_output)
 
             # Prepare for the next generation turn
