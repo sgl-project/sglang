@@ -37,9 +37,7 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .route("/startup_ready", post(startup_ready))
 }
 
-/// Internal startup latch used by the Python launcher after warmup completes.
-/// It is intentionally separate from `/health_generate`: model_info and warmup
-/// traffic must work before this latch opens, while readiness probes must not.
+/// Only the launcher may publish readiness after warmup.
 async fn startup_ready(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let expected = state.server_args.startup_ready_token.as_str();
     let supplied = headers

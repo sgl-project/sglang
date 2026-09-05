@@ -14,7 +14,6 @@
 //! Keeping CPU-bound tokenize/detokenize off the async executor avoids stalling
 //! axum's worker threads.
 
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -223,7 +222,6 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     // Response heartbeat: bumped per drained frame, watched by `/health_generate`.
     let response_activity: tokenizer_manager::from_scheduler::ActivityCounter =
         Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let ready = Arc::new(AtomicBool::new(false));
 
     // --- Response dispatcher: drains from_scheduler channel → routes chunks to shards ---
     {
@@ -283,7 +281,6 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let api_cores = plan.as_ref().map(|p| p.api.clone());
         let senders = senders.clone();
         let response_activity = response_activity.clone();
-        let ready = ready.clone();
         let shutdown_rx = shutdown_rx.clone();
         // Bind synchronously so an unavailable port (EADDRINUSE) is a hard
         // startup error. The `?` drops `shutdown_tx`/`senders`, which stops the
@@ -315,7 +312,6 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                     cfg.server_args.clone(),
                     // Response heartbeat watched by `/health_generate`.
                     response_activity,
-                    ready,
                     shutdown_rx,
                 ))
             })
@@ -353,49 +349,17 @@ mod tests {
         }
     }
 
-    fn request(addr: SocketAddr, method: &str, path: &str) -> (u16, String) {
-        request_with_headers(addr, method, path, &[])
-    }
-
-    fn request_with_headers(
-        addr: SocketAddr,
-        method: &str,
-        path: &str,
-        headers: &[(&str, &str)],
-    ) -> (u16, String) {
-        let mut conn = std::net::TcpStream::connect(addr).expect("connect");
-        let extra_headers = headers
-            .iter()
-            .map(|(name, value)| format!("{name}: {value}\r\n"))
-            .collect::<String>();
-        let req = format!(
-            "{method} {path} HTTP/1.1\r\nHost: t\r\n{extra_headers}Content-Length: 0\r\n\
-             Connection: close\r\n\r\n",
-        );
-        conn.write_all(req.as_bytes()).unwrap();
-        conn.flush().unwrap();
-
+    fn request(addr: SocketAddr, method: &str, path: &str, token: Option<&str>) -> u16 {
+        let mut conn = std::net::TcpStream::connect(addr).unwrap();
+        conn.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let header = token
+            .map(|t| format!("X-SGLang-Startup-Token: {t}\r\n"))
+            .unwrap_or_default();
+        write!(conn, "{method} {path} HTTP/1.1\r\nHost: t\r\n{header}Content-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
         let mut response = String::new();
         conn.read_to_string(&mut response).unwrap();
-        let status = response
-            .split_whitespace()
-            .nth(1)
-            .expect("status line")
-            .parse()
-            .expect("status code");
-        (status, response)
-    }
-
-    fn empty_batch_frame() -> bytes::Bytes {
-        let header = rmpv::Value::Array(vec![
-            rmpv::Value::Array(vec![]),
-            rmpv::Value::Array(vec![]),
-            rmpv::Value::Array(vec![]),
-            rmpv::Value::Array(vec![]),
-        ]);
-        let mut buf = Vec::new();
-        rmpv::encode::write_value(&mut buf, &header).unwrap();
-        crate::message::response::frame_decode_batch_cols(&buf, &[])
+        response.split_whitespace().nth(1).unwrap().parse().unwrap()
     }
 
     /// Regression: `request_shutdown` must actually stop the API server — it joins
@@ -454,37 +418,22 @@ mod tests {
         };
         let rt = start(cfg).expect("start runtime");
 
-        assert_eq!(request(addr, "GET", "/health_generate").0, 503);
-        assert!(
-            rt.to_scheduler_rx.drain(1).headers.is_empty(),
-            "health before startup readiness must not enqueue a scheduler probe"
-        );
-
-        assert_eq!(request(addr, "POST", "/startup_ready").0, 401);
-        assert_eq!(
-            request_with_headers(
-                addr,
-                "POST",
-                "/startup_ready",
-                &[("X-SGLang-Startup-Token", "wrong-token")]
-            )
-            .0,
-            401
-        );
-        assert_eq!(
-            request_with_headers(
-                addr,
-                "POST",
-                "/startup_ready",
-                &[("X-SGLang-Startup-Token", &startup_ready_token)]
-            )
-            .0,
-            200
-        );
-        let health = std::thread::spawn(move || request(addr, "GET", "/health_generate").0);
+        for path in ["/health", "/health_generate"] {
+            assert_eq!(request(addr, "GET", path, None), 503);
+        }
+        assert!(rt.to_scheduler_rx.drain(1).headers.is_empty());
+        assert_eq!(request(addr, "GET", "/model_info", None), 200);
+        for (token, status) in [
+            (None, 401),
+            (Some("wrong-token"), 401),
+            (Some(startup_ready_token.as_str()), 200),
+        ] {
+            assert_eq!(request(addr, "POST", "/startup_ready", token), status);
+        }
+        let health = std::thread::spawn(move || request(addr, "GET", "/health_generate", None));
 
         let mut saw_probe = false;
-        for _ in 0..100 {
+        for _ in 0..500 {
             if !rt.to_scheduler_rx.drain(1).headers.is_empty() {
                 saw_probe = true;
                 break;
@@ -493,7 +442,9 @@ mod tests {
         }
         assert!(saw_probe, "ready health check did not reach the scheduler");
 
-        assert!(rt.from_scheduler_tx.try_push(empty_batch_frame()).is_ok());
+        let header = rmp_serde::to_vec(&vec![Vec::<u32>::new(); 4]).unwrap();
+        let frame = crate::message::response::frame_decode_batch_cols(&header, &[]);
+        assert!(rt.from_scheduler_tx.try_push(frame).is_ok());
         assert_eq!(health.join().unwrap(), 200);
 
         rt.request_shutdown();

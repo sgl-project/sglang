@@ -104,7 +104,7 @@ pub(super) fn app_state(senders: Senders) -> Arc<super::AppState> {
         server_args: server_args(),
         chat_formatter: None,
         response_activity: Default::default(),
-        ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        ready: std::sync::atomic::AtomicBool::new(true),
     })
 }
 

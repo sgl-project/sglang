@@ -28,7 +28,7 @@ pub(super) struct AppState {
     /// Response heartbeat (bumped per drained ring frame).
     pub(super) response_activity: ActivityCounter,
     /// Startup readiness, set only after the Python launcher finishes warmup.
-    pub(super) ready: Arc<AtomicBool>,
+    pub(super) ready: AtomicBool,
 }
 
 pub async fn serve(
@@ -37,7 +37,6 @@ pub async fn serve(
     response_buf: usize,
     server_args: Arc<ServerArgs>,
     response_activity: ActivityCounter,
-    ready: Arc<AtomicBool>,
     // The runtime's shutdown signal, shared with every worker stage: it fires
     // (disconnects) when `Runtime::request_shutdown` drops the sender, at
     // which point `serve` stops accepting and its in-flight handlers are
@@ -51,7 +50,7 @@ pub async fn serve(
         server_args: server_args.clone(),
         chat_formatter,
         response_activity,
-        ready,
+        ready: AtomicBool::new(false),
     });
     // Each endpoint module registers its own routes and merges here.
     let router = Router::new()

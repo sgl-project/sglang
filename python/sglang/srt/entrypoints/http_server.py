@@ -2155,11 +2155,23 @@ def _get_vlm_warmup_image_base64(model_info: dict) -> str:
     return MINIMUM_PNG_PICTURE_BASE64
 
 
-async def _send_disaggregation_warmup_requests(
-    url: str,
+def _server_warmup_urls(server_args: ServerArgs) -> List[str]:
+    # Rust DP ranks have separate listeners; Python routes ranks on one listener.
+    return [
+        server_args.url(port=get_serving().port + rank)
+        if envs.SGLANG_RUST_SERVER.get()
+        else server_args.url()
+        for rank in range(get_parallel().dp_size)
+    ]
+
+
+async def _send_warmup_requests(
+    urls: List[str],
     headers: Dict[str, str],
     ssl_verify: Union[bool, str],
     timeout: int,
+    json_data: Optional[Dict] = None,
+    request_name: str = "/generate",
 ) -> List[int]:
     ssl_context = (
         ssl_verify
@@ -2168,19 +2180,23 @@ async def _send_disaggregation_warmup_requests(
     )
 
     async def send_request(session: aiohttp.ClientSession, dp_rank: int) -> int:
-        json_data = {
-            "sampling_params": {
-                "temperature": 0.0,
-                "max_new_tokens": 8,
-                "ignore_eos": True,
-            },
-            "bootstrap_host": FAKE_BOOTSTRAP_HOST,
-            "bootstrap_room": dp_rank,
-            "input_ids": [10, 11, 12, 13],
-            "routed_dp_rank": dp_rank,
-        }
+        payload = (
+            json_data
+            if json_data is not None
+            else {
+                "sampling_params": {
+                    "temperature": 0.0,
+                    "max_new_tokens": 8,
+                    "ignore_eos": True,
+                },
+                "bootstrap_host": FAKE_BOOTSTRAP_HOST,
+                "bootstrap_room": dp_rank,
+                "input_ids": [10, 11, 12, 13],
+                "routed_dp_rank": dp_rank,
+            }
+        )
         async with session.post(
-            url + "/generate", json=json_data, ssl=ssl_context
+            urls[dp_rank] + request_name, json=payload, ssl=ssl_context
         ) as response:
             await response.read()
             return response.status
@@ -2190,10 +2206,7 @@ async def _send_disaggregation_warmup_requests(
         headers=headers,
     ) as session:
         return await asyncio.gather(
-            *(
-                send_request(session, dp_rank)
-                for dp_rank in range(get_parallel().dp_size)
-            )
+            *(send_request(session, dp_rank) for dp_rank in range(len(urls)))
         )
 
 
@@ -2250,10 +2263,11 @@ def _execute_server_warmup(server_args: ServerArgs):
             "max_new_tokens": max_new_tokens,
         },
     }
+    batch_size = 1 if envs.SGLANG_RUST_SERVER.get() else get_parallel().dp_size
     if server_args.skip_tokenizer_init:
-        json_data["input_ids"] = [[10, 11, 12] for _ in range(get_parallel().dp_size)]
+        json_data["input_ids"] = [[10, 11, 12] for _ in range(batch_size)]
         # TODO Workaround the bug that embedding errors for list of size 1
-        if get_parallel().dp_size == 1:
+        if batch_size == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
     elif (
         is_vlm
@@ -2297,9 +2311,9 @@ def _execute_server_warmup(server_args: ServerArgs):
             "temperature": 0.0,
         }
     else:
-        json_data["text"] = ["The capital city of France is"] * get_parallel().dp_size
+        json_data["text"] = ["The capital city of France is"] * batch_size
         # TODO Workaround the bug that embedding errors for list of size 1
-        if get_parallel().dp_size == 1:
+        if batch_size == 1:
             json_data["text"] = json_data["text"][0]
 
     # Config debug dumping
@@ -2310,10 +2324,11 @@ def _execute_server_warmup(server_args: ServerArgs):
         ).tolist()
         json_data["sampling_params"]["max_new_tokens"] = 0
 
-    # Send a warmup request
+    # Send a warmup request to every rank concurrently for DP attention.
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
+    is_disaggregation = get_disagg().disaggregation_mode != "null"
     try:
-        if get_disagg().disaggregation_mode == "null":
+        if not is_disaggregation and not envs.SGLANG_RUST_SERVER.get():
             res = requests.post(
                 url + request_name,
                 json=json_data,
@@ -2321,42 +2336,30 @@ def _execute_server_warmup(server_args: ServerArgs):
                 timeout=warmup_timeout if warmup_timeout > 0 else 600,
                 verify=ssl_verify,
             )
-            assert res.status_code == 200, f"{res.text}"
-            # Skip server_status update for Rust server
-            if not envs.SGLANG_RUST_SERVER.get():
-                _global_state.tokenizer_manager.server_status = ServerStatus.Up
-
+            assert res.status_code == 200, res.text
+            status_codes = [res.status_code]
         else:
-            logger.info(f"Start of pd disaggregation warmup ...")
             status_codes = asyncio.run(
-                _send_disaggregation_warmup_requests(
-                    url=url,
+                _send_warmup_requests(
+                    urls=_server_warmup_urls(server_args),
                     headers=headers,
                     ssl_verify=ssl_verify,
-                    timeout=warmup_timeout if warmup_timeout > 0 else 1800,
+                    timeout=(
+                        warmup_timeout
+                        if warmup_timeout > 0
+                        else (1800 if is_disaggregation else 600)
+                    ),
+                    json_data=None if is_disaggregation else json_data,
+                    request_name="/generate" if is_disaggregation else request_name,
                 )
             )
-            failed_status_codes = [code for code in status_codes if code != 200]
-            if not failed_status_codes:
-                logger.info(
-                    "Disaggregation warmup requests completed for all %s DP ranks",
-                    get_parallel().dp_size,
-                )
-                logger.info("End of disaggregation warmup")
-            else:
-                logger.info(
-                    "Disaggregation warmup failed (mode=%s), status codes: %s",
-                    get_disagg().disaggregation_mode,
-                    failed_status_codes,
-                )
-            # In rust-server mode there is no TokenizerManager (readiness is
-            # the Rust server's own /health), so skip the status update.
-            if not envs.SGLANG_RUST_SERVER.get():
-                _global_state.tokenizer_manager.server_status = (
-                    ServerStatus.Up
-                    if not failed_status_codes
-                    else ServerStatus.UnHealthy
-                )
+        success = all(code == 200 for code in status_codes)
+        if not envs.SGLANG_RUST_SERVER.get():
+            _global_state.tokenizer_manager.server_status = (
+                ServerStatus.Up if success else ServerStatus.UnHealthy
+            )
+        if not success:
+            raise RuntimeError(f"Warmup failed: {status_codes}")
 
     except Exception:
         last_traceback = get_exception_traceback()
@@ -2397,13 +2400,14 @@ def _mark_rust_server_ready(server_args: ServerArgs, port_args: PortArgs) -> boo
     if ready_key:
         headers["Authorization"] = f"Bearer {ready_key}"
     try:
-        res = requests.post(
-            server_args.url() + "/startup_ready",
-            headers=headers,
-            timeout=10,
-            verify=ssl_verify_of(server_args),
-        )
-        res.raise_for_status()
+        for url in _server_warmup_urls(server_args):
+            res = requests.post(
+                url + "/startup_ready",
+                headers=headers,
+                timeout=10,
+                verify=ssl_verify_of(server_args),
+            )
+            res.raise_for_status()
         return True
     except requests.exceptions.RequestException:
         logger.error("failed to mark Rust server ready", exc_info=True)
@@ -2852,11 +2856,7 @@ def launch_server(
     )
 
     if envs.SGLANG_RUST_SERVER.get():
-        # The Rust server serves api-server, tokenizer, and detokenizer, so the
-        # main process has no Python HTTP server / tokenizer manager to run.
-        # Run a warmup /generate before advertising readiness: the Rust /health
-        # binds before any forward pass, so without this the first real request
-        # pays the cold-start cost (observed as a >60s first generation).
+        # Rust listeners accept warmup traffic before advertising readiness.
         if not get_serving().skip_server_warmup and not _execute_server_warmup(
             server_args
         ):
