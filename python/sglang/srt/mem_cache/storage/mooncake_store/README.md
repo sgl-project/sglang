@@ -315,6 +315,25 @@ python -m sglang.launch_server \
     --hicache-storage-backend-extra-config '{"master_server_address": "127.0.0.1:50051", "enable_group_semantics": true}'
 ```
 
+**Process-local placement (`process_local_first`):**
+
+When multiple SGLang processes on the same host each contribute a Mooncake segment,
+set `process_local_first` to `true` to prefer the segment registered by the writing
+process. If that segment cannot satisfy an allocation, Mooncake falls back to its
+configured allocation strategy.
+
+This option is disabled by default and is only meaningful when the SGLang process
+contributes storage. It is incompatible with `standalone_storage` and requires a
+Mooncake version that exposes `ReplicateConfig.preferred_segments`.
+
+```bash
+python -m sglang.launch_server \
+    --enable-hierarchical-cache \
+    --hicache-storage-backend mooncake \
+    --model-path [model_path] \
+    --hicache-storage-backend-extra-config '{"master_server_address": "127.0.0.1:50051", "process_local_first": true}'
+```
+
 **HiCache Related Parameters for SGLang Server**
 
 For a comprehensive overview of HiCache-related parameters, please refer to [this document](https://docs.sglang.io/advanced_features/hicache_design.html#related-parameters).

@@ -18,10 +18,21 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 class ReplicateConfigWithGroupIds:
     def __init__(self):
         self.group_ids = None
+        self.preferred_segments = []
 
 
 class ReplicateConfigWithoutGroupIds:
-    __slots__ = ()
+    __slots__ = ("preferred_segments",)
+
+    def __init__(self):
+        self.preferred_segments = []
+
+
+class ReplicateConfigWithoutPreferredSegments:
+    __slots__ = ("group_ids",)
+
+    def __init__(self):
+        self.group_ids = None
 
 
 class ReplicateConfigWithClassGroupIdsAndRequiredInit:
@@ -85,6 +96,9 @@ def _fake_store_class():
 
         def setup(self, *args, **kwargs):
             return 0
+
+        def get_hostname(self):
+            return "writer-segment"
 
         def register_buffer(self, *args, **kwargs):
             return 0
@@ -199,6 +213,7 @@ class FakeMultiBufferPool:
 def _make_config(
     *,
     enable_group_semantics=True,
+    process_local_first=False,
     extra_backend_tag=None,
     model_name=None,
     is_mla_model=False,
@@ -212,6 +227,7 @@ def _make_config(
         "check_server": False,
         "global_segment_size": 1024 * 1024,
         "enable_group_semantics": enable_group_semantics,
+        "process_local_first": process_local_first,
     }
     if extra_backend_tag is not None:
         extra_config["extra_backend_tag"] = extra_backend_tag
@@ -236,6 +252,7 @@ def _make_config(
 def _make_store(
     *,
     enable_group_semantics=True,
+    process_local_first=False,
     replicate_config_cls=ReplicateConfigWithGroupIds,
     extra_backend_tag=None,
     model_name=None,
@@ -248,6 +265,7 @@ def _make_store(
     fake_store_cls = _fake_store_class()
     cfg = _make_config(
         enable_group_semantics=enable_group_semantics,
+        process_local_first=process_local_first,
         extra_backend_tag=extra_backend_tag,
         model_name=model_name,
         is_mla_model=is_mla_model,
@@ -291,7 +309,7 @@ class TestMooncakeGroupSemantics(CustomTestCase):
             )
 
             replicate_config_cls, supports_group_ids = (
-                MooncakeBaseStore()._import_mooncake_group_semantics()
+                MooncakeBaseStore()._import_mooncake_replicate_config()
             )
 
         self.assertIs(
@@ -351,6 +369,25 @@ class TestMooncakeGroupSemantics(CustomTestCase):
 
         self.assertEqual(result, [True])
         self.assertEqual(fake_store.batch_put_calls[0]["args"], ())
+
+    def test_process_local_first_does_not_require_group_ids(self):
+        store, fake_store = _make_store(
+            enable_group_semantics=False,
+            process_local_first=True,
+            replicate_config_cls=ReplicateConfigWithoutGroupIds,
+        )
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+
+        self.assertEqual(store.batch_set_v1(["page0"], torch.tensor([0])), [True])
+        config = fake_store.batch_put_calls[0]["args"][0]
+        self.assertEqual(config.preferred_segments, ["writer-segment"])
+
+    def test_process_local_first_requires_mooncake_support(self):
+        with self.assertRaisesRegex(RuntimeError, "ReplicateConfig.preferred_segments"):
+            _make_store(
+                process_local_first=True,
+                replicate_config_cls=ReplicateConfigWithoutPreferredSegments,
+            )
 
     def test_mla_group_ids(self):
         store, fake_store = _make_store(is_mla_model=True)
@@ -423,8 +460,12 @@ class TestMooncakeGroupSemantics(CustomTestCase):
             ["sglang-hicache:tag_page0", "sglang-hicache:tag_page1"],
         )
 
-    def test_v2_multi_buffer_put_passes_group_ids(self):
-        store, fake_store = _make_store(extra_backend_tag="tag", is_mla_model=True)
+    def test_v2_multi_buffer_put_combines_group_ids_and_preferred_segment(self):
+        store, fake_store = _make_store(
+            extra_backend_tag="tag",
+            is_mla_model=True,
+            process_local_first=True,
+        )
         multi_buffer_pool = FakeMultiBufferPool()
         store.register_mem_host_pool_v2(multi_buffer_pool, PoolName.DEEPSEEK_V4_C4)
 
@@ -451,6 +492,7 @@ class TestMooncakeGroupSemantics(CustomTestCase):
             call["args"][0].group_ids,
             ["sglang-hicache:tag_page0", "sglang-hicache:tag_page1"],
         )
+        self.assertEqual(call["args"][0].preferred_segments, ["writer-segment"])
 
     def test_model_names_isolate_the_same_logical_key(self):
         store_a, fake_store_a = _make_store(
