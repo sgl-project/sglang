@@ -371,8 +371,10 @@ class JoyTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.hidden_size = config.hidden_size
         self.num_attention_heads = config.num_attention_heads
         self.rope_dim_list = config.rope_dim_list
-        self.mm_double_blocks_depth = config.mm_double_blocks_depth
-        self.rope_theta = config.rope_theta
+        self.mm_double_blocks_depth = getattr(
+            config, "num_layers", config.mm_double_blocks_depth
+        )
+        self.rope_theta = getattr(config, "theta", config.rope_theta)
         self.quant_config = quant_config
         self.num_channels_latents = self.out_channels
 
@@ -393,7 +395,7 @@ class JoyTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.condition_embedder = WanTimeTextImageEmbedding(
             dim=self.hidden_size,
             time_freq_dim=config.freq_dim,
-            text_embed_dim=config.text_states_dim,
+            text_embed_dim=getattr(config, "text_dim", config.text_states_dim),
         )
 
         # Double blocks (DiT layers)
@@ -428,7 +430,7 @@ class JoyTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.sp_size = get_sp_world_size()
         self.rotary_emb = NDRotaryEmbedding(
             rope_dim_list=config.rope_dim_list,
-            rope_theta=config.rope_theta,
+            rope_theta=self.rope_theta,
             dtype=torch.float32,
         )
 
