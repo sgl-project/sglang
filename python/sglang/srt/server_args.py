@@ -2175,6 +2175,12 @@ class ServerArgs:
         "Use rejection sampling for speculative decoding (requires topk=1).",
         NS("spec"),
     ] = False
+    speculative_draft_local_argmax: A[
+        bool,
+        "For greedy EAGLE/NEXTN drafting with tensor parallelism, reduce one "
+        "local maximum per rank instead of gathering the full vocabulary logits.",
+        NS("spec"),
+    ] = False
     speculative_token_map: A[
         Optional[str], "The path of the draft model's small vocab table.", NS("spec")
     ] = None

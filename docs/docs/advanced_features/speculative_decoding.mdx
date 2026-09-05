@@ -202,6 +202,11 @@ To enable EAGLE speculative decoding the following parameters are relevant:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>1.0</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-draft-local-argmax</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>For supported DeepSeek/GLM NextN models with greedy TP drafting, skip the full-vocabulary all-gather and reduce one local maximum per rank. This opt-in path targets high-batch workloads; incompatible configurations fall back to the ordinary logits path.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>False</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-attention-mode</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Attention mode for speculative operations (<code>prefill</code> or <code>decode</code>), affecting both target verification and draft extension.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"prefill"</code></td>

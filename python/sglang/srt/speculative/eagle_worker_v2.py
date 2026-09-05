@@ -190,6 +190,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
+        self._draft_vocab_parallel_argmax = getattr(
+            self.draft_runner.model, "_draft_vocab_parallel_argmax_fn", None
+        )
         self._init_dsa_index_share_state()
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
@@ -199,6 +202,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.tree_mask_mode = default_tree_mask_mode()
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+
+    def _local_argmax_proposal(
+        self,
+        local_logits: torch.Tensor,
+        positions: Optional[torch.Tensor] = None,
+        token_buffer: Optional[torch.Tensor] = None,
+        token_column: int = 0,
+    ):
+        topk_index = self._draft_vocab_parallel_argmax(local_logits)
+        topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+        if positions is not None:
+            positions.add_(1)
+        if token_buffer is not None:
+            token_buffer[:, token_column].copy_(topk_index.flatten())
+        return topk_p, topk_index
 
     def alloc_memory_pool(
         self,
@@ -689,6 +707,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     draft_probs_list.append(probs)
                     forward_batch.positions.add_(1)
+                elif self._draft_vocab_parallel_argmax is not None:
+                    topk_p, topk_index = self._local_argmax_proposal(
+                        logits_output.next_token_logits,
+                        forward_batch.positions,
+                        draft_tokens_topk1,
+                        i + 1,
+                    )
                 elif self.topk == 1 and not _is_hip:
                     if _is_cuda:
                         topk_p, topk_index = draft_topk1_postprocess(
@@ -711,11 +736,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
                     forward_batch.positions.add_(1)
+                output_vocab_size = (
+                    self.draft_runner.model.config.vocab_size
+                    if self._draft_vocab_parallel_argmax is not None
+                    else logits_output.next_token_logits.shape[-1]
+                )
                 maybe_detect_oob(
                     topk_index,
                     0,
-                    logits_output.next_token_logits.shape[-1],
-                    f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+                    output_vocab_size,
+                    f"draft_forward step {i}: topk_index OOB vs vocab_size={output_vocab_size}",
                 )
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]
@@ -876,15 +906,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Assemble the next-iter draft spec_info from the extend output.
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-        probs = renorm_draft_probs(
-            logits_output.next_token_logits,
-            batch.sampling_info,
-            use_rejection_sampling,
-        )
-        if use_rejection_sampling:
-            topk_p, topk_index = fast_sample(probs, num_samples=1)
+        if self._draft_vocab_parallel_argmax is not None:
+            probs = None
+            topk_p, topk_index = self._local_argmax_proposal(
+                logits_output.next_token_logits
+            )
         else:
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            probs = renorm_draft_probs(
+                logits_output.next_token_logits,
+                batch.sampling_info,
+                use_rejection_sampling,
+            )
+            if use_rejection_sampling:
+                topk_p, topk_index = fast_sample(probs, num_samples=1)
+            else:
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         return EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
@@ -1025,6 +1061,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output.next_token_logits,
                 batch.sampling_info.temperatures,
             )
+        elif self._draft_vocab_parallel_argmax is not None:
+            ret_topk_p, ret_topk_index = self._local_argmax_proposal(
+                draft_logits_output.next_token_logits
+            )
+            ret_draft_probs = None
         elif self.topk == 1 and not _is_hip:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
             # MTP draft selection on FP8 logits.

@@ -155,6 +155,53 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
     return True
 
 
+def _vocab_parallel_argmax(
+    local_logits: torch.Tensor,
+    valid_vocab_size: int,
+    global_vocab_start: int,
+    tp_group,
+) -> torch.Tensor:
+    """Return global greedy ids without gathering every vocabulary logit.
+
+    Values and ids share one FP32 collective.  FP32 represents every integer
+    vocabulary id below 2**24 exactly, which covers the model configurations
+    admitted by the draft-model construction gate.
+    """
+    max_exact_fp32_id = 2**24 - 1
+    output_shape = local_logits.shape[:-1]
+    if valid_vocab_size:
+        local_values, local_ids = local_logits[..., :valid_vocab_size].max(dim=-1)
+        local_ids = local_ids.add(global_vocab_start)
+    else:
+        local_values = local_logits.new_full(output_shape, float("-inf"))
+        local_ids = torch.full(
+            output_shape,
+            max_exact_fp32_id,
+            dtype=torch.long,
+            device=local_logits.device,
+        )
+
+    if tp_group.world_size == 1:
+        return local_ids.unsqueeze(-1)
+
+    local_pair = torch.stack((local_values.float(), local_ids.float()), dim=-1)
+    gathered_pairs = tp_group.all_gather(local_pair, dim=-1).reshape(
+        *output_shape, tp_group.world_size, 2
+    )
+    gathered_values = gathered_pairs[..., 0]
+    gathered_ids = gathered_pairs[..., 1]
+    max_values = gathered_values.max(dim=-1, keepdim=True).values
+    return (
+        torch.where(
+            gathered_values == max_values,
+            gathered_ids,
+            max_exact_fp32_id,
+        )
+        .min(dim=-1, keepdim=True)
+        .values.long()
+    )
+
+
 # FlashInfer autotune skips the unprofiled LM-head all-gather; its
 # [batch * dp_size, vocab] output can OOM under tight DP-attention memory.
 _in_autotune_dummy_run = False
@@ -424,6 +471,17 @@ class LogitsProcessor(nn.Module):
         )
 
         self.input_logprob_processor = InputLogprobProcessor()
+
+    def _vocab_parallel_argmax(
+        self, local_logits: torch.Tensor, lm_head: VocabParallelEmbedding
+    ) -> torch.Tensor:
+        shard = lm_head.shard_indices
+        return _vocab_parallel_argmax(
+            local_logits,
+            shard.num_org_elements,
+            shard.org_vocab_start_index,
+            get_tp_group(),
+        )
 
     def forward(
         self,
