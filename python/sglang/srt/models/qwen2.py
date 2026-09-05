@@ -20,6 +20,7 @@ import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.distributed import (
@@ -51,7 +52,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, get_bool_env_var, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 Qwen2Config = None
@@ -203,10 +204,127 @@ class Qwen2Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        is_last_layer: bool = False,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
+
+        can_optimize = (
+            is_last_layer
+            and forward_batch.forward_mode.is_extend()
+            and forward_batch.extend_seq_lens is not None
+            and q.shape[0] >= 2048
+            and not forward_batch.return_logprob
+            and not (
+                forward_batch.capture_hidden_mode
+                and forward_batch.capture_hidden_mode.is_full()
+            )
+            and not (
+                forward_batch.spec_info
+                and getattr(forward_batch.spec_info, "is_ragged_verify", False)
+            )
+            and not get_bool_env_var("SGLANG_DISABLE_FINAL_LAYER_OPT", "false")
+            and not (
+                torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+            )
+        )
+
+        if can_optimize:
+            # 1. Save KV cache into SGLang memory pool for subsequent decode steps
+            try:
+                self.attn.save_kv_cache_only(k, v, forward_batch)
+            except Exception:
+                _ = self.attn(q, k, v, forward_batch, save_kv_cache=True)
+
+            # 2. Compute Single-Query Attention on terminal token(s)
+            num_groups = self.num_heads // self.num_kv_heads
+            if forward_batch.extend_seq_lens.shape[0] == 1:
+                # Optimized fast path for single sequence (B=1)
+                q_b = q[-1:].view(1, 1, self.num_heads, self.head_dim).transpose(1, 2)
+                k_b = k.view(1, -1, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                v_b = v.view(1, -1, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                try:
+                    attn_output = (
+                        F.scaled_dot_product_attention(
+                            q_b,
+                            k_b,
+                            v_b,
+                            is_causal=False,
+                            scale=self.scaling,
+                            enable_gqa=(num_groups > 1),
+                        )
+                        .transpose(1, 2)
+                        .reshape(1, -1)
+                    )
+                except TypeError:
+                    if num_groups > 1:
+                        k_b = k_b.repeat_interleave(num_groups, dim=1)
+                        v_b = v_b.repeat_interleave(num_groups, dim=1)
+                    attn_output = (
+                        F.scaled_dot_product_attention(
+                            q_b, k_b, v_b, is_causal=False, scale=self.scaling
+                        )
+                        .transpose(1, 2)
+                        .reshape(1, -1)
+                    )
+            else:
+                last_token_indices = (
+                    torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+                )
+                start_indices = torch.cat(
+                    [
+                        torch.zeros(1, dtype=torch.long, device=q.device),
+                        last_token_indices[:-1] + 1,
+                    ]
+                )
+                outs = []
+                for start_idx, end_idx in zip(start_indices, last_token_indices + 1):
+                    q_b = (
+                        q[end_idx - 1 : end_idx]
+                        .view(1, 1, self.num_heads, self.head_dim)
+                        .transpose(1, 2)
+                    )
+                    k_b = (
+                        k[start_idx:end_idx]
+                        .view(1, -1, self.num_kv_heads, self.head_dim)
+                        .transpose(1, 2)
+                    )
+                    v_b = (
+                        v[start_idx:end_idx]
+                        .view(1, -1, self.num_kv_heads, self.head_dim)
+                        .transpose(1, 2)
+                    )
+                    try:
+                        out_b = (
+                            F.scaled_dot_product_attention(
+                                q_b,
+                                k_b,
+                                v_b,
+                                is_causal=False,
+                                scale=self.scaling,
+                                enable_gqa=(num_groups > 1),
+                            )
+                            .transpose(1, 2)
+                            .reshape(1, -1)
+                        )
+                    except TypeError:
+                        if num_groups > 1:
+                            k_b = k_b.repeat_interleave(num_groups, dim=1)
+                            v_b = v_b.repeat_interleave(num_groups, dim=1)
+                        out_b = (
+                            F.scaled_dot_product_attention(
+                                q_b, k_b, v_b, is_causal=False, scale=self.scaling
+                            )
+                            .transpose(1, 2)
+                            .reshape(1, -1)
+                        )
+                    outs.append(out_b)
+                attn_output = torch.cat(outs, dim=0)
+
+            output, _ = self.o_proj(attn_output)
+            return output
+
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
@@ -286,8 +404,64 @@ class Qwen2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        is_last_layer: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
+        is_extend_mode = forward_batch.forward_mode.is_extend()
+        can_optimize_last_layer = (
+            is_last_layer
+            and is_extend_mode
+            and forward_batch.extend_seq_lens is not None
+            and hidden_states.shape[0] >= 2048
+            and not forward_batch.return_logprob
+            and not (
+                forward_batch.capture_hidden_mode
+                and forward_batch.capture_hidden_mode.is_full()
+            )
+            and not (
+                forward_batch.spec_info
+                and getattr(forward_batch.spec_info, "is_ragged_verify", False)
+            )
+            and not get_bool_env_var("SGLANG_DISABLE_FINAL_LAYER_OPT", "false")
+            and not (
+                torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+            )
+        )
+
+        if can_optimize_last_layer:
+            # Self Attention
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(
+                    hidden_states, quant_linear=self.self_attn.qkv_proj
+                )
+            else:
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual, quant_linear=self.self_attn.qkv_proj
+                )
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                is_last_layer=True,
+            )
+
+            # Slice residual connection to terminal tokens to match hidden_states
+            if forward_batch.extend_seq_lens.shape[0] == 1:
+                residual = residual[-1:]
+            else:
+                last_token_indices = (
+                    torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+                )
+                residual = residual[last_token_indices]
+
+            # Fully Connected on terminal tokens only
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual, quant_linear=self.mlp.gate_up_proj
+            )
+            hidden_states = self.mlp(hidden_states)
+            return hidden_states, residual
+
+        # Standard execution path
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(
@@ -419,11 +593,13 @@ class Qwen2Model(nn.Module):
                     hidden_states + residual if residual is not None else hidden_states
                 )
             layer = self.layers[i]
+            is_last_layer = (i == self.end_layer - 1) and self.pp_group.is_last_rank
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 forward_batch,
                 residual,
+                is_last_layer=is_last_layer,
             )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
