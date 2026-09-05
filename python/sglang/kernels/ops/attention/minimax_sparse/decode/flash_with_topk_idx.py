@@ -7,6 +7,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_xpu
 
 from ..common.utils import (
     _bitonic_merge,
@@ -1004,7 +1005,12 @@ def flash_decode_with_topk_idx(
         # Equivalent output to the 2-stage path (set of block ids, front-packed,
         # -1 padded); ~2-16x faster for long context. See
         # sglang/kernels/ops/attention/minimax_decode_topk.py.
-        from sglang.kernels.ops.attention.minimax_decode_topk import minimax_decode_topk
+        if is_xpu():
+            from sgl_kernel import minimax_decode_topk
+        else:
+            from sglang.kernels.ops.attention.minimax_decode_topk import (
+                minimax_decode_topk,
+            )
 
         minimax_decode_topk(score, seq_lens, block_size, topk, out=topk_idx)
     else:
