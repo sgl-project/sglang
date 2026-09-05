@@ -423,17 +423,19 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
                 server_based_warmup=True,
             )
 
-        self.assertEqual(len(reqs), 1)
+        # the bounded warmup runs first so the worker can size the probe
+        self.assertEqual(len(reqs), 2)
+        self.assertFalse(reqs[0].extra.get("auto_residency_full_shape_probe"))
         self.assertEqual(
-            (reqs[0].width, reqs[0].height, reqs[0].num_frames),
+            (reqs[1].width, reqs[1].height, reqs[1].num_frames),
             (1280, 720, 81),
         )
-        self.assertTrue(reqs[0].extra["auto_residency_full_shape_probe"])
-        self.assertFalse(reqs[0].metrics.suppress_stage_breakdown)
-        self.assertEqual(reqs[0].num_inference_steps, 4)
+        self.assertTrue(reqs[1].extra["auto_residency_full_shape_probe"])
+        self.assertFalse(reqs[1].metrics.suppress_stage_breakdown)
+        self.assertEqual(reqs[1].num_inference_steps, 4)
         self.assertIn(
             "auto residency probe (1280x720x81f, 4/35 steps)",
-            format_warmup_req(reqs[0]),
+            format_warmup_req(reqs[1]),
         )
 
     def test_server_based_warmup_uses_model_default_resolution(self):
