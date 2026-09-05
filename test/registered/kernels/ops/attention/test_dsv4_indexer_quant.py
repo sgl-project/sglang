@@ -17,19 +17,22 @@ branches introduced by the scheduling optimization.
 from __future__ import annotations
 
 import pytest
+import sgl_kernel  # noqa: F401  the ROCm path dispatches to torch.ops.sgl_kernel
 import torch
 
 from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_first_quant,
     fused_q_indexer_rope_hadamard_quant,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 _is_hip = is_hip()
 
 register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=45, suite="jit-kernel-unit-test-amd")
+# the mi35x suite rather than the default AMD one: the ROCm case below is gfx95-only, and
+# everything else in here skips on HIP, so the mi300 registration only ever produced skips
+register_amd_ci(est_time=45, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 HEAD_DIM = 128
 ROPE_DIM = 64
@@ -45,10 +48,10 @@ N_HEADS = 64
 BATCHES = [1, 8, 64, 256, 512, 2048]
 
 
-def _skip_if_unavailable():
+def _skip_if_unavailable(hip_ok=False):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    if _is_hip:
+    if _is_hip and not hip_ok:
         pytest.skip("Indexer fused Q kernel is CUDA-specific")
 
 
@@ -73,7 +76,14 @@ def _fp8_dequant_ok(q_fp8, ref, scale):
 @pytest.mark.parametrize("pos_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("batch", BATCHES)
 def test_v4_rope_hadamard_quant_matches_reference(batch, pos_dtype):
-    _skip_if_unavailable()
+    # runs on gfx95 too: elementwise.py routes this one to the AOT op there, and that op
+    # carries its own copy of the cast, so this is the only coverage it gets
+    _skip_if_unavailable(hip_ok=True)
+    if _is_hip:
+        if not is_gfx95_supported():
+            pytest.skip("gfx942 keeps the software cast in the AOT copy")
+        if pos_dtype is torch.int64:
+            pytest.skip("the ROCm AOT op takes int32 positions only")
     dev = "cuda"
     g = torch.Generator(device=dev).manual_seed(0)
     q = torch.randn(
@@ -157,6 +167,9 @@ def test_v32_rope_first_quant_matches_reference(batch):
 # Strided weight (the non-contiguous wk slice) matches contiguous (V4 path).
 # ----------------------------------------------------------------------------
 def test_v4_strided_weight_matches_contiguous():
+    # stays CUDA-only. the ROCm op reads the weight linearly, so a non-contiguous slice
+    # comes out wrong there -- unrelated to the cast, and latent, since the indexer hands
+    # it the contiguous weights_proj output
     _skip_if_unavailable()
     dev = "cuda"
     B = 512  # grid-stride regime
