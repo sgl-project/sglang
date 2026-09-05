@@ -42,6 +42,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.layout.page_major import paged_view
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -1403,12 +1404,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 k_cache_raw, v_cache_raw, layer, layer.head_dim
             )
         else:
-            k_cache = k_cache_raw.view(
-                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-            )
-            v_cache = v_cache_raw.view(
-                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
-            )
+            k_cache = paged_view(k_cache_raw, self.page_size)
+            v_cache = paged_view(v_cache_raw, self.page_size)
 
         kv_cache = (k_cache, v_cache)
         # sink: additional value per head in the denominator of the softmax.

@@ -62,6 +62,7 @@ from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.mem_cache.layout.page_major import (
     build_page_major_mamba_views,
     mamba_entry_bytes,
+    paged_view,
 )
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
@@ -1795,6 +1796,17 @@ class KVCache(abc.ABC):
     @abc.abstractmethod
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError()
+
+    def get_paged_kv_buffer(
+        self, layer_id: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Per-layer K/V as ``[num_pages, page_size, ...]`` views of the flat
+        buffers; no copy, the slot stride is kept."""
+        k_buffer, v_buffer = self.get_kv_buffer(layer_id)
+        return (
+            paged_view(k_buffer, self.page_size),
+            paged_view(v_buffer, self.page_size),
+        )
 
     @abc.abstractmethod
     def set_kv_buffer(

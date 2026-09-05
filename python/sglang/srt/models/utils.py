@@ -32,6 +32,7 @@ from sglang.kernels.ops.layernorm.norm import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache.layout.page_major import paged_view
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
@@ -346,12 +347,8 @@ def create_fused_set_kv_buffer_arg(
             key_cache = k_buffer
             value_cache = v_buffer
         else:
-            key_cache = k_buffer.view(
-                -1, page_size, layer.tp_k_head_num, layer.qk_head_dim
-            )
-            value_cache = v_buffer.view(
-                -1, page_size, layer.tp_v_head_num, layer.v_head_dim
-            )
+            key_cache = paged_view(k_buffer, page_size)
+            value_cache = paged_view(v_buffer, page_size)
         return {
             "v": value.view(-1, layer.tp_v_head_num, layer.v_head_dim),
             "k_scale": layer.k_scale,

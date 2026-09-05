@@ -1172,21 +1172,24 @@ class FlashAttentionBackend(AttentionBackend):
         *,
         head_group_num: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        return (
-            key_cache.view(
+        key_cache, value_cache = self.token_to_kv_pool.get_paged_kv_buffer(
+            layer.layer_id
+        )
+        if head_group_num != 1:
+            # Reinterpret each page's heads as `head_group_num` pseudo-pages.
+            key_cache = key_cache.view(
                 -1,
                 self.page_size,
                 layer.tp_k_head_num // head_group_num,
                 layer.head_dim,
-            ),
-            value_cache.view(
+            )
+            value_cache = value_cache.view(
                 -1,
                 self.page_size,
                 layer.tp_v_head_num // head_group_num,
                 layer.v_head_dim,
-            ),
-        )
+            )
+        return key_cache, value_cache
 
     def prepare_paged_mha_query(
         self,

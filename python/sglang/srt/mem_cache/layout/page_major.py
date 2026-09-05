@@ -27,6 +27,24 @@ def _prod(shape: Sequence[int]) -> int:
     return out
 
 
+def paged_view(flat: torch.Tensor, page_size: int) -> torch.Tensor:
+    """``[slots, ...]`` -> ``[slots // page_size, page_size, ...]``, as a view.
+
+    Splitting dim 0 never copies: the slot stride becomes dim 1's stride, so a
+    strided per-layer view keeps addressing ``slot * stride(0)``.
+    """
+    num_slots = int(flat.shape[0])
+    assert num_slots % page_size == 0, (num_slots, page_size)
+    out = flat.view(num_slots // page_size, page_size, *flat.shape[1:])
+    assert out.stride(1) == flat.stride(0)
+    return out
+
+
+def paged_row_view(flat: torch.Tensor, page_size: int) -> torch.Tensor:
+    """``[slots, ...]`` -> ``[slots // page_size, page_size, row_elems]``, as a view."""
+    return paged_view(flat.view(int(flat.shape[0]), -1), page_size)
+
+
 def mha_entry_bytes(
     *, layer_num: int, head_num: int, head_dim: int, v_head_dim: int, itemsize: int
 ) -> int:

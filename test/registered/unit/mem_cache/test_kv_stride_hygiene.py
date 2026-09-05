@@ -32,6 +32,7 @@ import torch
 from sglang.kernels.ops.attention.utils import canonicalize_stride
 from sglang.kernels.ops.kv_canary.verify import RealKvSource
 from sglang.srt.kv_canary.pool_patcher.buffer_alloc import make_row_source
+from sglang.srt.mem_cache.layout.page_major import paged_row_view, paged_view
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -107,6 +108,47 @@ class TestMakeRowSourceAliases(unittest.TestCase):
         layer = torch.zeros(4, 16, 2, dtype=torch.bfloat16).transpose(1, 2)
         with self.assertRaises(RuntimeError):
             make_row_source(layer_buffer=layer, read_bytes=16)
+
+
+class TestPagedView(unittest.TestCase):
+    def test_contiguous_matches_plain_view(self):
+        N, ps, H, D = 12, 4, 2, 16
+        flat = torch.zeros(N, H, D)
+        out = paged_view(flat, ps)
+        self.assertEqual(tuple(out.shape), (N // ps, ps, H, D))
+        self.assertEqual(out.stride(), flat.view(-1, ps, H, D).stride())
+        self.assertEqual(out.data_ptr(), flat.data_ptr())
+
+    def test_strided_slots_keep_their_stride(self):
+        N, ps, H, D, E = 12, 4, 2, 16, 2 * 16 + 96
+        flat = torch.zeros(N * E).as_strided((N, H, D), (E, D, 1))
+        out = paged_view(flat, ps)
+        self.assertEqual(tuple(out.stride()), (ps * E, E, D, 1))
+        for t in range(N):
+            self.assertEqual(out[t // ps, t % ps].data_ptr(), flat[t].data_ptr())
+        rows = paged_row_view(flat, ps)
+        self.assertEqual(tuple(rows.shape), (N // ps, ps, H * D))
+        self.assertEqual(tuple(rows.stride()), (ps * E, E, 1))
+
+    def test_rejects_partial_pages(self):
+        with self.assertRaises(AssertionError):
+            paged_view(torch.zeros(10, 2, 16), 4)
+
+    def test_pool_accessor_returns_views(self):
+        N, ps, H, D, E = 8, 2, 2, 16, 2 * (2 * 16) + 32
+        backing = torch.zeros(N * E, dtype=torch.float16)
+        pool = MHATokenToKVPool.__new__(MHATokenToKVPool)
+        pool.page_size = ps
+        pool.start_layer = 0
+        pool.layer_transfer_counter = None
+        pool.is_quantized_kv_cache = False
+        pool.dtype = pool.store_dtype = torch.float16
+        pool.k_buffer = [backing.as_strided((N, H, D), (E, D, 1), 0)]
+        pool.v_buffer = [backing.as_strided((N, H, D), (E, D, 1), H * D)]
+        k, v = pool.get_paged_kv_buffer(0)
+        self.assertEqual(tuple(k.shape), (N // ps, ps, H, D))
+        self.assertEqual(tuple(k.stride()), (ps * E, E, D, 1))
+        self.assertEqual(v.data_ptr(), pool.v_buffer[0].data_ptr())
 
 
 class TestDataStridesFollowViews(unittest.TestCase):
