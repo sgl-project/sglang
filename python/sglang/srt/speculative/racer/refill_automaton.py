@@ -7,31 +7,35 @@ from sglang.srt.speculative.racer.automaton import RacerAutomaton, _CandidateTri
 
 
 class BinaryRefillRacerAutomaton(RacerAutomaton):
-    """RACER with a fixed-K, unique-aware TokenBin refill for SGLang.
+    """RACER plus SGLang's fixed-K, unique-aware TokenBin refill.
 
-    The first RetrievalTree/TokenBin split is identical to the original RACER
-    C++ implementation. If candidate-trie merging leaves fewer than K unique
-    nodes, extend the same TokenBin BFS trace and find the smallest raw TokenBin
-    budget whose merged trie reaches K.
+    Paper correspondence: Sec. 3.3 first allocates capacity to Retrieval Tree
+    candidates, assigns the remaining capacity to Logits Tree BFS expansion,
+    and merges both sources by trie union.
 
-    The refill search is intentionally cheap: TokenBin's raw BFS is generated
-    once (up to 4K nodes), cumulative unique-node counts are recorded while the
-    trace is merged, and ``bisect_left`` finds the minimal sufficient raw budget.
-    This preserves the binary-search semantics without replaying TokenBin and
-    rebuilding the candidate trie for every probe.
+    SGLang adaptation: trie union can collapse token-identical paths, whereas
+    the reused NGRAM TARGET_VERIFY ABI requires exactly K unique draft nodes.
+    If the paper-style pre-merge budget therefore under-fills after union, this
+    class extends the same TokenBin BFS trace and finds the smallest raw Logits
+    Tree budget whose merged trie reaches K.
+
+    The refill is intentionally cheap: one raw TokenBin trace is generated up
+    to 4K nodes, cumulative unique-node counts are recorded while merging, and
+    ``bisect_left`` finds the minimal sufficient raw budget. This refill/search
+    mechanism is an SGLang integration detail, not part of the RACER paper.
     """
 
     def _token_bin_raw_trace(
         self, next_token: int, max_num_draft: int
     ) -> list[tuple[int, int, int, int]]:
-        """Return TokenBin BFS nodes in the exact raw-budget order.
+        """Return Logits Tree BFS nodes in raw-budget order.
 
-        Each tuple is ``(token, parent_position, breadth, depth)``. The first B
-        entries are exactly the raw TokenBin tree that the original C++
-        ``TokenBin::retrieve(next_token, B)`` explores. Inserting every root-to-
-        node path from that prefix yields the same candidate trie as inserting
-        only its recovered leaf paths, because internal nodes are prefixes of
-        those leaves.
+        The tree construction follows Sec. 3.1 Eq. (3) and Appendix E.1
+        Algorithm 1. Each tuple is ``(token, parent_position, breadth, depth)``.
+        The first B entries are exactly the raw TokenBin tree explored under a
+        budget B. Inserting every root-to-node path from that prefix yields the
+        same candidate trie as inserting only recovered leaf paths, because all
+        internal nodes are prefixes of those leaves.
         """
 
         if max_num_draft <= 0:
@@ -52,6 +56,8 @@ class BinaryRefillRacerAutomaton(RacerAutomaton):
                 continue
 
             row = self._token_bin_row(token)
+            # Eq. (3) / Algorithm 1 root special case: preserve the root
+            # breadth first, then halve breadth for non-root expansion.
             next_breadth = breadth if depth == 0 else (breadth >> 1)
             next_depth = depth + 1
             for i in range(min(breadth, self.topk)):
@@ -118,7 +124,8 @@ class BinaryRefillRacerAutomaton(RacerAutomaton):
         retrieval_unique_nodes = candidate_trie.node_count
         merge_holes = max(0, len(selected) - retrieval_unique_nodes)
 
-        # Exact original C++ accounting before candidate-trie merging.
+        # Paper Sec. 3.3 budget split, before trie-union deduplication:
+        # Retrieval Tree first, remaining capacity to Logits Tree.
         original_tokenbin_budget = max(0, budget - len(selected))
         max_trace_budget = max(4 * budget, original_tokenbin_budget)
         trace = self._token_bin_raw_trace(root_token, max_trace_budget)
@@ -130,7 +137,8 @@ class BinaryRefillRacerAutomaton(RacerAutomaton):
         nodes_after_original_tokenbin = retrieval_unique_nodes
         reached_full_at: int | None = None
 
-        # Merge one TokenBin trace only once. Counts are monotone in raw budget.
+        # SGLang fixed-K adaptation. Merge one shared TokenBin trace only once;
+        # unique-node counts are monotone in the raw Logits Tree budget.
         for raw_index in range(len(trace)):
             candidate_trie.insert(
                 self._trace_path(trace, raw_index),
@@ -166,7 +174,8 @@ class BinaryRefillRacerAutomaton(RacerAutomaton):
         if refill_used:
             refill_probes = 1  # one shared raw trace; no TokenBin replay probes
             if cumulative_unique_nodes and cumulative_unique_nodes[-1] >= budget:
-                # Lower bound on the monotone cumulative unique-node counts.
+                # Minimum raw Logits Tree budget B* such that
+                # |union(RetrievalTree, LogitsTree(B*))| >= K.
                 refill_budget = bisect_left(
                     cumulative_unique_nodes, budget
                 ) + 1

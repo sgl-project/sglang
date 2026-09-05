@@ -127,13 +127,16 @@ class RacerDraftProvider:
         topk_ids: np.ndarray,
         prompt_lens: Sequence[int],
     ) -> None:
-        """Warm each request's TokenBin from flattened prompt-position logits.
+        """Warm TokenBin from prompt-position copy-logit rows.
 
-        ``prompt_tokens`` and ``topk_ids`` follow SGLang's flattened extend
-        layout.  For a prompt token x_i, row i contains the target model's
-        top-k next-token predictions p(x_{i+1} | x_{<=i}), matching RACER's
-        original prompt-time ``Automaton::update(input_ids, adj_topk)`` use.
-        Repeated token ids intentionally keep the latest row, as in TokenBin.
+        Paper correspondence: Sec. 3.1 defines copy-logit by reusing the most
+        recent logits associated with the same vocabulary token, while the
+        original RACER prefill updates the top-k adjacency from prompt logits.
+
+        ``prompt_tokens`` and ``topk_ids`` follow SGLang's flattened EXTEND
+        layout. For prompt token x_i, row i stores the target model's top-k
+        predictions for x_{i+1}. Repeated token ids intentionally keep the
+        latest row, matching the copy-logit adjacency semantics.
         """
 
         prompt_tokens = np.asarray(prompt_tokens).reshape(-1)
@@ -170,6 +173,14 @@ class RacerDraftProvider:
         draft_tokens: np.ndarray,
         topk_ids: np.ndarray,
     ) -> None:
+        """Refresh adjacency rows for every verified draft-tree node.
+
+        Paper correspondence: Appendix F's "w/ Rejected Logits" setting reuses
+        logits from all verified candidates, not only the accepted path. The
+        worker therefore supplies ``B * C`` draft tokens and their top-k rows,
+        including rejected branches, after each TARGET_VERIFY step.
+        """
+
         bs = len(req_ids)
         k = self.draft_token_num
         draft_tokens = np.asarray(draft_tokens).reshape(bs, k)

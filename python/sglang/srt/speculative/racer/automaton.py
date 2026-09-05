@@ -43,6 +43,17 @@ class _CandidateTrie:
             node = nxt
 
     def flatten(self, budget: int) -> tuple[list[int], list[list[bool]]]:
+        """Flatten the merged draft trie and build RACER's tree-attention mask.
+
+        Paper correspondence:
+          - Sec. 3.3: Retrieval Tree and Logits Tree are merged by trie union.
+          - Eq. (2): each draft node attends only to itself and its ancestors.
+
+        The returned ``tokens`` are in BFS order. ``parents[i]`` records the
+        flattened parent of node i, and walking that chain marks exactly the
+        self-plus-ancestor entries required by the tree-attention mask.
+        """
+
         tokens: list[int] = []
         parents: list[int] = []
         q = deque((child, -1) for child in self.root.children.values())
@@ -204,7 +215,19 @@ class RacerAutomaton:
     def update_logits(
         self, tokens: Sequence[int], topk_ids: Sequence[Sequence[int]]
     ) -> None:
-        # Original TokenBin is keyed only by token id; latest observation wins.
+        """Refresh RACER's copy-logit top-k adjacency.
+
+        Paper correspondence: Sec. 3.1 (copy-logit) and Sec. 3.3 (top-k
+        adjacency matrix). Conceptually each observed token stores
+
+            A[token_id] -> TopK_k(next-token logits).
+
+        The original implementation materializes A as a vocabulary-sized
+        matrix. This port stores only observed rows in ``_token_bin``. Repeated
+        token ids overwrite the row so later observations provide the current
+        copy-logit distribution.
+        """
+
         for token, row in zip(tokens, topk_ids):
             values = [int(x) for x in row[: self.topk]]
             if len(values) < self.topk:
@@ -219,7 +242,13 @@ class RacerAutomaton:
     def _token_bin_retrieve(
         self, next_token: int, max_num_draft: int, is_chain: bool = False
     ) -> list[list[int]]:
-        """Port of TokenBin::retrieve from the original RACER C++ code."""
+        """Construct the Logits Tree by breadth-first expansion.
+
+        Paper correspondence: Sec. 3.1 Eq. (3) and Appendix E.1 Algorithm 1.
+        The root preserves its breadth for its highest-ranked child; non-root
+        nodes halve it before assigning child breadths. Thus the highest-ranked
+        branch for the paper default k=8 follows 8 -> 8 -> 4 -> 2 -> 1.
+        """
 
         if max_num_draft <= 0:
             return []
@@ -239,6 +268,8 @@ class RacerAutomaton:
 
             if remaining > 0 and breadth > 0:
                 row = self._token_bin_row(token)
+                # Eq. (3) / Algorithm 1: only the root is exempt from the
+                # initial halving; sibling breadth then halves after each child.
                 next_breadth = breadth if depth == 0 else (breadth >> 1)
                 next_depth = depth + 1
                 added = 0
@@ -271,10 +302,14 @@ class RacerAutomaton:
         return candidates
 
     def _collect_borders(self, next_token: int) -> list[_TrieNode]:
+        """Collect AC border states used by the Retrieval Tree (Sec. 3.2)."""
+
         borders: list[_TrieNode] = []
         u = self._cur_state
         state_updated = False
 
+        # RACER considers matched border states with depth >= 2 before pooling
+        # their continuation sub-tries for retrieval expansion.
         while u is not self.root:
             v = u.children.get(int(next_token))
             if v is not None:
@@ -300,7 +335,13 @@ class RacerAutomaton:
     def _select_retrieval_nodes(
         self, borders: Sequence[_TrieNode], budget: int
     ) -> list[tuple[_TrieNode, _TrieNode]]:
-        """Equivalent final selection to the C++ frequency/depth top-k heap."""
+        """Select globally frequent continuation states across AC borders.
+
+        This corresponds to Sec. 3.2: continuations from all matched border
+        sub-tries are pooled, ranked by empirical frequency, and the strongest
+        states are retained before allocating the remaining draft capacity to
+        the Logits Tree.
+        """
 
         scored: list[tuple[int, int, int, _TrieNode, _TrieNode]] = []
         serial = 0
@@ -381,7 +422,17 @@ class RacerAutomaton:
     def retrieve(
         self, root_token: int, max_num_draft: int
     ) -> tuple[list[int], list[list[bool]]]:
-        """Port of Automaton::retrieve for the default non-chain RACER mode."""
+        """Build RACER's unified proposal tree under a fixed draft capacity.
+
+        Paper correspondence: Sec. 3.3 first selects Retrieval Tree candidates,
+        assigns the remaining capacity to Logits Tree BFS expansion, and merges
+        both sources by trie union.
+
+        SGLang adaptation: trie union can collapse token-identical paths, while
+        the reused NGRAM TARGET_VERIFY ABI requires exactly ``max_num_draft``
+        unique nodes. The refill/padding below restores that fixed-K invariant;
+        it is an integration detail rather than part of the RACER paper.
+        """
 
         budget = int(max_num_draft)
         if budget <= 0:
@@ -395,9 +446,16 @@ class RacerAutomaton:
         for path in self._selected_paths(selected):
             candidate_trie.insert(path, budget)
 
-        # Original RACER spends the remainder of the K-node budget on TokenBin.
-        remaining = budget - len(selected)
-        for path in self._token_bin_retrieve(root_token, remaining, is_chain=False):
+        retrieval_unique_nodes = candidate_trie.node_count
+        merge_holes = max(0, len(selected) - retrieval_unique_nodes)
+
+        # Sec. 3.3 budget split: retrieval is allocated first, then the
+        # remaining speculative capacity is assigned to the Logits Tree.
+        original_tokenbin_budget = budget - len(selected)
+        original_tokenbin_paths = self._token_bin_retrieve(
+            root_token, original_tokenbin_budget, is_chain=False
+        )
+        for path in original_tokenbin_paths:
             candidate_trie.insert(path, budget)
 
         # Original fallback when only the implicit trie root exists.

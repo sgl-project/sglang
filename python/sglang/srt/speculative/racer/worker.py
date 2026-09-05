@@ -139,6 +139,16 @@ class RACERWorker(NGRAMWorker):
         self._reset_racer_stats()
 
     def _update_copy_logits(self, batch, logits_output) -> float:
+        """Refresh copy-logit rows from every verified tree node.
+
+        Paper correspondence: Sec. 3.1 defines copy-logit reuse, while Appendix
+        F's "w/ Rejected Logits" setting keeps logits from rejected candidates
+        as well as accepted ones. TARGET_VERIFY returns logits for all ``B * C``
+        draft nodes, so this update intentionally consumes the complete tree.
+
+        Softmax is not needed here because TopK(softmax(z)) == TopK(z).
+        """
+
         start = time.perf_counter() if self.racer_stats_enabled else 0.0
         bs = len(batch.reqs)
         k = self.draft_token_num
@@ -156,12 +166,23 @@ class RACERWorker(NGRAMWorker):
         return 0.0
 
     def _warm_prompt_tokenbin(self, batch, hidden_states: torch.Tensor) -> None:
-        """Populate TokenBin from prompt/extend hidden states without rerunning the model.
+        """Seed RACER's copy-logit adjacency from prompt positions.
 
-        This first implementation is intentionally TP=1 only. It computes the
-        target LM-head top-k in small chunks to avoid materializing the whole
-        [prompt_tokens, vocab] matrix at once. Chunked prefill is naturally
-        supported because each EXTEND call warms the rows it just computed.
+        Paper correspondence: Sec. 3.1 reuses the latest next-token logit
+        distribution associated with a repeated vocabulary token. Prompt-time
+        logits therefore provide valid initial rows for the same top-k adjacency
+        used by Logits Tree expansion.
+
+        SGLang adaptation: EXTEND already computed the prompt hidden states, so
+        this path applies only the LM head in small chunks instead of rerunning
+        the transformer. For a chunk of ``Tc`` prompt positions:
+
+            hidden_states : [Tc, H]
+            logits        : [Tc, V]
+            top-k ids     : [Tc, racer_topk]
+
+        Softmax is omitted because it preserves the logits ranking. This first
+        implementation is intentionally TP=1 only.
         """
 
         if not self.racer_prompt_warmup:
