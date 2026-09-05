@@ -257,6 +257,27 @@ def model_config_of(server_args: Any):
     return model_config
 
 
+def ep_joiner_of(cfg: Any) -> bool:
+    """Whether this process was launched as an elastic-EP joiner.
+
+    The one definition. After publish the answer is a bag leaf --
+    `get_exec().moe.is_ep_joiner` -- computed from this function by the
+    declaration in `arg_groups/fields/exec_.py`; resolution needs it before
+    there is a bag to read, which is why it is still a function.
+    """
+    return cfg.ep_join_mode in ("scale", "recover")
+
+
+def ep_scale_joiner_of(cfg: Any) -> bool:
+    """The scale-up arm of :func:`ep_joiner_of`."""
+    return cfg.ep_join_mode == "scale"
+
+
+def startup_weight_load_overlap_of(cfg: Any) -> bool:
+    """Whether weight loading overlaps startup."""
+    return cfg.startup_weight_load_mode == "overlap"
+
+
 def mamba_extra_buffer_of(cfg: Any) -> bool:
     """The predicate, read off a config-shaped object mid-resolution.
 
