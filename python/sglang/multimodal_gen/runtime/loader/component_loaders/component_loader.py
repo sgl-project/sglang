@@ -5,6 +5,7 @@
 import importlib
 import os
 import pkgutil
+import re
 import traceback
 from abc import ABC
 from typing import Any, Type
@@ -21,6 +22,7 @@ from transformers import (
 )
 from transformers.quantizers import AutoHfQuantizer
 
+from sglang.multimodal_gen.configs.models.base import ModelConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     ComponentAttentionBackendNotAppliedError,
@@ -32,6 +34,9 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     component_name_to_loader_cls,
     format_component_residency,
     get_memory_usage_of_component,
+    load_safetensors_state_dict,
+    set_default_torch_dtype,
+    skip_init_modules,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     RESIDENT,
@@ -40,6 +45,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     is_fsdp_managed_module,
 )
+from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
@@ -48,7 +54,10 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     prepare_diffusers_component_path_for_loading,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
+from sglang.multimodal_gen.runtime.utils.precision import (
+    resolve_component_precision,
+    resolve_precision,
+)
 from sglang.multimodal_gen.runtime.weights.source import (
     materialize_weight,
     resolve_weight,
@@ -711,7 +720,101 @@ class OnlineQuantizationComponentLoader(WeightOverrideComponentLoader):
 
 
 class PlainStateDictComponentLoader(WeightOverrideComponentLoader):
-    """Base for native loaders whose current materializer expects plain weights."""
+    """Construct registered modules and restore a complete plain state dict."""
+
+    expected_library = "diffusers"
+    config_classes: dict[str, type[ModelConfig]] = {}
+    default_precision_attr = "dit_precision"
+    default_dtype = torch.bfloat16
+
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, component_name: str
+    ) -> nn.Module:
+        config = self.load_component_config(component_model_path, component_name)
+        class_name = config.pop("_class_name", None) or self.component_architecture
+        if class_name is None:
+            raise ComponentCheckpointUnsupportedError(
+                f"{component_name!r} must declare _class_name in config.json "
+                "or its architecture in model_index.json"
+            )
+        weights_path = self.resolve_component_weights_path(
+            component_model_path, server_args, component_name
+        )
+        model_cls, _ = ModelRegistry.resolve_model_cls(class_name)
+        model_config = self.build_model_config(config, component_name)
+        dtype = self.resolve_dtype(server_args, component_name)
+        target_device = self.target_device(
+            server_args.should_start_component_on_cpu(component_name)
+        )
+        with set_default_torch_dtype(dtype), skip_init_modules():
+            model = (
+                model_cls(**model_config)
+                if isinstance(model_config, dict)
+                else model_cls(model_config)
+            )
+            model = self.place_model(model, target_device, dtype)
+
+        state_dict = load_safetensors_state_dict(weights_path)
+        mapping = self.checkpoint_key_mapping(model_config)
+        if mapping:
+            remapped = {}
+            for name, tensor in state_dict.items():
+                # ordered rules can rename both a module and its nested buffer
+                for pattern, replacement in mapping.items():
+                    name = re.sub(pattern, replacement, name)
+                if name in remapped:
+                    raise ComponentCheckpointUnsupportedError(
+                        f"Checkpoint mapping for {component_name!r} produces "
+                        f"duplicate key {name!r}"
+                    )
+                remapped[name] = tensor
+            state_dict = remapped
+        try:
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        except RuntimeError as error:
+            raise ComponentCheckpointUnsupportedError(
+                f"Cannot restore checkpoint for {component_name!r}: {error}"
+            ) from error
+        self.validate_checkpoint_keys(missing, unexpected, component_name)
+        server_args.model_paths[component_name] = component_model_path
+        return model
+
+    def build_model_config(
+        self, config: dict[str, Any], component_name: str
+    ) -> ModelConfig | dict[str, Any]:
+        config_cls = self.config_classes.get(
+            self.structural_component_type(component_name)
+        )
+        if config_cls is not None:
+            model_config = config_cls()
+            model_config.update_model_arch(config)
+            return model_config
+        return {key: value for key, value in config.items() if not key.startswith("_")}
+
+    def resolve_dtype(
+        self, server_args: ServerArgs, component_name: str
+    ) -> torch.dtype:
+        try:
+            return resolve_precision(
+                server_args, component_name, precision_attr=self.default_precision_attr
+            )
+        except AttributeError:
+            return self.default_dtype
+
+    def checkpoint_key_mapping(self, model_config) -> dict[str, str]:
+        return {}
+
+    def place_model(self, model: nn.Module, device: torch.device, dtype: torch.dtype):
+        return model.to(device=device, dtype=dtype)
+
+    def validate_checkpoint_keys(
+        self, missing: list[str], unexpected: list[str], component_name: str
+    ) -> None:
+        if missing or unexpected:
+            raise ComponentCheckpointUnsupportedError(
+                f"Checkpoint weights do not match {component_name!r}. "
+                f"Missing: {sorted(missing)}. Unexpected: {sorted(unexpected)}."
+            )
 
     def component_load_precision(
         self, server_args: ServerArgs, component_name: str
