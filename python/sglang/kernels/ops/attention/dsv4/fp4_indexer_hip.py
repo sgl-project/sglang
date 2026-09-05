@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from functools import lru_cache
-from typing import TYPE_CHECKING, Callable, NamedTuple, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, Tuple, Union
 
 import torch
 
@@ -82,6 +82,17 @@ class FP4PrefillWorkspace(NamedTuple):
     # cta_info kernel reads. Pinned with the workspace so a refresh allocates
     # nothing and the buffers never return to the graph memory pool.
     schedule_buffers: Optional[PrefillScheduleBuffers] = None
+
+
+class FP4StreamingTopKScratch(NamedTuple):
+    """Bounded AITER candidate scratch reused across C4 layers on one stream."""
+
+    workspace: Any
+    values: torch.Tensor
+    raw_indices: torch.Tensor
+    counts: torch.Tensor
+    parallel_unit_num: int
+    stream_id: int
 
 
 class FP4KWriteMetadata(NamedTuple):
@@ -303,6 +314,52 @@ def prepare_fp4_prefill_workspace(
     return workspace
 
 
+def prepare_fp4_streaming_topk_scratch(
+    *,
+    rows: int,
+    topk: int,
+    device: torch.device,
+    scratch: Optional[FP4StreamingTopKScratch] = None,
+) -> FP4StreamingTopKScratch:
+    """Create or reuse context-independent AITER TopK candidate scratch."""
+    from aiter.ops.flydsl import allocate_fp4_prefill_topk_workspace
+
+    stream = torch.cuda.current_stream(device)
+    stream_id = stream.cuda_stream
+    parallel_unit_num = max(_PREFILL_BASE_CTA_TARGET, rows)
+    if (
+        scratch is not None
+        and scratch.values.shape == (rows, topk)
+        and scratch.values.device == device
+        and scratch.parallel_unit_num == parallel_unit_num
+        and scratch.stream_id == stream_id
+    ):
+        return scratch
+
+    with torch.cuda.stream(stream):
+        return FP4StreamingTopKScratch(
+            workspace=allocate_fp4_prefill_topk_workspace(
+                rows,
+                parallel_unit_num,
+                topk,
+                device,
+            ),
+            values=torch.empty(
+                (rows, topk),
+                dtype=torch.float32,
+                device=device,
+            ),
+            raw_indices=torch.empty(
+                (rows, topk),
+                dtype=torch.int32,
+                device=device,
+            ),
+            counts=torch.empty(rows, dtype=torch.int32, device=device),
+            parallel_unit_num=parallel_unit_num,
+            stream_id=stream_id,
+        )
+
+
 def aiter_fp4_paged_mqa_logits(
     *,
     q_fp4: torch.Tensor,
@@ -454,7 +511,8 @@ def aiter_fp4_paged_mqa_topk(
     out_page_indices: torch.Tensor,
     out_raw_indices: Optional[torch.Tensor] = None,
     prefill_workspace: Optional[FP4PrefillWorkspace] = None,
-) -> None:
+    streaming_scratch: Optional[FP4StreamingTopKScratch] = None,
+) -> FP4StreamingTopKScratch:
     """Run AITER's bounded FP4 score + exact TopK prefill operator."""
     fused_topk = get_aiter_fp4_streaming_topk()
     if fused_topk is None:
@@ -486,24 +544,21 @@ def aiter_fp4_paged_mqa_topk(
         row_to_batch = workspace.row_to_batch
         local_starts = workspace.local_starts
 
-    raw_indices = (
-        out_raw_indices
-        if out_raw_indices is not None
-        else torch.empty_like(out_page_indices)
+    streaming_scratch = prepare_fp4_streaming_topk_scratch(
+        rows=num_tokens,
+        topk=out_page_indices.shape[1],
+        device=q_fp4.device,
+        scratch=streaming_scratch,
     )
     out = FP4PrefillTopKResult(
-        values=torch.empty(
-            out_page_indices.shape,
-            dtype=torch.float32,
-            device=q_fp4.device,
+        values=streaming_scratch.values,
+        raw_indices=(
+            out_raw_indices
+            if out_raw_indices is not None
+            else streaming_scratch.raw_indices
         ),
-        raw_indices=raw_indices,
         physical_indices=out_page_indices,
-        counts=torch.empty(
-            num_tokens,
-            dtype=torch.int32,
-            device=q_fp4.device,
-        ),
+        counts=streaming_scratch.counts,
     )
     fused_topk(
         q_fp4.view(torch.uint8),
@@ -521,10 +576,12 @@ def aiter_fp4_paged_mqa_topk(
         block_k=256,
         kv_block_size=_KV_BLOCK_SIZE,
         num_warps=4,
-        parallel_unit_num=max(_PREFILL_BASE_CTA_TARGET, num_tokens),
+        parallel_unit_num=streaming_scratch.parallel_unit_num,
+        workspace=streaming_scratch.workspace,
         out=out,
         stream=torch.cuda.current_stream(q_fp4.device),
     )
+    return streaming_scratch
 
 
 def prepare_fp4_k_write_metadata(

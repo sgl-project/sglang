@@ -833,7 +833,7 @@ def test_streaming_topk_writes_raw_and_physical_indices(topk: int) -> None:
         pytest.skip("installed AITER does not expose FP4 streaming top-k")
 
     torch.manual_seed(41 + topk)
-    contexts = [topk - 1, topk, topk + 64]
+    contexts = [0, topk, topk + 64]
     case = _build_logits_case(
         len(contexts),
         topk + 64,
@@ -850,6 +850,11 @@ def test_streaming_topk_writes_raw_and_physical_indices(topk: int) -> None:
         case["page_table"],
         case["c4_seq_lens"],
     )
+    legacy_logits = _run_logits(
+        case,
+        is_decode=False,
+        prefill_ws=workspace,
+    ).clone()
 
     aiter_fp4_paged_mqa_topk(
         q_fp4=case["q_fp4"],
@@ -872,12 +877,14 @@ def test_streaming_topk_writes_raw_and_physical_indices(topk: int) -> None:
         assert torch.all((raw >= 0) & (raw < context))
         assert torch.unique(raw).numel() == valid
         if context <= topk:
-            torch.testing.assert_close(
-                raw,
-                torch.arange(context, device=raw.device),
-                rtol=0,
-                atol=0,
-            )
+            expected_raw = torch.arange(context, device=raw.device)
+        else:
+            expected_raw = torch.argsort(
+                legacy_logits[row, :context],
+                descending=True,
+                stable=True,
+            )[:topk]
+        torch.testing.assert_close(raw, expected_raw, rtol=0, atol=0)
         expected_slots = (
             case["page_table"][row, raw // PAGE_SIZE].long() * PAGE_SIZE
             + raw % PAGE_SIZE

@@ -920,7 +920,7 @@ class C4IndexerBackendMixin:
             k_scale = token_to_kv_pool.get_index_k_fp4_scale_buffer(c4_indexer.layer_id)
 
             if use_streaming_topk:
-                aiter_fp4_paged_mqa_topk(
+                metadata.fp4_streaming_topk_scratch = aiter_fp4_paged_mqa_topk(
                     q_fp4=q_fp4,
                     q_scale=q_scale,
                     k_payload=k_payload,
@@ -932,6 +932,7 @@ class C4IndexerBackendMixin:
                     out_page_indices=c4_sparse_page_indices,
                     out_raw_indices=raw_indices,
                     prefill_workspace=metadata.fp4_prefill_workspace,
+                    streaming_scratch=metadata.fp4_streaming_topk_scratch,
                 )
             else:
 

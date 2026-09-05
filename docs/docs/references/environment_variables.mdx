@@ -712,7 +712,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV4_FP4_FUSED_TOPK</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use AITER's streaming FP4 indexer score and top-k operator when supported, avoiding the full FP32 logits tensor. Set to <code>false</code> to use the legacy materialized-logits path.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On gfx950 eager prefill with the SGL top-k backend, use AITER's streaming FP4 indexer score and top-k operator when supported, avoiding the full FP32 logits tensor. Decode and graph capture retain the legacy path. Set to <code>false</code> to use materialized logits for all modes.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
