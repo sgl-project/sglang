@@ -21,6 +21,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
     get_spec,
+    get_stream,
 )
 
 logger = logging.getLogger(__name__)
@@ -89,6 +90,11 @@ from sglang.srt.utils import (
 # concat). Enable with SGLANG_DSA_TRITON_PREFILL=1. Decode stays on TileLang.
 _DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
 _IS_GFX95 = is_gfx95_supported()
+_CP_ASYNC_INDEXER_ENABLED = (
+    envs.SGLANG_LITETOPK.get()
+    and envs.SGLANG_LITETOPK_CP_ASYNC_PREP.get()
+    and envs.SGLANG_LITETOPK_CP_ASYNC_INDEXER.get()
+)
 
 if is_cuda():
     import deep_gemm
@@ -3155,6 +3161,7 @@ class DeepseekSparseAttnBackend(
         metadata = self.forward_metadata
 
         merge_query = q_rope is not None
+        cp_async_indexer_backend = False
         if self.kv_cache_dtype == torch.float8_e4m3fn:
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
@@ -3186,7 +3193,30 @@ class DeepseekSparseAttnBackend(
                 self.kv_lora_rank,
                 self.qk_rope_head_dim,
             )
+            cp_async_indexer_backend = (
+                _CP_ASYNC_INDEXER_ENABLED
+                and topk_indices is not None
+                and getattr(self, "_litetopk_cp_async_indexer_layer", -1)
+                == layer.layer_id
+            )
+            if cp_async_indexer_backend:
+                # The per-layer marker is the producer's commit token. Keep
+                # predicate drift fail-closed so collective ordering cannot
+                # silently diverge between the two streams.
+                assert is_prefill
+                assert dsa_use_prefill_cp(forward_batch)
+                assert is_cp_v2_active(forward_batch)
+                assert forward_batch.forward_mode.is_extend_without_speculative()
+                assert get_parallel().attn_tp_size == 1
+                assert not torch.cuda.is_current_stream_capturing()
             if save_kv_cache and dsa_use_prefill_cp(forward_batch):
+                if cp_async_indexer_backend:
+                    # Index-K all-gather was enqueued first on this CP group.
+                    # Order MLA's gather behind it while leaving the subsequent
+                    # LiteTopK scan overlapped on the independent stream.
+                    torch.cuda.current_stream().wait_stream(
+                        get_stream("dsa_cp_index_k_comm")
+                    )
                 if is_cp_v2_active(forward_batch):
                     k, k_rope = get_cp_strategy().all_gather_dsa_trtllm_fp8_kv(
                         forward_batch, k, k_rope
@@ -3206,6 +3236,14 @@ class DeepseekSparseAttnBackend(
                 else forward_batch.encoder_out_cache_loc
             )
             self.token_to_kv_pool.set_mla_kv_buffer(layer, cache_loc, k, k_rope)
+
+        if cp_async_indexer_backend:
+            # KV quantization/gather/store above does not consume top-k. Join
+            # only here, immediately before the first attention-side use.
+            current_stream = torch.cuda.current_stream()
+            current_stream.wait_stream(get_stream("dsa_cp_async_indexer"))
+            topk_indices.record_stream(current_stream)
+            self._litetopk_cp_async_indexer_layer = -1
 
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         kv_cache = k_cache.view(-1, self.real_page_size, self.kv_cache_dim).unsqueeze(1)

@@ -616,6 +616,7 @@ class Scheduler(
                 )
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
+        self.maybe_init_litetopk_cp_global_carry_runtime()
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
@@ -759,6 +760,23 @@ class Scheduler(
             device_module=self.tp_group.device_module,
         )
         logger.info("HCCL DP prewarm done: rank=%s", rank)
+
+    def maybe_init_litetopk_cp_global_carry_runtime(self) -> None:
+        """Prewarm LiteTopK's private CP communicator after final KV sizing.
+
+        This is an unconditional scheduler-startup point on every TP/CP rank,
+        after memory-pool sizing, CUDA graph capture, post-capture resizing, and
+        cache-wrapper construction. It preserves the profiled token capacity
+        while keeping CPU bootstrap and one-time NCCL warmup out of the request
+        path.
+        """
+        if not envs.SGLANG_LITETOPK_CP_GLOBAL_CARRY.get():
+            return
+        from sglang.srt.layers.attention.dsa import litetopk
+
+        litetopk.initialize_cp_global_carry(
+            min(int(self.model_config.context_len), litetopk.PRODUCTION_MAX_S)
+        )
 
     def init_zbal_on_npu(self):
         if _is_npu:

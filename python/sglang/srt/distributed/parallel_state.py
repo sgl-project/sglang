@@ -2984,6 +2984,15 @@ def get_moe_tensor_parallel_rank():
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    if envs.SGLANG_LITETOPK_CP_GLOBAL_CARRY.get():
+        # The LiteTopK communicator bootstraps from the attention-CP CPU group
+        # but owns an independent NCCL unique ID. Retire its side-stream work
+        # before destroying the aliased CP/TP groups so in-process model
+        # reinitialization cannot reuse a stale raw communicator.
+        from sglang.srt.layers.attention.dsa import litetopk
+
+        litetopk.shutdown_cp_global_carry()
+
     get_parallel().clear_derived_widths()
     dwdp_mgr = get_global_dwdp_manager()
     if dwdp_mgr is not None:

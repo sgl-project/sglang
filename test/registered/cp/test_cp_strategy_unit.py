@@ -917,6 +917,35 @@ class TestCPInterleaveStrategy(CustomTestCase):
         self.assertEqual(metadata.per_rank_actual_token, [4, 4, 4, 4])
         self.assertEqual(metadata.max_rank_len, [4, 4, 4, 4])
 
+    def test_interleave_reuses_preforward_gather_plan(self):
+        cp_size = 4
+        total_tokens = 8
+        x = torch.arange(total_tokens * 2).view(total_tokens, 2)
+        strategy = InterleaveCPStrategy(cp_size=cp_size)
+        metadata = strategy.build_metadata(
+            num_tokens=total_tokens,
+            seqs_len=[total_tokens],
+            extend_seqs_len=[total_tokens],
+        )
+        fb = self._forward_batch(metadata, [total_tokens])
+        rank_tensors = [x[rank::cp_size].contiguous() for rank in range(cp_size)]
+
+        with get_parallel().override(attn_cp_rank=0, attn_cp_size=cp_size):
+            local_x = strategy.shard_hidden_states(x, fb)
+            gather_plan = metadata.gather_indices
+            self.assertIsNotNone(gather_plan)
+            self.assertTrue(
+                torch.equal(gather_plan, torch.tensor([0, 2, 4, 6, 1, 3, 5, 7]))
+            )
+
+            with self._patch_interleave_all_gather(rank_tensors):
+                first = strategy.gather_hidden_states(local_x, fb, stream=None)
+                second = strategy.gather_kv_cache(local_x, fb, stream=None)
+
+        self.assertIs(metadata.gather_indices, gather_plan)
+        self.assertTrue(torch.equal(first, x))
+        self.assertTrue(torch.equal(second, x))
+
     def test_prepare_cp_forward_sizes_gather_buffer_for_all_cp_ranks(self):
         forward_batch = SimpleNamespace(
             input_ids=torch.arange(10),
@@ -1096,6 +1125,63 @@ class TestCPInterleaveStrategy(CustomTestCase):
                 )
 
             self.assertTrue(torch.equal(gathered, kv))
+
+    def test_interleave_rank_major_indexer_gather_equal_shards(self):
+        cp_size = 4
+        total_tokens = 8
+        x = torch.arange(total_tokens * 2).view(total_tokens, 2)
+        metas, rank_tensors = self._rank_tensors(
+            x,
+            cp_size=cp_size,
+            seq_lens=[total_tokens],
+            extend_seq_lens=[total_tokens],
+        )
+        expected_rank_major = torch.cat(rank_tensors, dim=0)
+
+        for rank in range(cp_size):
+            fb = self._forward_batch(metas[rank], [total_tokens])
+            with (
+                get_parallel().override(
+                    attn_cp_rank=rank,
+                    attn_cp_size=cp_size,
+                ),
+                self._patch_interleave_all_gather(rank_tensors),
+            ):
+                result = InterleaveCPStrategy(
+                    cp_size=cp_size
+                ).try_materialize_rank_major_indexer_k_cache(rank_tensors[rank], fb)
+
+            self.assertIsNotNone(result)
+            gathered, returned_cp_size = result
+            self.assertEqual(returned_cp_size, cp_size)
+            self.assertTrue(torch.equal(gathered, expected_rank_major))
+
+    def test_interleave_rank_major_indexer_declines_before_collective(self):
+        cases = ((4, 10), (3, 9))
+        for cp_size, total_tokens in cases:
+            metadata = self._metadata_for_rank(
+                0,
+                cp_size=cp_size,
+                seq_lens=[total_tokens],
+                extend_seq_lens=[total_tokens],
+            )
+            fb = self._forward_batch(metadata, [total_tokens])
+            local = torch.arange(metadata.per_rank_actual_token[0] * 2).view(-1, 2)
+            with (
+                get_parallel().override(
+                    attn_cp_rank=0,
+                    attn_cp_size=cp_size,
+                ),
+                patch(
+                    "sglang.srt.layers.cp.interleave.attn_cp_all_gather_into_tensor"
+                ) as all_gather,
+            ):
+                result = InterleaveCPStrategy(
+                    cp_size=cp_size
+                ).try_materialize_rank_major_indexer_k_cache(local, fb)
+
+            self.assertIsNone(result)
+            all_gather.assert_not_called()
 
     def test_interleave_materializes_full_mla_kv(self):
         strategy = InterleaveCPStrategy(cp_size=2)

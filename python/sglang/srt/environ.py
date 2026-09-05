@@ -1532,6 +1532,16 @@ class Envs:
     # predicate.  Coarse per-layer join keeps the single-slot born-q buffer
     # WAR-safe.
     SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP = EnvBool(False)
+    # Research/qualification path for eager CP-v2 + LiteTopK. Run the full
+    # replicated indexer on its own CUDA stream while the main stream prepares
+    # MLA Q/K. The two CP collectives remain ordered: MLA's KV gather waits
+    # for the index-K gather, then overlaps with the LiteTopK scan.
+    SGLANG_LITETOPK_CP_ASYNC_PREP = EnvBool(False)
+    SGLANG_LITETOPK_CP_ASYNC_INDEXER = EnvBool(False)
+    # Merge CP-local LiteTopK carry votes on a dedicated NCCL communicator.
+    # The next same-layer chunk consumes the result after a full model-depth
+    # overlap window, without perturbing the aliased CP/TP collective order.
+    SGLANG_LITETOPK_CP_GLOBAL_CARRY = EnvBool(False)
     # Opt-in: fuse the Q8KV8 non-prefix KV prep — cast-concat k/k_rope
     # directly into the persistent fp8 kv buffer and zero the pad band in one
     # Triton kernel (replaces bf16 _cat + copy_ cast + zero_ tail).
@@ -1540,6 +1550,19 @@ class Envs:
     # "cuda" = the hand-written SM90 WGMMA kernel (bitwise identical to the
     # Triton two_dot variant, 1.16-1.38x faster across GLM/DS shapes).
     SGLANG_OPT_Q8KV8_QPREP_VARIANT = EnvStr("auto")
+    # Fused indexer top-k (LiteTopk, SM100 only): prefill scoring + top-k in
+    # one pass, never materializing the [num_q, seq_len] logits. Opt-in.
+    SGLANG_ENABLE_DSA_LITETOPK = EnvBool(False)
+
+    # Opt-in LiteTopK fused sparse-indexer kernels. REQUIRED makes
+    # qualification runs fail closed instead of measuring a stock fallback.
+    SGLANG_LITETOPK = EnvBool(False)
+    SGLANG_LITETOPK_REQUIRED = EnvBool(False)
+    # Accuracy-harness escape hatch for DSV4's unsupported Q=1 decode only.
+    # Prefill remains REQUIRED/fail-closed when this flag is set.
+    SGLANG_LITETOPK_ALLOW_STOCK_FALLBACK = EnvBool(False)
+    SGLANG_LITETOPK_SO = EnvStr("")
+    SGLANG_LITETOPK_SO_SHA256 = EnvStr("")
 
     # ===================================================================
     # MiniMax M3

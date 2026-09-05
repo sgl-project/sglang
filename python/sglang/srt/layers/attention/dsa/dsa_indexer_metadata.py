@@ -70,6 +70,16 @@ class BaseIndexerMetadata(ABC):
         Return: batch idx for each token.
         """
 
+    def logical_topk(
+        self,
+        logits: torch.Tensor,
+        topk: int,
+        ks: Optional[torch.Tensor] = None,
+        lengths: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Select request-logical top-k IDs without backend transformation."""
+        raise NotImplementedError
+
     @abstractmethod
     def topk_transform(
         self,
@@ -125,6 +135,22 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
 
     def get_token_to_batch_idx(self) -> torch.Tensor:
         return self.attn_metadata.token_to_batch_idx
+
+    def logical_topk(
+        self,
+        logits: torch.Tensor,
+        topk: int,
+        ks: Optional[torch.Tensor] = None,
+        lengths: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if lengths is None:
+            lengths = self.get_seqlens_expanded()
+        return self.topk_backend.topk_func(
+            logits,
+            lengths,
+            topk,
+            row_starts=ks,
+        )
 
     def topk_transform(
         self,

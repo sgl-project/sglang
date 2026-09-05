@@ -7,9 +7,14 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.litetopk import (
+    _permuted_plan_length_metadata,
+)
 from sglang.srt.layers.attention.dsv4.indexer import (
     FP8_DTYPE,
     C4IndexerBackendMixin,
+    _litetopk_c4_gate_lengths,
+    _litetopk_fp4_scale_storage_rows,
 )
 from sglang.srt.layers.attention.dsv4.metadata import (
     NonPagedIndexerPlan,
@@ -23,6 +28,106 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 _INDEXER = "sglang.srt.layers.attention.dsv4.indexer"
+
+
+class TestDSV4LiteTopKCPGate(CustomTestCase):
+    def test_single_request_uses_cp_consistent_global_lengths(self):
+        batch = SimpleNamespace(
+            batch_size=1,
+            seq_lens_cpu=[229376],
+            extend_seq_lens_cpu=[32768],
+        )
+
+        results = {
+            _litetopk_c4_gate_lengths(
+                batch,
+                local_sequence_length=local_length,
+                query_rows=4096,
+                cp_size=8,
+            )
+            for local_length in (57342, 57343, 57344)
+        }
+
+        self.assertEqual(results, {(57344, 65536)})
+
+        batch.seq_lens_cpu = [262144]
+        results = {
+            _litetopk_c4_gate_lengths(
+                batch,
+                local_sequence_length=local_length,
+                query_rows=4096,
+                cp_size=8,
+            )
+            for local_length in (65534, 65535, 65536)
+        }
+        self.assertEqual(results, {(65536, 73728)})
+
+    def test_global_gate_is_only_plan_qualification_metadata(self):
+        batch = SimpleNamespace(
+            batch_size=1,
+            seq_lens_cpu=[262144],
+            extend_seq_lens_cpu=[32768],
+        )
+
+        for local_length in (65534, 65535, 65536):
+            gate_length, _ = _litetopk_c4_gate_lengths(
+                batch,
+                local_sequence_length=local_length,
+                query_rows=4096,
+                cp_size=8,
+            )
+            metadata = _permuted_plan_length_metadata(local_length, gate_length)
+
+            self.assertEqual(metadata["sequence_length"], local_length)
+            self.assertEqual(metadata["qualification_sequence_length"], 65536)
+
+    def test_plan_qualification_defaults_to_local_sequence_length(self):
+        self.assertEqual(
+            _permuted_plan_length_metadata(65535),
+            {
+                "sequence_length": 65535,
+                "qualification_sequence_length": 65535,
+            },
+        )
+
+    def test_missing_cpu_metadata_preserves_local_fallback(self):
+        batch = SimpleNamespace(
+            batch_size=1,
+            seq_lens_cpu=None,
+            extend_seq_lens_cpu=None,
+        )
+
+        self.assertEqual(
+            _litetopk_c4_gate_lengths(
+                batch,
+                local_sequence_length=57342,
+                query_rows=4096,
+                cp_size=8,
+            ),
+            (57342, 65534),
+        )
+
+        batch.seq_lens_cpu = [229376]
+        self.assertEqual(
+            _litetopk_c4_gate_lengths(
+                batch,
+                local_sequence_length=57342,
+                query_rows=4096,
+                cp_size=8,
+            ),
+            (57344, 65534),
+        )
+
+    def test_fp4_scale_backing_rounds_non_aligned_lengths_to_four_rows(self):
+        for remainder in (1, 2, 3):
+            sequence_length = 64 + remainder
+            storage_rows = _litetopk_fp4_scale_storage_rows(sequence_length)
+            backing = torch.empty((storage_rows, 4), dtype=torch.uint8)
+            logical_view = backing[:sequence_length]
+
+            self.assertEqual(storage_rows, 68)
+            self.assertEqual(logical_view.shape, (sequence_length, 4))
+            self.assertEqual(logical_view.untyped_storage().nbytes(), storage_rows * 4)
 
 
 class TestDSV4PagedIndexerMetadata(CustomTestCase):
