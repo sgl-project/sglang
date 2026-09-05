@@ -1,6 +1,7 @@
 import os
 import tempfile
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -265,3 +266,43 @@ def test_qwen4_ple_file_backend_fp8_table():
             .reshape(1, 3, embedding_dim)
         )
         torch.testing.assert_close(filed(ids), expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not _file_backend_supported(),
+    reason="the file backend needs pageable host memory reachable through host page tables",
+)
+@pytest.mark.parametrize("vocab_start", [0, 64])
+def test_qwen4_ple_file_prefetch_tp_shard(vocab_start):
+    with tempfile.TemporaryDirectory() as table_dir:
+        filed = Qwen4ExpPinnedHostEmbedding(
+            _make_source_embedding(
+                embedding_dim=160,
+                vocab_start=vocab_start,
+                vocab_end=vocab_start + 64,
+                org_vocab_size=128,
+                tp_size=2,
+            ),
+            backend="file",
+            table_dir=table_dir,
+        )
+        rows = torch.arange(64, device="cuda", dtype=torch.bfloat16)[:, None].expand(
+            64, 160
+        )
+        filed.weight.copy_(rows)
+        ids = torch.tensor([0, 63, 64, 76, 127], device="cuda").repeat(512)
+        out = torch.empty((ids.numel(), 160), device="cuda", dtype=torch.bfloat16)
+        owned = (ids >= vocab_start) & (ids < vocab_start + 64)
+        expected = torch.zeros_like(out)
+        expected[owned] = rows[ids[owned] - vocab_start]
+        try:
+            with mock.patch("os.posix_fadvise") as fadvise:
+                filed.gather(ids, out=out)
+                torch.cuda.synchronize()
+                filed._file_prefetcher._pool.shutdown(wait=True)
+                offsets = sorted(c.args[1] for c in fadvise.call_args_list)
+                assert offsets == ([0, 16384] if vocab_start == 0 else [0, 4096, 16384])
+            torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        finally:
+            filed._file_rss_trimmer.close()
+            filed._file_prefetcher.close()

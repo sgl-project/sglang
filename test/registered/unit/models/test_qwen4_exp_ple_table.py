@@ -131,6 +131,49 @@ class TestPleFilePrefetcher(CustomTestCase):
             finally:
                 pf.close()
 
+    def test_enqueue_uses_local_shard_rows(self):
+        for vocab_start in (0, 64):
+            with (
+                self.subTest(vocab_start=vocab_start),
+                tempfile.TemporaryDirectory() as d,
+            ):
+                path = os.path.join(d, "table.bin")
+                with open(path, "wb") as f:
+                    f.truncate(64 * 160)
+                pf = PleFilePrefetcher(path, row_bytes=160, min_rows=4)
+                try:
+                    with mock.patch("os.posix_fadvise") as fadvise:
+                        ids = torch.tensor([-1, 0, 25, 63, 64]) + vocab_start
+                        self.assertTrue(
+                            pf.enqueue(
+                                ids, vocab_start=vocab_start, vocab_end=vocab_start + 64
+                            )
+                        )
+                        pf._pool.shutdown(wait=True)
+                        offsets = sorted(c.args[1] for c in fadvise.call_args_list)
+                        self.assertEqual(offsets, [0, 4096, 8192])
+                finally:
+                    pf.close()
+
+    def test_enqueue_skips_ids_outside_shard(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "table.bin")
+            with open(path, "wb") as f:
+                f.truncate(64 * 160)
+            pf = PleFilePrefetcher(path, row_bytes=160, min_rows=4)
+            try:
+                with mock.patch.object(pf._pool, "submit") as submit:
+                    self.assertFalse(
+                        pf.enqueue(
+                            torch.tensor([0, 63, 128, 129]),
+                            vocab_start=64,
+                            vocab_end=128,
+                        )
+                    )
+                    submit.assert_not_called()
+            finally:
+                pf.close()
+
 
 class TestSmapsParsing(CustomTestCase):
     """The parser runs anywhere; only the live mapping needs Linux."""
