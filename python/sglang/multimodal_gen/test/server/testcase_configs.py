@@ -445,6 +445,7 @@ class PerformanceSummary:
     all_denoise_steps: dict[int, float]
     load_peak_vram_mb: float = 0.0
     runtime_peak_vram_mb: float = 0.0
+    warmup_peak_vram_mb: float = 0.0
     load_peak_host_anon_mb: float = 0.0
     runtime_peak_host_anon_mb: float = 0.0
     frames_per_second: float | None = None
@@ -482,6 +483,9 @@ class PerformanceSummary:
         runtime_peak_vram_mb = float(
             record.memory_snapshots.get("runtime_peak", {}).get("peak_reserved_mb", 0.0)
         )
+        warmup_peak_vram_mb = float(
+            record.memory_snapshots.get("warmup_peak", {}).get("peak_reserved_mb", 0.0)
+        )
         load_peak_host_anon_mb = float(
             record.memory_snapshots.get("load_peak", {}).get("peak_host_anon_mb", 0.0)
         )
@@ -501,6 +505,7 @@ class PerformanceSummary:
             all_denoise_steps=per_step,
             load_peak_vram_mb=load_peak_vram_mb,
             runtime_peak_vram_mb=runtime_peak_vram_mb,
+            warmup_peak_vram_mb=warmup_peak_vram_mb,
             load_peak_host_anon_mb=load_peak_host_anon_mb,
             runtime_peak_host_anon_mb=runtime_peak_host_anon_mb,
         )
