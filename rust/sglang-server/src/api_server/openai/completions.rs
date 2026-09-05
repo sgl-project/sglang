@@ -24,9 +24,10 @@ use tokio::sync::mpsc;
 use super::super::guard::AbortGuard;
 use super::super::submit::submit;
 use super::{
-    AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_decode_stream,
-    openai_error, submit_generation, unix_seconds_u32,
+    AppState, MAX_OPENAI_CHOICES, OpenAIRequestError, collect_output, error_payload,
+    indexed_decode_stream, openai_error, submit_generation, unix_seconds_u32,
 };
+use crate::message::config::ServerArgs;
 use crate::message::finish_reason::Matched;
 use crate::message::ids::Rid;
 use crate::message::request::{GenerateRequest, RequestKind};
@@ -60,6 +61,77 @@ pub(super) struct ChoiceExtensions {
     finish_reason_override: Option<String>,
 }
 
+/// Prepare one OpenAI completion request into the ordered native
+/// requests consumed by inference or standalone rendering.
+pub(in crate::api_server) fn prepare_completion_requests(
+    server_args: &ServerArgs,
+    request: &CreateCompletionRequest,
+    response_id: &str,
+) -> Result<Vec<GenerateRequest>, OpenAIRequestError> {
+    if request.model != server_args.served_model_name {
+        return Err(format!("The model `{}` does not exist", request.model).into());
+    }
+    if request.prompt_embeds.is_some() {
+        return Err("prompt_embeds is not supported by the Rust frontend".into());
+    }
+    if request.suffix.is_some() {
+        return Err("suffix is not supported by this model".into());
+    }
+    if request.best_of.is_some_and(|best_of| best_of != 1) {
+        return Err("best_of values greater than 1 are not supported".into());
+    }
+    if request.max_tokens == Some(0) {
+        return Err("max_tokens must be positive".into());
+    }
+    if request.n == Some(0) {
+        return Err("n must be at least 1".into());
+    }
+    let prompt_specs = completion_prompt_specs(&request.prompt)?;
+    let mut sampling = completion_sampling_params(request)?;
+    sampling
+        .normalize(
+            server_args.skip_tokenizer_init,
+            server_args.model_config.vocab_size,
+        )
+        .map_err(|error| error.to_string())?;
+    let n = request.n.unwrap_or(1) as usize;
+    let choice_count = prompt_specs
+        .len()
+        .checked_mul(n)
+        .filter(|&count| count <= MAX_OPENAI_CHOICES)
+        .ok_or_else(|| {
+            format!("prompt count times n exceeds the maximum of {MAX_OPENAI_CHOICES}")
+        })?;
+
+    let mut requests = Vec::with_capacity(choice_count);
+    for (prompt_index, prompt) in prompt_specs.into_iter().enumerate() {
+        let (text, input_ids) = match prompt {
+            PromptSpec::Text(text) => (Some(text), None),
+            PromptSpec::TokenIds(ids) => (None, Some(ids)),
+        };
+        for sample_index in 0..n {
+            let index = prompt_index * n + sample_index;
+            requests.push(GenerateRequest {
+                rid: Rid::from_client(&format!("{response_id}-{index}")),
+                text: text.clone(),
+                input_ids: input_ids.clone(),
+                sampling_params: sampling.clone(),
+                stream: request.stream.unwrap_or(false),
+                return_logprob: request.logprobs.is_some(),
+                logprob_start_len: if request.echo.unwrap_or(false) && request.logprobs.is_some() {
+                    0
+                } else {
+                    -1
+                },
+                top_logprobs_num: request.logprobs.unwrap_or(0) as i64,
+                return_text_in_logprobs: request.logprobs.map(|_| true),
+                ..Default::default()
+            });
+        }
+    }
+    Ok(requests)
+}
+
 async fn completions(
     State(state): State<Arc<AppState>>,
     body: Result<Json<CreateCompletionRequest>, JsonRejection>,
@@ -70,131 +142,50 @@ async fn completions(
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
+    let response_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
+    let native_requests =
+        match prepare_completion_requests(&state.server_args, &request, &response_id) {
+            Ok(requests) => requests,
+            Err(error) => return error.into_response(),
+        };
     let stream = request.stream.unwrap_or(false);
     let echo = request.echo.unwrap_or(false);
     let model = request.model.clone();
-    if model != state.server_args.served_model_name {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            format!("The model `{model}` does not exist"),
-            false,
-        );
-    }
-
-    if request.prompt_embeds.is_some() {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            "prompt_embeds is not supported by the Rust frontend",
-            false,
-        );
-    }
-    if request.suffix.is_some() {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            "suffix is not supported by this model",
-            false,
-        );
-    }
-    if request.best_of.is_some_and(|best_of| best_of != 1) {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            "best_of values greater than 1 are not supported",
-            false,
-        );
-    }
-    if request.max_tokens == Some(0) {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            "max_tokens must be positive",
-            false,
-        );
-    }
-    if request.n == Some(0) {
-        return openai_error(StatusCode::BAD_REQUEST, "n must be at least 1", false);
-    }
-    let prompts = match completion_prompt_specs(&request.prompt) {
-        Ok(prompts) => prompts,
-        Err(message) => {
-            return openai_error(StatusCode::BAD_REQUEST, &message, false);
-        }
-    };
-    let mut sampling = match completion_sampling_params(&request) {
-        Ok(sampling) => sampling,
-        Err(message) => {
-            return openai_error(StatusCode::BAD_REQUEST, &message, false);
-        }
-    };
-    if let Err(error) = sampling.normalize(
-        state.server_args.skip_tokenizer_init,
-        state.server_args.model_config.vocab_size,
-    ) {
-        return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false);
-    }
-
-    let n = request.n.unwrap_or(1) as usize;
-    let choice_count = match prompts.len().checked_mul(n) {
-        Some(count) if count <= MAX_OPENAI_CHOICES => count,
-        _ => {
-            return openai_error(
-                StatusCode::BAD_REQUEST,
-                format!("prompt count times n exceeds the maximum of {MAX_OPENAI_CHOICES}"),
-                false,
-            );
-        }
-    };
-    let response_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
     let created = unix_seconds_u32();
     let mut guard = AbortGuard::new_empty(state.senders.clone());
-    let mut submitted = Vec::with_capacity(choice_count);
+    let mut submitted = Vec::with_capacity(native_requests.len());
+    let n = request.n.unwrap_or(1) as usize;
+    let mut prompt_echo = String::new();
 
-    for (prompt_index, prompt) in prompts.into_iter().enumerate() {
-        let (text, input_ids, mut prompt_echo) = match prompt {
-            PromptSpec::Text(text) => {
-                let prompt_echo = if echo { text.clone() } else { String::new() };
-                (Some(text), None, prompt_echo)
-            }
-            PromptSpec::TokenIds(input_ids) => (None, Some(input_ids), String::new()),
-        };
-        for sample_index in 0..n {
-            let index = prompt_index * n + sample_index;
-            let rid = Rid::from_client(&format!("{response_id}-{index}"));
-            if echo
-                && sample_index == 0
-                && let Some(token_ids) = &input_ids
-            {
-                prompt_echo = match decode_prompt_echo(&state, token_ids.clone()).await {
+    for (index, native) in native_requests.into_iter().enumerate() {
+        let prompt_index = index / n;
+        let sample_index = index % n;
+        if sample_index == 0 {
+            prompt_echo = if !echo {
+                String::new()
+            } else if let Some(text) = &native.text {
+                text.clone()
+            } else if let Some(token_ids) = &native.input_ids {
+                match decode_prompt_echo(&state, token_ids.clone()).await {
                     Ok(echo) => echo,
                     Err(response) => return response,
-                };
-            }
-            let native = GenerateRequest {
-                rid: rid.clone(),
-                text: text.clone(),
-                input_ids: input_ids.clone(),
-                sampling_params: sampling.clone(),
-                stream,
-                return_logprob: request.logprobs.is_some(),
-                logprob_start_len: if echo && request.logprobs.is_some() {
-                    0
-                } else {
-                    -1
-                },
-                top_logprobs_num: request.logprobs.unwrap_or(0) as i64,
-                return_text_in_logprobs: request.logprobs.map(|_| true),
-                ..Default::default()
+                }
+            } else {
+                unreachable!("prepared completion request has a prompt")
             };
-            let rx = match submit_generation(&state, native, stream, &mut guard).await {
-                Ok(rx) => rx,
-                Err(response) => return response,
-            };
-            submitted.push(SubmittedChoice {
-                index,
-                prompt_index,
-                rid,
-                echo: prompt_echo.clone(),
-                rx,
-            });
         }
+        let rid = native.rid.clone();
+        let rx = match submit_generation(&state, native, stream, &mut guard).await {
+            Ok(rx) => rx,
+            Err(response) => return response,
+        };
+        submitted.push(SubmittedChoice {
+            index,
+            prompt_index,
+            rid,
+            echo: prompt_echo.clone(),
+            rx,
+        });
     }
 
     if stream {
