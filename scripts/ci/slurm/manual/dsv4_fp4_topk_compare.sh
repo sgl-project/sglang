@@ -327,6 +327,7 @@ install_fused_aiter() {
     rm -rf "$runtime_source"
     mkdir -p "$runtime_source"
     cp -a /aiter-source/. "$runtime_source/"
+    git config --global --add safe.directory "$runtime_source"
 
     export AITER_USE_SYSTEM_TRITON="${AITER_USE_SYSTEM_TRITON:-1}"
     export MAX_JOBS="${MAX_JOBS:-32}"
