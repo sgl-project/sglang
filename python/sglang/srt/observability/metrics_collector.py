@@ -1824,6 +1824,12 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
                 # Fallback for backward compatibility
                 labels_total = {**labels, "cache_source": "total"}
                 self.cached_tokens_total.labels(**labels_total).inc(cached_tokens)
+        else:
+            # Register an explicit zero-valued series so PromQL expressions
+            # combining prompt and cached-token counters retain this label set
+            # before the first cache hit.
+            labels_total = {**labels, "cache_source": "total"}
+            self.cached_tokens_total.labels(**labels_total).inc(0)
 
         self.num_requests_total.labels(**stream_labels).inc(1)
         if has_grammar:
