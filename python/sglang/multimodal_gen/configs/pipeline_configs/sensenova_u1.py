@@ -10,6 +10,16 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 )
 
 
+def _is_runtime_option_requested(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (dict, list, tuple, set)):
+        return bool(value)
+    return True
+
+
 @dataclass
 class SenseNovaU1PipelineConfig(PipelineConfig):
     """Native SenseNova-U1 text-to-image pipeline configuration."""
@@ -39,6 +49,31 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
                 "SenseNovaU1Pipeline does not support torch.compile yet. "
                 "Please omit --enable-torch-compile."
             )
+        if getattr(server_args, "lora_path", None):
+            raise ValueError(
+                "SenseNovaU1Pipeline does not support LoRA adapters yet. "
+                "Please omit --lora-path."
+            )
+        unsupported_runtime_options = {
+            "component_residency": "component residency",
+            "cpu_offload_components": "CPU offload",
+            "dit_cpu_offload": "DiT CPU offload",
+            "text_encoder_cpu_offload": "text encoder CPU offload",
+            "image_encoder_cpu_offload": "image encoder CPU offload",
+            "vae_cpu_offload": "VAE CPU offload",
+            "dit_layerwise_offload": "DiT layerwise offload",
+            "layerwise_offload_components": "layerwise offload",
+            "quantization": "quantization",
+            "transformer_weights_path": "pre-quantized transformer weights",
+            "component_quantizations": "component quantization",
+            "component_precisions": "component precision overrides",
+        }
+        for option, description in unsupported_runtime_options.items():
+            if _is_runtime_option_requested(getattr(server_args, option, None)):
+                raise ValueError(
+                    f"SenseNovaU1Pipeline does not support {description} yet. "
+                    f"Please omit --{option.replace('_', '-')}."
+                )
         if getattr(server_args, "attention_backend", None) is not None:
             raise ValueError(
                 "SenseNovaU1Pipeline does not support custom attention backends yet. "

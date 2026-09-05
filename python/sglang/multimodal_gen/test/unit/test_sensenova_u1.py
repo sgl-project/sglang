@@ -85,9 +85,10 @@ class _RecordingTraceContext:
 
 
 class _SequentialTestExecutor(PipelineExecutor):
-    def __init__(self, server_args, *, fail=False):
+    def __init__(self, server_args, *, fail=False, fail_request_ids=None):
         super().__init__(server_args)
         self.fail = fail
+        self.fail_request_ids = set(fail_request_ids or [])
         self.executed_requests = []
 
     def execute_group(self, stages, batches, server_args):
@@ -106,7 +107,7 @@ class _SequentialTestExecutor(PipelineExecutor):
 
     def execute(self, stages, batch, server_args):
         self.executed_requests.append(batch)
-        if self.fail:
+        if self.fail or batch.request_id in self.fail_request_ids:
             raise RuntimeError(f"generation failed for {batch.request_id}")
         return OutputBatch(
             output_file_paths=[batch.output_file_name],
@@ -115,9 +116,13 @@ class _SequentialTestExecutor(PipelineExecutor):
 
 
 class _SequentialTestPipeline:
-    def __init__(self, server_args, *, fail=False):
+    def __init__(self, server_args, *, fail=False, fail_request_ids=None):
         self.input_stage = InputValidationStage()
-        self.executor = _SequentialTestExecutor(server_args, fail=fail)
+        self.executor = _SequentialTestExecutor(
+            server_args,
+            fail=fail,
+            fail_request_ids=fail_request_ids,
+        )
 
     def forward_batch_sequentially(self, batches, server_args):
         return self.executor.execute_group_sequentially(
@@ -347,6 +352,7 @@ def test_sensenova_u1_rejects_multi_gpu_during_arg_validation():
             SimpleNamespace(
                 num_gpus=2,
                 enable_torch_compile=False,
+                lora_path=None,
                 attention_backend=None,
                 component_attention_backends={},
             )
@@ -357,6 +363,22 @@ def test_sensenova_u1_rejects_multi_gpu_during_arg_validation():
     ("override", "expected"),
     [
         ({"enable_torch_compile": True}, "torch.compile"),
+        ({"lora_path": "sensenova/SenseNova-U1.5-8B-MoT-LoRAs"}, "LoRA adapters"),
+        ({"component_residency": {"transformer": "cpu"}}, "component residency"),
+        ({"cpu_offload_components": ["transformer"]}, "CPU offload"),
+        ({"dit_cpu_offload": True}, "DiT CPU offload"),
+        ({"text_encoder_cpu_offload": True}, "text encoder CPU offload"),
+        ({"image_encoder_cpu_offload": True}, "image encoder CPU offload"),
+        ({"vae_cpu_offload": True}, "VAE CPU offload"),
+        ({"dit_layerwise_offload": True}, "DiT layerwise offload"),
+        ({"layerwise_offload_components": ["transformer"]}, "layerwise offload"),
+        ({"quantization": "fp8"}, "quantization"),
+        (
+            {"transformer_weights_path": "/tmp/transformer.safetensors"},
+            "pre-quantized transformer weights",
+        ),
+        ({"component_quantizations": {"transformer": "fp8"}}, "component quantization"),
+        ({"component_precisions": {"transformer": "fp16"}}, "component precision"),
         ({"attention_backend": "fa"}, "custom attention backends"),
         (
             {"component_attention_backends": {"text_encoder": "torch_sdpa"}},
@@ -370,6 +392,19 @@ def test_sensenova_u1_rejects_unsupported_runtime_modes(override, expected):
     args = {
         "num_gpus": 1,
         "enable_torch_compile": False,
+        "lora_path": None,
+        "component_residency": None,
+        "cpu_offload_components": None,
+        "dit_cpu_offload": None,
+        "text_encoder_cpu_offload": None,
+        "image_encoder_cpu_offload": None,
+        "vae_cpu_offload": False,
+        "dit_layerwise_offload": None,
+        "layerwise_offload_components": None,
+        "quantization": None,
+        "transformer_weights_path": None,
+        "component_quantizations": {},
+        "component_precisions": {},
         "attention_backend": None,
         "component_attention_backends": {},
         "attention_backend_config": {},
@@ -546,7 +581,33 @@ def test_sensenova_u1_multi_output_request_expands_before_generation_stage():
         assert len(output.output) == 1
 
 
-def _make_sensenova_u1_sequential_entrypoint(*, fail=False):
+def test_sensenova_u1_multi_output_rejects_short_seed_list():
+    sampling = SenseNovaU1SamplingParams(
+        prompt="a mountain lake",
+        width=2304,
+        height=4096,
+        num_outputs_per_prompt=2,
+        seed=[7],
+    )
+    batch = Req(
+        request_id="req-0",
+        prompt=sampling.prompt,
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=sampling.seed,
+        sampling_params=sampling,
+        extra=sampling.build_request_extra(),
+        output_file_name="sample.png",
+    )
+    server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
+
+    with pytest.raises(ValueError, match="seed list length"):
+        list(InputValidationStage().iter_sequential_requests(batch, server_args))
+
+
+def _make_sensenova_u1_sequential_entrypoint(*, fail=False, fail_request_ids=None):
     sampling = SenseNovaU1SamplingParams(
         prompt="a mountain lake",
         width=2304,
@@ -568,7 +629,9 @@ def _make_sensenova_u1_sequential_entrypoint(*, fail=False):
         trace_ctx=trace_ctx,
     )
     server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
-    pipeline = _SequentialTestPipeline(server_args, fail=fail)
+    pipeline = _SequentialTestPipeline(
+        server_args, fail=fail, fail_request_ids=fail_request_ids
+    )
     worker = GPUWorker.__new__(GPUWorker)
     worker.pipeline = pipeline
     worker.server_args = server_args
@@ -639,6 +702,30 @@ def test_sensenova_u1_multi_output_entrypoint_failure(monkeypatch):
         and req.metrics.memory_snapshots["after_validation"].peak_reserved_mb == 400.0
         for req in executor.executed_requests
     )
+    assert all(req.trace_ctx is trace_ctx for req in executor.executed_requests)
+    assert trace_ctx.started_slices == [("gpu_forward", 2)]
+    assert trace_ctx.finished_slices == [("gpu_forward", 2)]
+    assert trace_ctx.finish_count == 1
+
+
+@pytest.mark.parametrize("failed_request_id", ["req-0:0", "req-0:1"])
+def test_sensenova_u1_multi_output_entrypoint_mixed_failure_fails_parent(
+    monkeypatch, failed_request_id
+):
+    _force_cpu_entrypoint(monkeypatch)
+    batch, trace_ctx, executor, scheduler_client = (
+        _make_sensenova_u1_sequential_entrypoint(fail_request_ids={failed_request_id})
+    )
+
+    with pytest.raises(
+        RuntimeError, match=f"generation failed for {failed_request_id}"
+    ):
+        asyncio.run(process_generation_batch(scheduler_client, batch))
+
+    assert [req.request_id for req in executor.executed_requests] == [
+        "req-0:0",
+        "req-0:1",
+    ]
     assert all(req.trace_ctx is trace_ctx for req in executor.executed_requests)
     assert trace_ctx.started_slices == [("gpu_forward", 2)]
     assert trace_ctx.finished_slices == [("gpu_forward", 2)]

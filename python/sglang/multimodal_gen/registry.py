@@ -693,8 +693,9 @@ def get_model_info(
     if is_sensenova_u1_adapter_only_model(model_path):
         logger.error(
             "SenseNova-U1 adapter-only checkpoint '%s' does not contain base "
-            "model weights or config. Use the base checkpoint "
-            "'sensenova/SenseNova-U1.5-8B-MoT' with the adapter instead.",
+            "model weights or config. SenseNova-U1 adapters are not supported "
+            "yet; use the base checkpoint 'sensenova/SenseNova-U1.5-8B-MoT' "
+            "directly.",
             model_path,
         )
         return None
