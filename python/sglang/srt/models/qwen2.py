@@ -224,6 +224,9 @@ class Qwen2Attention(nn.Module):
                 and getattr(forward_batch.spec_info, "is_ragged_verify", False)
             )
             and not get_bool_env_var("SGLANG_DISABLE_FINAL_LAYER_OPT", "false")
+            and not (
+                torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+            )
         )
 
         if can_optimize:
@@ -389,6 +392,9 @@ class Qwen2DecoderLayer(nn.Module):
                 and getattr(forward_batch.spec_info, "is_ragged_verify", False)
             )
             and not get_bool_env_var("SGLANG_DISABLE_FINAL_LAYER_OPT", "false")
+            and not (
+                torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+            )
         )
 
         if can_optimize_last_layer:
