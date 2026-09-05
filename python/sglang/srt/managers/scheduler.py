@@ -1253,7 +1253,7 @@ class Scheduler(
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=self.flush_cache,
-            is_fully_idle=self.is_fully_idle,
+            not_idle_reasons=self.not_idle_reasons,
             ipc_channels=self.ipc_channels,
         )
         self._last_logged_elastic_radix_namespace: Optional[str] = None
@@ -4695,23 +4695,47 @@ class Scheduler(
             self.metrics_reporter.record_scheduler_active()
 
     def is_fully_idle(self, for_health_check=False) -> bool:
+        return not self.not_idle_reasons(for_health_check)
+
+    def not_idle_reasons(self, for_health_check=False) -> List[str]:
+        """What is currently keeping the scheduler from being idle.
+
+        Single source of truth for `is_fully_idle`, so that the rejection
+        messages of destructive ops (flush / attach / detach) can name the
+        actual blocker instead of guessing. Countable reasons carry their
+        count (`waiting_queue=16`); the rest are reported by name alone.
+        Every predicate is cheap and side-effect free, and this runs on
+        control-plane paths only, never in the event loop.
+        """
+        reasons: List[str] = []
+
+        def require(name: str, ok: bool) -> None:
+            if not ok:
+                reasons.append(name)
+
+        def require_empty(name: str, sized) -> None:
+            count = len(sized)
+            if count:
+                reasons.append(f"{name}={count}")
+
         # Health check piggybacks on running requests in process_output.
         # Only running_batch + waiting_queue guarantee active GPU processing;
         # disagg queues (bootstrap/prealloc/transfer) may have items without
         # any request actually running on GPU — e.g. stuck handshake, full
         # KV cache, or stalled transfer — so they can't carry health info.
         # Batch running status
-        idle = (
-            self.running_batch.is_empty()
-            and self.chunked_req is None
-            and not self.dllm_manager.any_staging_reqs()
-            and (self.last_batch is None or self.last_batch.is_empty())
-            and (not self.enable_overlap or len(self.result_queue) == 0)
-            and self._pp_microbatches_drained()
+        require_empty("running_batch", self.running_batch.reqs)
+        require("chunked_req", self.chunked_req is None)
+        require("dllm_staging", not self.dllm_manager.any_staging_reqs())
+        require_empty(
+            "last_batch", () if self.last_batch is None else self.last_batch.reqs
         )
+        if self.enable_overlap:
+            require_empty("result_queue", self.result_queue)
+        require("pp_microbatches", self._pp_microbatches_drained())
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
-        idle &= len(self.waiting_queue) == 0
+        require_empty("waiting_queue", self.waiting_queue)
 
         if (
             for_health_check
@@ -4719,43 +4743,63 @@ class Scheduler(
             and self.disaggregation_mode == DisaggregationMode.DECODE
             and self.disagg_decode_prealloc_queue is not None
         ):
-            idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
+            require_empty(
+                "disagg_decode_retracted",
+                self.disagg_decode_prealloc_queue.retracted_queue,
+            )
 
         if not for_health_check:
             # Grammar queue and prefill inflight queue may not produce batch
             # results instantly, but they still indicate the server is not idle.
-            idle &= len(self.grammar_manager.grammar_queue) == 0
+            require_empty("grammar_queue", self.grammar_manager.grammar_queue)
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                idle &= len(self.disagg_prefill_inflight_queue) == 0
-                idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
+                require_empty(
+                    "disagg_prefill_inflight", self.disagg_prefill_inflight_queue
+                )
+                require_empty(
+                    "disagg_prefill_bootstrap",
+                    self.disagg_prefill_bootstrap_queue.queue,
+                )
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
-                idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
-                idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
-                idle &= len(self.disagg_decode_transfer_queue.queue) == 0
+                require_empty(
+                    "disagg_decode_prealloc", self.disagg_decode_prealloc_queue.queue
+                )
+                require_empty(
+                    "disagg_decode_retracted",
+                    self.disagg_decode_prealloc_queue.retracted_queue,
+                )
+                require_empty(
+                    "disagg_decode_transfer", self.disagg_decode_transfer_queue.queue
+                )
                 if self.decode_offload_manager is not None:
-                    idle &= len(self.decode_offload_manager.ongoing_offload) == 0
+                    require_empty(
+                        "decode_offload", self.decode_offload_manager.ongoing_offload
+                    )
 
             # HiSparse: staging requests transitioning prefill -> decode
             if self.enable_hisparse:
-                idle &= not self.hisparse_coordinator.has_ongoing_staging()
+                require(
+                    "hisparse_staging",
+                    not self.hisparse_coordinator.has_ongoing_staging(),
+                )
 
             # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
             # destructive operations like attach/detach/flush_cache.
             if self.enable_hierarchical_cache:
                 tc = self.tree_cache
-                idle &= len(tc.ongoing_write_through) == 0
-                idle &= len(tc.ongoing_load_back) == 0
+                require_empty("hicache_write_through", tc.ongoing_write_through)
+                require_empty("hicache_load_back", tc.ongoing_load_back)
                 if tc.enable_storage:
-                    idle &= len(tc.ongoing_prefetch) == 0
-                    idle &= len(tc.ongoing_backup) == 0
+                    require_empty("hicache_prefetch", tc.ongoing_prefetch)
+                    require_empty("hicache_backup", tc.ongoing_backup)
                     if get_memory().hicache_host_memory_mode == "buffer_only":
                         # Queued writes, staged prefetches, and in-flight
                         # storage writes still hold host staging
                         # (buffer-mode unified tree only).
-                        idle &= tc.buffer_pipeline.is_idle()
+                        require("hicache_buffer_pipeline", tc.buffer_pipeline.is_idle())
 
-        return idle
+        return reasons
 
     def _pp_microbatches_drained(self) -> bool:
         if self.ps.pp_size == 1:
@@ -4777,8 +4821,7 @@ class Scheduler(
                 success=False,
                 message=(
                     "Reject attach: scheduler is not idle. "
-                    f"#queue-req={len(self.waiting_queue)} "
-                    f"#running-req={len(self.running_batch.reqs)}"
+                    f"blocked-by: {', '.join(self.not_idle_reasons())}"
                 ),
             )
 
@@ -4833,8 +4876,7 @@ class Scheduler(
                 success=False,
                 message=(
                     "Reject detach: scheduler is not idle. "
-                    f"#queue-req={len(self.waiting_queue)} "
-                    f"#running-req={len(self.running_batch.reqs)}"
+                    f"blocked-by: {', '.join(self.not_idle_reasons())}"
                 ),
             )
 
@@ -4891,9 +4933,8 @@ class Scheduler(
             success = True
         else:
             logging.warning(
-                f"Cache not flushed because there are pending requests. "
-                f"#queue-req: {len(self.waiting_queue)}, "
-                f"#running-req: {len(self.running_batch.reqs)}"
+                "Cache not flushed because the scheduler is not idle. "
+                f"blocked-by: {', '.join(self.not_idle_reasons())}"
             )
             success = False
         return success

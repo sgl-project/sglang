@@ -21,10 +21,11 @@ class TestSchedulerFlushCache(unittest.TestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.ipc_channels = MagicMock()
         scheduler.flush_cache = MagicMock(return_value=True)
-        scheduler.is_fully_idle = MagicMock(return_value=False)
+        # Non-empty list == "not idle"; the entries name what blocks the flush.
+        scheduler.not_idle_reasons = MagicMock(return_value=["running_batch"])
         scheduler.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=scheduler.flush_cache,
-            is_fully_idle=scheduler.is_fully_idle,
+            not_idle_reasons=scheduler.not_idle_reasons,
             ipc_channels=scheduler.ipc_channels,
         )
         return scheduler
@@ -42,7 +43,7 @@ class TestSchedulerFlushCache(unittest.TestCase):
     def test_immediate_flush_when_idle(self):
         """Positive timeout but already idle → flush immediately."""
         scheduler = self._new_scheduler()
-        scheduler.is_fully_idle.return_value = True
+        scheduler.not_idle_reasons.return_value = []
 
         output = scheduler.flush_wrapper.handle(FlushCacheReqInput(timeout_s=5.0))
 
@@ -81,7 +82,7 @@ class TestSchedulerFlushCache(unittest.TestCase):
 
     def test_pending_flush_completes_on_idle(self):
         scheduler = self._new_scheduler()
-        scheduler.is_fully_idle.return_value = True
+        scheduler.not_idle_reasons.return_value = []
         req = FlushCacheReqInput(timeout_s=1.0)
         scheduler.flush_wrapper._pending = (req, 111.0)
 
