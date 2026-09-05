@@ -24,7 +24,6 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -321,6 +320,8 @@ class RadixAttention(nn.Module):
             if hasattr(backend, "_kv_write_scales")
             else ()
         )
+        from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+
         backend.token_to_kv_pool.set_kv_buffer(
             self,
             KVWriteLoc(cache_loc, swa_loc),
