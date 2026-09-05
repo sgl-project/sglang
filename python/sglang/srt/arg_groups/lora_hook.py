@@ -168,34 +168,40 @@ def check_lora_moe_runner_args(server_args: Any):
     cfg = resolving_view(server_args)
     if (
         cfg.speculative_algorithm is not None
-        and cfg.speculative_moe_runner_backend == "lora"
+        and cfg.speculative_moe_runner_backend is not None
+        and cfg.speculative_moe_runner_backend.startswith("lora")
     ):
         # Draft models have no LoRA adapters.
         raise ValueError(
-            "--speculative-moe-runner-backend lora is not supported: the "
-            "LoRA MoE runner serves adapter traffic on the target model"
+            f"--speculative-moe-runner-backend {cfg.speculative_moe_runner_backend} "
+            "is not supported: the LoRA MoE runner serves adapter traffic on the "
+            "target model"
         )
-    if cfg.moe_runner_backend != "lora":
+    backend = cfg.moe_runner_backend
+    if not backend.startswith("lora"):
         return
     if not (cfg.enable_lora or cfg.lora_paths):
         raise ValueError(
-            "--moe-runner-backend lora requires --enable-lora (or --lora-paths)"
+            f"--moe-runner-backend {backend} requires --enable-lora (or --lora-paths)"
         )
-    if cfg.quantization is not None:
+    # Layer attachment checks the specific weight layout within each scheme.
+    if cfg.quantization not in (None, "fp8", "modelopt_fp4"):
         raise ValueError(
-            "--moe-runner-backend lora currently supports unquantized BF16 MoE "
-            f"only, got --quantization {cfg.quantization}"
+            f"--moe-runner-backend {backend} supports unquantized BF16, 128-block "
+            f"FP8, and ModelOpt NVFP4 MoE, got --quantization {cfg.quantization}"
         )
     if cfg.moe_a2a_backend != "none":
         raise ValueError(
-            "--moe-runner-backend lora requires Standard dispatch, "
+            f"--moe-runner-backend {backend} requires Standard dispatch, "
             f"got --moe-a2a-backend {cfg.moe_a2a_backend}"
         )
     if cfg.ep_join_mode is not None:
-        raise ValueError("--moe-runner-backend lora does not yet support elastic EP")
+        raise ValueError(
+            f"--moe-runner-backend {backend} does not yet support elastic EP"
+        )
     if cfg.enable_dp_attention and cfg.dp_size > 1:
         raise ValueError(
-            "--moe-runner-backend lora does not yet support DP-attention with dp_size > 1"
+            f"--moe-runner-backend {backend} does not yet support DP-attention with dp_size > 1"
         )
     if (
         cfg.enable_eplb
@@ -203,18 +209,18 @@ def check_lora_moe_runner_args(server_args: Any):
         or cfg.ep_num_redundant_experts > 0
     ):
         raise ValueError(
-            "--moe-runner-backend lora currently requires trivial expert placement "
+            f"--moe-runner-backend {backend} currently requires trivial expert placement "
             "without EPLB or redundant experts"
         )
     if cfg.enable_pdmux:
         raise ValueError(
-            "--moe-runner-backend lora does not yet support PD-multiplexing: its "
+            f"--moe-runner-backend {backend} does not yet support PD-multiplexing: its "
             "fused-align routing scratch is cached per (device, num_buckets) and is "
             "not safe under concurrent prefill/decode streams"
         )
     if cfg.enable_two_batch_overlap:
         raise ValueError(
-            "--moe-runner-backend lora does not yet support two-batch overlap: its "
+            f"--moe-runner-backend {backend} does not yet support two-batch overlap: its "
             "batch metadata and graph-stable MoE workspace are shared across layers "
             "and are not safe for concurrent child forwards"
         )

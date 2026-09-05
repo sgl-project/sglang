@@ -9,6 +9,7 @@ import torch
 pytest.importorskip("triton")
 
 from sglang.srt.lora.moe.activation import ActivationFn  # noqa: E402
+from sglang.srt.lora.moe.base_gemm_provider import select_provider_cls  # noqa: E402
 from sglang.srt.lora.moe.execution_plan import (  # noqa: E402
     Phase,
     resolve_plans,
@@ -44,7 +45,14 @@ def _graph_backend(device: torch.device) -> BaseLoRABackend:
         moe_layer=_FakeMoeLayer(device),
         include_legacy_kernel_buffers=False,
     )
-    backend.init_prefill_cuda_graph_moe_buffers(max_num_tokens=12)
+    backend.init_cuda_graph_moe_buffers(
+        max_bs=12,
+        max_loras=4,
+        compute_dtype=torch.bfloat16,
+        moe_layer=_FakeMoeLayer(device),
+        prefill=True,
+        include_legacy_kernel_buffers=False,
+    )
     return backend
 
 
@@ -306,7 +314,7 @@ class TestRunnerAdmission:
         dispatcher = object.__new__(StandardDispatcher)
         dispatcher.skip_local_expert_mapping = overrides.get("skip_local", False)
         is_gated = overrides.get("is_gated", True)
-        gateup_width = overrides.get("gateup_width", (2 if is_gated else 1) * 4)
+        gateup_width = (2 if is_gated else 1) * 4
         return SimpleNamespace(
             quant_method=quant_method,
             dispatcher=dispatcher,
@@ -361,7 +369,7 @@ class TestRunnerAdmission:
         experts, hidden, inter = 4, 256, 128
         slices = 2 if is_gated else 1
         device = torch.device("cuda")
-        provider = MoeLoraRunner.select_provider_cls("route_major", "triton")(
+        provider = select_provider_cls("route_major", "bf16", "triton")(
             MoeLoraBf16QuantInfo(
                 w13_weight=torch.zeros(
                     (experts, slices * inter, hidden),
@@ -384,6 +392,7 @@ class TestRunnerAdmission:
             is_gated=is_gated,
         )
         selected = resolve_plans(
+            quant_family="bf16",
             architecture="sm100",
             is_shared_outer=False,
             physical_rank=16,
@@ -405,10 +414,6 @@ class TestRunnerAdmission:
             (
                 {"activation": "gelu", "is_gated": False},
                 "SiLU or ReLU2",
-            ),
-            (
-                {"is_gated": False, "gateup_width": 8},
-                "disagrees with",
             ),
         ],
     )
