@@ -7661,10 +7661,10 @@ class TestMambaFinishedOvershootCheckpoint(CustomTestCase):
 
         match = self._match(cache, tokens)
         self.assertEqual(len(match.device_indices), 8)
-        node = cache.resolve_node_handle(match.last_device_node)
+        value = _device_value(cache, match.last_device_node, ComponentType.MAMBA)
         self.assertTrue(
             torch.equal(
-                node.component_data[ComponentType.MAMBA].value.reshape(-1),
+                value.reshape(-1),
                 previous_slot.reshape(-1),
             )
         )
