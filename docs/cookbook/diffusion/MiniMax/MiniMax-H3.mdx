@@ -245,6 +245,28 @@ The first launch resolves every selected source through the normal Hub path. If
 a repository requires authentication, export a Hugging Face token in the
 server environment; no manual pre-download is required.
 
+### Optional: approximate TAEHV `taeh3` decoder
+
+For latency-sensitive preview or realtime applications, install
+[TAEHV](https://github.com/madebyollin/taehv) and pass its MiniMax-H3-specific
+`taeh3.pth` checkpoint:
+
+```bash
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --num-gpus 4 \
+  --ulysses-degree 4 \
+  --vae-config.taehv-checkpoint-path /models/taeh3.pth \
+  --port 30010
+```
+
+This opt-in path changes only visual decoding. It passes H3's 24-channel
+diffusion latents directly to TAEHV with the `taeh3` architecture; the H3 audio
+VAE is unchanged. Do not use `taehv.pth`, which targets Hunyuan Video rather
+than MiniMax H3. TAEHV is faster and smaller than the full H3 visual VAE, but it
+is an approximate decoder and can lose fine detail.
+
 For MiniMax-H3, `--performance-mode speed` deliberately keeps the DiT eager.
 The current `torch.compile` path changes the model's numerical output, so no
 recommended lossless preset enables it implicitly. An explicit
