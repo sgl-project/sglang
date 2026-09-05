@@ -180,8 +180,8 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                         enable_ex2_emulation=enable_ex2_emulation,
                     )
 
+    @staticmethod
     def _fused_rope_fp8_quantize(
-        self,
         q_nope: torch.Tensor,
         q_pe: torch.Tensor,
         k_nope: torch.Tensor,
@@ -195,10 +195,8 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         """Fused RoPE + FP8 quantize that also packs nope+pe along the last
         dim, so FMHA consumes contig FP8 Q/K without an extra concat or cast.
 
-        ``cos_sin_cache`` is None for NoPE layers (models built with
-        ``skip_rope``, e.g. Kimi Linear / Kimi-K3 MLA). Those keep the FP8
-        quantize and the packed layout, only the rotation is dropped —
-        mirroring the ``cos_sin_cache is None`` branch in :meth:`forward_decode`.
+        ``cos_sin_cache`` is None for NoPE layers (``skip_rope``); they keep the
+        FP8 quantize and the packed layout, only the rotation is dropped.
         """
         num_heads = q_nope.shape[1]
         seq_len = q_nope.shape[0]
@@ -270,14 +268,15 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         v_bf16 = kv[..., layer.qk_nope_head_dim :]
         q_nope = q[..., : layer.qk_nope_head_dim]
 
+        rotary_emb = layer.rotary_emb
         q_fp8, k_fp8 = self._fused_rope_fp8_quantize(
             q_nope=q_nope,
             q_pe=q_pe,
             k_nope=k_nope,
             k_pe=k_pe,
-            cos_sin_cache=getattr(layer.rotary_emb, "cos_sin_cache", None),
+            cos_sin_cache=None if rotary_emb is None else rotary_emb.cos_sin_cache,
             positions=positions,
-            is_neox=getattr(layer.rotary_emb, "is_neox_style", True),
+            is_neox=True if rotary_emb is None else rotary_emb.is_neox_style,
             qk_nope_head_dim=layer.qk_nope_head_dim,
             qk_rope_head_dim=layer.qk_rope_head_dim,
         )
