@@ -3733,9 +3733,33 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
         )
 
+        skip_waiting_admission = False
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            post_chunk_budget_state = adder.budget_state()
+            # NO_TOKEN takes precedence over chunk exhaustion in budget_state().
+            chunk_budget_exhausted = (
+                self.dllm_config is None
+                and adder.rem_chunk_tokens is not None
+                and adder.rem_chunk_tokens <= 0
+            )
+            skip_waiting_admission = (
+                post_chunk_budget_state == AddReqResult.OTHER or chunk_budget_exhausted
+            )
+            if (
+                skip_waiting_admission
+                and post_chunk_budget_state == AddReqResult.NO_TOKEN
+            ):
+                if (
+                    self.enable_hierarchical_cache
+                    or self.enable_unified_cache_external_linker
+                ):
+                    running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
+                        not running_batch.is_empty()
+                    )
+                else:
+                    running_batch.batch_is_full = True
 
         if self.enable_lora:
             running_loras = {
@@ -3750,11 +3774,12 @@ class Scheduler(
                     running_batch.reqs,
                 )
 
+        waiting_reqs = () if skip_waiting_admission else self.waiting_queue
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
-            mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+            mamba_allocator.alloc_group_begin(len(waiting_reqs))
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        for req in waiting_reqs:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
