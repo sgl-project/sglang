@@ -203,6 +203,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             else capture_memory_snapshot().peak_reserved_mb
         )
         self._runtime_peak_reserved_mb = 0.0
+        # Warmup probes run the default workload's full shape and may exceed any
+        # serving request; keep their peak out of the runtime figure.
+        self._warmup_peak_reserved_mb = 0.0
         self.sp_group = get_sp_group()
         self.sp_cpu_group = self.sp_group.cpu_group
         self.tp_group = get_tp_group()
@@ -685,7 +688,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             req_label = req.request_id[:8] if req.request_id else "unnamed"
             with maybe_record_function(f"SAVE_OUTPUTS {req_label}"):
                 self._materialize_output_transport(output_batch, req, save_output_paths)
-            self._record_output_peak_memory(output_batch)
+            self._record_output_peak_memory(output_batch, is_warmup=req.is_warmup)
 
             collect_perf = (
                 req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING
@@ -741,7 +744,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             if output_batch is None:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing {error_context}: {e}"
-            self._record_output_peak_memory(output_batch)
+            self._record_output_peak_memory(output_batch, is_warmup=req.is_warmup)
             # clean cache if OOM
             if not current_platform.is_cpu():
                 torch.get_device_module().empty_cache()
@@ -962,13 +965,20 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         )
         return np.asarray(materialized.frames)
 
-    def _record_output_peak_memory(self, output_batch: OutputBatch) -> None:
+    def _record_output_peak_memory(
+        self, output_batch: OutputBatch, *, is_warmup: bool = False
+    ) -> None:
         if current_platform.is_cpu():
             return
         peak_reserved_mb = capture_memory_snapshot().peak_reserved_mb
-        self._runtime_peak_reserved_mb = max(
-            self._runtime_peak_reserved_mb, peak_reserved_mb
-        )
+        if is_warmup:
+            self._warmup_peak_reserved_mb = max(
+                self._warmup_peak_reserved_mb, peak_reserved_mb
+            )
+        else:
+            self._runtime_peak_reserved_mb = max(
+                self._runtime_peak_reserved_mb, peak_reserved_mb
+            )
         if self.is_output_rank:
             output_batch.peak_memory_mb = peak_reserved_mb
 
@@ -978,7 +988,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             return
 
         peaks = torch.tensor(
-            [self._load_peak_reserved_mb, self._runtime_peak_reserved_mb],
+            [
+                self._load_peak_reserved_mb,
+                self._runtime_peak_reserved_mb,
+                self._warmup_peak_reserved_mb,
+            ],
             dtype=torch.float64,
             device=current_platform.get_device(self.local_rank),
         )
@@ -987,13 +1001,16 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             return
 
         snapshot = capture_memory_snapshot()
-        load_peak_mb, runtime_peak_mb = peaks.tolist()
+        load_peak_mb, runtime_peak_mb, warmup_peak_mb = peaks.tolist()
         for metrics in output_metrics:
             metrics.record_memory_snapshot(
                 "load_peak", replace(snapshot, peak_reserved_mb=load_peak_mb)
             )
             metrics.record_memory_snapshot(
                 "runtime_peak", replace(snapshot, peak_reserved_mb=runtime_peak_mb)
+            )
+            metrics.record_memory_snapshot(
+                "warmup_peak", replace(snapshot, peak_reserved_mb=warmup_peak_mb)
             )
 
     def _forward_group(self, batch: list[Req]) -> OutputBatch:
