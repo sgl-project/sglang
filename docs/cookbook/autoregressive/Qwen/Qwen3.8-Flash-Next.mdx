@@ -10,31 +10,37 @@ tag: NEW
 
 <Accordion title="Install SGLang">
 
-For all methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install). The two paths below match the **Python / Docker** toggle in the command panel.
+For all methods and hardware platforms, see the [official SGLang installation guide](/docs/get-started/install). The available paths below match the command modes exposed for each hardware selection.
 
 <Tabs>
 
 <Tab title="Python (pip / uv)">
 
-Qwen3.8-Flash-Next support is not in a tagged release yet, so build the model-support PR rather than installing from PyPI:
+Qwen3.8-Flash-Next support is not in a tagged release yet, so build the applicable PR rather than installing from PyPI.
+
+**NVIDIA** uses the generic model integration in [#36497](https://github.com/sgl-project/sglang/pull/36497):
 
 ```bash Command
 pip install -U uv
 uv venv --python 3.12 && source .venv/bin/activate
 
-# Qwen3.8-Flash-Next model support:
-# https://github.com/sgl-project/sglang/pull/36497
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
-git fetch origin pull/36497/head && git checkout FETCH_HEAD
+git fetch origin pull/36497/head && git checkout --detach FETCH_HEAD
+
 uv pip install -e python
 ```
 
+The AMD native-Python path was not independently validated. For AMD, use the
+digest-pinned Docker recipe below, which already contains the tested #36601
+source revision.
+
 <Note>
-Model support lands in [#36497](https://github.com/sgl-project/sglang/pull/36497). Once it is in a release, `uv pip install sglang` is enough and this whole step goes away.
+Generic model support lands in [#36497](https://github.com/sgl-project/sglang/pull/36497), while the tested AMD graph and AITER path is in [#36601](https://github.com/sgl-project/sglang/pull/36601). Once both are integrated into a release, use the normal installation path for your platform instead of these PR checkouts.
 </Note>
 
-Then run the **Python** output of the command panel below in that environment.
+NVIDIA selections expose Python and Docker commands. AMD selections expose only
+the pinned Docker path used for validation.
 
 </Tab>
 
@@ -46,13 +52,35 @@ Then run the **Python** output of the command panel below in that environment.
 docker pull lmsysorg/sglang:qwen38flashnext
 ```
 
-**AMD GPUs** (MI350X / MI355X) — the matching ROCm build. It targets CDNA4 (gfx950) and is **not** interchangeable with the CUDA image above:
+**AMD MI300X / MI325X (gfx942)** — pull the FP8 image containing the exact
+[#36601](https://github.com/sgl-project/sglang/pull/36601) source revision. The
+image is published as `aigmkt/qwen3.8-flash-next-gfx942-260827:latest`; the
+command pins its immutable digest:
 
 ```bash Command
-docker pull lmsysorg/sglang-rocm:qwen38flashnext
+docker pull aigmkt/qwen3.8-flash-next-gfx942-260827@sha256:89f79a33f48cc0f99c95902507643a86a181a5fffdcd9d8c61b66d9aacc44673
 ```
 
-For how to launch either image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with whatever the command generator below produces.
+**AMD MI350X / MI355X (gfx950)** — pull the FP8 and Quark MXFP4 image used for
+the MI350X validation:
+
+```bash Command
+docker pull aigmkt/qwen3.8-flash-next-gfx950-260827@sha256:51e4be1fde02780a5c39b37c464ebbceeffed5f6d307586f871611209a905828
+```
+
+The image embeds SGLang commit `3003ddf1574ef5004e21a10e36aaabc364766921`
+from [#36601](https://github.com/sgl-project/sglang/pull/36601). It needs no
+host source checkout, bind mount, or `PYTHONPATH` override.
+
+<Warning>
+Do not use `lmsysorg/sglang-rocm:qwen38flashnext` for this AMD recipe. That tag
+reproduces the PLE weight-scale assertion reported in
+[#36616](https://github.com/sgl-project/sglang/issues/36616), and its TP8-only
+command omits the expert-parallel topology required by the eight-GPU FP8 and
+Quark MXFP4 recipes.
+</Warning>
+
+For general container setup, see [Install → Method 3: Using Docker](/docs/get-started/install#method-3-using-docker).
 
 </Tab>
 
@@ -61,6 +89,24 @@ For how to launch either image, see [Install → Method 3: Using Docker](../../.
 </Accordion>
 
 Pick your hardware + quantization to generate the launch command.
+
+On AMD, FP8 **Low Latency** is available on MI300X, MI325X, MI350X, and MI355X
+and enables the checkpoint's EAGLE/MTP head with the 3/1/4 configuration.
+MXFP4 is limited to MI350X and MI355X: **High Throughput** is the
+non-speculative control, while **Low Latency** enables the same MTP settings.
+All AMD cells use TP8+EP8, explicit AITER attention and MoE, disabled radix
+cache, and full decode graphs. The Verified badge covers the digest-pinned
+MI350X command; MI300X, MI325X, and MI355X remain Not Verified until the exact
+command is rerun on those products.
+
+<Note>
+The checkpoint layout constrains plain tensor parallelism. FP8 passes at TP1,
+but plain TP2/TP4/TP8 split the 640-wide expert output into widths that are not
+divisible by its 128-column quantization block. MXFP4 passes at TP1/TP2/TP4,
+but plain TP8 cannot shard the `(2560, 20)` expert scale tensor evenly. TP8+EP8
+keeps whole expert quantization groups intact and is the verified eight-GPU
+topology for both formats.
+</Note>
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/Qwen/qwen3.8-flash-next.jsx";
@@ -114,17 +160,22 @@ Each precision is its own repository:
     <tr style={{background: "rgba(255,255,255,0.02)"}}>
       <td style={{padding: "9px 12px"}}><strong>BF16</strong></td>
       <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/Qwen/Qwen3.8-Flash-Next">Qwen/Qwen3.8-Flash-Next</a></td>
-      <td style={{padding: "9px 12px"}}>H200, B200, B300, GB300, MI350X, MI355X</td>
+      <td style={{padding: "9px 12px"}}>H200, B200, B300, GB300; AMD support is in #36601, with no verified cookbook cell yet</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px"}}><strong>FP8</strong></td>
       <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8">Qwen/Qwen3.8-Flash-Next-FP8</a></td>
-      <td style={{padding: "9px 12px"}}>H200, B200, B300, GB300, MI350X, MI355X</td>
+      <td style={{padding: "9px 12px"}}>H200, B200, B300, GB300; MI300X / MI325X (gfx942 recipe; not rerun), MI350X TP8+EP8 with MTP (validated), MI355X (same gfx950 recipe; not rerun)</td>
     </tr>
     <tr style={{background: "rgba(255,255,255,0.02)"}}>
       <td style={{padding: "9px 12px"}}><strong>NVFP4</strong></td>
       <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4">RadixArk/Qwen3.8-Flash-Next-NVFP4</a></td>
       <td style={{padding: "9px 12px"}}>B200, B300, GB300 (Blackwell only)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><strong>MXFP4</strong></td>
+      <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4">amd/Qwen3.8-Flash-Next-Quark-MXFP4</a></td>
+      <td style={{padding: "9px 12px"}}>MI350X (validated), MI355X (same gfx950 recipe; not rerun)</td>
     </tr>
   </tbody>
 </table>
@@ -134,7 +185,7 @@ Each precision is its own repository:
 ## 2. Advanced Usage
 
 <Note>
-The `model` argument in the examples below is the BF16 repo id. Every precision is a **separate repo**, so `model` has to be the checkpoint the server was actually launched with — `…-Flash-Next-FP8` or `…-Flash-Next-NVFP4`. The Deploy panel's cURL snippet always shows the right id for the cell you have selected.
+The `model` argument in the examples below is the BF16 repo id. Every precision is a **separate repo**, so `model` has to be the checkpoint the server was actually launched with — `…-Flash-Next-FP8`, `…-Flash-Next-NVFP4`, or `amd/Qwen3.8-Flash-Next-Quark-MXFP4`. The Deploy panel's cURL snippet always shows the right id for the cell you have selected.
 </Note>
 
 ### 2.1 Reasoning

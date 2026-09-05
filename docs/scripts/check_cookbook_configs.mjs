@@ -31,6 +31,8 @@ const COOKBOOK_MODEL_TEMPLATE = join(
   SNIPPETS, "..", "..", "..", ".claude", "skills", "cookbook-add-model",
   "templates", "config.jsx.tmpl");
 const LEGACY_DIMS = ["variants", "quantizations", "strategies", "nodesOptions"];
+const QWEN38_GFX942_IMAGE = "aigmkt/qwen3.8-flash-next-gfx942-260827@sha256:89f79a33f48cc0f99c95902507643a86a181a5fffdcd9d8c61b66d9aacc44673";
+const QWEN38_GFX950_IMAGE = "aigmkt/qwen3.8-flash-next-gfx950-260827@sha256:51e4be1fde02780a5c39b37c464ebbceeffed5f6d307586f871611209a905828";
 
 const failures = [];
 const fail = (where, msg) => failures.push(`${where}: ${msg}`);
@@ -73,6 +75,28 @@ const playgroundSource = readFileSync(join(SNIPPETS, "_playground.jsx"), "utf8")
 if (/\bmatchedCell\s*!==\s*baseCell\b/.test(playgroundSource)) {
   fail("_playground.jsx", "sibling detection compares cloned cells by object identity");
 }
+// Deployment and Playground render the same serve command. Both must honor a
+// selection-dependent runModes contract; otherwise a Docker-only platform can
+// still leak an unverified bare-Python command through the Playground.
+for (const token of [
+  'typeof config.runModes === "function"',
+  "config.runModes(base)",
+  "runModes.map((mode, index)",
+  "activeRunMode",
+]) {
+  if (!playgroundSource.includes(token)) {
+    fail("_playground.jsx", `does not honor selection-dependent runModes (${token})`);
+  }
+}
+for (const token of [
+  'typeof config.dockerGpuVendor === "function"',
+  'dockerVendor === "amd"',
+  '"  --device=/dev/kfd --device=/dev/dri"',
+]) {
+  if (!playgroundSource.includes(token)) {
+    fail("_playground.jsx", `does not render selection-dependent GPU access (${token})`);
+  }
+}
 
 const cookbookModelTemplate = readFileSync(COOKBOOK_MODEL_TEMPLATE, "utf8");
 for (const oldName of [
@@ -90,13 +114,13 @@ if (!cookbookModelTemplate.includes("--enable-w4a4-mxfp4-megamoe")) {
 // --------------------------------------------------------------- 3/4. Configs
 // Configs are .jsx with a single `export const config` literal; import them
 // through a data: URL so no temp file is needed.
-const loadConfig = async (path) => {
+const loadModule = async (path) => {
   const src = readFileSync(path, "utf8");
-  const mod = await import(
+  return import(
     "data:text/javascript," + encodeURIComponent(src)
   );
-  return mod.config;
 };
+const loadConfig = async (path) => (await loadModule(path)).config;
 
 // Every combination of match dims + overlay dims the reader can produce.
 const selectionSpace = (config) => {
@@ -169,6 +193,118 @@ for (const path of walk(CONFIGS)) {
     // silently degrades a multi-node recipe to single-node.
     if (custom && !matchIds.includes("nodes") && cell.nnodes === undefined) {
       fail(where, `cells[${i}] has no \`nnodes\` and the config declares no nodes dim`);
+    }
+  }
+
+  // Qwen3.8-Flash-Next's AMD recipes are tied to public, immutable images and
+  // a topology matrix validated on MI350X. Keep the generated cells from
+  // drifting back to the broken mutable tag, a source bind mount, or plain TP8.
+  if (config.modelName === "Qwen3.8-Flash-Next") {
+    const amdImages = {
+      mi300x: QWEN38_GFX942_IMAGE,
+      mi325x: QWEN38_GFX942_IMAGE,
+      mi350x: QWEN38_GFX950_IMAGE,
+      mi355x: QWEN38_GFX950_IMAGE,
+    };
+    for (const [hw, image] of Object.entries(amdImages)) {
+      if (config.dockerImages?.[hw] !== image) {
+        fail(where, `${hw} must use its architecture-specific digest-pinned ROCm image`);
+      }
+      const selection = { hw, variant: "default", quant: "fp8",
+        strategy: "low-latency", nodes: "single" };
+      if (config.runModes?.(selection)?.join(",") !== "docker") {
+        fail(where, `${hw} must expose only the validated Docker command`);
+      }
+      if (config.dockerRunCommand?.(selection) !== "python3 -m sglang.launch_server") {
+        fail(where, `${hw} must launch the image's embedded SGLang source`);
+      }
+      if (config.dockerGpuVendor?.(selection) !== "amd") {
+        fail(where, `${hw} must render ROCm device access in both command panels`);
+      }
+    }
+    if (Object.hasOwn(config, "dockerMounts")) {
+      fail(where, "AMD image must not require a host source bind mount");
+    }
+
+    const expected = [
+      ["mi300x", "fp8", "low-latency", false],
+      ["mi325x", "fp8", "low-latency", false],
+      ["mi350x", "fp8", "low-latency", true],
+      ["mi350x", "mxfp4", "high-throughput", true],
+      ["mi350x", "mxfp4", "low-latency", true],
+      ["mi355x", "fp8", "low-latency", false],
+      ["mi355x", "mxfp4", "high-throughput", false],
+      ["mi355x", "mxfp4", "low-latency", false],
+    ];
+    const amdCells = (config.cells || []).filter((cell) =>
+      Object.hasOwn(amdImages, cell.match?.hw));
+    if (amdCells.length !== expected.length) {
+      fail(where, `expected ${expected.length} AMD cells, found ${amdCells.length}`);
+    }
+    for (const [hw, quant, strategy, verified] of expected) {
+      const cell = amdCells.find((entry) => entry.match.quant === quant
+        && entry.match.strategy === strategy && entry.match.hw === hw);
+      const label = `${hw}/${quant}/${strategy}`;
+      if (!cell) {
+        fail(where, `missing ${label} cell`);
+        continue;
+      }
+      if (cell.verified !== verified) {
+        fail(where, `${label} verified=${cell.verified}, expected ${verified}`);
+      }
+      for (const flag of [
+        "--tp-size 8",
+        "--ep-size 8",
+        "--attention-backend aiter",
+        "--moe-runner-backend aiter",
+        "--page-size 64",
+        "--disable-radix-cache",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 4",
+      ]) {
+        if (!cell.flags.includes(flag)) fail(where, `${label} is missing ${flag}`);
+      }
+      if (!cell.env.includes("SGLANG_USE_AITER=1")) {
+        fail(where, `${label} does not enable AITER`);
+      }
+      const revision = quant === "fp8"
+        ? "--revision bcd9f01ddc9cff2316eb84281bebcd5b058bddce"
+        : "--revision 1ad7d941b239f6dc83cba6e49234c0efe1ca5477";
+      if (!cell.flags.includes(revision)) fail(where, `${label} is missing ${revision}`);
+      const speculative = cell.flags.some((flag) => flag.startsWith("--speculative-"));
+      if (strategy === "low-latency") {
+        for (const flag of [
+          "--speculative-algorithm EAGLE",
+          "--speculative-num-steps 3",
+          "--speculative-eagle-topk 1",
+          "--speculative-num-draft-tokens 4",
+        ]) {
+          if (!cell.flags.includes(flag)) fail(where, `${label} is missing ${flag}`);
+        }
+      } else if (speculative) {
+        fail(where, `${label} must remain the non-MTP control`);
+      }
+    }
+    for (const cell of amdCells) {
+      if (cell.flags.includes("--tp-size 8") && !cell.flags.includes("--ep-size 8")) {
+        fail(where, `${cell.match.hw}/${cell.match.quant}/${cell.match.strategy} exposes invalid plain TP8`);
+      }
+    }
+    for (const hw of ["mi300x", "mi325x"]) {
+      if (amdCells.some((cell) => cell.match.hw === hw && cell.match.quant === "mxfp4")) {
+        fail(where, `${hw} must not expose the MI35X-only MXFP4 checkpoint`);
+      }
+    }
+
+    const benchmarkPath = join(dirname(path), "qwen3.8-flash-next-benchmarks.jsx");
+    const benchmarks = (await loadModule(benchmarkPath)).benchmarks || [];
+    const accuracyFor = (quant) => benchmarks.find((entry) => entry.match?.hw === "mi350x"
+      && entry.match.quant === quant && entry.match.strategy === "low-latency")?.accuracy?.gsm8k_pct;
+    if (accuracyFor("fp8") !== 96.9674) {
+      fail(where, "MI350X FP8 GSM8K result must be 1279/1319 (96.9674%)");
+    }
+    if (accuracyFor("mxfp4") !== 96.74) {
+      fail(where, "MI350X MXFP4 GSM8K result must be 1276/1319 (96.7400%)");
     }
   }
 
@@ -331,6 +467,31 @@ for (const path of walk(CONFIGS)) {
       }
     }
   };
+  if (typeof config.dockerRunCommand === "function") {
+    probe((sel) => {
+      if (typeof config.dockerRunCommand(sel) !== "string") {
+        throw new Error("must return a string");
+      }
+    }, "dockerRunCommand");
+  }
+  if (config.dockerGpuVendor !== undefined) {
+    probe((sel) => {
+      const vendor = typeof config.dockerGpuVendor === "function"
+        ? config.dockerGpuVendor(sel) : config.dockerGpuVendor;
+      if (!["nvidia", "amd"].includes(vendor)) {
+        throw new Error('must return "nvidia" or "amd"');
+      }
+    }, "dockerGpuVendor");
+  }
+  if (typeof config.runModes === "function") {
+    probe((sel) => {
+      const modes = config.runModes(sel);
+      if (!Array.isArray(modes) || modes.length === 0
+          || modes.some((mode) => !["python", "docker"].includes(mode))) {
+        throw new Error('must return a non-empty array containing only "python" and "docker"');
+      }
+    }, "runModes");
+  }
   // A cell may report its badge per selection (`verificationStatus` as a
   // function of sel), so it has to survive the same space the predicates do —
   // it renders on every pick, and an unrecognized return silently downgrades

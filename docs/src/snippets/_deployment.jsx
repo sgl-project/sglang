@@ -85,6 +85,8 @@
 //                      falls back to `lmsysorg/sglang:dev`
 //   dockerHostNetworkWhen optional — `(selection, {flags, env}) => boolean`
 //   dockerMounts       optional — additional `-v` mount specs
+//   dockerGpuVendor    optional — `nvidia` or `amd`; string or
+//                      `(selection) => string`
 //   dockerRunCommand   optional — command placed after the image and before
 //                      generated server flags; string or `(selection) => string`
 //   runModes           optional — command output tabs to show (`python` and/or
@@ -815,7 +817,11 @@ export const Deployment = ({ config, benchmarks }) => {
         }
         return [];
       };
-      const gpuAccessLines = vendorOf(sel.hw) === "amd"
+      const configuredDockerVendor = typeof config.dockerGpuVendor === "function"
+        ? config.dockerGpuVendor(sel)
+        : config.dockerGpuVendor;
+      const dockerVendor = configuredDockerVendor || vendorOf(sel.hw);
+      const gpuAccessLines = dockerVendor === "amd"
         ? [
             "docker run",
             "  --device=/dev/kfd --device=/dev/dri",
@@ -823,7 +829,7 @@ export const Deployment = ({ config, benchmarks }) => {
             "  --cap-add=SYS_PTRACE --security-opt seccomp=unconfined",
             "  --shm-size 32g",
           ]
-        : vendorOf(sel.hw) === "npu"
+        : dockerVendor === "npu"
         ? [
             // NPU: --privileged grants the davinci devices (16 dies on an
             // 8-card Atlas 800I A3 node); the host CANN driver/firmware/state
@@ -854,7 +860,7 @@ export const Deployment = ({ config, benchmarks }) => {
         hostNetwork ? "  --network host" : `  -p ${servePort}:${servePort}`,
         ...(multinode ? fabricFlagsOf(sel.hw).map((f) => "  " + f) : []),
         // The NPU device block already mounts ~/.cache/.
-        ...(vendorOf(sel.hw) === "npu"
+        ...(dockerVendor === "npu"
           ? [] : ["  -v ~/.cache/huggingface:/root/.cache/huggingface"]),
         ...(config.dockerMounts || []).map((mount) => `  -v ${mount}`),
         // HF token only for gated checkpoints — configs that declare an HF_TOKEN placeholder.
