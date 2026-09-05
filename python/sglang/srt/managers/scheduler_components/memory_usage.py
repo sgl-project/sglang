@@ -18,6 +18,7 @@ def build_memory_usage(
     kv_cache_gb: float,
     startup_available_gb: float,
     token_capacity: int,
+    token_capacity_per_dcp_rank: int,
     token_capacity_swa: int | None,
     target_graph_memory_usage: Mapping[str, float] | None,
     draft_graph_memory_usage: Mapping[str, float] | None,
@@ -31,6 +32,7 @@ def build_memory_usage(
         "kvcache": round(kv_cache_gb, 3),
         "startup_available": round(startup_available_gb, 3),
         "token_capacity": int(token_capacity),
+        "token_capacity_per_dcp_rank": int(token_capacity_per_dcp_rank),
         "token_capacity_swa": (
             None if token_capacity_swa is None else int(token_capacity_swa)
         ),

@@ -50,10 +50,12 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         max_req_len: int = 128,
         max_total_num_tokens: int = 1024,
         page_size: int = 1,
+        dcp_size: int = 1,
     ) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.max_req_len = max_req_len
-        scheduler.max_total_num_tokens = max_total_num_tokens
+        scheduler.max_total_num_tokens_per_dcp_rank = max_total_num_tokens
+        scheduler.logical_max_total_num_tokens = max_total_num_tokens * dcp_size
         scheduler.page_size = page_size
         scheduler.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
         return scheduler
@@ -83,7 +85,8 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         def satisfies_rules(candidate: int) -> bool:
             context_ok = input_len + candidate < scheduler.max_req_len
             budget_ok = (
-                paged_input_len + candidate + page_size < scheduler.max_total_num_tokens
+                paged_input_len + candidate + page_size
+                < scheduler.logical_max_total_num_tokens
             )
             limit_ok = not limit_active or candidate <= limit
             requested_ok = requested is None or candidate <= requested
@@ -142,6 +145,22 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             self.assertEqual(
                 self._init_and_check(scheduler, req),
                 max_total_num_tokens - paged_input_len - page_size - 1,
+            )
+
+    def test_dcp_budget_uses_aggregate_capacity(self):
+        max_total_num_tokens, dcp_size, page_size, input_len = 24, 4, 4, 8
+        with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(None):
+            scheduler = self._new_scheduler(
+                max_req_len=256,
+                max_total_num_tokens=max_total_num_tokens,
+                page_size=page_size,
+                dcp_size=dcp_size,
+            )
+            req = self._new_req(max_new_tokens=None, input_len=input_len)
+            paged_input_len = -(-input_len // page_size) * page_size
+            self.assertEqual(
+                self._init_and_check(scheduler, req),
+                max_total_num_tokens * dcp_size - paged_input_len - page_size - 1,
             )
 
     def test_min_new_tokens_clamped_to_limit(self):

@@ -92,7 +92,8 @@ def _build_server_args(scheduler: Scheduler) -> ServerArgs:
         # scheduler_info / the package — stamped here so the rust endpoint
         # can serve them statically (no scheduler round-trip).
         version=__version__,
-        max_total_num_tokens=scheduler.max_total_num_tokens,
+        max_total_num_tokens=scheduler.logical_max_total_num_tokens,
+        max_total_num_tokens_per_dcp_rank=(scheduler.max_total_num_tokens_per_dcp_rank),
     )
 
 
