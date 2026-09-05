@@ -90,7 +90,8 @@ class CanaryManager:
             )
         )
 
-        self._d2h_stream: torch.cuda.Stream = torch.cuda.Stream(device=device)
+        self._device_module = torch.get_device_module(device)
+        self._d2h_stream = self._device_module.Stream(device=device)
 
         swa_divergence_interval = (
             envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL.get()

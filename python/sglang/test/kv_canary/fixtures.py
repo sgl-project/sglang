@@ -15,8 +15,14 @@ from sglang.srt.kv_canary.pool_patcher.adapters.swa import attach_swa
 from sglang.srt.kv_canary.pool_patcher.api import register_pool_attacher
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils import get_device
 
-DEFAULT_DEVICE: torch.device = torch.device("cuda")
+# Resolve the active accelerator (cuda/xpu/...) instead of hardcoding cuda: a torch
+# build without CUDA cannot allocate cuda tensors or call torch.cuda.*. Tests that
+# need the runtime API (synchronize, streams, ...) go through DEFAULT_DEVICE_MODULE
+# rather than torch.cuda.
+DEFAULT_DEVICE: torch.device = torch.device(get_device())
+DEFAULT_DEVICE_MODULE = torch.get_device_module(DEFAULT_DEVICE)
 
 
 @dataclass

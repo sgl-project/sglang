@@ -9,6 +9,7 @@ from sglang.srt.kv_canary.plan_input import PlanInput
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
     DEFAULT_DEVICE,
+    DEFAULT_DEVICE_MODULE,
     make_forward_batch,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -122,7 +123,7 @@ class TestSelfUnitPlanInput(CustomTestCase):
         fb.req_all_ids_lens = torch.tensor([7, 9], dtype=torch.int64, pin_memory=True)
         plan = _make_static_plan_input(bs_capacity=4, device=self.device)
         plan.fill_from_forward_batch(forward_batch=fb)
-        torch.cuda.synchronize()
+        DEFAULT_DEVICE_MODULE.synchronize()
         self.assertEqual(
             plan.req_to_verify_expected_tokens_valid_lens[:2].tolist(), [7, 9]
         )

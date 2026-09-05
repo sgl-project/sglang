@@ -20,6 +20,7 @@ from sglang.kernels.ops.kv_canary.verify import (
 from sglang.kernels.ops.kv_canary.verify_ref import (
     _compute_real_kv_hash_scalar,
     launch_canary_verify_kernel_torch_reference,
+    materialize_real_kv_sources_on_host,
 )
 from sglang.kernels.ops.kv_canary.write_ref import (
     launch_canary_write_kernel_torch_reference,
@@ -917,14 +918,17 @@ class TestRealKvHash:
         positions = [0, 1, 2]
 
         running = splitmix64(consts.CANARY_CHAIN_ANCHOR)
+        host_sources = materialize_real_kv_sources_on_host(
+            real_kv_sources=sources_cuda,
+            real_kv_hash_mode=consts.RealKvHashMode.ALL,
+            work_device=torch.device("cpu"),
+        )
         real_kv_hashes: list[int] = []
         for slot_idx in slot_indices:
             real_kv_hashes.append(
                 _compute_real_kv_hash_scalar(
-                    real_kv_sources=sources_cuda,
-                    real_kv_hash_mode=consts.RealKvHashMode.ALL,
                     slot_idx=slot_idx,
-                    work_device=torch.device("cpu"),
+                    host_sources=host_sources,
                 )
             )
 
@@ -1310,12 +1314,15 @@ class TestLayoutAndScheduling:
         # byte-by-byte loop, so the stamped real_kv_hash matches what the kernel /
         # verify reference will recompute. A byte-by-byte fold was the previous bug
         # here and triggered REAL_KV_HASH violations on otherwise clean chains.
+        host_sources = materialize_real_kv_sources_on_host(
+            real_kv_sources=sources_cuda,
+            real_kv_hash_mode=consts.RealKvHashMode.ALL,
+            work_device=_DEVICE,
+        )
         rkv_values = [
             _compute_real_kv_hash_scalar(
                 slot_idx=slot_idx,
-                real_kv_sources=sources_cuda,
-                real_kv_hash_mode=consts.RealKvHashMode.ALL,
-                work_device=_DEVICE,
+                host_sources=host_sources,
             )
             for slot_idx in slot_indices
         ]

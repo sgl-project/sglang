@@ -575,9 +575,27 @@ def create_device_stream(device):
     return torch.get_device_module(device).Stream(device=device)
 
 
+def current_device_stream(device):
+    """Return the current stream for the given device type."""
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    return torch.get_device_module(device).current_stream(device)
+
+
 def device_stream_context(stream):
     """Return the appropriate stream context manager for ``stream``."""
     return torch.get_device_module(stream.device).stream(stream)
+
+
+# Device types whose runtime implements graph capture ("cuda" also covers HIP).
+_GRAPH_CAPTURE_DEVICE_TYPES = frozenset({"cuda", "xpu"})
+
+
+def is_device_stream_capturing(device: torch.device) -> bool:
+    """Whether ``device``'s current stream is mid graph capture (False if unsupported)."""
+    if device.type not in _GRAPH_CAPTURE_DEVICE_TYPES:
+        return False
+    return torch.get_device_module(device).is_current_stream_capturing()
 
 
 def get_amdgpu_memory_capacity():
