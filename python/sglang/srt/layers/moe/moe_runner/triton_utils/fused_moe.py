@@ -31,7 +31,6 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size, get_moe_runner_backend
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -125,6 +124,41 @@ def _validate_fused_swiglu_interleaved(
 
 def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
     return num_tokens <= 32 and not is_batch_invariant_mode_enabled()
+
+
+def _can_use_fused_silu_mul_quant_fp8(
+    *,
+    hidden_size: int,
+    hidden_dtype: torch.dtype,
+    use_fp8_w8a8: bool,
+    block_shape: Optional[List[int]],
+    filter_expert: bool,
+    activation: str,
+    is_gated: bool,
+    gemm1_alpha: Optional[float],
+    gemm1_limit: Optional[float],
+    hooks: Optional[Any],
+    fuse_swiglu_interleaved: bool,
+) -> bool:
+    """Whether the fused activation/quantization kernel is a safe replacement."""
+    if block_shape is None or len(block_shape) != 2 or block_shape[1] <= 0:
+        return False
+
+    activation_size = hidden_size // 2
+    return (
+        _is_cuda
+        and hidden_dtype in (torch.bfloat16, torch.float16)
+        and use_fp8_w8a8
+        and hidden_size % 2 == 0
+        and activation_size % block_shape[1] == 0
+        and not filter_expert
+        and activation == "silu"
+        and is_gated
+        and gemm1_alpha is None
+        and gemm1_limit is None
+        and hooks is None
+        and not fuse_swiglu_interleaved
+    )
 
 
 @register_custom_op(mutates_args=["hidden_states"])
@@ -584,30 +618,25 @@ def _fused_moe_kernel_sequence(
         ):
             out_hidden_states = torch.empty_like(hidden_states)
 
-    # Enable fused silu_and_mul + fp8_quant when:
-    # - server arg is set
-    # - FP8 block-wise quantization
-    # - no expert filtering (filtered rows handled separately)
-    # - standard silu gated activation
-    # - no GPT-OSS alpha (different activation path)
-    # - no gemm1_limit (limit-only models need _swiglu_silu_clamp_mul, not plain silu)
-    # - no LoRA hooks: after_down receives intermediate_cache2 as the down input,
-    #   which must be bf16 -- the fused path writes FP8 there with new scales.
-    # Note: swiglu_limit (DeepSeek-V4 clamp) IS supported by the fused kernel;
-    # the clamp is applied before silu(gate)*up inside the Triton kernel.
-    _enable_fused_silu_mul_quant_fp8 = (
-        get_global_server_args().enable_fused_silu_mul_quant_fp8
-        and _is_cuda
-        and use_fp8_w8a8
-        and block_shape is not None
-        and not filter_expert
-        and activation == "silu"
-        and is_gated
-        and gemm1_alpha is None
-        and gemm1_limit is None
-        and hooks is None
+    # Automatically fuse the activation and down-input quantization when the
+    # CUDA block-wise FP8 path satisfies every kernel and caller contract.
+    # Unsupported shapes, activation modifiers, expert filtering, and LoRA
+    # hooks keep using the existing two-kernel path below. DeepSeek-V4's
+    # swiglu_limit is supported and applied inside the fused kernel.
+    use_fused_silu_mul_quant_fp8 = _can_use_fused_silu_mul_quant_fp8(
+        hidden_size=N,
+        hidden_dtype=hidden_states.dtype,
+        use_fp8_w8a8=use_fp8_w8a8,
+        block_shape=block_shape,
+        filter_expert=filter_expert,
+        activation=activation,
+        is_gated=is_gated,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_limit=gemm1_limit,
+        hooks=hooks,
+        fuse_swiglu_interleaved=fuse_swiglu_interleaved,
     )
-    _a2_scale_fused = None
+    fused_a2_scale = None
 
     use_fused_moe_sum_all_reduce = (
         get_exec().moe.enable_fused_moe_sum_all_reduce
@@ -687,7 +716,7 @@ def _fused_moe_kernel_sequence(
         )
 
     if not fuse_swiglu_interleaved:
-        if not _enable_fused_silu_mul_quant_fp8:
+        if not use_fused_silu_mul_quant_fp8:
             intermediate_cache2 = torch.empty(
                 (total_tokens, N // 2),
                 device=hidden_states.device,
@@ -695,11 +724,11 @@ def _fused_moe_kernel_sequence(
             )
 
     # Activation function with multiplication
-    if _enable_fused_silu_mul_quant_fp8:
+    if use_fused_silu_mul_quant_fp8:
         # Fused path: silu_and_mul + fp8_quant in one kernel launch.
         # Pass swiglu_limit so the DeepSeek-V4 clamp is applied inside the
         # Triton kernel before silu(gate)*up, matching the non-fused path.
-        intermediate_cache2, _a2_scale_fused = fused_silu_mul_quant_fp8(
+        intermediate_cache2, fused_a2_scale = fused_silu_mul_quant_fp8(
             intermediate_cache1.view(-1, N),
             block_shape[1],
             swiglu_limit=swiglu_limit if swiglu_limit is not None else 0.0,
@@ -871,7 +900,7 @@ def _fused_moe_kernel_sequence(
                 else out_hidden_states.unsqueeze(0)
             )
         ),
-        _a2_scale_fused if _enable_fused_silu_mul_quant_fp8 else a2_scale,
+        fused_a2_scale if use_fused_silu_mul_quant_fp8 else a2_scale,
         w2_scale,
         w2_zp,
         topk_weights,
