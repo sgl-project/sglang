@@ -613,18 +613,18 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 
-        # Snapshot built -- the forward is done reading the shared pool. Publish
-        # a read-done event the scheduler's WAR barrier waits on (draft extend
-        # is the EAGLE-family last shared-read phase; last write wins the mailbox).
-        read_done = self.device_module.Event()
-        read_done.record()
-        self.model_runner.shared_read_done_event = read_done
-
         self.raw_bs = raw_bs
         self.bs = bs
         shape_key = self._make_graph_key(bs)
         with device_timer_ctx(self.model_runner.device_timer, "eagle_draft_extend"):
             out = self._replay_graph(shape_key, forward_batch)
+
+        # The replay still reads the scheduler-shared KV state. Publish the
+        # read-done event only after replay so the scheduler's WAR barrier
+        # cannot reuse or release a row while this graph is in flight.
+        read_done = self.device_module.Event()
+        read_done.record()
+        self.model_runner.shared_read_done_event = read_done
 
         out = LogitsProcessorOutput(
             next_token_logits=out.next_token_logits[:raw_bs],
