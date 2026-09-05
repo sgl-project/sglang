@@ -18,6 +18,7 @@ SWA KV + mamba/conv state in ONE unified byte buffer, chain
 Pure CPU; fakes stand in for the KV pools (data markers verify moves).
 """
 
+import inspect
 import unittest
 
 import torch
@@ -25,7 +26,10 @@ import torch
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaSWATokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.allocator.unified_sub_pool import FloatMultiEndedAllocator
+from sglang.srt.mem_cache.allocator.unified_sub_pool import (
+    FloatMultiEndedAllocator,
+    MultiEndedAllocator,
+)
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
     MHASubPoolSpec,
@@ -1180,6 +1184,14 @@ class TestFloatRelocationIsOrderedAgainstTheForward(unittest.TestCase):
         if not order:
             self.skipTest("no holes reached compact_holes in this geometry")
         self.assertEqual(order[0], "settle", f"first action was not a settle: {order}")
+
+    def test_the_settle_is_a_stream_wait_not_a_host_sync(self):
+        """The settle before a float move must be a stream wait: a host sync
+        there would land on the alloc-shortfall path every time the float moves."""
+        src = inspect.getsource(MultiEndedAllocator._settle_inflight_forward)
+        self.assertIn("wait_event", src)
+        self.assertNotIn(".item()", src)
+        self.assertNotIn("synchronize()", src)
 
 
 class TestFloatHoleCreditIsPerSide(unittest.TestCase):
