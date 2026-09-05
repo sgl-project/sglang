@@ -1417,7 +1417,6 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             return Err(TreeCoreRuntimeError::InsertAnchorNotDeviceResident { node_id: anchor.id });
         }
 
-        let mut path = Vec::new();
         let mut cursor = prefix_node_idx;
         let mut node_prefix_len = 0;
         loop {
@@ -1426,7 +1425,6 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 break;
             }
             node_prefix_len += node.key.atom_len();
-            path.push(cursor);
             cursor = node.parent();
         }
         if node_prefix_len != prefix_len {
@@ -1438,19 +1436,25 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         }
 
         // Release builds trust the retained match handle and avoid rereading the
-        // complete prefix. Debug builds verify that the handle is on this key's path.
+        // complete prefix. Debug builds verify that the handle is on this key's
+        // path, walking upward from the anchor so no path buffer is needed.
         #[cfg(debug_assertions)]
         {
-            let mut offset = 0;
-            for node_id in path.into_iter().rev() {
-                let node = self.arena.node(node_id);
-                let end = offset + node.key.atom_len();
+            let key = params.key.as_ref();
+            let mut end = prefix_len;
+            let mut cursor = prefix_node_idx;
+            loop {
+                let node = self.arena.node(cursor);
+                if node.is_root() {
+                    break;
+                }
+                let start = end - node.key.atom_len();
                 debug_assert!(
-                    end <= params.key.atom_len()
-                        && params.key.as_ref()[offset..end] == node.key.as_ref()[..],
+                    key[start..end] == node.key.as_ref()[..],
                     "insert continuation anchor is not on the supplied key path"
                 );
-                offset = end;
+                end = start;
+                cursor = node.parent();
             }
         }
         Ok(())
