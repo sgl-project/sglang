@@ -569,6 +569,7 @@ impl PDRouter {
                 Some(response_headers),
                 prefill,
                 decode,
+                None,
             )
         } else {
             // Handle non-streaming error response
@@ -703,27 +704,66 @@ impl PDRouter {
         }
         .emit();
 
-        let prefill_fut = prefill_request.send();
+        // Boxed so the streaming fast path below can hand the still-pending
+        // prefill leg to the relay task.
+        let mut prefill_fut: futures::future::BoxFuture<
+            'static,
+            Result<reqwest::Response, reqwest::Error>,
+        > = Box::pin(prefill_request.send());
         let decode_fut = decode_request.send();
-        tokio::pin!(prefill_fut);
         tokio::pin!(decode_fut);
 
         // Poll both until prefill resolves; decode normally resolves later, but
         // may resolve first if it rejects the request outright.
-        let prefill_result;
+        //
+        // Streaming fast path: a decode 2xx means the pair was accepted, so a
+        // streaming request that does not need prefill's body (no logprob
+        // merge) commits the client stream right away and the still-pending
+        // prefill leg is watched from the relay task. Gating the client stream
+        // on the prefill leg's HTTP response buffered every chunk (and SSE
+        // keepalive) decode produced while that response lagged and flushed
+        // them in one burst, destroying client-observed TTFT/TPOT.
+        let mut prefill_result: Option<Result<reqwest::Response, reqwest::Error>> = None;
         let mut decode_early: Option<Result<reqwest::Response, reqwest::Error>> = None;
+        let mut decode_commit: Option<reqwest::Response> = None;
         loop {
             tokio::select! {
                 biased;
                 pr = &mut prefill_fut => {
-                    prefill_result = pr;
+                    prefill_result = Some(pr);
                     break;
                 }
                 dr = &mut decode_fut, if decode_early.is_none() => {
+                    if context.is_stream
+                        && !context.return_logprob
+                        && matches!(&dr, Ok(res) if res.status().is_success())
+                    {
+                        decode_commit = dr.ok();
+                        break;
+                    }
                     decode_early = Some(dr);
                 }
             }
         }
+
+        if let Some(res) = decode_commit {
+            events::RequestReceivedEvent {}.emit();
+            let status = StatusCode::from_u16(res.status().as_u16())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let response_headers = header_utils::preserve_response_headers(res.headers());
+            return self.create_streaming_response(
+                res.bytes_stream(),
+                status,
+                None,
+                false,
+                Some(response_headers),
+                prefill,
+                decode,
+                Some(prefill_fut),
+            );
+        }
+        let prefill_result = prefill_result
+            .expect("dispatch loop exits with prefill resolved or decode committed");
 
         // Decode can't generate without prefill's KV, so any prefill failure
         // (non-2xx / transport error) dooms the paired decode request, which would
@@ -870,6 +910,7 @@ impl PDRouter {
                         Some(response_headers),
                         prefill,
                         decode,
+                        None,
                     )
                 } else {
                     // Non-streaming response
@@ -1110,6 +1151,9 @@ impl PDRouter {
         headers: Option<HeaderMap>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        pending_prefill: Option<
+            futures::future::BoxFuture<'static, Result<reqwest::Response, reqwest::Error>>,
+        >,
     ) -> Response {
         use crate::core::AttachedBody;
 
@@ -1136,10 +1180,59 @@ impl PDRouter {
             tracked.mark_errored();
         }
         let decode_for_log = decode.clone();
+        // Prefill leg still in flight (streaming fast path): watch it from the
+        // relay so its breaker outcome is recorded, and terminate the client
+        // stream with an in-band SSE error if it fails. Dropping the upstream
+        // stream disconnects decode, which aborts the paired request.
+        let prefill_watch_worker = prefill.clone();
+        let mut prefill_pending = pending_prefill.is_some();
+        let mut prefill_watch: futures::future::BoxFuture<
+            'static,
+            Result<reqwest::Response, reqwest::Error>,
+        > = match pending_prefill {
+            Some(f) => f,
+            None => Box::pin(std::future::pending()),
+        };
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     biased;
+                    pr = &mut prefill_watch, if prefill_pending => {
+                        prefill_pending = false;
+                        let (prefill_ok, prefill_failed) = match &pr {
+                            Ok(r) => {
+                                let s = r.status();
+                                (s.is_success() || s.is_client_error(), !s.is_success())
+                            }
+                            Err(_) => (false, true),
+                        };
+                        prefill_watch_worker.record_outcome(prefill_ok);
+                        if prefill_failed {
+                            error!(
+                                prefill_url = %prefill_watch_worker.url(),
+                                "Prefill leg failed after the client stream was committed; \
+                                 terminating relayed decode stream"
+                            );
+                            let err = serde_json::json!({
+                                "error": {
+                                    "message": "prefill leg failed after stream start",
+                                    "type": "prefill_failed",
+                                    "code": 502
+                                }
+                            });
+                            let _ = tx.send(Ok(bytes::Bytes::from(format!("data: {}\n\n", err))));
+                            break;
+                        }
+                        if let Ok(resp) = pr {
+                            // Drain the body: dropping a reqwest::Response with an
+                            // unread body closes the connection, which the prefill
+                            // server treats as a client disconnect and aborts the
+                            // request mid KV-transfer, orphaning the decode leg.
+                            tokio::spawn(async move {
+                                let _ = resp.bytes().await;
+                            });
+                        }
+                    }
                     chunk_result = tracked.next() => {
                         match chunk_result {
                             Some(Ok(chunk)) => {
@@ -1192,6 +1285,25 @@ impl PDRouter {
                         break;
                     }
                 }
+            }
+            if prefill_pending {
+                // The client stream ended before the prefill leg resolved: let
+                // it finish on its own so its breaker outcome is recorded and
+                // its connection is not severed mid-request.
+                tokio::spawn(async move {
+                    let pr = prefill_watch.await;
+                    let prefill_ok = match &pr {
+                        Ok(r) => {
+                            let s = r.status();
+                            s.is_success() || s.is_client_error()
+                        }
+                        Err(_) => false,
+                    };
+                    prefill_watch_worker.record_outcome(prefill_ok);
+                    if let Ok(resp) = pr {
+                        let _ = resp.bytes().await;
+                    }
+                });
             }
         });
 
