@@ -1120,6 +1120,16 @@ class Scheduler(
         if self.server_args.is_startup_weight_load_overlap:
             self.tp_worker.finalize_startup_weight_load()
 
+        # Adaptive/speculative graphs and post-capture KV sizing can consume
+        # the headroom seen by the initial DeepGEMM layout budget. Refresh it
+        # after these allocations, before elastic EP rejoins healthy ranks
+        # that do not participate in this startup collective.
+        from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
+            refresh_deep_gemm_layout_memory_budget,
+        )
+
+        refresh_deep_gemm_layout_memory_budget(model_runner, only_if_initialized=True)
+
         if (
             get_exec().moe.elastic_ep_backend is not None
             and get_exec().moe.ep_join_mode == "recover"
