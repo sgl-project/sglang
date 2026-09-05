@@ -1440,6 +1440,9 @@ class Envs:
     # Inside the fused gate: replace the cublas gate linear with the
     # expert-per-block GEMV JIT kernel at small token counts (GateGemvMode).
     SGLANG_OPT_GATE_GEMV_MODE = EnvInt(GateGemvMode.PAIR)
+    # Inside the fused gate on non-CUDA devices: use the unified router's
+    # LOGSIGMOID_SINK epilogue instead of the tl.topk kernel. Inert on CUDA.
+    SGLANG_OPT_USE_ROUTER_GATE_EPILOGUE = EnvBool(True)
     # Capture all multi-layer EAGLE draft-extend steps and the in-graph chain
     # rotation into ONE CUDA graph instead of one captured graph per step.
     SGLANG_ENABLE_SINGLE_CG_DRAFT = EnvBool(True)

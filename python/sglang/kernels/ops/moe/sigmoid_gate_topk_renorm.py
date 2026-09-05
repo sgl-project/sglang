@@ -21,6 +21,7 @@ from sglang.kernels.ops.moe.gate_topk import (
 from sglang.kernels.ops.moe.inkling_gate_topk_renorm import (
     inkling_gate_topk_renorm_v2,
 )
+from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
 from sglang.srt.environ import envs
 
 
@@ -113,10 +114,18 @@ def _sigmoid_gate_topk_renorm_kernel(
     active = tl.where(mask_k[None, :], routed_vals, shared)
 
     A: tl.constexpr = K + S
-    probs = tl.sigmoid(active)
     mask_a = offs_a < A
-    probs = tl.where(mask_a[None, :], probs, 0.0)
-    weights = probs / tl.sum(probs, axis=1, keep_dims=True)
+    # Normalize in LOG space, not as sigmoid(x) / sum(sigmoid(x)). The two are
+    # algebraically identical -- exp(log s_i - log sum_j s_j) == s_i / sum_j s_j --
+    # but fp32 sigmoid goes subnormal below x ~ -87 and flushes to 0 below x ~ -104,
+    # so once every one of the A active logits is in that region the explicit form
+    # divides 0/0 and every routed weight and shared gamma comes back NaN. This is
+    # the same form as the eager reference `_logsigmoid_normalize` (moe.py:140).
+    # log(sigmoid(x)) = min(x, 0) - log1p(exp(-|x|)), exact for large |x| either sign.
+    lp = tl.minimum(active, 0.0) - tl.log(1.0 + tl.exp(-tl.abs(active)))
+    lp = tl.where(mask_a[None, :], lp, float("-inf"))
+    e = tl.where(mask_a[None, :], tl.exp(lp - tl.max(lp, axis=1)[:, None]), 0.0)
+    weights = e / tl.sum(e, axis=1, keep_dims=True)
     weights *= (route_scale * tl.load(global_scale_ptr)).to(weights.dtype)
 
     mask_rk = mask_m[:, None] & mask_k[None, :]
@@ -179,13 +188,16 @@ def sigmoid_gate_topk_renorm(
     A = k + n_shared_experts
     assert bias.numel() == N and bias.stride(-1) == 1, f"{bias.shape=} expected [{N}]"
 
-    # The production shape uses the specialized CUDA JIT kernel.
+    # The production shape uses the specialized CUDA JIT kernel. Both conjuncts are
+    # load-bearing: XPU satisfies `torch.version.hip is None`, and ROCm reports
+    # `.is_cuda` -- while the kernel needs `__reduce_max_sync`, which HIP lacks.
     if (
         k == 6
         and n_shared_experts == 2
         and G == 258
         and logits.stride(0) % 8 == 0
         and logits.data_ptr() % 32 == 0
+        and logits.is_cuda
         and torch.version.hip is None
         and envs.SGLANG_OPT_USE_GATE_TOPK_JIT.get()
     ):
@@ -196,6 +208,30 @@ def sigmoid_gate_topk_renorm(
             route_scale,
             return_packed=return_packed_topk,
             enable_pdl=is_arch_support_pdl(),
+        )
+
+    # On non-CUDA devices prefer the unified router's LOGSIGMOID_SINK epilogue: it
+    # is the same op with the `tl.topk` / `tl.bitonic_merge` sort below replaced by
+    # k masked-max passes in registers, worth 22-46x on Intel Xe. CUDA is excluded
+    # deliberately -- the win is an Xe measurement and there is no NVIDIA A/B or
+    # test for this epilogue, so CUDA keeps the sort-based kernel when it misses
+    # the JIT gate above.
+    if (
+        n_shared_experts > 0
+        and not logits.is_cuda
+        and envs.SGLANG_OPT_USE_ROUTER_GATE_EPILOGUE.get()
+    ):
+        return moe_fused_gate(
+            logits,
+            bias,
+            topk=k,
+            scoring_func="sigmoid",
+            renormalize=False,  # LOGSIGMOID_SINK always renormalizes
+            routed_scaling_factor=route_scale,
+            apply_routed_scaling_factor_on_output=False,  # ditto for the scale
+            shared_sink=n_shared_experts,
+            global_scale=global_scale,
+            return_packed=return_packed_topk,
         )
 
     shared_w = torch.empty(
