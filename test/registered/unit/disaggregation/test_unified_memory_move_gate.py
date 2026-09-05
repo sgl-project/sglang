@@ -17,7 +17,7 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     unified_memory_disagg_move_gate,
 )
-from sglang.srt.mem_cache.multi_ended_allocator import MultiEndedAllocator
+from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -136,7 +136,7 @@ class TestPrefillMoveGate(CustomTestCase):
 class TestGatedPeerHolesAreNotSchedulable(CustomTestCase):
     """`schedulable_available_size` credits holes a peer urgent-flush would
     release. While the move gate is closed that flush relocates nothing, so
-    crediting them lets the scheduler admit work `_flush_peer_for_alloc` cannot
+    crediting them lets the scheduler admit work `_relieve_for_alloc` cannot
     satisfy; the alloc then returns None and the decode prealloc path treats
     that as a memory-estimation bug and aborts the scheduler.
     """
@@ -148,9 +148,20 @@ class TestGatedPeerHolesAreNotSchedulable(CustomTestCase):
             self.entry_bytes_per_page = 512
             self.disagg_move_gate = gate
 
+        def _is_frontier_transparent(self):
+            return False
+
     class _Owner:
+        """Stands in for a grow-up END pool: the credit walks the chain from
+        `_growth_side_neighbor()`, so the stub must expose what that walk reads,
+        not the pre-chain `_peer` slot it used to."""
+
         def __init__(self, peer):
-            self._peer = peer
+            self.grow_direction = "up"
+            self.high_peer = peer
+            self.low_peer = None
+
+        _growth_side_neighbor = MultiEndedAllocator._growth_side_neighbor
 
     def _credit(self, gate):
         peer = self._Peer(gate)

@@ -6,7 +6,7 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.multi_ended_allocator import MultiEndedAllocator
+from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
     MLASubPoolSpec,
@@ -47,7 +47,6 @@ def _build(device, page_size=1, kernel_page_multiplier=None):
         device=device,
         enable_memory_saver=False,
         page_size=page_size,
-        view_tail_pad_bytes=page_size * full_spec.entry_bytes(),
     )
     kvcache = UnifiedMLATokenToKVPool(
         unified_buffer=buf,

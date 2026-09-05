@@ -19,6 +19,8 @@ on:
     outputs:
       main_package:
         value: ${{ jobs.run.outputs.main_package }}
+      simulator:
+        value: ${{ jobs.run.outputs.simulator }}
       sgl_kernel:
         value: ${{ jobs.run.outputs.sgl_kernel }}
       jit_kernel:
@@ -44,6 +46,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
+      simulator: ${{ steps.filter.outputs.simulator || steps.run-mode.outputs.run_all_tests }}
       sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
       jit_kernel: ${{ steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }}
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
@@ -94,6 +97,11 @@ jobs:
               - "test/**/!(*.md)"
               - "rust/**"
               - "proto/sglang/runtime/v1/sglang.proto"
+            simulator:
+              - ".github/workflows/pr-test-extra.yml"
+              - ".github/workflows/_pr-test-simulator-cpu.yml"
+              - "benchmark/simulator/**/!(*.md)"
+              - "tools/sglang-simulator/**/!(*.md)"
             multimodal_gen:
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/pr-test-multimodal-gen.yml"

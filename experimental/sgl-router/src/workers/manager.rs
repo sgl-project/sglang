@@ -481,6 +481,9 @@ mod tests {
                 }),
                 cache_aware: None,
                 sticky: None,
+                affinity: None,
+                fused: None,
+                eligibility: None,
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                 urls: vec!["http://test:30000".into()],

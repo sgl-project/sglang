@@ -49,7 +49,6 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     register_memory_region,
 )
 from sglang.srt.runtime_context import (
-    configured_moe_dp_size,
     get_exec,
     get_model,
     get_parallel,
@@ -125,7 +124,6 @@ from sglang.srt.model_loader.weight_utils import (
     set_runai_streamer_env,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
@@ -212,7 +210,6 @@ def _get_quantization_config(
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
             return None
-        # Carry DSV4 expert layout into quant configs so downstream readers don't read env.
         from sglang.srt.layers.quantization.fp8 import Fp8Config
 
         if isinstance(quant_config, Fp8Config):
@@ -312,6 +309,10 @@ def _post_load_weights(model: nn.Module) -> None:
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 
+    # Rank-local weight memory already resident when ModelRunner sampled its
+    # pre-load baseline. Shared allocations must be reported by only one loader.
+    preloaded_weights_bytes: int = 0
+
     def __init__(self, load_config: LoadConfig):
         self.load_config = load_config
 
@@ -329,6 +330,28 @@ class BaseModelLoader(ABC):
     ) -> nn.Module:
         """Load a model with the given configurations."""
         raise NotImplementedError
+
+
+def _validate_default_loader_extra_config(
+    *, extra_config: dict, load_format: LoadFormat
+) -> None:
+    allowed_keys = {"enable_multithread_load", "num_threads"}
+    if load_format == LoadFormat.FASTSAFETENSORS:
+        allowed_keys.add("enable_gds")
+        if "enable_gds" in extra_config and not isinstance(
+            extra_config["enable_gds"], bool
+        ):
+            raise ValueError(
+                "enable_gds in --model-loader-extra-config must be a boolean"
+            )
+
+    unexpected_keys = set(extra_config.keys()) - allowed_keys
+    if unexpected_keys:
+        raise ValueError(
+            f"Unexpected extra config keys for load format "
+            f"{load_format}: "
+            f"{unexpected_keys}"
+        )
 
 
 class DefaultModelLoader(BaseModelLoader):
@@ -355,6 +378,12 @@ class DefaultModelLoader(BaseModelLoader):
         fall_back_to_pt: bool = True
         """Whether .pt weights can be used."""
 
+        allow_patterns_overrides: Optional[list[str]] = None
+        """If defined, weights will load exclusively using these patterns.
+
+        Used by checkpoints whose weights live in subfolders (e.g. the Cosmos3
+        diffusers-style layout with ``transformer/`` and ``vision_encoder/``)."""
+
         model_config: Optional[ModelConfig] = None
         """The model configuration (for checking architecture, etc)."""
 
@@ -365,6 +394,9 @@ class DefaultModelLoader(BaseModelLoader):
                 model_config.revision,
                 prefix="",
                 fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
+                allow_patterns_overrides=getattr(
+                    model, "allow_patterns_overrides", None
+                ),
                 model_config=model_config,
             )
 
@@ -382,24 +414,10 @@ class DefaultModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
-        extra_config = load_config.model_loader_extra_config
-        allowed_keys = {"enable_multithread_load", "num_threads"}
-        if load_config.load_format == LoadFormat.FASTSAFETENSORS:
-            allowed_keys.add("enable_gds")
-            if "enable_gds" in extra_config and not isinstance(
-                extra_config["enable_gds"], bool
-            ):
-                raise ValueError(
-                    "enable_gds in --model-loader-extra-config must be a boolean"
-                )
-        unexpected_keys = set(extra_config.keys()) - allowed_keys
-
-        if unexpected_keys:
-            raise ValueError(
-                f"Unexpected extra config keys for load format "
-                f"{load_config.load_format}: "
-                f"{unexpected_keys}"
-            )
+        _validate_default_loader_extra_config(
+            extra_config=load_config.model_loader_extra_config,
+            load_format=load_config.load_format,
+        )
 
     def _maybe_download_from_modelscope(
         self, model: str, revision: Optional[str]
@@ -428,7 +446,11 @@ class DefaultModelLoader(BaseModelLoader):
         return model
 
     def _prepare_weights(
-        self, model_name_or_path: str, revision: Optional[str], fall_back_to_pt: bool
+        self,
+        model_name_or_path: str,
+        revision: Optional[str],
+        fall_back_to_pt: bool,
+        allow_patterns_overrides: Optional[list[str]] = None,
     ) -> Tuple[str, List[str], bool]:
         """Prepare weights for the model.
 
@@ -468,6 +490,9 @@ class DefaultModelLoader(BaseModelLoader):
         if fall_back_to_pt:
             allow_patterns += ["*.pt"]
 
+        if allow_patterns_overrides is not None:
+            allow_patterns = allow_patterns_overrides
+
         if not is_local:
             hf_folder = download_weights_from_hf(
                 model_name_or_path,
@@ -490,7 +515,7 @@ class DefaultModelLoader(BaseModelLoader):
         for pattern in allow_patterns:
             hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
             if len(hf_weights_files) > 0:
-                if pattern == "*.safetensors":
+                if pattern.endswith(".safetensors"):
                     use_safetensors = True
                 break
 
@@ -508,7 +533,12 @@ class DefaultModelLoader(BaseModelLoader):
                     revision,
                 )
             hf_weights_files = filter_duplicate_safetensors_files(
-                hf_weights_files, hf_folder, index_file
+                hf_weights_files,
+                hf_folder,
+                index_file,
+                allow_patterns=(
+                    allow_patterns if allow_patterns_overrides is not None else None
+                ),
             )
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
@@ -548,9 +578,13 @@ class DefaultModelLoader(BaseModelLoader):
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
         use_multithread = extra_config.get("enable_multithread_load", True)
+
         if resolved_source is None:
             hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
-                source.model_or_path, source.revision, source.fall_back_to_pt
+                source.model_or_path,
+                source.revision,
+                source.fall_back_to_pt,
+                source.allow_patterns_overrides,
             )
             if use_safetensors and source.model_config is not None:
                 hf_weights_files = maybe_add_mtp_safetensors(
@@ -606,7 +640,7 @@ class DefaultModelLoader(BaseModelLoader):
                     {"enable_multithread_load", "num_threads"} & extra_config.keys()
                 )
             ):
-                logger.warning(
+                logger.debug(
                     "Checkpoint prefetching is active; falling "
                     "back to single-threaded weight loading to avoid I/O "
                     "oversubscription with the prefetch threads. Set "
@@ -718,6 +752,7 @@ class DefaultModelLoader(BaseModelLoader):
                 source.model_or_path,
                 source.revision,
                 source.fall_back_to_pt,
+                source.allow_patterns_overrides,
             )
             if use_safetensors and source.model_config is not None:
                 weight_files = maybe_add_mtp_safetensors(
@@ -1882,17 +1917,19 @@ class PreshardedModelLoader(DefaultModelLoader):
         def _safe(fn) -> int:
             try:
                 return fn()
-            except (AssertionError, AttributeError, RuntimeError):
+            except (AssertionError, AttributeError, RuntimeError, ValueError):
                 return 1
+
+        from sglang.srt.layers.dp_attention import get_moe_cp_size
 
         parallel = get_parallel()
         return {
             "tp": _safe(lambda: parallel.tp_size),
-            "dp": _safe(lambda: parallel.moe_dp_size),
+            "dp": _safe(get_moe_cp_size),
             "ep": _safe(lambda: parallel.moe_ep_size),
             "pp": _safe(lambda: parallel.pp_size),
             "moe_dense_tp_size": parallel.moe_dense_tp_size,
-            "moe_dp_size": configured_moe_dp_size(),
+            "moe_dp_size": get_parallel().moe_dp_size,
             "enable_dp_lm_head": parallel.enable_dp_lm_head,
             "enable_fp32_lm_head": get_exec().features.enable_fp32_lm_head,
             "quantization": model_config.quantization,
@@ -2883,7 +2920,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         for weight_name, weight_tensor in self._hf_weight_iter(
             hf_weights_files, use_safetensors
         ):
-
             if self._is_4bit_weight_name(weight_name):
                 continue
 
@@ -2907,7 +2943,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         for weight_name, weight_tensor in self._hf_weight_iter(
             hf_weights_files, use_safetensors
         ):
-
             if any(
                 target_module in weight_name for target_module in self.target_modules
             ) and weight_name.endswith(".weight"):
@@ -2917,7 +2952,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                     module in weight_name
                     for module in self.column_parallel_weights_modules
                 ):
-
                     total_size = weight_tensor.size(-1)
                     start_index = total_size // tp_size * tp_rank
                     end_index = total_size // tp_size * (tp_rank + 1)
@@ -2978,7 +3012,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         self.model_type = type(model).__name__
 
         logger.info(
-            "Loading weights with BitsAndBytes quantization. " " May take a while ..."
+            "Loading weights with BitsAndBytes quantization.  May take a while ..."
         )
 
         quant_config = getattr(model_config.hf_config, "quantization_config", None)
@@ -2990,8 +3024,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                 pre_quant = True
             else:
                 raise ValueError(
-                    f"BitsAndBytes loader does not support {quant_method} "
-                    "quantization"
+                    f"BitsAndBytes loader does not support {quant_method} quantization"
                 )
 
         # The quant_states in pre_quantized models cannot work with a split
@@ -3226,10 +3259,27 @@ class RemoteInstanceModelLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         if load_config.model_loader_extra_config:
-            raise ValueError(
-                f"Model loader extra config is not supported for "
-                f"load format {load_config.load_format}"
-            )
+            if (
+                load_config.remote_instance_weight_loader_backend
+                == RemoteInstanceWeightLoaderBackend.MODELEXPRESS
+            ):
+                # ModelExpress falls back to a DefaultModelLoader whenever no
+                # peer holds the weights, so it consumes this config; validate
+                # the keys here so a bad one fails on every rank instead of only
+                # on the ranks that end up taking the fallback.
+                _validate_default_loader_extra_config(
+                    extra_config=load_config.model_loader_extra_config,
+                    load_format=load_config.load_format,
+                )
+            else:
+                # nccl and transfer_engine replace the native loader outright,
+                # so nothing would ever read the config.
+                raise ValueError(
+                    f"Model loader extra config is not supported for "
+                    f"load format {load_config.load_format} with "
+                    f"remote instance weight loader backend "
+                    f"{load_config.remote_instance_weight_loader_backend}"
+                )
         self.remote_instance_transfer_engine_weight_info = None
 
     def download_model(self, model_config: ModelConfig) -> None:
@@ -3505,7 +3555,7 @@ class RemoteModelLoader(BaseModelLoader):
                     param_data = param_data.narrow(dim, 0, size)
             if tensor.shape != param_shape:
                 logger.warning(
-                    "loading tensor of shape %s into " "parameter '%s' of shape %s",
+                    "loading tensor of shape %s into parameter '%s' of shape %s",
                     tensor.shape,
                     key,
                     param_shape,
@@ -4351,22 +4401,10 @@ def get_model_loader(
 
     if load_config.load_format == LoadFormat.IPC_CACHE:
         from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
-        from sglang.srt.weight_cache.protocol import (
-            compute_global_rank,
-            get_socket_path,
-        )
 
-        if load_config.weight_cache_socket:
-            socket_path = load_config.weight_cache_socket
-        else:
-            from sglang.srt.runtime_context import get_parallel
-
-            ps = get_parallel()
-            global_rank = compute_global_rank(ps.tp_size, ps.pp_rank, ps.tp_rank)
-            socket_path = get_socket_path(global_rank=global_rank)
         return IpcModelLoader(
             load_config=load_config,
-            socket_path=socket_path,
+            socket_path=load_config.weight_cache_socket,
             weight_cache_mode=load_config.weight_cache_mode,
             fallback_load_format=load_config.fallback_load_format,
         )
