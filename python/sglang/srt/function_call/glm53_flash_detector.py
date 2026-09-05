@@ -21,7 +21,7 @@ used by glm47. This detector handles both formats.
 import json
 import logging
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -62,7 +62,7 @@ class Glm53FlashDetector(BaseFormatDetector):
             re.escape(TC_START)
             + r"(.*?)"
             + r"((?:" + re.escape(AK_START) + r".*?" + re.escape(AK_END)
-            + re.escape(AV_START) + r".*?" + re.escape(AV_END) + r"\s*)*)"
+            + re.escape(AV_START) + r".*?" + re.escape(AV_END) + r"\s*)+)"
             + re.escape(TC_END),
             re.DOTALL,
         )
@@ -72,6 +72,18 @@ class Glm53FlashDetector(BaseFormatDetector):
             + r"((?:(?!" + re.escape(AK_START) + r").)*?)"
             + r"((?:" + re.escape(AK_START) + r".*?" + re.escape(AK_END)
             + re.escape(AV_START) + r".*?" + re.escape(AV_END) + r"\s*)*)"
+            + re.escape(TC_END),
+            re.DOTALL,
+        )
+
+        # Simplified tag format observed in the wild (AK_END/AV_START omitted):
+        # TC_START + name + (AK_START key=value AV_END)+ + TC_END
+        self.tag_regex3 = re.compile(
+            re.escape(TC_START)
+            + r"((?:(?!" + re.escape(AK_START) + r").)*?)"
+            + r"((?:" + re.escape(AK_START)
+            + r"(?:(?!" + re.escape(TC_END) + r").)*?"
+            + re.escape(AV_END) + r"\s*)+)"
             + re.escape(TC_END),
             re.DOTALL,
         )
@@ -131,6 +143,71 @@ class Glm53FlashDetector(BaseFormatDetector):
 
         return name
 
+
+    def _fix_args_against_schema(
+        self, arguments, func_name, tools
+    ):
+        """Fix nested schema unwrapping by the model."""
+        if not func_name or not tools:
+            return arguments
+
+        tool_func = None
+        for t in tools:
+            if hasattr(t, "function") and t.function and t.function.name == func_name:
+                tool_func = t.function
+                break
+
+        if not tool_func or not tool_func.parameters:
+            return arguments
+
+        schema = tool_func.parameters
+        if not isinstance(schema, dict):
+            return arguments
+
+        props = schema.get("properties", {})
+        required = schema.get("required", [])
+        if not isinstance(required, list):
+            required = []
+
+        if isinstance(arguments, dict):
+            missing_required = [k for k in required if k not in arguments]
+            if not missing_required:
+                return arguments
+
+            for missing_key in missing_required:
+                prop_schema = props.get(missing_key, {})
+                if not isinstance(prop_schema, dict):
+                    continue
+                if prop_schema.get("type") != "array":
+                    continue
+
+                item_schema = prop_schema.get("items", {})
+                item_props = set()
+                if isinstance(item_schema, dict):
+                    item_props = set(item_schema.get("properties", {}).keys())
+
+                arg_keys = set(arguments.keys())
+                if item_props and arg_keys and arg_keys.issubset(item_props):
+                    logger.info(
+                        "GLM-5.3-Flash: fixing unwrapped args for '%s' - "
+                        "wrapping in {'%s': [args]}",
+                        func_name, missing_key,
+                    )
+                    return {missing_key: [arguments]}
+
+        if isinstance(arguments, list):
+            for missing_key in required:
+                prop_schema = props.get(missing_key, {})
+                if isinstance(prop_schema, dict) and prop_schema.get("type") == "array":
+                    logger.info(
+                        "GLM-5.3-Flash: fixing bare array args for '%s' - "
+                        "wrapping in {'%s': [args]}",
+                        func_name, missing_key,
+                    )
+                    return {missing_key: arguments}
+
+        return arguments
+
     def _parse_json_args(self, raw_args: str) -> Dict[str, Any]:
         """Parse JSON arguments from the raw argument string."""
         raw_args = raw_args.strip()
@@ -168,6 +245,34 @@ class Glm53FlashDetector(BaseFormatDetector):
                 arguments[key] = json.loads(value)
             except (json.JSONDecodeError, ValueError):
                 arguments[key] = value
+        if not arguments:
+            # Simplified tag format: AK_START key=value AV_END (AK_END/AV_START omitted)
+            simple_regex = re.compile(
+                re.escape(AK_START) + r"(.*?)" + re.escape(AV_END),
+                re.DOTALL,
+            )
+            for match in simple_regex.finditer(raw_args):
+                kv = match.group(1).strip()
+                if "=" in kv:
+                    key, value = kv.split("=", 1)
+                else:
+                    key, value = kv, ""
+                key = key.strip()
+                value = value.strip()
+                try:
+                    arguments[key] = json.loads(value)
+                except (json.JSONDecodeError, ValueError):
+                    arguments[key] = value
+        if not arguments:
+            # Last resort: embedded JSON object
+            brace = raw_args.find("{")
+            if brace >= 0:
+                try:
+                    parsed = json.loads(raw_args[brace:])
+                    if isinstance(parsed, dict):
+                        arguments = parsed
+                except (json.JSONDecodeError, ValueError):
+                    pass
         return arguments
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
@@ -204,6 +309,7 @@ class Glm53FlashDetector(BaseFormatDetector):
                     continue
 
                 arguments = self._parse_tag_args(raw_args)
+                arguments = self._fix_args_against_schema(arguments, func_name, tools)
                 call_item = {"name": func_name, "parameters": arguments}
                 calls.extend(self.parse_base_json(call_item, tools))
 
@@ -237,7 +343,7 @@ class Glm53FlashDetector(BaseFormatDetector):
                 normal_text_parts.append(text[last_end : match.start()])
             last_end = match.end()
 
-            raw_name = match.group(1).strip()
+            raw_name = match.group(1).split("<arg_key")[0].strip()
             raw_args = match.group(2)
 
             func_name = self._normalize_func_name(raw_name, tools)
@@ -245,6 +351,7 @@ class Glm53FlashDetector(BaseFormatDetector):
                 continue
 
             arguments = self._parse_json_args(raw_args)
+            arguments = self._fix_args_against_schema(arguments, func_name, tools)
             call_item = {"name": func_name, "parameters": arguments}
             calls.extend(self.parse_base_json(call_item, tools))
 
@@ -281,8 +388,8 @@ class Glm53FlashDetector(BaseFormatDetector):
 
         calls = []
 
-        # Check for tag format first (has TC_END)
-        if self.eot_token in current_text:
+        # Check for tag format first (has TC_END and at least one AK_START pair)
+        if self.eot_token in current_text and AK_START in current_text:
             tag_match = self.tag_regex2.search(current_text)
             if tag_match:
                 raw_name = tag_match.group(1).strip()
@@ -307,6 +414,7 @@ class Glm53FlashDetector(BaseFormatDetector):
                         )
 
                     arguments = self._parse_tag_args(raw_args)
+                    arguments = self._fix_args_against_schema(arguments, func_name, tools)
                     args_json = json.dumps(arguments, ensure_ascii=False)
                     self.streamed_args_for_tool[self.current_tool_id] = args_json
                     calls.append(
@@ -318,6 +426,52 @@ class Glm53FlashDetector(BaseFormatDetector):
                     )
 
                     self._buffer = current_text[tag_match.end():]
+                    # Advance tool_id for next tool call in the same response
+                    self.current_tool_id += 1
+                    self.current_tool_name_sent = False
+                    self.streamed_args_for_tool.append("")
+                    return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+        # Simplified tag format (AK_END/AV_START omitted) - must beat the JSON
+        # fallback, whose name regex would otherwise swallow "<arg_key" into
+        # the function name (e.g. "Read<arg_key").
+        if self.eot_token in current_text:
+            simple_match = self.tag_regex3.search(current_text)
+            if simple_match:
+                raw_name = simple_match.group(1).strip()
+                raw_args = simple_match.group(2)
+                func_name = self._normalize_func_name(raw_name, tools)
+                if func_name:
+                    if self.current_tool_id == -1:
+                        self.current_tool_id = 0
+                        self.prev_tool_call_arr = []
+                        self.streamed_args_for_tool = [""]
+                        self.current_tool_name_sent = False
+                    if not self.current_tool_name_sent:
+                        self.current_tool_name_sent = True
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=self.current_tool_id,
+                                name=func_name,
+                                parameters="",
+                            )
+                        )
+                    arguments = self._parse_tag_args(raw_args)
+                    arguments = self._fix_args_against_schema(arguments, func_name, tools)
+                    args_json = json.dumps(arguments, ensure_ascii=False)
+                    self.streamed_args_for_tool[self.current_tool_id] = args_json
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=None,
+                            parameters=args_json,
+                        )
+                    )
+                    self._buffer = current_text[simple_match.end():]
+                    # Advance tool_id for next tool call in the same response
+                    self.current_tool_id += 1
+                    self.current_tool_name_sent = False
+                    self.streamed_args_for_tool.append("")
                     return StreamingParseResult(normal_text=normal_text, calls=calls)
 
         # Try JSON format
@@ -329,7 +483,7 @@ class Glm53FlashDetector(BaseFormatDetector):
         if not match:
             return StreamingParseResult(normal_text=normal_text)
 
-        raw_name = match.group(1).strip()
+        raw_name = match.group(1).split("<arg_key")[0].strip()
         func_name = self._normalize_func_name(raw_name, tools)
 
         if not func_name:
@@ -356,8 +510,10 @@ class Glm53FlashDetector(BaseFormatDetector):
         json_start = after_name.find("{")
         if json_start >= 0:
             json_str = after_name[json_start:]
+            decoder = json.JSONDecoder()
             try:
-                parsed = json.loads(json_str)
+                parsed, end_idx = decoder.raw_decode(json_str)
+                parsed = self._fix_args_against_schema(parsed, func_name, tools)
                 args_json = json.dumps(parsed, ensure_ascii=False)
                 self.streamed_args_for_tool[self.current_tool_id] = args_json
                 calls.append(
@@ -367,27 +523,127 @@ class Glm53FlashDetector(BaseFormatDetector):
                         parameters=args_json,
                     )
                 )
-                self._buffer = after_name[json_start + len(json_str):]
+                # Advance tool_id for next tool call in the same response
+                self.current_tool_id += 1
+                self.current_tool_name_sent = False
+                self.streamed_args_for_tool.append("")
+                self._buffer = after_name[json_start + end_idx:]
             except json.JSONDecodeError:
-                last_brace = after_name.rfind("}")
-                if last_brace >= 0:
-                    try:
-                        partial = after_name[json_start : last_brace + 1]
-                        parsed = json.loads(partial)
-                        args_json = json.dumps(parsed, ensure_ascii=False)
-                        self.streamed_args_for_tool[self.current_tool_id] = args_json
-                        calls.append(
-                            ToolCallItem(
-                                tool_index=self.current_tool_id,
-                                name=None,
-                                parameters=args_json,
-                            )
-                        )
-                        self._buffer = after_name[last_brace + 1:]
-                    except json.JSONDecodeError:
-                        pass
+                # JSON incomplete - check if model moved to next tool call
+                next_tc = after_name.find(self.bot_token, json_start)
+                if next_tc >= 0:
+                    self.current_tool_id += 1
+                    self.current_tool_name_sent = False
+                    self.streamed_args_for_tool.append("")
+                    self._buffer = after_name[next_tc:]
+                # else: wait for more data (incomplete JSON)
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+
+    def finish(self, tools):
+        """Flush remaining buffer content when stream ends.
+
+        The base class finish() returns empty result, but we may have
+        unprocessed tool calls left in the buffer when the model outputs
+        multiple tool calls in a single response and the stream ends
+        before all are processed.
+        """
+        calls = []
+        if not self._buffer or self.bot_token not in self._buffer:
+            # No tool call in buffer, return as normal text
+            normal_text = self._buffer if self._buffer else ""
+            self._buffer = ""
+            return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+        # Process remaining tool calls in the buffer
+        current = self._buffer
+        self._buffer = ""
+
+        # Keep processing until no more tool calls found
+        while self.bot_token in current:
+            first_idx = current.find(self.bot_token)
+            if first_idx > 0:
+                # There's normal text before the tool call - discard it
+                current = current[first_idx:]
+
+            # Try tag format first
+            if self.eot_token in current and AK_START in current:
+                tag_match = self.tag_regex2.search(current)
+                if tag_match:
+                    raw_name = tag_match.group(1).strip()
+                    raw_args = tag_match.group(2)
+                    func_name = self._normalize_func_name(raw_name, tools)
+                    if func_name:
+                        if self.current_tool_id == -1:
+                            self.current_tool_id = 0
+                        if not self.current_tool_name_sent:
+                            self.current_tool_name_sent = True
+                            calls.append(ToolCallItem(
+                                tool_index=self.current_tool_id,
+                                name=func_name, parameters="",
+                            ))
+                        arguments = self._parse_tag_args(raw_args)
+                        arguments = self._fix_args_against_schema(arguments, func_name, tools)
+                        args_json = json.dumps(arguments, ensure_ascii=False)
+                        self.streamed_args_for_tool[self.current_tool_id] = args_json
+                        calls.append(ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=None, parameters=args_json,
+                        ))
+                        self.current_tool_id += 1
+                        self.current_tool_name_sent = False
+                        self.streamed_args_for_tool.append("")
+                        current = current[tag_match.end():]
+                        continue
+
+            # Try JSON format
+            match = re.search(
+                re.escape(self.bot_token) + r"(.*?)(?:>|\n)",
+                current, re.DOTALL,
+            )
+            if not match:
+                break
+
+            raw_name = match.group(1).split("<arg_key")[0].strip()
+            func_name = self._normalize_func_name(raw_name, tools)
+            if not func_name:
+                break
+
+            if self.current_tool_id == -1:
+                self.current_tool_id = 0
+            if not self.current_tool_name_sent:
+                self.current_tool_name_sent = True
+                calls.append(ToolCallItem(
+                    tool_index=self.current_tool_id,
+                    name=func_name, parameters="",
+                ))
+
+            after_name = current[match.end():]
+            json_start = after_name.find("{")
+            if json_start >= 0:
+                json_str = after_name[json_start:]
+                decoder = json.JSONDecoder()
+                try:
+                    parsed, end_idx = decoder.raw_decode(json_str)
+                    parsed = self._fix_args_against_schema(parsed, func_name, tools)
+                    args_json = json.dumps(parsed, ensure_ascii=False)
+                    self.streamed_args_for_tool[self.current_tool_id] = args_json
+                    calls.append(ToolCallItem(
+                        tool_index=self.current_tool_id,
+                        name=None, parameters=args_json,
+                    ))
+                    self.current_tool_id += 1
+                    self.current_tool_name_sent = False
+                    self.streamed_args_for_tool.append("")
+                    current = after_name[json_start + end_idx:]
+                    continue
+                except json.JSONDecodeError:
+                    pass
+
+            break
+
+        return StreamingParseResult(normal_text="", calls=calls)
 
     def supports_structural_tag(self) -> bool:
         return False
