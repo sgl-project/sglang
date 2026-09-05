@@ -51,6 +51,7 @@ from sglang.srt.state_capturer.indexer_topk import (
 from sglang.srt.utils import (
     add_prefix,
     ceil_align,
+    extend_mem_profile,
     get_bool_env_var,
     is_cuda,
     is_gfx95_supported,
@@ -248,6 +249,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and not is_neox_style
         )
         self.alt_stream = alt_stream
+        if not extend_mem_profile.ENABLED:
+            self.forward_cuda = self._forward_cuda_impl
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
@@ -1572,6 +1575,24 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         )
 
     def forward_cuda(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        return_indices: bool = True,
+    ) -> Optional[torch.Tensor]:
+        # Reached only when the profiler is enabled: __init__ rebinds
+        # forward_cuda straight to _forward_cuda_impl otherwise (BaseFusedOp
+        # resolves its dispatch target with getattr, so the instance binding
+        # wins and decode skips this wrapper layer).
+        with extend_mem_profile.phase("mla:indexer"):
+            return self._forward_cuda_impl(
+                x, q_lora, positions, forward_batch, layer_id, return_indices
+            )
+
+    def _forward_cuda_impl(
         self,
         x: torch.Tensor,
         q_lora: torch.Tensor,

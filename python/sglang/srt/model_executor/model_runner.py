@@ -96,6 +96,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
+    ForwardMode,
     PPProxyTensors,
 )
 from sglang.srt.model_executor.forward_context import (
@@ -217,6 +218,7 @@ from sglang.srt.state_capturer.routed_experts import (
 from sglang.srt.utils import (
     cpu_has_amx_support,
     enable_show_time_cost,
+    extend_mem_profile,
     get_available_gpu_memory,
     is_host_cpu_arm64,
     is_npu,
@@ -227,6 +229,7 @@ from sglang.srt.utils import (
     slow_rank_detector,
 )
 from sglang.srt.utils.device_timer import device_timer_ctx
+from sglang.srt.utils.mem_forensics import maybe_start_memory_forensics
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.offloader import (
@@ -271,6 +274,37 @@ def _prefill_cuda_graph_allows_context_parallel(
         bool(getattr(prefill_runner, "enable_cp_v2_bcg_capture", False))
         and is_cp_v2_active(forward_batch)
     )
+
+
+def extend_mem_profile_tokens(forward_batch: ForwardBatch) -> int:
+    """Real token count of a genuine prefill extend for the extend memory
+    profiler; 0 for anything else, so only such extends are recorded.
+
+    Genuine means the batch was built as ``ForwardMode.EXTEND``. MIXED,
+    TARGET_VERIFY, SPLIT_PREFILL, DLLM_EXTEND, decode and idle batches return
+    0, and so does a batch that ``prepare_mlp_sync_batch`` converted to
+    EXTEND for DP MAX_LEN padding (an idle hybrid-SSM rank running a
+    fabricated request, or decode rows padded to 1-token extends): those
+    keep their original mode in ``_original_forward_mode``, and the idle
+    conversion deliberately overwrites ``num_token_non_padded_cpu`` with the
+    peer's padded length, so neither the converted mode nor that count can
+    be trusted on its own.
+
+    The count comes from before padding: ``_original_num_tokens`` is the
+    pre-padding token count recorded by ``_pad_inputs_to_size``; when no
+    padding ran, ``num_token_non_padded_cpu`` is the batch's own count.
+    """
+    mode = forward_batch._original_forward_mode
+    if mode is None:
+        mode = forward_batch.forward_mode
+    if mode != ForwardMode.EXTEND:
+        return 0
+    num_tokens = forward_batch._original_num_tokens
+    if num_tokens is None:
+        num_tokens = forward_batch.num_token_non_padded_cpu
+    if num_tokens is None:
+        num_tokens = forward_batch.input_ids.numel()
+    return int(num_tokens)
 
 
 @dataclass
@@ -434,6 +468,10 @@ class ModelRunner:
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
         self.init_torch_distributed()
+
+        # Allocator-history recording must begin before any lazily created
+        # buffer that a captured CUDA graph may later reference.
+        maybe_start_memory_forensics()
 
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
@@ -1837,9 +1875,7 @@ class ModelRunner:
                 can_run_graph = True
             else:
                 # Eager: decode / extend / idle dispatched inside the runner.
-                ret = self.eager_runner.execute(
-                    forward_batch, pp_proxy_tensors=pp_proxy_tensors
-                )
+                ret = self._execute_eager(forward_batch, pp_proxy_tensors)
 
             if (
                 forward_batch.global_num_tokens_cpu is not None
@@ -1848,6 +1884,20 @@ class ModelRunner:
                 forward_batch.post_forward_mlp_sync_batch(ret)
 
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+
+    def _execute_eager(self, forward_batch: ForwardBatch, pp_proxy_tensors):
+        """Run the eager forward, under the extend memory profiler only when
+        it was enabled at import. Disabled cost: this method call and one
+        module-constant check; the token helper is not evaluated."""
+        if not extend_mem_profile.ENABLED:
+            return self.eager_runner.execute(
+                forward_batch, pp_proxy_tensors=pp_proxy_tensors
+            )
+        # end() runs on the exception path too (fail-open).
+        with extend_mem_profile.record(extend_mem_profile_tokens(forward_batch)):
+            return self.eager_runner.execute(
+                forward_batch, pp_proxy_tensors=pp_proxy_tensors
+            )
 
     def _preprocess_logits(
         self,

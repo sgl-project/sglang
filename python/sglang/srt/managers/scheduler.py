@@ -346,6 +346,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
     resolve_image_processor_backend,
 )
+from sglang.srt.utils.mem_forensics import maybe_dump_memory_forensics
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -1825,6 +1826,10 @@ class Scheduler(
         # Triton kernel device-load is a lazy first-use at serving time.
         triton_load_watch.install()
         triton_load_watch.mark_serving_started()
+
+        # Snapshot allocator state while every capture-era block is still
+        # alive; damaged addresses at runtime resolve against this dump.
+        maybe_dump_memory_forensics("ready")
 
         if use_mlx():
             # MLX overlap uses mx.async_eval for CPU/GPU overlap,
