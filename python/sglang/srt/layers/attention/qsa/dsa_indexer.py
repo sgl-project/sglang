@@ -12,7 +12,6 @@ import logging
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qsa.config import (
     QSA_VARIANT_TOKENWISE,
     parse_qsa_profile,
@@ -75,12 +74,6 @@ class QwenDSAIndexer(MultiPlatformOp):
             # The paged index-K layout and every fast path assume 64-token
             # pages, matching qsa_0511.
             raise ValueError(f"tokenwise QSA requires page_size = 64, got {page_size}")
-        if envs.SGLANG_QWEN_DSA_USE_FP8_INDEXER.get():
-            raise NotImplementedError(
-                "The FP8 tokenwise indexer path (qsa_0511 deep_gemm) is not "
-                "ported to this tree; unset SGLANG_QWEN_DSA_USE_FP8_INDEXER "
-                "to use the BF16 reference path"
-            )
         self.qsa_profile = profile
         self.layer_id = int(layer_id)
         self.index_n_heads = profile.n_heads

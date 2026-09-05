@@ -304,9 +304,6 @@ class Envs:
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
-    # Select the FP8 (deep_gemm) tokenwise QSA indexer; only the BF16 reference
-    # path is ported, so setting this fails loudly instead of degrading.
-    SGLANG_QWEN_DSA_USE_FP8_INDEXER = EnvBool(False)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
