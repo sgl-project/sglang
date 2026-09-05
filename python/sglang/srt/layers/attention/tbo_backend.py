@@ -185,6 +185,16 @@ class TboAttnBackend(AttentionBackend):
         return self.primary.get_indexer_metadata(layer_id, forward_batch)
 
     @property
+    def forward_metadata(self) -> Optional[object]:
+        # The base class declares forward_metadata, so normal lookup succeeds
+        # before __getattr__ can delegate it to the primary backend.
+        return self.primary.forward_metadata
+
+    @forward_metadata.setter
+    def forward_metadata(self, value: Optional[object]) -> None:
+        self.primary.forward_metadata = value
+
+    @property
     def verify_mask(self) -> Optional[VerifyMask]:
         # Needs an explicit override: the base declares this as a property, so
         # normal lookup succeeds with None and __getattr__ below never runs.
