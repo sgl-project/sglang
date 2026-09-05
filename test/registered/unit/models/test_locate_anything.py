@@ -96,7 +96,7 @@ class TestBoxGrammarLogitProcessor(CustomTestCase):
         logits = torch.zeros(1, self.VOCAB)
         out = proc(logits, self._params(output_ids))
         # Allowed ids are those left finite after masking.
-        return set(torch.nonzero(torch.isfinite(out[0])).flatten().tolist())
+        return set(torch.isfinite(out[0]).nonzero().flatten().tolist())
 
     def test_no_box_open_is_untouched(self):
         proc = LocateAnythingBoxGrammarLogitProcessor()

@@ -1861,7 +1861,7 @@ class DeepseekV4AscendAttnBackend(
             n_draft, dtype=start_positions.dtype
         ).view(1, -1)
         boundary_mask = abs_positions % ratio == 0
-        indices = torch.nonzero(boundary_mask.flatten(), as_tuple=False).flatten()
+        indices = boundary_mask.flatten().nonzero(as_tuple=False).flatten()
 
         if indices.numel() == 0:
             return

@@ -2802,7 +2802,7 @@ class MHATokenToKVPool(KVCache):
         if not (_is_cuda or _is_hip):
             row_offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
             valid_mask = row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
-            valid_idx = torch.nonzero(valid_mask.reshape(-1), as_tuple=False).flatten()
+            valid_idx = valid_mask.reshape(-1).nonzero(as_tuple=False).flatten()
             if valid_idx.numel() == 0:
                 return
             self.set_kv_buffer(

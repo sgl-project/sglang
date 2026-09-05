@@ -173,13 +173,13 @@ def test_local_text_layout_is_a_contiguous_prefix_per_ulysses_rank():
                 start = int(layout["text_source_start"])
                 stop = int(layout["text_source_stop"])
                 row_start = rank * (branch.seq_len // world_size)
-                expected = torch.nonzero(
+                expected = 
                     (torch.arange(text_len) >= row_start)
                     & (
                         torch.arange(text_len)
                         < row_start + branch.seq_len // world_size
                     )
-                ).view(-1)
+                .nonzero().view(-1)
                 assert expected.tolist() == list(range(start, stop))
 
 

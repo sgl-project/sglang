@@ -907,13 +907,13 @@ class TestCuteDslV1(unittest.TestCase):
                         ref_output, device=out.device, dtype=out.dtype
                     )
 
-                    positions = torch.nonzero(masked_m[topk_idx], as_tuple=False)
+                    positions = masked_m[topk_idx].nonzero(as_tuple=False)
                     rows, cols = positions[:, 0], positions[:, 1]
                     experts = topk_idx[rows, cols]
                     for i in range(num_experts):
                         mask = experts == i
                         if mask.any():
-                            idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+                            idx = mask.nonzero(as_tuple=False).squeeze(-1)
                             r, c = rows[idx], cols[idx]
                             out_weighted[r] += out[i, : len(r), :] * routing_weights[
                                 r, c
@@ -1076,7 +1076,7 @@ class TestCuteDslV1(unittest.TestCase):
                 topk_idx.to(device),
             )
 
-            positions = torch.nonzero(masked_m[topk_idx], as_tuple=False)
+            positions = masked_m[topk_idx].nonzero(as_tuple=False)
             rows, cols = positions[:, 0], positions[:, 1]
             experts = topk_idx[rows, cols]
 
@@ -1087,7 +1087,7 @@ class TestCuteDslV1(unittest.TestCase):
                 for i in range(num_experts):
                     mask = experts == i
                     if mask.any():
-                        idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+                        idx = mask.nonzero(as_tuple=False).squeeze(-1)
                         r, c = rows[idx], cols[idx]
                         out_weighted[r] += out[i, : len(r), :] * routing_weights[
                             r, c
@@ -1243,13 +1243,13 @@ class TestCuteDslV1(unittest.TestCase):
             )
 
             out_weighted = torch.zeros_like(ref, device=device)
-            positions = torch.nonzero(masked_m[topk_idx], as_tuple=False)
+            positions = masked_m[topk_idx].nonzero(as_tuple=False)
             rows, cols = positions[:, 0], positions[:, 1]
             experts = topk_idx[rows, cols]
             for i in range(num_experts):
                 mask = experts == i
                 if mask.any():
-                    idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+                    idx = mask.nonzero(as_tuple=False).squeeze(-1)
                     r, c = rows[idx], cols[idx]
                     out_weighted[r] += out[i, : len(r), :] * routing_weights[r, c].to(
                         device
