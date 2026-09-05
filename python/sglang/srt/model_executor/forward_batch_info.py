@@ -1142,15 +1142,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 (batch_size, 1), dtype=torch.int64, device=device
             )
         else:
-            mrope_deltas = [
-                (
-                    torch.zeros(1, dtype=torch.int64)
-                    if mm_inputs[i] is None
-                    else mm_inputs[i].mrope_position_delta.squeeze(0)
-                )
-                for i in range(batch_size)
-            ]
-            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
+            # Per-request scalar deltas must stay shaped (B, 1) so they broadcast
+            # against spec positions (B, num_draft_tokens). A 1-D stack of shape
+            # (B,) aligns on the last dim and crashes (or silently mis-broadcasts)
+            # whenever batch_size != num_draft_tokens — common for audio/ASR
+            # batches under NEXTN/EAGLE (e.g. Qwen3-ASR).
+            mrope_deltas = []
+            for i in range(batch_size):
+                if mm_inputs[i] is None or mm_inputs[i].mrope_position_delta is None:
+                    delta = torch.zeros(1, dtype=torch.int64)
+                else:
+                    delta = mm_inputs[i].mrope_position_delta.reshape(-1)[:1]
+                mrope_deltas.append(delta)
+            mrope_delta_tensor = (
+                torch.stack(mrope_deltas, dim=0).to(device=device).view(batch_size, 1)
+            )
         next_input_positions = (
             (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
         )
