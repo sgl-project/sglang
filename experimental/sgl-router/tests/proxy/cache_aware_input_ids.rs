@@ -12,20 +12,11 @@
 //!   doesn't render tool schemas, so its ids would diverge from the engine).
 //! * A request with multimodal (array) content → `input_ids` omitted (a text
 //!   tokenizer can't represent image content).
-//!
-//! The model id contains `deepseek-v4` so the tokenizer registry auto-attaches
-//! the built-in V4 chat encoder — the engine-equivalent path — without a
-//! template fixture.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
-use sgl_router::config::{
-    ActiveLoadConfig, CacheAwareConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig,
-    PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
-};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::engine_load::EngineLoadTable;
 use sgl_router::policies::factory::build_registry;
 use sgl_router::policies::kv_events::{BlockSizeOracle, HashTree};
 use sgl_router::proxy::Proxy;
@@ -37,35 +28,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
 
+use crate::common::cache_aware_fixture::{config, MODEL};
 use crate::common::mock_worker::MockWorker;
-
-const MODEL: &str = "deepseek-v4-tiny";
-
-fn config() -> Config {
-    Config {
-        server: ServerConfig {
-            host: "0".into(),
-            port: 0,
-        },
-        observability: ObservabilityConfig::default(),
-        model: ModelConfig {
-            id: MODEL.into(),
-            tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
-            policy: PolicyKind::CacheAwareZmq,
-            circuit_breaker: None,
-            cache_aware: Some(CacheAwareConfig::default()),
-            sticky: None,
-            affinity: None,
-            fused: None,
-            eligibility: None,
-        },
-        discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
-            urls: vec!["http://placeholder:0".into()],
-        }),
-        proxy: ProxyConfig::default(),
-        active_load: ActiveLoadConfig::default(),
-    }
-}
 
 fn build_ctx(url: String) -> Arc<AppContext> {
     let cfg = config();
@@ -82,18 +46,9 @@ fn build_ctx(url: String) -> Arc<AppContext> {
         model_ids: vec![ModelId(MODEL.into())],
         bootstrap_port: None,
     });
-    // Use the real loaded tokenizers (not the empty-registry test default) so
-    // the cache-aware policy can tokenize at ingress.
-    let policies = Arc::new(
-        build_registry(
-            &cfg,
-            Arc::new(HashTree::new()),
-            Arc::clone(&tokenizers),
-            BlockSizeOracle::new(),
-            EngineLoadTable::new(),
-        )
-        .unwrap(),
-    );
+    // Use the configured tokenizer so the chat path can emit input_ids.
+    let policies =
+        Arc::new(build_registry(&cfg, Arc::new(HashTree::new()), BlockSizeOracle::new()).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
     Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
 }
