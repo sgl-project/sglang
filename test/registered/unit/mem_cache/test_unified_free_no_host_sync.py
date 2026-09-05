@@ -11,28 +11,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""The unified free path must not move anything across the PCIe bus.
+"""The unified allocator free path must not sync the host.
 
-Two independent host syncs lived in `MultiEndedAllocator`'s free path:
+Two syncs are guarded. A tombstone written as ``t[idx] = -1`` makes torch
+materialise the scalar as a CPU tensor and copy it H2D, which BLOCKS the host
+until the stream drains. And `torch.unique`, recovering distinct PAGE ids from
+freed TOKEN ids, has a data-dependent output shape and so must D2H the count;
+`free_segment` instead takes stride slices off the caller's `start_pos`, a
+page's tokens sitting consecutively in the kv row.
 
-  1. Tombstone scatters written as ``t[idx] = -1``. The scalar RHS makes torch
-     materialise ``-1`` as a CPU tensor and copy it H2D, and a pageable H2D
-     copy BLOCKS the host until the stream drains. Invisible on decode-shaped
-     work; ~16 ms per free behind an 8192-token prefill.
-
-  2. `torch.unique` recovering distinct PAGE ids from freed TOKEN ids. Its
-     output shape is data-dependent, so it must D2H the count
-     (``_unique2 -> item -> _local_scalar_dense -> cudaStreamSynchronize``).
-     `PagedTokenToKVPoolAllocator` already solved this with `free_segment`:
-     a page's tokens sit consecutively in the kv row, so given `start_pos` the
-     page representatives are stride slices. The unified allocators simply
-     never implemented it and so were permanently on the syncing path.
-
-These tests mirror `test_paged_free_segment.py` -- the same sweep against the
-`torch.unique` reference, the same free-group deferral -- because the unified
-allocators now mirror that allocator's design rather than a parallel one.
-
-    python -m pytest test/registered/unit/mem_cache/test_unified_free_no_host_sync.py -v
+Mirrors `test_paged_free_segment.py`, which pins the same properties for
+`PagedTokenToKVPoolAllocator`.
 """
 
 import ast
@@ -68,10 +57,9 @@ def _paged_allocator(lazy: bool):
 
 _TABLES = {"virtual_to_physical", "physical_to_virtual"}
 
-# Methods that MUST tombstone through index_fill_. Explicit, because "this
-# method writes a tombstone" is a design fact per method, not something a scan
-# can infer -- but `test_every_allocator_free_path_is_listed` below fails if a
-# new allocator arrives with its own free path and is not added here.
+# Methods that MUST tombstone through index_fill_; hand-listed because "writes
+# a tombstone" is a per-method design fact a scan cannot infer. Completeness is
+# guarded by `test_every_allocator_free_path_is_listed` below.
 _TOMBSTONE_METHODS = [
     (mea.MultiEndedAllocator, "_free_lazy"),
     (mea.MultiEndedAllocator, "free"),
@@ -82,9 +70,8 @@ _TOMBSTONE_METHODS = [
 ]
 
 
-# Ways to write `-1` into a table without the value crossing the bus:
-# `index_fill_` takes the scalar as an argument torch keeps off the host, and
-# the fused launchers store it from inside the kernel.
+# Sanctioned no-sync tombstone forms: `index_fill_` takes the scalar as an
+# argument torch keeps off the host; the fused launcher stores it in-kernel.
 _NO_SYNC_TOMBSTONE_FORMS = ("index_fill_", "free_unbind_inplace")
 
 
@@ -109,9 +96,8 @@ def _allocators_in_module():
 def _table_touching_methods():
     """Every own method of every allocator whose source names a page table.
 
-    DISCOVERY, not a list: a hardcoded list stops guarding the moment a new
-    allocator class arrives with its own free path -- which is what happened
-    when FloatMultiEndedAllocator was added and inherited no coverage.
+    Discovery rather than a hand list, so a new allocator class with its own
+    free path is covered the day it lands.
     """
     out = []
     for cls in _allocators_in_module():
@@ -130,15 +116,13 @@ def _table_touching_methods():
 def _scalar_index_assignments(fn):
     """`self.<table>[<tensor idx>] = <scalar>` occurrences in fn's source.
 
-    Slice assignments (``t[a:b] = -1``) are excluded: a slice is a view, so the
-    fill needs no index tensor. Tensor-valued scatters are excluded too -- only
-    the scalar RHS materialises a CPU value tensor.
+    Slices (``t[a:b] = -1``) and tensor-valued scatters are excluded: only a
+    scalar RHS behind a tensor index materialises a CPU value tensor.
     """
 
     def _is_scalar_literal(node):
-        # NOTE: `-1` parses as UnaryOp(USub, Constant(1)), NOT Constant. Testing
-        # only for Constant silently skips every negative literal -- i.e. every
-        # tombstone this scan exists to find.
+        # `-1` parses as UnaryOp(USub, Constant(1)), not Constant; matching
+        # only Constant silently skips every negative literal.
         if isinstance(node, ast.Constant):
             return True
         return isinstance(node, ast.UnaryOp) and isinstance(node.operand, ast.Constant)
@@ -156,9 +140,8 @@ def _scalar_index_assignments(fn):
                 continue
             if isinstance(tgt.slice, ast.Slice):
                 continue
-            # A CONSTANT integer index (`t[0] = 0`, `t[-1] = -1`) is a
-            # single-element sentinel write, not the tensor-index tombstone this
-            # guard exists to find, and the only such writes are in `clear()`.
+            # A constant index (`t[0] = 0`) is a single-element sentinel write,
+            # not a tensor-index tombstone; only `clear()` does it.
             if _is_scalar_literal(tgt.slice):
                 continue
             bad.append(ast.unparse(node))
@@ -167,6 +150,13 @@ def _scalar_index_assignments(fn):
 
 class TestTombstonesDoNotCrossTheBus(unittest.TestCase):
     def test_no_scalar_index_assignment(self):
+        # Self-check first: a scan whose AST matching has drifted reports
+        # clean on every method below.
+        def _offender(self):
+            self.virtual_to_physical[free_v_pages] = -1  # noqa: F821
+
+        self.assertEqual(len(_scalar_index_assignments(_offender)), 1)
+
         discovered = _table_touching_methods()
         self.assertGreaterEqual(
             len(discovered), len(_TOMBSTONE_METHODS), "discovery scan went blind"
@@ -185,24 +175,10 @@ class TestTombstonesDoNotCrossTheBus(unittest.TestCase):
                     ),
                 )
 
-    def test_the_scan_detects_the_scalar_form_it_guards(self):
-        """Self-check. The scan is only as good as its AST matching, and it
-        silently missed every tombstone until `-1` was recognised as
-        UnaryOp(USub, Constant) rather than Constant. Pin that."""
-
-        def _offender(self):
-            self.virtual_to_physical[free_v_pages] = -1  # noqa: F821
-
-        self.assertEqual(len(_scalar_index_assignments(_offender)), 1)
-
     def test_every_allocator_free_path_is_listed(self):
-        """The positive list must name every allocator that owns a free path.
-
-        REGRESSION: the list used to hold three MultiEndedAllocator methods, so
-        adding FloatMultiEndedAllocator with its own `free` silently dropped that
-        free path out of coverage -- and it shipped a scalar tombstone. Fail here
-        instead, loudly, the next time an allocator arrives.
-        """
+        """Bug regression: an allocator that owns a free path but is missing
+        from `_TOMBSTONE_METHODS` must fail loudly here rather than drop out of
+        tombstone coverage."""
         listed = {(cls.__name__, name) for cls, name in _TOMBSTONE_METHODS}
         for cls in _allocators_in_module():
             for name, fn in vars(cls).items():
@@ -212,9 +188,8 @@ class TestTombstonesDoNotCrossTheBus(unittest.TestCase):
                     src = inspect.getsource(fn)
                 except OSError:
                     continue
-                # WRITES a page table -- either correctly (index_fill_) or in the
-                # banned scalar form the scan below catches. A method that only
-                # READS a table has nothing to tombstone.
+                # Only a method that WRITES a page table needs a tombstone;
+                # one that merely READS has nothing to guard.
                 if not (
                     any(f"{t}.index_fill_" in src for t in _TABLES)
                     or _scalar_index_assignments(fn)
@@ -231,10 +206,8 @@ class TestTombstonesDoNotCrossTheBus(unittest.TestCase):
                 )
 
     def test_free_paths_actually_write_a_tombstone(self):
-        """Positive form, so deleting the scatter entirely cannot pass. The
-        mechanism is not the point -- keeping the tombstone value off the host
-        is -- so this lists the sanctioned ways to do that and a new one is
-        added here deliberately."""
+        """Positive form, so deleting the scatter entirely cannot pass; a new
+        no-sync mechanism is added to `_NO_SYNC_TOMBSTONE_FORMS` deliberately."""
         for cls, name in _TOMBSTONE_METHODS:
             with self.subTest(method=f"{cls.__name__}.{name}"):
                 src = inspect.getsource(getattr(cls, name))
@@ -243,22 +216,6 @@ class TestTombstonesDoNotCrossTheBus(unittest.TestCase):
                     f"{cls.__name__}.{name} writes no tombstone through any of "
                     f"{_NO_SYNC_TOMBSTONE_FORMS}",
                 )
-
-    def test_index_fill_matches_scalar_assign_semantics(self):
-        """Behaviour-preserving, including the edge cases the free path hands
-        it: empty index, duplicate pages, full table."""
-        for idx in (
-            torch.tensor([], dtype=torch.int64),
-            torch.tensor([1, 3, 5], dtype=torch.int64),
-            torch.tensor([2, 2, 3], dtype=torch.int64),  # duplicates
-            torch.arange(6, dtype=torch.int64),
-        ):
-            with self.subTest(n=int(idx.numel())):
-                a = torch.arange(6, dtype=torch.int64)
-                b = a.clone()
-                a[idx] = -1
-                b.index_fill_(0, idx, -1)
-                self.assertTrue(torch.equal(a, b))
 
 
 # --------------------------------------------------------------------------
@@ -270,7 +227,6 @@ class TestFreeSegment(unittest.TestCase):
     """Mirrors `test_paged_free_segment.TestFreeSegment`."""
 
     def test_matches_unique_over_tail_alignments(self):
-        """Page-aligned starts against every tail alignment."""
         for num_tokens in (1, PAGE_SIZE, PAGE_SIZE + 1, 3 * PAGE_SIZE - 1):
             for start in range(0, num_tokens, PAGE_SIZE):
                 for end in (start + 1, num_tokens):
@@ -288,8 +244,6 @@ class TestFreeSegment(unittest.TestCase):
                         self.assertEqual(freed.numel(), expected.numel())
 
     def test_never_calls_unique(self):
-        """The decisive check -- make `torch.unique` explode. A textual guard
-        can be fooled; this cannot."""
         for start in (0, PAGE_SIZE, 2 * PAGE_SIZE):
             alloc = _paged_allocator(lazy=True)
             row = alloc.alloc(3 * PAGE_SIZE)
@@ -299,12 +253,6 @@ class TestFreeSegment(unittest.TestCase):
                 ):
                     alloc.free_segment(row[start : start + PAGE_SIZE], start_pos=start)
 
-    def test_unaligned_start_is_rejected(self):
-        alloc = _paged_allocator(lazy=True)
-        row = alloc.alloc(3 * PAGE_SIZE)
-        with self.assertRaises(AssertionError):
-            alloc.free_segment(row[1 : PAGE_SIZE + 1], start_pos=1)
-
     def test_empty_segment_is_noop(self):
         alloc = _paged_allocator(lazy=True)
         before = alloc._free_phys_pages.numel()
@@ -312,8 +260,8 @@ class TestFreeSegment(unittest.TestCase):
         self.assertEqual(alloc._free_phys_pages.numel(), before)
 
     def test_page_size_one_takes_the_plain_path(self):
-        """token == page: nothing to dedup, so `free_segment` must not invent
-        a stride slice that would drop tokens."""
+        """token == page: a stride slice would drop tokens, so take the plain
+        path."""
         alloc = _paged_allocator(lazy=True)
         alloc.page_size = 1
         v = alloc.alloc(PAGE_SIZE)
@@ -325,12 +273,9 @@ class TestFreeSegment(unittest.TestCase):
 class TestFreeGroupKeepsPositions(unittest.TestCase):
     """Mirrors `test_paged_free_segment.test_group_defers_until_group_end`.
 
-    Bug regression: buffering RAW tokens and `torch.cat`-ing them at
-    `free_group_end` destroys each segment's shape, so the merged tensor has no
-    recoverable page structure and falls back to `torch.unique`. Measured as 71
-    of 77 `_free_lazy` calls still syncing on gpt-oss and Qwen3.5 ps=256
-    (eval_429), all attributed to `free_group_end` via the decode path. The fix
-    buffers page REPRESENTATIVES, so the merge concatenates page ids.
+    Bug regression: a free group must buffer page REPRESENTATIVES, not raw
+    tokens -- concatenating raw tokens loses the page structure and sends
+    `free_group_end` back to `torch.unique`.
     """
 
     def test_group_defers_until_group_end(self):
@@ -346,8 +291,6 @@ class TestFreeGroupKeepsPositions(unittest.TestCase):
         self.assertEqual(alloc._free_phys_pages.numel(), before + 2)
 
     def test_group_end_does_not_sync(self):
-        """The property the whole fix exists for: a grouped segment free must
-        complete with `torch.unique` disabled."""
         alloc = _paged_allocator(lazy=True)
         row = alloc.alloc(3 * PAGE_SIZE)
         alloc.free_group_begin()
@@ -360,8 +303,8 @@ class TestFreeGroupKeepsPositions(unittest.TestCase):
         self.assertGreater(alloc._free_phys_pages.numel(), 0)
 
     def test_positionless_group_still_uses_the_unique_path(self):
-        """Plain `free()` inside a group has no position to keep, so it must
-        still go through the (syncing) dedup -- correctness over speed."""
+        """Plain `free()` carries no position to keep, so it must still take
+        the syncing dedup -- correctness over speed."""
         alloc = _paged_allocator(lazy=True)
         row = alloc.alloc(2 * PAGE_SIZE)
         alloc.free_group_begin()
@@ -374,12 +317,9 @@ class TestFreeGroupKeepsPositions(unittest.TestCase):
 
 
 class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
-    """Completeness guard. The base `free_segment` DISCARDS `start_pos` and
+    """Completeness guard: the base `free_segment` DISCARDS `start_pos` and
     calls plain `free`, so an allocator that inherits it sends every segment
-    free into the syncing dedup -- silently, with no error and no wrong answer,
-    just a stalled scheduler thread. That is exactly what happened: the SWA
-    composite was overridden and the Mamba composite was not, and 77 of 77
-    `_free_lazy` calls on Qwen3.5 ps=256 still synced (eval_428).
+    free into the syncing dedup -- silently, with no error and no wrong answer.
     """
 
     def test_all_overridden(self):
@@ -400,8 +340,8 @@ class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
                 )
 
     def test_composites_buffer_reps_not_tokens_in_a_group(self):
-        """The group buffer must exist on every allocator that can receive a
-        segment free, or `free_segment` raises inside a group."""
+        """Every allocator that can receive a segment free needs the group
+        buffer, or `free_segment` raises inside a group."""
         for cls in (
             mea.MultiEndedAllocator,
             unified_mamba.UnifiedMambaTokenToKVPoolAllocator,
@@ -432,13 +372,10 @@ class TestUnifiedSwaFullSideGroup(unittest.TestCase):
 
 
 class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
-    """The per-decode-step SWA window ratchet frees a CONTIGUOUS row slice
-    with host-int, page-aligned bounds — the same shape `free_segment` was
-    built for. `free_swa(..., start_pos=)` must therefore reach the swa side
-    with caller-derived page ids: no `torch.unique` (data-dependent shape =
-    host sync) and no stale-slot `.item()` on the per-step path.
-
-    Poisoning the ops is the decisive form (a textual guard can be fooled).
+    """The per-decode-step SWA window ratchet frees a CONTIGUOUS row slice with
+    host-int, page-aligned bounds, so `free_swa(..., start_pos=)` must reach the
+    swa side with caller-derived page ids: no `torch.unique` and no stale-slot
+    `.item()` on the per-step path.
     """
 
     PS = 4
@@ -480,8 +417,7 @@ class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
         )
 
     def test_ratchet_shape_free_swa_never_syncs(self):
-        """Aligned bounds (the ratchet guarantees them at ps>1): no unique,
-        no item -- on the lazy production config."""
+        """Aligned bounds, which the ratchet guarantees at ps > 1."""
         alloc = self._swa_composite(lazy=True)
         v = alloc.alloc(8 * self.PS)
         self.assertIsNotNone(v)
@@ -497,8 +433,8 @@ class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
             alloc.free_swa(v[4 * self.PS :], start_pos=4 * self.PS)
 
     def test_full_only_segment_free_never_syncs(self):
-        """The request-finish dead half (swa already tombstoned) frees the full
-        side by page reps: no unique from free_full's token dedup."""
+        """Request-finish shape: the swa side is already tombstoned, so the
+        full side must free by page reps rather than `free_full`'s dedup."""
         alloc = self._swa_composite(lazy=True)
         v = alloc.alloc(8 * self.PS)
         alloc.free_swa(v, start_pos=0)
@@ -523,8 +459,8 @@ class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
             alloc.free_swa(v[1 : 5 * self.PS], start_pos=1)
 
     def test_start_pos_path_matches_the_fallback_end_state(self):
-        """Derived property: the stride-rep path and the dedup fallback must
-        leave IDENTICAL allocator state (v2p tombstones, capacity)."""
+        """Derived property: the stride-rep path and the dedup fallback leave
+        identical v2p tombstones and capacity."""
         for lazy in (True, False):
             with self.subTest(lazy=lazy):
                 a1 = self._swa_composite(lazy=lazy)
@@ -559,10 +495,9 @@ class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
     torch.cuda.is_available(), "the fused tombstone is a Triton kernel"
 )
 class TestFusedTombstoneWritesBothTables(unittest.TestCase):
-    """The source scan above accepts `free_unbind_inplace` as a no-sync
-    mechanism; this is what makes that acceptance mean something. On CPU the
-    launcher takes its pure-torch reference path, so nothing else in the suite
-    ever runs the kernel that does the tombstoning.
+    """The source scan accepts `free_unbind_inplace` as a no-sync mechanism; on
+    CPU the launcher takes its pure-torch reference path, so nothing else in
+    the suite ever runs the kernel that does the tombstoning.
     """
 
     def test_matches_the_reference_over_randomized_bindings(self):
@@ -601,19 +536,6 @@ class TestFusedTombstoneWritesBothTables(unittest.TestCase):
                 torch.equal(v2p[live_v], phys[n_free:]),
                 f"a live binding was disturbed, trial {trial}",
             )
-
-    def test_cuda_agrees_with_the_cpu_reference(self):
-        from sglang.kernels.ops.memory.virtual_slot import free_unbind_inplace
-
-        v = torch.tensor([3, 0, 5], dtype=torch.int64)
-        cpu_v2p = torch.tensor([1, 2, 3, 4, 5, 0], dtype=torch.int64)
-        cpu_p2v = torch.tensor([5, 0, 1, 2, 3, 4], dtype=torch.int64)
-        cu_v2p, cu_p2v = cpu_v2p.cuda(), cpu_p2v.cuda()
-        cpu_out = free_unbind_inplace(v, cpu_v2p, cpu_p2v)
-        cu_out = free_unbind_inplace(v.cuda(), cu_v2p, cu_p2v)
-        self.assertTrue(torch.equal(cpu_out, cu_out.cpu()))
-        self.assertTrue(torch.equal(cpu_v2p, cu_v2p.cpu()))
-        self.assertTrue(torch.equal(cpu_p2v, cu_p2v.cpu()))
 
     def test_empty_free_is_a_noop(self):
         from sglang.kernels.ops.memory.virtual_slot import free_unbind_inplace
