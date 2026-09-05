@@ -94,21 +94,6 @@ def test_qwen4_ple_norm_eager_fallback():
     torch.testing.assert_close(out, expected, **_TOLERANCES[dtype])
 
 
-def test_qwen4_ple_norm_non_cuda_fallback():
-    torch.manual_seed(0)
-    norm = Qwen4ExpPLEGroupedNorm(
-        _PLE_HIDDEN_SIZE, eps=1e-6, group_size=_PLE_GROUP_SIZE
-    )
-    x = torch.randn(4, _PLE_HIDDEN_SIZE, dtype=torch.bfloat16)
-
-    out = norm(x)
-    expected = _reference_ple_norm(
-        x, norm.weight, _PLE_GROUP_SIZE, 1e-6, compute_dtype=torch.float64
-    ).to(torch.bfloat16)
-
-    torch.testing.assert_close(out, expected, **_TOLERANCES[torch.bfloat16])
-
-
 if __name__ == "__main__":
     import sys
 

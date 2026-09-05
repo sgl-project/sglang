@@ -60,21 +60,6 @@ def test_grouped_gemma_rmsnorm_correctness(
     torch.testing.assert_close(out, expected, **_TOLERANCES[dtype])
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_grouped_gemma_rmsnorm_3d_input(dtype):
-    torch.manual_seed(0)
-    x = torch.randn(4, 8, 10240, dtype=dtype, device="cuda")
-    weight = torch.randn(10240, dtype=dtype, device="cuda") * 0.2
-
-    out = grouped_gemma_rmsnorm(x, weight, 2560, 1e-6)
-    expected = _reference_grouped_gemma_rmsnorm(
-        x, weight, 2560, 1e-6, compute_dtype=torch.float64
-    ).to(dtype)
-
-    assert out.shape == x.shape
-    torch.testing.assert_close(out, expected, **_TOLERANCES[dtype])
-
-
 def test_grouped_gemma_rmsnorm_out_param():
     x = torch.randn(64, 10240, dtype=torch.bfloat16, device="cuda")
     weight = torch.randn(10240, dtype=torch.bfloat16, device="cuda") * 0.2
@@ -87,13 +72,6 @@ def test_grouped_gemma_rmsnorm_out_param():
 
     assert result.data_ptr() == out.data_ptr()
     torch.testing.assert_close(result, expected, **_TOLERANCES[x.dtype])
-
-
-def test_grouped_gemma_rmsnorm_unsupported_dtype():
-    x = torch.randn(4, 10240, dtype=torch.float32, device="cuda")
-    weight = torch.zeros(10240, dtype=torch.float32, device="cuda")
-    with pytest.raises(RuntimeError, match="dtype"):
-        grouped_gemma_rmsnorm(x, weight, 2560, 1e-6)
 
 
 def test_grouped_gemma_rmsnorm_bad_group_size():

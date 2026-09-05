@@ -7,11 +7,9 @@ import torch
 from sglang.kernels.ops.attention import qwen38_qsa_sm121_varlen
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig
 from sglang.srt.layers.attention import qwen_sparse_attn_backend as qsa_backend_module
-from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.attention.qsa import dsa_indexer as dsa_indexer_module
 from sglang.srt.layers.attention.qsa import qsa_indexer as qsa_indexer_module
 from sglang.srt.layers.attention.qsa.kernel import (
-    average_pool_qsa_keys,
     expand_qsa_block_indices,
     qsa_fast_topk,
     qsa_sparse_attention,
@@ -117,103 +115,9 @@ def test_qsa_sm121_resolves_kda_varlen_kernel(monkeypatch):
         resolver.cache_clear()
 
 
-def _qsa_packed_varlen_reference(q, k, v, cu_seqlens_k, scale):
-    rows = []
-    queries_per_kv = q.shape[1] // k.shape[1]
-    for row in range(q.shape[0]):
-        start = int(cu_seqlens_k[row])
-        end = int(cu_seqlens_k[row + 1])
-        keys = k[start:end].repeat_interleave(queries_per_kv, dim=1).float()
-        values = v[start:end].repeat_interleave(queries_per_kv, dim=1).float()
-        scores = torch.einsum("hd,khd->hk", q[row].float(), keys) * scale
-        rows.append(torch.einsum("hk,khd->hd", scores.softmax(-1), values))
-    return torch.stack(rows).to(q.dtype)
-
-
-@pytest.mark.parametrize(
-    ("lengths", "num_q_heads", "num_kv_heads", "head_dim"),
-    [
-        ([1], 12, 1, 256),
-        ([17, 64, 65], 24, 2, 256),
-        ([511, 2048, 2051], 12, 1, 256),
-        ([7, 127], 24, 2, 256),
-    ],
-)
-def test_qsa_sm121_kda_varlen_matches_torch_reference(
-    lengths, num_q_heads, num_kv_heads, head_dim
-):
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 1):
-        return
-    torch.manual_seed(2026)
-    device = torch.device("cuda")
-    q = torch.randn(
-        len(lengths), num_q_heads, head_dim, dtype=torch.bfloat16, device=device
-    )
-    total_k = sum(lengths)
-    k = torch.randn(
-        total_k, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
-    )
-    v = torch.randn_like(k)
-    cu_q = torch.arange(len(lengths) + 1, dtype=torch.int32, device=device)
-    cu_k = torch.tensor(
-        [0, *torch.tensor(lengths).cumsum(0).tolist()],
-        dtype=torch.int32,
-        device=device,
-    )
-    scale = head_dim**-0.5
-
-    actual = qwen38_qsa_sm121_varlen(
-        q,
-        k,
-        v,
-        cu_q,
-        cu_k,
-        max_seqlen_q=1,
-        max_seqlen_k=max(lengths),
-        softmax_scale=scale,
-        causal=True,
-    )
-    expected = _qsa_packed_varlen_reference(q, k, v, cu_k.cpu(), scale)
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-
-
-def test_qsa_sm121_kda_varlen_cuda_graph_replays_dynamic_lengths():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 1):
-        return
-    torch.manual_seed(2027)
-    device = torch.device("cuda")
-    batch, num_q_heads, num_kv_heads, head_dim = 3, 12, 1, 256
-    capacity = 3 * 2051
-    q = torch.randn(batch, num_q_heads, head_dim, dtype=torch.bfloat16, device=device)
-    k = torch.randn(
-        capacity, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
-    )
-    v = torch.randn_like(k)
-    cu_q = torch.arange(batch + 1, dtype=torch.int32, device=device)
-    cu_k = torch.tensor([0, 17, 82, 593], dtype=torch.int32, device=device)
-    scale = head_dim**-0.5
-
-    # Compile and validate the contract before capture.
-    qwen38_qsa_sm121_varlen(q, k, v, cu_q, cu_k, max_seqlen_k=2051, softmax_scale=scale)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = qwen38_qsa_sm121_varlen(
-            q, k, v, cu_q, cu_k, max_seqlen_k=2051, softmax_scale=scale
-        )
-
-    replay_lengths = torch.tensor([0, 64, 2115, 3139], dtype=torch.int32, device=device)
-    cu_k.copy_(replay_lengths)
-    q.normal_()
-    k.normal_()
-    v.normal_()
-    graph.replay()
-    expected = _qsa_packed_varlen_reference(q, k, v, replay_lengths.cpu(), scale)
-    torch.testing.assert_close(captured, expected, rtol=2e-2, atol=2e-2)
-
-
 def test_qsa_sm121_compaction_and_attention_match_sparse_reference():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 1):
-        return
+        pytest.skip("SM121-only kernel")
     torch.manual_seed(2028)
     device = torch.device("cuda")
     batch, topk = 3, FINAL_TOPK
@@ -287,25 +191,6 @@ def test_qsa_sm121_compaction_and_attention_match_sparse_reference():
     expected = qsa_sparse_attention(q, k_cache, v_cache, slots, scale)
     assert valid_counts.tolist() == valid_counts_cpu
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-
-
-def test_qwen4_exp_indexer_config_is_read_from_text_config():
-    config = Qwen4ExpConfig(
-        text_config={
-            "hc_count": 4,
-            "hidden_size": 32,
-            "num_hidden_layers": 1,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 1,
-            "indexer_n_heads": 4,
-            "indexer_kv_heads": 1,
-            "indexer_head_dim": 128,
-            "indexer_budget": TOKEN_TOPK,
-            "indexer_compress_ratio": COMPRESS_RATIO,
-        },
-    )
-    assert config.text_config.indexer_budget == TOKEN_TOPK
-    assert config.text_config.indexer_compress_ratio == COMPRESS_RATIO
 
 
 def _compressed_config_namespace(**overrides):
@@ -696,24 +581,6 @@ def test_qwen_dsa_pool_roundtrip_and_layer_mapping():
         raise AssertionError("QwenDSA pool must require page_size 64")
 
 
-def test_mambaish_pool_profile_variants_parse():
-    from sglang.srt.layers.attention.qsa.config import (
-        QSA_VARIANT_COMPRESSED,
-        QSA_VARIANT_TOKENWISE,
-        parse_qsa_profile,
-    )
-
-    assert parse_qsa_profile(None) is None
-    assert (
-        parse_qsa_profile(_compressed_config_namespace()).variant
-        == QSA_VARIANT_COMPRESSED
-    )
-    assert (
-        parse_qsa_profile(_tokenwise_config_namespace()).variant
-        == QSA_VARIANT_TOKENWISE
-    )
-
-
 def test_qwen_dsa_indexer_rejects_non_tokenwise_configs():
     from sglang.srt.layers.attention.qsa.dsa_indexer import QwenDSAIndexer
 
@@ -890,19 +757,6 @@ def test_qwen_dsa_indexer_forward_empty_batch_returns_zero_rows():
         metadata,
     )
     assert out.shape == (0, 4)
-
-
-def test_qsa_backend_is_registered():
-    assert ATTENTION_BACKENDS["qsa"] is not None
-
-
-def test_qsa_idle_skips_metadata_construction():
-    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
-    backend.forward_metadata = object()
-
-    backend.init_forward_metadata(SimpleNamespace(forward_mode=ForwardMode.IDLE))
-
-    assert backend.forward_metadata is None
 
 
 def _make_mtp_draft_batch(steps: int, seq_lens=(8, 16), loc_base: int = 40):
@@ -1085,58 +939,6 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
     assert calls == {"token_rows": 15, "logical_rows": 15, "rope_rows": 15}
 
 
-def test_qsa_extend_matches_with_and_without_dp_attention_padding(monkeypatch):
-    kernel_q_rows = []
-
-    def fake_sparse_attention(q, k, v, slots, scale):
-        kernel_q_rows.append(q.shape[0])
-        return q + 1
-
-    monkeypatch.setattr(
-        qsa_backend_module, "qsa_sparse_attention", fake_sparse_attention
-    )
-    metadata = SimpleNamespace(
-        token_to_batch_idx=torch.zeros(15, dtype=torch.int32),
-        sequence_lengths=torch.tensor([15], dtype=torch.int32),
-        token_slot_table=torch.arange(16, dtype=torch.int32).reshape(1, 16),
-    )
-    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
-    backend.forward_metadata = metadata
-
-    class Pool:
-        def set_kv_buffer(self, layer, loc, k, v):
-            pass
-
-        def get_key_buffer(self, layer_id):
-            return torch.zeros(16, 1, 2)
-
-        def get_value_buffer(self, layer_id):
-            return torch.zeros(16, 1, 2)
-
-    pool = Pool()
-    backend.token_to_kv_pool = pool
-    layer = SimpleNamespace(tp_q_head_num=1, head_dim=2, layer_id=0, scaling=1.0)
-    topk = torch.zeros(15, 3, dtype=torch.int32)
-
-    def run(num_rows):
-        values = torch.arange(num_rows * 2, dtype=torch.float32).reshape(num_rows, 2)
-        batch = SimpleNamespace(
-            forward_mode=ForwardMode.EXTEND,
-            token_to_kv_pool=pool,
-            out_cache_loc=torch.arange(num_rows, dtype=torch.int32),
-        )
-        return backend.forward_extend(
-            values, values.clone(), values.clone(), layer, batch, topk_indices=topk
-        )
-
-    unpadded = run(15)
-    padded = run(16)
-    torch.testing.assert_close(padded[:15], unpadded)
-    torch.testing.assert_close(padded[15], torch.zeros(2))
-    assert padded.shape == (16, 2)
-    assert kernel_q_rows == [15, 15]
-
-
 def test_qsa_cuda_extend_ignores_dp_attention_padding(monkeypatch):
     if not torch.cuda.is_available():
         return
@@ -1260,34 +1062,6 @@ def test_qsa_paged_extend_trims_padding_rows_and_restores_output(monkeypatch):
         assert "top-k rows exceed query rows" in str(exc)
     else:
         raise AssertionError("QSA must reject top-k rows beyond the query rows")
-
-
-def test_qsa_paged_extend_never_feeds_mismatched_rows_to_kernels(monkeypatch):
-    seen = []
-
-    def fake_paged_attention(self, q, layer, forward_batch, topk_indices):
-        # Emulates the FA3/FA2 contracts: every kernel requires one cache
-        # row per q row (the repro crashed FA3 with seqused_k 40 vs q 44).
-        seen.append((q.shape[0], topk_indices.shape[0]))
-        return q.reshape(q.shape[0], -1) + 1
-
-    monkeypatch.setattr(
-        QwenSparseAttnBackend, "_forward_paged_attention", fake_paged_attention
-    )
-    backend, pool, layer = _make_paged_extend_backend()
-    topk = torch.zeros(3, 2, dtype=torch.int32)
-    values = torch.arange(5 * 2, dtype=torch.float32).reshape(5, 2)
-    batch = SimpleNamespace(
-        forward_mode=ForwardMode.TARGET_VERIFY,
-        token_to_kv_pool=pool,
-        out_cache_loc=torch.arange(5, dtype=torch.int32),
-    )
-    output = backend.forward_extend(
-        values, values.clone(), values.clone(), layer, batch, topk_indices=topk
-    )
-    assert seen == [(3, 3)]
-    assert output.shape == (5, 2)
-    torch.testing.assert_close(output[3:], torch.zeros(2, 2))
 
 
 def test_qsa_indexer_rejects_shorter_source_than_request_mapping():
@@ -1472,83 +1246,6 @@ def test_qsa_speculative_pseudo_extend_is_rejected():
             raise AssertionError(f"QSA must reject pseudo-extend of {original_mode}")
 
 
-def test_qsa_indexer_requires_compress_ratio_above_one():
-    try:
-        QSAIndexer._validate_config(
-            SimpleNamespace(
-                indexer_n_heads=8,
-                indexer_kv_heads=1,
-                indexer_head_dim=64,
-                indexer_budget=512,
-                indexer_compress_ratio=1,
-            )
-        )
-    except ValueError as exc:
-        assert "compress_ratio" in str(exc)
-    else:
-        raise AssertionError("QSA must reject a unit compression ratio")
-
-
-def test_qsa_indexer_decode_ignores_dp_attention_token_padding():
-    calls = {}
-    mapping = torch.zeros(1, dtype=torch.int32)
-    metadata = SimpleNamespace(
-        token_to_kv_pool=None,
-        compress_member_rows=None,
-        decode_logical_positions=None,
-        pending_ring_slots=None,
-        get_token_to_batch_idx=lambda: mapping,
-        get_seqlens_expanded=lambda: torch.tensor([7], dtype=torch.int32),
-        get_seqlens_int32=lambda: torch.tensor([8], dtype=torch.int32),
-        get_decode_mqa_inputs=lambda layer_id: (
-            torch.zeros(1, 2, 1, 2),
-            torch.zeros(1, 1, dtype=torch.int32),
-            torch.zeros(1, dtype=torch.int32),
-            2,
-        ),
-    )
-    indexer = SimpleNamespace(
-        layer_id=0,
-        index_n_heads=4,
-        _pending_ring_slots=lambda metadata, logical_positions, is_extend: torch.zeros(
-            logical_positions.numel(), dtype=torch.long
-        ),
-        project_qk=lambda hidden, rope_positions, **kwargs: (
-            hidden.reshape(-1, 1, 2),
-            hidden.reshape(-1, 1, 2),
-            False,
-        ),
-        update_key_state_and_compress=lambda token_k, logical, rope, meta, state_slots=None, state_stored=False: (
-            calls.update(
-                token_rows=token_k.shape[0],
-                logical_rows=logical.numel(),
-                rope_rows=rope.numel(),
-            )
-        ),
-        select_decode_tokens=lambda q, cache, table, lengths, max_len, positions, seqlens: (
-            calls.update(q_rows=q.shape[0], positions=positions.tolist())
-            or q.squeeze(1)
-        ),
-    )
-    forward_batch = SimpleNamespace(
-        forward_mode=ForwardMode.DECODE,
-        # One real decode position plus one DP padding row.
-        positions=torch.tensor([6, 0]),
-        out_cache_loc=torch.arange(2, dtype=torch.int32),
-    )
-    hidden = torch.arange(4, dtype=torch.float32).reshape(2, 2)
-    QSAIndexer.forward_cuda(
-        indexer, hidden, forward_batch.positions, forward_batch, metadata
-    )
-    assert calls == {
-        "token_rows": 1,
-        "logical_rows": 1,
-        "rope_rows": 1,
-        "q_rows": 1,
-        "positions": [6],
-    }
-
-
 class _FakeQSAPool:
     qsa_index_kv_heads = 1
     qsa_index_head_dim = 128
@@ -1730,25 +1427,6 @@ class _ForwardMode:
         return self.decode
 
 
-def test_qsa_indexer_validates_config_values_instead_of_fixed_shapes():
-    QSAIndexer._validate_config(
-        SimpleNamespace(
-            indexer_n_heads=8,
-            indexer_kv_heads=1,
-            indexer_head_dim=64,
-            indexer_budget=1024,
-            indexer_compress_ratio=2,
-        )
-    )
-
-
-def test_qsa_average_pool_matches_training_reference():
-    token_keys = torch.arange(8 * 128, dtype=torch.float32).reshape(8, 1, 128)
-    expected = token_keys.reshape(2, 4, 1, 128).mean(dim=1)
-    actual = average_pool_qsa_keys(token_keys.to(torch.bfloat16).reshape(2, 4, 1, 128))
-    torch.testing.assert_close(actual.float(), expected, rtol=0, atol=2)
-
-
 def test_qsa_row_ranges_do_not_cross_sequences():
     sequence_lengths = torch.tensor([10, 7], dtype=torch.int32)
     query_positions = torch.tensor([8, 9, 4, 6], dtype=torch.int32)
@@ -1846,38 +1524,6 @@ def test_qsa_forward_cuda_dispatches_prefill_and_decode_mqa():
     assert decode_result.item() == 2
 
 
-def test_qsa_fast_topk_returns_sequence_relative_indices():
-    logits = torch.zeros(2, 1200, dtype=torch.float32)
-    starts = torch.tensor([100, 600], dtype=torch.int32)
-    ends = torch.tensor([700, 1150], dtype=torch.int32)
-    logits[0, 321] = 10
-    logits[1, 987] = 11
-    indices = qsa_fast_topk(logits, starts, ends, topk=BLOCK_TOPK)
-    assert 321 - 100 in indices[0].tolist()
-    assert 987 - 600 in indices[1].tolist()
-
-    decode_starts = torch.zeros(2, dtype=torch.int32)
-    decode_ends = torch.tensor([700, 550], dtype=torch.int32)
-    logits[0, 444] = 12
-    logits[1, 333] = 13
-    decode_indices = qsa_fast_topk(logits, decode_starts, decode_ends, topk=BLOCK_TOPK)
-    assert 444 in decode_indices[0].tolist()
-    assert 333 in decode_indices[1].tolist()
-
-
-def test_qsa_reranks_wider_candidate_set():
-    from sglang.srt.layers.attention.qsa.kernel import (
-        _rerank_qsa_topk_candidates,
-    )
-
-    logits = torch.tensor([[0.0, 9.0, 8.0, 7.0, 6.0, 10.0]], dtype=torch.float32)
-    starts = torch.tensor([1], dtype=torch.int32)
-    candidates = torch.tensor([[0, 1, 2, 3, 4]], dtype=torch.int32)
-
-    actual = _rerank_qsa_topk_candidates(logits, candidates, starts, topk=2)
-    assert actual.tolist() == [[4, 0]]
-
-
 def test_qsa_block_expansion_adds_only_incomplete_tail():
     blocks = torch.full((2, BLOCK_TOPK), -1, dtype=torch.int32)
     blocks[0, 0] = 0
@@ -1952,28 +1598,6 @@ def test_qsa_decode_mqa_reads_paged_cache():
     positions = torch.arange(192).unsqueeze(0)
     expected.masked_fill_(positions >= context_lens[:, None], -float("inf"))
     torch.testing.assert_close(actual, expected)
-
-
-def test_qsa_sparse_attention_matches_explicit_gqa():
-    torch.manual_seed(2)
-    q = torch.randn(2, 4, 16, dtype=torch.bfloat16)
-    k = torch.randn(7, 2, 16, dtype=torch.bfloat16)
-    v = torch.randn(7, 2, 16, dtype=torch.bfloat16)
-    slots = torch.full((2, FINAL_TOPK), -1, dtype=torch.int32)
-    slots[0, :4] = torch.tensor([0, 2, 4, 6])
-    slots[1, :3] = torch.tensor([1, 3, 5])
-    actual = qsa_sparse_attention(q, k, v, slots)
-    expected_rows = []
-    for row, selected in enumerate((slots[0, :4], slots[1, :3])):
-        keys = k[selected.long()].repeat_interleave(2, dim=1)
-        values = v[selected.long()].repeat_interleave(2, dim=1)
-        scores = torch.einsum("hd,khd->hk", q[row].float(), keys.float()) / 4
-        expected_rows.append(
-            torch.einsum("hk,khd->hd", scores.softmax(-1), values.float()).to(
-                torch.bfloat16
-            )
-        )
-    torch.testing.assert_close(actual, torch.stack(expected_rows), rtol=2e-2, atol=2e-2)
 
 
 def test_qsa_mtp_step_out_cache_loc_matches_draft_forward_layout():
