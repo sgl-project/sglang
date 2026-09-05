@@ -244,6 +244,14 @@ def supports_cuda_vmm_feature_transport(model_config: ModelConfig) -> bool:
 
 
 def get_resolved_model_impl(model_config: ModelConfig) -> ModelImpl:
+    # MLX serves via mlx_lm.load(), so there is no sglang/Transformers impl to
+    # resolve here; resolving would import the model's auto_map and crash (e.g.
+    # Hunyuan). Local import keeps the MLX backend off this module's import path.
+    from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+
+    if use_mlx():
+        return ModelImpl.SGLANG
+
     resolved_model_impl = getattr(model_config, "_resolved_model_impl", None)
     if resolved_model_impl is not None:
         return resolved_model_impl
