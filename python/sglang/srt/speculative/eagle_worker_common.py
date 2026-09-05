@@ -591,6 +591,12 @@ def run_eagle_verify(
         logits_output,
         grammar_mask,
         uno_target_max_top_k=uno_target_max_top_k,
+        watermark_state=target_worker.model_runner.watermark_state,
+        watermark_full_mask=(
+            target_worker.model_runner.attn_backend.verify_mask is None
+            or target_worker.model_runner.attn_backend.verify_mask.mode
+            == TreeMaskMode.FULL_MASK
+        ),
     )
     new_seq_lens = batch.seq_lens + accept_lens
     clear_unaccepted_c128 = getattr(
@@ -617,6 +623,10 @@ def run_eagle_verify(
 
     if not batch.forward_mode.is_idle():
         accept_tokens = predict[accept_index]
+        if target_worker.model_runner.watermark_state is not None:
+            target_worker.model_runner.watermark_state.append_speculative(
+                batch.req_pool_indices, accept_tokens, accept_lens
+            )
         bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
         # stride = accept_tokens per-req width = accept_index.shape[1]
         # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.

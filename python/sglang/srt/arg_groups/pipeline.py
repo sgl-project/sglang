@@ -79,12 +79,14 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_other_validations,
         handle_prefill_delayer_env_compat,
         handle_return_hidden_states_mode,
+        handle_secret_file_configs,
         handle_ssl_validation,
         handle_tokenizer_batching,
     )
 
     handle_return_hidden_states_mode(server_args)
     handle_media_url_security(server_args)
+    handle_secret_file_configs(server_args)
     from sglang.srt.arg_groups.hicache_hook import (
         handle_hicache,
         handle_hicache_ratio_default,

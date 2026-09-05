@@ -17,11 +17,61 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.sampling.watermark_config import (
+    MAX_WATERMARK_CONTEXT_WINDOW,
+    parse_watermark_key,
+)
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
+
+
+def check_watermark_server_args(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if (cfg.watermark_key is not None or cfg.watermark_config is not None) and not (
+        cfg.enable_watermark
+    ):
+        raise ValueError(
+            "--watermark-key and --watermark-config require --enable-watermark"
+        )
+
+    if not cfg.enable_watermark:
+        return
+
+    if cfg.device != "cuda":
+        raise ValueError(
+            f"--enable-watermark requires --device cuda, got {cfg.device!r}"
+        )
+    if cfg.watermark_key is not None:
+        parse_watermark_key(cfg.watermark_key)
+    if not 1 <= cfg.watermark_context_window <= MAX_WATERMARK_CONTEXT_WINDOW:
+        raise ValueError(
+            "--watermark-context-window must be from 1 to 64, "
+            f"got {cfg.watermark_context_window!r}"
+        )
+    if cfg.enable_custom_logit_processor:
+        raise ValueError(
+            "--enable-watermark is incompatible with --enable-custom-logit-processor"
+        )
+    if cfg.dllm_algorithm is not None:
+        raise ValueError("--enable-watermark is not supported with diffusion LLM")
+    if cfg.disaggregation_mode != "null":
+        raise ValueError("--enable-watermark is not supported with PD disaggregation")
+    if cfg.speculative_algorithm not in {None, "NGRAM", "EAGLE", "EAGLE3"}:
+        raise ValueError(
+            "--enable-watermark supports speculative algorithms NGRAM, EAGLE, "
+            f"and EAGLE3, got {cfg.speculative_algorithm!r}"
+        )
+    if cfg.speculative_use_rejection_sampling:
+        raise ValueError(
+            "--enable-watermark is incompatible with "
+            "--speculative-use-rejection-sampling"
+        )
+    if envs.SGLANG_RUST_SERVER.get():
+        raise ValueError("--enable-watermark is not supported with SGLANG_RUST_SERVER")
 
 
 def check_server_args(server_args: Any):
@@ -227,6 +277,8 @@ def check_server_args(server_args: Any):
         raise ValueError(
             "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
         )
+
+    check_watermark_server_args(server_args)
 
     check_load_publish_args(server_args)
 
