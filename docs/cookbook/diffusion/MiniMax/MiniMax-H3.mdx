@@ -1670,3 +1670,9 @@ For a measured lower-count AMD deployment, set both `--num-gpus` and
 `--ulysses-degree` to 4, 2, or 1. AITER packed attention matched segment-wise
 BF16 SDPA at cosine similarity `0.9999991655` on MI355X and `0.9999991059` on
 MI300X.
+
+## 10. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="minimax-h3" />
