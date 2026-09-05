@@ -121,9 +121,6 @@ class XPUAttentionBackend(AttentionBackend):
         if forward_batch.forward_mode.is_decode_or_idle():
             # Draft Decode
             if forward_batch.spec_info is not None:
-                assert False, (
-                    "XPUAttentionBackend doesn't support speculative decoding yet, please use --attention-backend triton instead."
-                )
                 if self.topk <= 1:
                     metadata.cache_seqlens_int32 = (
                         seqlens_in_batch + (self.speculative_step_id + 1)
@@ -335,7 +332,9 @@ class XPUAttentionBackend(AttentionBackend):
                         metadata, metadata_expand
                     )
 
-        elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+        elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
+            include_draft_extend_v2=True
+        ):
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
             metadata.cu_seqlens_k = torch.nn.functional.pad(
@@ -345,7 +344,16 @@ class XPUAttentionBackend(AttentionBackend):
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
 
-            if any(forward_batch.extend_prefix_lens_cpu):
+            # Detect draft extend: either explicit DRAFT_EXTEND_V2 mode or EXTEND
+            # mode with an EagleDraftInput spec_info.
+            is_draft_extend = (
+                forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND_V2
+                or (
+                    forward_batch.spec_info is not None
+                    and forward_batch.spec_info.is_draft_input()
+                )
+            )
+            if any(forward_batch.extend_prefix_lens_cpu) or is_draft_extend:
                 extend_seq_lens = forward_batch.extend_seq_lens
                 metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
@@ -530,6 +538,11 @@ class XPUAttentionBackend(AttentionBackend):
         if sinks is not None:
             kwargs["sinks"] = sinks
 
+        # Piecewise XPU graph for prefill pre-allocates a fixed-address output
+        # buffer so graph replay writes to the same storage. radix_attention sets
+        # it only on the graph path; None on the eager path.
+        attn_output_buffer = forward_batch._attn_output
+
         # Get the appropriate page table based on whether we're using local attention
         if use_local_attn:
             local_metadata = metadata.local_attn_metadata
@@ -570,7 +583,7 @@ class XPUAttentionBackend(AttentionBackend):
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
             )
             value_cache = value_cache.view(
-                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+                -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
             )
             if layer.is_cross_attention:
                 page_table = metadata.encoder_page_table
@@ -594,47 +607,43 @@ class XPUAttentionBackend(AttentionBackend):
                 k_descale=k_descale,
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,
-                # Piecewise XPU graph for prefill requires a pre-allocated
-                # output buffer at a stable device address so the graph can
-                # record writes to the same storage on every replay.
-                # _attn_output is that fixed buffer; None falls back to a
-                # freshly allocated tensor (eager / cascade-attn path).
-                out=(
-                    forward_batch._attn_output.view(
-                        -1, layer.tp_q_head_num, layer.v_head_dim
-                    )
-                    if not use_cascade_attn
-                    and getattr(forward_batch, "_attn_output", None) is not None
-                    else None
+                # `out` is injected via out_kwargs only on the graph path (buffer
+                # present, non-cascade); the eager path omits it for flash_attn
+                # builds that lack the kwarg.
+                **(
+                    {
+                        "out": attn_output_buffer.view(
+                            -1, layer.tp_q_head_num, layer.v_head_dim
+                        )
+                    }
+                    if not use_cascade_attn and attn_output_buffer is not None
+                    else {}
                 ),
                 **kwargs,
             )
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
-                o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
+                expand = self.forward_metadata_spec_decode_expand
+                o_expand, lse_expand, *_ = self._forward_attn_flat_page_table(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k_cache=key_cache,
-                    v_cache=value_cache,
-                    page_table=self.forward_metadata_spec_decode_expand.page_table,
-                    cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
-                    cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
-                    cu_seqlens_k_new=None,
-                    max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
-                    softmax_scale=layer.scaling,
-                    causal=False,
-                    window_size=window_size,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    page_table=expand.page_table,
+                    cache_seqlens=expand.cache_seqlens_int32,
+                    cu_seqlens_q=expand.cu_seqlens_q,
+                    max_seqlen_q=expand.max_seq_len_q,
+                    scale=layer.scaling,
                     softcap=layer.logit_cap,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
-                    return_softmax_lse=True,
-                    **kwargs,
+                    window_size=window_size,
+                    sinks=sinks,
                 )
                 o, _ = merge_state_v2_wrapper(
                     o,
                     softmax_lse.T.contiguous(),
                     o_expand,
-                    softmax_lse_expand.T.contiguous(),
+                    # lse_expand comes back as (Hq, total_q); merge_state wants (total_q, Hq).
+                    lse_expand.T.contiguous(),
                 )
             else:
                 o = result
@@ -765,6 +774,59 @@ class XPUAttentionBackend(AttentionBackend):
         out = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         return out
 
+    def _forward_attn_flat_page_table(
+        self,
+        q: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: Optional[torch.Tensor],
+        max_seqlen_q: int,
+        scale: float,
+        softcap: float,
+        window_size: tuple[int, int],
+        sinks: Optional[torch.Tensor],
+    ):
+        """Attention against a ``page_table`` that indexes individual token
+        slots rather than ``self.page_size``-sized blocks.
+        """
+        # page_size=1 attention has no sink-logit support today; drop-on-the-floor
+        # here would silently unsink the branch half of the merge.
+        assert sinks is None, (
+            "flat-page-table attention does not support attention sinks"
+        )
+
+        # key_cache/value_cache carry the backend's configured page_size, but
+        # page_table indexes individual tokens regardless of that page_size, so
+        # the cache must be re-viewed as page_size=1 to line up with it --
+        # otherwise each row's block id is read as page_table[row, 0], aliasing
+        # entry 0's block instead of the actual per-row token slots.
+        k_cache_unpaged = key_cache.reshape(
+            -1, 1, key_cache.shape[-2], key_cache.shape[-1]
+        )
+        v_cache_unpaged = value_cache.reshape(
+            -1, 1, value_cache.shape[-2], value_cache.shape[-1]
+        )
+
+        return flash_attn_with_kvcache(
+            q=q,
+            k_cache=k_cache_unpaged,
+            v_cache=v_cache_unpaged,
+            # Reads page_table[row, 0:cache_seqlens[row]] per row, so page_table
+            # must pack its valid entries first per row.
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k_new=None,
+            max_seqlen_q=max_seqlen_q,
+            softmax_scale=scale,
+            causal=False,
+            window_size=window_size,
+            softcap=softcap,
+            return_softmax_lse=True,
+        )
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -867,7 +929,7 @@ class XPUAttentionBackend(AttentionBackend):
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
             )
             value_cache = value_cache.view(
-                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+                -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
             )
 
             if layer.is_cross_attention:
@@ -955,31 +1017,26 @@ class XPUAttentionBackend(AttentionBackend):
                 )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
-                    o_expand, softmax_lse_expand, *rest_expand = (
-                        flash_attn_with_kvcache(
-                            q=q_reshaped,
-                            k_cache=key_cache,
-                            v_cache=value_cache,
-                            page_table=self.forward_metadata_spec_decode_expand.page_table,
-                            cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
-                            cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
-                            cu_seqlens_k_new=None,
-                            max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
-                            softmax_scale=layer.scaling,
-                            causal=False,
-                            window_size=window_size,
-                            softcap=layer.logit_cap,
-                            k_descale=k_descale,
-                            v_descale=v_descale,
-                            return_softmax_lse=True,
-                            **kwargs,
-                        )
+                    expand = self.forward_metadata_spec_decode_expand
+                    o_expand, lse_expand, *_ = self._forward_attn_flat_page_table(
+                        q=q_reshaped,
+                        key_cache=key_cache,
+                        value_cache=value_cache,
+                        page_table=expand.page_table,
+                        cache_seqlens=expand.cache_seqlens_int32,
+                        cu_seqlens_q=expand.cu_seqlens_q,
+                        max_seqlen_q=expand.max_seq_len_q,
+                        scale=layer.scaling,
+                        softcap=layer.logit_cap,
+                        window_size=window_size,
+                        sinks=sinks,
                     )
                     o, _ = merge_state_v2(
                         o,
                         softmax_lse.T.contiguous(),
                         o_expand,
-                        softmax_lse_expand.T.contiguous(),
+                        # lse_expand comes back as (Hq, total_q); merge_state wants (total_q, Hq).
+                        lse_expand.T.contiguous(),
                     )
                 else:
                     o = result
@@ -1061,6 +1118,28 @@ class XPUAttentionBackend(AttentionBackend):
         else:
             self.encoder_metadata = {}
 
+    def _spec_query_kv_offsets(
+        self,
+        is_verify: bool,
+        is_draft_extend: bool,
+        is_draft_decode: bool,
+        spec_info,
+    ) -> tuple[int, int]:
+        """Per-request query-row count and how far the KV length must extend
+        past ``seq_lens`` for each spec mode.
+        """
+        if is_verify:
+            # Packs speculative_num_draft_tokens rows, attending past seq_lens
+            # over those draft positions.
+            return self.speculative_num_draft_tokens, self.speculative_num_draft_tokens
+        if is_draft_extend:
+            # seq_lens already includes the extend tokens (standard extend
+            # convention), so no KV offset is needed.
+            return spec_info.num_tokens_per_req, 0
+        if is_draft_decode:
+            return 1, self.speculative_step_id + 1
+        return 1, 0
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -1082,11 +1161,15 @@ class XPUAttentionBackend(AttentionBackend):
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
 
-        assert spec_info is None, (
-            "XPUAttentionBackend does not support speculative decoding in XPU graph"
+        is_verify = forward_mode.is_target_verify()
+        is_draft_decode = forward_mode.is_decode_or_idle() and spec_info is not None
+        is_draft_extend = forward_mode.is_draft_extend_v2()
+        assert forward_mode.is_decode_or_idle() or is_verify or is_draft_extend, (
+            "XPUAttentionBackend XPU graph only supports decode / target-verify / draft-extend modes"
         )
-        assert forward_mode.is_decode_or_idle(), (
-            "XPUAttentionBackend XPU graph only supports decode mode"
+
+        q_len_per_req, kv_len_offset = self._spec_query_kv_offsets(
+            is_verify, is_draft_extend, is_draft_decode, spec_info
         )
 
         if in_capture:
@@ -1132,14 +1215,30 @@ class XPUAttentionBackend(AttentionBackend):
             if seq_lens_cpu is not None
             else seq_lens.max().item()
         )
-        metadata.max_seq_len_k = max_len
+        metadata.max_seq_len_k = max_len + kv_len_offset
 
-        metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
+        kv_seqlens = (seq_lens + kv_len_offset).to(torch.int32)
+        metadata.cache_seqlens_int32.copy_(kv_seqlens)
 
         metadata.cu_seqlens_k[0] = 0
-        metadata.cu_seqlens_k[1 : bs + 1].copy_(
-            torch.cumsum(seq_lens.to(torch.int32), dim=0)
-        )
+        metadata.cu_seqlens_k[1 : bs + 1].copy_(torch.cumsum(kv_seqlens, dim=0))
+
+        # target-verify and draft-extend pack multiple query rows per request;
+        # rebuild cu_seqlens_q as a strided ramp (0, q, 2q, ...). Plain/draft
+        # decode keep the identity ramp already stored in the pre-allocated buffer.
+        if q_len_per_req > 1:
+            metadata.max_seq_len_q = q_len_per_req
+            metadata.cu_seqlens_q[: bs + 1].copy_(
+                torch.arange(
+                    0,
+                    (bs + 1) * q_len_per_req,
+                    q_len_per_req,
+                    dtype=torch.int32,
+                    device=metadata.cu_seqlens_q.device,
+                )
+            )
+        else:
+            metadata.max_seq_len_q = 1
 
         if self.is_encoder_decoder and forward_batch.encoder_lens is not None:
             encoder_lens = forward_batch.encoder_lens[:bs].to(torch.int32)
@@ -1331,3 +1430,64 @@ class XPUAttentionBackend(AttentionBackend):
             metadata_swa.cu_seqlens_k.copy_(cu_seqlens_k)
 
         metadata.swa_spec_metadata = metadata_swa
+
+
+class XPUMultiStepDraftBackend:
+    """Wrap multiple XPU attention backends for consecutive draft decode steps."""
+
+    needs_cpu_seq_lens: bool = False
+
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        topk: int,
+        speculative_num_steps: int,
+    ):
+        self.topk = topk
+        self.speculative_num_steps = speculative_num_steps
+        self.attn_backends = [
+            XPUAttentionBackend(
+                model_runner,
+                skip_prefill=True,
+                speculative_step_id=i,
+                topk=topk,
+                speculative_num_steps=speculative_num_steps,
+            )
+            for i in range(speculative_num_steps - 1)
+        ]
+        self.max_context_len = self.attn_backends[0].max_context_len
+        self.device = model_runner.device
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        for attn_backend in self.attn_backends:
+            attn_backend.init_forward_metadata(forward_batch)
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        for attn_backend in self.attn_backends:
+            attn_backend.init_cuda_graph_state(max_bs, max_num_tokens)
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
+
+        assert forward_batch.spec_info is not None
+        assert forward_batch.spec_info.is_draft_input()
+
+        inner_fb = build_inner_fb_view(
+            forward_batch,
+            bs=forward_batch.batch_size,
+            forward_mode=ForwardMode.DECODE,
+            encoder_lens=forward_batch.encoder_lens,
+        )
+        for attn_backend in self.attn_backends:
+            attn_backend.init_forward_metadata_out_graph(
+                inner_fb, in_capture=in_capture
+            )
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        for attn_backend in self.attn_backends:
+            attn_backend.init_forward_metadata_in_graph(forward_batch)
