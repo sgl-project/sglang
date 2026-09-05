@@ -15,6 +15,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
 
 if TYPE_CHECKING:
@@ -187,9 +188,9 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 def _handle_dflash(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 
-    if not (cfg.device.startswith("cuda") or cfg.device == "npu"):
+    if not current_platform.supports_dflash():
         raise ValueError(
-            "DFLASH speculative decoding only supports CUDA and NPU devices."
+            f"DFLASH speculative decoding is not supported on {cfg.device}."
         )
 
     if resolved_view(server_args).enable_dp_attention:
