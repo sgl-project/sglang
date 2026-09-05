@@ -525,7 +525,12 @@ class SamplingParams:
         output_quality_mapper = {"maximum": 100, "high": 90, "medium": 55, "low": 35}
         if output_quality == "default":
             return 50 if data_type == DataType.VIDEO else 75
-        return output_quality_mapper.get(output_quality)
+        if output_quality not in output_quality_mapper:
+            valid = list(output_quality_mapper.keys()) + ["default"]
+            raise ValueError(
+                f"Invalid output_quality {output_quality!r}. Expected one of: {valid}"
+            )
+        return output_quality_mapper[output_quality]
 
     def _validate(self):
         """
@@ -1164,6 +1169,7 @@ class SamplingParams:
         add_argument(
             "--output-quality",
             type=str,
+            choices=["maximum", "high", "medium", "low", "default"],
             help="Output quality setting (default, low, medium, high, maximum)",
         )
         add_argument(
