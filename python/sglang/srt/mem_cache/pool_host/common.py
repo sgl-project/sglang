@@ -250,6 +250,32 @@ def alloc_with_pin_memory(
     return buffer
 
 
+def make_kernel_ptr_table(
+    tensors: list[torch.Tensor],
+    target_device: torch.device | str,
+    *,
+    host_memory_registered: bool,
+) -> torch.Tensor:
+    device = torch.device(target_device)
+    if host_memory_registered and device.type == "cuda":
+        from sgl_kernel.kvcacheio import get_device_accessible_ptr
+
+        if device.index is None:
+            device_index = torch.cuda.current_device()
+        else:
+            device_index = device.index
+        pointers = [
+            get_device_accessible_ptr(tensor, device_index) for tensor in tensors
+        ]
+    else:
+        pointers = [tensor.data_ptr() for tensor in tensors]
+    return torch.tensor(
+        pointers,
+        dtype=torch.uint64,
+        device=device,
+    )
+
+
 ALLOC_MEMORY_FUNCS = defaultdict(
     lambda: alloc_with_host_register,
     {
