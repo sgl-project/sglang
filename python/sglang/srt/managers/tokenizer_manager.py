@@ -1446,6 +1446,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 dimensions=obj.dimensions,
                 lora_id=obj.lora_id,
                 http_worker_ipc=obj.http_worker_ipc,
+                routing_key=obj.routing_key,
                 return_pooled_hidden_states=obj.return_pooled_hidden_states,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
             )
