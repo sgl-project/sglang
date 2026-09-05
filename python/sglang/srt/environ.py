@@ -563,6 +563,13 @@ class Envs:
     # ===================================================================
     # Scheduler token budgeting and admission
     # ===================================================================
+    # dLLM: schedule prefill-phase rows (block-size prompt chunks) and
+    # decode-phase rows (denoise blocks) into one mixed round instead of
+    # prefill-first either/or rounds. Every row is still exactly one block-size
+    # chunk, so the denoise step's uniform-block reshape holds; a prompt-only
+    # row self-finishes on its first denoise step. Requires --dllm-fdfo, where
+    # a round is a single denoise step; ignored otherwise.
+    SGLANG_ENABLE_DLLM_MIXED_BATCH = EnvBool(False)
     SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
     SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR = EnvFloat(0.14)
     SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS = EnvInt(600)
