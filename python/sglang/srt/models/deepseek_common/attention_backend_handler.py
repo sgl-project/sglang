@@ -1,3 +1,4 @@
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -13,17 +14,21 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
 from sglang.srt.models.deepseek_common.utils import _is_hip
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_platform,
 )
-from sglang.srt.utils import use_intel_amx_backend
+from sglang.srt.utils import (
+    is_gfx95_supported,
+    use_intel_amx_backend,
+)
 
 MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla"]
 
 # ROCm runs dedicated MHA/MLA implementations (forward_mha_rocm.py /
 # forward_mla_rocm.py) so the shared CUDA paths carry no AMD branches. Backend
 # handlers keep returning the generic method; the platform swap happens here.
-# MHA_CHUNKED_KV has no ROCm entry because its accumulation step needs the
-# CUDA-only merge_state_v2 kernel.
+# MHA_CHUNKED_KV deliberately stays generic on ROCm. Its shared implementation
+# selects the ROCm prepare/fetch helpers and the portable merge_state wrapper.
 _ROCM_FORWARD_METHODS = {
     AttnForwardMethod.MHA: AttnForwardMethod.MHA_ROCM,
     AttnForwardMethod.MHA_ONE_SHOT: AttnForwardMethod.MHA_ONE_SHOT_ROCM,
@@ -212,6 +217,26 @@ def handle_attention_dsa(attn, forward_batch):
     return AttnForwardMethod.MLA
 
 
+def _can_use_triton_dense_fp8_prefill(attn, forward_batch) -> bool:
+    prefix_lens = forward_batch.extend_prefix_lens_cpu
+    return (
+        _is_hip
+        and is_gfx95_supported()
+        and envs.SGLANG_TRITON_FP8_PREFILL_ATTN.get()
+        and attn.kv_cache_dtype == "fp8_e4m3"
+        and attn.num_local_heads == 12
+        and attn.qk_nope_head_dim == 128
+        and attn.qk_rope_head_dim == 64
+        and attn.v_head_dim == 128
+        and attn.kv_lora_rank == 512
+        and not get_parallel().dcp_enabled
+        and not mla_use_prefill_cp(forward_batch)
+        and forward_batch.forward_mode.is_extend_without_speculative()
+        and prefix_lens is not None
+        and any(prefix_lens)
+    )
+
+
 def handle_attention_triton(attn, forward_batch):
     if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return AttnForwardMethod.MLA
@@ -220,13 +245,18 @@ def handle_attention_triton(attn, forward_batch):
     if get_exec().deterministic.enable_deterministic_inference:
         return _dispatch_mla_subtype(attn, forward_batch)
 
+    # Kimi-K3 with an FP8 latent cache uses dense 192/128 K/V for cached
+    # prefixes. Always select chunked-KV here: its fast path packs the prefix
+    # once and fuses it with the current chunk in the normal extend kernel.
+    if _can_use_triton_dense_fp8_prefill(attn, forward_batch):
+        return AttnForwardMethod.MHA_CHUNKED_KV
+
     if (
         forward_batch.forward_mode.is_extend_without_speculative()
         and sum(forward_batch.extend_prefix_lens_cpu) == 0
     ):
         return AttnForwardMethod.MHA
-    else:
-        return _dispatch_mla_subtype(attn, forward_batch)
+    return _dispatch_mla_subtype(attn, forward_batch)
 
 
 def handle_attention_intel_xpu(attn, forward_batch):
