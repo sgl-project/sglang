@@ -563,7 +563,7 @@ python3 -m sglang.launch_server \
         --disaggregation-bootstrap-port 8996 \
         --base-gpu-id 8 \
         --disable-radix-cache \
-        --cuda-graph-bs 1 2 4 8 10 12 14 16 \
+        --cuda-graph-bs-decode 1 2 4 8 10 12 14 16 \
         --speculative-draft-model-quantization unquant \
         --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
         --enable-multi-layer-eagle \
@@ -676,7 +676,7 @@ do
         --port 8001 --trust-remote-code --nnodes 1 --node-rank 0 --tp-size 16 --dp-size 16 \
         --mem-fraction-static 0.8 --max-running-requests 448 --attention-backend ascend --device npu --quantization modelslim \
         --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency --enable-dp-lm-head \
-        --cuda-graph-bs 2 4 6 8 10 12 14 16 18 20 22 24 26 28 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
+        --cuda-graph-bs-decode 2 4 6 8 10 12 14 16 18 20 22 24 26 28 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
         --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4  \
         --prefill-round-robin-balance --disable-shared-experts-fusion --dtype bfloat16 --tokenizer-worker-num 4 \
        	--load-balance-method round_robin
