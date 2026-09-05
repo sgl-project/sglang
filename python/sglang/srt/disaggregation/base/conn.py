@@ -60,6 +60,9 @@ class KVArgs:
     # Number of rows before the slice axis in each per-slot state tensor.
     state_slice_outer_counts: List[List[int]]
     is_hybrid_mla_backend: bool
+    # Set by DecodePreallocQueue; see decode_kv_broadcast.py. Defaulted so the
+    # prefill side, which never resolves it, can still be read directly.
+    enable_decode_kv_broadcast: bool = False
     # Per-tensor conv sub-block dims (GDN: [key_dim, key_dim, value_dim]) so the
     # scatter transfer can slice each independently head-sharded sub-block; None
     # per tensor when the single contiguous slice already matches the layout.
@@ -100,6 +103,10 @@ class KVPoll:
 
 class BaseKVManager(ABC):
     """Base class for managing transfer states"""
+
+    # Whether the backend implements the decode-side KV broadcast skip
+    # (a receiver asks the sender to skip its KV so a peer relays it).
+    supports_decode_kv_broadcast: bool = False
 
     enable_deferred_decode_kv_release: bool = False
 

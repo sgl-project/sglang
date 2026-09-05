@@ -1,12 +1,14 @@
 import struct
 import threading
 import unittest
+from collections import defaultdict
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
 import torch
 
+from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_buffer import (
@@ -17,6 +19,7 @@ from sglang.srt.disaggregation.common.staging_handler import (
     handle_staging_req,
 )
 from sglang.srt.disaggregation.common.utils import (
+    TransferKVChunk,
     group_concurrent_contiguous,
     pack_int_lists,
     pack_list_of_buffers,
@@ -29,6 +32,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo,
     MooncakeKVManager,
+    TransferInfo,
 )
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
@@ -625,6 +629,202 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
                 self.assertEqual(kv_args.state_data_ptrs[-1], expected_infos[0])
                 self.assertEqual(kv_args.state_data_lens[-1], expected_infos[1])
                 self.assertEqual(kv_args.state_item_lens[-1], expected_infos[2])
+
+
+class TestTransferInfoRelaySentinel(unittest.TestCase):
+    """Three receiver kinds the sender must tell apart on the bootstrap message.
+
+    A dummy sends neither kv indices nor aux; a relayed receiver sends aux but
+    no indices, and sets the trailing frame; a puller sends everything. Collapsing
+    any pair drops a relayed receiver's aux, lets a dummy reach the KV send
+    path, or skips the state send for a rank nobody relays to.
+    """
+
+    @staticmethod
+    def _msg(kv_indices: bytes, aux_index: bytes, relayed: bytes = b""):
+        return [
+            b"42",
+            b"10.0.0.1",
+            b"5000",
+            b"session",
+            kv_indices,
+            aux_index,
+            b"",
+            b"8",
+            b"0",
+            b"",
+            relayed,
+        ]
+
+    def test_dummy_receiver_sends_neither(self):
+        info = TransferInfo.from_zmq(self._msg(kv_indices=b"", aux_index=b""))
+        self.assertTrue(info.is_dummy)
+        self.assertFalse(info.kv_relayed_by_peer)
+        self.assertIsNone(info.dst_aux_index)
+
+    def test_empty_delta_is_not_mistaken_for_a_relay(self):
+        """A full decode-radix prefix hit sends no kv indices but a real aux, so
+        inferring the relay from empty indices skips a puller's state send."""
+        info = TransferInfo.from_zmq(self._msg(kv_indices=b"", aux_index=b"7"))
+        self.assertFalse(info.is_dummy)
+        self.assertFalse(info.kv_relayed_by_peer)
+
+    def test_relaying_receiver_keeps_aux(self):
+        info = TransferInfo.from_zmq(
+            self._msg(kv_indices=b"", aux_index=b"7", relayed=b"1")
+        )
+        self.assertFalse(info.is_dummy)
+        self.assertTrue(info.kv_relayed_by_peer)
+        self.assertEqual(info.dst_aux_index, 7)
+        self.assertEqual(info.dst_kv_indices.size, 0)
+        self.assertEqual(info.dst_state_indices, [])
+
+
+class TestRelayedReceiverSkipsKVSend(unittest.TestCase):
+    """The sender side of the skip, for two receivers sharing one chunk.
+
+    A relayed receiver and a puller are served from the same TransferKVChunk,
+    so the relayed one has to be skipped without disturbing what the puller
+    still needs -- notably kv_chunk.prefill_kv_indices, which the length-
+    mismatch workaround would truncate on the relayed receiver's empty slice
+    and leave empty for every req after it.
+    """
+
+    ROOM = 42
+
+    def _req(self, session: str, relayed: bool, num_indices: int):
+        return TransferInfo(
+            room=self.ROOM,
+            endpoint="10.0.0.1",
+            dst_port=5000,
+            mooncake_session_id=session,
+            dst_kv_indices=np.arange(num_indices, dtype=np.int32),
+            dst_aux_index=7,
+            dst_state_indices=[[0]],
+            required_dst_info_num=2,
+            is_dummy=False,
+            kv_relayed_by_peer=relayed,
+        )
+
+    def _registration(self, session: str):
+        return KVArgsRegisterInfo(
+            room=str(self.ROOM),
+            endpoint="10.0.0.1",
+            dst_port=5000,
+            mooncake_session_id=session,
+            dst_kv_ptrs=[0],
+            dst_aux_ptrs=[0],
+            dst_state_data_ptrs=[[0]],
+            dst_tp_rank=0,
+            dst_attn_tp_size=1,
+            dst_kv_item_len=1,
+            dst_state_item_lens=[[1]],
+            dst_state_dim_per_tensor=[[1]],
+            dst_kv_layer_ids=[0],
+            dst_state_layer_ids=[[0]],
+        )
+
+    def _run_worker(self, kv_chunk):
+        """Drive one chunk through transfer_worker with the sends stubbed out."""
+        mgr = MooncakeKVManager.__new__(MooncakeKVManager)
+        mgr.enable_trace = False
+        mgr.enable_staging = False
+        mgr.is_mla_backend = True
+        mgr.is_hybrid_mla_backend = False
+        mgr.kv_args = SimpleNamespace(kv_data_ptrs=[0])
+        mgr.attn_tp_rank = 0
+        mgr.attn_tp_size = 1
+        mgr.attn_dp_rank = 0
+        mgr.attn_cp_rank = 0
+        mgr.attn_cp_size = 1
+        mgr.pp_rank = 0
+        mgr.pp_size = 1
+        mgr.bootstrap_port = 0
+        mgr.session_lock = threading.Lock()
+        mgr.failed_sessions = set()
+        mgr.session_failures = defaultdict(int)
+        mgr.request_status = {self.ROOM: KVPoll.WaitingForInput}
+        mgr._staging_outstanding = defaultdict(int)
+        mgr.enable_deferred_decode_kv_release = False
+        mgr._dcp_pack_buffers = None
+        mgr.req_to_decode_prefix_len = {}
+        mgr.transfer_infos = {
+            self.ROOM: {
+                "sess-relayed": self._req("sess-relayed", relayed=True, num_indices=0),
+                "sess-puller": self._req("sess-puller", relayed=False, num_indices=4),
+            }
+        }
+        mgr.decode_kv_args_table = {
+            session: self._registration(session)
+            for session in ("sess-relayed", "sess-puller")
+        }
+        mgr.check_status = MagicMock(return_value=KVPoll.WaitingForInput)
+        mgr.update_status = MagicMock()
+        mgr.sync_status_to_decode_endpoint = MagicMock()
+        mgr.record_failure = MagicMock()
+        mgr.send_kvcache = MagicMock(return_value=0)
+        mgr.send_kvcache_slice = MagicMock(return_value=0)
+        mgr.maybe_send_extra = MagicMock(return_value=0)
+        mgr.send_aux = MagicMock(return_value=0)
+
+        queue = MagicMock()
+        # transfer_worker loops forever; the second get() ends it, and its own
+        # except-Exception wrapper turns that into the RuntimeError below.
+        queue.get.side_effect = [kv_chunk, StopIteration()]
+        with self.assertRaises(RuntimeError):
+            mgr.transfer_worker(queue=queue, executor=MagicMock())
+        return mgr
+
+    def test_relayed_receiver_gets_aux_but_no_kv(self):
+        kv_chunk = TransferKVChunk(
+            room=self.ROOM,
+            prefill_kv_indices=np.arange(4, dtype=np.int32),
+            index_slice=slice(0, 4),
+            is_last_chunk=True,
+            prefill_aux_index=7,
+            state_indices=[[0]],
+        )
+        mgr = self._run_worker(kv_chunk)
+
+        # KV and state go to the puller only; aux goes to both, since the
+        # relaying peer copies KV but not the aux buffers.
+        self.assertEqual(
+            [call.args[0] for call in mgr.send_kvcache.call_args_list],
+            ["sess-puller"],
+        )
+        self.assertEqual(
+            [
+                call.args[0].mooncake_session_id
+                for call in mgr.maybe_send_extra.call_args_list
+            ],
+            ["sess-puller"],
+        )
+        self.assertEqual(
+            sorted(
+                call.args[0].mooncake_session_id for call in mgr.send_aux.call_args_list
+            ),
+            ["sess-puller", "sess-relayed"],
+        )
+
+    def test_relayed_receiver_does_not_truncate_the_shared_chunk(self):
+        """kv_chunk is shared by every req in the loop, relayed one first.
+
+        Treating its empty slice as a length mismatch truncates
+        prefill_kv_indices in place, so the puller behind it sends nothing.
+        """
+        kv_chunk = TransferKVChunk(
+            room=self.ROOM,
+            prefill_kv_indices=np.arange(4, dtype=np.int32),
+            index_slice=slice(0, 4),
+            is_last_chunk=True,
+            prefill_aux_index=7,
+            state_indices=[[0]],
+        )
+        mgr = self._run_worker(kv_chunk)
+
+        self.assertEqual(len(kv_chunk.prefill_kv_indices), 4)
+        mgr.send_kvcache.assert_called_once()
+        self.assertEqual(len(mgr.send_kvcache.call_args.args[1]), 4)
 
 
 if __name__ == "__main__":

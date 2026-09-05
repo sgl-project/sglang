@@ -91,6 +91,7 @@ class TransferInfo:
     dst_state_indices: List[List[int]]  # parallel to receiver's state_types
     required_dst_info_num: int
     is_dummy: bool
+    kv_relayed_by_peer: bool
     decode_prefix_len: Optional[int] = None
     dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
@@ -118,6 +119,7 @@ class TransferInfo:
             dst_state_indices=dst_state_indices,
             required_dst_info_num=int(msg[7].decode("ascii")),
             is_dummy=is_dummy,
+            kv_relayed_by_peer=(len(msg) > 10 and msg[10] == b"1"),
             decode_prefix_len=(
                 int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
             ),
@@ -205,6 +207,7 @@ class KVArgsRegisterInfo:
 
 class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
+    supports_decode_kv_broadcast = True
 
     def __init__(
         self,
@@ -1743,7 +1746,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             target_rank_registration_info.requires_dcp_relayout
                         )
                         chunked_dst_device_kv_indice = None
-                        if is_dcp_transfer:
+                        skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
+                            target_rank_registration_info
+                        )
+                        if req.kv_relayed_by_peer:
+                            # This receiver asked us to skip its KV: an attn TP
+                            # peer pulls and relays it over NVLink, so we owe it
+                            # only the aux data and the status sync below. Skip
+                            # the index math too -- its empty slice would look
+                            # like a length mismatch and truncate kv_chunk, which
+                            # is shared with the reqs after it.
+                            chunked_dst_kv_indice = []
+                            skip_kv = skip_state = True
+                        elif is_dcp_transfer:
                             if req.dst_device_kv_indices is not None:
                                 raise RuntimeError(
                                     "HiSparse destination device indices are not "
@@ -1779,9 +1794,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     ]
                                 )
 
-                        skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
-                            target_rank_registration_info
-                        )
                         if (
                             len(kv_chunk.prefill_kv_indices) == 0
                             or not self.kv_args.kv_data_ptrs
@@ -2564,8 +2576,12 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                 self.bootstrap_room, self.bootstrap_infos, self
             )
 
+        pull_kv = self.kv_mgr.pull_kv_from_prefill
         for bootstrap_info in self.bootstrap_infos:
             is_dummy = bootstrap_info["is_dummy"]
+            send_kv_indices = not is_dummy and pull_kv
+            kv_relayed_by_peer = not is_dummy and not pull_kv
+
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 with lock:
@@ -2575,20 +2591,21 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                             self.kv_mgr.local_ip.encode("ascii"),
                             str(self.kv_mgr.rank_port).encode("ascii"),
                             self.session_id.encode("ascii"),
-                            kv_indices.tobytes() if not is_dummy else b"",
+                            kv_indices.tobytes() if send_kv_indices else b"",
                             str(aux_index).encode("ascii") if not is_dummy else b"",
                             (
                                 pack_int_lists(state_indices, "i")
-                                if not is_dummy and state_indices
+                                if send_kv_indices and state_indices
                                 else b""
                             ),
                             str(self.required_dst_info_num).encode("ascii"),
                             str(decode_prefix_len or 0).encode("ascii"),
                             (
                                 np.asarray(device_kv_indices, dtype=np.int32).tobytes()
-                                if not is_dummy and device_kv_indices is not None
+                                if send_kv_indices and device_kv_indices is not None
                                 else b""
                             ),
+                            b"1" if kv_relayed_by_peer else b"",
                         ]
                     )
             except zmq.ZMQError:

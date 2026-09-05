@@ -45,6 +45,10 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.decode_kv_broadcast import (
+    DecodeKVBroadcaster,
+    resolve_decode_kv_broadcast,
+)
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
@@ -64,6 +68,8 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
+from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
+from sglang.srt.distributed.parallel_state import get_attn_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -80,6 +86,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
+    kv_to_page_indices_device,
     page_align_floor,
     release_kv_cache,
     retraction_discard,
@@ -302,6 +309,9 @@ class DecodeRequest:
     metadata_buffer_index: int = -1
     is_rebootstrap: bool = False
 
+    relay_kv_indices: Optional[torch.Tensor] = None
+    relay_state_indices: Optional[torch.Tensor] = None
+
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
     hicache_restored_kv_indices: Optional[torch.Tensor] = None
@@ -395,6 +405,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.kv_manager = self._init_kv_manager()
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
+        if self.enable_kv_broadcast:
+            self.transfer_queue._init_kv_broadcaster(
+                token_to_kv_pool=self.token_to_kv_pool,
+                draft_token_to_kv_pool=self.draft_token_to_kv_pool,
+            )
 
         if (
             self.scheduler.tp_worker.is_hybrid_swa
@@ -584,6 +599,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.ib_device = get_disagg().disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
+        server_args = self.scheduler.server_args
+        self.enable_kv_broadcast = resolve_decode_kv_broadcast(
+            state_types=kv_args.state_types,
+            is_mla_backend=self.is_mla_backend,
+            attn_tp_size=attn_tp_size,
+            supports_decode_kv_broadcast=kv_manager_class.supports_decode_kv_broadcast,
+            enable_hisparse=server_args.enable_hisparse,
+            enable_staging=self.enable_staging,
+            enable_decode_hicache=self.scheduler.enable_decode_hicache,
+        )
+        kv_args.enable_decode_kv_broadcast = self.enable_kv_broadcast
         kv_manager = kv_manager_class(
             kv_args,
             DisaggregationMode.DECODE,
@@ -1409,7 +1435,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 ]
                 # Indexer lives on device pool; always use device page_size
                 device_page_size = self.token_to_kv_pool.page_size
-                return kv_to_page_indices(kv_indices_full, device_page_size)
+                page_indices = kv_to_page_indices_device(
+                    kv_indices_full, device_page_size
+                )
+                if self.enable_kv_broadcast:
+                    decode_req.relay_state_indices = page_indices
+                return page_indices.cpu().numpy()
 
             def _swa_ring_payload():
                 # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
@@ -1475,6 +1506,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
                 np.int32
             )
+            if self.enable_kv_broadcast:
+                # The relay reads these iterations later; keep an owned copy
+                # rather than a live view into req_to_token.
+                decode_req.relay_kv_indices = kv_indices.clone()
             device_page_indices = None
             if (
                 self.scheduler.enable_hisparse
@@ -2057,6 +2092,46 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # Aborted-mid-transfer requests whose KV pages/slot are held until drained
         # or timed out. Entries: (decode_req, deadline, metadata_idx, required_acks).
         self._deferred_releases: List[Tuple[DecodeRequest, float, int, int]] = []
+        self.kv_broadcaster: Optional[DecodeKVBroadcaster] = None
+
+    def _init_kv_broadcaster(self, token_to_kv_pool, draft_token_to_kv_pool) -> None:
+        attn_tp_group = get_attn_tp_group()
+        # A dedicated NCCL communicator, not attn_tp_group's: using a single comm
+        # for both the schedule_stream and forward_stream can hang NCCL
+        relay_comm = PyNcclCommunicator(
+            group=attn_tp_group.cpu_group, device=attn_tp_group.device
+        )
+        self.kv_broadcaster = DecodeKVBroadcaster(
+            token_to_kv_pool=token_to_kv_pool,
+            draft_token_to_kv_pool=draft_token_to_kv_pool,
+            relay_comm=relay_comm,
+            attn_tp_rank=get_parallel().attn_tp_rank,
+            attn_tp_size=get_parallel().attn_tp_size,
+            forward_stream=self.scheduler.forward_stream,
+        )
+
+    def _broadcast_transferred_kv(self, polls: List[int]) -> None:
+        """Relay newly transferred KV from the pulling rank to its peers.
+
+        KV/state indices are relayed only for reqs polling Success. That status comes
+        out of a MIN all-reduce, so no rank sees Success before all do and every
+        rank broadcasts the same set; mismatched sets would hang the broadcast.
+        """
+        kv_indices_list = []
+        state_indices_list = []
+        for decode_req, poll in zip(self.queue, polls):
+            if poll != KVPoll.Success:
+                continue
+            if decode_req.relay_kv_indices is not None:
+                kv_indices_list.append(decode_req.relay_kv_indices)
+                decode_req.relay_kv_indices = None
+            if decode_req.relay_state_indices is not None:
+                state_indices_list.append(decode_req.relay_state_indices)
+                decode_req.relay_state_indices = None
+        self.kv_broadcaster.broadcast(
+            kv_indices_list=kv_indices_list,
+            state_indices_list=state_indices_list,
+        )
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -2285,6 +2360,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             polls = self._poll_with_staging()
         else:
             polls = self._poll_with_metadata_gate()
+
+        if self.kv_broadcaster is not None:
+            self._broadcast_transferred_kv(polls)
 
         transferred_reqs = []
         indices_to_remove = set()
