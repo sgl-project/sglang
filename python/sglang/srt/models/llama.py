@@ -300,16 +300,30 @@ class LlamaAttention(nn.Module):
                 q_b = q[-1:].view(1, 1, self.num_heads, self.head_dim).transpose(1, 2)
                 k_b = k.view(1, -1, self.num_kv_heads, self.head_dim).transpose(1, 2)
                 v_b = v.view(1, -1, self.num_kv_heads, self.head_dim).transpose(1, 2)
-                if num_groups > 1:
-                    k_b = k_b.repeat_interleave(num_groups, dim=1)
-                    v_b = v_b.repeat_interleave(num_groups, dim=1)
-                attn_output = (
-                    F.scaled_dot_product_attention(
-                        q_b, k_b, v_b, is_causal=False, scale=self.scaling
+                try:
+                    attn_output = (
+                        F.scaled_dot_product_attention(
+                            q_b,
+                            k_b,
+                            v_b,
+                            is_causal=False,
+                            scale=self.scaling,
+                            enable_gqa=(num_groups > 1),
+                        )
+                        .transpose(1, 2)
+                        .reshape(1, -1)
                     )
-                    .transpose(1, 2)
-                    .reshape(1, -1)
-                )
+                except TypeError:
+                    if num_groups > 1:
+                        k_b = k_b.repeat_interleave(num_groups, dim=1)
+                        v_b = v_b.repeat_interleave(num_groups, dim=1)
+                    attn_output = (
+                        F.scaled_dot_product_attention(
+                            q_b, k_b, v_b, is_causal=False, scale=self.scaling
+                        )
+                        .transpose(1, 2)
+                        .reshape(1, -1)
+                    )
             else:
                 last_token_indices = (
                     torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
@@ -337,19 +351,34 @@ class LlamaAttention(nn.Module):
                         .view(1, -1, self.num_kv_heads, self.head_dim)
                         .transpose(1, 2)
                     )
-                    if num_groups > 1:
-                        k_b = k_b.repeat_interleave(num_groups, dim=1)
-                        v_b = v_b.repeat_interleave(num_groups, dim=1)
-                    out_b = (
-                        F.scaled_dot_product_attention(
-                            q_b, k_b, v_b, is_causal=False, scale=self.scaling
+                    try:
+                        out_b = (
+                            F.scaled_dot_product_attention(
+                                q_b,
+                                k_b,
+                                v_b,
+                                is_causal=False,
+                                scale=self.scaling,
+                                enable_gqa=(num_groups > 1),
+                            )
+                            .transpose(1, 2)
+                            .reshape(1, -1)
                         )
-                        .transpose(1, 2)
-                        .reshape(1, -1)
-                    )
+                    except TypeError:
+                        if num_groups > 1:
+                            k_b = k_b.repeat_interleave(num_groups, dim=1)
+                            v_b = v_b.repeat_interleave(num_groups, dim=1)
+                        out_b = (
+                            F.scaled_dot_product_attention(
+                                q_b, k_b, v_b, is_causal=False, scale=self.scaling
+                            )
+                            .transpose(1, 2)
+                            .reshape(1, -1)
+                        )
                     outs.append(out_b)
                 attn_output = torch.cat(outs, dim=0)
 
+            # 3. Output projection on terminal token(s) only
             output, _ = self.o_proj(attn_output)
             return output
 
@@ -479,8 +508,13 @@ class LlamaDecoderLayer(nn.Module):
             )
 
             # Slice residual connection to terminal tokens to match hidden_states
-            last_token_indices = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
-            residual = residual[last_token_indices]
+            if forward_batch.extend_seq_lens.shape[0] == 1:
+                residual = residual[-1:]
+            else:
+                last_token_indices = (
+                    torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+                )
+                residual = residual[last_token_indices]
 
             # Fully Connected on terminal tokens only
             hidden_states, residual = self.post_attention_layernorm(

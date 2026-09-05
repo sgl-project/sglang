@@ -401,10 +401,13 @@ class Gemma2DecoderLayer(nn.Module):
         )
 
         if can_optimize:
-            last_token_indices = (
-                torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
-            )
-            residual = residual[last_token_indices]
+            if forward_batch.extend_seq_lens.shape[0] == 1:
+                residual = residual[-1:]
+            else:
+                last_token_indices = (
+                    torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+                )
+                residual = residual[last_token_indices]
 
         hidden_states, residual = self.pre_feedforward_layernorm(
             hidden_states, residual
