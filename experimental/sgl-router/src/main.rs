@@ -86,6 +86,7 @@ async fn main() -> Result<()> {
     init_tracing(&cfg.observability.log_level, cfg.observability.log_format)?;
 
     tracing::info!(
+        configured_decode_policy = ?cfg.model.decode_policy,
         "sgl-router {} starting on {}:{}",
         env!("CARGO_PKG_VERSION"),
         cfg.server.host,
