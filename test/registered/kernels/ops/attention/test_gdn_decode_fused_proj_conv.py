@@ -364,6 +364,73 @@ class TestGDNDecodeFusedProjectionConv1D(unittest.TestCase):
         torch.testing.assert_close(a, ref[3], rtol=0, atol=0)
         torch.testing.assert_close(state_test, ref[4], rtol=0, atol=0)
 
+    def test_padded_merged_projection_column_views_are_supported(self):
+        # _split_qkvzba hands down column views of the merged projection, whose
+        # N is padded for GEMM alignment, so stride(0) exceeds the slice width
+        # and the ba view starts at a nonzero storage offset.  The fusion only
+        # requires a unit stride on the feature dimension, not full contiguity.
+        torch.manual_seed(31)
+        batch = 6
+        qkv_dim, v_dim, num_v_heads, head_v_dim = 128, 64, 2, 32
+        qkvz_width = qkv_dim + v_dim
+        ba_width = 2 * num_v_heads
+        merged = torch.randn(
+            batch,
+            qkvz_width + ba_width + 96,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        qkvz = merged[:, :qkvz_width]
+        ba = merged[:, qkvz_width : qkvz_width + ba_width]
+        self.assertGreater(qkvz.stride(0), qkvz.shape[1])
+        self.assertNotEqual(ba.storage_offset(), 0)
+
+        weight = torch.randn(qkv_dim, 4, device="cuda", dtype=torch.bfloat16)
+        bias = torch.randn(qkv_dim, device="cuda", dtype=torch.bfloat16)
+        state = torch.randn(batch, qkv_dim, 3, device="cuda", dtype=torch.bfloat16)
+        indices = torch.arange(batch, device="cuda", dtype=torch.int32)
+
+        eligible, reason = can_use_fused_qkvzba_causal_conv1d_update_contiguous(
+            qkvz,
+            ba,
+            state,
+            weight,
+            bias,
+            indices,
+            qkv_dim=qkv_dim,
+            v_dim=v_dim,
+            num_v_heads=num_v_heads,
+            activation="silu",
+        )
+        self.assertTrue(eligible, reason)
+
+        def update(packed_qkvz, packed_ba):
+            state_out = state.clone()
+            outputs = fused_qkvzba_causal_conv1d_update_contiguous(
+                packed_qkvz,
+                packed_ba,
+                state_out,
+                weight,
+                bias,
+                indices,
+                qkv_dim=qkv_dim,
+                v_dim=v_dim,
+                num_v_heads=num_v_heads,
+                head_v_dim=head_v_dim,
+                activation="silu",
+            )
+            torch.cuda.synchronize()
+            return (*outputs, state_out)
+
+        # Padding absorbed by stride(0) must be bit-exact against packing the
+        # same rows densely, which pins this tighter than any float tolerance.
+        strided = update(qkvz, ba)
+        dense = update(qkvz.contiguous(), ba.contiguous())
+        for name, from_view, from_copy in zip(
+            ("mixed_qkv", "z", "b", "a", "conv_state"), strided, dense
+        ):
+            self.assertTrue(torch.equal(from_view, from_copy), name)
+
     def test_fp8_activation_is_an_explicit_fallback(self):
         if not hasattr(torch, "float8_e4m3fn"):
             self.skipTest("PyTorch has no FP8 dtype")
