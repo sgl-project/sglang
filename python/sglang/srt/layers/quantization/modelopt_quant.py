@@ -535,12 +535,9 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             self.use_marlin = (
                 envs.SGLANG_FORCE_FP8_MARLIN.get() or can_auto_enable_marlin_fp8()
             )
-        # SM120 decode fast path: cuBLAS serves M=1 FP8 GEMMs with SM89 tiles
-        # at 50-70% DRAM bandwidth for mid-sized N; a streaming GEMV recovers
-        # the gap.
+        # The SM12x facade selects the best qualified small-M FP8 kernel.
         cuda_capability = torch.cuda.get_device_capability() if is_cuda() else None
-        self.use_sm120_gemv = cuda_capability is not None and cuda_capability[0] == 12
-        self.use_kda_fp8_skinny = cuda_capability == (12, 0)
+        self.use_sm120_fp8 = cuda_capability is not None and cuda_capability[0] == 12
 
     def create_weights(
         self,
@@ -611,11 +608,11 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
         layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
         if (
-            (self.use_sm120_gemv or self.use_kda_fp8_skinny)
+            self.use_sm120_fp8
             and layer.weight_scale.numel() == 1
             and layer.input_scale.numel() == 1
         ):
-            # Combined epilogue scale shared by the SM120 GEMV and KDA paths.
+            # Precompute the combined epilogue scale for the SM12x facade.
             layer.sm120_fp8_alpha = (
                 (layer.input_scale.float() * layer.weight_scale.float())
                 .reshape(1)
@@ -643,34 +640,10 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 size_k=layer.input_size_per_partition,
                 bias=bias,
             )
-        if (
-            self.use_sm120_gemv
-            and bias is None
-            and x.dim() == 2
-            and x.shape[0] == 1
-            and hasattr(layer, "sm120_fp8_alpha")
-        ):
-            from sglang.kernels.ops.gemm.sm120_fp8_gemv import (
-                sm120_fp8_gemv,
-                use_sm120_fp8_gemv,
-            )
+        if self.use_sm120_fp8:
+            from sglang.kernels.ops.gemm import try_sm120_fp8_linear
 
-            # layer.weight is the [K, N] transposed view of an [N, K]-contiguous
-            # buffer, so .t() recovers the row-major weight the GEMV streams.
-            w = layer.weight.t()
-            if use_sm120_fp8_gemv(1, w.shape[0], w.shape[1]) and w.is_contiguous():
-                from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
-
-                qinput, _ = static_quant_fp8(x, layer.input_scale, repeat_scale=False)
-                return sm120_fp8_gemv(qinput, w, layer.sm120_fp8_alpha)
-        if self.use_kda_fp8_skinny:
-            # The existing SM120 GEMV stays first for M=1 shapes that it
-            # accepts; cold-L2 CUDA Graph benchmarks show it is faster there.
-            # KDA handles the qualified M>=2 shapes and oversized M=1
-            # projections.
-            from sglang.kernels.ops.gemm import try_sm120_fp8_skinny_gemm
-
-            output = try_sm120_fp8_skinny_gemm(
+            output = try_sm120_fp8_linear(
                 x,
                 layer.weight,
                 layer.input_scale,

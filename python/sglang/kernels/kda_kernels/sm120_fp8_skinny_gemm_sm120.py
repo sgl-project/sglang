@@ -71,27 +71,6 @@ def _jit_sm120_fp8_skinny_module() -> Module:
     )
 
 
-def _run_sm120_fp8_skinny_gemm(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    input_scale: torch.Tensor,
-    output_scale: torch.Tensor,
-) -> torch.Tensor:
-    """Compute a static per-tensor FP8 linear for an accepted decode shape.
-
-    ``input`` is BF16 ``[M, K]``. ``weight`` is the column-major ``[K, N]``
-    view used by SGLang's FP8 linear path. ``output_scale`` is the precomputed
-    ``input_scale * weight_scale`` used by FlashInfer's cuBLAS backend. The
-    activation is quantized with SGLang's reference static-FP8 kernel before
-    the SM120 CUTLASS GEMM so the full path stays within BF16 tolerance of the
-    FlashInfer fallback for real model activations, including saturation edges.
-    """
-    from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
-
-    quantized, _ = static_quant_fp8(input, input_scale, repeat_scale=False)
-    return _run_sm120_fp8_skinny_gemm_quantized(quantized, weight, output_scale)
-
-
 def _run_sm120_fp8_skinny_gemm_quantized(
     input: torch.Tensor,
     weight: torch.Tensor,
