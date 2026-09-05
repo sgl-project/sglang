@@ -1469,9 +1469,33 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         ):
             self._ensure_cutlass_buffers_initialized(layer)
 
+    def _dequantize_fp4_experts(self, layer: Module) -> None:
+        """Convert packed FP4 expert weights to block-FP8 in place."""
+        for weight_param, scale_param in [
+            (layer.w13_weight, layer.w13_weight_scale_inv),
+            (layer.w2_weight, layer.w2_weight_scale_inv),
+        ]:
+            num_experts = weight_param.shape[0]
+            new_weights = []
+            new_scales = []
+            for e in range(num_experts):
+                w, s = cast_e2m1fn_to_e4m3fn(
+                    weight_param.data[e], scale_param.data[e]
+                )
+                new_weights.append(w)
+                new_scales.append(s)
+            weight_param.data = torch.stack(new_weights)
+            scale_param.data = torch.stack(new_scales).float()
+            scale_param.format_ue8m0 = False
+        self.is_fp4_expert = False
+        logger.warning_once("Dequantized FP4 MoE expert weights to FP8.")
+
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
-        # AMD FP4 experts: use aiter's native MXFP4 MoE path
-        if _use_aiter and self.is_fp4_expert:
+        # AMD FP4 experts: use aiter's native MXFP4 MoE path.
+        # Skipped when dequant_fp4_to_fp8 is requested: this branch returns
+        # unconditionally, so without the extra check SGLANG_DSV4_FP4_DEQUANT=1
+        # is silently a no-op for routed experts on every AITER deployment.
+        if _use_aiter and self.is_fp4_expert and not self.dequant_fp4_to_fp8:
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
             fp4_weight_dtype = _require_fp4_dtype()
 
@@ -1602,6 +1626,54 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     )
             layer.w13_weight.is_shuffled = is_shuffled
             layer.w2_weight.is_shuffled = is_shuffled
+            return
+
+        # ROCm AITER: bypass the native FP4 early return when DSV4 dequant is
+        # requested, then use the standard block-FP8 MoE path.
+        if (
+            self.is_fp4_expert
+            and self.dequant_fp4_to_fp8
+            and _use_aiter
+        ):
+            self._dequantize_fp4_experts(layer)
+            self.weight_block_size = [128, 128]
+
+            # gfx942/gfx950 native FP8 is e4m3fnuz, not e4m3fn.
+            if _is_fp8_fnuz:
+                w13_weight, w13_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=layer.w13_weight,
+                    weight_scale=layer.w13_weight_scale_inv,
+                    input_scale=None,
+                )
+                w2_weight, w2_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=layer.w2_weight,
+                    weight_scale=layer.w2_weight_scale_inv,
+                    input_scale=None,
+                )
+                layer.w13_weight = Parameter(w13_weight, requires_grad=False)
+                layer.w13_weight_scale_inv = Parameter(
+                    w13_weight_scale, requires_grad=False
+                )
+                layer.w2_weight = Parameter(w2_weight, requires_grad=False)
+                layer.w2_weight_scale_inv = Parameter(
+                    w2_weight_scale, requires_grad=False
+                )
+                layer.w13_input_scale = None
+                layer.w2_input_scale = None
+
+            # Only aiter-shuffle when the MoE runner is aiter; the triton runner
+            # consumes un-shuffled weights (shuffling the wrong runner corrupts output).
+            runner_is_aiter = (
+                getattr(self, "runner", None) is not None
+                and self.runner.runner_backend.is_aiter()
+            )
+            if _use_aiter and runner_is_aiter:
+                layer.w13_weight.data = shuffle_weight(
+                    layer.w13_weight.contiguous(), (16, 16)
+                )
+                layer.w2_weight.data = shuffle_weight(
+                    layer.w2_weight.contiguous(), (16, 16)
+                )
             return
 
         if self.convert_mxfp8_to_block:
