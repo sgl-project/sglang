@@ -13,7 +13,8 @@ from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend impor
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=4, suite="stage-a-unit-test-npu")
+register_npu_ci(est_time=4, suite="base-a-unit-test-1-npu-a2")
+register_npu_ci(est_time=4, suite="base-a-unit-test-1-npu-a3")
 
 
 class TestInit(unittest.TestCase):
