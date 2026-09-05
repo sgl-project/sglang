@@ -173,6 +173,33 @@ class TestPackedQKVInputA2A(CustomTestCase):
                     )
                     self.assertTrue(packed[r][i].is_contiguous())
 
+    def test_batch_one_zero_copy_views_match_reference(self):
+        world, b, s_global, h_global, d = 4, 1, 128, 24, 64
+        torch.manual_seed(9876)
+        s_local, h_local = s_global // world, h_global // world
+        full = [
+            torch.randn(b, s_global, h_global, d, dtype=torch.bfloat16, device="cuda")
+            for _ in range(3)
+        ]
+        shards = [
+            tuple(t[:, r * s_local : (r + 1) * s_local].contiguous() for t in full)
+            for r in range(world)
+        ]
+
+        views = self._run_all_ranks(
+            lambda rank: usp_mod._usp_input_all_to_all_qkv(
+                *shards[rank], materialize=False
+            ),
+            world,
+        )
+        for rank in range(world):
+            storages = {tensor.untyped_storage().data_ptr() for tensor in views[rank]}
+            self.assertEqual(len(storages), 1)
+            for index in range(3):
+                expected = full[index][:, :, rank * h_local : (rank + 1) * h_local]
+                self.assertTrue(torch.equal(views[rank][index], expected))
+                self.assertEqual(views[rank][index].stride(-1), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
