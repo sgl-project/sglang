@@ -131,9 +131,19 @@ class BaseKVSender(ABC):
     ): ...
 
     @abstractmethod
-    def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
+    def init(
+        self,
+        num_kv_indices: int,
+        aux_index: Optional[int] = None,
+        num_request_pages: Optional[int] = None,
+        send_page_offset: int = 0,
+    ):
         """
         Set req's index metadata locally or notify the decoder server about the kv indices length and aux index.
+
+        ``num_request_pages`` and ``send_page_offset`` locate this sender's page
+        stream inside the whole request. They differ from ``num_kv_indices`` when
+        the decode server already owns a cached prefix.
         """
         ...
 

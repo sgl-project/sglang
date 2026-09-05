@@ -805,6 +805,50 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
         self.assertFalse(resolution_result(server_args, "disable_radix_cache"))
 
+    def test_pd_decode_radix_cache_allows_nextn(self):
+        server_args = self._load_balance_args(
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="nixl",
+            speculative_algorithm="NEXTN",
+        )
+
+        self.assertFalse(resolution_result(server_args, "disable_radix_cache"))
+
+    def test_pd_decode_radix_cache_rejects_other_speculative_algorithms(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="nixl",
+            speculative_algorithm="DSPARK",
+        )
+
+        with self.assertRaisesRegex(ValueError, "only for EAGLE and NEXTN"):
+            handle_pd_disaggregation(server_args)
+
+
+class TestDeepSeekV4Args(unittest.TestCase):
+    def test_accepts_nextn_before_alias_resolution(self):
+        from sglang.srt.arg_groups.deepseek_v4_hook import (
+            apply_deepseek_v4_defaults,
+        )
+
+        server_args = ServerArgs(
+            model_path="dummy",
+            max_running_requests=32,
+            speculative_algorithm="NEXTN",
+            speculative_eagle_topk=1,
+        )
+        with (
+            patch(
+                "sglang.srt.arg_groups.deepseek_v4_hook.get_platform",
+                return_value=SimpleNamespace(is_hip=False),
+            ),
+            patch("sglang.srt.arg_groups.deepseek_v4_hook.run_post_process_pass"),
+        ):
+            apply_deepseek_v4_defaults(server_args, "DeepseekV4ForCausalLM")
+
 
 class TestSkipTokenizerInit(unittest.TestCase):
     def test_skip_tokenizer_worker_counts(self):
