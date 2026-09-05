@@ -1,9 +1,16 @@
 import torch
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
 from aiter.ops.triton.fused_qk_concat import fused_qk_rope_cat
+from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import (
+    fused_fp8_bmm_rope_cat_and_cache_mla,
+)
 from aiter.tuned_gemm import tgemm
 
-__all__ = ["fused_qk_rope_cat", "fused_qk_rope_cat_and_cache_mla"]
+__all__ = [
+    "fused_fp8_bmm_rope_cat_and_cache_mla",
+    "fused_qk_rope_cat",
+    "fused_qk_rope_cat_and_cache_mla",
+]
 
 
 def aiter_dsv3_router_gemm(
