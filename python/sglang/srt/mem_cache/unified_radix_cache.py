@@ -938,6 +938,16 @@ class UnifiedRadixCache(BasePrefixCache):
             ):
                 self.session_refs.register_session_ref(req)
 
+    def supports_cache_unfinished_at_launch(self) -> bool:
+        # SWA/mamba components, host or storage write-through and session slots
+        # read request state that is only settled by the prefill result.
+        return (
+            set(self.components) == {ComponentType.FULL}
+            and self.cache_controller is None
+            and self.linker is None
+            and not getattr(self, "enable_session_radix_cache", False)
+        )
+
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return

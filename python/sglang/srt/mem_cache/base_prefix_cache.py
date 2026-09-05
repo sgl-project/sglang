@@ -495,6 +495,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_mamba(self) -> bool:
         return False
 
+    def supports_cache_unfinished_at_launch(self) -> bool:
+        return False
+
     def supports_streaming_session(self) -> bool:
         return False
 
