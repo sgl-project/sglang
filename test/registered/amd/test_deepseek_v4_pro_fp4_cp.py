@@ -73,6 +73,7 @@ class TestDeepseekV4ProFp4CPInterleave(CustomTestCase):
             "--disable-radix-cache",
             "--attention-backend",
             "dsv4",
+            "--enable-deepseek-v4-fp4-indexer",
             "--max-running-requests",
             "256",
             "--page-size",

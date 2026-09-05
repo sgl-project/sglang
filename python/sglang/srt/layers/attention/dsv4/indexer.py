@@ -25,6 +25,7 @@ from sglang.kernels.ops.attention.dsv4 import (
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     aiter_fp4_paged_mqa_logits,
+    aiter_fp4_paged_mqa_topk,
     aiter_q_indexer_fp4,
     logits_rows_per_chunk,
 )
@@ -906,6 +907,11 @@ class C4IndexerBackendMixin:
         elif use_aiter_fp4:
             q_fp4, q_scale = q
             is_decode = forward_batch.forward_mode.is_decode()
+            use_streaming_topk = (
+                not is_decode
+                and getattr(self, "use_aiter_fp4_streaming_topk", False)
+                and not torch.cuda.is_current_stream_capturing()
+            )
             # Hoisted: these await this layer's KV transfer, which every chunk
             # would otherwise re-await.
             k_payload = token_to_kv_pool.get_index_k_fp4_payload_buffer(
@@ -913,38 +919,55 @@ class C4IndexerBackendMixin:
             )
             k_scale = token_to_kv_pool.get_index_k_fp4_scale_buffer(c4_indexer.layer_id)
 
-            def run_fp4_indexer(rows: slice) -> None:
-                logits = aiter_fp4_paged_mqa_logits(
-                    q_fp4=q_fp4[rows],
-                    q_scale=q_scale[rows],
+            if use_streaming_topk:
+                metadata.fp4_streaming_topk_scratch = aiter_fp4_paged_mqa_topk(
+                    q_fp4=q_fp4,
+                    q_scale=q_scale,
                     k_payload=k_payload,
                     k_scale=k_scale,
-                    weights=weights[rows],
-                    page_table=page_table[rows],
-                    c4_seq_lens=c4_seq_lens[rows],
+                    weights=weights,
+                    page_table=page_table,
+                    c4_seq_lens=c4_seq_lens,
                     weight_scale=c4_indexer.weight_scale,
-                    is_decode=is_decode,
-                    decode_workspace=metadata.fp4_decode_workspace,
+                    out_page_indices=c4_sparse_page_indices,
+                    out_raw_indices=raw_indices,
                     prefill_workspace=metadata.fp4_prefill_workspace,
+                    streaming_scratch=metadata.fp4_streaming_topk_scratch,
                 )
-                run_topk_transform(rows, logits)
-
-            # The scores are the layer's largest transient and their width tracks
-            # context length, so prefill splits the rows into whatever fits the
-            # pooled logits block and reduces each chunk before the next one
-            # reuses it. Rows are scored and reduced independently, so this
-            # matches a single pass. Decode's rectangle is bounded by its capture
-            # shapes, so it always stays whole.
-            rows_per_chunk = (
-                query_rows if is_decode else logits_rows_per_chunk(page_table)
-            )
-            if rows_per_chunk >= query_rows:
-                run_fp4_indexer(all_rows)
             else:
-                for start in range(0, query_rows, max(1, rows_per_chunk)):
-                    run_fp4_indexer(
-                        slice(start, min(start + rows_per_chunk, query_rows))
+
+                def run_fp4_indexer(rows: slice) -> None:
+                    logits = aiter_fp4_paged_mqa_logits(
+                        q_fp4=q_fp4[rows],
+                        q_scale=q_scale[rows],
+                        k_payload=k_payload,
+                        k_scale=k_scale,
+                        weights=weights[rows],
+                        page_table=page_table[rows],
+                        c4_seq_lens=c4_seq_lens[rows],
+                        weight_scale=c4_indexer.weight_scale,
+                        is_decode=is_decode,
+                        decode_workspace=metadata.fp4_decode_workspace,
+                        prefill_workspace=metadata.fp4_prefill_workspace,
                     )
+                    run_topk_transform(rows, logits)
+
+                # The scores are the layer's largest transient and their width tracks
+                # context length, so prefill splits the rows into whatever fits the
+                # pooled logits block and reduces each chunk before the next one
+                # reuses it. Rows are scored and reduced independently, so this
+                # matches a single pass. Decode's rectangle is bounded by its capture
+                # shapes, so it always stays whole.
+                rows_per_chunk = (
+                    query_rows if is_decode else logits_rows_per_chunk(page_table)
+                )
+                if rows_per_chunk >= query_rows:
+                    run_fp4_indexer(all_rows)
+                else:
+                    for start in range(0, query_rows, max(1, rows_per_chunk)):
+                        run_fp4_indexer(
+                            slice(start, min(start + rows_per_chunk, query_rows))
+                        )
         else:
             c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
                 layer_id=c4_indexer.layer_id,

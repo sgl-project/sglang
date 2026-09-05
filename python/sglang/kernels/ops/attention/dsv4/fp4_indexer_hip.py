@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple, Union
+from functools import lru_cache
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, Tuple, Union
 
 import torch
 
@@ -41,6 +42,24 @@ _LOGITS_BUDGET_ELEMS = (
 _LOGITS_POOL: dict = {}
 
 
+@lru_cache(maxsize=1)
+def get_aiter_fp4_streaming_topk() -> Optional[Callable]:
+    """Resolve the optional fused AITER entry point once, before graph capture."""
+    try:
+        from aiter.ops.flydsl import flydsl_pa_mqa_topk_fp4_prefill
+    except (AttributeError, ImportError):
+        return None
+    return (
+        flydsl_pa_mqa_topk_fp4_prefill
+        if callable(flydsl_pa_mqa_topk_fp4_prefill)
+        else None
+    )
+
+
+def aiter_fp4_streaming_topk_available() -> bool:
+    return get_aiter_fp4_streaming_topk() is not None
+
+
 class FP4DecodeWorkspace(NamedTuple):
     guarded_page_table: torch.Tensor
     c4_seq_lens: torch.Tensor
@@ -63,6 +82,17 @@ class FP4PrefillWorkspace(NamedTuple):
     # cta_info kernel reads. Pinned with the workspace so a refresh allocates
     # nothing and the buffers never return to the graph memory pool.
     schedule_buffers: Optional[PrefillScheduleBuffers] = None
+
+
+class FP4StreamingTopKScratch(NamedTuple):
+    """Bounded AITER candidate scratch reused across C4 layers on one stream."""
+
+    workspace: Any
+    values: torch.Tensor
+    raw_indices: torch.Tensor
+    counts: torch.Tensor
+    parallel_unit_num: int
+    stream_id: int
 
 
 class FP4KWriteMetadata(NamedTuple):
@@ -284,6 +314,52 @@ def prepare_fp4_prefill_workspace(
     return workspace
 
 
+def prepare_fp4_streaming_topk_scratch(
+    *,
+    rows: int,
+    topk: int,
+    device: torch.device,
+    scratch: Optional[FP4StreamingTopKScratch] = None,
+) -> FP4StreamingTopKScratch:
+    """Create or reuse context-independent AITER TopK candidate scratch."""
+    from aiter.ops.flydsl import allocate_fp4_prefill_topk_workspace
+
+    stream = torch.cuda.current_stream(device)
+    stream_id = stream.cuda_stream
+    parallel_unit_num = max(_PREFILL_BASE_CTA_TARGET, rows)
+    if (
+        scratch is not None
+        and scratch.values.shape == (rows, topk)
+        and scratch.values.device == device
+        and scratch.parallel_unit_num == parallel_unit_num
+        and scratch.stream_id == stream_id
+    ):
+        return scratch
+
+    with torch.cuda.stream(stream):
+        return FP4StreamingTopKScratch(
+            workspace=allocate_fp4_prefill_topk_workspace(
+                rows,
+                parallel_unit_num,
+                topk,
+                device,
+            ),
+            values=torch.empty(
+                (rows, topk),
+                dtype=torch.float32,
+                device=device,
+            ),
+            raw_indices=torch.empty(
+                (rows, topk),
+                dtype=torch.int32,
+                device=device,
+            ),
+            counts=torch.empty(rows, dtype=torch.int32, device=device),
+            parallel_unit_num=parallel_unit_num,
+            stream_id=stream_id,
+        )
+
+
 def aiter_fp4_paged_mqa_logits(
     *,
     q_fp4: torch.Tensor,
@@ -420,6 +496,92 @@ def aiter_fp4_paged_mqa_logits(
         )
 
     return logits
+
+
+def aiter_fp4_paged_mqa_topk(
+    *,
+    q_fp4: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_payload: torch.Tensor,
+    k_scale: torch.Tensor,
+    weights: torch.Tensor,
+    page_table: torch.Tensor,
+    c4_seq_lens: torch.Tensor,
+    weight_scale: float,
+    out_page_indices: torch.Tensor,
+    out_raw_indices: Optional[torch.Tensor] = None,
+    prefill_workspace: Optional[FP4PrefillWorkspace] = None,
+    streaming_scratch: Optional[FP4StreamingTopKScratch] = None,
+) -> FP4StreamingTopKScratch:
+    """Run AITER's bounded FP4 score + exact TopK prefill operator."""
+    fused_topk = get_aiter_fp4_streaming_topk()
+    if fused_topk is None:
+        raise RuntimeError("The installed AITER does not expose FP4 streaming top-k")
+
+    from aiter.ops.flydsl import FP4PrefillTopKResult
+
+    num_tokens = q_fp4.shape[0]
+    c4_seq_lens = _as_int32_1d(c4_seq_lens)
+    expected_width = _guarded_pages(page_table.shape[1]) * _KV_BLOCK_SIZE
+    workspace = prefill_workspace
+    if workspace is not None and (
+        workspace.guarded_page_table.shape[0] != num_tokens
+        or workspace.max_seq_len != expected_width
+    ):
+        workspace = None
+
+    if workspace is None:
+        guarded_page_table, max_seq_len = _guard_page_table(page_table)
+        row_to_batch = torch.arange(
+            num_tokens,
+            dtype=torch.int32,
+            device=page_table.device,
+        )
+        local_starts = torch.zeros_like(c4_seq_lens)
+    else:
+        guarded_page_table = workspace.guarded_page_table
+        max_seq_len = workspace.max_seq_len
+        row_to_batch = workspace.row_to_batch
+        local_starts = workspace.local_starts
+
+    streaming_scratch = prepare_fp4_streaming_topk_scratch(
+        rows=num_tokens,
+        topk=out_page_indices.shape[1],
+        device=q_fp4.device,
+        scratch=streaming_scratch,
+    )
+    out = FP4PrefillTopKResult(
+        values=streaming_scratch.values,
+        raw_indices=(
+            out_raw_indices
+            if out_raw_indices is not None
+            else streaming_scratch.raw_indices
+        ),
+        physical_indices=out_page_indices,
+        counts=streaming_scratch.counts,
+    )
+    fused_topk(
+        q_fp4.view(torch.uint8),
+        q_scale,
+        k_payload.view(torch.uint8),
+        k_scale,
+        guarded_page_table,
+        weights,
+        row_to_batch,
+        local_starts,
+        c4_seq_lens,
+        max_seq_len,
+        topk=out_page_indices.shape[1],
+        weight_scale=weight_scale,
+        block_k=256,
+        kv_block_size=_KV_BLOCK_SIZE,
+        num_warps=4,
+        parallel_unit_num=streaming_scratch.parallel_unit_num,
+        workspace=streaming_scratch.workspace,
+        out=out,
+        stream=torch.cuda.current_stream(q_fp4.device),
+    )
+    return streaming_scratch
 
 
 def prepare_fp4_k_write_metadata(
