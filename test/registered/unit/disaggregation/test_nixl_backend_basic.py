@@ -621,6 +621,137 @@ class TestNixlTransferWorker(CustomTestCase):
         )
         self.assertEqual(submitted_counts_at_poll, [3, 3, 3])
 
+    def _run_staging_fanout(self, *, defer_second=False, mixed_first=False):
+        room = 24
+        mgr = self._make_manager(room)
+        mgr.enable_staging = True
+        mgr._staging_ctx = PrefillStagingContext()
+        template_req = mgr.transfer_infos[room]["agent"]
+        template_dst = mgr.decode_kv_args_table["agent"]
+        mgr.transfer_infos[room] = {}
+        mgr.decode_kv_args_table = {}
+        for rank, peer in enumerate(("a", "b")):
+            mgr.transfer_infos[room][peer] = TransferInfo(
+                **{**vars(template_req), "agent_name": peer}
+            )
+            mgr.decode_kv_args_table[peer] = SimpleNamespace(
+                **{
+                    **vars(template_dst),
+                    "decode_tp_size": 2,
+                    "decode_tp_rank": rank,
+                    "staging_base_ptr": 0x1000,
+                    "staging_total_size": 4096,
+                    "dst_kv_item_len": 4,
+                    "dst_state_data_ptrs": [0],
+                    "dst_state_item_lens": [4],
+                    "dst_state_dim_per_tensor": [1],
+                    "dst_state_layer_ids": [0],
+                }
+            )
+        if mixed_first:
+            mgr.decode_kv_args_table["a"].decode_tp_size = 1
+            mgr.decode_kv_args_table["a"].kv_xfer_segments = [object()]
+
+        chunk = self._make_chunk(room, [1], is_last_chunk=True)
+        chunk.state_indices = [0]
+        pending = [chunk]
+        handles = []
+        reads = []
+        live_at_dequeue = []
+        source = [None]
+
+        def get():
+            live_at_dequeue.append([h for h in handles if not h["done"]])
+            if not pending:
+                raise SystemExit()
+            return pending.pop(0)
+
+        def post(peer, kind):
+            handle = dict(peer=peer, kind=kind, polls=0, done=False)
+            handles.append(handle)
+            return handle
+
+        def staged(peer, *args, **kwargs):
+            # Model a destination-specific gather into the worker's one buffer.
+            # NIXL reads it asynchronously, when this handle completes below.
+            source[0] = peer
+            return post(peer, "staged")
+
+        def check(handle):
+            if handle["done"]:
+                return "DONE"
+            handle["polls"] += 1
+            if handle["polls"] == 1:
+                return "PROC"
+            if handle["kind"] == "staged":
+                reads.append((handle["peer"], source[0]))
+            handle["done"] = True
+            return "DONE"
+
+        ready_calls = defaultdict(int)
+
+        def ready(req, *args, **kwargs):
+            ready_calls[req.agent_name] += 1
+            if defer_second and req.agent_name == "b" and ready_calls["b"] == 1:
+                return False, 0, -1, 0, -1
+            return True, 0, 0, 0, 0
+
+        strategy = SimpleNamespace(
+            check_ready=ready, staging_buffer=FakeStagingBuffer()
+        )
+        mgr._try_create_staging_strategy = lambda buffer: strategy
+        mgr.send_kvcache_staged = staged
+        mgr.send_kvcache_mixed = lambda peer, *args: [
+            post(peer, "mixed-vram"),
+            post(peer, "mixed-dram"),
+        ]
+        mgr.send_aux = lambda peer, *args: post(peer, "aux")
+        mgr.maybe_send_extra = lambda peer, *args, **kwargs: [post(peer, "state")]
+        mgr.agent = SimpleNamespace(check_xfer_state=check)
+        queue = SimpleNamespace(get=get, put=pending.append)
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.disaggregation.common.staging_buffer": _fake_staging_buffer_module()
+            },
+        ):
+            with self.assertRaises(SystemExit):
+                mgr.transfer_worker(queue, staging_buffer=strategy.staging_buffer)
+
+        self.assertEqual(mgr.exceptions, {})
+        self.assertEqual(mgr.request_status[room], KVPoll.Success)
+        self.assertEqual(mgr._staging_outstanding.get(room, 0), 0)
+        return handles, reads, live_at_dequeue
+
+    def test_staging_fanout_preserves_each_destinations_source(self):
+        _, reads, _ = self._run_staging_fanout()
+        self.assertEqual(reads, [("a", "a"), ("b", "b")])
+
+    def test_staging_fanout_deferral_does_not_replay_completed_destination(self):
+        handles, reads, live = self._run_staging_fanout(defer_second=True)
+        self.assertEqual(
+            [(h["peer"], h["kind"]) for h in handles],
+            [
+                (peer, kind)
+                for peer in ("a", "b")
+                for kind in ("staged", "state", "aux")
+            ],
+        )
+        self.assertEqual(reads, [("a", "a"), ("b", "b")])
+        self.assertTrue(all(not pending for pending in live))
+
+    def test_staging_fanout_deferral_drains_mixed_handles_before_next_dequeue(self):
+        handles, reads, live = self._run_staging_fanout(
+            defer_second=True, mixed_first=True
+        )
+        self.assertTrue(all(not pending for pending in live))
+        self.assertEqual(
+            [(h["peer"], h["kind"]) for h in handles],
+            [("a", kind) for kind in ("mixed-vram", "mixed-dram", "state", "aux")]
+            + [("b", kind) for kind in ("staged", "state", "aux")],
+        )
+        self.assertEqual(reads, [("b", "b")])
+
 
 class TestNixlNotifications(CustomTestCase):
     def _make_manager(self, messages, required=None):
