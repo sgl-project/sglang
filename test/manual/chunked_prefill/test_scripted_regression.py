@@ -14,16 +14,21 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 )
 
 
-def _drain_until_released(t, *handles):
+def _drain_until_released(*reqs):
     for _ in range(12):
-        if all(
-            h.kv_pages == 0
-            and h.lock_refs == 0
-            and (h.req is None or h.req.kv.req_pool_idx is None)
-            for h in handles
-        ):
+        if all(r.kv.req_pool_idx is None and r.kv.is_kv_released for r in reqs):
             return
         yield
+
+
+def _run_until_prefix_locked(r):
+    # A chunk is inserted into the radix tree on the step after its forward,
+    # so last_node is still the root -- unlocked -- right after chunks_done ticks.
+    for _ in range(8):
+        if r.lock_refs >= 1:
+            return
+        yield
+    raise AssertionError(f"radix lock_ref must be held mid-chunk; got {r.lock_refs}")
 
 
 class TestRegressionBasic(ScriptedTestCase):
@@ -34,17 +39,21 @@ class TestRegressionBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_abort_waiting_releases_all(t: ScriptedContext):
+        baseline_refs = sum(t.get_all_node_lock_refs().values())
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
 
-        t.abort(r)
-        yield from _drain_until_released(t, r)
+        req = r.req
+        assert req is not None
 
-        assert r.kv_pages == 0
-        assert r.req.kv.req_pool_idx is None
-        assert r.lock_refs == 0
+        t.abort(r)
+        yield from _drain_until_released(req)
+
+        assert req.kv.is_kv_released, f"kv_allocated_len={req.kv.kv_allocated_len}"
+        assert req.kv.req_pool_idx is None
+        assert sum(t.get_all_node_lock_refs().values()) == baseline_refs
         assert not r.is_chunking
-        assert r.req.inflight_middle_chunks == 0
+        assert req.inflight_middle_chunks == 0
 
     def test_pause_covers_waiting_chunked(self):
         self.server.execute_script(self._script_pause_covers_waiting_chunked)
@@ -239,26 +248,29 @@ class TestRegressionBasic(ScriptedTestCase):
         baseline_refs = sum(t.get_all_node_lock_refs().values())
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
+        yield from _run_until_prefix_locked(r)
 
-        assert r.req.kv.req_pool_idx is not None, "row must be held mid-chunk"
+        req = r.req
+        assert req is not None
+        assert req.kv.req_pool_idx is not None, "row must be held mid-chunk"
         assert r.kv_pages > 0, "committed KV must be held mid-chunk"
-        assert r.lock_refs >= 1, "radix lock_ref must be held mid-chunk"
 
         t.abort(r)
-        yield from _drain_until_released(t, r)
+        yield from _drain_until_released(req)
 
-        assert r.req.kv.req_pool_idx is None, (
-            f"96d4749094: abort must release row; got row_idx={r.req.kv.req_pool_idx!r}"
+        assert req.kv.req_pool_idx is None, (
+            f"96d4749094: abort must release row; got row_idx={req.kv.req_pool_idx!r}"
         )
-        assert r.kv_pages == 0, (
-            f"96d4749094: abort must release KV; got kv_pages={r.kv_pages}"
+        assert req.kv.is_kv_released, (
+            f"96d4749094: abort must release KV; got "
+            f"kv_allocated_len={req.kv.kv_allocated_len}"
         )
-        assert r.lock_refs == 0, (
-            f"96d4749094: abort must release lock_ref; got lock_refs={r.lock_refs}"
+        assert sum(t.get_all_node_lock_refs().values()) == baseline_refs, (
+            f"96d4749094: abort must release lock_ref; tree lock_refs drifted "
+            f"from {baseline_refs} to {sum(t.get_all_node_lock_refs().values())}"
         )
         assert not r.is_chunking
-        assert r.req.inflight_middle_chunks == 0
-        assert sum(t.get_all_node_lock_refs().values()) == baseline_refs
+        assert req.inflight_middle_chunks == 0
 
     def test_pause_retract_releases_waiting_chunked_resume(self):
         self.server.execute_script(
@@ -269,6 +281,7 @@ class TestRegressionBasic(ScriptedTestCase):
     def _script_pause_retract_releases_waiting_chunked_resume(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
+        yield from _run_until_prefix_locked(r)
         assert r.req.kv.req_pool_idx is not None and r.kv_pages > 0 and r.lock_refs >= 1
 
         t.pause_generation(mode="retract")
@@ -338,6 +351,9 @@ class TestRegressionPp(ScriptedTestCase):
 
         yield from run_until(r, lambda h: h.chunks_done >= 1 and h.is_chunking)
 
+        req = r.req
+        assert req is not None
+
         t.abort(r)
         yield
 
@@ -348,7 +364,7 @@ class TestRegressionPp(ScriptedTestCase):
             f"waiting_queue; got {occurrences} occurrences of rid="
             f"{r.rid} (pre-fix bug would yield 3)"
         )
-        yield from _drain_until_released(t, r)
+        yield from _drain_until_released(req)
         assert r.finished
 
 
@@ -496,7 +512,7 @@ class TestRegressionGptOss(ScriptedTestCase):
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         model_path="openai/gpt-oss-20b",
         mem_fraction_static=0.70,
-        disable_piecewise_cuda_graph=True,
+        cuda_graph_backend_prefill="disabled",
     )
 
     def test_chunked_stash_bounded_by_kv_committed_len(self):

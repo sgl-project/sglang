@@ -1,5 +1,6 @@
 import unittest
 
+from sglang.srt.utils import is_xpu
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
@@ -11,6 +12,11 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     run_until_all_finished,
     run_until_finished,
 )
+
+_is_xpu = is_xpu()
+
+# Measured on the XPU canary runner; DEFAULT_RUN_TIMEOUT_S is not enough there.
+XPU_RUN_TIMEOUT_S: float = 360.0
 
 
 class TestInvariantsBasic(ScriptedTestCase):
@@ -185,8 +191,15 @@ class TestInvariantsBasic(ScriptedTestCase):
         final = t.engine_stats()
         assert final["kv_pool_free"] >= baseline["kv_pool_free"]
 
+    @unittest.skipIf(_is_xpu, "Non-XPU runners only")
     def test_sustained_long_chunked_load(self):
         self.server.execute_script(self._script_sustained_long_chunked_load)
+
+    @unittest.skipUnless(_is_xpu, "XPU runner only")
+    def test_sustained_long_chunked_load_xpu(self):
+        self.server.execute_script(
+            self._script_sustained_long_chunked_load, timeout_s=XPU_RUN_TIMEOUT_S
+        )
 
     @staticmethod
     def _script_sustained_long_chunked_load(t: ScriptedContext):
@@ -240,8 +253,15 @@ class TestInvariantsBasic(ScriptedTestCase):
         final = t.engine_stats()
         assert final["kv_pool_free"] >= baseline["kv_pool_free"]
 
+    @unittest.skipIf(_is_xpu, "Non-XPU runners only")
     def test_long_decode_then_many_short(self):
         self.server.execute_script(self._script_long_decode_then_many_short)
+
+    @unittest.skipUnless(_is_xpu, "XPU runner only")
+    def test_long_decode_then_many_short_xpu(self):
+        self.server.execute_script(
+            self._script_long_decode_then_many_short, timeout_s=XPU_RUN_TIMEOUT_S
+        )
 
     @staticmethod
     def _script_long_decode_then_many_short(t: ScriptedContext):

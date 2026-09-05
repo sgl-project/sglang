@@ -52,7 +52,11 @@ class ScriptedReqHandle:
         req = self.req
         if req is None:
             return 0
-        node = resolve_node(self.context.scheduler.tree_cache, req.last_node)
+        tree_cache = self.context.scheduler.tree_cache
+        if tree_cache.is_root(req.last_node):
+            # The root's lock_ref is a permanent sentinel, never a req's lock.
+            return 0
+        node = resolve_node(tree_cache, req.last_node)
         if node is None:
             return 0
         return _node_lock_ref(node)

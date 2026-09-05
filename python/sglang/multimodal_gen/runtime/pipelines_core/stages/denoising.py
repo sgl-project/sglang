@@ -124,6 +124,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
     is_layerwise_offloaded_module,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    get_or_create_request_scheduler,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -1203,7 +1206,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         assert self.transformer is not None
         pipeline = self.pipeline() if self.pipeline else None
-        scheduler = batch.scheduler
+        # Pipelines that skip timestep prep leave batch.scheduler unset.
+        scheduler = get_or_create_request_scheduler(batch, self.scheduler)
         assert scheduler is not None
 
         dual_transformer_mode = self._dual_transformer_execution_mode()
