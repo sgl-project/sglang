@@ -3127,6 +3127,15 @@ class ServerArgs:
         int, "Steps to prefetch in offloading.", NS("exec.offload")
     ] = 1
     offload_mode: A[str, "Mode of offloading.", NS("exec.offload")] = "cpu"
+    offload_embedding_to_host: A[
+        bool,
+        "Keep the input embedding table in page-locked host memory instead of "
+        "device memory; rows are gathered directly from the host over PCIe "
+        "(zero-copy, CUDA-graph safe). Frees device memory equal to the table "
+        "size for a few microseconds per forward. CUDA only, unquantized "
+        "embeddings only.",
+        NS("exec.offload"),
+    ] = False
 
     # -------------------------------------------------------------------------
     # LMCache
