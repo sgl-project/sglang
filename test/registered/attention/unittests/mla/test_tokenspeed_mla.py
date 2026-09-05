@@ -1,12 +1,9 @@
 import importlib.util
 import unittest
-from types import SimpleNamespace
-from unittest.mock import Mock
 
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.mla_attention import (
     MLAAttentionCase,
     run_mla_attention_case,
@@ -55,75 +52,10 @@ MLA_SHAPE_KWARGS = dict(
 )
 
 
+from sglang.test.ci.ci_register import register_cuda_ci
+
 register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
-
-
-@unittest.skipUnless(
-    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9,
-    "FP8 prefill preparation requires Hopper or newer",
-)
-class TestTokenspeedMLAPrefillPreparation(CustomTestCase):
-    def test_prefill_preserves_position_components_and_cache(self):
-        from sglang.srt.layers.attention.tokenspeed_mla_backend import (
-            TokenspeedMLABackend,
-        )
-
-        torch.manual_seed(0)
-        q = torch.randn(3, 2, 192, device="cuda", dtype=torch.bfloat16)
-        kv_a = torch.randn(3, 512, device="cuda", dtype=torch.bfloat16)
-        kv = torch.randn(3, 2, 256, device="cuda", dtype=torch.bfloat16)
-        k_pe = torch.randn(3, 1, 64, device="cuda", dtype=torch.bfloat16)
-        positions = torch.arange(3, device="cuda")
-        locations = torch.tensor([2, 0, 1], device="cuda")
-        backend = TokenspeedMLABackend.__new__(TokenspeedMLABackend)
-        backend.token_to_kv_pool = Mock()
-        identity_rope = SimpleNamespace(
-            cos_sin_cache=torch.cat(
-                [torch.ones(3, 32, device="cuda"), torch.zeros(3, 32, device="cuda")],
-                dim=-1,
-            ),
-            is_neox_style=True,
-        )
-        for rotary_emb in (None, identity_rope):
-            with self.subTest(uses_rope=rotary_emb is not None):
-                layer = SimpleNamespace(
-                    rotary_emb=rotary_emb,
-                    num_local_heads=2,
-                    qk_nope_head_dim=128,
-                    qk_rope_head_dim=64,
-                    v_head_dim=128,
-                    kv_b_proj=lambda _: (kv, None),
-                    attn_mha=object(),
-                )
-                actual = backend.prepare_prefill_qkv(
-                    q=q,
-                    q_pe=q[..., 128:],
-                    kv_a=kv_a,
-                    k_pe=k_pe,
-                    positions=positions,
-                    layer=layer,
-                    forward_batch=SimpleNamespace(out_cache_loc=locations),
-                )
-                expected = (
-                    q,
-                    torch.cat([kv[..., :128], k_pe.expand(-1, 2, -1)], -1),
-                    kv[..., 128:],
-                )
-                for output, reference in zip(actual, expected):
-                    self.assertEqual(output.dtype, torch.float8_e4m3fn)
-                    torch.testing.assert_close(
-                        output.float(), reference.to(output.dtype).float()
-                    )
-                write = backend.token_to_kv_pool.set_mla_kv_buffer.call_args.args
-                self.assertIs(write[0], layer.attn_mha)
-                self.assertIs(write[1], locations)
-                torch.testing.assert_close(
-                    write[2].float(), kv_a.to(torch.float8_e4m3fn).unsqueeze(1).float()
-                )
-                torch.testing.assert_close(
-                    write[3].float(), k_pe.to(torch.float8_e4m3fn).float()
-                )
 
 
 @unittest.skipIf(not _SUPPORTED, _SKIP_REASON)

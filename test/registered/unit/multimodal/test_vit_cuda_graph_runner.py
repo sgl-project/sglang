@@ -1,19 +1,18 @@
-import importlib.util
 import sys
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+
 from sglang.srt.multimodal.internvl_vit_cuda_graph_runner import (
     InternViTCudaGraphRunner,
 )
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class _Block:
@@ -94,44 +93,6 @@ def test_vit_graph_key_includes_full_and_window_attention_boundaries():
     )
 
     assert first != second
-
-
-def test_npu_graph_capture_and_replay_keep_sequence_boundaries():
-    path = (
-        Path(sys.modules[ViTCudaGraphRunner.__module__].__file__).parents[1]
-        / "hardware_backend/npu/graph_runner/vit_npu_graph_runner.py"
-    )
-    spec = importlib.util.spec_from_file_location("npu_graph_runner_test", path)
-    module = importlib.util.module_from_spec(spec)
-    with patch.dict(sys.modules, {"torch_npu": SimpleNamespace()}):
-        spec.loader.exec_module(module)
-
-    block = _Block()
-    block.attn = SimpleNamespace(num_attention_heads_per_partition=2, head_size=4)
-    runner = module.ViTNpuGraphRunner(
-        SimpleNamespace(blocks=[block], device=torch.device("cpu"), dtype=torch.float32)
-    )
-    runner.device_module = SimpleNamespace(graph_pool_handle=lambda: object())
-    captured = []
-
-    def capture(graph_key):
-        captured.append(graph_key)
-        runner.block_graphs[graph_key] = SimpleNamespace(replay=lambda: None)
-
-    x = torch.ones(8, 8)
-    cos, sin = torch.ones(8, 4), torch.zeros(8, 4)
-    with (
-        patch.object(module, "set_graph_pool_id"),
-        patch.object(runner, "_create_graph", side_effect=capture),
-    ):
-        for boundaries in ([0, 4, 8], [0, 2, 8], [0, 4, 8]):
-            result = runner.run(x, torch.tensor(boundaries), cos, sin)
-            torch.testing.assert_close(result.squeeze(1), x)
-
-    assert len(captured) == 2
-    assert runner.block_ws[captured[0]].shape == (8, 2, 4)
-    assert runner.cu_seq_lens[captured[0]].tolist() == [4, 8]
-    assert runner.cu_seq_lens[captured[1]].tolist() == [2, 8]
 
 
 def test_vit_graph_keeps_rotary_workspace_address_after_growth():

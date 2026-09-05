@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from __future__ import annotations
+
 """Attention backend for the tokenspeed-mla CuTe DSL kernels on Blackwell.
 
 Subclasses :class:`TRTLLMMLABackend` to share its MLA data preparation, prefill
@@ -26,8 +28,6 @@ forward lives here because the TokenSpeed decode kernel natively accepts CP
 rank/world metadata and returns the partial log-sum-exp needed by the cross-rank
 merge.
 """
-
-from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING, Optional
@@ -257,23 +257,17 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         v_bf16 = kv[..., layer.qk_nope_head_dim :]
         q_nope = q[..., : layer.qk_nope_head_dim]
 
-        if layer.rotary_emb is None:
-            q_fp8, k_nope_fp8, k_pe_fp8 = mla_quantize_without_rope_for_fp8(
-                q_nope, q_pe, k_nope, k_pe
-            )
-            k_fp8 = torch.cat((k_nope_fp8, k_pe_fp8.expand_as(q_pe)), dim=-1)
-        else:
-            q_fp8, k_fp8 = self._fused_rope_fp8_quantize(
-                q_nope=q_nope,
-                q_pe=q_pe,
-                k_nope=k_nope,
-                k_pe=k_pe,
-                cos_sin_cache=layer.rotary_emb.cos_sin_cache,
-                positions=positions,
-                is_neox=getattr(layer.rotary_emb, "is_neox_style", True),
-                qk_nope_head_dim=layer.qk_nope_head_dim,
-                qk_rope_head_dim=layer.qk_rope_head_dim,
-            )
+        q_fp8, k_fp8 = self._fused_rope_fp8_quantize(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            k_nope=k_nope,
+            k_pe=k_pe,
+            cos_sin_cache=layer.rotary_emb.cos_sin_cache,
+            positions=positions,
+            is_neox=getattr(layer.rotary_emb, "is_neox_style", True),
+            qk_nope_head_dim=layer.qk_nope_head_dim,
+            qk_rope_head_dim=layer.qk_rope_head_dim,
+        )
         v_fp8 = fp8_quantize(v_bf16, enable_pdl=is_arch_support_pdl())
 
         # k_pe is shared across heads (RoPE is position-only), so head 0
