@@ -169,3 +169,9 @@ def fused_copy_conv_slots(
         MAX_FEAT_BLOCKS=desc.max_feat_blocks,
         BLOCK=_BLOCK,
     )
+
+
+def warmup_fused_copy_conv_slots(desc: ConvSlotDescriptor) -> None:
+    """Warm the cache-hit COW specialization with two free pool slots."""
+    indices = torch.tensor([0, 1], dtype=torch.int32, device=desc.ptr.device)
+    fused_copy_conv_slots(desc, indices[:1], indices[1:])
