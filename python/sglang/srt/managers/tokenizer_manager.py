@@ -1586,8 +1586,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         input_ids_arr: Optional[array[int]] = (
             array("q", input_ids) if input_ids is not None else None
         )
-        extra_key = _namespace_mm_radix_cache(obj.extra_key, mm_inputs)
-
         # Parse sampling parameters
         # Note: if there are preferred sampling params, we use them if they are not
         # explicitly passed in sampling_params
@@ -1649,7 +1647,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,
-                extra_key=extra_key,
+                extra_key=_namespace_mm_radix_cache(obj.extra_key, mm_inputs),
                 cache_salt=obj.cache_salt,
                 routing_key=obj.routing_key,
                 token_type_ids=token_type_ids,

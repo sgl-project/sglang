@@ -1,3 +1,4 @@
+import asyncio
 import sys
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -7,8 +8,11 @@ import torch
 
 from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.io_struct import (
+    EmbeddingReqInput,
     GenerateReqInput,
     MMEmbeddingCacheAcquireReqInput,
+    TokenizedEmbeddingReqInput,
+    TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -17,6 +21,8 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.tokenizer_manager import (
+    ReqState,
+    TokenizerManager,
     _can_omit_mm_features,
     _namespace_mm_radix_cache,
 )
@@ -27,6 +33,8 @@ from sglang.srt.mem_cache.multimodal_cache import (
     EmbeddingResult,
     MultiModalStaticCache,
 )
+from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -210,6 +218,53 @@ def test_radix_namespace_fails_closed_on_partial_strong_identities():
         _namespace_mm_radix_cache("caller", SimpleNamespace(mm_items=[legacy]))
         == "caller"
     )
+
+
+@pytest.mark.parametrize("request_type", [GenerateReqInput, EmbeddingReqInput])
+@pytest.mark.parametrize("with_media", [False, True])
+def test_tokenized_request_namespaces_only_generation(request_type, with_media):
+    request = request_type(input_ids=[1, 2], rid="request")
+    request.normalize_batch_and_arguments()
+    if isinstance(request, GenerateReqInput):
+        request.extra_key = "caller"
+        request.bootstrap_room = 1
+    mm_inputs = (
+        MultimodalInputs(
+            mm_items=[_featureless_item(11, "lease", identity="sha256:" + "01" * 32)]
+        )
+        if with_media
+        else None
+    )
+    time_stats = APIServerReqTimeStats()
+    manager = object.__new__(TokenizerManager)
+    manager.preferred_sampling_params = {}
+    manager.sampling_params_class = SamplingParams
+    manager.tokenizer = None
+    manager.model_config = SimpleNamespace(vocab_size=256)
+    manager.rid_to_state = {
+        request.rid: ReqState(
+            out_list=[],
+            finished=False,
+            event=asyncio.Event(),
+            obj=request,
+            time_stats=time_stats,
+        )
+    }
+
+    tokenized = manager._create_tokenized_object(
+        request, None, request.input_ids, mm_inputs=mm_inputs
+    )
+
+    assert list(tokenized.input_ids) == request.input_ids
+    assert tokenized.mm_inputs is mm_inputs
+    assert tokenized.time_stats is time_stats
+    assert time_stats.tokenize_finish_time > 0
+    if isinstance(request, GenerateReqInput):
+        assert isinstance(tokenized, TokenizedGenerateReqInput)
+        assert tokenized.extra_key == _namespace_mm_radix_cache("caller", mm_inputs)
+    else:
+        assert isinstance(tokenized, TokenizedEmbeddingReqInput)
+        assert tokenized.sampling_params.max_new_tokens == 0
 
 
 def test_scheduler_admits_then_request_release_drops_lease():
