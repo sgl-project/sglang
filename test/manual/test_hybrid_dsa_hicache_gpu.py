@@ -12,25 +12,35 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _build_hybrid_dsa_index_entry,
     build_hybrid_mamba_stack,
 )
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import HybridCacheController
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 
 
 def check_derived_slot_lifecycle():
     """The INDEXER borrows KV addresses; it must never allocate/free its own."""
-    pools = {name: MagicMock() for name in (PoolName.KV, PoolName.MAMBA, PoolName.INDEXER)}
-    group = HostPoolGroup([
-        PoolEntry(name=name, host_pool=pool, device_pool=None,
-                  layer_mapper=lambda layer: layer,
-                  is_primary_index_anchor=name == PoolName.KV)
-        for name, pool in pools.items()
-    ])
+    pools = {
+        name: MagicMock() for name in (PoolName.KV, PoolName.MAMBA, PoolName.INDEXER)
+    }
+    group = HostPoolGroup(
+        [
+            PoolEntry(
+                name=name,
+                host_pool=pool,
+                device_pool=None,
+                layer_mapper=lambda layer: layer,
+                is_primary_index_anchor=name == PoolName.KV,
+            )
+            for name, pool in pools.items()
+        ]
+    )
     controller = object.__new__(HybridCacheController)
     controller.mem_pool_host = group
     controller.write_queue = []
@@ -43,13 +53,19 @@ def check_derived_slot_lifecycle():
         pools[PoolName.KV].alloc.return_value = host
         pools[PoolName.MAMBA].alloc.return_value = torch.tensor([iteration % 4])
         pools[PoolName.MAMBA].free.return_value = 1
-        result = controller.write(device, node_id=iteration, extra_pools=[
-            PoolTransfer(PoolName.INDEXER, indices_from_pool=PoolName.KV),
-            PoolTransfer(PoolName.MAMBA, device_indices=torch.tensor([3])),
-        ])
+        result = controller.write(
+            device,
+            node_id=iteration,
+            extra_pools=[
+                PoolTransfer(PoolName.INDEXER, indices_from_pool=PoolName.KV),
+                PoolTransfer(PoolName.MAMBA, device_indices=torch.tensor([3])),
+            ],
+        )
         assert result is host
         operation = controller.write_queue.pop()
-        derived = next(t for t in operation.pool_transfers if t.name == PoolName.INDEXER)
+        derived = next(
+            t for t in operation.pool_transfers if t.name == PoolName.INDEXER
+        )
         assert derived.host_indices is host
         assert derived.device_indices is device
         assert group.release_transfers(operation.pool_transfers) == 1
@@ -67,14 +83,24 @@ def check_ratio_mode():
     prefix = "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler."
     target = make_pool((True, True))
     target.kv_cache_dim = 656
-    memory = SimpleNamespace(hicache_size=0, hicache_ratio=2.5,
-                             hicache_mem_layout="page_first",
-                             hicache_write_policy="write_through",
-                             hicache_io_backend="kernel", hicache_host_memory_mode=None)
-    params = SimpleNamespace(page_size=64, mtp_draft_device_pools=(),
-                             req_to_token_pool=SimpleNamespace(mamba_allocator=MagicMock()),
-                             token_to_kv_pool_allocator=MagicMock(), tp_cache_group=None,
-                             attn_cp_cache_group=None, attn_tp_cache_group=None, pp_cache_group=None)
+    memory = SimpleNamespace(
+        hicache_size=0,
+        hicache_ratio=2.5,
+        hicache_mem_layout="page_first",
+        hicache_write_policy="write_through",
+        hicache_io_backend="kernel",
+        hicache_host_memory_mode=None,
+    )
+    params = SimpleNamespace(
+        page_size=64,
+        mtp_draft_device_pools=(),
+        req_to_token_pool=SimpleNamespace(mamba_allocator=MagicMock()),
+        token_to_kv_pool_allocator=MagicMock(),
+        tp_cache_group=None,
+        attn_cp_cache_group=None,
+        attn_tp_cache_group=None,
+        pp_cache_group=None,
+    )
     with (
         patch(prefix + "get_memory", return_value=memory),
         patch(prefix + "_get_allocator_type", return_value="default"),
@@ -86,9 +112,14 @@ def check_ratio_mode():
     ):
         build_kv.return_value.page_num = 20
         group, _ = build_hybrid_mamba_stack(
-            params=params, kv_pool=target, mamba_pool=MagicMock(),
-            full_layer_mapping={0: 0, 3: 1}, mamba_layer_mapping={1: 0, 2: 1},
-            load_cache_event=None, storage_backend=None, use_mla=True,
+            params=params,
+            kv_pool=target,
+            mamba_pool=MagicMock(),
+            full_layer_mapping={0: 0, 3: 1},
+            mamba_layer_mapping={1: 0, 2: 1},
+            load_cache_event=None,
+            storage_backend=None,
+            use_mla=True,
         )
         split.assert_not_called()
         assert build_kv.call_args.kwargs["host_size"] is None
@@ -103,10 +134,12 @@ def make_pool(live_layers):
     pool.index_kpool = 4
     pool.kpool_use_compress = True
     pool.layer_num = len(live_layers)
-    pool.index_key_cache = SimpleNamespace(buffer=[
-        torch.zeros((8 if live else 0, 64 * 132), dtype=torch.uint8, device="cuda")
-        for live in live_layers
-    ])
+    pool.index_key_cache = SimpleNamespace(
+        buffer=[
+            torch.zeros((8 if live else 0, 64 * 132), dtype=torch.uint8, device="cuda")
+            for live in live_layers
+        ]
+    )
     return pool
 
 
@@ -119,13 +152,18 @@ def run_case(layout, backend, trial):
     draft = make_pool((True,))
     prefix = "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler."
     with (
-        patch(prefix + "get_memory", return_value=SimpleNamespace(hicache_mem_layout=layout)),
+        patch(
+            prefix + "get_memory",
+            return_value=SimpleNamespace(hicache_mem_layout=layout),
+        ),
         patch(prefix + "_get_allocator_type", return_value="default"),
     ):
         entry = _build_hybrid_dsa_index_entry(
-            kv_pool=target, kv_host_pool=SimpleNamespace(page_num=16),
+            kv_pool=target,
+            kv_host_pool=SimpleNamespace(page_num=16),
             layer_mapping={0: 0, 4: 1, 8: 2, 45: 3},
-            transfer_layer_num=46, draft_pools=(draft,),
+            transfer_layer_num=46,
+            draft_pools=(draft,),
         )
     assert entry.layer_mapper(4) is None
     assert entry.layer_mapper(45) == 2
@@ -135,7 +173,9 @@ def run_case(layout, backend, trial):
     generator = torch.Generator(device="cpu").manual_seed(37625 + trial)
     originals = []
     for buffer in host.device_buffers:
-        original = torch.randint(0, 256, buffer.shape, dtype=torch.uint8, generator=generator)
+        original = torch.randint(
+            0, 256, buffer.shape, dtype=torch.uint8, generator=generator
+        )
         buffer.copy_(original)
         originals.append(original)
     source_pages = torch.randperm(8, generator=generator)
@@ -156,7 +196,10 @@ def run_case(layout, backend, trial):
     with torch.cuda.stream(backup_stream):
         for start in (0, 256):
             host.backup_from_device_all_layer(
-                target, backup_cached[start:start + 256], src[start:start + 256], backend,
+                target,
+                backup_cached[start : start + 256],
+                src[start : start + 256],
+                backend,
             )
         backed_up = backup_stream.record_event()
     torch.cuda.current_stream().wait_event(backed_up)
@@ -172,21 +215,41 @@ def run_case(layout, backend, trial):
         actual = buffer.cpu()[dest_pages]
         expected = originals[layer][source_pages]
         assert torch.equal(actual, expected), (layout, backend, trial, layer)
-    print(json.dumps({"layout": layout, "backend": backend, "trial": trial,
-                      "layers": 3, "pages": 8, "bytes_compared": 3 * 8 * 8448,
-                      "passed": True}), flush=True)
+    print(
+        json.dumps(
+            {
+                "layout": layout,
+                "backend": backend,
+                "trial": trial,
+                "layers": 3,
+                "pages": 8,
+                "bytes_compared": 3 * 8 * 8448,
+                "passed": True,
+            }
+        ),
+        flush=True,
+    )
 
 
 def main():
     assert torch.cuda.is_available(), "requires an isolated CUDA Job"
-    print(json.dumps({"gpu": torch.cuda.get_device_name(),
-                      "capability": torch.cuda.get_device_capability()}), flush=True)
+    print(
+        json.dumps(
+            {
+                "gpu": torch.cuda.get_device_name(),
+                "capability": torch.cuda.get_device_capability(),
+            }
+        ),
+        flush=True,
+    )
     with torch.inference_mode():
         check_derived_slot_lifecycle()
         check_ratio_mode()
         for layout, backend in (
-            ("page_first", "kernel"), ("layer_first", "kernel"),
-            ("layer_first", "direct"), ("page_first_direct", "direct"),
+            ("page_first", "kernel"),
+            ("layer_first", "kernel"),
+            ("layer_first", "direct"),
+            ("page_first_direct", "direct"),
         ):
             for trial in range(5):
                 run_case(layout, backend, trial)

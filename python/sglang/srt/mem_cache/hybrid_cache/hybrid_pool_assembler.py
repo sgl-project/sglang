@@ -35,6 +35,7 @@ from sglang.srt.runtime_context import (
 
 if TYPE_CHECKING:
     import torch
+
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
