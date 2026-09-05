@@ -7605,6 +7605,84 @@ class TestMambaCheckpointGrid(CustomTestCase):
         )
 
 
+class TestMambaFinishedOvershootCheckpoint(CustomTestCase):
+    """A donated checkpoint must not outrun the key it is stored under: the
+    stored prefix would restore a state that consumed tokens the key does not
+    name."""
+
+    _rid = 0
+
+    cfg = CacheConfig(
+        page_size=4,
+        components=(ComponentType.FULL, ComponentType.MAMBA),
+        enable_mamba_extra_buffer=True,
+        kv_size=64,
+        max_context_len=64,
+    )
+
+    def _build_req(self, allocator, req_to_token_pool, previous_track_seqlen=8):
+        tokens = list(range(12))
+        req = UnifiedRadixCacheSuite._make_req(self, req_to_token_pool)
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.extra_key = None
+        req.swa_uuid_for_lock = None
+        req.kv.kv_committed_len = len(tokens)
+        req.kv.kv_allocated_len = len(tokens)
+        req.kv.cache_protected_len = 0
+        req.kv.mamba_last_track_seqlen = len(tokens)
+        req.kv.mamba_prev_track_seqlen = previous_track_seqlen
+        req.kv.mamba_last_track_idx = 0
+        req.kv.mamba_next_track_idx = req_to_token_pool.get_mamba_ping_pong_other_idx(0)
+
+        kv_indices = allocator.alloc(len(tokens))
+        self.assertIsNotNone(kv_indices)
+        req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(0, len(tokens))), kv_indices
+        )
+        return req, tokens
+
+    def _finish(self, cache, req):
+        req.last_node = cache.root_node_handle()
+        # Key of 11 against a checkpoint at 12: one token of overshoot.
+        cache.cache_finished_req(req, is_insert=True, kv_len_to_handle=11)
+
+    def _match(self, cache, tokens):
+        return cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+
+    def test_falls_back_to_the_previous_checkpoint(self):
+        cache, allocator, pool = build_fixture(self.cfg, mamba_cache_chunk_size=4)
+        req, tokens = self._build_req(allocator, pool)
+        previous_slot = req.kv.mamba_ping_pong_track_buffer[
+            req.kv.mamba_next_track_idx
+        ].clone()
+
+        self._finish(cache, req)
+
+        match = self._match(cache, tokens)
+        self.assertEqual(len(match.device_indices), 8)
+        value = _device_value(cache, match.last_device_node, ComponentType.MAMBA)
+        self.assertTrue(
+            torch.equal(
+                value.reshape(-1),
+                previous_slot.reshape(-1),
+            )
+        )
+        cache.sanity_check()
+
+    def test_stores_nothing_when_the_other_slot_is_unnamed(self):
+        # A donated or freed slot still holds a tensor; only
+        # mamba_prev_track_seqlen says whether a key can name what is in it.
+        cache, allocator, pool = build_fixture(self.cfg, mamba_cache_chunk_size=4)
+        req, tokens = self._build_req(allocator, pool, previous_track_seqlen=None)
+
+        self._finish(cache, req)
+
+        self.assertEqual(len(self._match(cache, tokens).device_indices), 0)
+        self.assertIsNone(req.kv.mamba_pool_idx)
+        cache.sanity_check()
+
+
 class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
     cfg = CacheConfig(
         components=(ComponentType.FULL, ComponentType.MAMBA),

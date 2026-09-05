@@ -1455,6 +1455,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
         buf[:n] = slots
         req.kv.mamba_ping_pong_track_buffer = buf
+        req.kv.mamba_prev_track_seqlen = None
         req.kv.mamba_next_track_idx = 0
         req.kv.mamba_last_track_idx = (
             0

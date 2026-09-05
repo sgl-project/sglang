@@ -460,6 +460,9 @@ class LMCRadixCache(RadixCache):
             kv_committed_len = len(req.origin_input_ids) + max(
                 len(req.output_ids) - 1, 0
             )
+        # super() already freed the KV past kv_len_to_handle, and a key beyond it
+        # names tokens the client never saw.
+        kv_committed_len = min(kv_committed_len, kv_len_to_handle)
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[

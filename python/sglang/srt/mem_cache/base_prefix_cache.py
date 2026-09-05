@@ -66,6 +66,8 @@ class InsertParams:
 
     # Mamba specific
     mamba_value: Optional[torch.Tensor] = None
+    # The ping-pong slot prepare picked; cleanup keeps that same slot.
+    mamba_keep_idx: Optional[int] = None
 
     # DSV4 NPU C128 sidecar pages, one page id per physical C128 page group.
     c128_value: Optional[torch.Tensor] = None
