@@ -130,5 +130,42 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
         self.assertFalse(self._vote(beam=True))
 
 
+class TestPrefillCudaGraphVote(CustomTestCase):
+    def _vote(self, mode):
+        runner = Mock(spec=dp_attn.PrefillCudaGraphRunner)
+        runner.enable_lora = False
+        runner.can_replay_locally.return_value = True
+        batch = SimpleNamespace(
+            forward_mode=mode,
+            extend_num_tokens=4,
+            input_embeds=None,
+            replace_embeds=None,
+            prefix_lens=[1, 1],
+            return_logprob=False,
+            batch_size=lambda: 2,
+        )
+        vote = dp_attn._local_prefill_cuda_graph_vote(
+            local_batch=batch,
+            prefill_graph_runner=runner,
+            coordinated_prefill=True,
+            breakable_prefill=True,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            model_config=object(),
+        )
+        return vote, runner
+
+    def test_extend_batch_votes_for_prefill_graph(self):
+        vote, runner = self._vote(ForwardMode.EXTEND)
+
+        self.assertTrue(vote)
+        runner.can_replay_locally.assert_called_once()
+
+    def test_mixed_batch_forces_eager_fallback(self):
+        vote, runner = self._vote(ForwardMode.MIXED)
+
+        self.assertFalse(vote)
+        runner.can_replay_locally.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

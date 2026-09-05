@@ -289,16 +289,17 @@ def _local_prefill_cuda_graph_vote(
     model_config,
 ) -> bool:
     """This rank's vote for the prefill graph (min-reduced across dp
-    ranks). Extend/mixed batches vote their own replayability; a decode
-    batch eligible for the decode->extend conversion votes as its 1-token-
-    extend view, so the vote and the post-sync conversion always agree."""
+    ranks). Pure extend batches vote their own replayability; mixed batches
+    stay eager. A decode batch eligible for the decode->extend conversion
+    votes as its 1-token-extend view, so the vote and the post-sync conversion
+    always agree."""
     if local_batch is None or local_batch.forward_mode.is_idle():
         return True
     if not coordinated_prefill:
         return False
 
     mode = local_batch.forward_mode
-    if mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
+    if mode == ForwardMode.EXTEND:
         num_tokens = local_batch.extend_num_tokens
         input_embeds = local_batch.input_embeds
         replace_embeds = local_batch.replace_embeds

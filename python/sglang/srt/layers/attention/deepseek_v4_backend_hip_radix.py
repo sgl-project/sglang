@@ -146,6 +146,31 @@ class UnifiedKvMetadata:
             assign_fields=["swa_loc"],
         )
 
+    def refresh_for_breakable_cuda_graph_replay_(
+        self, other: UnifiedKvMetadata
+    ) -> None:
+        copy_metadata(
+            src=other,
+            dst=self,
+            check_eq_fields=[],
+            copy_fields=[
+                "swa_loc",
+                "swa_indices",
+                "swa_indptr",
+                "hca_indices",
+                "hca_indptr",
+                "csa_indices",
+                "csa_indptr",
+                "pf_state_slot",
+                "pf_chunk_start",
+                "pf_cu_q",
+                "pf_final_pos",
+                "verify_store_state_slot",
+                "c4_out_loc",
+                "c128_out_loc",
+            ],
+        )
+
 
 @dataclass
 class DSV4AttnMetadata:
@@ -236,6 +261,51 @@ class DSV4AttnMetadata:
                 "c128_flashmla_metadata",
             ],
         )
+
+    def refresh_for_breakable_cuda_graph_replay_(self, other: DSV4AttnMetadata) -> None:
+        assert self.c4_sparse_topk == other.c4_sparse_topk
+        assert self.page_size == other.page_size
+        assert self.cuda_int32_kwargs == other.cuda_int32_kwargs
+
+        tensor_copy_fields = [
+            "raw_out_loc",
+            "seq_lens_casual",
+            "positions_casual",
+            "swa_out_cache_loc",
+            "c4_out_loc",
+            "c128_out_loc",
+            "page_table",
+            "swa_page_indices",
+            "swa_topk_lengths",
+            "c128_page_indices",
+            "c128_topk_lengths_clamp1",
+            "c128_topk_lengths_raw",
+            "c4_topk_lengths_raw",
+            "c4_topk_lengths_clamp1",
+            "c4_sparse_topk_lengths",
+            "c4_sparse_topk_lengths_raw",
+            "c4_sparse_page_indices",
+            "c4_sparse_raw_indices",
+        ]
+        for field_name in tensor_copy_fields:
+            src_val = getattr(other, field_name)
+            dst_val = getattr(self, field_name)
+            if src_val is None and dst_val is None:
+                continue
+            assert src_val is not None and dst_val is not None, (
+                f"{field_name=} {src_val=} {dst_val=}"
+            )
+            dst_val.copy_(src_val)
+
+        if self.unified is None and other.unified is None:
+            pass
+        else:
+            assert self.unified is not None and other.unified is not None
+            self.unified.refresh_for_breakable_cuda_graph_replay_(other.unified)
+
+        self.c1_flashmla_metadata = other.c1_flashmla_metadata
+        self.c4_flashmla_metadata = other.c4_flashmla_metadata
+        self.c128_flashmla_metadata = other.c128_flashmla_metadata
 
     def init_compression_metadata(self, unified_swa_pages: int = 0):
         assert self.page_table.dim() == 2
@@ -383,6 +453,37 @@ class DSV4Metadata:
             self.c128_compress_metadata, src=other.c128_compress_metadata
         )
 
+    def refresh_for_breakable_cuda_graph_replay_(self, other: DSV4Metadata) -> None:
+        self.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(
+            other.core_attn_metadata
+        )
+        maybe_copy_inplace(self.indexer_metadata, src=other.indexer_metadata)
+        maybe_copy_inplace(self.c4_compress_metadata, src=other.c4_compress_metadata)
+        maybe_copy_inplace(
+            self.c128_compress_metadata, src=other.c128_compress_metadata
+        )
+
+        if self.fp4_k_write_metadata is None and other.fp4_k_write_metadata is None:
+            pass
+        else:
+            assert (
+                self.fp4_k_write_metadata is not None
+                and other.fp4_k_write_metadata is not None
+            )
+            for captured, replay in zip(
+                self.fp4_k_write_metadata,
+                other.fp4_k_write_metadata,
+                strict=True,
+            ):
+                captured.copy_(replay)
+
+        if self.fp4_q_positions is None and other.fp4_q_positions is None:
+            pass
+        else:
+            assert self.fp4_q_positions is not None
+            assert other.fp4_q_positions is not None
+            self.fp4_q_positions.copy_(other.fp4_q_positions)
+
 
 @dataclass
 class DSV4RawVerifyMetadata:
@@ -439,6 +540,7 @@ class DeepseekV4HipRadixBackend(
     # TboAttnBackend reads this to skip children in the *_graph paths only.
     tbo_supports_cuda_graph = False
     supports_ragged_verify_graph: bool = True
+    use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
 
     def __init__(
         self,
@@ -582,10 +684,21 @@ class DeepseekV4HipRadixBackend(
         self._attach_unified_kv_prefill_meta(
             core_attn_metadata,
             req_pool_indices,
+            req_pool_indices_repeated,
             seq_lens,
             extend_seq_lens,
             num_tokens,
             need_compress=need_compress,
+            repeat_output_size=(
+                num_tokens
+                if (
+                    need_compress
+                    and not attach_decode_streams
+                    and extend_seq_lens_cpu is not None
+                    and sum(extend_seq_lens_cpu) == num_tokens
+                )
+                else None
+            ),
         )
         if attach_decode_streams:
             # Target-verify runs through the unified_kv DECODE kernel, so build
@@ -602,33 +715,41 @@ class DeepseekV4HipRadixBackend(
         )
         if not need_compress:
             create = _create_dummy_paged_compress_data
-        elif compress_gpu_plan:
-            create = functools.partial(
-                create_paged_compressor_data,
-                is_prefill=True,
-                token_to_kv_pool=self.token_to_kv_pool,
-                req_to_token=self.req_to_token,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                seq_lens_cpu=None,
-                extend_lens=extend_seq_lens,
-                extend_lens_cpu=None,
-                num_q_tokens=num_tokens,
-                use_prefill_cuda_graph=use_prefill_cuda_graph,
-            )
         else:
-            create = functools.partial(
-                create_paged_compressor_data,
-                is_prefill=True,
-                token_to_kv_pool=self.token_to_kv_pool,
-                req_to_token=self.req_to_token,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens_cpu,
-                extend_lens=extend_seq_lens,
-                extend_lens_cpu=extend_seq_lens_cpu,
-                use_prefill_cuda_graph=use_prefill_cuda_graph,
-            )
+
+            def create(compress_ratio: Literal[4, 128]):
+                use_graph_plan = use_prefill_cuda_graph and not (
+                    compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+                )
+                if compress_gpu_plan or use_graph_plan:
+                    return create_paged_compressor_data(
+                        compress_ratio=compress_ratio,
+                        is_prefill=True,
+                        token_to_kv_pool=self.token_to_kv_pool,
+                        req_to_token=self.req_to_token,
+                        req_pool_indices=req_pool_indices,
+                        seq_lens=seq_lens,
+                        seq_lens_cpu=None,
+                        extend_lens=extend_seq_lens,
+                        extend_lens_cpu=None,
+                        num_q_tokens=(
+                            out_cache_loc.shape[0] if use_graph_plan else num_tokens
+                        ),
+                        use_prefill_cuda_graph=use_prefill_cuda_graph,
+                    )
+                return create_paged_compressor_data(
+                    compress_ratio=compress_ratio,
+                    is_prefill=True,
+                    token_to_kv_pool=self.token_to_kv_pool,
+                    req_to_token=self.req_to_token,
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
+                    seq_lens_cpu=seq_lens_cpu,
+                    extend_lens=extend_seq_lens,
+                    extend_lens_cpu=extend_seq_lens_cpu,
+                    use_prefill_cuda_graph=False,
+                )
+
         return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
@@ -1097,10 +1218,13 @@ class DeepseekV4HipRadixBackend(
                 else None
             )
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
-        if self.mtp_enabled and forward_batch.forward_mode.is_idle():
-            return
-
+    def _build_forward_metadata(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        max_seq_len_override: Optional[int] = None,
+        use_prefill_cuda_graph: bool = False,
+    ):
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens.to(torch.int32)
         seq_lens_cpu = forward_batch.seq_lens_cpu
@@ -1108,7 +1232,11 @@ class DeepseekV4HipRadixBackend(
 
         assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
         assert seq_lens_cpu is not None
-        max_seq_len = int(seq_lens_cpu.max().item())
+        max_seq_len = (
+            max_seq_len_override
+            if max_seq_len_override is not None
+            else int(seq_lens_cpu.max().item())
+        )
 
         if forward_batch.forward_mode.is_decode_or_idle():
             # DSv4 bakes this step's KV write target (c4/c128) into metadata,
@@ -1162,13 +1290,57 @@ class DeepseekV4HipRadixBackend(
                 extend_seq_lens=extend_seq_lens,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
                 need_compress=not is_draft,
+                use_prefill_cuda_graph=use_prefill_cuda_graph,
             )
         else:
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
 
-        self.forward_metadata = metadata
+        return metadata
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
+        if self.mtp_enabled and forward_batch.forward_mode.is_idle():
+            return
+
+        self.forward_metadata = self._build_forward_metadata(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
         self._refresh_fp4_prefill_workspace(forward_batch)
+
+    def init_forward_metadata_for_breakable_cuda_graph_capture(
+        self, forward_batch: ForwardBatch
+    ):
+        self.forward_metadata = self._build_forward_metadata(
+            forward_batch,
+            max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            use_prefill_cuda_graph=True,
+        )
+        self.init_forward_metadata_in_graph(forward_batch)
+        self._refresh_fp4_prefill_workspace(forward_batch)
+        assert isinstance(self.forward_metadata, DSV4Metadata)
+        return self.forward_metadata
+
+    def prepare_forward_metadata_for_breakable_cuda_graph_replay(
+        self,
+        capture_metadata,
+        forward_batch: ForwardBatch,
+        *,
+        static_forward_batch: Optional[ForwardBatch] = None,
+    ) -> None:
+        replay_batch = (
+            static_forward_batch if static_forward_batch is not None else forward_batch
+        )
+        replay_metadata = self._build_forward_metadata(
+            replay_batch,
+            max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            use_prefill_cuda_graph=True,
+        )
+        self.forward_metadata = replay_metadata
+        self.init_forward_metadata_in_graph(replay_batch)
+
+        assert isinstance(capture_metadata, DSV4Metadata)
+        assert isinstance(replay_metadata, DSV4Metadata)
+        capture_metadata.refresh_for_breakable_cuda_graph_replay_(replay_metadata)
+        self.forward_metadata = capture_metadata
+        self._refresh_fp4_prefill_workspace(replay_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
         self.cuda_graph_metadata_of_bucket_and_bs: Dict[
@@ -1280,10 +1452,12 @@ class DeepseekV4HipRadixBackend(
         self,
         core: DSV4AttnMetadata,
         req_pool_indices: torch.Tensor,
+        req_pool_indices_repeated: torch.Tensor,
         seq_lens: torch.Tensor,
         extend_seq_lens: torch.Tensor,
         num_tokens: int,
         need_compress: bool = True,
+        repeat_output_size: Optional[int] = None,
     ) -> None:
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -1295,10 +1469,10 @@ class DeepseekV4HipRadixBackend(
         bs = req_pool_indices.shape[0]
         seq_lens = seq_lens.to(torch.int64)
         extend_seq_lens = extend_seq_lens.to(torch.int64)
-        # token -> req index (length L = sum(extend_seq_lens)).
-        # output_size skips the implicit sum() D2H on draft-extend. dropping it on the
-        # target-extend path triggers a GPU memory access fault.
-        if need_compress:
+        # Draft extend already supplies an exact output size. Target prefill may
+        # opt in when its CPU length mirror proves the actual query count;
+        # GPU-only/ragged paths retain the established fallback.
+        if need_compress and repeat_output_size is None:
             bid = torch.repeat_interleave(
                 torch.arange(bs, device=device, dtype=torch.int64),
                 extend_seq_lens,
@@ -1307,15 +1481,41 @@ class DeepseekV4HipRadixBackend(
             bid = torch.repeat_interleave(
                 torch.arange(bs, device=device, dtype=torch.int64),
                 extend_seq_lens,
-                output_size=num_tokens,
+                output_size=(
+                    num_tokens
+                    if repeat_output_size is None
+                    else repeat_output_size
+                ),
             )
         if core.unified is None:
             core.unified = UnifiedKvMetadata()
-        core.unified.pf_state_slot = req_pool_indices[bid]
-        core.unified.pf_chunk_start = (seq_lens - extend_seq_lens)[bid]
+        state_slot = req_pool_indices[bid]
+        chunk_start = (seq_lens - extend_seq_lens)[bid]
         cu_q_per_req = torch.cumsum(extend_seq_lens, dim=0) - extend_seq_lens
-        core.unified.pf_cu_q = cu_q_per_req[bid]
-        core.unified.pf_final_pos = (seq_lens - 1)[bid]
+        cu_q = cu_q_per_req[bid]
+        final_pos = (seq_lens - 1)[bid]
+
+        padded_num_tokens = core.positions_casual.shape[0]
+        assert num_tokens <= padded_num_tokens
+        if num_tokens < padded_num_tokens:
+            pad_size = padded_num_tokens - num_tokens
+            state_slot = torch.cat(
+                (state_slot, req_pool_indices_repeated[num_tokens:padded_num_tokens])
+            )
+            chunk_start = F.pad(chunk_start, (0, pad_size), value=0)
+            cu_q = F.pad(cu_q, (0, pad_size), value=0)
+            # Padded positions are zero. final_pos=win makes the SWA store's
+            # `pos <= final_pos - win` guard skip every padded row.
+            final_pos = F.pad(
+                final_pos,
+                (0, pad_size),
+                value=self.token_to_kv_pool.unified_swa_window,
+            )
+
+        core.unified.pf_state_slot = state_slot
+        core.unified.pf_chunk_start = chunk_start
+        core.unified.pf_cu_q = cu_q
+        core.unified.pf_final_pos = final_pos
 
     def _forward_unified_kv(
         self,
@@ -1654,16 +1854,12 @@ class DeepseekV4HipRadixBackend(
             swa_page_indices = core_attn_metadata.swa_page_indices
             swa_topk_lengths = core_attn_metadata.swa_topk_lengths
 
-            if self.mtp_enabled:
-                if swa_page_indices.shape[0] != q.shape[0]:
-                    swa_page_indices = _pad_tensor_to_size(
-                        swa_page_indices, q.shape[0], value=0
-                    )
-
-                if swa_topk_lengths.shape[0] != q.shape[0]:
-                    swa_topk_lengths = _pad_tensor_to_size(
-                        swa_topk_lengths, q.shape[0], value=1
-                    )
+            swa_page_indices = _match_num_queries(swa_page_indices, q.shape[0], value=0)
+            swa_topk_lengths = _match_num_queries(swa_topk_lengths, q.shape[0], value=1)
+            extra_indices = _match_num_queries(extra_indices, q.shape[0], value=-1)
+            extra_topk_lengths = _match_num_queries(
+                extra_topk_lengths, q.shape[0], value=1
+            )
 
             if q.ndim == 3:
                 q = q.unsqueeze(1)
@@ -1942,6 +2138,33 @@ class DeepseekV4MultiStepBackend(DeepseekV4HipRadixBackend):
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata(forward_batch)
 
+    def init_forward_metadata_for_breakable_cuda_graph_capture(
+        self, forward_batch: ForwardBatch
+    ):
+        return [
+            self.attn_backends[
+                i
+            ].init_forward_metadata_for_breakable_cuda_graph_capture(forward_batch)
+            for i in range(self.speculative_num_steps - 1)
+        ]
+
+    def prepare_forward_metadata_for_breakable_cuda_graph_replay(
+        self,
+        capture_metadata,
+        forward_batch: ForwardBatch,
+        *,
+        static_forward_batch: Optional[ForwardBatch] = None,
+    ) -> None:
+        assert len(capture_metadata) == self.speculative_num_steps - 1
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends[
+                i
+            ].prepare_forward_metadata_for_breakable_cuda_graph_replay(
+                capture_metadata[i],
+                forward_batch,
+                static_forward_batch=static_forward_batch,
+            )
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for i in range(self.speculative_num_steps):
             self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
@@ -1951,7 +2174,13 @@ class DeepseekV4MultiStepBackend(DeepseekV4HipRadixBackend):
             backend.on_after_cuda_graph_warmup()
 
 
-def _pad_tensor_to_size(tensor: torch.Tensor, size: int, *, value: int = 0):
+def _match_num_queries(
+    tensor: Optional[torch.Tensor], size: int, *, value: int
+) -> Optional[torch.Tensor]:
+    if tensor is None or tensor.shape[0] == size:
+        return tensor
+    if tensor.shape[0] > size:
+        return tensor[:size]
     if value == 0:
         return torch.cat(
             [tensor, tensor.new_zeros(size - tensor.shape[0], *tensor.shape[1:])],
