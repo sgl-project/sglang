@@ -179,6 +179,7 @@ def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
     """
     if os.environ.get("SGLANG_DISABLE_SILU_FP4_QUANT_FUSION", "0") == "1":
         return
+    from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
     from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
 
     if not (
@@ -186,6 +187,17 @@ def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
         and mlp.gate_up_proj.quant_method.quant_mode == "w4a4"
         and isinstance(mlp.down_proj.quant_method, ModelOptFp4LinearMethod)
     ):
+        return
+    if get_fp4_gemm_runner_backend().is_marlin():
+        # Marlin is a weight-only (W4A16) kernel: ModelOptFp4LinearMethod.apply
+        # hands its `x` straight to apply_fp4_marlin_linear, which takes a plain
+        # activation tensor. Feeding it the fused kernel's prequantized
+        # (fp4, scale) tuple raises
+        #   "apply_fp4_marlin_linear() Expected a value of type 'Tensor' for
+        #    argument 'input' but instead found type 'tuple'"
+        # during warmup, so --fp4-gemm-backend marlin cannot start on any model
+        # that takes this path. The fusion is an optimisation for the W4A4
+        # kernels only; skip it and keep act_fn + the linear's own quant.
         return
     try:
         from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize  # noqa: F401
