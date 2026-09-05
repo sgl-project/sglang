@@ -31,6 +31,8 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     _decode_cta_count,
     _guard_page_table,
     aiter_fp4_paged_mqa_logits,
+    aiter_fp4_paged_mqa_topk,
+    aiter_fp4_streaming_topk_available,
     aiter_k_indexer_fp4_cache_write,
     aiter_q_indexer_fp4,
     prepare_fp4_decode_workspace,
@@ -823,6 +825,72 @@ def test_row_chunks_reproduce_the_unsplit_batch() -> None:
                 full[start + row, :ctx],
                 msg=f"row {start + row} (ctx={ctx})",
             )
+
+
+@pytest.mark.parametrize("topk", [512, 1024])
+def test_streaming_topk_writes_raw_and_physical_indices(topk: int) -> None:
+    if not aiter_fp4_streaming_topk_available():
+        pytest.skip("installed AITER does not expose FP4 streaming top-k")
+
+    torch.manual_seed(41 + topk)
+    contexts = [topk - 1, topk, topk + 64]
+    case = _build_logits_case(
+        len(contexts),
+        topk + 64,
+        ctx_lens=contexts,
+        shuffle_pages=True,
+    )
+    out_page_indices = torch.empty(
+        (len(contexts), topk),
+        dtype=torch.int32,
+        device=get_device(),
+    )
+    out_raw_indices = torch.empty_like(out_page_indices)
+    workspace = prepare_fp4_prefill_workspace(
+        case["page_table"],
+        case["c4_seq_lens"],
+    )
+
+    aiter_fp4_paged_mqa_topk(
+        q_fp4=case["q_fp4"],
+        q_scale=case["q_scale"],
+        k_payload=case["payload"],
+        k_scale=case["scale"],
+        weights=case["weights"],
+        page_table=case["page_table"],
+        c4_seq_lens=case["c4_seq_lens"],
+        weight_scale=case["weight_scale"],
+        out_page_indices=out_page_indices,
+        out_raw_indices=out_raw_indices,
+        prefill_workspace=workspace,
+    )
+    torch.cuda.synchronize()
+
+    for row, context in enumerate(contexts):
+        valid = min(context, topk)
+        raw = out_raw_indices[row, :valid].long()
+        assert torch.all((raw >= 0) & (raw < context))
+        assert torch.unique(raw).numel() == valid
+        if context <= topk:
+            torch.testing.assert_close(
+                raw,
+                torch.arange(context, device=raw.device),
+                rtol=0,
+                atol=0,
+            )
+        expected_slots = (
+            case["page_table"][row, raw // PAGE_SIZE].long() * PAGE_SIZE
+            + raw % PAGE_SIZE
+        )
+        torch.testing.assert_close(
+            out_page_indices[row, :valid].long(),
+            expected_slots,
+            rtol=0,
+            atol=0,
+        )
+        if valid < topk:
+            assert torch.all(out_raw_indices[row, valid:] == -1)
+            assert torch.all(out_page_indices[row, valid:] == -1)
 
 
 if __name__ == "__main__":

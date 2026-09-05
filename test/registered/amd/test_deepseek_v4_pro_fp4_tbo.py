@@ -91,6 +91,7 @@ class TestDeepseekV4ProFp4Tbo(CustomTestCase):
             "--disable-radix-cache",
             "--attention-backend",
             "dsv4",
+            "--enable-deepseek-v4-fp4-indexer",
             "--kv-cache-dtype",
             "fp8_e4m3",
             "--max-running-requests",

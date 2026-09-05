@@ -476,6 +476,22 @@ class DeepseekV4HipRadixBackend(
         self.enable_deepseek_v4_fp4_indexer: bool = (
             model_runner.server_args.enable_deepseek_v4_fp4_indexer
         )
+        self.use_aiter_fp4_streaming_topk = False
+        if (
+            self.enable_deepseek_v4_fp4_indexer
+            and envs.SGLANG_DSV4_FP4_FUSED_TOPK.get()
+            and self.dsa_topk_backend.is_sgl_kernel()
+        ):
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+                aiter_fp4_streaming_topk_available,
+            )
+
+            self.use_aiter_fp4_streaming_topk = aiter_fp4_streaming_topk_available()
+        if self.enable_deepseek_v4_fp4_indexer:
+            logger.info(
+                "AITER FP4 streaming top-k: %s",
+                "enabled" if self.use_aiter_fp4_streaming_topk else "legacy fallback",
+            )
         self.topk = get_spec().speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
         self.mtp_enabled = self.topk > 0

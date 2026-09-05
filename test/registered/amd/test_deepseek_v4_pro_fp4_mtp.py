@@ -69,6 +69,7 @@ class TestDeepseekV4ProFp4MTP(CustomTestCase):
             "--disable-radix-cache",
             "--attention-backend",
             "dsv4",
+            "--enable-deepseek-v4-fp4-indexer",
             # MTP / EAGLE speculative decoding (NextN head from the base model).
             "--speculative-algorithm",
             "EAGLE",

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple, Union
+from functools import lru_cache
+from typing import TYPE_CHECKING, Callable, NamedTuple, Optional, Tuple, Union
 
 import torch
 
@@ -39,6 +40,24 @@ _LOGITS_BUDGET_ELEMS = (
     int(os.environ.get("SGLANG_DSV4_FP4_LOGITS_BUDGET_MB", "2048")) * 2**20 // 4
 )
 _LOGITS_POOL: dict = {}
+
+
+@lru_cache(maxsize=1)
+def get_aiter_fp4_streaming_topk() -> Optional[Callable]:
+    """Resolve the optional fused AITER entry point once, before graph capture."""
+    try:
+        from aiter.ops.flydsl import flydsl_pa_mqa_topk_fp4_prefill
+    except (AttributeError, ImportError):
+        return None
+    return (
+        flydsl_pa_mqa_topk_fp4_prefill
+        if callable(flydsl_pa_mqa_topk_fp4_prefill)
+        else None
+    )
+
+
+def aiter_fp4_streaming_topk_available() -> bool:
+    return get_aiter_fp4_streaming_topk() is not None
 
 
 class FP4DecodeWorkspace(NamedTuple):
@@ -420,6 +439,92 @@ def aiter_fp4_paged_mqa_logits(
         )
 
     return logits
+
+
+def aiter_fp4_paged_mqa_topk(
+    *,
+    q_fp4: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_payload: torch.Tensor,
+    k_scale: torch.Tensor,
+    weights: torch.Tensor,
+    page_table: torch.Tensor,
+    c4_seq_lens: torch.Tensor,
+    weight_scale: float,
+    out_page_indices: torch.Tensor,
+    out_raw_indices: Optional[torch.Tensor] = None,
+    prefill_workspace: Optional[FP4PrefillWorkspace] = None,
+) -> None:
+    """Run AITER's bounded FP4 score + exact TopK prefill operator."""
+    fused_topk = get_aiter_fp4_streaming_topk()
+    if fused_topk is None:
+        raise RuntimeError("The installed AITER does not expose FP4 streaming top-k")
+
+    from aiter.ops.flydsl import FP4PrefillTopKResult
+
+    num_tokens = q_fp4.shape[0]
+    c4_seq_lens = _as_int32_1d(c4_seq_lens)
+    expected_width = _guarded_pages(page_table.shape[1]) * _KV_BLOCK_SIZE
+    workspace = prefill_workspace
+    if workspace is not None and (
+        workspace.guarded_page_table.shape[0] != num_tokens
+        or workspace.max_seq_len != expected_width
+    ):
+        workspace = None
+
+    if workspace is None:
+        guarded_page_table, max_seq_len = _guard_page_table(page_table)
+        row_to_batch = torch.arange(
+            num_tokens,
+            dtype=torch.int32,
+            device=page_table.device,
+        )
+        local_starts = torch.zeros_like(c4_seq_lens)
+    else:
+        guarded_page_table = workspace.guarded_page_table
+        max_seq_len = workspace.max_seq_len
+        row_to_batch = workspace.row_to_batch
+        local_starts = workspace.local_starts
+
+    raw_indices = (
+        out_raw_indices
+        if out_raw_indices is not None
+        else torch.empty_like(out_page_indices)
+    )
+    out = FP4PrefillTopKResult(
+        values=torch.empty(
+            out_page_indices.shape,
+            dtype=torch.float32,
+            device=q_fp4.device,
+        ),
+        raw_indices=raw_indices,
+        physical_indices=out_page_indices,
+        counts=torch.empty(
+            num_tokens,
+            dtype=torch.int32,
+            device=q_fp4.device,
+        ),
+    )
+    fused_topk(
+        q_fp4.view(torch.uint8),
+        q_scale,
+        k_payload.view(torch.uint8),
+        k_scale,
+        guarded_page_table,
+        weights,
+        row_to_batch,
+        local_starts,
+        c4_seq_lens,
+        max_seq_len,
+        topk=out_page_indices.shape[1],
+        weight_scale=weight_scale,
+        block_k=256,
+        kv_block_size=_KV_BLOCK_SIZE,
+        num_warps=4,
+        parallel_unit_num=max(_PREFILL_BASE_CTA_TARGET, num_tokens),
+        out=out,
+        stream=torch.cuda.current_stream(q_fp4.device),
+    )
 
 
 def prepare_fp4_k_write_metadata(
