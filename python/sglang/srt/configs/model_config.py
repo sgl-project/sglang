@@ -149,6 +149,15 @@ def is_deepseek_dsa(config) -> bool:
     )
 
 
+def is_glm_moe_dsa(config) -> bool:
+    """True for GLM-5.2 GlmMoeDsa models. The ``"GlmMoeDsa"`` substring matches
+    both the main arch ``GlmMoeDsaForCausalLM`` and the NextN draft head
+    ``GlmMoeDsaForCausalLMNextN``."""
+    return any(
+        "GlmMoeDsa" in arch for arch in (_hf_attr(config, "architectures") or [])
+    )
+
+
 def is_kimi_k3(config) -> bool:
     return _hf_arch(config) in (
         "KimiK3ForConditionalGeneration",

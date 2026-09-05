@@ -1757,9 +1757,20 @@ def biased_grouped_topk_gpu(
 
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
+        # Don't re-downcast an fp32 correction bias at the aiter boundary: an
+        # offset bias loses too many levels in bf16 and reorders top-k. Cast the
+        # gating logits up instead. Gated on the bias dtype rather than the
+        # architecture, so a bias that arrives as bf16 is byte-identical to
+        # before, as is the radix4 path above.
+        if correction_bias.dtype == torch.float32:
+            aiter_gating_output = gating_output.to(torch.float32)
+            aiter_bias = correction_bias
+        else:
+            aiter_gating_output = gating_output
+            aiter_bias = bias
         aiter_biased_grouped_topk(
-            gating_output,
-            bias,
+            aiter_gating_output,
+            aiter_bias,
             topk_weights,
             topk_ids,
             num_expert_group,
