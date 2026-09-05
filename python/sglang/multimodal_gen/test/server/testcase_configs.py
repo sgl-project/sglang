@@ -117,6 +117,9 @@ class ScenarioConfig:
     estimated_full_test_time_s: float | None = None
     load_peak_vram_mb: float | None = None
     runtime_peak_vram_mb: float | None = None
+    # Peak of the warmup calibration probe (the default workload's full shape
+    # under the load-safe placement); None skips the check until a baseline exists.
+    warmup_peak_vram_mb: float | None = None
     # Anonymous-host budget caps; None skips the check (older baselines).
     load_peak_host_anon_mb: float | None = None
     runtime_peak_host_anon_mb: float | None = None
@@ -136,6 +139,7 @@ class ScenarioConfig:
             estimated_full_test_time_s=optional_float("estimated_full_test_time_s"),
             load_peak_vram_mb=optional_float("load_peak_vram_mb"),
             runtime_peak_vram_mb=optional_float("runtime_peak_vram_mb"),
+            warmup_peak_vram_mb=optional_float("warmup_peak_vram_mb"),
             load_peak_host_anon_mb=optional_float("load_peak_host_anon_mb"),
             runtime_peak_host_anon_mb=optional_float("runtime_peak_host_anon_mb"),
         )
