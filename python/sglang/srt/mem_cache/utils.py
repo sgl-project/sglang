@@ -92,12 +92,11 @@ def maybe_init_custom_mem_pool(
     Returns:
         Tuple of (enable_custom_mem_pool, custom_mem_pool, custom_mem_pool_type)
     """
-    enable_custom_mem_pool = (
-        True if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None else False
-    )
+    enable_custom_mem_pool = envs.SGLANG_CUSTOM_MEM_POOL.get() is not None
 
     if enable_custom_mem_pool:
-        # Currently, only mooncake requires a custom mem pool for MNNVL/Barex PD disaggregation
+        # The allocator ships in the mooncake package, but the pool it returns is
+        # transfer-backend-agnostic; the NIXL backend registers the same memory.
         from sglang.srt.disaggregation.mooncake.utils import (
             init_mooncake_custom_mem_pool,
         )
