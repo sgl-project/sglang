@@ -405,7 +405,7 @@ class ServerManager:
             "--log-level=debug",
         ]
         if self.extra_args.strip():
-            command.extend(self.extra_args.strip().split())
+            command.extend(shlex.split(self.extra_args))
         access_log_exclude_flag = "--uvicorn-access-log-exclude-prefixes"
         if not any(arg.startswith(access_log_exclude_flag) for arg in command):
             command.extend(["--uvicorn-access-log-exclude-prefixes", "/health"])
@@ -590,6 +590,7 @@ class PerformanceValidator:
         summary: PerformanceSummary,
         expected_load_peak_vram_mb: float,
         expected_runtime_peak_vram_mb: float,
+        expected_warmup_peak_vram_mb: float | None = None,
     ) -> None:
         assert summary.load_peak_vram_mb > 0, "Load peak VRAM metric missing"
         assert summary.runtime_peak_vram_mb > 0, "Runtime peak VRAM metric missing"
@@ -609,6 +610,18 @@ class PerformanceValidator:
             min_abs_tolerance=128.0,
             unit=" MiB",
         )
+        # The warmup probe runs the default workload's full shape before any
+        # placement is promoted: a card that cannot hold it fails at startup,
+        # so its peak is held to a baseline of its own once one exists.
+        if expected_warmup_peak_vram_mb is not None and summary.warmup_peak_vram_mb > 0:
+            self._assert_le(
+                "Warmup Peak VRAM",
+                summary.warmup_peak_vram_mb,
+                expected_warmup_peak_vram_mb,
+                self.tolerances.runtime_peak_vram,
+                min_abs_tolerance=128.0,
+                unit=" MiB",
+            )
 
     def validate_peak_host_anon(
         self,

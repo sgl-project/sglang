@@ -1518,6 +1518,7 @@
             "expected_median_denoise_ms": 1010.9,
             "load_peak_vram_mb": 27320.0,
             "runtime_peak_vram_mb": 35926.0,
+            "warmup_peak_vram_mb": 56748.0,
             "estimated_full_test_time_s": 77.0
         },
         "wan2_2_i2v_a14b_2gpu": {
@@ -1647,6 +1648,7 @@
             "expected_median_denoise_ms": 656.68,
             "load_peak_vram_mb": 35350.0,
             "runtime_peak_vram_mb": 42674.0,
+            "warmup_peak_vram_mb": 45782.0,
             "estimated_full_test_time_s": 243.0
         },
         "wan2_1_i2v_14b_720P_2gpu": {
@@ -1775,6 +1777,7 @@
             "expected_median_denoise_ms": 2020.71,
             "load_peak_vram_mb": 6440.0,
             "runtime_peak_vram_mb": 21524.0,
+            "warmup_peak_vram_mb": 26902.0,
             "estimated_full_test_time_s": 204.3
         },
         "wan2_1_t2v_14b_2gpu": {
