@@ -16,6 +16,7 @@ from sglang.srt.managers.load_snapshot import (
     _zmq_addr_for,
     create_load_snapshot_reader,
     create_load_snapshot_writer,
+    is_load_aware_method,
     should_use_zmq,
     zmq_reader_owner,
 )
@@ -341,13 +342,16 @@ class TestZmqReaderOwner(CustomTestCase):
         )
 
     def test_data_parallel_controller_owns_load_aware(self):
-        for method in ("total_tokens", "total_requests"):
+        for method in ("total_tokens", "total_requests", "prefix_affinity"):
             self.assertEqual(
                 self._owners(
                     dp_size=4, tokenizer_worker_num=8, load_balance_method=method
                 ),
                 {"DataParallelController"},
             )
+
+    def test_load_aware_method_names_are_case_insensitive(self):
+        self.assertTrue(is_load_aware_method("PREFIX_AFFINITY"))
 
     def test_tokenizer_manager_owns_dp4_round_robin(self):
         self.assertEqual(
@@ -384,7 +388,12 @@ class TestZmqReaderOwner(CustomTestCase):
     def test_at_most_one_owner_across_configs(self):
         for dp_size in (1, 4):
             for tw in (1, 8):
-                for method in ("round_robin", "total_tokens", "total_requests"):
+                for method in (
+                    "round_robin",
+                    "total_tokens",
+                    "total_requests",
+                    "prefix_affinity",
+                ):
                     for node_rank in (0, 1):
                         owners = self._owners(
                             dp_size=dp_size,

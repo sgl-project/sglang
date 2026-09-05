@@ -1001,10 +1001,42 @@ class ServerArgs:
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
+                "prefix_affinity",
             ],
         ),
         NS("parallel"),
     ] = "auto"
+    prefix_affinity_fallback: A[
+        str,
+        Arg(
+            help=(
+                "Load-balance method used by 'prefix_affinity' when it cannot honor "
+                "affinity (no routing key and token fallback disabled or unusable, "
+                "or all live ranks over the load-skew threshold)."
+            ),
+            choices=["round_robin", "total_requests", "total_tokens"],
+        ),
+        NS("parallel"),
+    ] = "total_tokens"
+    prefix_affinity_max_load_skew: A[
+        float,
+        "For 'prefix_affinity': a rank is considered overloaded when its load exceeds "
+        "this multiple of the average load across live ranks, at which point routing "
+        "skips it to keep load balanced. Must be >= 1.0.",
+        NS("parallel"),
+    ] = 1.5
+    prefix_affinity_hash_tokens: A[
+        int,
+        "For 'prefix_affinity': number of leading input tokens hashed for the "
+        "token-prefix fallback key when a request has no routing key.",
+        NS("parallel"),
+    ] = 4096
+    prefix_affinity_disable_token_fallback: A[
+        bool,
+        "For 'prefix_affinity': disable the token-prefix fallback key so that requests "
+        "without an explicit routing key go straight to the fallback load-balance method.",
+        NS("parallel"),
+    ] = False
     attn_cp_size: A[
         int,
         Arg(
