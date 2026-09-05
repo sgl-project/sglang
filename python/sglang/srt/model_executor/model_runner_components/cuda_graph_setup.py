@@ -212,10 +212,12 @@ def capture_cuda_graphs(
         )
 
         world_group = get_world_group()
+        # Solo boot: deep_gemm's WORLD all_reduce has no matching peer -> wedge.
+        solo_join = model_runner.server_args.is_ep_offset_joiner
         available_memory_gb = get_available_gpu_memory(
             model_runner.device,
             model_runner.gpu_id,
-            distributed=world_group.world_size > 1,
+            distributed=not solo_join and world_group.world_size > 1,
             cpu_group=world_group.cpu_group,
         )
         budget_bytes = set_masked_standard_layout_memory_budget(

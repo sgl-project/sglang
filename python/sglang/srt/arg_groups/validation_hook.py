@@ -29,8 +29,8 @@ def check_server_args(server_args: Any):
 
     cfg = resolving_view(server_args)
 
-    # Check parallel size constraints
-    if cfg.ep_join_mode != "scale":
+    # Check parallel size constraints (offset joiners run per-cohort tp_size).
+    if not server_args.is_ep_offset_joiner:
         assert (cfg.tp_size * cfg.pp_size) % cfg.nnodes == 0, (
             "tp_size must be divisible by number of nodes"
         )
