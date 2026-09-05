@@ -1606,6 +1606,7 @@ class TestNgramExternalSamArgs(CustomTestCase):
         args.speculative_algorithm = "NGRAM"
         args.speculative_num_draft_tokens = 12
         args.device = "cuda"
+        args.page_size = 1
         for key, value in overrides.items():
             setattr(args, key, value)
         return args
@@ -1619,6 +1620,37 @@ class TestNgramExternalSamArgs(CustomTestCase):
         with self.assertRaises(ValueError) as context:
             handle_speculative_decoding(args)
         self.assertIn("speculative_num_draft_tokens - 1", str(context.exception))
+
+    def test_sam_match_depth_defaults_to_trie_depth(self):
+        args = self._make_dummy_ngram_args(
+            speculative_ngram_max_trie_depth=32,
+        )
+        handle_speculative_decoding(args)
+        self.assertEqual(
+            resolution_result(args, "speculative_ngram_max_sam_match_depth"), 32
+        )
+
+    def test_sam_match_depth_must_be_positive(self):
+        args = self._make_dummy_ngram_args(
+            speculative_ngram_max_sam_match_depth=0,
+        )
+        with self.assertRaisesRegex(ValueError, "max-sam-match-depth"):
+            handle_speculative_decoding(args)
+
+    def test_sam_match_depth_cli_flag_round_trip(self):
+        args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--speculative-algorithm",
+                "NGRAM",
+                "--speculative-ngram-max-sam-match-depth",
+                "64",
+            ]
+        )
+        self.assertEqual(
+            resolution_result(args, "speculative_ngram_max_sam_match_depth"), 64
+        )
 
     def test_external_corpus_max_tokens_must_be_positive(self):
         args = self._make_dummy_ngram_args(
