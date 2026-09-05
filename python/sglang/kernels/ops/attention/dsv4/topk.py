@@ -12,6 +12,7 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 from sglang.srt.utils import is_xpu
+from sglang.srt.utils.custom_op import register_custom_op
 
 from .utils import make_name
 
@@ -129,6 +130,26 @@ def topk_transform_ragged_v2(
     module.topk_transform_ragged(scores, seq_lens, row_starts, out_offsets, out_indices)
 
 
+# The JIT module exposes a bare tvm_ffi Function; Dynamo cannot trace its __call__,
+# which is fatal under the fullgraph piecewise prefill backend. Keep the launch opaque
+# behind a custom op. Only `page_indices` is written -- the kernel takes `scores` as
+# `const float*`. The XPU branch already goes through a registered op.
+@register_custom_op(
+    op_name="dsv4_topk_transform_paged_v2", mutates_args=["out_page_indices"]
+)
+def _topk_transform_paged_v2_jit(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: Optional[torch.Tensor],
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    metadata: torch.Tensor,
+) -> None:
+    _jit_topk_v2_module().topk_transform_paged(
+        scores, seq_lens, page_tables, out_page_indices, page_size, metadata
+    )
+
+
 def topk_transform_paged_v2(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -167,8 +188,7 @@ def topk_transform_paged_v2(
             metadata,
         )
         return
-    module = _jit_topk_v2_module()
-    module.topk_transform_paged(
+    _topk_transform_paged_v2_jit(
         scores,
         seq_lens,
         page_tables,
