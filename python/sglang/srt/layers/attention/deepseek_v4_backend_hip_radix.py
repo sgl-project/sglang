@@ -36,13 +36,16 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
-from sglang.srt.utils import ceil_align
+from sglang.srt.utils import ceil_align, get_bool_env_var
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -349,6 +352,92 @@ class DSV4AttnMetadata:
         self.c1_flashmla_metadata = _create_flashmla_metadata()
         self.c4_flashmla_metadata = _create_flashmla_metadata()
         self.c128_flashmla_metadata = _create_flashmla_metadata()
+
+
+# Fill values for the tail rows of each metadata tensor; anything not listed defaults
+# to 0. 0 is the inert slot: request-pool row 0 is reserved (free_slots starts at 1)
+# and req_to_token is zero-initialised, so it resolves to the KV pool's null slot.
+_METADATA_PAD_VALUES = {
+    "c4_sparse_page_indices": -1,
+    "c4_sparse_raw_indices": -1,
+    "page_table": 0,
+    "pf_state_slot": 0,
+    "pf_chunk_start": 0,
+    "pf_cu_q": 0,
+    "pf_final_pos": 0,
+    # -1 is the "no page" sentinel these are allocated with; 0 is a real page.
+    "swa_page_indices": -1,
+    "c128_page_indices": -1,
+    # flash_mla requires the clamp1 lengths to be >= 1; the *_raw lengths keep 0 so
+    # the indexer and top-k take their trivial path.
+    "swa_topk_lengths": 1,
+    "c4_topk_lengths_clamp1": 1,
+    "c128_topk_lengths_clamp1": 1,
+    "c4_sparse_topk_lengths": 1,
+    # Raw uint8 CompressPlan/WritePlan structs; an all-0xFF row is compress_v2.cuh's
+    # invalid() sentinel, which every consumer early-returns on.
+    "plan_c": 0xFF,
+    "plan_w": 0xFF,
+}
+
+
+def _refresh_metadata_rows_in_place(dst, src, _depth: int = 0) -> None:
+    """Copy src's rows into dst's tensors without replacing any of them.
+
+    dst is the object the captured graph recorded addresses for, so every tensor has
+    to stay put; only the contents may change. When src is shorter than the bucket the
+    tail rows still execute, so they are filled from _METADATA_PAD_VALUES rather than
+    left pointing at a real request's state. Tensors are matched by attribute name.
+    """
+    if _depth > 4 or dst is None or src is None:
+        return
+    for name in list(vars(dst)):
+        d = getattr(dst, name, None)
+        s_ = getattr(src, name, None)
+        if isinstance(d, torch.Tensor) and isinstance(s_, torch.Tensor):
+            if d.ndim == 0 or s_.ndim == 0 or d.shape[1:] != s_.shape[1:]:
+                continue
+            n = min(d.shape[0], s_.shape[0])
+            if n == 0:
+                continue
+            d[:n].copy_(s_[:n])
+            if d.shape[0] > n:
+                d[n:].fill_(_METADATA_PAD_VALUES.get(name, 0))
+        elif _is_namedtuple(d) and _is_namedtuple(s_) and type(d) is type(s_):
+            # CompressorPrefillPlan is a NamedTuple: neither a Tensor nor an object
+            # with a __dict__, so both other branches miss it. Left unrefreshed, every
+            # replay runs the compressor against the capture batch's plan -- indices
+            # stay in bounds, so it silently reads the wrong rows on every layer.
+            _refresh_namedtuple_rows_in_place(d, s_, _depth + 1)
+        elif hasattr(d, "__dict__") and hasattr(s_, "__dict__"):
+            _refresh_metadata_rows_in_place(d, s_, _depth + 1)
+
+
+def _is_namedtuple(obj) -> bool:
+    return isinstance(obj, tuple) and hasattr(obj, "_fields")
+
+
+def _refresh_namedtuple_rows_in_place(dst, src, _depth: int = 0) -> None:
+    """Row-refresh the tensor fields of a NamedTuple pair.
+
+    The tuple is immutable but its tensors are not, and it is the tensors the captured
+    graph recorded addresses for. Non-tensor fields are capture-time constants.
+    """
+    if _depth > 4:
+        return
+    for name in dst._fields:
+        d = getattr(dst, name, None)
+        s_ = getattr(src, name, None)
+        if not (isinstance(d, torch.Tensor) and isinstance(s_, torch.Tensor)):
+            continue
+        if d.ndim == 0 or s_.ndim == 0 or d.shape[1:] != s_.shape[1:]:
+            continue
+        n = min(d.shape[0], s_.shape[0])
+        if n == 0:
+            continue
+        d[:n].copy_(s_[:n])
+        if d.shape[0] > n:
+            d[n:].fill_(_METADATA_PAD_VALUES.get(name, 0))
 
 
 @dataclass
@@ -960,6 +1049,48 @@ class DeepseekV4HipRadixBackend(
             workspace=metadata.fp4_prefill_workspace,
         )
 
+    # Opt into the captured-metadata contract, as the CUDA backend already does:
+    # capture builds one metadata object per bucket and replay refreshes it in place,
+    # so the addresses the captured kernels recorded stay valid and Dynamo's shape
+    # guards keep holding. Without it, replay reads stale metadata.
+    use_captured_forward_metadata_for_breakable_cuda_graph = not get_bool_env_var(
+        "SGLANG_PIECEWISE_NO_CAPTURED_METADATA"
+    )
+
+    def init_forward_metadata_for_breakable_cuda_graph_capture(
+        self, forward_batch: ForwardBatch
+    ):
+        """Build this bucket's metadata and hand it back for the runner to keep."""
+        self.init_forward_metadata(forward_batch)
+        return self.forward_metadata
+
+    def prepare_forward_metadata_for_breakable_cuda_graph_replay(
+        self,
+        capture_metadata,
+        forward_batch: ForwardBatch,
+        *,
+        static_forward_batch: Optional[ForwardBatch] = None,
+    ) -> None:
+        """Refresh the captured metadata in place from the live batch.
+
+        Build against the padded batch so the shapes match what capture recorded, then
+        copy the contents into the captured object rather than swapping it out -- the
+        recorded kernels read those addresses. Mirrors
+        DSV4Metadata.refresh_for_breakable_cuda_graph_replay_ on the CUDA side.
+        """
+        src_batch = (
+            static_forward_batch if static_forward_batch is not None else forward_batch
+        )
+        self.init_forward_metadata(src_batch)
+        fresh = self.forward_metadata
+        if capture_metadata is None or fresh is None:
+            return
+        # Not DSV4Metadata.copy_: it requires an exact shape match and a served batch
+        # rarely fills the bucket, so it would raise on every replay and the fallback
+        # would rebuild the metadata, losing the address stability this exists for.
+        _refresh_metadata_rows_in_place(capture_metadata, fresh)
+        self.forward_metadata = capture_metadata
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -1108,7 +1239,14 @@ class DeepseekV4HipRadixBackend(
 
         assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
         assert seq_lens_cpu is not None
-        max_seq_len = int(seq_lens_cpu.max().item())
+        # max_seq_len sizes the page table's second dimension; taking it from the live
+        # batch moves that shape batch to batch and fails Dynamo's guard on it. The
+        # other CUDA-graph paths already pin it to MAX_SEQ_LEN_FOR_CAPTURE.
+        max_seq_len = (
+            self.MAX_SEQ_LEN_FOR_CAPTURE
+            if is_in_tc_piecewise_cuda_graph()
+            else int(seq_lens_cpu.max().item())
+        )
 
         if forward_batch.forward_mode.is_decode_or_idle():
             # DSv4 bakes this step's KV write target (c4/c128) into metadata,
@@ -1152,16 +1290,22 @@ class DeepseekV4HipRadixBackend(
             is_draft = (
                 forward_batch.forward_mode.is_draft_extend_v2() or self.is_draft_worker
             )
+            # Under tc_piecewise, ask for compressor plans padded to the bucket's
+            # token count: plans trimmed to their live length move with every batch
+            # and fail Dynamo's shape guard.
             metadata = self.init_forward_metadata_prefill(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 seq_lens_cpu=seq_lens_cpu.tolist(),
                 out_cache_loc=forward_batch.out_cache_loc,
+                # Live count on purpose: expand_prefill_casually asserts
+                # offset == num_tokens and does the CUDA-graph padding itself.
                 num_tokens=sum(extend_seq_lens_cpu),
                 extend_seq_lens=extend_seq_lens,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
                 need_compress=not is_draft,
+                use_prefill_cuda_graph=is_in_tc_piecewise_cuda_graph(),
             )
         else:
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
@@ -1344,6 +1488,11 @@ class DeepseekV4HipRadixBackend(
         device = q.device
         positions = forward_batch.positions.to(torch.int64)
         T = q.shape[0]
+        # Bound, not equality: Dynamo treats positions.shape[0] and T as unrelated
+        # symbols and would otherwise resolve the slice by specializing the token
+        # dimension. `==` would be wrong -- positions can be a padded buffer while T
+        # is the live count, and claiming they match folds the slice away.
+        torch._check(positions.shape[0] >= T)
         positions = positions[:T]
 
         c128_pi = getattr(core_attn_metadata, "c128_page_indices", None)
@@ -1449,6 +1598,18 @@ class DeepseekV4HipRadixBackend(
             positions_full = forward_batch.positions.to(torch.int64)[
                 : state_slot_full.shape[0]
             ].contiguous()
+        elif state_slot.shape[0] > T:
+            # pf_* arrive padded to the graph bucket while q/positions do not: DSv4
+            # attention is a split op that runs eager on the live token count. Slice
+            # back to it, or _prefill_lengths_kernel's unmasked load of positions past
+            # the live count corrupts the indptr for the real rows too.
+            state_slot = state_slot[:T]
+            chunk_start = chunk_start[:T]
+            cu_q = cu_q[:T]
+            final_pos = final_pos[:T]
+            state_slot_full = state_slot
+            final_pos_full = final_pos
+            positions_full = positions
 
         kpre_i, kpre_p, kext_i, kext_p = runtime.build_prefill_indices(
             compress_ratio=compress_ratio,
@@ -1489,6 +1650,10 @@ class DeepseekV4HipRadixBackend(
             _ring_final_pos = final_pos_full if _cp_active else final_pos
             _ring_positions = positions_full if _cp_active else positions
             n_real = _ring_state_slot.shape[0]
+            # The slice is load-bearing: kv can be longer than state_slot. Dynamo
+            # treats n_real and kv.shape[0] as unrelated symbols, so without the bound
+            # it resolves the slice by specializing the token dimension.
+            torch._check(n_real <= kv.shape[0])
             runtime.store_swa_into_unified(
                 kv=kv[:n_real],
                 state_slot=_ring_state_slot,
@@ -1739,10 +1904,16 @@ class DeepseekV4HipRadixBackend(
                 (0, pad_size),
                 value=1,
             )
+            # Pad with request-pool row 0, the inert slot (see _METADATA_PAD_VALUES),
+            # matching the decode graph's PaddingPolicy.ZERO. Repeating the last live
+            # request points padded tokens at a real request's SWA/compressor state,
+            # which the captured graph then writes into on every replay; the CUDA twin
+            # can repeat it only because its PlanC::invalid() sentinel skips those
+            # writes.
             req_pool_indices_repeated = torch.nn.functional.pad(
                 req_pool_indices_repeated,
                 (0, pad_size),
-                value=req_pool_indices_repeated[-1].item(),
+                value=0,
             )
 
         return seq_lens_casual, req_pool_indices_repeated
