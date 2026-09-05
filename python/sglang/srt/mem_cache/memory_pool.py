@@ -1914,9 +1914,8 @@ class MHATokenToKVPool(KVCache):
         self.use_native_move_kv_cache = envs.SGLANG_NATIVE_MOVE_KV_CACHE.get()
         if kv_cache_layout is not None:
             # Explicit physical-layout selector wins over the platform default.
-            # This is a label only; layouts that change buffer identity (e.g. the
-            # page-granularity envelope) live in a dedicated pool subclass
-            # (PageMajorMHATokenToKVPool) rather than in branches here.
+            # This is a label only; the page-granularity envelope layout lives in
+            # the unified pool.
             self.use_hnd = False
             self.kv_cache_layout = kv_cache_layout
         elif self.use_hnd:
@@ -2518,8 +2517,8 @@ class MHATokenToKVPool(KVCache):
         cache_v: torch.Tensor,
     ):
         # Per-layer physical write into K/V buffer ``layer_idx``. Override for
-        # layouts that change buffer identity (e.g. PageMajorMHATokenToKVPool's
-        # 4-D strided views). ``loc`` and the cache tensors are already dtype-cast
+        # layouts that change buffer identity. ``loc`` and the cache tensors
+        # are already dtype-cast
         # and viewed as ``store_dtype`` by ``set_kv_buffer``.
         if self.kv_cache_layout == "vectorized_5d":
             # Late-import to keep the NHD path import-clean.
@@ -2924,7 +2923,7 @@ class MHATokenToKVPool(KVCache):
 
     def _move_kv_cache_impl(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         # Physical move strategy. Override for layouts that change buffer
-        # identity (e.g. PageMajorMHATokenToKVPool always uses the native move).
+        # identity (the unified pool moves whole page envelopes).
         if self.use_native_move_kv_cache:
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
             if getattr(self, "k_scale_buffer", None) is not None:
@@ -3237,78 +3236,6 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
             self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_fp4_sf
             self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
-
-
-class PageMajorMHATokenToKVPool(MHATokenToKVPool):
-    """MHA pool with the page-major page-granularity envelope layout.
-
-    NON-CONSTRUCTIBLE: the strided 4-D view builder and its write kernel are
-    gone, and ServerArgs rejects the static page-major arm at boot. The class
-    stays as the seat for the per-layer-view reimplementation.
-    """
-
-    def __init__(
-        self,
-        *args,
-        kv_cache_layout: Optional[str] = None,
-        enable_kv_cache_copy: bool = False,
-        **kwargs,
-    ):
-        assert kv_cache_layout in (
-            None,
-            "page_major_layer_major",
-        ), f"PageMajorMHATokenToKVPool fixes its layout; got {kv_cache_layout!r}"
-        # The tiled copy kernel assumes stride == row bytes, which the strided 4-D
-        # views violate, so the copy path is never available here regardless of
-        # what the caller requested (the spec-decode call sites pass
-        # enable_kv_cache_copy=True). Always fall back to the native move.
-        super().__init__(
-            *args,
-            kv_cache_layout="page_major_layer_major",
-            enable_kv_cache_copy=False,
-            **kwargs,
-        )
-
-    def _create_buffers(self):
-        raise NotImplementedError(
-            "PageMajorMHATokenToKVPool: the strided 4-D envelope views were "
-            "removed; the static-pool page-major layout is temporarily "
-            "unsupported (ServerArgs rejects it at startup). "
-            "--enable-unified-memory provides the page-major layout with "
-            "per-layer views."
-        )
-
-    # The methods below assume the per-layer contiguous 3-D layout. The 4-D
-    # strided envelope views have no per-layer contiguous region (their bytes are
-    # interleaved layer-major within each page) and index page-major, not
-    # token-major. Inheriting them would silently mis-index; fail loudly instead.
-
-    def get_contiguous_buf_infos(self):
-        raise NotImplementedError(
-            "page-major layout has no per-layer contiguous regions; KV transfer / "
-            "disaggregation is unsupported (TODO: expose the single _raw buffer "
-            "with a page-aware transfer scheme)."
-        )
-
-    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
-        raise NotImplementedError(
-            "CPU offloading is unsupported under the page-major layout "
-            "(TODO: split token ids into page/slot for the 4-D index)."
-        )
-
-    def load_cpu_copy(
-        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
-    ):
-        raise NotImplementedError(
-            "CPU offloading is unsupported under the page-major layout "
-            "(TODO: split token ids into page/slot for the 4-D index)."
-        )
-
-    def set_kv_buffer_prefix_valid(self, *args, **kwargs):
-        raise NotImplementedError(
-            "prefix-valid commit is unsupported under the page-major layout "
-            "(_set_kv_buffer_prefix_valid_impl assumes 3-D contiguous + row_dim)."
-        )
 
 
 class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
@@ -3749,8 +3676,7 @@ class HybridLinearKVPool(KVCache):
                 TokenToKVPoolClass = NPUMHATokenToKVPool
                 quant_method_kwarg = {}
             elif full_kv_pool_class is not None:
-                # Caller-selected MHA layout variant (e.g. the page-major
-                # PageMajorMHATokenToKVPool). NPU / out-of-tree classes keep
+                # Caller-selected MHA pool class. NPU / out-of-tree classes keep
                 # priority since they don't understand alternate layouts.
                 TokenToKVPoolClass = full_kv_pool_class
             else:
