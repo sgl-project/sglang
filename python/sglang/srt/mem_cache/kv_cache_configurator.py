@@ -94,6 +94,7 @@ from sglang.srt.utils.common import (
     get_available_gpu_memory,
     get_device_memory_capacity,
     is_float4_e2m1fn_x2,
+    is_gfx95_supported,
     is_hip,
     is_npu,
 )
@@ -113,6 +114,7 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
 
 
 _is_hip = is_hip()
+_is_gfx95_supported = is_gfx95_supported()
 
 
 def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
@@ -1716,9 +1718,25 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
-    def _build_minimax_sparse_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
+    def minimax_sparse_index_dtype(self) -> torch.dtype:
+        """Lightning-indexer K-cache dtype. Also used by pool_configurator's
+        per-token cell-size estimate, which must match the constructed pool."""
         from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
 
+        # fp8 attn-GEMM mode opts the indexer cache into fp8 (fp8 indexer
+        # GEMMs); fp8 KV without the mode keeps the indexer bf16 with the
+        # widening-dequant contract.
+        if m3_fp8_attn_gemm_enabled(resolving_view(self.server_args)):
+            return self.kv_cache_dtype
+        if (
+            _is_hip
+            and _is_gfx95_supported
+            and envs.SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE.get()
+        ):
+            return torch.float8_e4m3fn
+        return self.model_dtype
+
+    def _build_minimax_sparse_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
         _hf_config = self.model_config.hf_config
         sparse_cfg = get_minimax_sparse_attention_config(_hf_config)
         dense_layer_ids, sparse_layer_ids = get_minimax_sparse_layer_ids(sparse_cfg)
@@ -1729,15 +1747,7 @@ class KVCacheConfigurator:
             size=max_total_num_tokens,
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
-            # fp8 attn-GEMM mode opts the lightning-indexer cache into
-            # fp8 too (fp8 indexer GEMMs); fp8 KV without the mode
-            # (e5m2 or non-trtllm_mha backend) keeps the indexer bf16
-            # with the widening-dequant contract.
-            index_dtype=(
-                self.kv_cache_dtype
-                if m3_fp8_attn_gemm_enabled(resolving_view(self.server_args))
-                else self.model_dtype
-            ),
+            index_dtype=self.minimax_sparse_index_dtype(),
             head_num=self.model_config.get_num_kv_heads(
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),
