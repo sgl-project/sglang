@@ -122,8 +122,7 @@ _is_gfx95_supported = is_gfx95_supported()
 # block-fp8 [128,128] at load and run through the native block-fp8 kernels.
 # SGLANG_FORCE_MXFP8_BLOCK_CONVERT=1 opts into that same block-fp8 path on
 # gfx950 (MI35x): it routes the fp8 GEMMs / fused MoE through the mature aiter
-# block-scale kernels instead of the native MX dot_scaled path (measured +20%
-# throughput at equal accuracy on MiniMax-M3, GSM8K 0.9719 vs 0.9689).
+# block-scale kernels instead of the native MX dot_scaled path.
 _mxfp8_to_block_fp8_required = mxfp8_block_convert_required() or get_bool_env_var(
     "SGLANG_FORCE_MXFP8_BLOCK_CONVERT"
 )
@@ -475,7 +474,10 @@ class Fp8LinearMethod(LinearMethodBase):
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
-        self.convert_mxfp8_to_block = self.use_mxfp8 and _mxfp8_to_block_fp8_required
+        self.convert_mxfp8_to_block = self.use_mxfp8 and (
+            _mxfp8_to_block_fp8_required
+            or (_is_hip and envs.SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE.get())
+        )
         self.weight_block_size = self.quant_config.weight_block_size
         self.w8a8_block_fp8_linear = None
         self.w8a8_mxfp8_linear = None
@@ -668,10 +670,28 @@ class Fp8LinearMethod(LinearMethodBase):
                 convert_mxfp8_weight_to_block_fp8,
             )
 
+            if _is_gfx95_supported:
+                from sglang.srt.layers.quantization.mxfp8_block_convert import (
+                    dequant_mxfp8_2d_to_bf16,
+                )
+
+                bf16_weight = dequant_mxfp8_2d_to_bf16(
+                    layer.weight.data, layer.weight_scale_inv.data
+                )
             qweight, scale = convert_mxfp8_weight_to_block_fp8(
                 layer.weight.data, layer.weight_scale_inv.data, block=128
             )
             layer.weight = Parameter(qweight, requires_grad=False)
+            # Small-M fast-path weights, consumed by aiter_w8a8_block_fp8_linear;
+            # attrs survive the later in-place bpreshuffle (copy_ keeps the object).
+            if _is_gfx95_supported:
+                w32 = bf16_weight.float()
+                row_scale = w32.abs().amax(dim=1, keepdim=True).clamp(min=1e-12) / 448.0
+                layer.weight._ptpc_weight = shuffle_weight(
+                    (w32 / row_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn),
+                    (16, 16),
+                )
+                layer.weight._ptpc_scale = row_scale.to(torch.float32)
             layer.weight_scale_inv = Parameter(scale, requires_grad=False)
             self.use_mxfp8 = False
             self.convert_mxfp8_to_block = False
@@ -2078,6 +2098,30 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             align_mxfp8_moe_weights_for_flashinfer_trtllm(layer)
 
+        if _is_hip and _is_gfx95_supported and get_moe_runner_backend().is_aiter():
+            from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+            from aiter.utility import fp4_utils
+
+            num_experts = layer.w13_weight.shape[0]
+            layer.w13_weight.data = shuffle_weight_a16w4(
+                layer.w13_weight.data.contiguous(), 16, True
+            )
+            w13_s3d = layer.w13_weight_scale_inv.data
+            layer.w13_weight_scale_inv.data = shuffle_scale_a16w4(
+                w13_s3d.reshape(-1, w13_s3d.shape[-1]).contiguous(),
+                num_experts,
+                True,
+            )
+            layer.w2_weight.data = shuffle_weight_a16w4(
+                layer.w2_weight.data.contiguous(), 16, False
+            )
+            w2_s3d = layer.w2_weight_scale_inv.data
+            layer.w2_weight_scale_inv.data = fp4_utils.e8m0_shuffle(
+                w2_s3d.reshape(-1, w2_s3d.shape[-1]).contiguous()
+            )
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
@@ -2752,6 +2796,34 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         w13_weight = layer.w13_weight
         w2_weight = layer.w2_weight
+
+        if self.use_mxfp8:
+            gemm1_alpha = self.moe_runner_config.gemm1_alpha
+            if gemm1_alpha is not None and gemm1_alpha != 1.702:
+                raise NotImplementedError(
+                    f"AITER MXFP8 MoE only supports swiglu-oai "
+                    f"alpha=1.702, got {gemm1_alpha=}."
+                )
+            from aiter import ActivationType
+            from aiter.ops.flydsl.moe_common import GateMode
+
+            return AiterMoeQuantInfo(
+                w13_weight=w13_weight,
+                w2_weight=w2_weight,
+                quant_type=AiterQuantType.PER_1X32,
+                w13_scale=layer.w13_weight_scale_inv,
+                w2_scale=layer.w2_weight_scale_inv,
+                expert_mask=layer.dispatcher.expert_mask_gpu if _use_aiter else None,
+                swiglu_limit=self.moe_runner_config.swiglu_limit
+                or self.moe_runner_config.gemm1_clamp_limit
+                or 0.0,
+                hidden_pad=getattr(layer, "hidden_pad", 0),
+                intermediate_pad=getattr(layer, "intermediate_pad", 0),
+                fused_moe_kwargs={
+                    "activation": ActivationType.Swiglu,
+                    "gate_mode": GateMode.INTERLEAVE.value,
+                },
+            )
 
         if self.block_quant:
             quant_type = (

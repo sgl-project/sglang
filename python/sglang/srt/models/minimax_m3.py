@@ -197,6 +197,7 @@ class _FusedQKVIndexProj(nn.Module):
         input_size_per_partition: int,
         logical_widths: List[int],
         orig_dtype: torch.dtype,
+        convert_mxfp8_to_block: bool = False,
     ) -> None:
         super().__init__()
         # Named ``_qm`` (not ``quant_method``) so the loader's post-process loop
@@ -215,12 +216,9 @@ class _FusedQKVIndexProj(nn.Module):
             self.weight_scale_inv.format_ue8m0 = True
             # The loader skips this module (see ``_qm``), so run the weight
             # post-process here instead of process_weights_after_loading.
-            if getattr(quant_method, "convert_mxfp8_to_block", False):
-                # Block-fp8 (gfx942/gfx950): convert the concatenated MXFP8 weight
-                # to block-fp8 [128,128] and run the same fnuz/scale/preshuffle
-                # steps as the per-linear path (this also flips quant_method into
-                # block-fp8 state). q/kv and index output sizes are 128-aligned, so
-                # converting the concatenation equals converting each proj alone.
+            if convert_mxfp8_to_block:
+                # Block-fp8 conversion must run on the concatenated fused
+                # projection, just as it would on the individual projections.
                 quant_method.process_weights_after_loading_block_quant(self)
             else:
                 # Derive the backend scale layout for the native MXFP8 GEMM.
@@ -897,6 +895,10 @@ class MiniMaxM3Attention(nn.Module):
             return
 
         is_unquant = isinstance(qm, UnquantizedLinearMethod)
+        # Whether the loader pass would rewrite this layer's weights at load
+        # (block-fp8 conversion); the holder must run the same pass on the
+        # concatenated weights since the loader skips it.
+        needs_load_convert = getattr(qm, "convert_mxfp8_to_block", False)
         use_mxfp8 = getattr(qm, "use_mxfp8", False) and hasattr(qp, "weight_scale_inv")
         if not (is_unquant or use_mxfp8):
             return
@@ -916,6 +918,7 @@ class MiniMaxM3Attention(nn.Module):
             getattr(qp, "input_size_per_partition", qp.input_size),
             [qp.output_size_per_partition, ip.output_size_per_partition],
             getattr(qp, "orig_dtype", qp.params_dtype),
+            convert_mxfp8_to_block=needs_load_convert,
         )
         self.add_module("fused_qkv_index_proj", holder)
         self._fused_qkv_index = holder
