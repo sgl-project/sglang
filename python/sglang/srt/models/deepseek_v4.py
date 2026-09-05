@@ -244,6 +244,7 @@ def _get_mhc_ops() -> MhcOps:
 
 
 logger = logging.getLogger(__name__)
+_rocm_after_shared_path_logged = False
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
@@ -921,6 +922,7 @@ class MQALayer(MqaAttentionBase):
 
         if alt_streams is not None and (
             (_is_cuda and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get())
+            or (_is_hip and envs.SGLANG_DSV4_ROCM_ATTN_MULTI_STREAM.get())
             or (_is_npu and envs.SGLANG_NPU_USE_MULTI_STREAM.get())
         ):
             self.alt_streams = alt_streams[:3]
@@ -1371,6 +1373,124 @@ class MQALayer(MqaAttentionBase):
 
         return q
 
+    def _forward_prepare_multi_stream_hip_after_shared(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend,
+        q_out: Optional[torch.Tensor] = None,
+        x_quant=None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Fork the C4 core after the side stream finishes shared projection."""
+        global _rocm_after_shared_path_logged
+        assert self.alt_streams is not None
+        assert self.compressor is not None and self.compress_ratio == 4
+        if not _rocm_after_shared_path_logged:
+            logger.info("Using experimental DSV4 ROCm after-shared multi-stream path")
+            _rocm_after_shared_path_logged = True
+
+        current_stream = torch.cuda.current_stream()
+        stream_qk_indexer = self.alt_streams[0]
+        stream_qk_indexer.wait_stream(current_stream)
+        core_compressor_ready = torch.cuda.Event()
+
+        try:
+            with torch.cuda.stream(stream_qk_indexer):
+                q, kv = self._forward_prepare(
+                    x,
+                    positions,
+                    forward_batch,
+                    attn_backend,
+                    q_out,
+                    x_quant=x_quant,
+                    skip_core_compressor=True,
+                    core_compressor_ready=core_compressor_ready,
+                )
+        except Exception:
+            current_stream.wait_stream(stream_qk_indexer)
+            raise
+
+        current_stream.wait_event(core_compressor_ready)
+        try:
+            attn_backend.forward_core_compressor(
+                x, forward_batch, self.layer_id, self.compressor
+            )
+        finally:
+            current_stream.wait_stream(stream_qk_indexer)
+
+        if isinstance(q, torch.Tensor):
+            q.record_stream(current_stream)
+        if isinstance(kv, torch.Tensor):
+            kv.record_stream(current_stream)
+        return q, kv
+
+    def _use_hip_after_shared_multi_stream(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> bool:
+        if not (
+            _is_hip
+            and _is_gfx95_supported
+            and _use_aiter
+            and envs.SGLANG_DSV4_ROCM_ATTN_MULTI_STREAM.get()
+            and self.alt_streams is not None
+            and self.compressor is not None
+            and self.compress_ratio == 4
+            and self.fuse_wqa_wkv
+            and self.use_fused_qk_norm_rope
+            and envs.SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY.get()
+            and get_is_capture_mode()
+            and not is_in_breakable_cuda_graph()
+        ):
+            return False
+        parallel = get_parallel()
+        if not (
+            parallel.tp_size == 8
+            and parallel.pp_size == 1
+            and parallel.attn_dp_size == 8
+            and parallel.attn_tp_size == 1
+            and parallel.moe_ep_size == 1
+            and parallel.moe_tp_size == 8
+        ):
+            return False
+        if not forward_batch.forward_mode.is_target_verify():
+            return False
+        if self.attn_tp_size != 1 or self.n_local_heads != 128:
+            return False
+        if not 4 <= x.shape[0] <= 8:
+            return False
+        if self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch):
+            return False
+
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
+        return is_unified_kv_triton()
+
+    def _use_generic_multi_stream(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> bool:
+        dedicated_hip_multi_stream = (
+            _is_hip and envs.SGLANG_DSV4_ROCM_ATTN_MULTI_STREAM.get()
+        )
+        return (
+            envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+            and not dedicated_hip_multi_stream
+            and self.alt_streams is not None
+            and get_is_capture_mode()
+            and (
+                is_in_breakable_cuda_graph()
+                or x.shape[0] <= self._multi_stream_bs_limit
+            )
+            and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
+            and not (_is_hip and self.compressor is None)
+        )
+
     def _forward_prepare(
         self,
         x: torch.Tensor,
@@ -1379,6 +1499,8 @@ class MQALayer(MqaAttentionBase):
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
+        skip_core_compressor: bool = False,
+        core_compressor_ready: Optional[torch.cuda.Event] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
         # kv_score depends only on x, so its CP all-gather can start before the
@@ -1426,9 +1548,13 @@ class MQALayer(MqaAttentionBase):
                     self.q_norm.weight,
                     self.q_norm.variance_epsilon,
                 )
+                if core_compressor_ready is not None:
+                    core_compressor_ready.record(torch.cuda.current_stream())
                 q, _ = self.wq_b(q_for_wqb)
             else:
                 q_lora = self.q_norm(q_lora)
+                if core_compressor_ready is not None:
+                    core_compressor_ready.record(torch.cuda.current_stream())
                 q, _ = self.wq_b(q_lora)
 
             kv = (
@@ -1544,6 +1670,8 @@ class MQALayer(MqaAttentionBase):
                 q_out.copy_(q)
         else:
             q_lora = self.q_norm(q_lora)
+            if core_compressor_ready is not None:
+                core_compressor_ready.record(torch.cuda.current_stream())
             q = self._compute_q_b(q_lora, positions, q_out)
             if unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
@@ -1601,7 +1729,7 @@ class MQALayer(MqaAttentionBase):
                 forward_batch=forward_batch,
                 attn_backend=attn_backend,
             )
-        if self.compressor is not None:
+        if self.compressor is not None and not skip_core_compressor:
             attn_backend.forward_core_compressor(
                 x,
                 forward_batch,
@@ -1631,22 +1759,19 @@ class MQALayer(MqaAttentionBase):
                 (DeepseekV4AttnBackend, DeepseekV4HipRadixBackend),
             )
 
+        enable_hip_after_shared = self._use_hip_after_shared_multi_stream(
+            x, forward_batch
+        )
         enable_multi_stream = (
-            envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
-            and self.alt_streams is not None
-            and get_is_capture_mode()
-            and (
-                is_in_breakable_cuda_graph()
-                or x.shape[0] <= self._multi_stream_bs_limit
+            enable_hip_after_shared
+            or self._use_generic_multi_stream(x, forward_batch)
+            or (
+                _is_npu
+                and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+                and self.alt_streams is not None
+                and x.shape[0] <= self._multi_stream_bs_limit
+                and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
             )
-            and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
-            and not (_is_hip and self.compressor is None)
-        ) or (
-            _is_npu
-            and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
-            and self.alt_streams is not None
-            and x.shape[0] <= self._multi_stream_bs_limit
-            and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None
@@ -1676,9 +1801,16 @@ class MQALayer(MqaAttentionBase):
         attn_sink = self._local_attn_sink()
 
         if enable_multi_stream:
-            # Multi-stream path always fuses cache write into the K kernel,
-            # so the bf16 KV intermediate is gone.
-            if _is_hip:
+            if enable_hip_after_shared:
+                q, kv = self._forward_prepare_multi_stream_hip_after_shared(
+                    x,
+                    positions,
+                    forward_batch,
+                    attn_backend,
+                    q_out,
+                    x_quant=x_quant,
+                )
+            elif _is_hip:
                 q = self._forward_prepare_multi_stream_hip(
                     x,
                     positions,
@@ -1705,7 +1837,8 @@ class MQALayer(MqaAttentionBase):
                     q_out,
                     x_quant=x_quant,
                 )
-            kv = None
+            if not enable_hip_after_shared:
+                kv = None
         else:
             q, kv = self._forward_prepare(
                 x,
@@ -2891,6 +3024,7 @@ class DeepseekV4Model(nn.Module):
                 and (
                     envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
                     or envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+                    or envs.SGLANG_DSV4_ROCM_ATTN_MULTI_STREAM.get()
                 )
             )
             or (_is_npu and envs.SGLANG_NPU_USE_MULTI_STREAM.get())
