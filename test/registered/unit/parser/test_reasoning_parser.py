@@ -1219,6 +1219,17 @@ class TestGptOssDetector(CustomTestCase):
         self.assertIn("reasoning part", all_reasoning)
         self.assertIn("answer", all_normal)
 
+    def test_finish_flushes_incomplete_final(self):
+        """Flush final text held by HarmonyParser when the stream ends."""
+        self.detector.parse_streaming_increment(
+            "<|start|>assistant<|channel|>final The answer"
+        )
+
+        result = self.detector.finish()
+
+        self.assertEqual(result.normal_text, "The answer")
+        self.assertEqual(result.reasoning_text, "")
+
 
 class TestMiniMaxAppendThinkDetector(CustomTestCase):
     """Test cases for MiniMaxAppendThinkDetector."""
