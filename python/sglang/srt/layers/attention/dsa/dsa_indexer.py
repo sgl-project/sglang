@@ -132,15 +132,18 @@ if TYPE_CHECKING:
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
+if _is_cuda or _is_hip:
+    # Plain-torch graph helpers: usable wherever the split-op surface is.
+    from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
+        logits_head_gate_graph,
+        scale_head_gate_graph,
+    )
+
 if _is_cuda:
     from sglang.kernels.ops.attention.dsv4 import fused_q_indexer_rope_first_quant
     from sglang.kernels.ops.quantization.dsv32 import (
         fused_k_indexer_norm_rope,
         fused_k_indexer_norm_rope_store,
-    )
-    from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
-        logits_head_gate_graph,
-        scale_head_gate_graph,
     )
 
     @register_custom_op(mutates_args=["topk_indices"])

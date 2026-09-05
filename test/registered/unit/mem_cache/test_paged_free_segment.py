@@ -1,5 +1,5 @@
-"""free_segment / free_segments vs the torch.unique reference: stride page
-extraction over all segment alignments, plus boundary-page dedup and free-group
+"""free_segment / free_segments vs the torch.unique reference: page-aligned
+starts over every tail alignment, the page-disjoint contract, and free-group
 deferral. See PagedTokenToKVPoolAllocator.free_segment for why unique is avoided.
 
     python -m pytest test/registered/unit/mem_cache/test_paged_free_segment.py -v
@@ -43,11 +43,9 @@ def _make_kv_row(alloc, num_tokens):
 
 
 class TestFreeSegment(unittest.TestCase):
-    def test_matches_unique_over_alignments(self):
-        # Sweep (start, end) so segments cover: aligned/unaligned head and
-        # tail, single partial page, full row.
+    def test_matches_unique_over_tail_alignments(self):
         for num_tokens in (1, PAGE_SIZE, PAGE_SIZE + 1, 3 * PAGE_SIZE - 1):
-            for start in range(num_tokens):
+            for start in range(0, num_tokens, PAGE_SIZE):
                 for end in range(start + 1, num_tokens + 1):
                     alloc = _make_allocator()
                     row = _make_kv_row(alloc, num_tokens)
@@ -66,6 +64,13 @@ class TestFreeSegment(unittest.TestCase):
         before = len(alloc.free_pages)
         alloc.free_segment(row[:0], start_pos=0)
         self.assertEqual(len(alloc.free_pages), before)
+
+    def test_unaligned_start_is_rejected(self):
+        alloc = _make_allocator()
+        row = _make_kv_row(alloc, 2 * PAGE_SIZE)
+        for start in (1, PAGE_SIZE - 1, PAGE_SIZE + 1):
+            with self.assertRaises(AssertionError):
+                alloc.free_segment(row[start:], start_pos=start)
 
     def test_need_sort_defers_released_pages(self):
         alloc = _make_allocator(need_sort=True)
@@ -169,29 +174,21 @@ class TestFreeSegments(unittest.TestCase):
         reference = torch.unique(torch.cat([row[a:b] for a, b in spans]) // PAGE_SIZE)
         return freed, reference
 
-    def test_adjacent_segments_share_boundary_page(self):
-        # [0, 6) and [6, 11) with page_size 4: page 1 spans both segments and
-        # must be freed exactly once.
-        freed, reference = self._freed_by_segments(11, [(0, 6), (6, 11)])
+    def test_partial_tail_then_next_page(self):
+        # [0, 5) releases page 1 whole; [8, 11) starts on page 2.
+        freed, reference = self._freed_by_segments(11, [(0, 5), (8, 11)])
         self.assertTrue(torch.equal(torch.sort(freed)[0], reference))
 
-    def test_disjoint_segments_share_boundary_page(self):
-        # [0, 5) and [7, 11): gap [5, 7) stays within page 1, which both
-        # segments touch.
-        freed, reference = self._freed_by_segments(11, [(0, 5), (7, 11)])
-        self.assertTrue(torch.equal(torch.sort(freed)[0], reference))
-
-    def test_second_segment_inside_shared_page_is_skipped(self):
-        # [0, 5) and [5, 7): the second segment lies entirely in page 1,
-        # already emitted by the first.
-        freed, reference = self._freed_by_segments(7, [(0, 5), (5, 7)])
-        self.assertTrue(torch.equal(torch.sort(freed)[0], reference))
-
-    def test_page_aligned_segments_no_trim(self):
+    def test_page_aligned_segments(self):
         freed, reference = self._freed_by_segments(
             3 * PAGE_SIZE, [(0, PAGE_SIZE), (PAGE_SIZE, 3 * PAGE_SIZE)]
         )
         self.assertTrue(torch.equal(torch.sort(freed)[0], reference))
+
+    def test_segments_sharing_a_page_are_rejected(self):
+        for spans in ([(0, 5), (5, 8)], [(0, 5), (7, 11)], [(0, 6), (4, 11)]):
+            with self.assertRaises(AssertionError):
+                self._freed_by_segments(11, spans)
 
 
 class _RecordingBaseAllocator(BaseTokenToKVPoolAllocator):
@@ -220,14 +217,23 @@ class _RecordingBaseAllocator(BaseTokenToKVPoolAllocator):
 
 
 class TestBaseFallbackFreeSegments(unittest.TestCase):
-    def test_trim_dedups_boundary_page_before_fallback_free(self):
-        # fallback allocators (UnifiedMamba/SWA) dedup per free() call at best;
-        # the shared boundary page must reach free() in exactly one call
+    def test_fallback_forwards_page_disjoint_segments(self):
+        # base fallback: each segment reaches free() as-is, no cross-segment dedup
         alloc = _RecordingBaseAllocator()
         row = torch.arange(11)  # position i lives on page i // PAGE_SIZE
-        alloc.free_segments([(row[0:6], 0), (row[6:11], 6)])
+        alloc.free_segments([(row[0:6], 0), (row[8:11], 8)])
         per_call_pages = [set((t // PAGE_SIZE).tolist()) for t in alloc.freed]
         self.assertEqual(per_call_pages, [{0, 1}, {2}])
+
+    def test_fallback_rejects_shared_page_and_unaligned_start(self):
+        alloc = _RecordingBaseAllocator()
+        row = torch.arange(11)
+        with self.assertRaises(AssertionError):
+            alloc.free_segments([(row[0:6], 0), (row[6:11], 6)])
+        with self.assertRaises(AssertionError):
+            alloc.free_segment(row[1:], start_pos=1)
+        self.assertEqual(len(alloc.freed), 1)
+        self.assertTrue(torch.equal(alloc.freed[0], row[0:6]))
 
 
 if __name__ == "__main__":

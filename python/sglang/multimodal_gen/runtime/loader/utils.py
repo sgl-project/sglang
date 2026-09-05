@@ -18,8 +18,13 @@ from safetensors.torch import load_file as safetensors_load_file
 from torch import nn
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.weights.source import (
+    filter_duplicate_precision_variant_safetensors,
+)
 
 logger = init_logger(__name__)
+
+_DEFAULT_SAFETENSORS_INDEX = "diffusion_pytorch_model.safetensors.index.json"
 
 _QUANTIZED_DTYPES = {
     torch.uint8,
@@ -250,11 +255,15 @@ def _try_redownload_missing_shards(model_path: str, missing: list[str]) -> bool:
 
 
 def checkpoint_bytes(model_path: str) -> int:
-    """On-disk size of every safetensors under a path, readable before any is."""
+    """On-disk size of the selected safetensors checkpoint files."""
+    if os.path.isfile(model_path):
+        return os.path.getsize(model_path)
+
+    paths = sorted(
+        glob.glob(os.path.join(str(model_path), "**", "*.safetensors"), recursive=True)
+    )
     total = 0
-    for path in glob.glob(
-        os.path.join(str(model_path), "**", "*.safetensors"), recursive=True
-    ):
+    for path in filter_duplicate_precision_variant_safetensors(paths):
         try:
             total += os.path.getsize(path)
         except OSError:
@@ -289,26 +298,41 @@ def keep_checkpoint_mapped(*, weight_bytes: int, component: str) -> bool:
     return True
 
 
-def _list_safetensors_files(model_path: str) -> list[str]:
-    """List all .safetensors files under a directory.
+def _select_safetensors_index_file(model_path: str, preferred_name: str) -> str | None:
+    preferred_path = os.path.join(str(model_path), preferred_name)
+    if os.path.exists(preferred_path):
+        return preferred_path
 
-    If a safetensors index file is present, verifies that every shard listed
-    in the index actually exists on disk. Missing shards are first repaired
-    automatically via HuggingFace Hub (if the path is an HF cache entry);
-    if repair fails a clear RuntimeError is raised.
+    candidates = filter_duplicate_precision_variant_safetensors(
+        sorted(glob.glob(os.path.join(str(model_path), "*.safetensors.index.json")))
+    )
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _list_safetensors_files(
+    model_path: str,
+    *,
+    index_file: str = _DEFAULT_SAFETENSORS_INDEX,
+    key_filter: Callable[[str], bool] | None = None,
+    raw_candidates: bool = False,
+) -> list[str]:
+    """Resolve the safetensors files to load from a local component path.
+
+    An index is authoritative when present. Otherwise canonical files are
+    preferred over precision-suffixed copies. ``raw_candidates`` is reserved
+    for model-specific selectors that must choose a precision variant first.
     """
     if os.path.isfile(model_path):
         return [str(model_path)] if str(model_path).endswith(".safetensors") else []
 
     found = sorted(glob.glob(os.path.join(str(model_path), "*.safetensors")))
 
-    index_path = os.path.join(
-        str(model_path), "diffusion_pytorch_model.safetensors.index.json"
-    )
-    if os.path.exists(index_path):
+    index_path = _select_safetensors_index_file(model_path, index_file)
+    if index_path is not None:
         with open(index_path) as f:
             index = json.load(f)
-        expected_shards = sorted(set(index.get("weight_map", {}).values()))
+        weight_map = index.get("weight_map", {})
+        expected_shards = sorted(set(weight_map.values()))
         found_basenames = {os.path.basename(p) for p in found}
         missing = [s for s in expected_shards if s not in found_basenames]
         if missing:
@@ -325,24 +349,30 @@ def _list_safetensors_files(model_path: str) -> list[str]:
                     f"`huggingface-cli download {os.path.basename(model_path)}`)."
                 )
 
-    return found
+        if not raw_candidates:
+            selected_shards = {
+                shard
+                for weight_name, shard in weight_map.items()
+                if key_filter is None or key_filter(weight_name)
+            }
+            return [
+                os.path.join(str(model_path), shard)
+                for shard in sorted(selected_shards)
+            ]
+
+    if raw_candidates:
+        return found
+    return filter_duplicate_precision_variant_safetensors(found)
 
 
 def load_safetensors_state_dict(model_path: str) -> dict[str, torch.Tensor]:
     """Load one safetensors checkpoint, including an indexed sharded set."""
-    index_path = os.path.join(
-        str(model_path), "diffusion_pytorch_model.safetensors.index.json"
-    )
+    index_path = _select_safetensors_index_file(model_path, _DEFAULT_SAFETENSORS_INDEX)
     safetensors_files = _list_safetensors_files(model_path)
-    if os.path.exists(index_path):
-        with open(index_path) as f:
-            index = json.load(f)
-        shard_names = sorted(set(index.get("weight_map", {}).values()))
+    if index_path is not None:
         state_dict: dict[str, torch.Tensor] = {}
-        for shard_name in shard_names:
-            state_dict.update(
-                safetensors_load_file(os.path.join(str(model_path), shard_name))
-            )
+        for path in safetensors_files:
+            state_dict.update(safetensors_load_file(path))
         return state_dict
 
     if not safetensors_files:

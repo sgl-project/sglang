@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from typing import (
     TYPE_CHECKING,
@@ -238,6 +238,32 @@ class TopKConfig:
     # Draft-side MoE blocks set this False so they never write the target's
     # process-global routed-experts capture buffer.
     allow_routed_experts_capture: bool = True
+    _correction_bias_dtype_cache: Optional[torch.Tensor] = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _correction_bias_cache_key: Optional[Tuple] = field(
+        default=None, init=False, repr=False, compare=False
+    )
+
+    def correction_bias_for_dtype(self, dtype: torch.dtype) -> Optional[torch.Tensor]:
+        """Return correction bias in ``dtype``, reusing a per-TopK lazy copy."""
+        correction_bias = self.correction_bias
+        if correction_bias is None or correction_bias.dtype == dtype:
+            return correction_bias
+
+        # Weight loaders update parameters in place. Including the version in
+        # the key prevents an early access from retaining pre-load contents.
+        cache_key = (
+            correction_bias.data_ptr(),
+            correction_bias._version,
+            correction_bias.device,
+            correction_bias.dtype,
+            dtype,
+        )
+        if self._correction_bias_cache_key != cache_key:
+            self._correction_bias_dtype_cache = correction_bias.to(dtype=dtype)
+            self._correction_bias_cache_key = cache_key
+        return self._correction_bias_dtype_cache
 
 
 # -------------------------------- TopKOutput ---------------------------------------
@@ -2305,6 +2331,9 @@ def select_experts(
         correction_bias=correction_bias,
         info=expert_location_dispatch_info,
     )
+
+    if _use_aiter and use_grouped_topk and correction_bias is not None:
+        correction_bias = topk_config.correction_bias_for_dtype(router_logits.dtype)
 
     # DeepSeek V2/V3/R1 series models use grouped_top_k
     # remove num_fused_shared_experts from grouped_topk/biased_grouped_topk

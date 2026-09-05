@@ -73,6 +73,9 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.sampling.sampling_params import (
+    set_request_reasoning_end_token_ids,
+)
 from sglang.srt.utils import random_uuid
 
 if TYPE_CHECKING:
@@ -393,6 +396,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                             else None
                         ),
                     )
+                    if processed_messages is not None:
+                        set_request_reasoning_end_token_ids(
+                            sampling_params,
+                            processed_messages.reasoning_end_token_ids,
+                        )
                     # _process_messages set skip_special_tokens on a chat_request
                     # we then discard, so re-apply it to the engine sampling dict.
                     if processed_messages is not None and (
@@ -591,6 +599,15 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
         processed_messages = self._process_messages(chat_request, is_multimodal)
+        # ``_process_messages`` merges server defaults into the temporary Chat
+        # request before rendering. Response parsing happens later from the
+        # original request, so carry over the exact template kwargs that selected
+        # the wire-format delimiters.
+        request.chat_template_kwargs = (
+            dict(chat_request.chat_template_kwargs)
+            if chat_request.chat_template_kwargs is not None
+            else None
+        )
 
         if is_multimodal:
             request_prompts = [processed_messages.prompt]

@@ -389,7 +389,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
 
         if save_kv_cache:
             self.token_to_kv_pool.set_mla_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, k_rope
+                layer, self._kv_write_loc(forward_batch), k, k_rope
             )
 
         query = q.view(-1, layer.tp_q_head_num, layer.head_dim)

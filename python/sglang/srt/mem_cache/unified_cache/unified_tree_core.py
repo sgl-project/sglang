@@ -404,7 +404,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.is_write_back = False
         self.has_swa_host_pool = False
         self.enable_session_radix_cache = params.enable_session_radix_cache
-        self.eviction_strategy = get_eviction_strategy(params.eviction_policy.lower())
+        self.eviction_strategy = get_eviction_strategy(
+            params.eviction_policy.lower(), params.eviction_policy_config
+        )
 
         # ``device`` is derived from the construction-time allocator; the
         # allocator/pool themselves are owned by the cache, not the tree.
@@ -445,6 +447,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         # The single in-flight resumable insert, if suspended at a barrier.
         self._ongoing_insert_walk_state: Optional[_InsertWalkState] = None
+        self._tracked_unbacked_tokens = 0
+        self._is_tracking_unbacked_tokens = False
 
         self.root_node = self._new_node()
         self.root_node.priority = -sys.maxsize
@@ -737,7 +741,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # nodes can also match, so we separately track the best device-resident
         # match for scheduler prefix indices and locking.
         node = self.root_node
-        child_key = key.child_key(self.page_size)
+        key_offset = 0
+        child_key = key.child_key_at(key_offset, self.page_size)
         value: list[torch.Tensor] = []
         best_match_node = node
         best_match_device_node = node
@@ -778,14 +783,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 best_match_device_value_len = len(value)
                 best_match_device_node = node
 
-        while len(key) > 0 and child_key in node.children:
+        while key_offset < len(key) and child_key in node.children:
             child = node.children[child_key]
 
             # HiCache: dead node (evicted + not backuped) — stop traversal
             if child.evicted and not child.backuped:
                 break
 
-            prefix_len = child.key.match(key, page_size=self.page_size)
+            prefix_len = child.key.match_at(key, key_offset, page_size=self.page_size)
             full_kv_hit_length += prefix_len
             if prefix_len < len(child.key):
                 node, action = self._split_node(child.key, child, prefix_len)
@@ -798,9 +803,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 value.append(child.component_data[BASE_COMPONENT_TYPE].value)
             node = child
             _update_best_if_valid(node)
-            key = key[prefix_len:]
-            if len(key):
-                child_key = key.child_key(self.page_size)
+            key_offset += prefix_len
+            if key_offset < len(key):
+                child_key = key.child_key_at(key_offset, self.page_size)
 
         return (
             value,
@@ -1128,9 +1133,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         state.phase = _InsertPhase.TAIL
 
     def _needs_incremental_component_backup(self, node: UnifiedTreeNode) -> bool:
+        components = self.components
+        if self.is_write_back:
+            swa = self.components_by_type.get(ComponentType.SWA)
+            components = () if swa is None else (swa,)
         return any(
             component.needs_incremental_backup(node)
-            for component in self.components
+            for component in components
             if component.component_type != BASE_COMPONENT_TYPE
         )
 
@@ -1144,7 +1153,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         node = state.target_node
         return (
             self.enable_hicache
-            and not self.is_write_back
             and node.backuped
             and node.write_through_pending_id is None
             and self._needs_incremental_component_backup(node)
@@ -1316,6 +1324,18 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Begin a component's device-eviction walk for up to request_cnt tokens."""
         self.components_by_type[component_type].evict_device_start(request_cnt)
 
+    def _begin_tracking_unbacked_tokens(self) -> None:
+        assert not self._is_tracking_unbacked_tokens
+        assert self._tracked_unbacked_tokens == 0
+        self._is_tracking_unbacked_tokens = True
+
+    def _finish_tracking_unbacked_tokens(self) -> int:
+        assert self._is_tracking_unbacked_tokens
+        self._is_tracking_unbacked_tokens = False
+        result = self._tracked_unbacked_tokens
+        self._tracked_unbacked_tokens = 0
+        return result
+
     def evict_device_next_node(
         self, component_type: ComponentType, tracker: dict[ComponentType, int]
     ) -> EvictDeviceNextNodeResult:
@@ -1324,9 +1344,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # The walk reads running totals for its doneness check; the result
         # carries only this step's delta.
         updated_tracker = defaultdict(int, tracker)
-        result.node_id = self.components_by_type[component_type].evict_device_next_node(
-            updated_tracker, result.device_frees, result.host_frees
-        )
+        self._begin_tracking_unbacked_tokens()
+        try:
+            result.node_id = self.components_by_type[
+                component_type
+            ].evict_device_next_node(
+                updated_tracker, result.device_frees, result.host_frees
+            )
+        finally:
+            result.unbacked_tokens = self._finish_tracking_unbacked_tokens()
         for ct, n in updated_tracker.items():
             delta = n - tracker.get(ct, 0)
             if delta:
@@ -1347,25 +1373,31 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result = EvictDeviceLeafResult()
         node = self.node_by_id(node_id)
         assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
-        if not node.backuped:
-            if is_write_back:
-                result.backup_kv = self._build_backup_kv_action(node, write_back=True)
+        self._begin_tracking_unbacked_tokens()
+        try:
+            if not node.backuped:
+                if is_write_back:
+                    result.backup_kv = self._build_backup_kv_action(
+                        node, write_back=True
+                    )
+                    return result
+                # Write-through: node has no backup, delete entirely.
+                self._delete_unbacked_device_leaf(
+                    node,
+                    result.tracker,
+                    device_frees=result.device_frees,
+                    host_frees=result.host_frees,
+                )
                 return result
-            # Write-through: node has no backup, delete entirely.
-            self._delete_unbacked_device_leaf(
+            self._demote(
                 node,
                 result.tracker,
                 device_frees=result.device_frees,
                 host_frees=result.host_frees,
             )
             return result
-        self._demote(
-            node,
-            result.tracker,
-            device_frees=result.device_frees,
-            host_frees=result.host_frees,
-        )
-        return result
+        finally:
+            result.unbacked_tokens = self._finish_tracking_unbacked_tokens()
 
     def drop_subtree_no_host(self, node_id: NodeId) -> DropSubtreeNoHostResult:
         """Write-back fallback when a D-leaf's D->H backup fails under host
@@ -1726,6 +1758,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         target: EvictLayer = EvictLayer.DEVICE,
         tracker: Optional[dict[ComponentType, int]] = None,
     ) -> tuple[int, int]:
+        had_host_copy = node.component_data[comp.component_type].host_value is not None
         device_freed, host_freed = comp.evict_component(
             node, target=target, device_frees=device_frees, host_frees=host_frees
         )
@@ -1734,6 +1767,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 tracker[comp.component_type] += device_freed
             elif EvictLayer.HOST in target:
                 tracker[comp.component_type] += host_freed
+        if (
+            self._is_tracking_unbacked_tokens
+            and comp.component_type == BASE_COMPONENT_TYPE
+            and device_freed > 0
+            and not had_host_copy
+        ):
+            self._tracked_unbacked_tokens += device_freed
 
         # Detach from the appropriate LRU list(s)
         ct = comp.component_type
@@ -1944,7 +1984,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         for comp in self.components:
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue
-            if node.component_data[comp.component_type].host_value is not None:
+            cd = node.component_data[comp.component_type]
+            if cd.host_value is not None and not comp.needs_incremental_backup(node):
                 continue
             t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
             if t:
@@ -2168,10 +2209,29 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             self._update_duplicate_tracking(node)
             node = node.parent
 
-    def mark_write_through_pending(self, node_id: NodeId) -> None:
-        """Mark a node as having an in-flight write-through backup."""
-        node = self.node_by_id(node_id)
-        node.write_through_pending_id = node_id
+    def mark_write_through_pending(
+        self, node_ids: list[NodeId], ack_id: NodeId
+    ) -> list[NodeId]:
+        """Stamp ack_id on every covered node; returns them ancestors first."""
+        marked: list[tuple[int, NodeId]] = []
+        for node_id in node_ids:
+            node = self.node_by_id(node_id)
+            assert node.write_through_pending_id in (
+                None,
+                ack_id,
+            ), f"node {node.id} is already pending under a different write-through ack"
+            node.write_through_pending_id = ack_id
+            marked.append((self._depth_from_root(node), node_id))
+        marked.sort()
+        return [node_id for _, node_id in marked]
+
+    @staticmethod
+    def _depth_from_root(node: UnifiedTreeNode) -> int:
+        depth = 0
+        while node.parent is not None:
+            depth += 1
+            node = node.parent
+        return depth
 
     def finish_write_through(self, node_ids: list[NodeId], ack_id: int) -> None:
         """Clear the write-through-pending mark (when it matches ack_id) and record the
