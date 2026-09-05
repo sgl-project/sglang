@@ -1349,7 +1349,7 @@ class ServerArgs:
     ] = "default"
     chat_template: A[
         Optional[str],
-        "The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
+        "The builtin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
         NS("serving"),
     ] = None
     hf_chat_template_name: A[
@@ -1359,7 +1359,7 @@ class ServerArgs:
     ] = None
     completion_template: A[
         Optional[str],
-        "The buliltin completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. only for code completion currently.",
+        "The builtin completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. only for code completion currently.",
         NS("serving"),
     ] = None
     file_storage_path: A[
@@ -4269,7 +4269,7 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     Prepare the server arguments from the command line arguments.
 
     Args:
-        args: The command line arguments. Typically, it should be `sys.argv[1:]`
+        argv: The command line arguments. Typically, it should be `sys.argv[1:]`
             to ensure compatibility with `parse_args` when no arguments are passed.
 
     Returns:
