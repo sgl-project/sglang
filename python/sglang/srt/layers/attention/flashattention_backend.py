@@ -306,7 +306,7 @@ class FlashAttentionBackend(AttentionBackend):
             self._get_scheduler_metadata = None
             if get_exec().deterministic.enable_deterministic_inference:
                 # Must precede the first kernel compile.
-                from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
+                from sglang.kernels.ops.attention.flash_attn.batch_invariance import (
                     set_batch_invariant,
                 )
 
