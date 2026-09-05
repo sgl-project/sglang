@@ -154,6 +154,7 @@ class VanillaMarkov(nn.Module):
         base_logits: torch.Tensor,
         *,
         first_prev_tokens: torch.Tensor,
+        vocab_limit: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         """Greedy-only draft-block sampling via the fused per-step
         [bias-dot + add + argmax] kernel (see MarkovGreedyStep) — one pass over
@@ -171,6 +172,12 @@ class VanillaMarkov(nn.Module):
             return torch.empty(
                 batch_size, 0, dtype=torch.long, device=base_logits.device
             )
+        # Slice base logits and the step-bias rows together so the Torch and
+        # Triton implementations argmax over the same capped vocabulary.
+        w2_weight = self.markov_w2.weight
+        if vocab_limit is not None and base_logits.shape[-1] > vocab_limit:
+            base_logits = base_logits[..., :vocab_limit]
+            w2_weight = w2_weight[:vocab_limit]
         sampled_tokens = []
         prev_tokens = first_prev_tokens.long()
         for step_idx in range(proposal_len):
@@ -178,7 +185,7 @@ class VanillaMarkov(nn.Module):
             prev_tokens = MarkovGreedyStep.execute(
                 base_logits=base_logits[:, step_idx, :],
                 prev_embeds=prev_embeds,
-                w2_weight=self.markov_w2.weight,
+                w2_weight=w2_weight,
             )
             sampled_tokens.append(prev_tokens)
         return torch.stack(sampled_tokens, dim=1)
@@ -251,6 +258,7 @@ class GatedMarkovHead(VanillaMarkov):
         base_logits: torch.Tensor,
         *,
         first_prev_tokens: torch.Tensor,
+        vocab_limit: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         # The gated step bias depends on hidden state; the fused vanilla
         # kernel does not apply.
@@ -364,6 +372,7 @@ class RNNHead(VanillaMarkov):
         base_logits: torch.Tensor,
         *,
         first_prev_tokens: torch.Tensor,
+        vocab_limit: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         # The recurrent step bias depends on hidden state; the fused vanilla
         # kernel does not apply.
