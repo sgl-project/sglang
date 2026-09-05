@@ -37,22 +37,26 @@ def _reference(accept_index, accept_lens, seq_lens, draft_token_num, track_inter
 
 @pytest.mark.parametrize("bs", [1, 3, 48, 257])
 @pytest.mark.parametrize("track_interval", [0, 64])
-def test_verify_commit_steps_matches_eager(bs, track_interval):
-    """The fused kernel must match eager on both outputs,
-    including the interval-crossing selection near tracking boundaries."""
+@pytest.mark.parametrize("tree_depth", [4, 3])
+def test_verify_commit_steps_matches_eager(bs, track_interval, tree_depth):
+    """The fused kernel must match eager on both outputs near tracking boundaries
+    and when accept_index rows (max_tree_depth) are narrower than draft_token_num."""
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
-    torch.manual_seed(bs + track_interval)
+    torch.manual_seed(bs + track_interval + tree_depth)
     device = "cuda"
     draft_token_num = 4
     accept_lens = torch.randint(
-        1, draft_token_num + 1, (bs,), device=device, dtype=torch.int64
+        1, tree_depth + 1, (bs,), device=device, dtype=torch.int32
     )
-    accept_index = torch.arange(bs, device=device, dtype=torch.int64).unsqueeze(
-        1
-    ) * draft_token_num + torch.arange(
-        draft_token_num, device=device, dtype=torch.int64
-    )
+    tree_nodes = torch.argsort(torch.rand(bs, draft_token_num, device=device), dim=1)[
+        :, :tree_depth
+    ]
+    accept_index = (
+        torch.arange(bs, device=device, dtype=torch.int64).unsqueeze(1)
+        * draft_token_num
+        + tree_nodes
+    ).to(torch.int32)
     # Cluster seq lens around tracking boundaries to exercise the crossing.
     seq_lens = torch.randint(60, 70, (bs,), device=device, dtype=torch.int64)
 

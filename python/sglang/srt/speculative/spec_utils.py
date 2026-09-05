@@ -817,7 +817,7 @@ def _verify_commit_step_indices(
             else 0
         )
         return fused_commit_track_indices(
-            accept_index.contiguous(),
+            accept_index,
             accept_lens,
             batch.seq_lens if track_grid > 0 else None,
             draft_token_num,
