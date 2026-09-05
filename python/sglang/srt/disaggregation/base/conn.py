@@ -71,6 +71,8 @@ class KVArgs:
     page_size: int
     # for system dp
     system_dp_rank: int
+    # Local Rust /route registry port; None on scheduler ranks without a listener.
+    rust_http_port: Optional[int]
     # for pp prefill
     pp_rank: int
     prefill_start_layer: int
