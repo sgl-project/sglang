@@ -554,7 +554,7 @@ class TestLoraMoeRunnerBackendArgs(unittest.TestCase):
         # silently corrupting routes.
         server_args = ServerArgs(
             model_path="dummy",
-            moe_runner_backend="lora",
+            moe_runner_backend="lora_cutedsl",
             enable_lora=True,
             enable_pdmux=True,
         )
@@ -572,7 +572,7 @@ class TestLoraMoeRunnerBackendArgs(unittest.TestCase):
         self.assertEqual(server_args.moe_runner_backend, "auto")
 
     def test_requires_enable_lora(self):
-        server_args = ServerArgs(model_path="dummy", moe_runner_backend="lora")
+        server_args = ServerArgs(model_path="dummy", moe_runner_backend="lora_cutedsl")
 
         with self.assertRaisesRegex(ValueError, "requires --enable-lora"):
             server_args.check_lora_server_args()
@@ -580,7 +580,7 @@ class TestLoraMoeRunnerBackendArgs(unittest.TestCase):
     def test_rejects_two_batch_overlap(self):
         server_args = ServerArgs(
             model_path="dummy",
-            moe_runner_backend="lora",
+            moe_runner_backend="lora_cutedsl",
             enable_lora=True,
             enable_two_batch_overlap=True,
         )
@@ -2379,44 +2379,56 @@ class TestDcpKvEventContract(CustomTestCase):
 
 
 class TestLoraMoeRunnerBackendGuards(unittest.TestCase):
-    """Startup guards for --moe-runner-backend lora."""
+    """Startup guards for the lora_* MoE runner backends."""
 
     def test_rejects_speculative_selection(self):
         server_args = ServerArgs(
             model_path="dummy",
             speculative_algorithm="EAGLE",
-            speculative_moe_runner_backend="lora",
+            speculative_moe_runner_backend="lora_cutedsl",
         )
         with self.assertRaisesRegex(ValueError, "speculative-moe-runner-backend"):
             server_args.check_lora_server_args()
 
     def test_speculative_value_ignored_without_speculative_decoding(self):
-        # The field inherits the target runner when unset, so it reads "lora"
-        # on every LoRA server; only an actual draft model makes it meaningful.
+        # The field inherits the target runner when unset, so it reads the
+        # lora_* name on every LoRA server; only an actual draft model makes
+        # it meaningful.
         server_args = ServerArgs(
             model_path="dummy",
-            moe_runner_backend="lora",
+            moe_runner_backend="lora_cutedsl",
             enable_lora=True,
             max_lora_rank=16,
             lora_target_modules=["gate_up_proj", "down_proj"],
-            speculative_moe_runner_backend="lora",
+            speculative_moe_runner_backend="lora_cutedsl",
         )
         server_args.check_lora_server_args()
 
-    def test_rejects_quantized_moe(self):
+    def test_rejects_unsupported_quantization(self):
         server_args = ServerArgs(
             model_path="dummy",
-            moe_runner_backend="lora",
+            moe_runner_backend="lora_cutedsl",
             enable_lora=True,
-            quantization="fp8",
+            quantization="awq",
         )
         with self.assertRaisesRegex(ValueError, "unquantized"):
+            server_args.check_lora_server_args()
+
+        for quantization in (None, "fp8", "modelopt_fp4"):
+            server_args = ServerArgs(
+                model_path="dummy",
+                moe_runner_backend="lora_cutedsl",
+                enable_lora=True,
+                max_lora_rank=16,
+                lora_target_modules=["gate_up_proj", "down_proj"],
+                quantization=quantization,
+            )
             server_args.check_lora_server_args()
 
     def test_rejects_non_standard_dispatch(self):
         server_args = ServerArgs(
             model_path="dummy",
-            moe_runner_backend="lora",
+            moe_runner_backend="lora_cutedsl",
             enable_lora=True,
             moe_a2a_backend="deepep",
         )

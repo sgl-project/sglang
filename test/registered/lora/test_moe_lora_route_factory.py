@@ -143,10 +143,11 @@ def _load_launch_config():
         package.__path__ = []
         packages[name] = package
     finalize = types.ModuleType("sglang.srt.lora.moe.kernels.finalize")
-    finalize.SHARED_RANK_DEFAULT_CONFIG = {
+    finalize.SHARED_TOKEN_DELTA_DEFAULT_CONFIG = {
         "reduce": {"BLOCK_SIZE_T": 16},
         "tail": {"BLOCK_SIZE_H": 16},
     }
+    finalize.SHARED_ONE_PASS_DEFAULT_CONFIG = {"BLOCK_SIZE_H": 16}
     act = types.ModuleType("sglang.srt.lora.moe.kernels.fused_act")
     act.FUSED_B_ACT_DEFAULT_CONFIG = {"BLOCK_SIZE_W": 16}
     module_name = "_host_launch_config"

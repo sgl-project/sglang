@@ -1,7 +1,4 @@
-"""The contiguous row movers: routed rows sorted by expert into one compact
-buffer whose segments start on aligned rows. The layout needs a launch
-sequence, because segment bases are a prefix sum over all experts; the rows
-then land in bf16.
+"""Dispatch rows into aligned expert segments, optionally quantizing to FP8.
 
 Negative expert IDs leave pair_to_row untouched; consumers must mask them.
 Atomic slot order may vary, so every stage must use the same pair_to_row map.
@@ -13,7 +10,11 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.moe.kernels.dispatch_checks import check_source_rows
+from sglang.srt.lora.moe.kernels.dispatch_checks import (
+    check_fp8_width,
+    check_source_rows,
+)
+from sglang.srt.lora.moe.kernels.fp8_quant import quantize_fp8_groups
 
 # Eight pairs per program outperformed 16/32 on 65k-pair prefill chunks.
 PAIRS_PER_PROGRAM = 8
@@ -185,4 +186,59 @@ def dispatch_fill_rows_contiguous_bf16(
         TOPK=num_pairs // num_tokens,
         PAIRS_PER_PROGRAM=PAIRS_PER_PROGRAM,
         BLOCK_H=1024,
+    )
+
+
+@triton.jit
+def _fill_rows_contiguous_fp8_kernel(
+    input_ptr,  # bf16 [num_tokens, K] source rows
+    out_ptr,  # fp8e4m3 [m_pad_ceiling, K] contiguous
+    scale_ptr,  # fp32 [m_pad_ceiling, K // 128] contiguous
+    topk_ids_ptr,  # [num_pairs]; < 0 = padding or EP-unrouted
+    pair_to_row_ptr,  # [num_pairs] int32 finalized compact rows
+    TOPK: tl.constexpr,
+    K: tl.constexpr,
+    GROUPS: tl.constexpr,  # K // 128
+):
+    # Quantize each token once, then fan out to its routed destinations.
+    token = tl.program_id(0)
+    offs = tl.arange(0, K)
+    x = tl.load(input_ptr + token.to(tl.int64) * K + offs).to(tl.float32)
+    grouped = tl.reshape(x, (GROUPS, 128))
+    q, scale = quantize_fp8_groups(grouped, GROUPS == 1)
+    qf = tl.reshape(q, (K,)).to(out_ptr.dtype.element_ty)
+    goffs = tl.arange(0, GROUPS)
+    for j in range(TOPK):
+        pair = token * TOPK + j
+        expert = tl.load(topk_ids_ptr + pair)
+        if expert >= 0:
+            dst = tl.load(pair_to_row_ptr + pair).to(tl.int64)
+            tl.store(out_ptr + dst * K + offs, qf)
+            tl.store(scale_ptr + dst * GROUPS + goffs, scale)
+
+
+def dispatch_fill_rows_contiguous_fp8(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    pair_to_row: torch.Tensor,
+    *,
+    rows_fp8_out: torch.Tensor,
+    scale_out: torch.Tensor,
+) -> None:
+    """Quantize and copy rows using the finalized pair_to_row map."""
+    num_tokens, k = hidden_states.shape
+    num_pairs = topk_ids.numel()
+    if num_pairs == 0:
+        return
+    check_source_rows(hidden_states, topk_ids, num_pairs // num_tokens)
+    check_fp8_width(k)
+    _fill_rows_contiguous_fp8_kernel[(num_tokens,)](
+        hidden_states,
+        rows_fp8_out,
+        scale_out,
+        topk_ids.view(-1),
+        pair_to_row,
+        TOPK=num_pairs // num_tokens,
+        K=k,
+        GROUPS=k // 128,
     )

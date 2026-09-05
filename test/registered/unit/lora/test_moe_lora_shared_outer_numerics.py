@@ -27,6 +27,7 @@ import torch.nn.functional as F
 
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.lora.moe.base_gemm_provider import select_provider_cls
 from sglang.srt.lora.moe.execution_plan import (
     ActivationFn,
     Phase,
@@ -189,7 +190,7 @@ def _bind_test_menu(runner, plan, launch_config):
     selected = SelectedPlan(key="test", name="test", base_gemm_rows="test", plan=plan)
     tiles = SimpleNamespace(config_for=lambda num_tokens: launch_config)
     runner.plans = {Phase.PREFILL: selected, Phase.DECODE: selected}
-    runner.tiles = {Phase.PREFILL: tiles, Phase.DECODE: tiles}
+    runner.tiles = {selected.key: tiles}
 
 
 def _build_runner(
@@ -203,6 +204,7 @@ def _build_runner(
         *torch.cuda.get_device_capability(device)
     )
     choice = resolve_plans(
+        quant_family="bf16",
         architecture=architecture,
         is_shared_outer=True,
         physical_rank=_PHYSICAL_RANK,
@@ -215,10 +217,7 @@ def _build_runner(
         plan_key_name=choice.name,
         physical_rank=_PHYSICAL_RANK,
     ).config_for(_NUM_TOKENS)
-    # The triton provider serves the route-major domain only; the plan's
-    # families run on either domain, so the same plan drives both vendors.
-    rows = "route_major" if vendor == "triton" else choice.base_gemm_rows
-    provider_cls = MoeLoraRunner.select_provider_cls(rows, vendor)
+    provider_cls = select_provider_cls(choice.base_gemm_rows, "bf16", vendor)
     provider = provider_cls(
         MoeLoraBf16QuantInfo(
             w13_weight=gpu["w13_weight"],

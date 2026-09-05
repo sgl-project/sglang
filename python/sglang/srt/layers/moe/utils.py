@@ -109,7 +109,9 @@ class MoeRunnerBackend(Enum):
     MARLIN = "marlin"
     HUMMING = "humming"
     EXPERIMENTAL_SGL_MARLIN = "experimental_sgl_marlin"
-    LORA = "lora"
+    LORA_CUTEDSL = "lora_cutedsl"
+    LORA_TRITON = "lora_triton"
+    LORA_MARLIN = "lora_marlin"
     AITER = "aiter"
     HPC_OPS = "hpc_ops"
 
@@ -123,7 +125,20 @@ class MoeRunnerBackend(Enum):
         return self == MoeRunnerBackend.DEEP_GEMM
 
     def is_lora(self):
-        return self == MoeRunnerBackend.LORA
+        return self in (
+            MoeRunnerBackend.LORA_CUTEDSL,
+            MoeRunnerBackend.LORA_TRITON,
+            MoeRunnerBackend.LORA_MARLIN,
+        )
+
+    def is_lora_cutedsl(self):
+        return self == MoeRunnerBackend.LORA_CUTEDSL
+
+    def is_lora_triton(self):
+        return self == MoeRunnerBackend.LORA_TRITON
+
+    def is_lora_marlin(self):
+        return self == MoeRunnerBackend.LORA_MARLIN
 
     def is_triton(self):
         return self == MoeRunnerBackend.TRITON

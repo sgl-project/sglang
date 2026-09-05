@@ -47,7 +47,6 @@ def _grouped_lora_a_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
-    PRODUCE_PDL: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_pairs_post_padded = tl.load(num_pairs_post_padded_ptr)
@@ -77,8 +76,6 @@ def _grouped_lora_a_kernel(
 
     n_offsets = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
     n_mask = n_offsets < N
-    if PRODUCE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k_begin in range(0, K, BLOCK_SIZE_K):
@@ -117,7 +114,6 @@ def grouped_lora_a(
     config: Mapping[str, int],
     pair_input: bool = False,
     pair_to_row: torch.Tensor | None = None,
-    produce_pdl: bool = False,
 ) -> None:
     num_pairs = routing.topk_ids.numel()
     if num_pairs == 0:
@@ -155,7 +151,6 @@ def grouped_lora_a(
         BLOCK_SIZE_N=block_size_n,
         BLOCK_SIZE_K=block_size_k,
         GROUP_SIZE_M=group_size_m,
-        PRODUCE_PDL=produce_pdl,
         num_warps=int(config["num_warps"]),
         num_stages=int(config["num_stages"]),
     )
@@ -288,7 +283,6 @@ def run_lora_a(
     routing: RouteView,
     config: Mapping[str, int],
     pair_to_row: torch.Tensor | None = None,
-    produce_pdl: bool = False,
 ) -> torch.Tensor:
     family = spec.family.value
     pair_input = spec.site.value == "down"
@@ -300,7 +294,6 @@ def run_lora_a(
                 output,
                 routing,
                 config=config,
-                produce_pdl=produce_pdl,
             )
         case "grouped":
             grouped_lora_a(
@@ -311,14 +304,8 @@ def run_lora_a(
                 config=config,
                 pair_input=pair_input,
                 pair_to_row=pair_to_row,
-                produce_pdl=produce_pdl,
             )
         case "per_pair":
-            if produce_pdl:
-                raise ValueError(
-                    f"{family} A has no qualified programmatic-dependent-launch "
-                    "producer"
-                )
             per_pair_lora_a(
                 input,
                 weight,
@@ -326,6 +313,13 @@ def run_lora_a(
                 routing,
                 config=config,
                 pair_input=pair_input,
+            )
+        case "token_dense":
+            # Batched GEMM covers all slots; per-pair B selects the slot plane.
+            torch.matmul(
+                input,
+                weight.transpose(1, 2),
+                out=output.view(weight.shape[0], input.shape[0], weight.shape[1]),
             )
         case _:
             raise NotImplementedError(f"no production LoRA-A executor for {family!r}")

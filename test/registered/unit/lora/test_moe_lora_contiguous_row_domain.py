@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.lora.moe.base_gemm_provider import select_provider_cls
 from sglang.srt.lora.moe.base_gemm_provider.base import MoeBaseProviderContract
 from sglang.srt.lora.moe.base_gemm_provider.contiguous_row_domain import (
     ContiguousRowDomainProvider,
@@ -84,6 +85,7 @@ class _DomainStub(ContiguousRowDomainProvider):
 
     contract = MoeBaseProviderContract(
         key="contiguous_stub",
+        quant_info_cls=MoeLoraBf16QuantInfo,
         gate_first=True,
         interleaved=False,
         gate_up_output_dtype=torch.bfloat16,
@@ -128,27 +130,29 @@ class TestAlignedSegmentMath:
 
 class TestRowDomainConfig:
     def test_prefill_ships_contiguous_providers(self) -> None:
-        # Prefill uses route-major rows. SM90 has no CuTeDSL contiguous
-        # kernel. H200 and the out-of-domain fallback therefore use the
-        # contiguous row domain. The shared fallback row has no
-        # per-expert form, so it stays on the masked provider.
+        # Every prefill row uses route-major rows, the fallbacks included:
+        # the masked slab domain allocates local_experts x padded-chunk-token
+        # x hidden scratch, which is unbounded exactly where the fallback
+        # serves (out-of-domain geometries -- 24.7GiB at E=256 H=6144 with an
+        # 8192-token chunk). Every vendor ships a contiguous provider, so the
+        # fallback never needs the masked domain for prefill.
         gb300_pe = _menu(_GB300, False)
         assert gb300_pe["prefill.per_expert"].base_gemm_rows == "route_major"
         assert gb300_pe["fallback.prefill.per_expert"].base_gemm_rows == "route_major"
         gb300_sh = _menu(_GB300, True)
         assert gb300_sh["prefill.shared"].base_gemm_rows == "route_major"
-        assert gb300_sh["fallback.prefill.shared"].base_gemm_rows == "expert_major"
+        assert gb300_sh["fallback.prefill.shared"].base_gemm_rows == "route_major"
         h200_pe = _menu(_H200, False)
         assert h200_pe["prefill.per_expert"].base_gemm_rows == "route_major"
         assert h200_pe["fallback.prefill.per_expert"].base_gemm_rows == "route_major"
         # Every shared prefill row on H200 uses route-major rows. The
-        # shared-rank row can do so for two reasons. Its reduce works on pairs.
-        # Its tail reads the base rows through ``pair_to_row`` alone.
+        # shared-finalize rows can do so for two reasons. Their reduce works on
+        # pairs. Their tail reads the base rows through ``pair_to_row`` alone.
         h200_sh = _menu(_H200, True)
         assert h200_sh["prefill.shared.rank_le8"].base_gemm_rows == "route_major"
         assert h200_sh["prefill.shared.rank_le64"].base_gemm_rows == "route_major"
         assert h200_sh["prefill.shared"].base_gemm_rows == "route_major"
-        assert h200_sh["fallback.prefill.shared"].base_gemm_rows == "expert_major"
+        assert h200_sh["fallback.prefill.shared"].base_gemm_rows == "route_major"
 
     def test_decode_choices_never_convert(self) -> None:
         # Every decode row uses expert-major rows. On GB300 the contiguous
@@ -157,7 +161,7 @@ class TestRowDomainConfig:
             for layout in (False, True):
                 for activation in (_SWIGLU, ActivationFn.RELU2):
                     for name, choice in _menu(architecture, layout, activation).items():
-                        if not name.startswith("decode.") and name != "fallback.decode":
+                        if not name.startswith(("decode.", "fallback.decode")):
                             continue
                         assert choice.base_gemm_rows == "expert_major", name
 
@@ -166,6 +170,7 @@ class TestRowDomainConfig:
         # memory. The contiguous row domain is then the only prefill
         # choice. That row also uses the b_act middle and the down-B scatter.
         routed = resolve_plans(
+            quant_family="bf16",
             architecture=_H200,
             is_shared_outer=False,
             physical_rank=16,
@@ -176,18 +181,18 @@ class TestRowDomainConfig:
         # rank 16 sits in the gated band, which keeps the campaign-tuned plan
         assert routed.name == "prefill.per_expert.rank_le16"
         assert routed.base_gemm_rows == "route_major"
-        assert not routed.plan.is_fully_serial_materialized()
         assert routed.plan.down_b_into_base is True
 
     def test_runner_accepts_the_contiguous_provider_keys(self) -> None:
-        from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
 
-        assert MoeLoraRunner.select_provider_cls("route_major", "triton") is not None
-        assert MoeLoraRunner.select_provider_cls("route_major", "cutedsl") is not None
+        assert select_provider_cls("route_major", "bf16", "triton") is not None
+        assert select_provider_cls("route_major", "bf16") is not None
         with pytest.raises(ValueError, match="row order"):
-            MoeLoraRunner.select_provider_cls("cutedsl_bf16_contiguous", "cutedsl")
-        with pytest.raises(ValueError, match="vendor"):
-            MoeLoraRunner.select_provider_cls("route_major", "nosuchvendor")
+            select_provider_cls("cutedsl_bf16_contiguous", "bf16", "cutedsl")
+        # An unlisted vendor resolves to the family default, logged.
+        assert select_provider_cls(
+            "route_major", "bf16", "nosuchvendor"
+        ) is select_provider_cls("route_major", "bf16")
 
 
 class TestCuteDslContiguousScheduleGeometry:
@@ -521,7 +526,7 @@ def _bind_test_menu(runner, plan, launch_config):
     selected = SelectedPlan(key="test", name="test", base_gemm_rows="test", plan=plan)
     tiles = SimpleNamespace(config_for=lambda num_tokens: launch_config)
     runner.plans = {Phase.PREFILL: selected, Phase.DECODE: selected}
-    runner.tiles = {Phase.PREFILL: tiles, Phase.DECODE: tiles}
+    runner.tiles = {selected.key: tiles}
 
 
 def _build_runner(architecture, choice, vendor: str, gpu, num_experts, layout):
@@ -534,10 +539,7 @@ def _build_runner(architecture, choice, vendor: str, gpu, num_experts, layout):
         intermediate_size=_INTERMEDIATE,
         hidden_size=_HIDDEN,
     )
-    # The Triton vendor has no masked domain; its route-major class runs the
-    # same plan.
-    rows = "route_major" if vendor == "triton" else choice.base_gemm_rows
-    provider = MoeLoraRunner.select_provider_cls(rows, vendor)(quant_info)
+    provider = select_provider_cls(choice.base_gemm_rows, "bf16", vendor)(quant_info)
     runner = MoeLoraRunner(
         providers={"test": provider},
         top_k=_TOP_K,
@@ -592,7 +594,7 @@ _ELIGIBLE_PLAN_PARAMS = (
         _H200,
         True,
         "prefill.shared.rank_le64",
-        id="shared-outer-shared-rank",
+        id="shared-outer-token-gemm",
     ),
 )
 

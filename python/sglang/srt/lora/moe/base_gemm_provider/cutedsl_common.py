@@ -8,7 +8,7 @@ import msgspec
 import torch
 
 if TYPE_CHECKING:
-    from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
+    from sglang.srt.lora.moe.quant_info import StandardLayoutQuantInfo
     from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 
 # Cache code only: caching bound arguments would retain layer weights.
@@ -18,6 +18,7 @@ _COMPILE_CACHE: dict[tuple, object] = {}
 class CuteDslStageCall(msgspec.Struct, frozen=True):
     compiled_fn: object
     b_arg: object
+    sf_weights: torch.Tensor | None = None
 
 
 class CuteDslTileMixin:
@@ -40,7 +41,7 @@ class CuteDslTileMixin:
     _DTYPE_TAG: str
 
     def _init_tiles(
-        self, quant_info: MoeLoraBf16QuantInfo, *, drop_narrow_tile: bool = False
+        self, quant_info: StandardLayoutQuantInfo, *, drop_narrow_tile: bool = False
     ) -> None:
         import cuda.bindings.driver as cuda_driver
 
@@ -65,6 +66,7 @@ class CuteDslTileMixin:
                 f"direct schedule's {MAX_EXPERTS}-expert packing"
             )
         self._max_token_clusters = MAX_TOKEN_CLUSTERS
+        self._bind_weights(quant_info)
 
         device = quant_info.w13_weight.device
         # The 152-cluster choice was tuned on GB300.
@@ -123,6 +125,9 @@ class CuteDslTileMixin:
             self._compile_stage(token_width, "gemm2")
         torch.cuda.synchronize(device)
 
+    def _bind_weights(self, quant_info: StandardLayoutQuantInfo) -> None:
+        """Optional hook for dtype-specific weight preparation."""
+
     def _admit_tile_width(self, token_width: int) -> None:
         """Optional hook for row-layout constraints."""
 
@@ -132,6 +137,9 @@ class CuteDslTileMixin:
         if stage == "gemm2":
             return self.quant_info.w2_weight
         raise ValueError(f"unknown CuTeDSL base stage {stage!r}")
+
+    def _stage_scale(self, stage: str) -> torch.Tensor | None:
+        return None
 
     def _compile_stage(self, token_width: int, stage: str) -> None:
         if stage in self._compiled[token_width]:
@@ -159,6 +167,7 @@ class CuteDslTileMixin:
         self._compiled[token_width][stage] = CuteDslStageCall(
             compiled_fn=compiled_fn,
             b_arg=self._as_dynamic_cute_tensor(weight, leading_dim=2),
+            sf_weights=self._stage_scale(stage),
         )
 
     def _token_width_for(self, m_max: int, expected_m: int) -> int:

@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.lora.moe.base_gemm_provider import select_provider_cls
 from sglang.srt.lora.moe.execution_plan import (
     ActivationFn,
     Phase,
@@ -46,7 +47,7 @@ def _bind_test_menu(runner, plan, launch_config):
     selected = SelectedPlan(key="test", name="test", base_gemm_rows="test", plan=plan)
     tiles = SimpleNamespace(config_for=lambda num_tokens: launch_config)
     runner.plans = {Phase.PREFILL: selected, Phase.DECODE: selected}
-    runner.tiles = {Phase.PREFILL: tiles, Phase.DECODE: tiles}
+    runner.tiles = {selected.key: tiles}
 
 
 def _cutedsl_ready() -> bool:
@@ -81,6 +82,7 @@ def _rand_bf16(
 
 def _resolve_execution(architecture, mode: Phase, num_tokens: int):
     selected = resolve_plans(
+        quant_family="bf16",
         architecture=architecture,
         is_shared_outer=False,
         physical_rank=_PHYSICAL_RANK,
@@ -250,7 +252,7 @@ def test_config_chosen_per_expert_swiglu_matches_fp32_reference(
     assert choice.base_gemm_rows is not None
     assert choice.plan is not None
 
-    provider_cls = MoeLoraRunner.select_provider_cls(choice.base_gemm_rows, "cutedsl")
+    provider_cls = select_provider_cls(choice.base_gemm_rows, "bf16")
     provider = provider_cls(
         MoeLoraBf16QuantInfo(
             w13_weight=gpu["w13_weight"],
@@ -331,7 +333,7 @@ def test_selected_pipeline_replays_correctly_in_a_real_cuda_graph(
     choice, launch_config = _resolve_execution(
         architecture_for_capability(*capability), mode, num_tokens
     )
-    provider = MoeLoraRunner.select_provider_cls(choice.base_gemm_rows, "cutedsl")(
+    provider = select_provider_cls(choice.base_gemm_rows, "bf16")(
         MoeLoraBf16QuantInfo(
             w13_weight=gpu["w13_weight"],
             w2_weight=gpu["w2_weight"],

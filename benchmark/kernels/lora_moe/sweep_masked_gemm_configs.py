@@ -1,12 +1,6 @@
-"""Sweep masked base-GEMM launch configs and emit the M-bucketed JSON store.
+"""Sweep BF16/FP8 base-GEMM tiles using the target device and TP-sharded geometry.
 
-Runs the MoE LoRA providers' S2/S4 masked GEMMs over a grid of ``expected_m``
-buckets on the current device and writes the store files consumed by
-``gemm_config_store.load_config_table``.  Only buckets that beat the built-in
-heuristic by at least ``--min-gain`` get entries — sparse tables are fine,
-nearest-M covers the gaps.
-
-Run on the target device with the layer's real TP-sharded geometry.
+Emit nearest-M config overrides only for gains above --min-gain.
 """
 
 from __future__ import annotations
@@ -75,6 +69,48 @@ def _quant_info(args, device) -> MoeLoraBf16QuantInfo:
     )
 
 
+def _fp8_block_quant(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize 128x128 blocks, including partial TP-shard tail blocks."""
+    e, rows, cols = weight.shape
+    block = 128
+    rb = (rows + block - 1) // block
+    cb = (cols + block - 1) // block
+    scale = torch.empty((e, rb, cb), dtype=torch.float32, device=weight.device)
+    q = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
+    fmax = torch.finfo(torch.float8_e4m3fn).max
+    for i in range(rb):
+        for j in range(cb):
+            blk = weight[
+                :, i * block : (i + 1) * block, j * block : (j + 1) * block
+            ].float()
+            amax = blk.abs().amax(dim=(1, 2)).clamp(min=1e-6)
+            s = amax / fmax
+            scale[:, i, j] = s
+            q[:, i * block : (i + 1) * block, j * block : (j + 1) * block] = (
+                blk / s[:, None, None]
+            ).to(torch.float8_e4m3fn)
+    return q, scale
+
+
+def _fp8_quant_info(args, device):
+    """Build synthetic FP8 weights with FP32 block scales."""
+    from sglang.srt.lora.moe.quant_info import MoeLoraFp8QuantInfo
+
+    bf16 = _quant_info(args, device)
+    w13_q, w13_s = _fp8_block_quant(bf16.w13_weight)
+    w2_q, w2_s = _fp8_block_quant(bf16.w2_weight)
+    return MoeLoraFp8QuantInfo(
+        w13_weight=w13_q,
+        w13_scale=w13_s,
+        w2_weight=w2_q,
+        w2_scale=w2_s,
+        block_shape=(128, 128),
+        num_local_experts=args.num_local_experts,
+        intermediate_size=args.intermediate_size,
+        hidden_size=args.hidden_size,
+    )
+
+
 def _stage_times(provider, ws) -> float:
     gateup_out = torch.empty(
         provider.gateup_out_shape(ws), device="cuda", dtype=torch.bfloat16
@@ -88,7 +124,9 @@ def _stage_times(provider, ws) -> float:
     return t1 + t2
 
 
-def sweep_cutedsl(args, buckets, device) -> dict[int, dict]:
+def sweep_cutedsl(
+    args, buckets, device, provider_cls=None, quant_info=None
+) -> dict[int, dict]:
     from sglang.srt.lora.moe.base_gemm_provider.cutedsl_bf16 import (
         CuteDslBf16MaskedProvider,
     )
@@ -96,8 +134,14 @@ def sweep_cutedsl(args, buckets, device) -> dict[int, dict]:
         GroupedGemmConfig,
     )
 
-    provider = CuteDslBf16MaskedProvider(_quant_info(args, device))
-    provider._config_table = None  # sweep against the pristine heuristic
+    if provider_cls is None:
+        provider_cls = CuteDslBf16MaskedProvider
+    if quant_info is None:
+        quant_info = _quant_info(args, device)
+    provider = provider_cls(quant_info)
+    # Ignore the installed bucket selection for the heuristic baseline; tile
+    # and cluster settings already compiled (installed store or --tiles) remain.
+    provider._config_table = None
     for spec in args.tiles.split(",") if args.tiles else ():
         token_width, clusters = (int(part) for part in spec.split(":"))
         if token_width in provider._compiled:
@@ -112,8 +156,13 @@ def sweep_cutedsl(args, buckets, device) -> dict[int, dict]:
             persistent_clusters=clusters,
         )
         provider._compiled[token_width] = {}
-        provider._compile_stage(token_width, "gemm1")
-        provider._compile_stage(token_width, "gemm2")
+        try:
+            provider._compile_stage(token_width, "gemm1")
+            provider._compile_stage(token_width, "gemm2")
+        except Exception as exc:  # kernel rejects unsupported tile geometries
+            print(f"skipping tile width {token_width}: {exc}")
+            provider._compiled.pop(token_width, None)
+            provider._tile_configs.pop(token_width, None)
     torch.cuda.synchronize(device)
 
     clusters_of = {
@@ -124,16 +173,22 @@ def sweep_cutedsl(args, buckets, device) -> dict[int, dict]:
     for bucket_m in buckets:
         hidden, topk_ids = _workload(bucket_m, args, device)
         m_max = (hidden.shape[0] // 256 + 1) * 256
-        heuristic = CuteDslBf16MaskedProvider._token_width_for(
-            provider, m_max, bucket_m
-        )
+        heuristic = provider_cls._token_width_for(provider, m_max, bucket_m)
         per_width = {}
         for width in sorted(provider._compiled):
-            if m_max > width * provider._max_token_clusters:
+            max_clusters = getattr(provider, "_max_token_clusters", None)
+            if max_clusters is not None and m_max > width * max_clusters:
+                continue
+            try:
+                provider._admit_tile_width(width)
+            except ValueError:
                 continue
             provider._token_width_for = lambda m_max, expected_m, _w=width: _w
             ws = provider.prepare(hidden, topk_ids, args.top_k)
             per_width[width] = _stage_times(provider, ws)
+            # Release masked slabs before the next candidate to bound memory.
+            del ws
+            torch.cuda.empty_cache()
         del provider._token_width_for
         best = min(per_width, key=per_width.get)
         gain = 1.0 - per_width[best] / per_width[heuristic]
@@ -209,6 +264,19 @@ def _emit(provider_key, results, args, version) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--family",
+        choices=("bf16", "fp8"),
+        default="bf16",
+        help="weight family to sweep; picks the matching providers",
+    )
+    parser.add_argument(
+        "--domain",
+        choices=("masked", "contiguous"),
+        default="masked",
+        help="base-GEMM row domain: masked (decode rows) or contiguous "
+        "(prefill rows)",
+    )
     parser.add_argument("--num-local-experts", type=int, required=True)
     parser.add_argument("--hidden-size", type=int, required=True)
     parser.add_argument("--intermediate-size", type=int, required=True)
@@ -227,11 +295,47 @@ def main() -> None:
     device = torch.device("cuda")
     buckets = [int(m) for m in args.buckets.split(",")]
     device_name = get_device_name()
-    results = sweep_cutedsl(args, buckets, device)
-    version = {"generated_on": device_name}
+    cutedsl_ver = {"generated_on": device_name}
     if cutedsl_version():
-        version["cutedsl"] = cutedsl_version()
-    _emit("cutedsl_bf16_masked", results, args, version)
+        cutedsl_ver["cutedsl"] = cutedsl_version()
+    if args.family == "bf16" and args.domain == "contiguous":
+        from sglang.srt.lora.moe.base_gemm_provider.cutedsl_bf16 import (
+            CuteDslBf16ContiguousProvider,
+        )
+
+        results = sweep_cutedsl(
+            args, buckets, device, provider_cls=CuteDslBf16ContiguousProvider
+        )
+        _emit("cutedsl_bf16_contiguous", results, args, cutedsl_ver)
+    elif args.family == "fp8" and args.domain == "contiguous":
+        from sglang.srt.lora.moe.base_gemm_provider.cutedsl_fp8 import (
+            CuteDslFp8ContiguousProvider,
+        )
+
+        results = sweep_cutedsl(
+            args,
+            buckets,
+            device,
+            provider_cls=CuteDslFp8ContiguousProvider,
+            quant_info=_fp8_quant_info(args, device),
+        )
+        _emit("cutedsl_fp8_contiguous", results, args, cutedsl_ver)
+    elif args.family == "bf16":
+        results = sweep_cutedsl(args, buckets, device)
+        _emit("cutedsl_bf16_masked", results, args, cutedsl_ver)
+    elif args.family == "fp8":
+        from sglang.srt.lora.moe.base_gemm_provider.cutedsl_fp8 import (
+            CuteDslFp8MaskedProvider,
+        )
+
+        results = sweep_cutedsl(
+            args,
+            buckets,
+            device,
+            provider_cls=CuteDslFp8MaskedProvider,
+            quant_info=_fp8_quant_info(args, device),
+        )
+        _emit("cutedsl_fp8_masked", results, args, cutedsl_ver)
 
 
 if __name__ == "__main__":

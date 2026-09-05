@@ -1079,11 +1079,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             physical_rank=self._max_lora_rank,
         )
         import sglang.srt.layers.moe.moe_runner.lora  # noqa: F401
-        from sglang.srt.layers.moe import MoeRunnerBackend
         from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
 
         self._lora_runner = MoeRunner(
-            MoeRunnerBackend.LORA,
+            self._lora_runner_backend,
             base_layer.moe_runner_config,
             lora_enabled=True,
         )

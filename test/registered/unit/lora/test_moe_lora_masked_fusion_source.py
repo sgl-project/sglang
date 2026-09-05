@@ -60,70 +60,30 @@ class _ContiguousRowStateStub(msgspec.Struct, kw_only=True):
 
 
 class TestMaskedFusionSource(unittest.TestCase):
-    def test_lora_a_to_b_pdl_has_a_complete_signal_wait_launch_chain(self):
-        # The benchmarks still use the A-to-B chain of Programmatic Dependent
-        # Launch (PDL), so the kernels must keep it. The serving runner does
-        # not use PDL. An A-to-B edge measured no better than launch order.
-        a = (KERNELS / "lora_a.py").read_text()
-        b = (KERNELS / "lora_b.py").read_text()
-        runner = (LORA_MOE / "moe_lora_runner.py").read_text()
-
-        grouped_a = _function(a, "_grouped_lora_a_kernel")
-        one_launch_b = _function(b, "_grouped_lora_b_kernel")
-        b_launcher = _function(b, "grouped_lora_b")
-        self.assertIn("gdc_launch_dependents", grouped_a)
-        self.assertIn("gdc_wait", one_launch_b)
-        self.assertLess(
-            grouped_a.index("gdc_launch_dependents"),
-            grouped_a.index("accumulator ="),
-        )
-        self.assertLess(
-            one_launch_b.index("if group == -1"),
-            one_launch_b.index("gdc_wait"),
-        )
-        self.assertIn('"launch_pdl": True', b_launcher)
-        self.assertNotIn("produce_pdl", runner)
-        self.assertNotIn("consume_pdl", runner)
-
-    def test_cutedsl_base_pdl_separates_producer_and_consumer_roles(self):
-        api = _source("cutedsl/api.py")
-        sm100 = _source("cutedsl/kernel_sm100_bf16.py")
-        sm90 = _source("cutedsl/kernel_sm90_bf16.py")
-        activation = _source("activation_delta.py")
-        act = _source("fused_act.py")
-        finalize = _source("finalize.py")
-        post_reorder = EP_MOE.read_text()
-
-        self.assertIn("produce_pdl: bool = False", api)
-        self.assertNotIn("use_pdl: bool = False", api)
-        for source in (sm100, sm90):
-            kernel = _function(source, "kernel")
-            self.assertIn("griddepcontrol_launch_dependents", kernel)
-            self.assertIn("self.produce_pdl", kernel)
-        # The base GEMM signals the kernels after it. It must not also wait
-        # on the kernel before it, so use_pdl must not read produce_pdl.
-        self.assertNotIn("use_pdl=self.produce_pdl", sm100)
-        self.assertNotIn("use_pdl=self.produce_pdl", sm90)
-
-        for source, kernel_name, launcher_name in (
-            (
-                activation,
-                "_act_delta_kernel",
-                "_launch_act_delta",
-            ),
-            (act, "_b_act_kernel", "_launch_b_act"),
+    def test_no_pdl_edges_outside_routing(self):
+        # PDL edges between stages tied in every e2e cell on all three
+        # architectures, so the A-to-B and base-to-act edges were removed
+        # outright for simplicity. Only the routing
+        # builder keeps its adjudicated PDL edge. This contract keeps the
+        # dead edges from creeping back without a fresh e2e win.
+        for name in (
+            "lora_a.py",
+            "lora_b.py",
+            "activation_delta.py",
+            "fused_act.py",
+            "cutedsl/api.py",
+            "cutedsl/kernel_sm100_bf16.py",
+            "cutedsl/kernel_sm100_fp8.py",
+            "cutedsl/kernel_sm90_bf16.py",
+            "cutedsl/kernel_sm90_fp8.py",
         ):
-            self.assertIn("gdc_wait", _function(source, kernel_name))
-            self.assertIn('"launch_pdl": True', _function(source, launcher_name))
-
-        # The combine kernel takes no PDL edge. No shipped plan row turns on
-        # the base-down to finalize handoff. The whole MoE stack shares this
-        # file, and an unused wait slows every other caller.
-        combine = _function(post_reorder, "post_reorder_deepgemm_triton_kernel")
-        self.assertNotIn("gdc_wait", combine)
-        self.assertNotIn(
-            '"launch_pdl": True', _function(post_reorder, "post_reorder_deepgemm")
-        )
+            source = _source(name)
+            self.assertNotIn("gdc_launch_dependents", source, name)
+            self.assertNotIn("gdc_wait", source, name)
+            self.assertNotIn("launch_pdl", source, name)
+            self.assertNotIn("produce_pdl", source, name)
+            self.assertNotIn("consume_base_pdl", source, name)
+        self.assertIn("USE_PDL", _source("routing.py"))
 
     def test_contiguous_cutedsl_launch_passes_no_pdl_argument(self):
         # The contiguous provider compiles no producer kernel, so its _launch
@@ -163,9 +123,8 @@ class TestMaskedFusionSource(unittest.TestCase):
         # These have one body, on the base.
         contiguous_src = _source("contiguous_row_domain.py")
         for method in (
-            "shared_rank_finalize",
-            "_shared_rank_reduce",
-            "_shared_rank_tail",
+            "shared_token_delta_finalize",
+            "shared_one_pass_finalize",
             "mapped_down_lora_a_input",
             "finalize",
             "num_local_experts",
@@ -192,18 +151,19 @@ class TestMaskedFusionSource(unittest.TestCase):
         self.assertIn("row_state.pair_to_row", body)
         self.assertNotIn("row_state.hidden_permuted", body)
         self.assertNotIn("row_state.masked_m", body)
-        # The shared-rank path is one body on the base. It reaches a physical
-        # row only through pair_to_row, and never through a masked-only field.
-        shared = _function(base, "shared_rank_finalize")
-        self.assertIn("self._shared_rank_reduce(", shared)
-        self.assertIn("self._shared_rank_tail(", shared)
-        finish = _function(base, "_shared_rank_tail")
-        self.assertNotIn("self.finalize(", finish)
-        self.assertIn("invoke_shared_from_scratch_finalize(", finish)
-        self.assertIn("down_rows=down_rows", finish)
-        self.assertIn("pair_to_row=row_state.pair_to_row", finish)
-        reduce_body = _function(base, "_shared_rank_reduce")
-        self.assertIn("del row_state", reduce_body)
+        # The shared finalizes are one body each on the base. They reach a
+        # physical row only through pair_to_row, never a masked-only field.
+        shared_bodies = [
+            _function(base, method)
+            for method in (
+                "shared_token_delta_finalize",
+                "shared_one_pass_finalize",
+            )
+        ]
+        for shared in shared_bodies:
+            self.assertNotIn("self.finalize(", shared)
+            self.assertIn("down_rows=down_rows", shared)
+            self.assertIn("pair_to_row=row_state.pair_to_row", shared)
         mapped = _function(base, "mapped_down_lora_a_input")
         # It hands back the flat row view paired with the route's pair_to_row.
         # Assert the return itself: a punctuation-level match breaks whenever
@@ -212,7 +172,7 @@ class TestMaskedFusionSource(unittest.TestCase):
             "return activation.view(-1, activation.shape[-1]), row_state.pair_to_row",
             " ".join(mapped.split()),
         )
-        for body in (shared, finish, reduce_body, mapped):
+        for body in (*shared_bodies, mapped):
             self.assertNotIn("row_state.hidden_permuted", body)
             self.assertNotIn("row_state.masked_m", body)
         self.assertNotIn("base_gemm_state.pair_to_row", runner)
@@ -287,22 +247,23 @@ class TestMaskedFusionSource(unittest.TestCase):
         self.assertEqual(offenders, [], "\n".join(offenders))
         self.assertEqual({fn.value for fn in ActivationFn}, {"silu", "relu2"})
 
-    def test_shared_rank_finalize_is_two_stage(self):
-        # The fail-closed guard lives in FinalizeSpec.validate: a
-        # SHARED_RANK_REDUCE plan row without shared-outer down-B ownership
-        # cannot construct.
+    def test_shared_token_delta_finalize_is_three_stage(self):
+        # The fail-closed guard lives in FinalizeSpec.validate: a shared
+        # finalize plan row without shared-outer down-B ownership cannot
+        # construct.
         source = _source("finalize.py")
-        # The wrapper is on the base: both row domains ran it identically.
-        wrapper = _function(_source("base.py"), "shared_rank_finalize")
-        self.assertIn("self._shared_rank_reduce(", wrapper)
-        self.assertIn("self._shared_rank_tail(", wrapper)
-        reduce_body = _function(source, "_shared_rank_reduce_kernel")
+        # The wrapper is on the base: both row domains run it identically.
+        wrapper = _function(_source("base.py"), "shared_token_delta_finalize")
+        self.assertIn("invoke_shared_token_delta_reduce(", wrapper)
+        self.assertIn("grouped_lora_b(", wrapper)
+        self.assertIn("invoke_shared_token_delta_tail(", wrapper)
+        reduce_body = _function(source, "_shared_token_delta_reduce_kernel")
         self.assertNotIn("routed_scaling", reduce_body)
-        from_scratch = _function(source, "_shared_from_scratch_finalize_kernel")
-        self.assertEqual(from_scratch.count("routed_scaling"), 2)
+        tail_body = _function(source, "_shared_token_delta_tail_kernel")
+        self.assertEqual(tail_body.count("routed_scaling"), 2)
         self.assertIn(
             "routed_scaling * (base_acc +",
-            " ".join(from_scratch.split()),
+            " ".join(tail_body.split()),
         )
 
     def test_every_shipped_plan_family_has_an_executor(self):
@@ -344,7 +305,7 @@ class TestMaskedFusionSource(unittest.TestCase):
             "num_stages",
         ):
             self.assertIn(f'"{key}"', act)
-        for key in ("BLOCK_SIZE_T", "BLOCK_SIZE_H", "BLOCK_SIZE_K"):
+        for key in ("BLOCK_SIZE_T", "BLOCK_SIZE_H"):
             self.assertIn(f'"{key}"', finalize)
         self.assertIn('"reduce"', finalize)
         self.assertIn('"tail"', finalize)
@@ -376,6 +337,7 @@ class TestMaskedFusionSource(unittest.TestCase):
         base = importlib.util.module_from_spec(base_spec)
         quant = types.ModuleType("sglang.srt.lora.moe.quant_info")
         quant.MoeLoraBf16QuantInfo = object
+        quant.StandardLayoutQuantInfo = object
         ep = types.ModuleType("sglang.kernels.ops.moe.ep_moe_kernels")
         ep.post_reorder_deepgemm = lambda *_args, **_kwargs: None
         activation = types.ModuleType("sglang.srt.lora.moe.kernels.activation_delta")
@@ -383,8 +345,8 @@ class TestMaskedFusionSource(unittest.TestCase):
         dispatch = types.ModuleType("sglang.srt.lora.moe.kernels.dispatch_masked")
         dispatch.dispatch_fill_masked_bf16 = lambda *_args, **_kwargs: None
         finalize = types.ModuleType("sglang.srt.lora.moe.kernels.finalize")
-        finalize.invoke_shared_from_scratch_finalize = lambda **_kwargs: None
-        finalize.invoke_shared_rank_reduce = lambda **_kwargs: None
+        finalize.invoke_shared_token_delta_tail = lambda **_kwargs: None
+        finalize.invoke_shared_token_delta_reduce = lambda **_kwargs: None
         act = types.ModuleType("sglang.srt.lora.moe.kernels.fused_act")
         act.fused_b_act_masked = lambda *_args, **_kwargs: None
         into_base = types.ModuleType("sglang.srt.lora.moe.kernels.lora_b")
@@ -474,6 +436,7 @@ class TestMaskedFusionSource(unittest.TestCase):
         row_module.MaskedRowState = StubWorkspace
         quant_module = types.ModuleType("sglang.srt.lora.moe.quant_info")
         quant_module.MoeLoraBf16QuantInfo = object
+        quant_module.StandardLayoutQuantInfo = object
         contiguous_module = types.ModuleType(
             "sglang.srt.lora.moe.base_gemm_provider.contiguous_row_domain"
         )

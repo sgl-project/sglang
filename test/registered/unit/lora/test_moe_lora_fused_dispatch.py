@@ -196,5 +196,49 @@ def test_empty_batch() -> None:
     assert torch.equal(masked, torch.zeros_like(masked))
 
 
+def test_masked_fp8_rows_match_upstream_quant() -> None:
+    """dispatch_fill_masked_fp8 writes every routed row exactly as the
+    reference per-token-group quantizer would (same amax / 448, reciprocal
+    multiply, clamp)."""
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+    from sglang.srt.lora.moe.kernels.dispatch_masked import dispatch_fill_masked_fp8
+
+    num_tokens, top_k, num_experts, hidden = 16, 8, 64, 512
+    device = torch.device("cuda")
+    topk_ids = _routed_topk_ids(num_tokens, top_k, num_experts, seed=5).to(device)
+    topk_ids[0, 2] = -1  # an EP-unrouted pair writes nothing
+    hidden_states = _rand_hidden(num_tokens, hidden, seed=6).to(device)
+
+    masked, pair_to_row, _slab = _masked_buffers(
+        num_tokens, top_k, num_experts, hidden, device=device
+    )
+    m_max = (num_tokens // 256 + 1) * 256
+    rows = torch.empty(
+        (num_experts, m_max, hidden), dtype=torch.float8_e4m3fn, device=device
+    )
+    scales = torch.empty(
+        (num_experts, m_max, hidden // 128), dtype=torch.float32, device=device
+    )
+    dispatch_fill_masked_fp8(
+        hidden_states,
+        topk_ids,
+        top_k,
+        masked_m_out=masked,
+        pair_to_row_out=pair_to_row,
+        rows_fp8_out=rows,
+        scale_out=scales,
+    )
+    up_q, up_s = sglang_per_token_group_quant_fp8(hidden_states, 128)
+    real = topk_ids.view(-1) >= 0
+    tokens = torch.arange(num_tokens, device=device).repeat_interleave(top_k)[real]
+    dst = pair_to_row[real].long()
+    assert torch.equal(
+        rows.view(-1, hidden)[dst].view(torch.uint8), up_q[tokens].view(torch.uint8)
+    )
+    assert torch.equal(scales.view(-1, hidden // 128)[dst], up_s[tokens])
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

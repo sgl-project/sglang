@@ -10,7 +10,7 @@ import torch
 
 from sglang.srt.lora.moe.base_gemm_provider.base import (
     MoeBaseProvider,
-    admit_bf16_weights,
+    admit_weight_layout,
 )
 from sglang.srt.lora.moe.kernels.activation_delta import (
     act_delta_contiguous,
@@ -23,7 +23,7 @@ from sglang.srt.lora.moe.kernels.dispatch_contiguous import (
 from sglang.srt.lora.moe.kernels.fused_act import (
     fused_b_act_contiguous,
 )
-from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
+from sglang.srt.lora.moe.quant_info import StandardLayoutQuantInfo
 
 if TYPE_CHECKING:
     from sglang.srt.lora.moe.route_view import RouteView
@@ -31,22 +31,24 @@ if TYPE_CHECKING:
 
 
 class ContiguousRowState(msgspec.Struct, kw_only=True):
-    hidden_compact: torch.Tensor  # [m_pad_ceiling, hidden] bf16
+    hidden_compact: torch.Tensor | None  # [m_pad_ceiling, hidden], the GEMM input dtype
     seg_counts: torch.Tensor  # [E_local] int32
     seg_offsets: torch.Tensor  # [E_local + 1] int32 first row of each segment
     pair_to_row: torch.Tensor  # [num_tokens * top_k] int32 compact rows
     m_pad_ceiling: int
     retained_inputs: bool
+    # Quantized activation and scales for the down GEMM.
+    act_quant: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 class ContiguousRowDomainProvider(MoeBaseProvider):
 
-    def __init__(self, quant_info: MoeLoraBf16QuantInfo, *, m_alignment: int):
+    def __init__(self, quant_info: StandardLayoutQuantInfo, *, m_alignment: int):
         self.quant_info = quant_info
         if not isinstance(m_alignment, int) or m_alignment < 1:
             raise ValueError(f"m_alignment must be a positive int, got {m_alignment!r}")
         self._m_alignment = m_alignment
-        self._gate_up_slices = admit_bf16_weights(quant_info)
+        self._gate_up_slices = admit_weight_layout(quant_info)
 
     @property
     def m_alignment(self) -> int:
@@ -58,6 +60,8 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         topk_ids: torch.Tensor,
         top_k: int,
         workspace: MoeLoraWorkspace | None = None,
+        *,
+        fill_rows: bool = True,
     ) -> ContiguousRowState:
         num_pairs = topk_ids.numel()
         num_experts = self.quant_info.num_local_experts
@@ -85,23 +89,30 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
                 dtype=torch.int32,
                 device=device,
             )
-            # First-allocation zero only: stale rows are safe, since nothing
-            # reads a padding row's output.
-            hidden_compact = workspace.tensor(
-                f"{prefix}:hidden_compact",
-                (m_pad_ceiling, hidden_states.size(1)),
-                dtype=torch.bfloat16,
-                device=device,
-                zero_on_first_allocation=True,
+            # Padding outputs are ignored, so reused padding needs no reset.
+            hidden_compact = (
+                None
+                if not fill_rows
+                else workspace.tensor(
+                    f"{prefix}:hidden_compact",
+                    (m_pad_ceiling, hidden_states.size(1)),
+                    dtype=torch.bfloat16,
+                    device=device,
+                    zero_on_first_allocation=True,
+                )
             )
         else:
             seg_counts = torch.empty(num_experts, dtype=torch.int32, device=device)
             seg_offsets = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
             pair_to_row = torch.empty(num_pairs, dtype=torch.int32, device=device)
-            hidden_compact = torch.zeros(
-                (m_pad_ceiling, hidden_states.size(1)),
-                dtype=torch.bfloat16,
-                device=device,
+            hidden_compact = (
+                None
+                if not fill_rows
+                else torch.zeros(
+                    (m_pad_ceiling, hidden_states.size(1)),
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
             )
         dispatch_layout_contiguous(
             hidden_states,
@@ -127,9 +138,8 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         )
 
     def release_prepared_inputs(self, row_state: ContiguousRowState) -> None:
-        # A workspace tensor must keep its address for graph replay, so this
-        # frees only an eagerly allocated buffer.
-        if row_state.retained_inputs:
+        # Workspace buffers retain their addresses for graph replay.
+        if row_state.retained_inputs or row_state.hidden_compact is None:
             return
         from sglang.srt.utils import dispose_tensor
 
@@ -145,8 +155,10 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         activation_lora_input: torch.Tensor,
         *,
         activation: str = "silu",
-        consume_base_pdl: bool = False,
+        act_quant: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> None:
+        if act_quant is not None:
+            row_state.act_quant = act_quant
         act_delta_contiguous(
             gateup_out,
             gate_up_delta,
@@ -158,7 +170,11 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
             gate_first=self.contract.gate_first,
             interleaved=self.contract.interleaved,
             activation=activation,
-            consume_base_pdl=consume_base_pdl,
+            act_quant=(
+                (*act_quant, self.contract.act_quant_group)
+                if act_quant is not None
+                else None
+            ),
         )
 
     def fused_act(
@@ -174,7 +190,6 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         bridge_gateup: torch.Tensor | None = None,
         b_gate_up: torch.Tensor | None = None,
         bridge_top_k: int = 1,
-        consume_base_pdl: bool = False,
     ) -> None:
         fused_b_act_contiguous(
             activation=activation,
@@ -190,7 +205,6 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
             bridge_gateup=bridge_gateup,
             b_gate_up=b_gate_up,
             bridge_top_k=bridge_top_k,
-            consume_base_pdl=consume_base_pdl,
         )
 
     def gateup_out_shape(self, row_state: ContiguousRowState) -> tuple[int, ...]:

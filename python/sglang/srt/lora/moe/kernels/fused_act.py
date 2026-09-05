@@ -129,7 +129,6 @@ def _b_act_kernel(
     block_k: tl.constexpr,
     group_m: tl.constexpr,
     store_pair_act: tl.constexpr,
-    consume_base_pdl: tl.constexpr,
 ):
     pid = tl.program_id(0)
     # Keep the tile count constexpr for grouped scheduling.
@@ -201,10 +200,6 @@ def _b_act_kernel(
                 block_k=block_k,
             )
 
-    if consume_base_pdl:
-        # The LoRA-B tile above overlaps the base GEMM; wait just before the
-        # first read of its output.
-        tl.extra.cuda.gdc_wait()
     base_gate = tl.load(
         base_ptr + dst_rows[:, None] * stride_pm + gate_cols[None, :] * stride_pn,
         mask=base_valid[:, None] & w_mask[None, :],
@@ -250,7 +245,6 @@ def _launch_b_act(
     bridge_gateup: torch.Tensor,
     b_gate_up: torch.Tensor,
     bridge_top_k: int,
-    consume_base_pdl: bool,
 ) -> None:
     ActivationFn.parse(activation)
     pairs = routing.topk_ids.numel()
@@ -301,10 +295,8 @@ def _launch_b_act(
         block_k=int(config["BLOCK_SIZE_K"]),
         group_m=int(config["GROUP_SIZE_M"]),
         store_pair_act=act_pairs is not None,
-        consume_base_pdl=consume_base_pdl,
         num_warps=int(config["num_warps"]),
         num_stages=int(config["num_stages"]),
-        **({"launch_pdl": True} if consume_base_pdl else {}),
     )
 
 
@@ -323,7 +315,6 @@ def fused_b_act_masked(
     bridge_gateup: torch.Tensor,
     b_gate_up: torch.Tensor,
     bridge_top_k: int = 1,
-    consume_base_pdl: bool = False,
 ) -> None:
     _launch_b_act(
         activation=activation,
@@ -339,7 +330,6 @@ def fused_b_act_masked(
         bridge_gateup=bridge_gateup,
         b_gate_up=b_gate_up,
         bridge_top_k=bridge_top_k,
-        consume_base_pdl=consume_base_pdl,
     )
 
 
@@ -358,7 +348,6 @@ def fused_b_act_contiguous(
     bridge_gateup: torch.Tensor,
     b_gate_up: torch.Tensor,
     bridge_top_k: int = 1,
-    consume_base_pdl: bool = False,
 ) -> None:
     _launch_b_act(
         activation=activation,
@@ -374,5 +363,4 @@ def fused_b_act_contiguous(
         bridge_gateup=bridge_gateup,
         b_gate_up=b_gate_up,
         bridge_top_k=bridge_top_k,
-        consume_base_pdl=consume_base_pdl,
     )

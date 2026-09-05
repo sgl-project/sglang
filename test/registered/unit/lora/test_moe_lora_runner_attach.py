@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+from sglang.srt.lora.moe.base_gemm_provider import select_provider_cls
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
@@ -18,11 +19,19 @@ class _FakeMoeLayer:
     def __init__(self, *, is_lora_runner: bool, with_quant_info: bool, device=None):
         device = device or torch.device("cpu")
         self._lora_runner_backend = (
-            MoeRunnerBackend.LORA if is_lora_runner else MoeRunnerBackend.DEEP_GEMM
+            MoeRunnerBackend.LORA_CUTEDSL
+            if is_lora_runner
+            else MoeRunnerBackend.DEEP_GEMM
         )
+        # The buffer sizing reads logical dims from the layer (quant-info
+        # tensor shapes are form-specific; Marlin payloads pack both dims).
         self.base_layer = SimpleNamespace(
             top_k=2,
             num_experts=4,
+            num_local_experts=4,
+            intermediate_size_per_partition=4,
+            hidden_size=6,
+            moe_runner_config=SimpleNamespace(is_gated=True),
             w13_weight=torch.zeros(4, 8, 6, device=device),
         )
         if with_quant_info:
@@ -194,6 +203,89 @@ class TestEngineAdmission(unittest.TestCase):
 
     def test_admits_a_supported_layer(self):
         self._admit()
+
+    def test_weight_family_of_a_bf16_layer(self):
+        from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
+
+        assert MoeLoraRunner._weight_family(self._base_layer()) == "bf16"
+
+    def _fp8_layer(self, *, block_quant=True, weight_dtype=torch.float8_e4m3fn):
+        from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+
+        layer = self._base_layer()
+        quant_method = object.__new__(Fp8MoEMethod)
+        quant_method.block_quant = block_quant
+        quant_method.use_mxfp8 = False
+        quant_method.weight_block_size = [128, 128] if block_quant else None
+        layer.quant_method = quant_method
+        layer.w13_weight = layer.w13_weight.to(weight_dtype)
+        layer.w2_weight = layer.w2_weight.to(weight_dtype)
+        return layer
+
+    def test_weight_family_of_a_block_fp8_layer(self):
+        from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
+
+        assert MoeLoraRunner._weight_family(self._fp8_layer()) == "fp8"
+
+    def test_rejects_per_tensor_fp8(self):
+        from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
+
+        with self.assertRaisesRegex(NotImplementedError, "128-block"):
+            MoeLoraRunner._weight_family(self._fp8_layer(block_quant=False))
+
+    def test_rejects_marlin_repacked_fp8(self):
+        from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
+
+        with self.assertRaisesRegex(NotImplementedError, "float8_e4m3fn"):
+            MoeLoraRunner._weight_family(self._fp8_layer(weight_dtype=torch.bfloat16))
+
+    def test_fp8_family_selects_its_vendors(self):
+
+        for vendor, rows in (
+            ("cutedsl", "expert_major"),
+            ("cutedsl", "route_major"),
+            ("triton", "route_major"),
+            # No masked slab domain: decode plans run the route-major
+            # provider, same as the Marlin nvfp4 vendor.
+            ("triton", "expert_major"),
+        ):
+            assert select_provider_cls(rows, "fp8", vendor)
+        # DeepGEMM is no vendor: bf16 lost to CuTeDSL at every m, fp8 lost to
+        # both surviving vendors on SM90 and was inadmissible on SM100 shards.
+        # A vendor serving no fp8 layers resolves to the fp8 default.
+        for absent in ("marlin", "deepgemm"):
+            assert select_provider_cls(
+                "expert_major", "fp8", absent
+            ) is select_provider_cls("expert_major", "fp8")
+
+    def test_every_listed_vendor_resolves_and_others_fall_back_to_the_first(self):
+        """A mixed-quant model (quant-excluded BF16 sink next to NVFP4 routed
+        experts) attaches per layer: a backend whose vendor serves no layers of
+        this family resolves to the family default instead of failing."""
+        from sglang.srt.lora.moe.base_gemm_provider import VENDORS
+
+        every_vendor = {vendor for vendors in VENDORS.values() for vendor in vendors}
+        for family, vendors in VENDORS.items():
+            default = select_provider_cls("route_major", family)
+            assert default is select_provider_cls("route_major", family, vendors[0])
+            for vendor in vendors:
+                assert select_provider_cls("expert_major", family, vendor)
+            for other in every_vendor - set(vendors):
+                assert select_provider_cls("route_major", family, other) is default
+
+    def test_vendors_without_a_masked_domain_serve_expert_major_rows(self):
+        """Every decode row asks for expert_major. Triton and Marlin gather rows
+        by the sort metadata and have one domain, so the request runs on their
+        route-major class; bf16 lora_triton used to fail at attach here."""
+
+        for vendor, family in (
+            ("triton", "bf16"),
+            ("triton", "fp8"),
+            ("marlin", "nvfp4"),
+        ):
+            assert select_provider_cls(
+                "expert_major", family, vendor
+            ) is select_provider_cls("route_major", family, vendor)
 
     def test_rejects_architectures_with_neither_mma_family(self):
         """SM90 and SM100 are a closed set, not a floor: SM120 reports major 12

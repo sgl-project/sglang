@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.lora.moe.base_gemm_provider import select_provider_cls
 from sglang.srt.lora.moe.execution_plan import (
     ActFamily,
     ActivationFn,
@@ -123,7 +124,15 @@ class TestBActConfig:
             for layout in (False, True):
                 for activation in (_SWIGLU, ActivationFn.RELU2):
                     for name, choice in _menu(architecture, layout, activation).items():
-                        if not name.startswith("decode.") and name != "fallback.decode":
+                        if not name.startswith(("decode.", "fallback.decode")):
+                            continue
+                        if ".fp8" in name:
+                            # The expert-banded fp8 row absorbs gate/up-B into
+                            # the activation.
+                            assert (
+                                choice.plan.act.family is ActFamily.B_ACTIVATION
+                            ), name
+                            assert choice.plan.gate_up_b is None, name
                             continue
                         assert choice.plan.act.family is ActFamily.MATERIALIZED, name
                         assert choice.plan.gate_up_b is not None, name
@@ -131,11 +140,12 @@ class TestBActConfig:
     def test_out_of_domain_prefill_rows_get_the_swap(self) -> None:
         def _prefill(is_shared_outer, activation=_SWIGLU):
             return resolve_plans(
+                quant_family="bf16",
                 architecture=_GB300,
                 is_shared_outer=is_shared_outer,
                 physical_rank=16,
                 activation=activation,
-                hidden_size=8192,  # outside the gb300 tuned domain
+                hidden_size=12288,  # outside the gb300 tuned domain
                 num_local_experts=256,
             )[Phase.PREFILL]
 
@@ -145,17 +155,21 @@ class TestBActConfig:
         for sel in (per_expert, relu2):
             assert sel.name == "fallback.prefill.per_expert"
         assert shared.name == "fallback.prefill.shared"
-        # Both layouts add down-B into the base output. The epilogue finds its
-        # rows through pair_to_row, so a shared down-B factor does not prevent it.
-        # A row does not depend on the activation, so the ReLU2 row matches.
+        # The per-expert row adds down-B into the base output; the shared row
+        # consumes down-B in its shared_token_delta finalize, like every shared
+        # prefill row. A row does not depend on the activation, so the ReLU2
+        # row matches.
         assert per_expert.plan.act.family is ActFamily.B_ACTIVATION
         assert per_expert.plan.gate_up_b is None
         assert per_expert.plan.down_b_into_base is True
         assert per_expert.base_gemm_rows == "route_major"
         assert shared.plan.act.family is ActFamily.B_ACTIVATION
         assert shared.plan.gate_up_b is None
-        assert shared.plan.down_b_into_base is True
-        assert shared.base_gemm_rows == "expert_major"
+        assert shared.plan.down_b is None
+        assert shared.plan.finalize.family is FinalizeFamily.SHARED_TOKEN_DELTA
+        # Route-major keeps the fallback's scratch bounded by routed pairs;
+        # the masked slab domain grows with experts x padded chunk tokens.
+        assert shared.base_gemm_rows == "route_major"
         assert relu2.plan.act.family is ActFamily.B_ACTIVATION
         assert relu2.plan.act.activation is ActivationFn.RELU2
         assert relu2.plan.down_b_into_base is True
@@ -276,14 +290,14 @@ def _bind_test_menu(runner, plan, launch_config):
     selected = SelectedPlan(key="test", name="test", base_gemm_rows="test", plan=plan)
     tiles = SimpleNamespace(config_for=lambda num_tokens: launch_config)
     runner.plans = {Phase.PREFILL: selected, Phase.DECODE: selected}
-    runner.tiles = {Phase.PREFILL: tiles, Phase.DECODE: tiles}
+    runner.tiles = {selected.key: tiles}
 
 
 def _build_runner(plan, launch_config, base_gemm_rows: str, gpu, num_experts: int):
     from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
     from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
 
-    provider = MoeLoraRunner.select_provider_cls(base_gemm_rows, "cutedsl")(
+    provider = select_provider_cls(base_gemm_rows, "bf16")(
         MoeLoraBf16QuantInfo(
             w13_weight=gpu["w13_weight"],
             w2_weight=gpu["w2_weight"],

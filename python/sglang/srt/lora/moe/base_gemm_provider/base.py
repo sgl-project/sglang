@@ -15,13 +15,15 @@ if TYPE_CHECKING:
 
 class MoeBaseProviderContract(msgspec.Struct, frozen=True, kw_only=True):
     key: str
-    # These two flags give the column order of the base gate/up GEMM output.
-    # The LoRA delta is always [gate | up].
+    quant_info_cls: type
+    # Base output order; the LoRA delta is always [gate | up].
     gate_first: bool
     interleaved: bool
     gate_up_output_dtype: torch.dtype
     lora_delta_dtype: torch.dtype
     lora_activation_dtype: torch.dtype
+    # Fuse FP8 quantization into activation for the down GEMM.
+    act_quant_group: int | None = None
 
 
 def expected_rows_per_expert(num_pairs: int, num_experts: int) -> int:
@@ -35,8 +37,8 @@ def prepare_buffer(workspace, name: str, shape, *, dtype, device) -> torch.Tenso
     return torch.empty(shape, dtype=dtype, device=device)
 
 
-def admit_bf16_weights(quant_info) -> int:
-    """Check the BF16 weight layout once at attach; return the gate/up slices."""
+def admit_weight_layout(quant_info) -> int:
+    """Validate [E, S*I, H] / [E, H, I] weights and return S."""
     if quant_info.intermediate_size <= 0:
         raise ValueError("intermediate_size must be positive")
     expected_w2 = (
@@ -65,7 +67,7 @@ def admit_bf16_weights(quant_info) -> int:
     gate_up_slices = gateup_width // quant_info.intermediate_size
     if gate_up_slices not in (1, 2):
         raise ValueError(
-            "the BF16 providers support one non-gated slice or two gated "
+            "the base providers support one non-gated slice or two gated "
             f"gate/up slices, got {gate_up_slices}"
         )
     return gate_up_slices
@@ -119,7 +121,6 @@ class MoeBaseProvider:
         activation_lora_input: torch.Tensor,
         *,
         activation: str = "silu",
-        consume_base_pdl: bool = False,
     ) -> None:
         raise NotImplementedError
 
@@ -136,7 +137,6 @@ class MoeBaseProvider:
         bridge_gateup: torch.Tensor | None = None,
         b_gate_up: torch.Tensor | None = None,
         bridge_top_k: int = 1,
-        consume_base_pdl: bool = False,
     ) -> None:
         raise NotImplementedError(
             f"{self.contract.key} has no fused-act implementation"
@@ -178,7 +178,7 @@ class MoeBaseProvider:
             lora_delta=lora_delta,
         )
 
-    def shared_rank_finalize(
+    def shared_token_delta_finalize(
         self,
         row_state,
         *,
@@ -190,77 +190,64 @@ class MoeBaseProvider:
         routed_scaling_factor: float | None,
         output: torch.Tensor,
         token_rank: torch.Tensor,
+        token_delta: torch.Tensor,
+        token_route: RouteView,
+        delta_config: Mapping[str, int],
         config: Mapping[str, Mapping[str, int]],
     ) -> None:
-        self._shared_rank_reduce(
-            row_state,
+        """Reduce in rank space before applying the shared down-B per token."""
+        from sglang.srt.lora.moe.kernels.finalize import (
+            invoke_shared_token_delta_reduce,
+            invoke_shared_token_delta_tail,
+        )
+        from sglang.srt.lora.moe.kernels.lora_b import grouped_lora_b
+
+        invoke_shared_token_delta_reduce(
             bridge=bridge,
             routing=routing,
             topk_weights=topk_weights,
-            routed_scaling_factor=routed_scaling_factor,
             token_rank=token_rank,
             config=config["reduce"],
         )
-        self._shared_rank_tail(
-            row_state,
+        grouped_lora_b(
+            token_rank,
+            b_down,
+            token_delta,
+            token_route,
+            destination_offsets=(0,),
+            config=delta_config,
+            intermediate_top_k=1,
+        )
+        invoke_shared_token_delta_tail(
             down_rows=down_rows,
-            b_down=b_down,
+            pair_to_row=row_state.pair_to_row,
+            token_delta=token_delta,
             routing=routing,
             topk_weights=topk_weights,
             routed_scaling_factor=routed_scaling_factor,
             output=output,
-            token_rank=token_rank,
             config=config["tail"],
         )
 
-    def _shared_rank_reduce(
-        self,
-        row_state,
-        *,
-        bridge: torch.Tensor,
-        routing: RouteView,
-        topk_weights: torch.Tensor,
-        routed_scaling_factor: float | None,
-        token_rank: torch.Tensor,
-        config: Mapping[str, int],
-    ) -> None:
-        from sglang.srt.lora.moe.kernels.finalize import (
-            invoke_shared_rank_reduce,
-        )
-
-        # Reads pair data only; ``row_state`` stays so every stage takes the
-        # same arguments.
-        del row_state
-        invoke_shared_rank_reduce(
-            bridge=bridge,
-            routing=routing,
-            topk_weights=topk_weights,
-            routed_scaling_factor=routed_scaling_factor,
-            token_rank=token_rank,
-            config=config,
-        )
-
-    def _shared_rank_tail(
+    def shared_one_pass_finalize(
         self,
         row_state,
         *,
         down_rows: torch.Tensor,
+        bridge: torch.Tensor,
         b_down: torch.Tensor,
         routing: RouteView,
         topk_weights: torch.Tensor,
         routed_scaling_factor: float | None,
         output: torch.Tensor,
-        token_rank: torch.Tensor,
         config: Mapping[str, int],
     ) -> None:
-        from sglang.srt.lora.moe.kernels.finalize import (
-            invoke_shared_from_scratch_finalize,
-        )
+        from sglang.srt.lora.moe.kernels.finalize import invoke_shared_one_pass
 
-        invoke_shared_from_scratch_finalize(
+        invoke_shared_one_pass(
             down_rows=down_rows,
             pair_to_row=row_state.pair_to_row,
-            token_rank=token_rank,
+            bridge=bridge,
             b_down=b_down,
             routing=routing,
             topk_weights=topk_weights,

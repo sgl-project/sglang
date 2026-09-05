@@ -444,12 +444,13 @@ class FusedMoE(torch.nn.Module):
                 )
             self.moe_runner_config.inplace = False
 
+        _nvfp4_backend = getattr(
+            self.quant_method, "_moe_runner_backend", get_moe_runner_backend()
+        )
         self.should_fuse_routed_scaling_factor_in_topk = (
             (
                 isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
-                and not getattr(
-                    self.quant_method, "_moe_runner_backend", get_moe_runner_backend()
-                ).is_marlin()
+                and not (_nvfp4_backend.is_marlin() or _nvfp4_backend.is_lora_marlin())
             )
             or (
                 isinstance(self.quant_method, Fp8MoEMethod)
