@@ -447,9 +447,15 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
                 server_based_warmup=True,
             )
 
-        # the bounded warmup runs first so the worker can size the probe
-        self.assertEqual(len(reqs), 2)
+        # the bounded warmup runs first so the worker can size the probe, and
+        # once more after it so serving starts from a serving-shaped pool
+        self.assertEqual(len(reqs), 3)
         self.assertFalse(reqs[0].extra.get("auto_residency_full_shape_probe"))
+        self.assertFalse(reqs[2].extra.get("auto_residency_full_shape_probe"))
+        self.assertEqual(
+            (reqs[2].width, reqs[2].height, reqs[2].num_frames),
+            (reqs[0].width, reqs[0].height, reqs[0].num_frames),
+        )
         self.assertEqual(
             (reqs[1].width, reqs[1].height, reqs[1].num_frames),
             (1280, 720, 81),
