@@ -42,6 +42,69 @@ import triton.language as tl
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.types import e4m3_dtype
 
+try:  # gfx950 assembly MTP-verify attention (in-tree .s, assembled at first use)
+    from sglang.kernels.ops.attention.vattn_asm_gfx950 import (
+        asm_toolchain_available as _asm_toolchain_available,
+    )
+    from sglang.kernels.ops.attention.vattn_asm_gfx950 import (
+        mtp_verify_attn_fwd_asm as _mtp_verify_attn_fwd_asm,
+    )
+except ImportError:
+    _mtp_verify_attn_fwd_asm = None
+
+import os as _os
+
+from sglang.srt.utils import is_gfx95_supported
+
+
+def asm_verify_attn_enabled() -> bool:
+    """The in-tree gfx950 assembly attention kernel (vattn_asm_gfx950) is used
+    by default on gfx95x when ROCm clang is available and the batch shape is
+    supported; SGLANG_ASM_VERIFY_ATTN=0 keeps everything on the Triton path."""
+    return (
+        _os.environ.get("SGLANG_ASM_VERIFY_ATTN", "1") == "1"
+        and _mtp_verify_attn_fwd_asm is not None
+        and is_gfx95_supported()
+        and _asm_toolchain_available()
+    )
+
+
+def asm_verify_attn_supported(
+    q,
+    k,
+    v,
+    seqused_k,
+    cu_seqlens_q,
+    block_table,
+    num_queries_per_kv,
+    max_seqlen_q,
+    k_descale,
+    v_descale,
+) -> bool:
+    num_tokens, _, head_size = q.shape
+    num_seqs = seqused_k.shape[0]
+    return (
+        head_size == 256
+        and k.shape[1] == 16
+        and num_queries_per_kv in (16, 8)
+        # The v3 kernel reads cu_seqlens_q natively (tail-aligned ragged,
+        # q_len 1..4): pad rows are store-masked in the kernel epilogue.
+        and 1 <= max_seqlen_q <= 4
+        and num_tokens <= num_seqs * 4
+        and q.stride(1) == head_size
+        and q.stride(2) == 1
+        and k.is_contiguous()
+        and v.is_contiguous()
+        and seqused_k.dtype == torch.int64
+        and cu_seqlens_q.dtype == torch.int32
+        and block_table.dtype == torch.int32
+        and k_descale is not None
+        and v_descale is not None
+        and k_descale.dtype == torch.float32
+        and v_descale.dtype == torch.float32
+    )
+
+
 float8_info = torch.finfo(e4m3_dtype)
 
 
@@ -626,10 +689,39 @@ def unified_attention_3d_mtp_func(
     # which packs two draft tokens per tile. Any (16N : N) GQA layout works because
     # the kernel indexes KV through kv_head_idx = program_id(1).
     assert num_query_heads % num_kv_heads == 0
-    assert num_queries_per_kv == 16
     assert head_size == 256 and k.shape[1] == 16
     assert q.dtype == torch.bfloat16
     assert k.dtype == e4m3_dtype and v.dtype == e4m3_dtype
+
+    if asm_verify_attn_enabled() and asm_verify_attn_supported(
+        q,
+        k,
+        v,
+        seqused_k,
+        cu_seqlens_q,
+        block_table,
+        num_queries_per_kv,
+        max_seqlen_q,
+        k_descale,
+        v_descale,
+    ):
+        # gfx950 assembly kernel: reads the page-16 fp8 cache in place, supports
+        # GQA ratios 16 and 8, does its own split-KV reduce into `out`.
+        return _mtp_verify_attn_fwd_asm(
+            q,
+            k,
+            v,
+            block_table,
+            seqused_k,
+            cu_seqlens_q,
+            k_descale,
+            v_descale,
+            softmax_scale,
+            out=out,
+        )
+
+    # The Triton kernel below is only correct for the 16:1 GQA layout.
+    assert num_queries_per_kv == 16
 
     block_m = 32
     block_q = block_m // num_queries_per_kv
@@ -741,3 +833,123 @@ def unified_attention_3d_mtp_func(
         num_stages=1,
     )
     return out
+
+
+def unified_attention_3d_mtp_ragged_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    block_table: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+) -> bool:
+    """ASM verify-attn for ragged draft batches (per-seq q_len 1..4).
+
+    The asm kernel reads cu_seqlens_q natively and tail-aligns each
+    sequence in-kernel: row r of a sequence with q_len ql holds real token
+    r - (4 - ql); pad rows reuse the sequence's first token and are
+    store-masked in the epilogue, so position math matches the ragged
+    original and seqused_k passes through unchanged.
+
+    Returns False (computing nothing) when the asm kernel cannot serve the
+    batch; the caller falls back to its Triton path.
+    """
+    _, num_query_heads, _ = q.shape
+    num_kv_heads = k.shape[2]
+    num_queries_per_kv = num_query_heads // num_kv_heads
+    if not (1 <= max_seqlen_q <= 4):
+        return False
+    if not asm_verify_attn_enabled():
+        return False
+    if not asm_verify_attn_supported(
+        q,
+        k,
+        v,
+        seqused_k,
+        cu_seqlens_q,
+        block_table,
+        num_queries_per_kv,
+        max_seqlen_q,
+        k_descale,
+        v_descale,
+    ):
+        return False
+    _mtp_verify_attn_fwd_asm(
+        q,
+        k,
+        v,
+        block_table,
+        seqused_k,
+        cu_seqlens_q,
+        k_descale,
+        v_descale,
+        softmax_scale,
+        out=out,
+    )
+    return True
+
+
+def unified_attention_3d_mtp_decode_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    seqused_k: torch.Tensor,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    block_table: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+) -> bool:
+    """ASM verify-attn for decode batches (uniform q_len 1, e.g. EAGLE draft
+    decode steps and plain decode).
+
+    cu_seqlens_q is a static arange (q_len 1 per sequence); the kernel
+    tail-aligns in-kernel, so the single real token sits on row 3 at its
+    original position and rows 0-2 are store-masked. All shapes are static,
+    so the path is safe under cuda-graph capture.
+
+    Returns False (computing nothing) when the asm kernel cannot serve the
+    batch; the caller falls back to its Triton path.
+    """
+    num_tokens, num_query_heads, _ = q.shape
+    num_seqs = seqused_k.shape[0]
+    if num_tokens != num_seqs:
+        return False
+    if not asm_verify_attn_enabled():
+        return False
+    num_kv_heads = k.shape[2]
+    num_queries_per_kv = num_query_heads // num_kv_heads
+    cu_dec = torch.arange(0, num_seqs + 1, device=q.device, dtype=torch.int32)
+    if not asm_verify_attn_supported(
+        q,
+        k,
+        v,
+        seqused_k,
+        cu_dec,
+        block_table,
+        num_queries_per_kv,
+        1,
+        k_descale,
+        v_descale,
+    ):
+        return False
+    _mtp_verify_attn_fwd_asm(
+        q,
+        k,
+        v,
+        block_table,
+        seqused_k,
+        cu_dec,
+        k_descale,
+        v_descale,
+        softmax_scale,
+        out=out,
+    )
+    return True
