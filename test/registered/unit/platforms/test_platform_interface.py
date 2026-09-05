@@ -249,7 +249,11 @@ class TestCudaDeviceMixin(CustomTestCase):
         mock_torch_seed.assert_called_once_with(123)
         mock_cuda_seed.assert_called_once_with(123)
 
-    def test_cuda_srt_platform_capabilities(self):
+    @patch(
+        "sglang.srt.layers.quantization.fp8_utils.cutlass_fp8_supported",
+        return_value=True,
+    )
+    def test_cuda_srt_platform_capabilities(self, _cutlass_fp8):
         base = CudaSRTPlatform()
         self.assertTrue(base.supports_fp8())
         self.assertTrue(base.support_cuda_graph())
