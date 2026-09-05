@@ -253,6 +253,49 @@ def _reject_explicit_component_selector(
         )
 
 
+def _enforce_quantized_component_offload_capability(
+    *,
+    server_args: ServerArgs,
+    quant_config: Optional[QuantizationConfig],
+    component_name: str | None,
+    model_cls: type[nn.Module],
+) -> None:
+    supports_offload = True
+    for cls in model_cls.__mro__:
+        capability = vars(cls).get("supports_quantized_component_offload")
+        if capability is not None:
+            supports_offload = bool(capability)
+            break
+    if quant_config is None or supports_offload:
+        return
+    if not _uses_component_offload(
+        server_args,
+        component_name,
+        legacy_enabled=bool(server_args.dit_cpu_offload),
+    ):
+        return
+
+    feature_name = f"quantized {model_cls.__name__} checkpoints"
+    _reject_explicit_component_selector(
+        server_args,
+        component_name,
+        feature_name=feature_name,
+    )
+    if component_name is None:
+        server_args.dit_cpu_offload = False
+    else:
+        server_args.require_component_resident(
+            component_name,
+            feature_name=feature_name,
+        )
+    logger.info(
+        "%s keeps %s resident because its quantized runtime layout does not "
+        "support component offload",
+        model_cls.__name__,
+        component_name or "the transformer",
+    )
+
+
 class _NunchakuQuantAdapter(_TransformerQuantAdapter):
     """Adapter for Nunchaku checkpoints"""
 
@@ -733,6 +776,13 @@ def resolve_transformer_quant_load_spec(
         quant_config.remap_checkpoint_prefixes(
             vars(model_cls).get("param_names_mapping", {})
         )
+
+    _enforce_quantized_component_offload_capability(
+        server_args=server_args,
+        quant_config=quant_config,
+        component_name=component_name,
+        model_cls=model_cls,
+    )
 
     nunchaku_config = server_args.nunchaku_config
     if quant_config is not None and nunchaku_config is not None:

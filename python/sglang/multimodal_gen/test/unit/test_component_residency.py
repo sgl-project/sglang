@@ -177,6 +177,31 @@ class _Stage:
         return self.uses
 
 
+def test_reports_components_with_mixed_use_dtypes():
+    encode = _Stage(ComponentUse("encode", "vae", target_dtype=torch.float32))
+    decode = _Stage(ComponentUse("decode", "vae", target_dtype=torch.bfloat16))
+    denoise = _Stage(
+        ComponentUse("denoise", "transformer", target_dtype=torch.bfloat16)
+    )
+    pipeline = SimpleNamespace(
+        modules={},
+        _stage_name_mapping={
+            "encode": encode,
+            "denoise": denoise,
+            "decode": decode,
+        },
+        component_residency_strategies={},
+    )
+    server_args = _server_args()
+    manager = ComponentResidencyManager(pipeline, server_args)
+
+    manager.begin_request(
+        [encode, denoise, decode], SimpleNamespace(is_warmup=True), server_args
+    )
+
+    assert manager.components_with_mixed_use_dtypes() == {"vae"}
+
+
 def test_warmup_records_use_and_transition_peaks(monkeypatch):
     device_module = SimpleNamespace(
         is_available=lambda: True,

@@ -32,6 +32,10 @@ class BaseDiT(nn.Module, ABC):
     # shard conditions left in the root group stays sharded unless the entry
     # point is registered; loaders read this and register each name.
     _fsdp_forward_methods: tuple[str, ...] = ()
+    # Quantized modules normally support the same coarse CPU residency as
+    # floating-point modules. Implementations whose packed runtime layout
+    # cannot survive that round trip override this after quant detection.
+    supports_quantized_component_offload: bool = True
     param_names_mapping: dict
     reverse_param_names_mapping: dict
     hidden_size: int

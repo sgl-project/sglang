@@ -4,11 +4,14 @@ ServerArgsAutoTuner tunes the ServerArgs based on the desired performance mode
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
+)
+from sglang.multimodal_gen.configs.quantization.nunchaku import (
+    NunchakuSVDQuantArgs,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
@@ -20,6 +23,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP,
     LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP,
     LAYERWISE_OFFLOAD_VAE_GROUP,
+    is_dit_component_name,
     normalize_layerwise_offload_components,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -29,6 +33,20 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
 
 logger = init_logger(__name__)
+
+PERFORMANCE_MODES = ("manual", "auto", "speed", "memory")
+
+DEFAULT_LAYERWISE_COMPONENT_ARG_NAMES = (
+    (LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP, "text_encoder_cpu_offload"),
+    (LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP, "image_encoder_cpu_offload"),
+    (LAYERWISE_OFFLOAD_VAE_GROUP, "vae_cpu_offload"),
+)
+
+# task-type defaults for keep_resident_min_available_gb when a model does not pin
+# one: image vae is tiny so any datacenter gpu keeps it resident, video vae is
+# larger so it only stays resident on very-high-memory gpus
+IMAGE_GEN_KEEP_RESIDENT_MIN_AVAILABLE_GB = 45.0
+DEFAULT_KEEP_RESIDENT_MIN_AVAILABLE_GB = 120.0
 
 
 def auto_residency_args_skip_reason(server_args: ServerArgs) -> str | None:
@@ -73,19 +91,33 @@ def auto_residency_args_skip_reason(server_args: ServerArgs) -> str | None:
     return None
 
 
-PERFORMANCE_MODES = ("manual", "auto", "speed", "memory")
+def fixed_loading_residency_components(
+    server_args: ServerArgs, component_names: Iterable[str]
+) -> set[str]:
+    """Components whose selected residency must remain unchanged.
 
-DEFAULT_LAYERWISE_COMPONENT_ARG_NAMES = (
-    (LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP, "text_encoder_cpu_offload"),
-    (LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP, "image_encoder_cpu_offload"),
-    (LAYERWISE_OFFLOAD_VAE_GROUP, "vae_cpu_offload"),
-)
-
-# task-type defaults for keep_resident_min_available_gb when a model does not pin
-# one: image vae is tiny so any datacenter gpu keeps it resident, video vae is
-# larger so it only stays resident on very-high-memory gpus
-IMAGE_GEN_KEEP_RESIDENT_MIN_AVAILABLE_GB = 45.0
-DEFAULT_KEEP_RESIDENT_MIN_AVAILABLE_GB = 120.0
+    Explicit/online quantization and direct GPU loading constrain their target
+    DiTs. LTX-2 two-stage ``original`` mode also relies on its offloaded DiT
+    while swapping the stage LoRA. Keep those components outside auto
+    residency while still calibrating unrelated encoders and VAEs.
+    """
+    fixed = set(server_args.component_quantizations)
+    nunchaku = server_args.nunchaku_config
+    fixed_dit_loading = (
+        server_args.quantization is not None
+        or server_args.direct_gpu_weight_loading
+        or server_args.ltx2_two_stage_device_mode == "original"
+        or (
+            nunchaku is not None
+            and (
+                not isinstance(nunchaku, NunchakuSVDQuantArgs)
+                or nunchaku.enable_svdquant
+            )
+        )
+    )
+    if fixed_dit_loading:
+        fixed.update(name for name in component_names if is_dit_component_name(name))
+    return fixed
 
 
 class ServerArgsAutoTuner:
@@ -97,6 +129,10 @@ class ServerArgsAutoTuner:
 
     def _deployment_config(self) -> ModelDeploymentConfig:
         return self.server_args.pipeline_config.get_model_deployment_config()
+
+    def _uses_warmup_calibrated_residency(self) -> bool:
+        """Whether warmup will replace coarse pre-load residency defaults."""
+        return auto_residency_args_skip_reason(self.server_args) is None
 
     def _resolve_keep_resident_min_available_gb(
         self, deployment_config: ModelDeploymentConfig
@@ -169,6 +205,11 @@ class ServerArgsAutoTuner:
     def maybe_adjust_auto_component_residency_after_offload(self) -> None:
         args = self.server_args
         if args.performance_mode != "auto" or current_platform.is_cpu():
+            return
+        if self._uses_warmup_calibrated_residency():
+            # Keep the load-safe placement until warmup has measured the real
+            # workload. The post-warmup planner replaces model/card thresholds
+            # with component sizes and per-phase headroom.
             return
 
         # Explicit placement is component-scoped; unmatched components still
@@ -563,6 +604,8 @@ class ServerArgsAutoTuner:
     ) -> list[str]:
         args = self.server_args
         if args.performance_mode != "auto" or current_platform.is_cpu():
+            return components
+        if self._uses_warmup_calibrated_residency():
             return components
 
         deployment_config = self._deployment_config()

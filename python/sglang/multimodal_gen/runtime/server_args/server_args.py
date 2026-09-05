@@ -14,7 +14,7 @@ import sys
 import tempfile
 from dataclasses import field
 from enum import Enum
-from typing import Any, List, Literal, Optional
+from typing import TYPE_CHECKING, Any, List, Literal, Optional
 
 import addict
 import yaml
@@ -88,6 +88,11 @@ from sglang.multimodal_gen.utils import (
 )
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+        HostPinBudget,
+    )
 
 LTX2_TWO_STAGE_DEVICE_MODES = ("original", "resident")
 LTX2_TWO_STAGE_DEVICE_MODE_CHOICES = LTX2_TWO_STAGE_DEVICE_MODES
@@ -403,8 +408,17 @@ class ServerArgs(DisaggServerArgsMixin):
     _automatic_component_attention_backend_keys: set[str] = field(
         default_factory=set, init=False, repr=False
     )
-    _required_resident_components: set[str] = field(
-        default_factory=set, init=False, repr=False
+    # component name -> owning feature; the first (loader-time) owner wins so
+    # a runtime feature's rollback can never release a loader hard requirement
+    _required_resident_components: dict[str, str] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    # Warmup-calibrated serving placement. This is deliberately separate from
+    # configured CLI placement and loader hard requirements: calibration can
+    # move among all three runtime modes, while a loader-owned resident
+    # requirement must remain authoritative.
+    _auto_residency_modes: dict[str, str] = field(
+        default_factory=dict, init=False, repr=False
     )
     _fsdp_disabled_components: set[str] = field(
         default_factory=set, init=False, repr=False
@@ -971,10 +985,7 @@ class ServerArgs(DisaggServerArgsMixin):
         device_total_memory_gb = (
             current_platform.get_device_total_memory() / BYTES_PER_GB
         )
-        if (
-            "H200" in device_name
-            or device_total_memory_gb >= LTX2_RESIDENT_AUTO_ENABLE_MEM_GB
-        ):
+        if device_total_memory_gb >= LTX2_RESIDENT_AUTO_ENABLE_MEM_GB:
             logger.info(
                 "Automatically set ltx2_two_stage_device_mode=resident for high-memory CUDA GPU (%s, %.2f GiB total)",
                 device_name,
@@ -1604,6 +1615,22 @@ class ServerArgs(DisaggServerArgsMixin):
             return RESIDENT
         if component_name in self._required_resident_components:
             return RESIDENT
+        auto_mode = self.auto_residency_mode(component_name)
+        if auto_mode is not None:
+            return auto_mode
+
+        return self.configured_residency_mode(component_name)
+
+    def configured_residency_mode(self, component_name: str) -> str:
+        """Return placement from user controls and startup auto tuning.
+
+        Unlike :meth:`residency_mode`, this excludes runtime requirements such
+        as warmup-calibrated auto residency. A runtime planner can therefore
+        recover and reconsider the load-safe baseline without overriding an
+        explicit user choice.
+        """
+        if current_platform.is_cpu():
+            return RESIDENT
 
         explicit_mode = self.explicit_residency_mode(component_name)
         if explicit_mode is not None:
@@ -1640,6 +1667,47 @@ class ServerArgs(DisaggServerArgsMixin):
             return COMPONENT_OFFLOAD if self.vae_cpu_offload else RESIDENT
         return RESIDENT
 
+    def component_residency_requirement(self, component_name: str) -> str | None:
+        """Return the feature that currently hard-requires GPU residency."""
+        return self._required_resident_components.get(component_name)
+
+    def auto_residency_mode(self, component_name: str) -> str | None:
+        """Return the warmup-calibrated serving override, if one is active."""
+        return self.__dict__.get("_auto_residency_modes", {}).get(component_name)
+
+    def host_pin_budget(self) -> "HostPinBudget":
+        """Return this worker's shared HostPin ledger.
+
+        Initial and lazily configured layerwise components must spend from the
+        same allowance. Keeping this process-local object out of dataclass
+        fields also keeps ServerArgs serialization and logging unchanged.
+        """
+        from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+            HostPinBudget,
+        )
+
+        budget = self.__dict__.get("_host_pin_budget")
+        if budget is None:
+            local_worker_count = max(1, self.num_gpus // self.nnodes)
+            budget = HostPinBudget.for_local_worker(local_worker_count)
+            self.__dict__["_host_pin_budget"] = budget
+        return budget
+
+    def set_auto_residency_mode(self, component_name: str, mode: str) -> None:
+        """Set one runtime placement without rewriting its configured policy."""
+        if mode not in (RESIDENT, COMPONENT_OFFLOAD, LAYERWISE_OFFLOAD):
+            raise ValueError(f"invalid auto residency mode {mode!r}")
+        owner = self._required_resident_components.get(component_name)
+        if owner is not None and mode != RESIDENT:
+            raise ValueError(
+                f"cannot set {component_name!r} to {mode!r}; "
+                f"{owner} requires it resident"
+            )
+        self.__dict__.setdefault("_auto_residency_modes", {})[component_name] = mode
+
+    def clear_auto_residency_mode(self, component_name: str) -> None:
+        self.__dict__.get("_auto_residency_modes", {}).pop(component_name, None)
+
     def should_cpu_offload_component(self, component_name: str) -> bool:
         return self.residency_mode(component_name) == COMPONENT_OFFLOAD
 
@@ -1658,7 +1726,18 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"{feature_name} requires {component_name!r} to be resident; "
                 f"got {configured_mode!r} from an explicit residency option"
             )
-        self._required_resident_components.add(component_name)
+        self._required_resident_components.setdefault(component_name, feature_name)
+
+    def release_required_component_residency(
+        self, component_name: str, *, feature_name: str
+    ) -> None:
+        """Undo ``require_component_resident`` for the same owning feature.
+
+        A release with a different owner is a no-op: an auto-residency
+        rollback must not clear a loader's hard residency requirement.
+        """
+        if self._required_resident_components.get(component_name) == feature_name:
+            del self._required_resident_components[component_name]
 
     def should_use_fsdp_for_component(self, component_name: str) -> bool:
         return bool(
@@ -2564,7 +2643,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 "LTX-2.3 two-stage device residency mode: "
                 "'original' keeps official two-stage semantics without premerged stage2, "
                 "'resident' keeps both transformers resident on GPU. "
-                "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise original."
+                "Default is auto: resident on CUDA GPUs with at least 130 GiB, otherwise original."
             ),
         )
         parser.add_argument(

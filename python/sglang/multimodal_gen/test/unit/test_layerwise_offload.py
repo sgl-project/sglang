@@ -40,6 +40,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
     LayerwiseOffloadManager,
+    LayerwiseUsageTracker,
     compute_streamed_layers,
     configure_layerwise_offload_modules,
     get_layerwise_offload_component_names_for_pipeline,
@@ -51,6 +52,53 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     RESIDENCY_POLICY_STRIDED,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+
+class _UsageTrackedVAE(torch.nn.Module, LayerwiseOffloadableModuleMixin):
+    layer_names = ["encoder", "decoder"]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.encoder = torch.nn.ModuleList(torch.nn.Identity() for _ in range(2))
+        self.decoder = torch.nn.ModuleList(torch.nn.Identity() for _ in range(3))
+
+    def forward(self, value):
+        for layer in self.decoder:
+            value = layer(value)
+        return value
+
+
+def test_layerwise_usage_tracker_observes_only_executed_groups():
+    module = _UsageTrackedVAE()
+    tracker = LayerwiseUsageTracker({"vae": module})
+
+    module(torch.zeros(1))
+    uses = tracker.finish()
+
+    assert uses == {
+        "vae": {
+            "encoder": (0, 0),
+            "decoder": (1, 1, 1),
+        }
+    }
+    assert all(not layer._forward_pre_hooks for layer in module.decoder)
+
+
+def test_layerwise_usage_tracker_attributes_calls_to_stages():
+    module = _UsageTrackedVAE()
+    stage = "encode"
+    tracker = LayerwiseUsageTracker({"vae": module}, stage_name_provider=lambda: stage)
+
+    module(torch.zeros(1))
+    stage = "decode"
+    module(torch.zeros(1))
+    uses, uses_by_stage = tracker.finish_with_stages()
+
+    assert uses["vae"]["decoder"] == (2, 2, 2)
+    assert uses_by_stage == {
+        "encode": {"vae": {"decoder": (1, 1, 1)}},
+        "decode": {"vae": {"decoder": (1, 1, 1)}},
+    }
 
 
 class _FakeStream:
@@ -184,11 +232,14 @@ class _LayerwiseComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
 
 class _TestServerArgs(SimpleNamespace):
     canonical_residency_mode = ServerArgs.canonical_residency_mode
+    configured_residency_mode = ServerArgs.configured_residency_mode
     explicit_residency_mode = ServerArgs.explicit_residency_mode
     _legacy_component_offload_flag = staticmethod(
         ServerArgs._legacy_component_offload_flag
     )
     residency_mode = ServerArgs.residency_mode
+    auto_residency_mode = ServerArgs.auto_residency_mode
+    host_pin_budget = ServerArgs.host_pin_budget
     is_arg_explicitly_set = ServerArgs.is_arg_explicitly_set
     is_explicit_layerwise_offload_component = (
         ServerArgs.is_explicit_layerwise_offload_component
@@ -206,7 +257,10 @@ def _server_args(**kwargs):
         component_residency=None,
         disagg_role=RoleType.MONOLITHIC,
         performance_mode="auto",
-        _required_resident_components=set(),
+        num_gpus=1,
+        nnodes=1,
+        _required_resident_components={},
+        _auto_residency_modes={},
         _component_layerwise_capabilities={},
         _explicit_arg_names=set(),
         cpu_offload_components=None,
@@ -227,6 +281,9 @@ def _server_args(**kwargs):
         # the pin budget ranks candidates by bytes x steps, and reads the step
         # count off the pipeline's sampling defaults
         pipeline_class_name=None,
+        model_path=None,
+        backend="sglang",
+        model_id=None,
     )
     defaults.update(kwargs)
     return _TestServerArgs(**defaults)
@@ -899,6 +956,29 @@ def test_resident_layers_off_by_default_streams_everything(monkeypatch):
     assert 2 not in manager._gpu_layers
 
 
+def test_resident_layer_size_and_runtime_reconfiguration(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(
+        _MultiBlockModel(4), num_layers=4, prefetch_size=1, resident_layers=2
+    )
+    full_bytes = sum(manager.layer_weight_bytes().values())
+
+    assert manager.resident_weight_bytes(0) == 0
+    assert manager.resident_weight_bytes(4) == full_bytes
+    assert manager.resident_weight_bytes(2) * 2 == full_bytes
+    assert manager.peak_managed_device_weight_bytes(0) == full_bytes // 4
+    assert manager.peak_managed_device_weight_bytes(2) == 3 * full_bytes // 4
+    assert manager.peak_managed_device_weight_bytes(4) == full_bytes
+
+    _arm_residency(manager)
+    previous = manager.set_resident_layers(1)
+    assert previous == 2
+    assert manager.resident_layers == 1
+    assert manager._resident_set == {0}
+    assert manager._residency_active is False
+    assert not manager._gpu_layers
+
+
 def test_prepare_for_next_req_repins_residents(monkeypatch):
     _patch_fake_device(monkeypatch)
     manager = _resident_manager(
@@ -1539,6 +1619,38 @@ def test_weights_are_copied_when_they_fit(tmp_path, monkeypatch):
     manager = _mapped_manager(tmp_path, monkeypatch, available_gib=64)
     assert not manager._mapped_cpu_weights[0], "a copy was affordable"
     assert manager._consolidated_cpu_weights[0]
+
+
+def test_anonymous_layer_store_can_reassign_its_pin_budget(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    manager = _mapped_manager(
+        tmp_path,
+        monkeypatch,
+        available_gib=64,
+        pin_budget_bytes=4 * 1024**3,
+        num_blocks=2,
+    )
+    original = manager.pinned_layer_indices()
+    assert original == (0, 1)
+    committed = manager._pin_budget.committed_bytes
+    pinned_store_bytes = sum(
+        manager.layer_host_store_bytes()[layer_idx] for layer_idx in original
+    )
+
+    previous = manager.set_pinned_layers(())
+    assert previous == original
+    assert manager.pinned_layer_indices() == ()
+    assert manager._pin_budget.committed_bytes == committed - pinned_store_bytes
+    assert all(
+        not buffer.is_pinned()
+        for stores in manager._consolidated_cpu_weights.values()
+        for buffer in stores.values()
+    )
+
+    manager.set_pinned_layers(previous)
+    assert manager.pinned_layer_indices() == original
+    assert manager._pin_budget.committed_bytes == committed
 
 
 def test_a_mapped_weight_is_not_written_back(tmp_path, monkeypatch):
