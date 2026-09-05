@@ -24,12 +24,14 @@ def is_mla_preprocess_enabled() -> bool:
 
 @lru_cache(maxsize=1)
 def is_fia_nz() -> bool:
-    is_fia_nz_ = get_bool_env_var("SGLANG_USE_FIA_NZ")
-    if is_fia_nz_:
-        assert is_mla_preprocess_enabled(), (
-            "SGLANG_USE_FIA_NZ must be enable with SGLANG_NPU_USE_MLAPO"
-        )
-    return is_fia_nz_
+    """Whether MLA KV cache uses the FIA NZ physical layout.
+
+    This is a cache-layout choice, not an MLAPO-only optimization. MLAPO can
+    write NZ cache directly, while the ordinary MLA path writes the same
+    layout through ``NPUMLATokenToKVPool``. Keeping the switch independent
+    lets models such as Kimi-K3 use FIA NZ without selecting MLAPO.
+    """
+    return get_bool_env_var("SGLANG_USE_FIA_NZ")
 
 
 def round_up(val: int, align: int) -> int:
