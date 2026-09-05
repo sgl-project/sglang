@@ -11,6 +11,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_xpu
 
 from .utils import make_name
@@ -43,7 +44,55 @@ def _jit_topk_v2_module():
             ("topk_transform_paged", "TopKKernel::transform_paged"),
             ("topk_transform_ragged", "TopKKernel::transform_ragged"),
             ("topk_plan", "TopKKernel::plan"),
+            ("topk_coop_workspace_bytes", "TopKKernel::coop_workspace_bytes"),
         ],
+    )
+
+
+# kClusterFloorSmall in topk_v2.cuh. The handoff guard the cooperative kernel
+# pairs with lives on the official kernel's cluster path, which a batch-1 row
+# only takes above this length.
+_COOP_TOPK_MIN_FLOOR = 32768
+
+
+def _coop_topk_floor() -> int:
+    # Row length above which paged top-k v2 hands off to the cooperative kernel;
+    # 0 is the wire value for "off". Read per call, like SGLANG_OPT_USE_TOPK_V2
+    # on this path; a captured graph freezes both at capture.
+    if is_hip_runtime() or not envs.SGLANG_OPT_USE_COOP_TOPK.get():
+        return 0
+    floor = envs.SGLANG_OPT_COOP_TOPK_FLOOR.get()
+    # Under the bound, a row the cooperative kernel claims can take the official
+    # kernel's non-cluster path, which carries no handoff guard: two writers into
+    # one output row. The kernel takes the floor as uint32_t, so a value past
+    # 0xffffffff would arrive truncated -- and truncated to 0 means "off".
+    if floor is None or not _COOP_TOPK_MIN_FLOOR <= floor <= 0xFFFFFFFF:
+        raise ValueError(
+            f"SGLANG_OPT_COOP_TOPK_FLOOR must be at least {_COOP_TOPK_MIN_FLOOR} "
+            f"and at most {0xFFFFFFFF} when SGLANG_OPT_USE_COOP_TOPK is set, "
+            f"got {floor}"
+        )
+    return floor
+
+
+@cache_once
+def _coop_topk_workspace(device_index: int) -> torch.Tensor:
+    # Cross-block state for the cooperative kernel: zeroed once here, and every
+    # launch leaves it ready for the next. One buffer per device serves every
+    # launch, so that handoff holds only while launches never overlap -- true
+    # while they are enqueued in order on the caller's stream, and false if a
+    # second stream ever reaches this entry point concurrently.
+    if torch.cuda.is_current_stream_capturing():
+        # Graph-private memory is reused after capture, so a buffer allocated
+        # here would be handed out again while a replay still reads it. Raising
+        # rather than asserting: python -O strips the assert and leaves the
+        # corruption silent.
+        raise RuntimeError(
+            "coop top-k workspace must be allocated before CUDA graph capture"
+        )
+    nbytes = int(_jit_topk_v2_module().topk_coop_workspace_bytes())
+    return torch.zeros(
+        -(-nbytes // 4), dtype=torch.int32, device=torch.device("cuda", device_index)
     )
 
 
@@ -148,6 +197,11 @@ def topk_transform_paged_v2(
     * ``page_tables`` given -- ``out_page_indices`` receives the page-table
       transform of them.
 
+    With ``SGLANG_OPT_USE_COOP_TOPK`` set, rows longer than
+    ``SGLANG_OPT_COOP_TOPK_FLOOR`` are instead selected by a second,
+    grid-cooperative kernel enqueued on the same stream; both output modes and
+    the contract below are unchanged.
+
     IMPORTANT: every entry of ``seq_lens`` must be NON-NEGATIVE, and
     ``metadata`` must come from :func:`plan_topk_v2` over the same ``seq_lens``
     values. The kernel reads lengths as ``uint32_t``: a negative entry
@@ -168,6 +222,7 @@ def topk_transform_paged_v2(
         )
         return
     module = _jit_topk_v2_module()
+    coop_floor = _coop_topk_floor()
     module.topk_transform_paged(
         scores,
         seq_lens,
@@ -175,4 +230,6 @@ def topk_transform_paged_v2(
         out_page_indices,
         page_size,
         metadata,
+        coop_floor,
+        _coop_topk_workspace(scores.device.index) if coop_floor else None,
     )
