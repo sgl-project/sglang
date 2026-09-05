@@ -991,26 +991,95 @@ class EnginePassthroughTestCase(CustomTestCase):
 
 
 class CancelIdempotencyTestCase(CustomTestCase):
+    def test_non_background_response_cannot_be_cancelled(self):
+        import orjson
+
+        from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
+
+        serving = make_serving()
+        serving.tokenizer_manager.abort_request = Mock()
+        resp = ResponsesResponse.from_request(
+            ResponsesRequest(model="x", input="hi", background=False, store=True),
+            sampling_params={},
+            model_name="x",
+            created_time=0,
+            output=[],
+            status="completed",
+            usage=None,
+        )
+        serving.response_store[resp.id] = resp
+
+        out = asyncio.run(serving.cancel_responses(resp.id))
+
+        self.assertEqual(out.status_code, 400)
+        body = orjson.loads(out.body)
+        self.assertEqual(
+            body,
+            {
+                "error": {
+                    "message": (
+                        "Only responses created with background=true can be cancelled."
+                    ),
+                    "type": "invalid_request_error",
+                    "param": "response_id",
+                    "code": 400,
+                }
+            },
+        )
+        self.assertEqual(resp.status, "completed")
+        serving.tokenizer_manager.abort_request.assert_not_called()
+
+    def test_cancelling_an_active_background_response_aborts_it(self):
+        from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
+
+        for status in ("queued", "in_progress"):
+            with self.subTest(status=status):
+                serving = make_serving()
+                serving.tokenizer_manager.abort_request = Mock()
+                resp = ResponsesResponse.from_request(
+                    ResponsesRequest(
+                        model="x", input="hi", background=True, store=True
+                    ),
+                    sampling_params={},
+                    model_name="x",
+                    created_time=0,
+                    output=[],
+                    status=status,
+                    usage=None,
+                )
+                serving.response_store[resp.id] = resp
+
+                out = asyncio.run(serving.cancel_responses(resp.id))
+
+                self.assertIs(out, resp)
+                self.assertEqual(out.status, "cancelled")
+                serving.tokenizer_manager.abort_request.assert_called_once_with(
+                    rid=resp.id
+                )
+
     def test_cancelling_a_terminal_response_returns_it_not_an_error(self):
         from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
 
-        for status in ("cancelled", "completed"):
-            serving = make_serving()
-            resp = ResponsesResponse.from_request(
-                ResponsesRequest(model="x", input="hi", store=False),
-                sampling_params={},
-                model_name="x",
-                created_time=0,
-                output=[],
-                status=status,
-                usage=None,
-            )
-            serving.response_store[resp.id] = resp
+        for status in ("cancelled", "completed", "failed", "incomplete"):
+            with self.subTest(status=status):
+                serving = make_serving()
+                resp = ResponsesResponse.from_request(
+                    ResponsesRequest(
+                        model="x", input="hi", background=True, store=True
+                    ),
+                    sampling_params={},
+                    model_name="x",
+                    created_time=0,
+                    output=[],
+                    status=status,
+                    usage=None,
+                )
+                serving.response_store[resp.id] = resp
 
-            out = asyncio.run(serving.cancel_responses(resp.id))
+                out = asyncio.run(serving.cancel_responses(resp.id))
 
-            self.assertIs(out, resp, status)
-            self.assertEqual(out.status, status)
+                self.assertIs(out, resp, status)
+                self.assertEqual(out.status, status)
 
 
 class StreamingLogprobsRejectionTestCase(CustomTestCase):
