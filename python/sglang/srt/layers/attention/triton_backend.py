@@ -7,6 +7,9 @@ import torch
 import triton
 
 from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
+from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
+    mla_kv_pack_quantize_fp8,
+)
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -36,12 +39,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import (
-    get_exec,
-    get_parallel,
-    get_schedule,
-    get_spec,
-)
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -90,8 +88,6 @@ def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv
     if use_mla:
         return is_kimi_k3(model_config.hf_config)
     if is_dspark_draft(model_config.hf_config):
-        # Added for the K3 DSpark draft model, which is qwen3 type attention,
-        # and using bidirectional (non-causal) mode.
         return use_verify_splitkv
     return (
         use_verify_splitkv
@@ -166,15 +162,13 @@ class TritonAttnBackend(AttentionBackend):
         )
         from sglang.kernels.ops.attention.extend_attention import (
             build_unified_kv_indices,
+            can_use_dense_prefill_fp8,
+            dense_prefill_attention_fwd,
             extend_attention_fwd,
             extend_attention_fwd_unified,
         )
-        from sglang.kernels.ops.attention.verify_mla import (
-            verify_shared_kv_fwd,
-        )
-        from sglang.kernels.ops.attention.verify_splitkv import (
-            verify_splitkv_fwd,
-        )
+        from sglang.kernels.ops.attention.verify_mla import verify_shared_kv_fwd
+        from sglang.kernels.ops.attention.verify_splitkv import verify_splitkv_fwd
 
         super().__init__()
 
@@ -189,6 +183,15 @@ class TritonAttnBackend(AttentionBackend):
             extend_attention_fwd_unified
         )
         self.build_unified_kv_indices = torch.compiler.disable(build_unified_kv_indices)
+        # Dense (non-absorbed) MLA prefill over a materialized prefix; see
+        # handle_attention_triton for when the dispatcher selects it.
+        self.dense_prefill_attention_fwd = torch.compiler.disable(
+            dense_prefill_attention_fwd
+        )
+        self.can_use_dense_prefill_fp8 = can_use_dense_prefill_fp8
+        # Cumulative full sequence lengths addressing the one-shot K/V; built
+        # on first use per forward and reset by init_forward_metadata.
+        self._dense_one_shot_kv_indptr = None
         # Split-KV EAGLE-verify kernel; enabled below once topk is known (valid only at topk == 1).
         self.verify_splitkv_fwd = torch.compiler.disable(verify_splitkv_fwd)
         # Grouped-head split-KV verify kernel for MLA or one shared local KV head.
@@ -235,6 +238,24 @@ class TritonAttnBackend(AttentionBackend):
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
         )
+        mla_config = model_runner.model_config
+        self.use_dense_fp8_chunked_prefill = (
+            self.use_mla
+            and is_gfx95_supported()
+            and envs.SGLANG_TRITON_DENSE_PREFILL_ATTN.get()
+            and envs.SGLANG_TRITON_FP8_PREFILL_ATTN.get()
+            and model_runner.kv_cache_dtype == torch.float8_e4m3fn
+            and self.num_head == 12
+            and mla_config.qk_nope_head_dim + mla_config.qk_rope_head_dim == 192
+            and mla_config.v_head_dim == 128
+            and mla_config.kv_lora_rank == 512
+        )
+        # forward_mha discovers these hooks dynamically. Hiding them when the
+        # exact Kimi-K3 FP8 configuration is absent keeps all other models on
+        # their existing code paths.
+        if not self.use_dense_fp8_chunked_prefill:
+            self.prepare_chunked_prefill_qkv = None
+            self.pack_prefix_chunk_kv = None
         # The decode kernel's "// Lv" stride trick requires attn_logits.shape[-1]
         # to exactly match the layer's v_head_dim, so hybrid SWA models with
         # differing SWA/full v_head_dim need a second buffer for SWA layers.
@@ -745,6 +766,7 @@ class TritonAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
 
+        self._dense_one_shot_kv_indptr = None
         bs = forward_batch.batch_size
         window_kv_indptr = self.window_kv_indptr
         window_kv_indices = None
@@ -1285,6 +1307,186 @@ class TritonAttnBackend(AttentionBackend):
     ):
         pass
 
+    @property
+    def pack_all_prefix_chunks(self) -> bool:
+        """Pack every prefix chunk into one FP8 buffer when capacity allows."""
+        return self.use_dense_fp8_chunked_prefill
+
+    @property
+    def fuse_prefix_into_extend(self) -> bool:
+        """Attend the packed prefix and current chunk in one launch."""
+        return self.use_dense_fp8_chunked_prefill
+
+    def prepare_chunked_prefill_qkv(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Convert the current dense MHA chunk once and reuse Q for prefix passes."""
+        fp8_dtype = torch.float8_e4m3fn
+        output_dtype = q.dtype
+        if output_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            output_dtype = torch.bfloat16
+        forward_batch._triton_dense_fp8_output_dtype = output_dtype
+
+        if q.dtype != fp8_dtype:
+            q = q.to(fp8_dtype)
+        if k.dtype != fp8_dtype:
+            k = k.to(fp8_dtype)
+        if v.dtype != fp8_dtype:
+            v = v.to(fp8_dtype)
+        return q.contiguous(), k.contiguous(), v.contiguous()
+
+    def pack_prefix_chunk_kv(
+        self,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        v: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pack a materialized dense prefix directly into unit-scale FP8 K/V."""
+        return mla_kv_pack_quantize_fp8(
+            k_nope,
+            k_pe,
+            v,
+            fp8_dtype=torch.float8_e4m3fn,
+            enable_pdl=False,
+        )
+
+    def _can_run_dense_fp8_chunked_mha(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ) -> bool:
+        return (
+            self.use_dense_fp8_chunked_prefill
+            and forward_batch.attn_attend_prefix_cache is not None
+            and self.forward_metadata.custom_mask is None
+            and q.dtype == torch.float8_e4m3fn
+            and k.dtype == torch.float8_e4m3fn
+            and v.dtype == torch.float8_e4m3fn
+            and layer.tp_q_head_num == 12
+            and layer.tp_k_head_num == 12
+            and layer.qk_head_dim == 192
+            and layer.v_head_dim == 128
+            and (layer.sliding_window_size is None or layer.sliding_window_size <= -1)
+            and layer.logit_cap <= 0
+        )
+
+    def _forward_dense_fp8_chunked_mha(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ):
+        """Run current or cached dense FP8 K/V through Triton extend attention."""
+        output_dtype = getattr(
+            forward_batch, "_triton_dense_fp8_output_dtype", torch.bfloat16
+        )
+        output = torch.empty(
+            (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+            dtype=output_dtype,
+            device=q.device,
+        )
+
+        prefix_k = getattr(forward_batch, "fused_prefix_k", None)
+        if prefix_k is not None:
+            # Prefix is non-causal while the current chunk is causal. The
+            # extend kernel already implements precisely that two-stage mask.
+            prefix_v = forward_batch.fused_prefix_v
+            self.extend_attention_fwd(
+                q,
+                k,
+                v,
+                output,
+                prefix_k,
+                prefix_v,
+                self.forward_metadata.qo_indptr,
+                forward_batch.prefix_chunk_cu_seq_lens[0],
+                forward_batch.prefix_dense_kv_indices[: prefix_k.shape[0]],
+                None,
+                True,
+                None,
+                self.forward_metadata.max_extend_len,
+                1.0,
+                1.0,
+                sm_scale=layer.scaling,
+                page_size=1,
+                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                identity_kv_indices=True,
+            )
+            return output
+
+        lse = torch.empty(
+            (q.shape[0], layer.tp_q_head_num),
+            dtype=torch.float32,
+            device=q.device,
+        )
+
+        if forward_batch.attn_attend_prefix_cache:
+            chunk_idx = forward_batch.prefix_chunk_idx
+            assert chunk_idx is not None and chunk_idx >= 0
+            kv_indptr = forward_batch.prefix_chunk_cu_seq_lens[chunk_idx]
+            kv_indices = forward_batch.prefix_dense_kv_indices[: k.shape[0]]
+            self.extend_attention_fwd(
+                q,
+                k[:0],
+                v[:0],
+                output,
+                k,
+                v,
+                self.forward_metadata.qo_indptr,
+                kv_indptr,
+                kv_indices,
+                None,
+                False,
+                None,
+                self.forward_metadata.max_extend_len,
+                1.0,
+                1.0,
+                sm_scale=layer.scaling,
+                lse_extend=lse,
+                skip_extend=True,
+                page_size=1,
+                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                identity_kv_indices=True,
+            )
+            # Empty ragged rows are returned as output=0, LSE=-inf, so the
+            # portable merge_state operation ignores them exactly.
+        else:
+            self.extend_attention_fwd(
+                q,
+                k,
+                v,
+                output,
+                k[:0],
+                v[:0],
+                self.forward_metadata.qo_indptr,
+                forward_batch.mha_empty_kv_indptr,
+                self.forward_metadata.kv_indices[:0],
+                None,
+                True,
+                None,
+                self.forward_metadata.max_extend_len,
+                1.0,
+                1.0,
+                sm_scale=layer.scaling,
+                lse_extend=lse,
+                skip_prefix=True,
+                page_size=1,
+                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            )
+
+        if forward_batch.mha_return_lse:
+            return output, lse
+        return output
+
     def _set_kv_buffer(
         self,
         forward_batch: ForwardBatch,
@@ -1330,6 +1532,16 @@ class TritonAttnBackend(AttentionBackend):
         score_mod=None,
         aux_tensors=None,
     ):
+        if (
+            k is not None
+            and v is not None
+            and sinks is None
+            and score_mod is None
+            and aux_tensors is None
+            and self._can_run_dense_fp8_chunked_mha(q, k, v, layer, forward_batch)
+        ):
+            return self._forward_dense_fp8_chunked_mha(q, k, v, layer, forward_batch)
+
         # TODO: reuse the buffer across layers
         attn_out = getattr(forward_batch, "_attn_output", None)
         if attn_out is not None:
@@ -1397,6 +1609,31 @@ class TritonAttnBackend(AttentionBackend):
             )
         ):
             causal = False
+
+        # Dense one-shot MLA prefill (AttnForwardMethod.MHA_ONE_SHOT): k/v were
+        # up-projected out of the latent cache and span prefix + current chunk,
+        # so they no longer line up row-for-row with q the way
+        # extend_attention_fwd requires. Route to the single-loop dense kernel.
+        # A prefix-chunk phase (attn_attend_prefix_cache) also carries a longer
+        # k/v, but the dispatcher never hands Triton MHA_CHUNKED_KV.
+        if (
+            forward_batch.mha_one_shot
+            and not forward_batch.attn_attend_prefix_cache
+            and k is not None
+            and k.shape[0] != q.shape[0]
+        ):
+            return self._forward_extend_dense_one_shot(
+                q,
+                k,
+                v,
+                o,
+                layer,
+                forward_batch,
+                causal,
+                logits_soft_cap,
+                sinks=sinks,
+                score_mod=score_mod,
+            )
 
         if self.dcp_size > 1:
             if score_mod is not None:
@@ -1514,6 +1751,81 @@ class TritonAttnBackend(AttentionBackend):
             score_mod=score_mod,
             aux_tensors=aux_tensors,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+        )
+        return o
+
+    def _dense_one_shot_kv_indptr_for(self, forward_batch: ForwardBatch):
+        """Cumulative full sequence lengths addressing the one-shot K/V rows.
+
+        The MHA one-shot K/V is gathered with fetch_mha_one_shot_kv_indices(),
+        which lays sequences out back to back at their full seq_len -- so the
+        row offsets are cumsum(seq_lens), not the prefix-only kv_indptr that
+        forward_metadata carries for the paged extend path.
+        """
+        if self._dense_one_shot_kv_indptr is None:
+            bs = forward_batch.batch_size
+            kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=self.device)
+            kv_indptr[1:] = torch.cumsum(forward_batch.seq_lens[:bs], dim=0)
+            self._dense_one_shot_kv_indptr = kv_indptr
+        return self._dense_one_shot_kv_indptr
+
+    def _forward_extend_dense_one_shot(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        causal: bool,
+        logits_soft_cap: float,
+        sinks: Optional[torch.Tensor] = None,
+        score_mod=None,
+    ):
+        # Guarded rather than silently fallen back on: dropping to
+        # extend_attention_fwd with a longer-than-q k/v would read the wrong
+        # rows and quietly return wrong numbers.
+        if sinks is not None or score_mod is not None:
+            raise NotImplementedError(
+                "Triton dense one-shot prefill does not support sinks/score_mod"
+            )
+        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+            raise NotImplementedError(
+                "Triton dense one-shot prefill does not support sliding windows"
+            )
+        if layer.k_scale is not None or layer.v_scale is not None:
+            raise NotImplementedError(
+                "Triton dense one-shot prefill does not support KV descales"
+            )
+        if layer.xai_temperature_len is not None and layer.xai_temperature_len > 0:
+            raise NotImplementedError(
+                "Triton dense one-shot prefill does not support xai temperature"
+            )
+
+        q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
+
+        if self.can_use_dense_prefill_fp8(
+            q, k, v, is_causal=causal, logit_cap=logits_soft_cap
+        ):
+            # Cast Q, K and V separately, matching the zero-prefix FP8 gate in
+            # extend_attention_fwd (and Aiter's opt-in behavior).
+            q = q.to(torch.float8_e4m3fn)
+            k = k.to(torch.float8_e4m3fn)
+            v = v.to(torch.float8_e4m3fn)
+
+        self.dense_prefill_attention_fwd(
+            q,
+            k.contiguous(),
+            v.contiguous(),
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            self.forward_metadata.qo_indptr,
+            self._dense_one_shot_kv_indptr_for(forward_batch),
+            self.forward_metadata.max_extend_len,
+            sm_scale=layer.scaling,
+            logit_cap=logits_soft_cap,
+            is_causal=causal,
         )
         return o
 

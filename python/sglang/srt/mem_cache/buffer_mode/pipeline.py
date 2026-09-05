@@ -42,7 +42,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    SidecarPoolSpec,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import RebuildFullToSWAMapping
 from sglang.srt.mem_cache.unified_cache.components import (
@@ -56,6 +61,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.pool_host import HostPoolGroup
     from sglang.srt.mem_cache.unified_cache.components import SWAComponent
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
@@ -161,18 +167,35 @@ def staged_splice_tokens(f: _StagedPrefetch, device_prefix_len: int) -> int:
 
 
 def validate_buffer_only_stack(
-    sidecar_pool_specs: list, swa_component: Optional[SWAComponent]
+    sidecar_pool_specs: list[SidecarPoolSpec],
+    host_pool_group: HostPoolGroup,
+    swa_component: Optional[SWAComponent],
 ) -> None:
     """Post-assembly buffer-mode fences.
 
-    Sidecar pools (DSv4 compressed regions) and unified_kv SWA (device-only
-    ring, never offloaded) have no per-pool staging path yet.
+    Sidecars reuse their source pool's transient slot ids, so every sidecar
+    host pool must expose the full source slot namespace.  unified_kv SWA
+    (device-only ring, never offloaded) still has no staging path.
     """
-    if sidecar_pool_specs:
-        raise ValueError(
-            "--hicache-host-memory-mode buffer_only does not support "
-            "sidecar storage pools (DeepSeek-V4 compressed regions)."
-        )
+    entry_map = host_pool_group.entry_map
+    for spec in sidecar_pool_specs:
+        source = entry_map.get(spec.indices_from_pool)
+        sidecar = entry_map.get(spec.pool_name)
+        if source is None or sidecar is None:
+            raise ValueError(
+                "--hicache-host-memory-mode buffer_only sidecar pool mapping "
+                f"is incomplete: pool={spec.pool_name}, "
+                f"indices_from_pool={spec.indices_from_pool}."
+            )
+        source_size = source.host_pool.logical_size
+        sidecar_size = sidecar.host_pool.logical_size
+        if sidecar_size < source_size:
+            raise ValueError(
+                "--hicache-host-memory-mode buffer_only sidecar host pool is "
+                "smaller than its index source: "
+                f"pool={spec.pool_name}, host_slots={sidecar_size}, "
+                f"source={spec.indices_from_pool}, source_slots={source_size}."
+            )
     swa = swa_component
     if swa is not None and swa._swa_kv_pool_host is None:
         # Only reachable on SWA models with the unified_kv layout (SWA as
@@ -222,8 +245,6 @@ class BufferModePipeline:
         # Metadata-only pending-write backlog cap; beyond it new intents
         # are dropped at admission (re-trigger on a later hit).
         self.write_backlog_cap = write_backlog_cap
-        # Anchor-lock knobs; the cap keeps queued holds from pinning the pool.
-        self.anchor_lock_enabled = envs.SGLANG_ENABLE_HICACHE_BUFFER_ANCHOR_LOCK.get()
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         kvcache = cache.token_to_kv_pool_allocator.get_kvcache()
@@ -239,8 +260,7 @@ class BufferModePipeline:
             ),
         )
         logger.info(
-            "BufferModePipeline anchor_lock_enabled=%s cap_tokens=%d",
-            self.anchor_lock_enabled,
+            "BufferModePipeline anchor_lock_cap_tokens=%d",
             self.anchor_lock_cap_tokens,
         )
         self.reset()
@@ -278,10 +298,15 @@ class BufferModePipeline:
         self._anchor_lock_cap_skips = 0
 
     def is_idle(self) -> bool:
-        """No queued writes, staged prefetches, or storage writes in flight
-        (all of which hold host staging or would re-trigger IO)."""
+        """No pending or in-flight buffer-mode transfer work."""
         return not (
-            self.pending_write_queue or self.staged_prefetches or self.ongoing_backup
+            self.pending_hit_allocs
+            or self.staged_prefetches
+            or self.ongoing_buffer_load_back
+            or self.pending_write_queue
+            or self.inflight_backup_node_ids
+            or self.ongoing_write_through
+            or self.ongoing_backup
         )
 
     # ---- backup pipeline (device -> staging -> storage) ----
@@ -309,7 +334,7 @@ class BufferModePipeline:
     def enqueue_backup_intent(self, node_id: NodeId) -> None:
         """Snapshot a backup intent and commit it to the write queue.
         Admission gates: belief skip, parent-cover, backlog cap, oversize.
-        Drops are silent; the node re-triggers on a later hit."""
+        Rejected intents are counted; the node re-triggers on a later hit."""
         if not self._cache.enable_storage:
             return
         if node_id in self.inflight_backup_node_ids:
@@ -438,7 +463,7 @@ class BufferModePipeline:
     ) -> Optional[BufferBackupState]:
         # Arena-lookup failure = deleted, key-length mismatch vs the snapshot
         # = split, a None FULL device value = evicted. Stale
-        # intents drop silently; the node re-triggers on a later hit.
+        # intents are counted as dropped; the node re-triggers on a later hit.
         snapshot = intent.snapshot
         return self._cache.tree_core.validate_buffer_backup(
             snapshot.node_id, len(snapshot.key)
@@ -453,16 +478,20 @@ class BufferModePipeline:
         page_size = self._cache.page_size
         survivors: deque[_UnifiedBackupIntent] = deque()
         states: dict[NodeId, BufferBackupState] = {}
+        swept_tokens = 0
         for intent in self.pending_write_queue:
             snapshot = intent.snapshot
             state = self._validate_backup_intent(intent)
             if state is None:
                 self.inflight_backup_node_ids.discard(snapshot.node_id)
-                self.write_backlog_tokens_ -= len(snapshot.hash_values) * page_size
+                intent_tokens = len(snapshot.hash_values) * page_size
+                self.write_backlog_tokens_ -= intent_tokens
+                swept_tokens += intent_tokens
                 continue
             survivors.append(intent)
             states[snapshot.node_id] = state
         self.pending_write_queue = survivors
+        self._log_backup_dropped(swept_tokens)
         return states
 
     def flush_pending_writes(self) -> None:
@@ -541,6 +570,11 @@ class BufferModePipeline:
         cc = cache.cache_controller
         snapshot = intent.snapshot
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        # Sidecars reuse the source pool's transient host/device indices.  This
+        # includes both KV-derived pools and SWA-derived DSV4 state pools.  They
+        # allocate no additional staging, but must ride the same D2H operation
+        # so their bytes are present when the storage write starts.
+        aux_xfers.extend(cache._build_backup_sidecar(device_value, comp_xfers))
         host_indices = cc.write(
             device_value,
             node_id=snapshot.node_id,
@@ -619,20 +653,46 @@ class BufferModePipeline:
         snapshot = intent.snapshot
         self._cache.dec_lock_ref(snapshot.node_id, entry.lock_params)
 
-        # Every aux pool writes a trailing snapshot keyed by the last KV page
-        # hashes it covers: the SWA window spans page_size-sized pages, the
-        # Mamba state is a single slot (host pool page_size 1 -> one key).
+        # Every independently staged aux pool writes a trailing snapshot keyed
+        # by the last KV page hashes it covers.  A derived sidecar writes the
+        # exact key span of its source pool while reusing that source's slots.
         storage_xfers: list[PoolTransfer] = []
+        storage_sources = {
+            PoolName.KV: PoolTransfer(
+                name=PoolName.KV,
+                host_indices=entry.host_indices,
+                keys=snapshot.hash_values,
+            )
+        }
         for staged in entry.aux_xfers:
+            if staged.indices_from_pool is not None:
+                continue
             keys = self._aux_window_keys(snapshot.hash_values, staged)
             if keys is None:
                 continue
+            transfer = PoolTransfer(
+                name=staged.name,
+                host_indices=staged.host_indices,
+                keys=keys,
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+            storage_xfers.append(transfer)
+            storage_sources.setdefault(staged.name, transfer)
+        for staged in entry.aux_xfers:
+            if staged.indices_from_pool is None:
+                continue
+            source = storage_sources.get(staged.indices_from_pool)
+            if source is None:
+                raise AssertionError(
+                    "Buffer-mode storage sidecar source missing: "
+                    f"{staged.name} from {staged.indices_from_pool}."
+                )
             storage_xfers.append(
                 PoolTransfer(
                     name=staged.name,
-                    host_indices=staged.host_indices,
-                    keys=keys,
-                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                    keys=source.keys,
+                    hit_policy=staged.hit_policy,
+                    indices_from_pool=staged.indices_from_pool,
                 )
             )
         operation_id = self._cache.cache_controller.write_storage(
@@ -690,8 +750,6 @@ class BufferModePipeline:
         O(prefix path)). Returns "locked", "no_anchor" (nothing to pin),
         "cap_skip" (over cap; launches unlocked), or "anchor_lost" (splice
         base gone — the caller cancels the storage IO)."""
-        if not self.anchor_lock_enabled:
-            return "no_anchor"
         if req_id in self.anchor_locks:
             return "locked"
         prefix_ctx = self._prefetch_prefix_ctx.get(req_id)
@@ -828,15 +886,25 @@ class BufferModePipeline:
         prefix_ctx = self._prefetch_prefix_ctx.pop(req_id, None)
         prefix_tokens = prefix_ctx[0] if prefix_ctx is not None else None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        # Component transfers are already present in comp_xfers.  Preserve the
+        # derived sidecars from the storage operation as well; cc.load resolves
+        # them against the freshly allocated source host/device indices.
+        aux_xfers.extend(
+            transfer
+            for transfer in operation.pool_transfers or ()
+            if transfer.indices_from_pool is not None
+        )
 
         if num_tokens == 0 or prefix_tokens is None:
             # Nothing usable fetched: recompute.
+            cache.discard_storage_prefetch_accounting(req_id)
             self.release_anchor_lock(req_id)
             cc.append_host_mem_release(
                 host_indices[:num_tokens], extra_pools=aux_xfers or None
             )
             cc.prefetch_tokens_occupied -= self._occupied_span(host_indices)
             cache.prefetch_loaded_tokens_by_reqid[req_id] = 0
+            cache.prefetch_loaded_storage_start_by_reqid.pop(req_id, None)
             return True
 
         staged_pages = num_tokens // cache.page_size
@@ -862,6 +930,7 @@ class BufferModePipeline:
             operation_id=operation.id,
         )
         cache.prefetch_loaded_tokens_by_reqid[req_id] = num_tokens
+        cache.prefetch_loaded_storage_start_by_reqid[req_id] = operation.storage_start
         return True
 
     def plan_staged_splice(
@@ -876,6 +945,7 @@ class BufferModePipeline:
             return 0, 0
         splice_tokens = staged_splice_tokens(f, device_prefix_len)
         if splice_tokens == 0:
+            covered_tokens = self._resolve_staged_device_coverage(f, device_prefix_len)
             logger.info(
                 "HiCache staged prefetch released req=%s matched=%d "
                 "device_prefix=%d tokens=%d",
@@ -884,9 +954,17 @@ class BufferModePipeline:
                 device_prefix_len,
                 f.num_tokens,
             )
-            self.release_staged_hold(req_id)
+            reason = None if covered_tokens == f.num_tokens else "shrunk"
+            self.release_staged_hold(req_id, reason=reason)
             return 0, 0
         return splice_tokens, self.staged_prefetch_swa_tokens(req_id)
+
+    def _resolve_staged_device_coverage(
+        self, f: _StagedPrefetch, device_prefix_len: int
+    ) -> int:
+        covered_tokens = min(max(device_prefix_len - f.matched_len, 0), f.num_tokens)
+        self._cache._resolve_storage_prefetch_tokens(f.req_id, covered_tokens)
+        return covered_tokens
 
     def staged_prefetch_swa_tokens(self, req_id: str) -> int:
         """SWA device tokens consuming this staged prefetch will allocate (the
@@ -923,13 +1001,17 @@ class BufferModePipeline:
             return unchanged
         cc = cache.cache_controller
 
-        def _drop() -> tuple[torch.Tensor, NodeId]:
+        def _drop(reason: Optional[str]) -> tuple[torch.Tensor, NodeId]:
+            cache._finish_storage_prefetch(req.rid, fulfilled_tokens=0, reason=reason)
             self.release_anchor_lock(req.rid)
             self._free_staging_now(f.host_indices, f.aux_xfers)
             cc.prefetch_tokens_occupied -= f.occupied_tokens
             # Nothing spliced: keep the surfaced host-hit fields truthful.
             req.host_hit_length = 0
             req.swa_host_hit_length = 0
+            req.storage_hit_length = 0
+            req.storage_hit_start = None
+            req.host_hit_is_storage = False
             return unchanged
 
         # A hold staged under a different namespace than the consuming request
@@ -943,11 +1025,12 @@ class BufferModePipeline:
                 (f.extra_key, f.cache_salt),
                 (req.extra_key, req.cache_salt),
             )
-            return _drop()
+            return _drop("dropped")
 
         splice_base = len(req.prefix_indices)
         splice_tokens = staged_splice_tokens(f, splice_base)
         if splice_tokens == 0:
+            covered_tokens = self._resolve_staged_device_coverage(f, splice_base)
             logger.warning(
                 "HiCache staged prefetch dropped req=%s matched=%d now=%d "
                 "tokens_wasted=%d locked=%s",
@@ -957,12 +1040,14 @@ class BufferModePipeline:
                 f.num_tokens,
                 req.rid in self.anchor_locks,
             )
-            return _drop()
+            reason = None if covered_tokens == f.num_tokens else "shrunk"
+            return _drop(reason)
         trim_tokens = splice_base - f.matched_len
         assert trim_tokens % cache.page_size == 0, (
             f"staged splice trim not page-aligned req={req.rid}: "
             f"matched={f.matched_len} splice_base={splice_base}"
         )
+        cache._resolve_storage_prefetch_tokens(req.rid, trim_tokens)
 
         key = RadixKey(
             array("q", f.key_tokens),
@@ -992,7 +1077,14 @@ class BufferModePipeline:
                 f.num_tokens,
                 req.rid in self.anchor_locks,
             )
-            return _drop()
+            available_end = min(
+                span_end,
+                len(live.device_indices),
+                live.full_kv_hit_length,
+            )
+            available_overlap = max(0, available_end - splice_base)
+            cache._resolve_storage_prefetch_tokens(req.rid, available_overlap)
+            return _drop(None if available_overlap == splice_tokens else "shrunk")
 
         # Evict-before-alloc (mirrors _load_back_transfers): the budget gate
         # counts evictable pages, but cc.load draws from free slots only.
@@ -1009,7 +1101,7 @@ class BufferModePipeline:
                 avail = cache.token_to_kv_pool_allocator.available_size()
             if avail < splice_tokens:
                 # Genuinely no room (locked pages): recompute.
-                return _drop()
+                return _drop("device_capacity")
 
         load_back_id = -(f.operation_id) - 1
         device_indices = cc.load(
@@ -1020,7 +1112,7 @@ class BufferModePipeline:
         if device_indices is None:
             # Transient allocator shortfall despite the evict: recompute
             # (init_load_back's degrade contract).
-            return _drop()
+            return _drop("device_capacity")
 
         swa_dev = next(
             (
@@ -1104,11 +1196,12 @@ class BufferModePipeline:
             cc.prefetch_tokens_occupied,
             self.anchor_locked_tokens_,
         )
-        if cache.enable_storage_metrics and cache.storage_metrics_collector is not None:
-            cache.storage_metrics_collector.log_prefetched_tokens(f.num_tokens)
+        cache._finish_storage_prefetch(
+            f.req_id, fulfilled_tokens=f.num_tokens, reason=None
+        )
         return True
 
-    def release_staged_hold(self, rid: str) -> bool:
+    def release_staged_hold(self, rid: str, reason: Optional[str] = None) -> bool:
         """Free a staged hold outright — anchor pin, host bounce (KV + aux),
         occupancy grant; nothing device-side exists yet. Called for aborts
         and for holds that can no longer splice. Returns True when a hold
@@ -1117,6 +1210,7 @@ class BufferModePipeline:
         staged = self.staged_prefetches.pop(rid, None)
         if staged is None:
             return False
+        self._cache._finish_storage_prefetch(rid, fulfilled_tokens=0, reason=reason)
         self._free_staging_now(staged.host_indices, staged.aux_xfers)
         self._cache.cache_controller.prefetch_tokens_occupied -= staged.occupied_tokens
         return True

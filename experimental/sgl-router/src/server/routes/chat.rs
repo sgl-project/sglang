@@ -2,13 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::discovery::{ModelId, WorkerMode};
+use crate::policies::admission::{resolve_cache_candidates, resolve_prefill, CandidateRange};
 use crate::policies::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
-use crate::policies::{request_tokens_for, ExternalPrefixSignal, RequestTokens, SelectionContext};
+use crate::policies::{
+    request_tokens_for, ExternalPrefixSignal, PrefillProposal, ProposalKind, RequestTokens,
+    SelectionContext,
+};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
-    MetricsRegistry, RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
+    MetricsRegistry, PolicySelectionFailureReason, RequestOutcome, StaleRequestOutcome,
+    WorkerModeLabel,
 };
 use crate::workers::{LoadGuard, Worker};
 use axum::body::Body;
@@ -88,6 +93,24 @@ impl Drop for RecordDurationOnDrop {
     fn drop(&mut self) {
         self.metrics
             .observe_request_duration(&self.model, self.start.elapsed().as_secs_f64());
+    }
+}
+
+fn policy_selection_failed(
+    ctx: &AppContext,
+    model: &str,
+    reason: PolicySelectionFailureReason,
+) -> ApiError {
+    ctx.metrics
+        .record_policy_selection_failure(ctx.config.model.policy, reason);
+    tracing::warn!(
+        policy = %ctx.config.model.policy,
+        reason = reason.as_str(),
+        model,
+        "prefill policy selection failed"
+    );
+    ApiError::PolicySelectionFailed {
+        model: model.to_owned(),
     }
 }
 
@@ -198,6 +221,15 @@ pub async fn chat_completions(
         _ => None,
     };
 
+    let prefill_load = request_tokens
+        .as_ref()
+        .map(|tokens| tokens.ids.len().max(1))
+        .unwrap_or_else(|| estimate_prefill_tokens(&body));
+    let request_input_tokens = prefill_load as u64;
+    let needs_load_snapshot = policy.needs_load_snapshot();
+    let load_snapshot =
+        needs_load_snapshot.then(|| ctx.engine_load.capture_snapshot(std::time::Instant::now()));
+
     // Sticky-session routing key. When the sticky policy is configured,
     // read the routing key from the operator-chosen header into the
     // selection context; the policy pins it to a worker. Other policies
@@ -210,15 +242,69 @@ pub async fn chat_completions(
         .and_then(|s| headers.get(s.header_name.as_str()))
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty());
-    let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
-        .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()))
+    let session_id = ctx
+        .config
+        .model
+        .affinity
+        .as_ref()
+        .and_then(|config| headers.get(config.session_id_header.as_str()))
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty());
+    let candidate_range = CandidateRange::global(&workers);
+    let mut selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
+        .with_session_id(session_id)
+        .with_candidate_range_id(candidate_range.id)
+        .with_input_tokens(request_input_tokens)
+        .with_request_tokens(request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()))
         .with_external_prefix(external_prefix.as_ref());
-    let worker =
-        policy
-            .select(&workers, &selection_ctx)
-            .ok_or_else(|| ApiError::PolicySelectionFailed {
-                model: model_str.clone(),
-            })?;
+    if let Some(snapshot) = load_snapshot.as_ref() {
+        selection_ctx = selection_ctx.with_load_snapshot(snapshot);
+    }
+    let worker = match policy.propose_prefill(candidate_range.workers, &selection_ctx) {
+        Some(PrefillProposal::Pair(proposal)) if policy.uses_shared_prefill_admission() => {
+            let snapshot = load_snapshot
+                .as_ref()
+                .expect("shared prefill admission requires a load snapshot");
+            let decision =
+                resolve_prefill(&candidate_range, &proposal, request_input_tokens, snapshot)
+                    .ok_or_else(|| {
+                        policy_selection_failed(
+                            &ctx,
+                            &model_str,
+                            PolicySelectionFailureReason::PrefillAdmissionExhausted,
+                        )
+                    })?;
+            policy.commit_prefill_selection(&selection_ctx, proposal.kind, &decision.selected);
+            decision.selected
+        }
+        Some(PrefillProposal::Pair(proposal)) => proposal.primary,
+        Some(PrefillProposal::CacheCandidates(proposal)) => {
+            let snapshot = load_snapshot
+                .as_ref()
+                .expect("cache candidate resolution requires a load snapshot");
+            let decision = resolve_cache_candidates(&proposal, request_input_tokens, snapshot)
+                .ok_or_else(|| {
+                    policy_selection_failed(
+                        &ctx,
+                        &model_str,
+                        PolicySelectionFailureReason::CacheCandidatesExhausted,
+                    )
+                })?;
+            policy.commit_prefill_selection(
+                &selection_ctx,
+                ProposalKind::CacheAffinity,
+                &decision.selected,
+            );
+            decision.selected
+        }
+        None => {
+            return Err(policy_selection_failed(
+                &ctx,
+                &model_str,
+                PolicySelectionFailureReason::ProposalEmpty,
+            ));
+        }
+    };
 
     // PD-mode decoder affinity. When the selected prefill worker is
     // part of a PD-disagg deployment, also resolve the matching decode
@@ -291,15 +377,11 @@ pub async fn chat_completions(
     // 0 here: the active-load registry's decode axis is reserved for a
     // future decode-side scheduler — current decode selection is
     // host-affinity only.
-    let guard = worker.load_guard();
-    // Use the exact token count from the ingress tokenization when available;
-    // fall back to the byte-count heuristic for load-only policies that don't
-    // tokenize. The exact count makes the cache-aware load-imbalance fast-path
-    // accurate rather than off by the char/token ratio.
-    let prefill_load = request_tokens
-        .as_ref()
-        .map(|t| t.ids.len().max(1))
-        .unwrap_or_else(|| estimate_prefill_tokens(&body));
+    let guard = if needs_load_snapshot {
+        worker.timestamped_load_guard()
+    } else {
+        worker.load_guard()
+    };
     let active_guard =
         ctx.active_load
             .register(worker.id.clone(), worker.url.clone(), prefill_load, 0);
@@ -469,8 +551,9 @@ pub async fn chat_completions(
 
         // Synchronously await the decode worker. Its response is what
         // the client sees. The decode side gets its own LoadGuard so
-        // per-worker `active_requests` reflects decode-pool load for
-        // cache-aware-zmq decisions on the decode side.
+        // per-worker `active_requests` reflects decode-pool load. Decode
+        // selection reads that atomic counter directly, so it does not need
+        // the prefill policy's timestamp registry.
         let decode_guard = decode_worker.load_guard();
         if streaming {
             let stream_guards: Box<dyn Send + 'static> =
