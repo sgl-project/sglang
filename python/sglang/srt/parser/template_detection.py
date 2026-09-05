@@ -176,6 +176,15 @@ REASONING_MODE_RULES = (
         ),
     ),
     DetectionRule(
+        name="hunyuan_reasoning_effort",
+        value=ReasoningToggleConfig(special_case="hunyuan_effort"),
+        predicate=lambda ctx: (
+            ctx.has_text("reasoning_effort")
+            and ctx.has_text("reasoning_mode_token")
+            and ctx.has_text("no_think")
+        ),
+    ),
+    DetectionRule(
         name="explicit_enable_thinking_default_false",
         value=ReasoningToggleConfig(
             toggle_param="enable_thinking", default_enabled=False
@@ -364,8 +373,16 @@ def _is_hunyuan(ctx):
     sep = ctx.has_text("<tool_sep>") or ctx.has_vocab_pattern(
         r"^<tool_sep(?::[^>]+)?>$"
     )
-    return (tc and sep) or (
-        ctx.has_text("reasoning_effort") and ctx.has_text("interleaved_thinking")
+    return (
+        (tc and sep)
+        or (
+            tc
+            and ctx.reasoning_config
+            == ReasoningToggleConfig(special_case="hunyuan_effort")
+            and ctx.has_vocab_pattern(r"^<arg_key(?::[^>]+)?>$")
+            and ctx.has_vocab_pattern(r"^<arg_value(?::[^>]+)?>$")
+        )
+        or (ctx.has_text("reasoning_effort") and ctx.has_text("interleaved_thinking"))
     )
 
 
