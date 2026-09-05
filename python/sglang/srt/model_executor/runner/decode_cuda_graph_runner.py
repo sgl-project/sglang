@@ -806,18 +806,22 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             trace_dir = graph_capture_profile_dir()
             os.makedirs(trace_dir, exist_ok=True)
 
-            # Track which BS is currently being captured for trace file naming
-            self._profile_bs_list = list(reversed(self.capture_bs))
-            self._profile_bs_idx = 0
+            # Names the trace for the shape being captured; capture() sets it
+            # before each capture_one_shape. The callback fires once per
+            # (bs, lora, dsa) combination, so a monotonic index into capture_bs
+            # alone walks off the end as soon as a model enables LoRA or DSA
+            # dual-graph capture.
+            self._profile_capture_tag = None
+            self._profile_trace_seq = 0
 
             def on_trace_ready(prof):
-                bs = self._profile_bs_list[self._profile_bs_idx]
+                tag = self._profile_capture_tag or f"seq_{self._profile_trace_seq}"
                 trace_file = os.path.join(
-                    trace_dir, f"{runner_name}_bs_{bs}_rank{rank}.json.gz"
+                    trace_dir, f"{runner_name}_{tag}_rank{rank}.json.gz"
                 )
                 prof.export_chrome_trace(trace_file)
-                logger.info(f"Saved trace for bs={bs} to {trace_file}")
-                self._profile_bs_idx += 1
+                logger.info(f"Saved trace for {tag} to {trace_file}")
+                self._profile_trace_seq += 1
 
             profile_context = profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -842,6 +846,27 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         torch.cuda.memory._record_memory_history()
         return profile_context
+
+    def _set_profile_capture_tag(
+        self,
+        bs: int,
+        variant_label: Optional[str],
+        dsa_variant: Optional[str],
+    ):
+        """Name the graph-capture trace for the shape about to be captured.
+
+        capture() runs one profiler cycle per (bs, lora, dsa) combination, so
+        the name has to carry all three: keying on bs alone makes the dense and
+        sparse traces of a DSA model collide under one filename.
+        """
+        if not self._graph_batch_capture_active():
+            return
+        parts = [f"bs_{bs}"]
+        if variant_label is not None:
+            parts.append(variant_label)
+        if dsa_variant is not None:
+            parts.append(dsa_variant)
+        self._profile_capture_tag = "_".join(parts)
 
     def _post_process_after_profile(self, prof_context):
         torch.cuda.memory._dump_snapshot("cuda_graph_runner_memory_usage.pickle")
@@ -1139,6 +1164,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 _set_capture_lora_variant(variant_label)
                 for dsa_variant in dsa_variants:
                     _set_capture_dsa_variant(dsa_variant)
+                    self._set_profile_capture_tag(bs, variant_label, dsa_variant)
                     with torch_compile_decoration.patch_model(
                         self.model_runner.model,
                         bs in self.compile_bs,
