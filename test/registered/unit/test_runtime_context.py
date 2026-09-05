@@ -1589,5 +1589,67 @@ class TestDerivedWidths(_IsolatedOverrides):
             self.assertEqual(attn_dp_size, widths["attn_dp_size"])
 
 
+class TestTheDerivedHalfIsDeclared(CustomTestCase):
+    """The quotients are declared beside the leaves, in the same class.
+
+    A namespace is one file and one class. `Parallel` says both what an
+    operator can set and what that decides; the quotients are unannotated, so
+    they are not dataclass fields and never reach the record.
+    `ParallelContext` installs a property per declaration rather than carrying
+    its own list, so the two cannot drift.
+    """
+
+    def test_every_declared_quotient_has_a_property(self):
+        from sglang.srt.arg_groups.arg_utils import Derived
+        from sglang.srt.arg_groups.fields.parallel import Parallel
+
+        declared = {
+            name for name, value in vars(Parallel).items() if isinstance(value, Derived)
+        }
+        self.assertTrue(declared, "the derived half is empty")
+        for name in declared:
+            self.assertIsInstance(
+                getattr(type(get_context().parallel), name, None),
+                property,
+                f"{name} is declared but no property was installed",
+            )
+
+    def test_the_declared_set_is_what_derive_parallel_widths_produces(self):
+        """The declaration is not a second list to keep in step: it names
+        exactly the quotients the derivation returns."""
+        from sglang.srt.arg_groups.arg_utils import Derived
+        from sglang.srt.arg_groups.fields.parallel import Parallel
+
+        declared = {
+            name for name, value in vars(Parallel).items() if isinstance(value, Derived)
+        }
+        produced = set(
+            derive_parallel_widths(
+                tp_size=8,
+                attn_cp_size=1,
+                attn_dp_size=2,
+                moe_ep_size=1,
+                moe_dp_size=1,
+                dcp_size=1,
+                dcp_enabled=False,
+            )
+        )
+        self.assertEqual(declared, produced)
+
+    def test_a_declared_quotient_is_not_a_record_field(self):
+        """It has no operator input to preserve, and the record is what crosses
+        a process boundary."""
+        import dataclasses
+
+        from sglang.srt.arg_groups.arg_utils import Derived
+        from sglang.srt.arg_groups.fields.parallel import Parallel
+        from sglang.srt.server_args import ServerArgs
+
+        fields = {f.name for f in dataclasses.fields(ServerArgs)}
+        for name, value in vars(Parallel).items():
+            if isinstance(value, Derived):
+                self.assertNotIn(name, fields)
+
+
 if __name__ == "__main__":
     unittest.main()
