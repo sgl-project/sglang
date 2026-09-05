@@ -1037,6 +1037,15 @@ class Envs:
     # gfx950 MLA decode stage-1: pick the launch geometry and split count per batch.
     # Reorders the fp32 accumulation, so off by default.
     SGLANG_MLA_DECODE_TUNE = EnvBool(False)
+    # Native FP8 prefill for exact gfx950 Kimi-K3 zero-prefix and absorbed
+    # cached-prefix shapes. Validated at 98% GSM8K accuracy.
+    SGLANG_TRITON_FP8_PREFILL_ATTN = EnvBool(True)
+    # Route Triton MLA prefill that carries a cached prefix through dense
+    # (non-absorbed) one-shot MHA: up-project the prefix out of the latent KV
+    # cache and run a single dense FP8 kernel instead of the absorbed 576/512
+    # prefill. Materializes K/V for the whole batch, so it only engages when
+    # the batch fits the chunk budget.
+    SGLANG_TRITON_DENSE_PREFILL_ATTN = EnvBool(True)
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
