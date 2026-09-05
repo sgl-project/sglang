@@ -3177,9 +3177,12 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
-    def get_num_allocatable_reqs(self, running_bs):
+    def get_num_allocatable_reqs(self, running_bs, can_run_list=()):
         res = get_parallel().pp_max_micro_batch_size - running_bs
-        res = min(res, self.req_to_token_pool.available_size())
+        # Continuing chunked requests already own a row. ReqToTokenPool.alloc
+        # reuses that row, so count it toward batch size but not free-slot demand.
+        reused_slots = sum(req.req_pool_idx is not None for req in can_run_list)
+        res = min(res, self.req_to_token_pool.available_size() + reused_slots)
         return res
 
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
@@ -3327,12 +3330,16 @@ class Scheduler(
                 continue
 
             running_bs = len(running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+                running_bs, adder.can_run_list
+            ):
                 running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
-                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
+                if sum(
+                    req.req_pool_idx is None for req in adder.can_run_list
+                ) >= self.req_to_token_pool.available_size():
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
