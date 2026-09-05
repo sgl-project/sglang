@@ -34,7 +34,10 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.bailing_moe_v3 import BailingMoeV3ForCausalLM
+from sglang.srt.models.bailing_moe_v3 import (
+    BailingMoeV3ForCausalLM,
+    is_bailing_multi_gate_enabled,
+)
 from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import get_mm
@@ -73,9 +76,7 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
         text_config = config.text_config
-        # Bailing V3 VL checkpoints carry image-specific router tensors even
-        # though the public config does not expose the internal router name.
-        text_config.multi_gate = True
+        self.multi_gate_enabled = is_bailing_multi_gate_enabled(text_config)
         self.model = BailingMoeV3ForCausalLM(
             config=text_config,
             quant_config=quant_config,
@@ -234,6 +235,21 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
             if self._build_mm_encoders and name.startswith(tuple(required_prefixes))
         }
 
+    def _required_router_weights(self) -> Set[str]:
+        gate_names = (
+            ("gate", "image_gate", "audio_gate")
+            if self.multi_gate_enabled
+            else ("gate",)
+        )
+        suffixes = tuple(
+            f".mlp.{gate_name}.{parameter_name}"
+            for gate_name in gate_names
+            for parameter_name in ("weight", "expert_bias")
+        )
+        return {
+            name for name, _ in self.model.named_parameters() if name.endswith(suffixes)
+        }
+
     @staticmethod
     def _map_text_weight_name(name: str) -> Optional[str]:
         if name == "lm_head.weight":
@@ -273,16 +289,12 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
                 f"Missing required Bailing VL weights: {sorted(missing_non_text)[:20]}"
             )
 
-        required_image_gates = {
-            name
-            for name, _ in self.model.named_parameters()
-            if ".image_gate." in name or name.endswith(".gate.expert_bias")
-        }
-        missing_image_gates = required_image_gates - loaded_text
-        if missing_image_gates:
+        required_router_weights = self._required_router_weights()
+        missing_router_weights = required_router_weights - loaded_text
+        if missing_router_weights:
             raise RuntimeError(
                 "Missing required Bailing VL router weights: "
-                f"{sorted(missing_image_gates)[:20]}"
+                f"{sorted(missing_router_weights)[:20]}"
             )
         if unexpected_non_text:
             logger.warning(

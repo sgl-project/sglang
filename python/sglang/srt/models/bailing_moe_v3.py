@@ -239,6 +239,14 @@ class DsV3MLA(DeepseekV2AttentionMLA):
 logger = logging.getLogger(__name__)
 
 
+def is_bailing_multi_gate_enabled(config: PretrainedConfig) -> bool:
+    """Select MultiRouter only when the checkpoint config declares it."""
+    return (
+        bool(getattr(config, "multi_gate", False))
+        or getattr(config, "router_type", "topN") == "MultiRouter"
+    )
+
+
 def is_linear_layer(layer_idx, layer_group_size):
     if layer_idx is None:
         return False
@@ -459,9 +467,7 @@ class BailingMoE(nn.Module):
         self.num_shared_experts = getattr(config, "num_shared_experts", 0)
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.score_function = getattr(config, "score_function", None)
-        self.multi_gate = getattr(config, "multi_gate", False) or (
-            getattr(config, "router_type", "topN") == "MultiRouter"
-        )
+        self.multi_gate = is_bailing_multi_gate_enabled(config)
 
         self.num_fused_shared_experts = num_fused_shared_experts
 
