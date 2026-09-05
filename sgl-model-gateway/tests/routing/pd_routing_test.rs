@@ -12,7 +12,10 @@ use smg::config::RouterConfig;
 use tower::ServiceExt;
 
 use crate::common::{
-    mock_worker::{HealthStatus, MockWorkerConfig, WorkerType},
+    mock_worker::{
+        generate_request_count, reset_generate_request_count, HealthStatus, MockWorkerConfig,
+        WorkerType,
+    },
     AppTestContext, TestWorkerConfig,
 };
 
@@ -149,18 +152,17 @@ mod pd_routing_tests {
         ctx.shutdown().await;
     }
 
-    /// Test PD mode handles worker failures gracefully
+    /// A PD request must not be replayed after either upstream may have
+    /// accepted it. Each dispatch injects a new bootstrap room, so retrying the
+    /// same RID would create a second, incompatible PD attempt.
     #[tokio::test]
-    async fn test_pd_mode_with_failing_decode_worker() {
+    async fn test_pd_mode_does_not_retry_after_dispatch() {
         use smg::config::RetryConfig;
 
         let config = RouterConfig::builder()
             .prefill_decode_mode(
                 vec![("http://127.0.0.1:19820".to_string(), None)],
-                vec![
-                    "http://127.0.0.1:19821".to_string(),
-                    "http://127.0.0.1:19822".to_string(),
-                ],
+                vec!["http://127.0.0.1:19821".to_string()],
             )
             .round_robin_policy()
             .host("127.0.0.1")
@@ -179,6 +181,8 @@ mod pd_routing_tests {
             })
             .build_unchecked();
 
+        reset_generate_request_count(19821);
+
         let ctx = AppTestContext::new_with_config(
             config,
             vec![
@@ -190,14 +194,12 @@ mod pd_routing_tests {
                     response_delay_ms: 0,
                     fail_rate: 1.0, // Failing decode worker
                 },
-                TestWorkerConfig::decode(19822), // Healthy decode worker
             ],
         )
         .await;
 
         let app = ctx.create_app().await;
 
-        // Request should succeed via retry to healthy decode worker
         let payload = json!({
             "text": "Test with failing decode worker",
             "stream": false
@@ -213,10 +215,16 @@ mod pd_routing_tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(
             resp.status(),
-            StatusCode::OK,
-            "Request should succeed via retry to healthy decode worker"
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "A dispatched PD request must return the first worker failure"
+        );
+        assert_eq!(
+            generate_request_count(19821),
+            1,
+            "A dispatched PD request must not be replayed, even when retries are configured"
         );
 
         ctx.shutdown().await;
+        reset_generate_request_count(19821);
     }
 }
