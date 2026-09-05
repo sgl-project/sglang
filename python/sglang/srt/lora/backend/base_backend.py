@@ -53,6 +53,8 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         self.prefill_moe_cg_buffers: dict | None = None
         self._moe_cg_buffer_init_args: tuple[int, torch.dtype, object] | None = None
         self._moe_cg_buffer_max_bs: int | None = None
+        # Sequential MoE layers share one workspace, including graph scratch.
+        self.lora_workspace = None
 
     def reset_batch_state(self):
         """Idle-forward counterpart of prepare_lora_batch(): clears all
@@ -306,7 +308,6 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
                 (max_bs,), -1, dtype=torch.int32, device=device
             ),
         }
-
         if prefill:
             self.prefill_moe_cg_buffers = buffers
         else:
@@ -441,12 +442,17 @@ def _compute_moe_lora_info_kernel(
     valid = offs < seg_len
     lora_id = tl.load(weight_indices_ptr + pid_seg)
     lora_rank = tl.load(lora_ranks_ptr + lora_id)
+    adapter_is_enabled = lora_rank > 0
     tl.store(
         adapter_enabled_ptr + lora_id,
-        (lora_rank > 0).to(tl.int32),
+        adapter_is_enabled.to(tl.int32),
         mask=pid_m == 0,
     )
-    tl.store(token_lora_mapping_ptr + seg_start + offs, lora_id, mask=valid)
+    tl.store(
+        token_lora_mapping_ptr + seg_start + offs,
+        tl.where(adapter_is_enabled, lora_id, -1),
+        mask=valid,
+    )
 
 
 def _compute_moe_lora_info(
@@ -529,8 +535,12 @@ def _compute_moe_lora_info(
         torch.searchsorted(seg_indptr.to(torch.int32), token_positions, right=True) - 1
     )
 
-    token_lora_mapping = torch.index_select(
+    torch.index_select(
         weight_indices.to(torch.int32), 0, req_indices, out=token_lora_mapping
     )
+    token_lora_ranks = torch.index_select(
+        lora_ranks, 0, token_lora_mapping.to(torch.int64)
+    )
+    token_lora_mapping.masked_fill_(token_lora_ranks <= 0, -1)
 
     return adapter_enabled, token_lora_mapping
