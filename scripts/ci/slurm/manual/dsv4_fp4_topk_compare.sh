@@ -755,7 +755,10 @@ prepare_aiter_checkout() {
         echo "[aiter-stage] source=$AITER_SOURCE_DIR"
         echo "[aiter-stage] ref=$AITER_REF"
         echo "[aiter-stage] sha=$AITER_EXPECTED_SHA"
-        git clone --local --no-checkout "$AITER_SOURCE_DIR" "$AITER_STAGE_DIR"
+        # /tmp is a different filesystem on the compute nodes, so local-clone
+        # hardlinks fail with EXDEV. Copy objects instead.
+        git clone --local --no-hardlinks --no-checkout \
+            "$AITER_SOURCE_DIR" "$AITER_STAGE_DIR"
         git -C "$AITER_STAGE_DIR" checkout --detach "$AITER_EXPECTED_SHA"
         if [[ "$AITER_UPDATE_SUBMODULES" == 1 && -f "$AITER_STAGE_DIR/.gitmodules" ]]; then
             while read -r key path; do
