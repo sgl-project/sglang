@@ -877,7 +877,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let Some(swa) = self.try_component_by_type_(SWA) else {
             return;
         };
-        swa.release_window_lock(self, node_id, swa_uuid_for_lock, device_frees, host_frees);
+        swa.release_window_lock(
+            self,
+            node_id,
+            swa_uuid_for_lock,
+            device_frees,
+            host_frees,
+            skip_lock_node_ids.and_then(|ids| ids.get(&SWA)),
+        );
 
         // Drop strictly-lower-priority locks (e.g. Mamba) co-located on the node.
         let swa_priority = swa.eviction_priority(/* is_leaf = */ false);

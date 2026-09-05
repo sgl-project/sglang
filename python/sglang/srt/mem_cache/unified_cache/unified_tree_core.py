@@ -664,7 +664,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if swa_component is None:
             return result
         swa_component.release_window_lock(
-            node, swa_uuid_for_lock, result.device_frees, result.host_frees
+            node,
+            swa_uuid_for_lock,
+            result.device_frees,
+            result.host_frees,
+            skip_lock_node_ids=(skip_lock_node_ids or {}).get(ComponentType.SWA, ()),
         )
 
         # Drop strictly-lower-priority locks (e.g. Mamba) co-located on the node,

@@ -1,11 +1,11 @@
 //! Per-component drivers; each receives the whole `UnifiedTreeCore` for backward access.
 #![allow(unused_variables)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tch::Tensor;
 
-use crate::node::{ChildKeyType, NodeArena, NodeIdx_, TreeCoreRuntimeError};
+use crate::node::{ChildKeyType, NodeArena, NodeId, NodeIdx_, TreeCoreRuntimeError};
 use crate::unified_tree_core::{
     CacheAction, CacheTransferPhase, DecLockRefParams, EvictLayer, IncLockRefResult, InsertParams,
     InsertResult, LRURefreshPhase, MatchPrefixParams, MatchResult, PoolTransfer,
@@ -355,6 +355,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         _swa_uuid_for_lock: Option<i64>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        _skip_lock_node_ids: Option<&HashSet<NodeId>>,
     ) {
         unimplemented!("release_window_lock is SWA-only")
     }
