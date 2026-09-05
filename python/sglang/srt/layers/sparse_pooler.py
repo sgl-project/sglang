@@ -11,6 +11,7 @@ from sglang.srt.model_executor.model_runner import ForwardBatch
 @dataclass
 class SparseEmbeddingOutput:
     embeddings: torch.Tensor  # [batch_size, vocab_size]
+    pooled_hidden_states: torch.Tensor | None = None
 
 
 class SparsePooler(nn.Module):
