@@ -370,6 +370,19 @@ def handle_elastic_ep(server_args: Any):
                 "_handle_elastic_ep",
                 mooncake_ib_device=validate_ib_devices(cfg.mooncake_ib_device),
             )
+            # Reject raw-NCCL fast paths that bypass active_ranks.
+            if envs.SGLANG_SYNC_TOKEN_IDS_ACROSS_TP.get():
+                raise ValueError(
+                    "SGLANG_SYNC_TOKEN_IDS_ACROSS_TP + mooncake bypasses active_ranks."
+                )
+            if cfg.enable_symm_mem:
+                raise ValueError("--enable-symm-mem + mooncake bypasses active_ranks.")
+            # shm broadcaster deadlocks on retiree exit (fixed-size, no remove_reader).
+            if envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get():
+                envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.set(False)
+                logger.warning(
+                    "[Elastic EP] mooncake: force SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=False"
+                )
     if cfg.ep_join_mode is not None:
         assert cfg.elastic_ep_backend is not None, (
             "--elastic-ep-join-mode requires --elastic-ep-backend to be set."
@@ -385,9 +398,10 @@ def handle_elastic_ep(server_args: Any):
                 "effective EP size."
             )
     if cfg.ep_join_rank_offset != 0:
-        assert cfg.ep_join_mode == "scale", (
+        # Non-zero offset is scale or recover-with-offset; fault recovery is offset=0.
+        assert cfg.ep_join_mode in ("scale", "recover"), (
             "--elastic-ep-join-rank-offset is only valid with "
-            "--elastic-ep-join-mode scale."
+            "--elastic-ep-join-mode scale or recover."
         )
         assert cfg.ep_join_rank_offset >= 0, "elastic EP join rank offset must be >= 0."
     if cfg.max_ep_size is not None:
@@ -405,6 +419,13 @@ def handle_elastic_ep(server_args: Any):
         assert scaling_active, (
             "--elastic-ep-initial-size is only valid for an Elastic EP "
             "deployment with --max-ep-size larger than its local TP size."
+        )
+    if server_args.is_ep_offset_joiner:
+        # A valid joiner always satisfies this; without it the checks below are
+        # skipped rather than run.
+        assert scaling_active, (
+            "An Elastic EP joiner requires --elastic-ep-backend and "
+            "--max-ep-size larger than its local TP size."
         )
     if scaling_active:
         resolved = resolved_view(server_args)
@@ -446,6 +467,14 @@ def handle_elastic_ep(server_args: Any):
                     "A single-rank Elastic EP joining group requires "
                     "--moe-dense-tp-size 1."
                 )
+        elif server_args.is_ep_offset_joiner:
+            # Recover-into-retired-slot: slot must lie inside launch cohort.
+            cohort = cfg.elastic_ep_initial_size
+            target = cfg.ep_join_rank_offset + cfg.tp_size
+            assert cohort is not None, "recover needs --elastic-ep-initial-size"
+            assert target <= cohort, f"joiner target {target} > cohort {cohort}"
+            if cfg.tp_size == 1:
+                assert cfg.moe_dense_tp_size == 1, "needs --moe-dense-tp-size 1"
         else:
             if cfg.elastic_ep_initial_size is None:
                 declare_resolution(
@@ -471,6 +500,13 @@ def handle_elastic_ep(server_args: Any):
         assert cfg.pp_size == 1, (
             "Elastic EP scale-up requires --pp-size 1 "
             f"(got pp_size={cfg.pp_size}); WORLD must not span PP stages."
+        )
+        # Only the two base event loops tick the scale FSM, so any loop
+        # selected ahead of them would make a scale request a silent no-op.
+        assert not cfg.enable_pdmux, "Elastic EP does not support --enable-pdmux."
+        assert cfg.disaggregation_mode == "null", (
+            "Elastic EP does not support disaggregation "
+            f"(got disaggregation_mode={cfg.disaggregation_mode})."
         )
 
         decode_cuda_graph_disabled = (
@@ -555,7 +591,7 @@ def handle_eplb_and_dispatch(server_args: Any):
             "--ep-dispatch-algorithm dynamic with --moe-a2a-backend none."
         )
 
-    if cfg.enable_eplb and cfg.ep_join_mode != "scale":
+    if cfg.enable_eplb and not server_args.is_ep_offset_joiner:
         assert resolved_view(server_args).ep_size > 1
 
 

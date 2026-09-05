@@ -30,6 +30,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_resources,
+    get_server_args,
 )
 
 if TYPE_CHECKING:
@@ -38,9 +39,26 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _scale_published_ep_size() -> bool:
+    from sglang.srt.runtime_context import get_context
+
+    return any(
+        src.startswith("elastic_ep.") and "ep_size" in fields
+        for src, fields in get_context().overrides_log()
+    )
+
+
 def _prefer_same_node_experts() -> bool:
     from sglang.srt.elastic_ep.elastic_ep import elastic_expanded_world_enabled
 
+    # Offset joiners: single-rank subprocess -> divide-by-zero in _find_nearest_expert.
+    if get_server_args().is_ep_offset_joiner:
+        return False
+    # A scale-published width no longer tiles the launch nodes: a partial-node shrink
+    # makes ep_size // nnodes a split that does not exist, and divides by zero below
+    # nnodes. reshuffle_for_scale passes num_nodes=1 for the same reason.
+    if _scale_published_ep_size():
+        return False
     return (
         get_exec().moe.ep_join_mode != "scale" and not elastic_expanded_world_enabled()
     )
@@ -240,7 +258,10 @@ class ExpertLocationMetadata:
         num_physical_experts = base_num_physical_experts
         initial_ep_size = get_parallel().elastic_ep_initial_size
         if initial_ep_size is not None:
-            if get_exec().moe.ep_join_mode == "scale":
+            # Offset joiners size against the post-join cohort, but only until a scale
+            # publishes a width: the launch-time floor would clamp a later shrink above
+            # the survivor count, leaving the map indivisible.
+            if get_server_args().is_ep_offset_joiner and not _scale_published_ep_size():
                 ep_size = max(
                     ep_size,
                     get_parallel().ep_join_rank_offset + get_parallel().tp_size,
@@ -516,10 +537,27 @@ def broadcast_global_expert_location_metadata(
     metadata = get_global_expert_location_metadata()
     assert metadata is not None
 
+    from sglang.srt.elastic_ep.elastic_ep import share_expert_map_via_store
+
     metadata.physical_to_logical_map = metadata.physical_to_logical_map.contiguous()
-    torch.distributed.broadcast(
-        metadata.physical_to_logical_map, src=src_rank, group=group
-    )
+    # Both callers are elastic EP, where the group's own broadcast can wedge the
+    # cohort -- see share_expert_map_via_store. No store, and this is the collective
+    # it always was.
+    rank_in_group = torch.distributed.get_rank(group=group)
+    if not share_expert_map_via_store(
+        metadata.physical_to_logical_map,
+        is_src=rank_in_group == src_rank,
+        cohort_size=torch.distributed.get_world_size(group=group),
+        group_rank=rank_in_group,
+    ):
+        torch.distributed.broadcast(
+            metadata.physical_to_logical_map, src=src_rank, group=group
+        )
+
+    # Src already rebuilt: skip redundant O(layers*experts*ep_size) recomputation.
+    if torch.distributed.get_rank(group=group) == src_rank:
+        return metadata
+
     metadata = ExpertLocationMetadata.init_by_mapping(
         model_config,
         metadata.physical_to_logical_map,
@@ -550,6 +588,11 @@ def _compute_logical_to_all_physical_map(
             logical_expert_id = physical_to_logical_map[
                 layer_id, physical_expert_id
             ].item()
+            if not (0 <= logical_expert_id < num_logical_experts):
+                raise IndexError(
+                    f"p2l[{layer_id},{physical_expert_id}]={logical_expert_id} "
+                    f"not in [0,{num_logical_experts}); ep_size={ep_size} rank={moe_ep_rank}"
+                )
             logical_to_all_physical_map[layer_id][logical_expert_id].append(
                 physical_expert_id
             )

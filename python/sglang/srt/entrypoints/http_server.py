@@ -2395,7 +2395,7 @@ def _wait_and_warmup(
         _wait_weights_ready()
 
     # Joiner schedulers are served through the primary after adoption.
-    skip_elastic_joiner_warmup = server_args.is_ep_scale_joiner
+    skip_elastic_joiner_warmup = server_args.is_ep_offset_joiner
     if skip_elastic_joiner_warmup:
         logger.debug(
             "[Elastic EP] Skipping server warmup for elastic joiner (ep_join_mode=%s)",
@@ -2825,6 +2825,14 @@ def launch_server(
         run_scheduler_process_func=run_scheduler_process_func,
         run_detokenizer_process_func=run_detokenizer_process_func,
     )
+
+    if server_args.node_rank >= 1 and server_args.elastic_ep_backend is not None:
+        # Retiring every rank on a non-head node lands here with no tokenizer manager;
+        # exit cleanly, since an orchestrator reads a failed startup as a crashed node.
+        # Gated on elastic EP: otherwise reaching here means the schedulers died and the
+        # non-zero exit is the signal. Not `tokenizer_manager is None` -- so is Rust's.
+        logger.info("All local schedulers exited; shutting down this node.")
+        return
 
     if envs.SGLANG_RUST_SERVER.get():
         # The Rust server serves api-server, tokenizer, and detokenizer, so the

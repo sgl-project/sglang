@@ -107,6 +107,8 @@ class MLPSyncBatchInfo:
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
+        from sglang.srt.elastic_ep.elastic_ep import departure_pending
+
         return torch.tensor(
             [
                 self.num_tokens,
@@ -116,6 +118,8 @@ class MLPSyncBatchInfo:
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
                 int(self.can_run_prefill_cuda_graph),
+                # Appended, so the column indices read elsewhere do not shift.
+                int(departure_pending()),
             ],
             device=device,
             dtype=dtype,
@@ -131,6 +135,8 @@ class MLPSyncBatchInfo:
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # can_run_prefill_cuda_graph
+                0,  # departure_pending: an absent slot is not a peer that can still
+                # post an mlp_sync, so it must never hold the cohort in DRAIN.
             ],
             device=device,
             dtype=dtype,
@@ -138,6 +144,10 @@ class MLPSyncBatchInfo:
 
     def finalize_local(self):
         """Populate gather-derived metadata from the sole attention-DP rank."""
+        from sglang.srt.elastic_ep.elastic_ep import departure_observe
+
+        # Sole rank, so there is no cohort to fall out of step with.
+        departure_observe(True)
         self.tp0_info_cpu = self._get_local_tensor(device="cpu").view(1, -1)
         self.global_num_tokens = [self.num_tokens]
         self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
@@ -152,6 +162,8 @@ class MLPSyncBatchInfo:
         group: torch.distributed.ProcessGroup,
         use_all_reduce: bool = False,
     ):
+        from sglang.srt.elastic_ep.elastic_ep import departure_observe
+
         local_info_tensor = self._get_local_tensor(device=device)
         fallback_tensor = self._get_fallback_tensor(device=device)
         info_width = local_info_tensor.numel()
@@ -171,11 +183,20 @@ class MLPSyncBatchInfo:
             rank = torch.distributed.get_rank(group)
             if 0 <= rank < flat_info.shape[0]:
                 flat_info[rank] = local_info_tensor
-            torch.distributed.all_reduce(
+            # Retried: Mooncake can transiently reject this on the first
+            # post-shrink tick while its bitmap catches up to active_ranks.
+            from sglang.srt.elastic_ep.elastic_ep import (
+                mooncake_all_reduce_transient_retry,
+            )
+
+            mooncake_all_reduce_transient_retry(
                 global_info_tensor,
                 op=torch.distributed.ReduceOp.SUM,
                 group=group,
             )
+            # Cheap scalar sync so tick N+1's collective can't fire before Mooncake
+            # settles tick N; b3c02cbce7 dropped the .item() that provided this.
+            global_info_tensor.sum().item()
             missing = flat_info.abs().sum(dim=1) == 0
             flat_info[missing] = fallback_tensor
         else:
@@ -207,8 +228,25 @@ class MLPSyncBatchInfo:
         # attn_tp * attn_cp > 1, adding a gather kernel inside the wait.
         tp0_info_cpu = global_info_tensor.cpu()[:, 0, :]
         self.tp0_info_cpu = tp0_info_cpu
+        # Retire-departure poll, read off the copy above so it costs no extra sync, and
+        # placed after the inactive rows were normalised: a retired slot's row is stale
+        # and it is not a peer that can still post an mlp_sync, so it must not hold the
+        # cohort in DRAIN. A rank that has not finished draining contributes 1, so a zero
+        # column means every live rank is ready -- and every rank reads that here, in the
+        # same iteration. See elastic_ep.departure_pending().
+        departure_observe(int(tp0_info_cpu[:, -1].sum()) == 0)
         self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
         self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()
+        if use_all_reduce:
+            # Retiree slots can carry all-reduce garbage across a mask flip.
+            _MAX = 1 << 30
+            self.global_num_tokens = [
+                0 if (t < 0 or t > _MAX) else t for t in self.global_num_tokens
+            ]
+            self.global_num_tokens_for_logprob = [
+                0 if (t < 0 or t > _MAX) else t
+                for t in self.global_num_tokens_for_logprob
+            ]
         self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())

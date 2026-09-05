@@ -1047,6 +1047,8 @@ class Envs:
     SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE = EnvIntWithAlias(
         32, deprecated_name="SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE"
     )
+    # Reshuffle experts in the elastic scale finalizer, not the next EPLB tick.
+    SGLANG_ELASTIC_SYNC_REBALANCE = EnvBool(True)
 
     # ===================================================================
     # DeepGEMM

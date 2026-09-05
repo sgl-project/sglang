@@ -2558,6 +2558,13 @@ class ServerArgs:
         "Timeout in seconds for a pending elastic EP scale operation.",
         NS("exec.moe"),
     ] = 600
+    elastic_ep_retiree_lifecycle: A[
+        Literal["self_exit", "external"],
+        "Who ends a retired rank's process. 'self_exit' exits it once local cleanup "
+        "finishes. 'external' parks it instead, so an orchestrator can terminate it "
+        "after /is_scaling_elastic_ep reports the survivors committed.",
+        NS("exec.moe"),
+    ] = "self_exit"
     elastic_ep_rejoin: A[
         bool, "[Deprecated] Alias for --elastic-ep-join-mode recover.", NS("exec.moe")
     ] = False
@@ -4136,6 +4143,15 @@ class ServerArgs:
         return cfg.ep_join_mode == "scale"
 
     @property
+    def is_ep_offset_joiner(self) -> bool:
+        """Joiner slotting into a specific global rank (scale append OR recover with offset>0)."""
+        cfg = resolving_view(self)
+
+        return cfg.ep_join_mode == "scale" or (
+            cfg.ep_join_mode == "recover" and cfg.ep_join_rank_offset > 0
+        )
+
+    @property
     def is_startup_weight_load_overlap(self) -> bool:
         cfg = resolving_view(self)
 
@@ -4415,7 +4431,9 @@ class PortArgs:
             # overflow.
             is_rust_server = envs.SGLANG_RUST_SERVER.get()
             NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + cfg.dp_size
-            if server_args.is_ep_scale_joiner:
+            if server_args.is_ep_offset_joiner:
+                # Offset joiners co-locate with the primary; derive from
+                # server_args.port to avoid collision.
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
                     port_base = server_args.port - ZMQ_TCP_PORT_DELTA
