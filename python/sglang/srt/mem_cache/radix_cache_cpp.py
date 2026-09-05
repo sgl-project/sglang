@@ -224,7 +224,11 @@ class RadixCacheCpp(BasePrefixCache):
         """Cache request when it is unfinished."""
         self._reject_cache_salt(req.cache_salt)
         assert req.kv.holds_kv
-        token_ids = req.get_fill_ids()
+        # Not get_fill_ids(): a dLLM request's trailing in-flight denoise block
+        # is rewritten every step, so it must not enter the tree (see
+        # ReqDllmMixin.get_cacheable_fill_ids). For every other request this is
+        # the same value.
+        token_ids = req.get_cacheable_fill_ids()
         prefill_len = len(token_ids)  # prefill only (maybe chunked)
         kv_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :prefill_len
