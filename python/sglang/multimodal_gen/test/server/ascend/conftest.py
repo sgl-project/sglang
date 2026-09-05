@@ -70,7 +70,9 @@ def _evict_stale_page_cache(cache_root: str, keep_dir: str, case_id: str) -> Non
     total_bytes = sum(size for _, size in evicted)
     prefix = f"[page-cache-evict] [{case_id}]"
     if not evicted:
-        print(f"{prefix} nothing to evict under {cache_root} (keep: {keep})", flush=True)
+        print(
+            f"{prefix} nothing to evict under {cache_root} (keep: {keep})", flush=True
+        )
         return
     for relpath, size in evicted:
         print(f"{prefix} evicted {relpath} ({size / 1024**3:.2f} GiB)", flush=True)
