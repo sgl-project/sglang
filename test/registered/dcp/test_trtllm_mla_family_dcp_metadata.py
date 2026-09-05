@@ -213,6 +213,225 @@ class TestTRTLLMMLARejectsDcpMultiTokenQuery(CustomTestCase):
         self.assertEqual(len(calls), 1)
 
 
+@unittest.skipUnless(
+    torch.cuda.is_available(), "the page-table build is a Triton kernel"
+)
+class TestDcpBlockTableIdSpace(CustomTestCase):
+    """`_fill_dcp_block_kv_indices` must emit entries in the pool's OWN id space.
+
+    On a static pool the DCP-collapsed page is already physical. Under the
+    unified memory pool it is still VIRTUAL, and an entry that skips the v2p
+    gather names whatever page happens to sit there now -- silent wrong-KV
+    reads rather than a crash, which is why the reference below is computed
+    from the tables rather than from the kernel.
+    """
+
+    PAGE_SIZE = 64
+    DCP_SIZE = 4
+    DCP_RANK = 2
+    MULTIPLIER = 3
+    # Virtual page per request, deliberately not the identity so a missing
+    # gather cannot coincide with the right answer.
+    VIRTUAL_PAGES = [[5, 2, 9], [7, 0, 4], [1, 8, 6]]
+    # Global KV lengths: one spanning 3 pages, one 2, one under a page.
+    SEQ_LENS = [3 * PAGE_SIZE * DCP_SIZE, 2 * PAGE_SIZE * DCP_SIZE - 1, 10]
+
+    def _make_backend(self, translator):
+        bs = len(self.VIRTUAL_PAGES)
+        max_pos = max(self.SEQ_LENS)
+        req_to_token = torch.full((bs, max_pos), -1, dtype=torch.int32, device="cuda")
+        span = self.PAGE_SIZE * self.DCP_SIZE
+        for req, pages in enumerate(self.VIRTUAL_PAGES):
+            for slot, virtual_page in enumerate(pages):
+                base = virtual_page * span
+                start = slot * span
+                end = min(start + span, self.SEQ_LENS[req])
+                if end <= start:
+                    break
+                req_to_token[req, start:end] = torch.arange(
+                    base, base + (end - start), dtype=torch.int32, device="cuda"
+                )
+        backend = object.__new__(TRTLLMMLABackend)
+        backend.page_size = self.PAGE_SIZE
+        backend.req_to_token = req_to_token
+        backend.kv_index_translator = translator
+        return backend, req_to_token
+
+    def _fill(self, translator):
+        backend, req_to_token = self._make_backend(translator)
+        bs = len(self.VIRTUAL_PAGES)
+        seq_lens = torch.tensor(self.SEQ_LENS, dtype=torch.int32, device="cuda")
+        local_seq_lens = get_dcp_lens(seq_lens, self.DCP_SIZE, self.DCP_RANK).to(
+            torch.int32
+        )
+        # One 128-page row: the padded width `_calc_padded_blocks` produces.
+        block_kv_indices = torch.full((bs, 128), -1, dtype=torch.int32, device="cuda")
+        parallel = SimpleNamespace(
+            dcp_enabled=True, dcp_size=self.DCP_SIZE, dcp_rank=self.DCP_RANK
+        )
+        with patch.object(backend_module, "get_parallel", return_value=parallel):
+            backend._fill_dcp_block_kv_indices(
+                block_kv_indices,
+                torch.arange(bs, dtype=torch.int64, device="cuda"),
+                local_seq_lens,
+            )
+        return block_kv_indices.cpu(), local_seq_lens.cpu(), req_to_token.cpu()
+
+    def _reference(self, req_to_token, local_seq_lens, v2p, multiplier):
+        """What each live entry must be, derived from the id-space definition."""
+        rows = []
+        for req in range(local_seq_lens.numel()):
+            local_pages = -(-int(local_seq_lens[req]) // self.PAGE_SIZE)
+            row = []
+            for page in range(local_pages):
+                pos = self.DCP_RANK + page * self.PAGE_SIZE * self.DCP_SIZE
+                widened = int(req_to_token[req, pos])
+                collapsed_page = widened // self.DCP_SIZE // self.PAGE_SIZE
+                if v2p is None:
+                    row.append(collapsed_page)
+                else:
+                    row.append(max(int(v2p[collapsed_page]) * multiplier, 0))
+            rows.append(row)
+        return rows
+
+    def _assert_matches(self, table, rows):
+        for req, row in enumerate(rows):
+            self.assertEqual(table[req, : len(row)].tolist(), row)
+            # Past the live prefix nothing is written: the caller-owned
+            # capture-stable buffer keeps what it had there.
+            self.assertTrue((table[req, len(row) :] == -1).all())
+
+    def test_static_pool_entries_are_the_collapsed_page(self):
+        translator = SimpleNamespace(full_v2p_table=None, full_page_multiplier=1)
+        table, local_lens, req_to_token = self._fill(translator)
+        self._assert_matches(table, self._reference(req_to_token, local_lens, None, 1))
+
+    def test_unified_pool_entries_go_through_the_page_table(self):
+        num_pages = 1 + max(max(p) for p in self.VIRTUAL_PAGES)
+        # A scrambled v2p, so an entry that skipped the gather would differ.
+        v2p = torch.tensor(
+            [(7 * i + 3) % num_pages for i in range(num_pages)],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        translator = SimpleNamespace(
+            full_v2p_table=v2p, full_page_multiplier=self.MULTIPLIER
+        )
+        table, local_lens, req_to_token = self._fill(translator)
+        expected = self._reference(req_to_token, local_lens, v2p.cpu(), self.MULTIPLIER)
+        self._assert_matches(table, expected)
+        # And it is genuinely a translation, not an accident of the fixture.
+        static = self._reference(req_to_token, local_lens, None, 1)
+        self.assertNotEqual(expected, static)
+
+    def test_freed_page_lands_on_the_padding_sink(self):
+        # A tombstoned (-1) v2p row must clamp to entry 0, the reserved
+        # padding page, rather than scale -1 into a wild block id.
+        num_pages = 1 + max(max(p) for p in self.VIRTUAL_PAGES)
+        v2p = torch.arange(num_pages, dtype=torch.int64, device="cuda")
+        v2p[self.VIRTUAL_PAGES[0][0]] = -1
+        translator = SimpleNamespace(
+            full_v2p_table=v2p, full_page_multiplier=self.MULTIPLIER
+        )
+        table, _, _ = self._fill(translator)
+        self.assertEqual(int(table[0, 0]), 0)
+
+
+class TestFusedFp8WriteGate(CustomTestCase):
+    """The fused fp8 KV write must not serve a DCP-resolved loc.
+
+    Its only skip is the DCP owner rule (`vloc % world != rank`). Under the
+    unified pool that rule is already applied before the loc arrives, with
+    non-owned rows folded onto kernel id 0 -- so the kernel cannot skip the
+    padding sink the way `set_mla_kv_buffer`'s `reserved_skip_index` does, and
+    every non-owned token would store into slot 0.
+
+    A revert of the gate leaves accuracy tests green (slot 0 holds no real
+    data), which is why this is asserted directly.
+    """
+
+    def _gate(self, *, dcp_enabled: bool, is_translating: bool) -> bool:
+        backend = object.__new__(TRTLLMMLABackend)
+        backend.data_type = torch.float8_e4m3fn
+        backend.kv_lora_rank = 512
+        backend.qk_rope_head_dim = 64
+        backend.kv_index_translator = SimpleNamespace(is_translating=is_translating)
+        parallel = SimpleNamespace(
+            dcp_enabled=dcp_enabled,
+            attn_dcp_size=DCP_SIZE if dcp_enabled else 1,
+            attn_dcp_rank=DCP_RANK if dcp_enabled else 0,
+        )
+        with (
+            patch.object(backend_module, "get_parallel", return_value=parallel),
+            patch.object(
+                backend_module, "can_use_set_mla_kv_concat_q_fp8", return_value=True
+            ),
+            patch.object(
+                backend_module.envs.SGLANG_ENABLE_ASYNC_ASSERT, "get", lambda: False
+            ),
+        ):
+            return bool(
+                backend.data_type == torch.float8_e4m3fn
+                and not backend_module.envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
+                and backend.kv_lora_rank == 512
+                and backend.qk_rope_head_dim == 64
+                and not (
+                    backend_module.get_parallel().dcp_enabled
+                    and backend.kv_index_translator.is_translating
+                )
+                and backend_module.can_use_set_mla_kv_concat_q_fp8()
+            )
+
+    def test_off_for_the_unified_pool_under_dcp(self):
+        self.assertFalse(self._gate(dcp_enabled=True, is_translating=True))
+
+    def test_on_for_every_other_combination(self):
+        # The gate must not cost the static pool or a non-DCP unified run
+        # their fused write.
+        self.assertTrue(self._gate(dcp_enabled=True, is_translating=False))
+        self.assertTrue(self._gate(dcp_enabled=False, is_translating=True))
+        self.assertTrue(self._gate(dcp_enabled=False, is_translating=False))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "backend construction")
+    def test_helper_refuses_a_resolved_loc(self):
+        """Belt and braces: reaching the helper with a resolved loc asserts
+        rather than silently storing into the sink."""
+        backend = object.__new__(TRTLLMMLABackend)
+        backend.kv_index_translator = SimpleNamespace(is_translating=True)
+        parallel = SimpleNamespace(
+            dcp_enabled=True, attn_dcp_size=DCP_SIZE, attn_dcp_rank=DCP_RANK
+        )
+        layer = SimpleNamespace(
+            tp_q_head_num=1, v_head_dim=512, head_dim=576, layer_id=0
+        )
+        n = 4
+        with (
+            patch.object(backend_module, "get_parallel", return_value=parallel),
+            patch.object(
+                backend_module, "set_mla_kv_concat_q_fp8_covered", return_value=True
+            ),
+            patch.object(
+                backend,
+                "token_to_kv_pool",
+                SimpleNamespace(
+                    get_key_buffer=lambda _: torch.zeros(
+                        (8, 576), dtype=torch.uint8, device="cuda"
+                    )
+                ),
+                create=True,
+            ),
+        ):
+            with self.assertRaises(AssertionError):
+                backend._set_kv_and_concat_q_fp8_fused(
+                    layer=layer,
+                    loc=torch.zeros(n, dtype=torch.int64, device="cuda"),
+                    q=torch.zeros((n, 512), dtype=torch.bfloat16, device="cuda"),
+                    q_rope=torch.zeros((n, 64), dtype=torch.bfloat16, device="cuda"),
+                    k=torch.zeros((n, 512), dtype=torch.bfloat16, device="cuda"),
+                    k_rope=torch.zeros((n, 64), dtype=torch.bfloat16, device="cuda"),
+                )
+
+
 class TestDcpDecodeLayout(CustomTestCase):
     """Rank-local length math the decode page table above is built from."""
 

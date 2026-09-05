@@ -2,8 +2,9 @@
 """SubBlock block-sparse attention backend.
 
 Routes the same 64-token SubBlock plan to SGLang's CuTe-DSL block-sparse
-FlashAttention kernel on SM90 or FlashInfer's kernel on SM100. A log-sum-exp
-over query/key sub-block pairs selects the blocks (see ``backends/subblock_sparse/``).
+FlashAttention kernel on SM90 or FlashInfer's architecture-specific kernels on
+SM100 and SM120. A log-sum-exp over query/key sub-block pairs selects the blocks
+(see ``backends/subblock_sparse/``).
 Everything is training-free: the router runs before attention and produces
 the ``q2k_block_index`` the selected kernel consumes.
 
@@ -18,15 +19,16 @@ individual keys of the defaults below::
     --attention-backend-config '{"sparsity": 0.85}'
 
 Requirements inherited from the kernels: compute capability 9.0 (Hopper) or
-10.0 (B200 / GB200), bf16, head_dim 128. Hopper uses SGLang's CuTe-DSL SM90
-block-sparse FlashAttention kernel; B200 uses FlashInfer's ``sm_100a`` blk64
-kernel. Inside the DiT, any call the kernels cannot serve -- cross/refiner
-attention, short sequences, non-bf16 -- runs dense instead. On any other GPU
-the resolver refuses the backend at startup rather than falling back.
+10.0/12.0 (Blackwell), bf16, head_dim 128. Hopper uses SGLang's CuTe-DSL SM90
+block-sparse FlashAttention kernel; B200 and SM120 devices use FlashInfer's
+architecture-specific blk64 kernels. Inside the DiT, any call the kernels cannot
+serve -- cross/refiner attention, short sequences, non-bf16 -- runs dense instead.
+On any other GPU the resolver refuses the backend at startup rather than falling back.
 
 ``--attention-backend`` reaches every component, and the text encoder admits
-only fa / torch_sdpa / sage_attn_3, so pair it with
-``--component-attention-backends text_encoder=fa``; see the README.
+only fa / torch_sdpa / sage_attn_3. Pair it with
+``--component-attention-backends text_encoder=fa`` on SM90/SM100, or
+``text_encoder=torch_sdpa`` on SM120; see the README.
 """
 
 from __future__ import annotations
@@ -48,6 +50,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
     SubBlockRouter,
     load_bsa_attn_blk64_fwd,
+    load_bsa_attn_sm120_blk64_fwd,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
@@ -198,6 +201,30 @@ def _sm100_sparse_attention(
     return out[0] if isinstance(out, tuple) else out
 
 
+def _sm120_sparse_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    topk: int,
+    softmax_scale: float,
+    block_counts: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run a SubBlock routing plan through FlashInfer's SM120 kernel."""
+    logger.info_once("SubBlock sparse attention kernel active: FlashInfer SM120 blk64")
+    out = load_bsa_attn_sm120_blk64_fwd()(
+        q,
+        k,
+        v,
+        q2k_block_index,
+        topk,
+        block_sizes=_cached_block_sizes(k.shape[1], k.device),
+        q2k_block_nums=block_counts,
+        softmax_scale=softmax_scale,
+    )
+    return out[0] if isinstance(out, tuple) else out
+
+
 @functools.lru_cache(maxsize=None)
 def _get_subblock_sparse_attention_runner(device: torch.device):
     """Resolve the architecture-specific kernel once per CUDA device."""
@@ -206,8 +233,10 @@ def _get_subblock_sparse_attention_runner(device: torch.device):
         return _sm90_sparse_attention
     if capability == (10, 0):
         return _sm100_sparse_attention
+    if capability == (12, 0):
+        return _sm120_sparse_attention
     raise RuntimeError(
-        "SubBlock sparse attention supports compute capability 9.0 or 10.0; "
+        "SubBlock sparse attention supports compute capability 9.0, 10.0, or 12.0; "
         f"this tensor is on a {capability[0]}.{capability[1]} device."
     )
 
@@ -224,8 +253,9 @@ def _run_subblock_sparse_attention(
     """Dispatch a prepared 64x64 routing plan to Hopper or Blackwell.
 
     SM90 requires every active index prefix to be sorted in ascending order;
-    SM100 accepts the router's original order. Heterogeneous callers must sort
-    compact sparse prefixes before expanding them to full-width dense rows.
+    SM100 and SM120 accept the router's original order. Heterogeneous callers
+    must sort compact sparse prefixes before expanding them to full-width dense
+    rows.
     """
     runner = _get_subblock_sparse_attention_runner(q.device)
     return runner(

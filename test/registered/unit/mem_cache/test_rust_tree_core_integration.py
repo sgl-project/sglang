@@ -593,7 +593,7 @@ def test_hicache_write_through_and_load_back_round_trip():
     device_value, comp_xfers = core.build_backup_spec(leaf)
     assert device_value.tolist() == [10, 11]
     assert comp_xfers == {}
-    core.mark_write_through_pending(leaf)
+    core.mark_write_through_pending([leaf], ack_id=leaf)
     core.commit_backup(leaf, torch.tensor([100, 101], dtype=torch.int64), comp_xfers)
     core.finish_write_through([leaf], leaf)
     tracker = {ComponentType.FULL: 0}
@@ -614,6 +614,30 @@ def test_hicache_write_through_and_load_back_round_trip():
     result = core.match_prefix(MatchPrefixParams(key=_key([1, 2])))
     assert result.device_indices.tolist() == [50, 51]
     core.finish_load_back(leaf)
+    core.sanity_check([], [])
+
+
+def test_cache_tracks_one_write_through_ack_across_rust_nodes():
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    core = _tree_core()
+    _insert(core, [1], [10])
+    _insert(core, [1, 2], [10, 11])
+    parent = core.match_prefix(MatchPrefixParams(key=_key([1]))).best_match_node
+    leaf = core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).best_match_node
+    cache = SimpleNamespace(tree_core=core, ongoing_write_through={})
+
+    # Child-first in, ancestors-first out: the publish side links every store
+    # event to its parent, and component transfer order is not tree order.
+    UnifiedRadixCache._track_write_through_node(
+        cache,
+        leaf,
+        lock_params=None,
+        publish_node_ids=[leaf, parent],
+    )
+
+    assert cache.ongoing_write_through[leaf].publish_node_ids == [parent, leaf]
+    core.finish_write_through([parent, leaf], ack_id=leaf)
     core.sanity_check([], [])
 
 
@@ -1588,7 +1612,7 @@ def test_split_of_a_write_through_pending_node_crosses_the_replace_action():
     core.set_hicache_enabled()
     _insert(core, [1, 2, 3, 4], [10, 11, 12, 13])
     leaf = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3, 4]))).best_match_node
-    core.mark_write_through_pending(leaf)
+    core.mark_write_through_pending([leaf], ack_id=leaf)
     # A divergent prefix splits the pending node; the publish list must follow.
     result = _insert(core, [1, 2], [10, 11])
     (replace,) = [

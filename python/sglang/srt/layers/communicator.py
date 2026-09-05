@@ -425,11 +425,17 @@ class LayerScatterModes:
                 return ScatterMode.MOE_FULL
             return ScatterMode.FULL
         else:
-            return (
-                ScatterMode.SCATTERED
-                if enable_moe_dense_fully_dp()
-                else ScatterMode.FULL
-            )
+            if enable_moe_dense_fully_dp():
+                return ScatterMode.SCATTERED
+            # A TP-sharded dense MLP reduces over the whole TP group, which spans
+            # every CP rank; a CP-sharded prefill must gather tokens across CP
+            # first or the all-reduce sums different tokens' partial outputs.
+            # MLA/DSA CP models do this in DSACPLayerCommunicator instead.
+            if _generic_prefill_cp_shards_tokens() and not (
+                is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
+            ):
+                return ScatterMode.MOE_FULL
+            return ScatterMode.FULL
 
     @classmethod
     def _should_gather_for_tbo(cls, context: _LayerModeComputationContext):
@@ -465,6 +471,15 @@ class LayerScatterModes:
 
 def enable_moe_dense_fully_dp():
     return get_parallel().moe_dense_tp_size == 1
+
+
+def _generic_prefill_cp_shards_tokens() -> bool:
+    """Whether the strategy prefill CP path shards prefill tokens across CP ranks."""
+    # Local import: module-level CP helper imports here are circular (#27014).
+    from sglang.srt.layers.cp.utils import enable_cp_v2
+
+    parallel = get_parallel()
+    return parallel.attn_cp_size > 1 and parallel.enable_prefill_cp and enable_cp_v2()
 
 
 def enable_dwdp():
@@ -890,7 +905,10 @@ class LayerCommunicator:
         # the fusion path skips postprocess_layer which contains the moe_cp scatter.
         # Without scatter, hidden_states remain at MOE_FULL size while residual is at
         # TP_ATTN_FULL size, causing a shape mismatch.
-        if is_enable_moe_cp_allgather():
+        if (
+            is_enable_moe_cp_allgather()
+            or self.layer_scatter_modes.mlp_mode == ScatterMode.MOE_FULL
+        ):
             return False
 
         # Fusing makes the next layer's residual+LN absorb the post-experts

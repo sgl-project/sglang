@@ -141,6 +141,7 @@ async fn main() -> Result<()> {
             kv_index.tree(),
             Arc::clone(&tokenizers),
             Arc::clone(&block_size_oracle),
+            kv_index.engine_load(),
         )
         .context("build policy registry")?,
     );
@@ -197,6 +198,7 @@ async fn main() -> Result<()> {
     );
     app_ctx.prefix_index = prefix_index;
     app_ctx.block_size_oracle = block_size_oracle;
+    app_ctx.engine_load = kv_index.engine_load();
     let ctx = Arc::new(app_ctx);
     ctx.mark_ready();
 

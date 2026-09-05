@@ -75,6 +75,7 @@ def _make_chunk_cache(req_to_token_pool) -> ChunkCache:
 
 def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s = Scheduler.__new__(Scheduler)
+    s.scheduler_stage_metrics = None
     s._abort_on_waiting_timeout = MagicMock()
     s._abort_on_running_timeout = MagicMock()
     s.dllm_config = None

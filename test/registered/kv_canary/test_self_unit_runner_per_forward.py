@@ -91,7 +91,7 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
         forward_batch.out_cache_loc = torch.tensor(
             [7, 0, 0], dtype=torch.int64, device=self.device
         )
-        forward_batch.num_token_non_padded_cpu = 1
+        forward_batch.global_num_token_non_padded_cpu = 1
 
         kernel_launcher_module.launch_endpoints_per_forward(
             endpoints=(endpoint,),
@@ -144,7 +144,7 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
         forward_batch.out_cache_loc = torch.tensor(
             [7], dtype=torch.int32, device=self.device
         )
-        forward_batch.num_token_non_padded_cpu = 1
+        forward_batch.global_num_token_non_padded_cpu = 1
 
         kernel_launcher_module.launch_endpoints_per_forward(
             endpoints=(endpoint,),
@@ -182,7 +182,7 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
         forward_batch.out_cache_loc = torch.tensor(
             [7, 0, 0], dtype=torch.int64, device=self.device
         )
-        forward_batch.num_token_non_padded_cpu = 1
+        forward_batch.global_num_token_non_padded_cpu = 1
 
         kernel_launcher_module.launch_endpoints_per_forward(
             endpoints=(endpoint,),
@@ -218,7 +218,7 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
         forward_batch.out_cache_loc = torch.tensor(
             [[7, 8]], dtype=torch.int64, device=self.device
         )[:, 0]
-        forward_batch.num_token_non_padded_cpu = 1
+        forward_batch.global_num_token_non_padded_cpu = 1
 
         kernel_launcher_module.launch_endpoints_per_forward(
             endpoints=(endpoint,),

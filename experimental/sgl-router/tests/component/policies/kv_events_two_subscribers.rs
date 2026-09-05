@@ -41,6 +41,8 @@ async fn two_independent_subscribers_converge_to_same_tree_state() {
         topic: String::new(),
         block_size,
         dp_size: 1,
+        load_port_base: None,
+        load_topic: None,
         is_bigram: false,
     };
 
@@ -53,12 +55,7 @@ async fn two_independent_subscribers_converge_to_same_tree_state() {
     router_a.add_worker(worker_url, Some(cfg.clone())).await;
     router_b.add_worker(worker_url, Some(cfg.clone())).await;
 
-    // SUB-side handshake settle. Publishing before the subscribers
-    // finish their initial connect loses messages in PUB/SUB semantics;
-    // the polling loop below would then never converge.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // 3. Publish a deterministic, multi-block event chain.
+    // 3. Build a deterministic, multi-block event chain.
     let tokens: Vec<u32> = (0..16).collect();
     let hashes = compute_block_hashes(&tokens, block_size as usize);
     assert!(
@@ -68,21 +65,21 @@ async fn two_independent_subscribers_converge_to_same_tree_state() {
     );
     let event_bytes = encode_block_stored_event(&hashes, None, &tokens, block_size);
     let payload = encode_event_batch(0.0, vec![event_bytes], Some(0));
-    publisher
-        .send(build_multipart(1, payload))
-        .await
-        .expect("publish BlockStored");
-
-    // 4. Poll both trees until both report the FULL chain matched. The
-    //    SUB→mpsc→pump→tree pipeline is async; loopback delivery is
-    //    reliable but not instantaneous.
+    // 4. Republish until both subscribers observe the event. PUB/SUB has
+    // no readiness acknowledgement, so a one-shot send can race a new
+    // subscriber's handshake under a parallel test load.
     let target = hashes.len();
     let key = KvWorkerId {
         url: worker_url.into(),
         dp_rank: 0,
     };
     let start = std::time::Instant::now();
+    let mut sequence = 1i64;
     loop {
+        publisher
+            .send(build_multipart(sequence, payload.clone()))
+            .await
+            .expect("publish BlockStored");
         let ma = router_a.tree().match_prefix(None, &hashes);
         let mb = router_b.tree().match_prefix(None, &hashes);
         let converged = ma.matched_blocks == target
@@ -112,6 +109,7 @@ async fn two_independent_subscribers_converge_to_same_tree_state() {
                 ma.matched_blocks, ma.workers, mb.matched_blocks, mb.workers,
             );
         }
+        sequence += 1;
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
@@ -174,6 +172,8 @@ async fn two_subscribers_merge_events_from_two_publishers() {
         topic: String::new(),
         block_size,
         dp_size: 1,
+        load_port_base: None,
+        load_topic: None,
         is_bigram: false,
     };
     let cfg_y = EventConfig {
@@ -182,6 +182,8 @@ async fn two_subscribers_merge_events_from_two_publishers() {
         topic: String::new(),
         block_size,
         dp_size: 1,
+        load_port_base: None,
+        load_topic: None,
         is_bigram: false,
     };
 
@@ -192,10 +194,6 @@ async fn two_subscribers_merge_events_from_two_publishers() {
     router_a.add_worker(worker_y, Some(cfg_y.clone())).await;
     router_b.add_worker(worker_x, Some(cfg_x.clone())).await;
     router_b.add_worker(worker_y, Some(cfg_y.clone())).await;
-
-    // Four SUB→PUB handshakes need to settle before publishing; missed
-    // SUBSCRIBE frames lose messages forever in PUB/SUB semantics.
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Two non-overlapping token streams → two distinct hash chains. The
     // gap between them (0..16 vs 1000..1016) keeps `compute_block_hashes`
@@ -221,15 +219,6 @@ async fn two_subscribers_merge_events_from_two_publishers() {
         )],
         Some(0),
     );
-    pub_x
-        .send(build_multipart(1, payload_x))
-        .await
-        .expect("publish on pub_x");
-    pub_y
-        .send(build_multipart(1, payload_y))
-        .await
-        .expect("publish on pub_y");
-
     let key_x = KvWorkerId {
         url: worker_x.into(),
         dp_rank: 0,
@@ -242,7 +231,16 @@ async fn two_subscribers_merge_events_from_two_publishers() {
     let target_y = hashes_y.len();
 
     let start = std::time::Instant::now();
+    let mut sequence = 1i64;
     loop {
+        pub_x
+            .send(build_multipart(sequence, payload_x.clone()))
+            .await
+            .expect("publish on pub_x");
+        pub_y
+            .send(build_multipart(sequence, payload_y.clone()))
+            .await
+            .expect("publish on pub_y");
         let ax = router_a.tree().match_prefix(None, &hashes_x);
         let ay = router_a.tree().match_prefix(None, &hashes_y);
         let bx = router_b.tree().match_prefix(None, &hashes_x);
@@ -298,6 +296,7 @@ async fn two_subscribers_merge_events_from_two_publishers() {
                 by.workers,
             );
         }
+        sequence += 1;
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 

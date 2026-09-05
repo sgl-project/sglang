@@ -21,6 +21,7 @@ def _write_index(folder, weight_map):
 
 def _touch(folder, name):
     path = os.path.join(folder, name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     open(path, "w").close()
     return path
 
@@ -71,6 +72,52 @@ class TestFilterDuplicateSafetensorsFiles(CustomTestCase):
             index_file=INDEX_NAME,
         )
         self.assertEqual(sorted(result), sorted([shard1, shard2]))
+
+    def test_missing_shard_outside_allow_patterns_is_ignored(self):
+        # Cosmos3-style checkpoints use one root index for multiple subfolder
+        # weight sources. Loading the transformer source should not require the
+        # vision encoder shard to already be present; the secondary source
+        # downloads and loads it separately.
+        _write_index(
+            self.folder,
+            {
+                "llm": "transformer/diffusion_pytorch_model.safetensors",
+                "vit": "vision_encoder/model.safetensors",
+            },
+        )
+        transformer = _touch(
+            self.folder, "transformer/diffusion_pytorch_model.safetensors"
+        )
+
+        result = filter_duplicate_safetensors_files(
+            hf_weights_files=[transformer],
+            hf_folder=self.folder,
+            index_file=INDEX_NAME,
+            allow_patterns=["transformer/*.safetensors"],
+        )
+        self.assertEqual(result, [transformer])
+
+    def test_missing_shard_inside_allow_patterns_raises(self):
+        _write_index(
+            self.folder,
+            {
+                "llm1": "transformer/model-00001-of-00002.safetensors",
+                "llm2": "transformer/model-00002-of-00002.safetensors",
+                "vit": "vision_encoder/model.safetensors",
+            },
+        )
+        transformer = _touch(
+            self.folder, "transformer/model-00001-of-00002.safetensors"
+        )
+
+        with self.assertRaises(RuntimeError) as cm:
+            filter_duplicate_safetensors_files(
+                hf_weights_files=[transformer],
+                hf_folder=self.folder,
+                index_file=INDEX_NAME,
+                allow_patterns=["transformer/*.safetensors"],
+            )
+        self.assertIn("model-00002-of-00002.safetensors", str(cm.exception))
 
     def test_single_file_model_no_index_returns_unchanged(self):
         # No index on disk (single-file / dummy / object-storage): early return.

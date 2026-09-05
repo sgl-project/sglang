@@ -118,6 +118,18 @@ def should_defer_dsa_cp_kv_gather(
     return dsa_prefill_cp and fuse_rope_for_trtllm_mla
 
 
+def _apply_attention_output_gate(module, attn_output, gate):
+    apply_gate = getattr(module, "apply_attention_output_gate", None)
+    if apply_gate is not None:
+        return apply_gate(attn_output, gate)
+    if hasattr(module, "_apply_gated"):
+        return module._apply_gated(attn_output, gate)
+    raise RuntimeError(
+        "Prepared MLA attention gates are unsigmoided and require a "
+        "model-specific application hook"
+    )
+
+
 class DeepseekMLAForwardMixin:
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
@@ -160,6 +172,8 @@ class DeepseekMLAForwardMixin:
         if self.use_deep_gemm_bmm:
             return False
         if is_kv_b_lora_active(self):
+            return False
+        if getattr(self, "learnable_sink_param", None) is not None:
             return False
         # The isolated 1-kernel graph is the bf16 fallback BMM. The fp8 and
         # DeepGEMM branches already use different fused paths.
@@ -291,6 +305,11 @@ class DeepseekMLAForwardMixin:
         # True between the alt-stream fork and its consumption in the born
         # block; also suppresses the duplicate split/rope on that path.
         self._q8kv8_qprep_overlap_pending = False
+        attention_output_gate = (
+            self.prepare_attention_output_gate(hidden_states)
+            if hasattr(self, "prepare_attention_output_gate")
+            else None
+        )
 
         fuse_bmm_attention = (
             self.q_lora_rank is not None
@@ -667,6 +686,13 @@ class DeepseekMLAForwardMixin:
             topk_indices,
             llama_4_scaling,
             fusion_plan,
+            # Bailing's DsV3MLA appends its own gate to inner_state, so this
+            # slot is emitted only for models owning the gate hook.
+            *(
+                (attention_output_gate,)
+                if hasattr(self, "prepare_attention_output_gate")
+                else ()
+            ),
         )
 
     def forward_absorb_core(
@@ -681,18 +707,20 @@ class DeepseekMLAForwardMixin:
         topk_indices,
         llama_4_scaling,
         fusion_plan: Optional[MlaBmmFusionPlan] = None,
-        gate: Optional[torch.Tensor] = None,
+        attention_output_gate: Optional[torch.Tensor] = None,
     ):
         save_kv_cache = True
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
+            if getattr(self, "learnable_sink_param", None) is not None:
+                extra_args["attn_sink"] = self.learnable_sink_param
             if self._fuse_rope_for_trtllm_mla(forward_batch):
-                extra_args = {
-                    "cos_sin_cache": self.rotary_emb.cos_sin_cache,
-                    "is_neox": self.rotary_emb.is_neox_style,
-                    "llama_4_scaling": llama_4_scaling,
-                }
+                extra_args.update(
+                    cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                    is_neox=self.rotary_emb.is_neox_style,
+                    llama_4_scaling=llama_4_scaling,
+                )
             if fusion_plan is not None:
                 bmm_attention_fn = (
                     bcg_mla_bmm_then_unified_attention
@@ -911,8 +939,10 @@ class DeepseekMLAForwardMixin:
             attn_bmm_output = apply_kv_b_lora_v_correction(
                 self, attn_output, attn_bmm_output
             )
-        if gate is not None:
-            attn_bmm_output = self._apply_gated(attn_bmm_output, gate)
+        if attention_output_gate is not None:
+            attn_bmm_output = _apply_attention_output_gate(
+                self, attn_bmm_output, attention_output_gate
+            )
         output, _ = self.o_proj(attn_bmm_output)
 
         if self.next_skip_topk is None:

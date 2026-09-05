@@ -12,6 +12,10 @@ from sglang.kernels.ops.attention.metadata import (
     prepare_swa_spec_page_table_triton,
 )
 from sglang.kernels.ops.attention.pa_page_table import _build_pa_page_table
+from sglang.kernels.ops.attention.suffix_attention_merge import (
+    can_use_fused_suffix_attention_merge,
+    merge_suffix_attention_in_place,
+)
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
@@ -1579,14 +1583,36 @@ class FlashAttentionBackend(AttentionBackend):
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
+            if (
+                use_cascade_attn
+                and forward_batch.spec_algorithm.is_uno()
+                and can_use_fused_suffix_attention_merge(
+                    layer=layer,
+                    q=q,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    extra_kwargs=kwargs,
+                )
+            ):
+                suffix_metadata = self.forward_metadata_spec_decode_expand
+                o = merge_suffix_attention_in_place(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k_cache=key_cache.view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v_cache=value_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    suffix_page_table=suffix_metadata.page_table,
+                    suffix_cache_seqlens=suffix_metadata.cache_seqlens_int32,
+                    prefix=o,
+                    prefix_lse=softmax_lse,
+                    softmax_scale=layer.scaling,
+                )
+            elif use_cascade_attn:
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    # Here metadata_expand.page_table is not divided with page_size.
-                    # This is because we loose the fine control of  what token to attend,
-                    # but has to attend to some block completely.
+                    # The suffix table stores physical token slots, so expose
+                    # the paged cache as page-size-one blocks.
                     k_cache=key_cache.view(-1, 1, layer.tp_k_head_num, layer.head_dim),
                     v_cache=value_cache.view(
-                        -1, 1, layer.tp_v_head_num, layer.head_dim
+                        -1, 1, layer.tp_v_head_num, layer.v_head_dim
                     ),
                     page_table=self.forward_metadata_spec_decode_expand.page_table,
                     cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
@@ -3157,6 +3183,9 @@ class FlashAttentionBackend(AttentionBackend):
         if cu_seqlens_q is None or cache_seqlens_int32 is None or page_table is None:
             metadata.local_attn_metadata = None
             return
+        if self.page_size > 1:
+            # Convert the eager token table to physical page indices.
+            page_table = page_table[:, :: self.page_size] // self.page_size
 
         cu_seqlens_q_np = cu_seqlens_q.cpu().numpy()
         seq_lens_np = cache_seqlens_int32.cpu().numpy()
@@ -3171,6 +3200,7 @@ class FlashAttentionBackend(AttentionBackend):
             seq_lens_np,
             page_table,
             self.page_size,
+            preserve_attn_chunk_size=True,
         )
 
         local_metadata = FlashAttentionMetadata.LocalAttentionMetadata(
@@ -3211,6 +3241,7 @@ class FlashAttentionBackend(AttentionBackend):
             seqlens_np,
             page_table_capture,
             self.page_size,
+            preserve_attn_chunk_size=True,
         )
 
         # Get exact dimensions from the calculation
@@ -3295,6 +3326,7 @@ class FlashAttentionBackend(AttentionBackend):
             seqlens_np,
             sliced_page_table,
             self.page_size,
+            preserve_attn_chunk_size=True,
         )
 
         # Convert back to tensors
@@ -3538,6 +3570,7 @@ def make_local_attention_virtual_batches(
     seq_lens_np: np.ndarray,
     block_table: torch.Tensor,
     page_size: int = 0,
+    preserve_attn_chunk_size: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, torch.Tensor]:
     """
     Take in `query_start_loc_np` and `seq_lens_np` and break the sequences into
@@ -3550,6 +3583,7 @@ def make_local_attention_virtual_batches(
         seq_lens_np: Sequence lengths (numpy array)
         block_table: Block table for KV cache
         page_size: Size of each page in the KV cache
+        preserve_attn_chunk_size: Skip sequence-length-based chunk normalization.
 
     Returns:
         seqlens_q_local: Query sequence lengths for local attention
@@ -3557,15 +3591,13 @@ def make_local_attention_virtual_batches(
         seqlens_k_local: Key sequence lengths for local attention
         block_table_local: Block table for local attention
     """
-    # Adjust attention_chunk_size based on the actual sequence length
-    # to avoid index out of bounds errors
-    max_seq_len = seq_lens_np.max()
-    effective_chunk_size = min(attn_chunk_size, max_seq_len)
-    # Make sure effective_chunk_size is divisible by page_size
-    effective_chunk_size = (effective_chunk_size // page_size) * page_size
-    if effective_chunk_size < page_size:
-        effective_chunk_size = page_size
-    attn_chunk_size = effective_chunk_size
+    if not preserve_attn_chunk_size:
+        max_seq_len = seq_lens_np.max()
+        effective_chunk_size = min(attn_chunk_size, max_seq_len)
+        effective_chunk_size = (effective_chunk_size // page_size) * page_size
+        if effective_chunk_size < page_size:
+            effective_chunk_size = page_size
+        attn_chunk_size = effective_chunk_size
 
     q_seqlens = query_start_loc_np[1:] - query_start_loc_np[:-1]
     actual_batch_size = seq_lens_np.shape[0]

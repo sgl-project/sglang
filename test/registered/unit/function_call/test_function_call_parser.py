@@ -37,7 +37,7 @@ from sglang.srt.function_call.utils import get_schema_properties
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
-register_cpu_ci(est_time=70, suite="base-c-test-cpu")
+register_cpu_ci(est_time=70, suite="stage-b-test-cpu-intel")
 
 
 @functools.lru_cache(maxsize=None)

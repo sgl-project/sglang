@@ -250,6 +250,35 @@ class TestStoreToPool(unittest.TestCase):
         with self.assertRaises(ValueError):
             ctrl.store_to_pool_async(["h"], [tensor], Modality.IMAGE)
 
+    def test_wait_store_isolates_failed_copy_and_waits_for_the_rest(self):
+        ctrl = _make_controller(num_pages=4, dim=4, page_size=2)
+        entries = []
+        for mm_hash in ("first", "failed", "last"):
+            page_runs = ctrl.vision_pool.allocator.allocate(2, 2)
+            entry = EmbeddingCacheEntry(
+                hash=mm_hash,
+                modality=Modality.IMAGE,
+                num_tokens=2,
+                dim=4,
+                page_runs=page_runs,
+                state=EntryState.FILLING,
+            )
+            ctrl.entries[mm_hash] = entry
+            entries.append(entry)
+
+        handles = [MagicMock(), MagicMock(), MagicMock()]
+        handles[1].wait.side_effect = RuntimeError("D2H copy failed")
+
+        with self.assertRaisesRegex(RuntimeError, "D2H copy failed"):
+            ctrl.wait_store_to_pool(list(zip(entries, handles)))
+
+        for handle in handles:
+            handle.wait.assert_called_once_with()
+        self.assertEqual(ctrl.entries["first"].state, EntryState.READY)
+        self.assertNotIn("failed", ctrl.entries)
+        self.assertEqual(ctrl.entries["last"].state, EntryState.READY)
+        self.assertEqual(ctrl.vision_pool.allocator.free_pages, 2)
+
 
 def _insert_ready_entry(ctrl, mm_hash, tensor, modality=Modality.IMAGE):
     """Manually write tensor into pool pages and create a READY entry."""

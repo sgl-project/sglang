@@ -79,7 +79,7 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
         original_out_cache_loc = torch.arange(5)
         forward_batch = SimpleNamespace(
             forward_mode=_ExtendMode(),
-            num_token_non_padded_cpu=3,
+            global_num_token_non_padded_cpu=3,
             out_cache_loc=original_out_cache_loc,
         )
 
@@ -119,7 +119,7 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
         original_out_cache_loc = torch.arange(5)
         forward_batch = SimpleNamespace(
             forward_mode=_TargetVerifyMode(),
-            num_token_non_padded_cpu=3,
+            global_num_token_non_padded_cpu=3,
             out_cache_loc=original_out_cache_loc,
         )
 
@@ -158,7 +158,7 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
         original_out_cache_loc = torch.arange(5)
         forward_batch = SimpleNamespace(
             forward_mode=_ExtendMode(),
-            num_token_non_padded_cpu=3,
+            global_num_token_non_padded_cpu=3,
             out_cache_loc=original_out_cache_loc,
         )
 
@@ -189,7 +189,7 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
             with self.subTest(padded_num_tokens=padded_num_tokens):
                 original_out_cache_loc = torch.arange(padded_num_tokens)
                 forward_batch = SimpleNamespace(
-                    num_token_non_padded_cpu=3,
+                    global_num_token_non_padded_cpu=3,
                     out_cache_loc=original_out_cache_loc,
                 )
                 context = SimpleNamespace(

@@ -29,6 +29,9 @@ pub fn config() -> Config {
             circuit_breaker: None,
             cache_aware: Some(CacheAwareConfig::default()),
             sticky: None,
+            affinity: None,
+            fused: None,
+            eligibility: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],

@@ -175,6 +175,8 @@ class ServerArgsAutoTuner:
                 args.dit_cpu_offload
                 and "dit" in components
                 and args.explicit_residency_mode("transformer") is None
+                and not args.is_arg_explicitly_set("dit_cpu_offload")
+                and not args.is_arg_explicitly_set("dit_layerwise_offload")
                 and not explicit_dit_layerwise
             ):
                 args.dit_cpu_offload = False

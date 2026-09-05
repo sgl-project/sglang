@@ -69,7 +69,7 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
         real_num_tokens=2,
     ):
         forward_batch = SimpleNamespace(
-            num_token_non_padded_cpu=real_num_tokens,
+            global_num_token_non_padded_cpu=real_num_tokens,
             out_cache_loc=torch.arange(num_tokens, dtype=torch.int64),
             positions=torch.arange(num_tokens, dtype=torch.int64),
             _attn_output=None,

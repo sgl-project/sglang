@@ -11,10 +11,10 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _fake_communicator():
+def _fake_communicator(mlp_mode=ScatterMode.TP_ATTN_FULL):
     return types.SimpleNamespace(
         _speculative_algo=None,
-        layer_scatter_modes=types.SimpleNamespace(mlp_mode=ScatterMode.TP_ATTN_FULL),
+        layer_scatter_modes=types.SimpleNamespace(mlp_mode=mlp_mode),
         is_last_layer=False,
         _context=types.SimpleNamespace(tp_size=4),
     )
@@ -31,7 +31,9 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
     Qwen3-30B-A3B with --tp-size 4 --ep-size 2.
     """
 
-    def _should_fuse(self, *, moe_ep_size, moe_tp_size):
+    def _should_fuse(
+        self, *, moe_ep_size, moe_tp_size, mlp_mode=ScatterMode.TP_ATTN_FULL
+    ):
         forward_batch = types.SimpleNamespace(
             input_ids=types.SimpleNamespace(shape=(8,))
         )
@@ -48,7 +50,7 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
             ),
         ):
             return LayerCommunicator.should_fuse_mlp_allreduce_with_next_layer(
-                _fake_communicator(), forward_batch
+                _fake_communicator(mlp_mode), forward_batch
             )
 
     def test_hybrid_ep_tp_does_not_fuse(self):
@@ -59,6 +61,16 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
 
     def test_pure_ep_still_fuses(self):
         self.assertTrue(self._should_fuse(moe_ep_size=4, moe_tp_size=1))
+
+    def test_moe_full_layer_does_not_fuse(self):
+        # Fusion skips postprocess_layer, which holds the CP scatter; a dense
+        # MOE_FULL layer (moe_dp_size == attn_cp_size) is not caught by the
+        # is_enable_moe_cp_allgather gate.
+        self.assertFalse(
+            self._should_fuse(
+                moe_ep_size=1, moe_tp_size=4, mlp_mode=ScatterMode.MOE_FULL
+            )
+        )
 
 
 if __name__ == "__main__":

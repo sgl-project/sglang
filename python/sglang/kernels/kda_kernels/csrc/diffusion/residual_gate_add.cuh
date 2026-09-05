@@ -29,7 +29,7 @@ constexpr uintptr_t kAlignment = 16;
 constexpr uint32_t kTransposeTile = 32;
 constexpr uint32_t kTransposeBlockSize = 256;
 
-enum class GateMode : int { kFull, kBroadcastRow };
+enum class GateMode : int { kFull, kBroadcastRow, kPerToken };
 
 template <typename T>
 SGL_DEVICE T residual_gate_value(T residual, T update, T gate) {
@@ -108,7 +108,10 @@ __global__ void residual_gate_add_scalar_kernel(
     int64_t hidden_size) {
   const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; index < numel; index += stride) {
-    const T gate_value = kGateMode == GateMode::kFull ? gate[index] : SGLANG_LDG(gate + index % hidden_size);
+    const T gate_value = kGateMode == GateMode::kFull
+                             ? gate[index]
+                             : (kGateMode == GateMode::kPerToken ? SGLANG_LDG(gate + index / hidden_size)
+                                                                 : SGLANG_LDG(gate + index % hidden_size));
     out[index] = residual_gate_value(residual[index], update[index], gate_value);
   }
 }
@@ -180,7 +183,7 @@ struct ResidualGateAddKernel {
       tvm::ffi::TensorView update,
       tvm::ffi::TensorView gate,
       int64_t hidden_size,
-      bool broadcast_gate) {
+      int64_t gate_mode) {
     using namespace host;
 
     auto N = SymbolicSize{"numel"};
@@ -192,7 +195,10 @@ struct ResidualGateAddKernel {
 
     const int64_t numel = N.unwrap();
     CHECK_HOST(hidden_size > 0 && numel % hidden_size == 0) << "hidden size must be positive and divide the input size";
-    CHECK_HOST(G.unwrap() == (broadcast_gate ? hidden_size : numel)) << "gate size does not match its mode";
+    // gate_mode: 0 = full (numel), 1 = broadcast row (hidden_size), 2 = per-token (numel/hidden_size)
+    const int64_t rows = numel / hidden_size;
+    const int64_t expected_gate = gate_mode == 0 ? numel : (gate_mode == 1 ? hidden_size : rows);
+    CHECK_HOST(G.unwrap() == expected_gate) << "gate size does not match its mode";
     if (numel == 0) {
       return;
     }
@@ -212,11 +218,24 @@ struct ResidualGateAddKernel {
     const bool vectorized = aligned && hidden_size % kVec == 0;
     if (vectorized) {
       const int64_t num_vectors = numel / kVec;
-      if (!broadcast_gate) {
+      if (gate_mode == 0) {
         const auto blocks =
             static_cast<uint32_t>(std::min<int64_t>(div_ceil(num_vectors, static_cast<int64_t>(kBlockSize)), kMaxGrid));
         LaunchKernel(blocks, kBlockSize, device.unwrap())(
             residual_gate_add_vec_kernel<T, kVec>, out_ptr, residual_ptr, update_ptr, gate_ptr, num_vectors);
+        return;
+      }
+      if (gate_mode == 2) {
+        const auto blocks =
+            static_cast<uint32_t>(std::min<int64_t>(div_ceil(numel, static_cast<int64_t>(kBlockSize)), kMaxGrid));
+        LaunchKernel(blocks, kBlockSize, device.unwrap())(
+            residual_gate_add_scalar_kernel<T, GateMode::kPerToken>,
+            out_ptr,
+            residual_ptr,
+            update_ptr,
+            gate_ptr,
+            numel,
+            hidden_size);
         return;
       }
 
@@ -233,7 +252,16 @@ struct ResidualGateAddKernel {
 
     const auto blocks =
         static_cast<uint32_t>(std::min<int64_t>(div_ceil(numel, static_cast<int64_t>(kBlockSize)), kMaxGrid));
-    if (broadcast_gate) {
+    if (gate_mode == 2) {
+      LaunchKernel(blocks, kBlockSize, device.unwrap())(
+          residual_gate_add_scalar_kernel<T, GateMode::kPerToken>,
+          out_ptr,
+          residual_ptr,
+          update_ptr,
+          gate_ptr,
+          numel,
+          hidden_size);
+    } else if (gate_mode == 1) {
       LaunchKernel(blocks, kBlockSize, device.unwrap())(
           residual_gate_add_scalar_kernel<T, GateMode::kBroadcastRow>,
           out_ptr,

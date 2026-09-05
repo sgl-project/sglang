@@ -48,6 +48,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import run_with_deadline
 
 try:
     from nixl._bindings import (
@@ -456,7 +457,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 backend_params.setdefault("thread_count", str(num_threads))
             elif backend == "UCCL":
                 backend_params.setdefault("num_cpus", str(num_threads))
-        self.agent.create_backend(backend, backend_params)
+        run_with_deadline(
+            lambda: self.agent.create_backend(backend, backend_params),
+            timeout_s=envs.SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT.get(),
+            what=f"NIXL create_backend({backend!r}, {backend_params})",
+        )
 
         available_plugins = self.agent.get_plugin_list()
         if backend not in available_plugins:

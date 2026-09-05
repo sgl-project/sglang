@@ -38,6 +38,7 @@ import re
 import resource
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -57,6 +58,7 @@ from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
 from io import BytesIO
 from json import JSONDecodeError
+from multiprocessing import parent_process
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import (
@@ -2408,6 +2410,14 @@ def configure_logger(server_args, prefix: str = ""):
     for name in ("httpx", "httpcore"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
+    # Server-sent hub warnings (e.g. the unauthenticated-request / HF_TOKEN
+    # hint) are deduplicated per process, so a TP-N launch repeats each one N
+    # times. Keep them only in the launching process -- every worker (scheduler,
+    # detokenizer, DP controller, ...) is spawned via multiprocessing, whether
+    # or not it passes a log prefix -- where they are printed exactly once.
+    if parent_process() is not None:
+        logging.getLogger("huggingface_hub.utils._http").setLevel(logging.ERROR)
+
     if is_flashinfer_available():
         from flashinfer.jit.core import logger as flashinfer_logger
 
@@ -3460,6 +3470,29 @@ def parse_connector_type(url: str) -> str:
     return m.group(1)
 
 
+def run_with_deadline(fn: Callable[[], Any], *, timeout_s: float, what: str) -> Any:
+    result: list = []
+    error: list = []
+
+    def _target():
+        try:
+            result.append(fn())
+        except BaseException as e:
+            error.append(e)
+
+    # An overrunning fn cannot be cancelled; only process exit reaps the daemon thread.
+    thread = threading.Thread(target=_target, daemon=True)
+    thread.start()
+    thread.join(timeout_s)
+    if thread.is_alive():
+        raise RuntimeError(
+            f"{what} did not return within {timeout_s}s on {socket.gethostname()}"
+        )
+    if error:
+        raise error[0]
+    return result[0]
+
+
 def retry(
     fn,
     max_retry: int,
@@ -4082,7 +4115,7 @@ def freeze_gc(context: str):
     g0_before, g1_before, g2_before = gc_object_counts()
     gc.freeze()
     g0_after, g1_after, g2_after = gc_object_counts()
-    logger.info(
+    logger.debug(
         f"Freezing GC in {context} process. "
         f"gen0: {g0_before}->{g0_after}, "
         f"gen1: {g1_before}->{g1_after}, "

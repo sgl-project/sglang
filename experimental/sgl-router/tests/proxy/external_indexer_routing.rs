@@ -17,6 +17,7 @@ use sgl_kv_indexer::{
     server_builder, GrpcPrefixIndex, InMemoryKvIndexerBackend, KvIndexerService, PrefixIndexConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+use sgl_router::policies::engine_load::EngineLoadTable;
 use sgl_router::policies::factory::build_registry;
 use sgl_router::policies::kv_events::{compute_block_hashes, BlockSizeOracle, HashTree};
 use sgl_router::policies::request_tokens_for;
@@ -94,6 +95,7 @@ async fn external_indexer_routes_to_the_cached_worker() {
             Arc::new(HashTree::new()),
             Arc::clone(&tokenizers),
             Arc::clone(&oracle),
+            EngineLoadTable::new(),
         )
         .unwrap(),
     );

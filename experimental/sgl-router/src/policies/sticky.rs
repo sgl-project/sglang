@@ -212,6 +212,10 @@ impl Policy for StickyPolicy {
     fn attach_metrics(&self, metrics: Arc<MetricsRegistry>) {
         let _ = self.state.metrics.set(metrics);
     }
+
+    fn needs_load_snapshot(&self) -> bool {
+        self.fallback.needs_load_snapshot()
+    }
 }
 
 impl std::fmt::Debug for StickyPolicy {
@@ -228,6 +232,16 @@ impl std::fmt::Debug for StickyPolicy {
 mod tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+
+    #[test]
+    fn sticky_propagates_fallback_load_snapshot_capability() {
+        let policy = StickyPolicy::new(
+            Duration::from_secs(60),
+            Duration::from_secs(10),
+            Arc::new(crate::policies::power_of_two::PowerOfTwoChoicesPolicy::new()),
+        );
+        assert!(policy.needs_load_snapshot());
+    }
     use crate::policies::round_robin::RoundRobinPolicy;
 
     fn worker(id: &str) -> Arc<Worker> {

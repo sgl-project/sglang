@@ -727,7 +727,7 @@ def test_kimi_k3_epd_rebuild_uses_the_same_media_contract():
     processor._tokenizer = _Tokenizer()
     embeddings = {Modality.IMAGE: torch.arange(20, dtype=torch.float32).reshape(5, 4)}
 
-    output = processor.get_mm_data(
+    output = processor.get_validated_mm_data(
         [1, 99, 2, 99, 3],
         embeddings,
         img_grid_thw=torch.tensor([[1, 2, 6], [1, 2, 4]]),
