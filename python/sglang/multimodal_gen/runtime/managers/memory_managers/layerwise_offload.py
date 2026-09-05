@@ -1895,7 +1895,10 @@ class LayerwiseOffloadManager:
             self._courier_inflight.discard(layer_idx)
             self.prefetch_layer(layer_idx, non_blocking=False)
             return
-        self._debug_collect_wait_s += time.perf_counter() - started
+        # debug counter; a manager built without __init__ (tests) has none yet
+        self._debug_collect_wait_s = getattr(self, "_debug_collect_wait_s", 0.0) + (
+            time.perf_counter() - started
+        )
         compute_stream = torch.get_device_module().current_stream()
         compute_stream.wait_event(event)
         with torch.inference_mode(False), torch.no_grad():
