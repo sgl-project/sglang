@@ -103,6 +103,16 @@ class SRTPlatform(DeviceMixin):
         """Whether this platform supports FP8 quantization."""
         return False
 
+    def support_mamba_cache_extra_buffer(self) -> bool:
+        """Whether this platform supports Mamba cache state snapshots."""
+        return (
+            self.is_cuda()
+            or self.is_rocm()
+            or self.is_musa()
+            or self.is_npu()
+            or self.is_xpu()
+        )
+
     def support_cuda_graph(self) -> bool:
         """Whether this platform supports device graph capture and replay.
         Controls CUDA graph (CudaGraphRunner) for the decode path.
