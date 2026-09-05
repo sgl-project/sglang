@@ -231,8 +231,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
+        self.forward_is_dp_local = self._forward_is_dp_local(model_runner)
         self.require_mlp_tp_gather = (
-            require_mlp_tp_gather() and not self._forward_is_dp_local(model_runner)
+            require_mlp_tp_gather() and not self.forward_is_dp_local
         )
         self.require_attn_tp_gather = require_attn_tp_gather()
         # Composite predicates derive from the instance values so the dp-local
@@ -242,8 +243,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.require_mlp_tp_gather or self.require_attn_tp_gather
         )
         self.require_mlp_sync = (
-            get_parallel().enable_dp_attention or self.require_gathered_buffer
-        )
+            get_parallel().enable_dp_attention and not self.forward_is_dp_local
+        ) or self.require_gathered_buffer
         self.enable_two_batch_overlap = (
             model_runner.server_args.enable_two_batch_overlap
         )
@@ -611,12 +612,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     @staticmethod
     def _forward_is_dp_local(model_runner) -> bool:
-        """The DSpark dense draft runs attn-TP-local (draft_tp_context): each
+        """Dense speculative drafts run attn-TP-local (draft_tp_context): each
         DP rank drafts independently with no cross-DP collective, so its
         hand-built batches carry no dp-global metadata and must key graphs by
         local batch size. Everything else keeps the dp-global padding path."""
         if not model_runner.is_draft_worker:
             return False
+        if model_runner.spec_algorithm.is_dflash():
+            return True
         if not model_runner.spec_algorithm.is_dspark():
             return False
         from sglang.srt.speculative.dspark_components.dspark_config import (
