@@ -907,7 +907,34 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "trtllm_mha backend only supports topk = 1 for speculative decoding."
             )
 
-    if cfg.speculative_use_rejection_sampling:
+    # ROCm/HIP has no CUDA/MUSA sampling-verify kernels, so EAGLE verify would
+    # otherwise fall back to greedy (argmax) and silently ignore temperature and
+    # top_p. Default rejection sampling on -- it routes verify through the Triton
+    # chain sampler -- for configs that support it, unless the user already opted
+    # in. The conditions mirror the validation below, so the flip can never turn a
+    # previously-working config into a raise, and no other platform is touched.
+    if (
+        get_platform().is_hip
+        and not cfg.speculative_use_rejection_sampling
+        and cfg.speculative_algorithm in ("EAGLE", "EAGLE3")
+        and cfg.speculative_eagle_topk == 1
+        and cfg.speculative_accept_threshold_single == 1.0
+        and cfg.speculative_accept_threshold_acc == 1.0
+        and not cfg.enable_deterministic_inference
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_eagle_family",
+            speculative_use_rejection_sampling=True,
+        )
+        logger.info(
+            "ROCm needs rejection sampling for EAGLE spec-decode to sample at all; "
+            "enabling speculative_use_rejection_sampling by default."
+        )
+
+    # resolved_view, not cfg: the block above may have just decided this field,
+    # and declare_resolution writes to the stash rather than the dataclass.
+    if resolved_view(server_args).speculative_use_rejection_sampling:
         # Resolved alias by now: NEXTN -> EAGLE, Gemma4 draft -> FROZEN_KV_MTP.
         # Only the EAGLE/EAGLE3 draft workers emit a target-vocab proposal that
         # the rejection-sampling kernel consumes; everything else (STANDALONE,
