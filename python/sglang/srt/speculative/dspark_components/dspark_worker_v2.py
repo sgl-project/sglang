@@ -33,6 +33,9 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_utils import (
+    build_speculative_verify_target_probs,
+)
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
     build_draft_tp_worker,
@@ -69,6 +72,9 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
     verify_logits_adjustments_are_noop,
+)
+from sglang.srt.speculative.sampling_mask import (
+    SpeculativeSamplingMaskCapture,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
@@ -121,6 +127,38 @@ def _configure_target_hidden_projection(
             draft_model.project_target_hidden,
             num_context_features=int(draft_model.num_context_features),
         )
+    )
+
+
+def _build_dspark_sampling_mask_capture(
+    *,
+    next_token_logits: torch.Tensor,
+    sampling_info,
+    draft_input: DFlashDraftInputV2,
+    greedy_mask: torch.Tensor,
+    draft_token_num: int,
+    bs: int,
+) -> Optional[SpeculativeSamplingMaskCapture]:
+    if sampling_info is None:
+        return None
+    return_sampling_masks = sampling_info.return_sampling_masks or []
+    if not any(return_sampling_masks):
+        return None
+    target_probs = None
+    if not sampling_info.is_all_greedy:
+        target_probs = build_speculative_verify_target_probs(
+            next_token_logits=next_token_logits,
+            sampling_info=sampling_info,
+            draft_token_num=draft_token_num,
+            bs=bs,
+            max_top_k=draft_input.max_top_k,
+            uniform_top_k_value=draft_input.uniform_top_k_value,
+        )
+    return SpeculativeSamplingMaskCapture(
+        target_probs=target_probs,
+        return_sampling_masks=list(return_sampling_masks),
+        max_top_k=sampling_info.sampling_mask_max_top_k,
+        greedy_mask=greedy_mask,
     )
 
 
@@ -817,6 +855,21 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
         )
+        sampling_mask_capture = _build_dspark_sampling_mask_capture(
+            next_token_logits=logits_output.next_token_logits,
+            sampling_info=sampling_info,
+            draft_input=draft_input,
+            greedy_mask=draft_block.greedy_mask,
+            draft_token_num=self.verify_num_draft_tokens,
+            bs=bs,
+        )
+        if sampling_mask_capture is not None:
+            logits_output.next_token_sampling_mask_output = (
+                sampling_mask_capture.build_output(
+                    out_tokens=accept.out_tokens,
+                    commit_lens=accept.commit_lens,
+                )
+            )
         if batch.return_logprob:
             compute_spec_logprobs(
                 batch,
