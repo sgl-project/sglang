@@ -81,6 +81,11 @@ class MockTemplateManager:
         self.force_reasoning = False
         self.jinja_template_may_reorder_tool_results = False
 
+    @property
+    def reasoning_toggle_config(self):
+        config = self.reasoning_config
+        return config if config is not None and config.has_toggle else None
+
 
 def make_serving(*, is_multimodal: bool = False) -> OpenAIServingResponses:
     return OpenAIServingResponses(

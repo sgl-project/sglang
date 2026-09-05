@@ -98,6 +98,7 @@ from sglang.srt.parser.jinja_template_utils import (
     process_content_for_template_format,
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.template_detection import normalize_reasoning_effort
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
 )
@@ -1491,12 +1492,30 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
             extra_template_kwargs = {}
+            effort_config = self.template_manager.reasoning_config
             if request.reasoning_effort is not None:
-                extra_template_kwargs["reasoning_effort"] = request.reasoning_effort
+                effort = request.reasoning_effort
+                if (
+                    effort_config is not None
+                    and effort_config.effort_levels
+                    and effort not in effort_config.effort_levels
+                ):
+                    mapped = normalize_reasoning_effort(effort, effort_config)
+                    logger.warning(
+                        "Model '%s' supports reasoning_effort %s; requested %r, %s",
+                        self.tokenizer_manager.served_model_name,
+                        effort_config.effort_levels,
+                        effort,
+                        f"mapped to {mapped!r}"
+                        if mapped != effort
+                        else "falling back to the chat template default",
+                    )
+                    effort = mapped
+                extra_template_kwargs["reasoning_effort"] = effort
             if request.chat_template_kwargs:
                 extra_template_kwargs.update(request.chat_template_kwargs)
 
-            rc = self.template_manager.reasoning_config
+            rc = self.template_manager.reasoning_toggle_config
             if rc is not None and rc.effort_kwarg is not None:
                 if request.reasoning_effort == "low":
                     extra_template_kwargs.setdefault(rc.effort_kwarg, True)
@@ -2559,7 +2578,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _get_reasoning_toggle_param(self) -> Optional[str]:
         """Resolve the chat-template kwarg that toggles reasoning, if any."""
-        config = self.template_manager.reasoning_config
+        config = self.template_manager.reasoning_toggle_config
         if config is not None:
             return config.toggle_param
 
@@ -2602,7 +2621,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.reasoning_effort = "none"
                 return
 
-        config = self.template_manager.reasoning_config
+        config = self.template_manager.reasoning_toggle_config
         is_mistral = (config is not None and config.special_case == "mistral") or (
             config is None and self._reasoning_default_mode() == "mistral"
         )
@@ -2630,7 +2649,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # name itself is resolvable, so writing the kwarg would set up the
         # template to emit reasoning tokens while the parser ignores them
         # (literal ``<think>`` markers leak into the assistant text).
-        config = self.template_manager.reasoning_config
+        config = self.template_manager.reasoning_toggle_config
         read_side_supported = toggle_param is not None and (
             config is None or config.default_enabled is not None
         )
@@ -2670,7 +2689,7 @@ class OpenAIServingChat(OpenAIServingBase):
             # output into reasoning_content.
             return request.reasoning_effort not in (None, "none", "no_think")
 
-        config = self.template_manager.reasoning_config
+        config = self.template_manager.reasoning_toggle_config
         if config is None:
             # Fallback to parser-level defaults when template toggle config
             # cannot be inferred (e.g., parser-only <think> templates).

@@ -192,6 +192,11 @@ class _MockTemplateManager:
         self.force_reasoning = False
         self.jinja_template_may_reorder_tool_results = False
 
+    @property
+    def reasoning_toggle_config(self):
+        config = self.reasoning_config
+        return config if config is not None and config.has_toggle else None
+
 
 class ServingChatTestCase(unittest.TestCase):
     # ------------- common fixtures -------------
@@ -3852,6 +3857,44 @@ class ServingChatTestCase(unittest.TestCase):
         kwargs = self._run_jinja_with_effort("high")
         self.assertNotIn("low_effort", kwargs)
 
+    def _setup_glm53_effort_levels(self):
+        self.tm.server_args.reasoning_parser = "glm45"
+        self.chat.reasoning_parser = "glm45"
+        self.template_manager.chat_template_name = None
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            effort_levels=("low", "high", "max"),
+            effort_aliases=(
+                ("none", "low"),
+                ("minimal", "low"),
+                ("medium", "high"),
+                ("xhigh", "max"),
+            ),
+        )
+        self.chat.chat_encoding_spec = None
+
+    def test_glm53_unsupported_effort_mapped_with_warning(self):
+        self._setup_glm53_effort_levels()
+        with self.assertLogs(
+            "sglang.srt.entrypoints.openai.serving_chat", level="WARNING"
+        ) as logs:
+            kwargs = self._run_jinja_with_effort("medium")
+        self.assertEqual(kwargs.get("reasoning_effort"), "high")
+        self.assertTrue(any("mapped to 'high'" in m for m in logs.output))
+
+    def test_glm53_supported_effort_passes_through(self):
+        self._setup_glm53_effort_levels()
+        kwargs = self._run_jinja_with_effort("max")
+        self.assertEqual(kwargs.get("reasoning_effort"), "max")
+
+    def test_glm53_unaliased_effort_falls_back_with_warning(self):
+        self._setup_glm53_effort_levels()
+        with self.assertLogs(
+            "sglang.srt.entrypoints.openai.serving_chat", level="WARNING"
+        ) as logs:
+            kwargs = self._run_jinja_with_effort(0.5)
+        self.assertEqual(kwargs.get("reasoning_effort"), 0.5)
+        self.assertTrue(any("template default" in m for m in logs.output))
+
     def test_non_stream_reasoning_response_preserves_payload_whitespace(self):
         self.chat.reasoning_parser = "qwen3"
         self.template_manager.force_reasoning = False
@@ -4324,7 +4367,9 @@ class InklingReasoningEffortTest(unittest.TestCase):
         "none" (0.0) expresses exactly that."""
         serving = object.__new__(OpenAIServingChat)
         serving.reasoning_parser = "inkling"
-        serving.template_manager = Mock(reasoning_config=None)
+        serving.template_manager = Mock(
+            reasoning_config=None, reasoning_toggle_config=None
+        )
         serving._reasoning_detector = Mock(reasoning_default="always")
         request = ChatCompletionRequest(
             model="test-model", messages=[{"role": "user", "content": "hi"}]

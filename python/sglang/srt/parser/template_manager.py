@@ -104,6 +104,13 @@ class TemplateManager:
         return self._reasoning_config
 
     @property
+    def reasoning_toggle_config(self) -> Optional[ReasoningToggleConfig]:
+        """reasoning_config restricted to configs that actually toggle
+        reasoning; effort-level-only configs (GLM-5.3) read as no toggle."""
+        config = self._reasoning_config
+        return config if config is not None and config.has_toggle else None
+
+    @property
     def suggested_reasoning_parser(self) -> Optional[str]:
         """Get the auto-detected reasoning parser name, or None."""
         return self._suggested_reasoning_parser
