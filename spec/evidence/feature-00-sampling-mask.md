@@ -23,7 +23,7 @@ PATH="$PWD/.venv/bin:$PATH" PYTHONPATH="$PWD/python" .venv/bin/python -m pytest 
   --disable-warnings --tb=short
 ```
 
-Result: **311 passed, 38 subtests passed**, 16 warnings, in **82.41 seconds**.
+Result: **311 passed, 38 subtests passed**, 15 warnings, in **19.35 seconds**.
 This includes real CUDA sampling and asynchronous copying, cutoff ties, min-p,
 mixed opt-in rows, overflow and invalid support, synchronized-token logprobs,
 batch filtering/merging, abort cleanup, pipeline payload reconstruction, and
@@ -33,6 +33,7 @@ disaggregation metadata transport.
 
 ```bash
 PATH="$PWD/.venv/bin:$PATH" PYTHONPATH="$PWD/python" \
+  SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM=0 \
   .venv/bin/python spec/evidence/run_sampling_mask.py
 ```
 
@@ -53,18 +54,8 @@ transport unit tests, not live deployment tests.
 | PyTorch | Disabled | 6 |
 | Seeded parity, PyTorch with Triton matrix multiplication | Enabled | 1 |
 
-The first matrix command passed the four ordinary server runs (24 tests). Its
-seeded run failed during startup because the installed DeepGEMM binary raised a
-PyTorch tensor-interpreter error. The existing Triton matrix-multiplication
-setting allowed the seeded check to run:
-
-```bash
-PATH="$PWD/.venv/bin:$PATH" PYTHONPATH="$PWD/python" \
-  SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM=0 \
-  .venv/bin/python spec/evidence/run_sampling_mask.py --deterministic-only
-```
-
-Result: **1 passed in 32.371 seconds**. Mask capture preserved both token IDs and
-text for the seeded request. To repeat all 25 tests with this setting, use the
-same command without `--deterministic-only`. DeepGEMM deterministic inference
-was not validated in this environment.
+Result: **25 passed**. The seeded-parity test passed in **31.562 seconds** and
+preserved both token IDs and text. The command uses Triton matrix multiplication
+for deterministic inference because the installed DeepGEMM binary is incompatible
+with the local PyTorch build. DeepGEMM deterministic inference was not validated
+in this environment.
