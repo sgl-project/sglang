@@ -3652,7 +3652,7 @@ class ServerArgs:
     ] = False
     enable_mis: A[
         bool,
-        "Enable Multi-Item Scoring optimization. Combines query and multiple items into a single sequence for efficient batch processing. Requires --attention-backend flashinfer; auto-disables CUDA graph, radix cache, and chunked prefill.",
+        "Enable Multi-Item Scoring optimization. Combines query and multiple items into a single sequence for efficient batch processing. Requires --attention-backend flashinfer; hybrid GDN models additionally require Triton linear-attention prefill. Auto-disables CUDA graph, radix cache, and chunked prefill.",
         NS("exec.features"),
     ] = False
 
