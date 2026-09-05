@@ -258,12 +258,13 @@ def model_config_of(server_args: Any):
 
 
 def mamba_extra_buffer_of(cfg: Any) -> bool:
-    """Mid-resolution equivalent of runtime_context.mamba_extra_buffer_enabled:
-    reads the (possibly overlaid) strategy from a config-shaped object.
+    """The predicate, read off a config-shaped object mid-resolution.
 
-    This is the one definition of the predicate: ``ServerArgs`` delegates its
-    member to it, and the runtime_context accessor is its post-publish sibling
-    (which cannot reuse it, because the two leaves land in different bags)."""
+    This is the one definition. After publish the answer is a bag leaf --
+    ``get_exec().mamba.enable_mamba_extra_buffer`` -- computed from this same
+    function by the declaration in ``arg_groups/fields/exec_.py``. Resolution
+    needs it before there is a bag to read, which is why it is still a
+    function."""
     return cfg.disable_radix_cache is False and cfg.mamba_radix_cache_strategy in (
         "extra_buffer",
         "extra_buffer_lazy",
