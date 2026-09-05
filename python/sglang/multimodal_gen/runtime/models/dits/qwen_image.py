@@ -72,6 +72,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
     apply_unquantized_linear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
@@ -80,6 +81,13 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
     is_nunchaku_available,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_customkernel import (
+    apply_convrot_int8_gelu_input,
+    apply_convrot_int8_shared_input,
+    apply_convrot_int8_shared_input_out,
+    convrot_int8_fuses_gelu_input,
+    convrot_int8_shares_input,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4LinearMethod,
@@ -719,6 +727,121 @@ class QwenEmbedLayer3DRope(nn.Module):
         return freqs.clone().contiguous()
 
 
+def _joint_qkv_layers(
+    attn: "QwenImageCrossAttention",
+) -> tuple[nn.Module, nn.Module, nn.Module, nn.Module, nn.Module, nn.Module]:
+    return (
+        attn.to_q,
+        attn.to_k,
+        attn.to_v,
+        attn.add_q_proj,
+        attn.add_k_proj,
+        attn.add_v_proj,
+    )
+
+
+def _use_joint_qkv_buffers(
+    *,
+    attn: "QwenImageCrossAttention",
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    masked: bool,
+) -> bool:
+    # Batch 1 keeps each slice contiguous for the out= writes and the in-place
+    # QK-norm; SP>1 and masked sequences never take join_seqs.
+    return (
+        (attn.separate_unquantized_qkv_proj or attn.separate_convrot_qkv_proj)
+        and not masked
+        # The out= GEMMs below reject grad-tracking operands.
+        and not torch.is_grad_enabled()
+        and hidden_states.shape[0] == 1
+        and hidden_states.is_contiguous()
+        and encoder_hidden_states.is_contiguous()
+        and get_sp_world_size() <= 1
+        # A LoRA wrapper forwards .weight to its base layer and adds its delta
+        # in forward, so the bare addmm below would silently drop it.
+        and all(
+            isinstance(layer, ColumnParallelLinear) for layer in _joint_qkv_layers(attn)
+        )
+    )
+
+
+def _project_into(
+    *, x: torch.Tensor, layer: ColumnParallelLinear, out: torch.Tensor
+) -> None:
+    # The addmm F.linear dispatches for a contiguous x, so the out= write is
+    # bitwise identical to layer(x).
+    x_2d = x.reshape(-1, x.shape[-1])
+    # view() rather than reshape(): a copy here would silently drop the write.
+    out_2d = out.view(-1, out.shape[-1])
+    if layer.bias is None:
+        torch.mm(x_2d, layer.weight.t(), out=out_2d)
+    else:
+        torch.addmm(layer.bias, x_2d, layer.weight.t(), out=out_2d)
+
+
+def _project_qkv_into_joint_buffers(
+    *,
+    attn: "QwenImageCrossAttention",
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    seq_len_txt: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Three [B, txt + img, local_inner_dim] buffers, text rows first.
+    batch_size, seq_len_img, _ = hidden_states.shape
+    inner_dim_local = attn.local_num_heads * attn.head_dim
+    shape = (batch_size, seq_len_txt + seq_len_img, inner_dim_local)
+    bufs = tuple(
+        torch.empty(shape, dtype=hidden_states.dtype, device=hidden_states.device)
+        for _ in range(3)
+    )
+    to_q, to_k, to_v, add_q_proj, add_k_proj, add_v_proj = _joint_qkv_layers(attn)
+    img_layers = (to_q, to_k, to_v)
+    txt_layers = (add_q_proj, add_k_proj, add_v_proj)
+    if attn.separate_convrot_qkv_proj:
+        apply_convrot_int8_shared_input_out(
+            x=hidden_states,
+            layers=img_layers,
+            outs=[buf[:, seq_len_txt:] for buf in bufs],
+        )
+        apply_convrot_int8_shared_input_out(
+            x=encoder_hidden_states,
+            layers=txt_layers,
+            outs=[buf[:, :seq_len_txt] for buf in bufs],
+        )
+        return bufs
+    for buf, img_layer, txt_layer in zip(bufs, img_layers, txt_layers):
+        _project_into(x=hidden_states, layer=img_layer, out=buf[:, seq_len_txt:])
+        _project_into(
+            x=encoder_hidden_states, layer=txt_layer, out=buf[:, :seq_len_txt]
+        )
+    return bufs
+
+
+def _joint_qkv_head_views(
+    bufs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    *,
+    seq_len_txt: int,
+    num_heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, ...]:
+    # (img_q, img_k, img_v, txt_q, txt_k, txt_v), each a [B, S, H, D] view.
+    img_views = tuple(
+        buf[:, seq_len_txt:].unflatten(-1, (num_heads, head_dim)) for buf in bufs
+    )
+    txt_views = tuple(
+        buf[:, :seq_len_txt].unflatten(-1, (num_heads, head_dim)) for buf in bufs
+    )
+    return (*img_views, *txt_views)
+
+
+def _sync_into_buffer(*, value: torch.Tensor, buf_view: torch.Tensor) -> None:
+    # In-place QK-norm/RoPE leaves value aliased to buf_view; only the
+    # non-fused fallback returns a fresh tensor that must be copied back.
+    if value.data_ptr() != buf_view.data_ptr():
+        buf_view.copy_(value)
+
+
 class QwenImageCrossAttention(nn.Module):
     def __init__(
         self,
@@ -767,6 +890,8 @@ class QwenImageCrossAttention(nn.Module):
         )
         self.local_num_heads = self.num_heads // tp_size
         self._unquantized_added_qkv_is_packed = False
+        self.separate_unquantized_qkv_proj = False
+        self.separate_convrot_qkv_proj = False
 
         if self.use_fused_qkv:
             # Use fused QKV projection for nunchaku quantization
@@ -850,6 +975,24 @@ class QwenImageCrossAttention(nn.Module):
                     gather_output=False,
                     quant_config=quant_config,
                     prefix=f"{prefix}.add_v_proj",
+                )
+                # Six plain linears can write straight into joint text-image
+                # buffers (see _use_joint_qkv_buffers); the fused-epilogue
+                # path consumes packed projection strides instead.
+                self.separate_unquantized_qkv_proj = (
+                    not self.use_fused_qkv
+                    and not self.use_fused_qkv_epilogue
+                    and all(
+                        isinstance(layer.quant_method, UnquantizedLinearMethod)
+                        for layer in _joint_qkv_layers(self)
+                    )
+                )
+                # Six ConvRot INT8 linears share one rotated+quantized input per
+                # stream and also write straight into the joint buffers.
+                self.separate_convrot_qkv_proj = (
+                    not self.use_fused_qkv
+                    and not self.use_fused_qkv_epilogue
+                    and convrot_int8_shares_input(_joint_qkv_layers(self))
                 )
 
         if context_pre_only is not None and not context_pre_only:
@@ -951,7 +1094,35 @@ class QwenImageCrossAttention(nn.Module):
         # Rows of tail padding inside THIS rank's text chunk (sp_shard meta).
         sp_txt_pad = _attn_mask_meta_local_pad(attn_mask_meta)
 
-        if self._unquantized_added_qkv_is_packed and not qwen_image_added_qkv_active(
+        # Joint [text, image] destination buffers take precedence over the
+        # packed added-QKV GEMM, which in turn precedes per-layer projections.
+        joint_qkv_bufs = None
+        if _use_joint_qkv_buffers(
+            attn=self,
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            masked=attn_mask is not None or encoder_hidden_states_mask is not None,
+        ):
+            joint_qkv_bufs = _project_qkv_into_joint_buffers(
+                attn=self,
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                seq_len_txt=seq_len_txt,
+            )
+            (
+                img_query,
+                img_key,
+                img_value,
+                txt_query,
+                txt_key,
+                txt_value,
+            ) = _joint_qkv_head_views(
+                joint_qkv_bufs,
+                seq_len_txt=seq_len_txt,
+                num_heads=self.local_num_heads,
+                head_dim=self.head_dim,
+            )
+        elif self._unquantized_added_qkv_is_packed and not qwen_image_added_qkv_active(
             self
         ):
             img_query, img_key, img_value, _, _, _ = _get_qkv_projections(
@@ -961,6 +1132,20 @@ class QwenImageCrossAttention(nn.Module):
             )
             txt_query, txt_key, txt_value = self._get_added_qkv_projections(
                 encoder_hidden_states
+            )
+        elif self.separate_convrot_qkv_proj and convrot_int8_shares_input(
+            _joint_qkv_layers(self)
+        ):
+            # Same rotate-once projections as the joint-buffer path, into fresh
+            # tensors when the joint layout is not applicable (SP, masks, B>1).
+            # Re-checked per call: LoRA mounting swaps the projections for
+            # wrappers that add their delta in forward.
+            img_query, img_key, img_value = apply_convrot_int8_shared_input(
+                x=hidden_states, layers=(self.to_q, self.to_k, self.to_v)
+            )
+            txt_query, txt_key, txt_value = apply_convrot_int8_shared_input(
+                x=encoder_hidden_states,
+                layers=(self.add_q_proj, self.add_k_proj, self.add_v_proj),
             )
         else:
             (
@@ -977,14 +1162,15 @@ class QwenImageCrossAttention(nn.Module):
                 make_contiguous=not self.use_fused_qkv_epilogue,
             )
 
-        # Reshape for multi-head attention
-        img_query = img_query.unflatten(-1, (self.local_num_heads, self.head_dim))
-        img_key = img_key.unflatten(-1, (self.local_num_heads, self.head_dim))
-        img_value = img_value.unflatten(-1, (self.local_num_heads, self.head_dim))
+        if joint_qkv_bufs is None:
+            # Reshape for multi-head attention
+            img_query = img_query.unflatten(-1, (self.local_num_heads, self.head_dim))
+            img_key = img_key.unflatten(-1, (self.local_num_heads, self.head_dim))
+            img_value = img_value.unflatten(-1, (self.local_num_heads, self.head_dim))
 
-        txt_query = txt_query.unflatten(-1, (self.local_num_heads, self.head_dim))
-        txt_key = txt_key.unflatten(-1, (self.local_num_heads, self.head_dim))
-        txt_value = txt_value.unflatten(-1, (self.local_num_heads, self.head_dim))
+            txt_query = txt_query.unflatten(-1, (self.local_num_heads, self.head_dim))
+            txt_key = txt_key.unflatten(-1, (self.local_num_heads, self.head_dim))
+            txt_value = txt_value.unflatten(-1, (self.local_num_heads, self.head_dim))
 
         img_cache = txt_cache = None
         if image_rotary_emb is not None:
@@ -1095,6 +1281,17 @@ class QwenImageCrossAttention(nn.Module):
             joint_query, joint_key, joint_value = joint_qkv
         elif seg_qkv is not None:
             joint_query, joint_key, joint_value = seg_qkv
+        elif joint_qkv_bufs is not None:
+            # The buffers already hold the [text, image] layout: Q/K/V were
+            # projected into them and QK-norm/RoPE ran in place on views.
+            joint_query, joint_key, joint_value = (
+                buf.unflatten(-1, (self.local_num_heads, self.head_dim))
+                for buf in joint_qkv_bufs
+            )
+            _sync_into_buffer(value=img_query, buf_view=joint_query[:, seq_len_txt:])
+            _sync_into_buffer(value=img_key, buf_view=joint_key[:, seq_len_txt:])
+            _sync_into_buffer(value=txt_query, buf_view=joint_query[:, :seq_len_txt])
+            _sync_into_buffer(value=txt_key, buf_view=joint_key[:, :seq_len_txt])
         elif attn_mask is not None and not sp_text_sharded:
             # Let the eager attention break point pack directly from the text
             # and image segments. Materializing three dense joint tensors here
@@ -1247,6 +1444,13 @@ class QwenImageFeedForward(nn.Module):
     def forward_with_bias(
         self, hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # Not cached at construction: LoRA mounting swaps net.2 for a wrapper.
+        if convrot_int8_fuses_gelu_input(self.net[2]):
+            # The down-projection's rotate kernel applies GELU(tanh) to its
+            # input bit-exactly, so the up-projection runs bare and the
+            # standalone activation kernel is skipped.
+            up, _ = self.net[0].proj(hidden_states)
+            return apply_convrot_int8_gelu_input(layer=self.net[2], x=up), None
         hidden_states = self.net[0](hidden_states)
         hidden_states = self.net[1](hidden_states)
         return self.net[2](hidden_states)

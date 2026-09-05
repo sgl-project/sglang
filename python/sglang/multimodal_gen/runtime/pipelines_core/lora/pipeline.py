@@ -43,6 +43,17 @@ from sglang.multimodal_gen.runtime.server_args import LORA_MERGE_MODES, ServerAr
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
+_FLOAT8_DTYPES = frozenset(
+    dtype
+    for dtype in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2fnuz", None),
+    )
+    if dtype is not None
+)
+
 # to avoid deadlocks when forking
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -558,6 +569,15 @@ class LoRAPipeline(ComposedPipelineBase):
         return any(isinstance(layer.weight, DTensor) for layer in lora_layers.values())
 
     @staticmethod
+    def _has_quantized_base_weights(lora_layers: dict[str, BaseLayerWithLoRA]) -> bool:
+        # Online-quantized bases (INT8, FP8) store a rotated and/or per-channel
+        # scaled matrix; an adapter delta cannot be added into it.
+        return any(
+            not layer.weight.is_floating_point() or layer.weight.dtype in _FLOAT8_DTYPES
+            for layer in lora_layers.values()
+        )
+
+    @staticmethod
     def _has_active_unmerged_lora(
         lora_layers: dict[str, BaseLayerWithLoRA],
     ) -> bool:
@@ -599,6 +619,17 @@ class LoRAPipeline(ComposedPipelineBase):
     ) -> bool:
         if merge_mode == "dynamic":
             return False
+        if self._has_quantized_base_weights(lora_layers):
+            if merge_mode == "auto":
+                logger.info(
+                    "Using dynamic LoRA for %s because its base weights are quantized and cannot take a merged delta.",
+                    module_name,
+                )
+                return False
+            raise ValueError(
+                f"LoRA cannot be merged into the quantized weights of {module_name}; "
+                "use --lora-merge-mode dynamic"
+            )
         uses_dtensor_weights = self._uses_dtensor_weights(lora_layers)
         has_unmergeable_weights = any(
             not layer.can_merge_base_weight for layer in lora_layers.values()

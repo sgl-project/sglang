@@ -113,6 +113,37 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("awq_dequantize(Tensor qweight, Tensor scales, Tensor qzeros) -> Tensor");
   m.impl("awq_dequantize", torch::kCUDA, &awq_dequantize);
 
+  m.def("convrot_rotate_quantize_activation(Tensor x, int group_size) -> (Tensor, Tensor)");
+  m.impl("convrot_rotate_quantize_activation", torch::kCUDA, &convrot_rotate_quantize_activation);
+
+  m.def(
+      "convrot_int8_fused_linear(Tensor x, Tensor weight_q, Tensor weight_scale, Tensor? bias, int group_size) -> "
+      "Tensor");
+  m.impl("convrot_int8_fused_linear", torch::kCUDA, &convrot_int8_fused_linear);
+
+  m.def(
+      "convrot_int8_fused_linear_gelu_input(Tensor x, Tensor weight_q, Tensor weight_scale, Tensor? bias, int "
+      "group_size) -> Tensor");
+  m.impl("convrot_int8_fused_linear_gelu_input", torch::kCUDA, &convrot_int8_fused_linear_gelu_input);
+
+  m.def(
+      "convrot_int8_fused_linear_out(Tensor x, Tensor weight_q, Tensor weight_scale, Tensor? bias, int group_size, "
+      "Tensor(a!) out) -> Tensor(a!)");
+  m.impl("convrot_int8_fused_linear_out", torch::kCUDA, &convrot_int8_fused_linear_out);
+
+  m.def(
+      "convrot_int8_linear_prequant(Tensor xq, Tensor xs, Tensor weight_q, Tensor weight_scale, Tensor? bias, int "
+      "group_size) -> Tensor");
+  m.impl("convrot_int8_linear_prequant", torch::kCUDA, &convrot_int8_linear_prequant);
+
+  m.def(
+      "convrot_int8_linear_prequant_out(Tensor xq, Tensor xs, Tensor weight_q, Tensor weight_scale, Tensor? bias, "
+      "int group_size, Tensor(a!) out) -> Tensor(a!)");
+  m.impl("convrot_int8_linear_prequant_out", torch::kCUDA, &convrot_int8_linear_prequant_out);
+
+  // No tensor argument to dispatch on: the schema carries its own kernel.
+  m.def("convrot_int8_supported_sm_versions() -> int[]", &convrot_int8_supported_sm_versions);
+
   m.def(
       "int8_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype, Tensor? "
       "bias) -> Tensor");

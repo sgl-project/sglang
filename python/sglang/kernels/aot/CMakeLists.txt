@@ -240,7 +240,9 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     endif()
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" AND SGL_KERNEL_ENABLE_FA3)
+# Not tied to FA3: Hopper CUTLASS 3.x kernels compile to arch-disabled stubs
+# without the sm_90a pass, and FA3 defaults OFF on aarch64 (Grace Hopper).
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
     )
@@ -272,6 +274,7 @@ set(SOURCES
     "csrc/expert_specialization/es_sm100_mxfp8_blockscaled_group_quant.cu"
 
     "csrc/gemm/awq_kernel.cu"
+    "csrc/gemm/convrot_int8_gemm.cu"
     "csrc/gemm/fp8_gemm_kernel.cu"
     "csrc/gemm/int8_gemm_kernel.cu"
     "csrc/gemm/per_token_group_quant_8bit.cu"
@@ -313,6 +316,16 @@ set(SOURCES
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_sm80.cu"
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
 )
+
+# CUTLASS enables dense INT8 tcgen05 MMA (CUTE_ARCH_TCGEN05_S8_MMA_ENABLED) only
+# for the arch-specific sm_100a target, not the sm_100f family target used
+# above from CUDA 12.9 on. Scoped to this file to keep the extra pass off
+# every other kernel.
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.9")
+    set_source_files_properties(csrc/gemm/convrot_int8_gemm.cu PROPERTIES
+        COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_100a,code=sm_100a>"
+    )
+endif()
 
 set(INCLUDES
     ${repo-cutlass_SOURCE_DIR}/include
