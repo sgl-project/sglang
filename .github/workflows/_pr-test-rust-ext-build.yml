@@ -270,7 +270,7 @@ jobs:
           release_dir = pathlib.Path(os.environ["CARGO_TARGET_DIR"]) / "release"
           if target := os.environ.get("CARGO_BUILD_TARGET"):
               release_dir = pathlib.Path(os.environ["CARGO_TARGET_DIR"]) / target / "release"
-          shutil.copy2(release_dir / "libmem_cache.so", inspection_path)
+          shutil.copy2(release_dir / "libsglang_radix_tree.so", inspection_path)
 
           def load(name, path):
               spec = importlib.util.spec_from_file_location(name, path)
