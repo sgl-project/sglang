@@ -90,13 +90,19 @@ class Derived:
     right, because it has no input to preserve and the record is what crosses a
     process boundary.
 
-    It carries only a name and a reason. What computes it belongs with the
-    other fields of its namespace: for the parallel quotients that is
-    ``derive_parallel_widths``, which produces all six from the leaves declared
-    beside them.
+    ``fn`` names what computes it, as a dotted path resolved lazily so that a
+    declaration module stays free of runtime imports. Such a field is a pure
+    function of the published configuration, so it is computed once at
+    ``publish`` and stored as an ordinary bag leaf -- a plain attribute load,
+    which is what a read inside compiled model code needs.
+
+    A declaration without ``fn`` is one whose namespace resolves it itself.
+    Only ``parallel`` does: its quotients can change after publish, because an
+    elastic scale-up restamps them, so they cannot be frozen into a leaf.
     """
 
     doc: str = ""
+    fn: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
