@@ -1209,6 +1209,14 @@ class OpenAIServingChat(OpenAIServingBase):
         if self.default_chat_template_kwargs:
             ctk = dict(request.chat_template_kwargs or {})
             for k, v in self.default_chat_template_kwargs.items():
+                if k == "reasoning_effort" and request.reasoning_effort is not None:
+                    # The request already chose an effort, either through the
+                    # top-level field or through a chat_template_kwargs value
+                    # that _convert_to_internal_request has moved onto the
+                    # request. Filling the default here would let the later
+                    # chat_template_kwargs merge overwrite the request's value,
+                    # so keep the same request-first precedence as other keys.
+                    continue
                 ctk.setdefault(k, v)
             request.chat_template_kwargs = ctk
             effort = ctk.get("reasoning_effort")
