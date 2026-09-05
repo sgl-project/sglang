@@ -197,12 +197,13 @@ def _run_pair_fp8(H_Q, H_KV, D, B, S, fp8_dtype, dev="cuda", seed=0):
 def _run_pair_paged(
     H_Q, H_KV, D, B, S, page_size, dev="cuda", dt=torch.float16, seed=0
 ):
-    """Standard vs Lean on a **paged** 4-D KV buffer ``[num_pages, page_size, head, dim]``.
+    """Standard vs Lean on dense 3-D KV views with ``page_size > 1``.
 
-    The KV cache is stored in pages and addressed through scattered slot ids in ``kv_indices``
-    (a permutation), so the kernel's page-aware address math (``kv_loc // page_size`` /
-    ``kv_loc % page_size``) is genuinely exercised — not the contiguous fast path. Both arms read
-    the identical buffer + indices, so their outputs must agree. Returns (o_std, o_lean).
+    The KV cache uses the current ``[row, head, dim]`` kernel contract and is
+    addressed through scattered row ids in ``kv_indices`` (a permutation). This
+    exercises the kernel specialization for multi-row pages, but not the retired
+    4-D paged-buffer layout. Both arms read the identical buffer + indices, so
+    their outputs must agree. Returns (o_std, o_lean).
     """
     torch.manual_seed(seed)
     D_V = D
@@ -214,12 +215,16 @@ def _run_pair_paged(
     )
     num_pages = tot // page_size
 
-    # 4-D paged KV buffers [num_pages, page_size, head, dim] (the shared-pool layout).
-    k = torch.randn(num_pages, page_size, H_KV, D, dtype=dt, device=dev)
-    v = torch.randn(num_pages, page_size, H_KV, D_V, dtype=dt, device=dev)
+    # Build page-shaped storage, then expose the dense per-layer view used by the pool.
+    k = torch.randn(num_pages, page_size, H_KV, D, dtype=dt, device=dev).view(
+        tot, H_KV, D
+    )
+    v = torch.randn(num_pages, page_size, H_KV, D_V, dtype=dt, device=dev).view(
+        tot, H_KV, D_V
+    )
 
     kv_indptr = torch.arange(0, (B + 1) * S, step=S, device=dev, dtype=torch.int32)
-    # Scatter slots across pages so page_id/tok_in_p vary within every BLOCK_N tile.
+    # Use noncontiguous slot ids while running the page_size > 1 specialization.
     kv_indices = torch.randperm(tot, device=dev).to(torch.int32)
     q = torch.randn(B, H_Q, D, dtype=dt, device=dev)
     num_kv_splits = torch.full((B,), MAX_KV_SPLITS, dtype=torch.int32, device=dev)
@@ -312,9 +317,9 @@ class TestLeanAttentionParity(CustomTestCase):
                         )
 
     def test_paged_kv_parity(self):
-        # Lean must read a paged 4-D KV buffer the same way the standard kernel does. Guards
-        # the page-aware address math (kv_loc // page_size, kv_loc % page_size); a regression
-        # to the contiguous-only form would scramble reads and drop cos well below 1.
+        # Lean must read the current dense 3-D KV view with page_size > 1 the
+        # same way the standard kernel does. This covers that specialization,
+        # not the retired 4-D paged-buffer layout.
         for name, H_Q, H_KV, D in GQA_SHAPES:
             for page_size in (16, 64):
                 with self.subTest(model=name, page_size=page_size):
