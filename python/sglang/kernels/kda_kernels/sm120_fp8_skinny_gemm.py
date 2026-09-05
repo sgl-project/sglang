@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 _SUPPORTED_M = (1, 2, 4, 8, 9)
 
 # Exact (K, N) projection shapes are enabled only at M values that passed
-# bitwise comparison, cold-L2 benchmarks against the available SGLang fast
+# BF16 numerical comparison, cold-L2 benchmarks against the available SGLang fast
 # paths, and model-level E2E validation on RTX PRO 6000 Blackwell.
 _QUALIFIED_M_BY_PROJECTION = {
     (5120, 8192): _SUPPORTED_M,

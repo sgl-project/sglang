@@ -68,19 +68,14 @@ FN_MAP = {
     "kda": _kda_impl,
     "torch": _torch_impl,
     "flashinfer": _flashinfer_impl,
+    "native": _native_gemv_impl,
 }
 
 
-QWEN38_PROJECTIONS = [
+PROJECTIONS = [
     ("Qwen3.8-27B/gdn-in", 16384, 5120),
     ("Qwen3.8-27B/attn-qkv", 8192, 5120),
     ("Qwen3.8-27B/out", 5120, 6144),
-]
-M_VALUES = [1, 2, 4, 8, 9]
-QWEN38_CASES = [
-    (model, m, n, k) for m in M_VALUES for model, n, k in QWEN38_PROJECTIONS
-]
-MODEL_FP8_PROJECTIONS = [
     ("Qwen3-8B+Llama-3.1-8B/qkv", 6144, 4096),
     ("Qwen3-8B+Llama-3.1-8B/o", 4096, 4096),
     ("Qwen3-8B/gate-up", 24576, 4096),
@@ -96,9 +91,8 @@ MODEL_FP8_PROJECTIONS = [
     ("Nemotron-3-Super/shared-up", 5376, 4096),
     ("Nemotron-3-Super/shared-down", 4096, 5376),
 ]
-MODEL_FP8_CASES = [
-    (model, m, n, k) for m in M_VALUES for model, n, k in MODEL_FP8_PROJECTIONS
-]
+M_VALUES = (1, 2, 4, 8, 9)
+MODEL_FP8_CASES = [(model, m, n, k) for m in M_VALUES for model, n, k in PROJECTIONS]
 NATIVE_M1_CASES = [
     ("Qwen3.8-27B/attn-qkv", 8192, 5120),
     ("Qwen3.8-27B/out", 5120, 6144),
@@ -112,7 +106,7 @@ NATIVE_M1_CASES = [
 # representative per-tensor FP8 projections from other model families.
 @marker.parametrize(
     "model,m,n,k",
-    QWEN38_CASES + MODEL_FP8_CASES,
+    MODEL_FP8_CASES,
     [("Qwen3.8-27B/attn-qkv", 9, 8192, 5120)],
 )
 @marker.benchmark("provider", ["kda", "torch", "flashinfer"])
@@ -137,9 +131,8 @@ def benchmark_m1_native(model: str, n: int, k: int, provider: str):
     """Compare M=1 with SGLang's existing SM120 GEMV before dispatching."""
     del model
     args = _make_inputs(1, n, k)
-    impl = _kda_impl if provider == "kda" else _native_gemv_impl
     return marker.do_bench(
-        impl,
+        FN_MAP[provider],
         input_args=args,
         graph_clone_args=(0, 1, 2, 3),
         disable_log_bandwidth=True,

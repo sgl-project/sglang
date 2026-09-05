@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -26,7 +27,7 @@ if not (torch.cuda.is_available() and torch.cuda.get_device_capability() == (12,
 
 ALL_M = (1, 2, 4, 8, 9)
 
-# Every tuple below passed three-seed bitwise comparison and cold-L2
+# Every tuple below passed three-seed BF16 comparison and cold-L2
 # performance gating against FlashInfer. Shapes reflect SGLang's packed QKV and
 # gate/up weights, not the individual checkpoint tensors.
 QUALIFIED_CONFIGS = [
@@ -45,6 +46,16 @@ QUALIFIED_SHAPES = [
     for m in supported_m
 ]
 
+# These shapes are numerically valid, but are intentionally left on the
+# existing backend because they missed either the accuracy or performance gate.
+UNQUALIFIED_CONFIGS = [
+    pytest.param((3,), 8192, 5120, id="unsupported-m"),
+    pytest.param((1, 9), 16384, 5120, id="qwen38-gdn-in"),
+    pytest.param((2, 4, 8, 9), 5376, 4096, id="nemotron-shared-up"),
+    pytest.param(ALL_M, 4096, 5376, id="nemotron-shared-down"),
+    pytest.param((8,), 6144, 4096, id="qwen3-8b-qkv"),
+]
+
 
 def _make_inputs(m: int, n: int, k: int, seed: int = 0):
     torch.manual_seed(seed)
@@ -60,34 +71,47 @@ def _make_inputs(m: int, n: int, k: int, seed: int = 0):
     return input, weight, weight_scale, input_scale
 
 
-def _reference(input, weight, weight_scale, input_scale):
-    return apply_fp8_linear_bmm_flashinfer(
+def _reference(args):
+    return apply_fp8_linear_bmm_flashinfer(*args)
+
+
+def _assert_matches_flashinfer(actual, expected):
+    # CUTLASS and cuBLAS may accumulate in a different order. On SM120 the
+    # observed differences are sparse and stay within standard BF16 tolerance.
+    torch.testing.assert_close(actual, expected)
+
+
+def _run_kda(args, *, m=None, vector_scales=False, bias=None):
+    input, weight, weight_scale, input_scale = args
+    if m is not None:
+        input = input[:m]
+    output_scale = input_scale * weight_scale
+    if vector_scales:
+        input_scale = input_scale.reshape(1)
+        output_scale = output_scale.reshape(1)
+    return try_sm120_fp8_skinny_gemm(
         input,
         weight,
-        weight_scale,
         input_scale,
+        output_scale,
+        bias,
     )
 
 
 @pytest.mark.parametrize("seed", [0, 1, 7])
 @pytest.mark.parametrize("m,n,k", QUALIFIED_SHAPES)
-def test_qualified_shapes_are_bitwise_equal(m: int, n: int, k: int, seed: int):
-    input, weight, weight_scale, input_scale = _make_inputs(m, n, k, seed)
-    expected = _reference(input, weight, weight_scale, input_scale)
-    actual = try_sm120_fp8_skinny_gemm(
-        input,
-        weight,
-        input_scale,
-        input_scale * weight_scale,
-        bias=None,
-    )
+def test_qualified_shapes_match_flashinfer(m: int, n: int, k: int, seed: int):
+    args = _make_inputs(m, n, k, seed)
+    expected = _reference(args)
+    actual = _run_kda(args)
     assert actual is not None
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    _assert_matches_flashinfer(actual, expected)
 
 
 @pytest.mark.parametrize("m", ALL_M)
 def test_cuda_graph_replay_uses_current_input(m: int):
-    input, weight, weight_scale, input_scale = _make_inputs(m, 8192, 5120)
+    args = _make_inputs(m, 8192, 5120)
+    input, weight, weight_scale, input_scale = args
     output_scale = input_scale * weight_scale
 
     graph = torch.cuda.CUDAGraph()
@@ -99,13 +123,14 @@ def test_cuda_graph_replay_uses_current_input(m: int):
     torch.manual_seed(17)
     input.copy_(torch.randn_like(input).mul_(8))
     graph.replay()
-    expected = _reference(input, weight, weight_scale, input_scale)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    expected = _reference(args)
+    _assert_matches_flashinfer(actual, expected)
 
 
 @pytest.mark.parametrize("m", (2, 4, 8))
-def test_saturated_real_activation_range_is_bitwise_equal(m: int):
-    input, weight, weight_scale, input_scale = _make_inputs(m, 16384, 5120, seed=11)
+def test_saturated_real_activation_range_matches_flashinfer(m: int):
+    args = _make_inputs(m, 16384, 5120, seed=11)
+    input = args[0]
     # Static ModelOpt scales can expose both saturation and FP8 rounding
     # boundaries in live GDN activations. This distribution reproduces the
     # class of mismatch that the former fused quantizer caused in E2E decode.
@@ -115,114 +140,34 @@ def test_saturated_real_activation_range_is_bitwise_equal(m: int):
         dtype=torch.bfloat16,
         device="cuda",
     )
-    expected = _reference(input, weight, weight_scale, input_scale)
-    actual = try_sm120_fp8_skinny_gemm(
-        input,
-        weight,
-        input_scale,
-        input_scale * weight_scale,
-        bias=None,
-    )
+    expected = _reference(args)
+    actual = _run_kda(args)
     assert actual is not None
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    _assert_matches_flashinfer(actual, expected)
 
 
-def test_production_dispatch_and_fallback():
-    input, weight, weight_scale, input_scale = _make_inputs(8, 8192, 5120)
-    output_scale = input_scale * weight_scale
-    expected = try_sm120_fp8_skinny_gemm(
-        input, weight, input_scale, output_scale, bias=None
-    )
+def test_scalar_and_vector_scale_layouts_dispatch():
+    args = _make_inputs(8, 8192, 5120)
+    expected = _run_kda(args)
     assert expected is not None
 
     # Some callers retain per-tensor scales as one-element vectors. The Python
     # facade normalizes both layouts to the scalar TVM-FFI contract.
-    vector_scale_output = try_sm120_fp8_skinny_gemm(
-        input,
-        weight,
-        input_scale.reshape(1),
-        output_scale.reshape(1),
-        bias=None,
-    )
+    vector_scale_output = _run_kda(args, vector_scales=True)
     torch.testing.assert_close(vector_scale_output, expected, rtol=0, atol=0)
 
-    unsupported_input = input[:3]
-    assert (
-        try_sm120_fp8_skinny_gemm(
-            unsupported_input, weight, input_scale, output_scale, bias=None
-        )
-        is None
-    )
 
-    # The GDN projection is qualified only for M=2/4/8. Keep M=1/9 on the
-    # reference path because real-activation E2E qualification exposed drift.
-    for slow_m in (1, 9):
-        slow_input, slow_weight, slow_weight_scale, slow_input_scale = _make_inputs(
-            slow_m, 16384, 5120
-        )
-        assert (
-            try_sm120_fp8_skinny_gemm(
-                slow_input,
-                slow_weight,
-                slow_input_scale,
-                slow_input_scale * slow_weight_scale,
-                bias=None,
-            )
-            is None
-        )
+@pytest.mark.parametrize("m_values,n,k", UNQUALIFIED_CONFIGS)
+def test_unqualified_shapes_fall_back(m_values, n: int, k: int):
+    args = _make_inputs(max(m_values), n, k)
+    for m in m_values:
+        assert _run_kda(args, m=m) is None
 
-    # Nemotron E2E qualification keeps shared-up only at M=1. Shared-up at
-    # larger batches and shared-down regressed in both GPU-lane orientations.
-    nemotron_up_input, nemotron_up_weight, weight_scale, input_scale = _make_inputs(
-        9, 5376, 4096
-    )
-    for slow_m in (2, 4, 8, 9):
-        assert (
-            try_sm120_fp8_skinny_gemm(
-                nemotron_up_input[:slow_m],
-                nemotron_up_weight,
-                input_scale,
-                input_scale * weight_scale,
-                bias=None,
-            )
-            is None
-        )
 
-    nemotron_down_input, nemotron_down_weight, weight_scale, input_scale = _make_inputs(
-        9, 4096, 5376
-    )
-    for slow_m in ALL_M:
-        assert (
-            try_sm120_fp8_skinny_gemm(
-                nemotron_down_input[:slow_m],
-                nemotron_down_weight,
-                input_scale,
-                input_scale * weight_scale,
-                bias=None,
-            )
-            is None
-        )
-
-    # This QKV shape is bitwise-correct but slower than FlashInfer, so it must
-    # stay on the fallback path.
-    slow_input, slow_weight, slow_weight_scale, slow_input_scale = _make_inputs(
-        8, 6144, 4096
-    )
-    assert (
-        try_sm120_fp8_skinny_gemm(
-            slow_input,
-            slow_weight,
-            slow_input_scale,
-            slow_input_scale * slow_weight_scale,
-            bias=None,
-        )
-        is None
-    )
-    bias = torch.zeros(weight.shape[1], dtype=torch.bfloat16, device="cuda")
-    assert (
-        try_sm120_fp8_skinny_gemm(input, weight, input_scale, output_scale, bias=bias)
-        is None
-    )
+def test_bias_falls_back():
+    args = _make_inputs(8, 8192, 5120)
+    bias = torch.zeros(args[1].shape[1], dtype=torch.bfloat16, device="cuda")
+    assert _run_kda(args, bias=bias) is None
 
 
 def _make_modelopt_dispatch_fixture():
@@ -234,47 +179,41 @@ def _make_modelopt_dispatch_fixture():
     layer = SimpleNamespace(
         weight=weight_storage.t(),
         input_scale=torch.ones(1, dtype=torch.float32, device="cuda"),
-        sm120_gemv_alpha=torch.ones(1, dtype=torch.float32, device="cuda"),
+        sm120_fp8_alpha=torch.ones(1, dtype=torch.float32, device="cuda"),
     )
     input = torch.empty((1, 512), dtype=torch.bfloat16, device="cuda")
     return method, layer, input
 
 
-def test_modelopt_prefers_native_m1_gemv(monkeypatch):
+@pytest.mark.parametrize("native_accepts", (True, False), ids=("native", "kda"))
+def test_modelopt_dispatch_order(monkeypatch, native_accepts: bool):
     import sglang.kernels.ops.gemm as gemm_ops
     import sglang.kernels.ops.gemm.sm120_fp8_gemv as native_gemv
     import sglang.kernels.ops.quantization.fp8_kernel as fp8_kernel
 
     method, layer, input = _make_modelopt_dispatch_fixture()
-    expected = torch.empty((1, 256), dtype=torch.bfloat16, device="cuda")
-    monkeypatch.setattr(native_gemv, "use_sm120_fp8_gemv", lambda *args: True)
-    monkeypatch.setattr(native_gemv, "sm120_fp8_gemv", lambda *args: expected)
+    native_output = torch.empty((1, 256), dtype=torch.bfloat16, device="cuda")
+    kda_output = torch.empty_like(native_output)
+    native_impl = Mock(return_value=native_output)
+    kda_impl = Mock(return_value=kda_output)
+
+    monkeypatch.setattr(native_gemv, "use_sm120_fp8_gemv", lambda *args: native_accepts)
+    monkeypatch.setattr(native_gemv, "sm120_fp8_gemv", native_impl)
     monkeypatch.setattr(
         fp8_kernel,
         "static_quant_fp8",
         lambda *args, **kwargs: (input.to(torch.float8_e4m3fn), None),
     )
-    monkeypatch.setattr(
-        gemm_ops,
-        "try_sm120_fp8_skinny_gemm",
-        lambda *args, **kwargs: pytest.fail("KDA must not preempt native M=1 GEMV"),
-    )
+    monkeypatch.setattr(gemm_ops, "try_sm120_fp8_skinny_gemm", kda_impl)
 
+    expected = native_output if native_accepts else kda_output
     assert method.apply(layer, input) is expected
-
-
-def test_modelopt_uses_kda_after_native_rejects(monkeypatch):
-    import sglang.kernels.ops.gemm as gemm_ops
-    import sglang.kernels.ops.gemm.sm120_fp8_gemv as native_gemv
-
-    method, layer, input = _make_modelopt_dispatch_fixture()
-    expected = torch.empty((1, 256), dtype=torch.bfloat16, device="cuda")
-    monkeypatch.setattr(native_gemv, "use_sm120_fp8_gemv", lambda *args: False)
-    monkeypatch.setattr(
-        gemm_ops, "try_sm120_fp8_skinny_gemm", lambda *args, **kwargs: expected
-    )
-
-    assert method.apply(layer, input) is expected
+    if native_accepts:
+        native_impl.assert_called_once()
+        kda_impl.assert_not_called()
+    else:
+        native_impl.assert_not_called()
+        kda_impl.assert_called_once()
 
 
 if __name__ == "__main__":

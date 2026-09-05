@@ -85,7 +85,7 @@ def _run_sm120_fp8_skinny_gemm(
     view used by SGLang's FP8 linear path. ``output_scale`` is the precomputed
     ``input_scale * weight_scale`` used by FlashInfer's cuBLAS backend. The
     activation is quantized with SGLang's reference static-FP8 kernel before
-    the SM120 CUTLASS GEMM so the full path stays bitwise-identical to the
+    the SM120 CUTLASS GEMM so the full path stays within BF16 tolerance of the
     FlashInfer fallback for real model activations, including saturation edges.
     """
     from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8

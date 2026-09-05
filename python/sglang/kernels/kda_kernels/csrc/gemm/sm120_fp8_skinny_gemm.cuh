@@ -99,7 +99,7 @@ CUTLASS_HOST_DEVICE constexpr auto select_b_smem_layout() {
 
 // FlashInfer's cuBLAS backend combines the static activation and weight scales
 // before applying them to the accumulator. Use the same single FP32 multiply
-// before BF16 conversion so speculative target logits remain bitwise stable.
+// before BF16 conversion to minimize speculative target-logit drift.
 class OneScaleLinearCombination {
  public:
   using ElementAccumulator = float;
@@ -423,7 +423,7 @@ namespace sglang {
  * \brief KDA-Pilot SM120 per-tensor FP8 skinny GEMM.
  *
  * SGLang performs its reference static quantization before this entry so the
- * full path remains bitwise-identical to the FlashInfer fallback.
+ * full path remains within BF16 tolerance of the FlashInfer fallback.
  */
 struct KdaSm120Fp8SkinnyGemm {
   static void run_quantized(
