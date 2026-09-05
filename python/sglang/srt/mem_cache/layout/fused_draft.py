@@ -152,6 +152,26 @@ class DraftKVProfile(msgspec.Struct, frozen=True, kw_only=True):
     full: DraftKVGeometry
     swa_layer_ids: Tuple[int, ...] = ()
     num_depths: int = 1
+    num_state_layers: int = 0
+
+
+def draft_state_layer_num(draft_model_config) -> int:
+    """Recurrent-state layers the draft HEAD owns -- not the trunk's.
+
+    A plain NEXTN head of a linear-attention trunk inherits the trunk's
+    config class, so `mamba2_cache_params` lists the TRUNK's state layers
+    while the head itself is a full-attention block. Only a conv-chain MTP
+    head declares `mtp_local_layer_ids`, so that is what separates them.
+    """
+    from sglang.srt.configs.hybrid_arch import mambaish_config
+
+    mambaish = mambaish_config(draft_model_config)
+    if mambaish is None:
+        return 0
+    # Optional HF attribute: only conv-chain MTP configs declare it.
+    if getattr(draft_model_config.hf_text_config, "mtp_local_layer_ids", None) is None:
+        return 0
+    return len(mambaish.mamba2_cache_params.layers)
 
 
 def draft_swa_layer_ids(draft_model_config) -> Tuple[int, ...]:
@@ -180,6 +200,7 @@ def draft_kv_profile(
         ),
         swa_layer_ids=draft_swa_layer_ids(mc),
         num_depths=1 if num_depths is None else int(num_depths),
+        num_state_layers=draft_state_layer_num(mc),
     )
 
 
@@ -224,6 +245,13 @@ def place_fused_draft(
     counts, reason = _runner_layer_counts(profile, num_runners)
     if counts is None:
         return FusedDraftDecision(declined=reason)
+    if profile.num_state_layers:
+        return FusedDraftDecision(
+            declined=(
+                f"the draft has {profile.num_state_layers} recurrent-state "
+                "layer(s) of its own, which no host state pool carries"
+            )
+        )
     num_swa = sum(swa for _, swa in counts)
     if num_swa:
         return FusedDraftDecision(

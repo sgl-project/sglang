@@ -34,9 +34,11 @@ reads the pool with virtual ids and silently returns wrong tokens.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import msgspec
 
+import sglang.srt.configs.hybrid_arch as hybrid_arch
 from sglang.srt.arg_groups.kv_cache_hook import handle_unified_memory_pool
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.server_args import ServerArgs
@@ -45,12 +47,24 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+class _PlainHFConfig:
+    """Matches none of the hybrid-arch isinstance probes."""
+
+    # `mambaish_config` screens on the architecture name, so a stub that
+    # declares none is what "not a hybrid arch" looks like to it.
+    architectures = ["LlamaForCausalLM"]
+
+    def get_text_config(self):
+        return self
+
+
 def _accepts(
     algorithm: str | None,
     *,
     topk: int | None = 1,
     backend: str | None = "triton",
     is_hybrid_swa: bool = True,
+    attention_arch: AttentionArch = AttentionArch.MHA,
     draft_backend: str | None = None,
     retraction_backup: str | None = None,
 ) -> bool:
@@ -80,7 +94,10 @@ def _accepts(
     }.items():
         msgspec.structs.force_setattr(sa, name, value)
     sa._model_config = SimpleNamespace(
-        is_hybrid_swa=is_hybrid_swa, attention_arch=AttentionArch.MHA
+        is_hybrid_swa=is_hybrid_swa,
+        attention_arch=attention_arch,
+        hf_config=_PlainHFConfig(),
+        linear_attn_registry_result=None,
     )
     try:
         handle_unified_memory_pool(sa)
@@ -162,11 +179,27 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
                         f"{algorithm} topk={topk} backend={backend} should pass",
                     )
 
-    def test_eagle_refused_off_hybrid_swa(self):
-        """No fused draft region outside the hybrid-SWA composite: another
-        family must be refused at the gate, not fail at boot."""
+    def test_eagle_refused_on_dense_targets(self):
+        """No fused draft region outside the unified composites: a dense
+        (non-hybrid) target must be refused, not fail at boot."""
         for algorithm in ("EAGLE", "EAGLE3"):
             self.assertFalse(_accepts(algorithm, is_hybrid_swa=False))
+
+    def test_eagle_admitted_on_mamba_mha(self):
+        """A mamba hybrid off the MLA backend provisions the region in its
+        MHA full sub-pool; refusing it strands the whole mamba x EAGLE
+        matrix."""
+        with patch.object(hybrid_arch, "mambaish_config", return_value=object()):
+            for algorithm in ("EAGLE", "EAGLE3"):
+                self.assertTrue(_accepts(algorithm, is_hybrid_swa=False))
+
+    def test_eagle_refused_on_mla_mamba(self):
+        """MLA hosts carry no fused draft region yet: an MLA mamba hybrid must
+        refuse at the gate, not fail at boot."""
+        with patch.object(hybrid_arch, "mambaish_config", return_value=object()):
+            self.assertFalse(
+                _accepts("EAGLE", is_hybrid_swa=False, attention_arch=AttentionArch.MLA)
+            )
 
     def test_eagle_refused_unaudited_and_unset_backends(self):
         """The MLA verify family must not leak into the MHA-shaped arm, and an

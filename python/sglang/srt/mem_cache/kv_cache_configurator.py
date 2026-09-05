@@ -733,6 +733,7 @@ class KVCacheConfigurator:
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),
             head_dim=self.model_config.head_dim,
+            fused_draft=self._fused_draft_for_pool_factory(),
             page_size=self.page_size,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
@@ -883,14 +884,16 @@ class KVCacheConfigurator:
                 if get_disagg().disaggregation_mode == "decode"
                 else 0
             ),
+            fused_draft=self._fused_draft_for_pool_factory(),
         )
 
     def _fused_draft_decision(self):
         """Whether, and where, the EAGLE draft's layers fuse into the target's
-        sub-pools. Fusion applies only for: unified memory ON, a two-pool
-        hybrid-SWA target, an EAGLE-family algorithm whose draft config was
-        loaded at target boot and has no recurrent state of its own;
-        `place_fused_draft` then admits or declines the draft's layer kinds."""
+        sub-pools. Fusion applies only for: unified memory ON, a target whose
+        full sub-pool is MHA-shaped (hybrid-SWA, or a mamba hybrid off the MLA
+        backend), an EAGLE-family algorithm whose draft config was loaded at
+        target boot; `place_fused_draft` then admits or declines the draft's
+        layer kinds."""
         from sglang.srt.mem_cache.layout.fused_draft import (
             FusedDraftDecision,
             draft_kv_profile,
@@ -899,15 +902,16 @@ class KVCacheConfigurator:
         from sglang.srt.mem_cache.unified_memory_pool import _store_dtype_for
 
         aux = self.spec_aux_config
+        host_has_mha_full_pool = self.is_hybrid_swa or (
+            self.mambaish_config is not None and not self.use_mla_backend
+        )
         if not (
             get_memory().enable_unified_memory
-            and self.is_hybrid_swa
-            and self.mambaish_config is None
+            and host_has_mha_full_pool
             and not self.is_draft_worker
             and self.spec_algorithm.is_eagle()
             and aux.eagle_draft_num_layers
             and aux.draft_model_config is not None
-            and mambaish_config(aux.draft_model_config) is None
         ):
             return FusedDraftDecision()
         profile = draft_kv_profile(
@@ -943,9 +947,20 @@ class KVCacheConfigurator:
             _store_dtype_for,
         )
 
+        # This runner's OWN layers, exactly as each pool factory slices them:
+        # the whole-model split would also count other pipeline ranks'.
+        full_attention_layer_ids = (
+            self.layer_info.full_attention_layer_ids
+            if self.is_hybrid_swa
+            else [
+                i
+                for i in self.mambaish_config.full_attention_layer_ids
+                if self.layer_info.start_layer <= i < self.layer_info.end_layer
+            ]
+        )
         return MHASubPoolSpec(
             name="full",
-            layer_num=len(self.layer_info.full_attention_layer_ids),
+            layer_num=len(full_attention_layer_ids),
             head_num=self.model_config.get_num_kv_heads(
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),
