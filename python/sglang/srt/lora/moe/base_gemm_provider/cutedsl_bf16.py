@@ -81,6 +81,7 @@ class CuteDslBf16MaskedRowState(MaskedRowState, kw_only=True):
 class CuteDslBf16MaskedProvider(_CuteDslBf16Mixin, MaskedRowDomainProvider):
     contract = MoeBaseProviderContract(
         key="cutedsl_bf16_masked",
+        quant_info_cls=MoeLoraBf16QuantInfo,
         gate_first=True,
         interleaved=False,
         gate_up_output_dtype=torch.bfloat16,
@@ -185,9 +186,9 @@ class CuteDslBf16ContiguousRowState(ContiguousRowState, kw_only=True):
 
 
 class CuteDslBf16ContiguousProvider(_CuteDslBf16Mixin, ContiguousRowDomainProvider):
-
     contract = MoeBaseProviderContract(
         key="cutedsl_bf16_contiguous",
+        quant_info_cls=MoeLoraBf16QuantInfo,
         gate_first=True,
         interleaved=False,
         gate_up_output_dtype=torch.bfloat16,

@@ -106,10 +106,6 @@ class MoESchedulerParams:
         return self.cta_tile_shape_mnk[0] * self.cluster_shape_mn[0]
 
     @property
-    def cluster_tile_n(self) -> int:
-        return self.cta_tile_shape_mnk[1] * self.cluster_shape_mn[1]
-
-    @property
     def cta_tile_k(self) -> int:
         return self.cta_tile_shape_mnk[2]
 
@@ -262,12 +258,10 @@ class MoEDirectPersistentTileScheduler:
                 (packed >> Int64(OUTPUT_CLUSTER_SHIFT)) & Int64(OUTPUT_CLUSTER_MASK)
             )
             tile_m = (
-                cluster_m * self.params.cluster_shape_mn[0]
-                + self.cta_id_in_cluster[0]  # type: ignore[index]
+                cluster_m * self.params.cluster_shape_mn[0] + self.cta_id_in_cluster[0]  # type: ignore[index]
             )
             tile_n = (
-                cluster_n * self.params.cluster_shape_mn[1]
-                + self.cta_id_in_cluster[1]  # type: ignore[index]
+                cluster_n * self.params.cluster_shape_mn[1] + self.cta_id_in_cluster[1]  # type: ignore[index]
             )
             k_tiles = (
                 self.params.hidden + self.params.cta_tile_k - 1

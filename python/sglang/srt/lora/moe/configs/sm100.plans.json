@@ -1,6 +1,6 @@
 {
  "domain": {
-  "max_hidden": 4096,
+  "max_hidden": 8192,
   "max_local_experts": 512
  },
  "scenarios": [
@@ -397,19 +397,21 @@
    ]
   },
   {
-   "name": "decode.shared",
+   "name": "decode.shared.fp8.e_ge512",
    "layout": "shared",
    "phase": "decode",
+   "min_local_experts": 512,
+   "quant": [
+    "fp8"
+   ],
    "base_gemm_rows": "expert_major",
    "plan": {
     "gate_up_a_family": "grouped",
     "down_a_family": "grouped",
-    "gate_up_b_family": "grouped",
-    "down_b_family": "grouped",
-    "act_family": "materialized",
-    "finalize_family": "materialized",
-    "gate_up_overlap": "gate_up_a_b",
-    "down_overlap": "down_a_b",
+    "act_family": "b_activation",
+    "finalize_family": "shared_one_pass",
+    "gate_up_overlap": "gate_up_a",
+    "down_overlap": "down_a",
     "route_builder": "parallel_shared_outer"
    },
    "tiles": [
@@ -452,7 +454,145 @@
        "num_stages": 2,
        "num_warps": 4
       },
-      "routing_block_size": 16
+      "routing_block_size": 16,
+      "shared_one_pass": {
+       "BLOCK_SIZE_H": 128,
+       "num_stages": 3,
+       "num_warps": 4
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "decode.shared.nvfp4",
+   "layout": "shared",
+   "phase": "decode",
+   "quant": [
+    "nvfp4"
+   ],
+   "base_gemm_rows": "expert_major",
+   "plan": {
+    "gate_up_a_family": "token_dense",
+    "gate_up_b_family": "per_pair",
+    "down_a_family": "per_pair",
+    "act_family": "materialized",
+    "finalize_family": "shared_one_pass",
+    "gate_up_overlap": "gate_up_a_b",
+    "down_overlap": "down_a",
+    "route_builder": "standard"
+   },
+   "tiles": [
+    {
+     "sites": {
+      "b_activation": {
+       "BLOCK_SIZE_K": 64,
+       "BLOCK_SIZE_W": 64,
+       "GROUP_SIZE_M": 1,
+       "num_stages": 2,
+       "num_warps": 4
+      },
+      "down_a": {
+       "BLOCK_SIZE_K": 128,
+       "BLOCK_SIZE_N": 64,
+       "GROUP_SIZE_M": 8,
+       "num_stages": 4,
+       "num_warps": 4
+      },
+      "down_b": {
+       "BLOCK_SIZE_K": 32,
+       "BLOCK_SIZE_M": 16,
+       "BLOCK_SIZE_N": 64,
+       "GROUP_SIZE_M": 8,
+       "num_stages": 2,
+       "num_warps": 4
+      },
+      "gate_up_a": {
+       "BLOCK_SIZE_K": 128,
+       "BLOCK_SIZE_N": 64,
+       "GROUP_SIZE_M": 8,
+       "num_stages": 4,
+       "num_warps": 4
+      },
+      "gate_up_b": {
+       "BLOCK_SIZE_K": 32,
+       "BLOCK_SIZE_M": 16,
+       "BLOCK_SIZE_N": 64,
+       "GROUP_SIZE_M": 8,
+       "num_stages": 2,
+       "num_warps": 4
+      },
+      "routing_block_size": 16,
+      "shared_one_pass": {
+       "BLOCK_SIZE_H": 128,
+       "num_stages": 2,
+       "num_warps": 4
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "decode.shared",
+   "layout": "shared",
+   "phase": "decode",
+   "base_gemm_rows": "expert_major",
+   "plan": {
+    "gate_up_a_family": "grouped",
+    "down_a_family": "grouped",
+    "gate_up_b_family": "grouped",
+    "act_family": "materialized",
+    "finalize_family": "shared_one_pass",
+    "gate_up_overlap": "gate_up_a_b",
+    "down_overlap": "down_a",
+    "route_builder": "parallel_shared_outer"
+   },
+   "tiles": [
+    {
+     "sites": {
+      "b_activation": {
+       "BLOCK_SIZE_K": 64,
+       "BLOCK_SIZE_W": 64,
+       "GROUP_SIZE_M": 1,
+       "num_stages": 2,
+       "num_warps": 4
+      },
+      "down_a": {
+       "BLOCK_SIZE_K": 128,
+       "BLOCK_SIZE_N": 64,
+       "GROUP_SIZE_M": 8,
+       "num_stages": 4,
+       "num_warps": 4
+      },
+      "down_b": {
+       "BLOCK_SIZE_K": 32,
+       "BLOCK_SIZE_M": 16,
+       "BLOCK_SIZE_N": 64,
+       "GROUP_SIZE_M": 8,
+       "num_stages": 2,
+       "num_warps": 4
+      },
+      "gate_up_a": {
+       "BLOCK_SIZE_K": 128,
+       "BLOCK_SIZE_N": 64,
+       "GROUP_SIZE_M": 8,
+       "num_stages": 4,
+       "num_warps": 4
+      },
+      "gate_up_b": {
+       "BLOCK_SIZE_K": 32,
+       "BLOCK_SIZE_M": 16,
+       "BLOCK_SIZE_N": 64,
+       "GROUP_SIZE_M": 8,
+       "num_stages": 2,
+       "num_warps": 4
+      },
+      "routing_block_size": 16,
+      "shared_one_pass": {
+       "BLOCK_SIZE_H": 128,
+       "num_stages": 3,
+       "num_warps": 4
+      }
      }
     }
    ]
@@ -465,11 +605,9 @@
    "plan": {
     "gate_up_a_family": "token_grouped",
     "down_a_family": "grouped",
-    "down_b_family": "grouped",
     "act_family": "b_activation",
-    "finalize_family": "materialized",
-    "route_builder": "parallel_shared_outer",
-    "down_b_into_base": true
+    "finalize_family": "shared_token_delta",
+    "route_builder": "parallel_shared_outer"
    },
    "max_rank": 32,
    "tiles": [
@@ -511,7 +649,19 @@
        "num_stages": 2,
        "num_warps": 4
       },
-      "routing_block_size": 32
+      "routing_block_size": 32,
+      "shared_token_delta": {
+       "reduce": {
+        "BLOCK_SIZE_T": 32,
+        "num_stages": 2,
+        "num_warps": 4
+       },
+       "tail": {
+        "BLOCK_SIZE_H": 1024,
+        "num_stages": 2,
+        "num_warps": 8
+       }
+      }
      }
     }
    ]
@@ -524,11 +674,9 @@
    "plan": {
     "gate_up_a_family": "token_grouped",
     "down_a_family": "grouped",
-    "down_b_family": "grouped",
     "act_family": "b_activation",
-    "finalize_family": "materialized",
-    "route_builder": "parallel_shared_outer",
-    "down_b_into_base": true
+    "finalize_family": "shared_token_delta",
+    "route_builder": "parallel_shared_outer"
    },
    "tiles": [
     {
@@ -569,13 +717,90 @@
        "num_stages": 2,
        "num_warps": 4
       },
-      "routing_block_size": 32
+      "routing_block_size": 32,
+      "shared_token_delta": {
+       "reduce": {
+        "BLOCK_SIZE_T": 32,
+        "num_stages": 2,
+        "num_warps": 4
+       },
+       "tail": {
+        "BLOCK_SIZE_H": 1024,
+        "num_stages": 2,
+        "num_warps": 8
+       }
+      }
      }
     }
    ]
   }
  ],
  "fallback": [
+  {
+   "name": "fallback.decode.shared",
+   "layout": "shared",
+   "phase": "decode",
+   "base_gemm_rows": "expert_major",
+   "plan": {
+    "gate_up_a_family": "grouped",
+    "down_a_family": "grouped",
+    "gate_up_b_family": "grouped",
+    "act_family": "materialized",
+    "finalize_family": "shared_one_pass",
+    "gate_up_overlap": "gate_up_a_b",
+    "down_overlap": "down_a",
+    "route_builder": "parallel_shared_outer"
+   },
+   "tiles": [
+    {
+     "sites": {
+      "b_activation": {
+       "BLOCK_SIZE_K": 64,
+       "BLOCK_SIZE_W": 64,
+       "GROUP_SIZE_M": 1,
+       "num_stages": 2,
+       "num_warps": 4
+      },
+      "down_a": {
+       "BLOCK_SIZE_K": 128,
+       "BLOCK_SIZE_N": 64,
+       "GROUP_SIZE_M": 8,
+       "num_stages": 4,
+       "num_warps": 4
+      },
+      "down_b": {
+       "BLOCK_SIZE_K": 32,
+       "BLOCK_SIZE_M": 16,
+       "BLOCK_SIZE_N": 64,
+       "GROUP_SIZE_M": 8,
+       "num_stages": 2,
+       "num_warps": 4
+      },
+      "gate_up_a": {
+       "BLOCK_SIZE_K": 128,
+       "BLOCK_SIZE_N": 64,
+       "GROUP_SIZE_M": 8,
+       "num_stages": 4,
+       "num_warps": 4
+      },
+      "gate_up_b": {
+       "BLOCK_SIZE_K": 32,
+       "BLOCK_SIZE_M": 16,
+       "BLOCK_SIZE_N": 64,
+       "GROUP_SIZE_M": 8,
+       "num_stages": 2,
+       "num_warps": 4
+      },
+      "routing_block_size": 16,
+      "shared_one_pass": {
+       "BLOCK_SIZE_H": 128,
+       "num_stages": 3,
+       "num_warps": 4
+      }
+     }
+    }
+   ]
+  },
   {
    "name": "fallback.decode",
    "phase": "decode",
@@ -697,14 +922,13 @@
    "name": "fallback.prefill.shared",
    "layout": "shared",
    "phase": "prefill",
-   "base_gemm_rows": "expert_major",
+   "base_gemm_rows": "route_major",
    "plan": {
-    "gate_up_a_family": "grouped",
+    "gate_up_a_family": "token_grouped",
     "down_a_family": "grouped",
-    "down_b_family": "grouped",
     "act_family": "b_activation",
-    "finalize_family": "materialized",
-    "down_b_into_base": true
+    "finalize_family": "shared_token_delta",
+    "route_builder": "parallel_shared_outer"
    },
    "tiles": [
     {
@@ -746,7 +970,19 @@
        "num_stages": 2,
        "num_warps": 4
       },
-      "routing_block_size": 32
+      "routing_block_size": 32,
+      "shared_token_delta": {
+       "reduce": {
+        "BLOCK_SIZE_T": 32,
+        "num_stages": 2,
+        "num_warps": 4
+       },
+       "tail": {
+        "BLOCK_SIZE_H": 1024,
+        "num_stages": 2,
+        "num_warps": 8
+       }
+      }
      }
     }
    ]

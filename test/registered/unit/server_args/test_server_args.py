@@ -43,6 +43,7 @@ from sglang.srt.arg_groups.kv_cache_hook import (
     handle_nvfp4_prefill_kv_dequant_dtype,
     validate_prefill_only_disable_kv_cache_args,
 )
+from sglang.srt.arg_groups.lora_hook import check_lora_moe_runner_args
 from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
 from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
@@ -1091,13 +1092,13 @@ class TestLoraMoeRunnerBackendArgs(unittest.TestCase):
         # silently corrupting routes.
         server_args = ServerArgs(
             model_path="dummy",
-            moe_runner_backend="lora",
+            moe_runner_backend="lora_cutedsl",
             enable_lora=True,
             enable_pdmux=True,
         )
 
         with self.assertRaisesRegex(ValueError, "PD-multiplexing"):
-            server_args.check_lora_server_args()
+            check_lora_moe_runner_args(server_args)
 
     def test_pdmux_allowed_with_other_moe_runner_backends(self):
         server_args = ServerArgs(
@@ -1105,25 +1106,25 @@ class TestLoraMoeRunnerBackendArgs(unittest.TestCase):
             enable_pdmux=True,
         )
 
-        server_args.check_lora_server_args()
+        check_lora_moe_runner_args(server_args)
         self.assertEqual(server_args.moe_runner_backend, "auto")
 
     def test_requires_enable_lora(self):
-        server_args = ServerArgs(model_path="dummy", moe_runner_backend="lora")
+        server_args = ServerArgs(model_path="dummy", moe_runner_backend="lora_cutedsl")
 
         with self.assertRaisesRegex(ValueError, "requires --enable-lora"):
-            server_args.check_lora_server_args()
+            check_lora_moe_runner_args(server_args)
 
     def test_rejects_two_batch_overlap(self):
         server_args = ServerArgs(
             model_path="dummy",
-            moe_runner_backend="lora",
+            moe_runner_backend="lora_cutedsl",
             enable_lora=True,
             enable_two_batch_overlap=True,
         )
 
         with self.assertRaisesRegex(ValueError, "two-batch overlap"):
-            server_args.check_lora_server_args()
+            check_lora_moe_runner_args(server_args)
 
 
 class TestLoadBalanceMethod(unittest.TestCase):
@@ -4085,49 +4086,61 @@ class TestLazyReexports(CustomTestCase):
 
 
 class TestLoraMoeRunnerBackendGuards(unittest.TestCase):
-    """Startup guards for --moe-runner-backend lora."""
+    """Startup guards for the lora_* MoE runner backends."""
 
     def test_rejects_speculative_selection(self):
         server_args = ServerArgs(
             model_path="dummy",
             speculative_algorithm="EAGLE",
-            speculative_moe_runner_backend="lora",
+            speculative_moe_runner_backend="lora_cutedsl",
         )
         with self.assertRaisesRegex(ValueError, "speculative-moe-runner-backend"):
-            server_args.check_lora_server_args()
+            check_lora_moe_runner_args(server_args)
 
     def test_speculative_value_ignored_without_speculative_decoding(self):
-        # The field inherits the target runner when unset, so it reads "lora"
-        # on every LoRA server; only an actual draft model makes it meaningful.
+        # The field inherits the target runner when unset, so it reads the
+        # lora_* name on every LoRA server; only an actual draft model makes
+        # it meaningful.
         server_args = ServerArgs(
             model_path="dummy",
-            moe_runner_backend="lora",
+            moe_runner_backend="lora_cutedsl",
             enable_lora=True,
             max_lora_rank=16,
             lora_target_modules=["gate_up_proj", "down_proj"],
-            speculative_moe_runner_backend="lora",
+            speculative_moe_runner_backend="lora_cutedsl",
         )
-        server_args.check_lora_server_args()
+        check_lora_moe_runner_args(server_args)
 
-    def test_rejects_quantized_moe(self):
+    def test_rejects_unsupported_quantization(self):
         server_args = ServerArgs(
             model_path="dummy",
-            moe_runner_backend="lora",
+            moe_runner_backend="lora_cutedsl",
             enable_lora=True,
-            quantization="fp8",
+            quantization="awq",
         )
         with self.assertRaisesRegex(ValueError, "unquantized"):
-            server_args.check_lora_server_args()
+            check_lora_moe_runner_args(server_args)
+
+        for quantization in (None, "fp8", "modelopt_fp4"):
+            server_args = ServerArgs(
+                model_path="dummy",
+                moe_runner_backend="lora_cutedsl",
+                enable_lora=True,
+                max_lora_rank=16,
+                lora_target_modules=["gate_up_proj", "down_proj"],
+                quantization=quantization,
+            )
+            check_lora_moe_runner_args(server_args)
 
     def test_rejects_non_standard_dispatch(self):
         server_args = ServerArgs(
             model_path="dummy",
-            moe_runner_backend="lora",
+            moe_runner_backend="lora_cutedsl",
             enable_lora=True,
             moe_a2a_backend="deepep",
         )
         with self.assertRaisesRegex(ValueError, "Standard dispatch"):
-            server_args.check_lora_server_args()
+            check_lora_moe_runner_args(server_args)
 
 
 if __name__ == "__main__":

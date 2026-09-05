@@ -1022,10 +1022,15 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
         from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
-        # Use the runner selected by the quant method so per-format backend resolution
-        # stays identical between base and LoRA forwards.
+        # Explicit LoRA engines take precedence over the base layer's vendor runner.
         global_backend = get_moe_runner_backend()
-        if base_layer.runner is not None:
+        if (
+            global_backend.is_lora()
+            or global_backend.is_experimental_sgl_trtllm()
+            or global_backend.is_experimental_sgl_marlin()
+        ):
+            runner_backend = global_backend
+        elif base_layer.runner is not None:
             runner_backend = base_layer.runner.runner_backend
         elif not global_backend.is_auto():
             runner_backend = global_backend
@@ -1112,11 +1117,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             physical_rank=self._max_lora_rank,
         )
         import sglang.srt.layers.moe.moe_runner.lora  # noqa: F401
-        from sglang.srt.layers.moe import MoeRunnerBackend
         from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
 
         self._lora_runner = MoeRunner(
-            MoeRunnerBackend.LORA,
+            self._lora_runner_backend,
             base_layer.moe_runner_config,
             lora_enabled=True,
         )
