@@ -568,56 +568,123 @@ fn decode_event_batch_impl(
 }
 
 fn decode_event(event: &Value, actions: &mut EventActions) -> Result<(), BridgeError> {
-    let event = expect_array(event, "KV event")?;
-    let event_type = expect_str(
-        event
-            .first()
-            .ok_or_else(|| BridgeError::Decode("KV event is empty".to_string()))?,
-        "KV event tag",
-    )?;
+    match parse_event(event)? {
+        DecodedEvent::BlockStored {
+            hashes,
+            tier,
+            component_mask,
+            block_size,
+        } => {
+            actions.report(tier, hashes, component_mask, block_size);
+        }
+        DecodedEvent::BlockRemoved { hashes, tier } => {
+            actions.revoke(tier, hashes);
+        }
+        DecodedEvent::AllBlocksCleared => {
+            actions.clear_all();
+        }
+        DecodedEvent::Unsupported(other) => {
+            debug!(event_type = other, "ignoring unsupported SGLang KV event");
+        }
+    }
+    Ok(())
+}
 
+enum DecodedEvent {
+    BlockStored {
+        hashes: Vec<i64>,
+        tier: i32,
+        component_mask: Option<u32>,
+        block_size: Option<u32>,
+    },
+    BlockRemoved {
+        hashes: Vec<i64>,
+        tier: i32,
+    },
+    AllBlocksCleared,
+    Unsupported(String),
+}
+
+fn parse_event(event: &Value) -> Result<DecodedEvent, BridgeError> {
+    let event = event
+        .as_map()
+        .map(Vec::as_slice)
+        .ok_or_else(|| BridgeError::Decode("KV event must be a map".to_string()))?;
+    let mut event_type = None;
+    let mut block_hashes = None;
+    let mut block_size = None;
+    let mut medium = None;
+    let mut component_types = None;
+
+    for (key, value) in event {
+        let name = expect_str(key, "KV event key")?;
+        let slot = match name {
+            "type" => &mut event_type,
+            "block_hashes" => &mut block_hashes,
+            "block_size" => &mut block_size,
+            "medium" => &mut medium,
+            "component_types" => &mut component_types,
+            _ => continue,
+        };
+        if slot.is_some() {
+            return Err(BridgeError::Decode(format!(
+                "KV event.{name} appears more than once"
+            )));
+        }
+        *slot = Some(value);
+    }
+
+    let event_type = expect_str(
+        event_type.ok_or_else(|| BridgeError::Decode("KV event.type is required".to_string()))?,
+        "KV event.type",
+    )?;
     match event_type {
         "BlockStored" => {
-            // At least 7 fields (the legacy schema); an 8th `component_types`
-            // slot appears with `--enable-kv-events-component-types`. Both
-            // shapes are accepted.
-            if event.len() < 7 {
-                return Err(BridgeError::Decode(
-                    "BlockStored must have at least 7 array fields".to_string(),
-                ));
-            }
-            let tier = medium_to_tier(expect_optional_str(&event[6], "BlockStored.medium")?)?;
-            // `component_types` is the trailing slot: a list of component labels
-            // folded into a bitmask, or nil/absent for a legacy whole-block store.
-            let mask = match event.get(7) {
+            let hashes = decode_hashes(block_hashes.ok_or_else(|| {
+                BridgeError::Decode("BlockStored.block_hashes is required".to_string())
+            })?)?;
+            let medium = match medium {
+                Some(value) => expect_optional_str(value, "BlockStored.medium")?,
+                None => None,
+            };
+            let tier = medium_to_tier(medium)?;
+            // Component labels are independent of other optional extensions,
+            // notably salted-store metadata.
+            let component_mask = match component_types {
                 Some(value) => decode_component_mask(value)?,
                 None => None,
             };
             // The token count is only carried alongside component-aware stores,
             // where the query path needs it to accumulate trailing windows.
-            let block_size = match mask {
-                Some(_) => Some(decode_block_size(&event[4])?),
+            let block_size = match component_mask {
+                Some(_) => Some(decode_block_size(block_size.ok_or_else(|| {
+                    BridgeError::Decode("BlockStored.block_size is required".to_string())
+                })?)?),
                 None => None,
             };
-            actions.report(tier, decode_hashes(&event[1])?, mask, block_size);
+            Ok(DecodedEvent::BlockStored {
+                hashes,
+                tier,
+                component_mask,
+                block_size,
+            })
         }
         "BlockRemoved" => {
-            if event.len() < 3 {
-                return Err(BridgeError::Decode(
-                    "BlockRemoved must have 3 array fields".to_string(),
-                ));
-            }
-            let tier = medium_to_tier(expect_optional_str(&event[2], "BlockRemoved.medium")?)?;
-            actions.revoke(tier, decode_hashes(&event[1])?);
+            let hashes = decode_hashes(block_hashes.ok_or_else(|| {
+                BridgeError::Decode("BlockRemoved.block_hashes is required".to_string())
+            })?)?;
+            let medium = match medium {
+                Some(value) => expect_optional_str(value, "BlockRemoved.medium")?,
+                None => None,
+            };
+            Ok(DecodedEvent::BlockRemoved {
+                hashes,
+                tier: medium_to_tier(medium)?,
+            })
         }
-        "AllBlocksCleared" => {
-            actions.clear_all();
-        }
-        other => {
-            debug!(event_type = other, "ignoring unsupported SGLang KV event");
-        }
+        "AllBlocksCleared" => Ok(DecodedEvent::AllBlocksCleared),
+        other => Ok(DecodedEvent::Unsupported(other.to_string())),
     }
-    Ok(())
 }
 
 fn decode_hashes(value: &Value) -> Result<Vec<i64>, BridgeError> {
@@ -643,7 +710,7 @@ fn decode_hashes(value: &Value) -> Result<Vec<i64>, BridgeError> {
         .collect()
 }
 
-/// Decodes the optional `component_types` slot of a `BlockStored` into a component
+/// Decodes the optional `component_types` field of a `BlockStored` into a component
 /// bitmask. `nil` maps to `None`, a legacy whole-block store; an array of labels
 /// folds into a bitmask, and labels this build does not model are ignored.
 fn decode_component_mask(value: &Value) -> Result<Option<u32>, BridgeError> {
@@ -662,7 +729,7 @@ fn decode_component_mask(value: &Value) -> Result<Option<u32>, BridgeError> {
     Ok(Some(mask))
 }
 
-/// Decodes the `block_size` (token count) slot of a `BlockStored`.
+/// Decodes the `block_size` (token count) field of a `BlockStored`.
 fn decode_block_size(value: &Value) -> Result<u32, BridgeError> {
     let raw = value
         .as_u64()
@@ -835,31 +902,44 @@ mod tests {
         Value::Array(values.iter().map(|v| Value::from(*v)).collect())
     }
 
-    fn stored(hashes: &[i64], medium: &str) -> Value {
-        Value::Array(vec![
-            Value::String("BlockStored".into()),
-            ints(hashes),
-            Value::Nil,         // parent_block_hash
-            ints(&[1]),         // token_ids
-            Value::from(1_i64), // block_size
-            Value::Nil,         // lora_id
-            Value::String(medium.into()),
-        ])
+    fn field(name: &str, value: Value) -> (Value, Value) {
+        (Value::String(name.into()), value)
     }
 
-    /// A component-aware `BlockStored` (8-element schema): trailing
-    /// `component_types` slot plus a concrete `block_size` token count.
+    fn event(tag: &str, fields: Vec<(Value, Value)>) -> Value {
+        let mut entries = vec![field("type", Value::String(tag.into()))];
+        entries.extend(fields);
+        Value::Map(entries)
+    }
+
+    fn stored(hashes: &[i64], medium: &str) -> Value {
+        event(
+            "BlockStored",
+            vec![
+                field("block_hashes", ints(hashes)),
+                field("parent_block_hash", Value::Nil),
+                field("token_ids", ints(&[1])),
+                field("block_size", Value::from(1_i64)),
+                field("lora_id", Value::Nil),
+                field("medium", Value::String(medium.into())),
+            ],
+        )
+    }
+
+    /// A component-aware `BlockStored` with a named `component_types` field.
     fn stored_c(hashes: &[i64], medium: &str, block_size: i64, components: Value) -> Value {
-        Value::Array(vec![
-            Value::String("BlockStored".into()),
-            ints(hashes),
-            Value::Nil, // parent_block_hash
-            ints(&[1]), // token_ids
-            Value::from(block_size),
-            Value::Nil, // lora_id
-            Value::String(medium.into()),
-            components, // component_types (Nil or array of strings)
-        ])
+        event(
+            "BlockStored",
+            vec![
+                field("block_hashes", ints(hashes)),
+                field("parent_block_hash", Value::Nil),
+                field("token_ids", ints(&[1])),
+                field("block_size", Value::from(block_size)),
+                field("lora_id", Value::Nil),
+                field("medium", Value::String(medium.into())),
+                field("component_types", components),
+            ],
+        )
     }
 
     fn strv(items: &[&str]) -> Value {
@@ -884,15 +964,17 @@ mod tests {
     }
 
     fn removed(hashes: &[i64], medium: &str) -> Value {
-        Value::Array(vec![
-            Value::String("BlockRemoved".into()),
-            ints(hashes),
-            Value::String(medium.into()),
-        ])
+        event(
+            "BlockRemoved",
+            vec![
+                field("block_hashes", ints(hashes)),
+                field("medium", Value::String(medium.into())),
+            ],
+        )
     }
 
     fn cleared() -> Value {
-        Value::Array(vec![Value::String("AllBlocksCleared".into())])
+        event("AllBlocksCleared", vec![])
     }
 
     /// Wrap events in a 3-element batch [ts, events, attn_dp_rank].
@@ -1190,8 +1272,66 @@ mod tests {
 
     #[test]
     fn unknown_event_tag_is_ignored() {
-        let events = vec![Value::Array(vec![Value::String("BlockUpdated".into())])];
+        let events = vec![event("BlockUpdated", vec![])];
         assert!(actions_of(events).is_empty());
+    }
+
+    #[test]
+    fn map_field_order_is_irrelevant() {
+        let store = Value::Map(vec![
+            field("medium", Value::String("GPU".into())),
+            field("block_hashes", ints(&[7])),
+            field("type", Value::String("BlockStored".into())),
+        ]);
+
+        assert_eq!(actions_of(vec![store]), vec![rep(hbm(), &["7"])]);
+    }
+
+    #[test]
+    fn duplicate_field_skips_only_that_event() {
+        let duplicate = event(
+            "BlockStored",
+            vec![
+                field("block_hashes", ints(&[1])),
+                field("medium", Value::String("GPU".into())),
+                field("medium", Value::String("DISK".into())),
+            ],
+        );
+
+        assert_eq!(
+            actions_of(vec![stored(&[2], "GPU"), duplicate, removed(&[3], "DISK")]),
+            vec![rep(hbm(), &["2"]), rev(ssd(), &["3"])]
+        );
+    }
+
+    #[test]
+    fn metadata_and_component_types_are_independent_extensions() {
+        let mut store = stored_c(&[7], "GPU", 64, strv(&["full", "swa"]));
+        let Value::Map(entries) = &mut store else {
+            panic!("stored helper must return a map");
+        };
+        entries.push(field(
+            "metadata",
+            Value::Map(vec![field("cache_salt", Value::String("tenant-a".into()))]),
+        ));
+
+        assert_eq!(
+            actions_of(vec![store]),
+            vec![Action::Report {
+                tier: hbm(),
+                hashes: vec![7],
+                masks: vec![Some(
+                    crate::service::COMPONENT_FULL | crate::service::COMPONENT_SWA
+                )],
+                block_sizes: vec![Some(64)],
+            }]
+        );
+    }
+
+    #[test]
+    fn legacy_positional_event_is_skipped() {
+        let legacy = Value::Array(vec![Value::String("AllBlocksCleared".into())]);
+        assert!(actions_of(vec![legacy]).is_empty());
     }
 
     #[test]
@@ -1211,10 +1351,13 @@ mod tests {
         // Generated by msgspec.msgpack.Encoder from the authoritative Python
         // KVEventBatch schema in sglang.srt.disaggregation.kv_events.
         let payload = golden_bytes(concat!(
-            "93cb405edd2f1a9fbe779397ab426c6f636b53746f72656492",
-            "cf0000011f71fb04cbd2c521974f2a940a141e280407a3475055",
-            "93ac426c6f636b52656d6f7665649264ccc8a44449534b",
-            "91b0416c6c426c6f636b73436c656172656402"
+            "93cb405edd2f1a9fbe779387a474797065ab426c6f636b53746f726564",
+            "ac626c6f636b5f68617368657392cf0000011f71fb04cbd2c521974f",
+            "b1706172656e745f626c6f636b5f686173682aa9746f6b656e5f696473",
+            "940a141e28aa626c6f636b5f73697a6504a76c6f72615f696407a66d",
+            "656469756da347505583a474797065ac426c6f636b52656d6f766564ac",
+            "626c6f636b5f6861736865739264ccc8a66d656469756da44449534b81",
+            "a474797065b0416c6c426c6f636b73436c656172656402"
         ));
         assert_eq!(
             decode_event_batch(&payload).unwrap().actions,
@@ -1227,12 +1370,31 @@ mod tests {
     }
 
     #[test]
+    fn python_msgspec_salted_store_golden_decodes() {
+        // metadata is a named extension and must not be interpreted as
+        // component_types or hide the store from the indexer.
+        let payload = golden_bytes(concat!(
+            "93cb3ff00000000000009188a474797065ab426c6f636b53746f726564",
+            "ac626c6f636b5f6861736865739107b1706172656e745f626c6f636b5f",
+            "68617368c0a9746f6b656e5f6964739101aa626c6f636b5f73697a6501",
+            "a76c6f72615f6964c0a66d656469756da3475055a86d65746164617461",
+            "81aa63616368655f73616c74a874656e616e742d6100"
+        ));
+        assert_eq!(
+            decode_event_batch(&payload).unwrap().actions,
+            vec![rep(hbm(), &["7"])]
+        );
+    }
+
+    #[test]
     fn python_msgspec_bigram_tokens_golden_decodes() {
         // token_ids contains Python tuples as nested msgpack arrays; the
         // bridge ignores payload shape and indexes the published hashes.
         let payload = golden_bytes(concat!(
-            "93cb3ff80000000000009197ab426c6f636b53746f726564916f",
-            "c092920a1492141e02c0a347505503"
+            "93cb3ff80000000000009187a474797065ab426c6f636b53746f726564",
+            "ac626c6f636b5f686173686573916fb1706172656e745f626c6f636b5f",
+            "68617368c0a9746f6b656e5f69647392920a1492141eaa626c6f636b5f",
+            "73697a6502a76c6f72615f6964c0a66d656469756da347505503"
         ));
         assert_eq!(
             decode_event_batch(&payload).unwrap().actions,
@@ -1245,8 +1407,11 @@ mod tests {
         // The Python schema permits medium=None; such events map to no
         // Indexer tier, so they are isolated rather than given a placement.
         let payload = golden_bytes(concat!(
-            "93cb00000000000000009297ab426c6f636b53746f7265649101",
-            "c092050602c0c093ac426c6f636b52656d6f7665649102c0c0"
+            "93cb00000000000000009286a474797065ab426c6f636b53746f726564",
+            "ac626c6f636b5f6861736865739101b1706172656e745f626c6f636b5f",
+            "68617368c0a9746f6b656e5f696473920506aa626c6f636b5f73697a65",
+            "02a76c6f72615f6964c082a474797065ac426c6f636b52656d6f766564",
+            "ac626c6f636b5f6861736865739102c0"
         ));
         assert!(decode_event_batch(&payload).unwrap().actions.is_empty());
     }
@@ -1363,8 +1528,8 @@ mod tests {
 
     #[test]
     fn component_types_nil_decodes_as_legacy() {
-        // An 8-element BlockStored whose trailing slot is nil is exactly the
-        // legacy whole-block store: no components, no size.
+        // A nil component_types field is a whole-block store: no component
+        // mask and no component-aware block size.
         assert_eq!(
             actions_of(vec![stored_c(&[1], "GPU", 64, Value::Nil)]),
             vec![rep(hbm(), &["1"])]

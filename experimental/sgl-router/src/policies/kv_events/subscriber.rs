@@ -703,7 +703,8 @@ mod tests {
         }
 
         /// Encode a minimal AllBlocksCleared batch with the given ts and
-        /// optional dp_rank, in the same array layout msgspec emits.
+        /// optional dp_rank, in the same outer-array and inner-map layout
+        /// msgspec emits.
         pub fn encode_all_blocks_cleared_batch(ts: f64, attn_dp_rank: Option<u32>) -> Vec<u8> {
             let mut buf = Vec::new();
             // Outer batch array: [ts, [event], dp_rank?]
@@ -711,8 +712,9 @@ mod tests {
             mp::write_f64(&mut buf, ts).unwrap();
             // events array length 1
             mp::write_array_len(&mut buf, 1).unwrap();
-            // event = ["AllBlocksCleared"]
-            mp::write_array_len(&mut buf, 1).unwrap();
+            // event = {"type": "AllBlocksCleared"}
+            mp::write_map_len(&mut buf, 1).unwrap();
+            mp::write_str(&mut buf, "type").unwrap();
             mp::write_str(&mut buf, "AllBlocksCleared").unwrap();
             match attn_dp_rank {
                 Some(v) => {
