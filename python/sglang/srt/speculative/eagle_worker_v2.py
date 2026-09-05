@@ -199,7 +199,25 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         self.tree_mask_mode = default_tree_mask_mode()
 
+        # Hand the draft the target's embedding / lm_head HERE, before the KV cache
+        # is sized. A self-draft (NEXTN/MTP) loads its own copy of embed_tokens and
+        # lm_head; init_lm_head() replaces them with the target's tensors and frees
+        # the copies. Doing that inside alloc_memory_pool() -- i.e. after
+        # Scheduler.init_memory_pools() has already profiled free memory -- charges
+        # the KV pool for weights that are about to be released. On a 32 GB card and
+        # Qwen3.5-27B-NVFP4 that is ~4 GB, i.e. most of the KV pool.
+        self._lm_head_initialized = False
+        self._init_token_map_and_lm_head()
+
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+
+    def _init_token_map_and_lm_head(self):
+        """Idempotent: the draft may only share the target's weights once."""
+        if self._lm_head_initialized:
+            return
+        self.init_token_map()
+        self.init_lm_head()
+        self._lm_head_initialized = True
 
     def alloc_memory_pool(
         self,
@@ -215,8 +233,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
-        self.init_token_map()
-        self.init_lm_head()
+        self._init_token_map_and_lm_head()
 
         if get_spec().speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size
