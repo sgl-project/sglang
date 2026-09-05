@@ -1,10 +1,12 @@
+from array import array
 from types import SimpleNamespace
 
 import torch
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -52,6 +54,7 @@ class _FakeInnerCache:
         self.token_to_kv_pool_allocator = allocator
         self.page_size = page_size
         self.match_results = list(match_results or [])
+        self.match_prefix_calls = []
         self.dec_lock_ref_calls = []
         self.dec_lock_ref_params = []
 
@@ -59,6 +62,7 @@ class _FakeInnerCache:
         raise AssertionError("Streaming requests should not delegate to inner cache")
 
     def match_prefix(self, *args, **kwargs):
+        self.match_prefix_calls.append((args, kwargs))
         if not self.match_results:
             raise AssertionError("Unexpected match_prefix call")
         return self.match_results.pop(0)
@@ -74,17 +78,39 @@ class _FakeInnerCache:
         return None
 
 
+class _FakeSession:
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        self.streaming = True
+        self.finish_calls = []
+        self.abort_calls = 0
+        self._inflight = False
+
+    def finish_req(self, req):
+        self.finish_calls.append(req)
+
+    def abort_req(self):
+        self.abort_calls += 1
+        self._inflight = False
+
+
+class _FakeMultimodalInputs:
+    def __init__(self, *, encoder_append_len: int, num_image_tokens: int):
+        self.incremental_encoder_cache = True
+        self.encoder_append_len = encoder_append_len
+        self.num_image_tokens = num_image_tokens
+        self.release_features_calls = 0
+        self.vision_position_ids = torch.tensor([1])
+
+    def release_features(self):
+        self.release_features_calls += 1
+
+
 class _FakeReq:
     def __init__(
         self, session_id: str, req_pool_idx: int, committed: int, allocated: int
     ):
-        self.session = SimpleNamespace(
-            session_id=session_id,
-            streaming=True,
-            finish_req=lambda req: None,
-            abort_req=lambda: None,
-            _inflight=False,
-        )
+        self.session = _FakeSession(session_id)
         self.kv = ReqKvInfo(
             req_pool_idx=req_pool_idx,
             kv_committed_len=committed,
@@ -103,10 +129,32 @@ class _FakeReq:
         self.to_finish = None
         self.finished_reason = None
         self.finished_len = None
+        self.multimodal_inputs = None
+        self.incremental_encoder_cache_prefix_len = None
+        self.incremental_encoder_cache_remapped = False
+        self.incremental_encoder_cache_prefix_indices = None
 
     def detach_kv(self):
         kv, self.kv = self.kv, ReqKvInfo()
         return kv
+
+
+def _mark_incremental_turn(
+    req: _FakeReq,
+    *,
+    encoder_cached_len: int,
+    encoder_append_len: int,
+    num_image_tokens: int,
+    remapped: bool = False,
+    prefix_indices: torch.Tensor | None = None,
+):
+    req.multimodal_inputs = _FakeMultimodalInputs(
+        encoder_append_len=encoder_append_len,
+        num_image_tokens=num_image_tokens,
+    )
+    req.incremental_encoder_cache_prefix_len = encoder_cached_len
+    req.incremental_encoder_cache_remapped = remapped
+    req.incremental_encoder_cache_prefix_indices = prefix_indices
 
 
 def test_session_slot_round_trip_preserves_mamba_state():
@@ -126,6 +174,413 @@ def test_session_slot_round_trip_preserves_mamba_state():
     assert next_req.kv.mamba_next_track_idx == 1
     assert next_req.kv.mamba_last_track_idx == 0
     assert next_req.kv.mamba_last_track_seqlen == 3
+
+
+def test_first_incremental_match_forces_raw_cache_miss_once():
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    raw_result = MatchResult(
+        device_indices=torch.tensor([], dtype=torch.int64),
+        last_device_node=None,
+        last_host_node=None,
+        best_match_node=None,
+    )
+    inner = _FakeInnerCache(
+        req_to_token_pool,
+        allocator,
+        page_size=1,
+        match_results=[raw_result],
+    )
+    tree_cache = StreamingSession(inner)
+    req = _FakeReq("session-a", req_pool_idx=0, committed=0, allocated=0)
+    _mark_incremental_turn(
+        req,
+        encoder_cached_len=0,
+        encoder_append_len=4,
+        num_image_tokens=4,
+    )
+    key = RadixKey(array("q", range(8)))
+    params = MatchPrefixParams(key=key, req=req)
+
+    result = tree_cache.match_prefix(params)
+
+    assert result is raw_result
+    assert key.limit == 0
+    assert len(inner.match_prefix_calls) == 1
+    assert inner.match_prefix_calls[0][0] == (params,)
+
+
+def test_first_incremental_unfinished_req_keeps_row_out_of_radix():
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
+    )
+    req = _FakeReq("session-a", req_pool_idx=0, committed=7, allocated=7)
+    req.extend_range = SimpleNamespace(end=7)
+    _mark_incremental_turn(
+        req,
+        encoder_cached_len=0,
+        encoder_append_len=3,
+        num_image_tokens=3,
+        remapped=True,
+        prefix_indices=torch.tensor([], dtype=torch.int64),
+    )
+
+    assert tree_cache.try_cache_unfinished_req(req)
+    assert req.prefix_indices.tolist() == list(range(7))
+    assert tree_cache.slots == {}
+
+
+def test_first_regular_unfinished_req_still_uses_radix():
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
+    )
+    req = _FakeReq("session-a", req_pool_idx=0, committed=7, allocated=7)
+
+    assert not tree_cache.try_cache_unfinished_req(req)
+
+
+def test_incremental_match_excludes_current_encoder_delta_from_prefix():
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
+    )
+    slot = SessionSlot(
+        kv=ReqKvInfo(
+            req_pool_idx=0,
+            kv_committed_len=10,
+            kv_allocated_len=12,
+            swa_evicted_seqlen=0,
+            cache_protected_len=0,
+        )
+    )
+    tree_cache.slots["session-a"] = slot
+    req = _FakeReq("session-a", req_pool_idx=0, committed=0, allocated=0)
+    _mark_incremental_turn(
+        req,
+        encoder_cached_len=3,
+        encoder_append_len=3,
+        num_image_tokens=6,
+    )
+
+    result = tree_cache.match_prefix(
+        MatchPrefixParams(key=RadixKey(array("q", range(11))), req=req)
+    )
+
+    assert result.device_indices.tolist() == list(range(8))
+    assert slot.kv.kv_committed_len == 8
+    assert slot.kv.kv_allocated_len == 8
+    assert [freed.tolist() for freed in allocator.freed] == [list(range(8, 12))]
+
+
+def test_incremental_retraction_checkpoints_without_committing_transaction():
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
+    )
+    req = _FakeReq("session-a", req_pool_idx=0, committed=12, allocated=12)
+    req.origin_input_ids = list(range(10))
+    req.output_ids = [20, 21]
+    snapshot = torch.tensor([10, 11, 12, 20, 21, 22, 23], dtype=torch.int64)
+    _mark_incremental_turn(
+        req,
+        encoder_cached_len=3,
+        encoder_append_len=2,
+        num_image_tokens=5,
+        remapped=True,
+        prefix_indices=snapshot,
+    )
+    slot = SessionSlot(kv=req.kv)
+    tree_cache.slots["session-a"] = slot
+    session = req.session
+
+    assert tree_cache.try_cache_finished_req(req, is_insert=False)
+
+    assert session.finish_calls == []
+    assert session.abort_calls == 0
+    assert slot.kv.kv_committed_len == 12
+    assert slot.kv.kv_allocated_len == 12
+    assert req.kv.req_pool_idx is None
+    assert req.incremental_encoder_cache_prefix_len == 3
+    assert req.incremental_encoder_cache_remapped
+    assert req.incremental_encoder_cache_prefix_indices is snapshot
+    assert req.multimodal_inputs.release_features_calls == 0
+
+
+def test_incremental_abort_after_retraction_retry_restores_snapshot():
+    current_row = torch.tensor(
+        [10, 11, 12, 30, 31, 20, 21, 22, 23, 40, 41, 42],
+        dtype=torch.int32,
+    )
+    req_to_token = torch.zeros((1, 128), dtype=torch.int32)
+    req_to_token[0, : len(current_row)] = current_row
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
+    )
+    req = _FakeReq("session-a", req_pool_idx=0, committed=12, allocated=12)
+    req.origin_input_ids = list(range(10))
+    req.output_ids = [50, 51]
+    old_row = torch.tensor([10, 11, 12, 20, 21, 22, 23], dtype=torch.int64)
+    _mark_incremental_turn(
+        req,
+        encoder_cached_len=3,
+        encoder_append_len=2,
+        num_image_tokens=5,
+        remapped=True,
+        prefix_indices=old_row,
+    )
+    slot = SessionSlot(kv=req.kv)
+    tree_cache.slots["session-a"] = slot
+    session = req.session
+
+    assert tree_cache.try_cache_finished_req(req, is_insert=False)
+    retry_match = tree_cache.match_prefix(
+        MatchPrefixParams(key=RadixKey(array("q", range(12))), req=req)
+    )
+    assert retry_match.device_indices.tolist() == current_row.tolist()
+
+    req.finished_reason = FINISH_ABORT("client disconnected")
+    tree_cache.cache_finished_req(req)
+
+    assert req_to_token[0, : len(old_row)].tolist() == old_row.tolist()
+    assert slot.kv.kv_committed_len == len(old_row)
+    assert slot.kv.kv_allocated_len == len(old_row)
+    assert [freed.tolist() for freed in allocator.freed] == [[30, 31], [40, 41, 42]]
+    assert req.kv.req_pool_idx is None
+    assert tree_cache.slots["session-a"] is slot
+    assert session.finish_calls == []
+    assert session.abort_calls == 1
+    assert req.multimodal_inputs.release_features_calls == 1
+    assert req.incremental_encoder_cache_prefix_len is None
+    assert not req.incremental_encoder_cache_remapped
+    assert req.incremental_encoder_cache_prefix_indices is None
+
+
+def test_incremental_oom_abort_during_retraction_restores_snapshot():
+    current_row = torch.tensor(
+        [10, 11, 12, 30, 31, 20, 21, 22, 23, 40, 41, 42],
+        dtype=torch.int32,
+    )
+    req_to_token = torch.zeros((1, 128), dtype=torch.int32)
+    req_to_token[0, : len(current_row)] = current_row
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
+    )
+    req = _FakeReq("session-a", req_pool_idx=0, committed=12, allocated=12)
+    old_row = torch.tensor([10, 11, 12, 20, 21, 22, 23], dtype=torch.int64)
+    _mark_incremental_turn(
+        req,
+        encoder_cached_len=3,
+        encoder_append_len=2,
+        num_image_tokens=5,
+        remapped=True,
+        prefix_indices=old_row,
+    )
+    slot = SessionSlot(kv=req.kv)
+    tree_cache.slots["session-a"] = slot
+    req.session._inflight = True
+    req.to_finish = FINISH_ABORT("KV cache pool is full")
+
+    assert tree_cache.try_cache_finished_req(req, is_insert=False)
+
+    assert req_to_token[0, : len(old_row)].tolist() == old_row.tolist()
+    assert slot.kv.kv_committed_len == len(old_row)
+    assert slot.kv.kv_allocated_len == len(old_row)
+    assert [freed.tolist() for freed in allocator.freed] == [[30, 31], [40, 41, 42]]
+    assert req.kv.req_pool_idx is None
+    assert req.multimodal_inputs.release_features_calls == 1
+    assert req.session.abort_calls == 1
+    assert not req.session._inflight
+    assert req.incremental_encoder_cache_prefix_len is None
+
+
+def test_queued_incremental_abort_preserves_completed_slot():
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
+    )
+    slot = SessionSlot(
+        kv=ReqKvInfo(
+            req_pool_idx=0,
+            kv_committed_len=6,
+            kv_allocated_len=6,
+            swa_evicted_seqlen=0,
+            cache_protected_len=0,
+        )
+    )
+    tree_cache.slots["session-a"] = slot
+    req = _FakeReq("session-a", req_pool_idx=1, committed=0, allocated=0)
+    req.kv = ReqKvInfo()
+    _mark_incremental_turn(
+        req,
+        encoder_cached_len=2,
+        encoder_append_len=3,
+        num_image_tokens=5,
+    )
+    req.session._inflight = True
+
+    assert tree_cache.abort_queued_req(req)
+
+    assert tree_cache.slots["session-a"] is slot
+    assert slot.kv.req_pool_idx == 0
+    assert slot.kv.kv_committed_len == 6
+    assert allocator.freed == []
+    assert req.multimodal_inputs is None
+    assert req.session.abort_calls == 1
+    assert not req.session._inflight
+    assert req.incremental_encoder_cache_prefix_len is None
+
+
+def test_queued_retracted_incremental_abort_restores_snapshot():
+    current_row = torch.tensor(
+        [10, 11, 12, 30, 31, 20, 21, 22, 23, 40, 41, 42],
+        dtype=torch.int32,
+    )
+    req_to_token = torch.zeros((1, 128), dtype=torch.int32)
+    req_to_token[0, : len(current_row)] = current_row
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
+    )
+    slot_kv = ReqKvInfo(
+        req_pool_idx=0,
+        kv_committed_len=12,
+        kv_allocated_len=12,
+        swa_evicted_seqlen=0,
+        cache_protected_len=0,
+    )
+    slot = SessionSlot(kv=slot_kv)
+    tree_cache.slots["session-a"] = slot
+    req = _FakeReq("session-a", req_pool_idx=1, committed=0, allocated=0)
+    req.kv = ReqKvInfo()
+    old_row = torch.tensor([10, 11, 12, 20, 21, 22, 23], dtype=torch.int64)
+    _mark_incremental_turn(
+        req,
+        encoder_cached_len=3,
+        encoder_append_len=2,
+        num_image_tokens=5,
+        remapped=True,
+        prefix_indices=old_row,
+    )
+    req.session._inflight = True
+
+    assert tree_cache.abort_queued_req(req)
+
+    assert req_to_token[0, : len(old_row)].tolist() == old_row.tolist()
+    assert tree_cache.slots["session-a"] is slot
+    assert slot.kv.kv_committed_len == len(old_row)
+    assert slot.kv.kv_allocated_len == len(old_row)
+    assert [freed.tolist() for freed in allocator.freed] == [[30, 31], [40, 41, 42]]
+    assert req.kv.req_pool_idx is None
+    assert req.multimodal_inputs is None
+    assert req.session.abort_calls == 1
+    assert not req.session._inflight
+    assert req.incremental_encoder_cache_prefix_len is None
+
+
+def test_incremental_abort_before_remap_preserves_completed_slot():
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
+    )
+    slot = SessionSlot(
+        kv=ReqKvInfo(
+            req_pool_idx=0,
+            kv_committed_len=6,
+            kv_allocated_len=8,
+            swa_evicted_seqlen=0,
+            cache_protected_len=0,
+        )
+    )
+    tree_cache.slots["session-a"] = slot
+    req = _FakeReq("session-a", req_pool_idx=1, committed=0, allocated=0)
+    req.kv = slot.kv
+    _mark_incremental_turn(
+        req,
+        encoder_cached_len=2,
+        encoder_append_len=3,
+        num_image_tokens=5,
+    )
+    req.finished_reason = FINISH_ABORT("invalid request")
+    session = req.session
+
+    tree_cache.cache_finished_req(req)
+
+    assert slot.kv.req_pool_idx == 0
+    assert slot.kv.kv_committed_len == 6
+    assert slot.kv.kv_allocated_len == 6
+    assert [freed.tolist() for freed in allocator.freed] == [[6, 7]]
+    assert req.kv.req_pool_idx is None
+    assert req.multimodal_inputs.release_features_calls == 1
+    assert req.incremental_encoder_cache_prefix_len is None
+    assert session.abort_calls == 1
+
+
+def test_preaborted_first_incremental_request_without_mm_state_releases_row():
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
+    )
+    req = _FakeReq("session-a", req_pool_idx=0, committed=0, allocated=4)
+    req.incremental_encoder_cache_prefix_len = 0
+    req.finished_reason = FINISH_ABORT("invalid request")
+
+    tree_cache.cache_finished_req(req)
+
+    assert "session-a" not in tree_cache.slots
+    assert [freed.tolist() for freed in allocator.freed] == [[0, 1, 2, 3]]
+    assert req_to_token_pool.free_slots == [0]
+    assert req.session.abort_calls == 1
+
+
+def test_first_incremental_abort_releases_the_entire_row():
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
+    )
+    req = _FakeReq("session-a", req_pool_idx=0, committed=0, allocated=20)
+    _mark_incremental_turn(
+        req,
+        encoder_cached_len=0,
+        encoder_append_len=5,
+        num_image_tokens=5,
+        remapped=True,
+        prefix_indices=torch.tensor([], dtype=torch.int64),
+    )
+    req.finished_reason = FINISH_ABORT("input too long")
+    session = req.session
+
+    tree_cache.cache_finished_req(req)
+
+    assert "session-a" not in tree_cache.slots
+    assert req_to_token_pool.free_slots == [0]
+    assert [freed.tolist() for freed in allocator.freed] == [list(range(20))]
+    assert req.kv.req_pool_idx is None
+    assert req.multimodal_inputs.release_features_calls == 1
+    assert session.abort_calls == 1
 
 
 def test_preabort_detaches_session_and_preserves_slot():

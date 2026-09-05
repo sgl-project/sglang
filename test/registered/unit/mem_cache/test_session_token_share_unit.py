@@ -16,6 +16,7 @@ import unittest
 from array import array
 from types import SimpleNamespace
 
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session
 from sglang.test.test_utils import CustomTestCase
@@ -136,6 +137,21 @@ class TestSessionTokenShare(CustomTestCase):
         self._decode_and_finish(r2, [9])
         r3 = self._create("r3", [6])
         self.assertEqual(list(r3.origin_input_ids), [4, 5, 9, 6])
+
+    def test_rejected_concurrent_turn_does_not_abort_the_active_turn(self):
+        active = self._create("r1", [1, 2, 3])
+
+        with get_parallel().override(tp_rank=0):
+            rejected = self._create("r2", [4, 5])
+
+        self.assertIsNotNone(rejected.to_finish)
+        self.assertIsNone(rejected.session)
+        self.assertTrue(self.session._inflight)
+
+        self.session.abort_req()
+        retry = self._create("r3", [6])
+        self.assertIsNotNone(retry.session)
+        self.assertIsNot(retry, active)
 
     def test_max_new_tokens_overshoot_falls_back(self):
         in1 = list(range(300, 310))

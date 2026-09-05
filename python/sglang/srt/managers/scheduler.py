@@ -2633,6 +2633,103 @@ class Scheduler(
             mm.mrope_positions = mrope_positions
             mm.mrope_position_delta = mrope_position_delta
 
+    def _is_moss_vl_realtime_request(self, req: Req) -> bool:
+        hf_config = self.model_config.hf_config
+        architectures = getattr(hf_config, "architectures", []) or []
+        return (
+            req.session is not None
+            and req.session.streaming
+            and "MossVLForConditionalGeneration" in architectures
+            and getattr(hf_config, "vision_seq_pad_multiple", None) == 1
+        )
+
+    @staticmethod
+    def _is_moss_vl_text_only_placeholder(
+        inputs: Optional[MultimodalInputs],
+    ) -> bool:
+        return (
+            inputs is not None
+            and len(inputs.mm_items) == 1
+            and inputs.mm_items[0].model_specific_data.get(
+                "moss_vl_text_only_placeholder", False
+            )
+            is True
+        )
+
+    def _resolve_moss_vl_text_only_placeholder(
+        self,
+        req: Req,
+        current: Optional[MultimodalInputs],
+    ) -> Optional[MultimodalInputs]:
+        if not self._is_moss_vl_text_only_placeholder(current):
+            return current
+        if not self._is_moss_vl_realtime_request(req):
+            raise ValueError(
+                "Moss-VL vision metadata must map one-to-one to image tokens: "
+                "found 1 frame(s) and 0 token(s)"
+            )
+
+        current.release_features()
+        return MultimodalInputs(mm_items=[])
+
+    def _prepare_moss_vl_realtime_inputs(
+        self,
+        req: Req,
+        current: Optional[MultimodalInputs],
+    ) -> None:
+        allocator_page_size = getattr(
+            self.token_to_kv_pool_allocator, "page_size", self.page_size
+        )
+        if self.page_size != 1 or allocator_page_size != 1:
+            raise ValueError(
+                "Moss-VL realtime streaming requires a token KV cache page size of 1"
+            )
+        if self.chunked_prefill_size is not None:
+            raise ValueError(
+                "Moss-VL realtime streaming requires chunked prefill to be disabled"
+            )
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            raise ValueError(
+                "Moss-VL realtime streaming does not support disaggregated serving"
+            )
+        if not self.spec_algorithm.is_none():
+            raise ValueError(
+                "Moss-VL realtime streaming does not support speculative decoding"
+            )
+
+        merge_realtime_inputs = getattr(
+            self._mm_processor, "merge_realtime_inputs", None
+        )
+        if merge_realtime_inputs is None or self.pad_input_ids_func is None:
+            raise ValueError("Moss-VL realtime streaming processor is unavailable")
+
+        previous = req.multimodal_inputs
+        req.incremental_encoder_cache_prefix_len = (
+            previous.encoder_cached_len
+            if previous is not None and previous.incremental_encoder_cache
+            else 0
+        )
+        if previous is not None and previous.incremental_encoder_cache:
+            has_slot = getattr(self.tree_cache, "has_slot", None)
+            if has_slot is None or not has_slot(req.session.session_id):
+                raise ValueError(
+                    "Moss-VL realtime session cache is unavailable; create a new "
+                    "streaming session"
+                )
+        if current is None:
+            current = MultimodalInputs(mm_items=[])
+        merged = merge_realtime_inputs(
+            req.origin_input_ids_unpadded,
+            previous,
+            current,
+        )
+        req.multimodal_inputs = merged
+        req.incremental_encoder_cache_prefix_len = merged.encoder_cached_len
+        req.origin_input_ids = array(
+            "q",
+            self.pad_input_ids_func(req.origin_input_ids_unpadded, merged),
+        )
+
     def _maybe_namespace_elastic_radix_cache(self, req: Req) -> None:
         if (
             get_exec().moe.elastic_ep_backend is None
@@ -2795,10 +2892,19 @@ class Scheduler(
             # TODO: set trace context
             if self.metrics_reporter.enable_metrics:
                 req.time_stats.set_metrics_collector(self.metrics_collector)
-            if isinstance(req.finished_reason, FINISH_ABORT):
+            if isinstance(req.finished_reason, FINISH_ABORT) or isinstance(
+                req.to_finish, FINISH_ABORT
+            ):
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
+            if self._is_moss_vl_realtime_request(req):
+                previous = req.multimodal_inputs
+                req.incremental_encoder_cache_prefix_len = (
+                    previous.encoder_cached_len
+                    if previous is not None and previous.incremental_encoder_cache
+                    else 0
+                )
 
         else:
             # Session not found, or session is closing
@@ -2900,6 +3006,7 @@ class Scheduler(
             return
 
         # Handle multimodal inputs
+        image_inputs = None
         if recv_req.mm_inputs is not None:
             try:
                 image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
@@ -2913,6 +3020,22 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        is_moss_vl_realtime = self._is_moss_vl_realtime_request(req)
+        try:
+            image_inputs = self._resolve_moss_vl_text_only_placeholder(
+                req, image_inputs
+            )
+            if is_moss_vl_realtime:
+                self._prepare_moss_vl_realtime_inputs(req, image_inputs)
+        except ValueError as error:
+            if image_inputs is not None:
+                image_inputs.release_features()
+            req.set_finish_with_abort(str(error))
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
+        if not is_moss_vl_realtime and image_inputs is not None:
             SessionController.adjust_mm_offsets(recv_req, req, image_inputs)
 
             # The following steps are already fast, execute locally on each rank.
@@ -2928,6 +3051,7 @@ class Scheduler(
             req.extend_image_inputs(image_inputs)
             self._maybe_compute_mrope_positions(req)
 
+        if image_inputs is not None or is_moss_vl_realtime:
             if len(req.origin_input_ids) >= self.max_req_input_len:
                 req.set_finish_with_abort(
                     error_msg=(
@@ -3156,6 +3280,7 @@ class Scheduler(
                 },
             )
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
+            self._abort_queued_request_cache_state(req)
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
             return False
         return True
@@ -3168,6 +3293,11 @@ class Scheduler(
             or self.enable_unified_cache_external_linker
         ):
             self.tree_cache.release_aborted_request(rid)
+
+    def _abort_queued_request_cache_state(self, req: Req) -> None:
+        abort_queued_req = getattr(self.tree_cache, "abort_queued_req", None)
+        if abort_queued_req is not None:
+            abort_queued_req(req)
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
@@ -3212,6 +3342,7 @@ class Scheduler(
             ),
             req_to_abort,
         )
+        self._abort_queued_request_cache_state(req_to_abort)
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
         return req_to_abort.rid == recv_req.rid
 
@@ -3225,6 +3356,7 @@ class Scheduler(
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
                 self._release_aborted_request(req.rid)
+                self._abort_queued_request_cache_state(req)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(
                         req,
@@ -5126,6 +5258,7 @@ class Scheduler(
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
             self._release_aborted_request(req.rid)
+            self._abort_queued_request_cache_state(req)
             self.beam_coordinator.retire_group(req)
             self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.

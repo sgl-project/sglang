@@ -237,6 +237,175 @@ class TestMixWithRunningOutOfPlace(unittest.TestCase):
 
 
 class TestPrepareEncoderInfoExtendOutOfPlace(unittest.TestCase):
+    def test_incremental_encoder_cache_remaps_request_row(self):
+        old_encoder_locs = torch.tensor([100, 101], dtype=torch.int64)
+        old_decoder_locs = torch.tensor([200, 201, 202], dtype=torch.int64)
+        fresh_encoder_locs = torch.tensor([300, 301], dtype=torch.int64)
+        fresh_decoder_locs = torch.tensor([400, 401], dtype=torch.int64)
+        prefix_indices = torch.cat([old_encoder_locs, old_decoder_locs])
+        req_to_token = torch.full((1, 16), -1, dtype=torch.int64)
+        req_to_token[0, :9] = torch.cat(
+            [
+                prefix_indices,
+                fresh_encoder_locs,
+                fresh_decoder_locs,
+            ]
+        )
+        fill_ids = array("q", [90, 91, 92, 93, 10, 11, 12, 13, 14])
+        mm_input = types.SimpleNamespace(
+            num_image_tokens=4,
+            incremental_encoder_cache=True,
+            encoder_cached_len=2,
+            encoder_append_len=2,
+        )
+        req = types.SimpleNamespace(
+            rid="incremental",
+            multimodal_inputs=mm_input,
+            prefix_indices=prefix_indices,
+            extend_range=Range(5, 9),
+            logprob_start_len=0,
+            incremental_encoder_cache_remapped=False,
+            incremental_encoder_cache_prefix_indices=None,
+            kv=types.SimpleNamespace(req_pool_idx=0),
+            get_fill_ids=lambda: fill_ids,
+        )
+        batch = make_schedule_batch(
+            1,
+            reqs=[req],
+            device="cpu",
+            forward_mode=ForwardMode.EXTEND,
+            out_cache_loc=torch.cat([fresh_encoder_locs, fresh_decoder_locs]),
+            prefix_lens=[5],
+            extend_lens=[4],
+            extend_num_tokens=4,
+            extend_logprob_start_lens=[0],
+            multimodal_inputs=[mm_input],
+            tree_cache=types.SimpleNamespace(page_size=1),
+            token_to_kv_pool_allocator=types.SimpleNamespace(page_size=1),
+            req_to_token_pool=types.SimpleNamespace(req_to_token=req_to_token),
+        )
+
+        batch.prepare_encoder_info_extend(
+            input_ids=[array("q", fill_ids[5:])],
+            seq_lens=[9],
+        )
+
+        self.assertTrue(
+            torch.equal(
+                req_to_token[0, :9],
+                torch.cat(
+                    [
+                        old_encoder_locs,
+                        fresh_encoder_locs,
+                        old_decoder_locs,
+                        fresh_decoder_locs,
+                    ]
+                ),
+            )
+        )
+        self.assertTrue(torch.equal(batch.encoder_out_cache_loc, fresh_encoder_locs))
+        self.assertTrue(torch.equal(batch.out_cache_loc, fresh_decoder_locs))
+        self.assertEqual(batch.encoder_lens_cpu, [4])
+        self.assertEqual(batch.encoder_cached, [False])
+        self.assertEqual(batch.prefix_lens, [3])
+        self.assertEqual(batch.extend_lens, [2])
+        self.assertEqual(batch.extend_num_tokens, 2)
+        self.assertTrue(
+            torch.equal(batch.seq_lens_cpu, torch.tensor([5], dtype=torch.int64))
+        )
+        self.assertEqual(batch.prefill_input_ids_cpu.tolist(), [13, 14])
+        self.assertEqual(req.extend_range, Range(7, 9))
+        self.assertTrue(req.incremental_encoder_cache_remapped)
+        self.assertTrue(
+            torch.equal(
+                req.incremental_encoder_cache_prefix_indices,
+                prefix_indices,
+            )
+        )
+
+    def test_incremental_cache_without_new_encoder_tokens_keeps_mixed_request(self):
+        old_encoder_locs = torch.tensor([110, 111], dtype=torch.int64)
+        old_decoder_locs = torch.tensor([210, 211], dtype=torch.int64)
+        incremental_decoder_loc = torch.tensor([410], dtype=torch.int64)
+        text_decoder_locs = torch.tensor([510, 511], dtype=torch.int64)
+        incremental_prefix = torch.cat([old_encoder_locs, old_decoder_locs])
+        req_to_token = torch.full((2, 12), -1, dtype=torch.int64)
+        req_to_token[0, :5] = torch.cat([incremental_prefix, incremental_decoder_loc])
+        req_to_token[1, :3] = torch.tensor([500, 510, 511], dtype=torch.int64)
+        fill_ids = array("q", [90, 91, 20, 21, 22])
+        mm_input = types.SimpleNamespace(
+            num_image_tokens=2,
+            incremental_encoder_cache=True,
+            encoder_cached_len=2,
+            encoder_append_len=0,
+        )
+        incremental_req = types.SimpleNamespace(
+            rid="incremental",
+            multimodal_inputs=mm_input,
+            prefix_indices=incremental_prefix,
+            extend_range=Range(4, 5),
+            logprob_start_len=0,
+            incremental_encoder_cache_remapped=False,
+            incremental_encoder_cache_prefix_indices=None,
+            kv=types.SimpleNamespace(req_pool_idx=0),
+            get_fill_ids=lambda: fill_ids,
+        )
+        text_req = types.SimpleNamespace(
+            rid="text",
+            multimodal_inputs=None,
+            prefix_indices=torch.tensor([500], dtype=torch.int64),
+            extend_range=Range(1, 3),
+            logprob_start_len=0,
+        )
+        batch = make_schedule_batch(
+            2,
+            reqs=[incremental_req, text_req],
+            device="cpu",
+            forward_mode=ForwardMode.EXTEND,
+            out_cache_loc=torch.cat([incremental_decoder_loc, text_decoder_locs]),
+            prefix_lens=[4, 1],
+            extend_lens=[1, 2],
+            extend_num_tokens=3,
+            extend_logprob_start_lens=[0, 0],
+            multimodal_inputs=[mm_input, None],
+            tree_cache=types.SimpleNamespace(page_size=1),
+            token_to_kv_pool_allocator=types.SimpleNamespace(page_size=1),
+            req_to_token_pool=types.SimpleNamespace(req_to_token=req_to_token),
+        )
+
+        batch.prepare_encoder_info_extend(
+            input_ids=[array("q", fill_ids[4:]), array("q", [31, 32])],
+            seq_lens=[5, 3],
+        )
+
+        self.assertTrue(
+            torch.equal(
+                req_to_token[0, :5],
+                torch.cat(
+                    [old_encoder_locs, old_decoder_locs, incremental_decoder_loc]
+                ),
+            )
+        )
+        self.assertTrue(torch.equal(req_to_token[1, :3], torch.tensor([500, 510, 511])))
+        self.assertEqual(batch.encoder_lens_cpu, [2, 0])
+        self.assertEqual(batch.encoder_cached, [True, True])
+        self.assertEqual(batch.prefix_lens, [2, 1])
+        self.assertEqual(batch.extend_lens, [1, 2])
+        self.assertEqual(batch.extend_num_tokens, 3)
+        self.assertTrue(
+            torch.equal(batch.seq_lens_cpu, torch.tensor([3, 3], dtype=torch.int64))
+        )
+        self.assertEqual(batch.prefill_input_ids_cpu.tolist(), [22, 31, 32])
+        self.assertTrue(
+            torch.equal(
+                batch.out_cache_loc,
+                torch.cat([incremental_decoder_loc, text_decoder_locs]),
+            )
+        )
+        self.assertEqual(batch.encoder_out_cache_loc.numel(), 0)
+        self.assertTrue(incremental_req.incremental_encoder_cache_remapped)
+        self.assertEqual(incremental_req.extend_range, Range(4, 5))
+
     def test_prepare_encoder_info_extend_rebinds_lens_without_mutating_old_lists(self):
         """prepare_encoder_info_extend must strip encoder tokens via rebound lists; old list objects stay intact."""
         req_with_image = types.SimpleNamespace(

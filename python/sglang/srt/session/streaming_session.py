@@ -85,6 +85,12 @@ def _is_streaming(req: Optional[Req]) -> bool:
     return req is not None and req.session is not None and req.session.streaming
 
 
+def _uses_incremental_encoder_cache(req: Optional[Req]) -> bool:
+    return _is_streaming(req) and (
+        getattr(req, "incremental_encoder_cache_prefix_len", None) is not None
+    )
+
+
 class StreamingSession(BasePrefixCache):
     """Adds streaming-session KV save/restore on top of any BasePrefixCache.
 
@@ -199,9 +205,26 @@ class StreamingSession(BasePrefixCache):
         otherwise None (caller falls back to its raw match)."""
         slot = self.find_active_slot(params.req)
         if slot is None:
+            if _uses_incremental_encoder_cache(params.req):
+                # The first turn must own its whole row so later turns can
+                # insert encoder KV before decoder KV without moving tree-owned
+                # entries. Mutating the cap lets both wrapper and embedded
+                # cache compositions continue through their normal raw path.
+                params.key.limit = 0
             return None
 
         req = params.req
+
+        if (
+            _uses_incremental_encoder_cache(req)
+            and not req.incremental_encoder_cache_remapped
+        ):
+            old_encoder_len = req.incremental_encoder_cache_prefix_len
+            assert self.page_size == 1
+            assert self.token_to_kv_pool_allocator.page_size == 1
+            assert slot.kv.cache_protected_len == 0
+            assert slot.kv.kv_committed_len >= old_encoder_len
+            assert req.multimodal_inputs.num_image_tokens >= old_encoder_len
 
         # [NPU] When aligned context < page_size, release the slot's KV and
         # fall back to radix cache (full prefill). Once context >= page_size,
@@ -225,7 +248,19 @@ class StreamingSession(BasePrefixCache):
         # token_ids = get_fill_ids()[:input_len-1] (1-token logit reserve
         # already applied). min handles retract retry where committed_len
         # can exceed len(token_ids) by 1.
-        prefix_len = min(req.kv.kv_committed_len, len(params.key))
+        if (
+            _uses_incremental_encoder_cache(req)
+            and not req.incremental_encoder_cache_remapped
+        ):
+            mm_input = req.multimodal_inputs
+            encoder_append_len = mm_input.encoder_append_len
+            prefix_len = min(
+                req.kv.kv_committed_len,
+                max(0, len(params.key) - encoder_append_len),
+            )
+            assert prefix_len >= req.incremental_encoder_cache_prefix_len
+        else:
+            prefix_len = min(req.kv.kv_committed_len, len(params.key))
 
         # Streaming sessions are append-only (session_controller rollback
         # ensures req_nodes always points to the last successful req).
@@ -274,12 +309,41 @@ class StreamingSession(BasePrefixCache):
         slot = self.slots.get(session_id)
         is_first = slot is None
 
-        # Mid-processing abort only. Pre-aborted reqs have session=None
-        # (set in find_active_slot) and never reach here.
-        # Nuke all KV via release_session, delete slot. Token IDs stay
-        # in req_nodes (finish_req was never called -> last successful
-        # req). Next request re-prefills from scratch.
-        if isinstance(req.finished_reason, FINISH_ABORT):
+        is_aborted = isinstance(req.finished_reason, FINISH_ABORT) or (
+            req.finished_reason is None and isinstance(req.to_finish, FINISH_ABORT)
+        )
+
+        # OOM retraction marks to_finish and immediately releases the row, so
+        # handle it before the normal retraction checkpoint path.
+        if is_aborted:
+            if (
+                slot is not None
+                and _uses_incremental_encoder_cache(req)
+                and not req.incremental_encoder_cache_remapped
+            ):
+                if req.multimodal_inputs is not None:
+                    req.multimodal_inputs.release_features()
+                if req.kv is slot.kv:
+                    self._free_tail(req.kv, req.kv.kv_committed_len)
+                    req.kv = ReqKvInfo()
+                else:
+                    assert not req.kv.holds_kv
+                self._clear_incremental_encoder_turn(req)
+                req.session.abort_req()
+                return True
+
+            if slot is not None and self._rollback_incremental_encoder_turn(req, slot):
+                if req.multimodal_inputs is not None:
+                    req.multimodal_inputs.release_features()
+                req.session.abort_req()
+                return True
+
+            if (
+                _uses_incremental_encoder_cache(req)
+                and req.multimodal_inputs is not None
+            ):
+                req.multimodal_inputs.release_features()
+
             kv = req.detach_kv()
             if slot is None:
                 # First-request mid-processing abort: create ephemeral
@@ -300,6 +364,23 @@ class StreamingSession(BasePrefixCache):
             req.session.abort_req()
             return True
 
+        # Retraction checkpoints the in-progress row without committing the
+        # turn to Session.req_nodes. The independent pre-remap snapshot remains
+        # live so a later abort can still restore the last completed turn.
+        if (
+            not is_insert
+            and req.finished_reason is None
+            and _uses_incremental_encoder_cache(req)
+            and req.incremental_encoder_cache_remapped
+        ):
+            finished_len = len(req.output_ids)
+            self._trim_overshoot(req, finished_len)
+            if is_first:
+                slot = SessionSlot()
+                self.slots[session_id] = slot
+            slot.save_from_req(req, is_first=is_first)
+            return True
+
         if is_first:
             slot = SessionSlot()
             self.slots[session_id] = slot
@@ -317,9 +398,43 @@ class StreamingSession(BasePrefixCache):
         # to keep committed <= allocated for prepare_for_decode.
         slot.kv.kv_committed_len = min(target, slot.kv.kv_allocated_len)
 
+        if _uses_incremental_encoder_cache(req):
+            req.multimodal_inputs.release_features()
+            req.multimodal_inputs.vision_position_ids = None
+            self._clear_incremental_encoder_turn(req)
+
         # Update req_nodes to this successfully finished request.
         req.session.finish_req(req)
 
+        return True
+
+    def abort_queued_req(self, req: Req) -> bool:
+        """Release an incremental turn that leaves the scheduler queue."""
+        if not _uses_incremental_encoder_cache(req):
+            return False
+
+        slot = self.slots.get(req.session.session_id)
+        if req.multimodal_inputs is not None:
+            req.multimodal_inputs.release_features()
+
+        if slot is not None and req.incremental_encoder_cache_remapped:
+            if req.kv is not slot.kv:
+                assert not req.kv.holds_kv
+                req.kv = slot.kv
+            assert self._rollback_incremental_encoder_turn(req, slot)
+        elif slot is not None:
+            if req.kv is slot.kv:
+                self._free_tail(req.kv, req.kv.kv_committed_len)
+                req.kv = ReqKvInfo()
+            else:
+                assert not req.kv.holds_kv
+            self._clear_incremental_encoder_turn(req)
+        else:
+            assert not req.kv.holds_kv
+            self._clear_incremental_encoder_turn(req)
+
+        req.multimodal_inputs = None
+        req.session.abort_req()
         return True
 
     def try_cache_unfinished_req(
@@ -327,12 +442,16 @@ class StreamingSession(BasePrefixCache):
     ) -> bool:
         """Handles a streaming-session mid-flight cache op:
           - chunked prefill: snapshot current KV as prefix, skip radix
+          - first incremental encoder turn: keep the whole row request-owned
           - subsequent turn: skip radix (slot already holds KV)
-        Returns False for first-turn non-chunked (caller must run raw radix
-        insert to set up the initial tree lock)."""
+        Returns False for an ordinary first-turn non-chunked request (caller
+        must run raw radix insert to set up the initial tree lock)."""
         if not _is_streaming(req):
             return False
-        if chunked:
+        if chunked or (
+            _uses_incremental_encoder_cache(req)
+            and req.session.session_id not in self.slots
+        ):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.kv.req_pool_idx, : req.extend_range.end
             ]
@@ -506,6 +625,59 @@ class StreamingSession(BasePrefixCache):
         kv.kv_allocated_len = prefix_len
         kv.kv_committed_len = min(kv.kv_committed_len, prefix_len)
         kv.swa_evicted_seqlen = min(kv.swa_evicted_seqlen, prefix_len)
+
+    def _rollback_incremental_encoder_turn(self, req: Req, slot: SessionSlot) -> bool:
+        if not (
+            _uses_incremental_encoder_cache(req)
+            and req.incremental_encoder_cache_remapped
+            and req.incremental_encoder_cache_prefix_indices is not None
+            and slot.kv is req.kv
+        ):
+            return False
+
+        mm_input = req.multimodal_inputs
+        old_encoder_len = req.incremental_encoder_cache_prefix_len
+        encoder_len = mm_input.num_image_tokens
+        old_prefix_indices = req.incremental_encoder_cache_prefix_indices
+        old_total_len = len(old_prefix_indices)
+        old_decoder_len = old_total_len - old_encoder_len
+        allocated_len = req.kv.kv_allocated_len
+
+        assert self.page_size == 1
+        assert req.kv.cache_protected_len == 0
+        assert encoder_len >= old_encoder_len
+        assert old_decoder_len >= 0
+
+        if old_total_len == 0:
+            kv = req.detach_kv()
+            assert kv is slot.kv
+            self.release_session(req.session.session_id)
+            self._clear_incremental_encoder_turn(req)
+            return True
+
+        new_ranges = [
+            (old_encoder_len, encoder_len),
+            (encoder_len + old_decoder_len, allocated_len),
+        ]
+        self.free_kv_row(
+            req.kv,
+            [(start, end) for start, end in new_ranges if start < end],
+        )
+
+        row = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx]
+        row[:old_total_len] = old_prefix_indices.to(row.dtype)
+        req.kv.kv_allocated_len = old_total_len
+        req.kv.kv_committed_len = old_total_len
+        req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, old_total_len)
+        req.kv = ReqKvInfo()
+        self._clear_incremental_encoder_turn(req)
+        return True
+
+    @staticmethod
+    def _clear_incremental_encoder_turn(req: Req) -> None:
+        req.incremental_encoder_cache_prefix_len = None
+        req.incremental_encoder_cache_remapped = False
+        req.incremental_encoder_cache_prefix_indices = None
 
     def _trim_overshoot(self, req: Req, finished_len: int) -> None:
         """Trim slot KV to finished_len boundary. Spec v2 may overshoot

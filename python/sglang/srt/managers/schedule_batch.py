@@ -652,6 +652,9 @@ class MultimodalInputs:
     padded_input_ids: Optional[List[int]] = None
     image_pad_len: Optional[list] = None
     num_image_tokens: Optional[int] = None
+    incremental_encoder_cache: bool = False
+    encoder_cached_len: int = 0
+    encoder_append_len: int = 0
 
     # image
     im_token_id: Optional[int] = None
@@ -1086,6 +1089,11 @@ class Req(ReqDllmMixin):
 
         # For multimodal inputs
         self.multimodal_inputs: Optional[MultimodalInputs] = None
+        # Previous encoder length for a streaming turn that inserts new
+        # encoder KV before the cached decoder KV in the request row.
+        self.incremental_encoder_cache_prefix_len: Optional[int] = None
+        self.incremental_encoder_cache_remapped: bool = False
+        self.incremental_encoder_cache_prefix_indices: Optional[torch.Tensor] = None
         # Pre-computed multimodal prompt token counts; populated on the prefill
         # node and transferred to decode via the metadata buffer in disagg (PD) mode.
         self.mm_image_tokens: int = 0
@@ -1550,11 +1558,28 @@ class Req(ReqDllmMixin):
                 extend_mrope_positions_for_retracted_request,
             )
 
-            self.multimodal_inputs.mrope_positions = (
-                extend_mrope_positions_for_retracted_request(
-                    self.multimodal_inputs.mrope_positions, len(self.output_ids)
+            mm_input = self.multimodal_inputs
+            if getattr(mm_input, "incremental_encoder_cache", False):
+                target_len = len(self.origin_input_ids_unpadded) + len(self.output_ids)
+                missing_len = target_len - mm_input.mrope_positions.shape[1]
+                if missing_len > 0:
+                    mm_input.mrope_positions = (
+                        extend_mrope_positions_for_retracted_request(
+                            mm_input.mrope_positions, missing_len
+                        )
+                    )
+                    if mm_input.visible_frame_counts is not None:
+                        last_count = mm_input.visible_frame_counts[-1]
+                        mm_input.visible_frame_counts = torch.cat(
+                            [
+                                mm_input.visible_frame_counts,
+                                last_count.repeat(missing_len),
+                            ]
+                        )
+            else:
+                mm_input.mrope_positions = extend_mrope_positions_for_retracted_request(
+                    mm_input.mrope_positions, len(self.output_ids)
                 )
-            )
 
     def _compute_max_prefix_len(self, input_len: int) -> int:
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
@@ -1985,7 +2010,10 @@ class Req(ReqDllmMixin):
             logger.error(f"{error_msg}, {self.rid=}")
         # Session requests share historical multimodal inputs with their prior
         # request. The session owns and releases those features when it closes.
-        if self.multimodal_inputs is not None and self.session is None:
+        if self.multimodal_inputs is not None and (
+            self.session is None
+            or getattr(self.multimodal_inputs, "incremental_encoder_cache", False)
+        ):
             self.multimodal_inputs.release_features()
         self.multimodal_inputs = None
         self.grammar = None
@@ -2440,6 +2468,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # No image input
                 encoder_lens_cpu.append(0)
                 encoder_cached.append(True)
+            elif getattr(im, "incremental_encoder_cache", False):
+                encoder_lens_cpu.append(im.num_image_tokens)
+                encoder_cached.append(
+                    req.incremental_encoder_cache_remapped or im.encoder_append_len == 0
+                )
             else:
                 encoder_lens_cpu.append(im.num_image_tokens)
                 encoder_cached.append(
@@ -2457,10 +2490,63 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         pt = 0
         decoder_out_cache_loc = []
         encoder_out_cache_loc = []
+        incremental_remapped = [False] * len(self.reqs)
         extend_lens = self.extend_lens[:]
         prefix_lens = self.prefix_lens[:]
         for i, req in enumerate(self.reqs):
             encoder_len = self.encoder_lens_cpu[i]
+            mm_input = req.multimodal_inputs
+
+            if (
+                mm_input is not None
+                and getattr(mm_input, "incremental_encoder_cache", False)
+                and not req.incremental_encoder_cache_remapped
+            ):
+                encoder_cached_len = mm_input.encoder_cached_len
+                encoder_append_len = mm_input.encoder_append_len
+                prefix_len = len(req.prefix_indices)
+                decoder_prefix_len = prefix_len - encoder_cached_len
+                decoder_seq_len = seq_lens[i] - encoder_len
+                decoder_extend_len = decoder_seq_len - decoder_prefix_len
+                request_extend_len = req.extend_range.length
+
+                assert self.tree_cache.page_size == 1
+                assert self.token_to_kv_pool_allocator.page_size == 1
+                assert encoder_len == encoder_cached_len + encoder_append_len
+                assert decoder_prefix_len >= 0
+                assert decoder_extend_len >= 0
+                assert request_extend_len == encoder_append_len + decoder_extend_len
+
+                req.incremental_encoder_cache_prefix_indices = (
+                    req.prefix_indices.clone()
+                )
+
+                fresh_cache_loc = self.out_cache_loc[pt : pt + request_extend_len]
+                fresh_encoder_loc = fresh_cache_loc[:encoder_append_len]
+                fresh_decoder_loc = fresh_cache_loc[encoder_append_len:]
+
+                if encoder_append_len:
+                    row = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx]
+                    old_decoder_loc = row[encoder_cached_len:prefix_len].clone()
+                    row[encoder_cached_len:encoder_len] = fresh_encoder_loc
+                    row[encoder_len : encoder_len + decoder_prefix_len] = (
+                        old_decoder_loc
+                    )
+
+                encoder_out_cache_loc.append(fresh_encoder_loc)
+                decoder_out_cache_loc.append(fresh_decoder_loc)
+                input_ids[i] = req.get_fill_ids()[
+                    encoder_len + decoder_prefix_len : encoder_len + decoder_seq_len
+                ]
+                seq_lens[i] = decoder_seq_len
+                extend_lens[i] = decoder_extend_len
+                prefix_lens[i] = decoder_prefix_len
+                self.extend_num_tokens -= encoder_append_len
+                req.incremental_encoder_cache_remapped = True
+                incremental_remapped[i] = True
+                pt += request_extend_len
+                continue
+
             seq_lens[i] -= encoder_len
 
             if len(req.prefix_indices) < encoder_len:
@@ -2491,6 +2577,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.device, non_blocking=True
         )
         self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        if any(
+            mm_input is not None
+            and getattr(mm_input, "incremental_encoder_cache", False)
+            for mm_input in self.multimodal_inputs
+        ):
+            self.seq_lens_sum = sum(seq_lens)
 
         if not decoder_out_cache_loc:
             self.out_cache_loc = torch.zeros(0, dtype=torch.int64).to(
@@ -2518,8 +2610,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 encoder_len = self.encoder_lens_cpu[i]
                 old_start_len = extend_logprob_start_lens[i]
                 old_contribution = req.extend_range.length - old_start_len
+                mm_input = req.multimodal_inputs
 
-                if len(req.prefix_indices) < encoder_len:
+                if (
+                    mm_input is not None
+                    and getattr(mm_input, "incremental_encoder_cache", False)
+                    and incremental_remapped[i]
+                ):
+                    tokens_to_strip = max(
+                        0, mm_input.encoder_append_len - old_start_len
+                    )
+                    new_token_ids_parts.append(
+                        self.extend_input_logprob_token_ids[
+                            offset + tokens_to_strip : offset + old_contribution
+                        ]
+                    )
+                    extend_logprob_start_lens[i] = max(
+                        0, old_start_len - mm_input.encoder_append_len
+                    )
+                elif len(req.prefix_indices) < encoder_len:
                     tokens_to_strip = max(0, encoder_len - old_start_len)
                     new_token_ids_parts.append(
                         self.extend_input_logprob_token_ids[
@@ -2546,7 +2655,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             encoder_len = self.encoder_lens_cpu[i]
             if encoder_len == 0:
                 continue
-            if len(req.prefix_indices) < encoder_len:
+            mm_input = req.multimodal_inputs
+            if (
+                mm_input is not None
+                and getattr(mm_input, "incremental_encoder_cache", False)
+                and incremental_remapped[i]
+            ):
+                req.extend_range = req.extend_range._replace(
+                    start=req.extend_range.start + mm_input.encoder_append_len
+                )
+            elif len(req.prefix_indices) < encoder_len:
                 assert len(req.prefix_indices) == 0
                 req.extend_range = req.extend_range._replace(
                     start=req.extend_range.start + encoder_len
