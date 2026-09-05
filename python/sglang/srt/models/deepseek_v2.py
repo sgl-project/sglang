@@ -533,7 +533,8 @@ class MoEGate(nn.Module):
                 True,  # is_vnni
             )
 
-        if get_exec().deterministic.enable_deterministic_inference:
+        deterministic = get_exec().deterministic.enable_deterministic_inference
+        if deterministic and not self.is_deepseek_v4:
             return F.linear(hidden_states, self.weight, None)
 
         if (
@@ -550,7 +551,13 @@ class MoEGate(nn.Module):
                 return linear_bf16_fp32(hidden_states, self.weight)
             return F.linear(hidden_states, self.weight, None)
         else:
-            if hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens:
+            if (
+                # The token-count threshold selects a different GEMM, so under
+                # deterministic inference the router logits -- and with them the
+                # expert choice -- would follow the batch a token arrived in.
+                not deterministic
+                and hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens
+            ):
                 logits = tiny_gemm_bf16(
                     hidden_states,
                     self.weight,

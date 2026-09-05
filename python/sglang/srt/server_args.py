@@ -232,6 +232,7 @@ add_chunked_prefix_cache_attention_backend = (
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
     "ascend",
+    "dsv4",
     "fa3",
     "fa4",
     "flashinfer",
@@ -242,7 +243,13 @@ add_deterministic_attention_backend_choices = (
     DETERMINISTIC_ATTENTION_BACKEND_CHOICES.extend
 )
 
-RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["ascend", "fa3", "fa4", "triton"]
+RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = [
+    "ascend",
+    "dsv4",
+    "fa3",
+    "fa4",
+    "triton",
+]
 add_radix_supported_deterministic_attention_backend_choices = (
     RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND.extend
 )
@@ -1803,11 +1810,17 @@ class ServerArgs:
         str,
         Arg(
             help=(
-                "DeepSeek-V4 sparse prefill backend. 'auto' and "
+                "DeepSeek-V4 prefill attention backend. 'auto' and "
                 "'flashmla_sparse' use the existing BF16 sparse prefill path; "
-                "'flashmla_sparse_q8' enables the Q8KV8 sparse prefill path."
+                "'flashmla_sparse_q8' enables the Q8KV8 sparse prefill path; "
+                "'flashmla_kv' uses the paged KV-cache kernel for prefill."
             ),
-            choices=["auto", "flashmla_sparse", "flashmla_sparse_q8"],
+            choices=[
+                "auto",
+                "flashmla_sparse",
+                "flashmla_sparse_q8",
+                "flashmla_kv",
+            ],
         ),
         NS("exec.kernel"),
     ] = "auto"
@@ -1841,8 +1854,9 @@ class ServerArgs:
     dsa_topk_backend: A[
         str,
         Arg(
-            help="DSA indexer top-k backend for the target model. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
+            help="DSA indexer top-k backend for the target model. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false. Deterministic inference resolves 'sgl-kernel' to 'flashinfer'.",
             choices=["sgl-kernel", "torch", "flashinfer"],
+            resolvable=True,
         ),
         NS("exec.kernel"),
     ] = "sgl-kernel"
@@ -2216,8 +2230,9 @@ class ServerArgs:
     speculative_dsa_topk_backend: A[
         str,
         Arg(
-            help="DSA indexer top-k backend for speculative draft workers. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
+            help="DSA indexer top-k backend for speculative draft workers. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false. Deterministic inference resolves 'sgl-kernel' to 'flashinfer'.",
             choices=["sgl-kernel", "torch", "flashinfer"],
+            resolvable=True,
         ),
         NS("spec"),
     ] = "sgl-kernel"

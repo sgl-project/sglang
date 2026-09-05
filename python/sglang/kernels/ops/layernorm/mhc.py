@@ -10,6 +10,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -736,13 +737,23 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
 
 
 def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
-    block_m, block_k = 64, 64
-    grid_size = (num_tokens + block_m - 1) // block_m
-    num_block_k = (hc_hidden_size + block_k - 1) // block_k
+    """Split-K count for the mHC pre-norm GEMM.
 
+    ``n_splits`` is how many partial sums the K reduction is later folded from,
+    so it fixes the summation order. Deterministic inference therefore drops the
+    token-count term and keeps the widest split the K extent allows -- the value
+    a single-tile batch would pick anyway.
+    """
+    block_m, block_k = 64, 64
+    num_block_k = (hc_hidden_size + block_k - 1) // block_k
+    max_splits = max(1, num_block_k // 4)
+    if is_batch_invariant_mode_enabled():
+        return max_splits
+
+    grid_size = (num_tokens + block_m - 1) // block_m
     n_sms = torch.cuda.get_device_properties(0).multi_processor_count
 
-    return max(1, min(n_sms // max(grid_size, 1), num_block_k // 4))
+    return max(1, min(n_sms // max(grid_size, 1), max_splits))
 
 
 def get_mhc_pre_token_count_representatives(
@@ -1053,7 +1064,9 @@ def mhc_pre(
         gemm_last_dim = hc_mult3
         big_fuse_n_splits = n_splits
     else:
-        if num_tokens <= 2048:
+        # The token-count threshold selects a different kernel and split-K, so
+        # deterministic inference pins the token-independent split-K stage.
+        if num_tokens <= 2048 or is_batch_invariant_mode_enabled():
             assert n_splits == 1
             if hc_hidden_size == 16384:
                 hidden_block = 256
@@ -1590,8 +1603,12 @@ def mhc_fused_post_pre(
 
     # The scalar-FMA kernel wins only for small batches where launch
     # overhead dominates; beyond the threshold DeepGEMM's tensor-core path wins.
-    fma_token_threshold = 32
-    if num_tokens <= fma_token_threshold:
+    # Deterministic inference stays on the DeepGEMM path: the FMA kernel's
+    # split-K follows the token count, which would tie a token's output to the
+    # batch it arrived in.
+    fma_token_threshold = 0 if is_batch_invariant_mode_enabled() else 32
+    use_fma = num_tokens <= fma_token_threshold
+    if use_fma:
         tile_n = 2 if num_tokens < 8 else 3
         n_splits = 8 if (num_tokens < 8 and hidden_size <= 4096) else 4
     else:
@@ -1612,7 +1629,7 @@ def mhc_fused_post_pre(
     )
     residual_cur = torch.empty_like(residual_flat)
 
-    if num_tokens <= fma_token_threshold:
+    if use_fma:
         # Small-batch path: one TileLang launch computes hc_post, the bf16
         # residual write, GEMM partials, and the RMS square-sum partials.
         mhc_fused_post_pre_fma_tilelang(

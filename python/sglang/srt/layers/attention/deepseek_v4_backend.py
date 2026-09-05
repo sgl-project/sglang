@@ -39,6 +39,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     BuildDsparkSwaPageIndices,
     ComputeDsparkWindowGather,
 )
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
@@ -1380,11 +1381,7 @@ class DeepseekV4AttnBackend(
             return
 
         assert isinstance(metadata, DSV4Metadata)
-        use_sparse_prefill = not get_platform().is_sm120 and (
-            num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
-            or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
-        )
-        if use_sparse_prefill:
+        if self._use_sparse_prefill(num_qo_tokens):
             metadata.sparse_prefill_cache = self._build_sparse_prefill_chunk_cache(
                 forward_batch, num_qo_tokens=num_qo_tokens
             )
@@ -1665,6 +1662,98 @@ class DeepseekV4AttnBackend(
             cache_k=swa_k,
         )
 
+    def _use_sparse_prefill(self, num_qo_tokens: int) -> bool:
+        """Whether an extend runs through ``flash_mla_sparse_fwd``.
+
+        sparse_prefill_fwd does not support SM120. Deterministic inference
+        pins the choice: the token-count threshold otherwise makes a prompt's
+        output follow the batch it was prefilled in. ``flashmla_kv`` is an
+        explicit correctness/debug mode that keeps prefill and decode on the
+        same paged KV-cache attention kernel.
+        """
+        if self.dsv4_prefill_backend == "flashmla_kv":
+            return False
+        if get_platform().is_sm120:
+            return False
+        if is_batch_invariant_mode_enabled():
+            return True
+        return (
+            num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
+            or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+        )
+
+    def _forward_flashmla_kvcache(
+        self,
+        *,
+        q: torch.Tensor,
+        swa_k_cache: torch.Tensor,
+        swa_page_indices: torch.Tensor,
+        swa_topk_lengths: torch.Tensor,
+        attn_sink: torch.Tensor,
+        extra_k_cache: Optional[torch.Tensor],
+        extra_indices: Optional[torch.Tensor],
+        extra_topk_lengths: Optional[torch.Tensor],
+        flashmla_metadata: FlashMLASchedMeta,
+    ) -> torch.Tensor:
+        """Sparse MLA attention over the paged SWA window plus the
+        compressed cache, via ``flash_mla_with_kvcache``."""
+        if _is_xpu:
+            from sgl_kernel import flash_mla_with_kvcache
+        else:
+            from sgl_kernel.flash_mla import flash_mla_with_kvcache
+
+        def run(q, indices, topk_lengths, ex_indices, ex_topk_lengths, sched_meta):
+            return flash_mla_with_kvcache(
+                q=q,
+                k_cache=swa_k_cache,
+                head_dim_v=self.head_dim_v,
+                block_table=None,
+                cache_seqlens=None,
+                tile_scheduler_metadata=sched_meta,
+                softmax_scale=self.softmax_scale,
+                is_fp8_kvcache=True,
+                indices=indices,
+                topk_length=topk_lengths,
+                attn_sink=attn_sink,
+                extra_k_cache=extra_k_cache,
+                extra_indices_in_kvcache=ex_indices,
+                extra_topk_length=ex_topk_lengths,
+            )[0]
+
+        if not is_batch_invariant_mode_enabled():
+            return run(
+                q,
+                swa_page_indices,
+                swa_topk_lengths,
+                extra_indices,
+                extra_topk_lengths,
+                flashmla_metadata,
+            )
+
+        # FlashMLA's tile scheduler cuts each request's KV range at boundaries
+        # derived from the whole batch's block count, so which partial sums a
+        # request's output is combined from -- and with it the last bits of
+        # that output -- follow whatever it was co-batched with. One launch per
+        # request makes the schedule a function of that request alone, at the
+        # cost of one kernel launch per request per layer.
+        def row(x: Optional[torch.Tensor], i: int) -> Optional[torch.Tensor]:
+            return None if x is None else x[i : i + 1]
+
+        return torch.cat(
+            [
+                run(
+                    q[i : i + 1],
+                    swa_page_indices[i : i + 1],
+                    swa_topk_lengths[i : i + 1],
+                    row(extra_indices, i),
+                    row(extra_topk_lengths, i),
+                    _create_flashmla_metadata(),
+                )
+                for i in range(q.shape[0])
+            ],
+            dim=0,
+        )
+
     def forward(
         self,
         q: torch.Tensor,
@@ -1758,14 +1847,9 @@ class DeepseekV4AttnBackend(
                     f"{extra_indices.shape=}'s last dimension is not aligned to 64"
                 )
 
-            # sparse_prefill_fwd does not support SM120.
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
-                and not get_platform().is_sm120
-                and (
-                    q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
-                    or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
-                )
+                and self._use_sparse_prefill(q.shape[0])
             ):
                 if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
                     return self._forward_prefill_sparse_q8kv8(
@@ -1817,27 +1901,17 @@ class DeepseekV4AttnBackend(
                     extra_topk_length=extra_topk_lengths,
                 )[0]
             else:
-                if _is_xpu:
-                    from sgl_kernel import flash_mla_with_kvcache
-                else:
-                    from sgl_kernel.flash_mla import flash_mla_with_kvcache
-
-                o = flash_mla_with_kvcache(
+                o = self._forward_flashmla_kvcache(
                     q=q,
-                    k_cache=swa_k_cache,
-                    head_dim_v=self.head_dim_v,
-                    block_table=None,
-                    cache_seqlens=None,
-                    tile_scheduler_metadata=flashmla_metadata,
-                    softmax_scale=self.softmax_scale,
-                    is_fp8_kvcache=True,
-                    indices=swa_page_indices,
-                    topk_length=swa_topk_lengths,
+                    swa_k_cache=swa_k_cache,
+                    swa_page_indices=swa_page_indices,
+                    swa_topk_lengths=swa_topk_lengths,
                     attn_sink=attn_sink,
                     extra_k_cache=extra_k_cache,
-                    extra_indices_in_kvcache=extra_indices,
-                    extra_topk_length=extra_topk_lengths,
-                )[0]
+                    extra_indices=extra_indices,
+                    extra_topk_lengths=extra_topk_lengths,
+                    flashmla_metadata=flashmla_metadata,
+                )
 
             o = o.squeeze(1)
             return o

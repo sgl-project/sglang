@@ -15,6 +15,7 @@ from sglang.srt.arg_groups.overrides import (
     _cutedsl_prefill_backend_fill,
     _deterministic_allreduce_fusion_disable,
     _deterministic_attention_backend,
+    _deterministic_dsa_topk_backend,
     _deterministic_sampling_backend,
     _fa4_page_constraint,
     _intel_xpu_page_constraint,
@@ -551,6 +552,7 @@ def handle_deterministic_inference(server_args: Any):
         # (arg_groups/overrides.py), invoked at their legacy slots.
 
         run_post_process_pass(server_args, _deterministic_sampling_backend)
+        run_post_process_pass(server_args, _deterministic_dsa_topk_backend)
         is_deepseek_model = False
         if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
             try:
@@ -584,6 +586,14 @@ def handle_deterministic_inference(server_args: Any):
                     "absorbed MLA, whose qv argument flash_attn.cute only "
                     "implements on those archs."
                 )
+
+        if attention_backend == "dsv4" and get_platform().is_sm120:
+            raise ValueError(
+                "Deterministic inference on the dsv4 attention backend requires "
+                "SM90 or SM100: the SM120 kernel is an autotuned Triton kernel "
+                "whose tile size, and with it the softmax rescaling order, is "
+                "picked from measured timings."
+            )
 
         if attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND:
             # Currently, only certain backends support radix cache. Support for other backends is in progress

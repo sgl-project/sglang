@@ -177,8 +177,15 @@ class TestPrepareServerArgs(CustomTestCase):
         )
         self.assertEqual(q8_args.dsv4_prefill_backend, "flashmla_sparse_q8")
 
+        kv_args = parser.parse_args(
+            base_args + ["--dsv4-prefill-backend", "flashmla_kv"]
+        )
+        self.assertEqual(kv_args.dsv4_prefill_backend, "flashmla_kv")
+
         with self.assertRaises(SystemExit):
-            parser.parse_args(base_args + ["--dsv4-prefill-backend", "flashmla_kv"])
+            parser.parse_args(
+                base_args + ["--dsv4-prefill-backend", "not_a_prefill_backend"]
+            )
 
     def test_return_hidden_states_mode_configuration(self):
         def _resolved(**kwargs):
@@ -2324,6 +2331,26 @@ class TestDeepEPv2Args(CustomTestCase):
             enable_deterministic_inference=True,
         )
         handle_a2a_moe(args)
+
+    def test_deterministic_inference_resolves_dsa_topk_backend(self):
+        """The default sgl-kernel DSA top-k picks tied candidates by thread
+        order, so a DSA model past index_topk tokens is not repeatable on it."""
+        args = self._args(enable_deterministic_inference=True)
+        handle_deterministic_inference(args)
+        self.assertEqual(resolution_result(args, "dsa_topk_backend"), "flashinfer")
+        self.assertEqual(
+            resolution_result(args, "speculative_dsa_topk_backend"), "flashinfer"
+        )
+
+        explicit = self._args(
+            enable_deterministic_inference=True, dsa_topk_backend="torch"
+        )
+        handle_deterministic_inference(explicit)
+        self.assertEqual(resolution_result(explicit, "dsa_topk_backend"), "torch")
+
+        default = self._args()
+        handle_deterministic_inference(default)
+        self.assertEqual(resolution_result(default, "dsa_topk_backend"), "sgl-kernel")
 
     def test_runner_restored_by_declaration_fails_fast(self):
         # Validate the declaration-resolved runner rather than the raw field.

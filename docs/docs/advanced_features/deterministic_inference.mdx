@@ -25,6 +25,8 @@ Building on [Thinking Machines Lab's batch-invariant operators](https://github.c
 
 Deterministic inference is only supported with the following three attention backends: **FlashInfer**, **FlashAttention 3 (FA3)**, and **Triton**.
 
+DeepSeek-V4 is the exception: it can only run on its own **dsv4** backend, which its config-time overrides select for you, so `--enable-deterministic-inference` is supported there without picking an attention backend. Deterministic inference on the dsv4 backend requires SM90 or SM100; SM120 is rejected at startup. The DSA indexer top-k is resolved from the default `sgl-kernel` backend to `flashinfer`, whose ordered selection is the only one that stays bit-stable once a sequence holds more than `index_topk` candidates.
+
 The following table shows feature compatibility for deterministic inference across different attention backends:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -61,6 +63,13 @@ The following table shows feature compatibility for deterministic inference acro
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Triton**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅ Yes</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅ Yes</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅ Yes</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅ Yes</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**dsv4** (DeepSeek-V4 only)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅ Yes</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅ Yes</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅ Yes</td>
