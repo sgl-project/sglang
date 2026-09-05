@@ -50,7 +50,11 @@ if TYPE_CHECKING:
     from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
         FP4DecodeWorkspace,
         FP4KWriteMetadata,
+        FP4PrefillChunkPlan,
         FP4PrefillWorkspace,
+    )
+    from sglang.srt.layers.attention.dsv4.fp4_logits_workspace import (
+        FP4LogitsWorkspace,
     )
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -365,6 +369,12 @@ class DSV4Metadata:
     fp4_prefill_workspace: Optional[FP4PrefillWorkspace] = field(
         default=None, repr=False
     )
+    # Capacity-driven row chunks own matching schedule addresses. The list is
+    # prepared once per forward and reused by every C4 layer.
+    fp4_prefill_chunk_plans: Optional[List[FP4PrefillChunkPlan]] = field(
+        default=None, repr=False
+    )
+    fp4_prefill_chunk_rows: int = field(default=0, repr=False)
     # Derived by the first C4 layer of a forward and reused by the rest.
     fp4_k_write_metadata: Optional[FP4KWriteMetadata] = field(default=None, repr=False)
     # AITER's rope kernels require int64 positions while the core metadata keeps
@@ -485,6 +495,67 @@ class DeepseekV4HipRadixBackend(
         self.is_dspark_draft = (
             self.is_draft_worker and model_runner.spec_algorithm.is_dspark()
         )
+        self.fp4_logits_workspace: Optional[FP4LogitsWorkspace] = None
+        pool_config = getattr(model_runner, "memory_pool_config", None)
+        workspace_bytes = (
+            getattr(pool_config, "dsv4_fp4_logits_workspace_bytes", 0)
+            if pool_config is not None
+            else 0
+        )
+        workspace_max_seq_len = (
+            getattr(
+                pool_config,
+                "dsv4_fp4_logits_workspace_max_seq_len",
+                0,
+            )
+            if pool_config is not None
+            else 0
+        )
+        if (
+            self.enable_deepseek_v4_fp4_indexer
+            and not self.is_draft_worker
+            and speculative_num_steps == 0
+            and workspace_bytes > 0
+            and workspace_max_seq_len > 0
+        ):
+            from sglang.srt.layers.attention.dsv4.fp4_logits_workspace import (
+                FP4LogitsWorkspace,
+                FP4LogitsWorkspacePlan,
+                limit_plan_to_available_memory,
+            )
+
+            def create_fp4_logits_workspace() -> FP4LogitsWorkspace:
+                from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+
+                row_bytes = workspace_max_seq_len * 4
+                plan = FP4LogitsWorkspacePlan(
+                    capacity_bytes=workspace_bytes,
+                    desired_bytes=workspace_bytes,
+                    max_seq_len=workspace_max_seq_len,
+                    max_query_rows=max(workspace_bytes // row_bytes, 1),
+                    rows_at_max_width=max(workspace_bytes // row_bytes, 1),
+                    limiting_reason="pool_config",
+                )
+                free_bytes, _ = torch.cuda.mem_get_info(self.device)
+                # The configured bytes were already deducted from the static
+                # token-pool budget, so do not apply a second safety haircut.
+                plan = limit_plan_to_available_memory(
+                    plan, free_bytes, safety_fraction=1.0
+                )
+                logger.info(
+                    "DSV4 FP4 logits workspace: %.2f MiB, %d rows at max "
+                    "C4 width %d (limit=%s)",
+                    plan.capacity_bytes / (1 << 20),
+                    plan.rows_at_max_width,
+                    plan.max_seq_len,
+                    plan.limiting_reason,
+                )
+                with model_runner.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                    return FP4LogitsWorkspace(plan=plan, device=self.device)
+
+            self.fp4_logits_workspace = model_runner.get_or_create_runtime_workspace(
+                "dsv4_fp4_logits", create_fp4_logits_workspace
+            )
         self.target_verify_num_draft_tokens = self.speculative_num_draft_tokens
         if self.is_dspark_draft:
             assert self.speculative_num_draft_tokens is not None
@@ -931,7 +1002,7 @@ class DeepseekV4HipRadixBackend(
         AITER's prefill scheduler frees the scratch that its schedule kernel
         reads, so recording the build into a graph would leave every replay
         reading recycled graph-pool memory. Only the pinned buffers it fills
-        (cta_info / logits / guarded page table) may be read from the graph.
+        (cta_info / guarded page table) may be read from the graph.
         """
         metadata = self.forward_metadata
         if not self._fp4_workspaces_enabled(metadata):
@@ -950,14 +1021,77 @@ class DeepseekV4HipRadixBackend(
             return
 
         from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+            fp4_logits_max_seq_len,
             prepare_fp4_prefill_workspace,
+        )
+        from sglang.srt.layers.attention.dsv4.fp4_logits_workspace import (
+            MAX_FUSED_ROWS,
         )
 
         indexer_metadata = metadata.indexer_metadata
-        metadata.fp4_prefill_workspace = prepare_fp4_prefill_workspace(
-            indexer_metadata.page_table,
-            indexer_metadata.c4_seq_lens,
-            workspace=metadata.fp4_prefill_workspace,
+        page_table = indexer_metadata.page_table
+        c4_seq_lens = indexer_metadata.c4_seq_lens
+        total_rows = c4_seq_lens.shape[0]
+        if total_rows == 0:
+            metadata.fp4_prefill_workspace = None
+            metadata.fp4_prefill_chunk_plans = []
+            metadata.fp4_prefill_chunk_rows = 0
+            return
+
+        chunk_rows = total_rows
+        if self.fp4_logits_workspace is not None:
+            chunk_rows = min(
+                total_rows,
+                self.fp4_logits_workspace.rows_per_chunk(
+                    fp4_logits_max_seq_len(page_table),
+                    max_rows=MAX_FUSED_ROWS,
+                ),
+            )
+
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+            FP4PrefillChunkPlan,
+        )
+
+        previous = metadata.fp4_prefill_chunk_plans or []
+        chunk_plans = []
+        build_topk = self.dsa_topk_backend.should_use_topk_v2()
+        if build_topk:
+            from sglang.kernels.ops.attention.dsv4 import plan_topk_v2
+
+        for chunk_id, start in enumerate(range(0, total_rows, chunk_rows)):
+            end = min(start + chunk_rows, total_rows)
+            old_workspace = (
+                previous[chunk_id].workspace if chunk_id < len(previous) else None
+            )
+            old_topk_metadata = (
+                previous[chunk_id].topk_metadata if chunk_id < len(previous) else None
+            )
+            if old_topk_metadata is not None and old_topk_metadata.shape != (
+                end - start + 1,
+                2,
+            ):
+                old_topk_metadata = None
+            chunk_plans.append(
+                FP4PrefillChunkPlan(
+                    start=start,
+                    stop=end,
+                    workspace=prepare_fp4_prefill_workspace(
+                        page_table[start:end],
+                        c4_seq_lens[start:end],
+                        workspace=old_workspace,
+                    ),
+                    topk_metadata=(
+                        plan_topk_v2(c4_seq_lens[start:end], out=old_topk_metadata)
+                        if build_topk
+                        else None
+                    ),
+                )
+            )
+
+        metadata.fp4_prefill_chunk_plans = chunk_plans
+        metadata.fp4_prefill_chunk_rows = chunk_rows
+        metadata.fp4_prefill_workspace = (
+            chunk_plans[0].workspace if len(chunk_plans) == 1 else None
         )
 
     def init_forward_metadata_out_graph(

@@ -64,6 +64,9 @@ COMMON_ENV_VARS = {
 # FP4 variant
 FP4_ENV_VARS = {
     "SGLANG_DSV4_FP4_EXPERTS": "true",
+    # Keep the test's persistent indexer scratch small enough to exercise
+    # capacity-driven row chunking under TBO.
+    "SGLANG_DSV4_FP4_LOGITS_BUDGET_MB": "64",
 }
 
 
@@ -91,6 +94,7 @@ class TestDeepseekV4ProFp4Tbo(CustomTestCase):
             "--disable-radix-cache",
             "--attention-backend",
             "dsv4",
+            "--enable-deepseek-v4-fp4-indexer",
             "--kv-cache-dtype",
             "fp8_e4m3",
             "--max-running-requests",

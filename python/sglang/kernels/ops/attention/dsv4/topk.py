@@ -75,7 +75,11 @@ def topk_transform_paged(
 _PLAN_METADATA_INTS_PER_BATCH = 2
 
 
-def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = 0) -> torch.Tensor:
+def plan_topk_v2(
+    seq_lens: torch.Tensor,
+    static_threshold: int = 0,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """Preprocess the per-batch routing plan for :func:`topk_transform_paged_v2`.
 
     IMPORTANT: every entry of ``seq_lens`` must be NON-NEGATIVE. The device
@@ -87,7 +91,24 @@ def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = 0) -> torch.Ten
     """
     module = _jit_topk_v2_module()
     bs = seq_lens.shape[0]
-    metadata = seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
+    expected_shape = (bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
+    if out is None:
+        metadata = seq_lens.new_empty(*expected_shape)
+    else:
+        if (
+            out.shape != expected_shape
+            or out.dtype != seq_lens.dtype
+            or out.device != seq_lens.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                "top-k v2 plan output must match the sequence lengths: "
+                f"expected shape={expected_shape}, dtype={seq_lens.dtype}, "
+                f"device={seq_lens.device}; got shape={tuple(out.shape)}, "
+                f"dtype={out.dtype}, device={out.device}, "
+                f"contiguous={out.is_contiguous()}"
+            )
+        metadata = out
     module.topk_plan(seq_lens, metadata, static_threshold)
     return metadata
 

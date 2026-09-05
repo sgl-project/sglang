@@ -46,6 +46,7 @@ COMMON_ENV_VARS = {
 # FP4 variant (matches test_deepseek_v4_pro_fp4.py; V4-Pro also auto-detects it).
 FP4_ENV_VARS = {
     "SGLANG_DSV4_FP4_EXPERTS": "true",
+    "SGLANG_DSV4_FP4_LOGITS_BUDGET_MB": "64",
 }
 
 
@@ -73,6 +74,7 @@ class TestDeepseekV4ProFp4CPInterleave(CustomTestCase):
             "--disable-radix-cache",
             "--attention-backend",
             "dsv4",
+            "--enable-deepseek-v4-fp4-indexer",
             "--max-running-requests",
             "256",
             "--page-size",
