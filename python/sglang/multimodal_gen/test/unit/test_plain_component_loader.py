@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -20,11 +19,16 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
     PipelineComponentLoader,
     PlainStateDictComponentLoader,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    COMPONENT_OFFLOAD,
+    RESIDENT,
+)
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 class _ProjectionPipeline(ComposedPipelineBase):
@@ -69,23 +73,9 @@ def checkpoint(tmp_path):
 
 @pytest.fixture
 def server_args():
-    return SimpleNamespace(
-        component_paths={},
-        component_weights_paths={},
-        component_precisions={},
-        component_quantizations={},
-        component_direct_gpu_weight_loading=set(),
-        model_paths={},
-        model_subfolder=None,
-        revision=None,
-        pipeline_config=SimpleNamespace(
-            dit_precision="bf16", native_only_components=[]
-        ),
-        should_start_component_on_cpu=lambda _name: True,
-        should_direct_gpu_weight_load_component=lambda _name: False,
-        should_use_fsdp_for_component=lambda _name: False,
-        resolve_component_attention_backend=lambda *_names: (None, None),
-        requested_component_attention_backend=lambda _name: None,
+    return ServerArgs(
+        model_path="x",
+        component_residency={"projection": COMPONENT_OFFLOAD},
     )
 
 
@@ -196,7 +186,7 @@ def test_explicit_selection_does_not_change_other_pipelines():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cuda_residency_and_forward(checkpoint, server_args):
     component, weights = checkpoint
-    server_args.should_start_component_on_cpu = lambda _name: False
+    server_args.component_residency["projection"] = RESIDENT
     model = _load(component, server_args)
     assert model.weight.device.type == "cuda"
     inputs = torch.ones(2, 4, device=model.weight.device, dtype=torch.bfloat16)
