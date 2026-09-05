@@ -282,10 +282,13 @@ class AiterRunnerCore(MoeRunnerCore):
             # `SGLANG_USE_AITER_MOE_GU_ITLV=0` to switch to SEPARATED, which
             # matches the layout produced by `Mxfp4MoEMethod` (gpt-oss
             # MXFP4) and the gptoss_fp4 tuned FlyDSL kernels.
-            extra["gate_mode"] = (
-                GateMode.INTERLEAVE.value
-                if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
-                else GateMode.SEPARATED.value
+            extra.setdefault(
+                "gate_mode",
+                (
+                    GateMode.INTERLEAVE.value
+                    if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                    else GateMode.SEPARATED.value
+                ),
             )
             extra["swiglu_limit"] = quant_info.swiglu_limit
         if self.config.no_combine:
