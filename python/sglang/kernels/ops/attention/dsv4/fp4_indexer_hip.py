@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.utils.custom_op import register_custom_op
+
 if TYPE_CHECKING:
     from sglang.kernels.ops.attention.dsv4.compress import (
         CompressorDecodePlan,
@@ -173,6 +175,10 @@ def _alloc_logits(
     if (
         is_decode
         or n > _LOGITS_BUDGET_ELEMS
+        # Short-circuit before the capture probe: it returns a runtime bool that
+        # Dynamo cannot put in the graph, which is fatal under fullgraph piecewise.
+        # Tracing wants the same plain allocation as capture does.
+        or torch.compiler.is_compiling()
         or torch.cuda.is_current_stream_capturing()
     ):
         return torch.empty(
@@ -284,6 +290,55 @@ def prepare_fp4_prefill_workspace(
     return workspace
 
 
+# FlyDSL JIT-compiles this kernel lazily inside forward, so Dynamo traces the whole
+# compiler and dies building a types.FunctionType (gb0007) -- fatal under fullgraph
+# piecewise prefill. Keep the launch opaque, as the FP8 sibling already does; the
+# output stays caller-allocated so Dynamo still sees its shape. Decode needs no
+# wrapper: it is captured, not traced.
+@register_custom_op(
+    op_name="dsv4_aiter_fp4_paged_mqa_logits_prefill", mutates_args=["out"]
+)
+def _fp4_paged_mqa_logits_prefill_launch(
+    q_payload: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_payload: torch.Tensor,
+    k_scale: torch.Tensor,
+    page_table: torch.Tensor,
+    weights: torch.Tensor,
+    row_to_batch: torch.Tensor,
+    local_starts: torch.Tensor,
+    c4_seq_lens: torch.Tensor,
+    cta_info: Optional[torch.Tensor],
+    out: torch.Tensor,
+    max_seq_len: int,
+    n_ctas: int,
+    parallel_unit_num: int,
+    weight_scale: float,
+) -> None:
+    from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4_prefill
+
+    pinned = {} if cta_info is None else {"cta_info": cta_info, "n_ctas": n_ctas}
+    flydsl_pa_mqa_logits_fp4_prefill(
+        q_payload,
+        q_scale,
+        k_payload,
+        k_scale,
+        page_table,
+        weights,
+        row_to_batch,
+        local_starts,
+        c4_seq_lens,
+        max_seq_len,
+        parallel_unit_num=parallel_unit_num,
+        **pinned,
+        weight_scale=weight_scale,
+        block_k=256,
+        kv_block_size=_KV_BLOCK_SIZE,
+        num_warps=4,
+        out=out,
+    )
+
+
 def aiter_fp4_paged_mqa_logits(
     *,
     q_fp4: torch.Tensor,
@@ -299,10 +354,7 @@ def aiter_fp4_paged_mqa_logits(
     prefill_workspace: Optional[FP4PrefillWorkspace] = None,
 ) -> torch.Tensor:
     """Compute FP4 Q/K indexer logits with the decode or prefill FlyDSL kernel."""
-    from aiter.ops.flydsl import (
-        flydsl_pa_mqa_logits_fp4,
-        flydsl_pa_mqa_logits_fp4_prefill,
-    )
+    from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
 
     num_tokens = q_fp4.shape[0]
     c4_seq_lens = _as_int32_1d(c4_seq_lens)
@@ -403,7 +455,7 @@ def aiter_fp4_paged_mqa_logits(
             }
             row_to_batch = workspace.row_to_batch
             local_starts = workspace.local_starts
-        logits = flydsl_pa_mqa_logits_fp4_prefill(
+        _fp4_paged_mqa_logits_prefill_launch(
             q_payload,
             q_scale,
             k_payload,
@@ -413,10 +465,12 @@ def aiter_fp4_paged_mqa_logits(
             row_to_batch,
             local_starts,
             c4_seq_lens,
+            pinned.get("cta_info"),
+            logits,
             max_seq_len,
-            parallel_unit_num=max(_PREFILL_BASE_CTA_TARGET, num_tokens),
-            **pinned,
-            **common,
+            pinned.get("n_ctas", 0),
+            max(_PREFILL_BASE_CTA_TARGET, num_tokens),
+            weight_scale,
         )
 
     return logits
