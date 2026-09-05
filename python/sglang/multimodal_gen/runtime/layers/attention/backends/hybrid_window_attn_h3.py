@@ -209,7 +209,7 @@ class _DecomposedPlan:
     the dense-q rows against all ``used`` keys, then each chunk of frames
     against its gathered [globals | window | anchors] keys."""
 
-    __slots__ = ("dense_q", "dense_cu_q", "dense_cu_k", "passes", "has_windows")
+    __slots__ = ("dense_q", "dense_cu_q", "dense_cu_k", "passes")
 
     def __init__(
         self,
@@ -249,7 +249,6 @@ class _DecomposedPlan:
                 )
             )
         self.passes = _window_passes(layout, groups, max_gather_rows, device)
-        self.has_windows = bool(self.passes)
         window_rows = sum(int(p.query_rows.numel()) for p in self.passes)
         covered = int(self.dense_q.numel()) + window_rows
         if covered != used:

@@ -30,8 +30,12 @@ _BLOCK_T = 16
 _BLOCK_ROWS = 32
 
 
+def _pow2_head_dim(head_dim: int) -> bool:
+    return head_dim >= 16 and head_dim & (head_dim - 1) == 0
+
+
 def _check_head_dim(head_dim: int) -> None:
-    if head_dim & (head_dim - 1) or head_dim < 16:
+    if not _pow2_head_dim(head_dim):
         raise ValueError(
             f"head_dim must be a power of two >= 16 (tl.arange), got {head_dim}"
         )
@@ -41,8 +45,8 @@ def _cuda_bf16_rows(t: torch.Tensor) -> bool:
     return t.is_cuda and t.dtype == torch.bfloat16 and t.stride(-1) == 1
 
 
-def _pow2_head_dim(head_dim: int) -> bool:
-    return head_dim >= 16 and head_dim & (head_dim - 1) == 0
+def _i32(t: torch.Tensor) -> torch.Tensor:
+    return t.to(torch.int32).contiguous()
 
 
 def can_use_vdn_temporal_conv_act(x: torch.Tensor, heads: int, head_dim: int) -> bool:
@@ -520,18 +524,17 @@ def vdn_gather_linear_state(
         logp = prefix  # unused
     text = text_state.float().contiguous() if text_state is not None else prefix
     out = torch.empty(prefix.shape, dtype=out_dtype, device=prefix.device)
-    i32 = lambda t: t.to(torch.int32).contiguous()  # noqa: E731
     _gather_state_kernel[(F, H, triton.cdiv(DV, _BLOCK_ROWS))](
         prefix,
         suffix,
         logp,
         text,
-        i32(before_idx),
-        i32(after_idx),
-        i32(has_before),
-        i32(has_after),
-        i32(bridge_before),
-        i32(bridge_after),
+        _i32(before_idx),
+        _i32(after_idx),
+        _i32(has_before),
+        _i32(has_after),
+        _i32(bridge_before),
+        _i32(bridge_after),
         out,
         H,
         DV,

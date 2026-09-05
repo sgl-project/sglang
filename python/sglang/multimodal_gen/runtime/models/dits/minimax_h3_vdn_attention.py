@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.layers.linear import RowParallelLinear
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.layers.usp import _a2a_staging_buffer
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn import (
     MiniMaxH3VDNLinearBranch,
@@ -192,11 +193,13 @@ def _vdn_frame_partial_sums(
 
 
 def _vdn_a2a_rows_to_heads(
-    field: torch.Tensor, *, ulysses_ws: int, role: str, process_group
+    field: torch.Tensor,
+    *,
+    ulysses_ws: int,
+    role: str,
+    process_group: torch.distributed.ProcessGroup,
 ) -> tuple[torch.distributed.Work, torch.Tensor]:
     # [L, H, d] row shard -> contiguous [S, H / ws, d] of this rank's heads
-    from sglang.multimodal_gen.runtime.layers.usp import _a2a_staging_buffer
-
     rows, total_heads, head_dim = field.shape
     local_heads = total_heads // ulysses_ws
     send = _a2a_staging_buffer(
@@ -219,11 +222,13 @@ def _vdn_a2a_rows_to_heads(
 
 
 def _vdn_a2a_heads_to_rows(
-    out: torch.Tensor, *, ulysses_ws: int, role: str, process_group
+    out: torch.Tensor,
+    *,
+    ulysses_ws: int,
+    role: str,
+    process_group: torch.distributed.ProcessGroup,
 ) -> tuple[torch.distributed.Work, torch.Tensor]:
     # [S, H / ws, d] -> [ws, L, H / ws, d] source-rank major; _vdn_merge_heads after wait
-    from sglang.multimodal_gen.runtime.layers.usp import _a2a_staging_buffer
-
     seq_len, local_heads, head_dim = out.shape
     rows = seq_len // ulysses_ws
     recv = _a2a_staging_buffer(
@@ -244,7 +249,7 @@ def _vdn_merge_heads(recv: torch.Tensor) -> torch.Tensor:
 
 def _vdn_window_softmax(
     attention: MiniMaxH3Attention,
-    meta,
+    meta: HybridWindowAttentionH3Metadata,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -299,7 +304,7 @@ def _vdn_window_softmax(
 
 def _vdn_linear_readout(
     attention: MiniMaxH3Attention,
-    meta,
+    meta: HybridWindowAttentionH3Metadata,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -402,7 +407,7 @@ def _minimax_h3_hybrid_attention_core_impl(
 
 def _vdn_ulysses_hybrid_core(
     attention: MiniMaxH3Attention,
-    meta,
+    meta: HybridWindowAttentionH3Metadata,
     x: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -411,7 +416,7 @@ def _vdn_ulysses_hybrid_core(
     softmax_gate: torch.Tensor | None,
     beta: torch.Tensor,
     gate_hidden: torch.Tensor,
-    softmax,
+    softmax: Callable[..., torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
 
@@ -502,7 +507,7 @@ def _vdn_return_to_rows(
     linear_out: torch.Tensor | None,
     *,
     ulysses_ws: int,
-    process_group,
+    process_group: torch.distributed.ProcessGroup,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     # [S, h, d] per branch -> ([L, H, d], [L, H * d] or None), both trips in flight together
     branch_outputs = [out for out in (softmax_out, linear_out) if out is not None]

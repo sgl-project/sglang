@@ -582,8 +582,8 @@ def _boundary_frames(
     ]
     starts = [c * chunk - frame_offset for c in range(num_chunks)]
     dev = torch.device(device)
-    in_clip = lambda frames: [(f, c) for c, f in enumerate(frames) if f >= 0]  # noqa: E731
-    ends, starts = in_clip(ends), in_clip(starts)
+    ends = [(f, c) for c, f in enumerate(ends) if f >= 0]
+    starts = [(f, c) for c, f in enumerate(starts) if f >= 0]
     return (
         num_chunks,
         torch.tensor([f for f, _ in ends], device=dev),

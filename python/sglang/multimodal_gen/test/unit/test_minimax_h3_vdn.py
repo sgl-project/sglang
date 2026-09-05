@@ -638,8 +638,3 @@ def test_branch_matches_eager_reference_algorithm() -> None:
     assert diff < 3e-2 * max(scale, 1.0), (
         f"branch vs reference max diff {diff} (scale {scale})"
     )
-
-
-# --------------------------------------------------------------------------
-# the overlay materializer's prefuse (fetched like the runtime fetches it)
-# --------------------------------------------------------------------------
