@@ -80,6 +80,10 @@ class InsertParams:
     priority: int = 0
     track_adopted_ranges: bool = False
 
+    # Session id for KV event reporting (available at insert time, before
+    # register_session_ref writes session_ids onto ComponentData).
+    session_id: Optional[str] = None
+
 
 @dataclasses.dataclass
 class InsertResult:

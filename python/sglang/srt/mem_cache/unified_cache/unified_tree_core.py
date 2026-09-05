@@ -1038,7 +1038,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         node.priority = max(node.priority, state.priority)
 
         if node.evicted:
-            self._unevict_node_on_insert(node, state.value[:prefix_len])
+            self._unevict_node_on_insert(
+                node,
+                state.value[:prefix_len],
+                session_id=state.params.session_id,
+            )
             state.result.record_adopted_range(
                 BASE_COMPONENT_TYPE,
                 state.total_prefix_length,
@@ -1108,7 +1112,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 state.total_prefix_length + len(state.key),
             )
             state.target_node = self._add_new_node(
-                state.node, state.key, state.value, priority=state.priority
+                state.node,
+                state.key,
+                state.value,
+                priority=state.priority,
+                session_id=state.params.session_id,
             )
             state.is_new_leaf = True
         else:
@@ -1231,6 +1239,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         key: RadixKey,
         value: torch.Tensor,
         priority: int = 0,
+        session_id: Optional[str] = None,
     ) -> UnifiedTreeNode:
         new_node = self._new_node(priority=priority)
         new_node.parent = parent
@@ -1243,11 +1252,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
-        self.kv_events.record_store(new_node)
+        self.kv_events.record_store(new_node, session_id=session_id)
         return new_node
 
     def _unevict_node_on_insert(
-        self, node: UnifiedTreeNode, fresh_value: torch.Tensor
+        self,
+        node: UnifiedTreeNode,
+        fresh_value: torch.Tensor,
+        session_id: Optional[str] = None,
     ) -> None:
         """Restore an evicted node's Full device value from fresh KV indices
         during insert."""
@@ -1262,7 +1274,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_duplicate_tracking(node)
         if node.parent is not None:
             self._update_evictable_leaf_sets(node.parent)
-        self.kv_events.record_store(node, medium=StorageMedium.GPU)
+        self.kv_events.record_store(
+            node, medium=StorageMedium.GPU, session_id=session_id
+        )
 
     def _update_evictable_leaf_sets(self, node: UnifiedTreeNode) -> None:
         """Update both device and host leaf sets for a node."""
