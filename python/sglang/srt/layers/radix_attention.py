@@ -312,6 +312,7 @@ def _unified_attention_with_output_impl(
     q_rope: Optional[torch.Tensor] = None,
     k_rope: Optional[torch.Tensor] = None,
     sinks: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
     # MLA / TRT-LLM / NSA paths pass these through RadixAttention.forward(**kwargs);
     # they must appear in the schema when --enforce-piecewise-cuda-graph is on.
     cos_sin_cache: Optional[torch.Tensor] = None,
@@ -323,7 +324,7 @@ def _unified_attention_with_output_impl(
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
-    real_query_num_tokens = forward_batch.num_token_non_padded_cpu
+    real_query_num_tokens = forward_batch.global_num_token_non_padded_cpu
     # Ordinary PCG attention pads Q/K/V to the same token bucket. Prefix MHA
     # instead supplies a fixed-capacity K/V chunk whose extent is independent
     # of the suffix queries, so its caller must preserve that separate extent.
@@ -364,6 +365,8 @@ def _unified_attention_with_output_impl(
         kwargs["k_rope"] = k_rope[:key_value_num_tokens]
     if sinks is not None:
         kwargs["sinks"] = sinks
+    if attn_sink is not None:
+        kwargs["attn_sink"] = attn_sink
     if cos_sin_cache is not None:
         kwargs["cos_sin_cache"] = cos_sin_cache
     if is_neox is not None:
@@ -438,6 +441,7 @@ def unified_attention_with_output(
     q_rope: Optional[torch.Tensor] = None,
     k_rope: Optional[torch.Tensor] = None,
     sinks: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
     cos_sin_cache: Optional[torch.Tensor] = None,
     is_neox: Optional[bool] = None,
     llama_4_scaling: Optional[torch.Tensor] = None,
@@ -456,6 +460,7 @@ def unified_attention_with_output(
         q_rope=q_rope,
         k_rope=k_rope,
         sinks=sinks,
+        attn_sink=attn_sink,
         cos_sin_cache=cos_sin_cache,
         is_neox=is_neox,
         llama_4_scaling=llama_4_scaling,
@@ -486,6 +491,7 @@ def unified_attention_with_output_and_lse(
     q_rope: Optional[torch.Tensor] = None,
     k_rope: Optional[torch.Tensor] = None,
     sinks: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
     cos_sin_cache: Optional[torch.Tensor] = None,
     is_neox: Optional[bool] = None,
     llama_4_scaling: Optional[torch.Tensor] = None,
@@ -504,6 +510,7 @@ def unified_attention_with_output_and_lse(
         q_rope=q_rope,
         k_rope=k_rope,
         sinks=sinks,
+        attn_sink=attn_sink,
         cos_sin_cache=cos_sin_cache,
         is_neox=is_neox,
         llama_4_scaling=llama_4_scaling,
@@ -531,7 +538,7 @@ def unified_sparse_attention_with_output(
     context = get_tc_piecewise_forward_context()
     forward_batch = context.forward_batch
     attention_layer = context.attention_layers[layer_id]
-    real_num_tokens = forward_batch.num_token_non_padded_cpu
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
 
     if real_num_tokens == 0:
         _zero_skipped_attn_outputs(attn_out, idx_out)
@@ -602,7 +609,7 @@ def attention_with_output_extra_kwargs(
     context = get_tc_piecewise_forward_context()
     forward_batch = context.forward_batch
     attention_layer = context.attention_layers[layer_id]
-    real_num_tokens = forward_batch.num_token_non_padded_cpu
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
 
     if real_num_tokens == 0:
         _zero_skipped_attn_outputs(output)

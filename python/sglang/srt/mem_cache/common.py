@@ -66,9 +66,9 @@ def free_swa_out_of_window_slots(
         return
 
     # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
-    assert (
-        req.kv.cache_protected_len % page_size == 0
-    ), "cache_protected_len must be page aligned"
+    assert req.kv.cache_protected_len % page_size == 0, (
+        "cache_protected_len must be page aligned"
+    )
     req.kv.swa_evicted_seqlen = max(
         req.kv.swa_evicted_seqlen, req.kv.swa_dead_lo(page_size)
     )
@@ -101,9 +101,9 @@ def free_swa_out_of_window_slots(
         free_slots = req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
         ]
-        # Local import: multi_ended_allocator imports this module lazily for
+        # Local import: the unified allocators import this module lazily for
         # eviction; a module-level import here would be a cycle hazard.
-        from sglang.srt.mem_cache.multi_ended_allocator import (
+        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
             UnifiedSWATokenToKVPoolAllocator,
         )
 
@@ -127,7 +127,7 @@ def free_kv_row_segments(
 ) -> None:
     """Free ascending disjoint ``(kv_indices, start_pos)`` segments of one
     request's kv row, split at the SWA eviction floor."""
-    swa_dead: list[torch.Tensor] = []
+    swa_dead: list[tuple[torch.Tensor, int]] = []
     swa_alive: list[tuple[torch.Tensor, int]] = []
     for kv_indices, start_pos in segments:
         num_indices = kv_indices.numel()
@@ -137,23 +137,19 @@ def free_kv_row_segments(
         # the deliberately unmapped prefix of a PD decode SWA-tail prealloc.
         num_dead = min(max(swa_evicted_seqlen - start_pos, 0), num_indices)
         if num_dead > 0:
-            swa_dead.append(kv_indices[:num_dead])
+            swa_dead.append((kv_indices[:num_dead], start_pos))
         if num_dead < num_indices:
             swa_alive.append((kv_indices[num_dead:], start_pos + num_dead))
 
     if swa_dead and swa_alive:
-        # A mid-page floor would send a page shared by the dead and alive
-        # sides back twice.
+        # The two sides are separate calls, so neither one's page-disjointness
+        # check sees a floor that splits a page between them.
         assert swa_evicted_seqlen % allocator.page_size == 0, (
             f"SWA eviction floor {swa_evicted_seqlen} splits a page "
             f"(page_size {allocator.page_size})"
         )
-    if len(swa_dead) == 1:
-        allocator.free_full(swa_dead[0])
-    elif swa_dead:
-        # Two dead pieces can share a boundary page, and only free_full's own
-        # page dedup covers that -- free_segments trims the alive side alone.
-        allocator.free_full(torch.cat(swa_dead))
+    if swa_dead:
+        allocator.free_full_segments(swa_dead)
     if swa_alive:
         allocator.free_segments(swa_alive)
 
@@ -255,9 +251,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:
-        assert (
-            tree_cache.supports_mamba()
-        ), "Only MambaRadixCache allow freeing before alloc"
+        assert tree_cache.supports_mamba(), (
+            "Only MambaRadixCache allow freeing before alloc"
+        )
         # TODO (csy, hanming): clean up this early allocation logic
         if req.kv.holds_mamba:
             tree_cache.req_to_token_pool.mamba_allocator.free(
@@ -286,9 +282,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
         not tree_cache.supports_mamba()
     ):
-        assert (
-            req.kv.holds_mamba
-        ), "mamba state is freed while the tree cache does not manage mamba states"
+        assert req.kv.holds_mamba, (
+            "mamba state is freed while the tree cache does not manage mamba states"
+        )
         tree_cache.req_to_token_pool.free_mamba_cache(req)
     # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the
     # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
@@ -306,9 +302,9 @@ def _release_overallocated_kv_indices(
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
     if spec_algo is None and not get_serving().strip_thinking_cache:
-        assert (
-            start_p == end_p
-        ), f"Unexpected overallocated KV cache, {req.kv.kv_committed_len=}, {req.kv.kv_allocated_len=}"
+        assert start_p == end_p, (
+            f"Unexpected overallocated KV cache, {req.kv.kv_committed_len=}, {req.kv.kv_allocated_len=}"
+        )
 
     if page_size > 1:
         start_p = ceil_align(start_p, page_size)

@@ -7,7 +7,7 @@ so a backend that forgets a translate -- or does one twice -- reads the wrong
 rows and nothing crashes. This scan makes both unrepresentable.
 
 Out of scope, deliberately: the allocator-internal implementations
-(`multi_ended_allocator` / `unified_memory_pool`), which ARE the mechanism the
+(`allocator/unified_*` / `unified_memory_pool`), which ARE the mechanism the
 translator calls; the PD transfer plane's `translate_kv_indices_for_transfer`,
 which stages for RDMA outside the forward path; and the STATIC SWA pool's
 legacy full->swa slot map, a different mapping kind with no virtual/physical
