@@ -348,18 +348,31 @@ def build_prefill_schedule(
     )
 
     BLOCK_P = 256
-    _prefill_cta_info_kernel[(triton.cdiv(parallel_unit_num, BLOCK_P),)](
+    cta_args = [
         buffers.incl,
         buffers.excl,
         buffers.chunks,
-        buffers.row_to_batch,
-        buffers.local_starts,
-        local_ends,
-        buffers.safe,
-        buffers.total_splits,
-        cta_info_out,
-        total_rows,
-        parallel_unit_num,
+    ]
+    # AITER's window-aware scheduler added first_chunks_ptr before rb_ptr.
+    # SGLang's fused prep always emits local_starts == 0, so that same zero
+    # buffer is the exact first-chunk vector. Keep the old signature working
+    # for released AITER builds.
+    if "first_chunks_ptr" in getattr(_prefill_cta_info_kernel, "arg_names", ()):
+        cta_args.append(buffers.local_starts)
+    cta_args.extend(
+        [
+            buffers.row_to_batch,
+            buffers.local_starts,
+            local_ends,
+            buffers.safe,
+            buffers.total_splits,
+            cta_info_out,
+            total_rows,
+            parallel_unit_num,
+        ]
+    )
+    _prefill_cta_info_kernel[(triton.cdiv(parallel_unit_num, BLOCK_P),)](
+        *cta_args,
         BLOCK_P=BLOCK_P,
     )
     return guarded_out, buffers
