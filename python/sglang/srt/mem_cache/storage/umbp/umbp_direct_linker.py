@@ -23,7 +23,11 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
-from sglang.srt.runtime_context import get_memory, get_model
+from sglang.srt.runtime_context import (
+    get_memory,
+    get_model,
+    get_parallel,
+)
 from sglang.srt.utils import freeze_gc, get_device_module
 
 logger = logging.getLogger(__name__)
@@ -278,7 +282,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
 
         storage_config = HiCacheStorageConfig(
             tp_rank=tp_rank,
-            tp_size=server_args.tp_size,
+            tp_size=get_parallel().tp_size,
             pp_rank=params.pp_rank,
             pp_size=params.pp_size,
             attn_cp_rank=params.attn_cp_rank,
