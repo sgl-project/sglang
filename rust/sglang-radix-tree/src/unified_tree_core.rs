@@ -1371,60 +1371,15 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         params: &InsertParams<'_, K, V>,
     ) -> Result<InsertResult<V>, TreeCoreRuntimeError> {
         let root_id = self.arena.root();
-        self.try_insert_at_(root_id, 0, 0, params)
+        self.try_insert_at_(root_id, 0, params)
     }
 
     /// Insert only the suffix after a retained prefix node.
     ///
-    /// The anchor must be the terminal node for `prefix_len`. Only the suffix key
-    /// and value are copied into the resumable walk, avoiding a second root walk
-    /// during chunked-prefill or decode growth.
-    pub fn insert_from_node(
-        &mut self,
-        prefix_node_id: NodeId,
-        prefix_len: usize,
-        params: &InsertParams<'_, K, V>,
-    ) -> InsertResult<V> {
-        self.try_insert_from_node(prefix_node_id, prefix_len, params)
-            .unwrap_or_else(|error| panic!("{error}"))
-    }
-
-    /// Fallible variant of [`Self::insert_from_node`].
-    pub fn try_insert_from_node(
-        &mut self,
-        prefix_node_id: NodeId,
-        prefix_len: usize,
-        params: &InsertParams<'_, K, V>,
-    ) -> Result<InsertResult<V>, TreeCoreRuntimeError> {
-        let aligned_key_len = params.key.atom_len() / self.page_size * self.page_size;
-        if !prefix_len.is_multiple_of(self.page_size) {
-            return Err(TreeCoreRuntimeError::InsertPrefixNotPageAligned {
-                prefix_len,
-                page_size: self.page_size,
-            });
-        }
-        if prefix_len > aligned_key_len {
-            return Err(TreeCoreRuntimeError::InsertPrefixExceedsKey {
-                prefix_len,
-                aligned_key_len,
-            });
-        }
-        if params.value.len() < aligned_key_len {
-            return Err(TreeCoreRuntimeError::InsertValueTooShort {
-                value_len: params.value.len(),
-                aligned_key_len,
-            });
-        }
-        let prefix_node_idx = self.try_resolve_node_handle_(prefix_node_id)?;
-        self.validate_insert_anchor_(prefix_node_idx, prefix_len, params)?;
-        self.try_insert_at_(prefix_node_idx, prefix_len, prefix_len, params)
-    }
-
-    /// Insert a suffix value after a retained prefix node.
-    ///
-    /// Unlike [`Self::insert_from_node`], `params.value` starts at `prefix_len`
-    /// rather than at the root. This lets page-native consumers pass only newly
-    /// materialized page identifiers during decode or chunked-prefill growth.
+    /// The anchor must be the terminal node for `prefix_len`, and `params.value`
+    /// holds only the atoms past `prefix_len`. Only the suffix key and value enter
+    /// the resumable walk, so decode or chunked-prefill growth skips a second root
+    /// walk.
     pub fn insert_suffix_from_node(
         &mut self,
         prefix_node_id: NodeId,
@@ -1464,7 +1419,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         }
         let prefix_node_idx = self.try_resolve_node_handle_(prefix_node_id)?;
         self.validate_insert_anchor_(prefix_node_idx, prefix_len, params)?;
-        self.try_insert_at_(prefix_node_idx, prefix_len, 0, params)
+        self.try_insert_at_(prefix_node_idx, prefix_len, params)
     }
 
     fn validate_insert_anchor_(
@@ -1526,14 +1481,12 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         &mut self,
         prefix_node_idx: NodeIdx_,
         prefix_len: usize,
-        value_offset: usize,
         params: &InsertParams<'_, K, V>,
     ) -> Result<InsertResult<V>, TreeCoreRuntimeError> {
         // Single-shot pump over the resumable walk: run every step inline and
         // fold the step actions into the result for the caller to apply.
         let mut actions = Vec::new();
-        let mut step =
-            self.try_begin_insert_at_(prefix_node_idx, prefix_len, value_offset, params)?;
+        let mut step = self.try_begin_insert_at_(prefix_node_idx, prefix_len, params)?;
         loop {
             actions.append(&mut step.actions);
             if let Some(mut result) = step.result {
@@ -1556,14 +1509,13 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         params: &InsertParams<'_, K, V>,
     ) -> Result<InsertStepResult<V>, TreeCoreRuntimeError> {
         let root_id = self.arena.root();
-        self.try_begin_insert_at_(root_id, 0, 0, params)
+        self.try_begin_insert_at_(root_id, 0, params)
     }
 
     fn try_begin_insert_at_(
         &mut self,
         prefix_node_idx: NodeIdx_,
         prefix_len: usize,
-        value_offset: usize,
         params: &InsertParams<'_, K, V>,
     ) -> Result<InsertStepResult<V>, TreeCoreRuntimeError> {
         // Insert walks are single-flight; a live walk means re-entrancy.
@@ -1585,11 +1537,10 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             });
         }
         let value_len = aligned_key_len - prefix_len;
-        let required_value_len = value_offset + value_len;
-        if params.value.len() < required_value_len {
+        if params.value.len() < value_len {
             return Err(TreeCoreRuntimeError::InsertValueTooShort {
                 value_len: params.value.len(),
-                aligned_key_len: required_value_len,
+                aligned_key_len: value_len,
             });
         }
         if aligned_key_len == prefix_len {
@@ -1628,7 +1579,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             key: K::from(params.key.as_ref()[prefix_len..aligned_key_len].to_vec()),
             key_offset: prefix_len,
             aligned_key_len,
-            value: params.value.slice(value_offset, value_len),
+            value: params.value.slice(0, value_len),
             namespace: params.namespace.to_owned(),
             prev_prefix_len: params.prev_prefix_len,
             swa_evicted_seqlen: params.swa_evicted_seqlen,
