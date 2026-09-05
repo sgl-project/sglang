@@ -308,6 +308,7 @@ class Qwen3Attention(nn.Module):
             is_last_layer
             and forward_batch.forward_mode.is_extend()
             and forward_batch.extend_seq_lens is not None
+            and q.shape[0] >= 2048
             and not forward_batch.return_logprob
             and not (
                 forward_batch.capture_hidden_mode
@@ -515,6 +516,7 @@ class Qwen3DecoderLayer(nn.Module):
             is_last_layer
             and is_extend_mode
             and forward_batch.extend_seq_lens is not None
+            and hidden_states.shape[0] >= 2048
             and not forward_batch.return_logprob
             and not (
                 forward_batch.capture_hidden_mode
