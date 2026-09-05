@@ -1817,8 +1817,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _dsa_split_backend_resolution,
         )
 
-        def _view(arch="DeepseekV32ForCausalLM", **kw):
-            hf = SimpleNamespace(architectures=[arch])
+        def _view(arch="DeepseekV32ForCausalLM", learnable_sink=False, **kw):
+            hf = SimpleNamespace(architectures=[arch], learnable_sink=learnable_sink)
             defaults = dict(
                 kv_cache_dtype="fp8_e4m3",
                 dsa_prefill_backend=None,
@@ -1866,6 +1866,28 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "dsa_decode_backend": "flashmla_kv",
                 },
             )
+            for arch in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN"):
+                with self.subTest(arch=arch, backends="default"):
+                    self.assertEqual(
+                        _dsa_split_backend_resolution(
+                            _view(arch=arch, learnable_sink=True)
+                        ),
+                        {
+                            "dsa_prefill_backend": "flashmla_sparse",
+                            "dsa_decode_backend": "flashmla_sparse",
+                        },
+                    )
+                for field, value in (
+                    ("dsa_prefill_backend", "fa3"),
+                    ("dsa_decode_backend", "trtllm"),
+                ):
+                    with self.subTest(arch=arch, field=field, value=value):
+                        with self.assertRaisesRegex(
+                            ValueError, field.replace("_", "-")
+                        ):
+                            _dsa_split_backend_resolution(
+                                _view(arch=arch, learnable_sink=True, **{field: value})
+                            )
             # non-family arch declares nothing
             self.assertEqual(
                 _dsa_split_backend_resolution(_view(arch="LlamaForCausalLM")), {}
@@ -2842,6 +2864,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 prefill_attention_backend=None,
                 decode_attention_backend=None,
                 enable_prefill_cp=False,
+                dcp_size=1,
             )
             defaults.update(kw)
             return SimpleNamespace(**defaults)
@@ -2857,6 +2880,22 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             _deepseek_family_overrides(_args(), None),
                             {"attention_backend": "dsa", "page_size": 64},
                         )
+                        for arch in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN"):
+                            hf_config = SimpleNamespace(architectures=[arch])
+                            with self.subTest(arch=arch, prefill_cp=True):
+                                with self.assertRaisesRegex(
+                                    ValueError, "--enable-prefill-cp.*HYV4"
+                                ):
+                                    _deepseek_family_overrides(
+                                        _args(enable_prefill_cp=True), hf_config
+                                    )
+                            with self.subTest(arch=arch, dcp_size=2):
+                                with self.assertRaisesRegex(
+                                    ValueError, "--dcp-size > 1.*HYV4"
+                                ):
+                                    _deepseek_family_overrides(
+                                        _args(dcp_size=2), hf_config
+                                    )
                     # HIP without the preshuffle path: page 1
                     with override_platform(is_hip=True):
                         with patch(

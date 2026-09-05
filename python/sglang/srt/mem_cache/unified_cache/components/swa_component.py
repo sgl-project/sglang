@@ -182,7 +182,7 @@ class SWAComponent(TreeComponent):
 
     def _unified_allocator(self):
         """The unified SWA composite, or None when running on the static pool."""
-        from sglang.srt.mem_cache.multi_ended_allocator import (
+        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
             UnifiedSWATokenToKVPoolAllocator,
         )
 

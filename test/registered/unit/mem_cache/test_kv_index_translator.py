@@ -48,10 +48,10 @@ from types import SimpleNamespace
 import torch
 from test_multi_ended_allocator import _FakeUnifiedSWAKVPool
 
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator, KVReadTables
-from sglang.srt.mem_cache.multi_ended_allocator import (
+from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWATokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator, KVReadTables
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
 
