@@ -135,22 +135,30 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.storage = storage
         self.storage.mem_pool_host = self.pool_group
         self.storage.registered_pools = self.pools
-        storage_suffix = _storage_suffix(
+        mla_suffix = _storage_suffix(
             rank_replicated=rank_replicated,
             tp_rank=tp_rank,
             attn_cp_rank=params.attn_cp_rank,
             pp_rank=params.pp_rank,
         )
-        self.storage.mla_suffix = storage_suffix
-        self.storage.mha_suffix = storage_suffix
+        mha_suffix = _storage_suffix(
+            rank_replicated=False,
+            tp_rank=tp_rank,
+            attn_cp_rank=params.attn_cp_rank,
+            pp_rank=params.pp_rank,
+        )
+        self.storage.mla_suffix = mla_suffix
+        self.storage.mha_suffix = mha_suffix
         logger.info(
             "Mooncake direct linker storage topology: "
-            "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s",
+            "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, "
+            "mla_suffix=%s, mha_suffix=%s",
             rank_replicated,
             tp_rank,
             tp_size,
             self.offload_owner,
-            storage_suffix,
+            mla_suffix,
+            mha_suffix,
         )
 
         self.register_buffers()
@@ -352,8 +360,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return False
         self.freeze_gc_once()
         if not self.offload_owner:
-            self.offload_results.put(True)
-            return True
+            # MLA target pools are replicated and written by TP0. MHA draft
+            # sidecars are TP-sharded, so every rank writes its own keyed copy.
+            expanded = [
+                transfer
+                for transfer in expanded
+                if transfer.name in (PoolName.DRAFT, PoolName.DRAFT_SWA)
+                and len(self.pools[transfer.name].components) == 2
+            ]
+            if not expanded:
+                self.offload_results.put(True)
+                return True
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
         ready_event = device_module.Event()

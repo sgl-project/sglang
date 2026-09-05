@@ -770,9 +770,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # tag is what keeps these keys from colliding with target's
             # `{rank}_k` / `{rank}_k` + `{rank}_v` keys.
             draft_pool = self.registered_pools.get(PoolName.DRAFT)
-            if isinstance(draft_pool, MLATokenToKVPoolHost):
+            direct_components = getattr(draft_pool, "components", None)
+            if isinstance(draft_pool, MLATokenToKVPoolHost) or (
+                direct_components is not None and len(direct_components) == 1
+            ):
                 suffixes = [f"_{self.mla_suffix}_{PoolName.DRAFT}_k"]
-            else:
+            elif direct_components is None or len(direct_components) == 2:
                 suffixes = [
                     f"_{self.mha_suffix}_{PoolName.DRAFT}_k",
                     f"_{self.mha_suffix}_{PoolName.DRAFT}_v",
@@ -783,12 +786,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
             from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
-            if isinstance(
-                host_pool,
-                (DeepSeekV4PagedHostPool, MLATokenToKVPoolHost),
+            if (
+                isinstance(
+                    host_pool,
+                    (DeepSeekV4PagedHostPool, MLATokenToKVPoolHost),
+                )
+                or len(getattr(host_pool, "components", ())) == 1
             ):
                 suffixes = [f"_{self.mla_suffix}_{pool_name}"]
-            elif isinstance(host_pool, MHATokenToKVPoolHost):
+            elif (
+                isinstance(host_pool, MHATokenToKVPoolHost)
+                or len(getattr(host_pool, "components", ())) == 2
+            ):
                 suffixes = [
                     f"_{self.mha_suffix}_{pool_name}_k",
                     f"_{self.mha_suffix}_{pool_name}_v",

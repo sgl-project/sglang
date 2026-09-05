@@ -232,6 +232,15 @@ def build_kv_cache(
 
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
     mtp_draft_device_pools = tp_worker.model_runner.mtp_draft_device_pools
+    direct_linker_draft_device_pools = ()
+    if (
+        get_memory().enable_unified_cache_external_linker
+        and hicache_draft_plan is not None
+    ):
+        from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
+
+        if hicache_draft_plan.mode == HiCacheDraftMode.SIDECAR:
+            direct_linker_draft_device_pools = hicache_draft_plan.device_pools
 
     retraction_backup = resolve_decode_retraction_backup(tp_worker=tp_worker)
 
@@ -319,6 +328,7 @@ def build_kv_cache(
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
+        direct_linker_draft_device_pools=direct_linker_draft_device_pools,
     )
 
     tree_cache = create_tree_cache(

@@ -57,4 +57,7 @@ class CacheInitParams:
         None
     )
 
+    # Draft pools packed into the target's stored per-page objects.
     mtp_draft_device_pools: tuple[object, ...] = ()
+    # Non-packed draft pools stored as direct-linker sidecar objects.
+    direct_linker_draft_device_pools: tuple[object, ...] = ()
