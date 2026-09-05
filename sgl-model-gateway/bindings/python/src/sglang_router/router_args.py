@@ -26,6 +26,7 @@ _POLICY_CHOICES = (
     "random",
     "round_robin",
     "cache_aware",
+    "lmetric",
     "power_of_two",
     "bucket",
     "manual",
