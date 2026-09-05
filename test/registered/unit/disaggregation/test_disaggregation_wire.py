@@ -336,7 +336,12 @@ class TestMooncakePPStaging(unittest.TestCase):
 
 class TestEagleDsaSeedTransfer(unittest.TestCase):
     @staticmethod
-    def _make_req(seed, metadata_buffer_index=0):
+    def _make_req(
+        seed,
+        metadata_buffer_index=0,
+        sampling_mask=None,
+        sampling_logprob=None,
+    ):
         return SimpleNamespace(
             metadata_buffer_index=metadata_buffer_index,
             output_ids=[101],
@@ -346,7 +351,13 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             cached_tokens_storage=0,
             multimodal_inputs=None,
             return_logprob=False,
-            return_sampling_mask=False,
+            return_sampling_mask=sampling_mask is not None,
+            output_token_sampling_mask=(
+                None if sampling_mask is None else [sampling_mask]
+            ),
+            output_token_sampling_logprobs=(
+                None if sampling_logprob is None else [sampling_logprob]
+            ),
             hidden_states_tensor=torch.tensor([1.0, 2.0]),
             output_topk_p=torch.tensor([1.0]),
             output_topk_index=torch.tensor([7]),
@@ -359,6 +370,7 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             size=2,
             hidden_size=2,
             hidden_states_dtype=torch.float32,
+            max_sampling_mask_tokens=16,
             output_dsa_topk_indices_dim=3,
         )
         seed = torch.tensor([4, 5, 6], dtype=torch.int32)
@@ -371,6 +383,28 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
         self.assertEqual(ptrs[-2], buffers.output_dsa_topk_indices.data_ptr())
         self.assertEqual(data_lens[-2], buffers.output_dsa_topk_indices.nbytes)
         self.assertEqual(item_lens[-2], buffers.output_dsa_topk_indices[0].nbytes)
+
+    def test_metadata_buffer_uses_explicit_sampling_mask_capacity(self):
+        buffers = MetadataBuffers(
+            size=1,
+            hidden_size=2,
+            hidden_states_dtype=torch.float32,
+            max_sampling_mask_tokens=3,
+        )
+        buffers.set_buf(
+            self._make_req(
+                None,
+                sampling_mask=[7, 8, 9],
+                sampling_logprob=-1.25,
+            )
+        )
+
+        self.assertEqual(buffers.output_token_sampling_mask_idx.shape, (1, 3))
+        self.assertEqual(buffers.output_token_sampling_mask_len[0, 0].item(), 3)
+        self.assertEqual(buffers.output_token_sampling_mask_idx[0].tolist(), [7, 8, 9])
+        self.assertAlmostEqual(
+            buffers.output_token_sampling_logprobs[0, 0].item(), -1.25
+        )
 
     def test_decode_input_requires_valid_seed_for_every_request(self):
         seeds = (

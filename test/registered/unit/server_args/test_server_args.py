@@ -163,6 +163,21 @@ class TestPrepareServerArgs(CustomTestCase):
         ):
             ServerArgs(model_path="dummy", prefill_decode_interval=-1).resolve_once()
 
+    def test_sampling_mask_max_tokens(self):
+        self.assertEqual(ServerArgs(model_path="dummy").sampling_mask_max_tokens, 4096)
+        self.assertEqual(
+            ServerArgs(
+                model_path="dummy", sampling_mask_max_tokens=8192
+            ).sampling_mask_max_tokens,
+            8192,
+        )
+        with self.assertRaisesRegex(
+            ValueError, "--sampling-mask-max-tokens must be positive"
+        ):
+            prepare_server_args(
+                ["--model-path", "dummy", "--sampling-mask-max-tokens", "0"]
+            ).resolve_once()
+
     def test_dsv4_prefill_backend_cli_choices(self):
         parser = server_args_module.argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
