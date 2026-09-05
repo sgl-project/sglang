@@ -266,15 +266,35 @@ def test_native_xllm_requires_bfloat16(monkeypatch):
         _validate_mova_config(config, quant_config=None)
 
 
-def test_native_xllm_rejects_quantized_weights(monkeypatch):
+def test_native_xllm_accepts_compressed_tensors_quantization(monkeypatch):
     config = XllmConfig(num_values=0, num_experts=0)
+    quant_config = SimpleNamespace(get_name=lambda: "compressed_tensors")
+    monkeypatch.setattr(torch, "get_default_dtype", lambda: torch.bfloat16)
+
+    with get_context().override_server_args(**_native_runtime_config()):
+        _validate_mova_config(config, quant_config=quant_config)
+
+
+def test_native_xllm_rejects_other_quantization(monkeypatch):
+    config = XllmConfig(num_values=0, num_experts=0)
+    quant_config = SimpleNamespace(get_name=lambda: "awq")
     monkeypatch.setattr(torch, "get_default_dtype", lambda: torch.bfloat16)
 
     with (
         get_context().override_server_args(**_native_runtime_config()),
-        pytest.raises(ValueError, match="does not support quantized"),
+        pytest.raises(ValueError, match="supports only compressed-tensors"),
     ):
-        _validate_mova_config(config, quant_config=object())
+        _validate_mova_config(config, quant_config=quant_config)
+
+
+def test_native_xllm_declares_quantized_fused_module_mapping():
+    assert XllmForCausalLM.packed_modules_mapping == {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+    assert K2HorizonForCausalLM.packed_modules_mapping == (
+        XllmForCausalLM.packed_modules_mapping
+    )
 
 
 def test_native_xllm_accepts_bfloat16_without_expert_remapping(monkeypatch):

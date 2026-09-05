@@ -70,7 +70,8 @@ impl Default for ActiveLoadConfig {
 /// policy factory.
 ///
 /// Accepted on the CLI (`--policy`) as `round_robin` / `random` /
-/// `power_of_two` / `load_based` / `fused_score` / `cache_aware_zmq` /
+/// `power_of_two` / `load_based` / `fused_score` / `score_policy` /
+/// `session_aware` / `cache_aware` / `cache_aware_zmq` /
 /// `sticky`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PolicyKind {
@@ -87,6 +88,15 @@ pub enum PolicyKind {
     /// Weighted sum of `--fuse` terms.
     #[value(name = "fused_score")]
     FusedScore,
+    /// Composes compatible scoring terms into a single routing policy.
+    #[value(name = "score_policy")]
+    ScorePolicy,
+    /// Selects a worker from session affinity.
+    #[value(name = "session_aware")]
+    SessionAware,
+    /// Selects cache-affine prefill candidates from external indexer data.
+    #[value(name = "cache_aware")]
+    CacheAware,
     /// Cache-aware routing fed by SGLang's ZMQ KV-cache event publisher.
     /// Requires the model to have a tokenizer loaded; cache_aware tuning
     /// lives on `ModelConfig::cache_aware`.
@@ -222,16 +232,19 @@ pub struct ModelConfig {
     pub tokenizer_path: String,
     pub policy: PolicyKind,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
-    /// Tuning for the cache-aware ZMQ policy. Ignored unless
-    /// `policy = "cache_aware_zmq"`. `None` falls back to defaults at
-    /// policy construction time.
+    /// Cache-Aware ZMQ tuning and optional external Indexer endpoint.
     pub cache_aware: Option<CacheAwareConfig>,
     /// Tuning for the sticky-session policy. `Some` exactly when
     /// `policy = "sticky"` (built by [`crate::config::cli::Cli::into_config`]).
     /// The chat handler reads `sticky.header_name` to populate
     /// [`crate::policies::SelectionContext::routing_key`].
     pub sticky: Option<StickyConfig>,
-    /// Terms for `policy = "fused_score"`.
+    /// Session and cache-affinity tuning.
+    pub affinity: Option<AffinityConfig>,
+    /// Terms the score-composition policy sums. `Some` exactly when
+    /// `policy = "fused_score"` or `policy = "score_policy"` (built by
+    /// [`crate::config::cli::Cli::into_config`]), defaulting to
+    /// [`DEFAULT_FUSE`] when `--fuse` is omitted.
     pub fused: Option<Vec<FusedTerm>>,
     /// Hard constraints applied before policy selection.
     pub eligibility: Option<EligibilityConfig>,
@@ -339,6 +352,76 @@ fn default_balance_rel() -> f32 {
 /// matches the router's other emitted/consumed metadata headers
 /// (`x-sgl-decode-url`, `x-sgl-router-error-code`).
 pub const DEFAULT_STICKY_HEADER: &str = "x-sgl-routing-key";
+
+/// Default request header for session-aware routing.
+pub const DEFAULT_SESSION_ID_HEADER: &str = "x-session-id";
+
+/// Default external-indexer request limits.
+pub const DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT: usize = 32;
+
+/// Controls whether admission may select a session-affinity backup.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum AffinityMode {
+    /// Keep the primary after it passes admission.
+    #[value(name = "strict")]
+    Strict,
+    /// Allow the admitted backup to relieve pressure.
+    #[default]
+    #[value(name = "soft")]
+    Soft,
+}
+
+/// Controls the session-affinity lookup and fallback behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum SessionAffinityMode {
+    /// Search only within the target bucket.
+    #[default]
+    #[value(name = "bucket")]
+    Bucket,
+    /// Rebind to a target-bucket fallback when the global primary is unavailable.
+    #[value(name = "global-rebind")]
+    GlobalRebind,
+    /// Keep a valid global assignment when a bucket fallback is used.
+    #[value(name = "global-preserve")]
+    GlobalPreserve,
+}
+
+/// Shared session-aware and cache-aware settings.
+#[derive(Debug, Clone)]
+pub struct AffinityConfig {
+    pub session_id_header: String,
+    pub session_idle_secs: u64,
+    pub session_eviction_interval_secs: u64,
+    pub stable_pair: bool,
+    pub mode: AffinityMode,
+    pub session_affinity_mode: SessionAffinityMode,
+    pub cache_affinity_min_matched_tokens: Option<u64>,
+    pub cache_affinity_min_match_ratio: Option<f64>,
+    pub cache_candidate_min_workers: usize,
+    pub cache_candidate_ratio: f64,
+    pub cache_candidate_max_workers: usize,
+    pub cache_switch_margin_tokens: u64,
+}
+
+impl Default for AffinityConfig {
+    fn default() -> Self {
+        Self {
+            session_id_header: DEFAULT_SESSION_ID_HEADER.to_string(),
+            session_idle_secs: default_sticky_idle_secs(),
+            session_eviction_interval_secs: default_sticky_eviction_interval_secs(),
+            stable_pair: false,
+            mode: AffinityMode::Soft,
+            session_affinity_mode: SessionAffinityMode::Bucket,
+            // Indexer prefix scans are truncated, so use an absolute token floor.
+            cache_affinity_min_matched_tokens: Some(1_024),
+            cache_affinity_min_match_ratio: None,
+            cache_candidate_min_workers: 8,
+            cache_candidate_ratio: 0.05,
+            cache_candidate_max_workers: 32,
+            cache_switch_margin_tokens: 1_024,
+        }
+    }
+}
 
 /// Per-model sticky-session tuning. Built from the `--routing-key-header`
 /// / `--sticky-*` flags by [`crate::config::cli::Cli::into_config`], which
