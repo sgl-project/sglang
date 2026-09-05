@@ -54,6 +54,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -140,6 +141,37 @@ def fp8_paged_mqa_logits_torch(
     return scores
 
 
+# aiter's kernel is a Triton JIT function whose launcher Dynamo cannot trace, which
+# is fatal under the fullgraph piecewise prefill backend. A custom op keeps the launch
+# opaque; the output allocation stays outside so Dynamo still sees its shape.
+@register_custom_op(op_name="dsv4_aiter_fp8_paged_mqa_logits", mutates_args=["logits"])
+def _aiter_fp8_paged_mqa_logits_custom_op(
+    q_fp8: torch.Tensor,
+    kvcache_fp8: torch.Tensor,
+    weight: torch.Tensor,
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    max_seq_len: int,
+    kv_block_size: int,
+) -> None:
+    from aiter.ops.triton.attention.pa_mqa_logits import (
+        deepgemm_fp8_paged_mqa_logits,
+    )
+
+    deepgemm_fp8_paged_mqa_logits(
+        q_fp8,
+        kvcache_fp8,
+        weight,
+        logits,
+        seq_lens,
+        page_table,
+        max_seq_len,
+        KVBlockSize=kv_block_size,
+        Preshuffle=aiter_can_use_preshuffle_paged_mqa(),
+    )
+
+
 def _aiter_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kvcache_fp8: torch.Tensor,
@@ -151,10 +183,6 @@ def _aiter_fp8_paged_mqa_logits(
     clean_logits: bool = False,
 ) -> torch.Tensor:
     """Wrapper adapting aiter's deepgemm_fp8_paged_mqa_logits to SGLang's interface."""
-    from aiter.ops.triton.attention.pa_mqa_logits import (
-        deepgemm_fp8_paged_mqa_logits,
-    )
-
     batch_size = q_fp8.shape[0]
     next_n = q_fp8.shape[1]
     total_tokens = batch_size * next_n
@@ -166,7 +194,7 @@ def _aiter_fp8_paged_mqa_logits(
         dtype=torch.float32,
         device=q_fp8.device,
     )
-    deepgemm_fp8_paged_mqa_logits(
+    _aiter_fp8_paged_mqa_logits_custom_op(
         q_fp8,
         kvcache_fp8,
         weight,
@@ -174,8 +202,7 @@ def _aiter_fp8_paged_mqa_logits(
         _sl.to(torch.int32),
         page_table.to(torch.int32),
         max_seq_len,
-        KVBlockSize=kv_block_size,
-        Preshuffle=aiter_can_use_preshuffle_paged_mqa(),
+        kv_block_size,
     )
     return logits
 
@@ -784,6 +811,9 @@ class C4IndexerBackendMixin:
 
         query_rows = q_indexer[0].shape[0] if use_fp4_indexer else q_indexer.shape[0]
 
+        # Kept as a branch chain on purpose: collapsing it into one F.pad removes a
+        # token-dimension specialization but returns a fresh tensor in the
+        # already-matching case, and something downstream relies on tensor identity.
         def match_num_queries(tensor: torch.Tensor, value: int) -> torch.Tensor:
             if tensor.shape[0] == query_rows:
                 return tensor

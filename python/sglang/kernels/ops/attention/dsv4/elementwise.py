@@ -9,6 +9,7 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 from sglang.srt.utils import is_hip, is_xpu
+from sglang.srt.utils.custom_op import register_custom_op
 
 from .utils import make_name
 
@@ -141,6 +142,26 @@ def fused_rope_inplace(
     module.forward(q, k, freqs_real, positions, inverse)
 
 
+# load_jit() modules expose their entry point as a `Function` instance, which Dynamo
+# cannot trace; under the fullgraph piecewise prefill backend that break is fatal
+# rather than a benign split. A custom op makes the call opaque, as fp8_wo_a.py does
+# for its own JIT kernel. Deliberately not a @register_split_op: these kernels are
+# small, and a split point per kernel would shred the graph and give back the speedup
+# piecewise exists to provide.
+@register_custom_op(op_name="dsv4_jit_main_q_norm_rope", mutates_args=["q_output"])
+def _jit_main_q_norm_rope_custom_op(
+    q_input: torch.Tensor,
+    q_output: torch.Tensor,
+    freqs_real: torch.Tensor,
+    positions: torch.Tensor,
+    eps: float,
+) -> None:
+    module = _jit_main_q_norm_rope_module(
+        q_input.dtype, q_input.shape[-1], freqs_real.shape[-1]
+    )
+    module.forward(q_input, q_output, freqs_real, positions, eps)
+
+
 def fused_q_norm_rope(
     q_input: torch.Tensor,
     q_output: torch.Tensor,
@@ -149,13 +170,10 @@ def fused_q_norm_rope(
     positions: torch.Tensor,
 ) -> None:
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
-    head_dim = q_input.shape[-1]
-    rope_dim = freqs_real.shape[-1]
     if _is_xpu:
         fused_q_norm_rope_xpu(q_input, q_output, freqs_real, positions, eps)
     else:
-        module = _jit_main_q_norm_rope_module(q_input.dtype, head_dim, rope_dim)
-        module.forward(q_input, q_output, freqs_real, positions, eps)
+        _jit_main_q_norm_rope_custom_op(q_input, q_output, freqs_real, positions, eps)
 
 
 def fused_q_indexer_rope_hadamard_quant(
@@ -264,6 +282,26 @@ def fused_q_indexer_rope_hadamard_fp4_quant(
     return (q_fp4, q_sf), weights_out
 
 
+# Same treatment as _jit_main_q_norm_rope_custom_op above, K side.
+@register_custom_op(
+    op_name="dsv4_jit_main_k_norm_rope_flashmla", mutates_args=["kvcache"]
+)
+def _jit_main_k_norm_rope_flashmla_custom_op(
+    kv: torch.Tensor,
+    kv_weight: torch.Tensor,
+    freqs_real: torch.Tensor,
+    positions: torch.Tensor,
+    out_loc: torch.Tensor,
+    kvcache: torch.Tensor,
+    eps: float,
+    page_size: int,
+) -> None:
+    module = _jit_main_k_norm_rope_flashmla_module(
+        kv.dtype, kv.shape[-1], freqs_real.shape[-1], page_size
+    )
+    module.forward(kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps)
+
+
 def fused_k_norm_rope_flashmla(
     kv: torch.Tensor,
     kv_weight: torch.Tensor,
@@ -275,14 +313,11 @@ def fused_k_norm_rope_flashmla(
     page_size: int,
 ) -> None:
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
-    head_dim = kv.shape[-1]
-    rope_dim = freqs_real.shape[-1]
     if _is_xpu:
         fused_k_norm_rope_flashmla_xpu(
             kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps, page_size
         )
     else:
-        module = _jit_main_k_norm_rope_flashmla_module(
-            kv.dtype, head_dim, rope_dim, page_size
+        _jit_main_k_norm_rope_flashmla_custom_op(
+            kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps, page_size
         )
-        module.forward(kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps)

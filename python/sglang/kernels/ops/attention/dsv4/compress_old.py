@@ -11,6 +11,7 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.utils.custom_op import register_custom_op
 
 from .utils import make_name
 
@@ -268,6 +269,30 @@ def compress_forward(
     return out
 
 
+# Wrapped for the same reason as _jit_main_q_norm_rope_custom_op in elementwise.py:
+# Dynamo cannot trace the JIT module's `Function.__call__` under fullgraph.
+@register_custom_op(op_name="dsv4_jit_norm_rope_inplace", mutates_args=["kv"])
+def _jit_norm_rope_inplace_custom_op(
+    kv: torch.Tensor,
+    weight: torch.Tensor,
+    positions: torch.Tensor,
+    freq_cis: torch.Tensor,
+    mode: int,
+    eps: float,
+    compress_ratio: int,
+) -> None:
+    module = norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
+    module.forward(
+        kv,
+        weight,
+        positions,
+        freq_cis,
+        mode,
+        eps,
+        compress_ratio,
+    )
+
+
 def compress_fused_norm_rope_inplace(
     kv: torch.Tensor,
     weight: torch.Tensor,
@@ -276,8 +301,7 @@ def compress_fused_norm_rope_inplace(
     plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
 ) -> None:
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
-    module = norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
-    module.forward(
+    _jit_norm_rope_inplace_custom_op(
         kv,
         weight,
         plan[1],
@@ -296,8 +320,7 @@ def fused_norm_rope_inplace(
     positions: torch.Tensor,
 ) -> None:
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
-    module = norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
-    module.forward(
+    _jit_norm_rope_inplace_custom_op(
         kv,
         weight,
         positions,
