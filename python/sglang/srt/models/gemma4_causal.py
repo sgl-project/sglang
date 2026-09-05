@@ -1192,7 +1192,9 @@ class Gemma4ForCausalLM(PreTrainedModel):
             i for i, lt in enumerate(self.config.layer_types) if lt == "full_attention"
         }
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], *, is_full_load: bool = True
+    ):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1365,7 +1367,7 @@ class Gemma4ForCausalLM(PreTrainedModel):
                         weight_loader(param, loaded_weight)
                         loaded_params.add(name)
         unloaded_params = params_dict.keys() - loaded_params
-        if unloaded_params:
+        if is_full_load and unloaded_params:
             param_names = set(dict(self.named_parameters()).keys())
             buckets = {
                 logging.WARNING: (

@@ -337,7 +337,9 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
     # ------------------------------------------------------------------
     # Weight loading
     # ------------------------------------------------------------------
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+    def load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], *, is_full_load: bool = True
+    ) -> Set[str]:
         k_eq_v_layers = self._get_k_eq_v_layers()
 
         params_dict = dict(self.named_parameters())
@@ -412,7 +414,7 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
                 loaded_params.add(name)
 
         unloaded_params = params_dict.keys() - loaded_params
-        if unloaded_params:
+        if is_full_load and unloaded_params:
             param_names = set(dict(self.named_parameters()).keys())
             buckets = {
                 logging.WARNING: (

@@ -834,7 +834,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             i for i, lt in enumerate(text_config.layer_types) if lt == "full_attention"
         }
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], *, is_full_load: bool = True
+    ):
         k_eq_v_layers = self._get_k_eq_v_layers()
 
         num_experts = getattr(self.config.text_config, "num_experts", 0) or 0
@@ -1036,7 +1038,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                             )
                         loaded_params.add(name)
         unloaded_params = params_dict.keys() - loaded_params
-        if unloaded_params:
+        if is_full_load and unloaded_params:
             param_names = set(dict(self.named_parameters()).keys())
             buckets = {
                 logging.WARNING: (
