@@ -23,6 +23,7 @@ from sglang.kernels.ops.attention.utils import (
     create_flashinfer_kv_indices_triton,
     create_flashmla_kv_indices_triton,
     get_num_kv_index_blocks_flashmla,
+    kv_indices_num_token_blocks,
 )
 from sglang.kernels.ops.kvcache.aiter_unified_attention import (
     scatter_ragged_to_page_table_kernel,
@@ -1239,7 +1240,12 @@ class AiterAttnBackend(AttentionBackend):
                     kv_indices = self._get_kv_indices_scratch(
                         forward_batch.seq_lens_sum, forward_batch.seq_lens.device
                     )
-                    create_flashinfer_kv_indices_triton[(bs,)](
+                    create_flashinfer_kv_indices_triton[
+                        (
+                            bs,
+                            kv_indices_num_token_blocks(self.req_to_token.shape[1], bs),
+                        )
+                    ](
                         self.req_to_token,
                         forward_batch.req_pool_indices,
                         forward_batch.seq_lens,
@@ -1366,7 +1372,9 @@ class AiterAttnBackend(AttentionBackend):
                     forward_batch.seq_lens_sum, device
                 )
 
-                create_flashinfer_kv_indices_triton[(bs,)](
+                create_flashinfer_kv_indices_triton[
+                    (bs, kv_indices_num_token_blocks(self.req_to_token.shape[1], bs))
+                ](
                     self.req_to_token,
                     forward_batch.req_pool_indices,
                     forward_batch.seq_lens,
@@ -1459,7 +1467,9 @@ class AiterAttnBackend(AttentionBackend):
                     kv_lens_sum,
                     device,
                 )
-                create_flashinfer_kv_indices_triton[(bs,)](
+                create_flashinfer_kv_indices_triton[
+                    (bs, kv_indices_num_token_blocks(self.req_to_token.shape[1], bs))
+                ](
                     self.req_to_token,
                     forward_batch.req_pool_indices,
                     kv_lens,
@@ -1556,7 +1566,12 @@ class AiterAttnBackend(AttentionBackend):
                     kv_indices = torch.empty(
                         kv_indptr[-1], dtype=torch.int64, device=self.device
                     )
-                    create_flashinfer_kv_indices_triton[(bs,)](
+                    create_flashinfer_kv_indices_triton[
+                        (
+                            bs,
+                            kv_indices_num_token_blocks(self.req_to_token.shape[1], bs),
+                        )
+                    ](
                         self.req_to_token,
                         forward_batch.req_pool_indices,
                         forward_batch.seq_lens,
@@ -1862,7 +1877,12 @@ class AiterAttnBackend(AttentionBackend):
                     kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
                     kv_indptr = kv_indptr[: bs + 1]
                     kv_indices = self.cuda_graph_kv_indices
-                    create_flashinfer_kv_indices_triton[(bs,)](
+                    create_flashinfer_kv_indices_triton[
+                        (
+                            bs,
+                            kv_indices_num_token_blocks(self.req_to_token.shape[1], bs),
+                        )
+                    ](
                         self.req_to_token,
                         req_pool_indices,
                         seq_lens,
@@ -2010,7 +2030,9 @@ class AiterAttnBackend(AttentionBackend):
                     bs=bs,
                     seq_lens_sum=seq_lens_sum,
                 )
-            create_flashinfer_kv_indices_triton[(bs,)](
+            create_flashinfer_kv_indices_triton[
+                (bs, kv_indices_num_token_blocks(self.req_to_token.shape[1], bs))
+            ](
                 self.req_to_token,
                 req_pool_indices,
                 kv_lens,
@@ -2136,7 +2158,9 @@ class AiterAttnBackend(AttentionBackend):
             kv_indptr = self.kv_indptr[: bs + 1]
             kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
             kv_indices = self.cuda_graph_kv_indices
-            create_flashinfer_kv_indices_triton[(bs,)](
+            create_flashinfer_kv_indices_triton[
+                (bs, kv_indices_num_token_blocks(self.req_to_token.shape[1], bs))
+            ](
                 self.req_to_token,
                 req_pool_indices,
                 seq_lens,
@@ -3219,7 +3243,9 @@ class AiterIndicesUpdaterPrefill:
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
-            create_flashinfer_kv_indices_triton[(bs,)](
+            create_flashinfer_kv_indices_triton[
+                (bs, kv_indices_num_token_blocks(self.req_to_token.shape[1], bs))
+            ](
                 self.req_to_token,
                 req_pool_indices,
                 paged_kernel_lens,
@@ -3302,7 +3328,9 @@ class AiterMlaIndicesUpdaterPrefill:
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
-            create_flashinfer_kv_indices_triton[(bs,)](
+            create_flashinfer_kv_indices_triton[
+                (bs, kv_indices_num_token_blocks(self.req_to_token.shape[1], bs))
+            ](
                 self.req_to_token,
                 req_pool_indices,
                 kv_lens,
@@ -3383,8 +3411,11 @@ class AiterMultiStepDraftBackend:
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
 
+        num_token_blocks = kv_indices_num_token_blocks(
+            self.pool_len, self.speculative_num_steps * num_seqs * self.topk
+        )
         self.generate_draft_decode_kv_indices[
-            (self.speculative_num_steps, num_seqs, self.topk)
+            (self.speculative_num_steps * num_token_blocks, num_seqs, self.topk)
         ](
             forward_batch.req_pool_indices,
             self.req_to_token_pool.req_to_token,
@@ -3399,6 +3430,7 @@ class AiterMultiStepDraftBackend:
             triton.next_power_of_2(self.speculative_num_steps),
             triton.next_power_of_2(bs),
             self.page_size,
+            NUM_STEPS=self.speculative_num_steps,
         )
 
         for i in range(self.speculative_num_steps - 1):
