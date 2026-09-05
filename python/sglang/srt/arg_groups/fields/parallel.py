@@ -16,6 +16,7 @@ from typing import Optional
 from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
+    Derived,
 )
 
 
@@ -275,3 +276,36 @@ class Parallel:
         Optional[int],
         "Maximum EP size the server can scale to at runtime. Pre-allocates active-rank state and backend buffers to this size. Defaults to the launch-time world size.",
     ] = None
+
+    # ---- derived: the quotients of the leaves above -------------------------
+    #
+    # Declared here, beside what they are computed from, because a namespace is
+    # one file and one class. They are not annotated, so they are not dataclass
+    # fields and `collect_input_fields` does not put them on the record -- which
+    # is right: a quotient has no operator input to preserve, and the record is
+    # what crosses a process boundary, so a width put there would be a stale
+    # copy the moment an elastic scale-up restamps one. `derive_parallel_widths`
+    # computes all six from the leaves above; `ParallelContext` installs a
+    # property per declaration.
+    attn_tp_size = Derived(
+        doc="Attention tensor-parallel width: `tp_size` divided by the "
+        "attention-DP and attention-CP dimensions.",
+    )
+    attn_dp_size = Derived(
+        doc="Attention data-parallel width, normalised from the configured "
+        "value (both an input to the derivation and an output of it).",
+    )
+    attn_dcp_size = Derived(
+        doc="Decode context-parallel width inside the attention TP group.",
+    )
+    moe_ep_size = Derived(
+        doc="MoE expert-parallel width, normalised from the configured value.",
+    )
+    moe_tp_size = Derived(
+        doc="MoE tensor-parallel width: what is left of `tp_size` after the "
+        "expert and MoE-DP dimensions.",
+    )
+    dcp_enabled = Derived(
+        doc="Whether decode context parallelism is in play -- a group exists "
+        "and is wider than one rank.",
+    )

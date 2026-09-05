@@ -20,6 +20,7 @@ from typing import (
 from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
+    Derived,
 )
 from sglang.srt.arg_groups.choices import (
     ATTENTION_BACKEND_CHOICES,
@@ -292,6 +293,27 @@ class ExecMamba:
     """Namespace ``exec.mamba``."""
 
     _NS_PATH = "exec.mamba"
+
+    # ---- derived: whether the mamba radix cache keeps its extra state buffer.
+    #
+    # One answer, computed at publish. There used to be three spellings of this
+    # predicate -- a `ServerArgs` member for the resolution pipeline, a
+    # `runtime_context` function for readers after publish, and the shared
+    # helper both delegated to -- which is three places to keep saying the same
+    # thing. The helper stays, because resolution needs it before there is a
+    # bag to read; the other two are this.
+    #
+    # It reads `memory.disable_radix_cache` as well as the strategy below, so
+    # it spans two namespaces and could not have been a method on either bag.
+    enable_mamba_extra_buffer = Derived(
+        fn="sglang.srt.arg_groups.model_override_base.mamba_extra_buffer_of",
+        doc="Whether the hybrid-mamba radix cache keeps its extra state "
+        "buffer: the radix cache is on and the strategy asks for one.",
+    )
+    enable_mamba_extra_buffer_lazy = Derived(
+        fn="sglang.srt.arg_groups.overrides.mamba_extra_buffer_lazy_of",
+        doc="The lazy variant: the strategy is `extra_buffer_lazy` exactly.",
+    )
     mamba_backend: A[
         str,
         Arg(
@@ -578,6 +600,16 @@ class ExecMoe:
     """Namespace ``exec.moe``."""
 
     _NS_PATH = "exec.moe"
+
+    # ---- derived: computed at publish from the leaves below.
+    is_ep_joiner = Derived(
+        fn="sglang.srt.arg_groups.model_override_base.ep_joiner_of",
+        doc="Whether this process was launched as an elastic-EP joiner (scale or recover).",
+    )
+    is_ep_scale_joiner = Derived(
+        fn="sglang.srt.arg_groups.model_override_base.ep_scale_joiner_of",
+        doc="Whether it is a scale-up joiner specifically.",
+    )
     enable_fused_moe_sum_all_reduce: A[
         bool,
         "Enable fused moe triton and sum all reduce.",

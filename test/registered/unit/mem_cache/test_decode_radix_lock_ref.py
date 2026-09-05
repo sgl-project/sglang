@@ -20,6 +20,8 @@ Usage:
     python -m pytest test/registered/unit/mem_cache/test_decode_radix_lock_ref.py -v
 """
 
+from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -97,14 +99,25 @@ def _make_req(fill_ids, req_pool_idx=0, cache_protected_len=0, last_node=None):
 
 
 class TestDecodeLockRefScenarios(unittest.TestCase):
+    def setUp(self):
+        # The decode queue reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="scheduler")
+
     """Test lock_ref balance across decode transfer scenarios."""
 
     def test_swa_tail_len_keeps_page_aligned_matchable_window(self):
+        self.enterContext(
+            get_context().override_server_args(
+                disaggregation_decode_enable_radix_cache=True
+            )
+        )
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
         queue.scheduler = SimpleNamespace(
             sliding_window_size=127,
-            server_args=SimpleNamespace(disaggregation_decode_enable_radix_cache=True),
+            server_args=SimpleNamespace(),
         )
         queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
 
@@ -420,7 +433,11 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         running_batch = MagicMock()
         running_batch.reqs = []
         server_args = MagicMock()
-        server_args.disaggregation_decode_enable_radix_cache = True
+        self.enterContext(
+            get_context().override_server_args(
+                disaggregation_decode_enable_radix_cache=True
+            )
+        )
         scheduler = MagicMock()
         scheduler.running_batch = running_batch
         scheduler.server_args = server_args

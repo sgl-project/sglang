@@ -53,21 +53,22 @@ _SRT = _pathlib.Path(next(iter(_sglang.__path__))).resolve() / "srt"
 _PS = "sglang.srt.distributed.parallel_state"
 _DP = "sglang.srt.layers.dp_attention"
 
+# Ranks and the world size read the live group: they are not implied by
+# anything, so there is nothing to derive them from. The quotients used to be
+# in this table and are not any more -- `attn_tp_size` and its siblings are
+# functions of the configured leaves, and `TestDerivedWidthsComeFromTheLeaves`
+# is what pins them.
 SIZE_RANK_DELEGATIONS = [
     ("world_size", f"{_PS}.get_world_size"),
     ("world_rank", f"{_PS}.get_world_rank"),
     ("tp_rank", f"{_PS}.get_tensor_model_parallel_rank"),
     ("dcp_rank", f"{_PS}.get_dcp_rank"),
     ("pp_rank", f"{_PS}.get_pipeline_model_parallel_rank"),
-    ("moe_ep_size", f"{_PS}.get_moe_expert_parallel_world_size"),
     ("moe_ep_rank", f"{_PS}.get_moe_expert_parallel_rank"),
     ("moe_dp_rank", f"{_PS}.get_moe_data_parallel_rank"),
-    ("moe_tp_size", f"{_PS}.get_moe_tensor_parallel_world_size"),
     ("moe_tp_rank", f"{_PS}.get_moe_tensor_parallel_rank"),
-    ("attn_tp_size", f"{_PS}.get_attn_tensor_model_parallel_world_size"),
     ("attn_tp_rank", f"{_PS}.get_attn_tensor_model_parallel_rank"),
     ("attn_cp_rank", f"{_PS}.get_attn_context_model_parallel_rank"),
-    ("attn_dp_size", f"{_DP}.get_attention_dp_size"),
     ("attn_dp_rank", f"{_DP}.get_attention_dp_rank"),
 ]
 
@@ -176,36 +177,45 @@ class TestParallelOverride(_IsolatedOverrides):
 
 
 class TestParallelDCP(_IsolatedOverrides):
-    def test_attn_dcp_defaults_when_group_is_uninitialized(self):
-        with (
-            patch(f"{_PS}.get_dcp_group_no_assert", return_value=None),
-            patch(f"{_PS}.get_dcp_world_size", side_effect=AssertionError),
-            patch(f"{_PS}.get_dcp_rank", side_effect=AssertionError),
-        ):
+    """The DCP width is a quotient; the DCP rank is a live reading.
+
+    They used to be tested the same way, by mocking the group getters, because
+    the width read the group too. It does not: `attn_dcp_size` is
+    `dcp_size if dcp_enabled else 1`, so the way to state it is to state the
+    leaves.
+    """
+
+    def test_attn_dcp_is_one_when_dcp_is_off(self):
+        with get_parallel().override(tp_size=8, dcp_size=4, dcp_enabled=False):
             self.assertFalse(get_parallel().dcp_enabled)
             self.assertEqual(get_parallel().attn_dcp_size, 1)
+
+    def test_attn_dcp_is_the_configured_width_when_on(self):
+        with get_parallel().override(tp_size=8, dcp_size=8, dcp_enabled=True):
+            self.assertTrue(get_parallel().dcp_enabled)
+            self.assertEqual(get_parallel().attn_dcp_size, 8)
+
+    def test_the_dcp_rank_still_reads_the_group(self):
+        """A rank is not implied by the configuration, so it reads the group --
+        gated on a width that is."""
+        with (
+            get_parallel().override(tp_size=8, dcp_size=8, dcp_enabled=False),
+            patch(f"{_PS}.get_dcp_rank", side_effect=AssertionError),
+        ):
             self.assertEqual(get_parallel().attn_dcp_rank, 0)
-
-    def test_attn_dcp_delegates_when_enabled(self):
         with (
-            patch(f"{_PS}.get_dcp_group_no_assert", return_value=object()),
-            patch(f"{_PS}.get_dcp_world_size", return_value=8),
+            get_parallel().override(tp_size=8, dcp_size=8, dcp_enabled=True),
             patch(f"{_PS}.get_dcp_rank", return_value=3),
         ):
-            self.assertTrue(get_parallel().dcp_enabled)
-            self.assertEqual(get_parallel().attn_dcp_size, 8)
             self.assertEqual(get_parallel().attn_dcp_rank, 3)
 
-    def test_dcp_enablement_is_platform_agnostic(self):
+    def test_the_width_does_not_consult_the_platform(self):
         with (
-            patch(f"{_PS}.get_dcp_group_no_assert", return_value=object()),
             patch("sglang.srt.utils.is_cuda", return_value=False) as is_cuda,
-            patch(f"{_PS}.get_dcp_world_size", return_value=8),
-            patch(f"{_PS}.get_dcp_rank", return_value=3),
+            get_parallel().override(tp_size=8, dcp_size=8, dcp_enabled=True),
         ):
             self.assertTrue(get_parallel().dcp_enabled)
             self.assertEqual(get_parallel().attn_dcp_size, 8)
-            self.assertEqual(get_parallel().attn_dcp_rank, 3)
             is_cuda.assert_not_called()
 
 
@@ -1150,27 +1160,32 @@ class TestDerivedPredicatesAgreeAcrossTiers(_IsolatedServerArgs):
 
     _STRATEGIES = ("auto", "no_buffer", "extra_buffer", "extra_buffer_lazy")
 
-    def test_mamba_extra_buffer_matches_the_member(self):
-        from sglang.srt.runtime_context import (
-            mamba_extra_buffer_enabled,
-            mamba_extra_buffer_lazy_enabled,
-        )
-
+    def test_the_mamba_extra_buffer_predicate_has_one_answer(self):
+        """It used to be asserted that two spellings agreed. There is one now:
+        the declaration computes it at publish, and the bag carries it."""
         for disable_radix_cache in (False, True):
             for strategy in self._STRATEGIES:
                 with self.subTest(radix=disable_radix_cache, strategy=strategy):
-                    args = _FakeResolvedArgs(
-                        disable_radix_cache=disable_radix_cache,
-                        mamba_radix_cache_strategy=strategy,
+                    reset_context()
+                    publish(
+                        ServerArgs(
+                            model_path="dummy",
+                            disable_radix_cache=disable_radix_cache,
+                            mamba_radix_cache_strategy=strategy,
+                        ),
+                        role="engine",
                     )
-                    get_context().set_server_args(args)
-                    self.assertEqual(
-                        ServerArgs.enable_mamba_extra_buffer(args),
-                        mamba_extra_buffer_enabled(),
+                    expected = disable_radix_cache is False and strategy in (
+                        "extra_buffer",
+                        "extra_buffer_lazy",
                     )
                     self.assertEqual(
-                        ServerArgs.enable_mamba_extra_buffer_lazy(args),
-                        mamba_extra_buffer_lazy_enabled(),
+                        get_exec().mamba.enable_mamba_extra_buffer, expected
+                    )
+                    self.assertEqual(
+                        get_exec().mamba.enable_mamba_extra_buffer_lazy,
+                        disable_radix_cache is False
+                        and strategy == "extra_buffer_lazy",
                     )
 
     def test_prefill_buffer_ceiling_matches_the_member(self):
@@ -1532,10 +1547,16 @@ class TestDerivedWidths(_IsolatedOverrides):
             self.assertEqual(parallel.attn_tp_size, 1)
         self.assertEqual(parallel.attn_tp_size, 4)
 
-    def test_without_a_stamp_the_live_group_still_answers(self):
-        """A process that installed groups by hand keeps working."""
-        with patch(f"{_PS}.get_attn_tensor_model_parallel_world_size", return_value=2):
-            self.assertEqual(get_parallel().attn_tp_size, 2)
+    def test_without_a_stamp_the_leaves_answer(self):
+        """There is no third source. A quotient not stamped is computed, and a
+        group coordinator is not consulted -- it could only ever agree, since
+        `initialize_model_parallel` stamps as its last statement."""
+        with patch(
+            f"{_PS}.get_attn_tensor_model_parallel_world_size",
+            side_effect=AssertionError("the group must not be consulted"),
+        ):
+            with get_parallel().override(tp_size=8, attn_dp_size=2):
+                self.assertEqual(get_parallel().attn_tp_size, 4)
 
     def test_with_neither_the_failure_names_the_cause(self):
         with patch(
@@ -1568,13 +1589,13 @@ class TestDerivedWidths(_IsolatedOverrides):
         parallel.stamp_derived_widths(attn_dp_size=4)
         self.assertEqual(parallel.attn_dp_size, 4)
         parallel.clear_derived_widths()
-        with patch(f"{_DP}.get_attention_dp_size", return_value=1):
+        with parallel.override(tp_size=8, attn_dp_size=1):
             self.assertEqual(parallel.attn_dp_size, 1)
 
     def test_reset_context_drops_the_stamp(self):
         """The stamp belongs to the lifecycle that made it.
 
-        `_derived_width` prefers the stamp over the live group, so a stamp that
+        `_derived_width` prefers the stamp over the leaves, so a stamp that
         outlived `reset_context()` would let the next test read the previous
         topology.
         """
@@ -1584,7 +1605,7 @@ class TestDerivedWidths(_IsolatedOverrides):
         parallel.stamp_derived_widths(attn_tp_size=4)
         self.assertEqual(parallel.attn_tp_size, 4)
         reset_context()
-        with patch(f"{_PS}.get_attn_tensor_model_parallel_world_size", return_value=1):
+        with get_parallel().override(tp_size=1):
             self.assertEqual(get_parallel().attn_tp_size, 1)
 
     def test_the_arithmetic_has_one_home(self):
@@ -1622,6 +1643,68 @@ class TestDerivedWidths(_IsolatedOverrides):
             )
             self.assertEqual(attn_tp_size, widths["attn_tp_size"])
             self.assertEqual(attn_dp_size, widths["attn_dp_size"])
+
+
+class TestTheDerivedHalfIsDeclared(CustomTestCase):
+    """The quotients are declared beside the leaves, in the same class.
+
+    A namespace is one file and one class. `Parallel` says both what an
+    operator can set and what that decides; the quotients are unannotated, so
+    they are not dataclass fields and never reach the record.
+    `ParallelContext` installs a property per declaration rather than carrying
+    its own list, so the two cannot drift.
+    """
+
+    def test_every_declared_quotient_has_a_property(self):
+        from sglang.srt.arg_groups.arg_utils import Derived
+        from sglang.srt.arg_groups.fields.parallel import Parallel
+
+        declared = {
+            name for name, value in vars(Parallel).items() if isinstance(value, Derived)
+        }
+        self.assertTrue(declared, "the derived half is empty")
+        for name in declared:
+            self.assertIsInstance(
+                getattr(type(get_context().parallel), name, None),
+                property,
+                f"{name} is declared but no property was installed",
+            )
+
+    def test_the_declared_set_is_what_derive_parallel_widths_produces(self):
+        """The declaration is not a second list to keep in step: it names
+        exactly the quotients the derivation returns."""
+        from sglang.srt.arg_groups.arg_utils import Derived
+        from sglang.srt.arg_groups.fields.parallel import Parallel
+
+        declared = {
+            name for name, value in vars(Parallel).items() if isinstance(value, Derived)
+        }
+        produced = set(
+            derive_parallel_widths(
+                tp_size=8,
+                attn_cp_size=1,
+                attn_dp_size=2,
+                moe_ep_size=1,
+                moe_dp_size=1,
+                dcp_size=1,
+                dcp_enabled=False,
+            )
+        )
+        self.assertEqual(declared, produced)
+
+    def test_a_declared_quotient_is_not_a_record_field(self):
+        """It has no operator input to preserve, and the record is what crosses
+        a process boundary."""
+        import dataclasses
+
+        from sglang.srt.arg_groups.arg_utils import Derived
+        from sglang.srt.arg_groups.fields.parallel import Parallel
+        from sglang.srt.server_args import ServerArgs
+
+        fields = {f.name for f in dataclasses.fields(ServerArgs)}
+        for name, value in vars(Parallel).items():
+            if isinstance(value, Derived):
+                self.assertNotIn(name, fields)
 
 
 if __name__ == "__main__":
