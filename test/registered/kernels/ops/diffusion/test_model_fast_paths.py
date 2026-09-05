@@ -120,6 +120,7 @@ from sglang.multimodal_gen.runtime.models.vaes import (
 from sglang.multimodal_gen.runtime.models.vaes import flux2_vae_cuda_opt as vae_opt
 from sglang.multimodal_gen.runtime.models.vaes import (
     wan_vae_cuda_opt,
+    wanvae,
 )
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
@@ -1058,6 +1059,92 @@ def test_wan_vae_rejects_empty_input() -> None:
     )
     gamma = torch.ones(96, 1, 1, 1, device="cuda", dtype=torch.bfloat16)
     assert not can_use_wan_rmsnorm_silu(x, gamma, None)
+
+
+@torch.no_grad()
+def test_wan_vae_time_interleave_matches_stack_and_keeps_layout() -> None:
+    # time_conv output [B, 2C, T, H, W] -> interleaved [B, C, 2T, H, W].
+    b, c, t, h, w = 1, 8, 3, 6, 10
+    x = _wan_cl3d((b, 2 * c, t, h, w), torch.bfloat16)
+    ref = torch.stack(
+        (x.reshape(b, 2, c, t, h, w)[:, 0], x.reshape(b, 2, c, t, h, w)[:, 1]), 3
+    ).reshape(b, c, 2 * t, h, w)
+
+    class _Holder:  # stands in for the WanResample instance
+        pass
+
+    holder = _Holder()
+    off = wanvae._interleave_time_pairs(holder, x, b, c, t, h, w)
+    assert torch.equal(off, ref) and off.is_contiguous()  # eager NCDHW path
+    holder._sgl_gate = VaeFastPathGate()
+    holder._sgl_gate.enabled = True
+    on = wanvae._interleave_time_pairs(holder, x, b, c, t, h, w)
+    assert torch.equal(on, ref)
+    assert on.is_contiguous(memory_format=torch.channels_last_3d)
+
+
+@torch.no_grad()
+def test_wan_vae_upsample_wrapper_dispatch() -> None:
+    gate = VaeFastPathGate()
+    up = GatedChannelsLastUpsample(
+        wanvae.WanUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact"), gate
+    )
+    aten = nn.Upsample(scale_factor=(2.0, 2.0), mode="nearest-exact")
+    # Canonical NHWC (multi-frame chunk): the Triton gather replaces aten's
+    # NHWC kernel on both paths, same values and layout.
+    x = torch.randn(4, 8, 6, 6, device="cuda", dtype=torch.bfloat16).contiguous(
+        memory_format=torch.channels_last
+    )
+    out = up(x)
+    assert torch.equal(out, aten(x))
+    assert out.is_contiguous(memory_format=torch.channels_last)
+    # Degenerate batch stride (single frame): gate off keeps aten's NCHW
+    # result, gate on canonicalises and stays channels_last.
+    x1 = (
+        _wan_cl3d((1, 8, 1, 6, 6), torch.bfloat16)
+        .permute(0, 2, 1, 3, 4)
+        .reshape(1, 8, 6, 6)
+    )
+    ref1 = aten(x1)
+    off = up(x1)
+    assert torch.equal(off, ref1) and off.is_contiguous()
+    gate.enabled = True
+    on = up(x1)
+    assert torch.equal(on, ref1)
+    assert on.is_contiguous(memory_format=torch.channels_last)
+    # NCHW input is untouched on either path.
+    xn = torch.randn(2, 8, 6, 6, device="cuda", dtype=torch.bfloat16)
+    assert torch.equal(up(xn), aten(xn)) and up(xn).is_contiguous()
+
+
+@torch.no_grad()
+def test_wan_vae_decoder_install_wires_resample_gate() -> None:
+    torch.manual_seed(0)
+    dec = wanvae.WanDecoder3d(
+        dim=16, z_dim=4, dim_mult=[1, 1], num_res_blocks=1, temperal_upsample=[True]
+    ).to("cuda", torch.bfloat16)
+    keys = set(dec.state_dict())
+    gate = VaeFastPathGate()
+    n_norm = wan_vae_cuda_opt._install_norm_silu(
+        dec,
+        gate,
+        residual_block_cls=wanvae.WanResidualBlock,
+        rms_norm_cls=WanRMS_norm,
+        label="test",
+    )
+    n_up = wan_vae_cuda_opt._install_channels_last_upsample(
+        dec, gate, wanvae.WanUpsample
+    )
+    n_gated = wan_vae_cuda_opt._install_module_gates(
+        dec, gate, (wanvae.WanResample, wanvae.WanAttentionBlock)
+    )
+    # one Resample plus the mid block's attention
+    assert n_norm == 13 and n_up == 1 and n_gated == 2
+    assert set(dec.state_dict()) == keys
+    resample = next(m for m in dec.modules() if type(m) is wanvae.WanResample)
+    assert resample._sgl_gate is gate
+    attn = next(m for m in dec.modules() if type(m) is wanvae.WanAttentionBlock)
+    assert attn._sgl_gate is gate
 
 
 # -------------------------------------------------------------------------

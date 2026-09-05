@@ -21,6 +21,7 @@ from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 from sglang.kernels.ops.diffusion import (
     build_inv_indices,
+    can_use_nearest_upsample_nhwc,
     can_use_usp_merge_heads,
     cat_pad_channels_last_3d,
     dup_up3d_add,
@@ -33,6 +34,7 @@ from sglang.kernels.ops.diffusion import (
     fused_pack_qkv,
     fused_pack_segmented_qkv,
     fused_scatter_to_padded,
+    nearest_upsample_nhwc,
     pack_qkv_destination_major,
     usp_merge_heads,
 )
@@ -657,3 +659,45 @@ def test_wan_cached_conv_chunk_loop_bitwise(pads_temporal_only):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# -------------------------------------------------------------------------
+# Wan-family VAE channels_last nearest upsample (pure gather, bit-exact)
+# -------------------------------------------------------------------------
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize(
+    "shape,scale", [((1, 192, 30, 52), 2), ((4, 96, 15, 26), 2), ((2, 3, 5, 7), (3, 2))]
+)
+@pytest.mark.parametrize("mode", ["nearest", "nearest-exact"])
+def test_nearest_upsample_nhwc_is_bit_exact(dtype, shape, scale, mode):
+    x = torch.randn(shape, device="cuda", dtype=dtype).contiguous(
+        memory_format=torch.channels_last
+    )
+    sf = (
+        (float(scale), float(scale))
+        if isinstance(scale, int)
+        else tuple(float(v) for v in scale)
+    )
+    assert can_use_nearest_upsample_nhwc(x, sf, mode)
+    ref = F.interpolate(x, scale_factor=sf, mode=mode)
+    out = nearest_upsample_nhwc(x, sf)
+    assert out.is_contiguous(memory_format=torch.channels_last)
+    assert out.shape == ref.shape
+    assert torch.equal(out, ref)
+
+
+@torch.no_grad()
+def test_nearest_upsample_nhwc_rejects_unsupported_inputs():
+    x = torch.randn(2, 8, 6, 6, device="cuda", dtype=torch.bfloat16)
+    assert not can_use_nearest_upsample_nhwc(x, 2.0, "nearest-exact")  # NCHW
+    x_cl = x.contiguous(memory_format=torch.channels_last)
+    assert not can_use_nearest_upsample_nhwc(x_cl, 1.5, "nearest-exact")
+    assert not can_use_nearest_upsample_nhwc(x_cl, 2.0, "bilinear")
+    assert not can_use_nearest_upsample_nhwc(x_cl[:, :, :0], 2.0, "nearest")
+    with torch.enable_grad():
+        assert not can_use_nearest_upsample_nhwc(x_cl, 2.0, "nearest")
+    with pytest.raises(ValueError):
+        nearest_upsample_nhwc(x_cl, 1.5)
