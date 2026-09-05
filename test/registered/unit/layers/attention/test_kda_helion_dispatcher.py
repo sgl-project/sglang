@@ -194,5 +194,56 @@ class TestHelionKDADispatcher(unittest.TestCase):
         self.assertEqual(args.linear_attn_backend, "helion")
 
 
+class TestKDATrackStateSnapshotDeclaration(unittest.TestCase):
+    """Bookkeeping: every KDA prefill kernel must declare whether extend()
+    honors the fp32 track snapshot (``supports_track_state_snapshot``).
+
+    KDAAttnBackend allocates the snapshot buffer whenever a tracked batch has
+    chunk-unaligned sequences and asserts the flag before use. A kernel that
+    serves extend() without the flag must reject tracked batches loudly
+    (NotImplementedError); a missing declaration used to mean the buffer was
+    silently left unwritten and prefix-cache restores read garbage (the
+    FlashKDA fallback once dropped the track arguments exactly this way).
+    """
+
+    def test_every_kda_prefill_kernel_declares_the_contract(self):
+        from sglang.srt.layers.attention.linear.kernels.kda_cutedsl import (
+            CuteDSLKDAKernel,
+        )
+        from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
+            FlashInferKDAKernel,
+        )
+        from sglang.srt.layers.attention.linear.kernels.kda_flashkda import (
+            FlashKDAKernel,
+        )
+        from sglang.srt.layers.attention.linear.kernels.kda_nvidia import (
+            NvidiaKDAKernel,
+        )
+        from sglang.srt.layers.attention.linear.kernels.kda_ptx import (
+            PtxKDAKernel,
+        )
+
+        # Native support or fallback that forwards the snapshot arguments.
+        for cls in (
+            TritonKDAKernel,
+            HelionKDAKernel,
+            NvidiaKDAKernel,
+            PtxKDAKernel,
+            FlashKDAKernel,
+        ):
+            self.assertTrue(
+                cls.supports_track_state_snapshot,
+                f"{cls.__name__} must declare supports_track_state_snapshot "
+                f"(native support or a fallback that forwards track_state)",
+            )
+        # Reject tracked batches loudly instead (extend() raises).
+        for cls in (CuteDSLKDAKernel, FlashInferKDAKernel):
+            self.assertFalse(
+                cls.supports_track_state_snapshot,
+                f"{cls.__name__} rejects tracked batches; it must not claim "
+                f"snapshot support it does not have",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

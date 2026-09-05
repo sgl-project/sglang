@@ -319,6 +319,14 @@ class KDAKernelDispatcher:
             **kwargs,
         )
 
+    def effective_extend_kernel(self, lower_bound: Optional[float]):
+        """The kernel ``extend`` will actually run: safe-gate models reroute
+        kernels without ``supports_safe_gate`` to Triton."""
+        kernel = self.extend_kernel
+        if lower_bound is not None and not getattr(kernel, "supports_safe_gate", True):
+            kernel = self.triton_kernel
+        return kernel
+
     def extend(
         self,
         q: torch.Tensor,
@@ -332,11 +340,7 @@ class KDAKernelDispatcher:
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        kernel = self.extend_kernel
-        if kwargs.get("lower_bound") is not None and not getattr(
-            kernel, "supports_safe_gate", True
-        ):
-            kernel = self.triton_kernel
+        kernel = self.effective_extend_kernel(kwargs.get("lower_bound"))
         return kernel.extend(
             q,
             k,
@@ -865,6 +869,34 @@ class KDAAttnBackend(MambaAttnBackendBase):
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
 
         track_ssm = self.forward_metadata.has_mamba_track_mask
+        track_chunk_idx = self.forward_metadata.track_chunk_idx
+        h_track_buf = None
+        if (
+            track_ssm
+            and track_chunk_idx is not None
+            # Same rows as track_ssm_h_batch_src, but known without a GPU sync.
+            and self.forward_metadata.track_ssm_h_src.numel() > 0
+        ):
+            # fp32 scratch the kernel snapshots the tracked chunk-boundary
+            # states into (rows follow the batch; untracked rows stay unread).
+            # A kernel that does not declare support would leave the buffer
+            # unwritten and corrupt prefix-cache restores — fail loudly here.
+            # Check the kernel the dispatcher will actually run (safe-gate
+            # reroute included), not just the configured one.
+            extend_kernel = self.kernel_dispatcher.effective_extend_kernel(
+                layer.lower_bound
+            )
+            assert extend_kernel.supports_track_state_snapshot, (
+                f"{type(extend_kernel).__name__} cannot write the fp32 track "
+                f"snapshot required by the mamba track path; use "
+                f"--linear-attn-prefill-backend triton or "
+                f"--mamba-radix-cache-strategy no_buffer"
+            )
+            h_track_buf = torch.empty(
+                (track_chunk_idx.shape[0], *ssm_states.shape[1:]),
+                dtype=torch.float32,
+                device=ssm_states.device,
+            )
         core_attn_out = self.kernel_dispatcher.extend(
             q=q,
             k=k,
@@ -888,6 +920,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
             track_ssm_h_src=(
                 self.forward_metadata.track_ssm_h_src if track_ssm else None
             ),
+            track_state=h_track_buf,
+            track_chunk_idx=(track_chunk_idx if h_track_buf is not None else None),
         )
         if track_ssm:
             # Snapshot the SSM state at the last track-aligned chunk boundary
@@ -895,7 +929,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # ping-pong track slots (see _init_track_ssm_indices).
             core_attn_out, h = core_attn_out
             self._track_mamba_state_extend(
-                forward_batch, h, ssm_states, self.forward_metadata
+                forward_batch,
+                h,
+                ssm_states,
+                self.forward_metadata,
+                h_track_buf=h_track_buf,
             )
 
         if (
