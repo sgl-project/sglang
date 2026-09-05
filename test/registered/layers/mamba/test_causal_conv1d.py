@@ -378,6 +378,62 @@ def test_causal_conv1d_varlen(
     assert torch.allclose(unpadded_out, out_ref_tensor, rtol=rtol, atol=atol)
 
 
+def test_causal_conv1d_varlen_mixed_input_and_state_dtype():
+    """Initial states may be bf16 even when the current hidden states are fp16."""
+    device = get_device()
+    torch.manual_seed(0)
+    dim, width = 64, 4
+    seqlens = [7, 9]
+    query_start_loc = torch.tensor([0, 7, 16], dtype=torch.int32, device=device)
+    x = torch.randn(dim, sum(seqlens), dtype=torch.float16, device=device)
+    weight = torch.randn(dim, width, dtype=torch.float16, device=device)
+    bias = torch.randn(dim, dtype=torch.float16, device=device)
+
+    conv_states = torch.randn(
+        4, width - 1, dim, dtype=torch.bfloat16, device=device
+    ).transpose(1, 2)
+    conv_states_ref = conv_states.clone()
+    cache_indices = torch.tensor([1, 3], dtype=torch.int32, device=device)
+    has_initial_state = torch.tensor([True, False], dtype=torch.bool, device=device)
+
+    out = causal_conv1d_fn(
+        x,
+        weight,
+        bias=bias,
+        conv_states=conv_states,
+        query_start_loc=query_start_loc,
+        seq_lens_cpu=torch.tensor(seqlens),
+        cache_indices=cache_indices,
+        has_initial_state=has_initial_state,
+        activation="silu",
+    )
+
+    expected = []
+    offset = 0
+    for i, seqlen in enumerate(seqlens):
+        state_idx = cache_indices[i]
+        x_i = x[:, offset : offset + seqlen].unsqueeze(0)
+        initial_state = (
+            conv_states_ref[state_idx].unsqueeze(0).to(x.dtype)
+            if has_initial_state[i]
+            else None
+        )
+        out_i, _ = causal_conv1d_ref(
+            x_i,
+            weight,
+            bias,
+            initial_states=initial_state,
+            return_final_states=True,
+            final_states_out=conv_states_ref[state_idx].unsqueeze(0),
+            activation="silu",
+        )
+        expected.append(out_i.squeeze(0))
+        offset += seqlen
+
+    torch.testing.assert_close(out, torch.cat(expected, dim=-1), rtol=1e-2, atol=5e-2)
+    torch.testing.assert_close(conv_states, conv_states_ref, rtol=1e-2, atol=5e-2)
+
+
 if __name__ == "__main__":
     import sys
 
