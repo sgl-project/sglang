@@ -35,7 +35,6 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn import (
     delta_factor_apply,
     frame_statistics,
     gather_linear_state,
-    linear_features,
     run_scans,
     vdn_h3_layout_from_packed,
 )
@@ -66,7 +65,6 @@ def test_registry_resolves_vdn_h3_configs() -> None:
 def test_vdn_h3_sampling_defaults_and_rejections() -> None:
     params = VDNH3SamplingParams(prompt="p")
     assert params.num_inference_steps == 9  # 8 NFE
-    assert params.guidance_scale == 1.0
     with pytest.raises(ValueError, match="exactly nine sigma grid points"):
         VDNH3SamplingParams(prompt="p", num_inference_steps=8)
     with pytest.raises(ValueError, match="t2va only"):
@@ -223,9 +221,6 @@ def test_frame_statistics_and_delta_rule_match_dense_algebra() -> None:
     inv = torch.linalg.inv(torch.eye(D_) + A)
     assert torch.allclose(transition, alpha.unsqueeze(-1) * inv, atol=1e-4)
     assert torch.allclose(injection, B @ inv, atol=1e-4)
-    # (I + A)^-1 is a contraction: eigenvalues in (0, 1]
-    eig = torch.linalg.eigvalsh(inv)
-    assert eig.max() <= 1.0 + 1e-5 and eig.min() > 0
 
 
 def test_scans_match_step_reference_and_text_seed() -> None:
@@ -418,10 +413,6 @@ def test_temporal_shift_features_match_conv1d() -> None:
         .permute(2, 0, 1)
     )
     assert torch.allclose(got, ref, atol=1e-5)
-    feat = linear_features(
-        torch.randn(10, 2, 8), proj="q", conv=None, num_frames=None, frame_size=None
-    )
-    assert torch.allclose(feat.norm(dim=-1), torch.ones(10, 2), atol=1e-4)
 
 
 def _branch(

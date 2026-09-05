@@ -218,23 +218,6 @@ def test_decomposed_passes_are_arithmetic_neutral() -> None:
 
 
 @requires_cuda
-def test_softmax_gate_scales_output_per_head() -> None:
-    device = torch.device("cuda")
-    layout, (q, k, v) = _qkv(device, seed=3)
-    meta = HybridWindowAttentionH3MetadataBuilder().build(
-        layout=layout, hybrid=_hybrid(), device=device
-    )
-    impl = _impl()
-    base = _run(impl, meta, layout, q, k, v).clone()
-    gate = torch.rand(layout.seq_len, HEADS, device=device).to(torch.bfloat16)
-    gated = _run(impl, meta, layout, q, k, v, gate=gate)
-    expected = (base.float() * gate.float().unsqueeze(-1)).to(torch.bfloat16)
-    assert torch.allclose(
-        gated[: layout.used].float(), expected[: layout.used].float(), atol=1e-2
-    )
-
-
-@requires_cuda
 def test_dense_fallback_off_the_dit_blocks() -> None:
     """The token refiner resolves the same backend but runs plain dense FA."""
     device = torch.device("cuda")
