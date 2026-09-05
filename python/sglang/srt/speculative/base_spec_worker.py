@@ -310,7 +310,7 @@ class BaseSpecWorker(ABC):
             self.draft_worker.init_cuda_graphs()
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
-        for runner in self.draft_worker.draft_runners:
+        for runner in self._draft_model_runners():
             success, message = runner.weight_updater.update_weights_from_disk(
                 recv_req.model_path,
                 recv_req.load_format,
@@ -321,7 +321,7 @@ class BaseSpecWorker(ABC):
         return True, "Succeeded to update model weights."
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
-        for runner in self.draft_worker.draft_runners:
+        for runner in self._draft_model_runners():
             success, message = runner.weight_updater.update_weights_from_ipc(recv_req)
             if not success:
                 return success, message
