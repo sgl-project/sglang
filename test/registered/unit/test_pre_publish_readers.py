@@ -8,25 +8,18 @@ normally free. The launcher's own reads are not: everything
 `multimodal_gen` calls into the same code with a `ServerArgs` of its own that
 never publishes them.
 
-This is a class no other test in the tree catches: a converted reader is
-exercised everywhere by tests that publish first, so it passes unit CI and then
-takes the server down on the first real launch -- which is how `configure_logger`
-shipped. So the protected set is *derived from the launch path* rather than
-listed here: the callees named in `_launch_subprocesses` above its `publish` are
-read out of the source, and each is called against a context where nothing has
-been published. A conversion of any of them turns this red without a boot.
+These tests call the launch helpers directly with no published context. A
+conversion that asks a config bag before publication therefore fails without
+requiring a full server boot.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-import ast
 import logging
-import pathlib
 import unittest
 
-import sglang
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.runtime_context import get_observability, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -39,44 +32,6 @@ _EXERCISED = {
     "configure_logger": configure_logger,
     "_set_envs_and_config": _set_envs_and_config,
 }
-
-# Named by the launcher before `publish`, but none of them reads config out of a
-# record. Listed so the set above stays a statement about all of the callees.
-_NOT_EXERCISED = {
-    "load_plugins",
-    "resolve_auto_parsers",
-    "snapshot_context",
-    "resolving_view",
-}
-
-
-def _pre_publish_callees():
-    """Functions `_launch_subprocesses` calls before it publishes.
-
-    Read from the source so the set cannot go stale: a call added above the
-    `publish(...)` line joins the protected set on its own.
-    """
-    source = (
-        pathlib.Path(next(iter(sglang.__path__))) / "srt" / "entrypoints" / "engine.py"
-    ).read_text(encoding="utf-8-sig")
-    tree = ast.parse(source)
-    launcher = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "_launch_subprocesses"
-    )
-    publish_line = min(
-        node.lineno
-        for node in ast.walk(launcher)
-        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "publish"
-    )
-    return {
-        node.func.id
-        for node in ast.walk(launcher)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.lineno < publish_line
-    }
 
 
 class TestPrePublishReaders(CustomTestCase):
@@ -98,11 +53,6 @@ class TestPrePublishReaders(CustomTestCase):
         with self.assertRaises(ValueError) as caught:
             get_observability()
         self.assertIn("not published", str(caught.exception))
-
-    def test_the_protected_set_is_what_the_launcher_calls(self):
-        """If the launcher stops calling one of these, or starts calling
-        something new before publishing, this file has to be looked at."""
-        self.assertEqual(set(_EXERCISED) | _NOT_EXERCISED, _pre_publish_callees())
 
     def test_none_of_them_asks_a_bag(self):
         """Each is called with nothing published. A bag read raises

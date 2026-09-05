@@ -11,14 +11,14 @@ This skill covers **how to write and register tests**. For CI pipeline internals
 
 1. **Always use `CustomTestCase`** — never raw `unittest.TestCase`. It ensures `tearDownClass` runs even when `setUpClass` fails, preventing resource leaks in CI.
 2. **`tearDownClass` must be defensive** — use `hasattr`/null checks before accessing resources (e.g. `cls.process`) that `setUpClass` may not have finished allocating.
-3. **Place tests in `test/registered/<category>/`** — including JIT kernel tests and benchmarks, which live in `test/registered/jit/` and `test/registered/jit/benchmark/` (nested subfolders are allowed)
+3. **Place tests in `test/registered/<kind>/<subsystem>/`** — `<kind>` is `unit`, `kernel`, `e2e`, `accuracy`, `perf`, or `stress`; hardware belongs in registrations, not directory names
 4. **Reuse server fixtures** — inherit from `DefaultServerBase` or write `setUpClass`/`tearDownClass` with `popen_launch_server`
-5. **Prefer mock over real server** — when testing logic that doesn't need a server / engine launch (middleware, request routing, config validation, argument parsing), use `unittest.mock.patch` / `MagicMock` and place tests in `test/registered/unit/`. Only launch a real server when the test genuinely needs inference results or server lifecycle behavior.
+5. **Mock boundaries, not SGLang behavior** — mock slow or external dependencies only when the assertion still checks an observable result, state transition, or error. A test whose evidence is only `assert_called*` mirrors its mock and is not admissible. Launch a real server only when inference results or lifecycle behavior are the contract under test.
 
 JIT kernel notes:
 - If the task is adding or updating code under `python/sglang/kernels/jit/`, prefer the `add-jit-kernel` skill first.
-- JIT kernel correctness tests use `test/registered/jit/**/test_*.py`.
-- JIT kernel benchmarks use `test/registered/jit/benchmark/**/bench_*.py`.
+- New JIT kernel correctness tests use `test/registered/kernel/jit/**/test_*.py`.
+- New JIT kernel benchmarks use `test/registered/kernel/jit/benchmark/**/bench_*.py`.
 - Those files are executed by `test/run_suite.py` through dedicated kernel suites (`base-b-kernel-*`); a `register_*_ci(...)` call placed under `python/sglang/` is rejected by the `check-no-registered-tests-in-package` pre-commit hook.
 
 ---
@@ -27,7 +27,7 @@ JIT kernel notes:
 
 | Scenario | Model | CI Registration | Suite |
 |----------|-------|-----------------|-------|
-| **Unit tests** (no server / engine launch) | None | `register_cpu_ci` (prefer) or `register_cuda_ci` | `base-a-test-cpu` or `base-b-test-1-gpu-small` |
+| **Unit tests** (no server / engine launch) | None | `register_cpu_ci` | `base-a-test-cpu` |
 | **Common / backend-independent** (middleware, abort, routing, config, arg parsing) | `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` (1B) | `register_cuda_ci` only | `base-b-test-1-gpu-small` |
 | **Model-agnostic functionality** (sampling, session, OpenAI API features) | `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` (1B) | `register_cuda_ci` (+ AMD if relevant) | `base-b-test-1-gpu-small` |
 | **General performance** (single node, no spec/DP/parallelism) | `DEFAULT_MODEL_NAME_FOR_TEST` (8B) | `register_cuda_ci` | `base-b-test-1-gpu-large` |
@@ -70,10 +70,10 @@ A per-commit suite name is **generated** from registration metadata as `{stage}-
 | `base-b-test-1-gpu-large` | `1-gpu-h100` | Tests that need H100-class memory or kernels (e.g. FA3) |
 | `base-b-test-2-gpu-large` | `2-gpu-h100` | Two-GPU correctness and parallelism (TP/PP) on H100 |
 | `base-b-test-4-gpu-b200` | `4-gpu-b200` | Early Blackwell coverage (SM100+ paths) on four GPUs |
-| `base-b-kernel-unit-test-1-gpu-large` | `1-gpu-h100` | JIT kernel correctness tests under `test/registered/jit/` |
+| `base-b-kernel-unit-test-1-gpu-large` | `1-gpu-h100` | JIT kernel correctness tests under `test/registered/kernel/jit/` |
 | `base-b-kernel-unit-test-4-gpu-b200` | `4-gpu-b200` | JIT kernel correctness tests for Blackwell / SM100-specific paths |
-| `base-b-kernel-unit-test-8-gpu-h200` | `8-gpu-h200` | Multi-GPU JIT kernel correctness tests under `test/registered/jit/` |
-| `base-b-kernel-benchmark-test-1-gpu-large` | `1-gpu-h100` | JIT kernel benchmark files under `test/registered/jit/benchmark/` |
+| `base-b-kernel-unit-test-8-gpu-h200` | `8-gpu-h200` | Multi-GPU JIT kernel correctness tests under `test/registered/kernel/jit/` |
+| `base-b-kernel-benchmark-test-1-gpu-large` | `1-gpu-h100` | JIT kernel benchmark files under `test/registered/kernel/jit/benchmark/` |
 | `base-c-test-4-gpu-h100` | `4-gpu-h100` | Large 4-GPU H100 integration and scaling tests |
 | `base-c-test-8-gpu-h200` | `8-gpu-h200` | Large 8-GPU H200 runs for big models and parallelism |
 | `base-c-test-8-gpu-h20` | `8-gpu-h20` | Large 8-GPU H20 runs for big models |
@@ -162,7 +162,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-# Prefer CPU. Only use register_cuda_ci when the test truly needs a GPU.
+# Unit tests are CPU-only. GPU operator tests belong under `kernel/`.
 
 class TestTargetClass(CustomTestCase):
     def test_basic_behavior(self):
@@ -180,7 +180,13 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-Use `unittest.mock.patch` / `MagicMock` to mock dependencies and isolate the logic under test. If the module transitively imports GPU-only packages (e.g. `sgl_kernel`), they can be stubbed so the test runs on CPU CI. Do not modify `sys.modules` at module level — use `patch.dict` (as a class decorator or with `start`/`stop`) to ensure cleanup and avoid cross-test pollution. See `test/registered/unit/README.md` for details and examples.
+Use `unittest.mock.patch` / `MagicMock` only at dependency boundaries. Assert the
+resulting value, state, protocol output, or error—not merely that the mock was
+called. If the module transitively imports GPU-only packages (e.g. `sgl_kernel`),
+they can be stubbed so the test runs on CPU CI. Do not modify `sys.modules` at
+module level—use `patch.dict` (as a class decorator or with `start`/`stop`) to
+ensure cleanup and avoid cross-test pollution. See
+`test/registered/unit/README.md` for details and examples.
 
 **Quality bar** — test real logic (validation boundaries, state transitions, error paths, branching, etc.). Skip tests that just verify Python itself works (e.g., "does calling an abstract method raise `NotImplementedError`?", "does a dataclass store the field I assigned?"). Consolidate repetitive patterns into parameterized tests. No production code changes in test PRs.
 
@@ -380,15 +386,12 @@ Every call generates a suite named `{stage}-test-{runner_config}`, e.g. `base-b-
 ```
 test/
 ├── registered/          # CI tests (auto-discovered by run_suite.py)
-│   ├── unit/            # No server / engine launch (see test/registered/unit/README.md)
-│   ├── kernels/         # CUDA kernel correctness (no server, GPU required)
-│   ├── sampling/        # test_penalty.py, test_sampling_params.py ...
-│   ├── sessions/        # test_session_control.py ...
-│   ├── openai_server/   # basic/, features/, validation/ ...
-│   ├── spec/            # eagle/, utils/ ...
-│   ├── models/          # model-specific accuracy tests
-│   ├── perf/            # performance benchmarks
-│   └── <category>/      # create new category if needed
+│   ├── unit/<subsystem>/      # CPU-only; no server or model weights
+│   ├── kernel/<group>/        # accelerator operator correctness/benchmarks
+│   ├── e2e/<subsystem>/       # engine/server integration
+│   ├── accuracy/<family>/     # scheduled eval floors
+│   ├── perf/<family>/         # scheduled latency/throughput contracts
+│   └── stress/<subsystem>/    # stress/weekly coverage
 ├── manual/              # Non-CI: debugging, one-off, manual verification
 └── run_suite.py         # CI runner (scans registered/ plus jit_kernel test/benchmark files)
 
@@ -398,10 +401,11 @@ python/sglang/kernels/jit/
 ```
 
 **Decision rule** (see also `test/registered/README.md`):
-- Component logic, no server → `registered/unit/`
-- JIT kernel correctness / benchmarks → `test/registered/jit/` or `test/registered/jit/benchmark/`
-- Other kernel correctness → `registered/kernels/`
-- Server needed → `registered/<category>/`
+- CPU component logic, no server → `registered/unit/<subsystem>/`
+- JIT kernel correctness / benchmarks → `registered/kernel/jit/`
+- Other accelerator operator correctness → `registered/kernel/<group>/`
+- Server needed → `registered/e2e/<subsystem>/`
+- Eval floor / performance contract → `registered/{accuracy,perf}/<family>/`
 - Local debugging → `manual/`
 
 ---
@@ -443,8 +447,8 @@ Before submitting a test:
 
 - [ ] Inherits from `CustomTestCase` (not `unittest.TestCase`)
 - [ ] Has `register_*_ci(...)` call at module level
-- [ ] Placed in `test/registered/<category>/` (JIT kernel test/benchmark → `test/registered/jit/` or `test/registered/jit/benchmark/`)
-- [ ] JIT kernel work: test files live in `test/registered/jit/`; only test-only helpers stay under `python/sglang/kernels/jit/`
+- [ ] Placed in `test/registered/<kind>/<subsystem>/`
+- [ ] JIT kernel work: test files live in `test/registered/kernel/jit/`; only test-only helpers stay under `python/sglang/kernels/jit/`
 - [ ] Backend-independent tests: `register_cuda_ci` only + smallest model
 - [ ] Logic that doesn't need a server / engine launch → unit test in `registered/unit/` (see Unit Tests section)
 - [ ] `setUpClass` launches server, `tearDownClass` kills it (if server-based)

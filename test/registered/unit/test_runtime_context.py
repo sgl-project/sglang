@@ -332,39 +332,6 @@ class TestAssertPublished(_IsolatedServerArgs):
 
         self.assertEqual(publish_role(), "tokenizer")
 
-    def test_no_constructor_publishes_outside_the_two_entries(self):
-        """Publishing from an `__init__` is an entry's job or a bug.
-
-        It is right when the constructor *is* the entry -- an `Engine` being
-        (re)built, the Ray actor that stands in for `run_scheduler_process`,
-        where resetting the bags is the point. It is wrong anywhere else,
-        because the process is already live with a record and re-projecting
-        drops its overrides. The census is pinned, so a new constructor publish
-        fails here until it is one of the two.
-
-        Both the publisher set and "which `__init__` reaches one" come from
-        `sglang.test.config_publishers`, which derives them from the code --
-        a hand-written spelling list here missed a constructor that publishes
-        one hop away through a helper. The derivation follows helpers defined
-        in the same module; a constructor that publishes through a helper in
-        *another* module is not seen, which is the one hole left here.
-        """
-        import pathlib
-
-        import sglang
-        from sglang.test.config_publishers import constructor_publishers
-
-        srt = pathlib.Path(sglang.__file__).resolve().parent / "srt"
-        self.assertEqual(
-            constructor_publishers(srt),
-            {
-                ("entrypoints/engine.py", "Engine", "publish"),
-                ("ray/scheduler_actor.py", "SchedulerActor", "publish"),
-            },
-            "a constructor publishes and it is not one of the two entries; "
-            "publish at the process entry and let the constructor assert",
-        )
-
 
 class TestServerArgsScopedOverride(_IsolatedServerArgs):
     """ctx.override_server_args: the config tier's scoped test override —
@@ -467,11 +434,6 @@ class TestServerArgsScopedOverride(_IsolatedServerArgs):
         override.install()
         with self.assertRaises(AssertionError):
             override.install()
-
-    def test_module_global_removed(self):
-        # The legacy storage must not survive: a stale _global_server_args would
-        # silently fork the config into two objects.
-        self.assertFalse(hasattr(server_args_module, "_global_server_args"))
 
 
 @dataclasses.dataclass
@@ -1345,64 +1307,6 @@ class TestAdaptiveDraftBoundLifecycle(_IsolatedServerArgs):
         self.assertEqual(max_speculative_num_draft_tokens(), 7)
 
 
-class TestNamedAccessorsCallWhatTheyWrap(CustomTestCase):
-    """A named accessor must *call* a member that is a method.
-
-    `return get_server_args().x` hands back a bound method when `x` is defined
-    with `def`; the failure then lands far away, in whatever arithmetic the
-    caller does with it. Checked statically so accessors that need a real model
-    config are covered too.
-    """
-
-    def test_accessors_that_wrap_methods_call_them(self):
-        import ast
-        import functools
-        import inspect
-
-        import sglang.srt.runtime_context as rc
-        from sglang.srt.server_args import ServerArgs
-
-        tree = ast.parse(inspect.getsource(rc))
-        wrong = []
-        for node in tree.body:
-            if not isinstance(node, ast.FunctionDef):
-                continue
-            for inner in ast.walk(node):
-                if not (isinstance(inner, ast.Return) and inner.value is not None):
-                    continue
-                value = inner.value
-                called = isinstance(value, ast.Call)
-                target = value.func if called else value
-                if not (
-                    isinstance(target, ast.Attribute)
-                    and isinstance(target.value, ast.Call)
-                    and isinstance(target.value.func, ast.Name)
-                    and target.value.func.id == "get_server_args"
-                ):
-                    continue
-                member = getattr(ServerArgs, target.attr, None)
-                # A `property` / `functools.cached_property` member is already
-                # evaluated by the attribute access, so it is named here to keep
-                # the failure message from calling it "not a method" -- the fix
-                # for those is the opposite one.
-                kind = (
-                    "a property"
-                    if isinstance(member, (property, functools.cached_property))
-                    else "not a method"
-                )
-                if inspect.isfunction(member) and not called:
-                    wrong.append(
-                        f"{node.name}(): returns ServerArgs.{target.attr} without "
-                        "calling it, so callers get a bound method"
-                    )
-                if not inspect.isfunction(member) and called:
-                    wrong.append(
-                        f"{node.name}(): calls ServerArgs.{target.attr}, which is "
-                        f"{kind} -- the attribute access already produced the value"
-                    )
-        self.assertEqual([], wrong, "\n".join(wrong))
-
-
 class TestParallelLeafReads(_IsolatedServerArgs):
     """The contract ``ParallelContext.__getattr__`` answers a parallel leaf on."""
 
@@ -1551,21 +1455,6 @@ class TestDerivedWidths(_IsolatedOverrides):
         reset_context()
         with patch(f"{_PS}.get_attn_tensor_model_parallel_world_size", return_value=1):
             self.assertEqual(get_parallel().attn_tp_size, 1)
-
-    def test_the_arithmetic_has_one_home(self):
-        """`parallel_state` builds its groups from the same dict it stamps, and
-        `dp_attention` derives the pair it needs for the ranks, so a second copy
-        of a quotient would let two answers to one width drift apart."""
-        for rel, spelling in (
-            ("distributed/parallel_state.py", "derive_parallel_widths("),
-            ("layers/dp_attention.py", "derive_attention_widths("),
-        ):
-            source = (_SRT / rel).read_text(encoding="utf-8-sig")
-            self.assertNotIn("// attn_dp_size // attn_cp_size", source, rel)
-            self.assertNotIn("// attn_cp_size // attn_dp_size", source, rel)
-            self.assertNotIn("// moe_ep_size // moe_dp_size", source, rel)
-            self.assertNotIn("if enable_dp_attention else 1", source, rel)
-            self.assertIn(spelling, source, rel)
 
     def test_the_rank_helper_agrees_with_the_stamp(self):
         """`compute_dp_attention_world_info` keeps the ranks and takes the

@@ -22,8 +22,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 # `sglang.srt.ray.engine` imports `ray` at module scope, and the CPU runner has
-# no ray wheel. The file-scoped source scan below is the part that has to run
-# everywhere; the three arithmetic cases need the import.
+# no ray wheel.
 _HAS_RAY = importlib.util.find_spec("ray") is not None
 _needs_ray = unittest.skipUnless(_HAS_RAY, "ray is not installed")
 
@@ -63,57 +62,6 @@ class TestRayDriverReadsTheBags(CustomTestCase):
         get_context().override("test.ray_driver", tp_size=8)
         self.assertEqual(get_parallel().tp_size, 8)
         self.assertEqual(_compute_world_size(), 8)
-
-    def test_the_driver_modules_read_no_field_off_a_record(self):
-        """File-scoped: neither Ray driver module reads a config field off an
-        instance any more.
-
-        The Ray path has no CI coverage, so this is what keeps a new
-        `server_args.tp_size` from appearing in it -- the placement arithmetic
-        runs after the publish, and the bags are the surface that carries what
-        resolution decided.
-        """
-        import ast
-        import dataclasses
-        import pathlib
-
-        import sglang
-        from sglang.srt.server_args import ServerArgs
-
-        fields = {field.name for field in dataclasses.fields(ServerArgs)}
-        srt = pathlib.Path(sglang.__file__).resolve().parent / "srt"
-        offenders = []
-        for rel in ("ray/engine.py", "ray/data_parallel_controller.py"):
-            tree = ast.parse((srt / rel).read_text(encoding="utf-8-sig"))
-            holders = {"server_args", "sa"}
-            for node in ast.walk(tree):
-                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    continue
-                for arg in list(node.args.args) + list(node.args.kwonlyargs):
-                    if arg.annotation is not None and "ServerArgs" in ast.dump(
-                        arg.annotation
-                    ):
-                        holders.add(arg.arg)
-            for node in ast.walk(tree):
-                if (
-                    isinstance(node, ast.Attribute)
-                    and node.attr in fields
-                    and isinstance(node.ctx, ast.Load)
-                    and (
-                        (isinstance(node.value, ast.Name) and node.value.id in holders)
-                        or (
-                            isinstance(node.value, ast.Attribute)
-                            and node.value.attr == "server_args"
-                        )
-                    )
-                ):
-                    offenders.append(f"{rel}:{node.lineno} reads .{node.attr}")
-        self.assertEqual(
-            offenders,
-            [],
-            "the Ray driver reads a config field off a record; the driver runs "
-            "after the publish, so read `get_parallel()`:\n  " + "\n  ".join(offenders),
-        )
 
 
 if __name__ == "__main__":

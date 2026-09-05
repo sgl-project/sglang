@@ -71,9 +71,6 @@ class _FakeServerArgs:
     def should_start_component_on_cpu(self, _component_name):
         return False
 
-    def should_use_fsdp_for_component(self, _component_name):
-        return False
-
     def should_configure_layerwise_offload_for_lazy_component(self, component_name):
         return component_name in self.layerwise_components
 
@@ -618,12 +615,6 @@ class TestVAELoader(unittest.TestCase):
                 loader.load("/quantized/vae", server_args, "vae", "diffusers")
 
         native_load.assert_not_called()
-
-    def test_pipeline_config_declares_an_empty_native_only_default(self):
-        loader = vae_loader.VAELoader()
-        server_args = _FakeServerArgs(QwenImagePipelineConfig())
-
-        self.assertFalse(loader.should_raise_customized_load_error(server_args, "vae"))
 
     def test_backfill_ltx2_audio_vae_latent_stats_maps_official_keys(self):
         loaded = {

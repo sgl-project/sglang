@@ -4223,8 +4223,7 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
 # NOTE: The process-wide ServerArgs is owned by the runtime context
 # (sglang.srt.runtime_context). The two functions below are LEGACY shims kept
 # for the existing call-sites; they publish/read the same live object by
-# reference. Do not add new call-sites — the counts are ratcheted
-# (decrease-only) by test/registered/unit/test_legacy_global_ratchet.py.
+# reference. Do not add new call-sites.
 # Imports are in-function so the two modules stay cycle-free at import time.
 @functools.lru_cache(maxsize=1)
 def _underscore_field_names() -> frozenset:

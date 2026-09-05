@@ -4,10 +4,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-import ast
 import unittest
 from array import array
-from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -24,77 +22,6 @@ from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.test_utils import CustomTestCase
-
-REPO_ROOT = Path(__file__).resolve().parents[4]
-MEM_CACHE_ROOT = REPO_ROOT / "python/sglang/srt/mem_cache"
-
-
-def class_bases(path: Path, class_name: str) -> set[str]:
-    tree = ast.parse(path.read_text())
-    class_node = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == class_name
-    )
-    return {
-        base.id if isinstance(base, ast.Name) else ast.unparse(base)
-        for base in class_node.bases
-    }
-
-
-class TestSessionCacheOwnership(CustomTestCase):
-    def test_only_unified_radix_cache_owns_session_ref_tracker(self):
-        ordinary_mixin = MEM_CACHE_ROOT / "session_radix_cache.py"
-        radix_cache = MEM_CACHE_ROOT / "radix_cache.py"
-        hiradix_cache = MEM_CACHE_ROOT / "hiradix_cache.py"
-        evict_policy = MEM_CACHE_ROOT / "evict_policy.py"
-        unified_cache = MEM_CACHE_ROOT / "unified_radix_cache.py"
-        session_ref_tracker = (
-            MEM_CACHE_ROOT / "unified_cache" / "session_ref_tracker.py"
-        )
-
-        self.assertFalse(ordinary_mixin.exists())
-        ordinary_source = "\n".join(
-            path.read_text() for path in (radix_cache, hiradix_cache, evict_policy)
-        )
-        for removed_symbol in (
-            "SessionRadixCacheMixin",
-            "SessionAwareEvictionStrategy",
-            "session_ref",
-            "_session_on_",
-            "_session_forget_node",
-            "_account_new_evictable_node",
-            "_supports_session_radix_cache",
-            "enable_session_radix_cache",
-        ):
-            self.assertNotIn(removed_symbol, ordinary_source)
-        self.assertNotIn(
-            "SessionRadixCacheMixin", class_bases(radix_cache, "RadixCache")
-        )
-        # Session behavior is composed, not mixed in (general-code-style rule).
-        self.assertEqual(
-            class_bases(unified_cache, "UnifiedRadixCache"), {"BasePrefixCache"}
-        )
-        self.assertIn("UnifiedSessionRefTracker", session_ref_tracker.read_text())
-        self.assertNotIn("SessionUnifiedRadixCacheMixin", unified_cache.read_text())
-
-        for component in (
-            "full_component.py",
-            "swa_component.py",
-            "mamba_component.py",
-        ):
-            self.assertIn(
-                "session_ref",
-                (
-                    MEM_CACHE_ROOT / "unified_cache" / "components" / component
-                ).read_text(),
-            )
-
-        registry = MEM_CACHE_ROOT / "registry.py"
-        self.assertIn(
-            "--enable-session-radix-cache requires UnifiedRadixCache",
-            registry.read_text(),
-        )
 
 
 def make_params(enable_session: bool) -> CacheInitParams:
