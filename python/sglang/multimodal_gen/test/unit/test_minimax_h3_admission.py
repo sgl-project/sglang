@@ -528,6 +528,7 @@ def test_validate_server_args_accepts_transformer_backend_override():
     server_args = SimpleNamespace(
         component_attention_backends={"transformer": "subblock_sparse_attn"},
         attention_backend="fa",
+        attention_backend_config={},
         ring_degree=1,
         resolve_component_attention_backend=lambda *_names: (
             AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
