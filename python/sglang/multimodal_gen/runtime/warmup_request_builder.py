@@ -589,14 +589,18 @@ def build_warmup_reqs(
             int(sampling_defaults.num_inference_steps),
             max(warmup_steps, AUTO_RESIDENCY_TIMING_STEPS),
         )
+    shapes = [
+        (width, height, warmup_num_frames, False) for width, height in resolutions
+    ]
     if auto_residency_warmup_shape is not None:
-        width, height, warmup_num_frames = auto_residency_warmup_shape
-        resolutions[0] = (width, height)
+        # The bounded warmup runs first: its measurement lets the worker size
+        # the full-shape probe to the memory the card actually has left.
+        shapes.append((*auto_residency_warmup_shape, True))
 
     # build warmup reqs
     warmup_reqs = []
     include_warmup_image = should_include_warmup_image(server_args, server_based_warmup)
-    for width, height in resolutions:
+    for width, height, num_frames, is_probe in shapes:
         req_kwargs = dict(
             data_type=task_type.data_type(),
             width=width,
@@ -610,7 +614,7 @@ def build_warmup_reqs(
             guidance_scale_2=sampling_defaults.guidance_scale_2,
             true_cfg_scale=sampling_defaults.true_cfg_scale,
             num_inference_steps=sampling_defaults.num_inference_steps,
-            num_frames=warmup_num_frames,
+            num_frames=num_frames,
         )
         if include_warmup_image:
             if warmup_input_path is None:
@@ -663,7 +667,7 @@ def build_warmup_reqs(
                 # their values for residency planning instead of discarding
                 # the measurements after paying that cost.
                 req.metrics.suppress_stage_breakdown = False
-            if auto_residency_warmup_shape is not None:
+            if is_probe:
                 req.extra["auto_residency_full_shape_probe"] = True
             warmup_reqs.append(req)
 

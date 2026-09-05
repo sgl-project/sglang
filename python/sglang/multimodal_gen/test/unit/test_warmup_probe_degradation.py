@@ -60,3 +60,79 @@ class TestLightenWarmupReq:
 
     def test_a_probe_at_the_floor_cannot_shrink(self):
         assert lighten_warmup_req(_server_args(), _req(16, 16, 1)) is None
+
+
+def _record(width: int, height: int, num_frames: int, *, peak_gib: float):
+    from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
+        WarmupMemoryRecord,
+    )
+
+    return WarmupMemoryRecord(
+        width=width,
+        height=height,
+        num_frames=num_frames,
+        baseline_allocated_bytes=2 << 30,
+        peak_allocated_bytes=int(peak_gib * (1 << 30)),
+        succeeded=True,
+    )
+
+
+class TestFitAutoResidencyProbe:
+    def test_probe_shrinks_until_its_extrapolated_peak_fits(self):
+        from sglang.multimodal_gen.runtime.managers.gpu_worker import (
+            fit_auto_residency_probe,
+        )
+
+        fitted, estimate, steps = fit_auto_residency_probe(
+            _req(1280, 720, 81),
+            records=[_record(832, 480, 81, peak_gib=20.0)],
+            free_bytes=40 << 30,
+            total_bytes=80 << 30,
+            server_args=_server_args(),
+        )
+        assert steps >= 1
+        assert (fitted.width, fitted.height) == (1280, 720)
+        assert fitted.num_frames < 81
+        assert estimate is not None and estimate <= 40 << 30
+
+    def test_probe_that_fits_runs_at_full_shape(self):
+        from sglang.multimodal_gen.runtime.managers.gpu_worker import (
+            fit_auto_residency_probe,
+        )
+
+        fitted, _, steps = fit_auto_residency_probe(
+            _req(1280, 720, 81),
+            records=[_record(832, 480, 81, peak_gib=20.0)],
+            free_bytes=79 << 30,
+            total_bytes=80 << 30,
+            server_args=_server_args(),
+        )
+        assert steps == 0
+        assert fitted.num_frames == 81
+
+    def test_without_a_trusted_estimate_the_probe_runs_as_requested(self):
+        from sglang.multimodal_gen.runtime.managers.gpu_worker import (
+            fit_auto_residency_probe,
+        )
+
+        fitted, estimate, steps = fit_auto_residency_probe(
+            _req(1280, 720, 81),
+            records=[],
+            free_bytes=1 << 30,
+            total_bytes=80 << 30,
+            server_args=_server_args(),
+        )
+        assert (steps, estimate) == (0, None)
+        assert fitted.num_frames == 81
+
+
+class TestOutOfMemoryClassification:
+    def test_allocation_failures_from_libraries_count_as_out_of_memory(self):
+        from sglang.multimodal_gen.runtime.server_warmup import _is_out_of_memory
+
+        assert _is_out_of_memory("CUDA error: out of memory")
+        assert _is_out_of_memory("cuBLAS error: CUBLAS_STATUS_ALLOC_FAILED")
+        assert _is_out_of_memory(
+            "RuntimeError: cudaErrorMemoryAllocation: out of memory"
+        )
+        assert not _is_out_of_memory("shape mismatch in attention")
