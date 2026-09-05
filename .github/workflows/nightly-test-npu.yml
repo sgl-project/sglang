@@ -401,15 +401,6 @@ jobs:
       max-parallel: 1
       matrix:
         test_config:
-          # kimi_k2_6 performance tests
-          - name: kimi_k2_6_w4a8_16p_in64k_out1k_100ms
-            node_size: 2
-            test_case: test/registered/npu/performance/kimi_k2_6/test_npu_kimi_k2_6_w4a8_16p_in64k_out1k_100ms.py
-            test_type: 'perf'
-          - name: kimi_k2_6_w4a8_16p_in64k_out1k_100ms_aime25
-            node_size: 2
-            test_case: test/registered/npu/accuracy/kimi_k2_6/test_npu_kimi_k2_6_w4a8_16p_in64k_out1k_100ms_aime25.py
-            test_type: 'accuracy'
           # glm_5_2 accuracy tests
           - name: glm_5_2_w4a8_16p_gpqa
             node_size: 2

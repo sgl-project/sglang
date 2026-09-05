@@ -69,7 +69,7 @@ KIMI_K3_W4A8_32P_OTHER_ARGS = [
     "--mem-fraction-static",
     0.72,
     "--chunked-prefill-size",
-    8192,
+    4096,
     "--cuda-graph-bs",
     1,
     4,
