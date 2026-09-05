@@ -37,6 +37,7 @@ norm/        RMSNorm / LayerNorm / GroupNorm and their fused epilogues
 modulate/    adaLN modulate, gating, timestep conditioning
 rope/        rotary embeddings and the QK-norm chains fused into them
 activation/  SiLU / GLU / GELU fusions
+quantization/ MXFP8 producers whose scales land in the GEMM's swizzled layout
 attention/   sparse linear attention, gated delta-net
 layout/      pure data movement: USP/Ulysses relayout, varlen pack, causal pad
 common/      numerics primitives, platform predicates, non-Triton fallbacks
@@ -156,7 +157,14 @@ tensor copy per residual site.
 |---|---|---|
 | `vdn_frame_stats_prep`, `vdn_gather_linear_state` | Triton | bit-exact (same products, fp32 gather) |
 | `vdn_temporal_conv_act`, `vdn_silu_l2norm`, `vdn_linear_epilogue` | Triton | one rounding at the store, within one bf16 ulp of the eager chain; the model's own inference kernels, mounted unconditionally by the VDN-H3 branch |
-| `silu_mul_mxfp8` | Triton | bit-exact against `flashinfer.mxfp8_quantize(silu(gate) * up)`; SwiGLU + MXFP8 block quant with swizzled E8M0 scales, the prequantized input of the online `mxfp8` linear |
+
+### MXFP8 producers (online `mxfp8`, cuBLASLt block-scaled GEMM on SM100)
+
+| Entry point | Backend | Contract |
+|---|---|---|
+| `mxfp8_quantize_swizzled` | Triton | bit-exact vs `flashinfer.mxfp8_quantize(x, True)`: e4m3 payload + block-32 E8M0 scales in the `SWIZZLE_32_4_4` layout; weights at load and any bf16 GEMM input |
+| `silu_mul_mxfp8` | Triton | bit-exact vs eager bf16 `silu(gate) * up` followed by the quantizer above; the fc2 input |
+| `indexed_scale_shift_mxfp8_` | Triton | bit-exact vs `indexed_scale_shift_bf16_` followed by the quantizer above, optionally keeping the bf16 rows in place; the qkv / fc1 inputs |
 
 ### Data movement and quantized layout producers
 

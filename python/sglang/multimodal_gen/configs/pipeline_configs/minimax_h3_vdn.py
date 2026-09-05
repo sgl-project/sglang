@@ -39,8 +39,9 @@ class VDNH3PipelineConfig(MiniMaxH3PipelineConfig):
             )
         # an unset backend would resolve to the platform default (dense FA)
         if server_args.quantization == "fp8":
-            # block scales into cuBLASLt: 0.955 s/NFE on 8x B200 vs 0.965
-            # per-tensor and 1.05 per-channel, same block-level error
+            # block scales into cuBLASLt with the quant fused into the adaLN and
+            # SwiGLU producers: 0.93 s/NFE on 8x B200 vs 1.05 per-channel,
+            # same block-level error
             server_args.quantization = "mxfp8"
         if server_args.attention_backend is None and not (
             server_args.component_attention_backends or {}

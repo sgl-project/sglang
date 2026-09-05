@@ -1395,13 +1395,13 @@ and the same clip length:
 | SGLang, FP8, 1× B200, DiT resident (`--layerwise-offload-components text_encoder`) | 7.49 | 61.1 s | 9.3 s | 63,922 MB |
 | SGLang, BF16, 4× B200 Ulysses4, `--performance-mode speed`, served-shape warmup | **2.53** | **20.3 s** | 3.5 s | 97,894 MB |
 | SGLang, FP8, 4× B200 Ulysses4, `--performance-mode speed`, served-shape warmup | **2.34** | **18.7 s** | 3.4 s | 63,022 MB |
-| SGLang, `--quantization fp8` (mapped to online `mxfp8`), 8× B200 Ulysses8, `--performance-mode speed`, served-shape warmup | **0.955** | **7.6 s** | 1.5 s | 77,704 MB |
+| SGLang, `--quantization fp8` (mapped to online `mxfp8`), 8× B200 Ulysses8, `--performance-mode speed`, served-shape warmup | **0.93** | **7.45 s** | 1.5 s | 77,704 MB |
 | SGLang, per-channel fp8 weight scales (the online `fp8` path of other models), 8× B200 Ulysses8 | 1.05 | 8.4 s | 1.5 s | 76,828 MB |
 
-On 8× B200 the SGLang Ulysses8 path runs the paper workload at 0.955 s/NFE
-(7.6 GPU-seconds per NFE) against the published 1.40 s/NFE of OpenVDN's 5+3
+On 8× B200 the SGLang Ulysses8 path runs the paper workload at 0.93 s/NFE
+(7.5 GPU-seconds per NFE) against the published 1.40 s/NFE of OpenVDN's 5+3
 branch-parallel layout; the whole request (text encoding, 8 forwards, joint
-decode) completes in 9.4 s after warmup. At this GPU count the step is
+decode) completes in 9.3 s after warmup. At this GPU count the step is
 launch- and copy-bound in the linear branch rather than FLOP-bound: the scans
 fold the 102 frames into per-chunk composites plus one chain over the chunks
 with both directions per launch (the chunked window only reads states at
@@ -1411,8 +1411,10 @@ window K/V gathers or the branch's conv), only the 128-wide output-gate
 hidden crosses the fabric (the gate's `up` runs on the head shard), the frame
 mean is a reshape-sum instead of an atomic index_add, and `--quantization
 fp8` selects online `mxfp8` (e4m3 with one E8M0 scale per 32 elements into
-cuBLASLt's block-scaled GEMM, the SwiGLU fused with the activation quant; the
-per-tensor fp8 variant measured 0.965 s/NFE). OpenVDN's branch-parallel layout was measured slower here (1.39
+cuBLASLt's block-scaled GEMM; the activation quant is fused into the adaLN
+modulation and SwiGLU producers, so no standalone quant pass runs; the
+per-tensor fp8 variant measured 0.965 s/NFE). The prompt's text state joins
+the frames' Cholesky batch as a virtual frame. OpenVDN's branch-parallel layout was measured slower here (1.39
 s/NFE at 5+3, 1.49 at 6+2): with 11 to 12 heads per softmax rank the window
 attention and its gathers grow faster than the linear ranks shrink; splitting
 each rank's heads into two pipelined all-to-all groups also lost (1.10 s/NFE)
