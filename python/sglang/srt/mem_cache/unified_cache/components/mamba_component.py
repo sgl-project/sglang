@@ -509,13 +509,20 @@ class MambaComponent(TreeComponent):
     def _log_skipped_donation(self, req: Req) -> None:
         self._skipped_donations += 1
         if self._skipped_donations == 1 or self._skipped_donations % 1000 == 0:
+            ct = self.component_type
+            allocator = self.cache.req_to_token_pool.mamba_allocator
             logger.warning(
-                "No free mamba slot to donate the chunk-boundary checkpoint of "
-                "request %s; skipping it (%d skipped so far). Every slot is held "
-                "by a running request: raise --max-mamba-cache-size or "
+                "No free mamba slot to donate the checkpoint of request %s at "
+                "seqlen %s; skipping it (%d skipped so far). Pool: available=%d "
+                "evictable=%d protected=%d. Every slot is held by a running "
+                "request: raise --max-mamba-cache-size or "
                 "--mamba-full-memory-ratio to keep prefix reuse.",
                 req.rid,
+                req.kv.mamba_last_track_seqlen,
                 self._skipped_donations,
+                allocator.available_size(),
+                self.tree_core.component_evictable_size_[ct],
+                self.tree_core.component_protected_size_[ct],
             )
 
     @property

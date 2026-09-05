@@ -9,6 +9,10 @@ the donated alloc comes back empty and that boundary's checkpoint is skipped;
 ratio 3 (pool = 3N) has headroom. Once decode's
 skip_mamba leaves the matched prefix evictable, even ratio 2 recovers via
 eviction -- which is why the peak, not the decode steady state, sets the floor.
+
+The lazy strategy has a real hole in that budget: under overlap the first
+decode step's pending ping-pong slot and the donate slot coexist for one step,
+so a pool sized exactly at the lazy ratio skips that boundary's checkpoint.
 """
 
 import unittest
@@ -45,6 +49,9 @@ class _BoundedMambaAllocator:
 
     def free(self, value: torch.Tensor):
         self.free_ids.extend(int(v) for v in value.tolist())
+
+    def available_size(self) -> int:
+        return len(self.free_ids)
 
 
 class _RatioCache:
