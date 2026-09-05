@@ -3634,7 +3634,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
                             first_config.image_std,
                             device,
                         )
-                        pixel_values, produced_grids = _gpu_preprocess_images(
+                        pixel_value_entries, produced_grids = _gpu_preprocess_images(
                             [item.feature for item in group_items],
                             [config.resize_config for config in group_configs],
                             image_scale,
@@ -3650,6 +3650,9 @@ class KimiK3ForConditionalGeneration(nn.Module):
                             raise ValueError(
                                 "Kimi-K3 deferred GPU preprocessing produced wrong grids"
                             )
+                        pixel_values = materialize_multimodal_features(
+                            pixel_value_entries, device=device, dtype=target_dtype
+                        )
                     elif backend == "cpu":
                         from sglang.srt.multimodal.kimi_k3_image_processing import (
                             materialize_kimi_k3_cpu_features,

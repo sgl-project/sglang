@@ -38,6 +38,7 @@ from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecuto
 from sglang.srt.multimodal.transport.cuda_ipc import (
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
+    PRECOMPUTED_FEATURE_HASHES_KEY,
     CudaIpcTensorTransportProxy,
     MmItemMemoryPool,
     get_mm_feature_pool_size_per_worker,
@@ -395,6 +396,7 @@ class BaseMultimodalProcessor(ABC):
             "patch_pixel_values": Modality.IMAGE,
             "block_sizes": Modality.IMAGE,
             "grid_thws": Modality.IMAGE,  # for kimi k2.5
+            PRECOMPUTED_FEATURE_HASHES_KEY: Modality.IMAGE,
             # Audio-related attributes
             "audio_features": Modality.AUDIO,
             "audio_feature_lens": Modality.AUDIO,
