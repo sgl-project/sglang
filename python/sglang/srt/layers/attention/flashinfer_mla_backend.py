@@ -511,6 +511,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.fast_decode_kwargs = {
             "qo_indptr_cpu": self.cuda_graph_qo_indptr_cpu,
             "kv_indptr_cpu": self.cuda_graph_kv_indptr_cpu,
+            "kv_indptr_gpu": self.cuda_graph_kv_indptr,
             "kv_indices": self.cuda_graph_kv_indices,
         }
 
@@ -886,6 +887,11 @@ class FlashInferMLAIndicesUpdaterDecode:
         kv_lens = paged_kernel_lens.to(torch.int32)
         sm_scale = self.scaling
         if spec_info is None:
+            if init_metadata_replay:
+                # Keep the capture-stable buffer bound to the wrapper current.
+                # This mirrors kv_indices below and matters to implementations
+                # that read kv_indptr directly during graph replay.
+                kv_indptr = fast_decode_kwargs["kv_indptr_gpu"]
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
             # On replay `kv_indices` IS the capture-stable buffer the captured
