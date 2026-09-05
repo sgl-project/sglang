@@ -464,18 +464,18 @@ class TestSpanlessAbortPaths(CustomTestCase):
         req = _ReqStub(0)
         req.rid = "r0"
         req.priority = 5
+        req.multimodal_inputs = None
         req.time_stats = SimpleNamespace(
             trace_ctx=SimpleNamespace(abort=lambda abort_info: None)
         )
         sent = []
-        scheduler = SimpleNamespace(
-            enable_priority_scheduling=False,
-            abort_on_priority_when_disabled=True,
-            ipc_channels=SimpleNamespace(
-                send_to_tokenizer=SimpleNamespace(
-                    send_output=lambda obj, req_arg: sent.append(obj)
-                )
-            ),
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_priority_scheduling = False
+        scheduler.abort_on_priority_when_disabled = True
+        scheduler.ipc_channels = SimpleNamespace(
+            send_to_tokenizer=SimpleNamespace(
+                send_output=lambda obj, req_arg: sent.append(obj)
+            )
         )
 
         with patch(

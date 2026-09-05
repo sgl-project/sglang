@@ -18,6 +18,7 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 class TestSchedulerUnoRequestValidation(CustomTestCase):
     def test_invalid_request_is_aborted_before_scheduler_admission(self):
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.ps = SimpleNamespace(pp_rank=0)
         scheduler.enable_session_radix_cache = False
         scheduler.model_config = SimpleNamespace(
             hf_eos_token_id={1},
@@ -36,6 +37,7 @@ class TestSchedulerUnoRequestValidation(CustomTestCase):
         scheduler._add_request_to_queue = MagicMock()
 
         recv_req = MagicMock(
+            mm_inputs=None,
             session_params=None,
             session_id=None,
             input_embeds=None,
