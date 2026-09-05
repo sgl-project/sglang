@@ -835,7 +835,9 @@ async def server_info():
             # Structured KV-event publisher descriptor for KV-aware routers.
             # `None` when publishing is disabled or misconfigured; see
             # `runtime_context.describe_kv_events_publisher` for the contract.
-            "kv_events": describe_kv_events_publisher(server_args),
+            "kv_events": describe_kv_events_publisher(
+                server_args, _global_state.scheduler_info
+            ),
         }
     )
 

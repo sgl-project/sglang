@@ -427,7 +427,7 @@ class RuntimeHandle:
         result: Dict[str, Any] = self.tokenizer_manager.server_args.resolved_dict()
         result.update(self.scheduler_info)
         result["kv_events"] = describe_kv_events_publisher(
-            self.tokenizer_manager.server_args
+            self.tokenizer_manager.server_args, self.scheduler_info
         )
         return json.dumps(msgspec_to_builtins(result), default=str)
 
