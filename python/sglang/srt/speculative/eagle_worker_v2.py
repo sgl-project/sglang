@@ -20,7 +20,11 @@ from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGra
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
-from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+    QSAMTPSharedSparseIndices,
+    QwenSparseAttnBackend,
+    QwenSparseMultiStepDraftBackend,
+)
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
@@ -374,25 +378,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def _configure_qsa_mtp_index_share(self) -> None:
         """Reuse the draft-extend QSA selection across the MTP decode steps;
         chain speculation only: with topk > 1 decode rows are not request-major."""
-        from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
         from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
-        from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
-            QSAMTPSharedSparseIndices,
-        )
 
         hf_config = self.draft_runner.model_config.hf_config
         if (
             not _qsa_index_share_requested(hf_config)
             or self.topk != 1
             or self.speculative_num_steps <= 1
-            or not is_qwen_qsa(hf_config)
-            or self.draft_attn_backend is None
-            or self.draft_extend_attn_backend is None
+            or not isinstance(self.draft_attn_backend, QwenSparseMultiStepDraftBackend)
+            or not isinstance(self.draft_extend_attn_backend, QwenSparseAttnBackend)
         ):
             return
         if get_spec().speculative_adaptive:
-            # Adaptive speculation rebuilds this worker per step count,
-            # sharing one draft-extend backend; the shared state is not sized for that.
+            # Adaptive speculation switches SpecRuntimeState between the draft-extend
+            # capture and the decode lookup; per-state index buffers would not match.
             logger.warning(
                 "index_share_for_mtp_iteration is disabled under adaptive "
                 "speculative decoding"
@@ -407,26 +406,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         if not layer_ids:
             return
-        from sglang.srt.layers.attention.qsa.glue import resolve_qsa_sparse_backend
-
-        extend_backend = resolve_qsa_sparse_backend(self.draft_extend_attn_backend)
-        state = getattr(extend_backend, "_mtp_shared_sparse_indices", None)
-        if state is None:
-            pool = self.draft_runner.token_to_kv_pool
-            # The expansion emits token_topk + ratio - 1 columns (top-k blocks
-            # plus the uncompressed tail of the capture position).
-            expanded_width = pool.qsa_token_topk + pool.qsa_compress_ratio - 1
-            state = QSAMTPSharedSparseIndices(
-                layer_ids=layer_ids,
-                num_requests=self.draft_runner.req_to_token_pool.req_to_token.shape[0],
-                token_topk=expanded_width,
-                tail_width=get_spec().speculative_num_steps + 1,
-                device=self.draft_runner.device,
-            )
+        pool = self.draft_runner.token_to_kv_pool
+        # The expansion emits token_topk + ratio - 1 columns (top-k blocks
+        # plus the uncompressed tail of the capture position).
+        expanded_width = pool.qsa_token_topk + pool.qsa_compress_ratio - 1
+        state = QSAMTPSharedSparseIndices(
+            layer_ids=layer_ids,
+            num_requests=self.draft_runner.req_to_token_pool.req_to_token.shape[0],
+            token_topk=expanded_width,
+            tail_width=get_spec().speculative_num_steps + 1,
+            device=self.draft_runner.device,
+        )
         for backend in (self.draft_attn_backend, self.draft_extend_attn_backend):
-            resolved = resolve_qsa_sparse_backend(backend)
-            assert hasattr(resolved, "set_mtp_shared_sparse_indices"), type(resolved)
-            resolved.set_mtp_shared_sparse_indices(state)
+            backend.set_mtp_shared_sparse_indices(state)
         logger.info(
             "QSA MTP index sharing enabled: draft decode steps reuse the "
             f"draft-extend selection for layers {layer_ids}"
@@ -516,6 +508,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             TRTLLMHAAttnBackend,
             TokenspeedMLABackend,
             FlashInferAttnBackend,
+            QwenSparseAttnBackend,
         ]
         if _is_cuda or _is_musa:
             # DSA is CUDA-only; import lazily so non-CUDA builds don't pull in
@@ -541,12 +534,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_extend_attn_backend,
             tuple(graph_supported_backend_types),
         )
-        if not graph_supported_backend and self.draft_extend_attn_backend is not None:
-            # Qwen QSA pads accepted rows to the captured width,
-            # so its hybrid backend is graph-capable although it is not in the list.
-            graph_supported_backend = is_qwen_qsa(
-                self.draft_runner.model_config.hf_config
-            )
         supports_cuda_draft_extend_graph = (
             _is_cuda or _is_musa
         ) and graph_supported_backend

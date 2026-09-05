@@ -1,3 +1,7 @@
+from sglang.srt.layers.attention.qsa.config import (
+    QSA_VARIANT_COMPRESSED,
+    parse_qsa_profile,
+)
 from sglang.srt.runtime_context import attention_backends, get_spec
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
@@ -38,6 +42,7 @@ class DraftBackendFactory:
         self.seed_dsa_topk_from_draft_extend = seed_dsa_topk_from_draft_extend
         # The draft runner's own backend, not the process-wide config.
         self.draft_attn_backend = draft_model_runner.draft_attention_backend
+        self.qsa_profile = parse_qsa_profile(draft_model_runner.model_config.hf_config)
 
     def _create_backend(
         self,
@@ -81,7 +86,7 @@ class DraftBackendFactory:
         if self.speculative_num_steps <= 1:
             return None
 
-        if self._is_qwen_qsa_draft_model():
+        if self.qsa_profile is not None:
             return self._create_qwen_qsa_decode_backend()
 
         # Returns a per-step CONTAINER, not an AttentionBackend, so
@@ -115,20 +120,8 @@ class DraftBackendFactory:
         )
 
     def create_draft_extend_backend(self):
-        if self._is_qwen_qsa_draft_model():
-            from sglang.srt.layers.attention.qsa.config import (
-                QSA_VARIANT_COMPRESSED,
-                parse_qsa_profile,
-            )
-
-            profile = parse_qsa_profile(self.draft_model_runner.model_config.hf_config)
-            if profile is not None and profile.variant != QSA_VARIANT_COMPRESSED:
-                # Tokenwise QSA has no graph-stable indexer metadata: draft extend
-                # stays eager instead of falling back to a dense backend.
-                return None
-            # Compressed QSA replay pads accepted-token rows to the captured width,
-            # so the runner's own hybrid backend serves the draft-extend graph.
-            return self.draft_model_runner.attn_backend
+        if self.qsa_profile is not None:
+            return self._create_qwen_qsa_draft_extend_backend()
 
         backend_map = {
             "flashinfer": self._create_flashinfer_prefill_backend,
@@ -174,10 +167,25 @@ class DraftBackendFactory:
             wrapped.decode_attention_backend_str = backend.decode_attention_backend_str
         return wrapped
 
-    def _is_qwen_qsa_draft_model(self) -> bool:
-        from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+    @staticmethod
+    def _stamp_qsa(backend) -> None:
+        backend.prefill_attention_backend_str = "qsa"
+        backend.decode_attention_backend_str = "qsa"
 
-        return is_qwen_qsa(self.draft_model_runner.model_config.hf_config)
+    def _create_qwen_qsa_draft_extend_backend(self):
+        if self.qsa_profile.variant != QSA_VARIANT_COMPRESSED:
+            # Tokenwise QSA has no graph-stable indexer metadata: draft extend
+            # stays eager instead of falling back to a dense backend.
+            return None
+        from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+            QwenSparseAttnBackend,
+        )
+
+        # The draft is full-attention only: give it a QSA backend of its own
+        # instead of the hybrid wrapper whose linear side has no draft layers.
+        backend = QwenSparseAttnBackend(self.draft_model_runner)
+        self._stamp_qsa(backend)
+        return backend
 
     def _create_qwen_qsa_decode_backend(self):
         from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
@@ -187,11 +195,9 @@ class DraftBackendFactory:
         backend = QwenSparseMultiStepDraftBackend(
             self.draft_model_runner, self.topk, self.speculative_num_steps
         )
-        backend.prefill_attention_backend_str = "qsa"
-        backend.decode_attention_backend_str = "qsa"
+        self._stamp_qsa(backend)
         for child in backend.attn_backends:
-            child.prefill_attention_backend_str = "qsa"
-            child.decode_attention_backend_str = "qsa"
+            self._stamp_qsa(child)
         return backend
 
     def _create_dsa_decode_backend(self):

@@ -16,6 +16,8 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
     model_type = "qwen4_exp_text"
     base_config_key = "text_config"
     keys_to_ignore_at_inference = ["past_key_values"]
+    # ModelConfig sizes the speculative hidden width off the DSV4 mHC name.
+    attribute_map = {"hc_mult": "hc_count"}
 
     def __init__(
         self,
@@ -56,9 +58,6 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
             self.rope_scaling = rope_parameters or {}
         self.rope_parameters = rope_parameters or self.rope_scaling
         self.hc_count = hc_count
-        # ModelConfig sizes the speculative hidden width off `hc_mult`
-        # (the DeepSeek-V4 mHC field); Qwen4-Exp spells it `hc_count`.
-        self.hc_mult = hc_count
         self.hc_lowrank = hc_lowrank
         self.layer_types = layer_types
         self.ple_layer_ids = ple_layer_ids or []

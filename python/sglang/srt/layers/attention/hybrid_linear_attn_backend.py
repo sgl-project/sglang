@@ -1082,13 +1082,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        if forward_batch.forward_mode.is_draft_extend_v2():
-            # DRAFT_EXTEND_V2 runs only full-attn layers in the draft model;
-            # skip linear/mamba metadata (mirrors init_forward_metadata).
-            self.full_attn_backend.init_forward_metadata_out_graph(
-                forward_batch, in_capture=in_capture
-            )
-            return
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
@@ -1100,11 +1093,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
-        if forward_batch.forward_mode.is_draft_extend_v2():
-            # DRAFT_EXTEND_V2 runs only full-attn layers in the draft model;
-            # skip linear/mamba metadata (mirrors init_forward_metadata).
-            self.full_attn_backend.init_forward_metadata_in_graph(forward_batch)
-            return
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_in_graph(forward_batch)
 

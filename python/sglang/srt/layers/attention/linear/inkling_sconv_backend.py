@@ -586,18 +586,6 @@ class InklingShortConvHybridAttnBackend(ShortConvHybridAttnBackend):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata(forward_batch)
 
-    def init_forward_metadata_out_graph(
-        self, forward_batch: ForwardBatch, in_capture: bool = False
-    ):
-        for attn_backend in self.attn_backend_list:
-            attn_backend.init_forward_metadata_out_graph(
-                forward_batch, in_capture=in_capture
-            )
-
-    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
-        for attn_backend in self.attn_backend_list:
-            attn_backend.init_forward_metadata_in_graph(forward_batch)
-
     @property
     def forward_metadata(self):
         # The sidecar's is reached via conv_state_metadata, so this is the attention

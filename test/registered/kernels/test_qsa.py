@@ -250,7 +250,6 @@ def test_qsa_profile_parses_compressed_qwen4_exp_schema():
         assert profile.compress_ratio == COMPRESS_RATIO
         assert profile.block_topk == BLOCK_TOPK
         assert profile.rope_mode == QSA_ROPE_MROPE
-        assert profile.draft_extend_cuda_graph is False
         assert is_qwen_qsa(config)
     # The legacy backend module keeps re-exporting the shared detector.
     assert qsa_backend_module.is_qwen_qsa is is_qwen_qsa
@@ -400,21 +399,19 @@ def test_qsa_draft_extend_backend_decision_follows_profile():
     from sglang.srt.speculative.draft_utils import DraftBackendFactory
 
     def factory(config):
+        runner = SimpleNamespace(
+            model_config=SimpleNamespace(hf_config=config),
+            draft_attention_backend=None,
+        )
         return DraftBackendFactory(
-            draft_model_runner=SimpleNamespace(
-                model_config=SimpleNamespace(hf_config=config),
-                draft_attention_backend=None,
-                attn_backend="draft-runner-backend",
-            ),
-            topk=1,
-            speculative_num_steps=3,
+            draft_model_runner=runner, topk=1, speculative_num_steps=3
         )
 
-    # Compressed profiles reuse the draft runner's own QSA-wrapped hybrid backend.
-    assert (
-        factory(_compressed_config_namespace()).create_draft_extend_backend()
-        == "draft-runner-backend"
-    )
+    compressed = factory(_compressed_config_namespace())
+    backend = compressed.create_draft_extend_backend()
+    assert isinstance(backend, QwenSparseAttnBackend)
+    assert backend.runner is compressed.draft_model_runner
+    assert backend.decode_attention_backend_str == "qsa"
     # Tokenwise profiles stay eager (no graph-stable indexer metadata); they
     # must never silently fall back to a dense backend either.
     assert factory(_tokenwise_config_namespace()).create_draft_extend_backend() is None

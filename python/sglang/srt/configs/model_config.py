@@ -177,12 +177,19 @@ def is_deepseek_v4(config) -> bool:
     )
 
 
+def is_qwen4_exp(config) -> bool:
+    return _hf_arch(config) in (
+        "Qwen4ExpForConditionalGeneration",
+        "Qwen4ExpForCausalLMMTP",
+    )
+
+
 def resolve_spec_hidden_size(
     hf_config, hidden_size: int, hc_mult: int
 ) -> tuple[int, Optional[int]]:
-    # Only DSV4 carries the hc-flattened stream across the target→draft
+    # DSV4 and Qwen4-Exp carry the hc-flattened stream across the target->draft
     # boundary; other hc models (hy_v4) collapse to hidden_size first.
-    if hc_mult <= 1 or not is_deepseek_v4(hf_config):
+    if hc_mult <= 1 or not (is_deepseek_v4(hf_config) or is_qwen4_exp(hf_config)):
         return hidden_size, None
     hc_hidden_size = hidden_size * hc_mult
     return hc_hidden_size, hc_hidden_size

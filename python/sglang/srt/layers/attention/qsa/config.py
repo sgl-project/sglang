@@ -52,7 +52,6 @@ class QSAProfile(msgspec.Struct, frozen=True):
     budget: int  # tokens selected per query row
     compress_ratio: int  # 1 for tokenwise variants
     rope_mode: str  # rotary layout the indexer expects
-    draft_extend_cuda_graph: bool  # draft-extend may use a CUDA-graph backend
 
     @property
     def block_topk(self) -> int:
@@ -108,9 +107,6 @@ def _parse_compressed(text_config) -> QSAProfile:
         compress_ratio=ratio,
         # The compressed indexer consumes the Qwen4-Exp layer's own (m)rope.
         rope_mode=QSA_ROPE_MROPE,
-        # Draft-extend stays eager: the static graph width cannot express the
-        # dynamic accepted-token count.
-        draft_extend_cuda_graph=False,
     )
 
 
@@ -137,9 +133,6 @@ def _parse_tokenwise(text_config) -> QSAProfile:
         compress_ratio=1,
         # The tokenwise indexer owns plain per-token rotary positions.
         rope_mode=QSA_ROPE_PLAIN,
-        # The BF16 reference tokenwise indexer is not graph-stable;
-        # keep this off until a graph-ready tokenwise path lands.
-        draft_extend_cuda_graph=False,
     )
 
 
