@@ -950,6 +950,27 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 "KDA target_verify requires a speculative mamba cache "
                 "(MambaPool.SpeculativeState); none found."
             )
+        # ReplaySSM: the ring-write is fused into the verify kernel
+        # (CACHE_RING) on both the fused chain-verify and the unfused triton
+        # paths; commit replays the ring instead of reading per-step
+        # snapshots. ring_kwargs stays empty for non-triton verify kernels,
+        # which never see replayssm. Ragged layouts work natively on the
+        # unfused path -- step_idx is the within-row step under varlen, so
+        # row i writes ring[slot][0..verify_lens[i]) and commit folds at most
+        # commit_lens of them (absorb overflow is bounded in-kernel).
+        replayssm_rawk = replayssm_g = replayssm_beta = None
+        ring_kwargs = {}
+        if replayssm_on:
+            replayssm_rawk = mamba_cache_params.replayssm_rawk
+            replayssm_g = mamba_cache_params.replayssm_g
+            replayssm_beta = mamba_cache_params.replayssm_beta
+            ring_kwargs = dict(
+                cache_ring=True,
+                replayssm_rawv=replayssm_rawv,
+                replayssm_rawk=replayssm_rawk,
+                replayssm_g=replayssm_g,
+                replayssm_beta=replayssm_beta,
+            )
         intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window[0]
         intermediate_state_indices = self.verify_intermediate_state_indices
 
@@ -1009,6 +1030,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
                 replayssm_rawv=replayssm_rawv,
+                replayssm_rawk=replayssm_rawk,
+                replayssm_g=replayssm_g,
+                replayssm_beta=replayssm_beta,
             ):
                 return self._fused_chain_verify_fn(
                     mixed_qkv=mixed_qkv,
@@ -1039,6 +1063,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     head_k_dim=layer.head_k_dim,
                     head_v_dim=layer.head_v_dim,
                     lower_bound=layer.lower_bound,
+                    **ring_kwargs,
                 )
             dense_token_indices = None
             mixed_qkv_dense = mixed_qkv.view(batch_size, draft_token_num, -1)
@@ -1096,22 +1121,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
-
-        # ReplaySSM: the ring-write is fused into the triton verify kernel
-        # (CACHE_RING). Ragged layouts work natively -- step_idx is the
-        # within-row step under varlen, so row i writes
-        # ring[slot][0..verify_lens[i]) and commit folds at most commit_lens
-        # of them (absorb overflow is bounded in-kernel). ring_kwargs stays
-        # empty for non-triton verify kernels, which never see replayssm.
-        ring_kwargs = {}
-        if replayssm_rawv is not None:
-            ring_kwargs = dict(
-                cache_ring=True,
-                replayssm_rawv=replayssm_rawv,
-                replayssm_rawk=mamba_cache_params.replayssm_rawk,
-                replayssm_g=mamba_cache_params.replayssm_g,
-                replayssm_beta=mamba_cache_params.replayssm_beta,
-            )
 
         core_attn_out = self.kernel_dispatcher.target_verify(
             A_log=layer.A_log,
@@ -1172,10 +1181,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
         retrieve_next_sibling: Optional[torch.Tensor],
         retrieve_parent_token: Optional[torch.Tensor],
         replayssm_rawv: Optional[torch.Tensor],
+        replayssm_rawk: Optional[torch.Tensor],
+        replayssm_g: Optional[torch.Tensor],
+        replayssm_beta: Optional[torch.Tensor],
     ) -> bool:
         if self._fused_chain_verify_fn is None or not mixed_qkv.is_cuda:
             return False
-        if replayssm_rawv is not None or any(
+        if any(
             value is not None
             for value in (
                 retrieve_next_token,
@@ -1184,6 +1196,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             )
         ):
             return False
+        replayssm_on = replayssm_rawv is not None
         if draft_token_num < 3 or mixed_qkv.shape[0] % draft_token_num != 0:
             return False
         if (
@@ -1235,7 +1248,21 @@ class KDAAttnBackend(MambaAttnBackendBase):
             layer.A_log.dtype != torch.float32
             or layer.dt_bias.dtype != torch.float32
             or ssm_states.dtype != torch.float32
-            or intermediate_state_cache is None
+        ):
+            return False
+        if replayssm_on:
+            if not self._replayssm_ring_ok(
+                layer=layer,
+                draft_token_num=draft_token_num,
+                mixed_qkv=mixed_qkv,
+                replayssm_rawv=replayssm_rawv,
+                replayssm_rawk=replayssm_rawk,
+                replayssm_g=replayssm_g,
+                replayssm_beta=replayssm_beta,
+            ):
+                return False
+        elif (
+            intermediate_state_cache is None
             or intermediate_state_cache.dtype != torch.float32
         ):
             return False
@@ -1245,7 +1272,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             or b.stride(-1) != 1
             or not conv_states.is_contiguous()
             or not ssm_states.is_contiguous()
-            or not intermediate_state_cache.is_contiguous()
+            or (not replayssm_on and not intermediate_state_cache.is_contiguous())
         ):
             return False
         if (
@@ -1263,10 +1290,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
             or ssm_states.ndim != 4
             or tuple(ssm_states.shape[-3:])
             != (layer.num_v_heads, layer.head_v_dim, layer.head_k_dim)
-            or intermediate_state_cache.ndim != 5
-            or intermediate_state_cache.shape[1] < draft_token_num
-            or tuple(intermediate_state_cache.shape[-3:])
-            != (layer.num_v_heads, layer.head_v_dim, layer.head_k_dim)
+            or (
+                not replayssm_on
+                and (
+                    intermediate_state_cache.ndim != 5
+                    or intermediate_state_cache.shape[1] < draft_token_num
+                    or tuple(intermediate_state_cache.shape[-3:])
+                    != (layer.num_v_heads, layer.head_v_dim, layer.head_k_dim)
+                )
+            )
         ):
             return False
         if (
@@ -1286,14 +1318,75 @@ class KDAAttnBackend(MambaAttnBackendBase):
             b,
             conv_states,
             ssm_states,
-            intermediate_state_cache,
             intermediate_conv_window_cache,
             cache_indices,
             intermediate_state_indices,
         )
         if layer.bias is not None:
             tensors += (layer.bias,)
+        # Ring devices are validated in _replayssm_ring_ok.
+        if not replayssm_on:
+            tensors += (intermediate_state_cache,)
         return all(tensor.device == mixed_qkv.device for tensor in tensors)
+
+    @staticmethod
+    def _replayssm_ring_ok(
+        *,
+        layer: RadixLinearAttention,
+        draft_token_num: int,
+        mixed_qkv: torch.Tensor,
+        replayssm_rawv: torch.Tensor,
+        replayssm_rawk: Optional[torch.Tensor],
+        replayssm_g: Optional[torch.Tensor],
+        replayssm_beta: Optional[torch.Tensor],
+    ) -> bool:
+        """Whether the per-layer ReplaySSM rings fit the fused ring-write.
+
+        Layouts follow memory_pool.py's KDA spec rings: rawv [slots, HV, L, V]
+        and rawk [slots, H, L, K] in the activation dtype, g [slots, HV, L, K]
+        fp32 (per-K KDA gate), beta [slots, HV, L] fp32. The kernel uses
+        stride(0) as the slot pitch and assumes packed inner dims; anything
+        else falls back to the unfused path, which handles it.
+        """
+        if replayssm_rawk is None or replayssm_g is None or replayssm_beta is None:
+            return False
+        if (
+            replayssm_rawv.ndim != 4
+            or replayssm_rawk.ndim != 4
+            or replayssm_g.ndim != 4
+            or replayssm_beta.ndim != 3
+        ):
+            return False
+        H, HV = layer.num_q_heads, layer.num_v_heads
+        K, V = layer.head_k_dim, layer.head_v_dim
+        ring_len = replayssm_rawv.shape[-2]
+        if ring_len < draft_token_num:
+            return False
+        if (
+            tuple(replayssm_rawv.shape[1:]) != (HV, ring_len, V)
+            or tuple(replayssm_rawk.shape[1:]) != (H, ring_len, K)
+            or tuple(replayssm_g.shape[1:]) != (HV, ring_len, K)
+            or tuple(replayssm_beta.shape[1:]) != (HV, ring_len)
+        ):
+            return False
+        if (
+            replayssm_rawv.dtype != mixed_qkv.dtype
+            or replayssm_rawk.dtype != mixed_qkv.dtype
+            or replayssm_g.dtype != torch.float32
+            or replayssm_beta.dtype != torch.float32
+        ):
+            return False
+        if (
+            replayssm_rawv.stride()[1:] != (ring_len * V, V, 1)
+            or replayssm_rawk.stride()[1:] != (ring_len * K, K, 1)
+            or replayssm_g.stride()[1:] != (ring_len * K, K, 1)
+            or replayssm_beta.stride()[1:] != (ring_len, 1)
+        ):
+            return False
+        return all(
+            ring.device == mixed_qkv.device
+            for ring in (replayssm_rawv, replayssm_rawk, replayssm_g, replayssm_beta)
+        )
 
     def _can_run_dspark_cutedsl_mtp(
         self,
