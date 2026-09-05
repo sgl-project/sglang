@@ -228,7 +228,7 @@ def test_batched_mismatched_cache_entry_is_reencoded():
 
     embeddings = mm_schedule._batch_encode_per_image_misses(encoder, [request], _CPU)
 
-    assert embeddings[(first_item.hash, _num_tokens(first_item))].shape == (
+    assert embeddings[(first_item.hash, None, _num_tokens(first_item))].shape == (
         _num_tokens(first_item),
         HIDDEN,
     )
@@ -253,8 +253,8 @@ def test_batched_colliding_hashes_with_different_lengths_are_not_deduplicated():
 
     embeddings = mm_schedule._batch_encode_per_image_misses(encoder, requests, _CPU)
 
-    first_key = (items[0].hash, _num_tokens(items[0]))
-    second_key = (items[1].hash, _num_tokens(items[1]))
+    first_key = (items[0].hash, None, _num_tokens(items[0]))
+    second_key = (items[1].hash, None, _num_tokens(items[1]))
     assert embeddings[first_key].shape == (_num_tokens(items[0]), HIDDEN)
     assert embeddings[second_key].shape == (_num_tokens(items[1]), HIDDEN)
     encoder.assert_called_once()

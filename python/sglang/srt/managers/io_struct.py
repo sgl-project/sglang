@@ -965,6 +965,10 @@ class GenerateReqInput:
                 else None
             ),
         )
+        # ``parallel_sample_num`` is derived during normalization rather than a
+        # dataclass field. Preserve it on sub-requests so downstream lifecycle
+        # decisions (notably MM embedding-lease ownership) see the parent mode.
+        sub.parallel_sample_num = self.parallel_sample_num
         cache[i] = sub
         return sub
 
@@ -1665,6 +1669,31 @@ class FlushCacheReqInput(BaseReq, kw_only=True):
 class FlushCacheReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str = ""
+
+
+class MMEmbeddingCacheAcquireReqInput(BaseReq, kw_only=True):
+    feature_hashes: List[Optional[int]]
+    input_ids: List[int]
+    feature_identities: Optional[List[Optional[str]]] = None
+    routed_dp_rank: Optional[int] = None
+    bootstrap_room: Optional[int] = None
+    ttl_s: float = 300.0
+
+
+class MMEmbeddingCacheAcquireReqOutput(BaseReq, kw_only=True):
+    hit_mask: List[bool]
+    lease_id: Optional[str]
+    routed_dp_rank: int
+
+
+class MMEmbeddingCacheReleaseReqInput(BaseReq, kw_only=True):
+    lease_id: str
+    routed_dp_rank: int
+
+
+class MMEmbeddingCacheLeaseMissReqOutput(BaseReq, kw_only=True):
+    lease_id: str
+    routed_dp_rank: int
 
 
 class AddExternalCorpusReqInput(BaseReq, kw_only=True):

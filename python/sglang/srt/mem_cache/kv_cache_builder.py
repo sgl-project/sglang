@@ -5,7 +5,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Protocol, runtime_checkable
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -40,7 +40,10 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.model_loader.utils import get_resolved_model_impl
+from sglang.srt.model_loader.utils import (
+    get_model_architecture,
+    get_resolved_model_impl,
+)
 from sglang.srt.runtime_context import (
     get_context,
     get_disagg,
@@ -60,6 +63,30 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import HiCacheDraftPlan
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+
+@runtime_checkable
+class MultimodalEmbeddingCacheConfigProvider(Protocol):
+    """Model-class contract for a non-reserving embedding-cache default."""
+
+    auto_mm_embedding_cache_size_mb: int
+
+
+def resolve_mm_embedding_cache_size_mb(model_config: ModelConfig) -> int:
+    """Resolve the per-rank GPU embedding-cache cap.
+
+    Models may declare a larger default than the historical 100 MiB to avoid
+    LRU thrashing. The cache remains lazy: this value is a cap, not a fixed HBM
+    allocation. An explicit environment value always wins, including zero for
+    deterministic or cache-off runs.
+    """
+    if envs.SGLANG_VLM_CACHE_SIZE_MB.is_set():
+        return envs.SGLANG_VLM_CACHE_SIZE_MB.get()
+
+    model_class, _ = get_model_architecture(model_config)
+    if isinstance(model_class, MultimodalEmbeddingCacheConfigProvider):
+        return model_class.auto_mm_embedding_cache_size_mb
+    return envs.SGLANG_VLM_CACHE_SIZE_MB.get()
 
 
 def get_draft_kv_pool(
@@ -356,7 +383,11 @@ def build_kv_cache(
             )
         tree_cache.validate_retraction_host_capacity()
 
-    embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
+    embedding_cache_size = resolve_mm_embedding_cache_size_mb(model_config)
+    logger.info(
+        "Multimodal embedding cache: max_size=%d MiB per rank (lazy HBM usage)",
+        embedding_cache_size,
+    )
     init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
     return KVCacheBuildResult(

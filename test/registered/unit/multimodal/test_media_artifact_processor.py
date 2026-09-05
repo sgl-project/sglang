@@ -5,6 +5,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import Optional
+from unittest.mock import patch
 
 from PIL import Image
 
@@ -23,6 +24,7 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 class _Artifact:
     content_digest: str
     artifact_key: str
+    feature_identity: str
     feature_hash: int
     feature: Optional[bytes]
 
@@ -37,6 +39,7 @@ class _Artifact:
         return (
             self.content_digest,
             self.artifact_key,
+            self.feature_identity,
             self.feature_hash,
             self.feature,
         )
@@ -47,6 +50,11 @@ class _FutureMediaInput:
     url: str
     content_hash: Optional[str] = None
     frame_sampling: int = 2
+
+
+@dataclass(frozen=True)
+class _Request:
+    mm_content_hashes: Optional[list[Optional[str]]] = None
 
 
 class _Processor(MediaArtifactCacheMixin):
@@ -78,6 +86,7 @@ class _Processor(MediaArtifactCacheMixin):
             _Artifact(
                 content_digest=entry.content_digest,
                 artifact_key=entry.artifact_key,
+                feature_identity=entry.artifact_key,
                 feature_hash=int(entry.content_digest[-16:], 16),
                 feature=entry.media,
             )
@@ -89,6 +98,23 @@ class _Processor(MediaArtifactCacheMixin):
 
 
 class TestMediaArtifactProcessor(unittest.TestCase):
+    def test_skip_compute_hash_disables_artifact_reuse(self):
+        processor = _Processor()
+        try:
+            with patch(
+                "sglang.srt.multimodal.media_artifacts.base."
+                "envs.SGLANG_MM_SKIP_COMPUTE_HASH.get",
+                return_value=True,
+            ):
+                lookup = asyncio.run(
+                    processor.lookup_preprocess_cache([b"image"], _Request())
+                )
+        finally:
+            processor.close()
+
+        self.assertIsNone(lookup)
+        self.assertEqual(len(processor.mm_preprocess_cache), 0)
+
     def test_default_image_decoder_rejects_lazy_pil_failure(self):
         malformed_png = base64.b64decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLJSwAAAABJRU5ErkJggg=="
@@ -171,7 +197,7 @@ class TestMediaArtifactProcessor(unittest.TestCase):
         processor = _Processor()
         first_digest = snapshot_media(b"first").content_digest
         first_key = processor._artifact_key(first_digest, b"first")
-        first = _Artifact(first_digest, first_key, 1, b"first")
+        first = _Artifact(first_digest, first_key, first_key, 1, b"first")
         processor.mm_preprocess_cache.put(first_key, first)
 
         try:
@@ -216,7 +242,7 @@ class TestMediaArtifactProcessor(unittest.TestCase):
         processor.trust_mm_content_hashes = True
         digest = snapshot_media(b"cached").content_digest
         key = processor._artifact_key(digest, "unread-source")
-        artifact = _Artifact(digest, key, 1, b"cached")
+        artifact = _Artifact(digest, key, key, 1, b"cached")
         processor.mm_preprocess_cache.put(key, artifact)
 
         try:
@@ -239,6 +265,7 @@ class TestMediaArtifactProcessor(unittest.TestCase):
             key,
             _Artifact(
                 snapshot_media(b"stale").content_digest,
+                key,
                 key,
                 1,
                 b"stale",

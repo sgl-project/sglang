@@ -1,0 +1,234 @@
+---
+title: "VLM preprocessing and caching"
+description: "Reuse repeated Kimi-K3 images before decode, preprocessing, feature transport, and vision encoding."
+---
+
+SGLang can identify a repeated image before running the full multimodal processor.
+This is useful for agent workloads that resend the same image on every turn.
+
+<Note>
+Per-image early reuse currently supports **Kimi-K3 image input**. Qwen3-VL image
+and video support is planned. Other VLMs continue to use their existing cache
+paths.
+</Note>
+
+## Recommended usage
+
+- Most clients should send images normally and omit `content_hash`. SGLang
+  computes a safe media identity and uses the preprocess cache automatically.
+- Start Kimi-K3 normally. The 256 MiB CPU preprocess cache is enabled
+  automatically; no request changes are required.
+- If the client already hashes immutable image bytes, send that SHA-256 as
+  `content_hash` (OpenAI API) or `mm_content_hashes` (Native Engine API).
+  SGLang verifies it against the image by default.
+- Use `--trust-mm-content-hashes` only when avoiding the repeated path/URL read
+  matters and the caller guarantees that each hash names exactly those bytes.
+  A stale trusted hash can reuse the wrong image artifact and change model
+  output. Do not use legacy `mm_hashes` for media identity.
+
+## What is cached
+
+SGLang keeps four identities separate:
+
+| Layer | Key or value | Purpose |
+|---|---|---|
+| Content | SHA-256 of the media snapshot | Detect the same media bytes or image/tensor content. |
+| Artifact | Content digest + modality + processor fingerprint + per-media options | Reuse prompt-independent processor metadata and CPU artifacts. |
+| Feature | Artifact identity + processor-output hash | Bind prefix/embedding reuse to both processor inputs and output. |
+| Embedding | ViT output indexed by the feature hash | Skip vision encoding when every required TP rank has the entry. |
+
+Only the content digest is accepted from a request. SGLang derives the artifact
+key, feature hash, embedding-cache key, and Radix prefix identity internally.
+A caller-provided content digest never directly replaces the feature hash or a
+Radix tree token.
+
+The prompt is not part of the per-image artifact key. A new turn rebuilds prompt
+tokens and image offsets while reusing image work. `mm_content_hashes` identifies
+input media. Legacy `mm_hashes` controls the external-router and pad sentinel;
+it cannot replace the processor-derived feature identity used for embedding
+reuse. Do not substitute one for the other.
+
+## Correctness contract
+
+An artifact hit is valid only when the decoder input and every setting that can
+change processor output are identical. SGLang therefore hashes:
+
+- the actual media bytes, or an immutable PIL/tensor snapshot including its
+  mode, shape, dtype, palette, transparency, and contents;
+- the model and processor revisions, decode and preprocessing backends, resize,
+  antialias, normalization, alpha handling, pixel limits, transport mode, and
+  per-image options.
+
+The key encoder preserves Python types and rejects unsupported values instead
+of reducing them to a lossy string. The feature identity combines the complete
+artifact identity with the actual processor-output hash. This prevents equal
+feature bytes from being reused across different grid or processor contexts.
+The embedding cache also stores and verifies a full feature identity beside its
+compact integer lookup key. The feature identity binds the complete artifact
+identity to the processor-output hash, so a compact-key collision is treated as
+a miss rather than returning another artifact's embedding.
+Kimi-K3 requests also namespace the Radix prefix cache by the ordered full
+feature identities. This prevents the legacy 30-bit multimodal pad sentinel
+from turning a collision into incorrect language-model KV reuse. Requests with
+different media therefore do not share a Radix namespace; repeated turns with
+the same ordered media still do.
+Legacy `mm_hashes` can still select the external-router and pad sentinel, but
+K3 keeps its processor-derived embedding key separately so a caller hash cannot
+redirect an embedding lease.
+Prompt text is intentionally excluded: every request rebuilds and validates its
+prompt tokens, image spans, grids, and offsets from the cached per-image
+metadata.
+
+Except for the explicit trusted mode below, a path, URL, caller object, mtime,
+or caller-provided digest is never accepted as proof that media is unchanged.
+SHA-256 cryptographic collisions remain theoretically possible; operational
+false hits from incomplete or lossy key construction are what this contract
+and its negative tests prevent.
+
+## Data flow
+
+On a cold request, SGLang reads and snapshots the input, calculates its SHA-256,
+decodes it, runs the processor, transfers processor features, and runs the ViT.
+The preprocess cache stores only metadata and artifacts already on CPU. It does
+not copy a CUDA tensor to CPU just to cache it.
+
+On a hot Kimi-K3 request with the embedding cache enabled:
+
+1. The tokenizer finds per-image processor metadata from the content identity.
+2. It acquires a short-lived embedding-cache lease on the final DP route.
+3. An image whose embedding exists on every required TP rank is sent as a
+   featureless cache reference.
+4. The scheduler consumes the pinned embedding and releases the lease.
+
+This path skips decode, processor work, processor-feature transport, and ViT for
+embedding hits. Without an embedding hit, a cached CPU artifact can still skip
+processor work. Multi-image requests may mix hits and misses without changing
+image order or prompt expansion. A lost lease is retried once through the cold
+processor path inside the server. Source reads are skipped only in the trusted
+hash mode described below.
+
+The preprocess cache uses CPU memory only and does not cache CUDA IPC or CUDA VMM
+proxies. It therefore adds no fixed HBM allocation. Existing feature-transport
+pools and the embedding cache keep their own memory budgets. Kimi-K3 raises the
+lazy per-rank embedding-cache cap to 4 GiB so concurrent multi-image agent
+conversations do not repeatedly evict and recompute image embeddings. Set
+`SGLANG_VLM_CACHE_SIZE_MB=1024` for a smaller cache, or `0` to disable it;
+memory is allocated only as embeddings are inserted.
+
+## Content hashes and trust
+
+By default, paths and URLs are not identities. SGLang reads the actual bytes on
+each lookup and verifies any caller-provided hash. A file or URL whose contents
+change is a cache miss even if its name is unchanged.
+
+| Request | Repeated-image cache hit | Cache miss |
+|---|---|---|
+| No caller hash | Read and hash the media, then skip decode and preprocessing | Read, hash, decode, and preprocess |
+| Caller hash, default server mode | Read the media and verify the hash, then skip decode and preprocessing | Read, verify, decode, and preprocess |
+| Caller hash with `--trust-mm-content-hashes` | Skip the media read, hashing, decode, and preprocessing | Read and verify before preprocessing |
+
+Send a content hash only when the client or an upload gateway already owns the
+exact immutable bytes. For a file or byte payload, compute
+`"sha256:" + hashlib.sha256(image_bytes).hexdigest()`. For Base64, hash the
+decoded image bytes, not the Base64 text. Do not hash a URL string, and do not
+use an HTTP ETag unless the storage service guarantees that it is the SHA-256 of
+the returned bytes. If the client only has a remote URL, omit the hash and let
+SGLang calculate it. SGLang does not return its calculated digest to the client.
+
+Native PIL and tensor inputs use a richer identity that also includes image
+mode or tensor dtype and shape. Callers should omit `mm_content_hashes` for
+those inputs unless they reproduce SGLang's identity format exactly.
+
+OpenAI-compatible request:
+
+```json
+{
+  "model": "moonshotai/Kimi-K3",
+  "messages": [{
+    "role": "user",
+    "content": [{
+      "type": "image_url",
+      "image_url": {
+        "url": "https://example.com/receipt.jpg",
+        "content_hash": "sha256:<64-hex-digits>"
+      }
+    }, {
+      "type": "text",
+      "text": "Read the total."
+    }]
+  }]
+}
+```
+
+Native Engine API:
+
+```python
+import hashlib
+
+from sglang import Engine
+
+image_bytes = open("receipt.jpg", "rb").read()
+content_hash = "sha256:" + hashlib.sha256(image_bytes).hexdigest()
+
+llm = Engine(model_path="moonshotai/Kimi-K3")
+output = llm.generate(
+    prompt="<|media_pad|>Read the total.",
+    image_data=[image_bytes],
+    mm_content_hashes=[content_hash],  # one entry per image, in request order
+)
+```
+
+`--trust-mm-content-hashes` lets a metadata hit skip reading the source. Enable
+it only when the caller computes SHA-256 from immutable media bytes. A cold miss
+still reads and verifies the media. Invalid format, count, or content is rejected;
+SGLang does not silently fall back. On a trusted hot hit the source cannot be
+verified, so a stale or incorrect caller digest can return a stale artifact;
+that correctness responsibility belongs to the caller.
+
+## Configuration
+
+Kimi-K3 defaults to a 256 MiB preprocess-cache budget with at most 8192 entries.
+The CPU budget is divided across tokenizer workers or encoder TP ranks.
+
+```bash
+# Model default: 256 MiB for Kimi-K3
+sglang serve --model-path moonshotai/Kimi-K3
+
+# Lower-HBM profile: retain a smaller per-rank embedding cache
+SGLANG_VLM_CACHE_SIZE_MB=1024 sglang serve \
+  --model-path moonshotai/Kimi-K3
+
+# Explicit CPU budget
+sglang serve --model-path moonshotai/Kimi-K3 \
+  --mm-preprocess-cache-size-mb 512
+
+# Kill switch / cache-off comparison
+sglang serve --model-path moonshotai/Kimi-K3 \
+  --mm-preprocess-cache-size-mb 0
+
+# Also disable the GPU embedding cache
+SGLANG_VLM_CACHE_SIZE_MB=0 sglang serve \
+  --model-path moonshotai/Kimi-K3 \
+  --mm-preprocess-cache-size-mb 0
+```
+
+`SGLANG_MM_SKIP_COMPUTE_HASH=1` also bypasses artifact and embedding reuse,
+because it intentionally removes the stable processor-output identity.
+
+`POST /flush_cache`, model updates that request a cache flush, and server
+shutdown clear preprocess entries and outstanding embedding leases.
+
+## Failure behavior
+
+Cache eviction changes performance, not correctness. If metadata and a newly
+computed feature hash disagree, SGLang discards the entry and rejects reuse.
+If an embedding lease disappears before scheduler admission, SGLang performs one
+internal cold-path retry.
+
+## Support matrix
+
+| Model and modality | Early per-media artifact reuse | Ordinary serving |
+|---|---:|---:|
+| Kimi-K3 image | Supported | Supported |
+| Qwen3-VL image | Planned | Existing cache path only |
+| Qwen3-VL video | Planned; requires FPS/frame-sampling identity | Existing cache path only |

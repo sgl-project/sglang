@@ -31,6 +31,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.multimodal.cache import (
     MultimodalPreprocessCache,
+    PreprocessCacheLookup,
     PreprocessFingerprintProvider,
     build_processor_fingerprint,
 )
@@ -232,6 +233,17 @@ class BaseMultimodalProcessor(ABC):
     # `process_and_combine_mm_data` -- resolves that clone instead of
     # `self._processor`, so isolation does not depend on the subclass.
     supports_mm_processor_concurrency = True
+    supports_early_mm_cache = False
+
+    async def lookup_preprocess_cache(
+        self, image_data, request_obj
+    ) -> Optional[PreprocessCacheLookup]:
+        """Return reusable per-media metadata before full preprocessing.
+
+        Processors opt in by overriding this method. The generic serving path
+        remains unaware of model-specific artifact types.
+        """
+        return None
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
