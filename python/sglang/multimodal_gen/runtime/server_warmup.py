@@ -250,9 +250,19 @@ async def maybe_apply_auto_residency(
 MAX_WARMUP_DEGRADE_ATTEMPTS = 3
 
 
+_OUT_OF_MEMORY_MARKERS = (
+    "out of memory",
+    "outofmemory",
+    "cudaerrormemoryallocation",
+    "cublas_status_alloc_failed",
+    "cannot allocate memory",
+    "unable to allocate",
+)
+
+
 def _is_out_of_memory(error: Any) -> bool:
     text = str(error).lower()
-    return "out of memory" in text or "outofmemory" in text
+    return any(marker in text for marker in _OUT_OF_MEMORY_MARKERS)
 
 
 def _degrade_after_oom(server_args: ServerArgs, req: Req) -> Req | None:
