@@ -556,6 +556,16 @@ class Envs:
     SGLANG_AITER_UNIFIED_DRAFT_EXTEND = EnvBool(True)
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
+    # KDA (linear-attention) extend: run chunk_kda over token blocks of at most
+    # this many tokens (whole sequences grouped per call, longer sequences
+    # split with the recurrent state chained between blocks), so the chunk
+    # kernels' workspace scales with the block instead of the whole extend.
+    # Opt-in: 0 (default) or any value below the 64-token chunk disables
+    # blocking; larger values are rounded down to a multiple of 64. Blocking
+    # trades the per-call transient workspace for one chunk-kernel pipeline
+    # per block, plus a metadata sync for each block layout not among the
+    # four most recently seen by chunk_kda's index cache.
+    SGLANG_KDA_EXTEND_BLOCK_TOKENS = EnvInt(0)
 
     # ===================================================================
     # Scheduler token budgeting and admission
