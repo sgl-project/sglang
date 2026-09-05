@@ -42,6 +42,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     wrap_attention_impl_forward,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.skip_softmax import (
+    get_request_skip_softmax_params,
+)
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.turbo_layer import (
     async_a2a_communicate,
@@ -344,6 +347,18 @@ def apply_attention_backend_override(
     layer.backend = target
 
 
+def supports_skip_softmax(layer: nn.Module) -> bool:
+    return (
+        not layer.is_cross_attention
+        and layer.head_size in (128, 256)
+        and layer.dtype in (torch.float16, torch.bfloat16)
+        and (
+            layer._required_attention_backend is None
+            or layer.backend is AttentionBackendEnum.FA
+        )
+    )
+
+
 class UlyssesAttention(nn.Module):
     """Ulysses-style SequenceParallelism attention layer."""
 
@@ -357,6 +372,7 @@ class UlyssesAttention(nn.Module):
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         required_attention_backend: AttentionBackendEnum | None = None,
         prefix: str = "",
+        is_cross_attention: bool = False,
         **extra_impl_args,
     ) -> None:
         super().__init__()
@@ -392,6 +408,7 @@ class UlyssesAttention(nn.Module):
             softmax_scale=self.softmax_scale,
             num_kv_heads=num_kv_heads,
             prefix=f"{prefix}.impl",
+            is_cross_attention=is_cross_attention,
             **extra_impl_args,
         )
         self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)
@@ -404,6 +421,7 @@ class UlyssesAttention(nn.Module):
         self._attn_impl_by_backend = {self.backend: self.attn_impl}
         self._supported_attention_backends = supported_attention_backends
         self._required_attention_backend = required_attention_backend
+        self.is_cross_attention = is_cross_attention
         self.dtype = dtype
         self.causal = causal
         self.sp_attention_mode, self.sp_attention_mode_is_auto = (
@@ -658,6 +676,7 @@ class LocalAttention(nn.Module):
             softmax_scale=self.softmax_scale,
             num_kv_heads=num_kv_heads,
             causal=causal,
+            is_cross_attention=is_cross_attention,
             **extra_impl_args,
         )
         self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)
@@ -670,6 +689,7 @@ class LocalAttention(nn.Module):
         self._attn_impl_by_backend = {self.backend: self.attn_impl}
         self._supported_attention_backends = supported_attention_backends
         self._required_attention_backend = required_attention_backend
+        self.is_cross_attention = is_cross_attention
         self.dtype = dtype
 
     def forward(
@@ -697,6 +717,13 @@ class LocalAttention(nn.Module):
         ctx_attn_metadata = forward_context.attn_metadata
 
         if attn_mask is not None:
+            if (
+                not self.is_cross_attention
+                and get_request_skip_softmax_params() is not None
+            ):
+                raise NotImplementedError(
+                    "Skip Softmax does not support LocalAttention masks."
+                )
             q_ = q.transpose(1, 2)
             k_ = k.transpose(1, 2)
             v_ = v.transpose(1, 2)
@@ -821,6 +848,7 @@ class USPAttention(nn.Module):
             softmax_scale=self.softmax_scale,
             num_kv_heads=num_kv_heads,
             prefix=f"{prefix}.impl",
+            is_cross_attention=is_cross_attention,
             **extra_impl_args,
         )
         self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)
@@ -833,6 +861,7 @@ class USPAttention(nn.Module):
         self._attn_impl_by_backend = {self.backend: self.attn_impl}
         self._supported_attention_backends = supported_attention_backends
         self._required_attention_backend = required_attention_backend
+        self.is_cross_attention = is_cross_attention
         self.dtype = dtype
         self.causal = causal
         self.dropout_p = dropout_rate
@@ -897,6 +926,14 @@ class USPAttention(nn.Module):
         """
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
+        if (
+            attn_mask is not None
+            and get_request_skip_softmax_params() is not None
+            and not self.is_cross_attention
+        ):
+            raise NotImplementedError(
+                "Skip Softmax does not support USPAttention masks."
+            )
         effective_skip_sp = (
             self.skip_sequence_parallel or skip_sequence_parallel_override
         )

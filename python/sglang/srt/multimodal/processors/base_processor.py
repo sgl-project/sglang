@@ -647,6 +647,69 @@ class BaseMultimodalProcessor(ABC):
             video_token_id=getattr(self, "VIDEO_TOKEN_ID", None),
         )
 
+    def get_validated_mm_data(
+        self,
+        prompt,
+        embeddings: Dict[Modality, torch.Tensor],
+        **kwargs,
+    ) -> MultimodalProcessorOutput:
+        """Build EPD multimodal inputs and validate the embedding layout.
+
+        Model processors may override ``get_mm_data`` to rebuild their prompt
+        layout. This shared wrapper ensures every override consumes exactly the
+        encoder rows it received before the result reaches the scheduler.
+        """
+        output = self.get_mm_data(prompt, embeddings, **kwargs)
+        self._validate_precomputed_embedding_layout(output, embeddings)
+        return output
+
+    @staticmethod
+    def _validate_precomputed_embedding_layout(
+        output: MultimodalProcessorOutput,
+        embeddings: Dict[Modality, torch.Tensor],
+    ) -> None:
+        consumed_per_modality = {modality: 0 for modality in embeddings}
+
+        for item in output.mm_items:
+            embedding = item.precomputed_embeddings
+            if not isinstance(embedding, torch.Tensor):
+                raise RuntimeError(
+                    "EPD multimodal items must contain tensor embeddings; "
+                    f"got {type(embedding).__name__} for "
+                    f"{item.modality.name.lower()}"
+                )
+
+            num_rows = embedding.shape[0]
+            if item.offsets is not None:
+                expected_rows = sum(end - start + 1 for start, end in item.offsets)
+                if num_rows != expected_rows:
+                    raise RuntimeError(
+                        "Precomputed multimodal embedding length mismatch for "
+                        f"{item.modality.name.lower()}: expected {expected_rows} "
+                        f"rows from prompt offsets, got {num_rows}"
+                    )
+
+            if item.modality not in consumed_per_modality:
+                raise RuntimeError(
+                    "EPD processor returned an unexpected embedding modality: "
+                    f"{item.modality.name.lower()}"
+                )
+            consumed_per_modality[item.modality] += num_rows
+
+        for modality, embedding in embeddings.items():
+            if not isinstance(embedding, torch.Tensor):
+                raise RuntimeError(
+                    "EPD encoder output must contain tensor embeddings; "
+                    f"got {type(embedding).__name__} for {modality.name.lower()}"
+                )
+            consumed_rows = consumed_per_modality[modality]
+            if consumed_rows != embedding.shape[0]:
+                raise RuntimeError(
+                    "Precomputed multimodal embedding consumption mismatch for "
+                    f"{modality.name.lower()}: received {embedding.shape[0]} rows, "
+                    f"consumed {consumed_rows}"
+                )
+
     def _resolve_processor(self, processor=None):
         if processor is None:
             return self._processor, self._tokenizer
