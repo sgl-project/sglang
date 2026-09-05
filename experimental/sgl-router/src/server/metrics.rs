@@ -32,6 +32,8 @@
 //! | `sgl_router_stale_requests_total` | Counter | `outcome` |
 //! | `sgl_router_decode_affinity_total` | Counter | `outcome` |
 //! | `sgl_router_sticky_total` | Counter | `outcome` |
+//! | `sgl_router_policy_decisions_total` | Counter | `policy`, `reason` |
+//! | `sgl_router_policy_selection_failures_total` | Counter | `policy`, `reason` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
@@ -42,6 +44,7 @@
 //!
 //! The exposition is text/plain; version=0.0.4 per the Prometheus spec.
 
+use crate::config::PolicyKind;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -184,6 +187,23 @@ impl StaleRequestOutcome {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PolicySelectionFailureReason {
+    PrefillAdmissionExhausted,
+    CacheCandidatesExhausted,
+    ProposalEmpty,
+}
+
+impl PolicySelectionFailureReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::PrefillAdmissionExhausted => "prefill_admission_exhausted",
+            Self::CacheCandidatesExhausted => "cache_candidates_exhausted",
+            Self::ProposalEmpty => "proposal_empty",
+        }
+    }
+}
+
 /// Active-load kind label — separates the two axes of per-worker load.
 #[derive(Debug, Clone, Copy)]
 pub enum ActiveLoadKind {
@@ -224,6 +244,8 @@ pub struct MetricsRegistry {
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    policy_decisions_total: Mutex<HashMap<PolicyDecisionKey, Arc<AtomicU64>>>,
+    policy_selection_failures_total: Mutex<HashMap<PolicyDecisionKey, Arc<AtomicU64>>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
 }
 
@@ -272,6 +294,12 @@ pub struct WorkerSnapshot {
 struct ActiveLoadKey {
     worker_url: String,
     kind: &'static str,
+}
+
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+struct PolicyDecisionKey {
+    policy: String,
+    reason: String,
 }
 
 #[derive(Debug)]
@@ -475,6 +503,39 @@ impl MetricsRegistry {
         let mut guard = self.sticky_total.lock();
         let counter = guard
             .entry(outcome.as_str())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record the final Prefill policy decision.
+    pub fn record_policy_decision(&self, policy: &str, reason: &str) {
+        let key = PolicyDecisionKey {
+            policy: policy.to_owned(),
+            reason: reason.to_owned(),
+        };
+        let mut guard = self.policy_decisions_total.lock();
+        let counter = guard
+            .entry(key)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_policy_selection_failure(
+        &self,
+        policy: PolicyKind,
+        reason: PolicySelectionFailureReason,
+    ) {
+        let key = PolicyDecisionKey {
+            policy: policy.to_string(),
+            reason: reason.as_str().to_owned(),
+        };
+        let mut guard = self.policy_selection_failures_total.lock();
+        let counter = guard
+            .entry(key)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone();
         drop(guard);
@@ -785,6 +846,48 @@ impl MetricsRegistry {
         }
         drop(guard);
 
+        // policy_decisions_total
+        out.push_str(
+            "# HELP sgl_router_policy_decisions_total Final Prefill policy decisions by policy and bounded reason.\n",
+        );
+        out.push_str("# TYPE sgl_router_policy_decisions_total counter\n");
+        let guard = self.policy_decisions_total.lock();
+        let mut entries: Vec<(&PolicyDecisionKey, u64)> = guard
+            .iter()
+            .map(|(key, value)| (key, value.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| (&a.0.policy, &a.0.reason).cmp(&(&b.0.policy, &b.0.reason)));
+        for (key, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_policy_decisions_total{{policy=\"{}\",reason=\"{}\"}} {}\n",
+                escape_label(&key.policy),
+                escape_label(&key.reason),
+                value,
+            ));
+        }
+        drop(guard);
+
+        // policy_selection_failures_total
+        out.push_str(
+            "# HELP sgl_router_policy_selection_failures_total Failed Prefill policy selections by policy and bounded reason.\n",
+        );
+        out.push_str("# TYPE sgl_router_policy_selection_failures_total counter\n");
+        let guard = self.policy_selection_failures_total.lock();
+        let mut entries: Vec<(&PolicyDecisionKey, u64)> = guard
+            .iter()
+            .map(|(key, value)| (key, value.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| (&a.0.policy, &a.0.reason).cmp(&(&b.0.policy, &b.0.reason)));
+        for (key, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_policy_selection_failures_total{{policy=\"{}\",reason=\"{}\"}} {}\n",
+                escape_label(&key.policy),
+                escape_label(&key.reason),
+                value,
+            ));
+        }
+        drop(guard);
+
         // ingress_tokenize_errors_total
         out.push_str(
             "# HELP sgl_router_ingress_tokenize_errors_total Chat requests on a chat-encoder model whose ingress tokenization failed, silently falling back to engine-side tokenization (the input_ids offload was defeated).\n",
@@ -870,6 +973,7 @@ mod tests {
         assert!(out.contains("# TYPE sgl_router_stale_requests_total counter"));
         assert!(out.contains("# TYPE sgl_router_decode_affinity_total counter"));
         assert!(out.contains("# TYPE sgl_router_sticky_total counter"));
+        assert!(out.contains("# TYPE sgl_router_policy_decisions_total counter"));
         assert!(out.contains("# TYPE sgl_router_ingress_tokenize_errors_total counter"));
         // Pool-size series exist (at 0) for all three modes even with no
         // workers, so dashboards have a stable series to graph.
@@ -1170,6 +1274,50 @@ mod tests {
         assert!(out.contains(r#"sgl_router_sticky_total{outcome="assigned"} 1"#));
         assert!(out.contains(r#"sgl_router_sticky_total{outcome="remap"} 1"#));
         assert!(out.contains(r#"sgl_router_sticky_total{outcome="no_routing_key"} 1"#));
+    }
+
+    #[test]
+    fn policy_decisions_are_keyed_by_policy_and_reason() {
+        let reg = MetricsRegistry::new();
+        reg.record_policy_decision("session_aware", "session_primary");
+        reg.record_policy_decision("session_aware", "session_primary");
+        reg.record_policy_decision("cache_aware", "cache_candidate");
+
+        let out = reg.render();
+        assert!(out.contains(
+            r#"sgl_router_policy_decisions_total{policy="cache_aware",reason="cache_candidate"} 1"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_policy_decisions_total{policy="session_aware",reason="session_primary"} 2"#
+        ));
+    }
+
+    #[test]
+    fn policy_selection_failures_are_keyed_by_policy_and_reason() {
+        let reg = MetricsRegistry::new();
+        reg.record_policy_selection_failure(
+            PolicyKind::SessionAware,
+            PolicySelectionFailureReason::PrefillAdmissionExhausted,
+        );
+        reg.record_policy_selection_failure(
+            PolicyKind::CacheAware,
+            PolicySelectionFailureReason::CacheCandidatesExhausted,
+        );
+        reg.record_policy_selection_failure(
+            PolicyKind::RoundRobin,
+            PolicySelectionFailureReason::ProposalEmpty,
+        );
+
+        let out = reg.render();
+        assert!(out.contains(
+            r#"sgl_router_policy_selection_failures_total{policy="session_aware",reason="prefill_admission_exhausted"} 1"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_policy_selection_failures_total{policy="cache_aware",reason="cache_candidates_exhausted"} 1"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_policy_selection_failures_total{policy="round_robin",reason="proposal_empty"} 1"#
+        ));
     }
 
     #[test]
