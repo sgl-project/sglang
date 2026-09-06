@@ -210,6 +210,7 @@ def _tokenizer_of(processor):
 
 class BaseMultimodalProcessor(ABC):
     models = []
+    HF_KEY_RENAMES: dict[str, str] = {}
     gpu_image_decode = True  # Enable GPU decoding by default
     smart_rgb_conversion = False
     video_preprocessing_device = None
@@ -1566,6 +1567,12 @@ class BaseMultimodalProcessor(ABC):
         Args:
             modality: if provided, force the data into a single MultimodalDataItem of that modality
         """
+
+        if self.HF_KEY_RENAMES:
+            data_dict = dict(data_dict)
+            for hf_key, attr_name in self.HF_KEY_RENAMES.items():
+                if hf_key in data_dict:
+                    data_dict[attr_name] = data_dict.pop(hf_key)
 
         # universal getter for data_dict
         get_data_value = (
