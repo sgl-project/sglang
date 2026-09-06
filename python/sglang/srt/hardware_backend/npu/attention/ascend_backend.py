@@ -19,6 +19,10 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+    get_sparsity_driven_kv_offload_sparse_context_len,
+    is_sparsity_driven_kv_offload_enabled,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.radix_attention import AttentionType
@@ -341,6 +345,30 @@ class AscendAttnBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
+        self.enable_sparsity_driven_kv_offload = is_sparsity_driven_kv_offload_enabled(
+            model_config=model_runner.model_config,
+            server_args=model_runner.server_args,
+            use_mla_backend=model_runner.use_mla_backend,
+        )
+        self.sparse_kv_manager = None
+        if self.enable_sparsity_driven_kv_offload:
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
+                SparseKVCacheManager,
+                register_sparse_kv_manager,
+            )
+
+            self.sparse_kv_manager = SparseKVCacheManager(
+                model_runner.req_to_token_pool,
+                model_runner.token_to_kv_pool_allocator,
+                sparse_context_len=get_sparsity_driven_kv_offload_sparse_context_len(
+                    model_config=model_runner.model_config
+                ),
+            )
+            register_sparse_kv_manager(self.sparse_kv_manager)
+            logger.info(
+                "Sparsity-driven KV offload is enabled with manager %s.",
+                self.sparse_kv_manager,
+            )
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
@@ -635,6 +663,14 @@ class AscendAttnBackend(AttentionBackend):
     ) -> ForwardMetadata:
         """Create and store the per-bs ForwardMetadata for CUDA graph capture."""
         metadata = ForwardMetadata()
+        if self.enable_sparsity_driven_kv_offload:
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_callback import (
+                register_npu_host_callback_stream,
+            )
+
+            register_npu_host_callback_stream(
+                torch.npu.current_stream(self.device), self.device
+            )
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
         if self.is_hybrid_swa:
             metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
@@ -1198,6 +1234,23 @@ class AscendAttnBackend(AttentionBackend):
                 k_rope=k_rope,
             )
         if topk_indices is not None:
+            if self.enable_sparsity_driven_kv_offload:
+                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.attention import (
+                    forward_sparsity_driven_kv_offload,
+                )
+
+                return forward_sparsity_driven_kv_offload(
+                    self,
+                    q,
+                    k,
+                    v,
+                    layer,
+                    forward_batch,
+                    save_kv_cache,
+                    q_rope,
+                    k_rope,
+                    topk_indices,
+                )
             return self.forward_sparse(
                 q,
                 k,
@@ -2551,6 +2604,23 @@ class AscendAttnBackend(AttentionBackend):
             # MLAPO does saving kv_cache
             save_kv_cache = False
         if topk_indices is not None:
+            if self.enable_sparsity_driven_kv_offload:
+                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.attention import (
+                    forward_sparsity_driven_kv_offload,
+                )
+
+                return forward_sparsity_driven_kv_offload(
+                    self,
+                    q,
+                    k,
+                    v,
+                    layer,
+                    forward_batch,
+                    save_kv_cache,
+                    q_rope,
+                    k_rope,
+                    topk_indices,
+                )
             return self.forward_sparse(
                 q,
                 k,
