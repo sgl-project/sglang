@@ -462,6 +462,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_split_seq_index: Optional[int] = None
 
     # === Borrowed from ScheduleBatch: host metadata (CPU lists / mirrors) ===
+    # CPU mirror of req_pool_indices. NPU metadata construction uses this to
+    # avoid synchronizing the device stream through Tensor.tolist().
+    req_pool_indices_cpu: Optional[torch.Tensor] = None
     # Optional seq_lens on cpu (CPU mirror of seq_lens)
     seq_lens_cpu: Optional[torch.Tensor] = None
 
@@ -809,6 +812,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             out_cache_loc=batch.out_cache_loc,
             seq_lens_sum=batch.seq_lens_sum,
             # Inputs aliased by reference from ScheduleBatch
+            req_pool_indices_cpu=batch.req_pool_indices_cpu,
             seq_lens_cpu=seq_lens_cpu,
             orig_seq_lens=batch.orig_seq_lens,
             out_cache_loc_dsv4=batch.out_cache_loc_dsv4,

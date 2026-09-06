@@ -140,7 +140,7 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils import flatten_nested_list
+from sglang.srt.utils import flatten_nested_list, is_npu
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
 if TYPE_CHECKING:
@@ -160,6 +160,8 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 _MM_HASH_MASK = (1 << 64) - 1
 
 logger = logging.getLogger(__name__)
+
+_is_npu = is_npu()
 
 
 ReturnHiddenStatesMode = Union[bool, Literal["last"]]
@@ -2430,7 +2432,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_encoder_info_extend(
         self, input_ids: List[array[int]], seq_lens: List[int]
     ):
-        _pin = is_pin_memory_available(self.device)
+        _pin = is_pin_memory_available(self.device) or (
+            _is_npu and str(self.device).split(":", 1)[0] == "npu"
+        )
         encoder_lens_cpu = []
         encoder_cached = []
 
@@ -2578,7 +2582,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             for i, r in enumerate(reqs)
         ]
 
-        _pin = is_pin_memory_available(self.device)
+        _pin = is_pin_memory_available(self.device) or (
+            _is_npu and str(self.device).split(":", 1)[0] == "npu"
+        )
         # Stay on pinned CPU; H2D is deferred to forward stream via
         # resolve_forward_inputs.
         pinned_input_ids = flatten_arrays_to_pinned_cpu(input_ids, _pin)

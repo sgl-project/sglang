@@ -1182,6 +1182,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
+            # Hybrid models (e.g. K3 with KDA): guard against prealloc
+            # draining the mamba pool before the KV pool (would assert "Not
+            # enough space for mamba cache"). Evict a cached mamba slot from
+            # the radix tree first (only if it manages mamba states;
+            # ChunkCache.evict is a no-op), else stop.
+            mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+            if mamba_allocator is not None and mamba_allocator.available_size() <= 0:
+                supports_mamba = self.tree_cache.supports_mamba()
+                if supports_mamba and hasattr(self.tree_cache, "evict"):
+                    self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+                if mamba_allocator.available_size() <= 0:
+                    break
+
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
                 break
 

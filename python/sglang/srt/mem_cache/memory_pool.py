@@ -3752,7 +3752,12 @@ class HybridLinearKVPool(KVCache):
     def get_kv_layer_ids(self):
         """Global layer ids aligned with the full-attention KV buffers."""
         layer_ids = list(self.full_attention_layer_id_mapping)
-        return layer_ids if self.use_mla else layer_ids * 2
+        # FP8 DSA packs K/V into the single k_buffer (see MLATokenToKVPool):
+        # only exists when the backing pool was built with packed storage.
+        dsa_kv_cache_store_fp8 = getattr(
+            self.full_kv_pool, "dsa_kv_cache_store_fp8", False
+        )
+        return layer_ids if self.use_mla or dsa_kv_cache_store_fp8 else layer_ids * 2
 
     def get_state_buf_infos(self):
         mamba_data_ptrs, mamba_data_lens, mamba_item_lens = (

@@ -144,8 +144,11 @@ def set_default_server_args(args: "ServerArgs"):
         disable_custom_all_reduce=True,
     )
 
-    # handles hierarchical cache configs
-    if cfg.enable_hierarchical_cache:
+    # handles hierarchical cache / decode-offload configs
+    if (
+        cfg.enable_hierarchical_cache
+        or cfg.disaggregation_decode_enable_offload_kvcache
+    ):
         declare_resolution(
             args,
             "set_default_server_args",

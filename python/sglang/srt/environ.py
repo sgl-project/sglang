@@ -778,6 +778,12 @@ class Envs:
     MOONCAKE_TENANT_ID = EnvStr("default")
 
     # ===================================================================
+    # Ascend MemCache (HiCache L3); see https://gitcode.com/Ascend/memcache
+    # ===================================================================
+    SGLANG_HICACHE_MEMCACHE_CONFIG_PATH = EnvStr(None)
+    SGLANG_ASCEND_MEMCACHE_ENABLE_WARMUP = EnvBool(False)
+
+    # ===================================================================
     # MoRI transport and expert dispatch
     # ===================================================================
     SGLANG_DEEPEP_V2_FORCE_MAX_LEN = EnvBool(False)

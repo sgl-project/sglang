@@ -650,15 +650,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     # for disagg
     def get_contiguous_buf_infos(self):
         # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
-        kv_data_ptrs = [self.k_buffer[i].data_ptr() for i in range(self.layer_num)] + [
-            self.v_buffer[i].data_ptr() for i in range(self.layer_num)
-        ]
-        kv_data_lens = [self.k_buffer[i].nbytes for i in range(self.layer_num)] + [
-            self.v_buffer[i].nbytes for i in range(self.layer_num)
-        ]
-        kv_item_lens = [self.k_buffer[i][0].nbytes for i in range(self.layer_num)] + [
-            self.v_buffer[i][0].nbytes for i in range(self.layer_num)
-        ]
+        kv_data_ptrs = [self.k_buffer[i].data_ptr() for i in range(self.layer_num)]
+        kv_data_lens = [self.k_buffer[i].nbytes for i in range(self.layer_num)]
+        kv_item_lens = [self.k_buffer[i][0].nbytes for i in range(self.layer_num)]
+        # When DSA KV cache is packed into the FP8 k_buffer, the v_buffer is
+        # intentionally empty (kr_cache_dim == 0). Its data_ptr() is null
+        if not getattr(self, "dsa_kv_cache_store_fp8", False):
+            kv_data_ptrs += [self.v_buffer[i].data_ptr() for i in range(self.layer_num)]
+            kv_data_lens += [self.v_buffer[i].nbytes for i in range(self.layer_num)]
+            kv_item_lens += [self.v_buffer[i][0].nbytes for i in range(self.layer_num)]
         if self.index_head_dim is not None:
             kv_data_ptrs += [
                 self.index_k_buffer[i].data_ptr() for i in range(self.layer_num)
