@@ -1549,6 +1549,10 @@ class Envs:
     # ===================================================================
     SGLANG_OPT_USE_BF16_ROUTER_GEMM = EnvBool(True)
     SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE = EnvBool(False)
+    # Experimental MiniMax-M3 decode step-3 replacement using FlashInfer's
+    # TRTLLM-GEN native block-sparse attention (flashinfer#3955). The initial
+    # integration targets TP configurations with one local index/KV head.
+    SGLANG_OPT_USE_MINIMAX_TRTLLM_SPARSE_DECODE = EnvBool(False)
     SGLANG_DISABLE_MSA = EnvBool(False)
     SGLANG_OPT_USE_MSA_DECODE_UNDER_GRAPH = EnvBool(False)
     # Kill switch for the derived fp8 attention-GEMM mode (m3_fp8_attn_gemm_enabled):
