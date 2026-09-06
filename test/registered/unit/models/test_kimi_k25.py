@@ -28,6 +28,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
 from sglang.srt.models.kimi_k25 import (
     KimiK25ForConditionalGeneration,
+    Learnable2DInterpPosEmbDivided_fixed,
     mm_projection_auto,
 )
 from sglang.srt.models.kimi_vl_moonvit import tpool_patch_merger
@@ -108,6 +109,28 @@ def _image_item(feature, grid_thw):
         feature=feature,
         model_specific_data={"image_grid_thw": torch.tensor(grid_thw)},
     )
+
+
+def test_kimi_temporal_position_buffer_matches_learned_embedding_placement():
+    position_embedding = Learnable2DInterpPosEmbDivided_fixed(
+        height=2,
+        width=2,
+        num_frames=4,
+        dim=8,
+    )
+    position_embedding.weight = nn.Parameter(
+        position_embedding.weight.to(dtype=torch.bfloat16)
+    )
+    hidden_states = torch.zeros(8, 8, dtype=torch.bfloat16)
+
+    output = position_embedding(
+        hidden_states,
+        grid_thws=torch.tensor([[2, 2, 2]]),
+    )
+
+    assert position_embedding.time_weight.dtype == torch.float32
+    assert output.dtype == position_embedding.weight.dtype
+    assert output.device == position_embedding.weight.device
 
 
 def test_kimi_gpu_preprocess_batches_only_source_compatible_images():
@@ -230,6 +253,35 @@ def test_kimi_expansion_matches_the_base_retokenize_avoidance_rebuild():
             ids, image_token_id=7, image_token_counts=counts
         )
         assert wrapper.flatten().tolist() == expected
+
+
+def test_kimi_video_chunks_expand_to_grid_token_counts():
+    wrapper = KimiGPUProcessorWrapper.__new__(KimiGPUProcessorWrapper)
+    wrapper._image_token_id = 7
+    wrapper._merge_kernel_size = 2
+    wrapper._hf_processor = SimpleNamespace(video_placeholder="<video>")
+    wrapper._decode_video_chunks = Mock(
+        return_value=([{"type": "video_chunk"}, {"type": "video_chunk"}], "chunks")
+    )
+    wrapper.media_processor = SimpleNamespace(
+        preprocess=Mock(
+            return_value={
+                "pixel_values": torch.zeros(1),
+                "grid_thws": torch.tensor([[4, 46, 26], [4, 20, 20]]),
+            }
+        )
+    )
+    wrapper.tokenizer = Mock(
+        return_value={"input_ids": torch.tensor([[1, 7, 2, 7, 3]])}
+    )
+
+    output = wrapper._video_call("before<video>after", images=[], videos=["video"])
+
+    # MoonViT pools over time, then spatially merges each 2x2 patch group.
+    expected_chunk_tokens = [46 * 26 // 4, 20 * 20 // 4]
+    assert output["input_ids"].shape[1] == 3 + sum(expected_chunk_tokens)
+    assert output["input_ids"].eq(7).sum().item() == sum(expected_chunk_tokens)
+    assert output["image_grid_thw"].tolist() == [[4, 46, 26], [4, 20, 20]]
 
 
 def test_kimi_cpu_fallback_keeps_the_request_tokens():
