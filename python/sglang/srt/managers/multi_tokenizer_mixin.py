@@ -622,9 +622,9 @@ class MultiDetokenizerRouter:
                 # tokenizer workers. It is forwarded so the detokenizer can
                 # answer the right HTTP worker, it is not a routing key.
                 ipcs = recv_obj.http_worker_ipcs
-                assert ipcs is None or len(ipcs) == len(
-                    recv_obj.rids
-                ), f"Batch req {recv_obj.rids=} has invalid http_worker_ipcs"
+                assert ipcs is None or len(ipcs) == len(recv_obj.rids), (
+                    f"Batch req {recv_obj.rids=} has invalid http_worker_ipcs"
+                )
 
                 # Split per-item and route each by its own rid.
                 for i, rid in enumerate(recv_obj.rids):
