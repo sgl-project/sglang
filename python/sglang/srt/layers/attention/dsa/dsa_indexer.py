@@ -39,6 +39,9 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.model_executor.runner_utils.capture_owner import (
+    retain_full_cuda_graph_owner,
+)
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
@@ -757,7 +760,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         target_heads = 32
         q_fp8 = torch.nn.functional.pad(q_fp8, (0, 0, 0, target_heads - num_heads))
         weights = torch.nn.functional.pad(weights, (0, target_heads - num_heads))
+        Indexer._retain_padded_head_capture_owners(q_fp8, weights)
         return q_fp8, weights, num_heads
+
+    @staticmethod
+    @torch.compiler.disable
+    def _retain_padded_head_capture_owners(
+        q_fp8: torch.Tensor, weights: torch.Tensor
+    ) -> None:
+        # The padded tensors, not their sources, are what the captured
+        # kernels record; no-op outside an active full-graph capture scope.
+        retain_full_cuda_graph_owner(q_fp8)
+        retain_full_cuda_graph_owner(weights)
 
     def _mask_init_and_local_tokens(
         self,
@@ -793,6 +807,21 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             logits.scatter_(dim=1, index=local_idxs, value=float("inf"))
         return logits
 
+    @torch.compiler.disable
+    def _retain_full_graph_capture_owner(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Retain a tensor whose address a full CUDA graph capture records.
+
+        CUDA graphs replay through raw device pointers, so every tensor a
+        captured kernel reads or writes must stay allocated for the graph's
+        lifetime. The retain call is a no-op outside an active full-graph
+        capture scope; during capture the backend stores the owner with the
+        captured shape and releases it on recapture or cleanup. The
+        ``torch.compiler.disable`` boundary keeps the Python side effect out
+        of any enclosing Dynamo graph, which would otherwise trace it away.
+        """
+        retain_full_cuda_graph_owner(tensor)
+        return tensor
+
     def _get_topk_paged(
         self,
         forward_batch: ForwardBatch,
@@ -804,6 +833,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
+        weights = self._retain_full_graph_capture_owner(weights)
         page_size = get_token_to_kv_pool().page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
         if _is_hip:
@@ -1006,6 +1036,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 q_offset=q_offset,
             )
 
+        logits = self._retain_full_graph_capture_owner(logits)
         # NOTE(dark): logits should be cleaned in topk_transform
         self._mask_init_and_local_tokens(logits, seqlens_32)
         topk_result = metadata.topk_transform(logits, self.index_topk)
@@ -1092,6 +1123,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
+        weights = self._retain_full_graph_capture_owner(weights)
         assert forward_batch.forward_mode.is_extend_without_speculative()
 
         page_size = get_token_to_kv_pool().page_size
@@ -1201,6 +1233,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
 
+            logits = self._retain_full_graph_capture_owner(logits)
             self._mask_init_and_local_tokens(logits, seq_lens_expanded, ks)
             raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
             topk_result[:q_offset] = raw_topk_result
@@ -1270,6 +1303,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 cu_seqlens_q_chunk = cu_seqlens_q_full[start:end]
                 batch_idx_chunk = token_to_batch_idx[start:end]
 
+            logits_chunk = self._retain_full_graph_capture_owner(logits_chunk)
             raw_topk_chunk = metadata.topk_transform(
                 logits_chunk,
                 self.index_topk,
@@ -1361,6 +1395,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             dtype=torch.float32,
             device=x_meta.device,
         )
+        dummy_logits = self._retain_full_graph_capture_owner(dummy_logits)
         raw_topk_result = metadata.topk_transform(dummy_logits, self.index_topk)
         if topk_result is not None:
             # PCG/BCG: fill the valid prefix of the padded static buffer and
@@ -1384,6 +1419,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             "DSA context parallel (_get_topk_ragged_with_cp) not supported under "
             "piecewise/breakable CUDA graph"
         )
+        weights = self._retain_full_graph_capture_owner(weights)
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
@@ -1464,6 +1500,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     ke,
                     clean_logits=False,
                 )
+            logits = self._retain_full_graph_capture_owner(logits)
             topk_result = metadata.topk_transform(
                 logits,
                 self.index_topk,
@@ -1514,6 +1551,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             actual_seq_q = torch.tensor([actual_seq_q], dtype=torch.int32).to(
                 device="cuda", non_blocking=True
             )
+            logits = self._retain_full_graph_capture_owner(logits)
             topk_result = metadata.topk_transform(
                 logits,
                 self.index_topk,
