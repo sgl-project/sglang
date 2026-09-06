@@ -132,6 +132,25 @@ class TestFitAutoResidencyProbe:
         assert steps == 0
         assert fitted.num_frames == 81
 
+    def test_probe_never_shrinks_below_the_bounded_warmup_shape(self):
+        from sglang.multimodal_gen.runtime.managers.gpu_worker import (
+            fit_auto_residency_probe,
+        )
+
+        # Nothing fits the extrapolation, but the bounded 832x480x17f warmup
+        # already ran, so the ladder (81 -> 41 -> 21 -> 9 frames) stops at the
+        # first shape at or below it instead of reaching a 16x16x1f probe.
+        fitted, _, steps = fit_auto_residency_probe(
+            _req(832, 480, 81),
+            records=[_record(832, 480, 17, peak_gib=30.0)],
+            free_bytes=8 << 30,
+            total_bytes=80 << 30,
+            server_args=_server_args(),
+        )
+        assert steps >= 1
+        assert (fitted.width, fitted.height) == (832, 480)
+        assert fitted.num_frames == 9
+
     def test_without_a_trusted_estimate_the_probe_runs_as_requested(self):
         from sglang.multimodal_gen.runtime.managers.gpu_worker import (
             fit_auto_residency_probe,

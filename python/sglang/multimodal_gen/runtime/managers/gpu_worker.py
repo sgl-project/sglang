@@ -211,6 +211,9 @@ def fit_auto_residency_probe(
     # planner's placement reserve (which held back 4 GiB of a 32 GiB card and
     # shrank a probe that had 10 GiB to spare).
     budget = free_bytes - max(PROBE_FIT_MIN_MARGIN_BYTES, total_bytes // 50)
+    # The bounded warmup already ran at the smallest measured shape; a probe
+    # below it measures nothing new and degenerate shapes fail inside models.
+    floor_units = min((record.workload_units() for record in records), default=0)
     fitted, steps = req, 0
     while True:
         units = (
@@ -221,7 +224,7 @@ def fit_auto_residency_probe(
         estimate = estimate_default_workload_peak_bytes(
             records=records, target_units=units
         )
-        if estimate is None or estimate <= budget:
+        if estimate is None or estimate <= budget or units <= floor_units:
             return fitted, estimate, steps
         lighter = lighten_warmup_req(server_args, fitted)
         if lighter is None:
@@ -1106,12 +1109,13 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         req.sampling_params = fitted.sampling_params
 
     def _release_warmup_pool(self, req: Req) -> None:
-        """Drop the allocator pool the full-shape probe left behind.
+        """Drop what the full-shape probe left behind before the next request.
 
-        The probe runs a shape serving never sees; its cached blocks would
-        otherwise become the floor of every runtime peak measurement. The
-        request after the probe (the bounded re-warm) regrows the pool at a
-        serving-sized shape.
+        The probe runs a shape serving may never see. Its cached allocator
+        blocks would become the floor of every runtime peak measurement, and
+        the IPC all-to-all staging buffers it created stay allocated at its
+        message size. The request after the probe (the bounded re-warm)
+        regrows both at a serving-sized shape.
         """
         if req.is_warmup and req.extra.get("auto_residency_full_shape_probe"):
             self._release_warmup_pool_before_serving = True
@@ -1121,6 +1125,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self._release_warmup_pool_before_serving = False
         if current_platform.is_cpu() or current_platform.is_mps():
             return
+        from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+            IPC_A2A,
+        )
+
+        IPC_A2A.drop_staging()
         torch.get_device_module().empty_cache()
 
     def _record_output_peak_memory(
