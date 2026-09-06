@@ -3363,6 +3363,10 @@ class DeepseekV4Model(nn.Module):
 
 
 class DeepseekV4ForCausalLM(nn.Module):
+    # DSV4 stores per-token/per-block scales alongside its FP8 cache payload.
+    # Static checkpoint or external JSON scales do not apply to this layout.
+    kv_cache_scale_mode = "dynamic"
+
     def __init__(
         self,
         config: DeepSeekV4Config,
