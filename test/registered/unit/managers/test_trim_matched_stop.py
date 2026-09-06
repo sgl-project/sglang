@@ -8,17 +8,21 @@ so no DetokenizerManager.__init__ / IPC / tokenizer."""
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-GPT_OSS_CALL_TOKEN = 200012
+HARMONY_CALL_TOKENS = {
+    "llm-jp-4": 13,
+    "gpt-oss": 200012,
+}
 
 
-def _trim(output, matched, no_stop_trim, *, gpt_oss=False):
-    stub = SimpleNamespace(is_tool_call_parser_gpt_oss=gpt_oss)
+def _trim(output, matched, no_stop_trim, *, harmony_call_token_id=None):
+    stub = SimpleNamespace(harmony_call_token_id=harmony_call_token_id)
     finished_reason = None if matched is None else {"matched": matched}
     return DetokenizerManager.trim_matched_stop(
         stub, output, finished_reason, no_stop_trim
@@ -30,7 +34,7 @@ class TestTrimMatchedStop(unittest.TestCase):
         self.assertEqual(_trim("abc", None, False), "abc")
 
     def test_no_matched_returns_output(self):
-        stub = SimpleNamespace(is_tool_call_parser_gpt_oss=False)
+        stub = SimpleNamespace(harmony_call_token_id=None)
         self.assertEqual(
             DetokenizerManager.trim_matched_stop(stub, "abc", {}, False), "abc"
         )
@@ -56,12 +60,56 @@ class TestTrimMatchedStop(unittest.TestCase):
     def test_token_no_trim_keeps_all(self):
         self.assertEqual(_trim([1, 2, 3], 3, True), [1, 2, 3])
 
-    def test_token_gpt_oss_call_kept(self):
-        # gpt-oss tool-call token is also an eos; keep it even when trimming.
-        self.assertEqual(
-            _trim([1, 2, GPT_OSS_CALL_TOKEN], GPT_OSS_CALL_TOKEN, False, gpt_oss=True),
-            [1, 2, GPT_OSS_CALL_TOKEN],
+    def test_token_harmony_call_kept(self):
+        # Harmony's tool-call token is also an eos; keep it even when trimming.
+        for model, call_token_id in HARMONY_CALL_TOKENS.items():
+            with self.subTest(model=model):
+                self.assertEqual(
+                    _trim(
+                        [1, 2, call_token_id],
+                        call_token_id,
+                        False,
+                        harmony_call_token_id=call_token_id,
+                    ),
+                    [1, 2, call_token_id],
+                )
+
+
+class TestResolveHarmonyCallTokenId(unittest.TestCase):
+    def test_resolves_call_token_with_selected_parser(self):
+        for model, call_token_id in HARMONY_CALL_TOKENS.items():
+            with self.subTest(model=model):
+                tokenizer = SimpleNamespace(
+                    unk_token_id=0,
+                    convert_tokens_to_ids=lambda token: (
+                        call_token_id if token == "<|call|>" else 0
+                    ),
+                )
+                manager = SimpleNamespace(tokenizer=tokenizer)
+
+                token_id = DetokenizerManager._resolve_harmony_call_token_id(
+                    manager, "gpt-oss"
+                )
+
+                self.assertEqual(token_id, call_token_id)
+
+    def test_non_gpt_oss_parser_does_not_inspect_tokenizer(self):
+        tokenizer = Mock()
+        manager = SimpleNamespace(tokenizer=tokenizer)
+
+        token_id = DetokenizerManager._resolve_harmony_call_token_id(
+            manager, "another-parser"
         )
+
+        self.assertIsNone(token_id)
+        tokenizer.convert_tokens_to_ids.assert_not_called()
+
+    def test_tokenizer_without_token_conversion_returns_none(self):
+        manager = SimpleNamespace(tokenizer=SimpleNamespace())
+
+        token_id = DetokenizerManager._resolve_harmony_call_token_id(manager, "gpt-oss")
+
+        self.assertIsNone(token_id)
 
 
 if __name__ == "__main__":
