@@ -385,4 +385,12 @@ def adjust_config_with_unaligned_cpu_tp(
                         pad_vocab_size(proj_inp_dim, tp_size),
                     )
 
+    if model_config.hf_config.model_type == "glm_ocr":
+        vision_config = model_config.hf_config.vision_config
+        model_config.hf_config.vision_config = update_intermediate_size(
+            vision_config,
+            "intermediate_size",
+            intermediate_padding_size,
+        )
+
     return model_config
