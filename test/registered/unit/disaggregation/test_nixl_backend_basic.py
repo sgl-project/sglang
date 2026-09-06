@@ -1205,19 +1205,19 @@ class TestNixlHeteroTpReplicatedKV(CustomTestCase):
         src_handle, num_groups, _num_ptr_pairs, _num_slots = mgr.prep_handle_slice_src
         self.assertEqual(num_groups, 2)
 
-        # Every source descriptor [addr, addr+len) must lie inside a registered
-        # base region [ptr, ptr+REGION_LEN). Pre-fix, num_groups=4 pushed the
-        # top group's addresses past the region -> NIXL_ERR_NOT_FOUND.
+        # Every source run must lie inside a registered base region
+        # [ptr, ptr+REGION_LEN), gaps between its blocks included. Pre-fix,
+        # num_groups=4 pushed the top group past the region -> NIXL_ERR_NOT_FOUND.
         src_call = next(c for c in mgr.agent.calls if c[0] == "")
         src_array = src_call[1]
         regions = [(p, p + self.REGION_LEN) for p in self.SRC_PTRS]
-        for addr, length, _dev in src_array:
+        for addr, length, _dev, stride, count in src_array:
             addr = int(addr)
-            length = int(length)
+            end = addr + (int(count) - 1) * int(stride) + int(length)
             self.assertTrue(
-                any(lo <= addr and addr + length <= hi for lo, hi in regions),
-                f"descriptor [{addr:#x}, {addr + length:#x}) escapes all "
-                f"registered source regions {[(hex(lo), hex(hi)) for lo, hi in regions]}",
+                any(lo <= addr and end <= hi for lo, hi in regions),
+                f"run [{addr:#x}, {end:#x}) escapes all registered source "
+                f"regions {[(hex(lo), hex(hi)) for lo, hi in regions]}",
             )
 
     def test_head_group_idx_maps_replicated_ranks_by_integer_division(self):

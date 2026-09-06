@@ -399,6 +399,10 @@ class TransferStatus:
 
 
 class NixlKVManager(StagingManagerMixin, CommonKVManager):
+    # Newer NIXL prepares compressed (addr, len, dev_id, stride, count) runs
+    # directly; cleared on the first TypeError to expand per block instead.
+    _use_strided_descs: bool = True
+
     def __init__(
         self,
         args: KVArgs,
@@ -668,6 +672,44 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             return
         super().update_status(bootstrap_room, status)
 
+    @staticmethod
+    def _pack_stride_descs(runs: list[tuple[int, int, int, int, int]]) -> np.ndarray:
+        """Pack (addr, len, dev_id, stride, count) runs into an Nx5 uint64 array."""
+        # uint64: Intel XPU addresses have bit 63 set and overflow int64.
+        return np.array(runs, dtype=np.uint64).reshape(-1, 5)
+
+    @staticmethod
+    def _expand_stride_descs(stride_descs: np.ndarray) -> np.ndarray:
+        """Expand Nx5 runs into one (addr, len, dev_id) descriptor per block."""
+        parts: list[np.ndarray] = []
+        for addr, length, dev_id, stride, count in stride_descs.tolist():
+            out = np.empty((count, 3), dtype=np.uint64)
+            out[:, 0] = addr + np.arange(count, dtype=np.uint64) * stride
+            out[:, 1] = length
+            out[:, 2] = dev_id
+            parts.append(out)
+        return np.concatenate(parts) if parts else np.empty((0, 3), dtype=np.uint64)
+
+    def _prep_xfer_dlist(self, peer_name: str, stride_descs: np.ndarray, mem_kind: str):
+        """Prepare a NIXL dlist handle from Nx5 runs.
+
+        Tries the strided API first and falls back to expanding one descriptor
+        per block when the installed NIXL rejects the Nx5 layout.
+        """
+        if self._use_strided_descs:
+            try:
+                return self.agent.prep_xfer_dlist(peer_name, stride_descs, mem_kind)
+            except TypeError:
+                logger.warning_once(
+                    "Installed NIXL does not support strided descriptors, "
+                    "falling back to per-block descriptors."
+                )
+                self._use_strided_descs = False
+        descs = self.agent.get_xfer_descs(
+            self._expand_stride_descs(stride_descs), mem_kind
+        )
+        return self.agent.prep_xfer_dlist(peer_name, descs, mem_kind)
+
     def _prep_equal_tp_dlist(
         self,
         peer_name: str,
@@ -690,12 +732,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 f"data_lens={len(kv_data_lens)}, xfer_lens={len(kv_xfer_lens)}"
             )
         device_id = _nixl_device_id(mem_kind, gpu_id)
-        arrays = []
-        # torch.int exceeds np.int64 range on Intel XPU (addresses have bit 63 set).
-        # Convert once at entry; all downstream arithmetic stays in uint64.
-        kv_ptrs_u64 = np.array(kv_ptrs, dtype=np.uint64)
+        runs: list[tuple[int, int, int, int, int]] = []
         for base_ptr, item_len, data_len, xfer_len in zip(
-            kv_ptrs_u64, kv_item_lens, kv_data_lens, kv_xfer_lens
+            kv_ptrs, kv_item_lens, kv_data_lens, kv_xfer_lens
         ):
             if xfer_len > item_len:
                 raise ValueError(
@@ -703,22 +742,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     f"xfer_len={xfer_len}, item_len={item_len}, mem_kind={mem_kind}"
                 )
             n = num_slots if num_slots is not None else (data_len // item_len)
-            addrs = np.arange(n, dtype=np.uint64) * np.uint64(item_len) + base_ptr
-            arrays.append(
-                np.column_stack(
-                    [
-                        addrs,
-                        np.full(n, xfer_len, dtype=np.uint64),
-                        np.full(n, device_id, dtype=np.uint64),
-                    ]
-                )
-            )
+            # One run per region: n slots of xfer_len bytes, item_len apart.
+            runs.append((base_ptr, xfer_len, device_id, item_len, n))
 
-        prep_handle = self.agent.prep_xfer_dlist(peer_name, np.vstack(arrays), mem_kind)
-        assert prep_handle is not None, (
-            f"prep_xfer_dlist returned None for peer '{peer_name}'"
-        )
-        return prep_handle
+        return self._prep_xfer_dlist(peer_name, self._pack_stride_descs(runs), mem_kind)
 
     def _init_equal_tp_prep_handle(
         self,
@@ -828,8 +855,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         src_kv_item_len = self.kv_args.kv_item_lens[0]
         bytes_per_token_to_send = num_heads_to_send * bytes_per_head_slice
-        bytes_per_token_src = src_kv_item_len // page_size
         bytes_per_token_dst = dst_kv_item_len // page_size
+        # One run per region below relies on tokens (and src head groups) tiling
+        # a slot exactly; otherwise the runs would address the wrong bytes.
+        assert page_size * num_groups * bytes_per_token_to_send == src_kv_item_len
+        assert page_size * bytes_per_token_dst == dst_kv_item_len
 
         src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_pp = (
             self.get_mha_kv_ptrs_with_pp(
@@ -841,33 +871,24 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         num_ptr_pairs = len(src_ptrs)
 
         num_slots = self.kv_args.kv_data_lens[0] // src_kv_item_len
-        slots = np.arange(num_slots, dtype=np.uint64)
-        tokens = np.arange(page_size, dtype=np.uint64)  # reused in dst dlist below
-        groups = np.arange(num_groups, dtype=np.uint64)
 
-        # Src dlist built once and shared.
+        # Src dlist built once and shared. One run per region: [slot, token, group]
+        # is one dense progression of head slices, the flat index
+        # expand_page_indices_for_slice computes.
         if self.prep_handle_slice_src is None:
-            src_ptrs_arr = np.array(src_ptrs, dtype=np.uint64)
-            addrs = (
-                src_ptrs_arr[:, None, None, None]
-                + slots[None, :, None, None] * np.uint64(src_kv_item_len)
-                + tokens[None, None, :, None] * np.uint64(bytes_per_token_src)
-                + groups[None, None, None, :] * np.uint64(bytes_per_token_to_send)
-            ).ravel()
-            src_array = np.column_stack(
-                [
-                    addrs,
-                    np.full(len(addrs), bytes_per_token_to_send, dtype=np.uint64),
-                    np.full(
-                        len(addrs),
-                        _nixl_device_id(src_mem_kind, self.kv_args.gpu_id),
-                        dtype=np.uint64,
-                    ),
-                ]
-            )
-            src_handle = self.agent.prep_xfer_dlist("", src_array, src_mem_kind)
-            assert src_handle is not None, (
-                f"prep_xfer_dlist returned None for slice src (decode_tp_size={decode_tp_size})"
+            src_device_id = _nixl_device_id(src_mem_kind, self.kv_args.gpu_id)
+            src_runs = [
+                (
+                    ptr,
+                    bytes_per_token_to_send,
+                    src_device_id,
+                    bytes_per_token_to_send,
+                    num_slots * page_size * num_groups,
+                )
+                for ptr in src_ptrs
+            ]
+            src_handle = self._prep_xfer_dlist(
+                "", self._pack_stride_descs(src_runs), src_mem_kind
             )
             self.prep_handle_slice_src = (
                 src_handle,
@@ -882,29 +903,21 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             if decode_kv_args.dst_num_slots is not None
             else num_slots
         )
-        dst_slots = np.arange(num_slots_dst, dtype=np.uint64)
-        # (ptr, slot, token) → ravel.
-        dst_ptrs_arr = np.array(dst_ptrs, dtype=np.uint64)
-        addrs = (
-            dst_ptrs_arr[:, None, None]
-            + dst_slots[None, :, None] * np.uint64(dst_kv_item_len)
-            + tokens[None, None, :] * np.uint64(bytes_per_token_dst)
-            + np.uint64(dst_head_offset)
-        ).ravel()
-        dst_array = np.column_stack(
-            [
-                addrs,
-                np.full(len(addrs), bytes_per_token_to_send, dtype=np.uint64),
-                np.full(
-                    len(addrs),
-                    _nixl_device_id(dst_mem_kind, decode_kv_args.gpu_id),
-                    dtype=np.uint64,
-                ),
-            ]
-        )
-        dst_handle = self.agent.prep_xfer_dlist(peer_name, dst_array, dst_mem_kind)
-        assert dst_handle is not None, (
-            f"prep_xfer_dlist returned None for slice dst for peer '{peer_name}'"
+        # One run per region over (slot, token): this peer's head slice sits at
+        # dst_head_offset in every token, bytes_per_token_dst apart.
+        dst_device_id = _nixl_device_id(dst_mem_kind, decode_kv_args.gpu_id)
+        dst_runs = [
+            (
+                ptr + dst_head_offset,
+                bytes_per_token_to_send,
+                dst_device_id,
+                bytes_per_token_dst,
+                num_slots_dst * page_size,
+            )
+            for ptr in dst_ptrs
+        ]
+        dst_handle = self._prep_xfer_dlist(
+            peer_name, self._pack_stride_descs(dst_runs), dst_mem_kind
         )
         self.prep_handles_slice_dst[peer_name] = (
             dst_handle,
