@@ -521,6 +521,15 @@ class TestResetTensors(_WeightCheckerTestBase):
         self.assertEqual(self.model.w.data_ptr(), before_w_ptr)
         self.assertFalse(torch.equal(self.model.w, before_w))
 
+    def test_preserves_tensors_excluded_from_weight_check(self):
+        """Unchecked tensors may not be restored, so reset must preserve them."""
+        self.model.w._skip_weight_check = True
+        before_w = self.model.w.clone()
+
+        self.checker._reset_tensors()
+
+        torch.testing.assert_close(self.model.w, before_w)
+
     def test_skips_cos_sin_cache(self):
         before = self.model.rotary_emb_cos_sin_cache.clone()
         self.checker._reset_tensors()
