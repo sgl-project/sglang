@@ -111,5 +111,6 @@ class TestNpuSpeculativeAttentionMode(CustomTestCase):
         finally:
             kill_process_tree(process.pid)
 
+
 if __name__ == "__main__":
     unittest.main()
