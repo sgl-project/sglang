@@ -234,7 +234,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return True
 
     def cancel_queued_load(self, rid: str) -> bool:
-        return self.pending_loads.pop(rid, None) is not None
+        # Already-published loads cannot be safely canceled without tree rollback.
+        return False
 
     def num_completed_loads(self) -> int:
         return self.completed_loads.qsize()
