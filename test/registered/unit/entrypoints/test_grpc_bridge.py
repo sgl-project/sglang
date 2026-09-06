@@ -1,5 +1,6 @@
 import asyncio
 import enum
+import json
 import unittest
 from types import SimpleNamespace
 
@@ -109,6 +110,30 @@ class TestNativeGrpcParallelResponses(CustomTestCase):
             [[1], [2], [3]],
         )
         self.assertEqual([call[1] for call in callback.calls], [False, False, True])
+
+
+class TestNativeGrpcTokenize(CustomTestCase):
+    def test_tokenize_returns_normalized_reusable_ids(self):
+        mask_id = 156895
+        tokenizer = SimpleNamespace(
+            encode=lambda text, add_special_tokens: [len(text), mask_id]
+        )
+        manager = SimpleNamespace(
+            tokenizer=tokenizer,
+            model_config=SimpleNamespace(context_len=128),
+            normalize_dllm_prompt_token_ids=lambda input_ids: [
+                replacement_id
+                for token_id in input_ids
+                for replacement_id in ([31, 32] if token_id == mask_id else [token_id])
+            ],
+        )
+        handle = RuntimeHandle.__new__(RuntimeHandle)
+        handle.tokenizer_manager = manager
+
+        result = json.loads(handle.tokenize("literal mask"))
+
+        self.assertEqual(result["tokens"], [12, 31, 32])
+        self.assertEqual(result["count"], 3)
 
 
 if __name__ == "__main__":
