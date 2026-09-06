@@ -39,10 +39,15 @@ export const config = {
   // Checkpoint precisions. NVFP4 is SGLang's own Blackwell-only quantization of
   // the BF16 weights (RadixArk), so it has no H200 or AMD cell — SM90 and CDNA4
   // have no NVFP4 path. AMD serves the upstream BF16 and FP8 repos.
+  // Two NVFP4 exports exist: RadixArk's (routed experts NVFP4, everything else
+  // BF16 with an FP8 N-gram table) and NVIDIA's ModelOpt MIXED_PRECISION export
+  // (NVFP4 experts, FP8 N-gram table, FP8 block-scaled MTP experts). The NVIDIA
+  // one currently has recipes only for the DGX Spark pair.
   quantizations: [
-    { id: "bf16",  label: "BF16"  },
-    { id: "fp8",   label: "FP8"   },
-    { id: "nvfp4", label: "NVFP4" },
+    { id: "bf16",       label: "BF16"         },
+    { id: "fp8",        label: "FP8"          },
+    { id: "nvfp4",      label: "NVFP4 (RDXA)" },
+    { id: "nvfp4-nvda", label: "NVFP4 (NVDA)" },
   ],
   // BF16, FP8 and NVFP4 each ship two operating points, low latency adding the
   // in-checkpoint MTP head (NEXTN 3/1/4) on top of the high-throughput shape.
@@ -109,6 +114,7 @@ export const config = {
     // Separate repos, not revisions of the BF16 one.
     "default|fp8":   "Qwen/Qwen3.8-Flash-Next-FP8",
     "default|nvfp4": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+    "default|nvfp4-nvda": "nvidia/Qwen3.8-Flash-Next-NVFP4",
   },
 
   placeholders: {
