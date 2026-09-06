@@ -1,14 +1,14 @@
 """
 Unit tests for UnquantizedLinearMethod.apply_with_addend.
 
-The cuBLAS route folds the addend into the GEMM beta input and writes back into
-the addend buffer; every other route must add separately and leave the caller's
-buffer intact.
+The cuBLAS route folds the addend into the GEMM beta input,
+writing back into that buffer; every other route must add separately
+and leave the caller's buffer intact.
 """
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=40, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-small")
 
 import unittest
 from contextlib import ExitStack
@@ -21,14 +21,14 @@ import sglang.srt.layers.quantization.unquant as unquant
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.test.test_utils import CustomTestCase
 
-# BF16 keeps 8 mantissa bits; addmm rounds once where the separate add rounds
-# twice, so the two paths agree only to that precision.
+# addmm rounds once in the accumulator where the separate add rounds twice;
+# with 8 BF16 mantissa bits the paths agree only to this precision.
 _BF16_RTOL = 1e-2
 _BF16_ATOL = 3.125e-2
 
 
 def _cublas_only_backend():
-    """The TORCH backend leaves every custom-kernel global unpopulated."""
+    # The TORCH backend leaves every custom-kernel global unpopulated.
     return patch.object(unquant, "_BF16_GEMM_BACKEND", unquant.Bf16GemmBackend.TORCH)
 
 
@@ -71,10 +71,8 @@ class TestApplyWithAddend(CustomTestCase):
 
     @torch.inference_mode()
     def test_cuda_graph_replay_reads_the_replayed_addend(self):
-        """A replay must use the addend the shared expert just produced.
-        addmm(out=addend) reads and writes one buffer, so a capture that let
-        the two alias would freeze the captured shared-expert contribution
-        into every later replay."""
+        """A graph replay must consume the addend written on that replay;
+        addmm(out=addend) reads and writes the one buffer."""
         with _cublas_only_backend():
             x = torch.randn(16, 64, device="cuda", dtype=torch.bfloat16)
             produced = torch.randn(16, 128, device="cuda", dtype=torch.bfloat16)
@@ -85,8 +83,8 @@ class TestApplyWithAddend(CustomTestCase):
 
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                # clone() stands in for the shared expert, which rewrites its
-                # output buffer on every replay.
+                # clone() stands in for the shared expert,
+                # which rewrites its output buffer on every replay.
                 captured = self.method.apply_with_addend(
                     self.projection, x, produced.clone()
                 )
@@ -103,9 +101,8 @@ class TestApplyWithAddend(CustomTestCase):
 
     @torch.inference_mode()
     def test_batch_invariant_mode_keeps_separate_add(self):
-        """torch.addmm(out=) dispatches to aten::addmm.out, which
-        batch-invariant mode does not override, so deterministic inference
-        must not reach the fused route."""
+        """Deterministic inference must not reach the fused route;
+        batch-invariant mode does not override aten::addmm.out."""
         with (
             _cublas_only_backend(),
             patch.object(unquant, "is_batch_invariant_mode_enabled", return_value=True),

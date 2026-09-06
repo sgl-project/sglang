@@ -166,8 +166,8 @@ def _get_or_create_alt_stream(device_module):
 
 def _latent_proj_fuses_shared_add(projection: nn.Module) -> bool:
     return (
-        # Exact type, not isinstance: LoRA swaps a wrapper module into this
-        # attribute after init, and a subclass may override forward.
+        # LoRA swaps a wrapper module over this attribute after init,
+        # and a subclass may override forward; exact type excludes both.
         type(projection) is ReplicatedLinear
         # Without a bias, ReplicatedLinear.forward is a bare quant_method.apply.
         and projection.bias is None

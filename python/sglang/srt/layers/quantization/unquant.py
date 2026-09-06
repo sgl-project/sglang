@@ -281,8 +281,8 @@ def _bf16_gemm_dispatch_impl(
             *x.shape[:-1], -1
         )
     elif addend is not None:
-        # cuBLAS folds the addend in through the GEMM beta input; a bias would
-        # need a third operand, so callers must exclude it.
+        # cuBLAS folds the addend in through the GEMM beta input;
+        # a bias would need a third operand, so callers must exclude it.
         assert bias is None
         return torch.addmm(addend, x, weight.t(), out=addend)
     else:
@@ -309,8 +309,8 @@ def _can_accumulate_into_addend(
 ) -> bool:
     if not _is_cuda or torch.compiler.is_compiling():
         return False
-    # Batch-invariant mode overrides aten::mm and aten::addmm but not
-    # aten::addmm.out, so deterministic inference keeps the separate add.
+    # Batch-invariant mode overrides aten::mm and aten::addmm,
+    # but not aten::addmm.out, so deterministic inference keeps a separate add.
     if is_batch_invariant_mode_enabled():
         return False
     # x.is_cuda also keeps the CPU AMX route in apply().
@@ -451,9 +451,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         """Run an inference-only BF16 linear and add ``addend`` to the result.
 
-        Only the cuBLAS route accumulates through the GEMM beta input and
-        returns ``addend`` itself; the custom-kernel routes add separately and
-        leave it untouched. Callers must treat it as consumed either way.
+        Only the cuBLAS route accumulates through the GEMM beta input,
+        returning ``addend`` itself; the other routes add separately,
+        leaving it untouched. Callers must treat it as consumed either way.
         """
         if _can_accumulate_into_addend(
             weight=layer.weight, x=x, addend=addend, bias=bias

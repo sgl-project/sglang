@@ -1,14 +1,14 @@
 """
 Unit tests for the NemotronHMoE latent-projection shared-expert add.
 
-The fused path calls the projection's quant method directly instead of
-``ReplicatedLinear.forward``; these cases pin the gate that decides when that
-substitution is behavior-preserving.
+The fused path calls the projection's quant method directly,
+not ``ReplicatedLinear.forward``.
+These cases pin the gate that decides when the substitution is safe.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
@@ -25,9 +25,8 @@ from sglang.srt.models.nemotron_h import (
 from sglang.test.test_utils import CustomTestCase
 
 
+# Stands in for a quantized linear method, which has no addend entry point.
 class _DoubleMethod:
-    """Stands in for a quantized linear method, which has no addend entry point."""
-
     def apply(self, layer, x, bias):
         return 2 * x
 
@@ -55,8 +54,8 @@ class TestNemotronHSharedAdd(CustomTestCase):
         self.shared = torch.randn(4, 8)
 
     def test_gate_accepts_plain_bias_free_projection(self):
-        """A bias-free unquantized ReplicatedLinear must stay eligible; a gate
-        that degrades to always-false silently drops the optimization."""
+        """A bias-free unquantized ReplicatedLinear must stay eligible;
+        a gate that degrades to always-false silently drops the fusion."""
         projection = ReplicatedLinear(8, 8, bias=False)
 
         self.assertTrue(_latent_proj_fuses_shared_add(projection))
