@@ -34,6 +34,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.code_completion_parser import (
     generate_completion_prompt_from_request,
 )
+from sglang.srt.runtime_context import get_serving
 from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
 from sglang.utils import convert_json_schema_to_str
 
@@ -246,7 +247,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         try:
             include_usage, continuous_usage_stats = should_include_usage(
                 request.stream_options,
-                self.tokenizer_manager.server_args.stream_response_default_include_usage,
+                get_serving().stream_response_default_include_usage,
             )
 
             async for content in self.tokenizer_manager.generate_request(
@@ -308,7 +309,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         output_top_logprobs = content["meta_info"].get(
                             "output_top_logprobs", []
                         )
-                        if not self.tokenizer_manager.server_args.incremental_streaming_output:
+                        if not get_serving().incremental_streaming_output:
                             output_token_logprobs = output_token_logprobs[
                                 n_prev_token:total_output_logprobs
                             ]
@@ -327,7 +328,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 chunk_prompt_token_ids = None
                 if request.return_token_ids:
                     output_ids = content["output_ids"]
-                    if not self.tokenizer_manager.server_args.incremental_streaming_output:
+                    if not get_serving().incremental_streaming_output:
                         n_prev_token_id = n_prev_token_ids.get(index, 0)
                         chunk_token_ids = output_ids[n_prev_token_id:]
                         n_prev_token_ids[index] = len(output_ids)
@@ -337,7 +338,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         chunk_prompt_token_ids = content.get("prompt_token_ids")
 
                 # Generate delta
-                if self.tokenizer_manager.server_args.incremental_streaming_output:
+                if get_serving().incremental_streaming_output:
                     delta = text
                 else:
                     delta = text[offset:]
@@ -475,7 +476,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     completion_tokens,
                     cached_tokens=cached_tokens,
                     n_choices=request.n,
-                    enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+                    enable_cache_report=get_serving().enable_cache_report,
                 )
                 final_usage_chunk = CompletionStreamResponse(
                     id=content["meta_info"]["id"],
@@ -620,7 +621,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             choices.append(choice_data)
 
         # Calculate usage
-        cache_report = self.tokenizer_manager.server_args.enable_cache_report
+        cache_report = get_serving().enable_cache_report
         usage = UsageProcessor.calculate_response_usage(
             ret, n_choices=request.n, enable_cache_report=cache_report
         )

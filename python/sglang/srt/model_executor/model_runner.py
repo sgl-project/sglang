@@ -316,7 +316,7 @@ class ModelRunner:
 
     def supports_sampling_observer(self) -> bool:
         """Whether this runner's sampling path publishes observer output."""
-        return self.server_args.dllm_algorithm is None and self.spec_algorithm.is_none()
+        return get_exec().dllm.dllm_algorithm is None and self.spec_algorithm.is_none()
 
     def __init__(
         self,
@@ -644,7 +644,6 @@ class ModelRunner:
                 world_size=self.ps.tp_size * self.ps.pp_size,
                 rank=self.ps.tp_size * self.ps.pp_rank + self.ps.tp_rank,
                 local_rank=self.gpu_id,
-                server_args=self.server_args,
                 port=self.dist_port,
             )
 

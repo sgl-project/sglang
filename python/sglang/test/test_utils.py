@@ -2143,6 +2143,20 @@ def server_args_variant(server_args, **fields):
     return variant
 
 
+def enter_override(test_case, override):
+    """Install a scoped context override for the length of one test.
+
+    `unittest.TestCase.enterContext` does exactly this in one call, but it is
+    Python 3.11+ and this package supports 3.10 (`requires-python = ">=3.10"`).
+    On 3.10 it raises `AttributeError: ... has no attribute 'enterContext'` --
+    and only there, so a developer on a newer interpreter sees every test pass
+    while CI does not.
+    """
+    installed = override.install()
+    test_case.addCleanup(override.restore)
+    return installed
+
+
 class CustomTestCase(unittest.TestCase):
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
