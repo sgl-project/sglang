@@ -1255,6 +1255,9 @@ class Scheduler(
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
         self.waiting_queue: List[Req] = []
+        # Opt-in, per-prefill diagnostic: log what each scheduling pass admitted.
+        # Off by default -- this fires on every prefill batch.
+        self.log_schedule_decisions = self.server_args.log_schedule_decisions
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
@@ -3906,6 +3909,19 @@ class Scheduler(
 
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+
+        if self.log_schedule_decisions:
+            # KV budget this pass saw: free now plus what eviction could reclaim.
+            pool_stats = self.pool_stats_observer.get_pool_stats()
+            logger.info(
+                f"Schedule prefill: #picked={len(can_run_list)}, "
+                f"#left-in-queue={len(self.waiting_queue)}, "
+                f"#running={len(running_batch.reqs)}, "
+                f"kv-free-tokens={pool_stats.full_available_size}, "
+                f"kv-evictable-tokens={pool_stats.full_evictable_size}, "
+                f"picked-rids={[req.rid for req in can_run_list]}"
+            )
+
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
@@ -5680,8 +5696,10 @@ def configure_scheduler_process(
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
 
-    # Configure the logger
-    configure_logger(server_args, prefix=prefix)
+    # Configure the logger. Append the OS pid so every scheduler log line
+    # identifies which subprocess emitted it. Kept out of the proctitle above,
+    # since ps already shows the pid there.
+    configure_logger(server_args, prefix=f"{prefix} PID{os.getpid()}")
     suppress_other_loggers()
 
     # Set cpu affinity to this gpu process

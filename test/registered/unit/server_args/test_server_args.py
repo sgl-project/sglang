@@ -2933,5 +2933,29 @@ class TestDcpKvEventContract(CustomTestCase):
         self.assertEqual(kv_event_block_size_of(resolving_view(args)), 8)
 
 
+class TestLogScheduleDecisionsArg(CustomTestCase):
+    """--log-schedule-decisions is auto-derived from the ``A[...]`` field metadata.
+
+    A bare annotation is silently skipped by ``add_cli_args_from_dataclass``, so a
+    typo there would drop the flag from the CLI without any import-time error.
+    """
+
+    def test_defaults_off_and_round_trips(self):
+        self.assertFalse(
+            resolution_result(
+                prepare_server_args(["--model-path", "dummy"]),
+                "log_schedule_decisions",
+            )
+        )
+        self.assertTrue(
+            resolution_result(
+                prepare_server_args(
+                    ["--model-path", "dummy", "--log-schedule-decisions"]
+                ),
+                "log_schedule_decisions",
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
