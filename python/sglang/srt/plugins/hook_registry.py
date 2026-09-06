@@ -269,9 +269,7 @@ class HookRegistry:
         # Sort: REPLACE hooks first (stable sort preserves registration order
         # within the same type). This ensures AROUND/BEFORE/AFTER always wrap
         # the replaced function, regardless of registration order.
-        sorted_hooks = sorted(
-            hooks, key=lambda h: (0 if h[0] == HookType.REPLACE else 1)
-        )
+        sorted_hooks = sorted(hooks, key=lambda h: 0 if h[0] == HookType.REPLACE else 1)
         wrapped = original
         for hook_type, hook, _src in sorted_hooks:
             if isinstance(hook, type) and hook_type == HookType.REPLACE:

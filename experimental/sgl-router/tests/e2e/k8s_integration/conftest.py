@@ -11,6 +11,7 @@ Teardown: ./tests/e2e/k8s_integration/setup.sh teardown
 
 from __future__ import annotations
 
+import json
 import logging
 import socket
 import subprocess
@@ -94,6 +95,60 @@ def _wait_for_pod_ready(
         "-n",
         namespace,
         f"--timeout={timeout}s",
+    )
+
+
+def _wait_for_replacement_pod_ready(
+    old_pod: str,
+    selector: str,
+    namespace: str = NAMESPACE,
+    timeout: int = 120,
+    interval: float = 0.5,
+) -> str:
+    deadline = time.time() + timeout
+    last_observed = "no pods"
+
+    while time.time() < deadline:
+        result = _kubectl(
+            "get",
+            "pods",
+            "-n",
+            namespace,
+            "-l",
+            selector,
+            "-o",
+            "json",
+            check=False,
+        )
+        if getattr(result, "returncode", 0) == 0:
+            pods = json.loads(result.stdout or "{}").get("items", [])
+            names = [pod.get("metadata", {}).get("name", "") for pod in pods]
+            last_observed = ", ".join(filter(None, names)) or "no pods"
+
+            if old_pod not in names:
+                for pod in sorted(
+                    pods, key=lambda item: item.get("metadata", {}).get("name", "")
+                ):
+                    metadata = pod.get("metadata", {})
+                    status = pod.get("status", {})
+                    ready = any(
+                        condition.get("type") == "Ready"
+                        and condition.get("status") == "True"
+                        for condition in status.get("conditions", [])
+                    )
+                    if (
+                        metadata.get("name") != old_pod
+                        and not metadata.get("deletionTimestamp")
+                        and status.get("phase") == "Running"
+                        and ready
+                    ):
+                        return metadata["name"]
+
+        time.sleep(interval)
+
+    raise TimeoutError(
+        f"No ready replacement for pod {old_pod!r} with selector {selector!r} "
+        f"after {timeout}s; last observed: {last_observed}"
     )
 
 

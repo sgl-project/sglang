@@ -23,6 +23,7 @@ class TboAttnBackend(AttentionBackend):
         # reads through TboAttnBackend resolve to the underlying pool.
         self.token_to_kv_pool = primary.token_to_kv_pool
         self.req_to_token_pool = primary.req_to_token_pool
+        self.kv_index_translator = primary.kv_index_translator
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
             primary, "extend_dummy_seqs_capped_by_req_pool", False
         )
@@ -219,9 +220,9 @@ def _build_tbo_child_replay_fb_view(
     capture-time buffers are sliced per child, spec_info is split, and
     seq_lens_sum is recomputed from the sliced ``seq_lens_cpu``.
     """
-    assert (
-        getattr(fb_view, "encoder_lens", None) is None
-    ), "TBO replay split does not support encoder_lens yet"
+    assert getattr(fb_view, "encoder_lens", None) is None, (
+        "TBO replay split does not support encoder_lens yet"
+    )
     spec_info = getattr(fb_view, "spec_info", None)
     if spec_info is not None:
         start_seq = seq_slice.start or 0

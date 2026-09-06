@@ -12,7 +12,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
-from sglang.srt.runtime_context import get_context, get_exec, get_flags
+from sglang.srt.runtime_context import get_context, get_exec, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -26,6 +26,12 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
     exists (``shared_experts_fusion_disable_reason``); the answer is installed
     on the ACTIVE moe flag, and the config bag keeps the user's intent.
     """
+
+    def setUp(self):
+        super().setUp()
+        cm = get_parallel().override(moe_ep_size=1)
+        cm.__enter__()
+        self.addCleanup(cm.__exit__, None, None, None)
 
     def _publish(self, enforce):
         override = get_context().override_server_args(

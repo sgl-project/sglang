@@ -34,6 +34,7 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import QWEN3_5_KV_SCALE_MAPPER, Qwen3_5ForCausalLM
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
@@ -82,7 +83,6 @@ def _mtp_quant_config(quant_config):
 
 
 class Qwen3_5ForCausalLMMTP(nn.Module):
-
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
         return Qwen3_5ForCausalLM.shared_experts_fusion_disable_reason(
@@ -154,14 +154,16 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
-        del self.model.embed_tokens.weight
-        if not self.config.tie_word_embeddings:
+        # A last-stage draft can share only the target lm_head under PP; retain its
+        # own embedding for the first-stage half it cannot receive.
+        if embed is not None:
+            del self.model.embed_tokens.weight
+            self.model.embed_tokens.weight = embed
+        if head is not None and not self.config.tie_word_embeddings:
             del self.lm_head.weight
-
-        self.model.embed_tokens.weight = embed
-        self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+            self.lm_head.weight = head
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     def set_lm_head_from_target(self, target_lm_head):
         if self.config.tie_word_embeddings:
@@ -214,6 +216,16 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             if not forward_batch.forward_mode.is_idle():
                 input_embeds = self.pre_fc_norm_embedding(input_embeds)
                 hidden_states = self.pre_fc_norm_hidden(hidden_states)
+            # Captured prefill gives padded embeddings but real-height target states;
+            # place the real rows in an equal-height slot whose padding stays unread.
+            if hidden_states.shape[0] != input_embeds.shape[0]:
+                rows = min(hidden_states.shape[0], input_embeds.shape[0])
+                slot = hidden_states.new_zeros(
+                    (input_embeds.shape[0], hidden_states.shape[1])
+                )
+                slot[:rows] = hidden_states[:rows]
+                hidden_states = slot
+
             hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
 
             hidden_states = self.fc(hidden_states)
@@ -311,6 +323,23 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
+            # The last-stage MTP draft cannot share the target embedding on PP0.
+            # Load the checkpoint embedding into its retained local copy instead
+            # of leaving the torch.empty() allocation uninitialized.
+            if name in (
+                "model.embed_tokens.weight",
+                "model.language_model.embed_tokens.weight",
+            ):
+                param_name = "model.embed_tokens.weight"
+                if param_name in params_dict:
+                    param = params_dict[param_name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(param_name)
+                continue
+
             if "rotary_emb.inv_freq" in name:
                 continue
 

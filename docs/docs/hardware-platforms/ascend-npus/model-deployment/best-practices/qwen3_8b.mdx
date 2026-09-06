@@ -118,10 +118,11 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --max-concurrency 64 \
+    --num-prompts 256 \
     --random-input-len 3500 \
     --random-output-len 1500 \
-    --num-prompts 256 \
-    --random-range-ratio 1
+    --random-range-ratio 1 \
+    --seed 1
 ```
 
 ### Qwen3-8B W8A8 1P IN3K5 OUT1K5 5ms
@@ -174,6 +175,7 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 
 python3 -m sglang.launch_server \
     --model-path $MODEL_PATH \
@@ -212,11 +214,13 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
+    --max-attempts 5 \
     --max-concurrency 1 \
+    --num-prompts 4 \
     --random-input-len 3500 \
     --random-output-len 1500 \
-    --num-prompts 4 \
-    --random-range-ratio 1
+    --random-range-ratio 1 \
+    --seed 1
 ```
 
 ### Qwen3-8B W8A8 1P IN6K OUT1K5 BS16
@@ -307,9 +311,10 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
+    --max-attempts 5 \
     --max-concurrency 16 \
+    --num-prompts 16 \
     --random-input-len 6144 \
     --random-output-len 1500 \
-    --num-prompts 16 \
     --random-range-ratio 1
 ```

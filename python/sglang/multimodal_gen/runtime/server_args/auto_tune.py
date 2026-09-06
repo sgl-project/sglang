@@ -10,6 +10,10 @@ from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
+    has_realtime_model_adapter,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     LAYERWISE_OFFLOAD_ALL_COMPONENTS,
     LAYERWISE_OFFLOAD_DIT_GROUP,
@@ -25,6 +29,49 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
 
 logger = init_logger(__name__)
+
+
+def auto_residency_args_skip_reason(server_args: ServerArgs) -> str | None:
+    """Return why args cannot use warmup-calibrated residency."""
+    if envs.SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY:
+        return "disabled via SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY"
+    if server_args.performance_mode != "auto":
+        return f"performance_mode={server_args.performance_mode}"
+    if (
+        server_args.pipeline_class_name == "LTX2TwoStagePipeline"
+        and server_args.ltx2_two_stage_device_mode is None
+    ):
+        return "legacy LTX-2 two-stage placement"
+    if server_args.ltx2_two_stage_device_mode == "original":
+        return "LTX-2 original two-stage placement"
+    if (
+        server_args.warmup_mode != "server"
+        or server_args.disagg_role != RoleType.MONOLITHIC
+    ):
+        return "no synthetic server warmup to calibrate from"
+    task_type = server_args.pipeline_config.task_type
+    if not (task_type.is_visual_gen() or task_type.is_mesh_gen()):
+        return "no synthetic server warmup to calibrate from"
+    if not server_args.pipeline_config.supports_auto_residency:
+        return "pipeline does not support post-warmup residency changes"
+    if has_realtime_model_adapter(server_args):
+        return "realtime serving has no representative synthetic warmup"
+    if server_args.backend == "diffusers":
+        return "diffusers backend"
+    if server_args.enable_breakable_cuda_graph:
+        return "breakable CUDA graph captures during warmup"
+    if server_args.enable_torch_compile:
+        # Compile warmup temporarily evicts resident auxiliaries and may
+        # layerwise-offload the DiT, so its peak is not a serving peak.
+        return "torch.compile warmup uses a stripped memory layout"
+    if envs.SGLANG_CACHE_DIT_ENABLED:
+        return "cache-dit enabled"
+    if server_args.batching_max_size > 1:
+        return "dynamic batching enabled"
+    if not current_platform.is_cuda():
+        return "requires CUDA"
+    return None
+
 
 PERFORMANCE_MODES = ("manual", "auto", "speed", "memory")
 
@@ -175,6 +222,8 @@ class ServerArgsAutoTuner:
                 args.dit_cpu_offload
                 and "dit" in components
                 and args.explicit_residency_mode("transformer") is None
+                and not args.is_arg_explicitly_set("dit_cpu_offload")
+                and not args.is_arg_explicitly_set("dit_layerwise_offload")
                 and not explicit_dit_layerwise
             ):
                 args.dit_cpu_offload = False

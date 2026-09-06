@@ -46,9 +46,9 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_sharded_mrope_vision_model,
 )
 from sglang.srt.runtime_context import (
-    configured_tp_size,
     get_exec,
     get_mm,
+    get_parallel,
 )
 from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
@@ -87,7 +87,6 @@ def apply_rope(
 
 
 class MoonViTEncoderLayer(nn.Module):
-
     def __init__(
         self,
         num_heads: int,
@@ -226,7 +225,6 @@ def get_1d_sincos_pos_embed(embed_dim, t_size, cls_token=False):
 
 
 class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
-
     def __init__(
         self,
         height: int,
@@ -370,7 +368,6 @@ class Rope2DPosEmbRepeated(nn.Module):
 
 
 class MoonVision3dPatchEmbed(nn.Module):
-
     def __init__(
         self,
         out_dim: int,
@@ -382,14 +379,14 @@ class MoonVision3dPatchEmbed(nn.Module):
         pos_emb_type: str = "divided_fixed",
     ):
         super().__init__()
-        assert isinstance(
-            patch_size, int | Sequence
-        ), f"Invalid patch_size type: {type(patch_size)}"
+        assert isinstance(patch_size, int | Sequence), (
+            f"Invalid patch_size type: {type(patch_size)}"
+        )
         if isinstance(patch_size, int):
             patch_size = (patch_size, patch_size)
-        assert (
-            len(patch_size) == 2
-        ), f"Expected patch_size to be a tuple of 2, got {patch_size}"
+        assert len(patch_size) == 2, (
+            f"Expected patch_size to be a tuple of 2, got {patch_size}"
+        )
         self.patch_size = patch_size
 
         self.proj = Conv2dLayer(
@@ -436,9 +433,9 @@ class MoonViT3dEncoder(nn.Module):
     ) -> None:
         super().__init__()
 
-        assert (
-            video_attn_type == "spatial_temporal"
-        ), f'video_attn_type must be "spatial_temporal", got {video_attn_type}'
+        assert video_attn_type == "spatial_temporal", (
+            f'video_attn_type must be "spatial_temporal", got {video_attn_type}'
+        )
         self.video_attn_type = video_attn_type
         self.rope_2d = Rope2DPosEmbRepeated(
             block_cfg["hidden_dim"] // block_cfg["num_heads"], 512, 512
@@ -733,7 +730,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
             # Match the configured TP consumer count captured when the
             # tokenizer creates MmItemMemoryPool. A live attention subgroup
             # size could leave acknowledgements missing and strand the lease.
-            ipc_consumer_count = max(configured_tp_size(), 1)
+            ipc_consumer_count = max(get_parallel().tp_size, 1)
             device_index = device.index
             if device.type == "cuda" and device_index is None:
                 device_index = torch.cuda.current_device()

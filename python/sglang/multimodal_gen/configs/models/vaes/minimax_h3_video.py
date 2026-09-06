@@ -56,6 +56,17 @@ class MiniMaxH3VideoVAEConfig(VAEConfig):
             f"{self.parallel_decode_mode!r}"
         )
 
+    def update_model_arch(self, source_model_dict: dict) -> None:
+        # Native-Diffusers AutoencoderKLMiniMaxH3 config field names.
+        aliases = {
+            "clip_length": "vae_clip_length",
+            "token_drop": "vae_token_drop",
+        }
+        model_dict = {
+            aliases.get(key, key): value for key, value in source_model_dict.items()
+        }
+        super().update_model_arch(model_dict)
+
     def post_init(self) -> None:
         self.resolved_parallel_decode_mode()
         validate_minimax_h3_vae_latent_stats(

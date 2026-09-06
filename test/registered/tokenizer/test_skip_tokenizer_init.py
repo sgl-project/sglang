@@ -101,7 +101,7 @@ class TestSkipTokenizerInit(CustomTestCase):
                     self.assertEqual(
                         len(item["meta_info"]["input_token_logprobs"]),
                         num_input_logprobs,
-                        f'{len(item["meta_info"]["input_token_logprobs"])} mismatch with {len(input_ids)}',
+                        f"{len(item['meta_info']['input_token_logprobs'])} mismatch with {len(input_ids)}",
                     )
                     self.assertEqual(
                         len(item["meta_info"]["output_token_logprobs"]),
@@ -245,9 +245,9 @@ class TestSkipTokenizerInitVLM(TestSkipTokenizerInit):
     def get_request_json(self, *args, **kwargs):
         ret = super().get_request_json(*args, **kwargs)
         ret["image_data"] = [self.image_url]
-        ret["logprob_start_len"] = (
-            -1
-        )  # Do not try to calculate logprobs of image embeddings.
+        ret[
+            "logprob_start_len"
+        ] = -1  # Do not try to calculate logprobs of image embeddings.
         return ret
 
     def test_simple_decode_stream(self):

@@ -25,7 +25,7 @@ from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLTextMod
 class IdeogramQwen3VLTextEncoder(TextEncoder):
     """Language-only Qwen3-VL text encoder stored inside Ideogram checkpoints."""
 
-    manages_checkpoint_quantization = True
+    checkpoint_quantization_backend = "model"
     _activation_layers = (0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 35)
     layer_names = ["language_model.layers"]
 

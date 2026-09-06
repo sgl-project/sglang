@@ -43,17 +43,17 @@ class TestNvFp4MoeBackends(CustomTestCase):
         quant_config = ModelOptFp4Config(
             is_checkpoint_nvfp4_serialized=True, group_size=16
         )
-        with get_context().override_server_args(
-            model_path="dummy"
-        ), get_flags().moe.override(
-            runner_backend=MoeRunnerBackend(backend)
-        ), get_parallel().override(
-            moe_ep_size=1,
-            moe_ep_rank=0,
-            moe_tp_size=1,
-            moe_tp_rank=0,
-            tp_size=1,
-            tp_rank=0,
+        with (
+            get_context().override_server_args(model_path="dummy"),
+            get_flags().moe.override(runner_backend=MoeRunnerBackend(backend)),
+            get_parallel().override(
+                moe_ep_size=1,
+                moe_ep_rank=0,
+                moe_tp_size=1,
+                moe_tp_rank=0,
+                tp_size=1,
+                tp_rank=0,
+            ),
         ):
             layer = FusedMoE(
                 num_experts=E,

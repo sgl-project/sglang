@@ -24,6 +24,14 @@ def resolve_precision(
     precision_attr: Optional[str] = None,
     field_name: Optional[str] = None,
 ) -> torch.dtype:
+    component_precision = server_args.component_precisions.get(
+        component_or_precision_attr
+    )
+    if component_precision is not None:
+        return precision_to_dtype(
+            component_precision,
+            f"component_precisions.{component_or_precision_attr}",
+        )
     precision_attr = precision_attr or component_or_precision_attr
     precision = getattr(server_args.pipeline_config, precision_attr)
     return precision_to_dtype(precision, field_name or precision_attr)
@@ -35,6 +43,12 @@ def resolve_decode_precision(
     *,
     quality: str | None = None,
 ) -> torch.dtype:
+    component_precision = server_args.component_precisions.get(component_name)
+    if component_precision is not None:
+        return precision_to_dtype(
+            component_precision, f"component_precisions.{component_name}"
+        )
+
     pipeline_config = server_args.pipeline_config
     if component_name in ("audio_vae", "vocoder"):
         return resolve_precision(
@@ -58,10 +72,21 @@ def resolve_decode_precision(
     )
 
 
-def resolve_component_precision(server_args, module_name: str) -> Optional[torch.dtype]:
-    pipeline_config = getattr(server_args, "pipeline_config", None)
-    if pipeline_config is None:
+def resolve_component_precision_override(
+    server_args, module_name: str
+) -> Optional[torch.dtype]:
+    exact_precision = server_args.component_precisions.get(module_name)
+    if exact_precision is None:
         return None
+    return precision_to_dtype(exact_precision, f"component_precisions.{module_name}")
+
+
+def resolve_component_precision(server_args, module_name: str) -> Optional[torch.dtype]:
+    exact_precision = resolve_component_precision_override(server_args, module_name)
+    if exact_precision is not None:
+        return exact_precision
+
+    pipeline_config = server_args.pipeline_config
 
     if module_name in ("audio_vae", "vocoder"):
         precision_attr = "audio_vae_precision"
@@ -104,6 +129,14 @@ def autocast_enabled(dtype: torch.dtype, disable_autocast: bool) -> bool:
         dtype != torch.float32
         and not disable_autocast
         and current_platform.is_amp_supported()
+    )
+
+
+def autocast_enabled_for_device(
+    tensor: torch.Tensor, dtype: torch.dtype, disable_autocast: bool
+) -> bool:
+    return tensor.device.type == current_platform.device_type and autocast_enabled(
+        dtype, disable_autocast
     )
 
 

@@ -421,7 +421,7 @@ def _norm_scale(
     norm: Ideogram4RMSNorm,
     enable_fused: bool,
 ) -> torch.Tensor:
-    """``RMSNorm(x) * (1 + scale)``, fused for ``quality="high"`` batches."""
+    """``RMSNorm(x) * (1 + scale)``, fused at extra-high or high quality."""
     if enable_fused:
         y = fused_rmsnorm_scale(
             x,
@@ -455,7 +455,7 @@ def _gate_residual(
     norm: Ideogram4RMSNorm,
     enable_fused: bool,
 ) -> torch.Tensor:
-    """``residual + tanh(gate) * RMSNorm(x)``, fused for ``quality="high"``."""
+    """``residual + tanh(gate) * RMSNorm(x)``, fused at extra-high or high."""
     if enable_fused:
         y = fused_rmsnorm_tanh_residual(
             x,
@@ -511,7 +511,7 @@ class Ideogram4TransformerBlock(nn.Module):
         self.ffn_norm1 = Ideogram4RMSNorm(hidden_size, eps=norm_eps)
         self.attention_norm2 = Ideogram4RMSNorm(hidden_size, eps=norm_eps)
         self.ffn_norm2 = Ideogram4RMSNorm(hidden_size, eps=norm_eps)
-        # quality="high" fusion sites: each RMSNorm modulate/gate chain
+        # extra-high/high fusion sites: each RMSNorm modulate/gate chain
         # collapses into one Triton kernel (Z-Image bf16-native suite). Off by
         # default (bit-exact reference path); mounted per batch by the
         # denoising stage.

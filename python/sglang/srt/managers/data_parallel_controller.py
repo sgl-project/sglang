@@ -50,9 +50,6 @@ from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
 from sglang.srt.observability.startup_time import aggregate_scheduler_startup_times
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.runtime_context import (
-    configured_attn_cp_size,
-    configured_moe_dp_size,
-    configured_pp_size,
     get_device,
     get_disagg,
     get_exec,
@@ -395,7 +392,7 @@ class DataParallelController:
             )
             threads.append(thread)
             base_gpu_id += (
-                server_args.tp_size * configured_pp_size() * server_args.gpu_id_step
+                server_args.tp_size * get_parallel().pp_size * server_args.gpu_id_step
             )
 
             if server_args.node_rank == 0:
@@ -616,8 +613,8 @@ class DataParallelController:
 
         scheduler_pipe_readers = []
 
-        pp_size_per_node = max(configured_pp_size() // server_args.nnodes, 1)
-        nnodes_per_pp_rank = max(server_args.nnodes // configured_pp_size(), 1)
+        pp_size_per_node = max(get_parallel().pp_size // server_args.nnodes, 1)
+        nnodes_per_pp_rank = max(server_args.nnodes // get_parallel().pp_size, 1)
         pp_rank_range = range(
             pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank),
             pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank + 1),
@@ -648,7 +645,7 @@ class DataParallelController:
                         tp_rank,
                         server_args.tp_size,
                         get_parallel().dp_size,
-                        configured_attn_cp_size(),
+                        get_parallel().attn_cp_size,
                     )
                     # compute zmq ports for this dp rank
                     rank_port_args = PortArgs.init_new(
@@ -684,18 +681,18 @@ class DataParallelController:
                 # - Attention: Global(TP) -> DP -> ATTN_CP -> ATTN_TP (innermost)
                 # - MoE: Global(TP) -> MOE_DP -> EP -> MOE_TP (innermost)
                 attn_tp_size = (
-                    server_args.tp_size // attn_dp_size // configured_attn_cp_size()
+                    server_args.tp_size // attn_dp_size // get_parallel().attn_cp_size
                 )
-                attn_cp_rank = (tp_rank // attn_tp_size) % configured_attn_cp_size()
+                attn_cp_rank = (tp_rank // attn_tp_size) % get_parallel().attn_cp_size
                 moe_dp_rank = tp_rank // (
-                    server_args.tp_size // configured_moe_dp_size()
+                    server_args.tp_size // get_parallel().moe_dp_size
                 )
                 moe_ep_rank = (
                     tp_rank
-                    % (server_args.tp_size // configured_moe_dp_size())
+                    % (server_args.tp_size // get_parallel().moe_dp_size)
                     // (
                         server_args.tp_size
-                        // configured_moe_dp_size()
+                        // get_parallel().moe_dp_size
                         // get_parallel().ep_size
                     )
                 )
