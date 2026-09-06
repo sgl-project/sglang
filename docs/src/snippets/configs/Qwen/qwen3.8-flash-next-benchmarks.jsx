@@ -143,6 +143,7 @@ export const benchmarks = [
   {
     match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvda", strategy: "high-throughput", nodes: "multi-2" },
     sglang_version: "qwen4-main-squashed @ 9b2aee2283",
+    accuracy: { gsm8k_pct: 97.0 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 398.49, tpot_ms: 38.62, tokens_per_sec_per_gpu: 61 },
