@@ -88,6 +88,9 @@ else:
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
+# Opt-in: fuse the indexer query's hadamard (rotate_activation) + fp8 act_quant
+# into one Triton kernel (gfx950). Enable with SGLANG_DSA_FUSE_HADAMARD_QUANT=1.
+_DSA_FUSE_HADAMARD_QUANT = get_bool_env_var("SGLANG_DSA_FUSE_HADAMARD_QUANT")
 # Whether the aiter preshuffle paged-MQA path (page_size=64 + Preshuffle=True +
 # KVBlockSize=64) can be used. Falls back to the legacy page_size=1 / KVBlockSize=1
 # path when the gluon kernel is unavailable (Triton<3.5 and no AOT bundle).
@@ -311,6 +314,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             device=get_device().device,
         )
         self.block_size = block_size
+        # Fuse the query hadamard + fp8 quant when opted in, on gfx950, and the
+        # shape is a single quant group (head_dim == block_size, power of 2).
+        self.fuse_hadamard_quant = (
+            _DSA_FUSE_HADAMARD_QUANT
+            and _is_hip
+            and _is_gfx95_supported
+            and self.head_dim == self.block_size
+            and (self.head_dim & (self.head_dim - 1)) == 0
+        )
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
         self.num_init_tokens = self.num_local_tokens = 0
@@ -374,6 +386,31 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
+
+    def _quant_query(self, query, act_quant, weights=None):
+        """Quantize the indexer query to fp8. When fusion is enabled the query
+        is passed in WITHOUT the hadamard (skipped in _get_q_k_bf16) and the
+        fused kernel does hadamard + quant in one pass; otherwise it has already
+        been hadamard'd and we just act_quant it.
+
+        If `weights` (the head-gate, ready before quant on the decode path) is
+        passed AND fusion is on, the kernel also folds
+        `_apply_q_scale_and_softmax_scale` and returns
+        `(q_fp8, q_scale, weights_scaled)`; the caller then skips that elementwise.
+        Otherwise returns `(q_fp8, q_scale)`."""
+        if self.fuse_hadamard_quant:
+            from sglang.srt.layers.attention.dsa.triton_hadamard_quant import (
+                fused_hadamard_act_quant,
+            )
+
+            return fused_hadamard_act_quant(
+                query,
+                self.block_size,
+                self.scale_fmt,
+                weights=weights,
+                softmax_scale=self.softmax_scale,
+            )
+        return act_quant(query, self.block_size, self.scale_fmt)
 
     @torch.compile(dynamic=True)
     def _apply_q_scale_and_softmax_scale(
@@ -522,7 +559,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            query = self._maybe_rotate(query)
+            if not self.fuse_hadamard_quant:
+                query = self._maybe_rotate(query)
 
             with torch.cuda.stream(self.alt_stream):
                 key = self._maybe_rotate(key)
@@ -535,7 +573,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             key = self._maybe_rotate(key)
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            query = self._maybe_rotate(query)
+            if not self.fuse_hadamard_quant:
+                query = self._maybe_rotate(query)
 
             # Gather the full key on alt_stream so the CP all-gather overlaps
             # with the query rotate above on the current stream.
@@ -554,7 +593,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             current_stream.wait_stream(self.alt_stream)
             return query, key, weights_raw
         else:
-            query = self._maybe_rotate(query)
+            if not self.fuse_hadamard_quant:
+                query = self._maybe_rotate(query)
             key = self._maybe_rotate(key)
 
         # allgather+rerrange
@@ -1754,7 +1794,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             query, key, weights_raw = self._get_q_k_bf16(
                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
             )
-            q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+            if self.fuse_hadamard_quant:
+                # fold _apply_q_scale_and_softmax_scale (weights * q_scale *
+                # softmax_scale) into the fused quant kernel: weights is ready here
+                # and the kernel already emits q_scale, so no separate launch.
+                q_fp8, q_scale, weights = self._quant_query(
+                    query, act_quant, weights=weights
+                )
+            else:
+                q_fp8, q_scale = self._quant_query(query, act_quant)
             with torch.cuda.stream(self.alt_stream):
                 self._store_index_k_cache(
                     forward_batch=forward_batch,
@@ -1765,7 +1813,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             current_stream.wait_stream(self.alt_stream)
             if self.use_dsa_indexer_fusion:
                 weights = self._scale_head_gates(weights_raw, q_scale)
-            else:
+            elif not self.fuse_hadamard_quant:
                 weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
         else:
             query, key, weights_raw = self._get_q_k_bf16(
@@ -1780,7 +1828,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
 
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+                q_fp8, q_scale = self._quant_query(query, act_quant)
                 with torch.cuda.stream(self.alt_stream):
                     self._store_index_k_cache(
                         forward_batch=forward_batch,
@@ -1790,7 +1838,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     )
                 current_stream.wait_stream(self.alt_stream)
             elif not in_piecewise_or_breakable_cuda_graph:
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+                q_fp8, q_scale = self._quant_query(query, act_quant)
                 self._store_index_k_cache(
                     forward_batch=forward_batch,
                     layer_id=layer_id,
@@ -1802,7 +1850,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 # still need q_fp8 for paged topk and q_scale for
                 # logits_head_gate_graph. K-cache storage is handled by the
                 # full graph split path when prefill requires it.
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+                q_fp8, q_scale = self._quant_query(query, act_quant)
 
             # aiter (ROCm gfx95): the 3-tuple (fp8, scale, bf16) from
             # fused_rms_fp8_group_quant is passed directly to _get_logits_head_gate,
