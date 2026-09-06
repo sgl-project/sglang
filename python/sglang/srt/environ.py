@@ -1833,10 +1833,10 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
 
 
 def _handle_deprecated_envs():
-    for old_name, deprecation in _DEPRECATED_ENVS.items():
-        deprecation.apply(old_name)
-
-    # Rewrite the legacy SGL_ prefix to SGLANG_ (names not covered above).
+    # Rewrite the legacy SGL_ prefix to SGLANG_ first, so a rewritten name
+    # that is itself in the registry (e.g. SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK
+    # -> SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK) still gets its forwarding
+    # below instead of being silently dropped.
     for key, value in list(os.environ.items()):
         if key.startswith("SGL_") and key not in _DEPRECATED_ENVS:
             new_key = key.replace("SGL_", "SGLANG_", 1)
@@ -1844,6 +1844,9 @@ def _handle_deprecated_envs():
                 f"Environment variable {key} is deprecated, please use {new_key}"
             )
             os.environ[new_key] = value
+
+    for old_name, deprecation in _DEPRECATED_ENVS.items():
+        deprecation.apply(old_name)
 
 
 def third_party_cache_defaults() -> Dict[str, str]:
