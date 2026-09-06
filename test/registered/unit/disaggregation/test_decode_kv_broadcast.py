@@ -314,6 +314,7 @@ class TestResolveDecodeKVBroadcast(unittest.TestCase):
             state_types=[],
             is_mla_backend=True,
             attn_tp_size=2,
+            attn_dcp_size=1,
             supports_decode_kv_broadcast=True,
             enable_hisparse=False,
             enable_staging=False,
@@ -340,6 +341,19 @@ class TestResolveDecodeKVBroadcast(unittest.TestCase):
         """One relayed state type must not license an unrelayed one alongside it."""
         with self.assertRaises(RuntimeError):
             self._resolve(state_types=[StateType.DSA, StateType.MAMBA])
+
+    def test_rejects_decode_context_parallel(self):
+        """DCP is the one parallel layout that keeps MLA but drops replication.
+
+        Under DCP an attn TP rank owns only the tokens with
+        pos % dcp_size == dcp_rank, compacted into its own slots, and
+        `req_to_token` holds widened ids rather than pool rows. Relaying rank 0's
+        rows over a peer's would give it the wrong tokens, drop the ones no rank
+        pulled, and index the pool out of bounds.
+        """
+        self.assertTrue(self._resolve(attn_dcp_size=1))
+        with self.assertRaises(RuntimeError):
+            self._resolve(attn_dcp_size=2)
 
     def test_rejects_unsupported_paths(self):
         for overrides in (

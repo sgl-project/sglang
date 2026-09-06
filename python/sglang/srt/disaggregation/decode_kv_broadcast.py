@@ -233,6 +233,7 @@ def resolve_decode_kv_broadcast(
     state_types: Sequence[StateType],
     is_mla_backend: bool,
     attn_tp_size: int,
+    attn_dcp_size: int,
     supports_decode_kv_broadcast: bool,
     enable_hisparse: bool,
     enable_staging: bool,
@@ -259,6 +260,14 @@ def resolve_decode_kv_broadcast(
             "attn TP rank per KV replica there is no duplicate pull to remove. "
             "Pure DP attention lands here; DP attention over several attn TP "
             "ranks does not and is supported."
+        )
+    if attn_dcp_size > 1:
+        raise RuntimeError(
+            f"{ENV_NAME} is incompatible with decode context parallel "
+            f"(attn_dcp_size={attn_dcp_size}); DCP splits the MLA pool by the "
+            "owner rule pos % dcp_size == dcp_rank, so attn TP ranks in different "
+            "DCP subgroups hold different tokens at different slots and no rank "
+            "can relay for another."
         )
     if not supports_decode_kv_broadcast:
         raise RuntimeError(

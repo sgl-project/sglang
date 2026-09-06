@@ -600,6 +600,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             state_types=kv_args.state_types,
             is_mla_backend=self.is_mla_backend,
             attn_tp_size=attn_tp_size,
+            attn_dcp_size=get_parallel().attn_dcp_size,
             supports_decode_kv_broadcast=kv_manager_class.supports_decode_kv_broadcast,
             enable_hisparse=server_args.enable_hisparse,
             enable_staging=self.enable_staging,
