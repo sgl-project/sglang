@@ -115,6 +115,10 @@ int64_t cutlass_mla_get_workspace_size(
 /*
  * From csrc/infllm_v2
  */
+/**
+ * \param max_seqlen_k Input row stride, not sequence length.
+ *        Per-request key lengths bound valid entries.
+ */
 void infllm_v2_max_pooling_1d_varlen(
     at::Tensor input,
     at::Tensor output,
