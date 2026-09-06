@@ -916,8 +916,9 @@ export const config = {
     },
 
     // ==== NVFP4 (RDXA) on 1x DGX Spark — PLE table file-backed on NVMe ====
-    // TP=1 on one GB10: ~80 GiB of weights resident, the 47.7 GiB FP8 N-gram
-    // table lives in a sparse file on the NVMe (the forced "On (NVMe file)" chip
+    // TP=1 on one GB10: the 78.3 GiB of experts and dense weights resident (~80 GB
+    // in the log after load, including CUDA context and allocator overhead); the
+    // 47.7 GiB FP8 N-gram table lives in a sparse file on the NVMe (the forced "On (NVMe file)" chip
     // appends --ple-offload-embedding --ple-offload-backend file). At
     // --mem-fraction-static 0.85 the two pools share ~12-18 GB, and at TP=1 a
     // mamba state slot is ~113 MB (fp32), so concurrency is pinned low:
