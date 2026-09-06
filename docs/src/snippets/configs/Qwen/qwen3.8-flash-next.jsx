@@ -101,11 +101,11 @@ export const config = {
           disabled: (sel) => sel.hw === "dgx-spark" || sel.hw === "rtx6000",
           disableReason: (sel) => sel.hw === "rtx6000"
             ? "RTX PRO 6000 (96 GB) only fits this checkpoint with the 47.7 GiB FP8 N-gram table in pinned host RAM; the verified cells pass --ple-offload-embedding explicitly, so On is the only pick."
-            : "DGX Spark is unified memory: PLE offload to RAM frees nothing (the pinned table shares the 128 GB pool with the weights). Off is the verified setting until NVMe-backed PLE lands.",
+            : "DGX Spark is unified memory: PLE offload to RAM frees nothing (the pinned table shares the 128 GB pool with the weights). The verified settings are Off for the two-node cells and On (NVMe file) for a single Spark.",
           hints: ["PLE Offload: auto-enabled for BF16 on CUDA, off otherwise"] },
         { id: "on",   label: "On",
           disabled: (sel) => sel.hw === "dgx-spark",
-          disableReason: "DGX Spark is unified memory: PLE offload to RAM frees nothing (the pinned table shares the 128 GB pool with the weights). Off is the verified setting until NVMe-backed PLE lands.",
+          disableReason: "DGX Spark is unified memory: PLE offload to RAM frees nothing (the pinned table shares the 128 GB pool with the weights). The verified settings are Off for the two-node cells and On (NVMe file) for a single Spark.",
           flags: ["--ple-offload-embedding"] },
         { id: "off",  label: "Off",
           disabled: (sel) => sel.hw === "rtx6000" || (sel.hw === "dgx-spark" && sel.nodes === "single"),
@@ -748,12 +748,12 @@ export const config = {
     // requests (120 mamba slots), 1.48M-token KV pool, MTP accept length
     // 3.5-3.7 on non-thinking output. No env is required: the image loads its
     // pip NCCL 2.30.7 by default (verified via /proc/<pid>/maps), and the cell
-    // passed the same checks without PYTORCH_CUDA_ALLOC_CONF — see the notes
+    // passed the same checks without PYTORCH_CUDA_ALLOC_CONF; see the notes
     // for when expandable_segments is still worth setting.
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2" },
       verified: true,
-      warn: "2x DGX Spark only (GB10 pair, TP=2 over ConnectX-7); use Docker mode with the lmsysorg/sglang:dev-qwen38-next-local image; the qwen38flashnext image does not run these recipes. Memory headroom at --mem-fraction-static 0.85 is ~8-12 GiB per node — keep a host memory watchdog for long-context runs. See [DGX Spark notes](#spark-note).",
+      warn: "2x DGX Spark only (GB10 pair, TP=2 over ConnectX-7); in Docker mode use the lmsysorg/sglang:dev-qwen38-next-local image, the qwen4-main-squashed build the Spark rows are generated for. Memory headroom at --mem-fraction-static 0.85 is ~8-12 GiB per node; keep a host memory watchdog for long-context runs. See [DGX Spark notes](#spark-note).",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -782,7 +782,7 @@ export const config = {
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "multi-2" },
       verified: true,
-      warn: "2x DGX Spark only (GB10 pair, TP=2 over ConnectX-7); use Docker mode with the lmsysorg/sglang:dev-qwen38-next-local image; the qwen38flashnext image does not run these recipes. At 96 concurrent requests the KV pool is ~1.07M tokens (~11k per request when full); lower --max-running-requests for long-context workloads. See [DGX Spark notes](#spark-note).",
+      warn: "2x DGX Spark only (GB10 pair, TP=2 over ConnectX-7); in Docker mode use the lmsysorg/sglang:dev-qwen38-next-local image, the qwen4-main-squashed build the Spark rows are generated for. At 96 concurrent requests the KV pool is ~1.07M tokens (~11k per request when full); lower --max-running-requests for long-context workloads. See [DGX Spark notes](#spark-note).",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -838,7 +838,7 @@ export const config = {
     // chat sweep at every concurrency up to the pin.
     // Verified 2026-09-05 on the qwen38flashnext image (SGLang 593134d17a):
     // GSM8K (chat API, thinking off, n=200) 97.0% / 97.5% on two runs of the
-    // low-latency cell, 98.0% / 97.0% on the high-throughput cell — inside the
+    // low-latency cell, 98.0% / 97.0% on the high-throughput cell, inside the
     // 95-98% band of the datacenter runs. Re-verified 2026-09-06 on the
     // dev-qwen38-next-local image (qwen4-main-squashed 9b2aee2283), the image
     // the Docker tab now uses for this card: GSM8K 97.0% / 97.0%, 6.2 ms TPOT
@@ -855,7 +855,7 @@ export const config = {
     {
       match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
       verified: true,
-      warn: "Single RTX PRO 6000 (96 GB). Use the lmsysorg/sglang:dev-qwen38-next-local image; the qwen38flashnext image does not run this recipe. The FP8 N-gram table lives in pinned host RAM: keep >= 64 GB of host memory free and run Docker with --ulimit memlock=-1. The KV pool is ~78k tokens (~4.9k per request at 16 concurrent) — lower --max-running-requests for long-context work. See [RTX PRO 6000 notes](#rtx6000-note).",
+      warn: "Single RTX PRO 6000 (96 GB). Use the lmsysorg/sglang:dev-qwen38-next-local image, the build this cell is verified on. The FP8 N-gram table lives in pinned host RAM: keep >= 64 GB of host memory free and run Docker with --ulimit memlock=-1. The KV pool is ~78k tokens (~4.9k per request at 16 concurrent); lower --max-running-requests for long-context work. See [RTX PRO 6000 notes](#rtx6000-note).",
       env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True", "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -891,7 +891,7 @@ export const config = {
     {
       match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
-      warn: "Single RTX PRO 6000 (96 GB). Use the lmsysorg/sglang:dev-qwen38-next-local image; the qwen38flashnext image does not run this recipe. The FP8 N-gram table lives in pinned host RAM: keep >= 64 GB of host memory free and run Docker with --ulimit memlock=-1. At 64 concurrent requests the KV pool is ~98k tokens (~1.5k per request when full); lower --max-running-requests for long-context workloads. See [RTX PRO 6000 notes](#rtx6000-note).",
+      warn: "Single RTX PRO 6000 (96 GB). Use the lmsysorg/sglang:dev-qwen38-next-local image, the build this cell is verified on. The FP8 N-gram table lives in pinned host RAM: keep >= 64 GB of host memory free and run Docker with --ulimit memlock=-1. At 64 concurrent requests the KV pool is ~98k tokens (~1.5k per request when full); lower --max-running-requests for long-context workloads. See [RTX PRO 6000 notes](#rtx6000-note).",
       env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True", "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
