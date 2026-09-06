@@ -146,15 +146,30 @@ def _get_quant_field(quant_config: Any, key: str) -> Any:
     return getattr(quant_config, key, None)
 
 
-def _fp8_round_trips_via_ipc(quant_config: Any) -> bool:
-    """Only block-wise FP8 is verified.
+def _deepgemm_ue8m0_active() -> bool:
+    """Whether DeepGEMM repacks block-FP8 scales to packed UE8M0 here.
 
-    Block-wise FP8 (weight_block_size set) preserves weight shape and the only
-    post-load metadata it stamps is accounted for. Per-tensor FP8 transposes
-    `layer.weight` during post-processing, a shape change the meta-init client
-    cannot reproduce, so it is not supported.
+    Imported lazily to keep protocol.py cheap; unknown means unsafe (reject).
     """
-    return _get_quant_field(quant_config, "weight_block_size") is not None
+    try:
+        from sglang.srt.layers.deep_gemm_wrapper.configurer import (
+            DEEPGEMM_SCALE_UE8M0,
+        )
+    except Exception:
+        return True
+    return bool(DEEPGEMM_SCALE_UE8M0)
+
+
+def _fp8_round_trips_via_ipc(quant_config: Any) -> bool:
+    """Only block-wise FP8 without the UE8M0 scale repack is verified.
+
+    Per-tensor FP8 transposes layer.weight post-load; UE8M0 (SM100+ DeepGEMM)
+    repacks weight_scale_inv shape/dtype. The meta-init client reproduces
+    neither, so both are rejected.
+    """
+    if _get_quant_field(quant_config, "weight_block_size") is None:
+        return False
+    return not _deepgemm_ue8m0_active()
 
 
 # quant_method name -> predicate(quant_config) -> bool (True == verified safe).
@@ -194,8 +209,10 @@ def check_ipc_quant_support(
         f"meta-initialized client cannot reproduce, which would silently serve "
         f"wrong-numerics weights. Verified methods: {verified}. Note: FP8 is "
         f"only verified for block-wise configs (weight_block_size set), not "
-        f"per-tensor FP8. Disable the weight cache (--weight-cache-mode off) "
-        f"for this model."
+        f"per-tensor FP8, and on SM100+ additionally requires the DeepGEMM "
+        f"UE8M0 scale repack to be disabled (SGLANG_ENABLE_JIT_DEEPGEMM=0 on "
+        f"both the daemon and the engine). Disable the weight cache "
+        f"(--weight-cache-mode off) for this model."
     )
 
 
@@ -338,13 +355,23 @@ def _read_ready_pid(ready_path: str) -> Optional[int]:
 
 
 def _is_pid_alive(pid: int) -> bool:
-    """Check whether a process is still running."""
+    """Check whether a process is still running (a zombie counts as dead).
+
+    os.kill(pid, 0) succeeds on a zombie, but it holds no GPU memory or IPC
+    exports; unreaped daemons are the norm in containers without a reaper.
+    """
     try:
         os.kill(pid, 0)
-        return True
     except ProcessLookupError:
         return False
     except PermissionError:
+        pass
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            # The comm field may contain spaces but is parenthesized; the
+            # state letter is the first field after the closing paren.
+            return f.read().rpartition(")")[2].split()[0] != "Z"
+    except (OSError, IndexError):
         return True
 
 
