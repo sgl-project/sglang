@@ -170,8 +170,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         else:
             ctx = empty_context()
         with (
-            ctx
-        ), draft_pp_context(), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), draft_model_build_scope():
+            ctx,
+            draft_pp_context(),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            draft_model_build_scope(),
+        ):
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -999,9 +1003,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         dsa_seed_topk_indices = None
         if self.seed_dsa_topk_from_draft_extend:
             if can_run_decode_cuda_graph:
-                dsa_extend_topk_capture = (
-                    self.cuda_graph_runner_for_draft_extend.buffers.dsa_seed_topk_capture
-                )
+                dsa_extend_topk_capture = self.cuda_graph_runner_for_draft_extend.buffers.dsa_seed_topk_capture
             else:
                 dsa_extend_topk_capture = forward_batch.spec_info.dsa_seed_topk_capture
             # Fancy indexing returns a fresh tensor (detached from the buffer).

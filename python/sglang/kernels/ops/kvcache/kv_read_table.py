@@ -192,9 +192,9 @@ def build_kv_read_table(
     region's live prefix is written -- never rebound, never tail-cleared.
     """
     bs = int(req_pool_indices.numel())
-    assert (
-        out.dtype == torch.int32
-    ), f"build_kv_read_table: out must be int32, got {out.dtype}"
+    assert out.dtype == torch.int32, (
+        f"build_kv_read_table: out must be int32, got {out.dtype}"
+    )
     assert out.dim() == 2 and out.shape[0] >= bs and out.shape[1] >= max_pages, (
         f"build_kv_read_table: out {tuple(out.shape)} cannot hold "
         f"(bs={bs}, max_pages={max_pages})"
@@ -262,7 +262,7 @@ def build_kv_read_table_packed(
     """
     bs = int(req_pool_indices.numel())
     assert out.dtype in (torch.int32, torch.int64), (
-        f"build_kv_read_table_packed: out must be int32 or int64, got " f"{out.dtype}"
+        f"build_kv_read_table_packed: out must be int32 or int64, got {out.dtype}"
     )
     assert out.dim() == 1 and out.numel() >= max_tokens, (
         f"build_kv_read_table_packed: out {tuple(out.shape)} cannot hold "

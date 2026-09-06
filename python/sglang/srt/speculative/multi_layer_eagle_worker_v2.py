@@ -159,7 +159,11 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         )
 
         # Load draft model weights only.
-        with empty_context(), speculative_moe_backend_context(), draft_model_build_scope():
+        with (
+            empty_context(),
+            speculative_moe_backend_context(),
+            draft_model_build_scope(),
+        ):
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -376,9 +380,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 draft_backend_factory.create_draft_extend_backend()
             )
             if self.draft_extend_attn_backend_list[-1] is not None:
-                self.draft_runner_list[step].attn_backend = (
-                    self.draft_extend_attn_backend_list[-1]
-                )
+                self.draft_runner_list[
+                    step
+                ].attn_backend = self.draft_extend_attn_backend_list[-1]
 
     def _capture_cuda_graphs(self):
         self.cuda_graph_runner = None

@@ -177,7 +177,6 @@ class _ModelInfo:
 
 
 class _BaseRegisteredModel(ABC):
-
     @abstractmethod
     def inspect_model_cls(self) -> _ModelInfo:
         raise NotImplementedError
@@ -231,7 +230,7 @@ def _run_in_subprocess(fn: Callable[[], _T]) -> _T:
         except Exception as e:
             # wrap raised exception to provide more information
             raise RuntimeError(
-                f"Error raised in subprocess:\n" f"{returned.stderr.decode()}"
+                f"Error raised in subprocess:\n{returned.stderr.decode()}"
             ) from e
 
         with open(output_filepath, "rb") as f:

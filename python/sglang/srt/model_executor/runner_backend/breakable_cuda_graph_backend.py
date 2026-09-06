@@ -131,11 +131,14 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         size = shape_key.size
         if self._shared_output_buffer is None:
             self._shared_output_buffer = self._alloc_full_buffer(warmup_out, size)
-        with graph_pool_capture_scope(), BreakableCUDAGraphCapture(
-            cuda_graph=graph,
-            pool=self._pool,
-            stream=self._capture_stream,
-            barrier_fn=self._tp_group.barrier,
+        with (
+            graph_pool_capture_scope(),
+            BreakableCUDAGraphCapture(
+                cuda_graph=graph,
+                pool=self._pool,
+                stream=self._capture_stream,
+                barrier_fn=self._tp_group.barrier,
+            ),
         ):
             self._precarve.mint()
             out = captured_fn()

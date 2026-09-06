@@ -37,12 +37,14 @@ def chunk_local_cumsum_scalar_kernel(
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
-            chunk_indices + i_t * 2 + 1
-        ).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
-            cu_seqlens + i_n + 1
-        ).to(tl.int32)
+        i_n, i_t = (
+            tl.load(chunk_indices + i_t * 2).to(tl.int32),
+            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+        )
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int32),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+        )
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
@@ -97,12 +99,14 @@ def chunk_local_cumsum_vector_kernel(
     i_s, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
-            chunk_indices + i_t * 2 + 1
-        ).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
-            cu_seqlens + i_n + 1
-        ).to(tl.int32)
+        i_n, i_t = (
+            tl.load(chunk_indices + i_t * 2).to(tl.int32),
+            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+        )
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int32),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+        )
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
@@ -169,9 +173,9 @@ def chunk_local_cumsum_scalar(
         B, H, T = g.shape
     else:
         B, T, H = g.shape
-    assert chunk_size == 2 ** (
-        chunk_size.bit_length() - 1
-    ), "chunk_size must be a power of 2"
+    assert chunk_size == 2 ** (chunk_size.bit_length() - 1), (
+        "chunk_size must be a power of 2"
+    )
     BT = chunk_size
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
@@ -216,9 +220,9 @@ def chunk_local_cumsum_vector(
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    assert chunk_size == 2 ** (
-        chunk_size.bit_length() - 1
-    ), "chunk_size must be a power of 2"
+    assert chunk_size == 2 ** (chunk_size.bit_length() - 1), (
+        "chunk_size must be a power of 2"
+    )
 
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
 
@@ -260,9 +264,9 @@ def chunk_local_cumsum(
     **kwargs,
 ) -> torch.Tensor:
     if cu_seqlens is not None:
-        assert (
-            g.shape[0] == 1
-        ), "Only batch size 1 is supported when cu_seqlens are provided"
+        assert g.shape[0] == 1, (
+            "Only batch size 1 is supported when cu_seqlens are provided"
+        )
     if len(g.shape) == 3:
         return chunk_local_cumsum_scalar(
             g=g,

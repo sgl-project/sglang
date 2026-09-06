@@ -303,8 +303,7 @@ class DeepseekV2MLP(nn.Module):
             self.down_proj.weight = self.down_proj.weight_packed
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
         self.use_fused_clamp_act_mul = _is_hip
@@ -479,7 +478,14 @@ class MoEGate(nn.Module):
         self.is_nextn = is_nextn
         self.is_deepseek_v4 = is_deepseek_v4
         self.weight = nn.Parameter(
-            torch.empty((config.n_routed_experts, config.hidden_size))
+            torch.empty(
+                (config.n_routed_experts, config.hidden_size),
+                dtype=(
+                    torch.float32
+                    if getattr(config, "router_fp32", False)
+                    else torch.get_default_dtype()
+                ),
+            )
         )
 
         if config.topk_method == "noaux_tc" and not is_hash_moe:
@@ -516,6 +522,9 @@ class MoEGate(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         forward_batch: ForwardBatch = None,
     ):
+        if self.weight.dtype == torch.float32:
+            return F.linear(hidden_states.float(), self.weight)
+
         if use_intel_amx_backend(self):
             return torch.ops.sgl_kernel.weight_packed_linear(
                 hidden_states,
@@ -563,7 +572,6 @@ class MoEGate(nn.Module):
 
 
 class DeepseekV2MoE(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -779,19 +787,22 @@ class DeepseekV2MoE(nn.Module):
                     ModelOptFp4LinearMethod,
                 )
                 and fc1_n % 128 == 0
+                and self.shared_experts.swiglu_limit is None
                 and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
             ):
                 self.shared_experts.gate_up_proj._interleave_for_swiglu_fusion = True
                 self.shared_experts._enable_nvfp4_gemm_swiglu_fusion = True
                 self.shared_experts.down_proj._accepts_prequantized_fp4 = True
             self._shared_expert_tp1 = _shared_expert_use_tp1
-            is_packed_weight = hasattr(
-                self.shared_experts.gate_up_proj.quant_method, "quant_config"
-            ) and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name() in {
-                "awq",
-                "awq_marlin",
-                "moe_wna16",
-            }
+            is_packed_weight = (
+                hasattr(self.shared_experts.gate_up_proj.quant_method, "quant_config")
+                and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name()
+                in {
+                    "awq",
+                    "awq_marlin",
+                    "moe_wna16",
+                }
+            )
             shared_gate_up_weight = getattr(
                 self.shared_experts.gate_up_proj, "weight", None
             )
@@ -823,9 +834,7 @@ class DeepseekV2MoE(nn.Module):
                         self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
                         == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
                     )
-                    self.shared_experts_weight_block_size = (
-                        self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
-                    )
+                    self.shared_experts_weight_block_size = self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
 
         self.top_k = config.num_experts_per_tok
 
@@ -1740,7 +1749,6 @@ class DeepseekV2AttentionMLA(
     DeepseekMLAFusedRopeRocmForwardMixin,
     DeepseekMLACpuForwardMixin,
 ):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -2106,18 +2114,18 @@ class DeepseekV2AttentionMLA(
                 not get_attn_tp_context().input_scattered
                 and hidden_states[0].shape[0] == 0
             ):
-                assert (
-                    not self.o_proj.reduce_results
-                ), "short-circuiting allreduce will lead to hangs"
+                assert not self.o_proj.reduce_results, (
+                    "short-circuiting allreduce will lead to hangs"
+                )
                 return hidden_states[0]
         else:
             if (
                 not get_attn_tp_context().input_scattered
                 and hidden_states.shape[0] == 0
             ):
-                assert (
-                    not self.o_proj.reduce_results
-                ), "short-circuiting allreduce will lead to hangs"
+                assert not self.o_proj.reduce_results, (
+                    "short-circuiting allreduce will lead to hangs"
+                )
                 return hidden_states, None, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
@@ -2301,7 +2309,6 @@ class DeepseekV2AttentionMLA(
 
 
 class DeepseekV2DecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,

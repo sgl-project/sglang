@@ -319,7 +319,9 @@ def _topk_transform_v2_paged(
         logits.dtype == torch.float32
         and logits.stride(1) == 1
         and logits.stride(0) % 4 == 0
-    ), f"v2 top-k expects fp32 scores with unit row stride and 16B-aligned score_stride, got {logits.dtype=} {logits.stride()=}"
+    ), (
+        f"v2 top-k expects fp32 scores with unit row stride and 16B-aligned score_stride, got {logits.dtype=} {logits.stride()=}"
+    )
     assert 0 < topk <= 2048, f"v2 top-k supports 0 < topk <= 2048, got {topk=}"
 
     page_table = attn_metadata.real_page_table
@@ -329,9 +331,9 @@ def _topk_transform_v2_paged(
     # mismatched plan means the caller skipped that preprocessing -- fail loudly
     # rather than silently recompute it per layer.
     plan = attn_metadata.topk_v2_plan
-    assert (
-        plan is not None and plan.shape[0] == num_rows + 1
-    ), "topk_v2_plan must be preprocessed per forward (see DSAMetadata.topk_v2_plan)"
+    assert plan is not None and plan.shape[0] == num_rows + 1, (
+        "topk_v2_plan must be preprocessed per forward (see DSAMetadata.topk_v2_plan)"
+    )
 
     page_size = attn_metadata.page_size
     out = logits.new_empty((num_rows, topk), dtype=torch.int32)

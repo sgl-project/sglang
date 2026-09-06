@@ -180,6 +180,8 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "ideogram-v4-instant",
         "ideogram-ai/ideogram-4-fp8",
         "ideogram-ai/ideogram-4-nf4",
+        "jdopensource/joyai-echo",
+        "joyai-echo",
         "lightricks/ltx-2",
         "lightricks/ltx-2.3",
         "meituan-longcat/longcat-image",
@@ -203,6 +205,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
     {
         "GlmImagePipelineConfig",
         "Ideogram4PipelineConfig",
+        "JoyEchoPipelineConfig",
         "LTX2PipelineConfig",
         "LTX23PipelineConfig",
         "LongCatImagePipelineConfig",
@@ -352,6 +355,11 @@ class ServerArgs(DisaggServerArgsMixin):
     # Widest timestep plan the rebuild slab is sized for; see
     # MINIMAX_H3_ADALN_MAX_PLAN_WIDTH.
     minimax_h3_adaln_plan_width: int = 4
+    # Pinned-host cache for built AdaLN plans (decimal GB, 0 disables). Plans
+    # evicted from the GPU slab swap back in from here instead of re-reading
+    # the 24.2 GiB checkpoint. Expert knobs (GPU slot count, fp32 rebuild)
+    # live in envs.py as SGLANG_DIFFUSION_MINIMAX_H3_ADALN_*.
+    minimax_h3_adaln_host_cache_gb: float = 8.0
     # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
     # When set, the transformer loader uses it instead of auto-detection.
     quantization: str | None = None
@@ -615,7 +623,20 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_cfg_parallel()
         self._validate_batching()
         self._validate_breakable_cuda_graph()
+        self._validate_minimax_h3_adaln()
         self.pipeline_config.validate_server_args(self)
+
+    def _validate_minimax_h3_adaln(self) -> None:
+        # Warn, not raise: config-file and from_kwargs construction mark every
+        # provided key as explicit, so a shared base config pinning the
+        # default (or 0) must not fail non-online launches.
+        if self.minimax_h3_adaln_online:
+            return
+        if self.is_arg_explicitly_set("minimax_h3_adaln_host_cache_gb"):
+            logger.warning(
+                "--minimax-h3-adaln-host-cache-gb only takes effect with "
+                "--minimax-h3-adaln-online; ignoring it"
+            )
 
     def _validate_scheduler_rpc_timeout(self) -> None:
         timeout = self.scheduler_rpc_timeout
@@ -662,12 +683,44 @@ class ServerArgs(DisaggServerArgsMixin):
                 "model default warmup resolution. Requests at other "
                 "resolutions run eager."
             )
+        if self._is_video_gen_task() and self.warmup_num_frames is None:
+            default_frames = self._bcg_default_warmup_num_frames()
+            logger.info(
+                "[Diffusion BCG] --warmup-num-frames unset; capturing the "
+                "model default warmup frame count (%s). Requests with a "
+                "different frame count run eager. Pass --warmup-num-frames N "
+                "matching your served frame count.",
+                default_frames,
+            )
         if self.bcg_text_buckets is not None and not any(
             int(b) > 0 for b in self.bcg_text_buckets
         ):
             raise ValueError(
                 "--bcg-text-buckets must contain at least one positive integer."
             )
+
+    def _is_video_gen_task(self) -> bool:
+        pipeline_config = getattr(self, "pipeline_config", None)
+        task_type = getattr(pipeline_config, "task_type", None)
+        is_video_gen = getattr(task_type, "is_video_gen", None)
+        return bool(is_video_gen()) if callable(is_video_gen) else False
+
+    def _bcg_default_warmup_num_frames(self):
+        """Best-effort preview of the warmup frame count BCG will capture."""
+        try:
+            from sglang.multimodal_gen.runtime.warmup_request_builder import (
+                _resolve_warmup_num_frames,
+                get_model_sampling_defaults,
+            )
+
+            sampling_defaults = get_model_sampling_defaults(self)
+            return _resolve_warmup_num_frames(
+                self,
+                sampling_defaults,
+                server_based_warmup=True,
+            )
+        except Exception:  # pragma: no cover - defensive
+            return None
 
     def _adjust_breakable_cuda_graph_support(self):
         if not self.enable_breakable_cuda_graph:
@@ -685,10 +738,10 @@ class ServerArgs(DisaggServerArgsMixin):
 
         logger.warning(
             "[Diffusion BCG] disabled for %s: only Ideogram-4, "
-            "Lightricks/LTX-2, LongCat-Image, MiniMax-H3, "
-            "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, SANA-Video, "
-            "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image are "
-            "currently supported.",
+            "jdopensource/JoyAI-Echo, Lightricks/LTX-2, LongCat-Image, "
+            "MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, "
+            "SANA-Video, Tongyi-MAI/Z-Image/Z-Image-Turbo, and "
+            "zai-org/GLM-Image are currently supported.",
             pipeline_config_name,
         )
         self.enable_breakable_cuda_graph = False
@@ -1926,6 +1979,20 @@ class ServerArgs(DisaggServerArgsMixin):
             ),
         )
         parser.add_argument(
+            "--minimax-h3-adaln-host-cache-gb",
+            type=float,
+            default=ServerArgs.minimax_h3_adaln_host_cache_gb,
+            help=(
+                "Pinned host memory (decimal GB, per rank) caching AdaLN plans "
+                "built by --minimax-h3-adaln-online, so a plan set evicted "
+                "from the GPU slab swaps back in over PCIe instead of "
+                "re-reading the 24.2 GiB checkpoint (measured 5.8-6.7 s). One "
+                "50-step schedule needs ~0.9 (t2va) / 1.33 (fl2va) / 1.77 "
+                "(ref2va) GB; the default 8 holds several. Groups are evicted "
+                "LRU and over-cap groups just recompute. 0 disables the tier."
+            ),
+        )
+        parser.add_argument(
             "--minimax-h3-adaln-cache-path",
             type=str,
             default=ServerArgs.minimax_h3_adaln_cache_path,
@@ -2545,7 +2612,7 @@ class ServerArgs(DisaggServerArgsMixin):
             type=int,
             default=None,
             choices=[0, 1],
-            help="Quantize the attention sink too (1, default) " "or keep it bf16 (0).",
+            help="Quantize the attention sink too (1, default) or keep it bf16 (0).",
         )
         parser.add_argument(
             "--kv-cache-quant-sink-keep",

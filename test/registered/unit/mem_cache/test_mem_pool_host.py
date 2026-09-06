@@ -242,10 +242,11 @@ class TestHostMemoryBudget(CustomTestCase):
         # Deliberate single-accessor stub: isolates the budget math from the
         # topology derivation, which the ranks_per_host case below covers.
         fake_mem = unittest.mock.Mock(available=self._AVAILABLE)
-        with unittest.mock.patch.object(
-            base, "ranks_per_host", return_value=ranks
-        ), unittest.mock.patch.object(
-            base.psutil, "virtual_memory", return_value=fake_mem
+        with (
+            unittest.mock.patch.object(base, "ranks_per_host", return_value=ranks),
+            unittest.mock.patch.object(
+                base.psutil, "virtual_memory", return_value=fake_mem
+            ),
         ):
             return base.host_memory_budget_bytes()
 
@@ -264,9 +265,15 @@ class TestHostMemoryBudget(CustomTestCase):
         # The launcher slices ranks uniformly across nodes, so the co-located
         # rank count is world_size // nnodes — no hostname collective.
         fake_group = unittest.mock.Mock(world_size=16)
-        with get_context().override_server_args(nnodes=2), unittest.mock.patch.object(
-            torch.distributed, "is_initialized", return_value=True
-        ), unittest.mock.patch.object(base, "get_world_group", return_value=fake_group):
+        with (
+            get_context().override_server_args(nnodes=2),
+            unittest.mock.patch.object(
+                torch.distributed, "is_initialized", return_value=True
+            ),
+            unittest.mock.patch.object(
+                base, "get_world_group", return_value=fake_group
+            ),
+        ):
             self.assertEqual(base.ranks_per_host(), 8)
 
 

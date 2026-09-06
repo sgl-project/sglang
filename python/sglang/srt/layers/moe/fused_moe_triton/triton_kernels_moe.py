@@ -153,12 +153,12 @@ def triton_kernel_fused_experts(
 
     # Shape check
     assert hidden_states.ndim == 2, "hidden_states must be 2D"
-    assert (
-        hidden_states.shape[-1] == w1.shape[-2]
-    ), f"hidden_states shape[-1] {hidden_states.shape} must be equal to w1 shape[-2] {w1.shape}"
-    assert (
-        w2.shape[-1] == w1.shape[1]
-    ), f"w2 shape[-1] {w2.shape[-1]} must be equal to w1 shape[1] {w1.shape[1]}"
+    assert hidden_states.shape[-1] == w1.shape[-2], (
+        f"hidden_states shape[-1] {hidden_states.shape} must be equal to w1 shape[-2] {w1.shape}"
+    )
+    assert w2.shape[-1] == w1.shape[1], (
+        f"w2 shape[-1] {w2.shape[-1]} must be equal to w1 shape[1] {w1.shape[1]}"
+    )
 
     # feature check
     assert inplace is False, "Inplace is not supported in new triton MoE kernel"
@@ -309,12 +309,12 @@ def triton_kernel_fused_experts_with_bias(
 
     # Shape check
     assert hidden_states.ndim == 2, "hidden_states must be 2D"
-    assert (
-        hidden_states.shape[-1] == w1.shape[-2]
-    ), f"hidden_states shape[-1] {hidden_states.shape} must be equal to w1 shape[-2] {w1.shape}"
-    assert (
-        w2.shape[-1] == w1.shape[1]
-    ), f"w2 shape[-1] {w2.shape[-1]} must be equal to w1 shape[1] {w1.shape[1]}"
+    assert hidden_states.shape[-1] == w1.shape[-2], (
+        f"hidden_states shape[-1] {hidden_states.shape} must be equal to w1 shape[-2] {w1.shape}"
+    )
+    assert w2.shape[-1] == w1.shape[1], (
+        f"w2 shape[-1] {w2.shape[-1]} must be equal to w1 shape[1] {w1.shape[1]}"
+    )
 
     # feature check
     assert inplace is False, "Inplace is not supported in new triton MoE kernel"

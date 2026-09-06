@@ -103,8 +103,8 @@ class TestPPCPRankOffsets(unittest.TestCase):
                 side_effect=fake_point_to_point_pyobj,
             ),
             patch(
-                "sglang.srt.managers.scheduler_pp_mixin.broadcast_pyobj",
-                side_effect=lambda data, *args, **kwargs: data,
+                "sglang.srt.managers.scheduler_pp_mixin.attn_cp_tp_broadcast_pyobj",
+                side_effect=lambda data: data,
             ),
         ):
             self.assertEqual(

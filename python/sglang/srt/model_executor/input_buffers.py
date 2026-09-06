@@ -58,7 +58,6 @@ INDEX_SEMANTIC_BUFFERS = frozenset(
 
 @dataclass
 class ForwardInputBuffers:
-
     def reset_index_buffers(self) -> None:
         """Zero the index-semantic buffers this set declares."""
         for f in fields(self):
@@ -87,14 +86,14 @@ class ForwardInputBuffers:
 
             if isinstance(buffer, dict):
                 for sub_name, sub_buffer in buffer.items():
-                    assert isinstance(
-                        sub_buffer, torch.Tensor
-                    ), f"Field {name}.{sub_name} is expected to be a torch.Tensor, but got {type(sub_buffer)}."
+                    assert isinstance(sub_buffer, torch.Tensor), (
+                        f"Field {name}.{sub_name} is expected to be a torch.Tensor, but got {type(sub_buffer)}."
+                    )
                     buffer[sub_name] = share_input_buffer(
                         f"{name}.{sub_name}", sub_buffer
                     )
             else:
-                assert isinstance(
-                    buffer, torch.Tensor
-                ), f"Field {name} is expected to be a torch.Tensor, a dict of torch.Tensor, or a dataclass of torch.Tensor, but got {type(buffer)}."
+                assert isinstance(buffer, torch.Tensor), (
+                    f"Field {name} is expected to be a torch.Tensor, a dict of torch.Tensor, or a dataclass of torch.Tensor, but got {type(buffer)}."
+                )
                 setattr(self, name, share_input_buffer(name, buffer))

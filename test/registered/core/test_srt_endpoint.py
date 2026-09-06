@@ -259,7 +259,6 @@ class TestSRTEndpoint(CustomTestCase):
                 for logprob_start_len in [0, 500, 2500, 5000, 25000]:
                     for return_logprob in [True, False]:
                         for top_logprobs_num in [0, 5]:
-
                             if logprob_start_len >= input_len:
                                 continue
 

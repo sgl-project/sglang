@@ -434,11 +434,11 @@ def run_unittest_files(
         logger.info(f"Fail. Time elapsed: {elapsed_total:.2f}s")
 
     # Print summary
-    logger.info(f"\n{'='*60}")
+    logger.info(f"\n{'=' * 60}")
     logger.info(f"Test Summary: {len(passed_tests)}/{len(files)} passed")
     if enable_retry and retried_tests:
         logger.info(f"Retries: {len(retried_tests)} test(s) were retried")
-    logger.info(f"{'='*60}")
+    logger.info(f"{'=' * 60}")
     if passed_tests:
         logger.info("✓ PASSED:")
         for test in passed_tests:
@@ -451,7 +451,7 @@ def run_unittest_files(
         logger.info("\n↻ RETRIED:")
         for test, attempts, result in retried_tests:
             logger.info(f"  {test} ({attempts} attempts, {result})")
-    logger.info(f"{'='*60}\n")
+    logger.info(f"{'=' * 60}\n")
 
     # Machine-readable timings block for downstream scrapers/dashboards.
     # One JSON object per executed file (post-retry: only the latest

@@ -259,9 +259,9 @@ class DedupedCudaGraphRegistry:
     def replay(self, graph: DedupedCudaGraph, stream: int) -> None:
         assert cuda_rt is not None
         group = graph.group
-        assert (
-            group is not None
-        ), "captured CUDA graph does not belong to this dedup state"
+        assert group is not None, (
+            "captured CUDA graph does not belong to this dedup state"
+        )
 
         raw_graph = graph.raw_graph
         graph_exec = group.graph_exec

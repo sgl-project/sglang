@@ -418,16 +418,16 @@ def silu_and_mul_masked_post_quant_fwd(
 
     if output_scale.dtype == torch.int32:
         assert scale_ue8m0, "packed int32 scales are UE8M0 by definition"
-        assert (
-            num_real_tokens is not None and topk is not None
-        ), "the packed schedule sizes its grid from num_real_tokens * topk"
+        assert num_real_tokens is not None and topk is not None, (
+            "the packed schedule sizes its grid from num_real_tokens * topk"
+        )
         E, m_max, _ = input.shape
         G = size_n // quant_group_size
         assert G % 4 == 0, "packed UE8M0 path requires num_groups % 4 == 0"
         BLOCK_N = quant_group_size * 4
-        assert (
-            size_n % BLOCK_N == 0
-        ), "packed UE8M0 path requires size_n % (4*group) == 0"
+        assert size_n % BLOCK_N == 0, (
+            "packed UE8M0 path requires size_n % (4*group) == 0"
+        )
         hidden_dim_split = size_n // BLOCK_N
         assert tuple(output_scale.shape) == (E, hidden_dim_split, m_max)
 
@@ -1155,9 +1155,12 @@ def ep_scatter(
     output_index: torch.Tensor,
     scale_ue8m0: bool = False,
     quant_block_size: int = 128,
+    expert_alignment: int = 128,
     expert_start: int = 0,
 ):
-    BLOCK_E = 128  # token num of per expert is aligned to 128
+    # tl.arange needs pow2, and the kernel's unmasked stores need BLOCK_E to
+    # divide the expert_alignment-padded segments; lowbit satisfies both.
+    BLOCK_E = expert_alignment & -expert_alignment
     BLOCK_D = quant_block_size  # block size of quantization
     num_warps = 8
     num_experts = num_recv_tokens_per_expert.shape[0]
@@ -1175,9 +1178,9 @@ def ep_scatter(
 
     is_fp8 = recv_x_scale is not None and recv_x.dtype != torch.bfloat16
     if is_fp8:
-        assert (
-            recv_x_scale.dtype == output_tensor_scale.dtype
-        ), f"recv_x_scale.dtype: {recv_x_scale.dtype}, output_tensor_scale.dtype: {output_tensor_scale.dtype}"
+        assert recv_x_scale.dtype == output_tensor_scale.dtype, (
+            f"recv_x_scale.dtype: {recv_x_scale.dtype}, output_tensor_scale.dtype: {output_tensor_scale.dtype}"
+        )
         assert (
             recv_x_scale.shape[1] == output_tensor_scale.shape[1] == scale_hidden_size
         )

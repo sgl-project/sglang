@@ -88,7 +88,7 @@ def _precompile_kernels(num_gpus: List[int]) -> None:
         p.join()
         if p.exitcode != 0:
             raise RuntimeError(
-                f"TP QKNorm precompile failed for {world_size=} " f"(exit {p.exitcode})"
+                f"TP QKNorm precompile failed for {world_size=} (exit {p.exitcode})"
             )
 
 

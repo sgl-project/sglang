@@ -1103,9 +1103,9 @@ def mhc_pre(
             gemm_out_sqrsum = torch.empty(
                 n_splits, num_tokens, dtype=torch.float32, device=residual.device
             )
-            assert (
-                n_splits == 1
-            ), "The simple TileLang version gemm_sqrsum doesn't support split-k"
+            assert n_splits == 1, (
+                "The simple TileLang version gemm_sqrsum doesn't support split-k"
+            )
             _mhc_pre_gemm_sqrsum_dispatch()(
                 residual_flat.view(num_tokens, hc_mult * hidden_size),
                 fn_flat,
@@ -1119,9 +1119,9 @@ def mhc_pre(
 
     if norm_weight is not None:
         assert norm_eps is not None, "norm_eps required when norm_weight is provided"
-        assert norm_weight.shape == (
-            hidden_size,
-        ), f"norm_weight shape {tuple(norm_weight.shape)} != (hidden_size={hidden_size},)"
+        assert norm_weight.shape == (hidden_size,), (
+            f"norm_weight shape {tuple(norm_weight.shape)} != (hidden_size={hidden_size},)"
+        )
         norm_weight_bf = (
             norm_weight.bfloat16()
             if norm_weight.dtype != torch.bfloat16

@@ -242,7 +242,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # "Missing TRTLLM-GEN kernel" error during CUDA-graph capture.
         # XQA (SM90/SM120 decode) has native page-128 kernels; no check needed.
         if self.page_size >= 128 and not self.is_xqa_impl:
-
             attn_tp_size = get_parallel().attn_tp_size
             num_q_heads = config.num_attention_heads // attn_tp_size
             num_kv_heads = config.get_num_kv_heads(attn_tp_size)
@@ -1214,7 +1213,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
         return output_by_request.view(-1, query.shape[-2], query.shape[-1])
 
-    def _get_nvfp4_decode_kv_cache(self, layer: RadixAttention) -> tuple[
+    def _get_nvfp4_decode_kv_cache(
+        self, layer: RadixAttention
+    ) -> tuple[
         tuple[torch.Tensor, torch.Tensor],
         tuple[torch.Tensor, torch.Tensor],
     ]:
@@ -1426,8 +1427,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 # run bs*L single-token rows over the full window instead (the
                 # window's K/V are already in the pool).
                 assert not self.forward_metadata.is_ragged_verify, (
-                    "ENCODER_ONLY target_verify does not support ragged "
-                    "verify layouts"
+                    "ENCODER_ONLY target_verify does not support ragged verify layouts"
                 )
                 assert self.forward_metadata.encoder_cache_seqlens is not None, (
                     "ENCODER_ONLY target_verify requires the expanded decode "

@@ -330,7 +330,6 @@ class MooncakeBaseStore:
 
 
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
-
     @staticmethod
     def _standalone_required_bytes(mem_pool: Any) -> int:
         """Compute total bytes of host buffers that must be visible to the real client.

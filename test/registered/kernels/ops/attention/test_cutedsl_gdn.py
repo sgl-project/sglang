@@ -267,8 +267,9 @@ def test_cutedsl_gdn_performance(B: int):
     # Benchmark
     triton_times, cutedsl_times = [], []
     for _ in range(bench_iters):
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
-            enable_timing=True
+        start, end = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
         )
         start.record()
         if graph_triton:
@@ -279,8 +280,9 @@ def test_cutedsl_gdn_performance(B: int):
         torch.cuda.synchronize()
         triton_times.append(start.elapsed_time(end))
 
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
-            enable_timing=True
+        start, end = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
         )
         with torch.cuda.stream(torch_stream):
             start.record()

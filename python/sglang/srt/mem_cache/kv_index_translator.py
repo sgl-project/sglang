@@ -64,11 +64,13 @@ from sglang.kernels.ops.kvcache.kv_read_table import (
     build_kv_read_table,
     build_kv_read_table_packed,
 )
-from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.mem_cache.multi_ended_allocator import (
-    UnifiedMambaTokenToKVPoolAllocator,
+from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWATokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.allocator.unified_mamba import (
+    UnifiedMambaTokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -227,8 +229,7 @@ class KVIndexTranslator:
 
         if sliding_window:
             assert self._swa_v2p_table is not None, (
-                "fill_packed_read_stream: sliding_window on a pool with no swa "
-                "sub-pool"
+                "fill_packed_read_stream: sliding_window on a pool with no swa sub-pool"
             )
         build_kv_read_table_packed(
             req_to_token=self.req_to_token,
@@ -392,6 +393,22 @@ class KVIndexTranslator:
         )
         self._index_table_memo = (weakref.ref(forward_batch), view)
         return view
+
+    @property
+    def full_v2p_table(self) -> Optional[torch.Tensor]:
+        """The full-attention virtual->physical PAGE table, or None when this
+        pool needs no translation.
+
+        For the DCP page-table builders, whose gather is over a rank's cyclic
+        slice rather than a row prefix, so `build_index_table` cannot serve
+        them.
+        """
+        return self._full_v2p_table
+
+    @property
+    def full_page_multiplier(self) -> int:
+        """Scales a physical page into the id space the per-layer views use."""
+        return self._full_page_multiplier
 
     def bind_and_verify_backends(self, backends) -> None:
         """Boot: make every reachable backend carry THIS translator.

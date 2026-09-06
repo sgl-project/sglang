@@ -155,9 +155,9 @@ def act_quant(
             - A tensor of scaling factors with dtype `torch.float32`.
     """
     assert x.is_contiguous(), "Input tensor must be contiguous"
-    assert (
-        x.size(-1) % block_size == 0
-    ), f"Last dimension size must be divisible by block_size (block_size={block_size})"
+    assert x.size(-1) % block_size == 0, (
+        f"Last dimension size must be divisible by block_size (block_size={block_size})"
+    )
     N = x.size(-1)
     if _is_fp8_fnuz:
         y = torch.empty_like(x, dtype=torch.float8_e4m3fnuz)
@@ -272,16 +272,16 @@ def sparse_attention_fwd_kernel_v1(
     num_stages=2,
     threads=256,
 ):
-    assert dim == tilelang.math.next_power_of_2(
-        dim
-    ), f"haven't check padding correctness yet, dim={dim}"
-    assert tail_dim == tilelang.math.next_power_of_2(
-        tail_dim
-    ), f"haven't check padding correctness yet, dim={tail_dim}"
+    assert dim == tilelang.math.next_power_of_2(dim), (
+        f"haven't check padding correctness yet, dim={dim}"
+    )
+    assert tail_dim == tilelang.math.next_power_of_2(tail_dim), (
+        f"haven't check padding correctness yet, dim={tail_dim}"
+    )
     assert is_causal == True, "non-casual is not supported"
-    assert (
-        topk % block_I == 0
-    ), "otherwise will load some index=0 thus causing wrong kv to be loaded"
+    assert topk % block_I == 0, (
+        "otherwise will load some index=0 thus causing wrong kv to be loaded"
+    )
     if sm_scale is None:
         sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504  # log2(e)
     else:
@@ -361,7 +361,6 @@ def sparse_attention_fwd_kernel_v1(
             T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
 
             for i_i in T.Pipelined(NI, num_stages=num_stages):
-
                 for bi_i in T.Parallel(BI):
                     mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] >= 0
 
@@ -446,15 +445,15 @@ def sparse_attention_fwd_kernel_v2(
     sm_scale: Optional[float] = None,
     block_I: int = 64,
 ):
-    assert dim == tilelang.math.next_power_of_2(
-        dim
-    ), f"haven't check padding correctness yet, dim={dim}"
-    assert tail_dim == tilelang.math.next_power_of_2(
-        tail_dim
-    ), f"haven't check padding correctness yet, dim={tail_dim}"
-    assert (
-        topk % block_I == 0
-    ), "otherwise will load some index=0 thus causing wrong kv to be loaded"
+    assert dim == tilelang.math.next_power_of_2(dim), (
+        f"haven't check padding correctness yet, dim={dim}"
+    )
+    assert tail_dim == tilelang.math.next_power_of_2(tail_dim), (
+        f"haven't check padding correctness yet, dim={tail_dim}"
+    )
+    assert topk % block_I == 0, (
+        "otherwise will load some index=0 thus causing wrong kv to be loaded"
+    )
     if sm_scale is None:
         sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504  # log2(e)
     else:
@@ -1078,9 +1077,9 @@ def sparse_mla_fwd_decode_partial_fp8(
     threads=256,
 ):
     assert d_v == 512, f"only support d_v=512"
-    assert (
-        topk % block_I == 0
-    ), "otherwise will load some index=0 thus causing wrong kv to be loaded"
+    assert topk % block_I == 0, (
+        "otherwise will load some index=0 thus causing wrong kv to be loaded"
+    )
 
     # Softmax scores are in [0, 1]. We scale by fp8_max_val before FP8 cast
     # to better utilize FP8 dynamic range, then apply the inverse scale after GEMM.
@@ -1104,9 +1103,9 @@ def sparse_mla_fwd_decode_partial_fp8(
     h_per_block = 16
     # Match bf16 partial behavior: keep fixed 16-head tiles and use
     # sliced T.copy on H0:H1 for tail handling.
-    assert (
-        num_heads <= h_per_block or num_heads % h_per_block == 0
-    ), "num_heads must be <=16 or divisible by 16"
+    assert num_heads <= h_per_block or num_heads % h_per_block == 0, (
+        "num_heads must be <=16 or divisible by 16"
+    )
     head_blocks_per_seq = (num_heads + h_per_block - 1) // h_per_block
 
     batch = 1
@@ -1594,9 +1593,7 @@ def dpsk_v4_fp8_partial_kernel(
         sm_scale = sm_scale * log2e
     assert dim == 448 and tail_dim == 64
     assert topk_1 % block_I == 0
-    assert (
-        topk_1 // block_I
-    ) % inner_iter_1 == 0, (
+    assert (topk_1 // block_I) % inner_iter_1 == 0, (
         f"NI_1={topk_1 // block_I} must be divisible by inner_iter_1={inner_iter_1}"
     )
     assert block_size_kv_1 > 0 and (block_size_kv_1 & (block_size_kv_1 - 1)) == 0
@@ -1605,9 +1602,7 @@ def dpsk_v4_fp8_partial_kernel(
     if is_dual:
         assert inner_iter_2 > 0, "dual-cache call requires inner_iter_2 > 0"
         assert topk_2 % block_I == 0
-        assert (
-            topk_2 // block_I
-        ) % inner_iter_2 == 0, (
+        assert (topk_2 // block_I) % inner_iter_2 == 0, (
             f"NI_2={topk_2 // block_I} must be divisible by inner_iter_2={inner_iter_2}"
         )
         assert block_size_kv_2 > 0 and (block_size_kv_2 & (block_size_kv_2 - 1)) == 0
@@ -2256,12 +2251,8 @@ def dpsk_v4_combine_kernel(
 
         @T.prim_func
         def main(
-            Partial_O: T.Tensor(
-                [batch, seq_len, n_groups, num_heads, DT], BF16
-            ),  # type: ignore
-            Partial_LSE: T.Tensor(
-                [batch, seq_len, n_groups, num_heads], accum_dtype
-            ),  # type: ignore
+            Partial_O: T.Tensor([batch, seq_len, n_groups, num_heads, DT], BF16),  # type: ignore
+            Partial_LSE: T.Tensor([batch, seq_len, n_groups, num_heads], accum_dtype),  # type: ignore
             Topk_length_1: T.Tensor([batch], INT32),  # type: ignore
             Topk_length_2: T.Tensor([batch], INT32),  # type: ignore
             Attn_sink: T.Tensor([num_heads], FP32),  # type: ignore
@@ -2369,12 +2360,8 @@ def dpsk_v4_combine_kernel(
 
     @T.prim_func
     def main(
-        Partial_O: T.Tensor(
-            [batch, seq_len, n_groups, num_heads, DT], BF16
-        ),  # type: ignore
-        Partial_LSE: T.Tensor(
-            [batch, seq_len, n_groups, num_heads], accum_dtype
-        ),  # type: ignore
+        Partial_O: T.Tensor([batch, seq_len, n_groups, num_heads, DT], BF16),  # type: ignore
+        Partial_LSE: T.Tensor([batch, seq_len, n_groups, num_heads], accum_dtype),  # type: ignore
         Attn_sink: T.Tensor([num_heads], FP32),  # type: ignore
         Output: T.Tensor([batch, seq_len, num_heads, DT], BF16),  # type: ignore
         LSE: T.Tensor([batch, seq_len, num_heads], accum_dtype),  # type: ignore

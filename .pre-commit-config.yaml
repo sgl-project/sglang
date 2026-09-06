@@ -48,10 +48,7 @@ repos:
           python/sglang/srt/grpc/.*_pb2\.pyi$|
           python/sglang/srt/grpc/.*_pb2_grpc\.pyi$|
           )$
-  - repo: https://github.com/psf/black
-    rev: 26.1.0
-    hooks:
-      - id: black-jupyter
+      - id: ruff-format
         exclude: '^python/sglang/srt/grpc/.*_pb2\.py$|^python/sglang/srt/grpc/.*_pb2_grpc\.py$|^python/sglang/srt/grpc/.*_pb2\.pyi$|^python/sglang/srt/grpc/.*_pb2_grpc\.pyi$'
   - repo: https://github.com/codespell-project/codespell
     rev: v2.4.1
