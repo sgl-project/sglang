@@ -1395,6 +1395,20 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
             "Setting page size to 64 for compressed QSA "
             "(full//ratio compressed addressing)."
         )
+        if server_args.enable_mixed_chunk:
+            # Mixed chunked prefill injects running decode rows into an
+            # EXTEND batch (ForwardMode.MIXED) with prefix_len == seq_len
+            # - 1, which is not a multiple of indexer_compress_ratio and
+            # breaks the compressed QSA write plan
+            # (QwenSparseAttnBackend._qsa_build_write_plan). Mutate
+            # server_args directly (speculative_hook-style): the publish
+            # gate's resolvable_fields whitelist does not admit
+            # enable_mixed_chunk as a model-overridable declaration.
+            server_args.enable_mixed_chunk = False
+            logger.warning(
+                "Disabling --enable-mixed-chunk: it is not supported with "
+                "compressed QSA (mixed decode rows break prefix compression)."
+            )
     return overrides
 
 
