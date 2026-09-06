@@ -368,6 +368,13 @@ sglang serve \
   --port 30010
 ```
 
+### Asynchronous output saving
+
+Use `--async-output-save` to overlap output saving with the next request during
+native NVIDIA CUDA serving. It is disabled by default. See
+[Asynchronous output saving](/docs/sglang-diffusion/performance-optimization#asynchronous-output-saving)
+for an example, eligible requests, and the response latency and memory tradeoffs.
+
 ### Health endpoints
 
 SGLang Diffusion separates process liveness from inference readiness:

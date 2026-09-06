@@ -487,6 +487,7 @@ class ServerArgs(DisaggServerArgsMixin):
     batching_delay_ms: float = 0.0
     batching_config: str | None = None
     enable_batching_metrics: bool = False
+    async_output_save: bool = False
 
     # Strict port mode: fail if requested port is unavailable instead of auto-selecting
     strict_ports: bool = False
@@ -2700,6 +2701,18 @@ class ServerArgs(DisaggServerArgsMixin):
             action="store_true",
             default=ServerArgs.enable_batching_metrics,
             help="Log periodic batch efficiency metrics such as realized batch size and queue wait time.",
+        )
+        parser.add_argument(
+            "--async-output-save",
+            action="store_true",
+            default=ServerArgs.async_output_save,
+            help="Finalize outputs (frame materialization, image/video encoding, disk "
+            "write, reply) on a background thread so the scheduler can start the next "
+            "request's GPU work immediately. Applies to save-to-file requests on the "
+            "output rank; requests carrying perf instrumentation keep the synchronous "
+            "path. Memory metrics reported for a request may include the next "
+            "request's allocations, and the per-request allocator cache release is "
+            "skipped.",
         )
         parser.add_argument(
             "--host",
