@@ -983,6 +983,22 @@ class DeepseekV2MoE(nn.Module):
             else self._maybe_quant_moe_input_once(hidden_states)
         )
         self.alt_stream.wait_stream(current_stream)
+        prequant_event = None
+        if (
+            envs.SGLANG_MOE_ALT_STREAM_PREQUANT.get()
+            and hidden_states.shape[0] > 0
+            and hidden_states.dtype == torch.bfloat16
+        ):
+            from sglang.kernels.ops.quantization.fp8_kernel import (
+                per_token_group_quant_fp8,
+            )
+
+            with torch.cuda.stream(self.alt_stream):
+                hidden_states._sglang_prequant_fp8 = per_token_group_quant_fp8(
+                    hidden_states, 128, column_major_scales=True
+                )
+                prequant_event = torch.cuda.Event()
+                prequant_event.record(self.alt_stream)
         has_shared_output = (
             hidden_states.shape[0] > 0 and self.num_fused_shared_experts == 0
         )
@@ -1017,6 +1033,8 @@ class DeepseekV2MoE(nn.Module):
             and topk_output.format == TopKOutputFormat.BYPASSED
             and self.experts.supports_deferred_finalize
         )
+        if prequant_event is not None:
+            current_stream.wait_event(prequant_event)
         if deferred_finalize:
             final_hidden_states = self.experts.forward_deferred_finalize(
                 hidden_states, topk_output

@@ -757,6 +757,67 @@ def ensure_workspace_initialized(
     return workspace_manager.initialized
 
 
+def flashinfer_allreduce(
+    input_tensor: torch.Tensor,
+    max_token_num: int = 2048,
+    use_oneshot: Optional[bool] = None,
+    use_attn_tp_group: bool = True,
+) -> Optional[torch.Tensor]:
+    """Plain all-reduce through the FlashInfer fusion workspace
+    (``AllReduceFusionPattern.kAllReduce``), sharing the workspace used by
+    ``flashinfer_allreduce_residual_rmsnorm``. Returns None whenever the
+    workspace/backend is unavailable so callers can fall back to NCCL.
+    """
+    if not is_flashinfer_available() or _flashinfer_comm is None:
+        return None
+
+    if use_attn_tp_group:
+        # Callers use this as a full-TP all-reduce; the attention-TP
+        # workspace only matches that contract when the groups coincide.
+        if get_parallel().attn_tp_size != get_parallel().tp_size:
+            return None
+        world_size = get_parallel().attn_tp_size
+    else:
+        if get_parallel().moe_ep_size > 1:
+            world_size = get_parallel().moe_ep_size
+        else:
+            world_size = get_parallel().moe_tp_size
+    if world_size <= 1:
+        return None
+
+    if input_tensor.shape[0] > max_token_num or not input_tensor.is_contiguous():
+        return None
+
+    if not ensure_workspace_initialized(
+        max_token_num=max_token_num,
+        hidden_dim=input_tensor.shape[-1],
+        use_fp32_lamport=(input_tensor.dtype == torch.float32),
+        dtype=input_tensor.dtype,
+        token_num=input_tensor.shape[0],
+        use_oneshot=use_oneshot,
+        use_attn_tp_group=use_attn_tp_group,
+    ):
+        return None
+
+    workspace_manager = _get_workspace_manager(use_attn_tp_group)
+    if workspace_manager.workspace is None:
+        return None
+
+    output = torch.empty_like(input_tensor)
+    kwargs = dict(
+        input=input_tensor,
+        workspace=workspace_manager.workspace,
+        pattern=_flashinfer_comm.AllReduceFusionPattern.kAllReduce,
+        launch_with_pdl=True,
+        output=output,
+        use_oneshot=use_oneshot,
+    )
+    if _flashinfer_allreduce_supports_trigger_completion:
+        kwargs["trigger_completion_at_end"] = False
+    _flashinfer_comm.allreduce_fusion(**kwargs)
+    return output
+
+
 def fake_flashinfer_allreduce_residual_rmsnorm(
     input_tensor: torch.Tensor,
     residual: torch.Tensor,

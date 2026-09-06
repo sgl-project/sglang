@@ -947,6 +947,19 @@ class Envs:
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
+    # Low-latency small-batch serving: dequantize fp8 block-quant DENSE linear
+    # weights to bf16 at load time so tiny-M GEMMs run through cuBLAS instead of
+    # the fp8 path plus its per-call activation quant. MoE expert weights are
+    # unaffected. Trades ~2x dense weight memory for decode latency.
+    SGLANG_BS1_BF16_DENSE = EnvBool(False)
+    # Route only profiled GLM-5.2 tiny-M dense shapes from the load-time BF16
+    # path through the Blackwell CuTe-DSL TGV kernel. Default-off and inert
+    # unless SGLANG_BS1_BF16_DENSE is also enabled.
+    SGLANG_BS1_BF16_TGV = EnvBool(False)
+    # Launch the CuTe-DSL TGV bf16 GEMM with programmatic dependent launch.
+    # Round 5/6 GB300 evidence: PDL TGV crashes or regresses under real TP8
+    # serving concurrency; set 0 to run the same tactics without PDL.
+    SGLANG_CUTEDSL_BF16_GEMM_PDL = EnvBool(True)
     # On by default; set SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0 as a kill switch.
     # Consults the tuned per-(N, K, M) Triton tile config table in
     # apply_fp8_linear. When a tuned config exists for this GPU / weight shape /
@@ -972,6 +985,10 @@ class Envs:
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
+    # Route small bf16 TP all-reduces (total bytes at or below this value)
+    # through the FlashInfer all-reduce workspace's plain kAllReduce pattern
+    # instead of NCCL. 0 disables.
+    SGLANG_FLASHINFER_SMALL_AR_MAX_BYTES = EnvInt(0)
     # Per-rank dispatch capacity of the FlashInfer MoE A2A dispatcher. Unset
     # means each call site keeps its own default.
     SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(None)
@@ -1147,6 +1164,11 @@ class Envs:
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
+    # Issue the FP8 MoE activation quant on the model's alt stream so it
+    # overlaps the router gate GEMM instead of sitting serially between the
+    # gate reduce and the routing kernel (trtllm bypassed path only;
+    # fail-closed: the runner ignores the pre-quant unless block/layout match).
+    SGLANG_MOE_ALT_STREAM_PREQUANT = EnvBool(False)
     # DeepSeek/GLM MoE (deepseek_v2.py): quantize the (dp-gathered) MoE input
     # to per-token-group-128 fp8 ONCE and feed both the fused shared-expert
     # GEMM (cutlass w8a8 linear) and the routed experts' triton fused runner,
@@ -1620,6 +1642,11 @@ class Envs:
     # ===================================================================
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
+    # Keep the multimem (symmetric-memory) all-gather enabled when the TP
+    # group spans nodes that form one NVLink clique (MNNVL fabric), where
+    # cross-node multicast works. Default off preserves the conservative
+    # single-node-only behavior.
+    SGLANG_MULTIMEM_AG_CROSS_NODE = EnvBool(False)
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
