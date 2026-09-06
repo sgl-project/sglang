@@ -209,7 +209,7 @@ fn every_eviction_policy_operates_without_torch() {
 }
 
 #[test]
-fn continuation_insert_shares_immutable_value_storage() {
+fn inserted_values_do_not_retain_the_caller_buffer() {
     let mut tree = core("lru");
     let initial_key = vec![10, 20];
     insert(&mut tree, &initial_key, &[1, 2]);
@@ -237,12 +237,13 @@ fn continuation_insert_shares_immutable_value_storage() {
         },
     );
 
-    // The stored suffix still points at the caller's buffer: no page was copied.
+    // The tree holds its own compact copy, so dropping or reusing the caller's
+    // buffer releases it even while these pages stay cached.
     let stored = tree.collect_full_device_indices(
         result.last_device_node_id.expect("inserted node"),
         prefix.last_device_node_id,
     );
     assert_eq!(stored.as_slice(), &[3, 4]);
-    assert_eq!(stored.as_slice().as_ptr(), extended_ptr);
+    assert_ne!(stored.as_slice().as_ptr(), extended_ptr);
     assert_eq!(stored.to_i64_vec(), vec![3, 4]);
 }

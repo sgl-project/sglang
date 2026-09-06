@@ -21,8 +21,9 @@ pub trait RadixValue: Debug + Sized + 'static {
     /// Cheap handle clone used while collecting a matched path.
     fn shallow_clone(&self) -> Self;
 
-    /// Ownership-independent value used when the tree adopts external indices.
-    /// Immutable backends may continue sharing their backing storage.
+    /// Compact, owned copy for the tree to store. It must not share the caller's
+    /// buffer: node values outlive the insert that produced them, and a shared
+    /// slice would pin the whole buffer until the last node holding it dies.
     fn copy_for_adoption(&self) -> Self;
 
     /// View or copy a contiguous logical range.
@@ -107,7 +108,7 @@ where
     }
 
     fn copy_for_adoption(&self) -> Self {
-        self.shallow_clone()
+        Self::from_vec(self.as_slice().to_vec())
     }
 
     fn slice(&self, start: usize, len: usize) -> Self {
@@ -125,16 +126,9 @@ where
 
     fn split_owned(self, at: usize) -> (Self, Self) {
         assert!(0 < at && at < self.len(), "split point must be internal");
-        let middle = self.range.start + at;
-        let head = Self {
-            storage: Arc::clone(&self.storage),
-            range: self.range.start..middle,
-        };
-        let tail = Self {
-            storage: self.storage,
-            range: middle..self.range.end,
-        };
-        (head, tail)
+        // Both halves stay in the tree, so neither may keep the wider buffer alive.
+        let (head, tail) = self.as_slice().split_at(at);
+        (Self::from_vec(head.to_vec()), Self::from_vec(tail.to_vec()))
     }
 
     fn concat(values: &[Self]) -> Self {
@@ -242,17 +236,31 @@ mod tests {
     use super::{PageValue, RadixValue};
 
     #[test]
-    fn page_value_slices_split_and_concatenates_without_changing_order() {
+    fn slices_are_views_and_stored_values_are_compact() {
         let value = PageValue::from_vec(vec![10_u64, 11, 12, 13]);
-        assert_eq!(value.slice(1, 2).as_slice(), &[11, 12]);
+        let view = value.slice(1, 2);
+        assert_eq!(view.as_slice(), &[11, 12]);
+        assert_eq!(view.as_slice().as_ptr(), value.as_slice()[1..].as_ptr());
+        assert_eq!(view.storage.len(), 4);
 
-        let value_ptr = value.as_slice().as_ptr();
-        let (head, tail) = value.split_owned(2);
-        assert_eq!(head.as_slice(), &[10, 11]);
-        assert_eq!(tail.as_slice(), &[12, 13]);
-        let joined = PageValue::concat(&[head, tail]);
+        // What the tree keeps must not pin the caller's wider buffer.
+        let adopted = view.copy_for_adoption();
+        assert_eq!(adopted.as_slice(), &[11, 12]);
+        assert_eq!(adopted.storage.len(), 2);
+        let (head, tail) = value.split_owned(3);
+        assert_eq!(head.as_slice(), &[10, 11, 12]);
+        assert_eq!(tail.as_slice(), &[13]);
+        assert_eq!((head.storage.len(), tail.storage.len()), (3, 1));
+    }
+
+    #[test]
+    fn concat_widens_adjacent_views_and_copies_otherwise() {
+        let value = PageValue::from_vec(vec![10_u64, 11, 12, 13]);
+        let joined = PageValue::concat(&[value.slice(0, 2), value.slice(2, 2)]);
         assert_eq!(joined.as_slice(), &[10, 11, 12, 13]);
-        assert_eq!(joined.as_slice().as_ptr(), value_ptr);
+        assert_eq!(joined.as_slice().as_ptr(), value.as_slice().as_ptr());
+        let copied = PageValue::concat(&[value.slice(2, 2), value.slice(0, 2)]);
+        assert_eq!(copied.as_slice(), &[12, 13, 10, 11]);
     }
 
     #[test]
