@@ -580,6 +580,48 @@ class VocabParallelEmbedding(torch.nn.Module):
                 output_parallel = tensor_model_parallel_all_reduce(output_parallel)
         return output_parallel
 
+    def share_table_from(self, source: "VocabParallelEmbedding") -> None:
+        """Take over ``source``'s table, quantization state included.
+
+        EAGLE / NextN drafts build their own input embedding and are then handed
+        the target's by ``set_embed_and_head()`` / ``set_embed()``, which moves
+        ``weight`` alone. That is the whole table only while it is a dense
+        ``[vocab, hidden]`` tensor. A quantized table stores packed rows whose
+        dequantization state -- the scales, the LUT, and the ``quant_method``
+        that reads them -- lives on the *module*, so a receiver that keeps its
+        own unquantized method gathers packed bytes and returns rows of the
+        wrong width and dtype. Adopt the source's method and every tensor it
+        owns instead; nothing is copied, so both modules share one table.
+        """
+        if source is self:
+            return
+        if (
+            self.num_embeddings_padded != source.num_embeddings_padded
+            or self.embedding_dim != source.embedding_dim
+            or self.tp_size != source.tp_size
+            or self.shard_indices != source.shard_indices
+        ):
+            raise ValueError(
+                "Cannot share an embedding table across different vocab-parallel "
+                f"layouts: {self.extra_repr()} vs {source.extra_repr()}."
+            )
+        for name in list(self._parameters) + list(self._buffers):
+            delattr(self, name)
+        self.quant_config = source.quant_config
+        self.quant_method = source.quant_method
+        self.scheme = source.scheme
+        for name, param in source.named_parameters(recurse=False):
+            # A previous handover may have left a plain attribute behind.
+            self.__dict__.pop(name, None)
+            self.register_parameter(name, param)
+        for name, buffer in source.named_buffers(recurse=False):
+            self.__dict__.pop(name, None)
+            self.register_buffer(
+                name,
+                buffer,
+                persistent=name not in source._non_persistent_buffers_set,
+            )
+
     def extra_repr(self) -> str:
         s = f"num_embeddings={self.num_embeddings_per_partition}"
         s += f", embedding_dim={self.embedding_dim}"
@@ -669,3 +711,22 @@ class ParallelLMHead(VocabParallelEmbedding):
     def forward(self, input_):
         del input_
         raise RuntimeError("LMHead's weights should be used in the sampler.")
+
+
+def find_embedding_module(
+    model: torch.nn.Module, weight: torch.Tensor
+) -> Optional[VocabParallelEmbedding]:
+    """The ``VocabParallelEmbedding`` in ``model`` whose table is ``weight``.
+
+    Identity, not name: the speculative handover is defined in terms of the
+    tensor a model hands over (``get_embed_and_head()``), and every model
+    spells the module that holds it differently. ``Module.modules()``
+    deduplicates by identity, so a tied lm_head is visited once.
+    """
+    for module in model.modules():
+        if (
+            isinstance(module, VocabParallelEmbedding)
+            and getattr(module, "weight", None) is weight
+        ):
+            return module
+    return None

@@ -1095,3 +1095,57 @@ def get_plan_stream(
         return plan_stream, plan_stream_ctx
     else:
         return None, contextlib.nullcontext()
+
+
+def share_target_embedding(
+    target_model: torch.nn.Module,
+    draft_model: torch.nn.Module,
+    embed: Optional[torch.Tensor],
+) -> None:
+    """Finish a quantized embedding handover the draft cannot finish itself.
+
+    ``set_embed_and_head()`` / ``set_embed()`` move the target's embedding
+    ``weight`` onto the draft. For an unquantized table that is the whole
+    table and there is nothing more to do -- the common case, and the early
+    return below. A quantized table is not self-contained: its rows are packed
+    and the scales, the lookup table and the ``quant_method`` that turn them
+    back into hidden states live on the target's *module*. The draft, built
+    unquantized (these checkpoints exclude the draft branch from
+    quantization), would gather packed bytes with its own unquantized method
+    and hand its first norm rows of half the width. Give it the target's
+    module state as well; the tensors are shared, not copied.
+    """
+    from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+    from sglang.srt.layers.vocab_parallel_embedding import find_embedding_module
+
+    if embed is None:
+        return
+    target_embed = find_embedding_module(target_model, embed)
+    if target_embed is None or isinstance(
+        target_embed.quant_method, UnquantizedEmbeddingMethod
+    ):
+        return
+    draft_embed = find_embedding_module(draft_model, embed)
+    if draft_embed is None:
+        # Not an error: several EAGLE3 drafts deliberately keep their own table
+        # -- their set_embed() returns early when target_hidden_size differs
+        # from the draft's hidden_size, and one converts the tensor rather than
+        # adopting it. Those drafts never gather from the target's packed rows,
+        # so there is nothing to finish here; leave them as they are.
+        logger.warning(
+            "The draft model did not adopt the target's embedding tensor "
+            "(set_embed_and_head()/set_embed() kept the draft's own table, as "
+            "EAGLE3 drafts do when target_hidden_size != hidden_size), so the "
+            "target's %s table is not shared. The draft embeds tokens with its "
+            "own table.",
+            type(target_embed.quant_method).__name__,
+        )
+        return
+    if draft_embed is target_embed:
+        return
+    draft_embed.share_table_from(target_embed)
+    logger.info(
+        "Draft model shares the target's %s embedding table (module state, not "
+        "just the packed weight).",
+        type(target_embed.quant_method).__name__,
+    )

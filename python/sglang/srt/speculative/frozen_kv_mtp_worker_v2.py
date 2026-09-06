@@ -77,6 +77,7 @@ from sglang.srt.speculative.spec_utils import (
     fast_topk,
     get_plan_stream,
     select_top_k_tokens,
+    share_target_embedding,
     spec_stage_span,
 )
 from sglang.srt.utils import empty_context, get_available_gpu_memory
@@ -156,6 +157,11 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
         if hasattr(self.draft_model_runner.model, "set_embed_and_head"):
             self.draft_model_runner.model.set_embed_and_head(embed, head)
+            share_target_embedding(
+                self.target_worker.model_runner.model,
+                self.draft_model_runner.model,
+                embed,
+            )
         else:
             logger.debug(
                 "Draft model %s does not implement set_embed_and_head; "

@@ -333,6 +333,22 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 param_name = "model.embed_tokens.weight"
                 if param_name in params_dict:
                     param = params_dict[param_name]
+                    if param.shape[1:] != loaded_weight.shape[1:]:
+                        # The checkpoint's embedding is quantized -- packed rows,
+                        # narrower than the hidden size -- while the MTP branch is
+                        # built unquantized, because these checkpoints exclude
+                        # `mtp*` from quantization. The local copy cannot hold it,
+                        # and it does not have to: a self-draft is handed the
+                        # target's embedding, and the speculative worker shares the
+                        # quantized module along with it.
+                        logger.warning_once(
+                            f"MTP: not loading {name} into the draft's unquantized "
+                            f"embedding (checkpoint rows are "
+                            f"{tuple(loaded_weight.shape[1:])}, the draft's are "
+                            f"{tuple(param.shape[1:])}); the draft shares the "
+                            f"target's embedding module instead."
+                        )
+                        continue
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )

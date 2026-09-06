@@ -85,6 +85,7 @@ from sglang.srt.speculative.spec_utils import (
     get_plan_stream,
     sample_draft_proposal,
     select_top_k_tokens,
+    share_target_embedding,
 )
 from sglang.srt.utils import (
     get_available_gpu_memory,
@@ -366,6 +367,11 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         # Share the embedding and lm_head
         for i in range(self.speculative_num_steps):
             self.draft_runner_list[i].model.set_embed_and_head(embed, head)
+            share_target_embedding(
+                self.target_worker.model_runner.model,
+                self.draft_runner_list[i].model,
+                embed,
+            )
 
     def init_attention_backend(self):
         # Create attn backends

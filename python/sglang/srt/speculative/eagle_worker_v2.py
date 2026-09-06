@@ -98,6 +98,7 @@ from sglang.srt.speculative.spec_utils import (
     renorm_draft_probs,
     sample_draft_proposal,
     select_top_k_tokens,
+    share_target_embedding,
     spec_stage_span,
 )
 from sglang.srt.utils.async_probe import (
@@ -336,6 +337,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
+
+        # Both branches above move the target's embedding *tensor* onto the
+        # draft. When that table is quantized the tensor is only the packed
+        # rows; the draft also needs the module state that dequantizes them.
+        share_target_embedding(
+            self.target_worker.model_runner.model, self.draft_runner.model, embed
+        )
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
