@@ -61,8 +61,9 @@ from sglang.srt.layers.linear import LinearBase as SrtLinearBase
 
 
 @pytest.mark.parametrize("missing", [False, True])
+@pytest.mark.parametrize("competing_index", [False, True])
 def test_native_encoder_restoration_checks_checkpoint_before_fallback(
-    tmp_path, missing
+    tmp_path, missing, competing_index
 ):
     config = transformers.T5Config(
         vocab_size=32,
@@ -80,6 +81,18 @@ def test_native_encoder_restoration_checks_checkpoint_before_fallback(
     if missing:
         weights.pop(required)
     save_file(weights, tmp_path / "model.safetensors")
+    if competing_index:
+        # LTX-2 ships both indexes in text_encoder; only the HF one owns this model
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {name: "model.safetensors" for name in weights}})
+        )
+        alternate = "diffusion_pytorch_model.safetensors"
+        save_file({"diffusion.weight": torch.ones(2, 2)}, tmp_path / alternate)
+        (tmp_path / "diffusion_pytorch_model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"diffusion.weight": alternate}})
+        )
+        alternate_weights = dict(checkpoint_weights_iterator(str(tmp_path)))
+        assert set(alternate_weights) == {"diffusion.weight"}
     args = ServerArgs(
         model_path="x",
         component_precisions={"text_encoder": "fp32"},

@@ -6,6 +6,7 @@ import torch
 import transformers
 from torch import nn
 from transformers import PretrainedConfig
+from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig
 from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
@@ -484,7 +485,10 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
             ) and model.should_materialize_checkpoint_weight(name)
 
         yield from checkpoint_weights_iterator(
-            model_path, to_cpu=to_cpu, key_filter=include_checkpoint_weight
+            model_path,
+            to_cpu=to_cpu,
+            key_filter=include_checkpoint_weight,
+            index_file=SAFE_WEIGHTS_INDEX_NAME,
         )
 
     def load_customized(

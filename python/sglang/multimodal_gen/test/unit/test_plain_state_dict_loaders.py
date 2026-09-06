@@ -138,8 +138,14 @@ def test_real_components_restore_weights_and_exact_policy(
         reference = model_cls(config).eval()
     if role != "vocoder":
         reference = reference.to(dtype=dtype)
+    # custom linear constructors allocate empty storage, not checkpoint values
+    generator = torch.Generator().manual_seed(0)
+    with torch.no_grad():
+        for parameter in reference.parameters():
+            parameter.uniform_(-0.1, 0.1, generator=generator)
     weights = {}
     for name, tensor in reference.state_dict().items():
+        assert torch.isfinite(tensor).all(), name
         name = name.replace("video_aggregate_embed.", "video_text_proj_in.").replace(
             "audio_aggregate_embed.", "audio_text_proj_in."
         )
