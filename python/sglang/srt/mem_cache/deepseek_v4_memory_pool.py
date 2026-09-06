@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
-from typing import List, Literal, NamedTuple, Optional, Sequence, Tuple
+from typing import List, Literal, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -564,11 +564,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.c4_size = c4_size
         self.c4_logical_size = c4_logical_size
         self.c128_size = c128_size
-        # Keep the legacy SWA-addressed pool large enough on non-unified paths.
-        # Unified request-addressed sizing is set exactly after resolving the
-        # unified-kv gate below.
-        c4_ring_size = self.get_ring_size(4)
-        c4_state_pool_size = max(c4_state_pool_size, self.num_req_slots * c4_ring_size)
         self.c4_state_pool_size = c4_state_pool_size
         c128_ring_size = self.get_ring_size(128)
         if ONLINE_C128:
@@ -629,9 +624,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
 
         self._unified_kv = is_unified_kv_triton()
-        if self._unified_kv:
-            # Unified C4 state is request-scoped: no SWA-derived over-allocation.
-            self.c4_state_pool_size = self.num_req_slots * c4_ring_size
 
         if self._unified_kv:
             self.swa_kv_pool = None
@@ -1058,37 +1050,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert self.online_c128_mtp_pending_seq_lens is not None
         return self.online_c128_mtp_pending_seq_lens
 
-    def clear_c4_req_states(self, req_pool_indices: Sequence[int]) -> None:
-        """Reset newly allocated unified C4 attention and indexer state rings.
-
-        Only the request-owned rows are touched. The extra sentinel/ring padding
-        allocated by :class:`CompressStatePool` remains intact.
-        """
-        if not self._unified_kv or not req_pool_indices:
-            return
-
-        pools = [
-            pool
-            for pool in self.compress_state_pools + self.indexer_compress_state_pools
-            if pool is not None and pool.ratio == 4
-        ]
-        if not pools:
-            return
-
-        ring_size = self.get_ring_size(4)
-        device = pools[0].kv_score_buffer.kv_score.device
-        req_indices = torch.as_tensor(req_pool_indices, dtype=torch.long, device=device)
-        state_locs = (
-            req_indices[:, None] * ring_size
-            + torch.arange(ring_size, dtype=torch.long, device=device)
-        ).flatten()
-
-        for pool in pools:
-            state = pool.kv_score_buffer.kv_score
-            half = state.shape[-1] // 2
-            state[state_locs, :half] = 0
-            state[state_locs, half:] = float("-inf")
-
     def clear_c128_req_state(self, req_pool_idx: int) -> None:
         """Reset request-scoped C128 state for one req slot."""
         for pool in self.compress_state_pools:
@@ -1115,13 +1076,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         accept_lens: torch.Tensor,
         num_draft_tokens: int,
     ) -> None:
-        """Clear offline C128 ring slots written for rejected speculative tokens.
-
-        C4 needs no equivalent cleanup: draft states are written in position order,
-        and every rejected position is overwritten before it can become the prior
-        state of a later accepted token. C128 cleanup is required because its
-        compression boundary can consume a previously written draft slot directly.
-        """
+        """Clear offline C128 ring slots written for rejected speculative tokens."""
         if ONLINE_C128 or num_draft_tokens <= 1 or req_pool_indices.numel() == 0:
             return
 
