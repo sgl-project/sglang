@@ -190,6 +190,39 @@ class TestCustomMoeFP4DispatchOverrides(CustomTestCase):
                     with self.subTest(provider=provider.__name__, changes=changes):
                         self.assertEqual(provider(self._args(**changes), None), {})
 
+    def test_auto_runner_guard_survives_later_quantization_resolution(self):
+        for architecture, provider in self._PROVIDERS:
+            for quantization, backend, disabled in (
+                ("nvfp4_online", "flashinfer_trtllm", True),
+                ("modelopt_fp4", "flashinfer_cutlass", False),
+            ):
+                args = self._args(moe_runner_backend="auto", quantization=quantization)
+                with (
+                    self.subTest(architecture=architecture, quantization=quantization),
+                    envs.SGLANG_MOE_NVFP4_DISPATCH.override(True),
+                    patch.object(
+                        overrides_module,
+                        "get_platform",
+                        return_value=SimpleNamespace(
+                            is_sm100=disabled, is_sm120=not disabled
+                        ),
+                    ),
+                ):
+                    # Model providers run before the generic quantization pass.
+                    overrides_module.declare_resolution(
+                        args, provider.__name__, **provider(args, None)
+                    )
+                    overrides_module.run_post_process_pass(
+                        args, overrides_module._moe_runner_backend_quant_constraints
+                    )
+                self.assertEqual(resolution_result(args, "moe_runner_backend"), backend)
+                self.assertEqual(
+                    resolution_result(
+                        args, "disable_flashinfer_cutlass_moe_fp4_allgather"
+                    ),
+                    disabled,
+                )
+
 
 class TestDSparkCheckpointConfig(CustomTestCase):
     def test_sample_from_anchor_is_read_from_checkpoint_config(self):
