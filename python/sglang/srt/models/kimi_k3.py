@@ -544,6 +544,7 @@ class KimiK3MoE(nn.Module):
         self._ep_a2a = (
             _a2a_backend.is_megamoe()
             or _a2a_backend.is_deepep()
+            or _a2a_backend.is_deepep_v2()
             or _a2a_backend.is_mooncake()
             or _a2a_backend.is_ascend_fuseep()
             or _a2a_backend.is_mori()
@@ -2347,6 +2348,7 @@ class KimiK3DecoderLayer(nn.Module):
             (
                 _a2a_backend.is_megamoe()
                 or _a2a_backend.is_deepep()
+                or _a2a_backend.is_deepep_v2()
                 or _a2a_backend.is_mooncake()
                 or _a2a_backend.is_ascend_fuseep()
                 or _a2a_backend.is_mori()
