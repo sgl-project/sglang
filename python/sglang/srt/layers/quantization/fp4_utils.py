@@ -98,6 +98,7 @@ class Fp4GemmRunnerBackend(Enum):
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
+    FLASHINFER_B12X = "flashinfer_b12x"
     MARLIN = "marlin"
 
     def is_auto(self) -> bool:
@@ -152,6 +153,8 @@ def initialize_fp4_gemm_config() -> None:
             backend = "flashinfer_cutedsl"
         elif is_cuda() and (10, 0) > get_device_capability() >= (8, 0):
             backend = "marlin"
+        elif is_cuda() and get_device_capability()[0] == 12:
+            backend = "flashinfer_b12x"
         else:
             backend = "flashinfer_cutlass"
 

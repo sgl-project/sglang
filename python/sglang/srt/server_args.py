@@ -317,6 +317,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutedsl",
     "flashinfer_cutlass",
     "flashinfer_trtllm",
+    "flashinfer_b12x",
     "marlin",
 ]
 add_fp4_gemm_runner_backend_choices = FP4_GEMM_RUNNER_BACKEND_CHOICES.extend
