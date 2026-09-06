@@ -751,6 +751,13 @@ class Envs:
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
     # staging_buffer.py once Triton kernels are fully validated in production.
     SGLANG_STAGING_USE_TORCH = EnvBool(False)
+    # MLA decode-side KV broadcast: only attn TP rank 0 pulls KV over the
+    # network, then relays it to the other attn TP ranks over NVLink.
+    SGLANG_ENABLE_DISAGG_MLA_DECODE_KV_BROADCAST = EnvBool(False)
+    # Relay chunk size. Caps the persistent HBM the relay holds, and with it how
+    # many gather -> broadcast -> scatter rounds a transfer costs; the rounds are
+    # serialized, so larger chunks trade HBM for fewer round trips.
+    SGLANG_DISAGG_MLA_DECODE_KV_BROADCAST_CHUNK_MIB = EnvInt(32)
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)

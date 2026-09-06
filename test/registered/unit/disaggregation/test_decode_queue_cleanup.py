@@ -33,6 +33,31 @@ class FakeReceiver:
         return None
 
 
+def _transfer_queue(decode_reqs, kv_broadcaster=None):
+    """A DecodeTransferQueue holding only the state pop_transferred touches."""
+    queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+    queue.queue = list(decode_reqs)
+    queue.enable_staging = False
+    queue.enable_deferred_kv_release = False
+    queue.gloo_group = MagicMock()
+    queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+    queue.tp_rank = 0
+    queue.tree_cache = MagicMock()
+    queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
+    queue.spec_algorithm = MagicMock()
+    queue.spec_algorithm.is_none.return_value = True
+    queue.kv_broadcaster = kv_broadcaster
+    queue._clean_hicache_prefetch_resources = MagicMock()
+
+    scheduler = MagicMock()
+    scheduler.enable_decode_hicache = False
+    scheduler.enable_hisparse = False
+    scheduler.output_streamer = MagicMock()
+    scheduler.metrics_reporter.enable_metrics = False
+    queue.scheduler = scheduler
+    return queue
+
+
 class TestDecodeQueueCleanup(CustomTestCase):
     def test_paged_swa_retraction_resume_uses_physical_page_budget(self):
         # resume_retracted_reqs reads the retraction backend off the disagg
@@ -335,25 +360,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
             hicache_restore_status=HiCacheRestoreResult.READY,
         )
 
-        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
-        queue.queue = [decode_req]
-        queue.enable_staging = False
-        queue.enable_deferred_kv_release = False
-        queue.gloo_group = MagicMock()
-        queue.req_to_metadata_buffer_idx_allocator = MagicMock()
-        queue.tp_rank = 0
-        queue.tree_cache = MagicMock()
-        queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
-        queue.spec_algorithm = MagicMock()
-        queue.spec_algorithm.is_none.return_value = True
-        queue._clean_hicache_prefetch_resources = MagicMock()
-
-        scheduler = MagicMock()
-        scheduler.enable_decode_hicache = False
-        scheduler.enable_hisparse = False
-        scheduler.output_streamer = MagicMock()
-        scheduler.metrics_reporter.enable_metrics = False
-        queue.scheduler = scheduler
+        queue = _transfer_queue([decode_req])
+        scheduler = queue.scheduler
 
         mock_poll.return_value = [KVPoll.Failed]
 
@@ -422,6 +430,110 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.enable_hierarchical_cache = False
 
         self.assertFalse(scheduler.is_fully_idle())
+
+
+class _RecordingBroadcaster:
+    """Records what the transfer queue hands the relay, and the queue it kept."""
+
+    def __init__(self, queue=None):
+        self.queue = queue
+        self.calls = []
+        self.queue_lens = []
+
+    def broadcast(self, kv_indices_list, state_indices_list):
+        self.calls.append((list(kv_indices_list), list(state_indices_list)))
+        if self.queue is not None:
+            self.queue_lens.append(len(self.queue.queue))
+
+
+def _relay_req(rid: str):
+    return SimpleNamespace(
+        rid=rid,
+        relay_kv_indices=f"{rid}-kv",
+        relay_state_indices=f"{rid}-state",
+    )
+
+
+class TestBroadcastTransferredKV(CustomTestCase):
+    """The relay hook behind SGLANG_ENABLE_DISAGG_MLA_DECODE_KV_BROADCAST.
+
+    DecodeKVBroadcaster.broadcast is a collective: every attention TP rank must
+    call it with the same number of index tensors, in the same iteration. What
+    picks those tensors is DecodeTransferQueue._broadcast_transferred_kv, so a
+    rank-dependent choice there hangs the broadcast instead of corrupting a
+    cache.
+    """
+
+    def test_relays_only_the_reqs_polling_success(self):
+        """Success comes out of a MIN all-reduce, so every rank agrees on it.
+
+        The commit loop's other per-entry conditions are local, so keying the
+        relay off any of them would give the ranks different index sets.
+        """
+        reqs = [_relay_req("a"), _relay_req("b"), _relay_req("c")]
+        broadcaster = _RecordingBroadcaster()
+        queue = _transfer_queue(reqs, broadcaster)
+
+        queue._broadcast_transferred_kv(
+            [KVPoll.Success, KVPoll.WaitingForInput, KVPoll.Success]
+        )
+
+        self.assertEqual(
+            broadcaster.calls,
+            [(["a-kv", "c-kv"], ["a-state", "c-state"])],
+        )
+
+    def test_relays_each_req_once(self):
+        """A req sits in the queue for several pollups after it transfers.
+
+        Relaying it again would rewrite rows the peers already hold, and a rank
+        that cleared its copy while another did not would desync the broadcast.
+        The second call is also the no-indices case -- a full prefix hit
+        captures nothing, and passing its None through would break the concat.
+        """
+        reqs = [_relay_req("a")]
+        broadcaster = _RecordingBroadcaster()
+        queue = _transfer_queue(reqs, broadcaster)
+
+        queue._broadcast_transferred_kv([KVPoll.Success])
+        queue._broadcast_transferred_kv([KVPoll.Success])
+
+        self.assertEqual(
+            broadcaster.calls,
+            [(["a-kv"], ["a-state"]), ([], [])],
+        )
+        self.assertIsNone(reqs[0].relay_kv_indices)
+        self.assertIsNone(reqs[0].relay_state_indices)
+
+    @patch("sglang.srt.disaggregation.decode.release_kv_cache")
+    @patch("sglang.srt.disaggregation.decode.prepare_abort")
+    @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
+    def test_relay_runs_before_entries_are_removed(
+        self, mock_poll, mock_prepare_abort, mock_release_kv_cache
+    ):
+        """The relay zips the queue against polls, so it needs the whole queue.
+
+        pop_transferred drops entries as it commits them; relaying after that
+        would pair each poll with the wrong req and broadcast the wrong rows.
+        """
+        decode_req = SimpleNamespace(
+            req=SimpleNamespace(rid="dropped", bootstrap_room=7, return_logprob=False),
+            rid="dropped",
+            kv_receiver=FakeReceiver(),
+            metadata_buffer_index=3,
+            hicache_restore_status=HiCacheRestoreResult.READY,
+            relay_kv_indices=None,
+            relay_state_indices=None,
+        )
+        queue = _transfer_queue([decode_req])
+        broadcaster = _RecordingBroadcaster(queue)
+        queue.kv_broadcaster = broadcaster
+
+        mock_poll.return_value = [KVPoll.Failed]
+        queue.pop_transferred()
+
+        self.assertEqual(queue.queue, [])
+        self.assertEqual(broadcaster.queue_lens, [1])
 
 
 if __name__ == "__main__":

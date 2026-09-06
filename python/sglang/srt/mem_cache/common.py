@@ -39,8 +39,12 @@ class RetractionBackup(NamedTuple):
     mamba_cpu: Any = None
 
 
+def kv_to_page_indices_device(kv_indices: torch.Tensor, page_size: int) -> torch.Tensor:
+    return kv_indices[::page_size] // page_size
+
+
 def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
-    return (kv_indices[::page_size] // page_size).cpu().numpy()
+    return kv_to_page_indices_device(kv_indices, page_size).cpu().numpy()
 
 
 def kv_to_page_num(num_kv_indices: int, page_size: int):
