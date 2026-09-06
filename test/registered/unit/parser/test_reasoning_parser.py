@@ -1122,24 +1122,47 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
                         self._feed(DeepSeekR1Detector(), text, chunk_size), expected
                     )
 
-    def test_text_before_think_token_is_chunk_dependent(self):
-        """Accepted divergence, inherited from main: text before `<think>` lands
-        in reasoning or content depending on where the chunk boundary falls."""
-        text = "lead<think>r</think>tail"
-        variants = {
-            self._feed(Qwen3Detector(), text, chunk_size)
-            for chunk_size in self.CHUNK_SIZES
-        }
+    def test_text_before_think_token_is_content(self):
+        """Text the model writes before `<think>` is content, whatever the
+        chunking. Previously this produced three different streaming splits --
+        including one where the whole block, markers and all, reached the client
+        as content -- plus a fourth from one-shot that kept the literal `<think>`
+        inside reasoning_content."""
+        self._assert_invariant(
+            Qwen3Detector,
+            "lead<think>r</think>tail",
+            ("r", "leadtail"),
+        )
 
-        self.assertEqual(
-            variants,
-            {("r", "leadtail"), ("", text), ("leadr", "tail")},
+    def test_single_leading_newline_before_think_token(self):
+        """The common shape: one character in front of the opening marker. The
+        one-shot path only stripped `<think>` at index 0, so the marker itself
+        used to be handed to the client inside reasoning_content."""
+        self._assert_invariant(
+            Qwen3Detector,
+            "\n<think>r</think>tail",
+            ("r", "\ntail"),
         )
-        # And the non-streaming path produces yet a fourth split.
-        one_shot = Qwen3Detector().detect_and_parse(text)
-        self.assertEqual(
-            (one_shot.reasoning_text, one_shot.normal_text), ("lead<think>r", "tail")
+
+    def test_forced_reasoning_keeps_lead_text_as_reasoning(self):
+        """When the chat template already opened the block, text before an echoed
+        marker is reasoning -- the opposite routing from the non-forced case, and
+        the streaming path's behaviour all along. Only the marker is dropped."""
+        self._assert_invariant(
+            DeepSeekR1Detector,
+            "lead<think>r</think>tail",
+            ("leadr", "tail"),
         )
+
+    def test_content_ending_in_start_token_prefix_survives(self):
+        """The holdback that recombines a split opening marker must not swallow
+        content that merely ends in one of its prefixes and is never completed."""
+        for chunk_size in self.CHUNK_SIZES:
+            with self.subTest(chunk_size=chunk_size):
+                self.assertEqual(
+                    self._feed(Qwen3Detector(), "answer <", chunk_size),
+                    ("", "answer <"),
+                )
 
     def test_dsv4_reasoning_quoting_dsml_is_chunk_dependent(self):
         """Accepted divergence: streaming ends the block at the DSML marker, while
