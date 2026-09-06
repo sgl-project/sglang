@@ -1902,6 +1902,36 @@ def test_host_copies_are_given_back_when_room_appears(monkeypatch):
     assert not comp._parked_non_layer_weights, "host copies should be released"
 
 
+def test_releasing_host_copies_restores_placeholders(monkeypatch):
+    """When room appears, release host copies but restore parameters from placeholders."""
+    local_device = layerwise_offload_mod.current_platform.get_local_torch_device()
+    if local_device.type == "cpu":
+        pytest.skip("parking targets device-resident parameters")
+
+    # The parking path is for the non-MPS accelerator path, so bypass the
+    # MPS-specific early return while still using the real local device.
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "is_mps", lambda: False)
+    comp = _ParkableResidentComponent(4)
+    comp.configure_layerwise_offload(_server_args(performance_mode="memory"))
+    assert comp.non_layer.device.type == local_device.type
+    _headroom(monkeypatch, 0)
+    comp.park_non_layer_weights()
+    assert comp._parked_non_layer_weights
+    comp.restore_non_layer_weights()
+
+    _headroom(monkeypatch, 400)
+    comp.park_non_layer_weights()
+    assert not comp._parked_non_layer_weights
+    # Only the non-layer parameter must be restored; streamed layer weights are
+    # intentionally left as placeholders by the layerwise manager.
+    assert comp.non_layer.shape != (1,), (
+        "non_layer left as a (1,) placeholder after host copies were released"
+    )
+
+
 def test_park_placeholders_are_shared(monkeypatch):
     """One stand-in per (device, dtype), not one allocation per parked weight."""
     comp = _ParkableResidentComponent(4)
