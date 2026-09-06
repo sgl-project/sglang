@@ -756,7 +756,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MOE_NVFP4_DISPATCH</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use nvfp4 for moe dispatch (on flashinfer_cutlass or flashinfer_cutedsl moe runner backend)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use NVFP4 for MoE dispatch. With <code>--moe-a2a-backend none</code>, opt <code>flashinfer_trtllm</code>, <code>flashinfer_trtllm_routed</code>, and <code>flashinfer_cutedsl</code> into FP4 all-gather for <code>modelopt_fp4</code> or <code>nvfp4_online</code>, including per-token FP32 activation scales. Requires DP attention with TP = EP = DP &gt; 1. CuTe DSL W4A16 keeps BF16 activations. Kimi-K3 and Inkling keep their existing BF16 communication because their custom MoE layouts do not support this all-gather path. The existing CUTLASS automatic enablement and <code>--disable-flashinfer-cutlass-moe-fp4-allgather</code> override still apply.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"false"</code></td>
     </tr>
     <tr>

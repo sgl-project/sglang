@@ -222,12 +222,24 @@ class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTest
 
 class TestServerUpdateWeightsFromDiskNVFP4(UpdateWeightsFromDiskBase, CustomTestCase):
     model = "nvidia/Qwen3-30B-A3B-NVFP4"
+    decode_payload = {**UpdateWeightsFromDiskBase.decode_payload, "routed_dp_rank": 0}
+    launch_env = {
+        "SGLANG_MOE_NVFP4_DISPATCH": "1",
+        "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "0",
+    }
     backend_test_suites = (
         {
             "name": "flashinfer_trtllm_nvfp4",
             "other_args": (
                 "--tp-size",
                 "4",
+                "--ep-size",
+                "4",
+                "--dp-size",
+                "4",
+                "--enable-dp-attention",
+                "--moe-a2a-backend",
+                "none",
                 "--fp4-gemm-backend",
                 "flashinfer_trtllm",
                 "--moe-runner-backend",
@@ -241,7 +253,9 @@ class TestServerUpdateWeightsFromDiskNVFP4CuteDSL(
     UpdateWeightsFromDiskBase, CustomTestCase
 ):
     model = "nvidia/Qwen3-30B-A3B-NVFP4"
+    decode_payload = {**UpdateWeightsFromDiskBase.decode_payload, "routed_dp_rank": 0}
     launch_env = {
+        "SGLANG_MOE_NVFP4_DISPATCH": "1",
         "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "1",
         "SGLANG_FLASHINFER_MOE_FUSED_FINALIZE": "1",
         "FLASHINFER_NVFP4_4OVER6": "1",
@@ -257,6 +271,9 @@ class TestServerUpdateWeightsFromDiskNVFP4CuteDSL(
                 "4",
                 "--ep-size",
                 "4",
+                "--dp-size",
+                "4",
+                "--enable-dp-attention",
                 "--fp4-gemm-backend",
                 "flashinfer_cutedsl",
                 "--moe-runner-backend",

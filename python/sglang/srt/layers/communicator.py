@@ -58,7 +58,7 @@ from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_una
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_dp_reduce_scatterv,
-    should_use_flashinfer_cutlass_moe_fp4_allgather,
+    should_use_flashinfer_moe_fp4_allgather,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
@@ -426,7 +426,7 @@ class LayerScatterModes:
             if (
                 # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
                 not get_moe_a2a_backend().is_none()
-                or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                or should_use_flashinfer_moe_fp4_allgather()
                 or enable_dwdp()
             ):
                 return ScatterMode.SCATTERED

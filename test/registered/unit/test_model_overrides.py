@@ -18,6 +18,8 @@ from unittest.mock import patch
 from sglang.srt.arg_groups import model_override_base as base_module
 from sglang.srt.arg_groups import overrides as overrides_module
 from sglang.srt.arg_groups.arg_utils import A, Arg, resolvable_fields
+from sglang.srt.arg_groups.model_overrides import inkling as inkling_module
+from sglang.srt.arg_groups.model_overrides import kimi_k3 as kimi_k3_module
 from sglang.srt.arg_groups.model_overrides import minicpm as minicpm_module
 from sglang.srt.arg_groups.model_overrides import qwen3_5 as qwen3_5_module
 from sglang.srt.arg_groups.overrides import (
@@ -91,6 +93,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "speculative_moe_runner_backend",
                     "speculative_moe_a2a_backend",
                     "disable_shared_experts_fusion",
+                    "disable_flashinfer_cutlass_moe_fp4_allgather",
                     "kv_cache_dtype",
                     "dsa_prefill_backend",
                     "dsa_decode_backend",
@@ -107,6 +110,85 @@ class TestModelOverridableWhitelist(CustomTestCase):
                 }
             ),
         )
+
+
+class TestCustomMoeFP4DispatchOverrides(CustomTestCase):
+    _PROVIDERS = (
+        (
+            "KimiK3ForConditionalGeneration",
+            kimi_k3_module._kimi_k3_fp4_dispatch_overrides,
+        ),
+        ("KimiK3LinearForCausalLM", kimi_k3_module._kimi_k3_fp4_dispatch_overrides),
+        (
+            "InklingForConditionalGeneration",
+            inkling_module._inkling_fp4_dispatch_overrides,
+        ),
+        (
+            "InklingForConditionalGenerationMTP",
+            inkling_module._inkling_fp4_dispatch_overrides,
+        ),
+    )
+
+    @staticmethod
+    def _args(**changes):
+        from sglang.srt.server_args import ServerArgs
+
+        config = dict(
+            model_path="dummy",
+            moe_runner_backend="flashinfer_trtllm",
+            enable_dp_attention=True,
+            tp_size=2,
+            ep_size=2,
+            dp_size=2,
+        )
+        config.update(changes)
+        return ServerArgs(**config)
+
+    def test_registered_guards_disable_only_the_new_allgather_path(self):
+        with envs.SGLANG_MOE_NVFP4_DISPATCH.override(True):
+            for architecture, provider in self._PROVIDERS:
+                self.assertIn(provider, base_module._MODEL_OVERRIDE_FNS[architecture])
+                for backend in (
+                    "flashinfer_trtllm",
+                    "flashinfer_trtllm_routed",
+                    "flashinfer_cutedsl",
+                ):
+                    # None covers checkpoint-inferred static quantization.
+                    for quantization in (None, "modelopt_fp4", "nvfp4_online"):
+                        with self.subTest(
+                            architecture=architecture,
+                            backend=backend,
+                            quantization=quantization,
+                        ):
+                            args = self._args(
+                                moe_runner_backend=backend, quantization=quantization
+                            )
+                            with self.assertLogs(base_module.logger, level="WARNING"):
+                                overrides = provider(args, None)
+                            self.assertEqual(
+                                overrides,
+                                {"disable_flashinfer_cutlass_moe_fp4_allgather": True},
+                            )
+                            validate_declarations(
+                                args, [(provider.__name__, overrides)]
+                            )
+                            self.assertFalse(
+                                args.disable_flashinfer_cutlass_moe_fp4_allgather
+                            )
+
+    def test_existing_dispatch_paths_are_unchanged(self):
+        for _, provider in self._PROVIDERS:
+            with envs.SGLANG_MOE_NVFP4_DISPATCH.override(False):
+                self.assertEqual(provider(self._args(), None), {})
+            with envs.SGLANG_MOE_NVFP4_DISPATCH.override(True):
+                for changes in (
+                    {"moe_runner_backend": "flashinfer_cutlass"},
+                    {"moe_a2a_backend": "deepep"},
+                    {"enable_dp_attention": False},
+                    {"disable_flashinfer_cutlass_moe_fp4_allgather": True},
+                ):
+                    with self.subTest(provider=provider.__name__, changes=changes):
+                        self.assertEqual(provider(self._args(**changes), None), {})
 
 
 class TestDSparkCheckpointConfig(CustomTestCase):

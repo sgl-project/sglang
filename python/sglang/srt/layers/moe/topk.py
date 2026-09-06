@@ -104,7 +104,10 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
     is_moe_input_scattered_across_dp_ranks,
 )
-from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
+from sglang.srt.layers.moe.utils import (
+    has_per_rank_fused_shared_slots,
+    should_use_flashinfer_moe_fp4_allgather,
+)
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -628,14 +631,7 @@ class TopK(BaseFusedOp):
         )
         return self._apply_waterfill(topk_output, hidden_states.shape[0])
 
-    def forward_cuda(
-        self,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-        *,
-        num_token_non_padded: Optional[torch.Tensor] = None,
-        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
-    ) -> TopKOutput:
+    def _get_output_format(self) -> TopKOutputFormat:
         if self.topk_config.output_format is not None:
             output_format = self.topk_config.output_format
         elif get_moe_runner_backend().is_triton_kernels():
@@ -658,7 +654,17 @@ class TopK(BaseFusedOp):
             output_format = TopKOutputFormat.BYPASSED
         else:
             output_format = TopKOutputFormat.STANDARD
+        return output_format
 
+    def forward_cuda(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        *,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    ) -> TopKOutput:
+        output_format = self._get_output_format()
         if output_format == TopKOutputFormat.TRITON_KERNEL:
             # renormalize=True is equivalent to sm_first=False
             (
@@ -764,6 +770,14 @@ class TopK(BaseFusedOp):
                         device=device,
                     )
                 )
+        if (
+            should_use_flashinfer_moe_fp4_allgather()
+            and self._get_output_format() == TopKOutputFormat.BYPASSED
+        ):
+            # Empty DP ranks must gather the same routing fields as nonempty
+            # ranks. The standard dispatcher fills in the logits' expert width.
+            empty = torch.empty((0, 0), dtype=torch.float32, device=device)
+            return BypassedTopKOutput(empty, empty, self.topk_config)
         topk = self.topk_config.top_k - self.topk_config.num_fused_shared_experts
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()

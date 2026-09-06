@@ -71,6 +71,7 @@ from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
     is_deepep_class_backend,
+    should_use_flashinfer_moe_fp4_allgather,
     uses_per_rank_fused_shared_slots,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -383,6 +384,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         or get_moe_a2a_backend().is_mori()
                         or get_moe_a2a_backend().is_deepep_v2()
                         or get_moe_a2a_backend().is_flashinfer()
+                        or should_use_flashinfer_moe_fp4_allgather()
                     )
                     else {}
                 ),
@@ -634,7 +636,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     @property
     def supports_deferred_finalize(self) -> bool:
         return bool(
-            self.experts.supports_deferred_finalize and self.shared_expert is not None
+            self.experts.supports_deferred_finalize
+            and self.shared_expert is not None
+            and not should_use_flashinfer_moe_fp4_allgather()
         )
 
     def _forward_router_experts(

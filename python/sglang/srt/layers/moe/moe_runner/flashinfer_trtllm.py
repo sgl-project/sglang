@@ -1287,10 +1287,14 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     hidden_states_scale = dispatch_output.hidden_states_scale
     per_token_scale = None
     if hidden_states_scale is not None:
-        # NVFP4 dispatch (flashinfer a2a): inputs are already FP4-quantized by
+        # NVFP4 dispatch: inputs are already FP4-quantized by
         # the dispatcher, so pass them through unchanged.
         hs_fp4 = hidden_states
         hs_scale_linear = hidden_states_scale
+        per_token_scale = getattr(
+            dispatch_output, "hidden_states_per_token_scale", None
+        )
+        assert (per_token_scale is not None) == quant_info.use_per_token_activation
     elif quant_info.use_per_token_activation:
         from flashinfer import SfLayout, nvfp4_quantize
 
@@ -1348,9 +1352,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
         )
         # When the dispatcher delivered pre-quantized FP4 (hidden_states is uint8),
-        # the MoE output is bf16 rather than the input dtype.
+        # the MoE output retains the configured activation dtype.
         output_dtype = (
-            hidden_states.dtype if hidden_states_scale is None else torch.bfloat16
+            hidden_states.dtype
+            if hidden_states_scale is None
+            else runner_config.params_dtype
         )
         from sglang.srt.runtime_context import get_forward
 
