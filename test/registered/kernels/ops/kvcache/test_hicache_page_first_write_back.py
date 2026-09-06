@@ -95,7 +95,7 @@ def _assert_pages_equal(host_ref, device_ref, host_pages, device_pages) -> None:
         )
 
 
-def _run_mha(element_dim: int, page_count: int) -> None:
+def _run_mha(element_dim: int, page_count: int, num_layers: int = NUM_LAYERS) -> None:
     pool_size = PAGE_SIZE * (page_count + 8)
     device_pool = MHATokenToKVPool(
         size=pool_size,
@@ -103,7 +103,7 @@ def _run_mha(element_dim: int, page_count: int) -> None:
         head_num=element_dim // 128,
         head_dim=128,
         dtype=torch.bfloat16,
-        layer_num=NUM_LAYERS,
+        layer_num=num_layers,
         device=DEVICE,
         enable_memory_saver=False,
     )
@@ -116,7 +116,7 @@ def _run_mha(element_dim: int, page_count: int) -> None:
     # page_first + kernel staged write-back JIT path must be enabled.
     assert host_pool.can_use_write_back_jit
 
-    for layer_id in range(NUM_LAYERS):
+    for layer_id in range(num_layers):
         _fill_with_offset(device_pool.k_buffer[layer_id], layer_id)
         _fill_with_offset(device_pool.v_buffer[layer_id], layer_id + 100)
 
@@ -133,7 +133,7 @@ def _run_mha(element_dim: int, page_count: int) -> None:
     )
     torch.cuda.synchronize()
 
-    for layer_id in range(NUM_LAYERS):
+    for layer_id in range(num_layers):
         _assert_pages_equal(
             host_pool.k_data_refs[layer_id],
             device_pool.k_buffer[layer_id],
@@ -150,20 +150,20 @@ def _run_mha(element_dim: int, page_count: int) -> None:
     # Load path (prefix-cache hit): exercises the hicache.cuh load matchers.
     if not host_pool.can_use_jit:
         return
-    for layer_id in range(NUM_LAYERS):
+    for layer_id in range(num_layers):
         device_pool.k_buffer[layer_id].zero_()
         device_pool.v_buffer[layer_id].zero_()
 
     load_pages = torch.arange(1, 1 + page_count, device=DEVICE, dtype=torch.int64)
     load_indices = _token_indices_for_pages(load_pages)
     host_indices_device = host_indices.to(DEVICE)
-    for layer_id in range(NUM_LAYERS):
+    for layer_id in range(num_layers):
         host_pool.load_to_device_per_layer(
             device_pool, host_indices_device, load_indices, layer_id, "kernel"
         )
     torch.cuda.synchronize()
 
-    for layer_id in range(NUM_LAYERS):
+    for layer_id in range(num_layers):
         _assert_pages_equal(
             host_pool.k_data_refs[layer_id],
             device_pool.k_buffer[layer_id],
@@ -247,6 +247,12 @@ def _run_mla(element_dim: int, page_count: int) -> None:
 @pytest.mark.parametrize("page_count", PAGE_COUNTS)
 def test_page_first_staged_write_back_mha(element_dim: int, page_count: int) -> None:
     _run_mha(element_dim, page_count)
+
+
+def test_page_first_staged_write_back_mha_batch_copy() -> None:
+    # Sixteen layers at this shape reach the 128 KiB threshold that selects
+    # cudaMemcpyBatchAsync instead of the per-page fallback.
+    _run_mha(element_dim=256, page_count=1, num_layers=16)
 
 
 @pytest.mark.parametrize("element_dim", MLA_ELEMENT_DIMS)
