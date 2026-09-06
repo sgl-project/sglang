@@ -367,10 +367,6 @@ def compressed_attention_tilelang(
             topk_values,
         )
 
-        # Note: q_idx masking is handled inside the kernel via causal_mask
-        # which sets scores to -1e9 for K blocks beyond the causal boundary.
-        # These blocks won't be selected in topk due to their low scores.
-
         # Sort with -1 values at the end (match original behavior)
         # Replace -1 with large value, sort, then replace back
         large_val = pooled_k_len + 1000  # Any value larger than max valid index

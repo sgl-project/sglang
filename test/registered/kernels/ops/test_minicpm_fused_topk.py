@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import functools
+
 import pytest
 import tilelang.math
+import torch
 from tilelang import tvm
 
 from sglang.srt.layers.attention.minicpm.fuse_kernel import (
     _fused_attn_pooling_online_topk,
+    fused_attn_pooling_online_topk_prefill,
+)
+from sglang.srt.layers.attention.minicpm.sparse_utils import (
+    compressed_attention_tilelang,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -46,6 +53,111 @@ _KERNEL_KWARGS = dict(
     local_blocks=_LOCAL_BLOCKS,
     dtype_str="bfloat16",
 )
+
+
+@functools.cache
+def _kernel(factory, **overrides):
+    return factory(batch_size=1, **_KERNEL_KWARGS, **overrides)
+
+
+def _run_topk(kernel, q, k, cu_seqlens_q, cu_seqlens_k, cache_lens):
+    return compressed_attention_tilelang(
+        q,
+        k,
+        _BLOCK_SIZE,
+        _SPARSE_TOPK,
+        _KERNEL_TOPK,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        cache_lens=cache_lens,
+        fused_kernel=kernel,
+        max_cache_len=_MAX_CACHE_LEN,
+    )
+
+
+_PREFILL_GRID = 256
+
+
+def _run_prefill_topk(seq_len: int, seed: int = 0) -> torch.Tensor:
+    num_k = (seq_len - _KERNEL_SIZE) // _KERNEL_STRIDE + 1
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    q = torch.randn(
+        (seq_len, _HEADS, _DIM),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    k = torch.randn(
+        (num_k, _HEAD_KV, _DIM),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    cu_seqlens_q = torch.tensor([0, seq_len], dtype=torch.int32, device="cuda")
+    cu_seqlens_k = torch.tensor([0, num_k], dtype=torch.int32, device="cuda")
+    kernel = _kernel(
+        fused_attn_pooling_online_topk_prefill, max_seqlen_q_grid=_PREFILL_GRID
+    )
+    return _run_topk(kernel, q, k, cu_seqlens_q, cu_seqlens_k, None)
+
+
+@pytest.mark.parametrize("seq_len", [78, 200])
+def test_prefill_topk_selects_each_tokens_own_block(seq_len):
+    """Select each token's own block even before its compressed row exists."""
+    topk_idx = _run_prefill_topk(seq_len)
+    own = torch.arange(seq_len, device="cuda") // _BLOCK_SIZE
+    assert (topk_idx == own[None, :, None]).any(-1).all()
+
+
+# Chunked prefill past the sparse capacity (_SPARSE_TOPK * _BLOCK_SIZE tokens):
+# every new token has more causally visible blocks than output slots.
+_CHUNK_CACHE_LEN = _SPARSE_TOPK * _BLOCK_SIZE
+_CHUNK_NEW_LEN = 384
+_CHUNK_TOTAL_LEN = _CHUNK_CACHE_LEN + _CHUNK_NEW_LEN
+
+
+def test_prefill_topk_subscribed_rows_select_only_causal_blocks():
+    """Raw kernel candidates must not include blocks past the token's own."""
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    direction = torch.ones(_DIM, dtype=torch.bfloat16, device="cuda")
+    q = (
+        5.0 * direction
+        + 0.1
+        * torch.randn(
+            (_CHUNK_NEW_LEN, _HEADS, _DIM),
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+        )
+    ).contiguous()
+    num_k = (_CHUNK_TOTAL_LEN - _KERNEL_SIZE) // _KERNEL_STRIDE + 1
+    k = 0.01 * torch.randn(
+        (num_k, _HEAD_KV, _DIM),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    num_blocks = _CHUNK_TOTAL_LEN // _BLOCK_SIZE
+    rows_per_block = _BLOCK_SIZE // _KERNEL_STRIDE
+    # This key is visible in block b - 1 but also overlaps block b.
+    for future_block in range(_SPARSE_TOPK + 1, num_blocks):
+        k[rows_per_block * future_block - 1] = 50.0 * direction
+    cu_seqlens_q = torch.tensor([0, _CHUNK_NEW_LEN], dtype=torch.int32, device="cuda")
+    cu_seqlens_k = torch.tensor([0, num_k], dtype=torch.int32, device="cuda")
+    cache_lens = torch.tensor([_CHUNK_CACHE_LEN], dtype=torch.int32, device="cuda")
+
+    kernel = _kernel(
+        fused_attn_pooling_online_topk_prefill, max_seqlen_q_grid=_CHUNK_NEW_LEN
+    )
+    pos = _CHUNK_CACHE_LEN + torch.arange(_CHUNK_NEW_LEN, device="cuda")
+    own = (pos // _BLOCK_SIZE)[None, :, None]
+
+    def check_candidates(q, k, cu_q, cu_k, cache, indices, values):
+        kernel(q, k, cu_q, cu_k, cache, indices, values)
+        assert ((indices <= own) | (indices < 0)).all()
+
+    topk_idx = _run_topk(check_candidates, q, k, cu_seqlens_q, cu_seqlens_k, cache_lens)
+    assert (topk_idx >= 0).sum(-1).eq(_SPARSE_TOPK).all()
 
 
 def _tir_nodes(statement, predicate):
