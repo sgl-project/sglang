@@ -17,6 +17,7 @@ import time
 
 from aiohttp import web
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqType
 from sglang.srt.utils.common import get_bool_env_var
 
@@ -164,8 +165,6 @@ async def serve_grpc(server_args, model_info=None):
             "If already installed, there may be a broken import due to a "
             "version mismatch — see the chained exception above for details."
         ) from e
-
-    from sglang.srt.arg_groups.overrides import resolving_view
 
     # The integrated servicer builds an `Engine`, which validates and publishes
     # on its own. Validating here would run `check_server_args` twice, and the

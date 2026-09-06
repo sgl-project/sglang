@@ -26,11 +26,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.configs.model_config import (
-    AttentionArch,
-    ModelConfig,
-    ModelImpl,
-)
+from sglang.srt.configs.model_config import AttentionArch, ModelConfig, ModelImpl
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.distributed import bootstrap
@@ -74,10 +70,7 @@ from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
 from sglang.srt.layers import deep_gemm_wrapper, model_parallel
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.layers.cp.utils import (
-    get_cp_strategy,
-    is_cp_v2_active,
-)
+from sglang.srt.layers.cp.utils import get_cp_strategy, is_cp_v2_active
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
@@ -86,17 +79,11 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.kv_cache_configurator import (
-    KVCacheConfigurator,
-)
+from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.model_executor.cuda_graph_config import (
-    cuda_graph_fully_disabled,
-)
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
@@ -123,8 +110,10 @@ from sglang.srt.model_executor.model_runner_components.kv_pool_runtime import (
     is_post_capture_kv_active,
 )
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
+    AttentionAndMoeLayers,
     ModelLayerInfo,
     adjust_hybrid_swa_layer_ids,
+    compute_attention_and_moe_layers,
     resolve_layer_indices,
 )
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
@@ -162,10 +151,7 @@ from sglang.srt.model_executor.model_runner_components.weight_updater import (
     WeightUpdater,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
-from sglang.srt.model_executor.runner import (
-    EagerRunner,
-    get_batch_sizes_to_capture,
-)
+from sglang.srt.model_executor.runner import EagerRunner, get_batch_sizes_to_capture
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     assert_published,
@@ -226,11 +212,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
-from sglang.srt.utils.offloader import (
-    create_offloader,
-    get_offloader,
-    set_offloader,
-)
+from sglang.srt.utils.offloader import create_offloader, get_offloader, set_offloader
 from sglang.srt.utils.profile_utils import build_step_span_name
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_checker import WeightChecker
@@ -250,6 +232,14 @@ elif current_platform.is_out_of_tree():
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SamplingPrewarmResult:
+    """Memory requirements observed while pre-warming a sampling path."""
+
+    sampling_input_bytes: int = 0
+    sampling_headroom_bytes: int = 0
 
 
 def _prefill_cuda_graph_allows_context_parallel(
@@ -300,8 +290,7 @@ class ModelRunner:
     def sampling_observer(self, observer: Optional[SamplingObserver]) -> None:
         if observer is not None and not self.supports_sampling_observer():
             raise ValueError(
-                "sampling observers are not supported by the configured "
-                "sampling path"
+                "sampling observers are not supported by the configured sampling path"
             )
         self._sampling_observer = observer
 
@@ -377,6 +366,7 @@ class ModelRunner:
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = get_memory().enable_hisparse
         self._sampling_observer: Optional[SamplingObserver] = None
+        self.sampling_prewarm_result = SamplingPrewarmResult()
 
         self.init_startup_observability()
 
@@ -445,7 +435,7 @@ class ModelRunner:
 
         # Update deep gemm configure
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-            deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
+            deep_gemm_wrapper.update_deep_gemm_config(gpu_id)
 
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
@@ -470,9 +460,9 @@ class ModelRunner:
         )
 
         if self.ps.pp_size > 1:
-            assert (
-                self.support_pp
-            ), "Pipeline Parallel is not compatible with this model."
+            assert self.support_pp, (
+                "Pipeline Parallel is not compatible with this model."
+            )
 
         # For weight updates
         self.init_weight_updater()
@@ -487,19 +477,17 @@ class ModelRunner:
         if not (get_exec().moe.elastic_ep_backend is not None and is_ep_scale_joiner()):
             return
 
-        join_effective_ep_size = (
-            get_parallel().config.ep_join_rank_offset + self.ps.tp_size
-        )
+        join_effective_ep_size = get_parallel().ep_join_rank_offset + self.ps.tp_size
         dist.barrier(group=self.tp_group.cpu_group)
         if self.ps.tp_rank == 0:
             register_scale_cohort(
-                get_parallel().config.ep_join_rank_offset,
+                get_parallel().ep_join_rank_offset,
                 join_effective_ep_size,
             )
         join_scale_process_group()
         get_context().override("elastic_ep.scale_join", ep_size=join_effective_ep_size)
 
-        global_ep_rank = self.ps.tp_rank + get_parallel().config.ep_join_rank_offset
+        global_ep_rank = self.ps.tp_rank + get_parallel().ep_join_rank_offset
         broadcast_global_expert_location_metadata(
             model_config=self.model_config,
             moe_ep_rank=global_ep_rank,
@@ -507,7 +495,6 @@ class ModelRunner:
         )
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
-                self.server_args,
                 get_global_expert_location_metadata(),
                 rank=global_ep_rank,
             )
@@ -546,7 +533,7 @@ class ModelRunner:
         self._rearm_eplb_after_elastic_scale()
 
     def init_msprobe(self):
-        self.msprobe_debugger = misc_utils.create_msprobe_debugger(self.server_args)
+        self.msprobe_debugger = misc_utils.create_msprobe_debugger()
 
     def init_weight_updater(self):
         self.weight_updater = WeightUpdater(
@@ -655,7 +642,6 @@ class ModelRunner:
         prepare_moe_topk(
             model=self.model,
             model_config=self.model_config,
-            server_args=self.server_args,
             moe_ep_size=self.ps.moe_ep_size,
             moe_ep_rank=self.ps.moe_ep_rank,
         )
@@ -698,7 +684,7 @@ class ModelRunner:
         if self.is_draft_worker:
             return
         expert_rank = self.ps.moe_ep_rank + (
-            get_parallel().config.ep_join_rank_offset if is_ep_scale_joiner() else 0
+            get_parallel().ep_join_rank_offset if is_ep_scale_joiner() else 0
         )
         set_global_expert_location_metadata(
             compute_initial_expert_location_metadata(
@@ -713,7 +699,6 @@ class ModelRunner:
             )
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
-                self.server_args,
                 get_global_expert_location_metadata(),
                 rank=expert_rank,
             )
@@ -754,7 +739,6 @@ class ModelRunner:
     def maybe_init_expert_backup_client(self):
         self.expert_backup_client = (
             ExpertBackupClient(
-                server_args=self.server_args,
                 model_config=self.model_config,
                 moe_ep_size=self.ps.moe_ep_size,
                 moe_ep_rank=self.ps.moe_ep_rank,
@@ -773,6 +757,12 @@ class ModelRunner:
             self.apply_torch_tp()
 
     def maybe_init_lora_manager(self):
+        if self.spec_algorithm.is_uno():
+            from sglang.srt.speculative.uno_lora import init_uno_lora_manager
+
+            self.lora_manager, self.uno_lora_id = init_uno_lora_manager(self)
+            return
+
         # Adapters apply to the target model only; the draft runs unadapted.
         if get_lora().enable_lora and not self.is_draft_worker:
             self.init_lora_manager()
@@ -863,6 +853,18 @@ class ModelRunner:
             return
         self.pre_model_load_memory += preloaded_weights_bytes / (1 << 30)
 
+    def init_kv_index_translator(self):
+        """The one object that converts KV ids for this runner: attention
+        backends build their read indices from the table it hands them instead
+        of probing the pool's id spaces themselves."""
+        self.kv_index_translator = KVIndexTranslator(
+            req_to_token=self.req_to_token_pool.req_to_token,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            token_to_kv_pool=self.token_to_kv_pool,
+            page_size=self.page_size or 1,
+            device=self.device,
+        )
+
     def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
         if memory_pool_config is not None:
@@ -889,6 +891,8 @@ class ModelRunner:
     def _init_post_memory_pool_components(self):
         """Post-pool component wiring, split out of alloc_memory_pool so forks
         that build bespoke memory pools can reuse it after allocating them."""
+        self.init_kv_index_translator()
+
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
         # forwards captured into the graph see the patched pool methods.
@@ -917,7 +921,7 @@ class ModelRunner:
         )
         from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-        hisparse_cfg = parse_hisparse_config(self.server_args)
+        hisparse_cfg = parse_hisparse_config()
         hisparse_top_k = getattr(
             self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
         )
@@ -929,7 +933,7 @@ class ModelRunner:
             device=self.device,
             tp_group=(
                 self.attention_tp_group.cpu_group
-                if get_parallel().config.enable_dp_attention
+                if get_parallel().enable_dp_attention
                 else self.tp_group.cpu_group
             ),
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
@@ -965,7 +969,7 @@ class ModelRunner:
     def post_capture_elastic_ep_recover(self):
         join_process_groups()
 
-        global_ep_rank = self.ps.tp_rank + get_parallel().config.ep_join_rank_offset
+        global_ep_rank = self.ps.tp_rank + get_parallel().ep_join_rank_offset
         broadcast_global_expert_location_metadata(
             model_config=self.model_config,
             moe_ep_rank=global_ep_rank,
@@ -975,7 +979,6 @@ class ModelRunner:
         )
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
-                self.server_args,
                 get_global_expert_location_metadata(),
                 rank=global_ep_rank,
             )
@@ -1004,8 +1007,11 @@ class ModelRunner:
         self.attn_backend = backends.attn_backend
         self.decode_attn_backend = backends.decode_attn_backend
         self.decode_attn_backend_group = backends.decode_attn_backend_group
+        self.kv_index_translator.bind_and_verify_backends(
+            [self.attn_backend, self.decode_attn_backend]
+        )
 
-        if get_parallel().dcp_enabled and get_parallel().config.dcp_replicate_q_proj:
+        if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
 
     def _prepare_replicated_q_proj(self) -> None:
@@ -1047,6 +1053,11 @@ class ModelRunner:
             "dcp_replicate_q_proj: prepared full-head Q weights for %d MLA layers",
             n_prepared,
         )
+
+    def prewarm_sampling(self) -> SamplingPrewarmResult:
+        """Warm the sampling path after graph initialization."""
+        self.sampling_prewarm_result = SamplingPrewarmResult()
+        return self.sampling_prewarm_result
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         capture = capture_cuda_graphs(
@@ -1138,13 +1149,8 @@ class ModelRunner:
             weight_cache_socket=get_model().weight_cache_socket,
         )
 
-        # If the weight cache is enabled, override the load format to IPC_CACHE
-        # and derive the per-rank daemon socket. Idempotent across reloads.
         maybe_enable_ipc_weight_cache(
             load_config=self.load_config,
-            tp_size=self.ps.tp_size,
-            pp_rank=self.ps.pp_rank,
-            tp_rank=self.ps.tp_rank,
         )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
@@ -1190,7 +1196,6 @@ class ModelRunner:
         # before configure_kv_cache_dtype.)
         load_kv_cache_scales(
             model=self.model,
-            server_args=self.server_args,
             kv_cache_dtype=get_model().kv_cache_dtype,
         )
 
@@ -1283,7 +1288,7 @@ class ModelRunner:
     def maybe_init_dwdp(self):
         if self.is_draft_worker:
             return
-        if get_parallel().config.dwdp_size <= 1:
+        if get_parallel().dwdp_size <= 1:
             return
         from sglang.srt.layers.moe.dwdp import DwdpManager
 
@@ -1411,11 +1416,22 @@ class ModelRunner:
 
         Subclasses can override this to install specialized decode graph runners.
         """
+        if self.spec_algorithm.is_uno():
+            from sglang.srt.speculative.uno_cuda_graph_runner import (
+                UnoDecodeCudaGraphRunner,
+            )
+
+            return UnoDecodeCudaGraphRunner
+
         from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
             DecodeCudaGraphRunner,
         )
 
         return DecodeCudaGraphRunner
+
+    def get_cuda_graph_layers(self, layer_model) -> AttentionAndMoeLayers:
+        """Return the model layers used by prefill CUDA graph execution."""
+        return compute_attention_and_moe_layers(layer_model)
 
     def init_decode_cuda_graph(self):
         self.decode_cuda_graph_runner = None
@@ -1456,7 +1472,7 @@ class ModelRunner:
         # rather than spawning additional processes, so dp_size must not be
         # multiplied into the process count here (unlike regular DP, where
         # dp_size * tp_size * pp_size is the true worker count).
-        dp_size = 1 if get_parallel().config.enable_dp_attention else self.ps.dp_size
+        dp_size = 1 if get_parallel().enable_dp_attention else self.ps.dp_size
         self.local_omp_cpuid = numa_utils.init_threads_binding(
             numa_index=self.gpu_id,
             world_size=dp_size * self.ps.tp_size * self.ps.pp_size,
@@ -1474,6 +1490,13 @@ class ModelRunner:
         """Customize a runner-created dummy batch before attention metadata initialization."""
         return forward_batch
 
+    def attn_tp_sequence_sharded(self, num_tokens: int) -> bool:
+        """Whether this forward (``num_tokens`` tokens) is attn-TP sharded (SP).
+        Extension point for per-forward SP gating; the default behavior shards iff
+        it holds a gathered buffer.
+        """
+        return require_gathered_buffer()
+
     def _prepare_eager_forward_batch(self, forward_batch: ForwardBatch) -> None:
         """Pad / normalize a batch for the eager (non-cuda-graph) forward.
 
@@ -1488,20 +1511,21 @@ class ModelRunner:
         else:
             forward_batch.prepare_attn_tp_scatter_input(self)
 
-        # Normalize num_token_non_padded to be local to this attention TP rank if needed.
-        # The skip is scoped to DSACPLayerCommunicator-style CP (DSA, MLA): those
-        # flavors already feed a zigzag-split rank-local layout whose token count
-        # should not be further divided by attn_tp_size. MHA-arch prefill CP
-        # (Qwen3/Qwen2 MoE) keeps the attn_tp-replicated layout and wants the
-        # adjustment to run — see docs/design/prefill-cp-mla.md §Phase 5.
-        if (
-            forward_batch.num_token_non_padded is not None
-            and forward_batch.global_num_tokens_gpu is not None
-            and require_gathered_buffer()
-            and not is_dsa_enable_prefill_cp()
-            and not is_mla_prefill_cp_enabled()
-        ):
-            forward_batch.adjust_num_token_non_padded_for_attn_tp()
+        # Derive the LOCAL num_token_non_padded from the GLOBAL scalar. sharded is
+        # cleared for DSACPLayerCommunicator-style CP (DSA, MLA): those flavors
+        # already feed a zigzag-split rank-local layout whose token count should
+        # not be further divided by attn_tp_size, so they keep the full count.
+        # MHA-arch prefill CP (Qwen3/Qwen2 MoE) keeps the attn_tp-replicated
+        # layout and wants sharding to apply — see docs/design/prefill-cp-mla.md
+        # §Phase 5.
+        if forward_batch.global_num_token_non_padded is not None:
+            forward_batch.set_local_num_token_non_padded(
+                sharded=(
+                    forward_batch.attn_tp_sequence_sharded
+                    and not is_dsa_enable_prefill_cp()
+                    and not is_mla_prefill_cp_enabled()
+                ),
+            )
 
         # Hisparse coordinator — backends now read it from self.model_runner.
         if self.hisparse_coordinator is not None:
@@ -1940,7 +1964,7 @@ class ModelRunner:
         if added <= 0:
             return
 
-        initial_ep_size = get_parallel().config.elastic_ep_initial_size
+        initial_ep_size = get_parallel().elastic_ep_initial_size
         assert initial_ep_size is not None
         get_context().override("elastic_ep.scale", ep_size=effective_size)
 
@@ -1958,7 +1982,7 @@ class ModelRunner:
         set_global_expert_location_metadata(new_metadata, allow_overwrite=True)
 
     def _elastic_global_rank(self) -> int:
-        return self.ps.tp_rank + get_parallel().config.ep_join_rank_offset
+        return self.ps.tp_rank + get_parallel().ep_join_rank_offset
 
     def _rearm_eplb_after_elastic_scale(self) -> None:
         if self.eplb_manager is None:
@@ -1973,7 +1997,6 @@ class ModelRunner:
             return
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
-                self.server_args,
                 get_global_expert_location_metadata(),
                 rank=self._elastic_global_rank(),
             )
@@ -2038,7 +2061,6 @@ class ModelRunner:
         ElasticEPStateManager.on_scale(effective_size, target_size)
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
-                self.server_args,
                 get_global_expert_location_metadata(),
                 rank=self._elastic_global_rank(),
             )

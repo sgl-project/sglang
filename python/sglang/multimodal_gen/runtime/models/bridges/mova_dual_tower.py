@@ -118,10 +118,12 @@ class PerFrameAttentionPooling(nn.Module):
         """
         B, L, D = x.shape
         T, H, W = grid_size
-        assert (
-            D == self.dim
-        ), f"Input dimension D={D} does not match module dim={self.dim}"
-        assert L == T * H * W, f"Flattened length L={L} does not match T*H*W={T*H*W}"
+        assert D == self.dim, (
+            f"Input dimension D={D} does not match module dim={self.dim}"
+        )
+        assert L == T * H * W, (
+            f"Flattened length L={L} does not match T*H*W={T * H * W}"
+        )
 
         S = H * W
         x_bt_s_d = x.view(B, T, S, D).contiguous().view(B * T, S, D)  # [B*T, S, D]

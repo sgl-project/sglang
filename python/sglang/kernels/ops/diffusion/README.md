@@ -26,10 +26,11 @@ re-export would make all of them import-time requirements everywhere.
 
 ## Layout
 
-One subpackage per **operator domain**; the backend is a **filename suffix**
-(`_triton`, `_jit`, `_cutedsl`, `_flydsl`, or `_bitexact` where that says more).
-This matches `ops/attention` and `ops/gemm`, and it keeps every implementation
-of one logical op in one directory.
+Ordinary implementations use one subpackage per **operator domain**; the
+compiler is a **filename suffix** (`_triton`, `_jit`, `_cutedsl`, `_flydsl`, or
+`_bitexact` where that says more). Implementations with Kernel Design Agents
+provenance live under `sglang.kernels.kda_kernels`; this facade remains their
+only supported runtime import surface.
 
 ```
 norm/        RMSNorm / LayerNorm / GroupNorm and their fused epilogues
@@ -37,17 +38,19 @@ modulate/    adaLN modulate, gating, timestep conditioning
 rope/        rotary embeddings and the QK-norm chains fused into them
 activation/  SiLU / GLU / GELU fusions
 attention/   sparse linear attention, gated delta-net
+routing/     diffusion-model MoE routing and expert selection
 layout/      pure data movement: USP/Ulysses relayout, varlen pack, causal pad
 common/      numerics primitives, platform predicates, non-Triton fallbacks
 sites/       request-scoped mount policy — NOT kernels (see below)
 ext/         JIT C++/CUDA extensions (Hunyuan3D raster/inpaint) — NOT kernels
+../../kda_kernels/  agent-generated implementations and their JIT CUDA sources
 ```
 
-## The two numerical contracts
+## Numerical contracts and quality policy
 
 **Bit-exact (`torch.equal` vs the eager chain) → mounted unconditionally.**
 These kernels reproduce every aten rounding boundary, sometimes down to the
-reduction tree: `norm/layernorm_modulate_triton.py` replicates torch 2.11's
+reduction tree: `../../kda_kernels/layernorm_modulate_triton.py` replicates torch 2.11's
 `vectorized_layer_norm_kernel` (128-thread Welford, `_rcp4` guarded
 reciprocal, `shfl.down` fold order, `div.rn` + `MUFU.RSQ`), and
 `norm/rmsnorm_scale_shift_bitexact.py` replicates flashinfer's CuTe-DSL
@@ -57,11 +60,18 @@ themselves against the live eager chain on first sight via
 dispatch they replicate can change under them.
 
 **Not bit-exact → quality-gated.** Mounted onto marked `nn.Module` sites only
-for `quality="high"` requests, at batch boundaries, all-or-nothing per
-transformer (`sites/quality_gate.py`). A plain fp32 single-pass norm fusion
-looks harmless and is not: on ERNIE-Image it moved the 50-step trajectory to
-PSNR 18.83 dB at `quality=high`, which is what motivated the bit-exact
-rewrite.
+for `quality="extra-high"` and `quality="high"` requests, at batch boundaries,
+all-or-nothing per transformer (`sites/quality_gate.py`). `extra-high` adds
+only these request-gated DiT/VAE fusions; `high` is cumulative and may also
+enable model-owned approximate paths such as Cache-DiT or a lower-precision
+decode. A plain fp32 single-pass norm fusion looks harmless and is not: on
+ERNIE-Image it moved the 50-step trajectory to PSNR 18.83 dB, which is what
+motivated the bit-exact rewrite.
+
+**Model/checkpoint-native.** Generic close-contract kernels, sparse operators,
+and FP8/NVFP4 producers can belong to the selected model or deployment path.
+The request `quality` tier neither selects nor disables those independent
+choices.
 
 SANA-Video's quality-gated linear-attention site keeps BF16 inputs for the
 first GEMM while requesting FP32 accumulation/output, then runs the second
@@ -90,11 +100,13 @@ Several norms look interchangeable and are not. Start here.
 
 | Entry point | Backend | Contract | Applies to |
 |---|---|---|---|
+| `fuse_scale_shift_kernel` | Triton | close | contiguous BLC; scalar/row/token modulation plus causal-video `[B, F, 1, C]`, using a static capped power-of-two tile to avoid request-time autotuning |
 | `fused_rmsnorm_scale_shift_bitexact` | Triton | bit-exact vs flashinfer CuTe RMSNorm + aten modulate | bf16, contiguous rows, `H == 64 * threads_per_row` |
 | `fused_scale_residual_rmsnorm_scale_shift_bitexact` | Triton | bit-exact, incl. the preceding residual-gate add | as above |
 | `fused_layernorm_modulate` | Triton | bit-exact vs aten `vectorized_layer_norm` | bf16, `N % 4 == 0`, 16B-aligned |
 | `fused_norm_scale_shift` / `fused_scale_residual_norm_scale_shift` | CuTe-DSL | fp32 statistics, close | fp16/bf16/fp32, LN or RMS, many broadcast modes |
 | `flydsl_norm_scale_shift` / `flydsl_fused_residual_norm_scale_shift` | FlyDSL | close | **ROCm gfx950 only** |
+| `try_fused_scale_residual_norm_scale_shift_nvfp4` | JIT CUDA | matches the selected NVFP4 producer contract | Qwen residual LayerNorm/modulation + FC1 NVFP4 quantization |
 | `fuse_layernorm_scale_shift_gate_select01_kernel` | Triton | close | per-token select between two modulation rows (Qwen-Image) |
 | `norm_infer` / `rms_norm_fn` | Triton (+torch/NPU/MPS fallbacks) | close | the generic entry point; use when nothing above fits |
 
@@ -110,25 +122,51 @@ Several norms look interchangeable and are not. Start here.
 | `fused_qk_head_layernorm` | Triton | bit-exact | per-head LN on q/k, `dim_head % 4 == 0`, `<= 128` |
 | `triton_one_pass_rms_norm` | Triton | close | standalone RMSNorm, one pass |
 
+### Residual gating
+
+| Entry point | Backend | Contract | Applies to |
+|---|---|---|---|
+| `residual_gate_add` | KDA (JIT CUDA) | bit-exact `residual + update * gate` | contiguous tensors, or a transposed-dense `[B, tokens, hidden]` residual/output with contiguous update and row-broadcast gate (SANA-Video) |
+
+The transposed-dense path uses a shared-memory tile to read the update in
+logical row-major order while keeping residual reads and output writes
+coalesced in their `[B, hidden, tokens]` backing layout. Do not insert a
+`.contiguous()` merely to reach the ordinary path; that restores an entire
+tensor copy per residual site.
+
 ### RoPE / QK-norm
 
 | Entry point | Backend | Contract |
 |---|---|---|
 | `fused_inplace_qknorm_rope` | JIT CUDA | one bf16 rounding step vs split baseline; `round_norm_before_rope=True` makes it exact; supports compact and full-width NeoX/interleaved caches |
 | `fused_qknorm_rope_pack_kv` | JIT CUDA | as above, also packs prefix K/V |
+| `try_fused_flux2_qkv_epilogue` | KDA (JIT CUDA) | bit-exact vs the selected BF16 chain | FLUX.2 QK RMSNorm + RoPE + joint QKV packing |
+| `try_fused_qwen_qkv_epilogue` | JIT CUDA | bit-exact vs the selected BF16 chain | Qwen-Image QK RMSNorm + RoPE + joint QKV writes; SM100+ |
 | `fused_rope_rotate_half_bitexact` | Triton | bit-exact (elementwise only) |
 | `fused_interleaved_rope_fp64` | JIT CUDA | bit-exact vs paired SANA-Video fp64 RoPE |
-| `ltx2_qknorm_split_rope_cuda` | JIT CUDA | close; **validated on B200** |
+| `fused_inplace_helios_qk_rope` | JIT CUDA | bit-exact paired in-place RoPE for Helios' transposed frequency layout |
+| `ltx2_qknorm_split_rope_cuda` | KDA (JIT CUDA) | close; **validated on B200** |
 | `fused_ltx25_decoder_rope` | JIT CUDA | bit-exact paired 3D RoPE from cached compact axis tables |
 | `apply_rotary_embedding` | Triton (+fallbacks) | close; the generic entry point |
 | `hunyuan_qkv_rope_pack` | Triton | bit-exact; packs QKV and applies RoPE in one pass |
 
-### Data movement (all bit-exact by construction)
+### MoE routing
+
+| Entry point | Backend | Contract | Applies to |
+|---|---|---|---|
+| `group_limited_topk` | Triton | selected expert-id set matches the guarded CUDA `torch.topk(..., sorted=False)` chain; output order is unspecified | LingBot Video's default-on sigmoid+bias group-limited routing; contiguous fp32 `[tokens, experts]`, at least two power-of-two experts per group |
+
+### Data movement and quantized layout producers
 
 `usp_merge_heads`, `pack_qkv_destination_major`, `fused_pack_qkv`,
-`fused_scatter_to_padded`, `fused_causal_conv3d_cat_pad_cuda`,
+`fused_pack_segmented_qkv`, `fused_scatter_to_padded`,
+`fused_causal_conv3d_cat_pad_cuda`,
 `cat_pad_channels_last_3d`, `dup_up3d_add`, `fused_temb_table_slices`,
-`ltx2_ada_values9`.
+and `ltx2_ada_values9` are bit-exact data movement or same-order arithmetic.
+`fused_layernorm_modulate_fp8_quant_raw` folds FLUX.2 LayerNorm, adaLN
+modulation, and static FP8 quantization. `try_flux2_token_cat_fp8` and
+`try_flux2_token_cat_nvfp4` fuse branch concatenation directly into the
+quantized representation selected by the FLUX.2 checkpoint path.
 
 `fused_temb_table_slices` is worth knowing about: the eager
 `(table + temb.float()).chunk(6, dim=2)` materializes ~8 GB of fp32 at
@@ -147,13 +185,15 @@ inspecting model modules is its whole job.
 
 ## Adding a kernel
 
-1. Put it in the operator domain it belongs to, with a backend suffix.
+1. Put ordinary implementations in their operator domain. Put a kernel
+   generated by the KDA workflow in `sglang.kernels.kda_kernels`, together
+   with its source revision and any JIT CUDA source files.
 2. Export it from `__init__.py` (`_EXPORTS`) and register a `KernelSpec`
    (`_SPECS`) — `test_import_surface.py` checks both resolve.
 3. Give it a `can_use_*` predicate; raise, don't return `None`.
 4. State the numerical contract in the module docstring, including which
    shapes it was verified on.
-5. If it is not bit-exact, gate it through `sites/`. Do not mount it by
-   default.
+5. If it is not bit-exact, gate it through `sites/`. It must mount for both
+   `extra-high` and `high`, never for the default `lossless` path.
 6. Test it in the domain suite (`test/registered/kernels/ops/diffusion/`), and
    the model wiring in `test_model_fast_paths.py`.

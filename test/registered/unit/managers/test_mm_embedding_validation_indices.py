@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -9,10 +10,8 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
-from sglang.srt.managers.tp_worker import (  # noqa: E402
-    _mm_embedding_validation_indices,
-)
+from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch  # noqa: E402
+from sglang.srt.managers.tp_worker import _mm_embedding_validation_indices  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -34,7 +33,7 @@ def _validation_batch(forward_mode, multimodal_inputs, prefix_lens, extend_lens)
 
 def _disagg_req(req_pool_idx, multimodal_inputs):
     return SimpleNamespace(
-        req_pool_idx=req_pool_idx,
+        kv=ReqKvInfo(req_pool_idx=req_pool_idx, kv_committed_len=4, kv_allocated_len=4),
         prefix_indices=[0, 1],
         extend_range=SimpleNamespace(length=2),
         origin_input_ids=[1, 2, 3, 4],
@@ -176,3 +175,7 @@ def test_extend_modes_reject_misaligned_metadata(forward_mode):
 
     with pytest.raises(ValueError, match="zip\\(\\) argument 2 is shorter"):
         batch.mm_embedding_validation_indices()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

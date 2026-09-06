@@ -18,7 +18,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     process_model_config,
 )
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import ceil_align, ceil_div
 
 
@@ -78,7 +78,7 @@ def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
 def should_remap_pd_dsa_seed_to_local_slots() -> bool:
     """Whether a PD seed should enter the allocator-local fused TopK domain."""
     return (
-        is_cuda()
+        (is_cuda() or is_hip())
         and envs.SGLANG_DSA_FUSE_TOPK.get()
         and get_disagg().disaggregation_mode == "decode"
         and not get_memory().enable_hisparse
@@ -105,12 +105,11 @@ def should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend: bool) -> bool:
 
 
 def is_dsa_enable_prefill_cp():
-    if not envs.SGLANG_ENABLE_CP_V2.get():
-        return get_parallel().config.enable_dsa_prefill_context_parallel
+    if is_hip() or is_npu():
+        return get_parallel().enable_dsa_prefill_context_parallel
 
-    # Derive from the runtime CP topology + model arch rather than the legacy
-    # flag under CP-v2: DSA prefill CP is active when the CP group is on for a
-    # DeepSeek Sparse Attention model.
+    # Generic prefill CP derives activation from the runtime topology and model
+    # architecture. Protected HIP/NPU paths continue to use their legacy field.
     if get_parallel().attn_cp_size <= 1:
         return False
     from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
@@ -122,14 +121,14 @@ def is_dsa_enable_prefill_cp():
 def is_dsa_prefill_cp_in_seq_split():
     return (
         is_dsa_enable_prefill_cp()
-        and get_parallel().config.dsa_prefill_cp_mode == "in-seq-split"
+        and get_parallel().dsa_prefill_cp_mode == "in-seq-split"
     )
 
 
 def is_dsa_prefill_cp_round_robin_split():
     return (
         is_dsa_enable_prefill_cp()
-        and get_parallel().config.dsa_prefill_cp_mode == "round-robin-split"
+        and get_parallel().dsa_prefill_cp_mode == "round-robin-split"
     )
 
 
@@ -264,9 +263,9 @@ def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
 
     if is_dsa_prefill_cp_round_robin_split():
         cur_cp_seq_len = seq_len // cp_size
-        assert (
-            seq_len % cp_size == 0
-        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when dsa_prefill_cp_mode is round-robin-split"
+        assert seq_len % cp_size == 0, (
+            f"seq_len {seq_len} is not divisible by cp_size {cp_size} when dsa_prefill_cp_mode is round-robin-split"
+        )
     else:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         # Note: (self.cp_size * 2) To achieve load balancing for seq computation,

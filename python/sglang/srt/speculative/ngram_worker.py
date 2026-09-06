@@ -15,11 +15,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
-from sglang.srt.runtime_context import (
-    get_device,
-    get_schedule,
-    get_spec,
-)
+from sglang.srt.runtime_context import get_device, get_schedule, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
@@ -306,9 +302,9 @@ class NGRAMWorker(BaseSpecWorker):
         total_draft_token_num = len(req_drafts)
 
         # Check if speculative decoding is needed; here we always enforce it
-        assert (
-            total_draft_token_num == bs * self.draft_token_num
-        ), f"{total_draft_token_num=}, {bs=}, {self.draft_token_num=}"
+        assert total_draft_token_num == bs * self.draft_token_num, (
+            f"{total_draft_token_num=}, {bs=}, {self.draft_token_num=}"
+        )
         return req_drafts, mask
 
     def _prepare_for_speculative_decoding(self, batch: ScheduleBatch):
@@ -427,7 +423,7 @@ class NGRAMWorker(BaseSpecWorker):
         self.ngram_corpus.batch_put(batch_tokens)
 
     def forward_batch_generation(
-        self, batch: ScheduleBatch, on_publish=None
+        self, batch: ScheduleBatch, on_publish=None, pp_proxy_tensors=None
     ) -> GenerationBatchResult:
         fwd_stream = torch.get_device_module(self.device).current_stream()
         record_stream_for_v2_verify(batch, None, fwd_stream)
@@ -443,7 +439,7 @@ class NGRAMWorker(BaseSpecWorker):
 
         if batch.forward_mode.is_target_verify():
             batch_result = self.target_worker.forward_batch_generation(
-                batch, is_verify=True
+                batch, pp_proxy_tensors=pp_proxy_tensors, is_verify=True
             )
             mm_embedding_errors = batch_result.mm_embedding_errors
 
@@ -530,7 +526,9 @@ class NGRAMWorker(BaseSpecWorker):
             batch.forward_mode = ForwardMode.DECODE
 
         else:
-            batch_result = self.target_worker.forward_batch_generation(batch)
+            batch_result = self.target_worker.forward_batch_generation(
+                batch, pp_proxy_tensors=pp_proxy_tensors
+            )
             mm_embedding_errors = batch_result.mm_embedding_errors
             logits_output, predict, can_run_cuda_graph = (
                 batch_result.logits_output,

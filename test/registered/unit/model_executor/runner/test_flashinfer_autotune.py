@@ -50,10 +50,7 @@ def test_packed_speculative_extend_is_limited_to_pd_prefill_target(mode, error):
 
 def test_chunked_prefill_disabled_uses_legacy_token_ceiling():
     model_runner = SimpleNamespace(
-        server_args=SimpleNamespace(
-            max_prefill_buffer_tokens=Mock(return_value=0),
-            max_prefill_tokens=32768,
-        ),
+        server_args=SimpleNamespace(),
         is_generation=True,
         is_draft_worker=False,
         spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
@@ -75,6 +72,12 @@ def test_chunked_prefill_disabled_uses_legacy_token_ceiling():
             flashinfer_autotune,
             "get_disagg",
             return_value=SimpleNamespace(disaggregation_mode="prefill"),
+        ),
+        patch.object(flashinfer_autotune, "max_prefill_buffer_tokens", return_value=0),
+        patch.object(
+            flashinfer_autotune,
+            "get_schedule",
+            return_value=SimpleNamespace(max_prefill_tokens=32768),
         ),
         patch.object(flashinfer_autotune, "run_flashinfer_autotune_forward"),
         patch.object(flashinfer_autotune.torch.cuda, "empty_cache"),

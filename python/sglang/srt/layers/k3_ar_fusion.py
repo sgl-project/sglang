@@ -25,6 +25,7 @@ import torch
 import sglang.srt.runtime_context as ctx
 from sglang.kernels.jit.utils import cache_once
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
@@ -84,7 +85,6 @@ def _get_state() -> Optional[_State]:
         CustomAllReduceV2,
     )
     from sglang.srt.distributed.parallel_state import get_tp_group
-    from sglang.srt.runtime_context import get_parallel
 
     if get_parallel().tp_size <= 1:
         return None

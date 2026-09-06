@@ -33,10 +33,11 @@ from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+from sglang.srt.function_call.utils import get_schema_properties
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
-register_cpu_ci(est_time=70, suite="base-c-test-cpu")
+register_cpu_ci(est_time=70, suite="stage-b-test-cpu-intel")
 
 
 @functools.lru_cache(maxsize=None)
@@ -372,7 +373,7 @@ class TestInklingDetector(unittest.TestCase):
         self.assertEqual(result.normal_text, "Here you go.")
 
     def test_empty_name_is_allowed_on_the_canonical_path(self):
-        source = "<|content_invoke_tool_json|>" '{"name":"","args":{}}<|end_message|>'
+        source = '<|content_invoke_tool_json|>{"name":"","args":{}}<|end_message|>'
         result = InklingDetector().detect_and_parse(source, self.tools)
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "")
@@ -1304,7 +1305,6 @@ class TestLlama32Detector(unittest.TestCase):
 
 
 class TestKimiK2Detector(unittest.TestCase):
-
     def setUp(self):
         """Set up test tools and detector."""
         self.tools = [
@@ -1373,7 +1373,6 @@ class TestKimiK2Detector(unittest.TestCase):
             result = self.detector.parse_streaming_increment(chunk, self.tools)
             for tool_call_chunk in result.calls:
                 if tool_call_chunk.tool_index is not None:
-
                     while len(tool_calls) <= tool_call_chunk.tool_index:
                         tool_calls.append({"name": "", "parameters": ""})
 
@@ -1422,7 +1421,6 @@ class TestKimiK2Detector(unittest.TestCase):
             result = self.detector.parse_streaming_increment(chunk, self.tools)
             for tool_call_chunk in result.calls:
                 if tool_call_chunk.tool_index is not None:
-
                     while len(tool_calls) <= tool_call_chunk.tool_index:
                         tool_calls.append({"name": "", "parameters": ""})
 
@@ -1457,7 +1455,6 @@ class TestKimiK2Detector(unittest.TestCase):
             result = self.detector.parse_streaming_increment(chunk, self.tools)
             for tool_call_chunk in result.calls:
                 if tool_call_chunk.tool_index is not None:
-
                     while len(tool_calls) <= tool_call_chunk.tool_index:
                         tool_calls.append({"name": "", "parameters": ""})
 
@@ -1530,7 +1527,7 @@ class TestDeepSeekV3Detector(unittest.TestCase):
             "function<｜tool▁sep｜>",
             "get_tour",
             "ist_att",
-            "ractions\n```" 'json\n{"',
+            'ractions\n```json\n{"',
             'city": "',
             'Beijing"}\n',
             "```<｜tool▁call▁end｜>",
@@ -1717,9 +1714,9 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertGreater(num_tool_call_chunks, 8)
 
@@ -1772,9 +1769,9 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertGreater(num_tool_call_chunks, 8)
         self.assertEqual(len(tool_calls_by_index), 1)
@@ -1865,9 +1862,9 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         # Verify that the no-parameter function was correctly parsed
         self.assertEqual(
@@ -1925,9 +1922,9 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         # Should still parse correctly even with whitespace-only content
         self.assertEqual(
@@ -2127,9 +2124,9 @@ class TestDeepSeekV4Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertGreater(num_tool_call_chunks, 8)
 
@@ -4499,9 +4496,7 @@ class TestLfm2Detector(unittest.TestCase):
     def test_reserved_kwarg_with_nested_quote_recovered(self):
         """A keyword-named parameter holding a nested-quote command needs
         the rename and requote rewrites to compose."""
-        text = (
-            "<|tool_call_start|>[search(from='sed -n '1,5p' f.py')]" "<|tool_call_end|>"
-        )
+        text = "<|tool_call_start|>[search(from='sed -n '1,5p' f.py')]<|tool_call_end|>"
         result = self.detector.detect_and_parse(text, self.tools)
 
         self.assertEqual(len(result.calls), 1)
@@ -4719,9 +4714,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "manage_user_memory")
@@ -4761,9 +4756,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertEqual(accumulated_text, "I'll help you.")
         self.assertEqual(len(tool_calls_by_index), 1)
@@ -4801,9 +4796,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "manage_user_memory")
@@ -4840,9 +4835,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "get_weather")
@@ -4877,9 +4872,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         # Should have name but incomplete parameters
         self.assertEqual(len(tool_calls_by_index), 1)
@@ -4915,9 +4910,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertEqual(accumulated_text, "I'll remember that.")
         self.assertEqual(len(tool_calls_by_index), 1)
@@ -4960,9 +4955,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "get_weather")
@@ -5010,9 +5005,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertEqual(accumulated_text, "I'll help you.")
         self.assertEqual(len(tool_calls_by_index), 1)
@@ -5264,9 +5259,9 @@ class TestQwen25Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
         return tool_calls_by_index
 
     def test_streaming_multiple_tool_calls(self):
@@ -5514,9 +5509,9 @@ class TestGemma4Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
         return normal_text, tool_calls_by_index
 
     def test_streaming_multiple_tool_calls(self):
@@ -5555,9 +5550,9 @@ class TestGemma4Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertEqual(len(tool_calls_by_index), 2)
         self.assertEqual(tool_calls_by_index[0]["name"], "get_weather")
@@ -5622,9 +5617,9 @@ class TestGemma4Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
         self.assertIn("Hello!", normal_text)
         self.assertIn("Let me also check", normal_text)
         self.assertEqual(len(tool_calls_by_index), 2)
@@ -5634,6 +5629,197 @@ class TestGemma4Detector(unittest.TestCase):
         params1 = json.loads(tool_calls_by_index[1]["parameters"])
         self.assertEqual(params0["location"], "Paris")
         self.assertEqual(params1["timezone"], "UTC")
+
+
+class TestGetSchemaProperties(unittest.TestCase):
+    def test_flat_properties(self):
+        schema = {"type": "object", "properties": {"a": {"type": "string"}}}
+        self.assertEqual(get_schema_properties(schema), {"a": {"type": "string"}})
+
+    def test_top_level_combinators(self):
+        schema = {
+            "type": "object",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"const": "acme"},
+                        "payload": {"type": "object"},
+                    },
+                },
+                {"type": "object", "properties": {"kind": {"const": "other"}}},
+            ],
+        }
+        # duplicate keys resolve to the first branch that declares them
+        self.assertEqual(
+            get_schema_properties(schema),
+            {"kind": {"const": "acme"}, "payload": {"type": "object"}},
+        )
+
+    def test_anyof_allof_and_nesting(self):
+        anyof = {
+            "anyOf": [{"properties": {"x": {"type": "integer"}}}, {"type": "null"}]
+        }
+        self.assertEqual(get_schema_properties(anyof), {"x": {"type": "integer"}})
+        allof = {
+            "allOf": [
+                {"oneOf": [{"properties": {"y": {"type": "boolean"}}}]},
+                {"properties": {"z": {"type": "string"}}},
+            ]
+        }
+        self.assertEqual(
+            get_schema_properties(allof),
+            {"y": {"type": "boolean"}, "z": {"type": "string"}},
+        )
+
+    def test_non_dict_and_missing(self):
+        self.assertEqual(get_schema_properties(None), {})
+        self.assertEqual(
+            get_schema_properties(
+                {"type": "object"},
+            ),
+            {},
+        )
+        self.assertEqual(get_schema_properties({"oneOf": "not-a-list"}), {})
+
+
+class TestTopLevelCompositeToolSchema(unittest.TestCase):
+    """Parsers must resolve argument types when tool ``parameters`` declares
+    its properties under a top-level anyOf/oneOf/allOf instead of directly."""
+
+    def setUp(self):
+        self.oneof_tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="acme",
+                    description="Send a value to Acme.",
+                    parameters={
+                        "type": "object",
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "kind": {"const": "acme"},
+                                    "payload": {
+                                        "type": "object",
+                                        "properties": {
+                                            "value": {"type": "string"},
+                                        },
+                                        "required": ["value"],
+                                    },
+                                },
+                                "required": ["kind", "payload"],
+                            },
+                            {
+                                "type": "object",
+                                "properties": {"kind": {"const": "other"}},
+                                "required": ["kind"],
+                            },
+                        ],
+                    },
+                ),
+            ),
+        ]
+        self.flat_tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="acme",
+                    description="Send a value to Acme.",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string"},
+                            "payload": {
+                                "type": "object",
+                                "properties": {"value": {"type": "string"}},
+                                "required": ["value"],
+                            },
+                        },
+                        "required": ["kind", "payload"],
+                    },
+                ),
+            ),
+        ]
+        self.glm47_text = (
+            "<tool_call>acme"
+            "<arg_key>kind</arg_key><arg_value>acme</arg_value>"
+            "<arg_key>payload</arg_key>"
+            '<arg_value>{"value": "hello"}</arg_value>'
+            "</tool_call>"
+        )
+        self.glm4_text = (
+            "<tool_call>acme\n"
+            "<arg_key>kind</arg_key>\n<arg_value>acme</arg_value>\n"
+            "<arg_key>payload</arg_key>\n"
+            '<arg_value>{"value": "hello"}</arg_value>\n'
+            "</tool_call>"
+        )
+        self.qwen_text = (
+            "<tool_call><function=acme>"
+            "<parameter=kind>acme</parameter>"
+            '<parameter=payload>{"value": "hello"}</parameter>'
+            "</function></tool_call>"
+        )
+        self.expected = {"kind": "acme", "payload": {"value": "hello"}}
+
+    def _stream_arguments(self, detector, text, tools, chunk_size=8):
+        name = None
+        arguments = ""
+        for i in range(0, len(text), chunk_size):
+            result = detector.parse_streaming_increment(text[i : i + chunk_size], tools)
+            for call in result.calls:
+                if call.name:
+                    name = call.name
+                arguments += call.parameters
+        return name, arguments
+
+    def test_glm47_streaming(self):
+        detector = Glm47MoeDetector()
+        name, arguments = self._stream_arguments(
+            detector, self.glm47_text, self.oneof_tools
+        )
+        self.assertEqual(name, "acme")
+        self.assertEqual(json.loads(arguments), self.expected)
+
+    def test_glm47_streaming_object_argument_closes_outer_brace(self):
+        detector = Glm47MoeDetector()
+        name, arguments = self._stream_arguments(
+            detector, self.glm47_text, self.flat_tools
+        )
+        self.assertEqual(name, "acme")
+        self.assertEqual(json.loads(arguments), self.expected)
+
+    def test_glm4_streaming(self):
+        detector = Glm4MoeDetector()
+        name, arguments = self._stream_arguments(
+            detector, self.glm4_text, self.oneof_tools
+        )
+        self.assertEqual(name, "acme")
+        self.assertEqual(json.loads(arguments), self.expected)
+
+    def test_glm4_streaming_object_argument_closes_outer_brace(self):
+        detector = Glm4MoeDetector()
+        name, arguments = self._stream_arguments(
+            detector, self.glm4_text, self.flat_tools
+        )
+        self.assertEqual(name, "acme")
+        self.assertEqual(json.loads(arguments), self.expected)
+
+    def test_qwen3_coder_detect_and_parse(self):
+        detector = Qwen3CoderDetector()
+        result = detector.detect_and_parse(self.qwen_text, self.oneof_tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(json.loads(result.calls[0].parameters), self.expected)
+
+    def test_qwen3_coder_streaming(self):
+        detector = Qwen3CoderDetector()
+        name, arguments = self._stream_arguments(
+            detector, self.qwen_text, self.oneof_tools
+        )
+        self.assertEqual(name, "acme")
+        self.assertEqual(json.loads(arguments), self.expected)
 
 
 if __name__ == "__main__":

@@ -58,6 +58,7 @@ class _MockTemplateManager:
         self.completion_template_name: Optional[str] = (
             None  # Set to None to avoid template processing
         )
+        self.jinja_template_may_reorder_tool_results = False
 
 
 class ServingCompletionTestCase(unittest.TestCase):

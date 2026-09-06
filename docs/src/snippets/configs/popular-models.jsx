@@ -30,6 +30,23 @@ export const popularModels = [
     },
   },
   {
+    name: "GLM-5.3-Flash",
+    vendor: "Z.ai",
+    href: "/cookbook/autoregressive/GLM/GLM-5.3-Flash",
+    logo: "/cards/logos/glm.png",
+    badge: "New",
+    tags: ["9 platforms", "MLA + DSA + KDA hybrid", "Multimodal"],
+    hero: {
+      eyebrow: "Featured model · New",
+      headline: "Meet GLM-5.3-Flash on SGLang",
+      blurb:
+        "Z.ai's natively multimodal Mixture-of-Experts model — 320B total parameters with 18B active, 45 text layers combining MLA, DSA sparse, and KDA linear attention, a 24-layer vision encoder for image and video input, and a native MTP draft layer for speculative decoding. Recipes cover H100 / H200 / B200 / B300 / GB200 / GB300 and AMD MI300X / MI325X / MI355X.",
+      tags: ["320B / 18B active", "1M context", "Text + image + video"],
+      cta: "Open the GLM-5.3-Flash cookbook",
+      caption: "GLM-5.3-Flash deployment guide",
+    },
+  },
+  {
     name: "MiniMax-H3",
     vendor: "MiniMax",
     href: "/cookbook/diffusion/MiniMax/MiniMax-H3",
@@ -61,23 +78,6 @@ export const popularModels = [
       tags: ["2.8T parameters", "Fused KDA decode", "NVIDIA + AMD"],
       cta: "Open the Kimi-K3 cookbook",
       caption: "Kimi-K3 deployment guide",
-    },
-  },
-  {
-    name: "Inkling",
-    vendor: "Thinking Machines",
-    href: "/cookbook/autoregressive/ThinkingMachines/Inkling",
-    logo: "/cards/logos/thinkingmachines.png",
-    badge: "New",
-    tags: ["7 platforms", "NVFP4 / BF16", "MTP + DSpark"],
-    hero: {
-      eyebrow: "Featured model · New",
-      headline: "Meet Inkling on SGLang",
-      blurb:
-        "Thinking Machines' open-weights Mixture-of-Experts model — 975B parameters, 41B active per token, a 1M-token context window, and native text, image, and audio input. The cookbook covers its MTP speculative-decoding path and long-context prefix caching on NVIDIA and AMD.",
-      tags: ["975B · 41B active", "1M context", "Text + image + audio"],
-      cta: "Open the Inkling cookbook",
-      caption: "Inkling deployment guide",
     },
   },
 ];

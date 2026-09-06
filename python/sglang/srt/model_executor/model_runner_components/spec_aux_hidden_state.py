@@ -158,6 +158,9 @@ def _resolve_dflash_aux_hidden_state(
                 f"in config. Got target={target_num_layers}."
             )
         target_num_layers = int(target_num_layers)
+        # Loop models: target layer ids span num_hidden_layers * num_loops.
+        num_loops = getattr(model_config.hf_text_config, "num_loops", 1)
+        target_num_layers = target_num_layers * int(num_loops)
 
         if (
             trained_target_layers is not None
@@ -240,7 +243,7 @@ def _resolve_dflash_draft_cell_size(
             draft_model_config=draft_model_config,
             draft_num_layers=draft_num_layers,
             draft_kv_cache_dtype=draft_kv_cache_dtype,
-            tp_size=get_parallel().config.tp_size,
+            tp_size=get_parallel().tp_size,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(

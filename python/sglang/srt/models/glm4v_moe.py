@@ -70,7 +70,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
                     config.hidden_size,
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
+                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 )
         else:
             # ranks other than the last rank will have a placeholder layer
@@ -104,9 +104,9 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
         if is_shared_experts_fusion_disabled():
             return
         self.num_fused_shared_experts = self.config.n_shared_experts
-        assert (
-            self.num_fused_shared_experts == 1
-        ), "Only 1 fused shared expert is supported for Glm4vMoeForConditionalGeneration"
+        assert self.num_fused_shared_experts == 1, (
+            "Only 1 fused shared expert is supported for Glm4vMoeForConditionalGeneration"
+        )
         log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):

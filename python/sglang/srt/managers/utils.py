@@ -26,7 +26,7 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.sampling.sampling_observer import HostAuxiliaryOutput
-    from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.speculative.spec_info import SpecInput
 
 
 logger = logging.getLogger(__name__)
@@ -76,6 +76,12 @@ class GenerationBatchResult:
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
+    # Padded row width in flattened speculative output. Existing algorithms
+    # default to speculative_num_draft_tokens; linear UNO emits F + 1 columns.
+    speculative_output_stride: Optional[int] = None
+    # Valid output tokens that are not accepted draft proposals. Existing
+    # algorithms have one bonus token; UNO also emits its clean root.
+    num_non_draft_tokens_per_req: int = 1
 
     # Grammar FSM advance memoization (spec-v2 overlap). advance_grammar_fsm sets
     # these once — eagerly via the scheduler's grammar barrier inside verify(), or
@@ -96,7 +102,7 @@ class GenerationBatchResult:
     new_seq_lens: Optional[torch.Tensor] = None
 
     # relay path: forward stream -> next step forward
-    next_draft_input: Optional[EagleDraftInput] = None
+    next_draft_input: Optional[SpecInput] = None
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
@@ -121,6 +127,9 @@ class GenerationBatchResult:
         """True when this iter sampled token ids; False when none were produced
         this rank/split (a non-last PP rank or a non-final prefill split)."""
         return isinstance(self.next_token_ids, torch.Tensor)
+
+    def get_num_generated_tokens(self, batch_size: int) -> int:
+        return self.num_correct_drafts + batch_size * self.num_non_draft_tokens_per_req
 
     @torch.profiler.record_function("copy_result_to_cpu")
     def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
@@ -260,36 +269,20 @@ def synchronize_mm_embedding_errors(
         ):
             groups.append(group)
 
-    failure = local_failure.clone()
-    for group in groups:
-        torch.distributed.all_reduce(
-            failure, op=torch.distributed.ReduceOp.MAX, group=group.device_group
-        )
-
-    if not groups:
-        return torch.cat(
-            (validated.unsqueeze(1), failure.unsqueeze(1), local_details), dim=1
-        )
-
-    rank = torch.distributed.get_rank()
-    owner = torch.where(
-        local_failure.bool(),
-        torch.full_like(local_failure, rank),
-        torch.full_like(local_failure, torch.iinfo(torch.int64).max),
+    result = torch.cat(
+        (validated.unsqueeze(1), local_failure.unsqueeze(1), local_details), dim=1
     )
     for group in groups:
-        torch.distributed.all_reduce(
-            owner, op=torch.distributed.ReduceOp.MIN, group=group.device_group
+        # carry the entire error row together so counts cannot come from different ranks
+        peers = [torch.empty_like(result) for _ in range(group.world_size)]
+        torch.distributed.all_gather(peers, result, group=group.device_group)
+        peers = torch.stack(peers)
+        owner = peers[:, :, 1].argmax(dim=0)
+        result = peers.gather(0, owner[None, :, None].expand(1, batch_size, 4)).squeeze(
+            0
         )
-
-    details = torch.where(
-        (owner == rank).unsqueeze(1), local_details, torch.zeros_like(local_details)
-    )
-    for group in groups:
-        torch.distributed.all_reduce(
-            details, op=torch.distributed.ReduceOp.SUM, group=group.device_group
-        )
-    return torch.cat((validated.unsqueeze(1), failure.unsqueeze(1), details), dim=1)
+        result[:, 0] = peers[:, :, 0].amax(dim=0)
+    return result
 
 
 def merge_mm_embedding_error_tensors(
@@ -499,7 +492,7 @@ def msgpack_decode_explained(data: bytes) -> Any:
             if m is not None:
                 idx = int(m.group(1))
                 if 1 <= idx <= len(fields):
-                    msg = f"{msg[:m.start()]}$.{fields[idx - 1]}{msg[m.end():]}"
+                    msg = f"{msg[: m.start()]}$.{fields[idx - 1]}{msg[m.end() :]}"
         raise MsgpackDecodeError(rid, msg) from e
 
 

@@ -178,6 +178,35 @@ class ComponentResidencyManager:
         self._ordered_uses = tuple(
             use for uses in self._stage_uses_by_index for use in uses
         )
+        self._validate_explicit_nonresident_components()
+
+    def _validate_explicit_nonresident_components(self) -> None:
+        """Reject explicit offload selectors with no request-time use site.
+
+        Component placement is enacted by the request timeline, not merely by
+        choosing an initial load device. An explicit non-resident module with
+        no declared ``ComponentUse`` would otherwise be accepted but never
+        moved to the device before a forward pass.
+        """
+        if not isinstance(self.server_args, ServerArgs):
+            return
+
+        declared_components = {use.component_name for use in self._ordered_uses}
+        unmanaged_components = sorted(
+            component_name
+            for component_name, module in self.pipeline.modules.items()
+            if isinstance(module, nn.Module)
+            and self.server_args.explicit_residency_mode(component_name)
+            in (COMPONENT_OFFLOAD, LAYERWISE_OFFLOAD)
+            and component_name not in declared_components
+        )
+        if unmanaged_components:
+            names = ", ".join(repr(name) for name in unmanaged_components)
+            raise ComponentResidencyError(
+                "Explicit component residency requires "
+                f"{names} to have a request-time ComponentUse declaration; "
+                "none appears in this pipeline"
+            )
 
     @staticmethod
     def _is_warmup_batch(batch: ResidencyBatch | list[ResidencyBatch]) -> bool:

@@ -7,7 +7,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers import mm_schedule as mm_utils
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="base-b-test-cpu")
+register_cpu_ci(est_time=8, suite="stage-a-test-cpu-intel")
 
 
 @pytest.mark.parametrize(
@@ -62,7 +62,9 @@ def test_get_embedding_and_mask_uses_offset_count_without_readback():
 
     with (
         envs.SGLANG_ENABLE_ASYNC_ASSERT.override(False),
-        patch.object(mm_utils, "_get_precomputed_embedding", return_value=embedding),
+        patch.object(
+            mm_utils, "_get_precomputed_embedding", return_value=(embedding, [])
+        ),
         patch.object(mm_utils, "_get_multimodal_mask", return_value=mask),
     ):
         result, result_mask, result_input_ids, errors = mm_utils.get_embedding_and_mask(
@@ -74,6 +76,7 @@ def test_get_embedding_and_mask_uses_offset_count_without_readback():
             prefix_length=[0],
             extend_length=[8],
             items_offset_list=[[(2, 4)]],
+            embedding_dim=4,
         )
 
     mask.sum.assert_not_called()
@@ -90,7 +93,9 @@ def test_get_embedding_and_mask_async_asserts_offset_count():
 
     with (
         envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True),
-        patch.object(mm_utils, "_get_precomputed_embedding", return_value=embedding),
+        patch.object(
+            mm_utils, "_get_precomputed_embedding", return_value=(embedding, [])
+        ),
         patch.object(mm_utils.torch, "_assert_async") as assert_async,
     ):
         mm_utils.get_embedding_and_mask(
@@ -102,6 +107,7 @@ def test_get_embedding_and_mask_async_asserts_offset_count():
             prefix_length=[0],
             extend_length=[8],
             items_offset_list=[[(2, 4)]],
+            embedding_dim=4,
         )
 
     assert_async.assert_called_once()
@@ -137,7 +143,7 @@ def test_get_embedding_and_mask_falls_back_after_input_ids_rewrite():
     mask.sum.return_value = mask_sum
 
     with (
-        patch.object(mm_utils, "_get_precomputed_embedding", return_value=None),
+        patch.object(mm_utils, "_get_precomputed_embedding", return_value=(None, [])),
         patch.object(
             mm_utils,
             "_get_chunked_prefill_embedding",
@@ -154,6 +160,7 @@ def test_get_embedding_and_mask_falls_back_after_input_ids_rewrite():
             prefix_length=[0],
             extend_length=[8],
             items_offset_list=[[(2, 4)]],
+            embedding_dim=4,
         )
 
     mask.sum.assert_called_once_with()

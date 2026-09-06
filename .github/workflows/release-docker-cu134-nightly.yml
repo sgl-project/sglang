@@ -33,7 +33,8 @@ concurrency:
 jobs:
   build-arm64:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: arm-docker-build-node
+    # Use kernel builder node since we need to build wheels from source.
+    runs-on: arm-kernel-build-node
     environment: ${{ (github.event_name == 'schedule' || !inputs.build_only) && 'prod' || null }}
     # Cold builds recompile three CUDA wheels from source.
     timeout-minutes: 360

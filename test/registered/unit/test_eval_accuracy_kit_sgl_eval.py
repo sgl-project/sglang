@@ -62,8 +62,9 @@ class TestEvalKitBackendDispatch(CustomTestCase):
         host.model = "m"
         for k, v in attrs.items():
             setattr(host, k, v)
-        with patch.object(kit, "run_eval", side_effect=fake_run_eval), patch.object(
-            kit.requests, "get", side_effect=_fake_get
+        with (
+            patch.object(kit, "run_eval", side_effect=fake_run_eval),
+            patch.object(kit.requests, "get", side_effect=_fake_get),
         ):
             host.test_gsm8k()
         return captured["args"]
@@ -108,8 +109,9 @@ class TestEvalKitBackendDispatch(CustomTestCase):
         host.model = "deployment-model"
         host.mmmu_pro_score_threshold = 0.75
         host.mmmu_pro_load_preset_from_model_id = "moonshotai/Kimi-K3"
-        with patch.object(kit, "run_eval", side_effect=fake_run_eval), patch.object(
-            kit.requests, "get", side_effect=_fake_get
+        with (
+            patch.object(kit, "run_eval", side_effect=fake_run_eval),
+            patch.object(kit.requests, "get", side_effect=_fake_get),
         ):
             host.test_mmmu_pro()
         return captured["args"]

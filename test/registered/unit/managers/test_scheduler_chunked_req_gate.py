@@ -12,7 +12,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import NextBatchPlan, Req
+from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.utils import complete_mm_embedding_validations
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
@@ -35,12 +35,12 @@ def _make_req(
     req.output_ids = array("q")
     req.full_untruncated_fill_ids = array("q", fill_ids)
     req.prefix_indices = prefix_indices
-    req.req_pool_idx = req_pool_idx
     req.extend_range = Range(fill_len - extend_input_len, fill_len)
     req.inflight_middle_chunks = 0
     req.host_hit_length = 0
-    req.cache_protected_len = 0
+    req.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
     req.skip_radix_cache_insert = False
+    req.mm_embedding_validation_count = 0
     req.last_node = None
     req.swa_uuid_for_lock = None
     req.session = None
@@ -49,7 +49,7 @@ def _make_req(
     req.positional_embed_overrides = None
     req.extra_key = None
     req.cache_salt = None
-    req.mamba_pool_idx = None
+    req.kv.mamba_pool_idx = None
     req.sampling_params = SimpleNamespace(max_new_tokens=128, ignore_eos=False)
     return req
 
@@ -77,6 +77,7 @@ def _make_chunk_cache(req_to_token_pool) -> ChunkCache:
 
 def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s = Scheduler.__new__(Scheduler)
+    s.scheduler_stage_metrics = None
     s._abort_on_waiting_timeout = MagicMock()
     s._abort_on_running_timeout = MagicMock()
     s.dllm_config = None
@@ -117,6 +118,7 @@ def _scheduler_for_raw_prefill(*, chunked_req, waiting_queue) -> Scheduler:
     s.grammar_manager = MagicMock()
     s.grammar_manager.has_waiting_grammars.return_value = False
     s.enable_hierarchical_cache = False
+    s.enable_unified_cache_external_linker = False
     s.enable_priority_preemption = False
     s.is_hybrid_swa = False
     s.chunked_req = chunked_req
@@ -124,7 +126,7 @@ def _scheduler_for_raw_prefill(*, chunked_req, waiting_queue) -> Scheduler:
     s.min_free_slots_delayer = None
     s.get_num_allocatable_reqs = MagicMock(return_value=1)
     s.policy = MagicMock()
-    s.enable_dynamic_chunking = False
+    s.dynamic_chunk_sizer = None
     s.chunked_prefill_size = 8
     s.tp_worker = SimpleNamespace(
         model_runner=SimpleNamespace(

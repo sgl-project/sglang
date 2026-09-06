@@ -111,7 +111,12 @@ def _compute_world_size() -> int:
     Reads the published parallel leaves: the driver is sizing the actors that
     will hold the process groups, so there is nothing live to ask.
     """
-    return compute_world_size(get_parallel().config)
+    return compute_world_size(
+        enable_dp_attention=get_parallel().enable_dp_attention,
+        dp_size=get_parallel().dp_size,
+        tp_size=get_parallel().tp_size,
+        pp_size=get_parallel().pp_size,
+    )
 
 
 def _resolve_bundle_indices(pg: PlacementGroup, world_size: int) -> List[int]:
@@ -269,7 +274,7 @@ class RayEngine(Engine):
                 placement_group as create_placement_group,
             )
 
-            parallel = get_parallel().config
+            parallel = get_parallel()
             if parallel.enable_dp_attention:
                 total_gpus = parallel.tp_size * parallel.pp_size
             else:
@@ -292,7 +297,7 @@ class RayEngine(Engine):
             ray.get(pg.ready())
 
         is_custom_pg = placement_group is not None
-        nnodes = get_parallel().config.nnodes
+        nnodes = get_parallel().nnodes
         world_size = _compute_world_size()
 
         if not is_custom_pg:
@@ -314,7 +319,7 @@ class RayEngine(Engine):
             rank0_bundle_idx = int(indices_str.split(",")[0]) if indices_str else 0
             rank0_node_ip = _get_bundle_node_ip(pg, rank0_bundle_idx)
 
-        if get_parallel().config.dp_size == 1:
+        if get_parallel().dp_size == 1:
             dist_init_addr = f"{rank0_node_ip}:{port_args.nccl_port}"
             logger.info(f"dist_init_addr: {dist_init_addr}")
 
@@ -332,8 +337,8 @@ class RayEngine(Engine):
                     pp_range, tp_range, pp_per_node, tp_per_node = (
                         _calculate_rank_ranges(
                             nnodes,
-                            get_parallel().config.pp_size,
-                            get_parallel().config.tp_size,
+                            get_parallel().pp_size,
+                            get_parallel().tp_size,
                             node_rank=node_idx,
                         )
                     )
@@ -369,7 +374,7 @@ class RayEngine(Engine):
                     f"bundle_indices={bundle_indices}"
                 )
 
-                tp_size = get_parallel().config.tp_size
+                tp_size = get_parallel().tp_size
                 for rank in range(world_size):
                     pp_rank = rank // tp_size
                     tp_rank = rank % tp_size
@@ -448,7 +453,7 @@ class RayEngine(Engine):
             RayDataParallelController,
         )
 
-        parallel = get_parallel().config
+        parallel = get_parallel()
         if parallel.enable_dp_attention:
             # DP attention folds DP into TP — total GPUs = tp_size * pp_size
             total_gpus = parallel.tp_size * parallel.pp_size

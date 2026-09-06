@@ -78,13 +78,15 @@ def _get_precomputed_embedding(
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
-) -> Optional[torch.Tensor]:
+    embedding_dim: int,
+) -> Tuple[Optional[torch.Tensor], List[MultimodalEmbeddingError]]:
     """
     If all items have precomputed_embeddings, return their concatenation.
     If some but not all have precomputed_embeddings, raise NotImplementedError.
     If none have precomputed_embeddings, return None.
     """
     precomputed_embeddings = []
+    errors = []
     max_iterations = min(len(items_size) - 1, len(prefix_length))
 
     for i in range(max_iterations):
@@ -98,9 +100,19 @@ def _get_precomputed_embedding(
         if any(item.precomputed_embeddings is None for item in items_per_req):
             chunk = None
         else:
-            req_embeddings = torch.concat(
-                [item.precomputed_embeddings for item in items_per_req]
-            )
+            expected = sum(end - start + 1 for start, end in items_offset)
+            parts = [item.precomputed_embeddings for item in items_per_req]
+            if any(part.ndim < 2 or part.shape[-1] != embedding_dim for part in parts):
+                actual = -1
+                req_embeddings = parts[0]
+            else:
+                req_embeddings = torch.concat(
+                    [part.reshape(-1, embedding_dim) for part in parts]
+                )
+                actual = _embedding_token_count(req_embeddings)
+            if actual != expected:
+                errors.append((i, expected, actual))
+                req_embeddings = req_embeddings.new_zeros((expected, embedding_dim))
             chunk, _, _ = get_embedding_chunk(
                 embedding=req_embeddings,
                 extend_prefix_len=prefix_length[i],
@@ -109,7 +121,7 @@ def _get_precomputed_embedding(
             )
 
         if chunk is None and len(items_per_req) > 1:
-            return None
+            return None, []
         precomputed_embeddings.append(chunk)
 
     if any(feature is not None for feature in precomputed_embeddings):
@@ -130,8 +142,8 @@ def _get_precomputed_embedding(
         result = torch.concat(precomputed_embeddings)
         # some models embedding is 3-dim, reshape it to 2-dim (similar to get_embedding_chunk)
         result = result.reshape(-1, result.shape[-1])
-        return result
-    return None
+        return result, errors
+    return None, []
 
 
 # A modality's embedding function. May return the combined [tokens, hidden]
@@ -184,37 +196,73 @@ def _pad_short_embedding(embedding: torch.Tensor, expected_tokens: int) -> torch
     )
 
 
-def _retry_individual_embeddings(
-    data_embedding_func: "DataEmbeddingFunc",
+def _validate_per_item_embeddings(
+    data_embedding_func: DataEmbeddingFunc,
     items: List[MultimodalDataItem],
-) -> List[torch.Tensor]:
-    embeddings = []
-    for item in items:
-        embedding = data_embedding_func([item])
-        if isinstance(embedding, list):
-            assert len(embedding) == 1, (
-                "single-item embedding retry returned "
-                f"{len(embedding)} per-item embeddings"
-            )
-            embedding = embedding[0]
-        embeddings.append(embedding.reshape(-1, embedding.shape[-1]))
-    return embeddings
-
-
-def _split_or_retry_short_combined_embedding(
-    data_embedding_func: "DataEmbeddingFunc",
-    items: List[MultimodalDataItem],
-    embedding: torch.Tensor,
+    embedding: torch.Tensor | List[torch.Tensor],
     token_counts: List[int],
-) -> Tuple[List[torch.Tensor], bool, int, int]:
-    embedding = embedding.reshape(-1, embedding.shape[-1])
-    expected_total = sum(token_counts)
-    actual_total = embedding.shape[0]
-    if actual_total >= expected_total:
-        return list(torch.split(embedding, token_counts, dim=0)), False, 0, 0
+    embedding_dim: int,
+    device: torch.device,
+) -> Tuple[List[torch.Tensor], Dict[int, Tuple[int, int]]]:
+    """validate fresh outputs before cache admission; fillers are never cached"""
+    if isinstance(embedding, list):
+        retry = len(embedding) != len(items)
+        outputs = embedding
+    elif embedding.ndim < 2:
+        retry = True
+        outputs = []
+    else:
+        embedding = embedding.reshape(-1, embedding.shape[-1])
+        retry = embedding.shape[0] != sum(token_counts)
+        outputs = [] if retry else list(embedding.split(token_counts))
 
-    retry_embeddings = _retry_individual_embeddings(data_embedding_func, items)
-    return retry_embeddings, False, 0, 0
+    # every participating rank must agree before re-entering a TP-aware encoder
+    parallel = get_parallel()
+    groups = []
+    if parallel.attn_tp_size > 1:
+        groups.append(parallel.attn_tp_group)
+    if parallel.attn_cp_size > 1 and all(
+        parallel.attn_cp_group.device_group is not group.device_group
+        for group in groups
+    ):
+        groups.append(parallel.attn_cp_group)
+    if groups:
+        retry_tensor = torch.tensor(int(retry), device=device)
+        for group in groups:
+            torch.distributed.all_reduce(
+                retry_tensor,
+                op=torch.distributed.ReduceOp.MAX,
+                group=group.device_group,
+            )
+        retry = bool(retry_tensor.item())
+
+    # a combined mismatch has no reliable item boundaries; retry each owner
+    if retry:
+        outputs = []
+        for item in items:
+            output = data_embedding_func([item])
+            if isinstance(output, list):
+                output = output[0] if len(output) == 1 else None
+            outputs.append(output)
+
+    errors = {}
+    for i, (output, expected) in enumerate(zip(outputs, token_counts, strict=True)):
+        actual = (
+            -1
+            if output is None or output.ndim < 2 or output.shape[-1] != embedding_dim
+            else _embedding_token_count(output)
+        )
+        if actual != expected:
+            errors[i] = (expected, actual)
+            # the caller supplies the width even when the encoder returned []
+            outputs[i] = (
+                torch.zeros(expected, embedding_dim, device=device)
+                if output is None
+                else output.new_zeros((expected, embedding_dim))
+            )
+        else:
+            outputs[i] = output.reshape(-1, output.shape[-1])
+    return outputs, errors
 
 
 def _discard_mismatched_cached_embedding(
@@ -294,6 +342,7 @@ def _get_chunked_embedding_full(
     extend_seq_len: int,
     input_ids: torch.Tensor,
     device: torch.device,
+    embedding_dim: int,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor, Optional[Tuple[int, int]]]:
     """
     Fallback: encode all items at once, cache combined result, extract chunk.
@@ -318,25 +367,36 @@ def _get_chunked_embedding_full(
             )
             embedding_per_req = None
 
+    error = None
     fresh_embedding = embedding_per_req is None
     if fresh_embedding:
         if not _can_skip_pre_embed_feature_move(data_embedding_func):
             _move_items_to_device(embedding_items_per_req, device)
         embedding = data_embedding_func(embedding_items_per_req)
-        if isinstance(embedding, list):
-            # This path caches the combined per-request embedding, so the
-            # per-item form is flattened here.
-            embedding = _flatten_embedding_result(embedding)
-        embedding_per_req = (
-            EmbeddingResult(embedding=embedding)
-            if isinstance(embedding, torch.Tensor)
-            else embedding
-        )
-        expected_token_count = sum(end - start + 1 for start, end in items_offset)
-        actual_token_count = _embedding_token_count(embedding_per_req.embedding)
-        if isinstance(embedding_per_req, EVSEmbeddingResult) or (
-            actual_token_count >= expected_token_count
-        ):
+        if isinstance(embedding, EVSEmbeddingResult):
+            embedding_per_req = embedding
+        else:
+            expected_token_count = sum(end - start + 1 for start, end in items_offset)
+            parts = embedding if isinstance(embedding, list) else [embedding]
+            invalid_shape = any(
+                part.ndim < 2 or part.shape[-1] != embedding_dim for part in parts
+            )
+            invalid_count = isinstance(embedding, list) and len(parts) != len(
+                embedding_items_per_req
+            )
+            if invalid_shape or invalid_count:
+                actual_token_count = -1
+            else:
+                embedding = _flatten_embedding_result(embedding)
+                actual_token_count = _embedding_token_count(embedding)
+            if actual_token_count != expected_token_count:
+                error = (expected_token_count, actual_token_count)
+                # a bundled result cannot be split reliably after a mismatch
+                embedding = torch.zeros(
+                    expected_token_count, embedding_dim, device=device
+                )
+            embedding_per_req = EmbeddingResult(embedding=embedding)
+        if error is None:
             embedding_cache.set(embedding_items_hash, embedding_per_req)
     else:
         _acknowledge_deferred_cuda_ipc_cache_hits(embedding_items_per_req)
@@ -359,19 +419,6 @@ def _get_chunked_embedding_full(
         extend_seq_len=extend_seq_len,
         items_offset=items_offset,
     )
-    error = None
-    if (
-        fresh_embedding
-        and not isinstance(embedding_per_req, EVSEmbeddingResult)
-        and actual_token_count < expected_token_count
-    ):
-        error = (expected_token_count, actual_token_count)
-        expected_chunk_tokens = _count_mm_tokens_in_extend(
-            [extend_prefix_len], [extend_seq_len], [items_offset]
-        )
-        embedding_per_req_chunk = _pad_short_embedding(
-            embedding_per_req_chunk, expected_chunk_tokens
-        )
     return embedding_per_req_chunk, input_ids, error
 
 
@@ -393,6 +440,7 @@ def _batch_encode_per_image_misses(
     data_embedding_func: DataEmbeddingFunc,
     per_image_requests: List[PerImageRequestInfo],
     device: torch.device,
+    embedding_dim: int,
 ) -> Tuple[
     Dict[Tuple[Optional[int], int], torch.Tensor],
     Dict[Tuple[Optional[int], int], Tuple[int, int]],
@@ -452,39 +500,17 @@ def _batch_encode_per_image_misses(
         if not _can_skip_pre_embed_feature_move(data_embedding_func):
             _move_items_to_device(miss_items, device)
         all_miss_embedding = data_embedding_func(miss_items)
-        ambiguous_short_output = False
-
-        if isinstance(all_miss_embedding, list):
-            # Per-item embeddings: no split needed, and each cache entry owns
-            # its storage (a torch.split view would pin the whole concatenated
-            # buffer for as long as any single item stays cached). Mirrors
-            # _get_chunked_embedding_by_item.
-            assert len(all_miss_embedding) == len(miss_items), (
-                f"per-item embedding count {len(all_miss_embedding)} != "
-                f"cache-miss item count {len(miss_items)}"
-            )
-            split_embeddings = [
-                emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
-            ]
-        else:
-            (
-                split_embeddings,
-                ambiguous_short_output,
-                expected_total,
-                actual_total,
-            ) = _split_or_retry_short_combined_embedding(
-                data_embedding_func, miss_items, all_miss_embedding, token_counts
-            )
-        for cache_key, emb in zip(ordered_cache_keys, split_embeddings):
-            actual_token_count = _embedding_token_count(emb)
-            expected_token_count = cache_key[1]
-            if not isinstance(all_miss_embedding, list) and ambiguous_short_output:
-                malformed_embeddings[cache_key] = (expected_total, actual_total)
-            elif actual_token_count < expected_token_count:
-                malformed_embeddings[cache_key] = (
-                    expected_token_count,
-                    actual_token_count,
-                )
+        split_embeddings, errors = _validate_per_item_embeddings(
+            data_embedding_func,
+            miss_items,
+            all_miss_embedding,
+            token_counts,
+            embedding_dim,
+            device,
+        )
+        for i, (cache_key, emb) in enumerate(zip(ordered_cache_keys, split_embeddings)):
+            if i in errors:
+                malformed_embeddings[cache_key] = errors[i]
             else:
                 embedding_cache.set(cache_key[0], EmbeddingResult(embedding=emb))
             # Keep a local ref (no extra GPU memory) so assembly never fails due to LRU eviction.
@@ -500,6 +526,7 @@ def _get_chunked_embedding_by_item(
     extend_prefix_len: int,
     extend_seq_len: int,
     device: torch.device,
+    embedding_dim: int,
 ) -> Tuple[Optional[torch.Tensor], Optional[Tuple[int, int]]]:
     """
     Per-image chunk-aware encoding for one request.
@@ -546,42 +573,21 @@ def _get_chunked_embedding_by_item(
         if not _can_skip_pre_embed_feature_move(data_embedding_func):
             _move_items_to_device(miss_item_list, device)
         all_miss_embedding = data_embedding_func(miss_item_list)
-        ambiguous_short_output = False
-
-        if isinstance(all_miss_embedding, list):
-            # Per-item embeddings: no split needed, and each cache entry owns
-            # its storage (a torch.split view would pin the whole concatenated
-            # buffer for as long as any single item stays cached).
-            assert len(all_miss_embedding) == len(miss_items), (
-                f"per-item embedding count {len(all_miss_embedding)} != "
-                f"cache-miss item count {len(miss_items)}"
-            )
-            split_embeddings = [
-                emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
-            ]
-        else:
-            # Split output by per-item token count
-            token_counts = [end - start + 1 for _, _, start, end in miss_items]
-            (
-                split_embeddings,
-                ambiguous_short_output,
-                expected_total,
-                actual_total,
-            ) = _split_or_retry_short_combined_embedding(
-                data_embedding_func,
-                miss_item_list,
-                all_miss_embedding,
-                token_counts,
-            )
-
-        for (idx, item, start, end), emb in zip(miss_items, split_embeddings):
+        token_counts = [end - start + 1 for _, _, start, end in miss_items]
+        split_embeddings, errors = _validate_per_item_embeddings(
+            data_embedding_func,
+            miss_item_list,
+            all_miss_embedding,
+            token_counts,
+            embedding_dim,
+            device,
+        )
+        for i, ((idx, item, start, end), emb) in enumerate(
+            zip(miss_items, split_embeddings)
+        ):
             cached_embeddings[idx] = emb
-            expected_token_count = end - start + 1
-            actual_token_count = _embedding_token_count(emb)
-            if not isinstance(all_miss_embedding, list) and ambiguous_short_output:
-                malformed = (expected_total, actual_total)
-            elif actual_token_count < expected_token_count:
-                malformed = (expected_token_count, actual_token_count)
+            if i in errors:
+                malformed = errors[i]
             else:
                 embedding_cache.set(item.hash, EmbeddingResult(embedding=emb))
 
@@ -638,6 +644,7 @@ def _get_chunked_prefill_embedding(
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
     input_ids: torch.Tensor,
+    embedding_dim: int,
 ) -> tuple[torch.Tensor | None, torch.Tensor, List[MultimodalEmbeddingError]]:
     """
     Chunked prefill embedding: encode items across all requests and extract
@@ -690,6 +697,7 @@ def _get_chunked_prefill_embedding(
                     extend_prefix_len,
                     extend_seq_len,
                     device,
+                    embedding_dim,
                 )
                 if chunk is not None:
                     all_chunks.append((i, chunk))
@@ -705,7 +713,7 @@ def _get_chunked_prefill_embedding(
     malformed_embeddings: Dict[Tuple[Optional[int], int], Tuple[int, int]] = {}
     if per_image_requests:
         hash_to_embedding, malformed_embeddings = _batch_encode_per_image_misses(
-            data_embedding_func, per_image_requests, device
+            data_embedding_func, per_image_requests, device, embedding_dim
         )
 
     # Phase 2: assemble per-request chunks in original request order
@@ -744,6 +752,7 @@ def _get_chunked_prefill_embedding(
             req_info.extend_seq_len,
             input_ids,
             device,
+            embedding_dim,
         )
         if chunk_embedding is not None:
             all_chunks.append((req_info.req_idx, chunk_embedding))
@@ -824,6 +833,7 @@ def get_embedding_and_mask(
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
+    embedding_dim: int,
 ) -> Tuple[
     torch.Tensor | None,
     torch.Tensor | None,
@@ -857,8 +867,13 @@ def get_embedding_and_mask(
     )
 
     # 1. Get embedding
-    embedding = _get_precomputed_embedding(
-        embedding_items, items_size, prefix_length, extend_length, items_offset_list
+    embedding, errors = _get_precomputed_embedding(
+        embedding_items,
+        items_size,
+        prefix_length,
+        extend_length,
+        items_offset_list,
+        embedding_dim,
     )
     if embedding is None:
         embedding, input_ids, errors = _get_chunked_prefill_embedding(
@@ -869,11 +884,10 @@ def get_embedding_and_mask(
             extend_length,
             items_offset_list,
             input_ids,
+            embedding_dim,
         )
         if embedding is None:
             return None, None, input_ids, errors
-    else:
-        errors = []
     # 2. Get mask
     if _is_npu:
         torch.npu.current_stream().synchronize()

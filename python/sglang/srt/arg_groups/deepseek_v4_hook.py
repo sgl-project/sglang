@@ -4,10 +4,13 @@ import logging
 from typing import TYPE_CHECKING
 
 from sglang.srt.arg_groups.overrides import (
+    _deepseek_v4_kv_cache_dtype,
     declare_resolution,
     resolving_view,
+    run_post_process_pass,
 )
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_platform
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -112,14 +115,13 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     that field) and the validations.
     """
     cfg = resolving_view(server_args)
-    from sglang.srt.utils import is_hip
 
     # FlashMLA sparse prefill (SGLANG_OPT_FLASHMLA_SPARSE_PREFILL, default on)
     # currently returns incorrect output for DeepSeek-V4-Flash on ROCm/HIP
     # (MI355X), which breaks the disaggregation nightly. Keep the previous
     # (dense prefill) behavior on ROCm until the sparse kernel is validated
     # there;
-    if is_hip():
+    if get_platform().is_hip:
         logger.warning(
             "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL by default on ROCm/HIP "
             f"for {model_arch}; set it explicitly to override."
@@ -129,10 +131,6 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     # The kv-cache dtype default moved to the resolution pipeline
     # (arg_groups/overrides.py: _deepseek_v4_kv_cache_dtype), invoked here at
     # its legacy slot.
-    from sglang.srt.arg_groups.overrides import (
-        _deepseek_v4_kv_cache_dtype,
-        run_post_process_pass,
-    )
 
     run_post_process_pass(server_args, _deepseek_v4_kv_cache_dtype)
 
@@ -150,11 +148,13 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         assert cfg.speculative_algorithm in (
             "EAGLE",
             "DSPARK",
-        ), f"Only EAGLE and DSPARK speculative algorithms are supported for {model_arch}"
+        ), (
+            f"Only EAGLE and DSPARK speculative algorithms are supported for {model_arch}"
+        )
         if cfg.speculative_algorithm == "EAGLE":
-            assert (
-                cfg.speculative_eagle_topk == 1
-            ), f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
+            assert cfg.speculative_eagle_topk == 1, (
+                f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
+            )
 
 
 def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
@@ -165,24 +165,27 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
 
     if cfg.cp_strategy != "interleave":
         raise ValueError(
-            "DeepSeekV4 only supports interleave CP strategy, " f"got {cfg.cp_strategy}"
+            f"DeepSeekV4 only supports interleave CP strategy, got {cfg.cp_strategy}"
         )
 
-    declare_resolution(
-        server_args,
-        "validate_deepseek_v4_cp",
-        enable_dsa_prefill_context_parallel=True,
-    )
-    declare_resolution(
-        server_args,
-        "validate_deepseek_v4_cp",
-        enable_prefill_context_parallel=False,
-    )
-    declare_resolution(
-        server_args,
-        "validate_deepseek_v4_cp",
-        dsa_prefill_cp_mode="round-robin-split",
-    )
+    if get_platform().is_hip or get_platform().is_npu:
+        # Protected platform implementations still consume the legacy runtime
+        # fields. Generic backends use enable_prefill_cp/cp_strategy directly.
+        declare_resolution(
+            server_args,
+            "validate_deepseek_v4_cp",
+            enable_dsa_prefill_context_parallel=True,
+        )
+        declare_resolution(
+            server_args,
+            "validate_deepseek_v4_cp",
+            enable_prefill_context_parallel=False,
+        )
+        declare_resolution(
+            server_args,
+            "validate_deepseek_v4_cp",
+            dsa_prefill_cp_mode="round-robin-split",
+        )
     declare_resolution(
         server_args,
         "validate_deepseek_v4_cp",
@@ -198,12 +201,12 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         "validate_deepseek_v4_cp",
         attn_cp_size=cfg.tp_size // cfg.dp_size,
     )
-    assert (
-        cfg.dp_size == 1
-    ), "For round-robin split mode, dp attention is not supported."
-    assert (
-        cfg.tp_size <= 8
-    ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+    assert cfg.dp_size == 1, (
+        "For round-robin split mode, dp attention is not supported."
+    )
+    assert cfg.tp_size <= 8, (
+        "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+    )
     supported_a2a_backends = ("none", "deepep", "megamoe", "mori")
     if cfg.moe_a2a_backend not in supported_a2a_backends:
         raise ValueError(

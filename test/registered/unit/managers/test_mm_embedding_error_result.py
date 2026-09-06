@@ -1,4 +1,6 @@
 import inspect
+import sys
+from array import array
 from http import HTTPStatus
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
@@ -7,11 +9,12 @@ import pytest
 import torch
 
 from sglang.srt.beam_search.coordinator import BeamCoordinator
+from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.overlap_utils import RelayPayload
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -27,11 +30,27 @@ from sglang.srt.managers.utils import (
     merge_mm_embedding_error_tensors,
     synchronize_mm_embedding_errors,
 )
+from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+@pytest.fixture(autouse=True)
+def runtime_config():
+    override = get_context().override_server_args(tp_size=1)
+    override.install()
+    try:
+        yield
+    finally:
+        override.restore()
 
 
 def _make_beam_failure():
@@ -44,7 +63,7 @@ def _make_beam_failure():
     req.session = None
     req.req_pool_idx = 0
     req.mamba_pool_idx = None
-    req.kv = SimpleNamespace(kv_allocated_len=4)
+    req.kv = ReqKvInfo(req_pool_idx=0, kv_allocated_len=4, kv_committed_len=4)
     req.kv_committed_len = 4
     req.time_stats = Mock()
 
@@ -227,6 +246,7 @@ def test_failed_validation_while_parked_restores_pool_without_kv_send():
         _pending_chunked_abort_req=req,
         disaggregation_mode=DisaggregationMode.NULL,
         enable_hicache_storage=False,
+        _release_aborted_request=Mock(),
         tree_cache=Mock(),
         ipc_channels=SimpleNamespace(
             send_to_tokenizer=SimpleNamespace(send_output=Mock())
@@ -238,6 +258,10 @@ def test_failed_validation_while_parked_restores_pool_without_kv_send():
 
     def free_once(*_args, **_kwargs):
         pool.available += 1
+
+    scheduler.batch_result_processor = SimpleNamespace(
+        _finish_deferred_mm_embedding_abort=Mock(side_effect=free_once)
+    )
 
     with (
         patch("sglang.srt.managers.scheduler.prepare_abort"),
@@ -258,7 +282,10 @@ def test_failed_validation_while_parked_restores_pool_without_kv_send():
         )
 
     assert pool.available == pool.baseline
-    release_kv_cache.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+    scheduler.batch_result_processor._finish_deferred_mm_embedding_abort.assert_called_once_with(
+        req
+    )
+    release_kv_cache.assert_not_called()
     scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
     scheduler.check_bootstrap.assert_not_called()
     scheduler.send_kv_chunk.assert_not_called()
@@ -371,6 +398,7 @@ def test_run_batch_registers_validation_before_optional_early_send():
     send_kv_chunk = Mock()
     scheduler = SimpleNamespace(
         forward_ct=0,
+        metrics_reporter=Mock(),
         _sched_idled=False,
         scripted_scheduler_hook=None,
         profiler_manager=Mock(),
@@ -492,15 +520,23 @@ def test_pp_embedding_error_metadata_remains_forwardable():
 
 def test_pp_future_map_filter_excludes_failed_rows():
     indices = torch.tensor([10, 11])
-    token_ids = torch.tensor([100, 101])
+    payload = RelayPayload(
+        bonus_tokens=torch.tensor([100, 101]),
+        hidden_states=torch.tensor([[1.0], [2.0]]),
+        topk_p=torch.tensor([[0.8], [0.9]]),
+        topk_index=torch.tensor([[42], [43]]),
+    )
     errors = torch.tensor([[1, 0, 0, 0], [1, 1, 6, 2]])
 
-    filtered_indices, filtered_tokens = _pp_filter_failed_rows(
-        indices, token_ids, errors
+    filtered_indices, filtered_payload = _pp_filter_failed_rows(
+        indices, payload, errors
     )
 
     assert filtered_indices.tolist() == [10]
-    assert filtered_tokens.tolist() == [100]
+    assert filtered_payload.bonus_tokens.tolist() == [100]
+    assert filtered_payload.hidden_states.tolist() == [[1.0]]
+    torch.testing.assert_close(filtered_payload.topk_p, torch.tensor([[0.8]]))
+    assert filtered_payload.topk_index.tolist() == [[42]]
 
 
 def test_pp_multistage_merge_preserves_incoming_failure_details():
@@ -575,30 +611,22 @@ def test_pp_does_not_skip_output_for_chunk_overlapping_mm_placeholder():
 def test_mm_embedding_errors_are_synchronized_as_batch_aligned_details(monkeypatch):
     group = SimpleNamespace(world_size=2, device_group=object())
     parallel = SimpleNamespace(attn_tp_group=group, attn_cp_group=group)
-    reduce_ops = []
+    gathered_groups = []
 
-    def all_reduce(values, op, **_kwargs):
-        reduce_ops.append(op)
-        if values.ndim == 2:
-            values[1] = torch.tensor([6, 2])
-        elif op == torch.distributed.ReduceOp.MAX:
-            values[1] = 1
-        else:
-            values[1] = 1
+    def all_gather(peers, values, group):
+        gathered_groups.append(group)
+        peers[0].copy_(values)
+        peers[1].copy_(values)
+        peers[1][1] = torch.tensor([1, 1, 6, 2])
 
     monkeypatch.setattr("sglang.srt.managers.utils.get_parallel", lambda: parallel)
-    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
-    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "all_gather", all_gather)
 
     synchronized = synchronize_mm_embedding_errors(None, 2, torch.device("cpu"), [1])
 
     assert synchronized.tolist() == [[0, 0, 0, 0], [1, 1, 6, 2]]
     assert decode_mm_embedding_errors(synchronized) == [(1, 6, 2)]
-    assert reduce_ops == [
-        torch.distributed.ReduceOp.MAX,
-        torch.distributed.ReduceOp.MIN,
-        torch.distributed.ReduceOp.SUM,
-    ]
+    assert gathered_groups == [group.device_group]
 
 
 def test_disagg_beam_failure_retires_group_and_releases_resources_once():
@@ -636,6 +664,7 @@ def test_disagg_beam_failure_retires_group_and_releases_resources_once():
     scheduler.clear_pending_chunk_send.assert_called_once_with(req)
     req.disagg_kv_sender.abort.assert_called_once_with()
     req.disagg_kv_sender.clear.assert_called_once_with()
+    req.disagg_kv_sender.clear.assert_called_once_with()
     release_metadata.assert_called_once_with(
         req, scheduler.req_to_metadata_buffer_idx_allocator
     )
@@ -647,3 +676,121 @@ def test_disagg_beam_failure_retires_group_and_releases_resources_once():
     req_to_token_pool.free_rows.assert_called_once_with([1])
     tree_cache.release_aborted_request.assert_called_once_with(req.rid)
     release_kv_cache.assert_called_once_with(req, tree_cache, is_insert=False)
+
+
+@pytest.mark.parametrize("path", ["normal", "disagg", "parked", "parked-disagg"])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                torch.version.hip is not None or not torch.cuda.is_available(),
+                reason="requires an NVIDIA GPU",
+            ),
+        ),
+    ],
+)
+def test_mm_abort_restores_real_kv_and_mamba_pools(path, device):
+    shape = Mamba2StateShape.create(
+        tp_world_size=1,
+        intermediate_size=32,
+        n_groups=1,
+        num_heads=2,
+        head_dim=16,
+        state_size=8,
+        conv_kernel=4,
+    )
+    pool = HybridReqToTokenPool(
+        size=4,
+        mamba_size=16,
+        mamba_spec_state_size=0,
+        max_context_len=32,
+        device=device,
+        enable_memory_saver=False,
+        cache_params=Mamba2CacheParams(shape=shape, layers=[0]),
+        mamba_layer_ids=[0],
+        enable_mamba_extra_buffer=True,
+        enable_overlap_schedule=True,
+    )
+    allocator = TokenToKVPoolAllocator(
+        size=64,
+        dtype=torch.float32,
+        device=device,
+        kvcache=None,
+        need_sort=False,
+    )
+    cache = ChunkCache(
+        CacheInitParams(
+            disable=True,
+            req_to_token_pool=pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+        )
+    )
+    processor = _make_result_processor(cache, Mock())
+    disagg = "disagg" in path
+    for index in range(20):
+        req = Req(
+            rid=f"bad-image-{index}",
+            origin_input_text="",
+            origin_input_ids=array("q", range(8)),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        pool.alloc([req])
+        pool.req_to_token[req.kv.req_pool_idx, :8] = allocator.alloc(8).to(torch.int32)
+        req.kv.kv_allocated_len = req.kv.kv_committed_len = 8
+        req.multimodal_inputs = Mock()
+        req.disagg_kv_sender = Mock()
+        req.disagg_kv_sender.abort.side_effect = RuntimeError("sender failed")
+        req.disagg_kv_sender.clear.side_effect = RuntimeError("sender clear failed")
+        assert (allocator.available_size(), pool.mamba_allocator.available_size()) == (
+            56,
+            13,
+        )
+        scheduler = SimpleNamespace(
+            chunked_req=req if "parked" in path else None,
+            _pending_chunked_abort_req=None,
+            disaggregation_mode=DisaggregationMode.PREFILL
+            if disagg
+            else DisaggregationMode.NULL,
+            clear_pending_chunk_send=Mock(),
+            req_to_metadata_buffer_idx_allocator=Mock(),
+            disagg_prefill_inflight_queue=[req],
+            batch_result_processor=processor,
+            ipc_channels=SimpleNamespace(
+                send_to_tokenizer=SimpleNamespace(send_output=Mock())
+            ),
+        )
+        scheduler.finish_disagg_mm_embedding_abort = MethodType(
+            SchedulerDisaggregationPrefillMixin.finish_disagg_mm_embedding_abort,
+            scheduler,
+        )
+        Scheduler.defer_mm_embedding_abort(scheduler, req, 8, 3)
+        if "parked" in path:
+            with patch(
+                "sglang.srt.managers.scheduler._make_abort_req", return_value=Mock()
+            ):
+                Scheduler.process_pending_chunked_abort(scheduler)
+                Scheduler.process_pending_chunked_abort(scheduler)
+        elif disagg:
+            scheduler.finish_disagg_mm_embedding_abort(req)
+            scheduler.finish_disagg_mm_embedding_abort(req)
+        else:
+            processor._finish_deferred_mm_embedding_abort(req)
+            processor._finish_deferred_mm_embedding_abort(req)
+
+        assert req.finished_reason.status_code == HTTPStatus.INTERNAL_SERVER_ERROR
+        assert not req.mm_embedding_abort_pending
+        assert not req.kv.holds_kv and not req.kv.holds_mamba
+        assert pool.available_size() == 4
+        assert allocator.available_size() == 64
+        assert pool.mamba_allocator.available_size() == 16
+        req.multimodal_inputs.release_features.assert_called_once_with()
+        if disagg:
+            assert scheduler.disagg_prefill_inflight_queue == []
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

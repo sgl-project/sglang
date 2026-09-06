@@ -61,7 +61,7 @@ class TestDeepseekV32DP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v32)\n" f'{metrics["score"]=:.3f}\n'
+                f'### test_gsm8k (deepseek-v32)\n{metrics["score"]=:.3f}\n'
             )
             self.assertGreater(metrics["score"], 0.935)
 
@@ -73,7 +73,7 @@ class TestDeepseekV32DP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (deepseek-v32)\n" f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (deepseek-v32)\n{speed=:.2f} token/s\n"
             )
             self.assertGreater(speed, 50)
 
@@ -119,7 +119,7 @@ class TestDeepseekV32TP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v32)\n" f'{metrics["score"]=:.3f}\n'
+                f'### test_gsm8k (deepseek-v32)\n{metrics["score"]=:.3f}\n'
             )
             self.assertGreater(metrics["score"], 0.935)
 
@@ -131,7 +131,7 @@ class TestDeepseekV32TP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (deepseek-v32)\n" f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (deepseek-v32)\n{speed=:.2f} token/s\n"
             )
             self.assertGreater(speed, 80)
 
@@ -180,7 +180,7 @@ class TestGLM5DP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (glm-5)\n" f'{metrics["score"]=:.3f}\n'
+                f'### test_gsm8k (glm-5)\n{metrics["score"]=:.3f}\n'
             )
             self.assertGreater(metrics["score"], 0.935)
 
@@ -192,7 +192,7 @@ class TestGLM5DP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (glm-5)\n" f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (glm-5)\n{speed=:.2f} token/s\n"
             )
             self.assertGreater(speed, 40)
 
@@ -238,7 +238,7 @@ class TestGLM5TP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (glm-5)\n" f'{metrics["score"]=:.3f}\n'
+                f'### test_gsm8k (glm-5)\n{metrics["score"]=:.3f}\n'
             )
             self.assertGreater(metrics["score"], 0.935)
 
@@ -250,7 +250,7 @@ class TestGLM5TP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (glm-5)\n" f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (glm-5)\n{speed=:.2f} token/s\n"
             )
             self.assertGreater(speed, 60)
 

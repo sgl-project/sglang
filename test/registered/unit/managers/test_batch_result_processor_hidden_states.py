@@ -5,10 +5,11 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -35,7 +36,7 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         enable_overlap_mlx=False,
         model_config=SimpleNamespace(think_end_ids=None),
         token_to_kv_pool_allocator=Mock(),
-        tree_cache=None,
+        tree_cache=Mock(),
         hisparse_coordinator=None,
         req_to_token_pool=None,
         decode_offload_manager=None,
@@ -69,8 +70,7 @@ class _PrefillReq:
         self.to_finish = None
         self.mm_embedding_abort_pending = False
         self.mm_embedding_validation_count = 0
-        self.req_pool_idx = 0
-        self.mamba_pool_idx = None
+        self.kv = ReqKvInfo(req_pool_idx=0)
         self.multimodal_inputs = None
         self.session = None
 
@@ -277,6 +277,7 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
                 )
                 result = SimpleNamespace(
                     copy_done=None,
+                    mm_embedding_errors=None,
                     auxiliary_host_output=None,
                     routed_experts_output=None,
                     indexer_topk_output=None,
@@ -324,17 +325,8 @@ class TestDecodeHiddenStateRetention(CustomTestCase):
         second_step = torch.arange(16, dtype=torch.float32).view(8, 2)[4:]
 
         def result(hidden_states):
-            return SimpleNamespace(
-                copy_done=None,
-                auxiliary_host_output=None,
-                routed_experts_output=None,
-                indexer_topk_output=None,
+            return GenerationBatchResult(
                 logits_output=SimpleNamespace(hidden_states=hidden_states),
-                next_token_ids=None,
-                can_run_cuda_graph=False,
-                num_correct_drafts=0,
-                num_block_accept_tokens=0,
-                num_cap_tokens=0,
                 speculative_num_draft_tokens=4,
             )
 
