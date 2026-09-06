@@ -76,6 +76,7 @@ if _use_aiter:
 class Bf16GemmBackend(Enum):
     AUTO = "auto"
     CUTEDSL = "cutedsl"
+    CUTEDSL_SM120 = "cutedsl_sm120"
     FLASHINFER_PR4266 = "flashinfer_pr4266"
     GEMV = "gemv"
     TORCH = "torch"
@@ -86,6 +87,9 @@ class Bf16GemmBackend(Enum):
     def is_cutedsl(self) -> bool:
         return self == Bf16GemmBackend.CUTEDSL
 
+    def is_cutedsl_sm120(self) -> bool:
+        return self == Bf16GemmBackend.CUTEDSL_SM120
+
     def is_gemv(self) -> bool:
         return self == Bf16GemmBackend.GEMV
 
@@ -93,12 +97,18 @@ class Bf16GemmBackend(Enum):
         return self == Bf16GemmBackend.FLASHINFER_PR4266
 
     def is_optimized(self) -> bool:
-        return self.is_cutedsl() or self.is_flashinfer_pr4266()
+        return (
+            self.is_cutedsl()
+            or self.is_cutedsl_sm120()
+            or self.is_flashinfer_pr4266()
+        )
 
 
 _BF16_GEMM_BACKEND: Optional[Bf16GemmBackend] = None
 _cutedsl_bf16_gemm = None
 _use_cutedsl_bf16_gemm = None
+_sm120_bf16_gemm = None
+_use_sm120_bf16_gemm = None
 _hopper_bf16_gemv = None
 _use_hopper_bf16_gemv = None
 _flashinfer_pr4266_splitk_tactic = None
@@ -154,6 +164,7 @@ def should_enable_bf16_splitk_gemm(backend: Bf16GemmBackend) -> bool:
 def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
     global _BF16_GEMM_BACKEND
     global _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
+    global _sm120_bf16_gemm, _use_sm120_bf16_gemm
     global _flashinfer_pr4266_splitk_tactic
     global _flashinfer_pr4266_run_splitk_dense
     global _flashinfer_pr4266_direct_default_tactic
@@ -167,6 +178,12 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
             "torch"
             if get_exec().deterministic.enable_deterministic_inference
             else "cutedsl"
+        )
+    elif backend_str == "auto" and get_platform().is_sm120:
+        backend_str = (
+            "torch"
+            if get_exec().deterministic.enable_deterministic_inference
+            else "cutedsl_sm120"
         )
 
     backend = Bf16GemmBackend(backend_str)
@@ -183,6 +200,25 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
 
         _hopper_bf16_gemv = hopper_bf16_gemv
         _use_hopper_bf16_gemv = use_hopper_bf16_gemv
+    elif backend.is_cutedsl_sm120():
+        if get_exec().deterministic.enable_deterministic_inference:
+            raise ValueError(
+                "--bf16-gemm-backend cutedsl_sm120 is batch-size dependent and "
+                "cannot be combined with --enable-deterministic-inference"
+            )
+        if not get_platform().is_sm120:
+            raise ValueError(
+                "--bf16-gemm-backend cutedsl_sm120 requires SM120 (consumer Blackwell)"
+            )
+
+        from sglang.kernels.kda_kernels.bf16_gemm_sm120 import (
+            run_bf16_gemm_sm120,
+            use_bf16_gemm_sm120,
+        )
+
+        _sm120_bf16_gemm = run_bf16_gemm_sm120
+        _use_sm120_bf16_gemm = use_bf16_gemm_sm120
+
     elif backend.is_optimized():
         if get_exec().deterministic.enable_deterministic_inference:
             raise ValueError(
@@ -202,8 +238,10 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
         _cutedsl_bf16_gemm = cutedsl_bf16_gemm
         _use_cutedsl_bf16_gemm = use_cutedsl_bf16_gemm
 
+    # Split-K is an SM100/SM103 fast path; the SM120 KDA backend has no
+    # Split-K tactics and its own dispatch covers all decode shapes.
     _enable_bf16_splitk_gemm = False
-    if should_enable_bf16_splitk_gemm(backend):
+    if should_enable_bf16_splitk_gemm(backend) and not backend.is_cutedsl_sm120():
         from sglang.kernels.ops.gemm.flashinfer_pr4266_dense_bf16_gemm_sm100_direct import (
             default_tactic,
             prefer_direct_bf16_gemm_sm100,
@@ -274,6 +312,12 @@ def _bf16_gemm_dispatch_impl(
         m, weight.shape[0], weight.shape[1]
     ):
         return _cutedsl_bf16_gemm(x.view(-1, x.shape[-1]), weight, bias).view(
+            *x.shape[:-1], -1
+        )
+    if _use_sm120_bf16_gemm is not None and _use_sm120_bf16_gemm(
+        m, weight.shape[0], weight.shape[1]
+    ):
+        return _sm120_bf16_gemm(x.view(-1, x.shape[-1]), weight, bias).view(
             *x.shape[:-1], -1
         )
     return F.linear(x, weight, bias)

@@ -177,6 +177,23 @@ def capture_cuda_graphs(
     # batch.
     eager_runner = EagerRunner(model_runner)
 
+    # Pre-warm the SM120 skinny-decode GEMV JIT modules (compile + load +
+    # cudaFuncSetAttribute) OUTSIDE capture. Runs after torch.distributed init
+    # and the EagerRunner, before decode-graph capture, so a GEMV's first
+    # in-capture run() never hits the lazy JIT-load path (which is illegal
+    # during capture). Best-effort; un-warmed shapes raise a clear error.
+    import os as _os
+
+    if _os.environ.get("SGLANG_SM120_BF16_GEMV", "0") == "1":
+        try:
+            from sglang.kernels.ops.gemm.sm120_bf16_gemv import (
+                prewarm_sm120_bf16_gemv_e2b,
+            )
+
+            prewarm_sm120_bf16_gemv_e2b()
+        except Exception:
+            pass
+
     if model_runner.is_draft_worker:
         moe_runner_backend = (
             get_spec().speculative_moe_runner_backend

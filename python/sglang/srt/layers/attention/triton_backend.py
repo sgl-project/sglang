@@ -2528,6 +2528,20 @@ def update_sliding_window_buffer(
         window_kv_indices = torch.empty(
             window_kv_indptr[-1], dtype=torch.int64, device=device
         )
+        packed_tokens = None
+    else:
+        # Caller-provided (CUDA-graph) buffer. Fill at full capacity; every
+        # downstream kernel (the packed gather below, the triton decode
+        # kernels, and the static-pool translate) indexes it through
+        # ``window_kv_indptr`` on-device, so the padded tail is never read.
+        # The packed extent is ``bs * sliding_window_size``, an exact
+        # device-free upper bound (window_kv_lens <= sliding_window_size), so
+        # slice the returned view to it WITHOUT the GPU->CPU
+        # ``indptr[-1].item()`` readback that would otherwise stall the
+        # pre-replay decode prep. Slicing keeps the buffer base address for
+        # the captured graph while capping its length.
+        window_kv_indices = window_kv_indices.view(-1)
+        packed_tokens = min(bs * sliding_window_size, window_kv_indices.numel())
     window_kv_start_idx = seq_lens - window_kv_lens
     translated = translator.fill_packed_read_stream(
         req_pool_indices=req_pool_indices[:bs],
@@ -2539,10 +2553,12 @@ def update_sliding_window_buffer(
         sliding_window=translator.reads_are_translated,
     )
     if not translated and isinstance(token_to_kv_pool, BaseSWAKVPool):
-        kv_last_index = window_kv_indptr[-1]
-        window_kv_indices[:kv_last_index] = (
-            token_to_kv_pool.translate_loc_from_full_to_swa(
-                window_kv_indices[:kv_last_index]
-            )
+        # Caller-provided buffer: translate only the exact packed prefix via a
+        # device-free upper bound (no ``indptr[-1].item()`` D2H readback).
+        limit = packed_tokens if packed_tokens is not None else window_kv_indptr[-1]
+        window_kv_indices[:limit] = token_to_kv_pool.translate_loc_from_full_to_swa(
+            window_kv_indices[:limit]
         )
+    if packed_tokens is not None:
+        window_kv_indices = window_kv_indices[:packed_tokens]
     return window_kv_indptr, window_kv_indices, window_kv_lens, window_kv_start_idx
