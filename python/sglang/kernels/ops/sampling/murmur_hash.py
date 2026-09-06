@@ -1,6 +1,33 @@
+"""MurmurHash3 x86_32 for deterministic sampling coins.
+
+Two backends behind one ``murmur_hash32(seed, positions, col_indices)`` entry:
+
+- ``_murmur_hash32_jit``: CUDA JIT kernel (``python/sglang/kernels/jit/csrc/sampling/murmur_hash.cuh``).
+- ``_murmur_hash32_triton``: Triton reference, kept as the ROCm fallback.
+
+Both are bit-identical: the JIT kernel reuses the same four-block blend and
+finalization. The Triton kernel stays importable so callers and tests can
+cross-check the two implementations against each other.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import torch
 import triton
 import triton.language as tl
+
+from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+
+if TYPE_CHECKING:
+    from tvm_ffi.module import Module
+
+_is_hip = torch.version.hip is not None
+
+#: Dtypes accepted for ``positions`` / ``col_indices``; all truncate to uint32
+#: in-kernel exactly like the Triton reference's ``.to(tl.uint32)``.
+_SUPPORTED_INDEX_DTYPES = (torch.int32, torch.int64, torch.uint32, torch.uint64)
 
 
 @triton.jit
@@ -101,17 +128,59 @@ def murmur_hash32_kernel(
     tl.store(output_ptr + row_idx * num_cols + col_offsets, h, mask=mask)
 
 
-def murmur_hash32(seed, positions, col_indices):
-    assert seed.shape == positions.shape, (
-        "Seed and positions must have the same shape (n,)"
+@cache_once
+def _jit_murmur_hash_module(pos_dtype: torch.dtype, col_dtype: torch.dtype) -> Module:
+    """Compile and cache the JIT MurmurHash32 module for the given dtypes."""
+    if (
+        pos_dtype not in _SUPPORTED_INDEX_DTYPES
+        or col_dtype not in _SUPPORTED_INDEX_DTYPES
+    ):
+        raise RuntimeError(
+            f"murmur_hash32: unsupported index dtypes {pos_dtype=} {col_dtype=}; "
+            f"expected one of {_SUPPORTED_INDEX_DTYPES}"
+        )
+    args = make_cpp_args(pos_dtype, col_dtype)
+    return load_jit(
+        "murmur_hash32",
+        *args,
+        cuda_files=["sampling/murmur_hash.cuh"],
+        cuda_wrappers=[("murmur_hash32", f"MurmurHashKernel<{args}>::launch")],
     )
-    assert len(seed.shape) == 1 and len(col_indices.shape) == 1, (
-        f"Inputs must be 1D tensors {seed.shape=} {col_indices.shape=}"
+
+
+def _murmur_hash32_jit(
+    seed: torch.Tensor, positions: torch.Tensor, col_indices: torch.Tensor
+) -> torch.Tensor:
+    """CUDA JIT path. Bit-identical to ``_murmur_hash32_triton``."""
+    n = seed.shape[0]
+    m = col_indices.shape[0]
+    out = torch.empty((n, m), dtype=torch.uint32, device=seed.device)
+    if n == 0 or m == 0:
+        return out
+    module = _jit_murmur_hash_module(positions.dtype, col_indices.dtype)
+    module.murmur_hash32(seed, positions, col_indices, out.view(-1))
+    return out
+
+
+def _murmur_hash32_triton(
+    seed: torch.Tensor, positions: torch.Tensor, col_indices: torch.Tensor
+) -> torch.Tensor:
+    """Triton reference implementation (kept as ROCm fallback).
+
+    The JIT path validates shapes in its C++ launcher; this path has no such
+    guard, so the checks the kernel relies on live here.
+    """
+    assert seed.ndim == 1 and positions.ndim == 1 and col_indices.ndim == 1, (
+        f"inputs must be 1D {seed.shape=} {positions.shape=} {col_indices.shape=}"
+    )
+    assert seed.shape == positions.shape, (
+        f"seed and positions must have the same shape {seed.shape=} {positions.shape=}"
     )
     n = seed.shape[0]
     m = col_indices.shape[0]
-    device = seed.device
-    hashed = torch.empty((n, m), dtype=torch.uint32, device=device)
+    hashed = torch.empty((n, m), dtype=torch.uint32, device=seed.device)
+    if n == 0 or m == 0:
+        return hashed
 
     BLOCK_SIZE = 1024
     grid = (n, triton.cdiv(m, BLOCK_SIZE))
@@ -119,3 +188,18 @@ def murmur_hash32(seed, positions, col_indices):
         seed, positions, col_indices, hashed, n, m, BLOCK_SIZE=BLOCK_SIZE
     )
     return hashed
+
+
+def murmur_hash32(
+    seed: torch.Tensor, positions: torch.Tensor, col_indices: torch.Tensor
+) -> torch.Tensor:
+    """Bit-identical MurmurHash3 x86_32 of ``seed``, ``positions``, ``col_indices``.
+
+    ``seed`` is ``uint64`` (per row), ``positions`` is a per-row 32-bit index,
+    and ``col_indices`` a per-column 32-bit index; the hash of the four 4-byte
+    blocks lands in an ``(n, m)`` ``uint32`` tensor. CUDA uses the JIT kernel;
+    ROCm falls back to the Triton reference.
+    """
+    if _is_hip:
+        return _murmur_hash32_triton(seed, positions, col_indices)
+    return _murmur_hash32_jit(seed, positions, col_indices)
