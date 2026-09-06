@@ -144,6 +144,11 @@ impl UnifiedLRUList {
         self.cell_mut_(b).prev = a;
     }
 
+    /// Whether a member node is the most-recently-used one; panics if not a member.
+    pub fn is_mru(&self, node_id: NodeIdx_) -> bool {
+        self.cell_(Self::cell_of_(node_id)).prev == HEAD
+    }
+
     /// Insert a node as the most-recently-used; panics if already a member.
     pub fn insert_mru(&mut self, node_id: NodeIdx_) {
         self.add_node_(Self::cell_of_(node_id));
