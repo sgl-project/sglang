@@ -18,7 +18,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     process_model_config,
 )
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_npu
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_musa, is_npu
 from sglang.srt.utils.common import ceil_align, ceil_div
 
 
@@ -105,7 +105,7 @@ def should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend: bool) -> bool:
 
 
 def is_dsa_enable_prefill_cp():
-    if is_hip() or is_npu():
+    if is_hip() or is_npu() or is_musa():
         return get_parallel().enable_dsa_prefill_context_parallel
 
     # Generic prefill CP derives activation from the runtime topology and model
@@ -116,13 +116,6 @@ def is_dsa_enable_prefill_cp():
 
     hf_config = process_model_config().hf_config
     return is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
-
-
-def is_dsa_prefill_cp_in_seq_split():
-    return (
-        is_dsa_enable_prefill_cp()
-        and get_parallel().dsa_prefill_cp_mode == "in-seq-split"
-    )
 
 
 def is_dsa_prefill_cp_round_robin_split():

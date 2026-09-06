@@ -39,7 +39,7 @@ def handle_context_parallelism(server_args: Any):
             cfg.enable_prefill_cp
             and model_arch == "DeepseekV32ForCausalLM"
             and cfg.cp_strategy == "zigzag"
-            and not (platform.is_hip or platform.is_npu)
+            and not (platform.is_hip or platform.is_npu or platform.is_musa)
         ):
             raise ValueError(
                 "DeepSeek V3.2 prefill CP does not support --cp-strategy "
@@ -563,7 +563,7 @@ def handle_eplb_and_dispatch(server_args: Any):
 def handle_platform_cp_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
     platform = get_platform()
-    is_protected_platform = platform.is_hip or platform.is_npu
+    is_protected_platform = platform.is_hip or platform.is_npu or platform.is_musa
     if not is_protected_platform:
         if (
             cfg.enable_prefill_context_parallel
@@ -571,7 +571,7 @@ def handle_platform_cp_compatibility(server_args: Any):
         ):
             raise ValueError(
                 "Legacy prefill context-parallel options are supported only "
-                "by protected HIP or Ascend NPU paths. Use "
+                "by protected HIP, Ascend NPU, or MUSA paths. Use "
                 "--enable-prefill-cp with --cp-strategy."
             )
         return
@@ -603,7 +603,10 @@ def handle_platform_cp_compatibility(server_args: Any):
 
 
 def handle_legacy_cp_runtime_compatibility(server_args: Any):
-    """Project canonical CP settings for runtime consumers removed by PR3."""
+    """Project canonical CP settings only for protected platform runtimes."""
+    platform = get_platform()
+    if not (platform.is_hip or platform.is_npu or platform.is_musa):
+        return
     cfg = resolving_view(server_args)
 
     if cfg.enable_prefill_context_parallel and cfg.enable_dsa_prefill_context_parallel:
