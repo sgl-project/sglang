@@ -144,6 +144,40 @@ print(f"Output 1: {response.json()[1]['text']}")
 terminate_process(server_process)
 ```
 
+### Publishing a new streamed version during generation
+
+On `sglang-miles`, a fresh adapter version can be published without pausing or
+waiting for existing generation requests. Use a different name for each version,
+such as `A@1` and `A@2`:
+
+1. Call `/register_lora_adapter` with `lora_name`, `config_dict` and
+   `defer_publish: true`. Require both `success: true` and `pending: true` in the
+   reply. Existing names are rejected; the new name cannot be used for inference.
+2. Call `/begin_weight_update` with `sync_base: false`,
+   `new_lora_names: ["A@2"]` and a nonempty `session_id`.
+3. Stream the usual `A@2:`-prefixed tensors through
+   `/update_weights_from_distributed` or `/update_weights_from_tensor`, passing
+   the same `session_id` and `flush_cache: false` on every bucket. Base tensors,
+   other adapter names, request abortion and base weight-version changes are
+   rejected. Only one weight-update session may be open at a time.
+4. Call `/end_weight_update` with the same `session_id` and a complete
+   `expected_lora_checksums` manifest: adapter name to HF tensor name to SHA-256
+   of the contiguous tensor bytes. Inference admission opens only after all
+   workers have successfully verified and applied the staged tensors.
+
+To discard a fresh-version session, call `/end_weight_update` with its
+`session_id` and `abort: true`. A failed stream never becomes available for
+inference. After aborting, an unused pending adapter may be explicitly unloaded.
+For a fleet of engines, the caller must wait for every engine's successful end
+reply before advertising the version to clients. Use a new version name after a
+partial fleet failure; do not overwrite an engine that already published it.
+
+Base updates and existing-name updates retain their exclusive inference lock.
+Setting `sync_base: false` alone does not enable overlap. The new-version path
+shares the inference reader lock and never flushes existing KV caches, but GPU
+transfers and scheduler work can still add latency; this is not a zero-cost
+publication guarantee.
+
 ### Dynamic LoRA loading
 
 

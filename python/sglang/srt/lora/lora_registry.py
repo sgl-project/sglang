@@ -44,6 +44,8 @@ class LoRARef(msgspec.Struct, frozen=True, array_like=True):
     # Trailing field with a default keeps the array_like wire format
     # compatible with refs encoded before this field existed.
     reloadable: bool = True
+    # Staged versions are registered for updates, but cannot acquire a lease.
+    ready: bool = True
 
     def __post_init__(self):
         if self.lora_id is None:
@@ -154,7 +156,39 @@ class LoRARegistry:
             existing = self._registry.get(lora_ref.lora_name, None)
         if existing is None:
             return lora_ref, False
+        if not existing.ready:
+            raise ValueError(
+                f"LoRA adapter {lora_ref.lora_name!r} is awaiting publication"
+            )
         return replace(lora_ref, lora_id=existing.lora_id), True
+
+    async def pending_lora_ids(self, names: List[str]) -> Dict[str, str]:
+        """Resolve only unpublished streamed versions under one admission lock."""
+        async with self._registry_lock.reader_lock:
+            result = {}
+            for name in names:
+                ref = self._registry.get(name)
+                if ref is None or ref.ready or ref.reloadable:
+                    raise ValueError(
+                        f"LoRA adapter {name!r} is not an unpublished streamed version"
+                    )
+                result[name] = ref.lora_id
+            return result
+
+    async def publish(self, lora_ids: Dict[str, str]) -> List[LoRARef]:
+        """Open admission only after every worker applied the exact staged IDs."""
+        async with self._registry_lock.writer_lock:
+            refs = []
+            for name, lora_id in lora_ids.items():
+                ref = self._registry.get(name)
+                if ref is None or ref.lora_id != lora_id or ref.ready:
+                    raise ValueError(
+                        f"Staged LoRA adapter {name!r} changed during publication"
+                    )
+                refs.append(replace(ref, ready=True))
+            for ref in refs:
+                self._registry[ref.lora_name] = ref
+            return refs
 
     async def refresh(self, lora_ref: LoRARef):
         """Replace a registered adapter's ref after a successful upsert.
@@ -187,6 +221,8 @@ class LoRARegistry:
                     f"The following requested LoRA adapters are not loaded: {name}\n"
                     f"Loaded adapters: {self._registry.keys()}."
                 )
+            if not lora_ref.ready:
+                raise ValueError(f"LoRA adapter {name!r} is not ready for inference")
             self._registry.move_to_end(name)
             return lora_ref.lora_id
 

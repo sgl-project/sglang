@@ -1820,6 +1820,8 @@ class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
 
+    session_id: Optional[str] = None
+
 
 class UpdateWeightsFromDistributedReqOutput(BaseReq, kw_only=True):
     success: bool
@@ -1848,6 +1850,7 @@ class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
     selector: Literal["target", "draft", "all"] = "all"
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
+    session_id: Optional[str] = None
 
 
 class UpdateWeightsFromTensorReqOutput(BaseReq, kw_only=True):
@@ -2006,6 +2009,9 @@ class BeginWeightUpdateReqInput(BaseReq, kw_only=True):
     # sync), so the quant unpack/repack round-trip is skipped and a base-named
     # tensor arriving in-session is an error.
     sync_base: bool = True
+    # Opt-in overlap: these versions must have been registered with defer_publish.
+    new_lora_names: Optional[List[str]] = None
+    session_id: Optional[str] = None
 
 
 class BeginWeightUpdateReqOutput(BaseReq, kw_only=True):
@@ -2021,6 +2027,9 @@ class EndWeightUpdateReqInput(BaseReq, kw_only=True):
     # {lora_name: {hf_key: sha256}}; when set, each stashed adapter is verified
     # (set equality + per-tensor checksum) before it is applied.
     expected_lora_checksums: Optional[Dict[str, Dict[str, str]]] = None
+    session_id: Optional[str] = None
+    # Discard a new-version stream without opening inference admission.
+    abort: bool = False
 
 
 class EndWeightUpdateReqOutput(BaseReq, kw_only=True):
@@ -2343,6 +2352,8 @@ class RegisterLoRAAdapterReqInput(BaseReq, kw_only=True):
     # and pinning every slot would trip the anti-starvation check.
     pinned: bool = False
     lora_id: Optional[str] = None
+    # Reject existing names and keep the new identity unavailable until end.
+    defer_publish: bool = False
 
     def to_ref(self) -> LoRARef:
         return LoRARef(
@@ -2350,6 +2361,8 @@ class RegisterLoRAAdapterReqInput(BaseReq, kw_only=True):
             lora_name=self.lora_name,
             lora_path="__stream__",
             pinned=self.pinned,
+            reloadable=False,
+            ready=not self.defer_publish,
         )
 
 
@@ -2357,6 +2370,8 @@ class LoRAUpdateOutput(BaseReq, kw_only=True):
     success: bool
     error_message: Optional[str] = None
     loaded_adapters: Optional[Dict[str, Union[str, LoRARef]]] = None
+    # Capability acknowledgement for callers opting into deferred publication.
+    pending: bool = False
 
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = RegisterLoRAAdapterReqOutput = (

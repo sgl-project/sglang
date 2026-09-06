@@ -1,7 +1,15 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+import torch
+
+from sglang.srt.managers.io_struct import (
+    BeginWeightUpdateReqInput,
+    EndWeightUpdateReqInput,
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromTensorReqInput,
+)
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
@@ -157,40 +165,69 @@ class TestRecordWeightVersionAfterUpdate(CustomTestCase):
         self.assertEqual(self.recorded, [])
 
     def test_successful_distributed_update_records_the_version(self):
-        """The distributed refit is the path an RL trainer actually drives, so it must record too."""
-        updater = self._updater(
-            target_result=(True, "ok"), method="update_weights_from_distributed"
+        updater, runner = self._streaming_updater()
+        runner.weight_updater.receive_weights_from_distributed.return_value = [
+            ("weight", torch.zeros(1))
+        ]
+        output = updater.update_weights_from_distributed(
+            UpdateWeightsFromDistributedReqInput(
+                names=["weight"], dtypes=["float32"], shapes=[[1]], weight_version="v2"
+            )
         )
-
-        output = updater.update_weights_from_distributed(self._request())
-
         self.assertTrue(output.success)
+        self.assertEqual(self.recorded, [])
+        self.assertTrue(updater.end_weight_update(EndWeightUpdateReqInput()).success)
         self.assertEqual(self.recorded, ["v2"])
 
     def test_failed_distributed_update_does_not_record_the_version(self):
         """A failed distributed refit leaves the version alone, exactly like the disk path."""
-        updater = self._updater(
-            target_result=(False, "boom"), method="update_weights_from_distributed"
+        updater, runner = self._streaming_updater()
+        runner.weight_updater.receive_weights_from_distributed.side_effect = (
+            RuntimeError("boom")
         )
-
-        output = updater.update_weights_from_distributed(self._request())
-
+        output = updater.update_weights_from_distributed(
+            UpdateWeightsFromDistributedReqInput(
+                names=["weight"], dtypes=["float32"], shapes=[[1]], weight_version="v2"
+            )
+        )
         self.assertFalse(output.success)
         self.assertEqual(self.recorded, [])
 
     def test_successful_tensor_update_records_the_version(self):
-        """The tensor refit records the version once the load reports success."""
-        updater = self._updater(
-            target_result=(True, "ok"), method="update_weights_from_tensor"
-        )
-
-        with patch("torch.distributed.barrier"):
+        updater, runner = self._streaming_updater()
+        runner.weight_updater.update_weights_from_tensor.return_value = (True, "ok")
+        module = "sglang.srt.managers.scheduler_components.weight_updater"
+        with (
+            patch(f"{module}.monkey_patch_torch_reductions"),
+            patch(
+                f"{module}.MultiprocessingSerializer.deserialize",
+                return_value=[("weight", torch.zeros(1))],
+            ),
+        ):
             output = updater.update_weights_from_tensor(
-                self._request(disable_draft_model=True)
+                UpdateWeightsFromTensorReqInput(
+                    serialized_named_tensors=[b"unused"], weight_version="v2"
+                )
             )
-
         self.assertTrue(output.success)
+        self.assertEqual(self.recorded, [])
+        self.assertTrue(updater.end_weight_update(EndWeightUpdateReqInput()).success)
         self.assertEqual(self.recorded, ["v2"])
+
+    def _streaming_updater(self):
+        """Stream buckets go through ModelRunner inside a begin/end session."""
+        barrier = patch("torch.distributed.barrier")
+        barrier.start()
+        self.addCleanup(barrier.stop)
+        updater = self._updater(target_result=None)
+        runner = Mock()
+        updater.tp_worker.model_runner = runner
+        updater.tp_worker.ps = SimpleNamespace(tp_rank=0)
+        updater.tp_worker.iter_runners = lambda: [("", runner)]
+        self.assertTrue(
+            updater.begin_weight_update(BeginWeightUpdateReqInput()).success
+        )
+        return updater, runner
 
     def test_successful_ipc_update_records_the_version(self):
         """The checkpoint-engine IPC refit records the version like every other path."""

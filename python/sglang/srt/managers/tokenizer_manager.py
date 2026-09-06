@@ -652,6 +652,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.is_pause_cond = asyncio.Condition()
         self._weight_update_session_open = False
         self._weight_update_pending_version: Optional[str] = None
+        self._weight_update_rpc_lock = asyncio.Lock()
+        self._weight_update_session_id: Optional[str] = None
+        self._weight_update_new_loras: Dict[str, str] = {}
+        self._weight_update_session_failed = False
 
     def init_lora(self):
         # LoRA
