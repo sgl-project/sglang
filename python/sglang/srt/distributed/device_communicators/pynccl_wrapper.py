@@ -667,3 +667,12 @@ __all__ = [
     "cudaStream_t",
     "buffer_type",
 ]
+
+NCCL_SYMMETRIC_PDL_FIX_VERSION = 23007
+
+
+def nccl_has_symmetric_pdl_fix() -> bool:
+    try:
+        return NCCLLibrary().ncclGetRawVersion() >= NCCL_SYMMETRIC_PDL_FIX_VERSION
+    except Exception:
+        return False
