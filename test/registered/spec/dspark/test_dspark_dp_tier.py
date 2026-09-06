@@ -5,11 +5,14 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.speculative.dspark_components import dspark_planner
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockProposer
 from sglang.srt.speculative.dspark_components.dspark_planner import (
+    DSparkVerifyPlanner,
     dp_global_verify_tier_num_tokens,
     local_verify_tier_num_tokens,
 )
+from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -51,6 +54,63 @@ class TestDpGlobalVerifyTierNumTokens(CustomTestCase):
         self.assertIsNone(
             dp_global_verify_tier_num_tokens(global_tier_num_tokens=[100, -1, 50, 0])
         )
+
+
+class TestDpTierGatherAdmission(CustomTestCase):
+    def test_pd_decode_can_enable_compact_dp_tier_gather(self):
+        spec = SimpleNamespace(
+            speculative_dspark_align_verify_tokens_to_graph_tier=False,
+            speculative_dspark_confidence_sts_path=None,
+            speculative_dspark_sps_table_path=None,
+            speculative_skip_dp_mlp_sync=False,
+        )
+        parallel = SimpleNamespace(attn_tp_size=1, attn_cp_size=1, pp_size=1)
+        schedule = SimpleNamespace(disable_overlap_schedule=False)
+        budget_planner = SimpleNamespace(lag_steps=2)
+
+        with (
+            patch.object(dspark_planner, "get_spec", return_value=spec),
+            patch.object(dspark_planner, "get_parallel", return_value=parallel),
+            patch.object(dspark_planner, "get_schedule", return_value=schedule),
+            patch.object(
+                dspark_planner,
+                "get_disagg",
+                return_value=SimpleNamespace(disaggregation_mode="decode"),
+                create=True,
+            ),
+            patch.object(
+                dspark_planner,
+                "read_ragged_verify_mode",
+                return_value=RaggedVerifyMode.COMPACT,
+            ),
+            patch.object(dspark_planner, "is_dp_attention_enabled", return_value=True),
+            patch.object(dspark_planner, "require_mlp_tp_gather", return_value=True),
+            patch.object(dspark_planner, "build_sps_cost_table", return_value=object()),
+            patch.object(
+                dspark_planner, "is_uninitialized_sps_table", return_value=False
+            ),
+            patch.object(
+                dspark_planner,
+                "HostConfidenceBudgetPlanner",
+                return_value=budget_planner,
+            ),
+            patch.object(
+                dspark_planner.envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER,
+                "get",
+                return_value=False,
+            ),
+        ):
+            planner = DSparkVerifyPlanner(
+                draft_model=SimpleNamespace(confidence_head=object()),
+                gamma=5,
+                model_runner=SimpleNamespace(),
+                device="cpu",
+                tp_rank=1,
+                verify_num_draft_tokens=6,
+                tp_sync=SimpleNamespace(),
+            )
+
+        self.assertTrue(planner._dp_tier_gather_enabled)
 
 
 class TestDraftDpSyncMetadata(CustomTestCase):
