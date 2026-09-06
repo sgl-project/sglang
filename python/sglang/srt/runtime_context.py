@@ -1280,6 +1280,96 @@ def get_schedule() -> _ConfigBag:
     return _CONTEXT.config_bag("schedule")
 
 
+@dataclasses.dataclass(frozen=True)
+class MoeForwardContract:
+    """Resolved maximum row domain shared by schedulers and MoE backends."""
+
+    max_rows: int
+    prefill_rows: int
+    prefill_base_rows: int
+    multimodal_overshoot_rows: int
+    decode_rows: int
+    decode_batch_size: int
+    speculative_tokens_per_request: int
+
+
+def get_moe_forward_contract() -> MoeForwardContract:
+    """Resolve the complete scheduler-admitted MoE row domain once.
+
+    Backends consume this value; they must not reconstruct it independently.
+    Multimodal overshoot belongs to the selected processor's explicit
+    contract, not a model-family guess in the backend.
+    """
+    cached = _CONTEXT.resources.buffers.get("moe:forward_contract")
+    if cached is not None:
+        return cached
+
+    schedule = get_schedule()
+    graph = get_exec().graph.cuda_graph_config
+    prefill_base = max(
+        int(schedule.max_prefill_tokens or 0),
+        int(schedule.chunked_prefill_size or 0),
+    )
+    if prefill_base <= 0:
+        raise ValueError(
+            "MoE forward contract requires a finite resolved prefill bound; "
+            "set --max-prefill-tokens or --chunked-prefill-size"
+        )
+
+    model_config = process_model_config()
+    multimodal_overshoot = 0
+    if model_config.is_multimodal:
+        from sglang.srt.managers.multimodal_processor import get_mm_processor_cls
+
+        processor_cls = get_mm_processor_cls(
+            model_config.hf_config, get_server_args(), model_config
+        )
+        if processor_cls is None:
+            raise ValueError(
+                "MoE forward contract cannot resolve the active multimodal processor"
+            )
+        resolver = getattr(processor_cls, "max_language_model_forward_overshoot", None)
+        multimodal_overshoot = (
+            None if resolver is None else resolver(model_config.hf_config)
+        )
+        if multimodal_overshoot is None:
+            raise ValueError(
+                f"multimodal processor {processor_cls.__name__} does not declare "
+                "max_language_model_forward_overshoot"
+            )
+        multimodal_overshoot = int(multimodal_overshoot)
+        if multimodal_overshoot < 0:
+            raise ValueError("multimodal forward overshoot cannot be negative")
+
+    spec = get_spec()
+    tokens_per_request = (
+        int(spec.max_speculative_num_draft_tokens or 1)
+        if spec.speculative_algorithm
+        else 1
+    )
+    decode_graph = getattr(graph, "decode", None) if graph is not None else None
+    decode_bs = max(
+        int(schedule.max_running_requests or 0),
+        int(getattr(decode_graph, "max_bs", 0) or 0),
+    )
+    if decode_bs <= 0:
+        raise ValueError("MoE forward contract requires a finite decode batch bound")
+
+    prefill_rows = prefill_base + multimodal_overshoot
+    decode_rows = decode_bs * tokens_per_request
+    contract = MoeForwardContract(
+        max_rows=max(prefill_rows, decode_rows),
+        prefill_rows=prefill_rows,
+        prefill_base_rows=prefill_base,
+        multimodal_overshoot_rows=multimodal_overshoot,
+        decode_rows=decode_rows,
+        decode_batch_size=decode_bs,
+        speculative_tokens_per_request=tokens_per_request,
+    )
+    _CONTEXT.resources.buffers["moe:forward_contract"] = contract
+    return contract
+
+
 def get_memory() -> _ConfigBag:
     return _CONTEXT.config_bag("memory")
 

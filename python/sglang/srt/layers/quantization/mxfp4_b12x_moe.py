@@ -66,9 +66,11 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 
 
-def _b12x_max_tokens() -> int:
-    """Upper bound on tokens in a single MoE call (prefill is chunked)."""
-    return envs.SGLANG_B12X_MAX_TOKENS.get()
+def _b12x_forward_contract():
+    """The scheduler-owned, resolved row domain for this backend."""
+    from sglang.srt.runtime_context import get_moe_forward_contract
+
+    return get_moe_forward_contract()
 
 
 def _core_token_counts(max_tokens: int, tokens_per_seq: int) -> tuple[int, ...]:
@@ -207,11 +209,17 @@ def _plan_scratch(*, experts, top_k, device, swiglu_limit, counts):
     return plan, scratch
 
 
-def _make_launcher(*, plan, scratch, experts):
+def _make_launcher(*, plan, scratch, experts, max_tokens):
     """W4A16 bind-and-run closure over the load-time frozen plan."""
     from b12x.moe import fused_moe
 
     def launch(a, topk_ids, topk_weights, out):
+        live_tokens = max(1, int(a.shape[0]))
+        if live_tokens > max_tokens:
+            raise RuntimeError(
+                "b12x MoE row-count invariant violated before frozen-plan bind: "
+                f"live_tokens={live_tokens}, derived_capacity={max_tokens}"
+            )
         fused_moe.run(
             binding=plan.bind(
                 scratch=scratch,
@@ -258,13 +266,17 @@ def _plan_a8_arena(*, experts, top_k, device, swiglu_limit, counts, quant_mode):
     key = f"b12x:moe_a8_arena:{device}"
     cached = buffers.get(key)
     if cached is not None and cached[0] == fingerprint:
-        return cached[1]
+        return cached[1], cached[2]
+    # W4A8 chooses its workspace plan from the exact live token count.
+    # Size across every count admitted by the resolved runtime contract, not
+    # just the sparse decode/power-of-two warmup ladder.
+    arena_counts = tuple(range(1, max(counts) + 1))
     caps = fused_moe.Caps(
         max_tokens=max(counts),
         num_topk=top_k,
         device=device,
         weight_plan=experts.plan,
-        core_token_counts=tuple(counts),
+        core_token_counts=arena_counts,
         route_num_experts=0,
         route_logits_dtype=None,
         quant_mode=quant_mode,
@@ -272,19 +284,26 @@ def _plan_a8_arena(*, experts, top_k, device, swiglu_limit, counts, quant_mode):
         swiglu_limit=swiglu_limit,
         frozen=True,
     )
-    arena = torch.empty(
-        int(fused_moe.required_nbytes(caps)), dtype=torch.uint8, device=device
-    )
-    buffers[key] = (fingerprint, arena)
-    return arena
+    required_bytes = int(fused_moe.required_nbytes(caps))
+    arena = torch.empty(required_bytes, dtype=torch.uint8, device=device)
+    buffers[key] = (fingerprint, arena, required_bytes)
+    return arena, required_bytes
 
 
-def _make_launcher_a8(*, arena, experts, top_k, device, swiglu_limit, quant_mode):
+def _make_launcher_a8(
+    *, arena, arena_bytes, experts, top_k, device, swiglu_limit, quant_mode, max_tokens
+):
     """W4A8 bind-and-run closure; plans at the live token count per call."""
     from b12x.moe import fused_moe
 
     def launch(a, topk_ids, topk_weights, out):
         m = max(1, int(a.shape[0]))
+        if m > max_tokens:
+            raise RuntimeError(
+                "b12x MoE row-count invariant violated before arena bind: "
+                f"live_tokens={m}, derived_capacity={max_tokens}. The resolved "
+                "scheduler/model contract changed after runner initialization."
+            )
         caps = fused_moe.Caps(
             max_tokens=m,
             num_topk=top_k,
@@ -298,6 +317,13 @@ def _make_launcher_a8(*, arena, experts, top_k, device, swiglu_limit, quant_mode
             swiglu_limit=swiglu_limit,
             frozen=True,
         )
+        live_required_bytes = int(fused_moe.required_nbytes(caps))
+        if live_required_bytes > arena_bytes:
+            raise RuntimeError(
+                "b12x workspace invariant violated before arena bind: "
+                f"live_tokens={m}, required_bytes={live_required_bytes}, "
+                f"reserved_bytes={arena_bytes}"
+            )
         plan = fused_moe.plan(caps)
         fused_moe.run(
             binding=plan.bind(
@@ -430,9 +456,11 @@ class Mxfp4B12xMoEMethod:
             intermediate=intermediate,
             quant_mode=quant_mode,
         )
-        counts = _core_token_counts(_b12x_max_tokens(), spec_tokens)
+        contract = _b12x_forward_contract()
+        max_tokens = contract.max_rows
+        counts = _core_token_counts(max_tokens, spec_tokens)
         if quant_mode != "w4a16":
-            arena = _plan_a8_arena(
+            arena, workspace_bytes = _plan_a8_arena(
                 experts=experts,
                 top_k=int(layer.top_k),
                 device=device,
@@ -442,11 +470,13 @@ class Mxfp4B12xMoEMethod:
             )
             self._launch = _make_launcher_a8(
                 arena=arena,
+                arena_bytes=workspace_bytes,
                 experts=experts,
                 top_k=int(layer.top_k),
                 device=device,
                 swiglu_limit=self._swiglu_limit,
                 quant_mode=quant_mode,
+                max_tokens=max_tokens,
             )
             plan_or_arena = arena
         else:
@@ -457,7 +487,12 @@ class Mxfp4B12xMoEMethod:
                 swiglu_limit=self._swiglu_limit,
                 counts=counts,
             )
-            self._launch = _make_launcher(plan=plan, scratch=scratch, experts=experts)
+            self._launch = _make_launcher(
+                plan=plan,
+                scratch=scratch,
+                experts=experts,
+                max_tokens=max_tokens,
+            )
             plan_or_arena = (plan, scratch)
         # The prepared weights alias the checkpoint storage (REUSE_SOURCE for
         # 128-aligned fp4_e8m0_k32; w4a8_mx repacks likewise discard the
