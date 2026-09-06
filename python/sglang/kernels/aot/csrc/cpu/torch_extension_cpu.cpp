@@ -473,6 +473,9 @@ void shm_allgather_into_tensor(at::Tensor& output_tensor, at::Tensor& data);
 // shared memory reduce_scatter_tensor
 void shm_reduce_scatter_tensor(at::Tensor& output_tensor, at::Tensor& data, int64_t op);
 
+// pack qkv
+void pack_qkv_destination_major_cpu(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, int64_t world_size, at::Tensor& output);
 // rope
 std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     at::Tensor& positions,
@@ -866,6 +869,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("shm_reduce_scatter_tensor(Tensor(a!) output_tensor, Tensor data, int reduce_op) -> ()");
   m.impl("shm_reduce_scatter_tensor", torch::kCPU, &shm_reduce_scatter_tensor);
 
+  // pack qkv
+  m.def("pack_qkv_destination_major_cpu(Tensor q, Tensor k, Tensor v, int world_size, Tensor(a!) output) -> ()");
+  m.impl("pack_qkv_destination_major_cpu", torch::kCPU, &pack_qkv_destination_major_cpu);
   // rope
   m.def(
       "rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
