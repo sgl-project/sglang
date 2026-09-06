@@ -21,23 +21,18 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
+    _is_hip,
     _is_musa,
     _is_npu,
     _use_aiter_gfx95,
 )
-from sglang.srt.runtime_context import (
-    get_exec,
-    get_parallel,
-    get_schedule,
-)
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.utils import BumpAllocator, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
 if _is_cuda:
-    from sgl_kernel import merge_state_v2
-
     from sglang.kernels.ops.attention.concat_mla import concat_mla_k
 elif _is_musa:
     from sgl_kernel import concat_mla_k
@@ -45,9 +40,52 @@ elif _is_musa:
 
 def resolve_attn_backend(forward_batch: ForwardBatch):
     backend = get_attn_backend()
-    if isinstance(backend, TboAttnBackend):
-        backend = backend.primary
-    return backend
+    while True:
+        if isinstance(backend, TboAttnBackend):
+            backend = backend.primary
+            continue
+        # Hybrid KDA/MLA models route full-attention calls through an outer
+        # HybridLinearAttnBackend. Model-side MHA preparation hooks belong to
+        # its full-attention child.
+        if hasattr(backend, "full_attn_backend"):
+            backend = backend.full_attn_backend
+            continue
+        # A split prefill/decode HybridAttnBackend may itself be the full-attn
+        # child. Resolve the backend serving this forward mode as well.
+        if (
+            hasattr(backend, "prefill_backend")
+            and hasattr(backend, "decode_backend")
+            and hasattr(backend, "_select_backend")
+        ):
+            backend = backend._select_backend(forward_batch.forward_mode)
+            continue
+        return backend
+
+
+def use_dense_prefix_kv(backend) -> bool:
+    """Whether the backend substitutes dense K/V for prefix chunks."""
+    return (
+        getattr(backend, "pack_prefix_chunk_kv", None) is not None
+        and getattr(backend, "pack_all_prefix_chunks", False)
+        and not get_parallel().dcp_enabled
+    )
+
+
+def use_packed_prefix_chunks(backend, forward_batch: ForwardBatch) -> bool:
+    """Whether the complete prefix can be packed into one bounded buffer."""
+    prefix_lens = forward_batch.extend_prefix_lens_cpu
+    return (
+        use_dense_prefix_kv(backend)
+        and prefix_lens is not None
+        and sum(prefix_lens) <= forward_batch.get_max_chunk_capacity()
+    )
+
+
+def use_fused_prefix_extend(backend, forward_batch: ForwardBatch) -> bool:
+    """Whether the packed prefix and current chunk can share one launch."""
+    return getattr(
+        backend, "fuse_prefix_into_extend", False
+    ) and use_packed_prefix_chunks(backend, forward_batch)
 
 
 def forward_dsa_indexer_for_mha(
@@ -281,7 +319,14 @@ class DeepseekMHAForwardMixin:
         # The top comments in https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/mla/common.py
         # will be helpful for understanding the purpose of this function.
 
-        # First do normal mha forward to get output for extended part
+        # Preserve the ROCm fused RMS/quantized projection path for the current
+        # chunk; the shared preparation path is primarily the CUDA version.
+        if _is_hip:
+            return self.forward_normal_rocm_prepare(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
+
+        # First do normal mha forward to get output for extended part.
         return self.forward_normal_prepare(
             positions, hidden_states, forward_batch, zero_allocator
         )
@@ -297,11 +342,33 @@ class DeepseekMHAForwardMixin:
         has_extend_prefix = forward_batch.extend_prefix_lens_cpu is not None and any(
             forward_batch.extend_prefix_lens_cpu
         )
+        backend = resolve_attn_backend(forward_batch)
+        prepare_qkv_fn = getattr(backend, "prepare_chunked_prefill_qkv", None)
+        if has_extend_prefix and prepare_qkv_fn is not None:
+            q, k, v = prepare_qkv_fn(q, k, v, forward_batch)
+
+        fused_prefix = has_extend_prefix and use_fused_prefix_extend(
+            backend, forward_batch
+        )
+
         # Only initialize the info once
         if has_extend_prefix and forward_batch.num_prefix_chunks is None:
-            forward_batch.prepare_chunked_prefix_cache_info(q.device)
+            forward_batch.prepare_chunked_prefix_cache_info(
+                q.device,
+                pack_all_prefix_chunks=use_packed_prefix_chunks(backend, forward_batch),
+                single_chunk=fused_prefix,
+                dense_metadata=use_dense_prefix_kv(backend),
+            )
             if hasattr(get_attn_backend(), "init_mha_chunk_metadata"):
                 get_attn_backend().init_mha_chunk_metadata(forward_batch)
+
+        if fused_prefix:
+            attn_output = self._fused_prefix_extend_attn_mha(q, k, v, forward_batch)
+            attn_output = attn_output.reshape(
+                -1, self.num_local_heads * self.v_head_dim
+            )
+            output, _ = self.o_proj(attn_output)
+            return output
 
         forward_batch.mha_return_lse = has_extend_prefix
         # Do mha for extended part without prefix
@@ -356,6 +423,48 @@ class DeepseekMHAForwardMixin:
         forward_batch.set_attn_attend_prefix_cache(False)
         return self.forward_normal_core(q, k, v, forward_batch, gate)
 
+    def _fused_prefix_extend_attn_mha(
+        self: DeepseekV2AttentionMLA,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Attend the complete prefix and current chunk in one kernel launch."""
+        assert forward_batch.num_prefix_chunks == 1, (
+            "fused prefix+extend needs the single-chunk layout, got "
+            f"{forward_batch.num_prefix_chunks} chunks"
+        )
+        backend = resolve_attn_backend(forward_batch)
+        get_mla_kv_buffer = (
+            self._get_mla_kv_buffer_rocm if _is_hip else self._get_mla_kv_buffer
+        )
+
+        # With one chunk, these indices are request-major and are described by
+        # prefix_chunk_cu_seq_lens[0]. Project and pack the prefix only once.
+        kv_a_normed, k_pe = get_mla_kv_buffer(
+            forward_batch.prefix_all_kv_indices, torch.bfloat16, forward_batch
+        )
+        kv = self.kv_b_proj(kv_a_normed)[0]
+        kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
+        prefix_k, prefix_v = backend.pack_prefix_chunk_kv(
+            kv[..., : self.qk_nope_head_dim],
+            k_pe,
+            kv[..., self.qk_nope_head_dim :],
+        )
+        del kv_a_normed, k_pe, kv
+
+        forward_batch.mha_return_lse = False
+        forward_batch.set_attn_attend_prefix_cache(False)
+        forward_batch.set_prefix_chunk_idx(0)
+        forward_batch.fused_prefix_k = prefix_k
+        forward_batch.fused_prefix_v = prefix_v
+        try:
+            return self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+        finally:
+            forward_batch.fused_prefix_k = None
+            forward_batch.fused_prefix_v = None
+
     def _chunked_prefix_attn_mha(
         self: DeepseekV2AttentionMLA,
         q: torch.Tensor,
@@ -364,46 +473,82 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         # kv_b_proj needs BF16 input, but legacy q.dtype was BF16 by accident.
+        from sglang.srt.layers.attention.merge_state import merge_state
+
         backend = resolve_attn_backend(forward_batch)
         pack_fn = getattr(backend, "pack_prefix_chunk_kv", None)
         kv_a_dtype = torch.bfloat16 if pack_fn is not None else q.dtype
+        get_mla_kv_buffer = (
+            self._get_mla_kv_buffer_rocm if _is_hip else self._get_mla_kv_buffer
+        )
 
-        assert forward_batch.num_prefix_chunks is not None
-        for i in range(forward_batch.num_prefix_chunks):
-            forward_batch.set_prefix_chunk_idx(i)
-
-            kv_indices = forward_batch.prefix_chunk_kv_indices[i]
-            # Fetch latent cache from memory pool with precomputed chunked kv indices
-            kv_a_normed, k_pe = self._get_mla_kv_buffer(
-                kv_indices, kv_a_dtype, forward_batch
-            )
-            kv_a_normed, k_pe = all_gather_kv_cache_for_mha_chunk_extend(
-                kv_a_normed,
-                k_pe,
-                forward_batch.prefix_chunk_seq_lens_cpu[i],
-                forward_batch.prefix_chunk_starts_cpu[i],
+        # If the complete prefix fits the capacity, gather/project/pack once.
+        # Larger prefixes retain bounded per-chunk materialization.
+        packed_prefix_k = None
+        packed_prefix_v = None
+        pack_all_prefix_chunks = use_packed_prefix_chunks(backend, forward_batch)
+        if pack_all_prefix_chunks:
+            kv_a_normed, k_pe = get_mla_kv_buffer(
+                forward_batch.prefix_all_kv_indices,
+                kv_a_dtype,
+                forward_batch,
             )
             kv = self.kv_b_proj(kv_a_normed)[0]
             kv = kv.view(
                 -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
             )
-            v = kv[..., self.qk_nope_head_dim :]
             k_nope = kv[..., : self.qk_nope_head_dim]
+            v_dense = kv[..., self.qk_nope_head_dim :]
+            packed_prefix_k, packed_prefix_v = pack_fn(k_nope, k_pe, v_dense)
+            del kv_a_normed, k_pe, kv, k_nope, v_dense
 
-            if pack_fn is not None:
-                k, v = pack_fn(k_nope, k_pe, v)
+        assert forward_batch.num_prefix_chunks is not None
+        packed_offset = 0
+        for i in range(forward_batch.num_prefix_chunks):
+            forward_batch.set_prefix_chunk_idx(i)
+
+            if pack_all_prefix_chunks:
+                chunk_num_tokens = forward_batch.prefix_chunk_num_tokens[i]
+                packed_end = packed_offset + chunk_num_tokens
+                k = packed_prefix_k[packed_offset:packed_end]
+                v = packed_prefix_v[packed_offset:packed_end]
+                packed_offset = packed_end
             else:
-                k = torch.empty(
-                    (
-                        k_nope.shape[0],
-                        self.num_local_heads,
-                        self.qk_nope_head_dim + self.qk_rope_head_dim,
-                    ),
-                    dtype=v.dtype,
-                    device=v.device,
+                kv_indices = forward_batch.prefix_chunk_kv_indices[i]
+                kv_a_normed, k_pe = get_mla_kv_buffer(
+                    kv_indices, kv_a_dtype, forward_batch
                 )
-                k[..., : self.qk_nope_head_dim] = k_nope
-                k[..., self.qk_nope_head_dim :] = k_pe
+                kv_a_normed, k_pe = all_gather_kv_cache_for_mha_chunk_extend(
+                    kv_a_normed,
+                    k_pe,
+                    forward_batch.prefix_chunk_seq_lens_cpu[i],
+                    forward_batch.prefix_chunk_starts_cpu[i],
+                )
+                kv = self.kv_b_proj(kv_a_normed)[0]
+                kv = kv.view(
+                    -1,
+                    self.num_local_heads,
+                    self.qk_nope_head_dim + self.v_head_dim,
+                )
+                v_dense = kv[..., self.qk_nope_head_dim :]
+                k_nope = kv[..., : self.qk_nope_head_dim]
+
+                if pack_fn is not None:
+                    k, v = pack_fn(k_nope, k_pe, v_dense)
+                else:
+                    v = v_dense
+                    k = torch.empty(
+                        (
+                            k_nope.shape[0],
+                            self.num_local_heads,
+                            self.qk_nope_head_dim + self.qk_rope_head_dim,
+                        ),
+                        dtype=v.dtype,
+                        device=v.device,
+                    )
+                    k[..., : self.qk_nope_head_dim] = k_nope
+                    k[..., self.qk_nope_head_dim :] = k_pe
+                del kv_a_normed, k_pe, kv, k_nope, v_dense
 
             output, lse = self.attn_mha(
                 q,
@@ -418,9 +563,20 @@ class DeepseekMHAForwardMixin:
             )
             tmp_output = torch.empty_like(accum_output)
             tmp_lse = torch.empty_like(accum_lse)
-            merge_state_v2(output, lse, accum_output, accum_lse, tmp_output, tmp_lse)
+            merge_state(
+                output,
+                lse,
+                accum_output,
+                accum_lse,
+                tmp_output,
+                tmp_lse,
+            )
             accum_output, accum_lse = tmp_output, tmp_lse
-            del kv, k, v, output, lse, tmp_output, tmp_lse
+            del k, v, output, lse, tmp_output, tmp_lse
+
+        if pack_all_prefix_chunks:
+            assert packed_offset == packed_prefix_k.shape[0]
+            del packed_prefix_k, packed_prefix_v
 
         return accum_output
 

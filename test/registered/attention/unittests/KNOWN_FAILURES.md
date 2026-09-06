@@ -174,9 +174,9 @@ moment production is fixed; no test method invokes them today.
 | Backend | Status | Root cause |
 |---|---|---|
 | Lightning | `[no test]` (`lightning/README.md`) | Backend returns flat `[T, num_heads * head_dim]` at `lightning_backend.py:335`; `RadixAttention` piecewise writes per-head (`radix_attention.py:124-137`). Shape mismatch eager vs piecewise |
-| Mamba2 | `[no test]` (`mamba/README.md`) | `MambaMixer2.forward` projects ALL rows of `hidden_states` before per-layer `num_token_non_padded_cpu` slicing (`mamba.py:467`); trips assert under token-padding |
+| Mamba2 | `[no test]` (`mamba/README.md`) | `MambaMixer2.forward` projects ALL rows of `hidden_states` before per-layer `global_num_token_non_padded_cpu` slicing (`mamba.py:467`); trips assert under token-padding |
 | DSV4 | `[no test]` (`dsv4/README.md`) | `flash_mla.flash_mla_with_kvcache` asserts `indices.shape == (b, s_q, topk)`; metadata sized for live batch, q is static-token-padded |
-| DSA MHA_ONE_SHOT dense fallback | `[no test]` (`dsa/README.md`) | DSA passes K as concatenated `prefix + extend` to `module.attn(save_kv_cache=False)`; `unified_attention_with_output` (`radix_attention.py:170-208`) slices K to `num_token_non_padded_cpu`, dropping the prefix portion — piecewise CG diverges from eager ~50% mismatch (~0.35 max diff) |
+| DSA MHA_ONE_SHOT dense fallback | `[no test]` (`dsa/README.md`) | DSA passes K as concatenated `prefix + extend` to `module.attn(save_kv_cache=False)`; `unified_attention_with_output` (`radix_attention.py:170-208`) slices K to `global_num_token_non_padded_cpu`, dropping the prefix portion — piecewise CG diverges from eager ~50% mismatch (~0.35 max diff) |
 
 ## C.5. Sparse-kernel production bugs
 

@@ -150,11 +150,16 @@ def _host_resident_tables(model: torch.nn.Module) -> List[torch.nn.Module]:
 def detach_host_resident_tables(
     model: torch.nn.Module,
 ) -> List[Tuple[torch.nn.Module, torch.Tensor]]:
-    """Swap large vocab tables for placeholders so a `.to(device)` skips them."""
+    """Park large vocab tables on the host so a `.to(device)` skips them."""
     detached = []
     for module in _host_resident_tables(model):
         weight = module.weight
-        detached.append((module, weight.data))
+        # Most loaders leave the table on the host, but model-owned loading
+        # paths may already have placed it on the accelerator.  The input hook
+        # below always sends indices to the host, so retaining accelerator data
+        # here would restore a CUDA weight and create a CPU-index/CUDA-weight
+        # mismatch in the embedding gather.
+        detached.append((module, weight.data.to("cpu")))
         weight.data = torch.empty(0, dtype=weight.dtype, device=weight.device)
     return detached
 
@@ -1130,11 +1135,16 @@ class LayerwiseOffloadManager:
             self._courier_inflight.discard(layer_idx)
             self.prefetch_layer(layer_idx, non_blocking=False)
             return
+        compute_stream = torch.get_device_module().current_stream()
+        compute_stream.wait_event(event)
         with torch.inference_mode(False), torch.no_grad():
             for name, gpu_tensor in tensors.items():
+                # wait_event orders the copy; record_stream keeps its storage
+                # live until the consuming kernels finish.
+                if gpu_tensor.device.type != "cpu":
+                    gpu_tensor.record_stream(compute_stream)
                 target = self.get_target_with_name(name)
                 target.data = self._wrap_for_target(target, gpu_tensor)
-        torch.get_device_module().current_stream().wait_event(event)
         self._courier_inflight.discard(layer_idx)
         self._gpu_layers.add(layer_idx)
 
@@ -1522,6 +1532,9 @@ class LayerwiseOffloadableModuleMixin:
         holds = sum(p.numel() * p.element_size() for _, p in resident)
         if holds <= self._device_headroom_bytes() * PARK_SIGNIFICANCE:
             # There is room. Give back any host copies rather than hold them.
+            # Restore any parameters still bound to placeholders first so we
+            # do not leave weights as (1,) tensors after clearing the copies.
+            self.restore_non_layer_weights()
             self._parked_non_layer_weights.clear()
             return
 
