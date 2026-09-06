@@ -140,7 +140,9 @@ def resolving_view(server_args: Any) -> ResolvingConfig:
     return ResolvingConfig(server_args)
 
 
-def _disable_fp4_allgather_for_custom_moe(server_args: Any, model_name: str) -> dict:
+def _should_disable_fp4_allgather_for_custom_moe(
+    server_args: Any, model_name: str
+) -> bool:
     """Keep custom MoE communication layouts outside the standard FP4 opt-in."""
     cfg = resolving_view(server_args)
     if (
@@ -162,8 +164,8 @@ def _disable_fp4_allgather_for_custom_moe(server_args: Any, model_name: str) -> 
             "custom MoE layout.",
             model_name,
         )
-        return {"disable_flashinfer_cutlass_moe_fp4_allgather": True}
-    return {}
+        return True
+    return False
 
 
 def _declaration_overlay(server_args: Any) -> Dict[str, Any]:

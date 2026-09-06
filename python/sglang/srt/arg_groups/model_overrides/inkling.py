@@ -7,8 +7,8 @@ import logging
 from typing import Any, Dict
 
 from sglang.srt.arg_groups.model_override_base import (
-    _disable_fp4_allgather_for_custom_moe,
     _register_for,
+    _should_disable_fp4_allgather_for_custom_moe,
     is_attention_backend_not_set,
     resolving_view,
 )
@@ -23,7 +23,9 @@ logger = logging.getLogger(__name__)
     "InklingForConditionalGenerationMTP",
 )
 def _inkling_fp4_dispatch_overrides(server_args: Any, hf_config: Any) -> dict:
-    return _disable_fp4_allgather_for_custom_moe(server_args, "Inkling")
+    if _should_disable_fp4_allgather_for_custom_moe(server_args, "Inkling"):
+        return {"disable_flashinfer_cutlass_moe_fp4_allgather": True}
+    return {}
 
 
 @_register_for(
