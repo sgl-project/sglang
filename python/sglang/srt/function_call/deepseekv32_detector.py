@@ -2,9 +2,6 @@ import json
 import logging
 import re
 
-from partial_json_parser.core.exceptions import MalformedJSON
-from partial_json_parser.core.options import Allow
-
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
@@ -13,7 +10,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import _find_common_prefix, _partial_json_loads
+from sglang.srt.function_call.utils import _find_common_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +72,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self.bot_token = "<｜DSML｜function_calls>"
         self.eot_token = "</｜DSML｜function_calls>"
         self.invoke_end_token = "</｜DSML｜invoke>"
+        self.parameter_end_token = "</｜DSML｜parameter>"
         self.parameter_regex = r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</｜DSML｜parameter>'
         self.partial_parameter_regex = (
             r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*)$'
@@ -90,8 +88,6 @@ class DeepSeekV32Detector(BaseFormatDetector):
             r"(?:(?P<self_close>/>)"
             r"|>(?P<body>.*?)(?P<end>(?:</｜DSML｜invoke>|$)))"
         )
-        self.prefix_parameter_end_call = ["</", "｜DSML｜", "parameter"]
-        self.prefix_invoke_end_call = ["</", "｜DSML｜", "inv", "oke"]
         self.current_tool_id = -1
 
     def has_tool_call(self, text: str) -> bool:
@@ -112,6 +108,13 @@ class DeepSeekV32Detector(BaseFormatDetector):
             return name, "", True
         return name, m.group("body"), bool(m.group("end"))
 
+    @staticmethod
+    def _strip_partial_tag_suffix(text: str, tag: str) -> str:
+        for length in range(min(len(tag), len(text)), 0, -1):
+            if text.endswith(tag[:length]):
+                return text[:-length]
+        return text
+
     def _parse_parameters_from_xml(
         self, invoke_content: str, allow_partial: bool = False
     ) -> str:
@@ -123,12 +126,13 @@ class DeepSeekV32Detector(BaseFormatDetector):
         2. Direct JSON: { "key": "value" }
         """
         # First, try to parse as direct JSON (new format)
+        if allow_partial:
+            invoke_content = self._strip_partial_tag_suffix(
+                invoke_content, self.invoke_end_token
+            )
         invoke_content_stripped = invoke_content.strip()
         if invoke_content_stripped.startswith("{"):
             if allow_partial:
-                # Remove incomplete invoke end call prefix in case they are captured by param
-                for token in reversed(self.prefix_invoke_end_call):
-                    invoke_content_stripped = invoke_content_stripped.rstrip(token)
                 return invoke_content_stripped
             elif invoke_content_stripped.endswith("}"):
                 return invoke_content_stripped
@@ -159,11 +163,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         # If allowed, try to parse a partial parameter at the end
         if allow_partial:
-            remaining_content = invoke_content[last_match_end:]
-
-            # Remove incomplete parameter_end_call prefix in case they are captured by param
-            for token in reversed(self.prefix_parameter_end_call):
-                remaining_content = remaining_content.rstrip(token)
+            remaining_content = self._strip_partial_tag_suffix(
+                invoke_content[last_match_end:], self.parameter_end_token
+            )
 
             # Match start of a parameter tag + value (potentially incomplete)
             # Regex: <tag name="..." string="...">VALUE... (no end tag)
@@ -175,13 +177,6 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 param_name = partial_match.group(1)
                 if partial_match.group(2) == "true":
                     parameters[param_name] = param_value.strip()
-                else:
-                    try:
-                        parameters[param_name] = _partial_json_loads(
-                            param_value, Allow.ALL
-                        )[0]
-                    except (json.JSONDecodeError, MalformedJSON, ValueError):
-                        parameters[param_name] = param_value.strip()
 
         return json.dumps(parameters, ensure_ascii=False)
 
