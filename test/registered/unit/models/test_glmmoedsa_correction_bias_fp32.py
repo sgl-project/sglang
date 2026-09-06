@@ -83,9 +83,7 @@ class TestIsGlmMoeDsaHelper(CustomTestCase):
 
     def test_matches_main_and_nextn(self):
         self.assertTrue(is_glm_moe_dsa(SimpleNamespace(architectures=[GLM_MAIN_ARCH])))
-        self.assertTrue(
-            is_glm_moe_dsa(SimpleNamespace(architectures=[GLM_NEXTN_ARCH]))
-        )
+        self.assertTrue(is_glm_moe_dsa(SimpleNamespace(architectures=[GLM_NEXTN_ARCH])))
 
     def test_matches_when_present_among_others(self):
         self.assertTrue(
