@@ -433,6 +433,53 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
         )
 
 
+def validate_mori_decode_dispatch_token_budget(server_args: Any) -> None:
+    """Check the MoRI per-rank buffer against the decode CUDA graph budget.
+
+    The mori branch in handle_moe_kernel_config only checks the prefill side
+    (chunked_prefill_size) and skips servers in decode-disaggregation mode
+    entirely, so the decode-time token count -- the CUDA graph batch size
+    times speculative draft tokens -- was never bounds-checked against
+    SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK. That value sizes a fixed
+    GPU allocation (max_num_inp_token_per_rank) passed straight to the MoRI
+    dispatcher, so exceeding it overflows the allocated buffer instead of
+    raising in sglang. Mirrors the decode half of
+    validate_deepep_v2_dispatch_token_budget; runs after speculative
+    decoding and CUDA graph batch sizes are resolved.
+    """
+    view = resolved_view(server_args)
+    if view.moe_a2a_backend != "mori":
+        return
+    if view.disaggregation_mode == "prefill":
+        return
+
+    decode_config = getattr(view.cuda_graph_config, "decode", None)
+    if decode_config is None or decode_config.backend == Backend.DISABLED:
+        return
+
+    graph_bs = decode_config.max_bs or 0
+    if view.max_running_requests is not None:
+        attn_dp_size = view.dp_size if view.enable_dp_attention else 1
+        per_rank_pool_bs = max(1, view.max_running_requests // attn_dp_size)
+        graph_bs = min(graph_bs, per_rank_pool_bs)
+    tokens_per_req = (
+        max_speculative_num_draft_tokens(server_args) or 1
+        if view.speculative_algorithm
+        else 1
+    )
+    graph_tokens = graph_bs * tokens_per_req
+    capacity = envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+    if graph_tokens > capacity:
+        raise ValueError(
+            "MoRI per-rank decode CUDA graph exceeds "
+            "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK: "
+            f"required={graph_tokens}, capacity={capacity} "
+            f"(requests={graph_bs}, tokens/request={tokens_per_req}). Raise "
+            "the environment value or lower --cuda-graph-max-bs-decode/"
+            "--max-running-requests."
+        )
+
+
 def validate_deepep_v2_model_architecture(server_args: Any) -> None:
     """Allow DeepEP v2 only where its model workflow is validated."""
 

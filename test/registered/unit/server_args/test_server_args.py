@@ -38,6 +38,7 @@ from sglang.srt.arg_groups.moe_hook import (
     handle_a2a_moe,
     validate_deepep_v2_dispatch_token_budget,
     validate_deepep_v2_speculative_draft,
+    validate_mori_decode_dispatch_token_budget,
 )
 from sglang.srt.arg_groups.overrides import (
     cutedsl_moe_max_num_tokens,
@@ -2562,6 +2563,77 @@ class TestDeepEPv2Args(CustomTestCase):
         args._resolved_overrides = [("test", {"moe_a2a_backend": "deepep"})]
         with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(1):
             validate_deepep_v2_dispatch_token_budget(args)
+
+
+class TestMoriDecodeDispatchTokenBudget(CustomTestCase):
+    """Regression coverage for https://github.com/sgl-project/sglang/issues/27194:
+    a small SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK on a decode node was
+    never bounds-checked against the decode CUDA graph batch (scaled by
+    speculative draft tokens), so it silently overflowed the MoRI dispatch
+    buffer instead of failing loudly."""
+
+    def _args(self, **overrides):
+        server_args = ServerArgs(model_path="dummy", moe_a2a_backend="mori")
+        server_args.cuda_graph_config = CudaGraphConfig(
+            decode=PhaseConfig(backend=Backend.FULL, max_bs=512),
+            prefill=PhaseConfig(backend=Backend.FULL, max_bs=512),
+        )
+        server_args._resolved_overrides = []
+        valid = {f.name for f in dataclasses.fields(ServerArgs)}
+        for key, value in overrides.items():
+            assert key in valid, f"{key} is not a ServerArgs field"
+            setattr(server_args, key, value)
+        return server_args
+
+    def test_speculative_decode_width_is_included(self):
+        # The exact shape of the reported issue: a decode node running
+        # MTP/EAGLE with a small buffer sized for low concurrency. Before
+        # the fix this never raised -- disaggregation_mode == "decode" made
+        # handle_moe_kernel_config's mori check skip validation entirely.
+        args = self._args(
+            disaggregation_mode="decode",
+            speculative_algorithm="EAGLE",
+            speculative_num_draft_tokens=4,
+            max_running_requests=64,
+            dp_size=8,
+            enable_dp_attention=True,
+        )
+        with envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(4):
+            with self.assertRaisesRegex(ValueError, "tokens/request=4"):
+                validate_mori_decode_dispatch_token_budget(args)
+
+    def test_decode_graph_at_cap_boundary_accepted(self):
+        args = self._args(disaggregation_mode="decode", max_running_requests=None)
+        args.cuda_graph_config.decode.max_bs = 128
+        with envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(128):
+            validate_mori_decode_dispatch_token_budget(args)
+
+    def test_dp_attention_divides_max_running_requests_per_rank(self):
+        args = self._args(
+            disaggregation_mode="decode",
+            max_running_requests=256,
+            tp_size=8,
+            dp_size=8,
+            enable_dp_attention=True,
+        )
+        with envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(128):
+            validate_mori_decode_dispatch_token_budget(args)
+
+    def test_disabled_decode_graph_skips_capacity_validation(self):
+        args = self._args(disaggregation_mode="decode", max_running_requests=None)
+        args.cuda_graph_config.decode.backend = Backend.DISABLED
+        with envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(1):
+            validate_mori_decode_dispatch_token_budget(args)
+
+    def test_prefill_role_skips_decode_capacity(self):
+        args = self._args(disaggregation_mode="prefill", max_running_requests=8192)
+        with envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(1):
+            validate_mori_decode_dispatch_token_budget(args)
+
+    def test_other_backend_skips_capacity_validation(self):
+        args = self._args(moe_a2a_backend="deepep", max_running_requests=4096)
+        with envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(1):
+            validate_mori_decode_dispatch_token_budget(args)
 
 
 class TestHandleCrashDumpEnv(CustomTestCase):
