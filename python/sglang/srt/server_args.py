@@ -60,7 +60,6 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.environ import envs
-from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -3858,6 +3857,12 @@ class ServerArgs:
             f"Use 'auto' to detect from chat template. "
             f"Options include: {reasoning_parser_choices}.",
         )
+        # Lazy import: FunctionCallParser drags in every tool-call detector,
+        # which in turn imports the OpenAI SDK via
+        # sglang.srt.entrypoints.openai.protocol. Deferring it keeps the
+        # openai package off the scheduler/server_args import path.
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
         tool_call_parser_choices = list(FunctionCallParser.ToolCallParserEnum.keys())
         parser.add_argument(
             "--tool-call-parser",

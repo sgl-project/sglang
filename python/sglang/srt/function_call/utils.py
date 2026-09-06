@@ -1,15 +1,20 @@
+from __future__ import annotations
+
 import ast
 import threading
 import warnings
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union
 
 import orjson
 import partial_json_parser
 from partial_json_parser.core.options import Allow
 
-from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+if TYPE_CHECKING:
+    # Lazy: importing protocol eagerly would pull the whole openai SDK into
+    # the scheduler import path.
+    from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 
 _STANDARD_JSON_SCHEMA_TYPES = {
     "null",
@@ -444,6 +449,9 @@ def get_json_schema_constraint(
     Returns:
         JSON schema dict, or None if no valid tools found
     """
+
+    # Lazy import: keeps the openai SDK off the scheduler import path.
+    from sglang.srt.entrypoints.openai.protocol import ToolChoice
 
     if isinstance(tool_choice, ToolChoice):
         # For specific function choice, return the user's parameters schema directly

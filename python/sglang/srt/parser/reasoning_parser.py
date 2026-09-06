@@ -1,6 +1,6 @@
 import inspect
 import re
-from typing import Dict, List, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Type
 
 from sglang.srt.entrypoints.openai.encoding_dsv4 import dsml_token as dsv4_dsml_token
 from sglang.srt.entrypoints.openai.encoding_dsv4 import eos_token as dsv4_eos_token
@@ -10,7 +10,6 @@ from sglang.srt.entrypoints.openai.encoding_dsv4 import (
 from sglang.srt.entrypoints.openai.encoding_dsv4 import (
     thinking_start_token as dsv4_thinking_start_token,
 )
-from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.function_call.hunyuan_detector import resolve_hunyuan_tokens
 from sglang.srt.function_call.kimik3_format import (
     MESSAGE_CLOSE,
@@ -45,6 +44,12 @@ from sglang.srt.parser.inkling_tokenizer import (
     INKLING_CONTROL_TOKENS,
     MESSAGE_MODEL,
 )
+
+if TYPE_CHECKING:
+    # Only needed for the `request` type check in ReasoningParser.__init__;
+    # importing protocol eagerly would pull the whole openai SDK into the
+    # scheduler import path.
+    from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
 
 class StreamingParseResult:
@@ -2058,7 +2063,7 @@ class ReasoningParser:
         model_type: Optional[str] = None,
         stream_reasoning: bool = True,
         force_reasoning: Optional[bool] = None,
-        request: ChatCompletionRequest = None,
+        request: Optional["ChatCompletionRequest"] = None,
         tokenizer=None,
         tool_call_parser_active: bool = False,
     ):
@@ -2089,14 +2094,17 @@ class ReasoningParser:
         if force_reasoning is not None:
             kwargs["force_reasoning"] = force_reasoning
 
-        if (
-            request is not None
-            and isinstance(request, ChatCompletionRequest)
-            and request.continue_final_message
-            and request.messages[-1].role == "assistant"
-        ):
-            kwargs["continue_final_message"] = True
-            kwargs["previous_content"] = request.messages[-1].content
+        if request is not None:
+            # Lazy import: keeps the openai SDK off the scheduler import path.
+            from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+
+            if (
+                isinstance(request, ChatCompletionRequest)
+                and request.continue_final_message
+                and request.messages[-1].role == "assistant"
+            ):
+                kwargs["continue_final_message"] = True
+                kwargs["previous_content"] = request.messages[-1].content
 
         if chat_template_kwargs.get("force_nonempty_content") is True:
             kwargs["force_nonempty_content"] = True
