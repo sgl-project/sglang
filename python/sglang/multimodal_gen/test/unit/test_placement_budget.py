@@ -63,15 +63,11 @@ def _exhaustive_plan_key(
             continue
         utility = sum(option.estimated_latency_savings for option in selected)
         cost_dimensions = max(
-            (len(option.placement_cost_bytes) for option in options), default=0
+            (len(option.preference_cost) for option in options), default=0
         )
         cost = tuple(
             sum(
-                (
-                    option.placement_cost_bytes[index]
-                    if option.placement_cost_bytes
-                    else 0
-                )
+                (option.preference_cost[index] if option.preference_cost else 0)
                 for option in selected
             )
             for index in range(cost_dimensions)
@@ -222,14 +218,14 @@ def test_latency_equivalent_plan_prefers_lower_soft_memory_cost():
                 option_key="transformer-resident",
                 resource_delta_bytes={"gpu:rank0:runtime": 40},
                 estimated_latency_savings=1_000,
-                placement_cost_bytes=(40, 0),
+                preference_cost=(40, 0),
             ),
             PlacementOption(
                 group_key="text_encoder",
                 option_key="text-encoder-resident",
                 resource_delta_bytes={"gpu:rank0:runtime": 10},
                 estimated_latency_savings=60,
-                placement_cost_bytes=(10, 0),
+                preference_cost=(10, 0),
             ),
         ],
         resource_budget_bytes={"gpu:rank0:runtime": 100},
@@ -238,7 +234,7 @@ def test_latency_equivalent_plan_prefers_lower_soft_memory_cost():
 
     assert [option.option_key for option in plan.selections] == ["transformer-resident"]
     assert plan.estimated_latency_savings == 1_000
-    assert plan.placement_cost_bytes == (40, 0)
+    assert plan.preference_cost == (40, 0)
 
 
 def test_latency_tolerance_is_global_not_per_option():
@@ -249,14 +245,14 @@ def test_latency_tolerance_is_global_not_per_option():
                 option_key="a-resident",
                 resource_delta_bytes={},
                 estimated_latency_savings=60,
-                placement_cost_bytes=(1,),
+                preference_cost=(1,),
             ),
             PlacementOption(
                 group_key="b",
                 option_key="b-resident",
                 resource_delta_bytes={},
                 estimated_latency_savings=60,
-                placement_cost_bytes=(1,),
+                preference_cost=(1,),
             ),
         ],
         resource_budget_bytes={},
@@ -348,7 +344,7 @@ def test_lifecycle_plan_jointly_constrains_load_transition_runtime_and_hostpin()
             ),
             PlacementOption(
                 group_key="dit-lifecycle",
-                option_key="dit-sharded-load-to-layerwise",
+                option_key="dit-rank-local-load-to-layerwise",
                 resource_delta_bytes={
                     "gpu:rank0:load": 4,
                     "gpu:rank0:transition": 3,
@@ -391,7 +387,7 @@ def test_lifecycle_plan_jointly_constrains_load_transition_runtime_and_hostpin()
     # Independently optimizing load and runtime would pick both resident
     # choices, but their transition uses 12 bytes and is infeasible.
     assert [option.option_key for option in plan.selections] == [
-        "dit-sharded-load-to-layerwise",
+        "dit-rank-local-load-to-layerwise",
         "encoder-gpu-load-to-resident",
     ]
     assert plan.resource_delta_bytes == {
@@ -531,21 +527,21 @@ def test_nonbinding_pin_prefixes_keep_only_globally_latency_eligible_states():
                 option_key="dit-pin-none",
                 resource_delta_bytes={"gpu": 5, "hostpin": 0},
                 estimated_latency_savings=800,
-                placement_cost_bytes=(5, 0),
+                preference_cost=(5, 0),
             ),
             PlacementOption(
                 group_key="dit",
                 option_key="dit-pin-most",
                 resource_delta_bytes={"gpu": 5, "hostpin": 80},
                 estimated_latency_savings=950,
-                placement_cost_bytes=(5, 80),
+                preference_cost=(5, 80),
             ),
             PlacementOption(
                 group_key="dit",
                 option_key="dit-pin-all",
                 resource_delta_bytes={"gpu": 5, "hostpin": 100},
                 estimated_latency_savings=1_000,
-                placement_cost_bytes=(5, 100),
+                preference_cost=(5, 100),
             ),
         ],
         resource_budget_bytes={"gpu": 5, "hostpin": 100},
@@ -573,9 +569,7 @@ def test_branch_and_bound_matches_exhaustive_multiresource_search():
                             name: rng.randint(-5, 8) for name in resource_names
                         },
                         estimated_latency_savings=rng.randint(-5, 20),
-                        placement_cost_bytes=tuple(
-                            rng.randint(-10, 10) for _ in range(4)
-                        ),
+                        preference_cost=tuple(rng.randint(-10, 10) for _ in range(5)),
                     )
                 )
         budgets = {name: rng.randint(-2, 12) for name in resource_names}
@@ -611,10 +605,108 @@ def test_branch_and_bound_matches_exhaustive_multiresource_search():
             == expected_resources
         )
         assert plan.estimated_latency_savings == expected_utility
-        assert plan.placement_cost_bytes == expected_cost
+        assert plan.preference_cost == expected_cost
 
 
-def test_nonbinding_two_cost_sweep_matches_exhaustive_search():
+def test_one_selection_vector_obeys_load_runtime_and_hostpin_budgets():
+    plan = optimize_placement(
+        [
+            PlacementOption(
+                group_key="text_encoder",
+                option_key="text-encoder-resident",
+                resource_delta_bytes={"gpu:load": 8, "gpu:runtime": 2},
+                estimated_latency_savings=60,
+            ),
+            PlacementOption(
+                group_key="text_encoder",
+                option_key="text-encoder-pinned",
+                resource_delta_bytes={"gpu:load": 1, "hostpin": 6},
+                estimated_latency_savings=50,
+            ),
+            PlacementOption(
+                group_key="transformer",
+                option_key="transformer-resident",
+                resource_delta_bytes={"gpu:load": 2, "gpu:runtime": 8},
+                estimated_latency_savings=100,
+            ),
+            PlacementOption(
+                group_key="transformer",
+                option_key="transformer-pinned",
+                resource_delta_bytes={"gpu:runtime": 1, "hostpin": 6},
+                estimated_latency_savings=20,
+            ),
+        ],
+        resource_budget_bytes={
+            "gpu:load": 9,
+            "gpu:runtime": 8,
+            "hostpin": 6,
+        },
+        require_selection_from_every_group=True,
+    )
+
+    assert [option.option_key for option in plan.selections] == [
+        "text-encoder-pinned",
+        "transformer-resident",
+    ]
+    assert plan.resource_delta_bytes == {
+        "gpu:load": 3,
+        "gpu:runtime": 8,
+        "hostpin": 6,
+    }
+
+
+def test_lexicographic_preference_prunes_irrelevant_later_dimension():
+    plan = optimize_placement(
+        [
+            PlacementOption(
+                group_key="dit",
+                option_key="partial-pin",
+                resource_delta_bytes={"gpu": 1},
+                estimated_latency_savings=90,
+                preference_cost=(0, -90, 5),
+            ),
+            PlacementOption(
+                group_key="dit",
+                option_key="full-pin",
+                resource_delta_bytes={"gpu": 1},
+                estimated_latency_savings=100,
+                preference_cost=(0, -100, 10),
+            ),
+        ],
+        resource_budget_bytes={"gpu": 1},
+        estimated_latency_tolerance=20,
+        require_selection_from_every_group=True,
+    )
+
+    assert [option.option_key for option in plan.selections] == ["full-pin"]
+
+
+def test_identical_resource_columns_keep_only_the_strictest_budget():
+    options = [
+        PlacementOption(
+            group_key="dit",
+            option_key="dit:small",
+            resource_delta_bytes={"phase-a": 4, "phase-b": 4},
+            estimated_latency_savings=4,
+        ),
+        PlacementOption(
+            group_key="dit",
+            option_key="dit:large",
+            resource_delta_bytes={"phase-a": 8, "phase-b": 8},
+            estimated_latency_savings=8,
+        ),
+    ]
+
+    plan = optimize_placement(
+        options,
+        resource_budget_bytes={"phase-a": 10, "phase-b": 6},
+    )
+
+    assert [option.option_key for option in plan.selections] == ["dit:small"]
+    assert plan.resource_delta_bytes == {"phase-a": 4, "phase-b": 4}
+
+
+def test_nonbinding_preference_sweep_matches_exhaustive_search():
     rng = random.Random(20260828)
 
     for _ in range(100):
@@ -627,7 +719,8 @@ def test_nonbinding_two_cost_sweep_matches_exhaustive_search():
                         option_key=f"group-{group_index}:option-{option_index}",
                         resource_delta_bytes={},
                         estimated_latency_savings=rng.randint(0, 50),
-                        placement_cost_bytes=(
+                        preference_cost=(
+                            rng.randint(0, 20),
                             rng.randint(0, 20),
                             rng.randint(0, 20),
                         ),
@@ -652,4 +745,4 @@ def test_nonbinding_two_cost_sweep_matches_exhaustive_search():
         expected_keys, _, expected_utility, expected_cost = expected
         assert tuple(option.option_key for option in plan.selections) == expected_keys
         assert plan.estimated_latency_savings == expected_utility
-        assert plan.placement_cost_bytes == expected_cost
+        assert plan.preference_cost == expected_cost

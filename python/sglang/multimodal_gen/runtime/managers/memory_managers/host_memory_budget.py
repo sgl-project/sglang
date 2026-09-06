@@ -211,6 +211,10 @@ class HostPinBudget:
             if reserve_bytes is None
             else reserve_bytes
         )
+        # This worker's non-overlapping share of the node-wide planner budget.
+        # Auto placement may later assign a different execution quota, but the
+        # next joint solve must still see the original node capacity.
+        self.planning_capacity_bytes = max(0, self.available_bytes - self.reserve_bytes)
         self.committed_bytes = 0
 
     @classmethod
@@ -227,6 +231,24 @@ class HostPinBudget:
     @property
     def spendable_bytes(self) -> int:
         return max(0, self.available_bytes - self.reserve_bytes - self.committed_bytes)
+
+    def set_spendable_capacity(self, capacity_bytes: int) -> tuple[int, int]:
+        """Replace this worker's quota and return its previous budget state.
+
+        The startup default is an equal, non-overlapping node share. Once all
+        ranks have reported their real layer-store sizes, the joint placement
+        planner can safely replace that provisional share with an asymmetric
+        quota whose node-wide sum stays within the same allowance.
+        """
+        if capacity_bytes < 0:
+            raise ValueError("host pin capacity must be non-negative")
+        previous = (self.available_bytes, self.reserve_bytes)
+        self.available_bytes = capacity_bytes
+        self.reserve_bytes = 0
+        return previous
+
+    def restore_capacity(self, state: tuple[int, int]) -> None:
+        self.available_bytes, self.reserve_bytes = state
 
     def request(self, *, component_name: str, weight_bytes: int) -> bool:
         """Whether `component_name` may pin `weight_bytes`, and book it if so.
