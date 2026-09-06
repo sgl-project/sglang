@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import os
@@ -425,24 +426,41 @@ def handle_environment_variables(server_args: Any):
             "--enable-deepseek-v4-fp4-indexer requires SM100, SM120, or gfx95 GPUs "
             "with FP4 indexer support."
         )
-    # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can run
-    # it, mirroring the forward scale split: the ue8m0 path
-    # (DEEPGEMM_SCALE_UE8M0, true sm100, default on) or an sm90 opt-in
-    # fp32-scale path (use FP4 expert ckpt). Disable in every other case.
+    # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can
+    # run it, mirroring the forward scale split: the default sm100 UE8M0
+    # path, or explicit opt-in on sm90 (FP32 scales) and sm120 (UE8M0).
     if get_platform().is_cuda and envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
         from sglang.srt.layers import deep_gemm_wrapper
 
         sm = get_platform().device_sm
         explicit = envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set()
-        supported = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or (
-            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and get_platform().is_sm90
-            and explicit
+        sm120_supported = False
+        if get_platform().is_sm120 and explicit:
+            try:
+                deep_gemm = importlib.import_module("deep_gemm")
+                sm120_supported = all(
+                    callable(getattr(deep_gemm, name, None))
+                    for name in (
+                        "fp8_einsum",
+                        "transform_sf_into_required_layout",
+                    )
+                )
+            except (ImportError, OSError, RuntimeError):
+                pass
+        supported = (
+            deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            or (
+                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and get_platform().is_sm90
+                and explicit
+            )
+            or sm120_supported
         )
         if not supported and explicit:
             logger.warning(
                 "Disabling SGLANG_OPT_FP8_WO_A_GEMM: requires DeepGEMM JIT "
-                "and sm100+ (Blackwell), or explicit opt-in on sm90; "
+                "and sm100, or a compatible DeepGEMM build with explicit "
+                "opt-in on sm90/sm120; "
                 "detected sm%d.",
                 sm,
             )
