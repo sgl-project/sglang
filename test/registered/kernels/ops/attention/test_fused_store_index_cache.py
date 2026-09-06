@@ -27,7 +27,10 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 try:
     from sglang.kernels.ops.attention.fused_store_index_cache import (
         can_use_dsa_fused_store,
+        fused_quantize_index_k_packed,
         fused_store_index_k_cache,
+        store_packed_index_k_cache,
+        store_rank_major_packed_index_k_cache,
     )
 
     HAS_FUSED = True
@@ -453,6 +456,68 @@ def test_reference_writes_nonzero():
 
     assert deq.abs().sum().item() > 0, "Reference buffer is all zeros — error!"
     torch.testing.assert_close(deq, key.float(), rtol=0.15, atol=5e-2)
+
+
+@pytest.mark.parametrize("num_tokens,base_index", [(1, 0), (65, 63), (257, 65)])
+def test_packed_transport_is_byte_exact(num_tokens: int, base_index: int):
+    """Local quantize -> packed transport -> cache matches fused store."""
+    _skip_if_unavailable()
+    device = torch.device("cuda")
+    key = torch.randn((num_tokens, HEAD_DIM), device=device, dtype=torch.bfloat16)
+    loc = (
+        base_index + torch.randperm(num_tokens, device=device, dtype=torch.int64)
+    ).contiguous()
+    num_pages = _num_pages(loc, PAGE_SIZE)
+
+    reference = _make_buffer(num_pages)
+    fused_store_index_k_cache(key, reference, loc, page_size=PAGE_SIZE)
+
+    packed = fused_quantize_index_k_packed(key, page_size=PAGE_SIZE)
+    assert packed.shape == (num_tokens, BYTES_PER_TOKEN)
+    assert packed.dtype == torch.uint8 and packed.is_contiguous()
+    transported = _make_buffer(num_pages)
+    store_packed_index_k_cache(packed, transported, loc, page_size=PAGE_SIZE)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(transported, reference, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "cp_size,rows_per_rank",
+    [(2, 65), (4, 33), (8, 17), (8, 4088), (8, 4096)],
+)
+def test_rank_major_packed_store_is_byte_exact(cp_size: int, rows_per_rank: int):
+    """Direct rank-major source mapping matches reorder + packed store."""
+    _skip_if_unavailable()
+    device = torch.device("cuda")
+    num_tokens = cp_size * rows_per_rank
+    key = torch.randn((num_tokens, HEAD_DIM), device=device, dtype=torch.bfloat16)
+    loc = (
+        61 + torch.randperm(num_tokens, device=device, dtype=torch.int64)
+    ).contiguous()
+    num_pages = _num_pages(loc, PAGE_SIZE)
+
+    packed_logical = fused_quantize_index_k_packed(key, page_size=PAGE_SIZE)
+    rank_major_rows = (
+        torch.arange(num_tokens, device=device)
+        .view(rows_per_rank, cp_size)
+        .transpose(0, 1)
+        .reshape(-1)
+    )
+    packed_rank_major = packed_logical.index_select(0, rank_major_rows)
+
+    reference = _make_buffer(num_pages)
+    store_packed_index_k_cache(packed_logical, reference, loc, page_size=PAGE_SIZE)
+    direct = _make_buffer(num_pages)
+    store_rank_major_packed_index_k_cache(
+        packed_rank_major,
+        direct,
+        loc,
+        cp_size,
+        page_size=PAGE_SIZE,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(direct, reference, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

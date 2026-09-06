@@ -31,6 +31,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa import litetopk
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
@@ -72,6 +73,73 @@ IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 
 
 _arange_cache = {}
+_litetopk_exec_logged = False
+
+
+def _litetopk_effective_required(
+    *,
+    required: bool,
+    allow_stock_fallback: bool,
+    is_decode: bool,
+    query_length: int,
+) -> bool:
+    """Keep DSV4 LiteTopK fail-closed except for explicit Q=1 decode."""
+    return bool(required) and not (
+        bool(allow_stock_fallback) and bool(is_decode) and int(query_length) == 1
+    )
+
+
+def _litetopk_c4_gate_lengths(
+    forward_batch: ForwardBatch,
+    *,
+    local_sequence_length: int,
+    query_rows: int,
+    cp_size: int,
+) -> Tuple[int, int]:
+    """Return CP-consistent current/next C4 lengths for threshold checks.
+
+    The rank-local C4 extent can differ by a couple of tokens after CP
+    interleaving.  For a single request, scheduler-owned CPU metadata is the
+    common source of truth on every rank.  Keep the local extent as the
+    fallback because graph/re-written batches do not always carry that CPU
+    metadata.
+    """
+
+    current = int(local_sequence_length)
+    next_length = current + int(query_rows) * int(cp_size) // 4
+    if int(forward_batch.batch_size) != 1:
+        return current, next_length
+
+    def single_cpu_length(values) -> Optional[int]:
+        if values is None:
+            return None
+        if isinstance(values, torch.Tensor):
+            if values.device.type != "cpu" or values.numel() != 1:
+                return None
+            return int(values.item())
+        try:
+            if len(values) != 1:
+                return None
+            return int(values[0])
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    seq_length = single_cpu_length(getattr(forward_batch, "seq_lens_cpu", None))
+    if seq_length is None:
+        return current, next_length
+
+    current = seq_length // 4
+    extend_length = single_cpu_length(
+        getattr(forward_batch, "extend_seq_lens_cpu", None)
+    )
+    if extend_length is not None:
+        next_length = (seq_length + extend_length) // 4
+    return current, next_length
+
+
+def _litetopk_fp4_scale_storage_rows(sequence_length: int) -> int:
+    """Return the four-record backing extent required by the FP4 TMA scale."""
+    return (int(sequence_length) + 3) & ~3
 
 
 def fp8_paged_mqa_logits_torch(
@@ -688,6 +756,8 @@ class C4IndexerBackendMixin:
         q_lora_ready: Optional[torch.cuda.Event] = None,
         skip_compressor: bool = False,
     ) -> None:
+        global _litetopk_exec_logged
+
         if forward_batch.forward_mode.is_idle():
             return
         token_to_kv_pool = self.token_to_kv_pool
@@ -828,6 +898,171 @@ class C4IndexerBackendMixin:
         if self.debug_use_external_c4_sparse_indices:
             return
 
+        litetopk_raw = None
+        litetopk_enabled = envs.SGLANG_LITETOPK.get()
+        litetopk_required = envs.SGLANG_LITETOPK_REQUIRED.get()
+        litetopk_allow_stock_fallback = envs.SGLANG_LITETOPK_ALLOW_STOCK_FALLBACK.get()
+        litetopk_effective_required = _litetopk_effective_required(
+            required=litetopk_required,
+            allow_stock_fallback=litetopk_allow_stock_fallback,
+            is_decode=forward_batch.forward_mode.is_decode(),
+            query_length=query_rows,
+        )
+        litetopk_requested = litetopk_enabled or litetopk_required
+        litetopk_capturing = False
+        litetopk_sequence_length = 0
+        litetopk_gate_sequence_length = 0
+        litetopk_next_gate_sequence_length = 0
+        litetopk_production_ready = False
+        required_path_args = None
+        if litetopk_requested:
+            litetopk_capturing = torch.cuda.is_current_stream_capturing()
+            litetopk_sequence_length = (
+                int(c4_seq_lens.max().item()) if c4_seq_lens.numel() else 0
+            )
+            (
+                litetopk_gate_sequence_length,
+                litetopk_next_gate_sequence_length,
+            ) = _litetopk_c4_gate_lengths(
+                forward_batch,
+                local_sequence_length=litetopk_sequence_length,
+                query_rows=query_rows,
+                cp_size=get_parallel().attn_cp_size,
+            )
+            # Unlike GLM's DSA indexer, the C4 path used to rely only on the
+            # official->fused boundary stash to notice a new request.  Two
+            # requests cross that boundary at the same extent, so equality
+            # cannot distinguish them and request-scoped carry/diagnostics
+            # could survive.  The scheduler-owned C4 extent is monotonic
+            # within a request; a strict rollback is an unambiguous reset.
+            litetopk_device = (
+                q_indexer[0].device
+                if isinstance(q_indexer, tuple)
+                else q_indexer.device
+            )
+            litetopk.retire_if_carry_extent_rollback(
+                litetopk_device, litetopk_sequence_length
+            )
+            extra_reasons = []
+            if not use_fp4_indexer:
+                extra_reasons.append("DSV4 LiteTopK requires the FP4 index cache")
+            if use_aiter_fp4:
+                extra_reasons.append(
+                    "DSV4 LiteTopK does not support the AITER FP4 indexer"
+                )
+            if page_table.shape[0] == 0:
+                extra_reasons.append("the C4 page table is empty")
+            required_path_args = {
+                "enabled": litetopk_enabled,
+                "required": litetopk_effective_required,
+                "use_fp4": True,
+                "query_length": query_rows,
+                "sequence_length": litetopk_gate_sequence_length,
+                "num_reqs": forward_batch.batch_size,
+                "capturing": litetopk_capturing,
+                "route": "SGLang DSV4 FP4 fused indexer",
+                "extra_reasons": tuple(extra_reasons),
+            }
+            litetopk_production_ready = litetopk.enforce_required_path(
+                **required_path_args
+            )
+        litetopk_eligible = (
+            use_fp4_indexer
+            and not use_aiter_fp4
+            and litetopk_enabled
+            and litetopk_production_ready
+            and forward_batch.batch_size == 1
+            and page_table.shape[0] > 0
+            and litetopk.supports_fused_query_len(query_rows, use_fp4=True)
+            and not litetopk_capturing
+        )
+        if litetopk_eligible:
+            # DSV4 repeats the single request's C4 page table for every query
+            # row. Gather one contiguous logical cache and let LiteTopK map its
+            # pair-swapped physical winners back before we translate them to
+            # SGLang page slots below.
+            seq_len = litetopk_sequence_length
+            qualification_delta = litetopk_gate_sequence_length - seq_len
+            max_c4_cp_skew = (get_parallel().attn_cp_size - 1 + 3) // 4
+            if not 0 <= qualification_delta <= max_c4_cp_skew:
+                raise RuntimeError(
+                    "DSV4 LiteTopK scheduler/local C4 length skew is outside "
+                    "the CP interleave contract: "
+                    f"global={litetopk_gate_sequence_length}, "
+                    f"local={seq_len}, max_skew={max_c4_cp_skew}"
+                )
+            one_page_table = page_table[:1].contiguous()
+            # GetKAndS is the stock FP8 accessor and sizes K with the logical
+            # 128-wide head dimension.  The FP4 cache instead stores 64 packed
+            # value bytes + four UE8M0 scale bytes per token.  Allocate the
+            # exact FP4 gather destinations; prepare_permuted_gather fills
+            # them directly from the raw paged cache (and pair-swaps HOT).
+            k_u8 = torch.empty((seq_len, 64), dtype=torch.uint8, device=q_fp4.device)
+            # The FP4-graft TMA descriptor rounds the scale-vector extent up
+            # to four records.  CP ranks can observe C4 lengths that differ by
+            # one, so allocating exactly ``seq_len`` records made every
+            # non-4-aligned rank decline the otherwise-qualified LiteTopK
+            # path.  Keep the public gather view at the logical shape while
+            # giving its backing storage the padding consumed by the kernel.
+            scale_rows = _litetopk_fp4_scale_storage_rows(seq_len)
+            scale_u8 = torch.empty(
+                (scale_rows, 4), dtype=torch.uint8, device=q_fp4.device
+            )[:seq_len]
+            ks_lite = torch.zeros(query_rows, dtype=torch.int32, device=q_fp4.device)
+            ke_lite = c4_seq_lens[:query_rows].to(torch.int32).contiguous()
+            common_end = int(ke_lite.min().item())
+            cache_u8 = token_to_kv_pool.get_index_k_with_scale_buffer(
+                c4_indexer.layer_id
+            ).view(-1, 64, 68)
+            plan = litetopk.prepare_permuted_gather(
+                cache_u8,
+                k_u8,
+                scale_u8,
+                one_page_table,
+                sequence_length=seq_len,
+                query_length=query_rows,
+                num_reqs=1,
+                common_end=common_end,
+                window_start=0,
+                hot_key=c4_indexer.layer_id,
+                qualification_sequence_length=litetopk_gate_sequence_length,
+            )
+            litetopk_raw = torch.empty(
+                query_rows, 512, dtype=torch.int32, device=q_fp4.device
+            )
+            if plan is None or not litetopk.try_large_exact_once_chunk(
+                q_fp4.contiguous(),
+                k_u8,
+                scale_u8.view(torch.int32).reshape(seq_len),
+                weights[:query_rows].contiguous(),
+                ks_lite,
+                ke_lite,
+                litetopk_raw,
+                512,
+                permuted_plan=plan,
+                num_reqs=1,
+                ke_min_hint=common_end,
+                hot_key=c4_indexer.layer_id,
+                ks_common_hint=0,
+                carry_extent_hint=seq_len,
+                q_sf=q_sf.contiguous(),
+            ):
+                litetopk_raw = None
+            elif not _litetopk_exec_logged:
+                print(
+                    "LITETOPK_KERNEL_EXECUTED SGLang DSV4 FP4 fused indexer "
+                    f"dispatched device={q_fp4.device}",
+                    flush=True,
+                )
+                _litetopk_exec_logged = True
+
+        if litetopk_effective_required and litetopk_production_ready:
+            assert required_path_args is not None
+            litetopk.enforce_required_path(
+                **required_path_args,
+                dispatched=litetopk_raw is not None,
+            )
+
         indexer_capturer = get_global_indexer_capturer()
         capture_enabled = indexer_capturer is not None
 
@@ -845,6 +1080,11 @@ class C4IndexerBackendMixin:
             ]
         elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
+        elif envs.SGLANG_LITETOPK.get():
+            # Keep the logical winners at the dense->fused boundary so the
+            # next chunk can seed the fixed HOT carry without re-reading the
+            # physical page transform.
+            raw_indices = torch.empty_like(c4_sparse_page_indices)
 
         all_rows = slice(0, _c4sl.shape[0])
 
@@ -893,7 +1133,19 @@ class C4IndexerBackendMixin:
                     row_raw_indices,
                 )
 
-        if nonpaged_plan is not None:
+        if litetopk_raw is not None:
+            valid = (litetopk_raw >= 0) & (
+                litetopk_raw < c4_seq_lens[:query_rows].view(-1, 1)
+            )
+            logical = litetopk_raw.clamp(min=0, max=page_table.shape[1] * 64 - 1)
+            pages = torch.gather(page_table[:query_rows], 1, logical // 64)
+            physical = pages * 64 + logical % 64
+            c4_sparse_page_indices.copy_(
+                torch.where(valid, physical, torch.full_like(physical, -1))
+            )
+            if raw_indices is not None:
+                raw_indices.copy_(litetopk_raw)
+        elif nonpaged_plan is not None:
             assert isinstance(q_indexer, torch.Tensor)
             logits = self._forward_nonpaged_indexer(
                 q_indexer=q_indexer,
@@ -981,6 +1233,24 @@ class C4IndexerBackendMixin:
                     run_paged_indexer(rows, deep_gemm_metadata[chunk_idx])
             else:
                 run_paged_indexer(all_rows, deep_gemm_metadata)
+
+        if litetopk_raw is None and raw_indices is not None and litetopk_enabled:
+            seq_len = (
+                litetopk_sequence_length
+                if litetopk_requested
+                else int(c4_seq_lens.max().item())
+            )
+            min_s = litetopk.production_min_s(True)
+            if (
+                litetopk_gate_sequence_length
+                < min_s
+                <= litetopk_next_gate_sequence_length
+            ):
+                litetopk.stash_carry(
+                    c4_indexer.layer_id,
+                    raw_indices,
+                    seq_len,
+                )
 
         if hisparse_coordinator is not None:
             if hisparse_decode:

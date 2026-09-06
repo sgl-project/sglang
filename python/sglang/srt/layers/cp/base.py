@@ -166,6 +166,19 @@ class ContextParallelStrategy(ABC):
             f"{self.name} strategy does not support DSA indexer key gather"
         )
 
+    def try_materialize_rank_major_indexer_k_cache(
+        self, key: Any, forward_batch: ForwardBatch
+    ) -> Optional[Tuple[Any, int]]:
+        """Optionally gather equal interleave shards without logical reorder.
+
+        The default declines before issuing a collective.  Strategies that
+        implement the optimization return ``(rank_major_rows, cp_size)``;
+        callers can then fold the source-row mapping into their destination
+        store.  Returning ``None`` preserves the ordinary one-collective
+        ``materialize_full_indexer_k_cache`` fallback.
+        """
+        return None
+
     def all_gather_dsa_trtllm_fp8_kv(
         self, forward_batch: ForwardBatch, k: Any, k_rope: Any
     ) -> Any:
