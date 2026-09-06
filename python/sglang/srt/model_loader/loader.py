@@ -320,6 +320,10 @@ class BaseModelLoader(ABC):
     def __init__(self, load_config: LoadConfig):
         self.load_config = load_config
 
+    def supports_startup_weight_load_overlap(self, model_config: ModelConfig) -> bool:
+        """Whether this loader implements the split prepare/commit contract."""
+        return False
+
     @abstractmethod
     def download_model(self, model_config: ModelConfig) -> None:
         """Download a model so that it can be immediately loaded."""
@@ -365,6 +369,11 @@ class DefaultModelLoader(BaseModelLoader):
     DEFAULT_NUM_THREADS = 8
 
     _MTP_PATTERN = re.compile(r"model\.mtp\.layers\.(\d+)\.")
+
+    def supports_startup_weight_load_overlap(self, model_config: ModelConfig) -> bool:
+        # Subclasses must opt in explicitly because overriding load_model or
+        # post-processing can invalidate the split startup contract.
+        return type(self) is DefaultModelLoader
 
     @dataclasses.dataclass
     class Source:
@@ -822,14 +831,12 @@ class DefaultModelLoader(BaseModelLoader):
         values so ``commit_model_weights`` can prove every one of them was
         replaced.
 
-        Note that this runs ``process_weights_after_loading`` on the sentinel
-        values, and ``commit_model_weights`` runs it again on the real weights,
-        so overlap invokes it once more than the serial path. That is safe for
-        the currently supported matrix, where the CUDA unquantized path is a
-        no-op, and it is not covered by the storage manifest, which proves
-        tensor identity rather than idempotence. Any quantization method that
-        mutates weights in place therefore has to be evaluated here before its
-        configuration is added to the supported set.
+        This runs ``process_weights_after_loading`` on capture-safe values, and
+        ``commit_model_weights`` runs it again on the checkpoint. The startup
+        manager validates after commit that parameters and buffers kept the
+        storage captured by CUDA graphs. Graph-visible derived tensors must be
+        registered as nonpersistent buffers before capture and updated in place.
+        Loaders with a different split/post-processing contract must opt in.
         """
         with set_default_torch_dtype(model_config.dtype):
             initialize_capture_safe_weights(model)
@@ -3777,6 +3784,11 @@ class ModelOptModelLoader(DefaultModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         # Any ModelOpt specific initialization if needed
+
+    def supports_startup_weight_load_overlap(self, model_config: ModelConfig) -> bool:
+        # Pre-quantized checkpoints use DefaultModelLoader's load and
+        # post-processing path. Calibration/export workflows do not.
+        return model_config._is_already_quantized()
 
     def _setup_modelopt_quantization(
         self,

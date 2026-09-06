@@ -17,6 +17,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import ModelImpl
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_config import Backend, CudaGraphConfig
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -26,7 +27,7 @@ from sglang.srt.model_executor.model_runner_components.startup_weight_load impor
     StartupWeightLoadOptions,
     StartupWeightLoadState,
 )
-from sglang.srt.model_loader.loader import DefaultModelLoader
+from sglang.srt.model_loader.loader import DefaultModelLoader, ModelOptModelLoader
 from sglang.srt.model_loader.weight_utils import initialize_capture_safe_weights
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -39,14 +40,6 @@ _STARTUP_MODULE = (
 )
 
 
-class _CanonicalModel:
-    pass
-
-
-class _ExternalModel:
-    pass
-
-
 def _make_options(**overrides):
     options = StartupWeightLoadOptions(
         device="cuda",
@@ -55,15 +48,8 @@ def _make_options(**overrides):
         prefill_cuda_graph_backend=Backend.FULL,
         is_draft_worker=False,
         speculative_algorithm=None,
-        tp_size=1,
-        attn_cp_size=1,
-        dcp_size=1,
-        pp_size=1,
-        dp_size=1,
-        ep_size=1,
         cpu_offload_gb=0,
         offload_group_size=-1,
-        enable_memory_saver=False,
         enable_weights_cpu_backup=False,
         enable_lora=False,
         has_lora_paths=False,
@@ -86,6 +72,7 @@ def _make_model_config(**overrides):
         is_generation=True,
         model_impl=ModelImpl.SGLANG,
         _resolved_model_impl=ModelImpl.SGLANG,
+        _is_already_quantized=lambda: False,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -156,6 +143,33 @@ class _TiedWeightModel(nn.Module):
         self.register_buffer("scale", torch.ones(2))
 
 
+class _RuntimeStateModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(2, 2))
+        self.scratch = {"indices": torch.ones(1)}
+        self.register_buffer("graph_scale", torch.ones(1), persistent=False)
+
+
+class _PackedWeightModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(2, 2))
+        self.optional_scale = nn.Parameter(torch.full((1,), -1.0))
+        self.optional_scale._skip_weight_check = True
+        self.packed_weight = nn.Parameter(
+            torch.full((2, 2), 7, dtype=torch.uint8), requires_grad=False
+        )
+        self.packed_weight.weight_loader = lambda param, loaded: param.copy_(loaded)
+        self.routing_table = nn.Parameter(
+            torch.tensor([[1, 2], [3, 4]], dtype=torch.int32), requires_grad=False
+        )
+
+
+class _UnsupportedDefaultLoaderSubclass(DefaultModelLoader):
+    pass
+
+
 class TestStartupWeightLoadSelector(CustomTestCase):
     def setUp(self):
         self.load_config = LoadConfig(load_format=LoadFormat.SAFETENSORS)
@@ -169,35 +183,48 @@ class TestStartupWeightLoadSelector(CustomTestCase):
         model_config=None,
         load_config=None,
         loader=None,
-        resolved_model_class=None,
     ):
         model_config = _make_model_config() if model_config is None else model_config
-        architecture = model_config.hf_config.architectures[0]
-        with (
-            patch(
-                f"{_STARTUP_MODULE}.get_model_architecture",
-                return_value=(
-                    resolved_model_class or _CanonicalModel,
-                    architecture,
-                ),
-            ),
-            patch(
-                f"{_STARTUP_MODULE}._get_canonical_model_class",
-                return_value=_CanonicalModel,
-            ),
-        ):
-            return StartupWeightLoadManager.create(
-                loader=self.loader if loader is None else loader,
-                model_config=model_config,
-                load_config=self.load_config if load_config is None else load_config,
-                device_config=self.device_config,
-                options=_make_options() if options is None else options,
-            )
+        return StartupWeightLoadManager.create(
+            loader=self.loader if loader is None else loader,
+            model_config=model_config,
+            load_config=self.load_config if load_config is None else load_config,
+            device_config=self.device_config,
+            options=_make_options() if options is None else options,
+        )
 
     def test_supported_overlap_creates_a_manager(self):
+        supported_cases = (
+            dict(model_config=_make_model_config(quantization="mxfp8")),
+            dict(
+                model_config=_make_model_config(
+                    hf_config=SimpleNamespace(architectures=["OtherForCausalLM"])
+                )
+            ),
+            dict(
+                model_config=_make_model_config(
+                    model_impl=ModelImpl.TRANSFORMERS,
+                    _resolved_model_impl=ModelImpl.TRANSFORMERS,
+                )
+            ),
+        )
         self.assertIsInstance(self._create(), StartupWeightLoadManager)
+        for kwargs in supported_cases:
+            with self.subTest(kwargs=kwargs):
+                self.assertIsInstance(
+                    self._create(**kwargs),
+                    StartupWeightLoadManager,
+                )
+
+    def test_prequantized_modelopt_loader_supports_overlap(self):
+        model_config = _make_model_config(
+            quantization="modelopt_fp4",
+            _is_already_quantized=lambda: True,
+        )
+        loader = ModelOptModelLoader(self.load_config)
+
         self.assertIsInstance(
-            self._create(options=_make_options(tp_size=2)),
+            self._create(model_config=model_config, loader=loader),
             StartupWeightLoadManager,
         )
 
@@ -262,24 +289,17 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                 "speculative decoding is not supported",
             ),
             (
-                "tp3",
-                dict(options=_make_options(tp_size=3)),
-                "only TP1 and TP2 are supported",
+                "loader_without_split_contract",
+                dict(loader=_UnsupportedDefaultLoaderSubclass(self.load_config)),
+                "does not support split startup loading",
             ),
             (
-                "attention_context_parallel",
-                dict(options=_make_options(tp_size=2, attn_cp_size=2)),
-                "attention context parallelism is not supported",
-            ),
-            (
-                "decode_context_parallel",
-                dict(options=_make_options(tp_size=2, dcp_size=2)),
-                "decode context parallelism is not supported",
-            ),
-            (
-                "quantized_model",
-                dict(model_config=_make_model_config(quantization="fp8")),
-                "quantization is not supported",
+                "online_modelopt",
+                dict(
+                    loader=ModelOptModelLoader(self.load_config),
+                    model_config=_make_model_config(quantization="modelopt_fp4"),
+                ),
+                "does not support split startup loading",
             ),
             (
                 "layer_group_offload",
@@ -290,31 +310,6 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                 "torch_compile",
                 dict(options=_make_options(enable_torch_compile=True)),
                 "torch.compile is not supported",
-            ),
-            (
-                "transformers_model_impl",
-                dict(
-                    model_config=_make_model_config(
-                        model_impl=ModelImpl.TRANSFORMERS,
-                        _resolved_model_impl=ModelImpl.TRANSFORMERS,
-                    ),
-                    resolved_model_class=_ExternalModel,
-                ),
-                "the native SGLang model implementation is required",
-            ),
-            (
-                "external_model_implementation",
-                dict(resolved_model_class=_ExternalModel),
-                "the native SGLang model implementation is required",
-            ),
-            (
-                "unknown_architecture",
-                dict(
-                    model_config=_make_model_config(
-                        hf_config=SimpleNamespace(architectures=["OtherForCausalLM"])
-                    )
-                ),
-                "model architecture is not in the startup-overlap allowlist",
             ),
         )
         for name, kwargs, reason in cases:
@@ -425,7 +420,7 @@ class TestStartupWeightLoadManager(CustomTestCase):
             patch(f"{_STARTUP_MODULE}.torch.cuda.synchronize"),
             self.assertRaisesRegex(
                 RuntimeError,
-                "did not replace capture-safe dummy values: parameter:tied_weight",
+                "did not populate capture-safe parameters: parameter:tied_weight",
             ),
         ):
             manager.finalize()
@@ -552,15 +547,62 @@ class TestModelStorageManifest(CustomTestCase):
             ("parameter:tied_weight",),
         )
 
+    def test_nonpersistent_buffers_are_manifested_but_plain_state_is_not(self):
+        model = _RuntimeStateModel()
+        manifest = ModelStorageManifest.capture(model)
+
+        model.scratch["indices"] = model.scratch["indices"].clone()
+        with torch.no_grad():
+            model.graph_scale.fill_(2)
+
+        self.assertNotIn("graph_scale", model.state_dict())
+        self.assertEqual(manifest.changed_names(model), ())
+
+        model.graph_scale = model.graph_scale.clone()
+
+        self.assertEqual(manifest.changed_names(model), ("buffer:graph_scale",))
+
+    def test_integral_weights_are_excluded_from_sentinel_check(self):
+        model = _PackedWeightModel()
+        initialize_capture_safe_weights(model)
+        manifest = ModelStorageManifest.capture(model)
+
+        self.assertEqual(
+            manifest.unchanged_parameter_names(1e-3),
+            ("parameter:weight",),
+        )
+
 
 class TestCaptureSafeWeightInitialization(CustomTestCase):
-    def test_only_parameters_are_filled(self):
-        model = _TiedWeightModel()
+    def test_parameters_are_filled_with_dtype_safe_values(self):
+        model = _PackedWeightModel()
+        model.register_buffer("scale", torch.ones(2))
 
         initialize_capture_safe_weights(model, value=0.125)
 
         torch.testing.assert_close(model.weight, torch.full_like(model.weight, 0.125))
+        torch.testing.assert_close(
+            model.packed_weight, torch.zeros_like(model.packed_weight)
+        )
+        torch.testing.assert_close(model.optional_scale, torch.full((1,), -1.0))
+        torch.testing.assert_close(
+            model.routing_table,
+            torch.tensor([[1, 2], [3, 4]], dtype=torch.int32),
+        )
         torch.testing.assert_close(model.scale, torch.ones_like(model.scale))
+
+    def test_omitted_kv_cache_scales_keep_their_serial_default(self):
+        layer = nn.Module()
+        method = BaseKVCacheMethod(SimpleNamespace())
+        method.create_weights(layer)
+
+        initialize_capture_safe_weights(layer)
+        method.process_weights_after_loading(layer)
+
+        self.assertEqual(layer.k_scale.item(), 1.0)
+        self.assertEqual(layer.v_scale.item(), 1.0)
+        self.assertEqual(layer.k_scale_float, 1.0)
+        self.assertEqual(layer.v_scale_float, 1.0)
 
 
 class _LifecycleRunner:

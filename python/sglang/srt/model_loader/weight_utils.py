@@ -1690,14 +1690,22 @@ def initialize_capture_safe_weights(
     model: torch.nn.Module,
     value: float = CAPTURE_SAFE_WEIGHT_SENTINEL,
 ) -> None:
-    """Fill floating-point parameters with finite values for graph warmup.
+    """Fill parameters with deterministic values safe for graph warmup.
 
-    Persistent buffers are intentionally left intact: unlike parameters, they
-    are not guaranteed to be replaced by ``model.load_weights()``.
+    Persistent buffers and parameters marked ``_skip_weight_check`` are left
+    intact because they are not guaranteed to be replaced by
+    ``model.load_weights()``. Checkpoint-backed floating weights use a
+    detectable finite sentinel. Integral parameters are zeroed only when they
+    explicitly own a checkpoint loader; other integral parameters may contain
+    initialized routing or layout metadata that must survive dummy setup.
     """
     for param in model.parameters():
+        if getattr(param, "_skip_weight_check", False):
+            continue
         if torch.is_floating_point(param):
             param.fill_(value)
+        elif callable(getattr(param, "weight_loader", None)):
+            param.zero_()
 
 
 def initialize_dummy_weights(

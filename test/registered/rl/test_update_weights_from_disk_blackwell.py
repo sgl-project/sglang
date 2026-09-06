@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=420, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=900, stage="extra-b", runner_config="4-gpu-b200")
 
 import time
 import unittest
@@ -48,7 +48,7 @@ class UpdateWeightsFromDiskBase:
                 "Subclass must set non-empty 'backend_test_suites'"
             )
 
-    def _launch_server(self, backend_test_suite):
+    def _launch_server(self, backend_test_suite, startup_weight_load_mode):
         launch_kwargs = {
             "env": {
                 "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "1",
@@ -58,6 +58,7 @@ class UpdateWeightsFromDiskBase:
         other_args = (
             *backend_test_suite.get("other_args", ()),
             "--enable-memory-saver",
+            f"--startup-weight-load-mode={startup_weight_load_mode}",
             "--cuda-graph-backend-prefill=disabled",
         )
         return popen_launch_server(
@@ -168,12 +169,22 @@ class UpdateWeightsFromDiskBase:
         for backend_test_suite in self.backend_test_suites:
             case_name = backend_test_suite.get("name", "default")
             with self.subTest(model=self.model, case_name=case_name):
-                process = self._launch_server(backend_test_suite)
+                serial_process = self._launch_server(backend_test_suite, "serial")
+                try:
+                    self.assertEqual(self._get_model_info(), self.model)
+                    serial_startup_sig = self._get_decode_logprob_signature()
+                finally:
+                    kill_process_tree(serial_process.pid, wait_timeout=60)
+
+                process = self._launch_server(backend_test_suite, "overlap")
                 try:
                     origin_model_path = self._get_model_info()
                     self.assertEqual(origin_model_path, self.model)
                     self._assert_non_empty_decode()
                     baseline_sig = self._get_decode_logprob_signature()
+                    self._assert_decode_logprob_unchanged(
+                        serial_startup_sig, baseline_sig
+                    )
 
                     for update_test_suite in self.update_test_suites:
                         with self.subTest(case_name=case_name, **update_test_suite):
