@@ -8,8 +8,43 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.quantization.quark.utils import e8m0_to_f32
+from sglang.srt.layers.quantization.quark.utils import (
+    e8m0_to_f32,
+    should_ignore_layer,
+)
 from sglang.test.test_utils import CustomTestCase
+
+
+class TestShouldIgnoreLayer(CustomTestCase):
+    """MiniMax-M3 MXFP4: sparse index_qkv_proj has q/k excluded, v absent."""
+
+    _LAYER = "language_model.model.layers.3.self_attn.index_qkv_proj"
+    _IGNORE = (
+        "language_model.model.layers.3.self_attn.index_q_proj",
+        "language_model.model.layers.3.self_attn.index_k_proj",
+    )
+    _MAPPING = {
+        "index_qkv_proj": ["index_q_proj", "index_k_proj", "index_v_proj"],
+    }
+
+    def test_minimax_dsa_index_qkv_ignored_when_v_absent(self):
+        # Must not raise; fused layer stays bf16 like its present excluded shards.
+        self.assertTrue(should_ignore_layer(self._LAYER, self._IGNORE, self._MAPPING))
+
+    def test_all_shards_agree_still_works(self):
+        layer = "model.layers.0.self_attn.qkv_proj"
+        ignore = (
+            "model.layers.0.self_attn.q_proj",
+            "model.layers.0.self_attn.k_proj",
+            "model.layers.0.self_attn.v_proj",
+        )
+        mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+        self.assertTrue(should_ignore_layer(layer, ignore, mapping))
+
+    def test_no_shards_ignored(self):
+        layer = "model.layers.0.self_attn.qkv_proj"
+        mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+        self.assertFalse(should_ignore_layer(layer, (), mapping))
 
 
 class TestE8M0ToF32(CustomTestCase):
