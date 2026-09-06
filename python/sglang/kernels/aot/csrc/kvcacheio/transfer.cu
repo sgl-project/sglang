@@ -662,6 +662,39 @@ void transfer_kv_per_layer_mla_pf_lf(
       num_warps_per_block);
 }
 
+void transfer_kv_per_layer_mla_lf_pf(
+    const at::Tensor src,
+    at::Tensor dst,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  at::Tensor empty;
+  // src already points at one layer, so a zero layer stride keeps its base
+  // fixed while layer_id selects the destination slot in page-first storage.
+  transfer_kv_launcher<get_global_offset_lf<const char>, get_global_offset_pf<char>, true>(
+      src,
+      dst,
+      empty,
+      empty,
+      src_indices,
+      dst_indices,
+      layer_id,
+      1,
+      item_size,
+      0,
+      dst_layout_dim,
+      empty,
+      empty,
+      empty,
+      empty,
+      block_quota,
+      num_warps_per_block);
+}
+
 void transfer_kv_all_layer_mla(
     const at::Tensor src_layers,
     const at::Tensor dst_layers,
