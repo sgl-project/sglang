@@ -152,10 +152,10 @@ class Schedule:
                 "The ratio of SWA layer KV tokens / full layer KV tokens, regardless "
                 "of the number of swa:full layers. It should be between 0 and 1. "
                 "E.g. 0.5 means if each swa layer has 50 tokens, then each full "
-                "layer has 100 tokens. Unset means 0.8, unless a model family "
-                "declares its own."
+                "layer has 100 tokens."
             ),
             resolvable=True,
+            fallback=0.8,
         ),
     ] = None
     disable_hybrid_swa_memory: A[
@@ -199,11 +199,9 @@ class Schedule:
     mamba_full_memory_ratio: A[
         Optional[float],
         Arg(
-            help=(
-                "The ratio of mamba state memory to full kv cache memory. "
-                "Defaults to 0.9; a model family may declare its own."
-            ),
+            help="The ratio of mamba state memory to full kv cache memory.",
             resolvable=True,
+            fallback=0.9,
         ),
     ] = None
 
