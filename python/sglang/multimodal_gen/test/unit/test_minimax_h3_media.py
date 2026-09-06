@@ -19,6 +19,115 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 )
 
 
+@pytest.mark.parametrize(
+    ("mode", "source_size", "canvas_size", "expected_size", "policy_version"),
+    [
+        (
+            "match",
+            (1920, 1080),
+            (960, 544),
+            (960, 544),
+            "reference_image_match_v1",
+        ),
+        (
+            "match",
+            (512, 512),
+            (960, 544),
+            (512, 512),
+            "reference_image_match_v1",
+        ),
+        (
+            "max",
+            (5000, 2500),
+            (960, 544),
+            (4096, 2048),
+            "reference_image_max_v1",
+        ),
+        (
+            "max",
+            (1920, 1080),
+            (960, 544),
+            (1920, 1088),
+            "reference_image_max_v1",
+        ),
+        (
+            "diffusers",
+            (512, 512),
+            (960, 544),
+            (2048, 2048),
+            "reference_image_short_edge_v1",
+        ),
+    ],
+)
+def test_reference_image_resize_modes(
+    mode, source_size, canvas_size, expected_size, policy_version
+):
+    resolved = reference_encoding.minimax_h3_resolve_reference_image_shape(
+        width=source_size[0],
+        height=source_size[1],
+        canvas_width=canvas_size[0],
+        canvas_height=canvas_size[1],
+        mode=mode,
+    )
+
+    assert (resolved["width"], resolved["height"]) == expected_size
+    assert resolved["shape_policy_version"] == policy_version
+    assert resolved["reference_resize_mode"] == mode
+    assert resolved["allow_upscale"] is (mode == "diffusers")
+
+
+def test_reference_image_resize_defaults_to_legacy_diffusers_policy():
+    resolved = reference_encoding.minimax_h3_resolve_reference_image_shape(
+        width=512,
+        height=512,
+        canvas_width=960,
+        canvas_height=544,
+    )
+
+    assert (resolved["width"], resolved["height"]) == (2048, 2048)
+    assert resolved["reference_resize_mode"] == "diffusers"
+    assert resolved["shape_policy_version"] == "reference_image_short_edge_v1"
+
+
+def test_reference_image_resize_normalizes_mode():
+    resolved = reference_encoding.minimax_h3_resolve_reference_image_shape(
+        width=1920,
+        height=1080,
+        canvas_width=960,
+        canvas_height=544,
+        mode=" MATCH ",
+    )
+
+    assert resolved["reference_resize_mode"] == "match"
+    assert (resolved["width"], resolved["height"]) == (960, 544)
+
+
+def test_reference_image_resize_rejects_unknown_mode():
+    with pytest.raises(ValueError, match="reference_resize_mode"):
+        reference_encoding.minimax_h3_resolve_reference_image_shape(
+            width=1920,
+            height=1080,
+            canvas_width=960,
+            canvas_height=544,
+            mode="unknown",
+        )
+
+
+@pytest.mark.parametrize(
+    ("canvas_width", "canvas_height"),
+    [(0, 544), (960, 0), (-960, 544), (float("nan"), 544)],
+)
+def test_reference_image_resize_rejects_invalid_canvas(canvas_width, canvas_height):
+    with pytest.raises(ValueError, match="target canvas"):
+        reference_encoding.minimax_h3_resolve_reference_image_shape(
+            width=1920,
+            height=1080,
+            canvas_width=canvas_width,
+            canvas_height=canvas_height,
+            mode="match",
+        )
+
+
 def test_keyframe_rng_supports_cpu_and_default_device():
     initial_state = torch.random.get_rng_state()
 

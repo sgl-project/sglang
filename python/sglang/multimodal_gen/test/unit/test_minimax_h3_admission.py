@@ -25,6 +25,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
     RESIDENT,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3 import (
+    prequeue,
+    reference_encoding,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
     MiniMaxH3PartitionAdmissionStage,
     MiniMaxH3ReleaseMetadata,
@@ -282,6 +286,133 @@ def test_video_adapter_lowers_only_native_fields_and_rejects_cfg():
         MiniMaxH3SamplingParams.lower_video_request_kwargs(
             request, {**generic, "guidance_scale": 7.5}
         )
+
+
+def test_reference_resize_mode_is_declared_as_video_request_extra():
+    assert (
+        "reference_resize_mode" in MiniMaxH3SamplingParams.video_request_extra_fields()
+    )
+
+
+def test_video_adapter_lowers_reference_resize_mode():
+    request = VideoGenerationsRequest(
+        prompt="contract",
+        task="ref2va",
+        conditions=[
+            {
+                "type": "image",
+                "uri": "file:///reference.png",
+                "role": "reference",
+            }
+        ],
+        target=TARGET,
+        reference_resize_mode="match",
+    )
+    lowered = MiniMaxH3SamplingParams.lower_video_request_kwargs(
+        request,
+        {"prompt": request.prompt, "seed": request.seed},
+    )
+
+    assert lowered["reference_resize_mode"] == "match"
+
+
+def test_video_adapter_does_not_override_default_reference_resize_mode():
+    request = VideoGenerationsRequest(
+        prompt="contract",
+        task="ref2va",
+        conditions=[
+            {
+                "type": "image",
+                "uri": "file:///reference.png",
+                "role": "reference",
+            }
+        ],
+        target=TARGET,
+    )
+    lowered = MiniMaxH3SamplingParams.lower_video_request_kwargs(
+        request,
+        {"prompt": request.prompt, "seed": request.seed},
+    )
+
+    assert "reference_resize_mode" not in lowered
+
+
+def test_sampling_params_normalizes_reference_resize_mode_and_defaults_to_diffusers():
+    assert MiniMaxH3SamplingParams().reference_resize_mode == "diffusers"
+    assert (
+        MiniMaxH3SamplingParams(reference_resize_mode=" MATCH ").reference_resize_mode
+        == "match"
+    )
+
+
+@pytest.mark.parametrize("bad_mode", ["unknown", "", None, 1])
+def test_sampling_params_rejects_invalid_reference_resize_mode(bad_mode):
+    with pytest.raises(ValueError, match="reference_resize_mode"):
+        MiniMaxH3SamplingParams(reference_resize_mode=bad_mode)
+
+
+@pytest.mark.parametrize(
+    ("sampling_params", "expected_mode"),
+    [
+        (SimpleNamespace(reference_resize_mode="match"), "match"),
+        (SimpleNamespace(), "diffusers"),
+    ],
+)
+def test_prequeue_forwards_reference_resize_mode_and_target_canvas(
+    sampling_params, expected_mode
+):
+    material = SimpleNamespace(
+        condition_index=0,
+        condition_type="image",
+        material_chain="image.reference_preserve",
+        start_time_seconds=0.0,
+        uri="file:///reference.png",
+    )
+    plan = SimpleNamespace(
+        materials=(material,),
+        shape={
+            "geometry": "resolved_v2",
+            "width": 960,
+            "height": 544,
+            "fps": 24,
+            "frame_count": 124,
+        },
+        task="ref2va",
+    )
+    batch = SimpleNamespace(extra={}, sampling_params=sampling_params)
+    resolved_reference_shape = {
+        "geometry": "reference_image_resolved",
+        "width": 960,
+        "height": 544,
+    }
+
+    with (
+        patch.object(prequeue, "minimax_h3_plan_from_batch", return_value=plan),
+        patch.object(
+            prequeue,
+            "minimax_h3_probe_material",
+            return_value={"display_width": 1920, "display_height": 1080},
+        ),
+        patch.object(prequeue, "_replace_plan_shape", return_value=plan),
+        patch.object(
+            reference_encoding,
+            "minimax_h3_resolve_reference_image_shape",
+            return_value=resolved_reference_shape,
+        ) as resolve_reference_shape,
+    ):
+        assert prequeue.minimax_h3_prepare_for_queue(batch) is plan
+
+    resolve_reference_shape.assert_called_once_with(
+        width=1920.0,
+        height=1080.0,
+        canvas_width=960,
+        canvas_height=544,
+        mode=expected_mode,
+    )
+    assert batch.extra[prequeue.MINIMAX_H3_RESOLVED_MATERIAL_SHAPES_EXTRA_KEY][0] == {
+        **resolved_reference_shape,
+        "condition_index": 0,
+    }
 
 
 @pytest.mark.parametrize("bad_quality", ["ultra", "draft", "", 1])
