@@ -59,6 +59,7 @@ from sglang.srt.entrypoints.engine_info_bootstrap_server import (
 )
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
+from sglang.srt.entrypoints.startup_checks import warn_missing_mxfp4_jit_cache
 from sglang.srt.environ import envs
 from sglang.srt.managers.data_parallel_controller import (
     SCHEDULER_PIDS_ARG,
@@ -1695,6 +1696,8 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Set ulimit
     set_ulimit()
+
+    warn_missing_mxfp4_jit_cache(cfg.moe_runner_backend, torch.version.cuda)
 
     # Check flashinfer version
     if not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
