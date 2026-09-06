@@ -590,6 +590,10 @@ class TpModelWorker(BaseTpWorker):
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
+    def _maybe_finalize_elastic_cuda_graph_scale(self) -> None:
+        if self.model_runner._elastic_cuda_graph_enabled():
+            self.model_runner.maybe_join_ep_ranks()
+
     def forward_batch_generation(
         self,
         batch: Optional[ScheduleBatch],
@@ -662,6 +666,7 @@ class TpModelWorker(BaseTpWorker):
                     batch_result.next_token_ids = self.model_runner.sample(
                         logits_output, forward_batch
                     )
+                    self._maybe_finalize_elastic_cuda_graph_scale()
                     return batch_result
 
                 batch_result.delay_sample_func = sample_batch_func
@@ -689,6 +694,7 @@ class TpModelWorker(BaseTpWorker):
                         logits_output, forward_batch
                     )
 
+            self._maybe_finalize_elastic_cuda_graph_scale()
             return batch_result
         else:
             out = self.model_runner.forward(
@@ -721,6 +727,7 @@ class TpModelWorker(BaseTpWorker):
             )
         else:
             next_token_ids = None
+        self._maybe_finalize_elastic_cuda_graph_scale()
         batch_result = GenerationBatchResult(
             logits_output=logits_output,
             can_run_cuda_graph=can_run_cuda_graph,

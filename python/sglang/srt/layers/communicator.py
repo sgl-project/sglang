@@ -40,6 +40,7 @@ from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
+    can_use_dp_reduce_scatter,
     dp_gather_partial,
     dp_gather_replicate,
     dp_reduce_scatter_tensor,
@@ -916,7 +917,10 @@ class LayerCommunicator:
         ):
             if should_use_dp_reduce_scatterv():
                 return True
-            if forward_batch.dp_padding_mode.is_max_len():
+            if (
+                forward_batch.dp_padding_mode.is_max_len()
+                and can_use_dp_reduce_scatter()
+            ):
                 return True
         if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
             return True
@@ -1520,7 +1524,11 @@ class CommunicateSummableTensorPairFn:
                 output=hidden_states,
                 sizes=get_dp_global_num_tokens(),
             )
-        elif allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
+        elif (
+            allow_reduce_scatter
+            and forward_batch.dp_padding_mode.is_max_len()
+            and can_use_dp_reduce_scatter()
+        ):
             dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
         else:
             dp_scatter(hidden_states, global_hidden_states, forward_batch)

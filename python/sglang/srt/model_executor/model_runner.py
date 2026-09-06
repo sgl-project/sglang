@@ -42,7 +42,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
     get_healthy_expert_location_src_rank,
-    get_scale_cohort_target,
+    get_scale_cohort,
     join_process_groups,
     join_scale_process_group,
     maybe_rebalance_after_rank_fault,
@@ -92,6 +92,9 @@ from sglang.srt.mem_cache.kv_cache_configurator import (
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
     cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -118,6 +121,12 @@ from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     capture_cuda_graphs,
     capture_decode_graph,
     capture_prefill_graph,
+    drop_elastic_cuda_graph_state,
+    finalize_cuda_graph_capture,
+    recapture_elastic_cuda_graph,
+    resolve_elastic_cuda_graph_config,
+    sync_elastic_cuda_graph_config,
+    validate_elastic_cuda_graph_recapture,
 )
 from sglang.srt.model_executor.model_runner_components.kv_pool_runtime import (
     compute_post_capture_kv_resize,
@@ -503,6 +512,7 @@ class ModelRunner:
             register_scale_cohort(
                 get_parallel().ep_join_rank_offset,
                 join_effective_ep_size,
+                self._elastic_cuda_graph_enabled(),
             )
         join_scale_process_group()
         get_context().override("elastic_ep.scale_join", ep_size=join_effective_ep_size)
@@ -544,13 +554,6 @@ class ModelRunner:
             state.snapshot_active_to_last()
             state.sync_active_to_cpu()
             state.scale_phase = "syncing_new_world"
-        self._elastic_scale_ready_barrier(
-            target_size=join_effective_ep_size,
-            log_tag="JOINER",
-        )
-        if state is not None:
-            state.scale_phase = "serving_expanded"
-        self._rearm_eplb_after_elastic_scale()
 
     def init_msprobe(self):
         self.msprobe_debugger = misc_utils.create_msprobe_debugger()
@@ -1080,14 +1083,36 @@ class ModelRunner:
         return self.sampling_prewarm_result
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
+        is_scale_joiner = is_ep_scale_joiner() and not self.is_draft_worker
+        defer_decode_capture = (
+            is_scale_joiner
+            and capture_decode_cuda_graph
+            and self._elastic_cuda_graph_enabled()
+        )
+        if is_scale_joiner:
+            self._validate_elastic_cuda_graph_recapture()
         capture = capture_cuda_graphs(
-            model_runner=self, capture_decode_cuda_graph=capture_decode_cuda_graph
+            model_runner=self,
+            capture_decode_cuda_graph=(
+                capture_decode_cuda_graph and not defer_decode_capture
+            ),
+            finalize=not defer_decode_capture,
+            defer_distributed_setup=defer_decode_capture,
         )
         self.eager_runner = capture.eager_runner
         self.prefill_cuda_graph_runner = capture.prefill.runner
         self.decode_cuda_graph_runner = capture.decode.runner
         self.graph_memory_usage = capture.memory_usage
         self.graph_time_usage = capture.time_usage
+
+        if is_scale_joiner:
+            if self._elastic_cuda_graph_enabled():
+                if defer_decode_capture:
+                    self._recapture_elastic_cuda_graphs()
+                    finalize_cuda_graph_capture(self)
+            # Scheduler startup calls this path even when CUDA graphs are disabled.
+            target_size = self.server_args.ep_join_rank_offset + self.ps.tp_size
+            self._finalize_elastic_ep_joiner(target_size)
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:
@@ -1696,7 +1721,10 @@ class ModelRunner:
             self.msprobe_debugger.stop()
             self.msprobe_debugger.step()
 
-        if get_exec().moe.elastic_ep_backend is not None:
+        if (
+            get_exec().moe.elastic_ep_backend is not None
+            and not self._elastic_cuda_graph_enabled()
+        ):
             self.maybe_join_ep_ranks()
 
         return output
@@ -2050,6 +2078,13 @@ class ModelRunner:
                 target_size,
             )
 
+    def _finalize_elastic_ep_joiner(self, target_size: int) -> None:
+        self._elastic_scale_ready_barrier(target_size=target_size, log_tag="JOINER")
+        state = ElasticEPStateManager.instance()
+        if state is not None:
+            state.scale_phase = "serving_expanded"
+        self._rearm_eplb_after_elastic_scale()
+
     def _finalize_scale_up(
         self,
         ranks_to_join: list[int],
@@ -2099,6 +2134,9 @@ class ModelRunner:
         )
         get_context().override("elastic_ep.scale", dp_size=target_size)
 
+        recapture_cuda_graph = self._elastic_cuda_graph_enabled()
+        if recapture_cuda_graph:
+            self._recapture_elastic_cuda_graphs()
         ElasticEPStateManager.mark_syncing_new_world()
         self._elastic_scale_ready_barrier(
             target_size=target_size,
@@ -2123,6 +2161,48 @@ class ModelRunner:
                 target_size,
                 ranks_to_join,
             )
+
+    def _elastic_cuda_graph_enabled(self) -> bool:
+        return (
+            self.server_args.elastic_ep_backend is not None
+            and self.server_args.max_ep_size is not None
+            and self.server_args.max_ep_size > self.server_args.tp_size
+            and check_cuda_graph_backend(Phase.DECODE, Backend.FULL)
+        )
+
+    def _validate_elastic_cuda_graph_recapture(self) -> None:
+        if not self._elastic_cuda_graph_enabled():
+            return
+
+        validate_elastic_cuda_graph_recapture()
+        self.attn_backend.validate_elastic_cuda_graph_recapture()
+
+    def _recapture_elastic_cuda_graphs(self) -> None:
+        if not self._elastic_cuda_graph_enabled():
+            return
+
+        sync_elastic_cuda_graph_config(
+            config=resolve_elastic_cuda_graph_config(self),
+            device=self.device,
+            world_group=dist.group.WORLD,
+        )
+        drop_elastic_cuda_graph_state(
+            decode_runner=self.decode_cuda_graph_runner,
+            eager_runner=self.eager_runner,
+        )
+        self.decode_cuda_graph_runner = None
+        capture = recapture_elastic_cuda_graph(model_runner=self)
+        self.decode_cuda_graph_runner = capture.runner
+        self.graph_memory_usage = replace_graph_memory_usage(
+            self.graph_memory_usage,
+            capture.memory_usage,
+            phases=("decode", "target_verify", "draft_decode"),
+        )
+        self.graph_time_usage = replace_graph_time_usage(
+            self.graph_time_usage,
+            capture.time_usage,
+            phases=("decode", "target_verify", "draft_decode"),
+        )
 
     def maybe_join_ep_ranks(self) -> None:
         if not ElasticEPStateManager.is_scaling():
@@ -2171,14 +2251,36 @@ class ModelRunner:
             return
 
         if state.scale_phase == "waiting_for_cohort":
-            cohort_target = get_scale_cohort_target(effective_size)
-            if cohort_target is None:
+            cohort = get_scale_cohort(effective_size)
+            if cohort is None:
                 return
-            if cohort_target != pending_size:
+            if cohort.target_ep_size != pending_size:
                 error = (
                     f"Requested target EP size {pending_size} does not match "
-                    f"joining cohort target {cohort_target}"
+                    f"joining cohort target {cohort.target_ep_size}"
                 )
+                ElasticEPStateManager.fail_scale(error)
+                self._reset_eplb_after_elastic_scale_failure()
+                self._report_elastic_scale_failure(error, effective_size)
+                if self.ps.tp_rank == 0 and not is_ep_scale_joiner():
+                    logger.error("[Elastic EP] %s", error)
+                return
+            cuda_graph_enabled = self._elastic_cuda_graph_enabled()
+            if cohort.cuda_graph_enabled != cuda_graph_enabled:
+                error = (
+                    "Primary and joining cohort must use the same CUDA graph "
+                    "configuration for Elastic EP scale-up"
+                )
+                ElasticEPStateManager.fail_scale(error)
+                self._reset_eplb_after_elastic_scale_failure()
+                self._report_elastic_scale_failure(error, effective_size)
+                if self.ps.tp_rank == 0 and not is_ep_scale_joiner():
+                    logger.error("[Elastic EP] %s", error)
+                return
+            try:
+                self._validate_elastic_cuda_graph_recapture()
+            except ValueError as exc:
+                error = str(exc)
                 ElasticEPStateManager.fail_scale(error)
                 self._reset_eplb_after_elastic_scale_failure()
                 self._report_elastic_scale_failure(error, effective_size)

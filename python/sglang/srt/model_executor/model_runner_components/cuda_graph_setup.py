@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import gc
+import hashlib
 import logging
 import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
+import torch
+import torch.distributed as dist
 
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.distributed import get_world_group
@@ -35,6 +39,7 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     PrefillCudaGraphRunner,
     get_batch_sizes_to_capture,
+    set_global_graph_memory_pool,
 )
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.platforms import current_platform
@@ -155,6 +160,91 @@ class CudaGraphsCapture(msgspec.Struct, frozen=True, kw_only=True):
         )
 
 
+class ElasticCudaGraphConfig(msgspec.Struct, frozen=True, kw_only=True):
+    decode_backend: Backend
+    capture_bs: tuple[int, ...] = ()
+    compile_bs: tuple[int, ...] = ()
+    attn_tp_size: int = 1
+    attn_cp_size: int = 1
+    attention_backend: str = ""
+    disable_padding: bool = False
+    enable_two_batch_overlap: bool = False
+    capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
+
+    def signature(self) -> tuple:
+        if self.decode_backend != Backend.FULL:
+            return (self.decode_backend,)
+        return (
+            self.decode_backend,
+            self.capture_bs,
+            self.compile_bs,
+            self.attn_tp_size,
+            self.attn_cp_size,
+            self.attention_backend,
+            self.disable_padding,
+            self.enable_two_batch_overlap,
+            self.capture_hidden_mode,
+        )
+
+
+def validate_elastic_cuda_graph_recapture() -> None:
+    if not check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
+        raise ValueError(
+            "Elastic EP CUDA graph recapture supports decode graphs only; "
+            "prefill CUDA graphs must be disabled."
+        )
+
+
+def resolve_elastic_cuda_graph_config(
+    model_runner: ModelRunner,
+) -> ElasticCudaGraphConfig:
+    decode_backend = (
+        Backend.FULL
+        if check_cuda_graph_backend(Phase.DECODE, Backend.FULL)
+        else Backend.DISABLED
+    )
+    capture_bs: tuple[int, ...] = ()
+    compile_bs: tuple[int, ...] = ()
+    if decode_backend == Backend.FULL:
+        resolved_capture_bs, resolved_compile_bs = get_batch_sizes_to_capture(
+            model_runner, model_runner.decode_num_tokens_per_req()
+        )
+        capture_bs = tuple(resolved_capture_bs)
+        compile_bs = tuple(resolved_compile_bs)
+
+    return ElasticCudaGraphConfig(
+        decode_backend=decode_backend,
+        capture_bs=capture_bs,
+        compile_bs=compile_bs,
+        attn_tp_size=model_runner.ps.attn_tp_size,
+        attn_cp_size=model_runner.ps.attn_cp_size,
+        attention_backend=model_runner.decode_attention_backend_str,
+        disable_padding=model_runner.server_args.disable_cuda_graph_padding,
+        enable_two_batch_overlap=model_runner.server_args.enable_two_batch_overlap,
+        capture_hidden_mode=get_server_return_hidden_states_mode(),
+    )
+
+
+def sync_elastic_cuda_graph_config(
+    *, config: ElasticCudaGraphConfig, device: torch.device, world_group: Any
+) -> None:
+    signature = config.signature()
+    digest = hashlib.sha256(repr(signature).encode()).digest()
+    signature_hash = int.from_bytes(digest[:8], "little") & ((1 << 63) - 1)
+    local_hash = torch.tensor([signature_hash], dtype=torch.int64, device=device)
+    gathered_hashes = torch.empty(
+        dist.get_world_size(world_group), dtype=torch.int64, device=device
+    )
+    dist.all_gather_into_tensor(gathered_hashes, local_hash, group=world_group)
+    hashes = gathered_hashes.cpu().tolist()
+    if any(value != hashes[0] for value in hashes[1:]):
+        raise RuntimeError(
+            "Elastic EP scale-up requires matching CUDA graph configuration "
+            "and effective capture sizes on every rank; "
+            f"local_signature={signature}, gathered_hashes={hashes}."
+        )
+
+
 def refresh_deep_gemm_layout_memory_budget(
     model_runner: ModelRunner, *, only_if_initialized: bool = False
 ) -> None:
@@ -167,11 +257,14 @@ def refresh_deep_gemm_layout_memory_budget(
         return
 
     if only_if_initialized:
+        if not _deep_gemm_layout_memory_budget_initialized:
+            return
+        # Scale joiners refresh with all expanded ranks during recapture.
+        if get_exec().moe.ep_join_mode == "scale":
+            return
         # Target and draft share the budget. Its pre-capture initialization
         # already used a world-wide collective, so this guard is rank-uniform
         # and also covers a draft-only DeepGEMM backend outside draft context.
-        if not _deep_gemm_layout_memory_budget_initialized:
-            return
     else:
         if model_runner.is_draft_worker:
             moe_runner_backend = (
@@ -224,8 +317,40 @@ def refresh_deep_gemm_layout_memory_budget(
     )
 
 
+def recapture_elastic_cuda_graph(
+    *,
+    model_runner: ModelRunner,
+) -> GraphCapture:
+    refresh_deep_gemm_layout_memory_budget(model_runner)
+    # Warmup may communicate, so every rank repeats it after the rendezvous.
+    model_runner._kernel_warmed_up = False
+    capture = capture_decode_graph(model_runner=model_runner)
+    if capture.runner is None:
+        raise RuntimeError(
+            "Elastic EP CUDA graph recapture did not create a decode graph runner."
+        )
+    current_platform.synchronize()
+    return capture
+
+
+def drop_elastic_cuda_graph_state(
+    *, decode_runner: Optional[BaseRunner], eager_runner: EagerRunner
+) -> None:
+    current_platform.synchronize()
+    if decode_runner is not None and decode_runner is not eager_runner:
+        decode_runner.backend.cleanup()
+        current_platform.synchronize()
+    set_global_graph_memory_pool(None)
+    gc.collect()
+    current_platform.empty_cache()
+
+
 def capture_cuda_graphs(
-    *, model_runner: ModelRunner, capture_decode_cuda_graph: bool = True
+    *,
+    model_runner: ModelRunner,
+    capture_decode_cuda_graph: bool = True,
+    finalize: bool = True,
+    defer_distributed_setup: bool = False,
 ) -> CudaGraphsCapture:
     """Capture cuda graphs. Requires init_attention_backends() to have run.
 
@@ -245,8 +370,10 @@ def capture_cuda_graphs(
     # it. Always built: it serves both the fully-disabled case (decode/prefill
     # runners point at it) and the eager fallback when a cg runner can't run a
     # batch.
-    eager_runner = EagerRunner(model_runner)
-    refresh_deep_gemm_layout_memory_budget(model_runner)
+    eager_runner = EagerRunner(model_runner, run_warmup=not defer_distributed_setup)
+
+    if not defer_distributed_setup:
+        refresh_deep_gemm_layout_memory_budget(model_runner)
 
     # cuda-graph capture: prefill before decode, so both coalesce onto the
     # eager buffer allocated above. (capture_prefill_graph routes prefill
@@ -277,10 +404,14 @@ def capture_cuda_graphs(
             capture_time=0,
         )
 
-    # Register forward hooks AFTER cuda-graph capture so their tensor ops are
-    # not traced into any captured graph — capture stays hook-free and hooks
-    # fire only on the eager forward path (capture replay never runs Python
-    # hooks anyway).
+    if finalize:
+        finalize_cuda_graph_capture(model_runner)
+
+    return CudaGraphsCapture(eager_runner=eager_runner, prefill=prefill, decode=decode)
+
+
+def finalize_cuda_graph_capture(model_runner: ModelRunner) -> None:
+    """Run setup that must happen after the final graph capture."""
     if model_runner.server_args.forward_hooks:
         register_forward_hooks(
             model_runner.model, model_runner.server_args.forward_hooks
@@ -295,8 +426,6 @@ def capture_cuda_graphs(
 
     if model_runner.canary_manager is not None and not model_runner.is_draft_worker:
         model_runner.canary_manager.mark_init_finished()
-
-    return CudaGraphsCapture(eager_runner=eager_runner, prefill=prefill, decode=decode)
 
 
 def capture_prefill_graph(
