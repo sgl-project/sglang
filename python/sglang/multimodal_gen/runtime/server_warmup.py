@@ -190,6 +190,9 @@ async def maybe_apply_auto_residency(
         )
         return
     status = _auto_residency_status(response)
+    recovering_from_oom = bool(
+        isinstance(response.output, dict) and response.output.get("recovering_from_oom")
+    )
     if status == PLACEMENT_STATUS_ROLLBACK_FAILED:
         raise RuntimeError(f"auto residency rollback failed: {response.error}")
     if response.error is not None:
@@ -204,11 +207,19 @@ async def maybe_apply_auto_residency(
         )
         return
     if status != PLACEMENT_STATUS_ADJUSTED:
+        if recovering_from_oom:
+            raise RuntimeError(
+                "default workload exceeds the VRAM budget and auto residency "
+                "found no feasible placement"
+            )
         return
 
     short_validation = bool(
         isinstance(response.output, dict) and response.output.get("short_validation")
     )
+    # This pass physically realizes the selected placement and measures phases
+    # that overlap under it. Resident-only changes need one full-shape step for
+    # memory safety; other changes retain the longer regression timing sample.
     try:
         validation_options = {"step_limit": 1} if short_validation else {}
         await run_async_client_warmup(
@@ -349,6 +360,7 @@ async def run_async_client_warmup(
     step_limit: int | None = None,
 ) -> None:
     try:
+        auto_residency_handles_oom = auto_residency_skip_reason(server_args) is None
         warmup_input_path = None
         if should_include_warmup_image(server_args, server_based_warmup=True):
             warmup_input_path = prepare_warmup_image_path(server_args)
@@ -362,6 +374,12 @@ async def run_async_client_warmup(
             response = await forward(req)
             for _ in range(MAX_WARMUP_DEGRADE_ATTEMPTS):
                 if response.error is None or not _is_out_of_memory(response.error):
+                    break
+                # The residency planner needs the first failed target-shape
+                # measurement. Retrying smaller requests cannot fix a weight-
+                # dominated OOM and can retain failed-forward allocations that
+                # contaminate the phase model used by the planner.
+                if auto_residency_handles_oom:
                     break
                 lighter = _degrade_after_oom(server_args, req)
                 if lighter is None:
