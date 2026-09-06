@@ -860,9 +860,13 @@ class GptOssDetector(BaseReasoningFormatDetector):
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         events = self.parser.parse(text)
-        # Flush the buffer for one-shot parsing
-        events += self.parser.parse("")
+        events += self.parser.finish()
 
+        return self._events_to_result(events)
+
+    def _events_to_result(
+        self, events, apply_force_nonempty_content: bool = True
+    ) -> StreamingParseResult:
         reasoning_text = "".join(
             [e.content for e in events if e.event_type == "reasoning"]
         )
@@ -876,32 +880,25 @@ class GptOssDetector(BaseReasoningFormatDetector):
         normal_text = "".join(normal_parts)
         # Tool call events preserve raw text with structural markers
 
+        result = StreamingParseResult(
+            normal_text=normal_text,
+            reasoning_text=reasoning_text,
+        )
+        return (
+            self._maybe_apply_force_nonempty_content(result)
+            if apply_force_nonempty_content
+            else result
+        )
+
+    def finish(self) -> StreamingParseResult:
+        """Flush HarmonyParser state when the output stream ends."""
         return self._maybe_apply_force_nonempty_content(
-            StreamingParseResult(
-                normal_text=normal_text,
-                reasoning_text=reasoning_text,
-            )
+            self._events_to_result(self.parser.finish())
         )
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         events = self.parser.parse(new_text)
-
-        reasoning_text = "".join(
-            [e.content for e in events if e.event_type == "reasoning"]
-        )
-        normal_parts = []
-        for e in events:
-            if e.event_type == "normal":
-                normal_parts.append(e.content)
-            elif e.event_type == "tool_call":
-                # Use raw_text to preserve structural markers for function call detector
-                normal_parts.append(e.raw_text if e.raw_text else e.content)
-        normal_text = "".join(normal_parts)
-
-        return StreamingParseResult(
-            normal_text=normal_text,
-            reasoning_text=reasoning_text,
-        )
+        return self._events_to_result(events, apply_force_nonempty_content=False)
 
 
 class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):

@@ -198,6 +198,75 @@ class CanonicalStrategy:
 
         return events, ""
 
+    def finish(self, text: str) -> List[Event]:
+        """Flush text that cannot form a complete channel block."""
+        events, remaining = self.parse(text)
+        events = [event for event in events if event.content]
+        if remaining:
+            event = self._flush_remaining(remaining)
+            if event is not None:
+                events.append(event)
+        return events
+
+    def _flush_remaining(self, text: str) -> Optional[Event]:
+        tokens = list(iter_tokens(text))
+        channel_pos = next(
+            (index for index, token in enumerate(tokens) if token.type == "CHANNEL"),
+            None,
+        )
+        if channel_pos is None:
+            if text.strip() and not self._is_standalone_structural_token(text):
+                return Event("normal", text)
+            return None
+
+        channel_token = tokens[channel_pos]
+        message_pos = next(
+            (
+                index
+                for index in range(channel_pos + 1, len(tokens))
+                if tokens[index].type == "MESSAGE"
+            ),
+            None,
+        )
+
+        if message_pos is not None:
+            channel_header = text[channel_token.end : tokens[message_pos].start]
+            channel_type = self._extract_channel_type(channel_header)
+            content_start = tokens[message_pos].end
+        else:
+            channel_text = text[channel_token.end :]
+            match = re.match(
+                r"\s*(analysis|commentary|final)", channel_text, re.IGNORECASE
+            )
+            if match is None:
+                return None
+            channel_type = match.group(1).lower()
+            content_start = channel_token.end + match.end()
+
+        if channel_type is None:
+            return None
+
+        content_end = len(text)
+        if message_pos is not None:
+            for token in tokens[message_pos + 1 :]:
+                if token.type in (
+                    "START",
+                    "CHANNEL",
+                    "MESSAGE",
+                    "END",
+                    "CALL",
+                    "RETURN",
+                ):
+                    content_end = token.start
+                    break
+
+        content = text[content_start:content_end]
+        if not content:
+            return None
+
+        event_type = "reasoning" if channel_type == "analysis" else "normal"
+        return Event(event_type, content.lstrip() if message_pos is None else content)
+
     def _parse_partial_analysis(
         self, text: str, tokens: List[Token], start_pos: int
     ) -> Optional[Tuple[Event, str]]:
@@ -497,6 +566,38 @@ class TextStrategy:
             events.append(Event("normal", emit))
         return events, hold
 
+    def finish(self, text: str) -> List[Event]:
+        """Flush text that was held while waiting for a text-format marker."""
+        events, remaining = self.parse(text)
+        if not remaining:
+            return events
+
+        if remaining.strip().lower() in {"analysis", "commentary"}:
+            return events
+
+        match = re.match(
+            r"^\s*(?:assistant\s*)?(analysis|commentary)(.*)$",
+            remaining,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if match:
+            content = match.group(2)
+            if content:
+                event_type = (
+                    "reasoning" if match.group(1).lower() == "analysis" else "normal"
+                )
+                events.append(Event(event_type, content.strip()))
+            return events
+
+        match = re.match(
+            r"^\s*assistantfinal(.*)$", remaining, re.IGNORECASE | re.DOTALL
+        )
+        if match and match.group(1):
+            events.append(Event("normal", match.group(1).strip()))
+        elif remaining.strip():
+            events.append(Event("normal", remaining))
+        return events
+
 
 class HarmonyParser:
     """Facade for parsing Harmony format, switching between strategies."""
@@ -512,6 +613,9 @@ class HarmonyParser:
         )
 
     def parse(self, chunk: str) -> List[Event]:
+        if not chunk:
+            return self.finish()
+
         self._buffer += chunk
 
         if self.strategy is None:
@@ -538,7 +642,26 @@ class HarmonyParser:
 
         self._buffer = remaining
 
-        # Filter events for streaming case
+        return self._filter_events(events, buffer_has_call_token)
+
+    def finish(self) -> List[Event]:
+        """Flush buffered text once no more stream chunks will arrive."""
+        if not self._buffer:
+            return []
+
+        buffered_text = self._buffer
+        if self.strategy is None:
+            events = [Event("normal", buffered_text)]
+        else:
+            events = self.strategy.finish(buffered_text)
+
+        self._buffer = ""
+        return self._filter_events(events, buffered_text.rstrip().endswith("<|call|>"))
+
+    def _filter_events(
+        self, events: List[Event], buffer_has_call_token: bool
+    ) -> List[Event]:
+        """Filter commentary filler from parsed events."""
         filtered_events = []
         for event in events:
             should_filter = False
