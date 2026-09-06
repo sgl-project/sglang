@@ -1,8 +1,9 @@
 import unittest
+from unittest.mock import patch
 
 from sglang.srt.utils.weight_versions import WeightVersionSpan
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
@@ -10,6 +11,7 @@ from sglang.srt.managers.io_struct import BatchStrOutput
 from sglang.srt.managers.multi_tokenizer_mixin import (
     TokenizerWorker,
     _handle_output_by_index,
+    _init_router_tracing,
     get_tokenizer_worker_class,
 )
 
@@ -137,6 +139,54 @@ class TestMultiTokenizerMixin(unittest.TestCase):
     def test_get_tokenizer_worker_class_rejects_non_worker(self):
         with self.assertRaisesRegex(TypeError, "TokenizerWorker"):
             get_tokenizer_worker_class(InvalidServerArgs())
+
+
+class TracingServerArgs:
+    enable_trace = True
+    otlp_traces_endpoint = "http://localhost:4317"
+    trace_modules = ["prefill_forward", "decode_forward"]
+
+
+class NoTracingServerArgs:
+    enable_trace = False
+    otlp_traces_endpoint = "http://localhost:4317"
+    trace_modules = []
+
+
+class TestInitRouterTracing(CustomTestCase):
+    def test_initializes_when_trace_enabled(self):
+        with patch(
+            "sglang.srt.managers.multi_tokenizer_mixin.get_global_tracing_enabled",
+            return_value=False,
+        ), patch(
+            "sglang.srt.managers.multi_tokenizer_mixin.process_tracing_init"
+        ) as mock_init:
+            _init_router_tracing(TracingServerArgs())
+
+        mock_init.assert_called_once_with(
+            "http://localhost:4317",
+            "sglang",
+            trace_modules=["prefill_forward", "decode_forward"],
+        )
+
+    def test_skips_when_trace_disabled(self):
+        with patch(
+            "sglang.srt.managers.multi_tokenizer_mixin.process_tracing_init"
+        ) as mock_init:
+            _init_router_tracing(NoTracingServerArgs())
+
+        mock_init.assert_not_called()
+
+    def test_skips_when_already_initialized(self):
+        with patch(
+            "sglang.srt.managers.multi_tokenizer_mixin.get_global_tracing_enabled",
+            return_value=True,
+        ), patch(
+            "sglang.srt.managers.multi_tokenizer_mixin.process_tracing_init"
+        ) as mock_init:
+            _init_router_tracing(TracingServerArgs())
+
+        mock_init.assert_not_called()
 
 
 if __name__ == "__main__":
