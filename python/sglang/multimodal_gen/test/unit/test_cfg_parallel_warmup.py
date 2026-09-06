@@ -16,7 +16,11 @@ All tests are CPU-only; no model loading, no distributed init.
 import unittest
 from collections import deque
 from types import SimpleNamespace
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import (
+    ANY,
+    MagicMock,
+    patch,
+)
 
 import torch
 
@@ -345,30 +349,6 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertTrue(req.extra["return_warmup_result"])
         self.assertTrue(req.extra["server_based_warmup"])
         self.assertEqual(req.extra["warmup_total"], 1)
-
-    def test_diff_generator_runs_server_style_startup_warmup(self):
-        generator = object.__new__(DiffGenerator)
-        generator.server_args = server_args = MagicMock()
-
-        with (
-            patch(
-                "sglang.multimodal_gen.runtime.entrypoints.diffusion_generator.should_run_synthetic_server_warmup",
-                return_value=True,
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.entrypoints.diffusion_generator.run_sync_startup_warmup"
-            ) as startup_warmup,
-            patch(
-                "sglang.multimodal_gen.runtime.entrypoints.diffusion_generator.run_sync_client_warmup"
-            ) as request_warmup,
-        ):
-            generator._run_client_warmup_if_needed()
-
-        startup_warmup.assert_called_once_with(
-            server_args,
-            ANY,
-        )
-        request_warmup.assert_not_called()
 
     def test_server_based_warmup_uses_model_default_negative_prompt(self):
         server_args = MagicMock()
@@ -983,6 +963,30 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             )
 
         self.assertEqual(reqs[0].image_path, ["/tmp/warmup.png"])
+
+    def test_diff_generator_runs_server_style_startup_warmup(self):
+        generator = object.__new__(DiffGenerator)
+        generator.server_args = server_args = MagicMock()
+
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.entrypoints.diffusion_generator.should_run_synthetic_server_warmup",
+                return_value=True,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.entrypoints.diffusion_generator.run_sync_startup_warmup"
+            ) as startup_warmup,
+            patch(
+                "sglang.multimodal_gen.runtime.entrypoints.diffusion_generator.run_sync_client_warmup"
+            ) as request_warmup,
+        ):
+            generator._run_client_warmup_if_needed()
+
+        startup_warmup.assert_called_once_with(
+            server_args,
+            ANY,
+        )
+        request_warmup.assert_not_called()
 
 
 class TestFlux2FinetunedVaeEncodePreprocess(unittest.TestCase):
