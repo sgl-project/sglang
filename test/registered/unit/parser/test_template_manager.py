@@ -574,10 +574,25 @@ class TestToolCallParserDetection(unittest.TestCase):
         self.assertEqual(rp, "qwen3")
         self.assertEqual(tcp, "qwen")
 
+    def test_spark_x25_detects_spark25_tool_call_parser(self):
+        # Regression for #37608: the official Spark-X2.5 template was resolved
+        # to glm45 through the generic xml_kv fallback, and Glm4MoeDetector
+        # cannot parse its single-line <arg_key>/<arg_value> calls.
+        _, tcp = self._detect_all("XHToken/Spark-X2.5-4B")
+        self.assertEqual(tcp, "spark25")
+
     def test_tool_call_parser_rule_values_via_snippets(self):
         """Table-driven: verify tool-call rule values differ from reasoning where expected."""
         cases = [
             # (name, template, vocab, expected_tool_call)
+            (
+                "spark25_bot_role_tags_one_line_xml_kv",
+                "<｜start▁of▁sentence｜><|Bot|></think>"
+                "<tool_call>{{ name }}<arg_key>{{ k }}</arg_key>"
+                "<arg_value>{{ v }}</arg_value></tool_call>",
+                ["<tool_call>", "<arg_key>", "<arg_value>"],
+                "spark25",
+            ),
             (
                 "qwen_maps_from_qwen3_config",
                 "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}",
@@ -744,6 +759,15 @@ class TestToolCallParserDetection(unittest.TestCase):
                     template, _DummyTokenizer(vocab), config, force
                 )
                 self.assertEqual(result, expected)
+
+    def test_spark25_rule_precedes_glm_and_xml_kv_fallback(self):
+        # Spark-X2.5 carries the same <arg_key> body as GLM, so it must be
+        # matched before both the glm rules and the generic xml_kv fallback,
+        # which would otherwise claim it for glm45 (#37608).
+        rule_index = {rule.name: i for i, rule in enumerate(TOOL_CALL_PARSER_RULES)}
+        self.assertLess(rule_index["spark25"], rule_index["glm47"])
+        self.assertLess(rule_index["spark25"], rule_index["glm45"])
+        self.assertLess(rule_index["spark25"], rule_index["xml_kv_tool_call"])
 
     def test_glm45_rule_precedes_xml_kv_fallback(self):
         # The specific GLM-4.5 family check must run before the generic
