@@ -287,9 +287,9 @@ class TritonLoRABackend(BaseLoRABackend):
         bs = forward_batch.batch_size
 
         if use_cuda_graph:
-            assert (
-                self.cuda_graph_batch_info is not None
-            ), "CUDA Graph batch info is not initialized."
+            assert self.cuda_graph_batch_info is not None, (
+                "CUDA Graph batch info is not initialized."
+            )
             batch_info = self.cuda_graph_batch_info
             if forward_batch.forward_mode.is_target_verify():
                 # seg_lens were pre-filled at the captured per-request width
@@ -361,6 +361,44 @@ class TritonLoRABackend(BaseLoRABackend):
         self.lm_head_batch_info, self.lm_head_pass_batch_infos = (
             self._prepare_lm_head_batch_info(forward_batch, weight_indices, batch_info)
         )
+
+    def prepare_lora_token_segments(
+        self,
+        *,
+        segment_lens: list[int],
+        weight_indices: list[int],
+        lora_ranks: list[int],
+        scalings: list[float],
+    ) -> None:
+        """Install explicit eager token-row routing metadata."""
+        self.reset_batch_state()
+
+        segment_lens_tensor = torch.tensor(
+            segment_lens, dtype=torch.int32, device=self.device
+        )
+        segment_indptr = torch.zeros(
+            len(segment_lens) + 1, dtype=torch.int32, device=self.device
+        )
+        segment_indptr[1:] = torch.cumsum(segment_lens_tensor, dim=0)
+
+        self.batch_info = LoRABatchInfo(
+            use_cuda_graph=False,
+            bs=len(segment_lens),
+            num_segments=len(segment_lens),
+            seg_lens=segment_lens_tensor,
+            seg_indptr=segment_indptr,
+            max_len=max(segment_lens),
+            weight_indices=torch.tensor(
+                weight_indices, dtype=torch.int32, device=self.device
+            ),
+            lora_ranks=torch.tensor(lora_ranks, dtype=torch.int64, device=self.device),
+            scalings=torch.tensor(scalings, dtype=torch.float, device=self.device),
+            permutation=None,
+            expected_tokens=sum(segment_lens),
+        )
+
+        # These segments already describe physical token-row order.
+        self.sgemm_batch_info = None
 
     def _prepare_lm_head_batch_info(
         self,

@@ -226,8 +226,10 @@ class TestMlxHybridInitializeAllocation(CustomTestCase):
         stub = _hybrid_stub_for_initialize(
             max_running_requests=4, max_mamba_cache_size=2
         )
-        with _arch(hybrid=True), _published(stub), self.assertRaisesRegex(
-            RuntimeError, "max_mamba_cache_size"
+        with (
+            _arch(hybrid=True),
+            _published(stub),
+            self.assertRaisesRegex(RuntimeError, "max_mamba_cache_size"),
         ):
             stub.initialize()
 

@@ -27,10 +27,13 @@ HUGE_MEM_BUDGET = 64 * 2**30
 def _decide(num_q, num_k, mem_budget=HUGE_MEM_BUDGET, is_hip=True):
     # __new__ skips an __init__ that needs a model config and a device.
     indexer = dsa_indexer.Indexer.__new__(dsa_indexer.Indexer)
-    with mock.patch.object(dsa_indexer, "_is_hip", is_hip), mock.patch.object(
-        dsa_indexer.Indexer,
-        "_get_mqa_logits_budget_bytes",
-        return_value=mem_budget,
+    with (
+        mock.patch.object(dsa_indexer, "_is_hip", is_hip),
+        mock.patch.object(
+            dsa_indexer.Indexer,
+            "_get_mqa_logits_budget_bytes",
+            return_value=mem_budget,
+        ),
     ):
         return indexer._should_chunk_mqa_logits(num_q, num_k, 0)
 

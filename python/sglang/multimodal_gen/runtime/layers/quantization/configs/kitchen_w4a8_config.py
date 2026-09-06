@@ -55,8 +55,7 @@ class KitchenW4A8Config(QuantizationConfig):
                 continue
             if marker_format != "asym_w4a8_int8":
                 raise ValueError(
-                    f"Unsupported Comfy W4A8 format for {prefix!r}: "
-                    f"{marker_format!r}"
+                    f"Unsupported Comfy W4A8 format for {prefix!r}: {marker_format!r}"
                 )
             if marker.get("convrot") is not True:
                 raise ValueError(

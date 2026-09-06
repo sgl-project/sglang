@@ -425,7 +425,7 @@ fn host_drive_spares_coexisting_host_values_under_an_in_flight_transfer() {
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
     tc.commit_backup(handle, Tensor::from_slice(&[20i64, 21]), HashMap::new());
-    tc.mark_write_through_pending(handle);
+    tc.mark_write_through_pending(vec![handle], /* ack_id = */ handle);
 
     let (mut tr, mut df, mut hf) = (tracker(), frees(), frees());
     accumulate_step(

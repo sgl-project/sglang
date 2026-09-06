@@ -23,7 +23,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=900, stage="extra-b", runner_config="4-gpu-b200")
 
-MODEL = "deepseek-ai/DeepSeek-V4-Flash"
+MODEL = "deepseek-ai/DeepSeek-V4-Flash-0731"
 SERVER_LAUNCH_TIMEOUT = 3600
 
 
@@ -64,16 +64,11 @@ class TestDSV4FlashFP4B200W4A8MegaMoE(
                 "--dp",
                 "4",
                 "--enable-dp-attention",
+                "--enable-dp-lm-head",
                 "--moe-a2a-backend",
                 "megamoe",
                 "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-num-steps",
-                "1",
-                "--speculative-eagle-topk",
-                "1",
-                "--speculative-num-draft-tokens",
-                "2",
+                "DSPARK",
             ],
             env=_W4A8_MEGAMOE_ENV,
         )
@@ -111,17 +106,12 @@ class TestDSV4FlashFP4B200W4A4MegaMoE(
                 "--dp",
                 "4",
                 "--enable-dp-attention",
+                "--enable-dp-lm-head",
                 "--moe-a2a-backend",
                 "megamoe",
                 "--enable-w4a4-mxfp4-megamoe",
                 "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-num-steps",
-                "3",
-                "--speculative-eagle-topk",
-                "1",
-                "--speculative-num-draft-tokens",
-                "4",
+                "DSPARK",
             ],
             env=_W4A4_MEGAMOE_ENV,
         )

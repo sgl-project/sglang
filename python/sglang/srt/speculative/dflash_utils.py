@@ -222,8 +222,7 @@ def apply_dflash_verify_logits_adjustments(
         return
     if next_token_logits.ndim != 2:
         raise ValueError(
-            "next_token_logits must be 2D, "
-            f"got shape={tuple(next_token_logits.shape)}."
+            f"next_token_logits must be 2D, got shape={tuple(next_token_logits.shape)}."
         )
     if draft_token_num <= 0:
         raise ValueError(f"draft_token_num must be positive, got {draft_token_num}.")
@@ -894,8 +893,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         raise ValueError(f"candidates must be 2D, got shape={tuple(candidates.shape)}")
     if next_token_logits.ndim != 2:
         raise ValueError(
-            "next_token_logits must be 2D, "
-            f"got shape={tuple(next_token_logits.shape)}."
+            f"next_token_logits must be 2D, got shape={tuple(next_token_logits.shape)}."
         )
 
     bs, draft_token_num = candidates.shape
@@ -915,10 +913,8 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         )
 
     if threshold_single is None:
-
         threshold_single = get_spec().speculative_accept_threshold_single
     if threshold_acc is None:
-
         threshold_acc = get_spec().speculative_accept_threshold_acc
     threshold_single = float(threshold_single)
     threshold_acc = max(float(threshold_acc), 1e-9)

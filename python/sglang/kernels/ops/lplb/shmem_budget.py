@@ -111,8 +111,8 @@ def assert_fits(nc: int, nv: int, gpu: str = "h100") -> None:
     cap = gpu_budget_bytes(gpu)
     if used > cap:
         raise ValueError(
-            f"fused IPM kernel needs {used/1024:.1f} KiB of shared memory for "
-            f"NC={nc}, NV={nv}, but {gpu} allows {cap/1024:.1f} KiB/block. "
+            f"fused IPM kernel needs {used / 1024:.1f} KiB of shared memory for "
+            f"NC={nc}, NV={nv}, but {gpu} allows {cap / 1024:.1f} KiB/block. "
             f"Either reduce problem size or switch to a tiled design."
         )
 
@@ -145,8 +145,8 @@ def report(nc: int, nv: int, gpu: str = "h100") -> str:
     status = "FITS" if bd.total_bytes <= cap else "OVER BUDGET"
     return (
         f"[shmem] NC={nc} NV={nv} gpu={gpu} | "
-        f"A={bd.a_bytes/1024:.1f}K "
-        f"ata={bd.ata_bytes/1024:.1f}K "
-        f"rest={(bd.c_bytes+bd.x_bytes+bd.rhs_bytes+bd.d_bytes)/1024:.1f}K | "
-        f"total={bd.total_bytes/1024:.1f}K / {cap/1024:.1f}K  {status}"
+        f"A={bd.a_bytes / 1024:.1f}K "
+        f"ata={bd.ata_bytes / 1024:.1f}K "
+        f"rest={(bd.c_bytes + bd.x_bytes + bd.rhs_bytes + bd.d_bytes) / 1024:.1f}K | "
+        f"total={bd.total_bytes / 1024:.1f}K / {cap / 1024:.1f}K  {status}"
     )

@@ -75,5 +75,60 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
         )
 
 
+class TestDecodeToExtendConversionVote(CustomTestCase):
+    """A decode batch votes for the prefill graph only when its 1-token extend
+    view can represent every row. Beam requests cannot: the converted batch
+    takes the prefill result path, which commits them per-req instead of
+    through the batch decode fold, and member rows carry no req."""
+
+    def _vote(self, *, beam):
+        runner = Mock(spec=dp_attn.PrefillCudaGraphRunner)
+        runner.enable_lora = False
+        runner.can_replay_locally.return_value = True
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=lambda: 2,
+            return_logprob=False,
+            has_grammar=False,
+            reqs=[
+                SimpleNamespace(beam_group=Mock() if beam else None),
+                SimpleNamespace(beam_group=None),
+            ],
+        )
+        with (
+            patch.object(
+                dp_attn, "get_moe_a2a_backend", return_value=Mock(is_none=lambda: True)
+            ),
+            patch.object(dp_attn, "uses_ssm_state", return_value=False),
+            patch.object(
+                dp_attn,
+                "get_memory",
+                return_value=SimpleNamespace(enable_hisparse=False),
+            ),
+            patch.object(
+                dp_attn,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    overlap=SimpleNamespace(enable_two_batch_overlap=False)
+                ),
+            ),
+            patch.object(dp_attn, "get_cp_strategy", return_value=None),
+        ):
+            return dp_attn._local_prefill_cuda_graph_vote(
+                local_batch=batch,
+                prefill_graph_runner=runner,
+                coordinated_prefill=True,
+                breakable_prefill=True,
+                spec_algorithm=SpeculativeAlgorithm.NONE,
+                model_config=object(),
+            )
+
+    def test_plain_decode_batch_votes_for_conversion(self):
+        self.assertTrue(self._vote(beam=False))
+
+    def test_beam_request_blocks_conversion(self):
+        self.assertFalse(self._vote(beam=True))
+
+
 if __name__ == "__main__":
     unittest.main()

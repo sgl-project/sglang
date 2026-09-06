@@ -93,8 +93,10 @@ def maybe_trigger_remote_instance_nccl_send_group(
     ``--speculative-draft-draft-load-format`` needs its own send group, and the
     target's format cannot answer for it."""
     if (
-        load_format or get_model().load_format
-    ) == LoadFormat.REMOTE_INSTANCE and get_model().remote_instance_weight_loader_backend == RemoteInstanceWeightLoaderBackend.NCCL:
+        (load_format or get_model().load_format) == LoadFormat.REMOTE_INSTANCE
+        and get_model().remote_instance_weight_loader_backend
+        == RemoteInstanceWeightLoaderBackend.NCCL
+    ):
         if tp_rank == 0:
             instance_ip = NetworkAddress.resolve_host(socket.gethostname())
             t = threading.Thread(
@@ -130,8 +132,7 @@ def load_kv_cache_scales(*, model, kv_cache_dtype: str) -> None:
         else:
             logger.warning(
                 "Using FP8 KV cache but no scaling factors "
-                "provided. Defaulting to scaling factors of 1.0. "
-                "This may lead to less accurate results!"
+                "provided. Defaulting to scaling factors of 1.0."
             )
 
 

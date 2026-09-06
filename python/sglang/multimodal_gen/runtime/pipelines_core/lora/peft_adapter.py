@@ -264,7 +264,9 @@ def scale_fused_sections(
         alpha = float(
             alpha_parts[index].item()
             if index in alpha_parts
-            else default_alpha if default_alpha is not None else rank
+            else default_alpha
+            if default_alpha is not None
+            else rank
         )
         scale = alpha / rank
         weight = b_parts[index]

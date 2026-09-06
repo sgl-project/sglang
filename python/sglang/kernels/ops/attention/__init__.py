@@ -16,6 +16,7 @@ _TRITON_KERNELS = [
     ("extend_attention", "build_unified_kv_indices"),
     ("prefill_attention", "context_attention_fwd"),
     ("merge_state", "merge_state_triton"),
+    ("suffix_attention_merge", "merge_suffix_attention_in_place"),
     ("metadata", "get_num_kv_splits_triton"),
     ("metadata", "prepare_swa_spec_page_table_triton"),
     ("metadata", "normal_decode_set_metadata"),

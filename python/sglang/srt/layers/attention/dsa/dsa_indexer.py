@@ -132,15 +132,18 @@ if TYPE_CHECKING:
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
+if _is_cuda or _is_hip:
+    # Plain-torch graph helpers: usable wherever the split-op surface is.
+    from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
+        logits_head_gate_graph,
+        scale_head_gate_graph,
+    )
+
 if _is_cuda:
     from sglang.kernels.ops.attention.dsv4 import fused_q_indexer_rope_first_quant
     from sglang.kernels.ops.quantization.dsv32 import (
         fused_k_indexer_norm_rope,
         fused_k_indexer_norm_rope_store,
-    )
-    from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
-        logits_head_gate_graph,
-        scale_head_gate_graph,
     )
 
     @register_custom_op(mutates_args=["topk_indices"])
@@ -193,9 +196,9 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
         from sglang.kernels.ops.quantization.hadamard import hadamard_transform
 
     hidden_size = x.size(-1)
-    assert (
-        hidden_size & (hidden_size - 1)
-    ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
+    assert (hidden_size & (hidden_size - 1)) == 0, (
+        "Hidden size must be a power of 2 for Hadamard transform."
+    )
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
@@ -806,13 +809,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
         if _is_hip:
             if _use_aiter_preshuffle:
-                assert (
-                    page_size % 16 == 0
-                ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+                assert page_size % 16 == 0, (
+                    f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+                )
             else:
-                assert (
-                    page_size == 1
-                ), f"HIP legacy DSA path requires page_size == 1, got {page_size}"
+                assert page_size == 1, (
+                    f"HIP legacy DSA path requires page_size == 1, got {page_size}"
+                )
         else:
             assert page_size == 64, "only support page size 64"
         # NOTE(dark): this support extend/decode/decode+graph
@@ -1041,13 +1044,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         page_size = get_token_to_kv_pool().page_size
         if _is_hip:
             if _use_aiter_preshuffle:
-                assert (
-                    page_size % 16 == 0
-                ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+                assert page_size % 16 == 0, (
+                    f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+                )
             else:
-                assert (
-                    page_size == 1
-                ), f"HIP legacy DSA path requires page_size == 1, got {page_size}"
+                assert page_size == 1, (
+                    f"HIP legacy DSA path requires page_size == 1, got {page_size}"
+                )
         else:
             assert page_size == 64, "only support page size 64"
 
@@ -1159,13 +1162,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if global_topk_offset is None:
             cu_seqlens_q_full = torch.ones(q_offset, dtype=torch.int32, device=device)
 
-        assert (
-            seq_lens_expanded.shape[0] == q_offset
-        ), f"seq_lens_expanded length mismatch: {seq_lens_expanded.shape[0]} != {q_offset}"
+        assert seq_lens_expanded.shape[0] == q_offset, (
+            f"seq_lens_expanded length mismatch: {seq_lens_expanded.shape[0]} != {q_offset}"
+        )
         if global_topk_offset is not None:
-            assert (
-                global_topk_offset.shape[0] >= q_offset
-            ), f"topk_indices_offset too short: {global_topk_offset.shape[0]} < {q_offset}"
+            assert global_topk_offset.shape[0] >= q_offset, (
+                f"topk_indices_offset too short: {global_topk_offset.shape[0]} < {q_offset}"
+            )
 
         start = 0
         while start < q_offset:

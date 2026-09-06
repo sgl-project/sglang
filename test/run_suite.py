@@ -32,9 +32,9 @@ HW_MAPPING = {
 PER_COMMIT_SUITES = {
     HWBackend.CPU: [
         "base-a-test-cpu",
-        "base-b-test-cpu",
-        "base-b-tp-test-cpu",
-        "base-c-test-cpu",
+        "stage-a-test-cpu-intel",
+        "stage-a-tp-test-cpu-intel",
+        "stage-b-test-cpu-intel",
         "base-b-test-cpu-arm64",
     ],
     HWBackend.AMD: [
@@ -101,12 +101,8 @@ PER_COMMIT_SUITES = {
         "base-b-test-8-npu-a3",
         "base-b-test-16-npu-a3",
         "base-c-test-acc-2-npu-a3",
-        "base-c-test-acc-4-npu-a3",
-        "base-c-test-acc-8-npu-a3",
         "base-c-test-acc-16-npu-a3",
         "base-c-test-perf-2-npu-a3",
-        "base-c-test-perf-4-npu-a3",
-        "base-c-test-perf-8-npu-a3",
         "base-c-test-perf-16-npu-a3",
     ],
     HWBackend.XPU: [
@@ -157,25 +153,30 @@ NIGHTLY_SUITES = {
     ],
     HWBackend.CPU: [],
     HWBackend.NPU: [
-        "nightly-1-npu-a2",
         "nightly-1-npu-a3",
         "nightly-2-npu-a3",
         "nightly-4-npu-a3",
         "nightly-8-npu-a3",
         "nightly-16-npu-a3",
         "nightly-acc-2-npu-a3",
-        "nightly-acc-4-npu-a3",
         "nightly-acc-8-npu-a3",
         "nightly-acc-16-npu-a3",
         "nightly-perf-2-npu-a3",
         "nightly-perf-4-npu-a3",
-        "nightly-perf-8-npu-a3",
         "nightly-perf-16-npu-a3",
+        "full-4-npu-a2",
         "full-1-npu-a3",
         "full-2-npu-a3",
         "full-4-npu-a3",
         "full-8-npu-a3",
         "full-16-npu-a3",
+        "full-acc-2-npu-a3",
+        "full-acc-4-npu-a3",
+        "full-acc-16-npu-a3",
+        "full-perf-2-npu-a3",
+        "full-perf-4-npu-a3",
+        "full-perf-8-npu-a3",
+        "full-perf-16-npu-a3",
     ],
     HWBackend.XPU: [
         "nightly-xpu-1-gpu",
@@ -425,7 +426,7 @@ def main():
         required=True,
         help=(
             "Test suite to run. Accepts a comma-separated list of suites "
-            "(e.g. 'base-b-test-cpu,base-c-test-cpu'); their tests are unioned "
+            "(e.g. 'stage-a-test-cpu-intel,stage-b-test-cpu-intel'); their tests are unioned "
             "into one pool before partitioning."
         ),
     )

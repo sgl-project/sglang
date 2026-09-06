@@ -60,9 +60,9 @@ def _run_accuracy_eval(
     ``None``, so the common case stays identical to ``run_eval``'s defaults.
     Returns the metrics dict.
     """
-    assert (
-        score_threshold == score_threshold
-    ), f"{type(test_case).__name__} must set the {eval_name} score threshold"
+    assert score_threshold == score_threshold, (
+        f"{type(test_case).__name__} must set the {eval_name} score threshold"
+    )
 
     model = eval_overrides.pop("model", getattr(test_case, "model", None))
     kwargs = dict(
@@ -111,21 +111,18 @@ def _run_sgl_eval(
     asserts the score meets ``score_threshold``, and checks the speculative accept
     length. ``thinking=True`` sends per-request ``chat_template_kwargs={"thinking":
     True}`` so the server separates reasoning from the final answer. Skips the test
-    if sgl-eval (git-only) is not installed. Returns the RunResult.
+    if sgl-eval is not installed. Returns the RunResult.
     """
-    assert (
-        score_threshold == score_threshold
-    ), f"{type(test_case).__name__} must set the {eval_name} score threshold"
+    assert score_threshold == score_threshold, (
+        f"{type(test_case).__name__} must set the {eval_name} score threshold"
+    )
 
     try:
         from sgl_eval.registry import get as get_eval_spec
         from sgl_eval.sampler import ChatCompletionSampler
         from sgl_eval.types import GenConfig
     except ImportError:
-        test_case.skipTest(
-            "sgl-eval not installed; pip install "
-            "'sgl-eval @ git+https://github.com/sgl-project/sgl-eval'"
-        )
+        test_case.skipTest("sgl-eval not installed; pip install 'sglang[test]'")
 
     base_url = test_case.base_url.rstrip("/")
     if not base_url.endswith("/v1"):
@@ -302,7 +299,7 @@ class MMMUProMixin:
 
     def test_mmmu_pro(self):
         assert self.mmmu_pro_load_preset_from_model_id, (
-            f"{type(self).__name__} must set " "mmmu_pro_load_preset_from_model_id"
+            f"{type(self).__name__} must set mmmu_pro_load_preset_from_model_id"
         )
         _run_accuracy_eval(
             self,

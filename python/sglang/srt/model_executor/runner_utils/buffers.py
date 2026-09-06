@@ -329,6 +329,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 local = compute_local_num_token_non_padded(
                     global_num_token_non_padded=forward_batch.num_token_non_padded,
                     num_tokens_per_dp=num_tokens_per_dp,
+                    sharded=forward_batch.attn_tp_sequence_sharded,
                 )
                 dsts.append(self.num_token_non_padded)
                 srcs.append(local)
