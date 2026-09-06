@@ -204,7 +204,9 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
         SpecAuxHiddenStateConfig,
     )
-    from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+    from sglang.srt.model_executor.pool_configurator import (
+        MemoryPoolConfig,
+    )
 
 
 class KVCacheConfigResult(msgspec.Struct, frozen=True, kw_only=True):
@@ -1033,7 +1035,9 @@ class KVCacheConfigurator:
         extra_max_context_len: int,
         pre_alloc_size: int,
     ) -> ReqToTokenPool:
-        from sglang.srt.disaggregation.decode import HybridMambaDecodeReqToTokenPool
+        from sglang.srt.disaggregation.decode import (
+            HybridMambaDecodeReqToTokenPool,
+        )
 
         req_to_token_pool = HybridMambaDecodeReqToTokenPool(
             size=max_num_reqs,
@@ -1321,7 +1325,9 @@ class KVCacheConfigurator:
             assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
 
         if self.is_draft_worker:
-            from sglang.srt.models.deepseek_v4_nextn import COMPRESS_RATIO_NEXTN_LAYER
+            from sglang.srt.models.deepseek_v4_nextn import (
+                COMPRESS_RATIO_NEXTN_LAYER,
+            )
 
             compression_ratios = [
                 COMPRESS_RATIO_NEXTN_LAYER
@@ -1436,7 +1442,9 @@ class KVCacheConfigurator:
         full_max_total_num_tokens: Optional[int],
         swa_max_total_num_tokens: Optional[int],
     ) -> KVCache:
-        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+            NPUMHATokenToKVPool,
+        )
 
         kwargs = {}
         if self.is_hybrid_swa_compress:
@@ -1502,7 +1510,9 @@ class KVCacheConfigurator:
     def _build_ascend_mla_kv_pool(
         self, *, max_total_num_tokens: int, is_dsa_model: bool
     ) -> KVCache:
-        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+            NPUMLATokenToKVPool,
+        )
 
         token_to_kv_pool = NPUMLATokenToKVPool(
             max_total_num_tokens,
@@ -1520,7 +1530,9 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_ascend_mha_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+            NPUMHATokenToKVPool,
+        )
 
         token_to_kv_pool = NPUMHATokenToKVPool(
             max_total_num_tokens,

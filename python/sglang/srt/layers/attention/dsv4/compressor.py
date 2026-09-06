@@ -26,7 +26,9 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_finish,
     cp_all_gather_rerange_launch,
 )
-from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
+from sglang.srt.mem_cache.deepseek_v4_compress_state import (
+    CompressStatePool,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v2 import _is_hip
@@ -270,9 +272,7 @@ def create_paged_compressor_data(
 
     def get_raw_loc(positions: torch.Tensor) -> torch.Tensor:
         positions = positions.masked_fill(positions < 0, 0)
-        if compress_ratio == 128:
-            state_loc = req_pool_indices * ring_size + positions % ring_size
-        elif use_req_ring:
+        if compress_ratio == 128 or use_req_ring:
             state_loc = req_pool_indices * ring_size + positions % ring_size
         else:
             loc = req_to_token[req_pool_indices, positions]

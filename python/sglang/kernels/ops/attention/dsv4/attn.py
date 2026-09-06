@@ -134,9 +134,7 @@ def create_paged_compress_data_kernel(
         else:
             pos = write_overlap_pos
         pos = tl.maximum(pos, 0)
-        if compress_ratio == 128:
-            state_loc = rid * ring_size + (pos % ring_size)
-        elif use_req_ring:
+        if compress_ratio == 128 or use_req_ring:
             state_loc = rid * ring_size + (pos % ring_size)
         else:
             loc = tl.load(

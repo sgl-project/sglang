@@ -3,7 +3,14 @@ from __future__ import annotations
 import logging
 from collections import deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, Deque, List, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Deque,
+    List,
+    Optional,
+    Tuple,
+)
 
 import torch
 
@@ -25,7 +32,10 @@ from sglang.srt.observability.scheduler_stage_metrics import (
     scheduler_stage_method,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.common import ceil_align, raise_error_or_warn
+from sglang.srt.utils.common import (
+    ceil_align,
+    raise_error_or_warn,
+)
 from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:

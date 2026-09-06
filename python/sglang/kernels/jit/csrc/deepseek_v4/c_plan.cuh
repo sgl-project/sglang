@@ -28,14 +28,12 @@ using R2T_T = int32_t;
 using F2S_T = int64_t;
 using IDX_T = int64_t;
 
-/// NOTE: for the internal use, we pack the ragged and batch id, since both not
-/// exceed 65536
+/// NOTE: for the internal use, we pack the ragged and batch id, since both not exceed 65536
 SGL_DEVICE __host__ PlanW pack_w(uint32_t ragged_id, uint32_t batch_id, int32_t seq_len) {
   return {static_cast<uint32_t>(ragged_id | batch_id << 16), seq_len};
 }
 
-/// NOTE: for the internal use, we pack the ragged and batch id, since both not
-/// exceed 65536
+/// NOTE: for the internal use, we pack the ragged and batch id, since both not exceed 65536
 SGL_DEVICE uint2 unpack_w(PlanW plan) {
   return {static_cast<uint16_t>(plan.ragged_id), static_cast<uint16_t>(plan.ragged_id >> 16)};
 }
@@ -161,8 +159,7 @@ __global__ __launch_bounds__(1024, 1)  //
     counter_w = 0;
   }
   // === Stage B: min/max(extend_len) for MTP-uniform detection ===
-  // For min, treat threads outside `batch_size` as +inf so they don't pull the
-  // min down.
+  // For min, treat threads outside `batch_size` as +inf so they don't pull the min down.
   const uint32_t e_for_max = static_cast<uint32_t>(extend_len);
   const uint32_t e_for_min = (tx < params.batch_size) ? e_for_max : 0xFFFFFFFFu;
   warp_max[warp_id] = warp::reduce_max(e_for_max);
@@ -175,19 +172,17 @@ __global__ __launch_bounds__(1024, 1)  //
   __syncthreads();
 
   const auto num_q = params.num_q_tokens;
-  // MTP-uniform: every batch shares the same small extend_len `E`, so we can
-  // decompose a global token id `k` into (batch_id, j) = (k / E, k % E) and
-  // skip the per-batch loop.
+  // MTP-uniform: every batch shares the same small extend_len `E`, so we can decompose
+  // a global token id `k` into (batch_id, j) = (k / E, k % E) and skip the per-batch loop.
   const bool is_mtp_extend = (s_min_extend == s_max_extend) && (s_max_extend > 0) && (s_max_extend <= 32);
 
   // === Stage C: emit valid plans, slot allocation via shared-mem atomicAdd ===
   if (is_mtp_extend) {
-    // Path 1: token-driven. Each global token id maps to exactly one (batch_id,
-    // j).
+    // Path 1: token-driven. Each global token id maps to exactly one (batch_id, j).
     const uint32_t E = s_max_extend;
-    // num_q is the padded buffer size (graph bucket), not the work size: cap
-    // the loop at the real token count so batch_id = k / E stays < batch_size
-    // on an underfilled replay; Stage D pads [counter, num_q) with invalid.
+    // num_q is the padded buffer size (graph bucket), not the work size: cap the
+    // loop at the real token count so batch_id = k / E stays < batch_size on an
+    // underfilled replay; Stage D pads [counter, num_q) with invalid.
     const uint32_t num_real_q = params.batch_size * E;
     for (uint32_t k = tx; k < num_real_q; k += block_size) {
       const uint32_t batch_id = k / E;
@@ -375,10 +370,8 @@ __global__ void plan_compress_prefill_legacy_kernel(const Prefill1ParamsLegacy p
   auto plan_w = idx < params.num_w ? params.plan_w[idx] : PlanW::invalid();
 
   /// Per-request ring buffer slot translation:
-  /// - c4:   page = rid * 2 + (position / 4) % 2; slot = page * 4 + position %
-  /// 4
-  /// - c128: page = rid;                          slot = rid * 128 + position %
-  /// 128
+  /// - c4:   page = rid * 2 + (position / 4) % 2; slot = page * 4 + position % 4
+  /// - c128: page = rid;                          slot = rid * 128 + position % 128
   const auto legacy_compute_page = [&](int32_t rid, int32_t position) {
     if (params.compress_ratio == 4) return rid * 2 + ((position / 4) & 1);
     return rid;  // c128
@@ -404,8 +397,7 @@ __global__ void plan_compress_prefill_legacy_kernel(const Prefill1ParamsLegacy p
   if (!plan_w.is_invalid()) {
     const auto [ragged_id, batch_id] = unpack_w(plan_w);
     const auto rid = static_cast<int32_t>(params.rid_ptr[batch_id]);
-    // `write_loc` carries (position + 1) at this stage; may not be
-    // ratio-aligned
+    // `write_loc` carries (position + 1) at this stage; may not be ratio-aligned
     const auto position = static_cast<int32_t>(plan_w.write_loc) - 1;
     plan_w.ragged_id = ragged_id;
     plan_w.write_loc = legacy_compute_loc(rid, position);
@@ -419,10 +411,8 @@ __global__ void plan_compress_decode_legacy_kernel(const DecodeParamsLegacy para
   const auto idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= params.batch_size) return;
   /// Per-request ring buffer slot translation:
-  /// - c4:   page = rid * 2 + (position / 4) % 2; slot = page * 4 + position %
-  /// 4
-  /// - c128: page = rid;                          slot = rid * 128 + position %
-  /// 128
+  /// - c4:   page = rid * 2 + (position / 4) % 2; slot = page * 4 + position % 4
+  /// - c128: page = rid;                          slot = rid * 128 + position % 128
   const auto legacy_compute_page = [&](int32_t rid, int32_t position) {
     if (params.compress_ratio == 4) return rid * 2 + ((position / 4) & 1);
     return rid;  // c128
@@ -461,8 +451,7 @@ using PrefillPlan = tvm::ffi::Tuple<tvm::ffi::Tensor, tvm::ffi::Tensor>;
  * @param compress_plan     `[num_q_tokens, 16]` uint8 (output)
  * @param write_plan        `[num_q_tokens,  8]` uint8 (output)
  * @param compress_ratio 4 for c4, 128 for c128
- * @param use_cuda_graph Whether the plans will be used with cuda graph (affects
- * padding)
+ * @param use_cuda_graph Whether the plans will be used with cuda graph (affects padding)
  * @return (compress plan tensor, write plan tensor)
  */
 inline PrefillPlan plan_compress_prefill(

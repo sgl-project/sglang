@@ -408,7 +408,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             indexer_ratio = parse_hisparse_config().host_to_device_ratio
 
-        from sglang.srt.mem_cache.kv_cache_configurator import _should_elide_dsa_index_k
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            _should_elide_dsa_index_k,
+        )
 
         if allocate_all_layers or not _should_elide_dsa_index_k(
             is_draft_worker=kvc.is_draft_worker
@@ -1123,14 +1125,13 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             return 0
 
         c4_state_dtype_size, _ = _get_dsv4_compress_state_dtype_sizes()
-        attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         # CompressStatePool allocates `size + ring_size + 1` rows, padded to the
         # compress ratio (see CompressStatePool.__init__). Mirror that here so the
         # reserved bias covers the real allocation.
         state_rows = self._unified_c4_state_pool_size(max_running_requests)
         state_rows = ceil_div(state_rows + self.c4_ring_size + 1, 4) * 4
         # overlap c4: last_dim = 2 * (1 + overlap) * head_dim = 4 * head_dim.
-        core_bytes = 4 * attn_head_dim * c4_state_dtype_size
+        core_bytes = 4 * self.attn_head_dim * c4_state_dtype_size
         indexer_bytes = 4 * self.indexer_head_dim * c4_state_dtype_size
         return state_rows * (core_bytes + indexer_bytes) * self.num_layers_ca4
 
