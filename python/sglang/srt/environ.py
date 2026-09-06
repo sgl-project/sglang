@@ -717,6 +717,9 @@ class Envs:
     MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr(None)
     MOONCAKE_TENANT_ID = EnvStr("default")
 
+    # NIXL plugin for remote-instance weight transfer
+    SGLANG_REMOTE_INSTANCE_NIXL_BACKEND = EnvStr("UCX")
+
     # ===================================================================
     # MoRI transport and expert dispatch
     # ===================================================================

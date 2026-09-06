@@ -318,6 +318,8 @@ def remote_instance_transfer_engine_of(cfg: Any, load_format: Any = None) -> boo
     the post-publish accessor."""
     if cfg.remote_instance_weight_loader_start_seed_via_transfer_engine:
         return True
+    if cfg.remote_instance_weight_loader_start_seed_via_nixl:
+        return True
     if (load_format or cfg.load_format) != "remote_instance":
         return False
     backend = cfg.remote_instance_weight_loader_backend
