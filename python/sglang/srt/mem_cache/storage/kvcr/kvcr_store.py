@@ -68,7 +68,7 @@ from kvcr.config import (
     FrameworkDramInput,
     KVCRBackendConfigs,
     KVCRConfig,
-    LocalDramInfo,
+    LocalDramOptions,
     RemoteFWDramOptions,
 )
 from kvcr.control_channels import ZmqPeerControlChannel
@@ -97,7 +97,7 @@ from sglang.srt.mem_cache.storage.kvcr.kvcr_config import (
 from sglang.srt.mem_cache.storage.kvcr.pin_adapter import NoFrameworkPinning
 from sglang.srt.mem_cache.storage.kvcr.router_hint import (
     RouterHint,
-    StrKeyHintAdapter,
+    StrKeyAdapter,
 )
 from sglang.srt.mem_cache.storage.kvcr.router_hint import encode_key as _encode_key
 from sglang.srt.utils import dynamic_import
@@ -441,7 +441,7 @@ class KVCRStore(HiCacheStorage):
             f"-tp{storage_config.tp_rank}-{uuid.uuid4().hex[:8]}"
         )
         self._pinning = NoFrameworkPinning()
-        self._key_hint_adapter = StrKeyHintAdapter()
+        self._key_adapter = StrKeyAdapter()
 
         # KVCR is constructed lazily in register_mem_pool_host(), once we know
         # the engine host KV region to register with NIXL as framework_dram.
@@ -641,7 +641,7 @@ class KVCRStore(HiCacheStorage):
             release_pin=self._pinning.release_pin,
             cancel_pin_request=self._pinning.cancel_pin_request,
             framework_control=self._control,
-            key_hint_adapter=self._key_hint_adapter,
+            key_adapter=self._key_adapter,
             policy=_resolve_policy(self._config.policy),
         )
         # eager_ctrl_connect / opportunistic_query / metadata_retry moved out of
@@ -801,7 +801,7 @@ class KVCRStore(HiCacheStorage):
 
     def _local_dram_region(
         self, mem_pool_host: HostKVCache
-    ) -> Optional[LocalDramInfo]:
+    ) -> Optional[LocalDramOptions]:
         """Allocate KVCR's own local DRAM tier (the buffer-only L3 pool).
 
         One slot holds one page *segment* (a K or V run of a page), so slot_size
@@ -829,7 +829,7 @@ class KVCRStore(HiCacheStorage):
         # it is not garbage-collected while NIXL has it registered.
         self._local_dram_buffer = torch.empty(length, dtype=torch.uint8)
         address = self._local_dram_buffer.data_ptr()
-        return LocalDramInfo(address=address, length=length, slot_count=slots)
+        return LocalDramOptions(address=address, length=length, slot_count=slots)
 
     def _probe_page_layout(
         self, mem_pool_host: HostKVCache
@@ -1164,11 +1164,16 @@ class KVCRStore(HiCacheStorage):
         """Parse a router hint and register it with the core for this request.
 
         Returns the request_id the core keys the hint on, or None when no
-        well-formed hint is present / remote hints are disabled. The hint is
-        submitted with an empty key set so the facade only records the
-        advisory routing entry (and, if eager, warms the control connection) --
-        the actual pull is driven by ``deliver`` in ``_deliver_transfer``, which
-        lets us target engine host pages rather than KVCR-owned slots.
+        well-formed hint is present / remote hints are disabled. ``submit_hint``
+        only records the advisory routing entry (and, if eager, warms the
+        control connection) -- the actual pull is driven by ``deliver`` in
+        ``_deliver_transfer``, which lets us target engine host pages rather
+        than KVCR-owned slots.
+
+        The core parses the hint itself (kvcr#14), so a hint it rejects raises
+        rather than degrading to local-only. We have already validated the same
+        fields in ``_parse_hint``, so a raise here means the two parsers
+        disagree -- report it as a fault instead of failing the batch.
         """
         hint = self._parse_hint(extra_info)
         if hint is None:
@@ -1179,12 +1184,11 @@ class KVCRStore(HiCacheStorage):
         # KVCR keys the request-scoped hint table on request_id; the controller
         # does not thread one through extra_info, so we mint our own.
         request_id = self._hint_request_id()
-        self._kvcr.submit_hint(
-            (),
-            src=hint.source_control_endpoint,
-            hints=hint,
-            request_id=request_id,
-        )
+        try:
+            self._kvcr.submit_hint(hint.to_kvcr_hint(), request_id=request_id)
+        except Exception:
+            self._note_fault("submit_hint")
+            return None
         logger.debug(
             "KVCRStore: registered router hint (source=%s, %d blocks, req=%s)",
             hint.source_control_endpoint,

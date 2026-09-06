@@ -79,6 +79,19 @@ def page_hash_key(key: str) -> str:
     return key[:_BLOCK_HASH_HEX_WIDTH].lower()
 
 
+def page_hash_int(key: str) -> int:
+    """The u64 block hash a page (or segment) key carries.
+
+    Inverse of :func:`normalize_block_hash`'s int branch, and the form KVCR's
+    own hint parser holds: it validates every wire hash into ``0 <= h < 1<<64``
+    and compares ``KeyAdapter.decode(key)`` against that set. SGLang's
+    ``hash_str_to_int64`` produces a *signed* int64 from the same 16 hex chars,
+    so decoding through the hex prefix rather than through that helper is what
+    keeps both sides on the unsigned value the router indexed.
+    """
+    return int(page_hash_key(key.split("#", 1)[0]), 16)
+
+
 def normalize_block_hash(value: Union[int, str]) -> Optional[str]:
     """Map one wire-form hint block hash onto :func:`page_hash_key` form.
 
@@ -222,15 +235,31 @@ class RouterHint(msgspec.Struct, kw_only=True):
         """
         return page_hash_key(key.split("#", 1)[0]) in self.covered_pages
 
+    def to_kvcr_hint(self) -> dict:
+        """This hint in the shape KVCR's own parser accepts.
 
-class StrKeyHintAdapter:
-    """KVCR ``KeyHintAdapter`` over SGLang string keys + our :class:`RouterHint`.
+        Since kvcr#14 the core parses the hint and owns membership, so what
+        crosses ``submit_hint`` is a plain dict rather than this struct. Block
+        hashes go over as **unsigned** ints: the core validates them into
+        ``0 <= h < 1<<64`` and compares them against ``KeyAdapter.decode``, so
+        a signed value here would be rejected outright, and a signed decode on
+        the other side would miss every block without erroring.
+        """
+        return {
+            "source_control_endpoint": self.source_control_endpoint,
+            "block_hashes": [int(h, 16) for h in self.block_hashes],
+            "mode": "copy",
+        }
 
-    The core calls ``matches(key, hint)`` to decide whether a queried block is
-    covered by the current request's router hint. The key it passes is a
-    *segment* key, so membership goes through :meth:`RouterHint.covers`, which
-    strips the segment suffix and compares in canonical page-hash form.
-    ``encode`` maps a framework key (str or bytes) to a KVCR :class:`BlockKey`.
+
+class StrKeyAdapter:
+    """KVCR ``KeyAdapter`` over SGLang string keys.
+
+    The core owns hint membership since kvcr#14: it parses the hint itself into
+    a ``frozenset[int]`` and tests ``decode(key) in hashes``, so this adapter
+    only translates keys in both directions. ``encode`` maps a framework key
+    (str or bytes) to a KVCR :class:`BlockKey`; ``decode`` maps a *segment* key
+    back to the u64 block hash the router indexed.
 
     Kept torch-free here (alongside :class:`RouterHint`) so the KVCR<->SGLang
     hint contract can be exercised against the real core without importing the
@@ -244,7 +273,5 @@ class StrKeyHintAdapter:
             return encode_key(framework_key)
         raise TypeError(f"unsupported KVCR framework key: {type(framework_key)!r}")
 
-    def matches(self, key: BlockKey, hint: object) -> bool:
-        if not isinstance(hint, RouterHint):
-            return False
-        return hint.covers(key.decode("utf-8"))
+    def decode(self, key: BlockKey) -> int:
+        return page_hash_int(key.decode("utf-8"))

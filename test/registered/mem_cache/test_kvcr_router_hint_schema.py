@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.storage.kvcr.router_hint import (
     SOURCE_LOCATIONS_ACTION_TYPE,
     SOURCE_LOCATIONS_ACTION_VERSION,
     RouterHint,
+    StrKeyAdapter,
     normalize_block_hash,
     page_hash_key,
 )
@@ -40,6 +41,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 _PAGE_HASH = "f" * 16 + "0123456789abcdef" * 3
 # One whose leading 16 chars stay below 2**63 (no wrap), for the other branch.
 _SMALL_PAGE_HASH = "0123456789abcdef" * 4
+_U64_MASK = (1 << 64) - 1
 
 
 def _envelope(payload, *, action_type=None, action_version=None):
@@ -82,6 +84,58 @@ class RoundTripTest(unittest.TestCase):
         """A leading-bit-set digest becomes a negative i64 and must survive."""
         self.assertLess(hash_str_to_int64(_PAGE_HASH), 0)
         self.assertEqual(self._round_trip(_PAGE_HASH), page_hash_key(_PAGE_HASH))
+
+
+class CoreHandoffTest(unittest.TestCase):
+    """The last leg: what crosses submit_hint, and what decode() answers.
+
+    KVCR parses the hint itself and tests ``KeyAdapter.decode(key) in hashes``,
+    having validated every wire hash into ``0 <= h < 1<<64``. Both sides of that
+    comparison are produced here, so a signed value on either one makes every
+    hinted block miss with nothing logged.
+    """
+
+    def test_submitted_hashes_are_unsigned(self):
+        hint = RouterHint.maybe_from_extra_info(
+            _extra_info(
+                {
+                    "source_control_endpoint": "tcp://peer:25000",
+                    "block_hashes": [hash_str_to_int64(_PAGE_HASH) & _U64_MASK],
+                }
+            )
+        )
+        submitted = hint.to_kvcr_hint()["block_hashes"]
+        self.assertTrue(all(0 <= h < 1 << 64 for h in submitted))
+        self.assertEqual(submitted, [int(page_hash_key(_PAGE_HASH), 16)])
+
+    def test_decode_matches_a_submitted_hash(self):
+        """A segment key must decode onto the hash its own page was hinted with."""
+        adapter = StrKeyAdapter()
+        hint = RouterHint.maybe_from_extra_info(
+            _extra_info(
+                {
+                    "source_control_endpoint": "tcp://peer:25000",
+                    "block_hashes": [hash_str_to_int64(_PAGE_HASH) & _U64_MASK],
+                }
+            )
+        )
+        hashes = frozenset(hint.to_kvcr_hint()["block_hashes"])
+        segment_key = adapter.encode(f"{_PAGE_HASH}#3")
+        self.assertIn(adapter.decode(segment_key), hashes)
+
+    def test_decode_rejects_an_unhinted_page(self):
+        adapter = StrKeyAdapter()
+        hint = RouterHint.maybe_from_extra_info(
+            _extra_info(
+                {
+                    "source_control_endpoint": "tcp://peer:25000",
+                    "block_hashes": [hash_str_to_int64(_PAGE_HASH) & _U64_MASK],
+                }
+            )
+        )
+        hashes = frozenset(hint.to_kvcr_hint()["block_hashes"])
+        other = adapter.encode(f"{_SMALL_PAGE_HASH}#0")
+        self.assertNotIn(adapter.decode(other), hashes)
 
 
 class ParseTest(unittest.TestCase):
