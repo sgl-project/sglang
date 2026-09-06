@@ -465,6 +465,7 @@ class DiffusionServerBase:
                         summary,
                         expected_load_peak_vram_mb,
                         expected_runtime_peak_vram_mb,
+                        scenario.warmup_peak_vram_mb,
                         expected_load_peak_allocated_mb=scenario.load_peak_allocated_mb,
                         expected_runtime_peak_allocated_mb=(
                             scenario.runtime_peak_allocated_mb
@@ -539,10 +540,12 @@ class DiffusionServerBase:
 
         if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
             logger.info(
-                "%s realtime peak VRAM baseline: load=%.0fMiB, runtime=%.0fMiB",
+                "%s realtime peak VRAM baseline: load=%.0fMiB, runtime=%.0fMiB, "
+                "warmup=%.0fMiB",
                 case.id,
                 summary.load_peak_vram_mb,
                 summary.runtime_peak_vram_mb,
+                summary.warmup_peak_vram_mb,
             )
             return
 
@@ -559,6 +562,7 @@ class DiffusionServerBase:
                 summary,
                 scenario.load_peak_vram_mb,
                 scenario.runtime_peak_vram_mb,
+                scenario.warmup_peak_vram_mb,
                 expected_load_peak_allocated_mb=scenario.load_peak_allocated_mb,
                 expected_runtime_peak_allocated_mb=scenario.runtime_peak_allocated_mb,
             )
@@ -579,6 +583,7 @@ class DiffusionServerBase:
             "median_denoise_ms": summary.median_denoise_ms,
             "load_peak_vram_mb": summary.load_peak_vram_mb,
             "runtime_peak_vram_mb": summary.runtime_peak_vram_mb,
+            "warmup_peak_vram_mb": summary.warmup_peak_vram_mb,
             "load_peak_allocated_mb": summary.load_peak_allocated_mb,
             "runtime_peak_allocated_mb": summary.runtime_peak_allocated_mb,
             "stage_metrics": summary.stage_metrics,
@@ -680,6 +685,7 @@ class DiffusionServerBase:
                 {
                     "load_peak_vram_mb": round(summary.load_peak_vram_mb, 2),
                     "runtime_peak_vram_mb": round(summary.runtime_peak_vram_mb, 2),
+                    "warmup_peak_vram_mb": round(summary.warmup_peak_vram_mb, 2),
                     "load_peak_allocated_mb": round(summary.load_peak_allocated_mb, 2),
                     "runtime_peak_allocated_mb": round(
                         summary.runtime_peak_allocated_mb, 2
