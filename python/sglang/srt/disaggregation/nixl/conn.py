@@ -3083,6 +3083,10 @@ class NixlKVReceiver(CommonKVReceiver):
             self.conclude_state = status
             return status
         if not self.started_transfer:
+            if status == KVPoll.WaitingForInput:
+                timeout_result = self._check_waiting_timeout()
+                if timeout_result is not None:
+                    return timeout_result
             return status
 
         # Drain notifications before enforcing the waiting deadline. The decode

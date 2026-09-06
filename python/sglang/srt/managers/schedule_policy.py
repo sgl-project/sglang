@@ -808,6 +808,11 @@ class PrefillAdder:
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
+    def chunk_budget_exhausted(self) -> bool:
+        return (
+            self.rem_chunk_tokens is not None and self.rem_chunk_tokens < self.page_size
+        )
+
     def budget_state(self):
         no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
         if not no_token and self.is_hybrid_swa:

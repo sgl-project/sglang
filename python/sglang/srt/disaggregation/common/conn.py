@@ -1593,7 +1593,9 @@ class CommonKVReceiver(BaseKVReceiver):
 
     def _check_waiting_timeout(self) -> Optional[KVPoll]:
         if self.init_time is None:
-            return None
+            # Start on the first WaitingForInput poll, before KV allocation.
+            # send_metadata starts a fresh deadline for the transfer phase.
+            self.init_time = time.time()
         elapsed = time.time() - self.init_time
         if elapsed < self.kv_mgr.waiting_timeout:
             return None

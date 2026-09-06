@@ -138,6 +138,34 @@ class TestReceiverConnectionPool(CustomTestCase):
         self.assertEqual(receiver._check_waiting_timeout(), KVPoll.Failed)
         self.assertEqual(receiver.kv_mgr.connection_pool, {})
 
+    @patch("sglang.srt.disaggregation.common.conn.time.time")
+    def test_waiting_deadline_starts_before_metadata_and_is_not_reset(self, clock):
+        receiver = _receiver({}, {})
+        receiver.bootstrap_room = 1
+        receiver.init_time = None
+        receiver.abort_notified = True
+        receiver.kv_mgr.waiting_timeout = 5.0
+        receiver.kv_mgr.record_failure = Mock()
+        receiver.kv_mgr.update_status = Mock()
+
+        clock.return_value = 100.0
+        self.assertIsNone(receiver._check_waiting_timeout())
+        self.assertEqual(receiver.init_time, 100.0)
+        clock.return_value = 104.0
+        self.assertIsNone(receiver._check_waiting_timeout())
+        self.assertEqual(receiver.init_time, 100.0)
+        clock.return_value = 105.0
+        self.assertEqual(receiver._check_waiting_timeout(), KVPoll.Failed)
+        receiver.kv_mgr.update_status.assert_called_once_with(1, KVPoll.Failed)
+
+    @patch("sglang.srt.disaggregation.common.conn.time.time", return_value=105.0)
+    def test_metadata_phase_uses_its_new_deadline(self, clock):
+        receiver = _receiver({}, {})
+        receiver.init_time = 104.0
+        receiver.kv_mgr.waiting_timeout = 5.0
+        self.assertIsNone(receiver._check_waiting_timeout())
+        self.assertEqual(receiver.init_time, 104.0)
+
 
 if __name__ == "__main__":
     unittest.main()
