@@ -5,9 +5,11 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.runtime_context import override_platform
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -70,8 +72,6 @@ class TestKVCacheQuantRegistry(CustomTestCase):
             resolve_kv_cache_quant("fp4_e2m1")
 
     def test_model_runner_rejects_legacy_fp4_alias(self):
-        from types import SimpleNamespace
-
         from sglang.srt.model_executor.model_runner import ModelRunner
         from sglang.srt.runtime_context import get_context
 
@@ -170,18 +170,32 @@ class TestNVFP4KVCacheMethod(CustomTestCase):
             NVFP4KVCacheMethod,
         )
 
-        m = NVFP4KVCacheMethod(num_layers=4, device="cpu")
+        m = NVFP4KVCacheMethod(num_layers=4, device="cpu", native_scale_layout=True)
         self.assertEqual(m.name, "nvfp4")
         self.assertEqual(m.SCALE_BLOCK_SIZE, 16)
         self.assertTrue(m.needs_dequant_workspace())
+        self.assertTrue(m.needs_native_fp4_scales())
         self.assertTrue(m.needs_global_scale())
+
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            KVCacheAttentionAccessKind,
+        )
+
+        self.assertEqual(
+            m.resolve_attention_access("prefill", "trtllm_mha").kind,
+            KVCacheAttentionAccessKind.NATIVE_FP4,
+        )
+        self.assertEqual(
+            m.resolve_attention_access("prefill", "flashinfer").kind,
+            KVCacheAttentionAccessKind.DEQUANT_WORKSPACE,
+        )
 
     def test_create_buffers_shapes(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             NVFP4KVCacheMethod,
         )
 
-        m = NVFP4KVCacheMethod(num_layers=4, device="cpu")
+        m = NVFP4KVCacheMethod(num_layers=4, device="cpu", native_scale_layout=True)
         size, heads, dim, layers = 64, 8, 128, 4
         bufs = m.create_buffers(size, heads, dim, layers, "cpu")
 
@@ -189,11 +203,17 @@ class TestNVFP4KVCacheMethod(CustomTestCase):
         self.assertEqual(len(bufs["v_buffer"]), layers)
         self.assertEqual(len(bufs["k_scale_buffer"]), layers)
         self.assertEqual(len(bufs["v_scale_buffer"]), layers)
+        self.assertEqual(len(bufs["native_k_scale_buffer"]), layers)
+        self.assertEqual(len(bufs["native_v_scale_buffer"]), layers)
 
         # FP4 packed: (size, heads, dim//2)
         self.assertEqual(bufs["k_buffer"][0].shape, (size, heads, dim // 2))
         # Block scales: (size, heads, dim//16)
         self.assertEqual(bufs["k_scale_buffer"][0].shape, (size, heads, dim // 16))
+        self.assertEqual(
+            bufs["native_k_scale_buffer"][0].shape,
+            (size // 16, heads, 16, dim // 16),
+        )
         # Dequant workspace: (size, heads, dim), FP8
         self.assertEqual(bufs["dq_k_buffer"].shape, (size, heads, dim))
         self.assertEqual(bufs["dq_k_buffer"].dtype, torch.float8_e4m3fn)
@@ -204,10 +224,134 @@ class TestNVFP4KVCacheMethod(CustomTestCase):
             NVFP4KVCacheMethod,
         )
 
-        m = NVFP4KVCacheMethod(num_layers=4, device="cpu")
+        m = NVFP4KVCacheMethod(num_layers=4, device="cpu", native_scale_layout=True)
         cell = m.compute_cell_size(head_num=8, head_dim=128, num_layers=4, kv_size=1)
-        # FP4: 8*64*4*2 = 4096, scales: 8*8*4*2 = 512, dq: 8*128*2 = 2048
-        self.assertEqual(cell, 4096 + 512 + 2048)
+        # FP4: 4096, linear scales: 512, native scales: 512, shared DQ: 2048.
+        self.assertEqual(cell, 4096 + 512 + 512 + 2048)
+
+    def test_active_prefill_recipe_controls_auxiliary_memory(self):
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            NVFP4KVCacheMethod,
+        )
+
+        size, heads, dim, layers = 64, 8, 128, 4
+
+        native = NVFP4KVCacheMethod(
+            num_layers=layers,
+            device="cpu",
+            page_size=16,
+            native_scale_layout=True,
+        )
+        native.configure_attention_backends("trtllm_mha", "trtllm_mha")
+        native_bufs = native.create_buffers(size, heads, dim, layers, "cpu")
+        self.assertIsNone(native_bufs["k_scale_buffer"])
+        self.assertIsNone(native_bufs["v_scale_buffer"])
+        self.assertIsNone(native_bufs["dq_k_buffer"])
+        self.assertIsNotNone(native_bufs["native_k_scale_buffer"])
+        self.assertEqual(native.compute_cell_size(heads, dim, layers, 1), 4096 + 512)
+
+        mixed = NVFP4KVCacheMethod(
+            num_layers=layers,
+            device="cpu",
+            page_size=16,
+            native_scale_layout=True,
+        )
+        mixed.configure_attention_backends("flashinfer", "trtllm_mha")
+        mixed_bufs = mixed.create_buffers(size, heads, dim, layers, "cpu")
+        self.assertIsNotNone(mixed_bufs["k_scale_buffer"])
+        self.assertIsNotNone(mixed_bufs["dq_k_buffer"])
+        self.assertIsNotNone(mixed_bufs["native_k_scale_buffer"])
+        self.assertEqual(
+            mixed.compute_cell_size(heads, dim, layers, 1),
+            4096 + 512 + 512 + 2048,
+        )
+
+    def test_server_args_backend_selection_uses_resolution_projection(self):
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            KVCacheAttentionAccessKind,
+            NVFP4KVCacheMethod,
+        )
+
+        # Model/backend hooks declare overrides without mutating the raw
+        # ServerArgs fields. Pool sizing and allocation must observe the same
+        # resolved pair, and must not depend on a private ServerArgs method.
+        server_args = SimpleNamespace(
+            attention_backend="triton",
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
+            _resolved_overrides=[
+                (
+                    "test_model_override",
+                    {
+                        "prefill_attention_backend": "flashinfer",
+                        "decode_attention_backend": "trtllm_mha",
+                    },
+                )
+            ],
+        )
+        method = NVFP4KVCacheMethod(
+            num_layers=1,
+            device="cpu",
+            page_size=16,
+            native_scale_layout=True,
+        )
+
+        method.configure_attention_backends_from_server_args(server_args)
+
+        accesses = method.active_attention_accesses()
+        self.assertEqual(
+            [access.kind for access in accesses],
+            [
+                KVCacheAttentionAccessKind.DEQUANT_WORKSPACE,
+                KVCacheAttentionAccessKind.NATIVE_FP4,
+            ],
+        )
+
+    def test_xqa_recipe_retains_linear_scales(self):
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            NVFP4KVCacheMethod,
+        )
+
+        size, heads, dim, layers = 64, 8, 128, 4
+        xqa = NVFP4KVCacheMethod(
+            num_layers=layers,
+            device="cpu",
+            page_size=16,
+            native_scale_layout=False,
+        )
+        xqa.configure_attention_backends("flashinfer", "trtllm_mha")
+        bufs = xqa.create_buffers(size, heads, dim, layers, "cpu")
+
+        self.assertIsNotNone(bufs["k_scale_buffer"])
+        self.assertIsNotNone(bufs["dq_k_buffer"])
+        self.assertIsNone(bufs["native_k_scale_buffer"])
+        self.assertFalse(xqa.needs_native_fp4_scales())
+        self.assertEqual(
+            xqa.compute_cell_size(heads, dim, layers, 1),
+            4096 + 512 + 2048,
+        )
+
+    def test_native_v_scale_swizzle_reference(self):
+        from sglang.srt.layers.quantization.nvfp4_kv_cache import (
+            nvfp4_v_scale_swizzle_indices,
+        )
+
+        token = torch.arange(16)[:, None]
+        scale = torch.arange(8)[None, :]
+        swizzled_token, swizzled_scale = nvfp4_v_scale_swizzle_indices(
+            token, scale, scale_dim=8
+        )
+
+        # Every logical (token, scale) pair maps bijectively inside each
+        # four-token group and agrees with FlashInfer/TRT-LLM's published map.
+        flat = (swizzled_token * 8 + swizzled_scale).flatten()
+        self.assertEqual(torch.unique(flat).numel(), 16 * 8)
+        self.assertEqual(
+            (swizzled_token[3, 7].item(), swizzled_scale[3, 7].item()), (3, 7)
+        )
+        self.assertEqual(
+            (swizzled_token[1, 4].item(), swizzled_scale[1, 4].item()), (2, 1)
+        )
 
     def test_scales_init(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -219,6 +363,48 @@ class TestNVFP4KVCacheMethod(CustomTestCase):
         self.assertTrue(torch.all(m.k_scales_gpu == 1.0))
         self.assertTrue(torch.all(m.v_scales_gpu == 1.0))
         self.assertEqual(len(m.k_scales_gpu), 4)
+
+    def test_sm100_scale_loading_preserves_uncalibrated_fallback(self):
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            NVFP4KVCacheMethod,
+        )
+
+        attention = SimpleNamespace(
+            layer_id=0,
+            k_scale=torch.tensor(1.0),
+            v_scale=torch.tensor(1.0),
+        )
+        model = SimpleNamespace(
+            layers=[SimpleNamespace(self_attn=SimpleNamespace(attn=attention))]
+        )
+        method = NVFP4KVCacheMethod(num_layers=1, device="cpu")
+
+        with override_platform(is_sm100=True):
+            method.load_scales_from_model(model)
+
+        self.assertEqual(method.get_bmm_scales(0), (1.0, 1.0))
+
+    def test_sm100_scale_loading_converts_calibrated_checkpoint_scales(self):
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            NVFP4KVCacheMethod,
+        )
+
+        attention = SimpleNamespace(
+            layer_id=0,
+            k_scale=torch.tensor(0.002),
+            v_scale=torch.tensor(0.003),
+        )
+        model = SimpleNamespace(
+            layers=[SimpleNamespace(self_attn=SimpleNamespace(attn=attention))]
+        )
+        method = NVFP4KVCacheMethod(num_layers=1, device="cpu")
+
+        with override_platform(is_sm100=True):
+            method.load_scales_from_model(model)
+
+        k_scale, v_scale = method.get_bmm_scales(0)
+        self.assertAlmostEqual(k_scale, 0.012)
+        self.assertAlmostEqual(v_scale, 0.018)
 
     @skip_if_no_blackwell_nvfp4
     def test_quantize_dequantize_roundtrip(self):

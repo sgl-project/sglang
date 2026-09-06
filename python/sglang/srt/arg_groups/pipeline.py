@@ -165,6 +165,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_cache_compatibility,
         handle_kv4_compatibility,
         handle_mxfp8_kv_cache_compatibility,
+        handle_nvfp4_prefill_kv_dtype,
         handle_page_major_kv_layout,
         handle_prefill_only_disable_kv_cache,
         handle_unified_memory_pool,
@@ -248,6 +249,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     handle_deterministic_inference(server_args)
+    handle_nvfp4_prefill_kv_dtype(server_args)
     handle_attention_backend_compatibility(server_args)
     # Must run after the attention backend is resolved so the trtllm_mla
     # default (auto-selected for DeepseekV3ForCausalLM on sm100) is visible.

@@ -1995,6 +1995,8 @@ class MHATokenToKVPool(KVCache):
         else:
             self.k_scale_buffer = None
             self.v_scale_buffer = None
+            self.native_k_scale_buffer = None
+            self.native_v_scale_buffer = None
             self.dq_k_buffer = None
             self.dq_v_buffer = None
             if self.post_capture_active:
@@ -2023,6 +2025,8 @@ class MHATokenToKVPool(KVCache):
         self.v_buffer = buf["v_buffer"]
         self.k_scale_buffer = buf.get("k_scale_buffer")
         self.v_scale_buffer = buf.get("v_scale_buffer")
+        self.native_k_scale_buffer = buf.get("native_k_scale_buffer")
+        self.native_v_scale_buffer = buf.get("native_v_scale_buffer")
         self.dq_k_buffer = buf.get("dq_k_buffer")
         self.dq_v_buffer = buf.get("dq_v_buffer")
         self.store_dtype = buf.get("store_dtype", torch.uint8)
@@ -2032,6 +2036,23 @@ class MHATokenToKVPool(KVCache):
         expected_workspace_dtype = self.quant_method.dequant_workspace_dtype()
         has_k_workspace = self.dq_k_buffer is not None
         has_v_workspace = self.dq_v_buffer is not None
+        has_k_native_scales = self.native_k_scale_buffer is not None
+        has_v_native_scales = self.native_v_scale_buffer is not None
+        if has_k_native_scales != has_v_native_scales:
+            raise RuntimeError(
+                f"KV cache method {self.quant_method.name!r} created only one "
+                "native FP4 scale buffer."
+            )
+        if self.quant_method.needs_native_fp4_scales() != has_k_native_scales:
+            expectation = (
+                "requires"
+                if self.quant_method.needs_native_fp4_scales()
+                else "does not require"
+            )
+            raise RuntimeError(
+                f"KV cache method {self.quant_method.name!r} {expectation} native "
+                f"FP4 scales, but buffer presence is {has_k_native_scales}."
+            )
         if has_k_workspace != has_v_workspace:
             raise RuntimeError(
                 f"KV cache method {self.quant_method.name!r} created only one "
@@ -2240,6 +2261,16 @@ class MHATokenToKVPool(KVCache):
             del self.k_scale_buffer
         if hasattr(self, "v_scale_buffer") and self.v_scale_buffer is not None:
             del self.v_scale_buffer
+        if (
+            hasattr(self, "native_k_scale_buffer")
+            and self.native_k_scale_buffer is not None
+        ):
+            del self.native_k_scale_buffer
+        if (
+            hasattr(self, "native_v_scale_buffer")
+            and self.native_v_scale_buffer is not None
+        ):
+            del self.native_v_scale_buffer
         if hasattr(self, "dq_k_buffer") and self.dq_k_buffer is not None:
             del self.dq_k_buffer
         if hasattr(self, "dq_v_buffer") and self.dq_v_buffer is not None:
@@ -2256,6 +2287,9 @@ class MHATokenToKVPool(KVCache):
         if getattr(self, "k_scale_buffer", None) is not None:
             k_size_bytes += get_tensor_size_bytes(self.k_scale_buffer)
             v_size_bytes += get_tensor_size_bytes(self.v_scale_buffer)
+        if getattr(self, "native_k_scale_buffer", None) is not None:
+            k_size_bytes += get_tensor_size_bytes(self.native_k_scale_buffer)
+            v_size_bytes += get_tensor_size_bytes(self.native_v_scale_buffer)
         if getattr(self, "dq_k_buffer", None) is not None:
             k_size_bytes += get_tensor_size_bytes(self.dq_k_buffer)
             v_size_bytes += get_tensor_size_bytes(self.dq_v_buffer)
@@ -2554,6 +2588,16 @@ class MHATokenToKVPool(KVCache):
             cache_v,
             k_scale,
             v_scale,
+            native_k_scale_buffer=(
+                self.native_k_scale_buffer[local_layer_id]
+                if self.native_k_scale_buffer is not None
+                else None
+            ),
+            native_v_scale_buffer=(
+                self.native_v_scale_buffer[local_layer_id]
+                if self.native_v_scale_buffer is not None
+                else None
+            ),
         )
 
     def get_raw_kv_buffer(
@@ -2581,6 +2625,28 @@ class MHATokenToKVPool(KVCache):
                 "Dequant workspace requested from a KV pool without FP4 dequant buffers."
             )
         return self.dq_k_buffer, self.dq_v_buffer
+
+    def get_native_kv_buffer(
+        self, layer_id: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return packed NHD data and TRT-LLM-native HND block scales."""
+        local_layer_id = layer_id - self.start_layer
+        if self.native_k_scale_buffer is None or self.native_v_scale_buffer is None:
+            raise RuntimeError(
+                "Native FP4 KV cache requested from a pool without native scales."
+            )
+        k_scale = self.native_k_scale_buffer[local_layer_id]
+        v_scale = self.native_v_scale_buffer[local_layer_id]
+        scale_view_dtype = self.quant_method.scale_buffer_view_dtype()
+        if scale_view_dtype is not None:
+            k_scale = k_scale.view(scale_view_dtype)
+            v_scale = v_scale.view(scale_view_dtype)
+        return (
+            self.k_buffer[local_layer_id],
+            self.v_buffer[local_layer_id],
+            k_scale,
+            v_scale,
+        )
 
     def get_flashinfer_dequant_workspace_kv_buffer(
         self,
@@ -2872,6 +2938,7 @@ class MHATokenToKVPool(KVCache):
             for kb, vb in zip(self.k_buffer, self.v_buffer):
                 kb[pages_t, :, offs_t, :] = kb[pages_s, :, offs_s, :]
                 vb[pages_t, :, offs_t, :] = vb[pages_s, :, offs_s, :]
+            self._move_native_fp4_scales(tgt_loc, src_loc)
             return
 
         self._move_kv_cache_impl(tgt_loc, src_loc)
@@ -2885,6 +2952,7 @@ class MHATokenToKVPool(KVCache):
                 move_kv_cache_native(
                     self.k_scale_buffer, self.v_scale_buffer, tgt_loc, src_loc
                 )
+            self._move_native_fp4_scales(tgt_loc, src_loc)
             return
 
         N = tgt_loc.numel()
@@ -2908,6 +2976,7 @@ class MHATokenToKVPool(KVCache):
                 next_power_of_2(N),
                 cfg,
             )
+            self._move_native_fp4_scales(tgt_loc, src_loc)
             return
 
         # Huge N: chunk, but each chunk's upper is still pow2(<= cap)
@@ -2923,6 +2992,21 @@ class MHATokenToKVPool(KVCache):
                 next_power_of_2(chunk_len),
                 cfg,
             )
+        self._move_native_fp4_scales(tgt_loc, src_loc)
+
+    def _move_native_fp4_scales(
+        self, tgt_loc: torch.Tensor, src_loc: torch.Tensor
+    ) -> None:
+        if self.native_k_scale_buffer is None:
+            return
+        from sglang.srt.layers.quantization.nvfp4_kv_cache import (
+            move_nvfp4_native_scales,
+        )
+
+        for k_scale, v_scale in zip(
+            self.native_k_scale_buffer, self.native_v_scale_buffer
+        ):
+            move_nvfp4_native_scales(k_scale, v_scale, tgt_loc, src_loc)
 
 
 class NoOpMHATokenToKVPool(MHATokenToKVPool):
@@ -3910,6 +3994,13 @@ class HybridLinearKVPool(KVCache):
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_raw_kv_buffer(layer_id)
+
+    def get_native_kv_buffer(
+        self, layer_id: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_native_kv_buffer(layer_id)
 
     def get_dequant_workspace(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self.full_kv_pool.get_dequant_workspace()

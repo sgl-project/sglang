@@ -29,6 +29,8 @@ from sglang.srt.arg_groups.hisparse_hook import (
 )
 from sglang.srt.arg_groups.kv_cache_hook import (
     handle_cache_compatibility,
+    handle_kv4_compatibility,
+    handle_nvfp4_prefill_kv_dtype,
     validate_prefill_only_disable_kv_cache_args,
 )
 from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
@@ -658,6 +660,227 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "requires SM100"):
             handle_mamba_backend(server_args)
+
+
+class TestKV4Compatibility(unittest.TestCase):
+    def setUp(self):
+        self._use_mla_backend_patcher = patch(
+            "sglang.srt.arg_groups.kv_cache_hook.use_mla_backend",
+            return_value=False,
+        )
+        self._use_mla_backend_patcher.start()
+        self.addCleanup(self._use_mla_backend_patcher.stop)
+
+    @staticmethod
+    def _make_nvfp4_args(**overrides):
+        return ServerArgs(
+            model_path="dummy",
+            kv_cache_dtype="nvfp4",
+            attention_backend="trtllm_mha",
+            **overrides,
+        )
+
+    @staticmethod
+    def _make_unrouted_nvfp4_args(**overrides):
+        return ServerArgs(model_path="dummy", kv_cache_dtype="nvfp4", **overrides)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_prefill_kv_dtype_selects_native_backends_on_sm100(self):
+        args = self._make_unrouted_nvfp4_args(prefill_kv_cache_dtype="nvfp4")
+        handle_nvfp4_prefill_kv_dtype(args)
+        self.assertEqual(
+            resolution_result(args, "prefill_attention_backend"), "trtllm_mha"
+        )
+        self.assertEqual(
+            resolution_result(args, "decode_attention_backend"), "trtllm_mha"
+        )
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_prefill_kv_dtype_selects_fp8_prefill_on_sm100(self):
+        args = self._make_unrouted_nvfp4_args(prefill_kv_cache_dtype="fp8_e4m3")
+        handle_nvfp4_prefill_kv_dtype(args)
+        self.assertEqual(
+            resolution_result(args, "prefill_attention_backend"), "flashinfer"
+        )
+        self.assertEqual(
+            resolution_result(args, "decode_attention_backend"), "trtllm_mha"
+        )
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_prefill_kv_dtype_auto_defaults_to_native_on_sm100(self):
+        args = self._make_unrouted_nvfp4_args()
+        handle_nvfp4_prefill_kv_dtype(args)
+        self.assertEqual(resolution_result(args, "prefill_kv_cache_dtype"), "nvfp4")
+        self.assertEqual(
+            resolution_result(args, "prefill_attention_backend"), "trtllm_mha"
+        )
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_prefill_kv_dtype_auto_preserves_fp8_prefill_recipe(self):
+        args = self._make_unrouted_nvfp4_args(
+            prefill_attention_backend="flashinfer",
+            decode_attention_backend="trtllm_mha",
+        )
+        handle_nvfp4_prefill_kv_dtype(args)
+        self.assertEqual(resolution_result(args, "prefill_kv_cache_dtype"), "fp8_e4m3")
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_prefill_kv_dtype_auto_defaults_to_fp8_on_sm120(self):
+        args = self._make_unrouted_nvfp4_args()
+        handle_nvfp4_prefill_kv_dtype(args)
+        self.assertEqual(resolution_result(args, "prefill_kv_cache_dtype"), "fp8_e4m3")
+        self.assertEqual(
+            resolution_result(args, "prefill_attention_backend"), "flashinfer"
+        )
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_prefill_kv_dtype_rejects_native_prefill_off_sm100(self):
+        args = self._make_unrouted_nvfp4_args(prefill_kv_cache_dtype="nvfp4")
+        with self.assertRaisesRegex(ValueError, "requires SM100"):
+            handle_nvfp4_prefill_kv_dtype(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_prefill_kv_dtype_rejects_conflicting_prefill_backend(self):
+        args = self._make_unrouted_nvfp4_args(
+            prefill_kv_cache_dtype="nvfp4",
+            prefill_attention_backend="flashinfer",
+        )
+        with self.assertRaisesRegex(ValueError, "Remove the backend option"):
+            handle_nvfp4_prefill_kv_dtype(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_prefill_kv_dtype_rejects_conflicting_decode_backend(self):
+        args = self._make_unrouted_nvfp4_args(
+            prefill_kv_cache_dtype="fp8_e4m3",
+            decode_attention_backend="flashinfer",
+        )
+        with self.assertRaisesRegex(ValueError, "NVFP4 decode requires"):
+            handle_nvfp4_prefill_kv_dtype(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_prefill_kv_dtype_rejects_non_nvfp4_storage(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_cache_dtype="fp8_e4m3",
+            prefill_kv_cache_dtype="nvfp4",
+        )
+        with self.assertRaisesRegex(ValueError, "applies only"):
+            handle_nvfp4_prefill_kv_dtype(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_sm100_native_nvfp4_allows_topk_one_speculative_decoding(self):
+        for algorithm in ("EAGLE", "EAGLE3", "NEXTN"):
+            for prefill_backend, decode_backend in (
+                (None, None),
+                ("flashinfer", "trtllm_mha"),
+            ):
+                for speculative_attention_mode in ("prefill", "decode"):
+                    with self.subTest(
+                        algorithm=algorithm,
+                        prefill_backend=prefill_backend,
+                        decode_backend=decode_backend,
+                        speculative_attention_mode=speculative_attention_mode,
+                    ):
+                        args = self._make_nvfp4_args(
+                            prefill_attention_backend=prefill_backend,
+                            decode_attention_backend=decode_backend,
+                            speculative_algorithm=algorithm,
+                            speculative_eagle_topk=1,
+                            speculative_attention_mode=speculative_attention_mode,
+                        )
+                        handle_kv4_compatibility(args)
+                        expected_mode = (
+                            "decode"
+                            if prefill_backend == "flashinfer"
+                            and speculative_attention_mode == "prefill"
+                            else speculative_attention_mode
+                        )
+                        self.assertEqual(
+                            resolution_result(args, "speculative_attention_mode"),
+                            expected_mode,
+                        )
+                        self.assertEqual(
+                            resolution_result(
+                                args, "speculative_draft_attention_backend"
+                            ),
+                            "trtllm_mha",
+                        )
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_sm100_native_nvfp4_rejects_unvalidated_spec_algorithms(self):
+        for algorithm in ("STANDALONE", "FROZEN_KV_MTP", "CUSTOM_SPEC"):
+            with self.subTest(algorithm=algorithm):
+                args = self._make_nvfp4_args(speculative_algorithm=algorithm)
+                with self.assertRaisesRegex(ValueError, "supports EAGLE"):
+                    handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_sm100_native_nvfp4_rejects_non_native_draft_backend(self):
+        args = self._make_nvfp4_args(
+            speculative_algorithm="EAGLE",
+            speculative_eagle_topk=1,
+            speculative_draft_attention_backend="flashinfer",
+        )
+        with self.assertRaisesRegex(ValueError, "physical NVFP4 KV layout"):
+            handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_sm100_native_nvfp4_ngram_needs_no_draft_backend(self):
+        args = self._make_nvfp4_args(
+            speculative_algorithm="NGRAM",
+            speculative_ngram_max_bfs_breadth=1,
+        )
+        handle_kv4_compatibility(args)
+        self.assertIsNone(
+            resolution_result(args, "speculative_draft_attention_backend")
+        )
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_sm100_native_nvfp4_rejects_branched_ngram(self):
+        args = self._make_nvfp4_args(
+            speculative_algorithm="NGRAM",
+            speculative_ngram_max_bfs_breadth=2,
+        )
+        with self.assertRaisesRegex(ValueError, "speculative-ngram-max-bfs-breadth=1"):
+            handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_sm100_native_nvfp4_rejects_prefix_commit_spec_algorithms(self):
+        for algorithm in ("DFLASH", "DSPARK"):
+            with self.subTest(algorithm=algorithm):
+                args = self._make_nvfp4_args(speculative_algorithm=algorithm)
+                with self.assertRaisesRegex(ValueError, algorithm):
+                    handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_sm120_xqa_keeps_existing_speculative_support(self):
+        args = self._make_nvfp4_args(speculative_algorithm="EAGLE")
+        handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_sm100_native_nvfp4_allows_monolithic_non_speculative_inference(self):
+        args = self._make_nvfp4_args()
+        handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_sm100_native_nvfp4_rejects_unified_memory(self):
+        args = self._make_nvfp4_args(enable_unified_memory=True)
+        with self.assertRaisesRegex(ValueError, "does not yet support.*unified-memory"):
+            handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_sm100_native_nvfp4_rejects_host_tiered_cache(self):
+        for option in ("enable_hierarchical_cache", "enable_lmcache"):
+            with self.subTest(option=option):
+                args = self._make_nvfp4_args(**{option: True})
+                with self.assertRaisesRegex(ValueError, "host pools"):
+                    handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_sm100_native_nvfp4_rejects_pd_disaggregation(self):
+        args = self._make_nvfp4_args(disaggregation_mode="decode")
+        with self.assertRaisesRegex(ValueError, "PD disaggregation"):
+            handle_kv4_compatibility(args)
 
 
 class TestLoadBalanceMethod(unittest.TestCase):
