@@ -295,6 +295,14 @@ class DiffusionSamplingParams:
 
 
 @dataclass(frozen=True)
+class DiffusionTestRequest:
+    """A follow-up request with its own performance baseline and ground truth."""
+
+    id: str
+    sampling_params: DiffusionSamplingParams
+
+
+@dataclass(frozen=True)
 class DiffusionTestCase:
     """Configuration for a single model/scenario test case."""
 
@@ -302,12 +310,10 @@ class DiffusionTestCase:
     server_args: DiffusionServerArgs
     sampling_params: DiffusionSamplingParams | None = None
     run_perf_check: bool = True
-    # Send the request this many times in one server session; performance and
-    # consistency are validated on the last one. >1 asserts a warm second
-    # request meets the same baselines -- a leak in residency arming, courier
-    # in-flight tracking, or host copies shows up as the second request
-    # degrading or dying.
+    # Validate every repetition against the same baseline and GT.
     perf_repeat_requests: int = 1
+    # Run in order on the same server, inheriting this case's checks.
+    follow_up_requests: tuple[DiffusionTestRequest, ...] = ()
     run_consistency_check: bool = True
     run_component_accuracy_check: bool = True
     run_models_api_check: bool = True
@@ -318,6 +324,11 @@ class DiffusionTestCase:
     run_multi_lora_api_check: bool = False
 
     def __post_init__(self) -> None:
+        if self.perf_repeat_requests < 1:
+            raise ValueError(f"{self.id}: perf_repeat_requests must be positive")
+        request_ids = [self.id, *(request.id for request in self.follow_up_requests)]
+        if len(request_ids) != len(set(request_ids)):
+            raise ValueError(f"{self.id}: request IDs must be unique")
         if self.sampling_params is None:
             object.__setattr__(
                 self,
@@ -348,6 +359,21 @@ class DiffusionTestCase:
             raise ValueError(
                 f"{self.id}: run_multi_lora_api_check requires lora_path and second_lora_path"
             )
+
+    def request_cases(self) -> tuple[DiffusionTestCase, ...]:
+        """Reuse validators without duplicating server configuration per request."""
+        return (
+            self,
+            *(
+                replace(
+                    self,
+                    id=request.id,
+                    sampling_params=request.sampling_params,
+                    follow_up_requests=(),
+                )
+                for request in self.follow_up_requests
+            ),
+        )
 
 
 _REALTIME_MODEL_COMMON_EXTRAS = {

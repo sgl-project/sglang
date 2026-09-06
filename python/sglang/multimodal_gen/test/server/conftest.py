@@ -54,12 +54,20 @@ def _write_results_json(results: list, output_path: str = "diffusion-results.jso
                 pass
 
         merged = {
-            (entry.get("class_name"), entry.get("test_name")): entry
+            (
+                entry.get("class_name"),
+                entry.get("test_name"),
+                entry.get("request_index", 1),
+            ): entry
             for entry in existing
         }
         merged.update(
             {
-                (entry.get("class_name"), entry.get("test_name")): entry
+                (
+                    entry.get("class_name"),
+                    entry.get("test_name"),
+                    entry.get("request_index", 1),
+                ): entry
                 for entry in results
             }
         )
@@ -83,13 +91,13 @@ def _generate_diffusion_markdown_report(results: list) -> str:
 
     # Main performance table
     markdown = header
-    markdown += "| Test Suite | Test Name | Modality | E2E (ms) | Avg Denoise (ms) | Median Denoise (ms) | Load Peak VRAM (MiB) | Runtime Peak VRAM (MiB) |\n"
-    markdown += "| ---------- | --------- | -------- | -------- | ---------------- | ------------------- | -------------------- | ----------------------- |\n"
+    markdown += "| Test Suite | Test Name | Request | Modality | E2E (ms) | Avg Denoise (ms) | Median Denoise (ms) | Load Peak VRAM (MiB) | Runtime Peak VRAM (MiB) |\n"
+    markdown += "| ---------- | --------- | ------- | -------- | -------- | ---------------- | ------------------- | -------------------- | ----------------------- |\n"
 
     for entry in sorted(results, key=lambda x: (x["class_name"], x["test_name"])):
         modality = entry.get("modality", "image")
         markdown += (
-            f"| {entry['class_name']} | {entry['test_name']} | {modality} | "
+            f"| {entry['class_name']} | {entry['test_name']} | {entry.get('request_index', 1)} | {modality} | "
             f"{entry['e2e_ms']:.2f} | {entry['avg_denoise_ms']:.2f} | "
             f"{entry['median_denoise_ms']:.2f} | "
             f"{entry.get('load_peak_vram_mb', 0):.0f} | "
@@ -100,8 +108,8 @@ def _generate_diffusion_markdown_report(results: list) -> str:
     video_results = [r for r in results if r.get("modality") == "video"]
     if video_results:
         markdown += "\n### Video Generation Metrics\n\n"
-        markdown += "| Test Name | FPS | Total Frames | Avg Frame Time (ms) |\n"
-        markdown += "| --------- | --- | ------------ | ------------------- |\n"
+        markdown += "| Test Name | Request | FPS | Total Frames | Avg Frame Time (ms) |\n"
+        markdown += "| --------- | ------- | --- | ------------ | ------------------- |\n"
         for entry in video_results:
             fps = entry.get("frames_per_second", "N/A")
             frames = entry.get("total_frames", "N/A")
@@ -110,7 +118,7 @@ def _generate_diffusion_markdown_report(results: list) -> str:
                 fps = f"{fps:.2f}"
             if isinstance(avg_frame, float):
                 avg_frame = f"{avg_frame:.2f}"
-            markdown += f"| {entry['test_name']} | {fps} | {frames} | {avg_frame} |\n"
+            markdown += f"| {entry['test_name']} | {entry.get('request_index', 1)} | {fps} | {frames} | {avg_frame} |\n"
 
     return markdown
 

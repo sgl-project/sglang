@@ -226,15 +226,16 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         _measured_full_time = _fixture_end_time - _fixture_start_time
         is_baseline_generation_mode = os.environ.get("SGLANG_GEN_BASELINE", "0") == "1"
 
-        pending_dump = _PENDING_BASELINE_DUMPS.pop(case.id, None)
-        if pending_dump is not None:
-            summary, missing_scenario = pending_dump
-            DiffusionServerBase()._dump_baseline_for_testcase(
-                case,
-                summary,
-                missing_scenario=missing_scenario,
-                measured_full_time=_measured_full_time,
-            )
+        for request_case in case.request_cases():
+            pending_dump = _PENDING_BASELINE_DUMPS.pop(request_case.id, None)
+            if pending_dump is not None:
+                summary, missing_scenario = pending_dump
+                DiffusionServerBase()._dump_baseline_for_testcase(
+                    request_case,
+                    summary,
+                    missing_scenario=missing_scenario,
+                    measured_full_time=_measured_full_time,
+                )
 
         scenario = BASELINE_CONFIG.scenarios.get(case.id)
         needs_estimated_time = (
@@ -405,6 +406,7 @@ class DiffusionServerBase:
         self,
         case: DiffusionTestCase,
         perf_record: RequestPerfRecord,
+        request_index: int = 1,
     ) -> None:
         """Validate metrics and record results."""
         is_baseline_generation_mode = os.environ.get("SGLANG_GEN_BASELINE", "0") == "1"
@@ -434,6 +436,7 @@ class DiffusionServerBase:
 
         summary = validator.collect_metrics(perf_record)
         self._print_performance_log(case, summary, scenario)
+        self._record_performance_result(case, summary, request_index)
 
         if case.run_perf_check:
             if is_baseline_generation_mode:
@@ -484,13 +487,12 @@ class DiffusionServerBase:
                 self._dump_baseline_for_testcase(case, summary, missing_scenario)
                 raise
 
-        self._record_performance_result(case, summary)
-
     def _validate_realtime_performance(
         self,
         ctx: ServerContext,
         case: DiffusionTestCase,
         chunk_stats: list[RealtimeChunkStats],
+        request_index: int = 1,
     ) -> None:
         validate_realtime_perf_stats(
             case.id,
@@ -531,7 +533,7 @@ class DiffusionServerBase:
         )
         summary = validator.collect_metrics(perf_record)
         self._print_performance_log(case, summary, scenario)
-        self._record_performance_result(case, summary)
+        self._record_performance_result(case, summary, request_index)
 
         if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
             logger.info(
@@ -564,9 +566,11 @@ class DiffusionServerBase:
         self,
         case: DiffusionTestCase,
         summary: PerformanceSummary,
+        request_index: int = 1,
     ) -> None:
         result = {
             "test_name": case.id,
+            "request_index": request_index,
             "modality": case.server_args.modality,
             "e2e_ms": summary.e2e_ms,
             "avg_denoise_ms": summary.avg_denoise_ms,
@@ -710,11 +714,10 @@ class DiffusionServerBase:
             return
 
         if not content:
-            logger.warning(
-                f"[Consistency] Skipping consistency check for {case.id}: "
-                "content is empty (generation may have timed out)"
+            pytest.fail(
+                f"[Consistency] Empty output for {case.id} "
+                "(generation may have timed out)"
             )
-            return
 
         if case.server_args.modality == "action":
             self._validate_action_consistency(case, content)
@@ -1545,31 +1548,52 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         case: DiffusionTestCase,
         diffusion_server: ServerContext,
     ):
-        # Check if we're in GT generation mode
-        is_gt_gen_mode = os.environ.get("SGLANG_GEN_GT", "0") == "1"
-
         # GT generation also needs the dynamic set_lora step before generation.
         if case.run_lora_dynamic_load_check:
             self._test_dynamic_lora_loading(diffusion_server, case)
 
+        request_cases = case.request_cases()
+        total_requests = len(request_cases) * case.perf_repeat_requests
+        failures = []
+        request_index = 0
+        for request_case in request_cases:
+            for _ in range(case.perf_repeat_requests):
+                request_index += 1
+                label = f"request {request_index}/{total_requests} ({request_case.id})"
+                _print_case_log_separator(case.id, f"BEGIN {label}")
+                try:
+                    self._test_diffusion_request(
+                        request_case, diffusion_server, request_index
+                    )
+                except (Exception, pytest.fail.Exception) as exc:
+                    failures.append(f"[{label}] {exc}")
+                    _print_case_log_separator(case.id, f"FAILED {label}")
+                else:
+                    _print_case_log_separator(case.id, f"PASSED {label}")
+
+        if failures:
+            pytest.fail("\n\n".join(failures), pytrace=False)
+
+    def _test_diffusion_request(
+        self,
+        case: DiffusionTestCase,
+        diffusion_server: ServerContext,
+        request_index: int,
+    ):
+        is_gt_gen_mode = os.environ.get("SGLANG_GEN_GT", "0") == "1"
         generate_fn = get_generate_fn(
             model_path=case.server_args.model_path,
             modality=case.server_args.modality,
             sampling_params=case.sampling_params,
         )
 
-        # Generation - output of the last request is used for both validations.
-        # perf_repeat_requests > 1 asserts a warm second request meets the same
-        # baselines as the first: residency or courier state leaking between
-        # requests shows up here as degradation or an OOM.
         is_realtime_case = case.sampling_params.realtime_num_chunks is not None
-        for _ in range(max(1, case.perf_repeat_requests)):
-            perf_record, content = self.run_and_collect(
-                diffusion_server,
-                case.id,
-                generate_fn,
-                collect_perf=not is_gt_gen_mode and not is_realtime_case,
-            )
+        perf_record, content = self.run_and_collect(
+            diffusion_server,
+            case.id,
+            generate_fn,
+            collect_perf=not is_gt_gen_mode and not is_realtime_case,
+        )
 
         if is_gt_gen_mode:
             # GT generation mode: save output and skip all validations/tests
@@ -1594,12 +1618,13 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                     diffusion_server,
                     case,
                     chunk_stats,
+                    request_index,
                 ),
             )
         else:
             run_case_check(
                 "performance",
-                lambda: self._validate_and_record(case, perf_record),
+                lambda: self._validate_and_record(case, perf_record, request_index),
             )
 
         if case.server_args.custom_validator == "mesh":
