@@ -1329,6 +1329,11 @@ class Envs:
     # Eager forward wraps the ForwardBatch's own tensors instead of copying them
     # into the CUDA graph buffer registry (no per-iter device-to-device copy).
     SGLANG_EAGER_INPUT_NO_COPY = EnvBool(False)
+    # Directory for allocator-history forensics snapshots (unset = disabled).
+    # Snapshots map damaged addresses to the allocation site of the block a
+    # captured CUDA graph still writes through.
+    SGLANG_MEM_FORENSICS_DIR = EnvStr(None)
+    SGLANG_MEM_FORENSICS_MAX_ENTRIES = EnvInt(300000)
 
     # ===================================================================
     # Tokenizer, request state, embeddings, and reasoning controls
