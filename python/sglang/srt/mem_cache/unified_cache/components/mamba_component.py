@@ -204,7 +204,13 @@ class MambaComponent(TreeComponent):
                 # stops at this request's window boundary instead of walking to
                 # root and over-decrementing locks held by other requests.
                 lock_result = self.cache.inc_lock_ref(result.best_match_node)
-                self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
+                self.cache.evict_for_alloc(
+                    EvictParams(
+                        num_tokens=0,
+                        mamba_num=1,
+                        reason="recurrent_allocation_pressure",
+                    )
+                )
                 dst_index = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
                 self.cache.dec_lock_ref(
                     result.best_match_node, lock_result.to_dec_params()
@@ -264,7 +270,7 @@ class MambaComponent(TreeComponent):
         tail: UnifiedTreeNode,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> None:
+    ) -> int:
         """Evict shallow eligible device checkpoints beyond the path cap.
 
         Full KV and any existing host backup are retained. The tail, forks,
@@ -274,7 +280,7 @@ class MambaComponent(TreeComponent):
         """
         cap = self.mamba_max_states_per_path
         if cap < 0:
-            return
+            return 0
 
         ct = self.component_type
         holders = []
@@ -286,7 +292,7 @@ class MambaComponent(TreeComponent):
 
         excess = len(holders) - cap
         if excess <= 0:
-            return
+            return 0
 
         tracker = {component: 0 for component in self.cache.tree_components}
         for node in reversed(holders):
@@ -306,6 +312,7 @@ class MambaComponent(TreeComponent):
             )
             self.tree_core._cascade_evict(node, self, tracker, device_frees, host_frees)
             excess -= 1
+        return tracker[ct]
 
     def redistribute_on_node_split(
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
@@ -494,7 +501,13 @@ class MambaComponent(TreeComponent):
         """Allocate one mamba pool slot, evicting if necessary."""
         slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if slot is None:
-            self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
+            self.cache.evict_for_alloc(
+                EvictParams(
+                    num_tokens=0,
+                    mamba_num=1,
+                    reason="recurrent_allocation_pressure",
+                )
+            )
             slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
             assert slot is not None, "Can not alloc mamba cache"
         return slot
@@ -506,7 +519,13 @@ class MambaComponent(TreeComponent):
     def _alloc_int8_ckpt_slot(self) -> torch.Tensor:
         slot = self.int8_ckpt_pool.alloc(1)
         if slot is None:
-            self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+            self.cache.evict(
+                EvictParams(
+                    num_tokens=0,
+                    mamba_num=1,
+                    reason="recurrent_allocation_pressure",
+                )
+            )
             slot = self.int8_ckpt_pool.alloc(1)
             assert slot is not None, "Can not alloc int8 mamba checkpoint slot"
         return slot
@@ -677,7 +696,13 @@ class MambaComponent(TreeComponent):
             return PrepareLoadBackResult()
         dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if dst is None:
-            self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
+            self.cache.evict_for_alloc(
+                EvictParams(
+                    num_tokens=0,
+                    mamba_num=1,
+                    reason="recurrent_allocation_pressure",
+                )
+            )
             dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
             assert dst is not None, "Cannot alloc mamba for load_back"
         req.kv.mamba_pool_idx = dst[0]
@@ -924,8 +949,13 @@ class MambaComponent(TreeComponent):
             # Drain even if the walk raises so tombstoned slots are not leaked;
             # the walk runs behind the tree-core interface (Rust runs it natively).
             try:
-                self.tree_core.evict_excess_path_states(
+                recurrent_states = self.tree_core.evict_excess_path_states(
                     action.tail_node_id, device_frees, host_frees
+                )
+                self.cache.update_hybrid_eviction_metrics(
+                    full_attention_tokens=0,
+                    recurrent_states=recurrent_states,
+                    reason="path_state_cap",
                 )
             finally:
                 self.cache._free_values(device_frees, host_frees)

@@ -118,6 +118,8 @@ class EvictParams:
     num_tokens: int = 0
     swa_num_tokens: int = 0
     mamba_num: int = 0
+    # Stable, bounded value for eviction observability; never request-derived.
+    reason: str = "unspecified"
 
 
 @dataclasses.dataclass
@@ -314,6 +316,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
                 time.perf_counter() - start_time
             )
             self.metrics_collector.increment_eviction_num_tokens(num_evicted)
+
+    def update_hybrid_eviction_metrics(
+        self, full_attention_tokens: int, recurrent_states: int, reason: str
+    ) -> None:
+        if self.metrics_collector is not None:
+            self.metrics_collector.increment_hybrid_cache_evictions(
+                full_attention_tokens=full_attention_tokens,
+                recurrent_states=recurrent_states,
+                reason=reason,
+            )
 
     def release_host_resources(self) -> None:
         """Release pinned host buffers in userspace on graceful shutdown.

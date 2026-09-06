@@ -633,6 +633,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Report full-layer tokens only
         self.update_eviction_metrics(tracker[BASE_COMPONENT_TYPE], start_time)
+        self.update_hybrid_eviction_metrics(
+            full_attention_tokens=tracker[BASE_COMPONENT_TYPE],
+            recurrent_states=tracker.get(ComponentType.MAMBA, 0),
+            reason=params.reason,
+        )
         return EvictResult(
             num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
             swa_num_tokens_evicted=tracker.get(ComponentType.SWA, 0),
@@ -1538,7 +1543,9 @@ class UnifiedRadixCache(BasePrefixCache):
         avail = self._component_available_size(ComponentType.FULL)
         if avail < kv_tokens:
             needed = kv_tokens - avail
-            self.evict_for_alloc(EvictParams(num_tokens=needed))
+            self.evict_for_alloc(
+                EvictParams(num_tokens=needed, reason="hicache_load_back_pressure")
+            )
             if self._component_available_size(ComponentType.FULL) < kv_tokens:
                 self.dec_lock_ref(node_id, ancestor_lock_params)
                 self.dec_host_lock_ref(node_id, host_anchor_params)

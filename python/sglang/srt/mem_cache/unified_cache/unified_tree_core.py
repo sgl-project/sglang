@@ -1513,8 +1513,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         tail_node_id: NodeId,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> None:
-        self.components_by_type[ComponentType.MAMBA]._evict_excess_path_states(
+    ) -> int:
+        return self.components_by_type[ComponentType.MAMBA]._evict_excess_path_states(
             self.node_by_id(tail_node_id), device_frees, host_frees
         )
 
