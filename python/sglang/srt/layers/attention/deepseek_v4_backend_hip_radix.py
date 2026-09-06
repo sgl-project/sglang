@@ -23,6 +23,7 @@ from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
     FusedCompressMetadata,
@@ -51,6 +52,7 @@ if TYPE_CHECKING:
         FP4DecodeWorkspace,
         FP4KWriteMetadata,
         FP4PrefillWorkspace,
+        FP4StreamingTopKScratch,
     )
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -365,6 +367,9 @@ class DSV4Metadata:
     fp4_prefill_workspace: Optional[FP4PrefillWorkspace] = field(
         default=None, repr=False
     )
+    fp4_streaming_topk_scratch: Optional[FP4StreamingTopKScratch] = field(
+        default=None, repr=False
+    )
     # Derived by the first C4 layer of a forward and reused by the rest.
     fp4_k_write_metadata: Optional[FP4KWriteMetadata] = field(default=None, repr=False)
     # AITER's rope kernels require int64 positions while the core metadata keeps
@@ -449,6 +454,7 @@ class DeepseekV4HipRadixBackend(
         speculative_num_steps=0,
     ):
         super().__init__()
+        self.dsa_topk_backend = DSATopKBackend.resolve(model_runner)
         self.device = torch.device(model_runner.device)
         head_dim = model_runner.model_config.head_dim
         assert head_dim == 512, (
@@ -476,6 +482,22 @@ class DeepseekV4HipRadixBackend(
         self.enable_deepseek_v4_fp4_indexer: bool = (
             model_runner.server_args.enable_deepseek_v4_fp4_indexer
         )
+        self.use_aiter_fp4_streaming_topk = False
+        if (
+            self.enable_deepseek_v4_fp4_indexer
+            and envs.SGLANG_DSV4_FP4_FUSED_TOPK.get()
+            and self.dsa_topk_backend.is_sgl_kernel()
+        ):
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+                aiter_fp4_streaming_topk_available,
+            )
+
+            self.use_aiter_fp4_streaming_topk = aiter_fp4_streaming_topk_available()
+        if self.enable_deepseek_v4_fp4_indexer:
+            logger.info(
+                "AITER FP4 streaming top-k: %s",
+                "enabled" if self.use_aiter_fp4_streaming_topk else "legacy fallback",
+            )
         self.topk = get_spec().speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
         self.mtp_enabled = self.topk > 0
@@ -504,12 +526,18 @@ class DeepseekV4HipRadixBackend(
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
         return pin_tensor.to(self.device, non_blocking=True)
 
-    def init_forward_metadata_indexer(self, core_attn_metadata: DSV4AttnMetadata):
+    def init_forward_metadata_indexer(
+        self,
+        core_attn_metadata: DSV4AttnMetadata,
+        *,
+        use_prefill_cuda_graph: bool = False,
+    ):
         return PagedIndexerMetadata(
             page_size=self.page_size,
             page_table=core_attn_metadata.page_table,
             c4_seq_lens=core_attn_metadata.c4_topk_lengths_raw,
             use_topk_v2=self.dsa_topk_backend.should_use_topk_v2(),
+            use_prefill_cuda_graph=use_prefill_cuda_graph,
         )
 
     def init_forward_metadata_decode(
@@ -596,7 +624,10 @@ class DeepseekV4HipRadixBackend(
                 core_attn_metadata, req_pool_indices_repeated
             )
         indexer_metadata = (
-            self.init_forward_metadata_indexer(core_attn_metadata)
+            self.init_forward_metadata_indexer(
+                core_attn_metadata,
+                use_prefill_cuda_graph=use_prefill_cuda_graph,
+            )
             if need_compress
             else None
         )
@@ -752,7 +783,10 @@ class DeepseekV4HipRadixBackend(
             out_loc=out_cache_loc,
             need_compress=True,
         )
-        indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
+        indexer_metadata = self.init_forward_metadata_indexer(
+            core_attn_metadata,
+            use_prefill_cuda_graph=True,
+        )
         create = functools.partial(
             create_paged_compressor_data,
             is_prefill=True,

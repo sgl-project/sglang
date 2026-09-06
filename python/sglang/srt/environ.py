@@ -889,6 +889,10 @@ class Envs:
     # go back to the unfused chain on the verify path.
     SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY = EnvBool(True)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
+    # Experimental opt-in for AITER's FP4 paged-MQA streaming top-k. The legacy
+    # materialized-logits path remains the default until the fused prefill
+    # performance gap is closed.
+    SGLANG_DSV4_FP4_FUSED_TOPK = EnvBool(False)
 
     # ===================================================================
     # Apple Silicon and MLX
