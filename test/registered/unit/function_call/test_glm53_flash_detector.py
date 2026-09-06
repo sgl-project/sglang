@@ -398,6 +398,57 @@ def test_streaming_multi_tool_todo_bash():
     assert name_calls[0].tool_index != name_calls[1].tool_index
 
 
+def test_streaming_bare_json_array_args():
+    """Streaming: model outputs a bare JSON array as tool arguments.
+
+    The model sometimes outputs <![todo_write>[{...}, {...}, ...] instead
+    of <![todo_write>{"todos": [{...}, {...}, ...]}. Without checking for
+    [ before {, the parser would find the first { inside the array and
+    only parse that single object, leaking the rest as content.
+    """
+    detector = Glm53FlashDetector()
+    tools = make_tools_todo_bash()
+
+    # Simulate bare array: [{...}, {...}, {...}]
+    text = (
+        '<![todo_write>'
+        '[{"content": "task1", "status": "pending"},'
+        ' {"content": "task2", "status": "pending"},'
+        ' {"content": "task3", "status": "pending"}]'
+    )
+    r = detector.parse_streaming_increment(text, tools)
+    assert r.calls, "Expected tool calls"
+
+    # Should have 1 call with all 3 items wrapped in {"todos": [...]}
+    args_calls = [c for c in r.calls if c.parameters]
+    assert args_calls, "Expected call with parameters"
+    args = json.loads(args_calls[0].parameters)
+    assert "todos" in args, f"Expected 'todos' key, got {args}"
+    assert len(args["todos"]) == 3, f"Expected 3 items, got {len(args['todos'])}"
+    assert args["todos"][0]["content"] == "task1"
+    assert args["todos"][1]["content"] == "task2"
+    assert args["todos"][2]["content"] == "task3"
+
+
+def test_non_streaming_bare_json_array_args():
+    """Non-streaming: model outputs a bare JSON array as tool arguments."""
+    detector = Glm53FlashDetector()
+    tools = make_tools_todo_bash()
+
+    text = (
+        '<![todo_write>'
+        '[{"content": "task1", "status": "pending"},'
+        ' {"content": "task2", "status": "pending"}]'
+    )
+    res = detector.detect_and_parse(text, tools)
+    assert len(res.calls) == 1
+    args = json.loads(res.calls[0].parameters)
+    assert "todos" in args, f"Expected 'todos' key, got {args}"
+    assert len(args["todos"]) == 2
+    assert args["todos"][0]["content"] == "task1"
+    assert args["todos"][1]["content"] == "task2"
+
+
 if __name__ == "__main__":
     import sys
 
