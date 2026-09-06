@@ -45,11 +45,7 @@ def _collect_case_weight_paths(server_args) -> set[str]:
     for attr in ("component_paths", "component_weights_paths"):
         mapping = getattr(server_args, attr, None)
         if mapping:
-            paths.update(
-                os.path.realpath(value)
-                for value in mapping.values()
-                if value
-            )
+            paths.update(os.path.realpath(value) for value in mapping.values() if value)
     return paths
 
 
