@@ -101,21 +101,12 @@ def free_swa_out_of_window_slots(
         free_slots = req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
         ]
-        # Local import: the unified allocators import this module lazily for
-        # eviction; a module-level import here would be a cycle hazard.
-        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-            UnifiedSWATokenToKVPoolAllocator,
+        # Contiguous range with host-int bounds: hand the allocator its start
+        # position so the free stays host-sync-free (page reps come from stride
+        # math instead of `torch.unique`; see free_swa on the SWA allocators).
+        token_to_kv_pool_allocator.free_swa(
+            free_slots, start_pos=req.kv.swa_evicted_seqlen
         )
-
-        if isinstance(token_to_kv_pool_allocator, UnifiedSWATokenToKVPoolAllocator):
-            # Contiguous range with host-int bounds: hand the composite its
-            # start position so the free stays host-sync-free (`free_segment`
-            # derives page reps by stride math instead of `torch.unique`).
-            token_to_kv_pool_allocator.free_swa(
-                free_slots, start_pos=req.kv.swa_evicted_seqlen
-            )
-        else:
-            token_to_kv_pool_allocator.free_swa(free_slots)
         req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 

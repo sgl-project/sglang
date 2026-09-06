@@ -303,6 +303,22 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         else:
             self.free_page_reps_group.append(self._copy_for_free_group(reps))
 
+    def free_page_ids(self, page_ids: torch.Tensor):
+        """Free live, unique page IDs without a data-dependent output shape."""
+        if page_ids.numel() == 0:
+            return
+        assert self.free_group is None
+        valid = ((page_ids >= 1) & (page_ids <= self.num_pages)).all()
+        page_ids = page_ids.clamp(1, self.num_pages)
+        sorted_page_ids = torch.sort(page_ids).values
+        torch._assert_async(
+            valid & (sorted_page_ids[1:] != sorted_page_ids[:-1]).all(),
+            "page ids must be valid and unique",
+        )
+        self._release_page_ids(sorted_page_ids)
+        if self.debug_mode:
+            self._debug_check_no_duplicate_pages()
+
     def _debug_check_no_duplicate_pages(self):
         pages = self.get_all_free_pages()
         assert len(torch.unique(pages)) == len(pages)
