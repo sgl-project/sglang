@@ -404,7 +404,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.is_write_back = False
         self.has_swa_host_pool = False
         self.enable_session_radix_cache = params.enable_session_radix_cache
-        self.eviction_strategy = get_eviction_strategy(params.eviction_policy.lower())
+        self.eviction_strategy = get_eviction_strategy(
+            params.eviction_policy.lower(), params.eviction_policy_config
+        )
 
         # ``device`` is derived from the construction-time allocator; the
         # allocator/pool themselves are owned by the cache, not the tree.
@@ -1131,9 +1133,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         state.phase = _InsertPhase.TAIL
 
     def _needs_incremental_component_backup(self, node: UnifiedTreeNode) -> bool:
+        components = self.components
+        if self.is_write_back:
+            swa = self.components_by_type.get(ComponentType.SWA)
+            components = () if swa is None else (swa,)
         return any(
             component.needs_incremental_backup(node)
-            for component in self.components
+            for component in components
             if component.component_type != BASE_COMPONENT_TYPE
         )
 
@@ -1147,7 +1153,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         node = state.target_node
         return (
             self.enable_hicache
-            and not self.is_write_back
             and node.backuped
             and node.write_through_pending_id is None
             and self._needs_incremental_component_backup(node)
@@ -1979,7 +1984,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         for comp in self.components:
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue
-            if node.component_data[comp.component_type].host_value is not None:
+            cd = node.component_data[comp.component_type]
+            if cd.host_value is not None and not comp.needs_incremental_backup(node):
                 continue
             t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
             if t:
