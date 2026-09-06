@@ -338,8 +338,7 @@ class KVCacheConfigurator:
 
         swa_max_total_num_tokens = sizes.swa_max_total_num_tokens
         # Unified-KV DSV4: swa_max_total_num_tokens was sized from the vestigial
-        # SWA pool; reconcile it to real ring capacity so the idle-leak invariant
-        # holds. Safe: swa_kv_pool is None here, so no buffer is resized.
+        # SWA pool; reconcile to real ring capacity. swa_kv_pool is None here.
         if (
             self.is_hybrid_swa
             and not self.is_draft_worker
@@ -2263,8 +2262,7 @@ class KVCacheConfigurator:
         if cap_tokens is not None:
             max_tokens = min(max_tokens, cap_tokens)
         # calculate_pool_sizes_from_max_tokens takes a token count, not a byte
-        # budget, so it cannot re-subtract the request-scoped fixed pools; it is
-        # only safe because every constraint above is a min(). Assert that here.
+        # budget; it cannot re-subtract the fixed pools, so capacity must not rise.
         assert max_tokens <= config.max_total_num_tokens, (
             f"token constraints must not raise capacity: {max_tokens} > "
             f"{config.max_total_num_tokens}"

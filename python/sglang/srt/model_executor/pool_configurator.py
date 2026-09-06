@@ -847,10 +847,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     Splits available memory across full / swa / c4 / c128 + c4_state / c128_state
     pools. coeff is bytes_per_full_token (inflated by (T+D)/T when speculative
-    decode reserves a draft worker, mirroring dflash's cell_size scaling). The
-    bias is the sum of request-scoped fixed pools that do not scale with
-    full_token: the c128 state pool and, on the unified_kv path, the fixed SWA
-    per-request ring (bf16, see _fixed_swa_bytes).
+    decode reserves a draft worker, mirroring dflash's cell_size scaling). bias
+    is the request-scoped fixed pools that do not scale with full_token.
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
@@ -907,13 +905,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
 
-        # Unified-KV uses a different physical layout than the fp8 path:
-        #  * KV is stored bf16 over the full latent (attn_head_dim * 2 bytes),
-        #    not the fp8(nope) + bf16(rope) + scales 584-byte cell.
-        #  * SWA is a fixed per-request ring (num_req_slots * ring_size),
-        #    independent of full_token, so it is a fixed *bias* rather than a
-        #    per-token term. Gate on the same switch the pool itself uses so the
-        #    sizing and the allocation never drift apart.
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )
@@ -1034,13 +1025,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             + c4_frac * kv_bytes * self.num_layers_ca4
             + 1 / 128 * kv_bytes * self.num_layers_ca128
             + 1 / 4 * self.indexer_bytes_per_token * self.num_layers_ca4
-            # Unified_kv: the c4 (attn + indexer) compress-state is a ring buffer
-            # addressed off the SWA slot ((swa_loc // swa_page_size) * ring_size),
-            # and the unified SWA pool is a fixed per-request ring
-            # (swa_pages = num_req_slots * swa_ring_size), so the state ring is
-            # request-scoped, not full_token-scoped. It is therefore a fixed bias
-            # (see _fixed_c4_state_bytes), not a per-token term. On the non-unified
-            # path the SWA pool scales with full_token, so it stays per-token.
+            # Unified_kv: c4 state is addressed off the SWA slot, and that pool
+            # is a fixed per-request ring, so the state ring is request-scoped.
             + (
                 0.0
                 if self._unified
@@ -1069,9 +1055,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             swa_max_total_num_tokens=swa_tokens,
             c4_max_total_num_tokens=full_token // (4 * self.c4_shrink_factor),
             c128_max_total_num_tokens=full_token // 128,
-            # Unified_kv sizes the c4 state ring from the fixed SWA ring
-            # (request-scoped), finalized once max_running_requests is known -- so
-            # it must not scale with full_token here (mirrors c128_state below).
+            # Unified_kv: request-scoped, finalized once concurrency is known.
             c4_state_pool_size=(
                 0
                 if self._unified
@@ -1108,26 +1092,17 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
 
     def _unified_c4_state_pool_size(self, max_running_requests: int) -> int:
-        """Exact request-scoped C4 ring size for the unified address contract.
-
-        Unified C4 state locations are
-        ``req_pool_idx * c4_ring_size + position % c4_ring_size``.
-        """
+        # Unified C4 state loc is req_pool_idx * c4_ring_size + pos % c4_ring_size.
         num_req_slots = self._get_num_req_slots(max_running_requests)
         return num_req_slots * self.c4_ring_size
 
     def _fixed_c4_state_bytes(self, max_running_requests: int) -> int:
-        """Unified_kv c4 (attn + indexer) compress-state is a fixed per-request
-        ring, sized by concurrency rather than full_token. Return its byte
-        footprint across all c4 layers. Returns 0 on the non-unified path (where
-        the c4 state pool scales with the SWA pool and is accounted per-token)."""
         if not self._unified or self.num_layers_ca4 == 0:
             return 0
 
         c4_state_dtype_size, _ = _get_dsv4_compress_state_dtype_sizes()
-        # CompressStatePool allocates `size + ring_size + 1` rows, padded to the
-        # compress ratio (see CompressStatePool.__init__). Mirror that here so the
-        # reserved bias covers the real allocation.
+        # Mirror CompressStatePool.__init__: it allocates `size + ring_size + 1`
+        # rows, padded to the compress ratio.
         state_rows = self._unified_c4_state_pool_size(max_running_requests)
         state_rows = ceil_div(state_rows + self.c4_ring_size + 1, 4) * 4
         # overlap c4: last_dim = 2 * (1 + overlap) * head_dim = 4 * head_dim.
@@ -1136,9 +1111,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return state_rows * (core_bytes + indexer_bytes) * self.num_layers_ca4
 
     def _resolve_max_running_requests_per_worker(self, available_bytes: int) -> int:
-        """Approximate ModelRunner._resolve_max_num_reqs closely enough to size
-        the request-scoped fixed pools (c128 state, unified SWA ring). Over-
-        estimating is safe: a larger fixed bias yields a smaller full_token."""
+        # Approximates ModelRunner._resolve_max_num_reqs. Over-estimating is safe:
+        # a larger fixed bias yields a smaller full_token.
         if self.requested_max_running_requests_per_worker is not None:
             return self.requested_max_running_requests_per_worker
 
@@ -1148,11 +1122,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return min(estimated, full_token // 2)
 
     def _fixed_swa_bytes(self, max_running_requests: int) -> int:
-        """Unified_kv SWA is a fixed per-request ring, sized by concurrency
-        (num_req_slots) rather than by full_token. Return its bf16 byte
-        footprint across all full layers, inflated for the draft worker the same
-        way as the per-token coeff. Returns 0 on the non-unified path (where SWA
-        is already accounted per-token)."""
         if not self._unified:
             return 0
         num_req_slots = self._get_num_req_slots(max_running_requests)
@@ -1194,9 +1163,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             config.c128_state_pool_size = num_req_slots
         else:
             config.c128_state_pool_size = num_req_slots * self.c128_ring_size
-        # Unified_kv: the c4 state ring is request-scoped (fixed SWA pool), so
-        # finalize it here from the now-known concurrency. On the non-unified path
-        # it was already sized from full_token in _compute_dsv4_sizes.
+        # Unified_kv: request-scoped, so it is sized here from the now-known
+        # concurrency rather than from full_token in _compute_dsv4_sizes.
         if self._unified and self.num_layers_ca4 > 0:
             config.c4_state_pool_size = self._unified_c4_state_pool_size(
                 config.max_running_requests
@@ -1245,13 +1213,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
-        """Caller contract: max_total_num_tokens must not exceed the value
+        """Caller contract: max_total_num_tokens must not exceed what
         calculate_pool_sizes derived from the same budget (config_from_budget
-        asserts this). No fixed-pool bias is subtracted here -- the input is a
-        token count, not a byte budget, so subtracting bytes would double-count
-        what calculate_pool_sizes already removed. The request-scoped pools are
-        re-derived from the capped token count by
-        finalize_with_max_running_requests, so they shrink with it."""
+        asserts it). Subtracting the fixed-pool bias again here would
+        double-count -- the input is a token count, not a byte budget."""
         assert page_size % 128 == 0, (
             "page_size must be multiple of 128 for compressed attention"
         )

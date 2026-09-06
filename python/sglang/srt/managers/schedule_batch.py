@@ -3090,9 +3090,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return ok
 
     def _log_unified_swa_bottleneck(self, allocator, num_tokens, selected_indices):
-        """Diagnostic (unified-KV only): when check_decode_mem is short, compare
-        the SWA token bookkeeping against the real per-slot ring utilization.
-        Throttled to avoid log floods during retract storms."""
+        """Compare the SWA token bookkeeping against real per-slot ring
+        utilization; throttled so retract storms cannot flood the log."""
         global _last_swa_bottleneck_log
         now = time.monotonic()
         if now - _last_swa_bottleneck_log < 1.0:

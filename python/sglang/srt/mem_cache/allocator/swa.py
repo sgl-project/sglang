@@ -241,9 +241,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return None
 
         if self._unified:
-            # Unified SWA ring is slot-addressed and not paged here: allocate only
-            # the full-attention KV and skip the vestigial SWA allocator / mapping
-            # (unused by the DSV4 kernels).
+            # The unified SWA ring is slot-addressed, not paged here, so the
+            # vestigial paged allocator and full->swa mapping are skipped.
             return self.full_attn_allocator.alloc_extend(
                 prefix_lens,
                 prefix_lens_cpu,
@@ -305,10 +304,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return None
 
         if self._unified:
-            # Unified SWA ring is slot-addressed and not paged here, so the tail
-            # needs no SWA allocation and no full->swa mapping, as in
-            # alloc_extend. new_pages_available already ignored num_swa_pages,
-            # so the paged SWA allocator below has no capacity gate left.
+            # See alloc_extend. new_pages_available already ignored
+            # num_swa_pages, so the paged allocator has no capacity gate left.
             return self.full_attn_allocator.alloc_extend(
                 prefix_lens,
                 prefix_lens_cpu,
@@ -366,8 +363,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     ):
         assert self.page_size > 1
         if self._unified:
-            # See alloc_extend: unified SWA ring is slot-addressed, allocate full
-            # only and skip the vestigial SWA allocator / mapping.
+            # See alloc_extend: slot-addressed ring, so full-attention KV only.
             return self.full_attn_allocator.alloc_decode(
                 seq_lens, seq_lens_cpu, last_loc
             )

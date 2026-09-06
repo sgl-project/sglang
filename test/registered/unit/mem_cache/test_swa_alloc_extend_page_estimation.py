@@ -36,10 +36,8 @@ def _make_self(*, page_size: int, full_available: int, swa_available: int):
 
     return SimpleNamespace(
         page_size=page_size,
-        # alloc_extend branches on self._unified to skip the vestigial paged SWA
-        # allocator on the unified-KV path. This stub exercises the standard
-        # hybrid-SWA path, so pin it False rather than letting the attribute go
-        # missing (SimpleNamespace raises instead of defaulting).
+        # alloc_extend branches on _unified; pin it to the hybrid-SWA path
+        # (SimpleNamespace raises instead of defaulting if it goes missing).
         _unified=False,
         full_attn_allocator=SimpleNamespace(
             available_size=lambda: full_available,

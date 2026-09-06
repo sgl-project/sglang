@@ -1071,9 +1071,8 @@ class TestSWAPoolFloor(CustomTestCase):
         self.assertEqual(sizes.c4_state_pool_size, 3072 // 128 * 8)
 
     def test_dsv4_token_cap_never_grows_total_footprint(self):
-        """Regression: the token-cap path subtracts no fixed-pool bias, which is
-        only safe while every constraint in config_from_budget is a min(). Cap
-        the budget-derived token count and check the total footprint shrinks."""
+        """Regression: the token-cap path subtracts no fixed-pool bias, so
+        capping the budget-derived token count must still shrink the total."""
         cfg = self._dsv4_configurator_for_budget()
         page_size = 128
         budget = 256 * (1 << 30)
@@ -1091,9 +1090,8 @@ class TestSWAPoolFloor(CustomTestCase):
             with self.subTest(numerator=numerator):
                 self.assertLessEqual(capped_bytes, base_bytes)
 
+    # White-box 671B-class shape: the byte arithmetic runs without a model fixture.
     def _dsv4_configurator_for_budget(self):
-        """DSV4 configurator with a 671B-class shape, built white-box so the
-        byte arithmetic runs without a real model fixture."""
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 
         cfg = object.__new__(DSV4PoolConfigurator)
@@ -1120,9 +1118,9 @@ class TestSWAPoolFloor(CustomTestCase):
         cfg._unified = True
         return cfg
 
+    # Token pool plus the three request-scoped fixed pools, sized from the
+    # concurrency resolve_max_num_reqs derives from this token count.
     def _dsv4_total_bytes(self, cfg, tokens):
-        """Token pool plus the three request-scoped fixed pools, sized from the
-        concurrency that resolve_max_num_reqs derives from this token count."""
         estimated = max(min(int(tokens / cfg.context_len * 512), 4096), 2048)
         max_running_requests = min(estimated, tokens // 2)
         return int(

@@ -675,11 +675,8 @@ class PrefillAdder:
     def rem_swa_tokens(self):
         allocator = self.token_to_kv_pool_allocator
         if self._unified_kv:
-            # Unified-KV: SWA is a per-request ring, not a tree-reusable token
-            # pool. swa_available_size() already reports ring capacity
-            # (free_slots * ring_cost). tree swa_evictable is in the old linear
-            # token unit and freeing it does not release ring space, so exclude
-            # it here to keep a single consistent accounting unit.
+            # swa_available_size() already reports ring capacity; tree
+            # swa_evictable is in linear token units and frees no ring space.
             return allocator.swa_available_size() - self.rem_swa_token_offset
         return (
             allocator.swa_available_size()
@@ -731,10 +728,8 @@ class PrefillAdder:
         """
         allocator = self.token_to_kv_pool_allocator
         if self._unified_kv:
-            # Unified-KV: each request occupies exactly one fixed SWA ring slot,
-            # independent of context / chunk length; a host-hit prefix reuses the
-            # same ring. Budget the fixed per-slot ring cost (paired with the
-            # ring-based swa_available_size on the allocator).
+            # One fixed ring slot per request, independent of context or chunk
+            # length; pairs with the ring-based swa_available_size.
             return allocator.swa_ring_cost_tokens
         if self.rem_chunk_tokens is not None:
             alloc = min(extend_input_len, self.rem_chunk_tokens)
@@ -887,10 +882,8 @@ class PrefillAdder:
         self.rem_input_tokens -= extend_input_len
 
         if self.is_hybrid_swa:
-            # Unified-KV: SWA is a fixed per-request ring slot reserved once at
-            # first admission and already reflected in swa_available_size() on
-            # later rounds. Charging it again on a chunked continuation would
-            # double-count the slot and over-throttle admission, so skip it.
+            # The ring slot is reserved once at first admission; charging it
+            # again on a continuation would double-count and over-throttle.
             if not (self._unified_kv and is_chunked_continuation):
                 self.rem_swa_token_offset += self._swa_budget_for_req(
                     extend_input_len, max_new_tokens
@@ -1032,10 +1025,8 @@ class PrefillAdder:
             if self.is_hybrid_swa and not self._unified_kv:
                 # alloc_extend needs extend_num_tokens + page_size per request,
                 # so reserve one page here to avoid OOM.
-                # Unified-KV: rem_swa_tokens is ring capacity (free_slots * ring
-                # cost), not a linear per-chunk token budget, and this request's
-                # ring slot is already reserved -- mixing units here would wrongly
-                # truncate the chunk, so skip the SWA clamp.
+                # Unified-KV: rem_swa_tokens is ring capacity, not a per-chunk
+                # token budget; clamping against it would truncate the chunk.
                 _rem_tokens = min(
                     _rem_tokens, int(self.rem_swa_tokens) - self.page_size
                 )
@@ -1284,9 +1275,8 @@ class PrefillAdder:
                 self._swa_new_tokens(req),
                 swa_host_hit_length=req.swa_host_hit_length,
             )
-            # Unified-KV: rem_swa_tokens is an exact ring-slot capacity, so a
-            # request needing exactly what is left still fits. The legacy
-            # SWA-token path keeps its original conservative `>=`.
+            # Ring-slot capacity is exact, so needing exactly what is left still
+            # fits; the legacy SWA-token path keeps its conservative `>=`.
             if (
                 swa_needed > self.rem_swa_tokens
                 if self._unified_kv

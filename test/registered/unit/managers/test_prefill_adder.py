@@ -71,12 +71,8 @@ class TestPrefillAdder(CustomTestCase):
         allocator.swa_available_size.return_value = swa_available_size
         allocator.available_size.return_value = available_size
         allocator.size_swa = size_swa
-        # get_kvcache().[_unified_kv] gates the unified-KV SWA-ring accounting
-        # path in schedule_policy.add_chunked_req / rem_swa_tokens. A bare
-        # MagicMock auto-creates any attribute access as a truthy Mock, so
-        # without this the getattr(..., "_unified_kv", False) default never
-        # triggers and these tests silently exercise the unified-KV branch
-        # instead of the standard hybrid-SWA one they intend to cover.
+        # A bare MagicMock auto-creates a truthy `_unified_kv`, silently flipping
+        # these tests onto the unified-KV branch; pin it to the hybrid-SWA path.
         allocator.get_kvcache.return_value._unified_kv = False
         return allocator
 
