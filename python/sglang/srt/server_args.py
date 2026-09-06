@@ -2813,6 +2813,7 @@ class ServerArgs:
                 "simm",
                 "mori",
                 "shm",
+                "kvcr",
             ],
         ),
         NS("memory"),

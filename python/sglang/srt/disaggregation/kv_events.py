@@ -273,31 +273,92 @@ class OffloadedState(msgspec.Struct):
 
 
 class BlockStored(KVCacheEvent):
+    """Positionally aligned with vLLM's BlockStored tuple.
+
+    These structs serialize as arrays, so consumers read them by *position*.
+    KV-aware routers parse a single positional layout for every framework, and
+    fields after ``medium`` are only interpreted when they land on the slots
+    that layout expects: ``lora_name`` and ``extra_keys``, then a five-slot
+    trailing tail (``group_idx``, ``kv_cache_spec_kind``,
+    ``kv_cache_spec_sliding_window``, ``locality``, ``ownership``). SGLang does
+    not populate most of them, but it has to hold their places -- appending a
+    field into a slot the router reads as something else is silently
+    misinterpreted rather than rejected.
+
+    Consequently these fields are append-only, and new ones go after
+    ``ownership``.
+    """
+
     block_hashes: list[int]
     parent_block_hash: Optional[int]
     token_ids: list[int]
     block_size: int
     lora_id: Optional[int]
     medium: Optional[str] = None
+    # Placeholders: SGLang has no LoRA-name or per-block extra-key concept, but
+    # the router reads a cache namespace out of extra_keys (see
+    # BlockStoredWithMetadata).
+    lora_name: Optional[str] = None
+    extra_keys: Optional[list[list[str]]] = None
+    # Cache-group metadata. SGLang publishes one event stream per KV cache, so
+    # it has no group dimension to report.
+    group_idx: Optional[int] = None
+    kv_cache_spec_kind: Optional[str] = None
+    kv_cache_spec_sliding_window: Optional[int] = None
+    # Where the blocks live relative to this instance, and who owns them.
+    # Reserved: nothing populates these yet.
+    locality: Optional[str] = None
+    ownership: Optional[str] = None
+
+
+# Tag every cache salt so a consumer can tell it apart from the LoRA names and
+# multimodal hashes that share the extra_keys list. Must match
+# DYNAMO_CACHE_SALT_PREFIX in dynamo's lib/kv-router/src/zmq_wire/extra_keys.rs.
+CACHE_SALT_EXTRA_KEY_PREFIX = "dynamo-cache-salt:"
 
 
 class BlockStoredWithMetadata(BlockStored, tag="BlockStored", kw_only=True):
     """BlockStored wire extension used only when typed metadata is present.
 
-    A separate struct keeps unsalted events at their legacy array length; an
-    optional field on BlockStored would still serialize a trailing null.
+    ``metadata`` sits past the positional layout above, so consumers that read
+    by position ignore it. It is a typed convenience for consumers that decode
+    this struct by name; a cross-framework consumer reads the same cache salt
+    from ``extra_keys`` instead (see :func:`cache_salt_extra_keys`).
     """
 
     metadata: BlockStoredMetadata
 
 
+def cache_salt_extra_keys(cache_salt: Optional[str]) -> Optional[list[list[str]]]:
+    """Render ``cache_salt`` into the positional ``extra_keys`` slot.
+
+    vLLM aligns ``extra_keys`` with blocks and carries the salt on the first
+    block only, so match that shape. ``None`` when there is no salt, which keeps
+    the slot null for the overwhelmingly common unsalted event.
+    """
+    if cache_salt is None:
+        return None
+    return [[f"{CACHE_SALT_EXTRA_KEY_PREFIX}{cache_salt}"]]
+
+
 class BlockRemoved(KVCacheEvent):
+    """Positionally aligned with vLLM's BlockRemoved tuple.
+
+    Same trailing layout as :class:`BlockStored`, minus the store-only fields.
+    Append-only for the same reason.
+    """
+
     block_hashes: list[int]
     medium: Optional[str] = None
+    group_idx: Optional[int] = None
+    kv_cache_spec_kind: Optional[str] = None
+    kv_cache_spec_sliding_window: Optional[int] = None
+    locality: Optional[str] = None
+    ownership: Optional[str] = None
 
 
 class AllBlocksCleared(KVCacheEvent):
-    pass
+    ownership: Optional[str] = None
 
 
 class KVEventBatch(EventBatch):
