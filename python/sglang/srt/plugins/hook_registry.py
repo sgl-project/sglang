@@ -79,6 +79,11 @@ class HookRegistry:
         list
     )
     _patched: set[str] = set()
+    # target -> number of hooks already applied to it. Two loaders share this
+    # registry (sglang.srt.plugins and sglang.multimodal_gen.plugins), so hooks
+    # can be registered after their target was patched by the earlier loader;
+    # this is what lets apply_hooks() report them instead of dropping silently.
+    _applied: dict[str, int] = {}
 
     @classmethod
     def register(
@@ -154,14 +159,30 @@ class HookRegistry:
         subsequent method-level hooks (AROUND, BEFORE, AFTER) on child
         attributes resolve against the *replaced* class rather than the
         original.
+
+        Hooks registered on a target that a previous apply_hooks() call already
+        patched cannot be applied any more; they are reported with their plugin
+        source rather than dropped silently.
         """
         sorted_items = sorted(cls._hooks.items(), key=cls._target_sort_key)
         for target, hooks in sorted_items:
             if target in cls._patched:
+                late = hooks[cls._applied.get(target, len(hooks)) :]
+                if late:
+                    sources = sorted({_format_source(src) for _, _, src in late})
+                    logger.warning(
+                        "%d hook(s) on '%s' were registered after it was already "
+                        "patched and are NOT applied (from: %s). Register them "
+                        "before the loader that patched this target runs.",
+                        len(late),
+                        target,
+                        ", ".join(sources),
+                    )
                 continue
             try:
                 cls._apply_target(target, hooks)
                 cls._patched.add(target)
+                cls._applied[target] = len(hooks)
             except Exception:
                 logger.exception("Failed to apply hooks to %s", target)
 
@@ -315,6 +336,7 @@ class HookRegistry:
         """Reset all hooks and patches. Primarily for testing."""
         cls._hooks.clear()
         cls._patched.clear()
+        cls._applied.clear()
 
 
 def _propagate_patch(original: object, wrapped: object, source_module: object) -> int:

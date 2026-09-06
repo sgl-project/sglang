@@ -26,7 +26,6 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE: bool = False
     SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
-    SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
     SGLANG_EXTERNAL_MODEL_PACKAGE: str = ""
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
@@ -225,11 +224,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD": _lazy_str(
         "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD", "fork"
     ),
-    # Internal per-worker platform override used by disaggregated role launch.
-    # Empty means normal platform auto-detection.
-    "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": _lazy_str(
-        "SGLANG_DIFFUSION_PLATFORM_OVERRIDE", ""
-    ),
+    # NOTE: the diffusion plugin selectors (SGLANG_DIFFUSION_PLATFORM,
+    # SGLANG_DIFFUSION_PLUGINS, SGLANG_DIFFUSION_PLATFORM_OVERRIDE) live in
+    # sglang.srt.environ, next to their SRT counterparts: the platform resolver
+    # and the plugin loader must read them without importing this module.
     # Import an installed package that registers out-of-tree diffusion models
     # and pipelines. This is shared with the SRT model plugin mechanism.
     "SGLANG_EXTERNAL_MODEL_PACKAGE": _lazy_str("SGLANG_EXTERNAL_MODEL_PACKAGE", ""),

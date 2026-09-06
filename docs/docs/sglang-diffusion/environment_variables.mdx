@@ -24,6 +24,21 @@ description: "Configure SGLang diffusion behavior with environment variables."
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Installed package that registers out-of-tree diffusion pipelines and component models. The package is imported once in every process.</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_PLATFORM</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>not set</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Select an out-of-tree platform plugin by entry_point name (group <code>sglang.multimodal_gen.platforms</code>). Only the named plugin is imported; required when several installed plugins would activate. See <a href="/docs/hardware-platforms/plugin">Plugin System</a>.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_PLUGINS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>not set</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Comma-separated whitelist of diffusion general plugin names (group <code>sglang.multimodal_gen.plugins</code>). Unset loads every discovered plugin.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_PLATFORM_OVERRIDE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>not set</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Force a platform, bypassing detection and plugins: a built-in short name (<code>cpu</code>, <code>cuda</code>, <code>rocm</code>, <code>mps</code>, <code>npu</code>, <code>musa</code>, <code>xpu</code>) or an explicit <code>module.Class</code> qualname.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_TARGET_DEVICE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>cuda</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Target device for inference (<code>cuda</code>, <code>rocm</code>, <code>xpu</code>, <code>npu</code>, <code>musa</code>, <code>mps</code>, <code>cpu</code>)</td>

@@ -3,8 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/platforms/__init__.py
 
-import os
+import pkgutil
 import traceback
+from importlib.metadata import entry_points
+
+from sglang.multimodal_gen.plugins import (
+    DIFFUSION_PLATFORM_PLUGINS_GROUP,
+    discover_diffusion_plugins,
+)
 
 # imported by other files, do not remove
 from sglang.multimodal_gen.runtime.platforms.interface import (  # noqa: F401
@@ -13,9 +19,19 @@ from sglang.multimodal_gen.runtime.platforms.interface import (  # noqa: F401
     PlatformEnum,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import resolve_obj_by_qualname
+from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
+
+_BUILTIN_PLATFORM_QUALNAMES = {
+    "cpu": "sglang.multimodal_gen.runtime.platforms.cpu.CpuPlatform",
+    "cuda": "sglang.multimodal_gen.runtime.platforms.cuda.CudaPlatform",
+    "rocm": "sglang.multimodal_gen.runtime.platforms.rocm.RocmPlatform",
+    "mps": "sglang.multimodal_gen.runtime.platforms.mps.MpsPlatform",
+    "npu": "sglang.multimodal_gen.runtime.platforms.npu.NPUPlatformBase",
+    "musa": "sglang.multimodal_gen.runtime.platforms.musa.MusaPlatform",
+    "xpu": "sglang.multimodal_gen.runtime.platforms.xpu.XpuPlatform",
+}
 
 
 def cuda_platform_plugin() -> str | None:
@@ -192,25 +208,38 @@ builtin_platform_plugins = {
 
 
 def resolve_current_platform_cls_qualname() -> str:
-    forced_platform = os.environ.get("SGLANG_DIFFUSION_PLATFORM_OVERRIDE", "").strip()
-    if forced_platform:
-        forced_map = {
-            "cpu": "sglang.multimodal_gen.runtime.platforms.cpu.CpuPlatform",
-            "cuda": "sglang.multimodal_gen.runtime.platforms.cuda.CudaPlatform",
-            "rocm": "sglang.multimodal_gen.runtime.platforms.rocm.RocmPlatform",
-            "mps": "sglang.multimodal_gen.runtime.platforms.mps.MpsPlatform",
-            "npu": "sglang.multimodal_gen.runtime.platforms.npu.NPUPlatformBase",
-            "musa": "sglang.multimodal_gen.runtime.platforms.musa.MusaPlatform",
-        }
-        qualname = forced_map.get(forced_platform.lower())
-        if qualname is None:
-            raise ValueError(
-                f"Unsupported SGLANG_DIFFUSION_PLATFORM_OVERRIDE={forced_platform!r}"
-            )
-        return qualname
+    """Resolve the qualname of the platform class to instantiate.
 
-    # TODO(will): if we need to support other platforms, we should consider if
-    # vLLM's plugin architecture is suitable for our needs.
+    Resolution order:
+
+    1. ``SGLANG_DIFFUSION_PLATFORM_OVERRIDE`` — a built-in short name
+       (``cpu``, ``cuda``, ...) or an explicit ``module.Class`` /
+       ``module:Class`` qualname. Bypasses detection and plugins entirely.
+    2. ``SGLANG_DIFFUSION_PLATFORM`` set — front-loading filter over the
+       ``sglang.multimodal_gen.platforms`` entry point group: only the named
+       plugin is imported and activated. Name not found, or ``activate()``
+       returning None, is an error.
+    3. ``SGLANG_DIFFUSION_PLATFORM`` unset — import and activate every
+       discovered plugin. Exactly one activated wins, several is an error, none
+       falls through to the built-in detection chain below.
+    """
+    forced_platform = envs.SGLANG_DIFFUSION_PLATFORM_OVERRIDE.get().strip()
+    if forced_platform:
+        qualname = _BUILTIN_PLATFORM_QUALNAMES.get(forced_platform.lower())
+        if qualname is not None:
+            return qualname
+        # Not a short name: accept an explicit out-of-tree platform qualname.
+        if "." in forced_platform or ":" in forced_platform:
+            return forced_platform
+        raise ValueError(
+            f"Unsupported SGLANG_DIFFUSION_PLATFORM_OVERRIDE={forced_platform!r}. "
+            f"Use one of {sorted(_BUILTIN_PLATFORM_QUALNAMES)} or a "
+            f"'module.Class' qualname."
+        )
+
+    platform_cls_qualname = _resolve_platform_plugin_qualname()
+    if platform_cls_qualname is not None:
+        return platform_cls_qualname
 
     # Try MPS first on macOS
     platform_cls_qualname = mps_platform_plugin()
@@ -250,6 +279,79 @@ def resolve_current_platform_cls_qualname() -> str:
     raise RuntimeError("No platform plugin found. Please check your installation.")
 
 
+def _resolve_platform_plugin_qualname() -> str | None:
+    """Resolve an out-of-tree platform from the entry point group.
+
+    Returns None when no plugin claims the machine, so the caller can fall back
+    to the built-in detection chain.
+    """
+    selected = envs.SGLANG_DIFFUSION_PLATFORM.get().strip()
+
+    if selected:
+        # Front-loading filter: only the selected plugin is imported, so the
+        # other vendors' modules never pull their hardware dependencies.
+        ep_map = {
+            ep.name: ep for ep in entry_points(group=DIFFUSION_PLATFORM_PLUGINS_GROUP)
+        }
+        if selected not in ep_map:
+            available = ", ".join(f"'{name}'" for name in ep_map) if ep_map else "none"
+            raise RuntimeError(
+                f"SGLANG_DIFFUSION_PLATFORM={selected!r} not found in discovered "
+                f"diffusion platform plugins (available: {available}). Install the "
+                f"plugin with 'pip install -e' to register its entry_points."
+            )
+        try:
+            result = ep_map[selected].load()()
+        except Exception as e:
+            logger.exception(
+                "Failed to activate diffusion platform plugin: %s", selected
+            )
+            raise RuntimeError(
+                f"Diffusion platform plugin {selected!r} failed to activate: {e}"
+            ) from e
+        if result is None:
+            raise RuntimeError(
+                f"Diffusion platform plugin {selected!r} is installed but activate() "
+                f"returned None (hardware not available on this machine?)."
+            )
+        logger.info("OOT diffusion platform activated: %s -> %s", selected, result)
+        return result
+
+    # Auto-discover: activate every plugin and expect at most one to claim the
+    # machine. An activation error only disables that plugin.
+    activated: dict[str, str] = {}
+    for name, (activate, _dist) in discover_diffusion_plugins(
+        DIFFUSION_PLATFORM_PLUGINS_GROUP
+    ).items():
+        try:
+            result = activate()
+        except Exception:
+            logger.exception("Failed to activate diffusion platform plugin: %s", name)
+            continue
+        if result is not None:
+            activated[name] = result
+            logger.info("OOT diffusion platform activated: %s -> %s", name, result)
+
+    if not activated:
+        return None
+    if len(activated) == 1:
+        return next(iter(activated.values()))
+
+    names_str = ", ".join(f"'{name}'" for name in activated)
+    raise RuntimeError(
+        f"Multiple diffusion platform plugins activated: {names_str}. "
+        f"Set SGLANG_DIFFUSION_PLATFORM to select one."
+    )
+
+
+def _load_platform_class(qualname: str) -> type[Platform]:
+    """Load a Platform subclass from ``module.Class`` or ``module:Class``."""
+    cls = pkgutil.resolve_name(qualname)
+    if not isinstance(cls, type) or not issubclass(cls, Platform):
+        raise TypeError(f"Expected a Platform subclass, got {type(cls)}: {qualname}")
+    return cls
+
+
 _current_platform: Platform | None = None
 _init_trace: str = ""
 
@@ -266,7 +368,7 @@ def __getattr__(name: str):
         global _current_platform
         if _current_platform is None:
             platform_cls_qualname = resolve_current_platform_cls_qualname()
-            _current_platform = resolve_obj_by_qualname(platform_cls_qualname)()
+            _current_platform = _load_platform_class(platform_cls_qualname)()
             global _init_trace
             _init_trace = "".join(traceback.format_stack())
         return _current_platform

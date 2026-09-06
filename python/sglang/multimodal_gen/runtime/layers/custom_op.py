@@ -71,6 +71,11 @@ class CustomOp(nn.Module):
     def dispatch_forward(self) -> Callable:
         if _is_cuda:
             return self.forward_cuda
+        # Out-of-tree platforms are checked before the in-tree predicates: a
+        # vendor torch build can expose torch.xpu / torch.npu and report them
+        # available, so those branches would otherwise steal the dispatch.
+        elif current_platform.is_out_of_tree():
+            return self.forward_oot
         elif current_platform.is_hip():
             return self.forward_hip
         elif current_platform.is_npu():
