@@ -27,6 +27,7 @@ import numpy as np
 import torch
 from PIL import Image, ImageOps
 
+from sglang.srt.managers.mm_utils import hash_feature
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -262,6 +263,18 @@ class DeepseekV4VLImageProcessor(BaseMultimodalProcessor):
                 MultimodalDataItem(
                     modality=Modality.IMAGE,
                     feature=patches,
+                    # Grid and compression alignment determine types/perm for
+                    # this processor. Cached blocks include that layout as well
+                    # as pixels, even when two layouts have the same length.
+                    hash=hash_feature(
+                        [
+                            patches,
+                            torch.tensor(
+                                [n_vit_h, n_vit_w, start % COMPRESS_PAD_TO],
+                                dtype=torch.int64,
+                            ),
+                        ]
+                    ),
                     offsets=[(start, len(input_ids) - 1)],
                     model_specific_data={
                         "types": types,
