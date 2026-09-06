@@ -3,7 +3,14 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
+try:
+    from sgl_kernel.speculative import (
+        reconstruct_indices_from_tree_mask as _reconstruct_indices_from_tree_mask_kernel,
+    )
+except ImportError:
+    # sgl_kernel ships CUDA-only binaries; on other platforms (e.g. NPU) the
+    # host implementation defined below fills in.
+    _reconstruct_indices_from_tree_mask_kernel = None
 
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
@@ -70,6 +77,61 @@ def _derive_tree_links(
                 next_sibling[b, i] = earliest_child_of.get(parent, -1)
                 earliest_child_of[parent] = i
     return torch.from_numpy(next_token), torch.from_numpy(next_sibling)
+
+
+def _reconstruct_indices_from_tree_mask_host(
+    tree_mask,
+    seq_lens,
+    positions,
+    retrieve_index,
+    retrieve_next_token,
+    retrieve_next_sibling,
+    bs,
+    draft_token_num,
+) -> None:
+    """Host fallback for platforms without the sgl_kernel CUDA kernel (e.g. NPU).
+
+    Produces the same outputs as the kernel into the caller's preallocated
+    device tensors: ``retrieve_index`` (draft slot identity), ``positions``
+    (tree depth + seq_len), and the tree links (via :func:`_derive_tree_links`).
+    """
+    d = draft_token_num
+    mask = (
+        tree_mask.detach()
+        .reshape(-1)[: bs * d * d]
+        .reshape(bs, d, d)
+        .to("cpu", torch.bool)
+        .numpy()
+    )
+    node_order = np.arange(d)
+    depths = (mask & (node_order < node_order[:, None])).sum(-1)
+
+    next_token, next_sibling = _derive_tree_links(mask, bs, d)
+    seqs = np.asarray(seq_lens.detach().to("cpu").tolist(), dtype=np.int64)
+
+    dev = positions.device
+    positions.copy_(
+        torch.from_numpy(depths.reshape(-1) + np.repeat(seqs, d))
+        .to(dev)
+        .reshape(positions.shape)
+    )
+    retrieve_index.copy_(
+        torch.arange(bs * d, dtype=torch.int64).to(dev).reshape(retrieve_index.shape)
+    )
+    retrieve_next_token.copy_(
+        next_token.to(dev).reshape(retrieve_next_token.shape)
+    )
+    retrieve_next_sibling.copy_(
+        next_sibling.to(dev).reshape(retrieve_next_sibling.shape)
+    )
+
+
+def reconstruct_indices_from_tree_mask(*args, **kwargs):
+    """Dispatch to the sgl_kernel CUDA kernel when available, else to the host
+    fallback (see :func:`_reconstruct_indices_from_tree_mask_host`)."""
+    if _reconstruct_indices_from_tree_mask_kernel is not None:
+        return _reconstruct_indices_from_tree_mask_kernel(*args, **kwargs)
+    return _reconstruct_indices_from_tree_mask_host(*args, **kwargs)
 
 
 class NGRAMWorker(BaseSpecWorker):
