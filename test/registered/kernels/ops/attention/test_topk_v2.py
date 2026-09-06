@@ -400,6 +400,10 @@ def test_topk_v2_packed_rows(extend_lens: list[int], k: int) -> None:
     causal, so lengths grow by one within a request. This is the shape
     ``dsa_topk_backend`` routes to v2 for PAGED extend; a distinct page-table
     permutation per request catches any row/request index mix-up.
+
+    The ragged case below also leaves most window starts off the 16-byte load
+    boundary, which is the general case in production -- a window start is a
+    running KV length, aligned only by luck.
     """
     torch.manual_seed(4242 + k + len(extend_lens))
     device = "cuda"
@@ -434,6 +438,9 @@ def test_topk_v2_packed_rows(extend_lens: list[int], k: int) -> None:
 
     out = torch.full((rows, k), -1, dtype=torch.int32, device=device)
     metadata = plan_topk_v2(lengths_t)
+    # The kernel masks the <= 3 columns its aligned read base pulls in ahead of
+    # each window, so reference values have to be read before the call.
+    scores_cpu = scores.cpu()
     topk_transform_paged_v2(
         scores,
         lengths_t,
@@ -446,7 +453,6 @@ def test_topk_v2_packed_rows(extend_lens: list[int], k: int) -> None:
     )
     torch.cuda.synchronize()
 
-    scores_cpu = scores.cpu()
     out_cpu = out.cpu().tolist()
     for r in range(rows):
         L, start, req = lengths[r], row_starts[r], row_to_batch[r]

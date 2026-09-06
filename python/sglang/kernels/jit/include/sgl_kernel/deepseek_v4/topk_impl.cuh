@@ -195,12 +195,19 @@ struct TopKProblem {
   uint32_t seq_len;
   uint32_t page_bits;
   int32_t bias = 0;  // needed by ragged mode
+  // Paged mode with packed rows: `in` is rounded down to the 16-byte load
+  // boundary, so a selected position is `residue` too large. Applied at the
+  // page lookup rather than at emit because the paged select stages raw
+  // positions in shared memory first; ragged emits directly and uses `bias`.
+  // Zero for every caller that does not round down, which is all of them today
+  // except DSA extend.
+  int32_t index_shift = 0;
 
   SGL_DEVICE void emit(uint32_t pos, uint32_t raw_idx) const {
     out[pos] = static_cast<int32_t>(raw_idx) + bias;
   }
   SGL_DEVICE void transform_output(uint32_t t, int32_t raw) const {
-    out[t] = raw < 0 ? -1 : page_to_indices(page_table, raw, page_bits);
+    out[t] = raw < 0 ? -1 : page_to_indices(page_table, raw + index_shift, page_bits);
   }
 };
 
