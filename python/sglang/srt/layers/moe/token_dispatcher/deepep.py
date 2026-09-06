@@ -24,6 +24,7 @@ from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
     DispatcherOutputDtype,
+    MoeRunnerBackendLike,
     get_deepep_config,
     get_deepep_output_dtype,
     is_tbo_enabled,
@@ -371,6 +372,7 @@ class _DeepEPDispatcherImplBase:
         hidden_size: int,
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
+        runner_backend: Optional[MoeRunnerBackendLike] = None,
     ):
         if not use_deepep:
             raise ImportError(
@@ -386,6 +388,7 @@ class _DeepEPDispatcherImplBase:
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
+        self.runner_backend = runner_backend
 
         self.params_bytes = 2
         # A large value will lead to large memory occupation, thus users should change it accordingly
@@ -629,7 +632,12 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
 
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
+        if (
+            (self.runner_backend is not None and self.runner_backend.is_marlin())
+            or deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            or _use_aiter
+            or _is_npu
+        ):
             output = hidden_states
         else:
             raise NotImplementedError()  # triton runner was supported but it's temporarily disabled
@@ -897,6 +905,7 @@ class DeepEPDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
+        runner_backend: Optional[MoeRunnerBackendLike] = None,
     ):
         super().__init__()
 
@@ -911,6 +920,7 @@ class DeepEPDispatcher(BaseDispatcher):
             hidden_size=hidden_size,
             params_dtype=params_dtype,
             deepep_mode=deepep_mode,
+            runner_backend=runner_backend,
         )
 
         if self.deepep_mode.enable_low_latency():

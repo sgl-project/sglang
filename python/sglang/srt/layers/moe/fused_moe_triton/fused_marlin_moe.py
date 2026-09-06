@@ -131,6 +131,63 @@ def swiglu_gpt_oss_sigmoid_alpha_contiguous(
     output.copy_(gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1))
 
 
+@triton.jit
+def _align_compact_experts_kernel(
+    counts,
+    sorted_ids,
+    expert_ids,
+    total,
+    EXPERTS: tl.constexpr,
+    ROWS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+):
+    expert = tl.program_id(0)
+    es = tl.arange(0, BLOCK_E)
+    sizes = tl.load(counts + es, es < EXPERTS, 0)
+    padded = tl.cdiv(sizes, BLOCK_M) * BLOCK_M
+    start = tl.sum(tl.where(es < expert, sizes, 0))
+    aligned_start = tl.sum(tl.where(es < expert, padded, 0))
+    count = tl.load(counts + expert)
+    rows = tl.program_id(1) * BLOCK_R + tl.arange(0, BLOCK_R)
+    tl.store(
+        sorted_ids + aligned_start + rows,
+        tl.where(rows < count, start + rows, ROWS),
+        rows < tl.cdiv(count, BLOCK_M) * BLOCK_M,
+    )
+    tl.store(
+        expert_ids + (aligned_start + rows) // BLOCK_M,
+        expert,
+        (rows < tl.cdiv(count, BLOCK_M) * BLOCK_M) & (rows % BLOCK_M == 0),
+    )
+    if expert == 0 and tl.program_id(1) == 0:
+        tl.store(total, tl.sum(padded))
+
+
+def _align_compact_experts(counts, rows, block_size):
+    """Build the schedule directly from contiguous expert segments on the GPU."""
+    experts = counts.numel()
+    size = rows + experts * (block_size - 1)
+    sorted_ids = torch.empty((size,), device=counts.device, dtype=torch.int32)
+    expert_ids = torch.empty(
+        (triton.cdiv(size, block_size),), device=counts.device, dtype=torch.int32
+    )
+    total = torch.empty((1,), device=counts.device, dtype=torch.int32)
+    _align_compact_experts_kernel[(experts, triton.cdiv(rows + block_size - 1, 256))](
+        counts,
+        sorted_ids,
+        expert_ids,
+        total,
+        experts,
+        rows,
+        block_size,
+        triton.next_power_of_2(experts),
+        256,
+    )
+    return sorted_ids, expert_ids, total
+
+
 @register_custom_op(out_shape="hidden_states")
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
@@ -138,7 +195,7 @@ def fused_marlin_moe(
     w2: torch.Tensor,
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,
-    gating_output: torch.Tensor,
+    gating_output: Optional[torch.Tensor],
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     global_num_experts: int = -1,
@@ -162,6 +219,9 @@ def fused_marlin_moe(
     gemm1_alpha: Optional[float] = None,
     activation: str = "silu",
     is_gated: bool = True,
+    is_ep: bool = False,
+    expected_m: Optional[int] = None,
+    expert_num_tokens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -192,7 +252,14 @@ def fused_marlin_moe(
     """
     from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
-    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+    if gating_output is not None:
+        assert hidden_states.shape[0] == gating_output.shape[0], (
+            "Number of tokens mismatch"
+        )
+    assert hidden_states.shape[0] == topk_ids.shape[0] == topk_weights.shape[0], (
+        "Number of routed tokens mismatch"
+    )
+    is_ep = is_ep or expert_map is not None
     assert hidden_states.shape[1] == w1.shape[1] * 16, "Hidden size mismatch w1"
     assert hidden_states.shape[1] == w2.shape[2] // (num_bits // 2), (
         "Hidden size mismatch w2"
@@ -237,16 +304,22 @@ def fused_marlin_moe(
 
     # M block size selection logic
     # TODO: tune this further for specific models
+    tokens_per_expert = M * topk / E if expected_m is None else expected_m
     for block_size_m in [8, 16, 32, 48, 64]:
-        if M * topk / E / block_size_m < 0.9:
+        if tokens_per_expert / block_size_m < 0.9:
             break
 
     if global_num_experts == -1:
         global_num_experts = E
-    if (
+    if expert_num_tokens is not None:
+        assert topk == 1 and expert_num_tokens.numel() == E
+        sorted_token_ids, expert_ids, num_tokens_post_padded = _align_compact_experts(
+            expert_num_tokens, M, block_size_m
+        )
+    elif (
         M == 1
         and topk <= 32
-        and expert_map is None
+        and not is_ep
         # The JIT kernel is int32-only; torch-native topk emits int64 -- let
         # that (test-only) shape take the generic path instead of casting.
         and topk_ids.dtype == torch.int32
@@ -286,8 +359,10 @@ def fused_marlin_moe(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    # Marlin skips masked expert rows, so their shared cache must start at zero.
-    intermediate_cache13 = torch.zeros(
+    # Compact segments never read or return unused rows. Standard routing
+    # reduces masked contributions, which must instead start at zero.
+    allocate_cache = torch.empty if expert_num_tokens is not None else torch.zeros
+    intermediate_cache13 = allocate_cache(
         (M * topk_ids.shape[1] * max(gemm1_n, K),),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
@@ -320,7 +395,8 @@ def fused_marlin_moe(
         moe_block_size=block_size_m,
         top_k=topk,
         mul_topk_weights=False,
-        is_ep=expert_map is not None,
+        # The compact schedule contains only local, valid expert blocks.
+        is_ep=is_ep and expert_num_tokens is None,
         b_q_type=scalar_type1,
         size_m=M,
         size_n=gemm1_n,
@@ -362,7 +438,9 @@ def fused_marlin_moe(
     else:
         raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
 
-    if expert_map is not None:
+    if is_ep and expert_num_tokens is None:
+        # GEMM2 shares storage with GEMM1; skipped routes must not retain gate/up
+        # values (including bias) when their contributions are reduced.
         intermediate_cache3.zero_()
 
     intermediate_cache3 = moe_wna16_marlin_gemm(
@@ -383,7 +461,8 @@ def fused_marlin_moe(
         moe_block_size=block_size_m,
         top_k=1,
         mul_topk_weights=True,
-        is_ep=expert_map is not None,
+        # The compact schedule contains only local, valid expert blocks.
+        is_ep=is_ep and expert_num_tokens is None,
         b_q_type=scalar_type2,
         size_m=M * topk,
         size_n=K,
@@ -395,6 +474,15 @@ def fused_marlin_moe(
     ).view(-1, topk, K)
 
     output = zero_copy_context.get_moe_output(hidden_states)
+    if (
+        expert_num_tokens is not None
+        and output is None
+        and not inplace
+        and (is_mxfp4_marlin or routed_scaling_factor in (None, 1.0))
+    ):
+        # One expert per compact row: the unpacker reads only valid rows,
+        # so no reduction or initialization of unused rows is necessary.
+        return intermediate_cache3.view(M, K)
     if output is None:
         output = hidden_states if inplace else torch.empty_like(hidden_states)
 
