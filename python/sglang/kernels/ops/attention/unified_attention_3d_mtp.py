@@ -44,13 +44,17 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 
 try:  # gfx950 assembly MTP-verify attention (in-tree .s, assembled at first use)
     from sglang.kernels.ops.attention.vattn_asm_gfx950 import (
-        asm_toolchain_available as _asm_toolchain_available,
+        AsmKernelUnavailable as _AsmKernelUnavailable,
+    )
+    from sglang.kernels.ops.attention.vattn_asm_gfx950 import (
+        asm_kernel_available as _asm_kernel_available,
     )
     from sglang.kernels.ops.attention.vattn_asm_gfx950 import (
         mtp_verify_attn_fwd_asm as _mtp_verify_attn_fwd_asm,
     )
 except ImportError:
     _mtp_verify_attn_fwd_asm = None
+    _AsmKernelUnavailable = RuntimeError
 
 import os as _os
 
@@ -59,13 +63,14 @@ from sglang.srt.utils import is_gfx95_supported
 
 def asm_verify_attn_enabled() -> bool:
     """The in-tree gfx950 assembly attention kernel (vattn_asm_gfx950) is used
-    by default on gfx95x when ROCm clang is available and the batch shape is
-    supported; SGLANG_ASM_VERIFY_ATTN=0 keeps everything on the Triton path."""
+    by default on gfx950 when ROCm clang is available and the batch shape is
+    supported; SGLANG_ASM_VERIFY_ATTN=0 keeps everything on the Triton path.
+    A failed assembly or module load disables it for the rest of the process."""
     return (
         _os.environ.get("SGLANG_ASM_VERIFY_ATTN", "1") == "1"
         and _mtp_verify_attn_fwd_asm is not None
         and is_gfx95_supported()
-        and _asm_toolchain_available()
+        and _asm_kernel_available()
     )
 
 
@@ -707,18 +712,21 @@ def unified_attention_3d_mtp_func(
     ):
         # gfx950 assembly kernel: reads the page-16 fp8 cache in place, supports
         # GQA ratios 16 and 8, does its own split-KV reduce into `out`.
-        return _mtp_verify_attn_fwd_asm(
-            q,
-            k,
-            v,
-            block_table,
-            seqused_k,
-            cu_seqlens_q,
-            k_descale,
-            v_descale,
-            softmax_scale,
-            out=out,
-        )
+        try:
+            return _mtp_verify_attn_fwd_asm(
+                q,
+                k,
+                v,
+                block_table,
+                seqused_k,
+                cu_seqlens_q,
+                k_descale,
+                v_descale,
+                softmax_scale,
+                out=out,
+            )
+        except _AsmKernelUnavailable:
+            pass  # could not be built/loaded: continue on the Triton path
 
     # The Triton kernel below is only correct for the 16:1 GQA layout.
     assert num_queries_per_kv == 16
@@ -880,18 +888,21 @@ def unified_attention_3d_mtp_ragged_func(
         v_descale,
     ):
         return False
-    _mtp_verify_attn_fwd_asm(
-        q,
-        k,
-        v,
-        block_table,
-        seqused_k,
-        cu_seqlens_q,
-        k_descale,
-        v_descale,
-        softmax_scale,
-        out=out,
-    )
+    try:
+        _mtp_verify_attn_fwd_asm(
+            q,
+            k,
+            v,
+            block_table,
+            seqused_k,
+            cu_seqlens_q,
+            k_descale,
+            v_descale,
+            softmax_scale,
+            out=out,
+        )
+    except _AsmKernelUnavailable:
+        return False
     return True
 
 
@@ -940,16 +951,19 @@ def unified_attention_3d_mtp_decode_func(
         v_descale,
     ):
         return False
-    _mtp_verify_attn_fwd_asm(
-        q,
-        k,
-        v,
-        block_table,
-        seqused_k,
-        cu_dec,
-        k_descale,
-        v_descale,
-        softmax_scale,
-        out=out,
-    )
+    try:
+        _mtp_verify_attn_fwd_asm(
+            q,
+            k,
+            v,
+            block_table,
+            seqused_k,
+            cu_dec,
+            k_descale,
+            v_descale,
+            softmax_scale,
+            out=out,
+        )
+    except _AsmKernelUnavailable:
+        return False
     return True

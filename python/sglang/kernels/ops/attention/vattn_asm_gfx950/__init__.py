@@ -28,6 +28,13 @@ _LOG2E = 1.4426950408889634
 _hip = None
 _kernels = {}
 _build_dir = None
+_available = None
+_disabled_reason = None
+
+
+class AsmKernelUnavailable(RuntimeError):
+    """Raised once when the kernel cannot be assembled or loaded; the caller
+    falls back to its Triton path and asm_kernel_available() stays False."""
 
 
 class VattnKernelArgs(ctypes.Structure):
@@ -171,14 +178,27 @@ def _clang():
     return os.path.join(rocm, "llvm", "bin", "clang")
 
 
-_TOOLCHAIN_AVAILABLE = None
+def asm_kernel_available() -> bool:
+    """True on a gfx950 device with ROCm clang present, until a build or load
+    failure disables the kernel for the rest of the process."""
+    global _available
+    if _available is None:
+        arch = ""
+        if torch.version.hip and torch.cuda.is_available():
+            arch = torch.cuda.get_device_properties(0).gcnArchName
+        _available = arch.startswith("gfx950") and os.path.exists(_clang())
+    return _available and _disabled_reason is None
 
 
-def asm_toolchain_available() -> bool:
-    global _TOOLCHAIN_AVAILABLE
-    if _TOOLCHAIN_AVAILABLE is None:
-        _TOOLCHAIN_AVAILABLE = os.path.exists(_clang())
-    return _TOOLCHAIN_AVAILABLE
+def _disable(reason):
+    global _disabled_reason
+    _disabled_reason = reason
+    print(
+        f"[vattn_asm] disabling the gfx950 asm attention kernel, falling back to "
+        f"the Triton path: {reason}",
+        flush=True,
+    )
+    raise AsmKernelUnavailable(reason)
 
 
 def _build(name, text):
@@ -189,21 +209,27 @@ def _build(name, text):
     with open(src, "w") as f:
         f.write(text)
     co = os.path.join(_build_dir, name + ".co")
-    subprocess.run(
-        [
-            _clang(),
-            "-target",
-            "amdgcn-amd-amdhsa",
-            "-mcpu=gfx950",
-            "-I",
-            _DIR,
-            "-o",
-            co,
-            src,
-        ],
-        check=True,
-        cwd=_DIR,
-    )
+    try:
+        subprocess.run(
+            [
+                _clang(),
+                "-target",
+                "amdgcn-amd-amdhsa",
+                "-mcpu=gfx950",
+                "-I",
+                _DIR,
+                "-o",
+                co,
+                src,
+            ],
+            check=True,
+            cwd=_DIR,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as e:
+        detail = getattr(e, "stderr", None) or str(e)
+        _disable(f"assembling {name}.s failed: {detail.strip()[:400]}")
     return co
 
 
@@ -221,7 +247,10 @@ def _get_kernel(hq):
             f".set NTDMA, 1\n.set ABL, 0\n"
             f'.include "vattn3_core.s"\n',
         )
-        kern = _Kernel(co, "vattn_asm", declared)
+        try:
+            kern = _Kernel(co, "vattn_asm", declared)
+        except RuntimeError as e:
+            _disable(f"loading {co} failed: {e}")
         _kernels[hq] = kern
         print(
             f"[vattn_asm] gfx950 asm verify-attention kernel active "
@@ -240,7 +269,10 @@ def _get_reduce():
             f"vred.s declares {declared} B"
         )
         co = _build("vred", '.set DBG, 0\n.include "vred.s"\n')
-        kern = _Kernel(co, "vred_asm", declared)
+        try:
+            kern = _Kernel(co, "vred_asm", declared)
+        except RuntimeError as e:
+            _disable(f"loading {co} failed: {e}")
         _kernels["reduce"] = kern
     return kern
 
