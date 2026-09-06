@@ -1045,11 +1045,11 @@ class TestSWAPoolFloor(CustomTestCase):
         self.assertEqual(config.swa_max_total_num_tokens, 3072)
 
     def _dsv4_sizes(self, max_tokens, page_size):
-        """Exercise the DSV4 size arithmetic without a full V4 model fixture:
-        _compute_dsv4_sizes reads only these five attributes."""
+        """Exercise non-unified DSV4 size arithmetic without a full model fixture."""
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 
         cfg = object.__new__(DSV4PoolConfigurator)
+        cfg._unified = False
         cfg.swa_ratio = 0.1
         cfg.sliding_window_size = 128
         cfg.swa_page_size = 128
