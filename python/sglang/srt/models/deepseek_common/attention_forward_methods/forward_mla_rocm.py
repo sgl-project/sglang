@@ -891,14 +891,14 @@ class DeepseekMLARocmForwardMixin:
 
     def _skip_rope_for_dsa_tilelang_fused(self: DeepseekV2AttentionMLA) -> bool:
         """
-        Check if we should skip rope and use fused rope+cache path for TileLang DSA on gfx95.
+        Check if we should skip rope and use fused rope+cache path for TileLang/Triton DSA on gfx95.
         """
         return (
             _use_aiter_gfx95
             and self.current_attention_backend in ("dsa", "nsa")
             and (
-                get_exec().kernel.dsa_decode_backend == "tilelang"
-                or get_exec().kernel.dsa_prefill_backend == "tilelang"
+                get_exec().kernel.dsa_decode_backend in ("tilelang", "triton")
+                or get_exec().kernel.dsa_prefill_backend in ("tilelang", "triton")
             )
         )
 

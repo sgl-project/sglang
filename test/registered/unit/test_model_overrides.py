@@ -1913,12 +1913,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             override_platform(is_hip=True),
             patch("torch.cuda.get_device_capability", return_value=(9, 4)),
         ):
-            # ROCm with both unset -> tilelang
+            # ROCm with both unset -> Triton for FP8 and BF16 KV cache.
             self.assertEqual(
                 _dsa_split_backend_resolution(_view(kv_cache_dtype="bfloat16")),
                 {
-                    "dsa_prefill_backend": "tilelang",
-                    "dsa_decode_backend": "tilelang",
+                    "dsa_prefill_backend": "triton",
+                    "dsa_decode_backend": "triton",
                 },
             )
 
