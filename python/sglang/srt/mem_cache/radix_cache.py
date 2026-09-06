@@ -496,6 +496,19 @@ class RadixCache(BasePrefixCache):
             )
             return
 
+        if not is_insert:
+            # The protected prefix is owned by the cache. Release every KV slot
+            # owned by the request, including slots without a committed token id.
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, req.cache_protected_len : kv_len_to_handle
+            ]
+            self.token_to_kv_pool_allocator.free_segment(
+                kv_indices, start_pos=req.cache_protected_len
+            )
+            if req.last_node is not None:
+                self.dec_lock_ref(req.last_node)
+            return
+
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, : len(token_ids)
@@ -511,14 +524,11 @@ class RadixCache(BasePrefixCache):
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool
-        if is_insert:
-            priority = getattr(req, "priority", 0) or 0
-            result = self.insert(
-                InsertParams(key=radix_key, value=values, priority=priority)
-            )
-            freed_end = result.prefix_len
-        else:
-            freed_end = key_len
+        priority = getattr(req, "priority", 0) or 0
+        result = self.insert(
+            InsertParams(key=radix_key, value=values, priority=priority)
+        )
+        freed_end = result.prefix_len
 
         # duplicates / uninserted range, then the unaligned tail
         self.token_to_kv_pool_allocator.free_segments(
