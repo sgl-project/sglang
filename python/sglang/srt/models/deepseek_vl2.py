@@ -8,6 +8,7 @@ from torch import nn
 from sglang.srt.configs.deepseekvl2 import (
     DeepseekVL2Config,
     DeepseekVL2MlpProjectorConfig,
+    DeepseekVL2VisionEncoderConfig,
 )
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -205,8 +206,10 @@ class DeepseekVL2ForCausalLM(nn.Module):
             # deepseek-vl2-tiny forbids mla
             self.language_model = DeepseekForCausalLM(language_config)
 
+    @staticmethod
     def _init_vision_module(
-        self, vision_config, quant_config: Optional[QuantizationConfig]
+        vision_config: DeepseekVL2VisionEncoderConfig,
+        quant_config: Optional[QuantizationConfig],
     ) -> nn.Module:
         # TODO: refactor vision model through timm wrapper from transformers
         try:
@@ -266,22 +269,24 @@ class DeepseekVL2ForCausalLM(nn.Module):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
-    def get_image_feature(self, items: List[MultimodalDataItem]):
-
-        images_spatial_crop = torch.cat(
-            [item.images_spatial_crop for item in items], dim=0
-        )
-
-        assert images_spatial_crop.dim() == 3
-
+    @staticmethod
+    def build_image_features(
+        items: List[MultimodalDataItem],
+        vision: nn.Module,
+        projector: nn.Module,
+        image_newline: torch.Tensor,
+        view_seperator: torch.Tensor,
+        global_view_pos: str,
+    ) -> torch.Tensor:
+        """Build the final image features expected by the language model."""
         # TODO: can it be batched ?
         images_in_this_batch = []
         for item in items:
             assert item.feature.dim() == 4
-            image_feature = self.vision.forward_features(
-                item.feature.type(next(self.vision.parameters()).dtype)
+            image_feature = vision.forward_features(
+                item.feature.type(next(vision.parameters()).dtype)
             )
-            images_embeds = self.projector(image_feature)
+            images_embeds = projector(image_feature)
             _, hw, n_dim = images_embeds.shape
             h = w = int(hw**0.5)
             tile_index = 0
@@ -306,7 +311,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
                 global_features = global_features.view(h, w, n_dim)
 
                 # [D]     -> [h, 1, D]
-                new_lines_in_global = repeat(self.image_newline, "d -> h 1 d", h=h)
+                new_lines_in_global = repeat(image_newline, "d -> h 1 d", h=h)
 
                 # cat([h, w, D], [h, 1, D], dim=1) -> [h, w + 1, D]
                 global_features = torch.cat(
@@ -330,7 +335,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
 
                 # [D] -> [num_height_tiles * h, 1, D]
                 new_lines_in_local = repeat(
-                    self.image_newline,
+                    image_newline,
                     "d -> (th h) 1 d",
                     th=num_height_tiles,
                     h=h,
@@ -344,11 +349,11 @@ class DeepseekVL2ForCausalLM(nn.Module):
                 local_features = local_features.view(-1, n_dim)
 
                 # merge global and local tiles
-                if self.global_view_pos == "head":
+                if global_view_pos == "head":
                     global_local_features = torch.cat(
                         [
                             global_features,
-                            self.view_seperator[None, :],
+                            view_seperator[None, :],
                             local_features,
                         ]
                     )
@@ -356,7 +361,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
                     global_local_features = torch.cat(
                         [
                             local_features,
-                            self.view_seperator[None, :],
+                            view_seperator[None, :],
                             global_features,
                         ]
                     )
@@ -364,6 +369,23 @@ class DeepseekVL2ForCausalLM(nn.Module):
                 images_in_this_batch.append(global_local_features)
 
         return torch.cat(images_in_this_batch, dim=0)
+
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+
+        images_spatial_crop = torch.cat(
+            [item.images_spatial_crop for item in items], dim=0
+        )
+
+        assert images_spatial_crop.dim() == 3
+
+        return self.build_image_features(
+            items=items,
+            vision=self.vision,
+            projector=self.projector,
+            image_newline=self.image_newline,
+            view_seperator=self.view_seperator,
+            global_view_pos=self.global_view_pos,
+        )
 
 
 EntryClass = DeepseekVL2ForCausalLM
