@@ -140,11 +140,7 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
             num_gpus=2,
             tp_size=1,
             ulysses_degree=2,
-            extras=[
-                *EXTRAS_DISABLE_WARMUP,
-                "--dit-cpu-offload",
-                "false",
-            ],
+            extras=EXTRAS_DISABLE_WARMUP,
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
