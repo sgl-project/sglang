@@ -1030,10 +1030,12 @@ def _handle_ngram(server_args: ServerArgs) -> None:
             // cfg.speculative_eagle_topk,
         )
     if cfg.speculative_ngram_external_corpus_path is not None:
-        if cfg.speculative_ngram_external_sam_budget <= 0:
+        uses_legacy_allocation = cfg.speculative_ngram_global_tree_mode == "disabled"
+        if uses_legacy_allocation and cfg.speculative_ngram_external_sam_budget <= 0:
             raise ValueError(
                 "--speculative-ngram-external-sam-budget must be positive when "
-                "--speculative-ngram-external-corpus-path is set."
+                "--speculative-ngram-external-corpus-path is set and global tree "
+                "allocation is disabled."
             )
         if cfg.speculative_ngram_external_corpus_max_tokens <= 0:
             raise ValueError(
@@ -1041,7 +1043,8 @@ def _handle_ngram(server_args: ServerArgs) -> None:
                 "--speculative-ngram-external-corpus-path is set."
             )
         if (
-            cfg.speculative_ngram_external_sam_budget
+            uses_legacy_allocation
+            and cfg.speculative_ngram_external_sam_budget
             > cfg.speculative_num_draft_tokens - 1
         ):
             raise ValueError(

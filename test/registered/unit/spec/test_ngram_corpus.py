@@ -26,24 +26,25 @@ def _make_corpus(match_type="BFS", **kwargs):
         capacity=100000,
         external_sam_budget=0,
         external_corpus_max_tokens=10000000,
+        global_tree_mode="disabled",
     )
     defaults.update(kwargs)
     defaults["match_type"] = match_type
     corpus = NgramCorpus(**defaults)
     if external_corpus_documents is not None:
-        from sglang.srt.speculative.cpp_ngram.external_corpus import SEPARATOR_TOKEN
-
-        chunks = []
-        has_prev = False
-        for doc in external_corpus_documents:
-            if has_prev:
-                chunks.append([SEPARATOR_TOKEN] + list(doc))
-            else:
-                chunks.append(list(doc))
-            has_prev = True
-        loaded_token_count = corpus.load_external_corpus_named("test_corpus", chunks)
-        corpus.commit_external_corpus_load("test_corpus", loaded_token_count)
+        _load_external_documents(corpus, "test_corpus", external_corpus_documents)
     return corpus
+
+
+def _load_external_documents(corpus, corpus_id, documents):
+    from sglang.srt.speculative.cpp_ngram.external_corpus import SEPARATOR_TOKEN
+
+    chunks = []
+    for index, document in enumerate(documents):
+        prefix = [SEPARATOR_TOKEN] if index else []
+        chunks.append(prefix + list(document))
+    loaded_token_count = corpus.load_external_corpus_named(corpus_id, chunks)
+    corpus.commit_external_corpus_load(corpus_id, loaded_token_count)
 
 
 def _batch_get(
@@ -688,6 +689,240 @@ class TestNgramCorpusExternalSam(CustomTestCase):
 
         ids, _ = _batch_get(corpus, [[1, 2, 3]])
         self.assertEqual(ids.tolist(), [3, 20])
+
+
+class TestNgramCorpusGlobalTree(CustomTestCase):
+    def test_all_child_denominator_lets_sam_beat_top_one_trie(self):
+        corpus = _make_corpus(
+            "BFS",
+            global_tree_mode="path_probability",
+            draft_token_num=2,
+            max_bfs_breadth=1,
+            external_sam_budget=0,
+            external_corpus_documents=[[1, 2, 3, 20]],
+        )
+        corpus.batch_put([[1, 2, 3, 10]] * 6)
+        corpus.batch_put([[1, 2, 3, 11]] * 4)
+        corpus.synchronize()
+
+        ids, _ = _batch_get(corpus, [[1, 2, 3]])
+
+        self.assertEqual(ids.tolist(), [3, 20])
+
+    def test_strong_trie_beats_weak_sam(self):
+        corpus = _make_corpus(
+            "PROB",
+            global_tree_mode="path_probability",
+            draft_token_num=2,
+            max_bfs_breadth=2,
+            external_sam_budget=0,
+            external_corpus_documents=[
+                [1, 2, 3, 20],
+                [1, 2, 3, 20],
+                [1, 2, 3, 20],
+                [1, 2, 3, 21],
+                [1, 2, 3, 21],
+            ],
+        )
+        corpus.batch_put([[1, 2, 3, 10]] * 9)
+        corpus.batch_put([[1, 2, 3, 11]])
+        corpus.synchronize()
+
+        ids, _ = _batch_get(corpus, [[1, 2, 3]])
+        self.assertEqual(ids.tolist(), [3, 10])
+
+    def test_specificity_mode_reverses_short_concentrated_choice(self):
+        def build(mode):
+            corpus = _make_corpus(
+                "BFS",
+                global_tree_mode=mode,
+                max_trie_depth=6,
+                draft_token_num=2,
+                max_bfs_breadth=2,
+                external_sam_budget=0,
+                external_corpus_documents=[
+                    [1, 2, 3, 4, 10],
+                    [1, 2, 3, 4, 11],
+                ],
+            )
+            corpus.batch_put([[90, 3, 4, 20]] * 9)
+            corpus.batch_put([[91, 3, 4, 21]])
+            corpus.synchronize()
+            return corpus
+
+        probability_ids, _ = _batch_get(build("path_probability"), [[1, 2, 3, 4]])
+        specificity_ids, _ = _batch_get(
+            build("specificity_path_probability"), [[1, 2, 3, 4]]
+        )
+
+        self.assertEqual(probability_ids.tolist(), [4, 20])
+        self.assertEqual(specificity_ids.tolist(), [4, 10])
+
+    def test_path_probability_tie_does_not_use_match_specificity(self):
+        def build(mode):
+            corpus = _make_corpus(
+                "BFS",
+                global_tree_mode=mode,
+                max_trie_depth=6,
+                draft_token_num=2,
+                external_sam_budget=0,
+                external_corpus_documents=[[1, 2, 3, 4, 10]],
+            )
+            corpus.batch_put([[90, 3, 4, 20]])
+            corpus.synchronize()
+            return corpus
+
+        probability_ids, _ = _batch_get(build("path_probability"), [[1, 2, 3, 4]])
+        specificity_ids, _ = _batch_get(
+            build("specificity_path_probability"), [[1, 2, 3, 4]]
+        )
+
+        self.assertEqual(probability_ids.tolist(), [4, 20])
+        self.assertEqual(specificity_ids.tolist(), [4, 10])
+
+    def test_shared_prefix_retains_divergent_source_cursors(self):
+        corpus = _make_corpus(
+            "BFS",
+            global_tree_mode="path_probability",
+            draft_token_num=4,
+            max_bfs_breadth=2,
+            external_sam_budget=0,
+            external_corpus_documents=[[1, 2, 3, 7, 9]],
+        )
+        corpus.batch_put([[1, 2, 3, 7, 8]])
+        corpus.synchronize()
+
+        ids, masks = _batch_get(corpus, [[1, 2, 3]])
+        leaf_paths = corpus.leaf_paths_from_mask(
+            ids.tolist(), masks.reshape(4, 4).tolist()
+        )
+
+        self.assertEqual(ids.tolist(), [3, 7, 8, 9])
+        self.assertEqual(leaf_paths, [[3, 7, 8], [3, 7, 9]])
+
+    def test_best_first_selection_is_materialized_in_selection_order(self):
+        corpus = _make_corpus(
+            "BFS",
+            global_tree_mode="path_probability",
+            draft_token_num=4,
+            max_bfs_breadth=2,
+        )
+        corpus.batch_put([[1, 2, 3, 10, 11]] * 6)
+        corpus.batch_put([[1, 2, 3, 20, 21]] * 4)
+        corpus.synchronize()
+
+        ids, masks = _batch_get(corpus, [[1, 2, 3]])
+
+        self.assertEqual(ids.tolist(), [3, 10, 11, 20])
+        self.assertEqual(
+            masks.reshape(4, 4).tolist(),
+            [
+                [1, 0, 0, 0],
+                [1, 1, 0, 0],
+                [1, 1, 1, 0],
+                [1, 0, 0, 1],
+            ],
+        )
+
+    def test_underfilled_tree_has_fixed_shape_and_ancestor_mask(self):
+        corpus = _make_corpus(
+            "PROB",
+            global_tree_mode="path_probability",
+            max_trie_depth=6,
+            draft_token_num=6,
+            max_bfs_breadth=2,
+        )
+        corpus.batch_put([[1, 2, 3, 10, 11]])
+        corpus.synchronize()
+
+        ids, masks = _batch_get(corpus, [[1, 2, 3]])
+        mask = masks.reshape(6, 6).tolist()
+
+        self.assertEqual(ids.tolist(), [3, 10, 11, 0, 0, 0])
+        self.assertEqual(mask[2], [1, 1, 1, 0, 0, 0])
+        self.assertEqual(len(mask), 6)
+        self.assertTrue(all(len(row) == 6 for row in mask))
+
+    def test_sam_only_and_proposal_budget_one(self):
+        corpus = _make_corpus(
+            "BFS",
+            global_tree_mode="path_probability",
+            draft_token_num=2,
+            external_sam_budget=0,
+            external_corpus_documents=[[1, 2, 3, 20, 21]],
+        )
+
+        ids, masks = _batch_get(corpus, [[1, 2, 3]])
+
+        self.assertEqual(ids.tolist(), [3, 20])
+        self.assertEqual(masks.reshape(2, 2).tolist(), [[1, 0], [1, 1]])
+
+    def test_zero_proposal_budget_returns_root_only(self):
+        corpus = _make_corpus(
+            "BFS",
+            global_tree_mode="path_probability",
+            draft_token_num=1,
+            external_sam_budget=0,
+            external_corpus_documents=[[1, 2, 3, 20]],
+        )
+        corpus.batch_put([[1, 2, 3, 10]])
+        corpus.synchronize()
+
+        ids, masks = _batch_get(corpus, [[1, 2, 3]])
+
+        self.assertEqual(ids.tolist(), [3])
+        self.assertEqual(masks.reshape(1, 1).tolist(), [[1]])
+
+    def test_no_match_returns_root_and_padding(self):
+        corpus = _make_corpus(
+            "BFS",
+            global_tree_mode="path_probability",
+            draft_token_num=3,
+            external_sam_budget=0,
+        )
+
+        ids, _ = _batch_get(corpus, [[1, 2, 3]])
+        self.assertEqual(ids.tolist(), [3, 0, 0])
+
+    def test_corpus_load_order_does_not_affect_equal_score_tie(self):
+        def build(corpus_order):
+            corpus = _make_corpus(
+                "BFS",
+                global_tree_mode="path_probability",
+                draft_token_num=2,
+                external_sam_budget=0,
+            )
+            documents = {"alpha": [[1, 2, 3, 20]], "zeta": [[1, 2, 3, 10]]}
+            for corpus_id in corpus_order:
+                _load_external_documents(corpus, corpus_id, documents[corpus_id])
+            return corpus
+
+        forward_ids, forward_masks = _batch_get(build(["alpha", "zeta"]), [[1, 2, 3]])
+        reverse_ids, reverse_masks = _batch_get(build(["zeta", "alpha"]), [[1, 2, 3]])
+
+        self.assertEqual(forward_ids.tolist(), [3, 20])
+        np.testing.assert_array_equal(forward_ids, reverse_ids)
+        np.testing.assert_array_equal(forward_masks, reverse_masks)
+
+    def test_incremental_trie_cursor_matches_stateless_global_lookup(self):
+        corpus = _make_corpus(
+            "BFS",
+            global_tree_mode="path_probability",
+            max_trie_depth=4,
+            draft_token_num=4,
+        )
+        corpus.batch_put([[1, 2, 3, 4, 5, 6], [9, 3, 4, 7, 8]])
+        corpus.synchronize()
+
+        req_id = "global-incremental"
+        for full_sequence in ([1, 2, 3], [1, 2, 3, 4], [1, 2, 3, 4, 5, 6]):
+            current_tail = full_sequence[-4:]
+            incremental_ids, incremental_masks = _batch_get_with_state(
+                corpus, req_id, current_tail, len(full_sequence)
+            )
+            stateless_ids, stateless_masks = _batch_get(corpus, [current_tail])
+            np.testing.assert_array_equal(incremental_ids, stateless_ids)
+            np.testing.assert_array_equal(incremental_masks, stateless_masks)
 
 
 class TestNgramCorpusMatchBenchmark(CustomTestCase):
