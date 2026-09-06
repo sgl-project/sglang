@@ -102,11 +102,24 @@ class DeepSeekV31Detector(BaseFormatDetector):
         )
 
         if not has_tool_call:
-            self._buffer = ""
+            # bot_token/tool_call_begin are multi-codepoint markers, not single
+            # vocab tokens, so they routinely arrive split across increments.
+            # Only flush text that cannot become the start of either marker;
+            # keep a possible partial prefix buffered for the next increment.
+            partial_len = max(
+                self._ends_with_partial_token(current_text, self.bot_token),
+                self._ends_with_partial_token(current_text, "<｜tool▁call▁begin｜>"),
+            )
+            if partial_len:
+                safe_text = current_text[:-partial_len]
+                self._buffer = current_text[-partial_len:]
+            else:
+                safe_text = current_text
+                self._buffer = ""
             for e_token in [self.eot_token, "<｜tool▁call▁end｜>"]:
-                if e_token in new_text:
-                    new_text = new_text.replace(e_token, "")
-            return StreamingParseResult(normal_text=new_text)
+                if e_token in safe_text:
+                    safe_text = safe_text.replace(e_token, "")
+            return StreamingParseResult(normal_text=safe_text)
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
