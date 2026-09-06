@@ -107,6 +107,7 @@ default = true
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
+flashboot = ["flashboot @ git+https://github.com/scitix/flashboot-release.git"]
 runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
 diffusion = [
   "addict==2.4.0",

@@ -1658,6 +1658,7 @@ class ShardedStateLoader(BaseModelLoader):
     """
 
     DEFAULT_PATTERN = "model-rank-{rank}-part-{part}.safetensors"
+    PADDING_KEY_SUFFIX = "!__pad__"
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
@@ -1719,6 +1720,31 @@ class ShardedStateLoader(BaseModelLoader):
                     result[k] = t
         return result
 
+    @staticmethod
+    def add_alignment_padding(
+        state_dict: Dict[str, torch.Tensor], alignment: int
+    ) -> Dict[str, torch.Tensor]:
+        if alignment <= 0:
+            return state_dict
+        padded_state_dict = dict(state_dict)
+        for key, tensor in state_dict.items():
+            tensor_size_bytes = tensor.nelement() * tensor.element_size()
+            padding_size_bytes = (-tensor_size_bytes) % alignment
+            if padding_size_bytes % tensor.element_size():
+                raise ValueError(
+                    f"FB_SHARD_PAD_ALIGNMENT={alignment} is incompatible with "
+                    f"{tensor.dtype}"
+                )
+            if padding_size_bytes:
+                padded_state_dict[key + ShardedStateLoader.PADDING_KEY_SUFFIX] = (
+                    torch.zeros(
+                        padding_size_bytes // tensor.element_size(),
+                        dtype=tensor.dtype,
+                        device=tensor.device,
+                    )
+                )
+        return padded_state_dict
+
     def _prepare_weights(self, model_name_or_path: str, revision: Optional[str]):
         if os.path.isdir(model_name_or_path):
             return model_name_or_path
@@ -1772,6 +1798,8 @@ class ShardedStateLoader(BaseModelLoader):
             for path in filepaths:
                 with safe_open(path, framework="pt") as f:
                     for key in f.keys():  # noqa: SIM118
+                        if key.endswith(ShardedStateLoader.PADDING_KEY_SUFFIX):
+                            continue
                         tensor = f.get_tensor(key)
                         # If loading with LoRA enabled, additional padding may
                         # be added to certain parameters. We only load into a
@@ -1813,13 +1841,16 @@ class ShardedStateLoader(BaseModelLoader):
         part_idx = 0
         total_size = 0
         state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
+        padding_alignment = int(os.environ.get("FB_SHARD_PAD_ALIGNMENT", "0"))
         state_dict_part: Dict[str, torch.Tensor] = {}
         for key, tensor in state_dict.items():
             param_size = tensor.nelement() * tensor.element_size()
             if max_size is not None and total_size + param_size > max_size:
                 filename = pattern.format(rank=rank, part=part_idx)
                 save_file(
-                    state_dict_part,
+                    ShardedStateLoader.add_alignment_padding(
+                        state_dict_part, padding_alignment
+                    ),
                     os.path.join(path, filename),
                 )
                 part_idx += 1
@@ -1830,7 +1861,9 @@ class ShardedStateLoader(BaseModelLoader):
         if len(state_dict_part) > 0:
             filename = pattern.format(rank=rank, part=part_idx)
             save_file(
-                state_dict_part,
+                ShardedStateLoader.add_alignment_padding(
+                    state_dict_part, padding_alignment
+                ),
                 os.path.join(path, filename),
             )
 
@@ -4289,6 +4322,17 @@ def get_model_loader(
 
     if isinstance(load_config.load_format, type):
         return load_config.load_format(load_config)
+
+    if load_config.load_format in (LoadFormat.FLASHLOAD, LoadFormat.FLASHCLONE):
+        try:
+            from flashboot.sglang_plugin import get_flashboot_loader
+        except ImportError as exc:
+            raise ImportError(
+                "FlashBoot load formats require the external flashboot package. "
+                'Install it with `pip install "sglang[flashboot]"`.'
+            ) from exc
+
+        return get_flashboot_loader(load_config, model_config)
 
     if model_config and model_config.quantization in ["auto-round-int8"]:
         logger.info("Using IncModelLoader due to AutoRound quantization config.")
