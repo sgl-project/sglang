@@ -600,10 +600,11 @@ refer to files visible inside the SGLang server environment.
 
 ## 5. LoRA recipes
 
-H3 accepts both native fused adapters and standard Diffusers/PEFT adapters.
-Native adapters target modules such as `blocks.*.attn.qkv_proj`; PEFT adapters
-may instead provide separate `to_q`, `to_k`, and `to_v` projections and the
-`default` adapter namespace. SGLang normalizes both layouts.
+H3 accepts native fused adapters, standard Diffusers/PEFT adapters, and Kohya
+`lora_unet_blocks_*` exports from `networks.lora_minimax_h3`. Native adapters
+target modules such as `blocks.*.attn.qkv_proj`; PEFT adapters may instead
+provide separate `to_q`, `to_k`, and `to_v` projections and the `default`
+adapter namespace. SGLang normalizes all three layouts.
 
 The following pinned FL2VA adapters have distinct purposes:
 
@@ -612,13 +613,18 @@ The following pinned FL2VA adapters have distinct purposes:
 | Recommended speed/quality balance | [`larryvrh/MiniMax-H3-Turbo-Lora`](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora), `minimax_h3_turbo_v4_step600_ema.safetensors` | `num_inference_steps: 9` (8 denoiser evaluations), `lora_scale: 1.0` | None |
 | Most aggressive speed preset (standard PEFT layout) | [`lightx2v/Minimax-h3-Turbo`](https://huggingface.co/lightx2v/Minimax-h3-Turbo), `minimax_h3_fl2v_turbo_4step_v0.1.safetensors` | `num_inference_steps: 5` (4 denoiser evaluations), `lora_scale: 1.0`, `lora_alpha: 8` | None |
 | Realistic people style | [`fal/MiniMax-H3-Realism-People-LoRA`](https://huggingface.co/fal/MiniMax-H3-Realism-People-LoRA), `h3-realism-people-t2v-i2v-r2v.safetensors` | Keep the normal `num_inference_steps: 50` schedule; start with `lora_scale: 0.7` | Include `r34l1sm` in the prompt |
+| Spatial and physics | [`Jojocodex/minimax-h3-spatial-physics-lora`](https://huggingface.co/Jojocodex/minimax-h3-spatial-physics-lora), `wushu_spatial_physics_clean_3000_pruned.safetensors` | Keep the normal `num_inference_steps: 50` schedule; start with `lora_scale: 0.4` | None. Describe collisions, stacking, and gravity-consistent motion in the prompt |
+| Wushu action | [`Jojocodex/minimax-h3-wushu-action-lora`](https://huggingface.co/Jojocodex/minimax-h3-wushu-action-lora), `wushu_action_h3_lora_v5_3000_pruned.safetensors` | Keep the normal `num_inference_steps: 50` schedule; start with `lora_scale: 0.8` | Put `wushu_action` at the start of the prompt |
+| Camera motion | [`Jojocodex/minimax-h3-yunjing-lora`](https://huggingface.co/Jojocodex/minimax-h3-yunjing-lora), `camera_motion_h3_lora_v1_3000_pruned.safetensors` | Keep the normal `num_inference_steps: 50` schedule; start with `lora_scale: 0.8` | Put `camera motion` at the start of the prompt |
+| Looping sketch anime | [`Inner-Reflections/MiniMax-H3-Looping-Sketch-Anime`](https://huggingface.co/Inner-Reflections/MiniMax-H3-Looping-Sketch-Anime), `minimax_h3_looping_sketch_anime_v1.safetensors` | Keep the normal `num_inference_steps: 50` schedule; start with `lora_scale: 1.0` | Include the author's hand-drawn sketch style phrase in the prompt |
+| 3D-to-real detail slider | [`siraxe/3d_to_real_detail_slider_H3`](https://huggingface.co/siraxe/3d_to_real_detail_slider_H3), `3d_to_real_H3_detail_slider_bf16.safetensors` | Keep the normal `num_inference_steps: 50` schedule; start with `lora_scale: 1.0` | None. Sweep the scale; this is a slider, not a fixed style |
 
 The H3 request field controls the number of sigma grid points, including the
 terminal zero; the denoising loop therefore runs one fewer model evaluation.
 This is why an adapter described as 8-step uses `9`, and a 4-step adapter uses
 `5`, in the request.
 
-All three use the same launch shape. Pinning the filename is required for
+Every recipe uses the same launch shape. Pinning the filename is required for
 repositories that publish multiple revisions, and is also recommended for a
 reproducible single-file recipe:
 

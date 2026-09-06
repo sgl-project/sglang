@@ -77,6 +77,26 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
         }
     )
 
+    # Kohya `networks.lora_minimax_h3` uses lora_unet_blocks_* + lora_down/up.
+    # The format adapter rewrites these first; keep the aliases here in case a
+    # raw key still reaches the loader.
+    lora_param_names_mapping: dict = field(
+        default_factory=lambda: {
+            r"^lora_unet_blocks_(\d+)_attn_qkv_proj\.lora_down$": r"blocks.\1.attn.qkv_proj.lora_A",
+            r"^lora_unet_blocks_(\d+)_attn_qkv_proj\.lora_up$": r"blocks.\1.attn.qkv_proj.lora_B",
+            r"^lora_unet_blocks_(\d+)_attn_qkv_proj\.(lora_[AB]|alpha)$": r"blocks.\1.attn.qkv_proj.\2",
+            r"^lora_unet_blocks_(\d+)_attn_out_proj\.lora_down$": r"blocks.\1.attn.out_proj.lora_A",
+            r"^lora_unet_blocks_(\d+)_attn_out_proj\.lora_up$": r"blocks.\1.attn.out_proj.lora_B",
+            r"^lora_unet_blocks_(\d+)_attn_out_proj\.(lora_[AB]|alpha)$": r"blocks.\1.attn.out_proj.\2",
+            r"^lora_unet_blocks_(\d+)_mlp_fc1\.lora_down$": r"blocks.\1.mlp.fc1.lora_A",
+            r"^lora_unet_blocks_(\d+)_mlp_fc1\.lora_up$": r"blocks.\1.mlp.fc1.lora_B",
+            r"^lora_unet_blocks_(\d+)_mlp_fc1\.(lora_[AB]|alpha)$": r"blocks.\1.mlp.fc1.\2",
+            r"^lora_unet_blocks_(\d+)_mlp_fc2\.lora_down$": r"blocks.\1.mlp.fc2.lora_A",
+            r"^lora_unet_blocks_(\d+)_mlp_fc2\.lora_up$": r"blocks.\1.mlp.fc2.lora_B",
+            r"^lora_unet_blocks_(\d+)_mlp_fc2\.(lora_[AB]|alpha)$": r"blocks.\1.mlp.fc2.\2",
+        }
+    )
+
     num_layers: int = 50
     token_refiner_num_layers: int = 2
     hidden_size: int = 5376
