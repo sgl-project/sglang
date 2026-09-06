@@ -216,6 +216,22 @@ def _move_items_to_device(
             item.feature = item.feature.to(device, non_blocking=True)
 
 
+def _offload_items_to_host(items: List[MultimodalDataItem]) -> None:
+    """Move items' raw device features back to host memory (in-place).
+
+    After the encoder returns, the raw input is kept on host so later
+    cache-miss retries still have it. Only a top-level tensor feature is
+    moved; container-valued, non-tensor and host features are left untouched,
+    and ``None`` placeholders in the item list are skipped.
+    """
+    for item in items:
+        if item is None:
+            continue
+        feature = item.feature
+        if isinstance(feature, torch.Tensor) and feature.is_cuda:
+            item.feature = feature.to("cpu", non_blocking=True)
+
+
 def _acknowledge_deferred_cuda_ipc_cache_hits(
     items: List[MultimodalDataItem],
 ) -> None:
@@ -272,6 +288,7 @@ def _get_chunked_embedding_full(
         if not _can_skip_pre_embed_feature_move(data_embedding_func):
             _move_items_to_device(embedding_items_per_req, device)
         embedding = data_embedding_func(embedding_items_per_req)
+        _offload_items_to_host(embedding_items_per_req)
         if isinstance(embedding, list):
             # This path caches the combined per-request embedding, so the
             # per-item form is flattened here.
@@ -379,6 +396,7 @@ def _batch_encode_per_image_misses(
         if not _can_skip_pre_embed_feature_move(data_embedding_func):
             _move_items_to_device(miss_items, device)
         all_miss_embedding = data_embedding_func(miss_items)
+        _offload_items_to_host(miss_items)
 
         if isinstance(all_miss_embedding, list):
             # Per-item embeddings: no split needed, and each cache entry owns
@@ -457,6 +475,7 @@ def _get_chunked_embedding_by_item(
         if not _can_skip_pre_embed_feature_move(data_embedding_func):
             _move_items_to_device(miss_item_list, device)
         all_miss_embedding = data_embedding_func(miss_item_list)
+        _offload_items_to_host(miss_item_list)
 
         if isinstance(all_miss_embedding, list):
             # Per-item embeddings: no split needed, and each cache entry owns
