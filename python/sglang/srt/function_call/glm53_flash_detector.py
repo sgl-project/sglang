@@ -506,6 +506,13 @@ class Glm53FlashDetector(BaseFormatDetector):
             self._buffer = ""
             return StreamingParseResult(normal_text=normal_text + current_text)
 
+        # If AK_START is present but TC_END is not, the model is using tag
+        # format in streaming mode and TC_END hasn't arrived yet. Don't
+        # emit the name via the JSON handler — wait for TC_END so the tag
+        # handler can process the complete tool call.
+        if AK_START in current_text and self.eot_token not in current_text:
+            return StreamingParseResult(normal_text=normal_text)
+
         if self.current_tool_id == -1:
             self.current_tool_id = 0
             self.prev_tool_call_arr = []
