@@ -403,6 +403,10 @@ class BenchResult:
         idx = int(len(self.latencies_us) * 0.99)
         return sorted(self.latencies_us)[min(idx, len(self.latencies_us) - 1)]
 
+    @property
+    def mean_us(self):
+        return statistics.mean(self.latencies_us) if self.latencies_us else 0
+
     def report(self):
         tok = (
             f"{self.tokens_per_sec:>12,.0f} tok/s"
@@ -411,7 +415,8 @@ class BenchResult:
         )
         return (
             f"  {self.name:<18s} | {tok} | {self.ops_per_sec:>10,.0f} ops/s | "
-            f"p50={self.p50_us:>8,.0f}us  p99={self.p99_us:>8,.0f}us"
+            f"p50={self.p50_us:>8,.0f}us  p99={self.p99_us:>8,.0f}us  "
+            f"mean={self.mean_us:>8,.0f}us"
         )
 
 
@@ -559,6 +564,60 @@ def bench_evict(
     )
 
 
+def bench_evict_step(
+    num_seqs=5000,
+    chunk_len=256,
+    kv_size=500_000,
+    components=None,
+    verify=False,
+    tree_cls=None,
+    page_size=1,
+    step_tokens=64,
+):
+    """Decode-shaped eviction: pool full, then evict *step_tokens* and re-insert
+    one sequence of the same length per step so the tree stays full.
+
+    Isolates the per-call eviction overhead (heap maintenance over the
+    evictable-leaf set) instead of the prefill-shaped batch evictions of
+    ``bench_evict``. Prints the evictable-leaf count before and after.
+    """
+    env = _make_env(num_seqs, chunk_len, kv_size, components, tree_cls, page_size)
+    inserted = _fill_no_evict(env)
+    step_tokens = max(step_tokens, page_size)
+
+    def leaf_count():
+        core = getattr(env.tree, "tree_core", None)
+        leaves = getattr(core, "evictable_device_leaves", None)
+        return len(leaves) if leaves is not None else -1
+
+    num_steps = min(1000, max(inserted // 5, 100))
+    warmup = min(20, num_steps // 10)
+    # Fresh sequences (unique tails) so each step re-inserts new leaves.
+    fresh = env.seqs[inserted:] + env.seqs[:inserted]
+    items = [(step_tokens, fresh[i % len(fresh)][:step_tokens]) for i in range(num_steps + warmup)]
+
+    def step(item):
+        n, seq = item
+        env.tree.evict(EvictParams(num_tokens=n, mamba_num=2))
+        _insert_seq(env, seq)
+
+    leaves_before = leaf_count()
+    result = bench_api(
+        "evict_step",
+        lambda: items,
+        step,
+        num_steps,
+        step_tokens,
+        warmup,
+        (lambda _: env.tree.sanity_check()) if verify else None,
+    )
+    print(
+        f"  evict_step         | evictable leaves {leaves_before:,} -> {leaf_count():,} "
+        f"| {step_tokens} tokens/step"
+    )
+    return result
+
+
 def bench_lock_unlock(
     num_seqs=5000,
     chunk_len=256,
@@ -682,6 +741,7 @@ ALL_BENCHMARKS = {
     "insert": bench_insert,
     "match": bench_match_prefix,
     "evict": bench_evict,
+    "evict_step": bench_evict_step,
     "lock": bench_lock_unlock,
     "cache_finished": bench_cache_finished,
 }
@@ -804,6 +864,9 @@ class _BenchSuite:
     def test_bench_evict(self):
         self._run(bench_evict)
 
+    def test_bench_evict_step(self):
+        self._run(bench_evict_step)
+
     def test_bench_lock_unlock(self):
         self._run(bench_lock_unlock)
 
@@ -855,7 +918,7 @@ def _run_bench_cli():
         "--benchmarks",
         nargs="+",
         default=["all"],
-        help="insert match evict lock cache_finished all",
+        help="insert match evict evict_step lock cache_finished all",
     )
     args, _ = parser.parse_known_args()
 
