@@ -140,7 +140,11 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
             num_gpus=2,
             tp_size=1,
             ulysses_degree=2,
-            extras=EXTRAS_DISABLE_WARMUP,
+            extras=[
+                *EXTRAS_DISABLE_WARMUP,
+                "--dit-cpu-offload",
+                "false",
+            ],
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
@@ -176,14 +180,6 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
                 "SGLANG_CACHE_DIT_TAYLORSEER": "true",
                 "SGLANG_CACHE_DIT_TS_ORDER": "2",
                 "HCCL_BUFFSIZE": "256",
-                # Cgroup memory.current includes reclaimable page cache from
-                # previously loaded models, so host_memory_budget reports ~0
-                # GiB available and layerwise offload degrades to the slow
-                # checkpoint-mapping path. Force a sane budget so text-encoder
-                # layers are pinned normally. 64 GiB covers RssAnon (~2.5 GiB
-                # at planning time) plus all 23.09 GiB of text-encoder weights;
-                # a smaller force (e.g. 32) leaves 41 of 50 layers pageable and
-                # the stage runs ~4.8x over baseline (measured 648ms vs 134ms).
                 "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB": "64",
             },
         ),
@@ -237,13 +233,6 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
             tp_size=2,
             dit_layerwise_offload=True,
             env_vars={
-                # Same page-cache contamination as minimax_h3_t2va_2npu: force
-                # the host memory budget so DiT layerwise offload pins layers
-                # instead of falling back to the checkpoint mapping. 96 GiB
-                # covers RssAnon (~23 GiB) plus all 45.28 GiB of text-encoder
-                # + video/audio DiT weights; 64 only pins video_dit 31/40 and
-                # audio_dit 7/30 layers, leaving ~4.9 GiB re-streamed
-                # synchronously per denoise step (e2e 26% over baseline).
                 "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB": "96",
             },
             extras=EXTRAS_DISABLE_WARMUP,
