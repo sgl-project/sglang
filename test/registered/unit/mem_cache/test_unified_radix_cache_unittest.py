@@ -1677,6 +1677,65 @@ class UnifiedRadixCacheSuite:
         )
         cache.sanity_check()
 
+    def test_cache_unfinished_req_degrades_when_mamba_pool_exhausted(self):
+        """A caching-path mamba slot alloc that still fails after the one-shot
+        eviction (every cached state pinned by running requests or in-flight
+        hicache DMAs) must skip caching the chunk, never kill the scheduler:
+        nothing is inserted, the request keeps its live state and prefix, no
+        slot leaks, and the failure is observable (metric + WARNING census)."""
+        if not self.cfg.has_mamba:
+            self.skipTest("requires Mamba")
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        req = self._make_req(req_to_token_pool)
+        tokens = self._make_seq(1, 3)
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(
+            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+        )
+        kv_len = len(tokens)
+        kv_indices = self._alloc(allocator, kv_len)
+        req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
+        req.kv_committed_len = kv_len
+        req.last_node = cache.root_node_handle()
+        req.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+        req.mamba_last_track_seqlen = kv_len
+
+        pool = req_to_token_pool.mamba_allocator
+        live_slot = int(req.mamba_pool_idx)
+        free_before = pool.available_size()
+        collector = mock.Mock()
+        cache.metrics_collector = collector
+        mamba_logger = "sglang.srt.mem_cache.unified_cache.components.mamba_component"
+
+        # The pool hands out nothing and eviction cannot free anything.
+        with (
+            mock.patch.object(pool, "alloc", return_value=None),
+            mock.patch.object(
+                cache, "evict_for_alloc", autospec=True
+            ) as evict_for_alloc,
+            self.assertLogs(mamba_logger, level="WARNING") as logs,
+        ):
+            cache.cache_unfinished_req(req)
+
+        evict_for_alloc.assert_called_once_with(EvictParams(num_tokens=0, mamba_num=1))
+        collector.increment_aux_alloc_failed.assert_called_once_with()
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("census", logs.output[0])
+
+        # Nothing was cached ...
+        self.assertEqual(list(_node_children(cache, cache.root_node_handle())), [])
+        # ... and the request is untouched: it still owns its live mamba slot,
+        # its prefix indices cover the whole fill, and the pool did not leak.
+        self.assertEqual(int(req.mamba_pool_idx), live_slot)
+        self.assertEqual(len(req.prefix_indices), kv_len)
+        self.assertEqual(pool.available_size(), free_before)
+        cache.sanity_check()
+
     def test_swa_unfinished_req_preserves_existing_eviction_boundary(self):
         if not self.cfg.has_swa or self.cfg.has_mamba:
             self.skipTest("requires SWA without Mamba")
@@ -6593,6 +6652,86 @@ class UnifiedRadixCacheSuite:
         evict_for_alloc.assert_called_once_with(EvictParams(num_tokens=0, mamba_num=1))
         self.assertIs(prep.allocated_mamba_slot, retry_slot)
         self.assertEqual(int(req.kv.mamba_pool_idx), int(retry_slot[0]))
+
+    def test_hicache_concurrent_full_and_mamba_load_back_on_shared_node(self):
+        """End-to-end regression for the cross-component load-back overlap
+        (production shape reported in #34975; fixed by #36317).
+
+        A load-back anchored at a descendant pins an evicted ancestor through
+        its Full-KV chain. Before that DMA acks, a second request anchors AT
+        the ancestor to restore its independently-evicted mamba state. The
+        mamba transfer must ride its own host lock rather than the Full
+        pending owner, so the second load-back commits, both acks drain, and
+        the tree stays consistent.
+        """
+        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+Mamba")
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+        core = cache.tree_core
+        MAMBA = ComponentType.MAMBA
+
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 4)
+        self.assertGreaterEqual(len(chain), 2, "need a >=2 node chain")
+        self._backup_tree(cache)
+        total = sum(_node_key_length(cache, n) for n in chain)
+        cache.evict(EvictParams(num_tokens=total + 16, mamba_num=64))
+
+        leaf = chain[-1]
+        self.assertTrue(core.is_full_device_evicted(leaf))
+        # An ancestor that is Full-evicted (so the leaf anchor's KV chain
+        # covers it) and mamba host-only (so a second anchor can target it).
+        ancestor = next(
+            (
+                n
+                for n in chain[:-1]
+                if core.is_full_device_evicted(n)
+                and core.component_has_host_value_only(n, MAMBA)
+            ),
+            None,
+        )
+        self.assertIsNotNone(
+            ancestor, "fixture produced no Full-evicted + mamba-host-only ancestor"
+        )
+
+        # Load-back 1: anchored at the leaf; its Full-KV chain pins the
+        # ancestor. The ack is withheld, so the pin stays live.
+        self.assertTrue(cache.load_back(leaf))
+        self.assertEqual(core.node_by_id(ancestor).load_back_pending_id, leaf)
+        # Commit republishes the Full device value before the ack, so a second
+        # anchor's Full chain stops above the ancestor; only its mamba state
+        # is still host-only.
+        self.assertFalse(core.is_full_device_evicted(ancestor))
+        self.assertTrue(core.component_has_host_value_only(ancestor, MAMBA))
+
+        # Load-back 2: anchored AT the still-pinned ancestor for its mamba
+        # state. Before #36317 this died with
+        # AssertionError: node <ancestor> pinned by load-back <leaf>, new anchor <ancestor>
+        req = self._make_req(req_to_token_pool)
+        req_to_token_pool.mamba_allocator.free(req.mamba_pool_idx.unsqueeze(0))
+        req.mamba_pool_idx = None
+        self.assertTrue(cache.load_back(ancestor, req=req))
+        self.assertIsNotNone(req.mamba_pool_idx)
+        # The Full pending owner is untouched by the aux transfer ...
+        self.assertEqual(core.node_by_id(ancestor).load_back_pending_id, leaf)
+        # ... whose source is protected by the mamba host lock until the ack.
+        self.assertGreater(
+            core.node_by_id(ancestor).component_data[MAMBA].host_lock_ref, 0
+        )
+
+        # Both DMAs ack; the Full pin drains and the mamba state is on device.
+        self._finish_pending_loads(cache)
+        for n in chain:
+            self.assertIsNone(
+                core.node_by_id(n).load_back_pending_id,
+                f"node {n} kept a stale load-back pin",
+            )
+        self.assertIsNotNone(_device_value(cache, ancestor, MAMBA))
+        self._release_ongoing_load_back_locks(cache)
+        self.assertEqual(
+            core.node_by_id(ancestor).component_data[MAMBA].host_lock_ref, 0
+        )
+        cache.sanity_check()
 
     def test_hicache_swa_load_back_min_suffix(self):
         """LOAD_BACK collects only the suffix nodes needed to cover sliding_window_size."""

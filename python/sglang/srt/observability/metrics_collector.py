@@ -2237,6 +2237,16 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=list(labels.keys()) + ["pool"],
         )
 
+        self.aux_alloc_failed_total = Counter(
+            name="sglang:radix_cache_aux_alloc_failed_total",
+            documentation="Radix-cache inserts skipped because an auxiliary "
+            "device pool (e.g. the mamba state pool) could not allocate a slot "
+            "even after eviction: every cached state was held by a running "
+            "request or an in-flight hicache transfer. The request keeps "
+            "serving; only that chunk goes uncached.",
+            labelnames=labels.keys(),
+        )
+
         self.hicache_dropped_tokens = Counter(
             name="sglang:hicache_dropped_tokens_total",
             documentation="The number of logical device KV tokens destroyed "
@@ -2249,6 +2259,9 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
+
+    def increment_aux_alloc_failed(self) -> None:
+        self.aux_alloc_failed_total.labels(**self.labels).inc()
 
     def increment_load_back_num_tokens(self, num_tokens: int, pool: str) -> None:
         self.load_back_num_tokens.labels(**self.labels, pool=pool).inc(num_tokens)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
@@ -54,6 +56,9 @@ if TYPE_CHECKING:
         UnifiedRadixCache,
         UnifiedTreeNode,
     )
+
+
+logger = logging.getLogger(__name__)
 
 
 class MambaComponent(TreeComponent):
@@ -490,14 +495,77 @@ class MambaComponent(TreeComponent):
                 self.tree_core.component_protected_size_[ct] -= vlen
             cd.lock_ref -= 1
 
-    def _alloc_mamba_slot(self) -> torch.Tensor:
-        """Allocate one mamba pool slot, evicting if necessary."""
+    def _try_alloc_mamba_slot(self) -> Optional[torch.Tensor]:
+        """Allocate one mamba pool slot for the radix cache, evicting if necessary.
+
+        Returns None when no slot is free and the one-shot eviction could not
+        free one either: every cached mamba state is momentarily unevictable
+        (held by a running request's lock_ref, or pinned by an in-flight
+        write-through backup / H->D load-back). Callers on the caching path
+        must degrade (skip caching this chunk) rather than crash: the radix
+        cache is an optimization and the request's own live state is untouched.
+        Logs a throttled pin census so a persistent pin leak is distinguishable
+        from a transient DMA window.
+        """
         slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if slot is None:
             self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
             slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-            assert slot is not None, "Can not alloc mamba cache"
+        if slot is None:
+            self._on_mamba_alloc_failed()
         return slot
+
+    _CENSUS_THROTTLE_S = 60.0
+    _last_census_t = 0.0
+
+    def _on_mamba_alloc_failed(self) -> None:
+        """Account for a caching-path mamba slot alloc failure: bump the
+        radix-cache metric and emit a throttled WARNING census of the tree's
+        mamba-bearing device nodes by pin class. Never raises."""
+        if self.cache.metrics_collector is not None:
+            self.cache.metrics_collector.increment_aux_alloc_failed()
+        now = time.monotonic()
+        if now - self._last_census_t < self._CENSUS_THROTTLE_S:
+            return
+        self._last_census_t = now
+        try:
+            ct = self.component_type
+            total = locked = host_locked = wt_pending = lb_pending = 0
+            stack = [self.tree_core.root_node]
+            while stack:
+                node = stack.pop()
+                stack.extend(node.children.values())
+                cd = node.component_data[ct]
+                if cd.value is None:
+                    continue
+                total += 1
+                if cd.lock_ref > 0:
+                    locked += 1
+                if cd.host_lock_ref > 0:
+                    host_locked += 1
+                if node.write_through_pending_id is not None:
+                    wt_pending += 1
+                if node.load_back_pending_id is not None:
+                    lb_pending += 1
+            logger.warning(
+                "mamba slot alloc failed after eviction; skipping radix caching "
+                "for this chunk. census: device_nodes=%d lock_ref>0=%d "
+                "host_lock_ref>0=%d write_through_pending=%d load_back_pending=%d "
+                "evictable_size=%d protected_size=%d",
+                total,
+                locked,
+                host_locked,
+                wt_pending,
+                lb_pending,
+                self.tree_core.component_evictable_size_[ct],
+                self.tree_core.component_protected_size_[ct],
+            )
+        except Exception:
+            logger.warning(
+                "mamba slot alloc failed after eviction; skipping radix caching "
+                "for this chunk (census unavailable)",
+                exc_info=True,
+            )
 
     @property
     def int8_ckpt_pool(self):
@@ -571,10 +639,16 @@ class MambaComponent(TreeComponent):
         else:
             if cache_len is None:
                 return 0
-            # Donate the mamba index to the radix cache instead of copying.
+            # Donate the mamba index to the radix cache instead of copying. A
+            # failed slot alloc (every cached state transiently pinned) degrades
+            # to "cache nothing this chunk" (return 0 -> the caller's existing
+            # effective_cache_len<=0 skip path) instead of crashing: the request
+            # keeps its own live state and a later chunk retries the insert.
             if self.int8_ckpt_pool is not None:
                 if self.cache.enable_mamba_extra_buffer:
-                    new_slot = self._alloc_mamba_slot()
+                    new_slot = self._try_alloc_mamba_slot()
+                    if new_slot is None:
+                        return 0
                     src_active = (
                         self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
                             req, new_slot
@@ -587,14 +661,18 @@ class MambaComponent(TreeComponent):
                         req.kv.mamba_pool_idx.view(-1)
                     )
             elif self.cache.enable_mamba_extra_buffer:
-                new_slot = self._alloc_mamba_slot()
+                new_slot = self._try_alloc_mamba_slot()
+                if new_slot is None:
+                    return 0
                 mamba_value_donated = (
                     self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
                         req, new_slot
                     )
                 )
             else:
-                mamba_value_donated = self._alloc_mamba_slot()
+                mamba_value_donated = self._try_alloc_mamba_slot()
+                if mamba_value_donated is None:
+                    return 0
                 # mamba_pool is a pure PHYSICAL store; translate both slot ids
                 # virtual->physical (identity for the non-unified memory pool) first.
                 translate = self.cache.req_to_token_pool.translate_mamba_indices
