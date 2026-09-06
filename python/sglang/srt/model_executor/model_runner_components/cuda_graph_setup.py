@@ -257,14 +257,14 @@ def refresh_deep_gemm_layout_memory_budget(
         return
 
     if only_if_initialized:
+        if not _deep_gemm_layout_memory_budget_initialized:
+            return
         # Scale joiners refresh with all expanded ranks during recapture.
         if get_exec().moe.ep_join_mode == "scale":
             return
         # Target and draft share the budget. Its pre-capture initialization
         # already used a world-wide collective, so this guard is rank-uniform
         # and also covers a draft-only DeepGEMM backend outside draft context.
-        if not _deep_gemm_layout_memory_budget_initialized:
-            return
     else:
         if model_runner.is_draft_worker:
             moe_runner_backend = (
