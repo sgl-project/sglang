@@ -986,6 +986,13 @@ class Req(ReqDllmMixin):
         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
         # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
+        # Last tail window + its decoded text for tail_str(): with stop
+        # strings configured, the same window is decoded twice per decode step
+        # (finish check, then the streaming prefix check). Keyed on window
+        # content so every output_ids mutation (append, retract, in-place
+        # fixup) invalidates naturally.
+        self._tail_str_cache_ids = None
+        self._tail_str_cache_text = ""
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by _refresh_fill_ids; admission only updates
         # extend_range, never mutates this array's length.
@@ -1604,7 +1611,21 @@ class Req(ReqDllmMixin):
             return ""
 
         tail_len = self._stop_match_tail_len(new_accepted_len)
-        return self.tokenizer.decode(self.output_ids[-tail_len:])
+        window = self.output_ids[-tail_len:]
+        if tail_len >= len(self.output_ids):
+            # The window is the whole output (an unquantified regex repeat such
+            # as stop_regex=".*END", or the output is still shorter than the
+            # stop tail). It grows on every step, so a memo hit is impossible
+            # and caching would pin a whole-output id copy plus its text on
+            # the Req. Decode directly instead.
+            return self.tokenizer.decode(window)
+        if self._tail_str_cache_ids is None or self._tail_str_cache_ids != window:
+            text = self.tokenizer.decode(window)
+            # Store only after a successful decode so a raising decode cannot
+            # leave a window/text mismatch behind in the memo.
+            self._tail_str_cache_ids = window
+            self._tail_str_cache_text = text
+        return self._tail_str_cache_text
 
     def check_match_stop_str_prefix(self) -> bool:
         if not self.sampling_params.stop_strs:
