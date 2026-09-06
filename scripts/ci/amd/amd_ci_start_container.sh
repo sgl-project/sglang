@@ -4,19 +4,18 @@ set -euo pipefail
 # Get version from git tags
 SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if git tags are found
 
-# Fetch tags from origin to ensure we have the latest
-if git fetch --tags origin; then
-  # Use the shared helper so stable/post releases sort above rc tags.
-  VERSION_FROM_TAG=$(python3 scripts/release/get_version_tag.py --tag-only || true)
-  if [ -n "$VERSION_FROM_TAG" ]; then
-    SGLANG_VERSION="$VERSION_FROM_TAG"
-    echo "Using SGLang version from git tags: $SGLANG_VERSION"
-  else
-    echo "Warning: No version tags found; using default $SGLANG_VERSION" >&2
-  fi
+# Read the tag name off the remote; the helper explains why this must not go
+# back to `git fetch --tags origin`. Nothing later in the job needs tag objects
+# in the checkout: the editable install already resolves to a tagless
+# 0.0.0.dev1+g<sha> either way, because a depth-1 HEAD cannot describe from a tag.
+VERSION_FROM_TAG=$(python3 scripts/ci/amd/amd_ci_latest_release_tag.py || true)
+if [ -n "$VERSION_FROM_TAG" ]; then
+  SGLANG_VERSION="$VERSION_FROM_TAG"
+  echo "Using SGLang version from git tags: $SGLANG_VERSION"
 else
-  echo "Warning: Failed to fetch tags from origin; using default $SGLANG_VERSION" >&2
+  echo "Warning: No version tags resolved; using default $SGLANG_VERSION" >&2
 fi
+VERSION_RESOLVE_SECONDS=$SECONDS
 
 
 # Default base tags (can be overridden by command line arguments)
@@ -58,6 +57,8 @@ while [[ $# -gt 0 ]]; do
       echo "Environment:"
       echo "  ENABLE_CACHE_HOST=1|0"
       echo "      Mount /home/runner/sglang-data to /sgl-data. Defaults to 1 when RUNNER_NAME contains 300 or 35x, otherwise 0. Missing host cache falls back to container-local /sgl-data."
+      echo "  AMD_CI_IMAGE_TARBALL_CACHE=1|0"
+      echo "      Cache the image as a tarball on the persistent volume so later jobs load instead of pulling. Defaults to on for mi30x, off elsewhere."
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -147,7 +148,10 @@ find_latest_image() {
       *)     echo "Error: unsupported GPU architecture '${gpu_arch}'" >&2; return 1 ;;
   esac
 
-  # First, check local cache on the runner.
+  # First, check local cache on the runner. Note that the CI runners are
+  # docker-in-docker with ephemeral storage and each job starts the container
+  # once, so in CI this store is always cold and these probes always miss --
+  # nothing downstream may assume an image survives from an earlier job.
   for days_back in {0..6}; do
     image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
     image_id=$(docker images -q "rocm/sgl-dev:${image_tag}")
@@ -225,10 +229,60 @@ find_latest_image() {
   esac
 }
 
+CACHE_HOST=/home/runner/sglang-data
+if [[ -z "${ENABLE_CACHE_HOST:-}" ]]; then
+  RUNNER_NAME_LOWER="${RUNNER_NAME:-}"
+  RUNNER_NAME_LOWER="${RUNNER_NAME_LOWER,,}"
+  if [[ "${RUNNER_NAME_LOWER}" == *300* || "${RUNNER_NAME_LOWER}" == *35x* ]]; then
+    ENABLE_CACHE_HOST="1"
+  else
+    ENABLE_CACHE_HOST="0"
+  fi
+fi
+case "${ENABLE_CACHE_HOST,,}" in
+  1|true|yes|on|pvc|persistent)
+    if [[ -d "$CACHE_HOST" ]]; then
+      CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
+      echo "Mounting persistent CI data: ${CACHE_HOST} -> /sgl-data"
+    else
+      CACHE_VOLUME=""
+      echo "Warning: ${CACHE_HOST} does not exist; using container-local /sgl-data." >&2
+    fi
+    ;;
+  0|false|no|off|"")
+    CACHE_VOLUME=""
+    echo "Not mounting ${CACHE_HOST}; /sgl-data will be container-local."
+    ;;
+  *)
+    echo "Error: unsupported ENABLE_CACHE_HOST='${ENABLE_CACHE_HOST}'" >&2
+    echo "Use 1/true/pvc/persistent or 0/false/off." >&2
+    exit 1
+    ;;
+esac
+
+# The image tarball cache lives on that same volume, so it has to be resolved
+# before the image is acquired rather than just before `docker run`.
+# shellcheck source=scripts/ci/amd/amd_ci_image_cache.sh
+source "$(dirname "${BASH_SOURCE[0]}")/amd_ci_image_cache.sh"
+if [[ "${AMD_CI_IMAGE_TARBALL_CACHE:-}" == "0" ]]; then
+  echo "Image tarball cache disabled by AMD_CI_IMAGE_TARBALL_CACHE=0"
+  image_cache_init ""
+elif [[ -z "${CACHE_VOLUME}" ]]; then
+  echo "No persistent volume mounted; image tarball cache unavailable."
+  image_cache_init ""
+elif [[ "${AMD_CI_IMAGE_TARBALL_CACHE:-}" == "1" || "${GPU_ARCH}" == "mi30x" ]]; then
+  image_cache_init "${CACHE_HOST}"
+else
+  echo "Image tarball cache is mi30x-only for now; set AMD_CI_IMAGE_TARBALL_CACHE=1 to opt ${GPU_ARCH} in."
+  image_cache_init ""
+fi
+
 # Determine which image to use
+IMAGE_SOURCE="unknown"
 if [[ -n "${CUSTOM_IMAGE}" ]]; then
   # Use explicitly provided custom image
   IMAGE="${CUSTOM_IMAGE}"
+  IMAGE_SOURCE="custom-image"
   echo "Using custom image: ${IMAGE}"
   if [[ "${IMAGE}" == "${LOCAL_DOCKER_REGISTRY}/"* ]]; then
     docker pull "${IMAGE}"
@@ -260,45 +314,29 @@ elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
     -t "${IMAGE}" \
     -f "${DOCKERFILE}" \
     "${DOCKERFILE_DIR}"
+  IMAGE_SOURCE="dockerfile-build"
   echo "Successfully built image: ${IMAGE}"
 else
   # Find the latest pre-built image
   IMAGE=$(find_latest_image "${GPU_ARCH}")
-  # Temporarily bypass the shared local registry while concurrent CI pulls
-  # saturate it. Keep using the authenticated, retried public-registry path.
-  retry_with_backoff 6 docker pull "${IMAGE}"
-fi
-
-CACHE_HOST=/home/runner/sglang-data
-if [[ -z "${ENABLE_CACHE_HOST:-}" ]]; then
-  RUNNER_NAME_LOWER="${RUNNER_NAME:-}"
-  RUNNER_NAME_LOWER="${RUNNER_NAME_LOWER,,}"
-  if [[ "${RUNNER_NAME_LOWER}" == *300* || "${RUNNER_NAME_LOWER}" == *35x* ]]; then
-    ENABLE_CACHE_HOST="1"
+  # Cheapest source first: a tarball on the persistent volume, seeded by
+  # whichever job missed before this one. Otherwise pull from Docker Hub, which
+  # #36171 made the only remote source, and seed the tarball so the next job on
+  # this volume does not repeat the pull.
+  if image_cache_load "${IMAGE}"; then
+    IMAGE_SOURCE="local-tarball"
   else
-    ENABLE_CACHE_HOST="0"
+    IMAGE_SOURCE="docker-hub"
+    retry_with_backoff 6 docker pull "${IMAGE}"
+    image_cache_save "${IMAGE}"
   fi
 fi
-case "${ENABLE_CACHE_HOST,,}" in
-  1|true|yes|on|pvc|persistent)
-    if [[ -d "$CACHE_HOST" ]]; then
-      CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
-      echo "Mounting persistent CI data: ${CACHE_HOST} -> /sgl-data"
-    else
-      CACHE_VOLUME=""
-      echo "Warning: ${CACHE_HOST} does not exist; using container-local /sgl-data." >&2
-    fi
-    ;;
-  0|false|no|off|"")
-    CACHE_VOLUME=""
-    echo "Not mounting ${CACHE_HOST}; /sgl-data will be container-local."
-    ;;
-  *)
-    echo "Error: unsupported ENABLE_CACHE_HOST='${ENABLE_CACHE_HOST}'" >&2
-    echo "Use 1/true/pvc/persistent or 0/false/off." >&2
-    exit 1
-    ;;
-esac
+
+# One greppable line per job so the nightly dashboard can track where setup time
+# goes and which source is actually serving the image.
+echo "[amd-ci-setup] image=${IMAGE} source=${IMAGE_SOURCE}" \
+     "version_resolve=${VERSION_RESOLVE_SECONDS}s" \
+     "image_acquire=$(( SECONDS - VERSION_RESOLVE_SECONDS ))s"
 
 echo "Launching container: ci_sglang"
 docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
