@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
     HostPinBudget,
     describe_host_memory,
+    host_copies_are_redundant,
     host_copies_would_not_fit,
     host_memory_available_bytes,
     module_weight_bytes,
@@ -265,6 +266,30 @@ def _install_host_gather_hooks(
 
     module.register_forward_pre_hook(_inputs_to_table, with_kwargs=True)
     module.register_forward_hook(_output_to_device)
+
+
+def _shared_pool_hosting(
+    totals: Dict[int, int], mapped: Dict[int, int]
+) -> Dict[int, str]:
+    """Hosting when host and device draw from one pool.
+
+    A mapped layer stays mapped: the device reads page-cache pages directly, so
+    a pinned or pageable copy would hold the same bytes twice. Only a layer with
+    no mapping at all -- an anonymous fused weight -- keeps a pageable copy.
+    """
+    return {
+        layer_idx: "mapped" if mapped.get(layer_idx, 0) > 0 else "pageable"
+        for layer_idx in totals
+    }
+
+
+_DIRECT_ALIGN = 4096
+_DIRECT_CHUNK = 64 << 20
+# Components smaller than this keep the page-cache path: their pages fit the
+# cache next to a resident DiT, and a component re-streamed many times per
+# request (the H3 video VAE: 36 layers, 4.5 GiB, ~200 passes per decode)
+# must not go to the drive on every pass.
+MAPPED_DIRECT_READ_MIN_BYTES = 8 * 1024**3
 
 
 class MappedLayerCourier:
@@ -688,6 +713,19 @@ class LayerwiseOffloadManager:
         buys a whole layer's worth of per-step overlap.
         """
         totals, mapped = self._layer_byte_totals(layer_groups)
+        if host_copies_are_redundant():
+            hosting = _shared_pool_hosting(totals, mapped)
+            logger.info(
+                "Layerwise offload: %s keeps %d of %d layers on the checkpoint "
+                "mapping (host and device share one memory pool, so a pinned or "
+                "pageable copy would hold the same bytes twice); %d layers "
+                "without a mapping stay pageable.",
+                self._pin_component_name,
+                sum(1 for where in hosting.values() if where == "mapped"),
+                len(totals),
+                sum(1 for where in hosting.values() if where == "pageable"),
+            )
+            return hosting
         pinned_bytes = 0
         hosting: Dict[int, str] = {}
         pin_order: List[int] = []
@@ -1048,6 +1086,21 @@ class LayerwiseOffloadManager:
         else:
             target = self._named_buffers[name]
         return target
+
+    def mapped_layer_bytes(self) -> dict[int, int]:
+        """Per layer, the bytes served straight from the checkpoint mapping.
+
+        Those bytes are page cache while the layer streams: not allocated by
+        this process, but memory the kernel must keep for the stream to run at
+        memory speed rather than disk speed.
+        """
+        return {
+            layer_idx: sum(
+                tensor.numel() * tensor.element_size() for tensor in weights.values()
+            )
+            for layer_idx, weights in self._mapped_cpu_weights.items()
+            if weights
+        }
 
     @torch.compiler.disable
     def prefetch_layer(self, layer_idx: int, non_blocking: bool = True) -> None:
@@ -1500,10 +1553,11 @@ class LayerwiseOffloadManager:
         total = 0
         for layer_meta in self._weight_metadata.values():
             for meta in layer_meta.values():
-                if meta.get("preserve_strides", False):
+                # Consolidated stores record their slice; strided and mapped
+                # weights only carry a shape.
+                numel = meta.get("numel")
+                if numel is None:
                     numel = math.prod(meta["shape"])
-                else:
-                    numel = meta["numel"]
                 total += int(numel) * meta["dtype"].itemsize
         return total
 

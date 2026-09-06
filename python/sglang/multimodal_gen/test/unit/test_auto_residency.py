@@ -73,6 +73,18 @@ from sglang.multimodal_gen.runtime.warmup_request_builder import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _discrete_host_for_planner_tests(monkeypatch):
+    # These expectations describe a discrete GPU (pageable copies cost 3x, pins
+    # have a budget). On a shared host/device pool the planner prices things
+    # differently (see test_shared_memory_pool), so pin the platform here.
+    monkeypatch.setattr(
+        type(current_platform),
+        "device_shares_host_memory",
+        classmethod(lambda cls: False),
+    )
+
+
 def _record(
     *,
     width=832,
@@ -2743,7 +2755,7 @@ class TestPlanAutoResidency:
                 node_rank=0,
                 host_pin_budget=lambda: None,
             ),
-            _auto_residency_budget_bytes=lambda: 30 * GIB_BYTES,
+            _auto_residency_budget_bytes=lambda **_kwargs: 30 * GIB_BYTES,
             _collect_auto_residency_targets=collect_targets,
             _auto_residency_modules=lambda: modules,
         )
@@ -2823,7 +2835,7 @@ class TestPlanAutoResidency:
                 node_rank=0,
                 host_pin_budget=lambda: None,
             ),
-            _auto_residency_budget_bytes=lambda: 80 * GIB_BYTES,
+            _auto_residency_budget_bytes=lambda **_kwargs: 80 * GIB_BYTES,
             _collect_auto_residency_targets=lambda _workload, **_kwargs: [
                 transformer,
                 vae,

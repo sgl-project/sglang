@@ -129,6 +129,20 @@ def maybe_seed_initial_residency(
         or not current_platform.is_cuda()
     ):
         return
+    if current_platform.device_shares_host_memory():
+        # The seed exists to skip layerwise initialization where it is costly.
+        # On a shared host/device pool the layers simply stay on their mapping,
+        # and a resident load would hold a component's bytes twice -- on the
+        # device and in the page cache the other components stream from --
+        # at the one moment the kernel has the least room to give. Measured on
+        # a GB10: a 57 GiB resident DiT seed ended in the host OOM killer.
+        # Promotion is a calibrated decision made layer by layer after warmup.
+        logger.info(
+            "Initial auto residency: host and device share one memory pool; "
+            "every component starts on its checkpoint mapping and warmup "
+            "calibration decides what becomes resident."
+        )
+        return
 
     available_gib = current_platform.get_available_gpu_memory(
         distributed=server_args.num_gpus > 1,
