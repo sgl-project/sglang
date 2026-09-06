@@ -213,6 +213,25 @@ class TestBlockStoredWireFormat(CustomTestCase):
         self.assertEqual(decoded[7], {"cache_salt": "tenant-a"})
         self.assertEqual(round_tripped.metadata.cache_salt, "tenant-a")
 
+    def test_session_event_appends_typed_metadata(self):
+        event = self._event(BlockStoredMetadata(session_id="session-a"))
+        encoded = msgspec.msgpack.encode(event)
+        decoded = msgspec.msgpack.decode(encoded)
+        round_tripped = msgspec.msgpack.decode(encoded, type=BlockStoredWithMetadata)
+        self.assertEqual(len(decoded), 8)
+        self.assertEqual(decoded[7], {"session_id": "session-a"})
+        self.assertEqual(round_tripped.metadata.session_id, "session-a")
+
+    def test_salt_and_session_share_metadata_extension(self):
+        event = self._event(
+            BlockStoredMetadata(cache_salt="tenant-a", session_id="session-a")
+        )
+        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(event))
+        self.assertEqual(
+            decoded[7],
+            {"cache_salt": "tenant-a", "session_id": "session-a"},
+        )
+
     def test_salted_event_remains_compatible_with_typed_batch_consumers(self):
         batch = KVEventBatch(
             ts=1.0,

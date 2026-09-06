@@ -260,7 +260,8 @@ class StorageMedium(str, enum.Enum):
 class BlockStoredMetadata(msgspec.Struct, omit_defaults=True, gc=False):
     """Typed request metadata attached to a stored KV block."""
 
-    cache_salt: str
+    cache_salt: Optional[str] = None
+    session_id: Optional[str] = None
 
 
 class OffloadedState(msgspec.Struct):

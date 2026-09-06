@@ -65,6 +65,7 @@ class TestKVCacheEventQueue(unittest.TestCase):
         medium: StorageMedium = StorageMedium.GPU,
         lora_id: int | None = None,
         cache_salt: str | None = None,
+        session_id: str | None = None,
     ) -> BlockStored:
         event_args = dict(
             block_hashes=[block_hash],
@@ -74,11 +75,14 @@ class TestKVCacheEventQueue(unittest.TestCase):
             lora_id=lora_id,
             medium=medium,
         )
-        if cache_salt is None:
+        if cache_salt is None and session_id is None:
             return BlockStored(**event_args)
         return BlockStoredWithMetadata(
             **event_args,
-            metadata=BlockStoredMetadata(cache_salt=cache_salt),
+            metadata=BlockStoredMetadata(
+                cache_salt=cache_salt,
+                session_id=session_id,
+            ),
         )
 
     def test_enqueue_coalesces_compatible_stores(self):
@@ -130,6 +134,11 @@ class TestKVCacheEventQueue(unittest.TestCase):
         queue = KVCacheEventRecorder(enabled=True, page_size=DEFAULT_PAGE_SIZE)
         queue.enqueue(self._store(1, None, cache_salt="tenant-a"))
         queue.enqueue(self._store(2, 1, cache_salt="tenant-b"))
+        self.assertEqual(len(queue.take()), 2)
+
+        queue = KVCacheEventRecorder(enabled=True, page_size=DEFAULT_PAGE_SIZE)
+        queue.enqueue(self._store(1, None, session_id="session-a"))
+        queue.enqueue(self._store(2, 1, session_id="session-b"))
         self.assertEqual(len(queue.take()), 2)
 
 
