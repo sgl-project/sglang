@@ -124,7 +124,7 @@ def test_audio_vae_attention_defaults_to_local_sdpa_and_allows_fa():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_audio_snake_first_call_matches_repeated_calls():
-    # A fresh process prevents earlier tests from warming a profiling JIT graph.
+    # a fresh process prevents earlier tests from warming a profiling JIT graph
     subprocess.run(
         [
             sys.executable,

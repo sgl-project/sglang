@@ -141,7 +141,7 @@ def WNConv1d(*args, **kwargs):
 
 
 def snake(x, alpha):
-    # Profiling JIT changes rounding after the first call when it fuses this graph.
+    # profiling JIT changes rounding after the first call when it fuses this graph
     shape = x.shape
     x = x.reshape(shape[0], shape[1], -1)
     x = x + (alpha + 1e-9).reciprocal() * torch.sin(alpha * x).pow(2)
