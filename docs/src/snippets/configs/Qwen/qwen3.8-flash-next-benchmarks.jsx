@@ -155,6 +155,36 @@ export const benchmarks = [
         ttft_ms: 17962.94, tpot_ms: 289.52, tokens_per_sec_per_gpu: 632 },
     ],
   },
+  // 1x DGX Spark, TP=1, nvidia export with the N-gram table file-backed on NVMe,
+  // lmsysorg/sglang:dev-qwen38-next-local (9b2aee2283), 2026-09-06. Chat-API
+  // GSM8K with thinking off, n=100 (the other DGX Spark rows are n=200); same
+  // 1024/256 bench workload. The in-checkpoint MTP head is used at TP=1.
+  {
+    match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
+    sglang_version: "dev-qwen38-next-local image @ 9b2aee2283",
+    accuracy: { gsm8k_pct: 96.0 },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
+        ttft_ms: 650.03, tpot_ms: 33.26, tokens_per_sec_per_gpu: 136 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 4 },
+        ttft_ms: 1546.18, tpot_ms: 61.22, tokens_per_sec_per_gpu: 266 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 8 },
+        ttft_ms: 2167.14, tpot_ms: 95.63, tokens_per_sec_per_gpu: 342 },
+    ],
+  },
+  {
+    match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvda", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "dev-qwen38-next-local image @ 9b2aee2283",
+    accuracy: { gsm8k_pct: 98.0 },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
+        ttft_ms: 604.33, tpot_ms: 63.54, tokens_per_sec_per_gpu: 78 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 16 },
+        ttft_ms: 6272.56, tpot_ms: 179.25, tokens_per_sec_per_gpu: 397 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 24 },
+        ttft_ms: 7151.52, tpot_ms: 246.79, tokens_per_sec_per_gpu: 443 },
+    ],
+  },
   // 1x RTX PRO 6000 Blackwell (96 GB), TP=1, lmsysorg/sglang:dev-qwen38-next-local
   // (qwen4-main-squashed 9b2aee2283), 2026-09-06: all four cells run as the
   // command generator emits them. Same chat-API GSM8K protocol as the DGX

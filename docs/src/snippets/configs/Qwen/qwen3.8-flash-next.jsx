@@ -1051,6 +1051,65 @@ export const config = {
       ],
     },
 
+    // ==== NVFP4 (NVDA) on 1x DGX Spark — nvidia/Qwen3.8-Flash-Next-NVFP4 ====
+    // Same file-backed N-gram table and pins as the RDXA single-Spark cells
+    // (memfrac 0.85; MTP: 8 requests / 40 slots, no MTP: 24 / 96 lazy slots),
+    // with the export's own differences: no `--quantization` (resolves to
+    // modelopt_mixed) and `--moe-runner-backend flashinfer_cutlass` explicit.
+    // At TP=1 the in-checkpoint MTP head loads directly: its fp8 block-scaled
+    // experts need no sharding, so the RadixArk draft used by the 2-node cell
+    // is not needed. Verified 2026-09-06 on the dev-qwen38-next-local image
+    // (9b2aee2283): GSM8K (chat, thinking off, n=100) 96.0% (MTP, accept 3.0-3.6) / 98.0%;
+    // boot ~11-12 min with a fresh table file. The smaller fp8 draft leaves a
+    // 174k-token KV pool with MTP (vs 93k for the RDXA cell) and 300k without.
+    {
+      match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      warn: "Single DGX Spark (GB10, 128 GB unified). Use the lmsysorg/sglang:dev-qwen38-next-local image: this ModelOpt MIXED_PRECISION export needs the loader from [sgl-project/sglang#38121](https://github.com/sgl-project/sglang/pull/38121), which the qwen38flashnext image does not have. The N-gram table is a 47.7 GiB sparse file on the local NVMe (PLE Offload = On (NVMe file)); keep ~50 GB free there and mount that directory into the container. Boot writes the whole table each time: delete the previous file first (a populated file rewrites at ~17 MB/s). Concurrency is memory-bound at 8 with MTP. See [DGX Spark notes](#spark-note).",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--moe-runner-backend flashinfer_cutlass",
+        "--fp4-gemm-backend flashinfer_cutlass",
+        "--page-size 64",
+        "--chunked-prefill-size 4096",
+        "--context-length 262144",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--max-running-requests 8",
+        "--max-mamba-cache-size 40",
+        "--reasoning-parser qwen3",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvda", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      warn: "Single DGX Spark (GB10, 128 GB unified). Use the lmsysorg/sglang:dev-qwen38-next-local image: this ModelOpt MIXED_PRECISION export needs the loader from [sgl-project/sglang#38121](https://github.com/sgl-project/sglang/pull/38121), which the qwen38flashnext image does not have. The N-gram table is a 47.7 GiB sparse file on the local NVMe (PLE Offload = On (NVMe file)); keep ~50 GB free there and mount that directory into the container. Boot writes the whole table each time: delete the previous file first (a populated file rewrites at ~17 MB/s). At 24 concurrent requests the KV pool is ~300k tokens; lower --max-running-requests for long-context workloads. See [DGX Spark notes](#spark-note).",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--moe-runner-backend flashinfer_cutlass",
+        "--fp4-gemm-backend flashinfer_cutlass",
+        "--page-size 64",
+        "--chunked-prefill-size 4096",
+        "--context-length 262144",
+        "--mamba-radix-cache-strategy extra_buffer_lazy",
+        "--max-running-requests 24",
+        "--max-mamba-cache-size 96",
+        "--reasoning-parser qwen3",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
     // ==== NVFP4 (NVDA) on 1x RTX PRO 6000 — nvidia/Qwen3.8-Flash-Next-NVFP4 ====
     // Same ModelOpt MIXED_PRECISION export as the Spark NVDA cells; the loader
     // (sgl-project/sglang#38121) is in the dev-qwen38-next-local image the
