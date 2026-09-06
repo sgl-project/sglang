@@ -86,6 +86,7 @@ class StartupWeightLoadOptions:
     ep_size: int
     cpu_offload_gb: int
     offload_group_size: int
+    offload_embedding_to_host: bool
     enable_memory_saver: bool
     enable_weights_cpu_backup: bool
     enable_lora: bool
@@ -127,6 +128,7 @@ class StartupWeightLoadOptions:
             ep_size=get_parallel().ep_size,
             cpu_offload_gb=get_exec().offload.cpu_offload_gb,
             offload_group_size=get_exec().offload.offload_group_size,
+            offload_embedding_to_host=get_exec().offload.offload_embedding_to_host,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             enable_weights_cpu_backup=get_exec().features.enable_weights_cpu_backup,
             enable_lora=get_lora().enable_lora,
@@ -375,6 +377,10 @@ class StartupWeightLoadManager:
             (
                 options.offload_group_size > 0,
                 "layer-group offloading is not supported",
+            ),
+            (
+                options.offload_embedding_to_host,
+                "embedding host offload is not supported",
             ),
             (options.enable_memory_saver, "memory saver is not supported"),
             (

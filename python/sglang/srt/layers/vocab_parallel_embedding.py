@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.3.post1/vllm/model_executor/layers/vocab_parallel_embedding.py
 
+import contextlib
 import logging
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
@@ -9,6 +10,9 @@ from typing import List, Optional, Sequence, Tuple
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
 
+from sglang.kernels.ops.embeddings.host_embedding_gather import (
+    host_embedding_gather,
+)
 from sglang.kernels.ops.embeddings.vocab_parallel_embedding import (
     vocab_parallel_embedding as fused_vocab_parallel_embedding,
 )
@@ -35,7 +39,7 @@ from sglang.srt.layers.quantization.base_config import (
     method_has_implemented_embedding,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_compiler_backend,
@@ -46,6 +50,36 @@ from sglang.srt.utils import (
 from sglang.srt.utils.async_probe import maybe_detect_oob
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
+
+# Tables below this size stay on the device when host offload is requested:
+# a PCIe read buys nothing for a vision tower's position table.
+HOST_OFFLOAD_MIN_BYTES = 64 << 20
+
+
+def _host_offload_requested() -> bool:
+    """``--offload-embedding-to-host``; False when no config is published
+    (layers built outside a server, e.g. in unit tests)."""
+    try:
+        return bool(get_exec().offload.offload_embedding_to_host)
+    except Exception:
+        return False
+
+
+def _config_ties_word_embeddings() -> bool:
+    """Return True when the model config sets ``tie_word_embeddings``.
+
+    Tied embeddings share their ``nn.Parameter`` with the LM head, so
+    moving the embedding to the host would also move the logits weight and
+    break the sampler's device matmul.
+    """
+    try:
+        from sglang.srt.runtime_context import get_server_args
+
+        hf_config = get_server_args().get_model_config().hf_config
+        return bool(getattr(hf_config, "tie_word_embeddings", False))
+    except Exception:
+        return False
+
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
@@ -244,6 +278,7 @@ class VocabParallelEmbedding(torch.nn.Module):
     ):
         super().__init__()
         self.quant_config = quant_config
+        self.prefix = prefix
 
         self.enable_tp = enable_tp
         self.use_attn_tp_group = use_attn_tp_group
@@ -335,15 +370,44 @@ class VocabParallelEmbedding(torch.nn.Module):
             - self.shard_indices.added_vocab_start_index
         )
 
-        self.quant_method.create_weights(
-            self,
-            self.embedding_dim,
-            [self.num_embeddings_per_partition],
-            self.embedding_dim,
-            self.num_embeddings_padded,
-            params_dtype=params_dtype,
-            weight_loader=self.weight_loader,
+        # Input-embedding layers only (an LM head feeds a matmul). When the
+        # table is to live on the host, build it there straight away: a device
+        # tensor created and dropped here would only sit in the allocator cache
+        # (the caching allocator does not hand its pieces to the layers built
+        # afterwards), and the free-memory measurement that sizes the KV pool
+        # would never see it.
+        place_on_host = (
+            is_embedding_layer
+            and _host_offload_requested()
+            and isinstance(quant_method, UnquantizedEmbeddingMethod)
+            and params_dtype in (torch.float32, torch.float16, torch.bfloat16)
+            and self.num_embeddings_per_partition
+            * embedding_dim
+            * torch.empty((), dtype=params_dtype, device="cpu").element_size()
+            >= HOST_OFFLOAD_MIN_BYTES
+            # Meta-device construction is materialised later; the post-load
+            # fallback (offload_weight_to_host) takes over in that case.
+            and torch.empty(()).device.type == "cuda"
+            # Tied embeddings share their Parameter with an LM head; moving
+            # the table to the host would break the logits matmul.  The
+            # model config is not always reachable here, but _host_offload
+            # is only called from VocabParallelEmbedding.__init__ where the
+            # caller has not yet called tie_weights, so the tie is unknown.
+            # We conservatively check the HF config when available.
+            and not _config_ties_word_embeddings()
         )
+        with torch.device("cpu") if place_on_host else contextlib.nullcontext():
+            self.quant_method.create_weights(
+                self,
+                self.embedding_dim,
+                [self.num_embeddings_per_partition],
+                self.embedding_dim,
+                self.num_embeddings_padded,
+                params_dtype=params_dtype,
+                weight_loader=self.weight_loader,
+            )
+        if place_on_host:
+            self._pin_host_weight()
 
     @classmethod
     def _get_indices(
@@ -526,6 +590,102 @@ class VocabParallelEmbedding(torch.nn.Module):
             and self.weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
         )
 
+    def _pin_host_weight(self) -> None:
+        """Replace a pageable host table with a page-locked copy the GPU can
+        read (see ``host_embedding_gather``)."""
+        weight = self.weight
+        assert weight.device.type == "cpu"
+        self.weight.data = weight.data.pin_memory()
+        self._host_weight_verified = True
+        logger.info(
+            "Embedding table %s created in pinned host memory (%.2f GiB)",
+            self.prefix or type(self).__name__,
+            weight.numel() * weight.element_size() / (1 << 30),
+        )
+
+    def offload_weight_to_host(self) -> int:
+        """Move the embedding table to page-locked host memory.
+
+        The lookup then gathers rows straight from the host over PCIe
+        (:func:`host_embedding_gather`), so the table costs no device memory
+        and no host/device synchronisation. Returns the number of device bytes
+        released, 0 if nothing was moved. Only unquantized fp32/fp16/bf16
+        tables living on a CUDA device are eligible.
+        """
+        weight = self.weight
+        if not weight.is_cuda:
+            return 0
+        if weight.numel() * weight.element_size() < HOST_OFFLOAD_MIN_BYTES:
+            return 0
+        if not isinstance(self.quant_method, UnquantizedEmbeddingMethod):
+            logger.warning(
+                "Not offloading %s to host: quantized embedding method %s",
+                type(self).__name__,
+                type(self.quant_method).__name__,
+            )
+            return 0
+        if weight.ndim != 2 or weight.dtype not in (
+            torch.float32,
+            torch.float16,
+            torch.bfloat16,
+        ):
+            logger.warning(
+                "Not offloading %s to host: unsupported weight %s %s",
+                type(self).__name__,
+                tuple(weight.shape),
+                weight.dtype,
+            )
+            return 0
+        host = torch.empty(
+            weight.shape, dtype=weight.dtype, device="cpu", pin_memory=True
+        )
+        host.copy_(weight)
+        nbytes = weight.numel() * weight.element_size()
+        # Keep the Parameter object (weight_loader and friends hang off it);
+        # only its storage moves. The device copy dies with `weight`.
+        self.weight.data = host
+        self._host_weight_verified = True
+        logger.info(
+            "Embedding table %s moved to pinned host memory (%.2f GiB)",
+            self.prefix or type(self).__name__,
+            nbytes / (1 << 30),
+        )
+        return nbytes
+
+    def _weight_is_host_resident(self, input_: torch.Tensor) -> bool:
+        if self.weight.device.type != "cpu" or not input_.is_cuda:
+            return False
+        if not getattr(self, "_host_weight_verified", False):
+            # The table can also arrive through weight sharing (a draft model
+            # handed the target's embedding); make sure the GPU may read it.
+            if not self.weight.is_pinned():
+                raise RuntimeError(
+                    "VocabParallelEmbedding weight is on the host but not pinned; "
+                    "CUDA inputs cannot be embedded from pageable memory."
+                )
+            self._host_weight_verified = True
+        return True
+
+    def _embed_local_shard_from_host(
+        self, input_: torch.Tensor, symm_alloc
+    ) -> torch.Tensor:
+        """Host-resident table: same contract as ``_embed_local_shard``."""
+        if self.tp_size == 1:
+            with symm_alloc:
+                return host_embedding_gather(input_, self.weight)
+        masked_input, input_mask = get_masked_input_and_mask(
+            input_,
+            self.shard_indices.org_vocab_start_index,
+            self.shard_indices.org_vocab_end_index,
+            self.shard_indices.num_org_vocab_padding,
+            self.shard_indices.added_vocab_start_index,
+            self.shard_indices.added_vocab_end_index,
+        )
+        with symm_alloc:
+            output_parallel = host_embedding_gather(masked_input, self.weight)
+        output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+        return output_parallel
+
     def _embed_local_shard(self, input_: torch.Tensor) -> torch.Tensor:
         """Embed against the local vocab shard; out-of-shard rows are zero
         (identity when tp_size == 1).
@@ -537,6 +697,8 @@ class VocabParallelEmbedding(torch.nn.Module):
         symm_alloc = use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         )
+        if self._weight_is_host_resident(input_):
+            return self._embed_local_shard_from_host(input_, symm_alloc)
         if self.tp_size == 1:
             with symm_alloc:
                 return self.quant_method.embedding(self, input_.long())
@@ -588,6 +750,42 @@ class VocabParallelEmbedding(torch.nn.Module):
         if self.enable_tp:
             s += f", tp_size={self.tp_size}"
         return s
+
+
+def offload_input_embeddings_to_host(
+    model: torch.nn.Module,
+) -> List[Tuple[str, int]]:
+    """Offload any input-embedding table of ``model`` still on the device.
+
+    Tables are normally placed on the host at construction (see
+    ``VocabParallelEmbedding.__init__``); this catches the ones built on a
+    meta device and materialised later. LM heads (``ParallelLMHead``) are
+    left alone: they feed a matmul, not a gather. Embeddings that share
+    their weight tensor with an LM head (``tie_word_embeddings``) are also
+    skipped, because moving the shared tensor would break the logits matmul.
+    Returns ``(module_name, device_bytes_released)`` per table moved.
+    """
+    # Collect data pointers of all LM-head weights so we can detect ties.
+    lm_head_ptrs: set = set()
+    for module in model.modules():
+        if isinstance(module, ParallelLMHead):
+            w = getattr(module, "weight", None)
+            if w is not None:
+                lm_head_ptrs.add(w.data.data_ptr())
+
+    moved = []
+    for name, module in model.named_modules():
+        if not isinstance(module, VocabParallelEmbedding) or isinstance(
+            module, ParallelLMHead
+        ):
+            continue
+        if module.weight.data.data_ptr() in lm_head_ptrs:
+            logger.info("Not offloading %s: weight is tied with an LM head", name)
+            continue
+        nbytes = module.offload_weight_to_host()
+        if nbytes:
+            moved.append((name, nbytes))
+    return moved
 
 
 class ParallelLMHead(VocabParallelEmbedding):
