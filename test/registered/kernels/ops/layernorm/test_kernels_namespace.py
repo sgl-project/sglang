@@ -44,6 +44,7 @@ EXPECTED = {
     "diffusion.flux2_qkv_epilogue": {"KDA"},
     "diffusion.flux2_token_cat_fp8": {"KDA"},
     "gemm.qwen3x_nvfp4": {"KDA"},
+    "gemm.sm120_fp8_linear": {"KDA"},
 }
 
 _CPU = PlatformInfo(device_type="cpu")
