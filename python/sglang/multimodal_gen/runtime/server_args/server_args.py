@@ -3832,6 +3832,18 @@ class ServerArgs(DisaggServerArgsMixin):
                 default_backend,
             )
 
+    def is_layerwise_residency_policy_explicit(
+        self, component_name: str, *, dit_group: bool
+    ) -> bool:
+        """Whether auto placement must preserve this component's policy."""
+        policy_map = self._parse_component_value_map(
+            self.layerwise_residency_policy,
+            option="--layerwise-residency-policy",
+        )
+        return component_name in policy_map or (
+            dit_group and self.is_arg_explicitly_set("dit_layerwise_residency_policy")
+        )
+
 
 @dataclasses.dataclass
 class PortArgs:

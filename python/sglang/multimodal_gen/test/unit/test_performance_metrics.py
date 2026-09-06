@@ -790,3 +790,61 @@ def test_worker_keeps_the_pool_when_no_probe_ran(monkeypatch):
     worker._release_warmup_pool(_warmup_req())
     worker._release_warmup_pool(SimpleNamespace(is_warmup=False, extra={}))
     assert calls == []
+
+
+def test_server_warmup_normalizes_profile_stage_names_for_residency_timing():
+    worker = GPUWorker.__new__(GPUWorker)
+    worker._auto_residency_warmup_records = []
+    stage = Mock()
+    stage._active_profile_stage_name.return_value = "RefinerStage"
+    stage._component_stage_name.return_value = "refiner"
+    worker.pipeline = SimpleNamespace(stages=[stage])
+    residency_manager = Mock()
+    residency_manager.take_warmup_phase_peaks.return_value = {
+        "0:refiner:use:transformer_2": WarmupPhasePeak(
+            ("transformer_2",),
+            8,
+            used_components=("transformer_2",),
+        )
+    }
+    residency_manager.current_device_components.return_value = ("transformer_2",)
+    device_module = Mock()
+    device_module.max_memory_allocated.return_value = 8
+    device_module.max_memory_reserved.return_value = 8
+    req = SimpleNamespace(
+        metrics=SimpleNamespace(
+            total_duration_ms=12.0,
+            stages={"RefinerStage": 10.0},
+            steps=[],
+            steps_by_stage={},
+            stage_iterations={},
+        )
+    )
+
+    with (
+        patch.object(torch, "get_device_module", return_value=device_module),
+        patch.object(
+            gpu_worker_module,
+            "peek_global_component_residency_manager",
+            return_value=residency_manager,
+        ),
+    ):
+        worker._record_server_warmup_memory(
+            req=req,
+            workload=(64, 64, 1, 1),
+            baseline_allocated_bytes=3,
+            baseline_reserved_bytes=3,
+            succeeded=True,
+        )
+
+    record = worker._auto_residency_warmup_records[0]
+    assert record.stage_duration_ms == {"refiner": 10.0}
+    _, stage_duration_ns, component_stages = (
+        gpu_worker_module.estimate_default_workload_timing(
+            records=[record],
+            target_units=record.workload_units(),
+            target_num_inference_steps=1,
+        )
+    )
+    assert stage_duration_ns == {"refiner": 10_000_000}
+    assert component_stages == {"transformer_2": ("refiner",)}
