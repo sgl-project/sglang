@@ -70,10 +70,19 @@ def _install_cache_dit_stub():
             return cls.supported
 
     block_adapters.BlockAdapterRegister = _FakeBlockAdapterRegister
+    cache_dit.BlockAdapterRegister = _FakeBlockAdapterRegister
+
+    class _FakeDMDCalibratorConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    cache_dit.DMDCalibratorConfig = _FakeDMDCalibratorConfig
 
     parallelism = types.ModuleType("cache_dit.parallelism")
     parallelism.ParallelismBackend = object
     parallelism.ParallelismConfig = object
+    cache_dit.ParallelismBackend = parallelism.ParallelismBackend
+    cache_dit.ParallelismConfig = parallelism.ParallelismConfig
 
     return {
         "cache_dit": cache_dit,
@@ -318,10 +327,68 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
         self.assertIs(returned, transformer)
         adapter = transformer._sglang_cache_dit_adapter
         self.assertIs(module.cache_dit.enable_calls[0]["target"], adapter)
-
         self.assertIs(module.disable_cache_on_transformer(transformer), transformer)
         self.assertEqual(module.cache_dit.disable_calls, [adapter])
         self.assertFalse(hasattr(transformer, "_sglang_cache_dit_adapter"))
+
+
+class TestCalibratorSelection(unittest.TestCase):
+    def _config(self, module, **kwargs):
+        return module.CacheDitConfig(enabled=True, num_inference_steps=28, **kwargs)
+
+    def test_dmd_takes_calibrator_slot(self):
+        module = _import_module_with_stub()
+        transformer = _make_transformer("AnyModel")
+        config = self._config(
+            module,
+            enable_dmd=True,
+            dmd_history=8,
+            dmd_rank=4,
+            dmd_ridge=1e-6,
+            dmd_svd_precision="high",
+        )
+
+        module.enable_cache_on_transformer(transformer, config)
+
+        calibrator = module.cache_dit.enable_calls[0]["calibrator_config"]
+        self.assertIsInstance(calibrator, module.DMDCalibratorConfig)
+        self.assertEqual(
+            calibrator.kwargs,
+            {
+                "dmd_history": 8,
+                "dmd_rank": 4,
+                "dmd_ridge": 1e-6,
+                "dmd_svd_precision": "high",
+            },
+        )
+
+    def test_both_calibrators_raise_on_transformer(self):
+        module = _import_module_with_stub()
+        transformer = _make_transformer("AnyModel")
+        config = self._config(module, enable_dmd=True, enable_taylorseer=True)
+
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            module.enable_cache_on_transformer(transformer, config)
+        self.assertEqual(module.cache_dit.enable_calls, [])
+
+    def test_both_calibrators_raise_on_dual_transformer(self):
+        module = _import_module_with_stub()
+        transformer = _make_transformer("AnyModel")
+        transformer.blocks = ["block_0"]
+        transformer_2 = _make_transformer("AnyModel")
+        transformer_2.blocks = ["block_0"]
+        primary = self._config(module, enable_dmd=True, enable_taylorseer=True)
+        secondary = self._config(module)
+
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            module.enable_cache_on_dual_transformer(
+                transformer,
+                transformer_2,
+                primary,
+                secondary,
+                model_name="wan2.2",
+            )
+        self.assertEqual(module.cache_dit.enable_calls, [])
 
 
 if __name__ == "__main__":
