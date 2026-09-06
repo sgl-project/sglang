@@ -472,6 +472,13 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         x_fp4 = hidden_states
         per_token_scale = dispatch_output.hidden_states_per_token_scale
         assert (per_token_scale is not None) == quant_info.use_per_token_activation
+        if hidden_states.shape[0] == 0:
+            # No expert work remains, but the dispatcher must still combine.
+            return StandardCombineInput(
+                hidden_states.new_empty(
+                    (0, hidden_states.shape[1] * 2), dtype=torch.bfloat16
+                )
+            )
     elif quant_info.use_per_token_activation:
         from flashinfer import SfLayout, nvfp4_quantize
 
