@@ -510,6 +510,12 @@ class MoEGate(nn.Module):
             )
 
         if get_exec().deterministic.enable_deterministic_inference:
+            if _is_cuda or _is_hip:
+                from sglang.srt.batch_invariant_ops import matmul_persistent
+
+                return matmul_persistent(
+                    hidden_states, self.weight.t(), out_dtype=torch.float32
+                )
             return F.linear(hidden_states, self.weight, None)
 
         if (
