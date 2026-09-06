@@ -5,8 +5,8 @@ import tilelang
 import tilelang.language as T
 import tilelang.math
 
+# Shared Q/K tiles need block barriers before cross-warp MMA operand loads.
 _pass_configs = {
-    tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
     tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
 }
