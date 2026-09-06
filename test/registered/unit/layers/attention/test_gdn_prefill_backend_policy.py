@@ -108,6 +108,19 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
     def test_selects_flashinfer_for_supported_sm100_gdn(self):
         self.assertEqual(self.apply_policy(make_runner(self)), "flashinfer")
 
+    def test_selects_flashinfer_for_sm120_gdn(self):
+        # SM120 (consumer/workstation Blackwell) shares SM100's state-pool
+        # prefill path, but its kernel entry only accepts float32 SSM state.
+        runner = make_runner(self, state_dtype=torch.float32)
+        self.assertEqual(self.apply_policy(runner, capability=(12, 0)), "flashinfer")
+
+    def test_rejects_sm120_with_bfloat16_state(self):
+        # A bf16 pool is what the kernel converts from, so it is not wrong per
+        # se -- it is just outside the domain this default is validated on, and
+        # users who want it can still ask for FlashInfer explicitly.
+        runner = make_runner(self, state_dtype=torch.bfloat16)
+        self.assertIsNone(self.apply_policy(runner, capability=(12, 0)))
+
     def test_selects_flashinfer_for_radix_cache_strategies(self):
         for strategy in ("no_buffer", "extra_buffer", "extra_buffer_lazy"):
             with self.subTest(strategy=strategy):
@@ -165,10 +178,31 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
     def test_rejects_unsupported_capability(self):
         cases = (
             ("non_cuda", {}, {"cuda": False}),
-            ("hopper", {}, {"capability": (9, 0)}),
-            ("future_sm", {}, {"capability": (12, 0)}),
+            ("future_sm", {}, {"capability": (13, 0)}),
             ("cuda_12", {}, {"cuda_version": "12.9"}),
-            ("fp32_state", {"state_dtype": torch.float32}, {}),
+            # Each supported major has one validated state dtype.
+            ("sm90_bf16_state", {}, {"capability": (9, 0)}),
+            (
+                "sm100_fp32_state",
+                {"state_dtype": torch.float32},
+                {"capability": (10, 0)},
+            ),
+            (
+                "sm120_bf16_state",
+                {"state_dtype": torch.bfloat16},
+                {"capability": (12, 0)},
+            ),
+            # SM120 inherits SM100's CUDA>=13 floor and 8192 chunk ceiling.
+            (
+                "sm120_cuda_12",
+                {"state_dtype": torch.float32},
+                {"capability": (12, 0), "cuda_version": "12.9"},
+            ),
+            (
+                "sm120_large_chunk",
+                {"state_dtype": torch.float32, "chunked_prefill_size": 8193},
+                {"capability": (12, 0)},
+            ),
             ("key_dim", {"key_dim": 64}, {}),
             ("value_dim", {"value_dim": 64}, {}),
             ("missing_api", {}, {"flashinfer_available": False}),
