@@ -815,7 +815,7 @@ class ServerArgs:
         NS("schedule"),
     ] = 16
     swa_full_tokens_ratio: A[
-        float,
+        Optional[float],
         Arg(
             help=(
                 "The ratio of SWA layer KV tokens / full layer KV tokens, regardless "
@@ -824,9 +824,10 @@ class ServerArgs:
                 "layer has 100 tokens."
             ),
             resolvable=True,
+            fallback=0.8,
         ),
         NS("schedule"),
-    ] = 0.8
+    ] = None
     disable_hybrid_swa_memory: A[
         bool,
         Arg(help="Disable the hybrid SWA memory pool.", resolvable=True),
@@ -2641,13 +2642,14 @@ class ServerArgs:
         NS("exec.mamba"),
     ] = 0
     mamba_full_memory_ratio: A[
-        float,
+        Optional[float],
         Arg(
             help="The ratio of mamba state memory to full kv cache memory.",
             resolvable=True,
+            fallback=0.9,
         ),
         NS("schedule"),
-    ] = 0.9
+    ] = None
     mamba_radix_cache_strategy: A[
         str,
         Arg(

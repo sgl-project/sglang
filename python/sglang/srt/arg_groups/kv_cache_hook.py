@@ -10,6 +10,7 @@ from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
     declare_resolution,
     model_config_of,
+    resolution_result,
     resolved_view,
     resolving_view,
     use_mla_backend,
@@ -189,7 +190,13 @@ def handle_cache_compatibility(server_args: Any) -> None:
     # Validate the effective ratio: model branches may declare a reset
     # (e.g. Step3p forces 1.0 under hierarchical cache) that supersedes
     # the user input before it ever takes effect.
-    if not (0 < resolved_view(server_args).swa_full_tokens_ratio <= 1.0):
+    #
+    # `resolution_result`, not the view: the views answer with what resolution
+    # has decided over what the operator typed, which is `None` while nobody
+    # has claimed the field. The effective value -- the one the pools will
+    # size against -- includes the declared fallback, and that is what a range
+    # check is about.
+    if not (0 < resolution_result(server_args, "swa_full_tokens_ratio") <= 1.0):
         raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
 
