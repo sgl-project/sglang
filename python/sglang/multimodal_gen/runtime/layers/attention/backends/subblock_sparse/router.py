@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Sub-block block-sparse routing for FlashInfer's ``bsa_attn_blk64_fwd``.
+"""Sub-block block-sparse routing for architecture-specific attention kernels.
 
-Training-free. Runs *before* attention, produces the ``q2k_block_index`` tensor the
-64-token block-sparse kernel consumes.
+Training-free. Runs *before* attention and produces the ``q2k_block_index`` tensor
+the selected block-sparse kernel consumes. The current BF16 kernels use Q64 x K64
+on SM90, SM100, and SM120; SM90 ``sage_fp8`` uses Q64 x K128. The router accepts
+both block widths so each compute path receives indices in its native geometry.
 
 Why sub-blocks
 --------------
-The usual proxy score for a 64x64 block is ``mean(Q_block) . mean(K_block)``. Averaging
-64 keys into one vector throws away exactly the variation that decides which keys a query
-wants. Splitting each 64-token block into ``n`` sub-blocks of ``64/n`` tokens, scoring all
-sub-block pairs and combining them with a log-sum-exp recovers most of that:
+For the Q64 x K64 BF16 paths, the usual proxy score is
+``mean(Q_block) . mean(K_block)``. Averaging a whole key block into one vector throws
+away exactly the variation that decides which keys a query wants. Splitting the query
+and key blocks into ``n_q`` and ``n_k`` sub-blocks, scoring all sub-block pairs, and
+combining them with a log-sum-exp recovers most of that:
 
     score(i, j) = log sum_{a<n_q, b<n_k} exp( qbar_{i,a} . kbar_{j,b} * softmax_scale )
 
@@ -17,8 +20,9 @@ which is a direct estimate of the block's un-normalised softmax mass
 ``sum_{r in i, c in j} exp(q_r . k_c * scale)`` -- the quantity that decides how much
 attention mass is lost when the block is skipped.
 
-Measured on 567 (task x denoise-step x layer x head) samples of MiniMax-H3 DiT attention,
-mean recall of the retained softmax mass at 0.9 block sparsity:
+Measured with Q64 x K64 geometry on 567 (task x denoise-step x layer x head)
+samples of MiniMax-H3 DiT attention, mean recall of the retained softmax mass at
+0.9 block sparsity:
 
     n_q=1 n_k=1     .6513     4 u        <- plain avg pooling
     n_q=1 n_k=2     .6598     8 u
@@ -35,7 +39,9 @@ to score against, the query detail averages out. Splitting both together is a di
 proposition -- the log-sum-exp then runs over query-key sub-block *pairs*, and "some part
 of this query block wants some part of that key block" is a signal that survives the
 averaging. That is the best row in the table, and it is the only estimator change in this
-family that has separated from anything else end to end. ``n_q = n_k = 4`` ships.
+family that has separated from anything else end to end. The Q64 x K64 BF16 paths
+ship with ``n_q = n_k = 4``. SM90 ``sage_fp8`` uses ``n_q = 4, n_k = 8`` with
+Q64 x K128, preserving the same 16-token pooling cells.
 
 Not worth retrying without new evidence
 ---------------------------------------
@@ -63,7 +69,7 @@ the pipeline currently produces.
 
 Usage
 -----
-    router = SubBlockRouter(n_k=4, n_q=4)
+    router = SubBlockRouter(n_k=4, n_q=4)  # current BF16 geometry
     plan = router.route(q, k, sparsity=0.8, softmax_scale=d**-0.5)   # q, k: [B, S, H, D]
     out, _ = bsa_attn_blk64_fwd(q, k, v, plan.index, plan.topk,
                                 block_sizes=SubBlockRouter.block_sizes(S, q.device),
@@ -145,9 +151,9 @@ def load_bsa_attn_sm120_blk64_fwd():
 
 
 LOG2E = 1.4426950408889634
-BLOCK = 64  # the kernel's block granularity (kSparseBlockSize=64)
-BUDGET_GRANULARITY = 8  # blocks per query row the kernel bills in, padding to fit
-VALID_N = (1, 2, 4, 8)  # sub-blocks per 64-token block -> 64 / 32 / 16 / 8 tokens
+BLOCK = 64  # default Q/K block size for the current BF16 consumers
+BUDGET_GRANULARITY = 8  # Q64 x K64 default; SM90 sage_fp8 uses exact block counts
+VALID_N = (1, 2, 4, 8)  # sub-blocks per query/key block
 
 
 def _snap_up_to_8(topk: int, num_blocks: int) -> int:
@@ -164,7 +170,14 @@ def _snap_up_to_8(topk: int, num_blocks: int) -> int:
     The consequence for the caller is that ``sparsity`` is an upper bound rather
     than an exact figure: 0.75 of 590 blocks becomes 152 kept, 0.7424 dropped.
     """
-    return min(num_blocks, max(1, -(-topk // BUDGET_GRANULARITY)) * BUDGET_GRANULARITY)
+    return _snap_up(topk, num_blocks, BUDGET_GRANULARITY)
+
+
+def _snap_up(topk: int, num_blocks: int, granularity: int) -> int:
+    """Clamp a requested budget and round it to a kernel's billing unit."""
+    if granularity < 1:
+        raise ValueError(f"budget granularity must be positive, got {granularity}")
+    return min(num_blocks, max(1, -(-topk // granularity)) * granularity)
 
 
 class RoutingPlan(msgspec.Struct, frozen=True):
@@ -183,11 +196,18 @@ class SubBlockRouter:
     """Builds ``q2k_block_index`` from sub-block-pooled Q/K.
 
     Args:
-        n_k: key sub-blocks per 64-token block (1, 2, 4 or 8). 1 reproduces plain avg
-            pooling; 4 is the quality/cost point the recall table above lands on.
-        n_q: query sub-blocks, same values. Splitting Q *alone* (n_q>1 with n_k=1) is
-            worse than not splitting; splitting both sides together is what the default
-            does. Costs n_q times the score matrix, 0.5% of the denoise time.
+        n_k: key sub-blocks per key block (1, 2, 4 or 8). 1 reproduces plain
+            average pooling. The BF16 Q64 x K64 paths default to 4; SM90
+            ``sage_fp8`` defaults to 8 for its K128 blocks.
+        n_q: query sub-blocks per query block, with the same allowed values.
+            Splitting Q *alone* (n_q>1 with n_k=1) is worse than not splitting;
+            splitting both sides together is what the defaults do. Costs n_q
+            times the score matrix, 0.5% of denoise time.
+        block_size_k: native key-block width. It is 64 for the BF16 kernels and
+            128 for SM90 ``sage_fp8``.
+        budget_granularity: rounding applied to the selected block count. The
+            Q64 x K64 paths retain the established default of 8 (required by
+            FlashInfer on SM100/SM120); SM90 ``sage_fp8`` uses 1.
 
     Structural block reservation (an attention sink, or forcing the diagonal j == i) was
     measured on 200 real H3 attention cells and is deliberately absent: at a fixed budget
@@ -195,12 +215,30 @@ class SubBlockRouter:
     which did not survive to the pixels.
     """
 
-    def __init__(self, n_k: int = 4, n_q: int = 4) -> None:
+    def __init__(
+        self,
+        n_k: int = 4,
+        n_q: int = 4,
+        *,
+        block_size_k: int = BLOCK,
+        budget_granularity: int = BUDGET_GRANULARITY,
+    ) -> None:
         if n_k not in VALID_N or n_q not in VALID_N:
             raise ValueError(
                 f"n_q/n_k must be one of {VALID_N}, got n_q={n_q}, n_k={n_k}"
             )
+        if block_size_k <= 0 or block_size_k % n_k:
+            raise ValueError(
+                f"key block size {block_size_k} must be positive and divisible "
+                f"by n_k={n_k}"
+            )
+        if budget_granularity < 1:
+            raise ValueError(
+                f"budget granularity must be positive, got {budget_granularity}"
+            )
         self.n_k, self.n_q = n_k, n_q
+        self.block_size_k = block_size_k
+        self.budget_granularity = budget_granularity
 
     @torch.no_grad()
     def scores(
@@ -223,12 +261,14 @@ class SubBlockRouter:
         """
         b, s, h, d = q.shape
         sk = k.shape[1]
-        gq, gk = -(-s // BLOCK), -(-sk // BLOCK)
+        gq = -(-s // BLOCK)
+        gk = -(-sk // self.block_size_k)
         nq, nk = self.n_q, self.n_k
-        sub_q, sub_k = BLOCK // nq, BLOCK // nk
+        sub_q = BLOCK // nq
+        sub_k = self.block_size_k // nk
 
         # Pooling handles the ragged tail on the *pooled* tensor: padding q/k up to
-        # G*BLOCK first would copy the whole 300+ MB activation to add a few rows.
+        # complete native blocks first would copy the whole 300+ MB activation.
         # Sub-cells past the last real token pool to zero, and `*_valid` tells the score
         # kernel to drop them -- left in, each would contribute an exp(0)=1 term that
         # both inflates the score and flattens the differences the ranking depends on.
@@ -255,13 +295,14 @@ class SubBlockRouter:
     ) -> RoutingPlan:
         """Select the top ``(1 - sparsity)`` fraction of key blocks per query block."""
         b, s, h, d = q.shape
-        gk = -(-k.shape[1] // BLOCK)
+        gk = -(-k.shape[1] // self.block_size_k)
         scores = self.scores(q, k, softmax_scale)  # [B, H, Gq, Gk]
         gq = scores.shape[2]
-        topk = _snap_up_to_8(math.ceil((1.0 - sparsity) * gk), gk)
+        topk = _snap_up(math.ceil((1.0 - sparsity) * gk), gk, self.budget_granularity)
         # One pass over the score matrix instead of torch.topk's several. The
-        # output order is unspecified: SM100 consumes it directly, while the
-        # SM90 backend sorts compact active prefixes before heterogeneous expansion.
+        # output order is unspecified. SM100/SM120 BF16 consume it directly;
+        # SM90 sage_fp8 converts it to an order-independent block map. Only the
+        # SM90 CuTe BF16 consumer sorts compact active prefixes before expansion.
         index = fused_topk(scores.reshape(-1, gk), topk).view(b, h, gq, topk)
         return RoutingPlan(index=index, topk=topk, num_blocks=gk)
 

@@ -1,8 +1,11 @@
 # SubBlock sparse attention — training-free block sparsity for the MiniMax-H3 DiT
 
-Routes the same 64-token SubBlock plan to SGLang's CuTe-DSL block-sparse
-FlashAttention kernel on SM90 or FlashInfer's architecture-specific blk64
-kernels on SM100 and SM120.
+Routes a SubBlock plan to SGLang's CuTe-DSL block-sparse FlashAttention kernel
+on SM90 or FlashInfer's architecture-specific blk64 kernels on SM100 and SM120.
+The architecture-neutral `"compute_mode": "sage_fp8"` selects online Sage-style
+FP8 compute; its current SM90 implementation uses the native SageAttention2
+INT8-QK/FP8-PV Hopper kernel. Future SM100 and SM120 Sage FP8 implementations
+can register under the same configuration value.
 Nothing is trained and no weights change: a cheap estimator runs before
 attention and hands the selected kernel a `q2k_block_index`.
 
@@ -16,7 +19,7 @@ sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va \
   --component-attention-backends text_encoder=fa \
   --attention-backend-config '{"sparsity": 0.75, "n_k": 4, "n_q": 4,
                                "skip_first_steps": 10, "skip_first_layers": 0,
-                               "min_seq_len": 4096}'
+                               "min_seq_len": 4096, "compute_mode": "bf16"}'
 ```
 
 **The text-encoder override is not optional.** `--attention-backend` applies to
@@ -43,7 +46,7 @@ are listed below.
 
 | | |
 | --- | --- |
-| GPU | **compute capability 9.0, 10.0, or 12.0** — H100 / H200 use SGLang's CuTe-DSL SM90 block-sparse FlashAttention kernel; B200 / GB200 use FlashInfer's architecture-specific `sm_100a` kernel; SM120 devices use FlashInfer's `bsa_attn_sm120_blk64_fwd` CuTe-DSL kernel. Other capabilities, including 10.3 (B300 / GB300), are rejected. |
+| GPU | **compute capability 9.0, 10.0, or 12.0** — H100 / H200 use SGLang's CuTe-DSL SM90 block-sparse FlashAttention kernel or the current `sage_fp8` implementation; B200 / GB200 use FlashInfer's architecture-specific `sm_100a` BF16 kernel; SM120 devices use FlashInfer's `bsa_attn_sm120_blk64_fwd` CuTe-DSL BF16 kernel. Other capabilities, including 10.3 (B300 / GB300), are rejected. |
 | dtype | bfloat16 |
 | head_dim | 128 |
 | attention | non-causal, one contiguous sequence per call |
@@ -86,17 +89,33 @@ rejected.
 | key | default | meaning |
 | --- | ---: | --- |
 | `sparsity` | 0.75 | key blocks dropped per query block, as an upper bound |
-| `n_k` | 4 | key sub-blocks per 64-token block (1, 2, 4, 8) |
+| `n_k` | 4 (`sage_fp8` on SM90: 8) | key sub-blocks per key block (1, 2, 4, 8) |
 | `n_q` | 4 | query sub-blocks per 64-token block (1, 2, 4, 8) |
 | `skip_first_steps` | 10 | leading denoise forwards kept dense |
 | `skip_first_layers` | 0 | leading DiT blocks kept dense |
 | `min_seq_len` | 4096 | shorter sequences run dense |
+| `compute_mode` | `"bf16"` | compute path: `"bf16"` or architecture-dispatched `"sage_fp8"` |
 
-**`sparsity` is an upper bound, not an exact figure.** The kernel pads each query
-row's block count up to a multiple of 8 with phantom slots it then masks out, so
-148 blocks costs exactly what 152 costs; the router takes the 152. At 590 blocks,
-0.75 requested delivers 0.7424, and the startup log reports what was kept. It is
-the speed lever — see below — and the only knob most users should touch.
+`compute_mode="sage_fp8"` is the stable public name, not a promise that every
+architecture quantizes every operand identically. On SM90 it calls
+SpargeAttention's native Hopper SageAttention2 kernel: Q/K are quantized online
+to INT8 and V/P to E4M3. Its Q64 x K128 geometry defaults `n_k` to 8, preserving
+the normal router's 16-token key pooling cells. Install the optional dependency:
+
+```bash
+pip install git+https://github.com/thu-ml/SpargeAttn.git --no-build-isolation
+```
+
+Enable it on SM90 with:
+
+```bash
+--attention-backend-config '{"compute_mode":"sage_fp8"}'
+```
+
+**`sparsity` is an upper bound, not always an exact figure.** BF16 plans round
+the budget up to groups of 8: 148 blocks costs what 152 costs. Native SM90
+`sage_fp8` uses 128-token key blocks without that rounding; at S=37,760 and
+sparsity 0.75 it keeps 74 of 295 blocks. Startup logs report the actual budget.
 
 **`n_k` and `n_q` buy score accuracy, not speed.** They set how finely a block is
 cut before scoring: `n_k=4` means four 16-token key sub-blocks, and the block's
@@ -168,10 +187,11 @@ are comparable.
 | --- | --- |
 | `router.py` | `SubBlockRouter` — pooling, scoring, selection, `RoutingPlan` |
 | `kernels.py` | Triton pooling / segmented-LSE / fused top-k |
+| `../../../../../../kernels/ops/attention/subblock_sage_fp8_sm90.py` | production adapter to native SM90 SageAttention2 |
 | `../subblock_sparse_attn.py` | the `AttentionBackend`: schedule, gating, dense fallback |
 
-Tests: `test/unit/test_subblock_sparse_attention.py`. The trick that makes the sparse
-kernel checkable against dense is running it at a sparsity just above 0 — every
-block is then inside the budget, so the result must reproduce dense attention up
-to bf16 rounding, which pins the routing indices, the ragged tail block sizes
-and the softmax scale in one assertion.
+Tests: `test/unit/test_subblock_sparse_attention.py` and
+`test/registered/kernels/ops/attention/test_subblock_sage_fp8_sm90.py`. The GPU
+test covers the native production dispatch. Running at a full block budget must
+reproduce dense attention up to the expected quantization error, pinning routing
+indices, ragged tails, scale domains and the softmax scale in one check.
