@@ -8,7 +8,7 @@ import pkgutil
 import traceback
 from abc import ABC
 from collections.abc import Callable, Iterator
-from typing import Any, Type
+from typing import Any
 
 import torch
 import transformers
@@ -340,6 +340,7 @@ class ComponentLoader(ABC):
         *,
         component_attn_backend: Any = None,
         component_attn_name: str | None = None,
+        allow_native_fallback: bool = True,
     ) -> tuple[AutoModel, float]:
         """
         Template method that standardizes logging around the core load implementation.
@@ -411,7 +412,7 @@ class ComponentLoader(ABC):
         ):
             raise
         except Exception as e:
-            if require_backend_selection:
+            if require_backend_selection or not allow_native_fallback:
                 raise
             native_loader_required = isinstance(e, NativeComponentLoaderRequired)
             if native_loader_required and component_weight_override is not None:
@@ -661,6 +662,8 @@ class ComponentLoader(ABC):
         component_type: str,
         transformers_or_diffusers: str,
         component_architecture: str | None = None,
+        *,
+        loader_cls: type["ComponentLoader"] | None = None,
     ) -> "ComponentLoader":
         """
         Factory method to create a component loader for a specific component type.
@@ -679,10 +682,9 @@ class ComponentLoader(ABC):
             transformers_or_diffusers, loader_type
         )
 
-        if loader_type in component_name_to_loader_cls:
-            loader_cls: Type[ComponentLoader] = component_name_to_loader_cls[
-                loader_type
-            ]
+        if loader_cls is None:
+            loader_cls = component_name_to_loader_cls.get(loader_type)
+        if loader_cls is not None:
             expected_library = loader_cls.expected_library
             # Assert that the library matches what's expected for this component type
             assert transformers_or_diffusers == expected_library, (
@@ -1038,6 +1040,7 @@ class PipelineComponentLoader:
         component_attn_backend: Any = None,
         component_attn_name: str | None = None,
         component_type: str | None = None,
+        loader_cls: type[ComponentLoader] | None = None,
     ):
         """
         Load a pipeline component.
@@ -1048,6 +1051,7 @@ class PipelineComponentLoader:
             transformers_or_diffusers: Whether the component is from transformers or diffusers
             component_architecture: the class name of the module
             component_type: structural config slot when it differs from the exact key
+            loader_cls: explicit pipeline-local loader, with no native fallback
         """
 
         # Get the appropriate loader for this component type
@@ -1055,6 +1059,7 @@ class PipelineComponentLoader:
             component_type or component_name,
             transformers_or_diffusers,
             component_architecture,
+            loader_cls=loader_cls,
         )
 
         try:
@@ -1065,6 +1070,7 @@ class PipelineComponentLoader:
                 transformers_or_diffusers,
                 component_attn_backend=component_attn_backend,
                 component_attn_name=component_attn_name,
+                allow_native_fallback=loader_cls is None,
             )
         except Exception:
             logger.error(
