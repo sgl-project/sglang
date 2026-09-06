@@ -208,14 +208,22 @@ class Glm53FlashDetector(BaseFormatDetector):
 
         return arguments
 
-    def _parse_json_args(self, raw_args: str) -> Dict[str, Any]:
-        """Parse JSON arguments from the raw argument string."""
+    def _parse_json_args(self, raw_args: str) -> Any:
+        """Parse JSON arguments from the raw argument string.
+
+        Returns a dict, a list (for bare array args), or empty dict on failure.
+        When the model outputs a bare array [{...}, {...}] for a tool with
+        an array-type required property, we return the list so
+        _fix_args_against_schema can wrap it.
+        """
         raw_args = raw_args.strip()
         if not raw_args:
             return {}
         try:
             parsed = json.loads(raw_args)
             if isinstance(parsed, dict):
+                return parsed
+            if isinstance(parsed, list):
                 return parsed
             return {"value": parsed}
         except (json.JSONDecodeError, ValueError):
@@ -507,7 +515,14 @@ class Glm53FlashDetector(BaseFormatDetector):
             )
 
         after_name = current_text[match.end():]
-        json_start = after_name.find("{")
+        # Look for JSON array first ([), then JSON object ({)
+        # The model sometimes outputs a bare array [{...}, {...}] for
+        # tools with array-type required properties (e.g. todo_write).
+        # If we start from the first { inside the array, raw_decode only
+        # parses the first object and the rest leaks as content.
+        json_start = after_name.find("[")
+        if json_start < 0:
+            json_start = after_name.find("{")
         if json_start >= 0:
             json_str = after_name[json_start:]
             decoder = json.JSONDecoder()
@@ -620,7 +635,10 @@ class Glm53FlashDetector(BaseFormatDetector):
                 ))
 
             after_name = current[match.end():]
-            json_start = after_name.find("{")
+            # Look for JSON array first ([), then JSON object ({)
+            json_start = after_name.find("[")
+            if json_start < 0:
+                json_start = after_name.find("{")
             if json_start >= 0:
                 json_str = after_name[json_start:]
                 decoder = json.JSONDecoder()
