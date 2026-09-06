@@ -26,6 +26,7 @@ import unittest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -242,7 +243,7 @@ class _RecordingMLAPool(_RecordingPool):
         self.mla_set_calls.append(loc)
 
 
-class TestHybridLinearMLARouting(unittest.TestCase):
+class TestHybridLinearMLARouting(CustomTestCase):
     """MLA-side door contract of `HybridLinearKVPool`: `set_mla_kv_buffer`
     forwards `loc` untouched -- writes are kernel-facing since the ForwardBatch
     rebind."""
@@ -268,6 +269,23 @@ class TestHybridLinearMLARouting(unittest.TestCase):
 
         self.assertEqual(len(pool.full_kv_pool.mla_set_calls), 1)
         self.assertIs(pool.full_kv_pool.mla_set_calls[0], loc)
+
+    def test_get_mla_kv_buffer_waits_before_layer_remap(self):
+        pool = self._make_bare_pool()
+        pool.start_layer = 4
+        pool.full_attention_layer_id_mapping = {6: 0}
+        calls = []
+        pool.layer_transfer_counter = types.SimpleNamespace(
+            wait_until=lambda layer_id: calls.append(("wait", layer_id))
+        )
+
+        def read(layer, loc, dst_dtype=None):
+            calls.append(("read", layer.layer_id))
+
+        pool.full_kv_pool.get_mla_kv_buffer = read
+        layer = types.SimpleNamespace(layer_id=6)
+        pool.get_mla_kv_buffer(layer, None)
+        self.assertEqual(calls, [("wait", 2), ("read", 0)])
 
 
 class TestMlaWriteDoorsUnderDcp(unittest.TestCase):
