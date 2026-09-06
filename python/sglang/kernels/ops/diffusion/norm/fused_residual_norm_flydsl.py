@@ -1,4 +1,4 @@
-"""FlyDSL fused normalization kernels for AMD ROCm (gfx950).
+"""FlyDSL fused normalization kernels for AMD ROCm (wave64 and wave32).
 
 Provides two fused kernels:
   - flydsl_fused_residual_norm_scale_shift:
@@ -26,9 +26,21 @@ import flydsl.expr as fx
 import torch
 from flydsl.expr import const_expr, range_constexpr
 
-WARP_SIZE = 64
+
+def _detect_warp_size() -> int:
+    try:
+        return torch.cuda.get_device_properties(0).warp_size
+    except Exception:
+        return 64
+
+
+WARP_SIZE = _detect_warp_size()
 _VEC = 8
-_NUM_WAVES = 10
+_BLOCK = 640
+# Deriving the wave count from the fixed block size keeps BLOCK and the public
+# FLYDSL_NORM_MIN_ALIGNED_DIM guard identical on wave32 and wave64, so callers
+# do not have to care which one they are on.
+_NUM_WAVES = _BLOCK // WARP_SIZE
 FLYDSL_NORM_MIN_ALIGNED_DIM = WARP_SIZE * _NUM_WAVES * _VEC  # 5120
 
 # Kernel-side epsilon. The public `eps` argument is intentionally ignored, as it
@@ -39,7 +51,10 @@ _EPS = 1e-6
 _ELEM_BITS = 16
 
 # Reduction order is part of the numerical contract; keep the descending sequence.
-_SHUFFLE_OFFSETS = (32, 16, 8, 4, 2, 1)
+# The ladder has to start at WARP_SIZE // 2. A stride of 32 on a wave32 part
+# crosses the wave boundary and lowers to permlane32_swap, which only exists in
+# the wave64 ISA.
+_SHUFFLE_OFFSETS = tuple(1 << i for i in reversed(range(WARP_SIZE.bit_length() - 1)))
 
 
 def _require_stable_api() -> None:
