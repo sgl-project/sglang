@@ -18,9 +18,10 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+import threading
 import time
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Any, Callable, Dict, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -383,6 +384,8 @@ class ModelRunner:
         self.forward_pass_id = 0
         self._pending_elastic_scale_update = None
         self.init_new_workspace = False
+        self._runtime_workspaces: Dict[str, Any] = {}
+        self._runtime_workspaces_lock = threading.Lock()
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = get_memory().enable_hisparse
         self._sampling_observer: Optional[SamplingObserver] = None
@@ -907,6 +910,27 @@ class ModelRunner:
         self._unified_memory_pool = result.unified_memory_pool
 
         self._init_post_memory_pool_components()
+
+    def get_or_create_runtime_workspace(
+        self, name: str, factory: Callable[[], Any]
+    ) -> Any:
+        """Return one model-runner-owned workspace shared by backend clones."""
+        with self._runtime_workspaces_lock:
+            workspace = self._runtime_workspaces.get(name)
+            if workspace is None:
+                workspace = factory()
+                self._runtime_workspaces[name] = workspace
+            return workspace
+
+    def close_runtime_workspaces(self) -> None:
+        """Close and forget persistent compute workspaces owned by this runner."""
+        with self._runtime_workspaces_lock:
+            workspaces = list(self._runtime_workspaces.values())
+            self._runtime_workspaces.clear()
+        for workspace in workspaces:
+            close = getattr(workspace, "close", None)
+            if close is not None:
+                close()
 
     def _init_post_memory_pool_components(self):
         """Post-pool component wiring, split out of alloc_memory_pool so forks

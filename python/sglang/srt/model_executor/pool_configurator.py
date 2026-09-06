@@ -14,6 +14,7 @@ Two entry points, same core computation:
 from __future__ import annotations
 
 import logging
+import math
 from bisect import bisect_right
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
@@ -33,7 +34,15 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
+from sglang.srt.layers.attention.dsv4.fp4_logits_workspace import (
+    FP4LogitsWorkspacePlan,
+    fp4_logits_width_for_context,
+    plan_fp4_logits_workspace,
+)
+from sglang.srt.mem_cache.allocation_sizing import (
+    get_alloc_len_per_decode,
+    get_req_to_token_extra_context_len,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_compress_state_ring_size,
     get_compress_state_write_pad,
@@ -46,6 +55,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_spec,
+    max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils.common import (
@@ -73,6 +83,8 @@ class MemoryPoolConfig:
     c128_max_total_num_tokens: int = 0
     c4_state_pool_size: int = 0
     c128_state_pool_size: int = 0
+    dsv4_fp4_logits_workspace_bytes: int = 0
+    dsv4_fp4_logits_workspace_max_seq_len: int = 0
 
     mem_fraction_static: Optional[float] = None
 
@@ -84,6 +96,12 @@ class MemoryPoolConfig:
     unified_total_bytes: Optional[int] = None
 
     def __post_init__(self):
+        if self.dsv4_fp4_logits_workspace_bytes < 0:
+            raise ValueError("dsv4_fp4_logits_workspace_bytes must be non-negative")
+        if self.dsv4_fp4_logits_workspace_max_seq_len < 0:
+            raise ValueError(
+                "dsv4_fp4_logits_workspace_max_seq_len must be non-negative"
+            )
         if self.max_total_num_tokens <= 0:
             msg = "Not enough memory. Please try to increase --mem-fraction-static."
             if self.mem_fraction_static is not None:
@@ -914,6 +932,22 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.disaggregation_decode_extra_slots = (
             get_disagg().disaggregation_decode_extra_slots or 0
         )
+        self.fp4_logits_workspace_enabled = bool(
+            _is_hip
+            and not kvc.is_draft_worker
+            and kvc.server_args.enable_deepseek_v4_fp4_indexer
+            and 4 in self.compression_ratios
+            and (self.disaggregation_mode != "decode" or self.is_speculative)
+        )
+        self.fp4_logits_workspace_plan: Optional[FP4LogitsWorkspacePlan] = None
+        fp4_workspace_context_len = (
+            self.context_len + get_req_to_token_extra_context_len()
+        )
+        self.fp4_logits_workspace_max_seq_len = (
+            fp4_logits_width_for_context(fp4_workspace_context_len, kvc.page_size)
+            if self.fp4_logits_workspace_enabled
+            else 0
+        )
         if get_memory().enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
@@ -976,6 +1010,72 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 logger.info(
                     "DSV4 compressed attention: online c128 enabled (ring_size=1)"
                 )
+
+    def _plan_fp4_logits_workspace(
+        self, available_bytes: int
+    ) -> Optional[FP4LogitsWorkspacePlan]:
+        if not self.fp4_logits_workspace_enabled:
+            return None
+
+        schedule = get_schedule()
+        mem_fraction_static = schedule.mem_fraction_static
+        if mem_fraction_static is None:
+            mem_fraction_static = 0.9
+        # ``available_bytes`` is the static-pool budget after preserving runtime
+        # slack. Reconstruct a conservative share of that slack without another
+        # device query; the allocation is checked once against live free memory
+        # when the runner creates the workspace.
+        runtime_headroom_bytes = int(
+            available_bytes
+            * max(0.0, 1.0 - mem_fraction_static)
+            / max(mem_fraction_static, 1.0e-6)
+        )
+        free_memory_fraction = envs.SGLANG_DSV4_FP4_LOGITS_FREE_MEM_FRACTION.get()
+        if not 0.0 < free_memory_fraction <= 1.0:
+            raise ValueError(
+                "SGLANG_DSV4_FP4_LOGITS_FREE_MEM_FRACTION must be in (0, 1], "
+                f"got {free_memory_fraction}"
+            )
+        # At mem_fraction_static=1 there is no nominal activation headroom, but
+        # this persistent workspace is charged directly against the token pool.
+        # Reserve at least one maximum-width row from that static budget.
+        row_bytes = self.fp4_logits_workspace_max_seq_len * 4
+        runtime_headroom_bytes = max(
+            runtime_headroom_bytes,
+            math.ceil(row_bytes / free_memory_fraction),
+        )
+
+        prefill_buffer_rows = max_prefill_buffer_tokens()
+        if prefill_buffer_rows <= 0:
+            prefill_buffer_rows = schedule.max_prefill_tokens or 1
+        max_prefill_rows = (
+            1 if self.disaggregation_mode == "decode" else prefill_buffer_rows
+        )
+        # CP round-robin reindexes query rows before the local indexer runs.
+        max_prefill_rows = ceil_div(
+            max_prefill_rows, max(get_parallel().attn_cp_size, 1)
+        )
+        max_query_rows = max_prefill_rows
+        if self.requested_max_running_requests_per_worker is not None:
+            verify_rows = self.requested_max_running_requests_per_worker * max(
+                self.online_c128_mtp_max_draft_tokens, 1
+            )
+            max_query_rows = max(max_query_rows, verify_rows)
+
+        ceiling_mb = envs.SGLANG_DSV4_FP4_LOGITS_BUDGET_MB.get()
+        if ceiling_mb < 0:
+            raise ValueError(
+                "SGLANG_DSV4_FP4_LOGITS_BUDGET_MB must be non-negative "
+                f"(0 selects auto), got {ceiling_mb}"
+            )
+        max_workspace_bytes = ceiling_mb * (1 << 20) if ceiling_mb else None
+        return plan_fp4_logits_workspace(
+            max_seq_len=self.fp4_logits_workspace_max_seq_len,
+            max_query_rows=max_query_rows,
+            runtime_headroom_bytes=runtime_headroom_bytes,
+            free_memory_fraction=free_memory_fraction,
+            max_workspace_bytes=max_workspace_bytes,
+        )
 
     def _assert_ring_serves_draft_tokens(self, num_draft_tokens: int) -> None:
         """A verify batch writes its whole optimistic tail into the ring, so ring
@@ -1089,6 +1189,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     def _to_config(self, sizes: _DSV4PoolSizes) -> MemoryPoolConfig:
         full = sizes.full_max_total_num_tokens
+        fp4_plan = self.fp4_logits_workspace_plan
         swa = sizes.swa_max_total_num_tokens
         logger.info(
             f"DSV4 pool sizes: full={full}, swa={swa}, "
@@ -1105,6 +1206,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             c128_max_total_num_tokens=sizes.c128_max_total_num_tokens,
             c4_state_pool_size=sizes.c4_state_pool_size,
             c128_state_pool_size=sizes.c128_state_pool_size,
+            dsv4_fp4_logits_workspace_bytes=(
+                fp4_plan.capacity_bytes if fp4_plan is not None else 0
+            ),
+            dsv4_fp4_logits_workspace_max_seq_len=(
+                fp4_plan.max_seq_len if fp4_plan is not None else 0
+            ),
         )
 
     def finalize_with_max_running_requests(
@@ -1135,7 +1242,18 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 self._get_c128_state_fixed_bytes_for_token_capacity(full_token)
             )
 
-        available_bytes_for_tokens = max(available_bytes - c128_state_fixed_bytes, 0)
+        self.fp4_logits_workspace_plan = self._plan_fp4_logits_workspace(
+            available_bytes
+        )
+        fp4_logits_workspace_bytes = (
+            self.fp4_logits_workspace_plan.capacity_bytes
+            if self.fp4_logits_workspace_plan is not None
+            else 0
+        )
+        available_bytes_for_tokens = max(
+            available_bytes - c128_state_fixed_bytes - fp4_logits_workspace_bytes,
+            0,
+        )
         full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
 
         sizes = self._compute_dsv4_sizes(full_token, page_size)
@@ -1144,6 +1262,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             f"bytes_per_full_token={self.bytes_per_full_token:.2f}, "
             f"available_bytes={available_bytes / (1 << 30):.2f} GB, "
             f"c128_state_fixed={c128_state_fixed_bytes / (1 << 30):.2f} GB, "
+            f"fp4_logits_workspace={fp4_logits_workspace_bytes / (1 << 20):.2f} MiB, "
             f"full_token={sizes.full_max_total_num_tokens}"
         )
         return self._to_config(sizes)
@@ -1154,6 +1273,16 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         assert page_size % 128 == 0, (
             "page_size must be multiple of 128 for compressed attention"
         )
+        # A token-capped configuration bypasses byte profiling. Still resolve
+        # the workspace from the equivalent token-pool footprint so the runner
+        # receives the same explicit capacity contract.
+        if self.fp4_logits_workspace_plan is None:
+            estimated_available_bytes = max(
+                int(max_total_num_tokens * self.bytes_per_full_token), 1
+            )
+            self.fp4_logits_workspace_plan = self._plan_fp4_logits_workspace(
+                estimated_available_bytes
+            )
         sizes = self._compute_dsv4_sizes(max_total_num_tokens, page_size)
         return self._to_config(sizes)
 
