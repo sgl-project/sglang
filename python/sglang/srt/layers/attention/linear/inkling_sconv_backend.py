@@ -144,6 +144,9 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         self._graph_track_conv_indices = torch.zeros(
             (max_bs, self.conv_state_len), dtype=torch.int64, device=dev
         )
+        # Prefill can capture before init_cuda_graph_state. Keep the translated
+        # checkpoint destinations at one address across both graph phases.
+        self._graph_track_indices = torch.empty(max_bs, dtype=torch.int64, device=dev)
         # Inert track fields for graph capture: a capture warmup batch that
         # carries no tracking metadata must still LAUNCH the track scatter
         # (all rows masked off), or the python-level `if` specializes the
@@ -248,6 +251,8 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
 
     def _prepare_slot_indices(self, forward_batch: ForwardBatch):
         self._reset_step_state()
+        if not self._slot_gather_recordable:
+            self._prepare_track_indices(forward_batch)
         req_pool_indices = forward_batch.req_pool_indices
         n = req_pool_indices.shape[0]
         buf = self._cache_indices_buf
@@ -269,6 +274,21 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
             return
         self.forward_metadata = self._forward_metadata(forward_batch)
         self._refresh_cache_indices()
+
+    def _prepare_track_indices(self, forward_batch: ForwardBatch):
+        indices = forward_batch.mamba_track_indices
+        if indices is None:
+            return
+        n = indices.shape[0]
+        assert n <= self._graph_track_indices.shape[0], (
+            "checkpoint-index buffer too small for the forward batch"
+        )
+        # Scheduler and replay input buffers remain virtual. Only the forward
+        # view is rebound, as in MambaAttnBackendBase; every Inkling track-save
+        # consumer (including fused kernels) then sees physical slot IDs.
+        out = self._graph_track_indices[:n]
+        out.copy_(self._translate_mamba_indices(indices))
+        forward_batch.mamba_track_indices = out
 
     def _refresh_sconv_metadata(
         self, forward_batch: ForwardBatch, *, on_graph_path: bool
@@ -508,6 +528,8 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         buffer may already belong to a later forward.
         """
         pool = self.req_to_token_pool
+        if mamba_track_indices is not None:
+            mamba_track_indices = self._translate_mamba_indices(mamba_track_indices)
         scatter_mamba_states_after_mtp_verify(
             pool.get_speculative_mamba2_params_all_layers(),
             self._translate_mamba_indices(pool.get_mamba_indices(req_pool_indices)),
