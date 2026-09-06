@@ -31,7 +31,7 @@ _BACKEND = "sglang.srt.layers.attention.linear.inkling_sconv_backend"
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 class TestInklingCheckpointIndices(CustomTestCase):
-    def make_backend(self, *, lazy=False, static=False):
+    def make_backend(self, *, lazy=False, static=False, slot_count=6):
         mamba = MambaSubPoolSpec(
             name="mamba",
             layer_num=2,
@@ -70,7 +70,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
             is_id_owner=True,
             lazy_compaction=lazy,
         )
-        slots = allocator.alloc(6)
+        slots = allocator.alloc(slot_count)
         self.assertIsNotNone(slots)
         req_type = HybridReqToTokenPool if static else UnifiedHybridReqToTokenPool
         req_pool = req_type.__new__(req_type)
@@ -248,50 +248,146 @@ class TestInklingCheckpointIndices(CustomTestCase):
                 )
                 torch.testing.assert_close(ids, slots[-1:])
 
-    def test_strided_batched_ids_and_padding_keep_static_storage(self):
-        backend, allocator, _, slots = self.make_backend()
+    def test_distinct_strided_destinations_keep_static_storage(self):
+        backend, allocator, pool, slots = self.make_backend()
         allocator.free(slots[:1].clone())
-        storage = slots[-1:].repeat(8)
+        selected = slots[2:].flip(0)
+        storage = torch.stack(
+            [selected, slots[1:2].expand_as(selected)], dim=1
+        ).flatten()
+        original = storage.clone()
         ids = storage[::2]
         self.assertFalse(ids.is_contiguous())
         batch = self.batch(ids)
         backend._prepare_slot_indices(batch)
         pointer = batch.mamba_track_indices.data_ptr()
-        torch.testing.assert_close(
-            batch.mamba_track_indices,
-            backend._translate_mamba_indices(ids).to(torch.int64),
-        )
+        physical = backend._translate_mamba_indices(selected).to(torch.int64)
+        torch.testing.assert_close(batch.mamba_track_indices, physical, rtol=0, atol=0)
+        cache = pool.mamba_cache.conv[0][0]
+        expected = cache.clone()
+        hidden = torch.arange(12 * 64, device="cuda").reshape(12, 64).to(torch.bfloat16)
+        rows = torch.arange(12, device="cuda").reshape(4, 3)
+        ShortConvolution._prepare_extend_sconv_cache(None, batch, cache, hidden, rows)
+        expected[physical] = hidden.reshape(4, 3, 64)
+        torch.testing.assert_close(cache, expected, rtol=0, atol=0)
         smaller = self.batch(ids[:2])
         backend._prepare_slot_indices(smaller)
         self.assertEqual(smaller.mamba_track_indices.data_ptr(), pointer)
-        torch.testing.assert_close(storage, slots[-1:].repeat(8))
+        torch.testing.assert_close(storage, original, rtol=0, atol=0)
+
+    def test_decode_graph_refreshes_distinct_destinations_and_masks_padding(self):
+        backend, allocator, pool, slots = self.make_backend(lazy=True, slot_count=12)
+        req_pool = backend.req_to_token_pool
+        req_pool.req_index_to_mamba_index_mapping = torch.cat(
+            [slots.new_zeros(1), slots[1:5]]
+        ).to(torch.int32)
+        ids = slots[-4:].clone()
+        track_mask = torch.ones(4, dtype=torch.bool, device="cuda")
+        batch = self.batch(ids, mode=ForwardMode.DECODE, mask=track_mask)
+        batch.req_pool_indices = torch.arange(1, 5, device="cuda")
+        backend.init_forward_metadata_out_graph(batch)
+        pointer = batch.mamba_track_indices.data_ptr()
+        cache = pool.mamba_cache.conv[0][0]
+        hidden = torch.zeros(4, 64, dtype=torch.bfloat16, device="cuda")
+        weight = torch.ones(64, 4, dtype=torch.bfloat16, device="cuda")
+        conv = SimpleNamespace(
+            activation=None, use_residual=True, _weight_2d=lambda: weight
+        )
+
+        def decode():
+            backend.init_forward_metadata_in_graph(batch)
+            ShortConvolution._apply_decode_sconv_kernel(
+                conv,
+                hidden,
+                cache,
+                backend._cache_indices,
+                backend.sconv_metadata.precomputed,
+                batch,
+            )
+
+        decode()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            decode()
+        for step, live in enumerate((3, 1, 4)):
+            with self.subTest(live=live):
+                if step < 2:
+                    hole = slots[:1] if step == 0 else slots[5:6]
+                    allocator.free(hole.clone())
+                    allocator._flush(urgent=True)
+                ids.copy_(slots[-4:].roll(step + 1))
+                ids[live:].zero_()
+                original = ids.clone()
+                track_mask.zero_()
+                track_mask[:live] = True
+                if live > 1:
+                    track_mask[1] = False
+                fresh = self.batch(ids, mode=ForwardMode.DECODE, mask=track_mask)
+                fresh.req_pool_indices = torch.arange(1, 5, device="cuda")
+                fresh.req_pool_indices[live:] = 0
+                backend.init_forward_metadata_out_graph(fresh)
+                self.assertEqual(fresh.mamba_track_indices.data_ptr(), pointer)
+                physical = backend._translate_mamba_indices(ids).to(torch.int64)
+                active = backend._cache_indices.clone().to(torch.int64)
+                cache.fill_(-7)
+                cache[0].zero_()
+                hidden.copy_(torch.arange(4, device="cuda")[:, None] + step + 1)
+                hidden[live:].zero_()
+                expected = cache.clone()
+                for row in range(live):
+                    window = torch.cat([cache[active[row], 1:], hidden[row : row + 1]])
+                    expected[active[row]] = window
+                    if row != 1:
+                        expected[physical[row]] = window
+                graph.replay()
+                torch.testing.assert_close(cache, expected, rtol=0, atol=0)
+                torch.testing.assert_close(ids, original, rtol=0, atol=0)
+
+    def test_oversized_checkpoint_batch_fails_without_reallocating(self):
+        backend, _, _, slots = self.make_backend()
+        pointer = backend._graph_track_indices.data_ptr()
+        batch = self.batch(slots[-1:].repeat(5))
+        with self.assertRaisesRegex(
+            AssertionError, "checkpoint-index buffer too small"
+        ):
+            backend._prepare_slot_indices(batch)
+        self.assertEqual(backend._graph_track_indices.data_ptr(), pointer)
 
     def test_verify_commit_translates_both_destinations(self):
         backend, allocator, _, slots = self.make_backend()
         allocator.free(slots[:1].clone())
-        ids = slots[-1:].clone()
         indices = torch.tensor([0], device="cuda")
-        with (
-            patch.object(
-                backend.req_to_token_pool,
-                "get_speculative_mamba2_params_all_layers",
-                return_value=object(),
-            ),
-            patch(_BACKEND + ".scatter_mamba_states_after_mtp_verify") as scatter,
-        ):
-            backend.commit_conv_state_after_mtp_verify(
-                req_pool_indices=indices,
-                last_correct_step_indices=indices,
-                mamba_track_indices=ids,
-                mamba_steps_to_track=indices,
-            )
-        torch.testing.assert_close(
-            scatter.call_args.args[3], backend._translate_mamba_indices(ids)
-        )
-        torch.testing.assert_close(
-            scatter.call_args.args[1],
-            backend._translate_mamba_indices(slots[1:2].to(torch.int32)),
-        )
+        for tracking in (False, True):
+            with self.subTest(tracking=tracking):
+                ids = slots[-1:].clone() if tracking else None
+                with (
+                    patch.object(
+                        backend.req_to_token_pool,
+                        "get_speculative_mamba2_params_all_layers",
+                        return_value=object(),
+                    ),
+                    patch(
+                        _BACKEND + ".scatter_mamba_states_after_mtp_verify"
+                    ) as scatter,
+                ):
+                    backend.commit_conv_state_after_mtp_verify(
+                        req_pool_indices=indices,
+                        last_correct_step_indices=indices,
+                        mamba_track_indices=ids,
+                        mamba_steps_to_track=indices if tracking else None,
+                    )
+                if tracking:
+                    torch.testing.assert_close(
+                        scatter.call_args.args[3], backend._translate_mamba_indices(ids)
+                    )
+                    torch.testing.assert_close(ids, slots[-1:], rtol=0, atol=0)
+                else:
+                    self.assertIsNone(scatter.call_args.args[3])
+                    self.assertIsNone(scatter.call_args.args[4])
+                torch.testing.assert_close(
+                    scatter.call_args.args[1],
+                    backend._translate_mamba_indices(slots[1:2].to(torch.int32)),
+                )
 
 
 if __name__ == "__main__":
