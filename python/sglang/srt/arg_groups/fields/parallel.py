@@ -284,28 +284,36 @@ class Parallel:
     # fields and `collect_input_fields` does not put them on the record -- which
     # is right: a quotient has no operator input to preserve, and the record is
     # what crosses a process boundary, so a width put there would be a stale
-    # copy the moment an elastic scale-up restamps one. `derive_parallel_widths`
-    # computes all six from the leaves above; `ParallelContext` installs a
-    # property per declaration.
+    # copy the moment an elastic scale-up restamps one. Every input is a leaf
+    # above, so all six are fixed once the configuration is: `publish` computes
+    # them through `parallel_widths_of` and stores them as ordinary bag leaves,
+    # and `ParallelContext` answers with the stamp when a scale-up has moved
+    # one.
     attn_tp_size = Derived(
+        fn="sglang.srt.runtime_context.attn_tp_size_of",
         doc="Attention tensor-parallel width: `tp_size` divided by the "
         "attention-DP and attention-CP dimensions.",
     )
     attn_dp_size = Derived(
-        doc="Attention data-parallel width, normalised from the configured "
-        "value (both an input to the derivation and an output of it).",
+        fn="sglang.srt.runtime_context.attn_dp_size_of",
+        doc="Attention data-parallel width: `dp_size` when DP attention is "
+        "on, otherwise one.",
     )
     attn_dcp_size = Derived(
+        fn="sglang.srt.runtime_context.attn_dcp_size_of",
         doc="Decode context-parallel width inside the attention TP group.",
     )
     moe_ep_size = Derived(
+        fn="sglang.srt.runtime_context.moe_ep_size_of",
         doc="MoE expert-parallel width, normalised from the configured value.",
     )
     moe_tp_size = Derived(
+        fn="sglang.srt.runtime_context.moe_tp_size_of",
         doc="MoE tensor-parallel width: what is left of `tp_size` after the "
         "expert and MoE-DP dimensions.",
     )
     dcp_enabled = Derived(
-        doc="Whether decode context parallelism is in play -- a group exists "
-        "and is wider than one rank.",
+        fn="sglang.srt.runtime_context.dcp_enabled_of",
+        doc="Whether decode context parallelism is in play: `dcp_size` is "
+        "wider than one rank, which is exactly when the group gets built.",
     )

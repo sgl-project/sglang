@@ -182,6 +182,62 @@ def derive_parallel_widths(
     }
 
 
+def parallel_widths_of(cfg: Any) -> dict:
+    """The six quotients, from a resolved config.
+
+    Every input is a record field, so this is a function of the configuration
+    and nothing else -- which is why the six are declared `Derived(fn=...)` and
+    computed once at publish rather than on every read. `dcp_enabled` is
+    `dcp_size > 1` because that is exactly when `initialize_model_parallel`
+    builds the group.
+    """
+    attn_dp_size, _ = derive_attention_widths(
+        tp_size=cfg.tp_size,
+        attn_cp_size=cfg.attn_cp_size,
+        dp_size=cfg.dp_size,
+        enable_dp_attention=cfg.enable_dp_attention,
+    )
+    return derive_parallel_widths(
+        tp_size=cfg.tp_size,
+        attn_cp_size=cfg.attn_cp_size,
+        attn_dp_size=attn_dp_size,
+        moe_ep_size=cfg.ep_size,
+        moe_dp_size=cfg.moe_dp_size,
+        dcp_size=cfg.dcp_size,
+        dcp_enabled=cfg.dcp_size > 1,
+    )
+
+
+def attn_tp_size_of(cfg: Any):
+    """`attn_tp_size`, computed at publish. See `parallel_widths_of`."""
+    return parallel_widths_of(cfg)["attn_tp_size"]
+
+
+def attn_dp_size_of(cfg: Any):
+    """`attn_dp_size`, computed at publish. See `parallel_widths_of`."""
+    return parallel_widths_of(cfg)["attn_dp_size"]
+
+
+def attn_dcp_size_of(cfg: Any):
+    """`attn_dcp_size`, computed at publish. See `parallel_widths_of`."""
+    return parallel_widths_of(cfg)["attn_dcp_size"]
+
+
+def moe_ep_size_of(cfg: Any):
+    """`moe_ep_size`, computed at publish. See `parallel_widths_of`."""
+    return parallel_widths_of(cfg)["moe_ep_size"]
+
+
+def moe_tp_size_of(cfg: Any):
+    """`moe_tp_size`, computed at publish. See `parallel_widths_of`."""
+    return parallel_widths_of(cfg)["moe_tp_size"]
+
+
+def dcp_enabled_of(cfg: Any):
+    """`dcp_enabled`, computed at publish. See `parallel_widths_of`."""
+    return parallel_widths_of(cfg)["dcp_enabled"]
+
+
 class ParallelContext:
     """Parallel-topology namespace: one spelling per name.
 
@@ -248,20 +304,20 @@ class ParallelContext:
         self._derived.clear()
 
     def _derived_width(self, name):
-        """A width the leaves imply: the stamp, else the live group.
+        """A width the configuration implies: override, else stamp, else the
+        published leaf.
 
-        A quotient *is* a function of the configured leaves -- that is what it
-        is, and it is why the declaration in `arg_groups/fields/parallel.py`
-        names nothing but the field. The two steps here are how a value that
-        moved after publish reaches a reader: `initialize_model_parallel`
-        stamps all six as its last statement, and an elastic scale-up restamps
-        `attn_dp_size` through `update_dp_attention_post_scale`.
+        The leaf is computed at publish by `parallel_widths_of` -- every input
+        is a record field, so the answer is fixed once the configuration is.
+        The stamp is above it because an elastic scale-up restamps
+        `attn_dp_size` through `update_dp_attention_post_scale`, and the
+        override is above that because a test states a topology by naming the
+        width it wants.
 
-        The live-group step stays below the stamp. On every path in this tree a
-        built group has already been stamped, so it does not fire;
-        `test_size_rank_delegate_to_canonical_getters` and the DCP tests pin it
-        for a process that installs groups some other way. (`world_size` is not
-        a quotient, is not derived here, and stays a live read outright.)
+        Naming the width is the only way to state one: overriding `tp_size`
+        does not move `attn_tp_size`, because the quotient is not recomputed on
+        read. That is the trade for having one answer, computed once, in the
+        bag where every other config value lives.
         """
         overrides = self._overrides
         if name in overrides:
@@ -269,23 +325,15 @@ class ParallelContext:
         derived = self._derived
         if name in derived:
             return derived[name]
-        getter = _LIVE_WIDTH_READINGS.get(name)
-        if getter is not None:
-            try:
-                return getter(self)
-            except (AssertionError, AttributeError, RuntimeError) as exc:
-                raise RuntimeError(
-                    f"derived parallel width {name!r} is not available: it is "
-                    "computed from the configured leaves when the process "
-                    "groups are built (initialize_model_parallel / "
-                    "initialize_dp_attention), and neither a stamp nor a live "
-                    "group is present"
-                ) from exc
+        config = self._config
+        if config is not None and name in config._fields:
+            return getattr(config, name)
         raise RuntimeError(
-            f"derived parallel width {name!r} is not available: it is "
-            "computed from the configured leaves when the process groups are "
-            "built (initialize_model_parallel / initialize_dp_attention), and "
-            "neither a stamp nor a live group is present"
+            f"derived parallel width {name!r} is not available: it is computed "
+            "from the configured leaves at publish, and restamped when the "
+            "process groups are built. Nothing is published and nothing has "
+            "been stamped -- publish a parallel config, or state the width "
+            f"with get_parallel().override({name}=...)"
         )
 
     @contextmanager
@@ -387,23 +435,6 @@ class ParallelContext:
     @property
     def dcp_group(self) -> Any:
         return self._v("dcp_group", _ps().get_dcp_group)
-
-
-# How a built process group reports each quotient. This is a property of the
-# reading, not of the field: what `attn_tp_size` *is* is the quotient declared
-# in `arg_groups/fields/parallel.py`, which names nothing but itself.
-_LIVE_WIDTH_READINGS = {
-    "attn_tp_size": lambda ctx: _ps().get_attn_tensor_model_parallel_world_size(),
-    "attn_dp_size": lambda ctx: _dp().get_attention_dp_size(),
-    "attn_dcp_size": lambda ctx: _ps().get_dcp_world_size() if ctx.dcp_enabled else 1,
-    "moe_ep_size": lambda ctx: _ps().get_moe_expert_parallel_world_size(),
-    "moe_tp_size": lambda ctx: _ps().get_moe_tensor_parallel_world_size(),
-    "dcp_enabled": lambda ctx: (
-        False
-        if _ps().get_dcp_group_no_assert() is None
-        else _ps().get_dcp_world_size() > 1
-    ),
-}
 
 
 def _install_derived_widths() -> None:
@@ -1719,8 +1750,8 @@ def reset_context() -> None:
     ``server_args`` and install fresh ``Flags`` and ``Resources``.
 
     ``parallel`` holds the stamped derived widths, which go with the lifecycle
-    that stamped them: `_derived_width` prefers the stamp over the live group,
-    so leaving one behind lets the next test read the previous topology.
+    that stamped them: `_derived_width` prefers the stamp over the leaves, so
+    leaving one behind lets the next test read the previous topology.
     """
     _CONTEXT._server_args = None
     _CONTEXT._config_bags = None
