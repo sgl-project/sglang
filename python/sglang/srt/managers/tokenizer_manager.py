@@ -1384,6 +1384,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_room = self.fake_bootstrap_room_counter
                 self.fake_bootstrap_room_counter += 1
 
+            # Fail fast on hidden_dim mismatch so the caller sees an actionable
+            # error instead of a scatter RuntimeError raised in the scheduler.
+            self._validate_positional_embed_overrides_hidden_dim(
+                obj.positional_embed_overrides
+            )
+
             tokenized_obj = TokenizedGenerateReqInput(
                 input_text=input_text,
                 input_ids=input_ids_arr,
@@ -1436,6 +1442,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     input_ids_arr, obj.embed_override_token_id, obj.embed_overrides
                 )
 
+            # Fail fast on hidden_dim mismatch so the caller sees an actionable
+            # error instead of a scatter RuntimeError raised in the scheduler.
+            self._validate_positional_embed_overrides_hidden_dim(
+                positional_embed_overrides
+            )
+
             tokenized_obj = TokenizedEmbeddingReqInput(
                 input_text=input_text,
                 input_ids=input_ids_arr,
@@ -1456,6 +1468,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
 
         return tokenized_obj
+
+    def _validate_positional_embed_overrides_hidden_dim(
+        self,
+        positional_embed_overrides: Optional[
+            Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]
+        ],
+    ) -> None:
+        """Validate hidden_dim on any PositionalEmbeds reaching the scheduler.
+
+        Handles both the single-request shape (``PositionalEmbeds``) and the
+        score-request shape (``List[Optional[PositionalEmbeds]]``). Skips None
+        entries. No-op when the request carries no overrides.
+        """
+        if positional_embed_overrides is None:
+            return
+        expected = self.model_config.hidden_size
+        if isinstance(positional_embed_overrides, PositionalEmbeds):
+            positional_embed_overrides.validate_hidden_dim(expected)
+        else:
+            for item in positional_embed_overrides:
+                if item is not None:
+                    item.validate_hidden_dim(expected)
 
     @staticmethod
     def _resolve_embed_overrides(
