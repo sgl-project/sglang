@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import sglang.srt.layers.quantization.fp4_utils as fp4_utils
+import sglang.srt.model_executor.runner.flashinfer_autotune as autotune
 from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
 from sglang.test.test_utils import CustomTestCase
 
@@ -72,6 +73,49 @@ class TestFp4GemmBackendAuto(CustomTestCase):
         self.assertEqual(
             Fp4GemmRunnerBackend.FLASHINFER_B12X.get_flashinfer_backend(), "b12x"
         )
+
+    def test_b12x_predicate(self):
+        self.assertTrue(Fp4GemmRunnerBackend.FLASHINFER_B12X.is_flashinfer_b12x())
+        self.assertFalse(Fp4GemmRunnerBackend.FLASHINFER_CUTLASS.is_flashinfer_b12x())
+
+
+def _autotune_gate(backend, *, quantization="modelopt_fp4"):
+    """Run ``should_run_flashinfer_autotune`` with only the FP4 GEMM term live.
+
+    The MoE backend is ``triton`` and the model is NVFP4, so the MoE and FP8
+    terms are both False and the result is the FP4 GEMM term alone.
+    """
+    exec_ns = SimpleNamespace(
+        kernel=SimpleNamespace(disable_flashinfer_autotune=False),
+        deterministic=SimpleNamespace(enable_deterministic_inference=False),
+        moe=SimpleNamespace(moe_runner_backend="triton", moe_a2a_backend="none"),
+    )
+    runner = SimpleNamespace(
+        device="cuda",
+        model_config=SimpleNamespace(quantization=quantization),
+        spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
+        is_draft_worker=False,
+    )
+    fp4_utils.FP4_GEMM_RUNNER_BACKEND = backend
+    try:
+        with (
+            patch.object(autotune, "get_exec", return_value=exec_ns),
+            patch("torch.cuda.get_device_capability", return_value=(12, 0)),
+        ):
+            return autotune.should_run_flashinfer_autotune(runner)
+    finally:
+        fp4_utils.FP4_GEMM_RUNNER_BACKEND = None
+
+
+class TestFp4AutotuneGate(CustomTestCase):
+    def test_b12x_keeps_the_fp4_autotune_pass(self):
+        self.assertTrue(_autotune_gate(Fp4GemmRunnerBackend.FLASHINFER_B12X))
+
+    def test_cutlass_still_autotunes(self):
+        self.assertTrue(_autotune_gate(Fp4GemmRunnerBackend.FLASHINFER_CUTLASS))
+
+    def test_marlin_does_not_autotune(self):
+        self.assertFalse(_autotune_gate(Fp4GemmRunnerBackend.MARLIN))
 
 
 if __name__ == "__main__":

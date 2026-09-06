@@ -116,6 +116,9 @@ class Fp4GemmRunnerBackend(Enum):
     def is_flashinfer_cutedsl(self) -> bool:
         return self == Fp4GemmRunnerBackend.FLASHINFER_CUTEDSL
 
+    def is_flashinfer_b12x(self) -> bool:
+        return self == Fp4GemmRunnerBackend.FLASHINFER_B12X
+
     def is_marlin(self) -> bool:
         return self == Fp4GemmRunnerBackend.MARLIN
 
@@ -131,6 +134,7 @@ class Fp4GemmRunnerBackend(Enum):
             'flashinfer_cutlass' -> 'cutlass'
             'flashinfer_cudnn' -> 'cudnn'
             'flashinfer_cutedsl' -> 'cute-dsl'
+            'flashinfer_b12x' -> 'b12x'
         """
         if self == Fp4GemmRunnerBackend.FLASHINFER_CUTEDSL:
             return "cute-dsl"

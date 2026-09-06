@@ -107,6 +107,7 @@ def should_run_flashinfer_autotune(
     fp4_gemm_needs_autotune = model_uses_fp4 and (
         get_fp4_gemm_runner_backend().is_flashinfer_cutlass()
         or get_fp4_gemm_runner_backend().is_flashinfer_cutedsl()
+        or get_fp4_gemm_runner_backend().is_flashinfer_b12x()
     )
 
     from sglang.srt.layers.quantization.fp8_utils import (
