@@ -2197,6 +2197,44 @@ async def _send_disaggregation_warmup_requests(
         )
 
 
+def _build_speculative_multi_request_warmup(
+    server_args: ServerArgs,
+    *,
+    dp_size: int,
+    is_generation: bool,
+    max_new_tokens: int,
+) -> Optional[Dict[str, Any]]:
+    """Build a warmup for the non-singleton extend-attention specialization.
+
+    The default request only covers batch size one, which Triton specializes as
+    a constexpr. The first concurrent prefill otherwise compiles the generic
+    runtime-batch kernel after the server has advertised readiness.
+    """
+    if (
+        not is_generation
+        or server_args.speculative_algorithm is None
+        or server_args.max_running_requests == 1
+    ):
+        return None
+
+    # DP dispatch is round-robin, so submit two requests per rank to make every
+    # local scheduler observe a multi-request batch.
+    batch_size = max(2, 2 * dp_size)
+    sampling_params = {
+        "temperature": 0,
+        "max_new_tokens": max_new_tokens,
+    }
+    if server_args.skip_tokenizer_init:
+        return {
+            "input_ids": [[10, 11, 12] for _ in range(batch_size)],
+            "sampling_params": sampling_params,
+        }
+    return {
+        "text": ["The capital city of France is"] * batch_size,
+        "sampling_params": sampling_params,
+    }
+
+
 def _execute_server_warmup(server_args: ServerArgs):
     headers = {}
     url = server_args.url()
@@ -2322,6 +2360,21 @@ def _execute_server_warmup(server_args: ServerArgs):
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
+            speculative_batch_warmup = _build_speculative_multi_request_warmup(
+                server_args,
+                dp_size=get_parallel().dp_size,
+                is_generation=model_info["is_generation"],
+                max_new_tokens=max_new_tokens,
+            )
+            if speculative_batch_warmup is not None:
+                res = requests.post(
+                    url + "/generate",
+                    json=speculative_batch_warmup,
+                    headers=headers,
+                    timeout=warmup_timeout if warmup_timeout > 0 else 600,
+                    verify=ssl_verify,
+                )
+                assert res.status_code == 200, f"{res.text}"
             # Skip server_status update for Rust server
             if not envs.SGLANG_RUST_SERVER.get():
                 _global_state.tokenizer_manager.server_status = ServerStatus.Up
