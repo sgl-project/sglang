@@ -15,6 +15,7 @@ from torch import nn
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import get_device_sm
 
@@ -244,6 +245,17 @@ def supports_cuda_vmm_feature_transport(model_config: ModelConfig) -> bool:
 
 
 def get_resolved_model_impl(model_config: ModelConfig) -> ModelImpl:
+    if use_mlx():
+        # The MLX backend loads and runs models through mlx_lm, so inference
+        # never routes through sglang/srt/models or the Transformers fallback.
+        # Skip the Transformers-architecture compatibility gate entirely:
+        # resolving it imports the model's remote auto_map code, which the
+        # MLX path does not need and which can fail on its own (e.g. Hunyuan
+        # configs map "AutoModel" to a class name the remote module never
+        # defines). The scheduler only uses this value to detect the
+        # Transformers backend, which never applies here.
+        return ModelImpl.SGLANG
+
     resolved_model_impl = getattr(model_config, "_resolved_model_impl", None)
     if resolved_model_impl is not None:
         return resolved_model_impl
