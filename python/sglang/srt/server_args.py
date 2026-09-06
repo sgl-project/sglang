@@ -909,7 +909,7 @@ class ServerArgs:
     ] = False
     num_continuous_decode_steps: A[
         int,
-        "Run multiple continuous decoding steps to reduce scheduling overhead. This can potentially increase throughput but may also increase time-to-first-token latency. The default value is 1, meaning only run one decoding step at a time.",
+        "[Deprecated] This flag has no effect. Continuous decoding steps were removed when constrained decoding became compatible with the overlap scheduler; the overlap scheduler now amortizes the scheduling overhead. It will be removed in a future release.",
         NS("schedule"),
     ] = 1
     scheduler_recv_interval: A[
