@@ -660,6 +660,13 @@ class PipelineConfig:
             raise ValueError("text conditioning mask must have shape [batch, seq]")
         return torch.count_nonzero(mask, dim=1).tolist()
 
+    @staticmethod
+    def seq_lens_from_prompt_embeds(prompt_embeds: "torch.Tensor") -> list[int]:
+        """Text lengths for maskless embeddings; 2-D (seq x dim) means batch=1."""
+        if prompt_embeds.ndim == 2:
+            return [int(prompt_embeds.shape[0])]
+        return [int(prompt_embeds.shape[1])] * int(prompt_embeds.shape[0])
+
     def require_text_seq_lens(
         self,
         batch,
