@@ -215,6 +215,11 @@ class PrefillBootstrapQueue:
         kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.ps.dp_rank
+        kv_args.rust_http_port = (
+            self.scheduler.rust_server.http_port
+            if self.scheduler.rust_server is not None
+            else None
+        )
         kv_args.kv_cache_dtype_str = (
             self.scheduler.tp_worker.model_runner.kv_cache_dtype_str
         )

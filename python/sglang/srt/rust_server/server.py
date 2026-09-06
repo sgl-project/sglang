@@ -55,10 +55,12 @@ class RustServer:
     def __init__(
         self,
         server: Server,
+        http_port: int,
         mm_spec: Optional[RustMmSpec] = None,
         max_per_poll: int = 256,
     ):
         self.server = server
+        self.http_port = http_port
         self.mm_spec = mm_spec
         self._max_per_poll = max_per_poll
 
@@ -151,7 +153,7 @@ class RustServer:
             dp_note,
         )
 
-        return cls(server, mm_spec=mm_spec)
+        return cls(server, http_port=listen_port, mm_spec=mm_spec)
 
     def wait_request(self, timeout_ms: int) -> None:
         """Block until a request is pushed into the in-process ring or the timeout
