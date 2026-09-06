@@ -34,7 +34,7 @@ def _distribution_version(name: str) -> Version:
         return Version(importlib.metadata.version(name))
     except importlib.metadata.PackageNotFoundError as exc:
         raise RuntimeError(
-            f"cuDNN GDN prefill requires {name}; install SGLang's CUDA dependencies."
+            f"GDN cudnn prefill backend requires {name}; install SGLang's CUDA dependencies."
         ) from exc
 
 
@@ -42,14 +42,14 @@ def _validate_cudnn_gdn_runtime() -> None:
     frontend_version = _distribution_version("nvidia-cudnn-frontend")
     if frontend_version < _MIN_CUDNN_FRONTEND_VERSION:
         raise RuntimeError(
-            "cuDNN GDN prefill requires nvidia-cudnn-frontend>=1.28.0; "
+            f"cuDNN GDN prefill requires nvidia-cudnn-frontend>={_MIN_CUDNN_FRONTEND_VERSION}; "
             f"found {frontend_version}."
         )
 
     cutlass_version = _distribution_version("nvidia-cutlass-dsl")
     if cutlass_version < _MIN_CUTLASS_DSL_VERSION:
         raise RuntimeError(
-            "cuDNN FROST GDN prefill requires nvidia-cutlass-dsl>=4.7.0; "
+            f"cuDNN FROST GDN prefill requires nvidia-cutlass-dsl>={_MIN_CUTLASS_DSL_VERSION}; "
             f"found {cutlass_version}."
         )
 
