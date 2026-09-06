@@ -26,7 +26,9 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_finish,
     cp_all_gather_rerange_launch,
 )
-from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
+from sglang.srt.mem_cache.deepseek_v4_compress_state import (
+    CompressStatePool,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v2 import _is_hip
@@ -262,7 +264,6 @@ def create_paged_compressor_data(
 ) -> FusedCompressMetadata:
     swa_page_size = token_to_kv_pool.swa_page_size
     ring_size = token_to_kv_pool.get_ring_size(compress_ratio=compress_ratio)
-    use_req_ring = compress_ratio == 4 and token_to_kv_pool._unified_kv
     # assert ring_size % compress_ratio == 0
 
     def clip_down(positions: torch.Tensor) -> torch.Tensor:
@@ -271,8 +272,6 @@ def create_paged_compressor_data(
     def get_raw_loc(positions: torch.Tensor) -> torch.Tensor:
         positions = positions.masked_fill(positions < 0, 0)
         if compress_ratio == 128:
-            state_loc = req_pool_indices * ring_size + positions % ring_size
-        elif use_req_ring:
             state_loc = req_pool_indices * ring_size + positions % ring_size
         else:
             loc = req_to_token[req_pool_indices, positions]
@@ -295,7 +294,6 @@ def create_paged_compressor_data(
             extend_seq_lens=extend_lens,
             req_to_token=req_to_token,
             full_to_swa_index_mapping=token_to_kv_pool.full_to_swa_index_mapping,
-            use_req_ring=use_req_ring,
         )
 
         plan_kwargs: dict
