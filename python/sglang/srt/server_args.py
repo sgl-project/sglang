@@ -1316,7 +1316,9 @@ class ServerArgs:
     ] = None
     ssl_ca_certs: A[Optional[str], "The CA certificates file.", NS("serving")] = None
     ssl_keyfile_password: A[
-        Optional[str], "The password to decrypt the SSL keyfile.", NS("serving")
+        Optional[str],
+        Arg(help="The password to decrypt the SSL keyfile.", secret=True),
+        NS("serving"),
     ] = None
     enable_ssl_refresh: A[
         bool,
@@ -1329,12 +1331,18 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     api_key: A[
         Optional[str],
-        "Set API key of the server. It is also used in the OpenAI API compatible server.",
+        Arg(
+            help="Set API key of the server. It is also used in the OpenAI API compatible server.",
+            secret=True,
+        ),
         NS("serving"),
     ] = None
     admin_api_key: A[
         Optional[str],
-        "Set admin API key for sensitive management endpoints (e.g. /clear_hicache_storage_backend). When set, admin endpoints require this key and do NOT accept --api-key.",
+        Arg(
+            help="Set admin API key for sensitive management endpoints (e.g. /clear_hicache_storage_backend). When set, admin endpoints require this key and do NOT accept --api-key.",
+            secret=True,
+        ),
         NS("serving"),
     ] = None
     served_model_name: A[
