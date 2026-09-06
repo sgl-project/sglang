@@ -93,9 +93,8 @@ class DllmConfig:
         # Preserve the previous fixed-block behavior unless the user explicitly
         # opts into larger prefill chunks.
         prefill_block_size = algorithm_config.get("prefill_block_size", block_size)
-        dllm_prefill_block_size = getattr(cfg, "dllm_prefill_block_size", None)
-        if dllm_prefill_block_size is not None:
-            prefill_block_size = dllm_prefill_block_size
+        if cfg.dllm_prefill_block_size is not None:
+            prefill_block_size = cfg.dllm_prefill_block_size
         _require_positive_int("prefill_block_size", prefill_block_size)
         if prefill_block_size < block_size or prefill_block_size % block_size != 0:
             raise ValueError(
@@ -104,7 +103,7 @@ class DllmConfig:
             )
         # Each dLLM step needs one complete block; reject smaller budgets
         # to avoid unschedulable requests and scheduler livelock.
-        max_prefill_tokens = getattr(cfg, "max_prefill_tokens", None)
+        max_prefill_tokens = cfg.max_prefill_tokens
         if max_prefill_tokens is not None and max_prefill_tokens < block_size:
             raise ValueError(
                 "max_prefill_tokens must be at least the dLLM block_size: "

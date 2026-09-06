@@ -447,6 +447,8 @@ class SchedulerDllmMixin:
 
             # The request was cache-matched and phase-classified before this
             # homogeneous batch was selected.
+            # truncation_align_size is None by construction: add_one_req asserts
+            # it, and check_dllm_deterministic_inference rejects the only setter.
             res = adder.add_one_req(
                 req,
                 has_chunked_req=True,
@@ -488,17 +490,22 @@ class SchedulerDllmMixin:
         return result
 
     def _cleanup_dllm_req(self: Scheduler, req: Req) -> None:
-        if (
-            getattr(self, "enable_hierarchical_cache", False)
-            or getattr(self, "enable_hicache_storage", False)
-            or getattr(self, "enable_unified_cache_external_linker", False)
-        ):
-            self.tree_cache.release_aborted_request(req.rid)
+        self._release_aborted_request(req.rid)
 
         # `Req.kv` is always a ReqKvInfo, so every field below is present.
         kv = req.kv
         if kv.holds_kv or kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, is_insert=False)
+            return
+
+        # Only a STAGING_* request owns anything here: it was stashed by
+        # cache_unfinished_req, which locked `last_node` before the req slot was
+        # freed. An INCOMING_* one only ran match_prefix, which takes no ref, so
+        # releasing would drop a ref it never took and unprotect a live prefix.
+        if req.dllm_phase not in (
+            DllmReqPhase.STAGING_PREFILL,
+            DllmReqPhase.STAGING_DECODE,
+        ):
             return
 
         uncached = req.prefix_indices[kv.cache_protected_len :]

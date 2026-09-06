@@ -524,8 +524,8 @@ class TestPrefillAdder(CustomTestCase):
             adder.can_run_list.append(req) or AddReqResult.CONTINUE
         )
         scheduler = SimpleNamespace(process_dllm_incoming_reqs=MagicMock())
-        scheduler.process_dllm_staging_reqs = (
-            lambda a, r: SchedulerDllmMixin.process_dllm_staging_reqs(scheduler, a, r)
+        scheduler.process_dllm_staging_reqs = lambda a, r: (
+            SchedulerDllmMixin.process_dllm_staging_reqs(scheduler, a, r)
         )
         running_batch = SimpleNamespace(batch_is_full=False, reqs=[])
 
@@ -633,9 +633,12 @@ class TestPrefillAdder(CustomTestCase):
     def _make_stale_flag_req(self, rid, phase):
         req = SimpleNamespace(rid=rid, dllm_phase=phase, is_retracted=False)
         req.init_next_round_input = lambda *a, **kw: None
-        req.is_dllm_prefill = lambda r=req: r.dllm_phase in (
-            DllmReqPhase.STAGING_PREFILL,
-            DllmReqPhase.INCOMING_PREFILL,
+        req.is_dllm_prefill = lambda r=req: (
+            r.dllm_phase
+            in (
+                DllmReqPhase.STAGING_PREFILL,
+                DllmReqPhase.INCOMING_PREFILL,
+            )
         )
         return req
 
@@ -661,16 +664,16 @@ class TestPrefillAdder(CustomTestCase):
             _retract_dllm_req=MagicMock(),
             _abort_dllm_req_exact=MagicMock(),
         )
-        scheduler._should_skip_prefill = (
-            lambda *, running_batch: SchedulerDllmMixin._should_skip_prefill(
+        scheduler._should_skip_prefill = lambda *, running_batch: (
+            SchedulerDllmMixin._should_skip_prefill(
                 scheduler, running_batch=running_batch
             )
         )
         scheduler._dllm_phase_order = lambda: SchedulerDllmMixin._dllm_phase_order(
             scheduler
         )
-        scheduler._retract_or_abort_dllm_req = (
-            lambda rb: SchedulerDllmMixin._retract_or_abort_dllm_req(scheduler, rb)
+        scheduler._retract_or_abort_dllm_req = lambda rb: (
+            SchedulerDllmMixin._retract_or_abort_dllm_req(scheduler, rb)
         )
 
         SchedulerDllmMixin.get_new_batch_dllm(scheduler, running_batch)

@@ -652,6 +652,28 @@ class TestPrepareServerArgs(CustomTestCase):
         args.speculative_algorithm = None
         check_dllm_speculative_decoding(args)  # no raise
 
+    def test_dllm_rejects_deterministic_inference(self):
+        # The dLLM path passes truncation_align_size=None, so add_one_req's
+        # assert can never fire; without this check determinism is dropped.
+        from sglang.srt.arg_groups.validation_hook import (
+            check_dllm_deterministic_inference,
+        )
+
+        args = SimpleNamespace(
+            dllm_algorithm="LowConfidence",
+            enable_deterministic_inference=True,
+            _resolved_overrides=[],
+        )
+        with self.assertRaisesRegex(ValueError, "not supported with diffusion LLM"):
+            check_dllm_deterministic_inference(args)
+
+        args.enable_deterministic_inference = False
+        check_dllm_deterministic_inference(args)  # no raise
+
+        args.dllm_algorithm = None
+        args.enable_deterministic_inference = True
+        check_dllm_deterministic_inference(args)  # no raise
+
     @patch(
         "sglang.srt.dllm.config.DllmConfig.from_server_args",
         return_value=SimpleNamespace(

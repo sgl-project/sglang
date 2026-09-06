@@ -10,6 +10,7 @@ from sglang.srt.dllm.mixin.req import DllmReqPhase, ReqDllmMixin
 from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.schedule_policy import AddReqResult
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocation import alloc_for_extend
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_context
@@ -66,12 +67,20 @@ class _SchedulerHarness:
     _abort_dllm_req_exact = SchedulerDllmMixin._abort_dllm_req_exact
     _retract_dllm_req = SchedulerDllmMixin._retract_dllm_req
     _retract_or_abort_dllm_req = SchedulerDllmMixin._retract_or_abort_dllm_req
+    # The real teardown, plus the three flags it reads: a stub or an attribute
+    # default would let this double drift from what the scheduler runs.
+    _release_aborted_request = Scheduler._release_aborted_request
+    enable_hierarchical_cache = False
+    enable_hicache_storage = False
+    enable_unified_cache_external_linker = False
 
 
 def _make_req(rid, prefix, block_size, *, req_pool_idx=None, reuse=False):
     return SimpleNamespace(
         rid=rid,
         prefix_indices=torch.tensor(prefix, dtype=torch.int32),
+        # Admitted at some point, which is what stashes a request as locked.
+        dllm_phase=DllmReqPhase.STAGING_DECODE,
         dllm_incomplete_ids=array("q", range(block_size)) if reuse else array("q"),
         inflight_middle_chunks=1 if req_pool_idx is not None else 0,
         last_node=None,
@@ -251,8 +260,8 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
             req.dllm_block_offset = self.block_size
             req.reset_for_retract = lambda r=req: setattr(r, "is_retracted", True)
             req.time_stats = SimpleNamespace(set_retract_time=lambda: None)
-            req.reset_dllm_for_retract = (
-                lambda r=req: ReqDllmMixin.reset_dllm_for_retract(r)
+            req.reset_dllm_for_retract = lambda r=req: (
+                ReqDllmMixin.reset_dllm_for_retract(r)
             )
         manager.waiting_queue = [victim, keep]
         manager.staging_queue = []
@@ -260,7 +269,6 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         outputs = []
         freed = []
         scheduler = _SchedulerHarness()
-        scheduler.enable_hicache_storage = False
         scheduler.dllm_manager = manager
         # A victim with no req_pool_idx still holds uncached prefix slots, which
         # _cleanup_dllm_req releases straight through the allocator.
@@ -337,7 +345,6 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
             outputs.append((msg, output_req))
 
         scheduler = _SchedulerHarness()
-        scheduler.enable_hicache_storage = False
         scheduler.dllm_manager = manager
         scheduler.token_to_kv_pool_allocator = SimpleNamespace(free=free)
         scheduler.tree_cache = SimpleNamespace(dec_lock_ref=dec_lock_ref)
@@ -363,6 +370,74 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         # Built through `_make_abort_req` like every other abort path, so the
         # tokenizer manager sees the same payload it does elsewhere.
         self.assertIsNotNone(outputs[0][0].weight_versions)
+
+    def test_abort_of_never_admitted_req_keeps_shared_prefix_locked(self):
+        """An INCOMING request only ran match_prefix, which does not lock.
+
+        Releasing its `last_node` would drop a ref it never took, and that node
+        is shared with whichever live request actually put the prefix there.
+        """
+        from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+        from sglang.srt.mem_cache.radix_cache import (
+            CacheInitParams,
+            InsertParams,
+            RadixCache,
+            RadixKey,
+        )
+
+        freed = []
+        allocator = SimpleNamespace(
+            device="cpu",
+            page_size=1,
+            available_size=lambda: 1 << 30,
+            free=lambda indices: freed.append(indices.tolist()),
+        )
+        pool = ReqToTokenPool(
+            size=8, max_context_len=64, device="cpu", enable_memory_saver=False
+        )
+        cache = RadixCache(
+            CacheInitParams(
+                req_to_token_pool=pool,
+                token_to_kv_pool_allocator=allocator,
+                page_size=1,
+                disable=False,
+            )
+        )
+
+        prefix = [1, 2, 3, 4]
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", prefix)),
+                value=torch.arange(len(prefix), dtype=torch.int64),
+            )
+        )
+
+        # A live request holding the prefix, as cache_unfinished_req would.
+        live = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", prefix))))
+        cache.inc_lock_ref(live.last_device_node)
+        self.assertEqual(cache.protected_size(), len(prefix))
+
+        # The victim: matched the same node this round, never admitted, so
+        # init_next_round_input left cache_protected_len == len(prefix_indices).
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", prefix))))
+        victim = _make_req("never-admitted", prefix, self.block_size)
+        victim.dllm_phase = DllmReqPhase.INCOMING_PREFILL
+        victim.prefix_indices = match.device_indices
+        victim.last_node = match.last_device_node
+        victim.kv = ReqKvInfo(cache_protected_len=len(match.device_indices))
+        self.assertIs(victim.last_node, live.last_device_node)
+
+        scheduler = _SchedulerHarness()
+        scheduler.tree_cache = cache
+        scheduler.token_to_kv_pool_allocator = allocator
+
+        scheduler._cleanup_dllm_req(victim)
+
+        # The live request's prefix stays protected, and nothing is handed back.
+        self.assertEqual(live.last_device_node.lock_ref, 1)
+        self.assertEqual(cache.protected_size(), len(prefix))
+        self.assertEqual(cache.evictable_size(), 0)
+        self.assertEqual(freed, [])
 
 
 if __name__ == "__main__":

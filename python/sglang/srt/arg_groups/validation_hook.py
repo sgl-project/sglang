@@ -201,6 +201,8 @@ def check_server_args(server_args: Any):
 
     check_dllm_speculative_decoding(server_args)
 
+    check_dllm_deterministic_inference(server_args)
+
     # Check communications compression
     if cfg.enable_quant_communications and cfg.tp_size == 1:
         raise ValueError("Communications quantization is only used with tp_size != 1")
@@ -434,6 +436,23 @@ def check_dllm_speculative_decoding(server_args: Any):
             "--speculative-algorithm is not supported with diffusion LLM "
             "inference (--dllm-algorithm): dLLM decodes a masked block per "
             "step rather than verifying draft tokens."
+        )
+
+
+def check_dllm_deterministic_inference(server_args: Any):
+    """dLLM aligns prefill truncation to the denoising block, not the split tile.
+
+    `add_one_req` asserts `truncation_align_size is None` for dLLM, so without
+    this check the deterministic alignment would be silently ignored rather
+    than refused.
+    """
+    cfg = resolving_view(server_args)
+    if cfg.dllm_algorithm is not None and cfg.enable_deterministic_inference:
+        raise ValueError(
+            "--enable-deterministic-inference is not supported with diffusion "
+            "LLM inference (--dllm-algorithm): dLLM aligns prefill truncation "
+            "to the denoising block size, which cannot also honour the "
+            "deterministic split-tile alignment."
         )
 
 

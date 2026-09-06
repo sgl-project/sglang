@@ -1455,7 +1455,6 @@ def _page_size_default(view: Any) -> dict:
     if view.page_size is not None:
         return {}
 
-    platform = get_platform()
     # SHUFFLE 5D vectorized KV layout (aiter backend + pa_decode_gluon)
     # is tuned for and prefers page_size=64 — making it the default
     # when the layout flag is set avoids users having to pass
@@ -1464,7 +1463,7 @@ def _page_size_default(view: Any) -> dict:
     # platforms the SHUFFLE 5D pool has no consumer kernels and the
     # env var is silently ignored (see MHATokenToKVPool).
     if (
-        platform.is_hip
+        get_platform().is_hip
         and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d"
     ):
         logger.info(
@@ -1472,7 +1471,9 @@ def _page_size_default(view: Any) -> dict:
             "SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d."
         )
         return {"page_size": 64}
-    return {"page_size": 64 if platform.is_musa else 1}
+    if not get_platform().is_musa:
+        return {"page_size": 1}
+    return {"page_size": 64}
 
 
 @register_post_process
