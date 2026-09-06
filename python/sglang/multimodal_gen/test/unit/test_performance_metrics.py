@@ -661,6 +661,8 @@ def _warmup_req(*, probe: bool = False) -> SimpleNamespace:
 
 
 def test_worker_releases_the_probe_pool_before_the_next_request(monkeypatch):
+    import sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a as ipc_a2a_module
+
     calls = []
     fake_device = SimpleNamespace(empty_cache=lambda: calls.append("empty_cache"))
     monkeypatch.setattr(
@@ -668,6 +670,9 @@ def test_worker_releases_the_probe_pool_before_the_next_request(monkeypatch):
     )
     monkeypatch.setattr(type(current_platform), "is_cpu", lambda self: False)
     monkeypatch.setattr(type(current_platform), "is_mps", lambda self: False)
+    monkeypatch.setattr(
+        ipc_a2a_module.IPC_A2A, "drop_staging", lambda: calls.append("drop_staging")
+    )
     worker = GPUWorker.__new__(GPUWorker)
     worker._release_warmup_pool_before_serving = False
 
@@ -675,12 +680,13 @@ def test_worker_releases_the_probe_pool_before_the_next_request(monkeypatch):
     worker._release_warmup_pool(_warmup_req(probe=True))
     assert calls == []
 
-    # the bounded re-warm after the probe regrows the pool from empty
+    # the bounded re-warm after the probe regrows the pool from empty, and the
+    # IPC staging buffers sized for the probe's messages go with it
     worker._release_warmup_pool(_warmup_req())
-    assert calls == ["empty_cache"]
+    assert calls == ["drop_staging", "empty_cache"]
 
     worker._release_warmup_pool(SimpleNamespace(is_warmup=False, extra={}))
-    assert calls == ["empty_cache"]
+    assert calls == ["drop_staging", "empty_cache"]
 
 
 def test_worker_keeps_the_pool_when_no_probe_ran(monkeypatch):
