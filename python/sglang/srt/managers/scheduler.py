@@ -313,7 +313,10 @@ from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
-from sglang.srt.speculative.dflash_utils import validate_dflash_request
+from sglang.srt.speculative.dflash_utils import (
+    is_dflash_sampling_verify_available,
+    validate_dflash_request,
+)
 from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec_from_config,
 )
@@ -2909,12 +2912,71 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if req.return_sampling_mask and not self.spec_algorithm.is_none():
-            # Spec workers do not emit one sampling support per accepted token, so
-            # the returned mask would not align 1:1 with generated tokens. Reject
-            # the combination instead of silently returning a misaligned mask.
+        if req.return_sampling_mask and not (
+            self.spec_algorithm.is_none() or self.spec_algorithm.is_dflash_family()
+        ):
             error_msg = (
                 "return_sampling_mask is not supported with speculative decoding."
+            )
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
+        if (
+            req.return_sampling_mask
+            and self.spec_algorithm.is_dflash_family()
+            and req.sampling_params.min_p > 0
+        ):
+            error_msg = (
+                "return_sampling_mask with DFlash-family speculative decoding "
+                "does not support min_p."
+            )
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
+        if (
+            req.return_sampling_mask
+            and self.spec_algorithm.is_dflash()
+            and req.sampling_params.top_k > 1
+            and not is_dflash_sampling_verify_available()
+        ):
+            error_msg = (
+                "return_sampling_mask with non-greedy DFlash decoding requires "
+                "sampling verification support."
+            )
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
+        if (
+            req.return_sampling_mask
+            and self.spec_algorithm.is_dflash()
+            and (
+                get_spec().speculative_accept_threshold_single != 1.0
+                or get_spec().speculative_accept_threshold_acc != 1.0
+            )
+        ):
+            error_msg = (
+                "return_sampling_mask with DFlash requires acceptance thresholds "
+                "of 1.0."
+            )
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
+        if (
+            req.return_sampling_mask
+            and self.spec_algorithm.is_dflash_family()
+            and envs.SGLANG_SIMULATE_ACC_LEN.get() > 0
+        ):
+            error_msg = (
+                "return_sampling_mask is not supported with simulated speculative "
+                "acceptance."
             )
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
@@ -5019,6 +5081,45 @@ class Scheduler(
                 )
                 if_success = False
                 break
+            elif (
+                k
+                in (
+                    "speculative_accept_threshold_single",
+                    "speculative_accept_threshold_acc",
+                )
+                and self.spec_algorithm.is_dflash()
+                and float(v) != 1.0
+            ):
+                active_batches = [self.running_batch, self.last_batch]
+                active_batches.extend(getattr(self, "running_mbs", ()))
+                active_batches.extend(getattr(self, "mbs", ()))
+                active_batches.extend(getattr(self, "last_mbs", ()))
+                has_active_mask_request = any(
+                    req.return_sampling_mask and not req.finished()
+                    for batch in active_batches
+                    if batch is not None
+                    for req in batch.reqs
+                )
+                has_active_mask_request |= any(
+                    req.return_sampling_mask and not req.finished()
+                    for req in self.waiting_queue
+                )
+                has_active_mask_request |= any(
+                    req.return_sampling_mask and not req.finished()
+                    for req in self.grammar_manager.grammar_queue
+                )
+                has_active_mask_request |= (
+                    self.chunked_req is not None
+                    and self.chunked_req.return_sampling_mask
+                    and not self.chunked_req.finished()
+                )
+                if has_active_mask_request:
+                    logging.warning(
+                        f"Updating {k} is rejected while DFlash sampling-mask "
+                        "requests are active."
+                    )
+                    if_success = False
+                    break
             elif k == "dspark_force_budget_frac":
                 if not self.spec_algorithm.is_dspark() or not hasattr(
                     self.draft_worker, "set_dspark_forced_budget_frac"

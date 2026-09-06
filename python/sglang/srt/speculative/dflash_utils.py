@@ -877,7 +877,10 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     uniform_samples: Optional[torch.Tensor] = None,
     uniform_samples_for_final_sampling: Optional[torch.Tensor] = None,
     use_sparse_topk: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    return_target_probs: bool = False,
+) -> (
+    Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+):
     """Compute DFlash accept lengths and bonus tokens for non-greedy sampling.
 
     This is a chain-specialized variant of speculative target-only verification:
@@ -950,6 +953,18 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         device=device,
     )
 
+    target_probs = None
+    if return_target_probs:
+        target_probs = build_speculative_verify_target_probs(
+            next_token_logits=next_token_logits,
+            sampling_info=sampling_info,
+            draft_token_num=draft_token_num,
+            bs=bs,
+            max_top_k=max_top_k,
+            uniform_top_k_value=uniform_top_k_value,
+            use_sparse_topk=use_sparse_topk,
+        )
+
     # The full-vocabulary matrices die with this step, so their bytes may come
     # from the graph pool's idle storage. Anything outliving the scope is not.
     with borrow_graph_pool(user="DFLASH verify probabilities"):
@@ -969,15 +984,16 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
                 dtype=torch.float32,
             )
 
-        target_probs = build_dflash_verify_target_probs(
-            next_token_logits=next_token_logits,
-            sampling_info=sampling_info,
-            draft_token_num=draft_token_num,
-            bs=bs,
-            max_top_k=max_top_k,
-            uniform_top_k_value=uniform_top_k_value,
-            use_sparse_topk=use_sparse_topk,
-        )
+        if target_probs is None:
+            target_probs = build_speculative_verify_target_probs(
+                next_token_logits=next_token_logits,
+                sampling_info=sampling_info,
+                draft_token_num=draft_token_num,
+                bs=bs,
+                max_top_k=max_top_k,
+                uniform_top_k_value=uniform_top_k_value,
+                use_sparse_topk=use_sparse_topk,
+            )
         draft_probs = torch.zeros_like(target_probs)
         candidates_i64 = (
             candidates
@@ -1000,17 +1016,21 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
             threshold_acc=threshold_acc,
             deterministic=True,
         )
-        del target_probs, draft_probs, candidates_i64
+        if not return_target_probs:
+            del target_probs
+        del draft_probs, candidates_i64
         del coins, coins_for_final_sampling
 
     correct_len = accept_token_num
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
     accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
     bonus = predicts[accept_pos].to(torch.int64)
+    if return_target_probs:
+        return correct_len, bonus, target_probs
     return correct_len, bonus
 
 
-def build_dflash_verify_target_probs(
+def build_speculative_verify_target_probs(
     *,
     next_token_logits: torch.Tensor,
     sampling_info: Any,
