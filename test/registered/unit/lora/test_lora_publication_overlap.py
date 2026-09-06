@@ -34,6 +34,7 @@ def _manager():
     tm = TokenizerManager.__new__(TokenizerManager)
     tm.server_args = SimpleNamespace(
         enable_lora=True,
+        pp_size=1,
         max_loaded_loras=None,
         checkpoint_engine_wait_weights_before_ready=False,
     )
@@ -98,6 +99,19 @@ class TestPublicationOverlap(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(result.success)
         self.assertTrue(result.pending)
+
+    async def test_pipeline_parallel_registration_fails_before_allocating(self):
+        self.tm.server_args.pp_size = 2
+        self.tm.update_lora_adapter_communicator.reset_mock()
+        result = await self.tm.register_lora_adapter(
+            RegisterLoRAAdapterReqInput(
+                lora_name="A@3", config_dict={"r": 8}, defer_publish=True
+            )
+        )
+        self.assertFalse(result.success)
+        self.assertIn("pp_size=1", result.error_message)
+        self.tm.update_lora_adapter_communicator.assert_not_awaited()
+        self.assertIsNone(await self.tm.lora_registry.get_lora_id("A@3"))
 
     async def test_full_session_finishes_with_existing_readers_and_lora_leases(self):
         tm = self.tm

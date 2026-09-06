@@ -148,7 +148,8 @@ terminate_process(server_process)
 
 On `sglang-miles`, a fresh adapter version can be published without pausing or
 waiting for existing generation requests. Use a different name for each version,
-such as `A@1` and `A@2`:
+such as `A@1` and `A@2`. This opt-in requires `pp_size=1`; cross-stage commit
+acknowledgement for pipeline-parallel serving is not supported.
 
 1. Call `/register_lora_adapter` with `lora_name`, `config_dict` and
    `defer_publish: true`. Require both `success: true` and `pending: true` in the
