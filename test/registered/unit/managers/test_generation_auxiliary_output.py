@@ -443,6 +443,8 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
     req = SimpleNamespace(
         output_ids=[],
         finished_len=None,
+        to_finish=None,
+        finished_reason=None,
         inflight_middle_chunks=0,
         pending_bootstrap=False,
         return_logprob=False,
