@@ -886,9 +886,10 @@ export const config = {
     // ==== NVFP4 (NVDA) on 2x DGX Spark — nvidia/Qwen3.8-Flash-Next-NVFP4 ====
     // ModelOpt MIXED_PRECISION export: NVFP4 routed experts, FP8 N-gram table,
     // FP8_BLOCK_SCALES (128-wide) MTP experts. Loading it needs the mixed-
-    // precision loader from sgl-project/sglang#38121, which the qwen38flashnext
-    // image does not carry yet — hence in-progress. Same TP=2 shape and flags as
-    // the RDXA cells, with two differences forced by this export:
+    // precision loader from sgl-project/sglang#38121 (merged into
+    // qwen4-main-squashed as 9b2aee2283, the branch the Python install path
+    // builds); the qwen38flashnext image predates it. Same TP=2 shape and flags
+    // as the RDXA cells, with two differences forced by this export:
     //   - `--quantization` is NOT passed (the checkpoint resolves to
     //     modelopt_mixed), and `--moe-runner-backend flashinfer_cutlass` is
     //     explicit: the modelopt_mixed auto-default picks flashinfer_trtllm on
@@ -905,8 +906,7 @@ export const config = {
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "multi-2" },
       verified: true,
-      verificationStatus: "in-progress",
-      warn: "2x DGX Spark only (GB10 pair, TP=2 over ConnectX-7). Needs the ModelOpt MIXED_PRECISION loader from [sgl-project/sglang#38121](https://github.com/sgl-project/sglang/pull/38121), not yet in the qwen38flashnext image — run the Python command from that PR's branch until it lands. The MTP draft is read from the RadixArk export (same head, BF16) because this export's fp8 block-scaled MTP experts cannot be split across two ranks. See [DGX Spark notes](#spark-note).",
+      warn: "2x DGX Spark only (GB10 pair, TP=2 over ConnectX-7). Verified on the qwen4-main-squashed branch (the Python install path above). The qwen38flashnext Docker image predates the MIXED_PRECISION loader ([sgl-project/sglang#38121](https://github.com/sgl-project/sglang/pull/38121)) and cannot load this export until it is rebuilt. The MTP draft is read from the RadixArk export (same head, BF16) because this export's fp8 block-scaled MTP experts cannot be split across two ranks. See [DGX Spark notes](#spark-note).",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -933,8 +933,7 @@ export const config = {
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvda", strategy: "high-throughput", nodes: "multi-2" },
       verified: true,
-      verificationStatus: "in-progress",
-      warn: "2x DGX Spark only (GB10 pair, TP=2 over ConnectX-7). Needs the ModelOpt MIXED_PRECISION loader from [sgl-project/sglang#38121](https://github.com/sgl-project/sglang/pull/38121), not yet in the qwen38flashnext image — run the Python command from that PR's branch until it lands. At 96 concurrent requests the KV pool is ~1.1M tokens; lower --max-running-requests for long-context workloads. See [DGX Spark notes](#spark-note).",
+      warn: "2x DGX Spark only (GB10 pair, TP=2 over ConnectX-7). Verified on the qwen4-main-squashed branch (the Python install path above). The qwen38flashnext Docker image predates the MIXED_PRECISION loader ([sgl-project/sglang#38121](https://github.com/sgl-project/sglang/pull/38121)) and cannot load this export until it is rebuilt. At 96 concurrent requests the KV pool is ~1.1M tokens; lower --max-running-requests for long-context workloads. See [DGX Spark notes](#spark-note).",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
