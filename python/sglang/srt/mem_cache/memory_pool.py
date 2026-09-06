@@ -1398,16 +1398,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
     @property
     def mamba_translate_is_fusable(self) -> bool:
         """Whether `fused_replay_state_indices` can reproduce this pool's
-        `translate_mamba_indices` inside its own launch.
+        `translate_mamba_indices` in its own launch.
 
-        It can express exactly two shapes: the identity, and one gather through
-        `mamba_v2p_table`. Anything else has to run the unfused reference
-        chain, so the default answers for the identity by checking that the
-        method is still this class's -- a subclass that replaces it with
-        something the kernel cannot express is then excluded automatically,
-        rather than silently mis-served. A subclass whose translate IS one of
-        the two shapes says so by publishing `mamba_v2p_table` or by
-        overriding this.
+        The kernel expresses exactly two shapes: the identity, and one gather
+        through `mamba_v2p_table`. A subclass that replaces the translate with
+        anything else is excluded here rather than silently mis-served.
         """
         if self.mamba_v2p_table is not None:
             return True

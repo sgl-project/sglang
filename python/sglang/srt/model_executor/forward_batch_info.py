@@ -1819,8 +1819,10 @@ def build_inner_fb_view(
         seq_lens_cpu=forward_batch.seq_lens_cpu,
         encoder_lens=encoder_lens,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
-        # The write contract's virtual source: a view that omits it silently
-        # skips the capture-stable fill.
+        # The write contract's virtual source. `getattr` on purpose, unlike
+        # `build_replay_fb_view`: that one is handed the live ForwardBatch,
+        # while this can be handed another hand-built view (the speculative
+        # runners and DSV4 each build their own) that predates this field.
         out_cache_loc_virtual=getattr(forward_batch, "out_cache_loc_virtual", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         spec_info=forward_batch.spec_info,
