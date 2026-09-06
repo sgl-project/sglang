@@ -315,14 +315,22 @@ class TestMHAViews(unittest.TestCase):
             _build_views(_make_raw(ps, num_pages, short=1), ps, num_pages)
 
     def test_paged_view_regroups_by_page(self):
-        ps, num_pages = 4, 3
-        dk, _ = _build_views(_make_raw(ps, num_pages), ps, num_pages)
-        paged = paged_view(dk[1], ps)
-        self.assertEqual(
-            tuple(paged.stride()), (ps * _ENTRY // _ITEM, _ENTRY // _ITEM, _D, 1)
-        )
-        for t in range(num_pages * ps):
-            self.assertEqual(paged[t // ps, t % ps].data_ptr(), dk[1][t].data_ptr())
+        """BUG REGRESSION at page_size 1: a `view`-built split gives the size-1
+        slot dim the ROW stride, not the entry stride, so the paged view
+        misreported the slot stride of every MHA/SWA layer at ps=1."""
+        num_pages = 3
+        for ps in (1, 4):
+            dk, _ = _build_views(_make_raw(ps, num_pages), ps, num_pages)
+            paged = paged_view(dk[1], ps)
+            self.assertEqual(
+                tuple(paged.stride()),
+                (ps * _ENTRY // _ITEM, _ENTRY // _ITEM, _D, 1),
+                ps,
+            )
+            for t in range(num_pages * ps):
+                self.assertEqual(
+                    paged[t // ps, t % ps].data_ptr(), dk[1][t].data_ptr(), (ps, t)
+                )
 
 
 # ---- pool level ----

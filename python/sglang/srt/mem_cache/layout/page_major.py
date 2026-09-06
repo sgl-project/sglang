@@ -54,14 +54,18 @@ def align_entry_bytes(num_bytes: int) -> int:
 def paged_view(flat: torch.Tensor, page_size: int) -> torch.Tensor:
     """``[slots, ...]`` -> ``[slots // page_size, page_size, ...]``, as a view.
 
-    Splitting dim 0 never copies: the slot stride becomes dim 1's stride, so a
-    strided per-layer view keeps addressing ``slot * stride(0)``.
+    Built with ``as_strided``, not ``view``: dim 1 must carry the slot stride
+    at every page size, and ``view`` gives a size-1 dim (``page_size == 1``)
+    the row stride instead, which differs from the slot stride whenever the
+    per-layer view is strided.
     """
     num_slots = int(flat.shape[0])
     assert num_slots % page_size == 0, (num_slots, page_size)
-    out = flat.view(num_slots // page_size, page_size, *flat.shape[1:])
-    assert out.stride(1) == flat.stride(0)
-    return out
+    slot_stride = flat.stride(0)
+    return flat.as_strided(
+        (num_slots // page_size, page_size, *flat.shape[1:]),
+        (slot_stride * page_size, slot_stride, *flat.stride()[1:]),
+    )
 
 
 def paged_row_view(flat: torch.Tensor, page_size: int) -> torch.Tensor:

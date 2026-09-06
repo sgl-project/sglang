@@ -60,9 +60,7 @@ _HAS_CUDA = torch.cuda.is_available()
 _DEV = "cuda"
 
 
-def _fill_block_table(
-    req_to_token, req_pool_indices, seq_lens, page_size, *, v2p
-):
+def _fill_block_table(req_to_token, req_pool_indices, seq_lens, page_size, *, v2p):
     """The unified route: canonical builder into a -1-filled block table
     (exactly what KVIndexTranslator.build_into does for trtllm_mla/flashmla)."""
     from sglang.kernels.ops.kvcache.kv_read_table import build_kv_read_table
@@ -208,9 +206,7 @@ class TestBlockTable(unittest.TestCase):
         physical page."""
         page_size = 64
         rt, rpi, sl, v2p = self._make_batch(page_size)
-        block_table = _fill_block_table(
-            rt, rpi, sl, page_size, v2p=v2p
-        ).long()
+        block_table = _fill_block_table(rt, rpi, sl, page_size, v2p=v2p).long()
         for r in range(rt.shape[0]):
             n = int(sl[r].item())
             virt_tokens = rt[r, :n].long()
@@ -297,9 +293,7 @@ class TestFa3MetadataBlockTable(unittest.TestCase):
                 None,
             )
         torch.cuda.synchronize()
-        want = _reference(
-            rt, rpi, sl, page_size, v2p=(v2p_full if v2p else None)
-        )
+        want = _reference(rt, rpi, sl, page_size, v2p=(v2p_full if v2p else None))
         return page_table, want, sl
 
     def _assert_live_prefix(self, got, want, sl, page_size):

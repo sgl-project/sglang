@@ -1660,7 +1660,7 @@ class KVWriteLoc:
         *,
         swa_loc: Optional[torch.Tensor] = None,
         full_loc: Optional[torch.Tensor] = None,
-    ) -> "KVWriteLoc":
+    ) -> KVWriteLoc:
         """A write loc derived from the batch's ``out_cache_loc`` (or a slice /
         alias of it), carrying the batch's id space."""
         return cls(
@@ -1836,9 +1836,7 @@ class KVCache(abc.ABC):
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError()
 
-    def get_paged_kv_buffer(
-        self, layer_id: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_paged_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-layer K/V as ``[num_pages, page_size, ...]`` views of the flat
         buffers; no copy, the slot stride is kept."""
         k_buffer, v_buffer = self.get_kv_buffer(layer_id)

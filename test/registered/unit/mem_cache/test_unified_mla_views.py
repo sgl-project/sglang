@@ -40,12 +40,13 @@ import unittest
 
 import torch
 
+from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
 from sglang.srt.mem_cache.layout.page_major import (
     ENTRY_ALIGN_BYTES,
     build_dense_views,
     mla_entry_bytes,
+    paged_row_view,
 )
-from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
     MLASubPoolSpec,
@@ -163,6 +164,24 @@ class TestMLAViews(unittest.TestCase):
                 self.assertTrue(
                     torch.all(flat[elem : elem + _D] == marker),
                     f"(p={p}, l={l}, s={s}, ps={ps}) landed off-formula",
+                )
+
+    def test_paged_row_view_keeps_the_slot_stride(self):
+        """BUG REGRESSION at page_size 1: the paged MLA backends hand the
+        kernels `paged_row_view(kv)`, whose dim 1 must carry the entry stride
+        at every page size; a `view`-built split gave the size-1 slot dim the
+        row stride instead."""
+        num_pages = 3
+        for ps in (1, 4):
+            views = _build_views(self._make_raw(ps, num_pages), ps, num_pages)
+            paged = paged_row_view(views[1], ps)
+            self.assertEqual(tuple(paged.shape), (num_pages, ps, _D), ps)
+            self.assertEqual(tuple(paged.stride()), (ps * _E_ELEMS, _E_ELEMS, 1), ps)
+            for t in range(num_pages * ps):
+                self.assertEqual(
+                    paged[t // ps, t % ps].data_ptr(),
+                    views[1][t].data_ptr(),
+                    (ps, t),
                 )
 
     def test_views_do_not_alias_across_layers(self):

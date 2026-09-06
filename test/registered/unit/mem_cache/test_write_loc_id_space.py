@@ -75,12 +75,20 @@ def _batch(loc):
 
 def _unified_mha_pool(ps=1):
     full = MHASubPoolSpec(
-        name="full", layer_num=_L, head_num=_H, head_dim=_D,
-        store_dtype=_DTYPE, grow_direction="down",
+        name="full",
+        layer_num=_L,
+        head_num=_H,
+        head_dim=_D,
+        store_dtype=_DTYPE,
+        grow_direction="down",
     )
     swa = MHASubPoolSpec(
-        name="swa", layer_num=_L, head_num=_H, head_dim=_D,
-        store_dtype=_DTYPE, grow_direction="up",
+        name="swa",
+        layer_num=_L,
+        head_num=_H,
+        head_dim=_D,
+        store_dtype=_DTYPE,
+        grow_direction="up",
     )
     kv = UnifiedKVPool(
         total_bytes=full.entry_bytes() * 32 + swa.entry_bytes() * 16,
@@ -165,8 +173,14 @@ class TestUnifiedDoorsRefuseUnmarkedLocs(unittest.TestCase):
 
     def test_plain_pool_ignores_the_marker(self):
         pool = MHATokenToKVPool(
-            size=8, page_size=1, head_num=_H, head_dim=_D, dtype=_DTYPE,
-            layer_num=1, device=_DEV, enable_memory_saver=False,
+            size=8,
+            page_size=1,
+            head_num=_H,
+            head_dim=_D,
+            dtype=_DTYPE,
+            layer_num=1,
+            device=_DEV,
+            enable_memory_saver=False,
         )
         loc = torch.tensor([2], dtype=torch.int64, device=_DEV)
         k, v = self._kv(1)
