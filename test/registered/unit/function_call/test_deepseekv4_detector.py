@@ -68,6 +68,23 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             normal, DeepSeekV4Detector().detect_and_parse(text, self.tools).normal_text
         )
 
+    def test_text_after_tool_call_is_not_dropped(self):
+        """Plain text following a completed invoke must survive streaming."""
+        text = _weather_call() + "\nThe rest of the answer."
+        normal, calls = self._feed([text])
+
+        self.assertEqual(normal, "The rest of the answer.")
+        self.assertEqual([c.name for c in calls if c.name], ["get_weather"])
+
+    def test_text_between_multiple_tool_calls_is_not_dropped(self):
+        text = _weather_call("SF") + "\nChecking another city.\n" + _weather_call("NY")
+        normal, calls = self._feed([text])
+
+        self.assertEqual(normal, "Checking another city.\n")
+        self.assertEqual(
+            [c.name for c in calls if c.name], ["get_weather", "get_weather"]
+        )
+
     def test_preamble_before_bare_invoke_without_wrapper(self):
         """The bare `<｜DSML｜invoke …>` form has no tool_calls wrapper to walk
         back to, so the preamble is computed from the invoke itself."""
