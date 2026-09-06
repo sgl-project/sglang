@@ -1174,6 +1174,143 @@ class Glm5NextForConditionalGeneration(nn.Module):
             self.config.rope_scaling or {}
         )
 
+    def precompile_kernels_after_loading(self) -> None:
+        """Compile and load the vision tower's lazily built kernels before pools exist."""
+        self._precompile_vision_attention_kernel()
+        self._precompile_vision_mlp_kernel()
+
+    def _precompile_vision_attention_kernel(self) -> None:
+        """Load the vision tower's Triton attention kernel before pools exist.
+
+        ``ModelRunner.load_model`` invokes this hook (through
+        ``maybe_precompile_model_kernels_after_loading``) once the model object
+        exists, before the KV pool and CUDA graphs claim device memory. Under
+        overlapping startup loading the real weights are committed later by
+        ``finalize_startup_weight_load``; the hook reads only the tower's
+        shape, dtype and device, never its weights.
+
+        When the vision attention backend resolves to ``triton_attn``, the
+        tower's ``context_attention_fwd`` Triton module is otherwise JIT-compiled
+        and device-loaded on the first image request, which can arrive long
+        after startup with almost no free device memory left. One tiny call
+        with the tower's specialization inputs (head_dim, dtype,
+        kv_group_num=1, is_causal=False) loads it now. Only the first pipeline
+        rank runs the vision tower (``general_mm_embed_routine`` embeds on
+        ``pp_group.is_first_rank``), so other ranks skip.
+
+        Failures are non-fatal: the device is synchronized inside the ``try``
+        so that both synchronous errors (compile or launch failures) and
+        asynchronously reported kernel errors are logged at WARNING and
+        swallowed before success is reported. A sticky device error (for
+        example an illegal memory access) still poisons the CUDA context and
+        resurfaces at the next device operation; this hook cannot recover that.
+
+        Note that the generic wrapper synchronizes the device and empties the
+        allocator cache before and after every invocation, including the ones
+        that return early here; that is a startup-only cost.
+        """
+        if self.visual is None or not self.pp_group.is_first_rank:
+            return
+        vision_attn = next(
+            (m for m in self.visual.modules() if isinstance(m, VisionAttention)),
+            None,
+        )
+        if vision_attn is None or vision_attn.qkv_backend_name != "triton_attn":
+            return
+
+        try:
+            from sglang.kernels.ops.attention.prefill_attention import (
+                context_attention_fwd,
+            )
+
+            head_dim = self.visual.hidden_size // self.visual.num_heads
+            device = self.visual.device
+            dtype = self.visual.dtype
+            dummy = torch.zeros((1, 1, head_dim), dtype=dtype, device=device)
+            start_loc = torch.zeros((1,), dtype=torch.int32, device=device)
+            seq_len = torch.ones((1,), dtype=torch.int32, device=device)
+            context_attention_fwd(
+                dummy,
+                dummy,
+                dummy,
+                torch.empty_like(dummy),
+                start_loc,
+                seq_len,
+                1,
+                is_causal=False,
+            )
+            if device.type == "cuda":
+                # Surface asynchronously reported kernel errors here, inside
+                # the handler, rather than at the wrapper's synchronize.
+                torch.cuda.synchronize(device)
+            log_info_on_rank0(
+                logger,
+                "Precompiled the vision-tower Triton attention kernel "
+                "before memory-pool allocation.",
+            )
+        except Exception:
+            logger.warning(
+                "Vision-tower attention precompile failed; the kernel will be "
+                "loaded on the first image request instead",
+                exc_info=True,
+            )
+
+    def _precompile_vision_mlp_kernel(self) -> None:
+        """Compile the vision MLP's ``torch.compile``d activation before pools exist.
+
+        ``swiglu_clamped`` is compiled with dynamo's default shape policy: the
+        first call compiles a static-shape kernel and a second, different token
+        count recompiles a dynamic-shape one. Each compile runs inductor's
+        Triton autotuning, which allocates benchmark buffers on the device.
+        Without this, the first image whose token count differs from the
+        warmup image's triggers that autotune during serving with the memory
+        pools already allocated, which fails with CUDA OOM at a high
+        ``mem_fraction_static``. Running the block MLP and the patch merger
+        (the two callers, with different gate_up widths) at two token counts
+        here settles dynamo on the dynamic kernels while memory is free; the
+        inductor cache then serves later boots. Failures are logged at WARNING
+        and swallowed, as for the attention precompile.
+        """
+        if self.visual is None or not self.pp_group.is_first_rank:
+            return
+        targets = []
+        for cls, first_linear in (
+            (Glm5NextVisionMLP, "gate_up_proj"),
+            (Glm5NextVisionPatchMerger, "proj"),
+        ):
+            module = next(
+                (m for m in self.visual.modules() if isinstance(m, cls)), None
+            )
+            if module is not None:
+                targets.append((module, getattr(module, first_linear).input_size))
+        if not targets:
+            return
+        try:
+            device = self.visual.device
+            dtype = self.visual.dtype
+            with torch.no_grad():
+                for module, in_features in targets:
+                    for tokens in (64, 4096):
+                        module(
+                            torch.zeros(
+                                (tokens, in_features), dtype=dtype, device=device
+                            )
+                        )
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            log_info_on_rank0(
+                logger,
+                "Precompiled the vision-tower MLP and patch-merger activation "
+                "kernels (static and dynamic token counts) before memory-pool "
+                "allocation.",
+            )
+        except Exception:
+            logger.warning(
+                "Vision-tower MLP precompile failed; the activation will be "
+                "compiled on the first image request instead",
+                exc_info=True,
+            )
+
     def get_input_embeddings(self) -> nn.Embedding:
         if self.model is None:
             raise AttributeError(
