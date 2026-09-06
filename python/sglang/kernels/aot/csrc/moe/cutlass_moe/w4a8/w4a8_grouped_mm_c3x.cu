@@ -156,6 +156,40 @@ void dispatch_w4a8_moe_mm_sm90(
     } else {
       INVOKE_GEMM_WITH_CONFIG((SM90_PP<128, 64, 128, 1, 1, 1>));
     }
+  } else if (n == 6144 && k == 256) {
+    // GLM-5.2 group gemm 2 at TP-8
+    if (m <= 256) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<256, 16, 128, 1, 1, 1>));
+    } else if (m <= 512) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<256, 32, 128, 2, 1, 1>));
+    } else if (m <= 4096) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<256, 64, 128, 1, 1, 1>));
+    } else {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 128, 128, 1, 1, 1>));
+    }
+  } else if (n == 512 && k == 6144) {
+    // GLM-5.2 group gemm 1 at TP-8
+    if (m <= 256) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 2, 1, 1>));
+    } else if (m <= 2048) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
+    } else {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
+    }
+  } else if (n == 4096 && k == 6144) {
+    // GLM-5.2 group gemm 1
+    if (m <= 256) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 2, 1, 1>));
+    } else {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
+    }
+  } else if (n == 6144 && k == 2048) {
+    // GLM-5.2 group gemm 2
+    if (m <= 256) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 2, 1, 1>));
+    } else {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
+    }
   } else {
     if (k % 512 == 0) {
       // For large m (prefill), prefer larger cluster
