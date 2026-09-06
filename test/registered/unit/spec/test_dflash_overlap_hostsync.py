@@ -61,6 +61,95 @@ class TestCompactSeqLensHostBound(CustomTestCase):
         self.assertGreaterEqual(int(bound), int(exact_true))
 
 
+class TestDFlashMambaCommit(CustomTestCase):
+    def test_fold_replayssm_uses_common_mamba_commit_hook(self):
+        from sglang.srt.speculative import dflash_worker_v2
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        calls = []
+
+        def fake_commit(**kwargs):
+            calls.append(kwargs)
+
+        old_commit = dflash_worker_v2.commit_mamba_states_after_verify
+        dflash_worker_v2.commit_mamba_states_after_verify = fake_commit
+        try:
+            worker = SimpleNamespace(
+                _need_mamba_verify_commit=True,
+                block_size=4,
+                target_worker=SimpleNamespace(
+                    model_runner=SimpleNamespace(
+                        req_to_token_pool=SimpleNamespace(
+                            mamba_pool=SimpleNamespace(
+                                replayssm_spec_fold=True,
+                                replayssm_is_kda=False,
+                            )
+                        )
+                    )
+                ),
+            )
+            batch = object()
+            commit_lens = torch.tensor([1, 3], dtype=torch.int32)
+            DFlashWorkerV2._update_target_mamba_state_after_verify(
+                worker,
+                batch=batch,
+                seq_lens_pre_verify=torch.tensor([10, 20], dtype=torch.int64),
+                commit_lens=commit_lens,
+            )
+        finally:
+            dflash_worker_v2.commit_mamba_states_after_verify = old_commit
+
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertIs(call["target_worker"], worker.target_worker)
+        self.assertIs(call["batch"], batch)
+        self.assertIs(call["accept_lens"], commit_lens)
+        self.assertEqual(call["draft_token_num"], 4)
+        torch.testing.assert_close(
+            call["accept_index"],
+            torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32),
+        )
+
+    def test_non_replayssm_keeps_legacy_mamba_commit_path(self):
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        calls = []
+
+        class FakeAttnBackend:
+            def update_mamba_state_after_mtp_verify(self, **kwargs):
+                calls.append(kwargs)
+
+        worker = SimpleNamespace(
+            _need_mamba_verify_commit=True,
+            block_size=4,
+            server_args=SimpleNamespace(mamba_track_interval=16),
+            target_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(
+                    req_to_token_pool=SimpleNamespace(mamba_pool=SimpleNamespace()),
+                    attn_backend=FakeAttnBackend(),
+                    model=object(),
+                )
+            ),
+        )
+        batch = SimpleNamespace(mamba_track_indices=None)
+        commit_lens = torch.tensor([1, 3], dtype=torch.int32)
+
+        DFlashWorkerV2._update_target_mamba_state_after_verify(
+            worker,
+            batch=batch,
+            seq_lens_pre_verify=torch.tensor([10, 20], dtype=torch.int64),
+            commit_lens=commit_lens,
+        )
+
+        self.assertEqual(len(calls), 1)
+        torch.testing.assert_close(
+            calls[0]["last_correct_step_indices"],
+            torch.tensor([0, 2], dtype=torch.int64),
+        )
+        self.assertIsNone(calls[0]["mamba_track_indices"])
+        self.assertIsNone(calls[0]["mamba_steps_to_track"])
+
+
 class _FakeTpGroup:
     """Single-process stand-in for the TP GroupCoordinator: replays the
     concatenation of all ranks' recorded all-gather inputs."""
