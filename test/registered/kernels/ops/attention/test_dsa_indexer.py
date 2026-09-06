@@ -219,6 +219,7 @@ class MockModelRunner:
 
         self.sliding_window_size = None
         self.page_size = self.config["page_size"]
+        self.max_running_requests = max_batch_size
 
         # Create req_to_token_pool
         self.req_to_token_pool = type(
@@ -1240,6 +1241,7 @@ class TestDSAIndexer(CustomTestCase):
                 backend.use_fused_topk = True
                 backend.dsa_topk_backend = topk_backend
                 backend.dsa_index_topk = 2048
+                backend.dsa_index_kpool = 1
                 backend.dsa_decode_impl = "fa3"
                 backend.req_to_token = torch.empty(
                     2, 4096, dtype=torch.int32, device=self.device
