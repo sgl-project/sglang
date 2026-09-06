@@ -13,9 +13,11 @@ is tuned for -- hidden=6144, moe_intermediate_size=2048, E=256, topk=8:
   at the full intermediate size -- gemm1 (n=4096, k=6144) and gemm2
   (n=6144, k=2048).
 
-Shapes with m<=2048 run captured under a CUDA graph (matching how decode-sized
-batches run in production); larger m runs eager, since prefill of that size
-is not graphed in production either.
+Each timed call is preceded by a 256MB L2 flush so small-M numbers aren't
+optimistic from a warm cache the way production never sees. Shapes with
+m<=2048 run captured under a CUDA graph (matching how decode-sized batches
+run in production); larger m runs eager, since prefill of that size is not
+graphed in production either.
 
 Run on H200:
 
@@ -25,13 +27,17 @@ Run on H200:
 from __future__ import annotations
 
 import argparse
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import msgspec
 import torch
 
 from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+
+GROUP_SIZE = 128
+CUDA_GRAPH_MAX_TOKENS = 2048  # decode-sized batches run under a captured graph in production
+L2_FLUSH_BYTES = 256 * 1024 * 1024
 
 
 def pack_int4_values_to_int8(int4_values_interleaved: torch.Tensor) -> torch.Tensor:
@@ -112,9 +118,6 @@ _EP_TOKENS = (8, 16, 32, 64, 128, 256)
 DEFAULT_SHAPES: List[Shape] = [
     Shape(tokens=m, mode="tp", **_BODY) for m in _TP_TOKENS
 ] + [Shape(tokens=m, mode="ep", **_BODY) for m in _EP_TOKENS]
-
-GROUP_SIZE = 128
-CUDA_GRAPH_MAX_TOKENS = 2048  # decode-sized batches run under a captured graph in production
 
 
 def _make_weights(shape: Shape, seed: int = 0) -> dict:
@@ -251,8 +254,19 @@ def make_runner(inputs: dict) -> Callable[[], torch.Tensor]:
     return _call
 
 
+_l2_flush_buffer: Optional[torch.Tensor] = None
+
+
+def _l2_flush() -> None:
+    """Zeroes a 256MB buffer so the next timed call can't hit warm L2 state."""
+    global _l2_flush_buffer
+    if _l2_flush_buffer is None:
+        _l2_flush_buffer = torch.empty(L2_FLUSH_BYTES, dtype=torch.uint8, device="cuda")
+    _l2_flush_buffer.zero_()
+
+
 def time_call(fn: Callable, warmup: int = 5, iters: int = 30) -> Tuple[float, float]:
-    """Returns (median_us, min_us) across ``iters`` calls after ``warmup``."""
+    """Returns (median_us, min_us) across ``iters`` L2-flushed calls after ``warmup``."""
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -260,6 +274,7 @@ def time_call(fn: Callable, warmup: int = 5, iters: int = 30) -> Tuple[float, fl
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     for s, e in zip(starts, ends):
+        _l2_flush()
         s.record()
         fn()
         e.record()
