@@ -7,8 +7,9 @@ import logging
 import threading
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Dict, List, NamedTuple, Optional, Set, Tuple, Union
 
+import msgspec
 import numpy as np
 import numpy.typing as npt
 import requests
@@ -49,6 +50,9 @@ from sglang.srt.utils.network import (
 )
 
 logger = logging.getLogger(__name__)
+
+ABORT_TAG = b"ABORT"
+ABORT_ACK_TAG = b"ABORT_ACK"
 
 
 # Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
@@ -143,6 +147,114 @@ class PrefillRankInfo:
         self.rank_port = int(self.rank_port)
 
 
+class AckTarget(NamedTuple):
+    ip: str
+    port: int
+    generation: int
+
+
+class AbortNotification(msgspec.Struct, frozen=True):
+    room: int
+    decode_ip: Optional[str] = None
+    decode_port: Optional[int] = None
+    generation: Optional[int] = None
+
+    @classmethod
+    def from_zmq(cls, msg: List[bytes]) -> Optional[AbortNotification]:
+        if len(msg) < 2:
+            logger.warning("Malformed ABORT message: too few frames (%d)", len(msg))
+            return None
+
+        try:
+            room = int(msg[1].decode("ascii"))
+        except (ValueError, UnicodeDecodeError):
+            logger.warning("Malformed ABORT message: invalid room field %r", msg[1])
+            return None
+
+        if len(msg) < 4:
+            return cls(room=room)
+
+        try:
+            decode_ip = msg[2].decode("ascii")
+            decode_port = int(msg[3].decode("ascii"))
+        except (ValueError, UnicodeDecodeError):
+            logger.warning("Malformed ABORT message: invalid return address")
+            return cls(room=room)
+
+        generation = None
+        if len(msg) >= 5:
+            try:
+                generation = int(msg[4].decode("ascii"))
+            except (ValueError, UnicodeDecodeError):
+                logger.warning("Malformed ABORT message: invalid generation")
+        return cls(
+            room=room,
+            decode_ip=decode_ip,
+            decode_port=decode_port,
+            generation=generation,
+        )
+
+    def to_zmq(self) -> List[bytes]:
+        frames = [ABORT_TAG, str(self.room).encode("ascii")]
+        if self.decode_ip is not None and self.decode_port is not None:
+            frames.extend(
+                [
+                    self.decode_ip.encode("ascii"),
+                    str(self.decode_port).encode("ascii"),
+                ]
+            )
+            if self.generation is not None:
+                frames.append(str(self.generation).encode("ascii"))
+        return frames
+
+    def deferred_ack_target(self) -> Optional[AckTarget]:
+        if self.decode_ip is None or self.decode_port is None:
+            return None
+        if self.generation is None:
+            logger.warning_once(
+                "Generation-less ABORT received; deferred ACK is unavailable. "
+                "Mixed SGLang versions may wait for the KV release timeout."
+            )
+            return None
+        return AckTarget(self.decode_ip, self.decode_port, self.generation)
+
+
+class AbortAck(msgspec.Struct, frozen=True):
+    room: int
+    prefill_rank: int
+    generation: Optional[int] = None
+
+    @classmethod
+    def from_zmq(cls, msg: List[bytes]) -> Optional[AbortAck]:
+        if len(msg) < 3:
+            logger.warning("Incomplete ABORT_ACK received")
+            return None
+        try:
+            return cls(
+                room=int(msg[1].decode("ascii")),
+                prefill_rank=int(msg[2].decode("ascii")),
+                generation=(int(msg[3].decode("ascii")) if len(msg) >= 4 else None),
+            )
+        except (ValueError, UnicodeDecodeError):
+            logger.warning("Malformed ABORT_ACK received")
+            return None
+
+    def to_zmq(self) -> List[bytes]:
+        frames = [
+            ABORT_ACK_TAG,
+            str(self.room).encode("ascii"),
+            str(self.prefill_rank).encode("ascii"),
+        ]
+        if self.generation is not None:
+            frames.append(str(self.generation).encode("ascii"))
+        return frames
+
+
+class DeferredAbortAckState(msgspec.Struct):
+    generation: int
+    prefill_ranks: Set[int]
+
+
 class CommonKVManager(BaseKVManager):
     def __init__(
         self,
@@ -223,6 +335,11 @@ class CommonKVManager(BaseKVManager):
         self._socket_lock = threading.Lock()
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
+        self._staging_outstanding: Dict[int, int] = defaultdict(int)
+        self._deferred_ack_targets: Dict[int, AckTarget] = {}
+        # A poisoned room has a permanently outstanding transfer whose backend
+        # can no longer prove quiescent. A new room lifecycle clears this state.
+        self._deferred_ack_poisoned_rooms: Set[int] = set()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # When SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER is True, all CP ranks
@@ -241,9 +358,6 @@ class CommonKVManager(BaseKVManager):
             )
             self.register_to_bootstrap()
             self.transfer_infos = {}
-            # Deferred KV release: aborted room -> (decode_ip, decode_port);
-            # ack held until the transfer drains.
-            self._deferred_ack_targets: Dict[int, Tuple[str, int]] = {}
             self.req_to_decode_prefix_len: Dict[int, int] = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
@@ -262,10 +376,11 @@ class CommonKVManager(BaseKVManager):
             self.session_pool_lock = threading.Lock()
             self.addr_to_rooms_tracker: Dict[str, Set[int]] = defaultdict(set)
             self.prefill_response_tracker: Dict[int, Set[int]] = defaultdict(set)
-            # Deferred KV release: room -> prefill ranks that acked their transfer
-            # drained. Entry exists only while the room is held, so a stale/late
-            # ack for a reused bootstrap_room is dropped.
-            self._deferred_abort_ack_tracker: Dict[int, Set[int]] = {}
+            # Deferred KV release: room -> current generation and ranks that
+            # ACKed. The generation rejects an old request's late ACK after room
+            # reuse.
+            self._deferred_abort_ack_tracker: Dict[int, DeferredAbortAckState] = {}
+            self._deferred_abort_generation = 0
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
                 envs.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL.get(), 2.0
@@ -370,6 +485,9 @@ class CommonKVManager(BaseKVManager):
             # pollute a future request that reuses the same bootstrap_room.
             if status == KVPoll.Failed:
                 return
+            self._deferred_ack_targets.pop(bootstrap_room, None)
+            self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
+            self._staging_outstanding.pop(bootstrap_room, None)
             self.request_status[bootstrap_room] = status
         else:
             if status == KVPoll.Failed:
@@ -383,24 +501,47 @@ class CommonKVManager(BaseKVManager):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
 
-    def register_deferred_abort_room(self, bootstrap_room: int) -> None:
-        """Arm drain-ack accounting for a held room; a fresh set wipes stale acks
-        from a prior request that reused this bootstrap_room."""
-        self._deferred_abort_ack_tracker[bootstrap_room] = set()
+    def register_deferred_abort_room(self, bootstrap_room: int) -> int:
+        """Arm a new generation for a held room and return its wire id."""
+        self._deferred_abort_generation += 1
+        generation = self._deferred_abort_generation
+        self._deferred_abort_ack_tracker[bootstrap_room] = DeferredAbortAckState(
+            generation=generation,
+            prefill_ranks=set(),
+        )
+        return generation
 
-    def note_abort_ack(self, bootstrap_room: int, prefill_rank: int) -> None:
-        """Record a prefill rank's drain ack (decode receiver thread). Only counts
-        while the room is held; grabs the set by reference to avoid racing clear."""
-        acks = self._deferred_abort_ack_tracker.get(bootstrap_room)
-        if acks is not None:
-            acks.add(prefill_rank)
+    def note_abort_ack(
+        self, bootstrap_room: int, prefill_rank: int, generation: int
+    ) -> None:
+        """Record an ACK only for the generation currently holding the room."""
+        state = self._deferred_abort_ack_tracker.get(bootstrap_room)
+        if state is not None and state.generation == generation:
+            state.prefill_ranks.add(prefill_rank)
+
+    def handle_abort_ack_message(self, msg: List[bytes]) -> bool:
+        """Consume an ABORT_ACK and record it for an armed decode room."""
+        if not msg or msg[0] != ABORT_ACK_TAG:
+            return False
+        if not self.enable_deferred_decode_kv_release:
+            return True
+        ack = AbortAck.from_zmq(msg)
+        if ack is None:
+            return True
+        if ack.generation is None:
+            logger.warning_once(
+                "Generation-less ABORT_ACK received; ignoring it. "
+                "Mixed SGLang versions may wait for the KV release timeout."
+            )
+            return True
+        self.note_abort_ack(ack.room, ack.prefill_rank, ack.generation)
+        return True
 
     def is_abort_release_safe(self, bootstrap_room: int, required_acks: int) -> bool:
         """True once every prefill rank that could still write these pages has acked."""
-        return (
-            len(self._deferred_abort_ack_tracker.get(bootstrap_room, ()))
-            >= required_acks
-        )
+        state = self._deferred_abort_ack_tracker.get(bootstrap_room)
+        acks = state.prefill_ranks if state is not None else ()
+        return len(acks) >= required_acks
 
     def clear_deferred_abort_state(self, bootstrap_room: int) -> None:
         self._deferred_abort_ack_tracker.pop(bootstrap_room, None)
@@ -413,17 +554,13 @@ class CommonKVManager(BaseKVManager):
             + self.attn_cp_rank
         )
 
-    def _send_abort_ack(self, decode_ip: str, decode_port: int, room: int) -> None:
+    def _send_abort_ack(self, room: int, target: AckTarget) -> None:
         """Best-effort ack that this rank's transfer for an aborted room drained."""
         try:
-            na = NetworkAddress(decode_ip, decode_port)
+            na = NetworkAddress(target.ip, target.port)
             self._send_multipart_locked(
                 na.to_tcp(),
-                [
-                    b"ABORT_ACK",
-                    str(room).encode("ascii"),
-                    str(self._prefill_unique_rank()).encode("ascii"),
-                ],
+                AbortAck(room, self._prefill_unique_rank(), target.generation).to_zmq(),
                 is_ipv6=na.is_ipv6,
             )
         except Exception as e:
@@ -436,15 +573,21 @@ class CommonKVManager(BaseKVManager):
             return
         target = self._deferred_ack_targets.pop(room, None)
         if target is not None:
-            self._send_abort_ack(target[0], target[1], room)
+            self._send_abort_ack(room, target)
 
-    def register_deferred_ack_target(
-        self, room: int, decode_ip: str, decode_port: int
-    ) -> None:
-        """Hold this room's ack until its transfer drains. Callers must mark the
-        room Failed FIRST -- registering while it still accepts chunks lets the
-        worker ack, then a new chunk writes pages the decode already released."""
-        self._deferred_ack_targets[room] = (decode_ip, decode_port)
+    def register_deferred_ack_target(self, room: int, target: AckTarget) -> None:
+        """Hold this generation's ACK until the room's transfer drains.
+
+        Active-room callers must mark the room Failed before registering so no
+        new chunk can be accepted after the ACK is sent.
+        """
+        if room not in self._deferred_ack_poisoned_rooms:
+            self._deferred_ack_targets[room] = target
+
+    def poison_deferred_ack_room(self, room: int) -> None:
+        """Drop an ACK target when the backend cannot prove the room drained."""
+        self._deferred_ack_targets.pop(room, None)
+        self._deferred_ack_poisoned_rooms.add(room)
 
     def get_kv_replica_factor(self) -> int:
         if self._kv_replica_factor is None:
@@ -1337,13 +1480,11 @@ class CommonKVSender(BaseKVSender):
 
     def clear(self) -> None:
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
-        if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
-            self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
-        if hasattr(self.kv_mgr, "transfer_infos"):
-            self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
-        if hasattr(self.kv_mgr, "_deferred_ack_targets"):
-            # Drop a held ack target if the room concluded without draining
-            # (e.g. aborted before any chunk enqueued); else it leaks on prefill.
+        self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
+        self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
+        # A sender can be cleared while a counted transfer is still writing.
+        # Keep its target so the transfer worker can ACK after it drains.
+        if self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) <= 0:
             self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
 
     def abort(self):
@@ -1375,6 +1516,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.require_staging: bool = False
         self.init_time: Optional[float] = None
         self.abort_notified: bool = False
+        self._abort_generation: Optional[int] = None
         self._connection_pool_entries: Dict[str, List[Dict]] = {}
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
@@ -1637,6 +1779,14 @@ class CommonKVReceiver(BaseKVReceiver):
             self._send_abort_notification()
             self.abort_notified = True
 
+    def abort_for_deferred_release(self) -> None:
+        """Arm ACK aggregation before the backend can emit an immediate ACK."""
+        if self.kv_mgr.enable_deferred_decode_kv_release and not self.abort_notified:
+            self._abort_generation = self.kv_mgr.register_deferred_abort_room(
+                self.bootstrap_room
+            )
+        self.abort()
+
     def _send_abort_notification(self):
         for bootstrap_info in self.bootstrap_infos:
             # Best-effort notification to prefill side that this request was aborted.
@@ -1644,12 +1794,12 @@ class CommonKVReceiver(BaseKVReceiver):
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 with lock:
                     sock.send_multipart(
-                        [
-                            b"ABORT",
-                            str(self.bootstrap_room).encode("ascii"),
-                            self.kv_mgr.local_ip.encode("ascii"),
-                            str(self.kv_mgr.rank_port).encode("ascii"),
-                        ]
+                        AbortNotification(
+                            room=self.bootstrap_room,
+                            decode_ip=self.kv_mgr.local_ip,
+                            decode_port=self.kv_mgr.rank_port,
+                            generation=self._abort_generation,
+                        ).to_zmq()
                     )
                 logger.debug(
                     f"Sent abort notification for room {self.bootstrap_room} "
