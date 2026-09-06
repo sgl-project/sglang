@@ -100,6 +100,7 @@ def create_paged_compress_data_kernel(
     stride_out_1_1: tl.constexpr,
     compress_ratio: tl.constexpr,
     is_overlap: tl.constexpr,
+    use_req_ring: tl.constexpr,
     swa_page_size: tl.constexpr,
     ring_size: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -134,6 +135,8 @@ def create_paged_compress_data_kernel(
             pos = write_overlap_pos
         pos = tl.maximum(pos, 0)
         if compress_ratio == 128:
+            state_loc = rid * ring_size + (pos % ring_size)
+        elif use_req_ring:
             state_loc = rid * ring_size + (pos % ring_size)
         else:
             loc = tl.load(
@@ -182,6 +185,7 @@ def triton_create_paged_compress_data(
     extend_seq_lens: torch.Tensor,
     req_to_token: torch.Tensor,
     full_to_swa_index_mapping: torch.Tensor,
+    use_req_ring: bool = False,
     block: int = 128,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     batch_size = req_pool_indices.shape[0]
@@ -205,6 +209,7 @@ def triton_create_paged_compress_data(
         stride_out_1_1=out_1.stride(1),  # type: ignore
         compress_ratio=compress_ratio,  # type: ignore
         is_overlap=1 if is_overlap else 0,  # type: ignore
+        use_req_ring=1 if use_req_ring else 0,  # type: ignore
         swa_page_size=swa_page_size,  # type: ignore
         ring_size=ring_size,  # type: ignore
         BLOCK=block,  # type: ignore
