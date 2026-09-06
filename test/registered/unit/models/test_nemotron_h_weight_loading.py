@@ -1,5 +1,5 @@
 """
-Unit tests for NemotronHForCausalLM.load_weights.
+Unit tests for Nemotron-H weight loading and empty FP4 expert dispatch.
 
 Regression test for Nemotron-H expert scale checkpoint tensors that map to
 parameters absent from the current runtime model.
@@ -11,10 +11,11 @@ register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.models.nemotron_h import NemotronHForCausalLM
+from sglang.srt.models.nemotron_h import NemotronHForCausalLM, NemotronHMoE
 
 
 class _FakePPGroup:
@@ -133,6 +134,33 @@ class TestNemotronHWeightLoading(unittest.TestCase):
         self.assertIsNone(
             skipped.loaded_weight, "non-MTP target weight should be skipped"
         )
+
+    @patch(
+        "sglang.srt.models.nemotron_h.should_use_flashinfer_moe_fp4_allgather",
+        return_value=True,
+    )
+    def test_empty_fp4_dispatch_preserves_latent_width(self, _):
+        hidden = torch.empty((0, 64), dtype=torch.bfloat16)
+        for latent in (False, True):
+            with self.subTest(latent=latent):
+                model = SimpleNamespace(
+                    use_latent_moe=latent,
+                    moe_hidden_size=32 if latent else 64,
+                    tp_size=1,
+                    topk=Mock(),
+                    experts=Mock(side_effect=lambda hidden, topk: hidden),
+                    fc2_latent_proj=Mock(),
+                )
+                model._forward_core = NemotronHMoE._forward_core.__get__(model)
+                output = NemotronHMoE.forward(model, hidden)
+                model.topk.empty_topk_output.assert_called_once_with(hidden.device)
+                model.experts.assert_called_once()
+                expert_input, topk = model.experts.call_args.args
+                self.assertEqual(expert_input.shape, (0, model.moe_hidden_size))
+                self.assertIs(topk, model.topk.empty_topk_output.return_value)
+                model.fc2_latent_proj.assert_not_called()
+                self.assertEqual(output.shape, hidden.shape)
+                self.assertEqual(output.dtype, hidden.dtype)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,31 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
+def _dispatch(tokens, per_token=False, *, raw=False, fp4=True, hidden_size=32):
+    hidden = torch.empty(
+        tokens,
+        hidden_size // 2 if fp4 else hidden_size,
+        dtype=torch.uint8 if fp4 else torch.bfloat16,
+    )
+    topk = (
+        BypassedTopKOutput(
+            hidden, torch.empty(tokens, 2, dtype=torch.float32), TopKConfig(top_k=1)
+        )
+        if raw
+        else StandardTopKOutput(
+            torch.ones(tokens, 1), torch.zeros(tokens, 1, dtype=torch.int32), None
+        )
+    )
+    return StandardDispatchOutput(
+        hidden,
+        torch.empty(tokens, hidden_size // 16, dtype=torch.uint8) if fp4 else None,
+        topk,
+        hidden_states_per_token_scale=(
+            torch.ones(tokens, dtype=torch.float32) if per_token else None
+        ),
+    )
+
+
 def _cutedsl_quant_info(wrapper, *, per_token=False, quant_mode="w4a4"):
     return SimpleNamespace(
         wrapper=wrapper,
@@ -42,15 +67,7 @@ def _cutedsl_quant_info(wrapper, *, per_token=False, quant_mode="w4a4"):
 
 
 def test_flashinfer_prefill_returns_standard_combine_input():
-    dispatch_output = StandardDispatchOutput(
-        hidden_states=torch.empty(2, 16, dtype=torch.bfloat16),
-        hidden_states_scale=None,
-        topk_output=StandardTopKOutput(
-            topk_weights=torch.empty(2, 1),
-            topk_ids=torch.zeros(2, 1, dtype=torch.int32),
-            router_logits=None,
-        ),
-    )
+    dispatch_output = _dispatch(2, fp4=False, hidden_size=16)
     expected_output = torch.empty(2, 16, dtype=torch.bfloat16)
     wrapper = Mock()
     wrapper.run.return_value = expected_output
@@ -76,17 +93,7 @@ def test_flashinfer_prefill_returns_standard_combine_input():
 @pytest.mark.parametrize("num_tokens", [0, 3])
 @pytest.mark.parametrize("per_token", [False, True])
 def test_standard_cutedsl_forwards_fp4_dispatch(num_tokens, per_token):
-    hidden = torch.empty(num_tokens, 16, dtype=torch.uint8)
-    block_scales = torch.empty(num_tokens, 2, dtype=torch.uint8)
-    token_scales = torch.ones(num_tokens, dtype=torch.float32) if per_token else None
-    topk = StandardTopKOutput(
-        topk_weights=torch.ones(num_tokens, 1),
-        topk_ids=torch.zeros(num_tokens, 1, dtype=torch.int32),
-        router_logits=None,
-    )
-    dispatch = StandardDispatchOutput(
-        hidden, block_scales, topk, hidden_states_per_token_scale=token_scales
-    )
+    dispatch = _dispatch(num_tokens, per_token)
     expected = torch.empty(num_tokens, 32, dtype=torch.bfloat16)
     wrapper = Mock(run=Mock(return_value=expected))
     # Neither static nor per-token quantization may run on packed FP4 input.
@@ -106,25 +113,18 @@ def test_standard_cutedsl_forwards_fp4_dispatch(num_tokens, per_token):
         assert result.hidden_states.dtype == torch.bfloat16
         return
     call = wrapper.run.call_args.kwargs
-    assert call["x"] is hidden
-    assert call["x_sf"].data_ptr() == block_scales.data_ptr()
+    assert call["x"] is dispatch.hidden_states
+    assert call["x_sf"].data_ptr() == dispatch.hidden_states_scale.data_ptr()
     assert call["x_sf"].shape == (num_tokens, 2)
     assert call["x_sf"].dtype == torch.float8_e4m3fn
-    assert call["per_token_scale"] is token_scales
-    assert call["token_selected_experts"] is topk.topk_ids
-    assert call["token_final_scales"] is topk.topk_weights
+    assert call["per_token_scale"] is dispatch.hidden_states_per_token_scale
+    assert call["token_selected_experts"] is dispatch.topk_output.topk_ids
+    assert call["token_final_scales"] is dispatch.topk_output.topk_weights
     assert result.hidden_states is expected
 
 
 def test_standard_cutedsl_w4a16_keeps_bf16_activations():
-    hidden = torch.empty(3, 32, dtype=torch.bfloat16)
-    dispatch = StandardDispatchOutput(
-        hidden,
-        None,
-        StandardTopKOutput(
-            torch.ones(3, 1), torch.zeros(3, 1, dtype=torch.int32), None
-        ),
-    )
+    dispatch = _dispatch(3, fp4=False)
     wrapper = Mock()
     cutedsl_runner.fused_experts_none_to_flashinfer_cutedsl_fp4(
         dispatch,
@@ -132,7 +132,7 @@ def test_standard_cutedsl_w4a16_keeps_bf16_activations():
         MoeRunnerConfig(),
     )
     call = wrapper.run.call_args.kwargs
-    assert call["x"] is hidden
+    assert call["x"] is dispatch.hidden_states
     assert call["x_sf"] is None
     assert call["per_token_scale"] is None
     assert call["fc2_input_scale"] is None
@@ -187,19 +187,11 @@ def test_empty_topk_matches_fp4_dispatch_routing(
 def test_standard_trtllm_forwards_fp4_dispatch(routed, per_token, params_dtype, tokens):
     import sglang.srt.layers.moe.moe_runner.flashinfer_trtllm as trtllm_runner
 
-    hidden = torch.empty(tokens, 16, dtype=torch.uint8)
-    block_scales = torch.empty(tokens, 2, dtype=torch.uint8)
-    token_scales = torch.ones(tokens, dtype=torch.float32) if per_token else None
-    router_logits = torch.empty(tokens, 2, dtype=torch.float32)
-    topk = (
-        StandardTopKOutput(
-            torch.ones(tokens, 1), torch.zeros(tokens, 1, dtype=torch.int32), None
-        )
-        if routed
-        else BypassedTopKOutput(hidden, router_logits, TopKConfig(top_k=1))
-    )
-    dispatch = StandardDispatchOutput(
-        hidden, block_scales, topk, hidden_states_per_token_scale=token_scales
+    dispatch = _dispatch(tokens, per_token, raw=not routed)
+    hidden, block_scales, topk = (
+        dispatch.hidden_states,
+        dispatch.hidden_states_scale,
+        dispatch.topk_output,
     )
     quant_info = trtllm_runner.FlashInferTrtllmFp4MoeQuantInfo(
         w13_weight=hidden,
@@ -270,13 +262,13 @@ def test_standard_trtllm_forwards_fp4_dispatch(routed, per_token, params_dtype, 
     assert call["hidden_states_scale"].data_ptr() == block_scales.data_ptr()
     assert call["hidden_states_scale"].shape == (tokens, 2)
     assert call["hidden_states_scale"].dtype == torch.float8_e4m3fn
-    assert call["per_token_scale"] is token_scales
+    assert call["per_token_scale"] is dispatch.hidden_states_per_token_scale
     if routed:
         pack_topk.assert_called_once_with(topk)
         assert call["topk_ids"] is packed_topk
     else:
         pack_topk.assert_not_called()
-        assert call["routing_logits"] is router_logits
+        assert call["routing_logits"] is topk.router_logits
 
 
 if __name__ == "__main__":

@@ -36,6 +36,7 @@ from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
     handle_a2a_moe,
+    handle_moe_kernel_config,
     validate_deepep_v2_dispatch_token_budget,
     validate_deepep_v2_speculative_draft,
 )
@@ -2240,6 +2241,99 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
         )
         self.assertIn("token_oracle", enabled_action.choices)
         self.assertNotIn("token_oracle", disabled_action.choices)
+
+
+class TestStandardFP4DispatchArgs(CustomTestCase):
+    def _args(self, architecture="KimiK3ForConditionalGeneration", **changes):
+        config = dict(
+            model_path="dummy",
+            quantization="modelopt_fp4",
+            moe_runner_backend="flashinfer_trtllm",
+            enable_dp_attention=True,
+            tp_size=2,
+            ep_size=2,
+            dp_size=2,
+        )
+        config.update(changes)
+        args = ServerArgs(**config)
+        args._model_config = SimpleNamespace(
+            quantization=config["quantization"] or "modelopt_fp4",
+            hf_config=SimpleNamespace(architectures=[architecture]),
+        )
+        return args
+
+    def test_custom_layouts_rejected_after_runner_resolution(self):
+        with (
+            envs.SGLANG_MOE_NVFP4_DISPATCH.override(True),
+            override_platform(is_sm100=True),
+        ):
+            for architecture in (
+                "KimiK3ForConditionalGeneration",
+                "KimiK3LinearForCausalLM",
+                "InklingForConditionalGeneration",
+                "InklingForConditionalGenerationMTP",
+            ):
+                for backend, quantization in (
+                    ("flashinfer_trtllm", None),  # Checkpoint-inferred static NVFP4.
+                    ("flashinfer_trtllm_routed", "modelopt_fp4"),
+                    ("flashinfer_cutedsl", "modelopt_fp4"),
+                    ("auto", "nvfp4_online"),
+                ):
+                    with self.subTest(architecture=architecture, backend=backend):
+                        args = self._args(
+                            architecture,
+                            moe_runner_backend=backend,
+                            quantization=quantization,
+                        )
+                        handle_moe_kernel_config(args)
+                        if backend == "auto":
+                            self.assertEqual(
+                                resolution_result(args, "moe_runner_backend"),
+                                "flashinfer_trtllm",
+                            )
+                        with self.assertRaisesRegex(
+                            ValueError, "FP4 all-gather.*custom MoE layout"
+                        ):
+                            handle_a2a_moe(args)
+
+    def test_other_dispatch_configurations_are_unchanged(self):
+        for enabled, w4a16, changes in (
+            (False, False, {}),
+            (True, False, {"disable_flashinfer_cutlass_moe_fp4_allgather": True}),
+            (True, False, {"moe_runner_backend": "flashinfer_cutlass"}),
+            (True, False, {"enable_dp_attention": False}),
+            (True, False, {"ep_size": 1}),
+            (True, False, {"dp_size": 1}),
+            (True, False, {"tp_size": 4}),
+            (True, False, {"quantization": "fp8"}),
+            (True, True, {"moe_runner_backend": "flashinfer_cutedsl"}),
+            (True, False, {"architecture": "Qwen3MoeForCausalLM"}),
+            (True, False, {"architecture": "NemotronHForCausalLM"}),
+            (True, False, {"enable_waterfill": True}),
+        ):
+            with (
+                self.subTest(enabled=enabled, w4a16=w4a16, changes=changes),
+                envs.SGLANG_MOE_NVFP4_DISPATCH.override(enabled),
+                envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(w4a16),
+                override_platform(is_sm100=True),
+            ):
+                args = self._args(**changes)
+                handle_moe_kernel_config(args)
+                handle_a2a_moe(args)
+                if changes.get("enable_waterfill"):
+                    self.assertEqual(
+                        resolution_result(args, "moe_a2a_backend"), "deepep"
+                    )
+        with (
+            envs.SGLANG_MOE_NVFP4_DISPATCH.override(True),
+            override_platform(is_sm100=False, is_sm120=True),
+        ):
+            args = self._args(moe_runner_backend="auto")
+            handle_moe_kernel_config(args)
+            handle_a2a_moe(args)
+            self.assertEqual(
+                resolution_result(args, "moe_runner_backend"), "flashinfer_cutlass"
+            )
 
 
 class TestDeepEPv2Args(CustomTestCase):

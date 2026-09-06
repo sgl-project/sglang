@@ -2,6 +2,7 @@
 
 import itertools
 import unittest
+from functools import partial
 from unittest.mock import patch
 
 import torch
@@ -27,7 +28,6 @@ from sglang.srt.layers.moe.token_dispatcher.standard import (
 )
 from sglang.srt.layers.moe.topk import (
     BypassedTopKOutput,
-    PackedTopKOutput,
     StandardTopKOutput,
     TopK,
     TopKConfig,
@@ -45,16 +45,18 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="extra-b", runner_config="4-gpu-b200")
 
+_assert_equal = partial(torch.testing.assert_close, rtol=0, atol=0)
+
 
 def _check_dispatch(
     rank,
     runner,
     per_token,
-    sizes,
-    packed_routing=False,
+    sizes=(0, 1, 3, 129),
     quantized=True,
     hidden_size=256,
 ):
+    sizes = list(sizes)
     total = sum(sizes)
     start = sum(sizes[:rank])
     stop = start + sizes[rank]
@@ -73,14 +75,9 @@ def _check_dispatch(
             router_logits=logits[start:stop],
             topk_config=TopKConfig(top_k=2),
         )
-    elif packed_routing:
-        packed_ids = (ids << 16) | (
-            weights.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF
-        )
-        topk = PackedTopKOutput(packed_ids[start:stop], None)
     else:
         topk = StandardTopKOutput(weights[start:stop], ids[start:stop], None)
-    if sizes[rank] == 0 and not packed_routing:
+    if sizes[rank] == 0:
         topk = TopK(top_k=2).empty_topk_output(local_hidden.device)
     scale = torch.tensor([2.0], device="cuda", dtype=torch.float32)
     if per_token:
@@ -108,11 +105,7 @@ def _check_dispatch(
     payloads = gather.call_args.args[0]
     if quantized:
         assert all(t.dtype != torch.bfloat16 for t in payloads)
-    routing_bytes = (
-        num_experts * 4
-        if isinstance(topk, BypassedTopKOutput)
-        else (8 if packed_routing else 16)
-    )
+    routing_bytes = num_experts * 4 if isinstance(topk, BypassedTopKOutput) else 16
     activation_bytes = (
         hidden_size // 2 + hidden_size // 16 + 4 * per_token
         if quantized
@@ -129,7 +122,7 @@ def _check_dispatch(
     assert result.hidden_states_pre_quant is None
     if not quantized:
         # Ignored layers must still gather tokens and routing for the EP runner.
-        torch.testing.assert_close(result.hidden_states, hidden, rtol=0, atol=0)
+        _assert_equal(result.hidden_states, hidden)
         assert result.hidden_states_scale is None
         assert result.hidden_states_per_token_scale is None
     elif total:
@@ -142,7 +135,7 @@ def _check_dispatch(
                 backend="cute-dsl",
             )
             assert result.hidden_states_per_token_scale.dtype == torch.float32
-            torch.testing.assert_close(
+            _assert_equal(
                 result.hidden_states_per_token_scale, expected_rows, rtol=0, atol=0
             )
         else:
@@ -150,39 +143,27 @@ def _check_dispatch(
                 hidden, scale, is_sf_swizzled_layout=False
             )
             assert result.hidden_states_per_token_scale is None
-        torch.testing.assert_close(result.hidden_states, expected_x, rtol=0, atol=0)
-        torch.testing.assert_close(
+        _assert_equal(result.hidden_states, expected_x)
+        _assert_equal(
             result.hidden_states_scale.view(torch.uint8),
             expected_sf.view(torch.uint8).reshape(total, hidden_size // 16),
-            rtol=0,
-            atol=0,
         )
     elif per_token:
         assert result.hidden_states_per_token_scale.shape == (0,)
     if runner == MoeRunnerBackend.FLASHINFER_TRTLLM:
         assert isinstance(result.topk_output, BypassedTopKOutput)
-        torch.testing.assert_close(
-            result.topk_output.router_logits, logits.float(), rtol=0, atol=0
-        )
-    elif packed_routing:
-        torch.testing.assert_close(
-            result.topk_output.packed_topk_ids, packed_ids, rtol=0, atol=0
-        )
+        _assert_equal(result.topk_output.router_logits, logits.float(), rtol=0, atol=0)
     else:
-        torch.testing.assert_close(result.topk_output.topk_ids, ids, rtol=0, atol=0)
-        torch.testing.assert_close(
-            result.topk_output.topk_weights, weights, rtol=0, atol=0
-        )
+        _assert_equal(result.topk_output.topk_ids, ids)
+        _assert_equal(result.topk_output.topk_weights, weights, rtol=0, atol=0)
 
     # Each expert rank contributes a known partial output. Combine must sum once
     # and return only this attention-DP rank's original token range.
     partial = torch.full_like(hidden, rank + 1)
     combined = dispatcher.combine(StandardCombineInput(partial))
-    torch.testing.assert_close(
+    _assert_equal(
         combined,
         torch.full_like(local_hidden, len(sizes) * (len(sizes) + 1) // 2),
-        rtol=0,
-        atol=0,
     )
     with envs.SGLANG_MOE_NVFP4_DISPATCH.override(False):
         unquantized = dispatcher.dispatch(local_hidden, topk)
@@ -254,21 +235,13 @@ def _worker(rank, world_size, port):
                         assert not should_use_flashinfer_moe_fp4_allgather()
                     with get_parallel().override(attn_dp_size=2):
                         assert not should_use_flashinfer_moe_fp4_allgather()
-                    for sizes in ([0, 1, 3, 129], [8, 8, 8, 8], [0, 0, 0, 0]):
-                        _check_dispatch(rank, runner, per_token, sizes)
-                    if runner == MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED:
-                        _check_dispatch(
-                            rank, runner, per_token, [0, 1, 3, 129], packed_routing=True
-                        )
+                    cases = [{}, {"sizes": [8] * 4}, {"sizes": [0] * 4}]
                     if quantization == "nvfp4_online":
-                        _check_dispatch(
-                            rank, runner, per_token, [0, 1, 3, 129], quantized=False
-                        )
-                        # Latent MoE width can differ from the model's DP buffer
-                        # width (256 here); combine must keep the expert width.
-                        _check_dispatch(
-                            rank, runner, per_token, [0, 1, 3, 129], hidden_size=128
-                        )
+                        # Ignored layers retain BF16; latent experts are narrower
+                        # than the model's DP buffer (256).
+                        cases += [{"quantized": False}, {"hidden_size": 128}]
+                    for case in cases:
+                        _check_dispatch(rank, runner, per_token, **case)
                     if runner == MoeRunnerBackend.FLASHINFER_CUTEDSL:
                         with envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(True):
                             assert not should_use_flashinfer_moe_fp4_allgather()

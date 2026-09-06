@@ -11,7 +11,6 @@ answer questions about the model. It deliberately depends on nothing in
 import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import is_mps, is_no_spec_infer_or_topk_one
@@ -138,34 +137,6 @@ class ResolvingConfig:
 def resolving_view(server_args: Any) -> ResolvingConfig:
     """A live read view of what resolution has decided so far."""
     return ResolvingConfig(server_args)
-
-
-def _should_disable_fp4_allgather_for_custom_moe(
-    server_args: Any, model_name: str
-) -> bool:
-    """Keep custom MoE communication layouts outside the standard FP4 opt-in."""
-    cfg = resolving_view(server_args)
-    if (
-        envs.SGLANG_MOE_NVFP4_DISPATCH.get()
-        and (
-            cfg.moe_runner_backend
-            in ("flashinfer_trtllm", "flashinfer_trtllm_routed", "flashinfer_cutedsl")
-            # The later quantization pass resolves online NVFP4's auto to TRT-LLM.
-            or (cfg.moe_runner_backend == "auto" and cfg.quantization == "nvfp4_online")
-        )
-        and cfg.enable_dp_attention
-        and cfg.moe_a2a_backend == "none"
-        and not cfg.disable_flashinfer_cutlass_moe_fp4_allgather
-    ):
-        # Quantization may still be unset until it is inferred from the checkpoint.
-        logger.warning(
-            "%s keeps its existing BF16 MoE communication: the "
-            "SGLANG_MOE_NVFP4_DISPATCH all-gather opt-in does not support its "
-            "custom MoE layout.",
-            model_name,
-        )
-        return True
-    return False
 
 
 def _declaration_overlay(server_args: Any) -> Dict[str, Any]:

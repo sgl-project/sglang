@@ -463,11 +463,10 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         topk_ids = topk_ids.to(torch.int32)
 
     x_sf = dispatch_output.hidden_states_scale
-    if quant_info.quant_mode == "w4a16":
-        assert x_sf is None, "CuTe DSL W4A16 requires unquantized activations."
-        x_fp4 = hidden_states
-        per_token_scale = None
-    elif x_sf is not None:
+    if x_sf is not None:
+        assert quant_info.quant_mode != "w4a16", (
+            "CuTe DSL W4A16 requires unquantized activations."
+        )
         # Standard dispatch gathers packed FP4 and linear block scales together.
         x_fp4 = hidden_states
         per_token_scale = dispatch_output.hidden_states_per_token_scale
@@ -489,6 +488,10 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
             per_token_activation=True,
             backend="cute-dsl",
         )
+    elif quant_info.quant_mode == "w4a16":
+        x_fp4 = hidden_states
+        x_sf = None
+        per_token_scale = None
     else:
         x_fp4, x_sf = fp4_quantize(
             hidden_states,
