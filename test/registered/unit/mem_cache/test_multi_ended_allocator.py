@@ -3100,10 +3100,6 @@ class TestDcpWidening(unittest.TestCase):
                     self.assertLess(base_cost * full_entry, mamba_bytes * dcp_size)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestFusedWriteLocTranslate(unittest.TestCase):
     """`write_loc_to_kernel_ids` must equal the eager formula it replaced.
 
@@ -3181,3 +3177,7 @@ class TestFusedWriteLocTranslate(unittest.TestCase):
                     dcp_rank=dcp_rank,
                     device="cpu",
                 )
+
+
+if __name__ == "__main__":
+    unittest.main()
