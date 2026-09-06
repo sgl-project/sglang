@@ -97,6 +97,7 @@ from sglang.srt.layers.utils.cp_utils import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_buffer, get_exec, get_parallel, get_spec
 from sglang.srt.utils import (
+    extend_mem_profile,
     get_bool_env_var,
     is_cuda,
     is_gfx95_supported,
@@ -2053,12 +2054,13 @@ class DeepseekSparseAttnBackend(
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                self.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
-                    layer,
-                    cache_loc,
-                    k,
-                    k_rope,
-                )
+                with extend_mem_profile.phase("mla:kv-write"):
+                    self.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
+                        layer,
+                        cache_loc,
+                        k,
+                        k_rope,
+                    )
 
         # Use MHA kernel if in MHA_ONE_SHOT mode
         if self.use_mha:
@@ -2260,14 +2262,15 @@ class DeepseekSparseAttnBackend(
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 page_table_1 = topk_indices
-            return self._forward_flashinfer_sparse_mla(
-                q_all=q_all,
-                kv_cache=kv_cache,
-                page_table_1=page_table_1,
-                seq_lens=metadata.dsa_cache_seqlens_int32,
-                sm_scale=layer.scaling,
-                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
-            )
+            with extend_mem_profile.phase("mla:sparse-attn"):
+                return self._forward_flashinfer_sparse_mla(
+                    q_all=q_all,
+                    kv_cache=kv_cache,
+                    page_table_1=page_table_1,
+                    seq_lens=metadata.dsa_cache_seqlens_int32,
+                    sm_scale=layer.scaling,
+                    skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+                )
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
