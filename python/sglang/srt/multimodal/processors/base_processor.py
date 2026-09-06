@@ -29,6 +29,12 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputFormat,
     MultimodalProcessorOutput,
 )
+from sglang.srt.multimodal.audio_encoder_windowing import (
+    AudioEncoderWindowConfig,
+    AudioEncoderWindowSpec,
+    build_audio_encoder_window_items,
+    resolve_audio_encoder_window_config,
+)
 from sglang.srt.multimodal.cache import (
     MultimodalPreprocessCache,
     PreprocessFingerprintProvider,
@@ -535,6 +541,96 @@ class BaseMultimodalProcessor(ABC):
         model does not use M-RoPE.
         """
         return None, None
+
+    @property
+    def audio_encoder_window_spec(self) -> Optional[AudioEncoderWindowSpec]:
+        """Return window geometry only when this encoder is block-independent."""
+        return None
+
+    def get_audio_encoder_output_lengths(self, feature_lengths):
+        """Map feature-frame lengths to encoder token counts."""
+        return self._processor._get_feat_extract_output_lengths(feature_lengths)
+
+    def _audio_encoder_window_extract_kwargs(self) -> dict:
+        """Merge audio_config with the fixed values windowing depends on.
+
+        Raises on conflicts so a misconfigured --mm-process-config is rejected
+        where this is first called (policy resolution at connection setup),
+        not on the first windowed request mid-stream.
+        """
+        feature_extractor = self._processor.feature_extractor
+        required = {
+            "sampling_rate": feature_extractor.sampling_rate,
+            "return_attention_mask": True,
+            "return_tensors": "pt",
+            "truncation": False,
+            "padding": "longest",
+        }
+        kwargs = dict(self.audio_config)
+        conflicts = [
+            key
+            for key, value in required.items()
+            if key in kwargs and kwargs[key] != value
+        ]
+        if conflicts:
+            raise ValueError(
+                "audio windowing requires fixed preprocessing values for "
+                + ", ".join(sorted(conflicts))
+            )
+        kwargs.update(required)
+        return kwargs
+
+    def extract_audio_encoder_window_features(self, windows):
+        """Extract window features with the normal audio preprocessing config."""
+        kwargs = self._audio_encoder_window_extract_kwargs()
+        return self._processor.feature_extractor(windows, **kwargs)
+
+    def resolve_audio_encoder_window_config(self, model_sample_rate: int):
+        spec = self.audio_encoder_window_spec
+        if spec is None:
+            raise ValueError("model does not support audio encoder windowing")
+        # Validate the extractor kwargs now: every deterministic per-server
+        # misconfiguration must fail policy resolution, not each request.
+        self._audio_encoder_window_extract_kwargs()
+        return resolve_audio_encoder_window_config(
+            spec,
+            feature_extractor=self._processor.feature_extractor,
+            output_length_fn=self.get_audio_encoder_output_lengths,
+            model_sample_rate=model_sample_rate,
+        )
+
+    def build_audio_encoder_window_items(
+        self,
+        base_output: BaseMultiModalProcessorOutput,
+        mm_tokens: MultimodalSpecialTokens,
+        config: AudioEncoderWindowConfig,
+    ) -> tuple[list[MultimodalDataItem], torch.Tensor]:
+        """Build cacheable complete windows and one uncached mutable tail."""
+        audios = base_output.audios or []
+        if len(base_output.organize_results()) != 1 or len(audios) != 1:
+            raise ValueError("audio windowing requires exactly one audio item")
+
+        placeholder_token_id = mm_tokens.get_token_id_by_modality(Modality.AUDIO)
+        if placeholder_token_id is None:
+            raise ValueError("audio windowing requires an audio placeholder")
+
+        input_ids = self._tokenizer(
+            base_output.input_text,
+            return_tensors="pt",
+            padding=False,
+        ).input_ids.flatten()
+        mm_items, input_ids = build_audio_encoder_window_items(
+            samples=audios[0],
+            input_ids=input_ids,
+            placeholder_token_id=placeholder_token_id,
+            config=config,
+            extract_features_fn=self.extract_audio_encoder_window_features,
+            output_length_fn=self.get_audio_encoder_output_lengths,
+        )
+        if self.use_cuda_ipc:
+            for item in mm_items:
+                item.feature = self._wrap_tensor_for_cuda_ipc(item.feature)
+        return mm_items, input_ids
 
     @property
     def spatial_merge_size(self):
@@ -1771,6 +1867,7 @@ class BaseMultimodalProcessor(ABC):
         base_output: BaseMultiModalProcessorOutput,
         mm_tokens: MultimodalSpecialTokens,
         processor=None,
+        audio_encoder_window_config: Optional[AudioEncoderWindowConfig] = None,
         **kwargs,
     ) -> Tuple[List[MultimodalDataItem], torch.Tensor, dict]:
         """
@@ -1780,6 +1877,14 @@ class BaseMultimodalProcessor(ABC):
         Returns:
             Tuple of (list of mm_items, input_ids)
         """
+        if audio_encoder_window_config is not None:
+            mm_items, input_ids = self.build_audio_encoder_window_items(
+                base_output,
+                mm_tokens,
+                audio_encoder_window_config,
+            )
+            return mm_items, input_ids, {}
+
         processor_override = processor
         processor, tokenizer = self._resolve_processor(processor)
 

@@ -1,10 +1,14 @@
+"""Shared cumulative streaming ASR state and backend request helpers."""
+
 import asyncio
 import io
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Union
 
+import msgspec
+import numpy as np
 import soundfile as sf
 from fastapi import Request
 
@@ -12,15 +16,31 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     TranscriptionAdapter,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.mm_utils import hash_feature
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from sglang.srt.multimodal.audio_encoder_windowing import (
+        AudioEncoderWindowConfig,
+    )
 
-# Collapse whitespace before punctuation so batched-inference token
-# boundary jitter (" ," vs ",") doesn't leak into deltas. Covers both
-# ASCII punctuation and the CJK / fullwidth equivalents.
+# Cumulative decodes can jitter only in whitespace before punctuation. Remove
+# that formatting noise before comparing successive transcript prefixes.
 _PUNCT_WS_RE = re.compile(r"\s+([,.;:!?，。！？；：、])")
+
+
+class GeneratedTranscript(msgspec.Struct, frozen=True):
+    """Normalized ASR text plus the backend stop reason."""
+
+    text: str
+    finish_reason: Optional[str]
+
+
+def hash_audio_content(audio_data: Union[bytes, np.ndarray]) -> str:
+    """Return the per-audio hex identity accepted by GenerateReqInput."""
+    return f"{hash_feature(audio_data):016x}"
 
 
 @dataclass
@@ -69,6 +89,7 @@ class StreamingASRState:
         self.chunk_index += 1
         if self.confirmed_text.startswith(old_confirmed):
             return self._record_emit(self.confirmed_text[len(old_confirmed) :].strip())
+
         # Model revised earlier text, use word level common prefix to avoid
         # re-emitting already-sent content and cutting mid-word.
         old_words = old_confirmed.split()
@@ -104,20 +125,22 @@ def split_audio_chunks(audio_data: bytes, chunk_size_sec: float) -> List[bytes]:
     audio_file = io.BytesIO(audio_data)
     try:
         data, sample_rate = sf.read(audio_file, dtype="float32")
-    except sf.LibsndfileError as e:
-        raise ValueError(f"failed to decode audio: {e}") from e
+    except sf.LibsndfileError as error:
+        raise ValueError(f"failed to decode audio: {error}") from error
     if len(data.shape) > 1:
         data = data.mean(axis=1)
     chunk_size_samples = int(chunk_size_sec * sample_rate)
     total_samples = len(data)
     chunks = []
     for end in range(
-        chunk_size_samples, total_samples + chunk_size_samples, chunk_size_samples
+        chunk_size_samples,
+        total_samples + chunk_size_samples,
+        chunk_size_samples,
     ):
         end = min(end, total_samples)
-        buf = io.BytesIO()
-        sf.write(buf, data[:end], sample_rate, format="WAV")
-        chunks.append(buf.getvalue())
+        buffer = io.BytesIO()
+        sf.write(buffer, data[:end], sample_rate, format="WAV")
+        chunks.append(buffer.getvalue())
     return chunks
 
 
@@ -129,19 +152,20 @@ _NO_SPACE_BEFORE = frozenset(".,!?;:%)]}，。！？；：、）】》」』")
 _NO_SPACE_AFTER = frozenset("([{（【《「『")
 
 
-def _is_cjk(c: str) -> bool:
-    """Whether char is a CJK-context glyph that doesn't take inter-word
-    spaces — ideographs, Japanese kana, CJK punctuation, fullwidth forms.
-    Excludes Hangul / Devanagari / Arabic etc., which are non-ASCII but
-    space-separated and need the normal boundary space."""
-    cp = ord(c)
+def is_cjk_char(char: str) -> bool:
+    """Whether a character belongs to a CJK context that takes no added space.
+
+    This includes CJK punctuation, Japanese kana, ideographs, and fullwidth
+    forms while excluding non-ASCII scripts that remain whitespace-delimited.
+    """
+    cp = ord(char)
     return (
-        0x3000 <= cp <= 0x303F  # CJK Symbols and Punctuation (，。、《》「」…)
-        or 0x3040 <= cp <= 0x309F  # Hiragana
-        or 0x30A0 <= cp <= 0x30FF  # Katakana
-        or 0x3400 <= cp <= 0x4DBF  # CJK Unified Ideographs Ext A
-        or 0x4E00 <= cp <= 0x9FFF  # CJK Unified Ideographs
-        or 0xFF00 <= cp <= 0xFFEF  # Halfwidth & Fullwidth Forms (fullwidth ASCII)
+        0x3000 <= cp <= 0x303F
+        or 0x3040 <= cp <= 0x309F
+        or 0x30A0 <= cp <= 0x30FF
+        or 0x3400 <= cp <= 0x4DBF
+        or 0x4E00 <= cp <= 0x9FFF
+        or 0xFF00 <= cp <= 0xFFEF
     )
 
 
@@ -157,53 +181,143 @@ def needs_space(prev: str, cur: str) -> bool:
         return False
     if cur[0] in _NO_SPACE_BEFORE or prev[-1] in _NO_SPACE_AFTER:
         return False
-    if _is_cjk(prev[-1]) and _is_cjk(cur[0]):
+    if is_cjk_char(prev[-1]) and is_cjk_char(cur[0]):
         return False
     return True
+
+
+async def generate_asr_transcript(
+    tokenizer_manager: TokenizerManager,
+    adapter: TranscriptionAdapter,
+    audio_data: Union[bytes, np.ndarray],
+    sampling_params: Dict[str, Any],
+    prompt: str,
+    raw_request: Optional[Request] = None,
+    routing_key: Optional[str] = None,
+    audio_encoder_window_config: Optional["AudioEncoderWindowConfig"] = None,
+    mm_hashes: Optional[List[str]] = None,
+    on_update: Optional[Callable[[str], Awaitable[None]]] = None,
+) -> Optional[GeneratedTranscript]:
+    """Run one backend request and optionally publish decoder snapshots."""
+    stream = on_update is not None
+    chunk_request = GenerateReqInput(
+        text=prompt,
+        audio_data=audio_data,
+        sampling_params=sampling_params,
+        stream=stream,
+        modalities=["audio"],
+        routing_key=routing_key,
+        mm_hashes=mm_hashes,
+    )
+
+    cumulative_text = ""
+    incremental = tokenizer_manager.server_args.incremental_streaming_output
+    try:
+        ret = None
+        async for ret in tokenizer_manager.generate_request(
+            chunk_request,
+            raw_request,
+            audio_encoder_window_config=audio_encoder_window_config,
+        ):
+            # Streaming requests receive scheduler aborts as terminal responses.
+            # Reject them before publishing partial text or committing audio.
+            _raise_for_aborted_response(ret)
+            if not stream:
+                break
+            chunk_text = ret.get("text", "")
+            if incremental:
+                cumulative_text += chunk_text
+            else:
+                cumulative_text = chunk_text
+            visible_text = adapter.postprocess_streaming_text(cumulative_text)
+            if visible_text is not None:
+                await on_update(normalize_whitespace(visible_text))
+    except asyncio.CancelledError:
+        raise
+    except ValueError:
+        logger.warning("[streaming_asr] ASR request failed", exc_info=True)
+        raise
+
+    if ret is None:
+        logger.warning("[streaming_asr] ASR request returned no response")
+        return None
+
+    raw_text = cumulative_text if stream else ret.get("text", "")
+    return GeneratedTranscript(
+        text=normalize_whitespace(adapter.postprocess_text(raw_text)),
+        finish_reason=_finish_reason_type(ret),
+    )
+
+
+def _finish_reason_type(response: Dict[str, Any]) -> Optional[str]:
+    finish_reason = response.get("meta_info", {}).get("finish_reason")
+    if isinstance(finish_reason, dict):
+        finish_reason = finish_reason.get("type")
+    return finish_reason
+
+
+def _raise_for_aborted_response(response: Dict[str, Any]) -> None:
+    if _finish_reason_type(response) != "abort":
+        return
+    finish_reason = response.get("meta_info", {}).get("finish_reason")
+    message = finish_reason.get("message") if isinstance(finish_reason, dict) else None
+    raise RuntimeError(message or "ASR backend request aborted")
+
+
+async def generate_cumulative_transcript(
+    tokenizer_manager: TokenizerManager,
+    adapter: TranscriptionAdapter,
+    state: StreamingASRState,
+    audio_data: Union[bytes, np.ndarray],
+    sampling_params: Dict[str, Any],
+    raw_request: Optional[Request] = None,
+    routing_key: Optional[str] = None,
+    on_update: Optional[Callable[[str], Awaitable[None]]] = None,
+) -> Optional[GeneratedTranscript]:
+    """Generate one cumulative hypothesis with stable raw-audio identity."""
+    return await generate_asr_transcript(
+        tokenizer_manager=tokenizer_manager,
+        adapter=adapter,
+        audio_data=audio_data,
+        sampling_params=sampling_params,
+        prompt=adapter.prompt_template + state.get_prefix_text(),
+        raw_request=raw_request,
+        routing_key=routing_key,
+        mm_hashes=[hash_audio_content(audio_data)],
+        on_update=on_update,
+    )
+
+
+def apply_cumulative_transcript(
+    state: StreamingASRState, text: str, *, is_last: bool
+) -> str:
+    """Apply a cumulative hypothesis to the shared rollback state."""
+    if is_last:
+        state.full_transcript = text
+        return state.finalize()
+    return state.update(text)
 
 
 async def process_asr_chunk(
     tokenizer_manager: TokenizerManager,
     adapter: TranscriptionAdapter,
     state: StreamingASRState,
-    audio_data: bytes,
+    audio_data: Union[bytes, np.ndarray],
     sampling_params: Dict[str, Any],
     is_last: bool,
     raw_request: Optional[Request] = None,
     routing_key: Optional[str] = None,
 ) -> str:
-    """Run inference on one audio chunk. Shared by the HTTP and WebSocket paths."""
-    prompt = adapter.prompt_template + state.get_prefix_text()
-
-    chunk_request = GenerateReqInput(
-        text=prompt,
+    """Run and reconcile one cumulative chunk for HTTP streaming ASR."""
+    result = await generate_cumulative_transcript(
+        tokenizer_manager=tokenizer_manager,
+        adapter=adapter,
+        state=state,
         audio_data=audio_data,
         sampling_params=sampling_params,
-        stream=False,
-        modalities=["audio"],
+        raw_request=raw_request,
+        routing_key=routing_key,
     )
-    if routing_key is not None:
-        chunk_request.routing_key = routing_key
-
-    try:
-        ret = None
-        async for ret in tokenizer_manager.generate_request(chunk_request, raw_request):
-            break
-    except asyncio.CancelledError:
-        raise
-    except ValueError:
-        logger.warning(
-            "[streaming_asr] chunk %d failed", state.chunk_index, exc_info=True
-        )
-        raise
-
-    if ret is None:
-        logger.warning("[streaming_asr] empty response for chunk %d", state.chunk_index)
+    if result is None:
         return ""
-
-    text = normalize_whitespace(adapter.postprocess_text(ret.get("text", "")))
-
-    if is_last:
-        state.full_transcript = text
-        return state.finalize()
-    return state.update(text)
+    return apply_cumulative_transcript(state, result.text, is_last=is_last)

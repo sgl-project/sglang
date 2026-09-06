@@ -1418,9 +1418,19 @@ class ServerArgs:
     ] = "model"
     asr_max_buffer_seconds: A[
         int,
-        "Maximum seconds of PCM audio the streaming ASR WebSocket handler will accumulate before closing the session with a buffer_overflow error. Guards against OOM when a client streams audio faster than inference can consume it. Default 60s.",
+        "Maximum total PCM audio seconds accepted per streaming ASR item before closing the session with a buffer_overflow error. This duration cap is independent of resident-buffer compaction. Default 60s.",
         NS("serving"),
     ] = 60
+    enable_asr_encoder_window: A[
+        bool,
+        "Enable encoder-aligned rolling context for supported realtime ASR "
+        "models after the adapter's long-audio threshold. Raise "
+        "--asr-max-buffer-seconds above that threshold to process longer items. "
+        "Models and languages without a compatible policy remain cumulative and "
+        "retain the adapter's long-audio limit. Validated on local single-GPU "
+        "execution; encoder disaggregation is not supported.",
+        NS("serving"),
+    ] = False
     asr_max_concurrent_sessions: A[
         int,
         "Maximum number of concurrent realtime ASR WebSocket sessions served by /v1/realtime. New connections beyond this cap are accepted, sent an error{code:too_many_sessions} frame, and closed. Default 32.",

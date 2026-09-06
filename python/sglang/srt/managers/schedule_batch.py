@@ -358,6 +358,7 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     """
     One MultimodalDataItem represents a single multimodal input (one image, one video, or one audio).
     For example, if there are 3 images and 1 audio, there will be 4 MultimodalDataItems.
+    A processor may also split one input into several items when they encode independently.
 
     Each item has its own hash and pad_value, enabling per-image RadixAttention caching.
 
@@ -385,6 +386,12 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     model_specific_data: Dict[str, MultimodalDataValue] = msgspec.field(
         default_factory=dict
     )
+    # One-use items can skip embedding-cache reads and writes so they do not
+    # evict reusable entries.
+    use_embedding_cache: bool = True
+    # Keep producer-normalized items out of the default MM encoder batch when
+    # their tensor geometry is not compatible with ordinary requests.
+    separate_encoder_batch: bool = False
 
     def __post_init__(self) -> None:
         if self.hash is not None:

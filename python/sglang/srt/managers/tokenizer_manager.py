@@ -34,7 +34,17 @@ from datetime import datetime
 from enum import Enum
 from functools import lru_cache
 from http import HTTPStatus
-from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import fastapi
 import numpy as np
@@ -173,6 +183,11 @@ from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.srt.utils.weight_versions import add_weight_versions_to_meta_info
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+
+if TYPE_CHECKING:
+    from sglang.srt.multimodal.audio_encoder_windowing import (
+        AudioEncoderWindowConfig,
+    )
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -776,11 +791,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        *,
+        audio_encoder_window_config: Optional[AudioEncoderWindowConfig] = None,
     ):
         self.auto_create_handle_loop()
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
+        if audio_encoder_window_config is not None and not obj.is_single:
+            raise ValueError("audio encoder windowing requires a single request")
         self._set_default_priority(obj)
         if (
             isinstance(obj, GenerateReqInput)
@@ -820,7 +839,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 # Tokenize the request and send it to the scheduler
                 if obj.is_single:
-                    tokenized_obj = await self._tokenize_one_request(obj)
+                    tokenized_obj = await self._tokenize_one_request(
+                        obj,
+                        audio_encoder_window_config=audio_encoder_window_config,
+                    )
                     state = self.rid_to_state[obj.rid]
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
@@ -969,6 +991,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def _tokenize_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
+        *,
+        audio_encoder_window_config: Optional[AudioEncoderWindowConfig] = None,
     ):
         """Tokenize one request."""
         # Tokenize
@@ -1065,6 +1089,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         audio_data=obj.audio_data,
                         input_text=mm_processor_input,
                         request_obj=obj,
+                        audio_encoder_window_config=audio_encoder_window_config,
                         max_req_input_len=self.max_req_input_len,
                     )
             elif (
@@ -1080,6 +1105,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     audio_data=obj.audio_data,
                     input_text=mm_processor_input,
                     request_obj=obj,
+                    audio_encoder_window_config=audio_encoder_window_config,
                     max_req_input_len=self.max_req_input_len,
                 )
 
