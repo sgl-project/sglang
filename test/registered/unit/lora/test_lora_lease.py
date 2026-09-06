@@ -18,7 +18,7 @@ negative, which hangs it just the same (it waits for exactly zero). Covers:
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -181,6 +181,14 @@ class TestLruSkipsNonReloadable(CustomTestCase):
 
 
 class TestUnloadRefCacheCleanup(CustomTestCase):
+    def setUp(self):
+        parallel = patch(
+            "sglang.srt.managers.tokenizer_control_mixin.get_parallel",
+            return_value=SimpleNamespace(dp_size=1, enable_dp_attention=False),
+        )
+        parallel.start()
+        self.addCleanup(parallel.stop)
+
     def _make_unload_tm(self, success: bool) -> TokenizerManager:
         tm = TokenizerManager.__new__(TokenizerManager)
         tm.auto_create_handle_loop = Mock()
@@ -188,6 +196,7 @@ class TestUnloadRefCacheCleanup(CustomTestCase):
         tm.server_args.enable_lora = True
         tm.server_args.dp_size = 1
         tm.lora_update_lock = asyncio.Lock()
+        tm._weight_update_new_loras = {}
         tm._unload_lora_adapter_locked = AsyncMock(
             return_value=SimpleNamespace(success=success)
         )

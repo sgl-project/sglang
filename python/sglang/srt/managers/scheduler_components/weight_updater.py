@@ -131,6 +131,8 @@ class SchedulerWeightUpdaterManager:
     # Session scope, recorded at begin_weight_update: only sync_base sessions
     # unpack/re-finalize base weights, and only they accept base tensors.
     _weight_update_sync_base: bool = True
+    _weight_update_session_id: Optional[str] = None
+    _weight_update_new_lora_names: Optional[set[str]] = None
     # Streamed adapter tensors accumulated this session: {lora_name: {hf_key: tensor}}.
     # Applied and cleared by end_weight_update; discarded by the next begin.
     _lora_stash: Dict[str, Dict[str, torch.Tensor]] = field(default_factory=dict)
@@ -283,6 +285,7 @@ class SchedulerWeightUpdaterManager:
                     recv_req.load_format,
                 )
                 base_tensors, lora_tensors = _split_lora_named_tensors(weights)
+                self._validate_new_lora_tensors(recv_req, base_tensors, lora_tensors)
                 self._stash_lora_tensors(lora_tensors)
                 if base_tensors:
                     assert (
@@ -333,7 +336,14 @@ class SchedulerWeightUpdaterManager:
             else:
                 base_tensors, lora_tensors = _split_lora_named_tensors(named_tensors)
                 named_tensors = base_tensors
-            self._stash_lora_tensors(lora_tensors)
+            try:
+                self._validate_new_lora_tensors(recv_req, base_tensors, lora_tensors)
+            except ValueError as error:
+                torch.distributed.barrier(group=self.tp_cpu_group)
+                return UpdateWeightsFromTensorReqOutput(
+                    success=False, message=str(error)
+                )
+            self._stash_lora_tensors(lora_tensors, copy_tensors=True)
             success, message = True, "Success"
             if base_tensors:
                 assert (
@@ -397,11 +407,24 @@ class SchedulerWeightUpdaterManager:
         loadable state on the selected runners (target and/or draft), so the draft
         model is prepared identically to the target. The selector is recorded and
         reused by end_weight_update so the same set is finalized."""
-        assert (
-            not self._weight_update_in_progress
-        ), "begin_weight_update called while a weight-update session is already open"
+        if self._weight_update_in_progress:
+            return BeginWeightUpdateReqOutput(
+                success=False, message="A weight-update session is already open"
+            )
+        if recv_req.new_lora_names is not None and (
+            recv_req.sync_base or not recv_req.new_lora_names or not recv_req.session_id
+        ):
+            return BeginWeightUpdateReqOutput(
+                success=False, message="Invalid new-version LoRA session"
+            )
         self._weight_update_selector = recv_req.selector
         self._weight_update_sync_base = recv_req.sync_base
+        self._weight_update_session_id = recv_req.session_id
+        self._weight_update_new_lora_names = (
+            set(recv_req.new_lora_names)
+            if recv_req.new_lora_names is not None
+            else None
+        )
         self._lora_stash = {}
         self._weight_update_pending_version = None
         if recv_req.sync_base:
@@ -416,9 +439,33 @@ class SchedulerWeightUpdaterManager:
         """End the weight-update session on the runners begin_weight_update opened
         (its recorded selector): quant finalize on each, plus model.post_load_weights
         only when load_weights was bypassed this session (e.g. P2P/RDMA)."""
-        assert (
-            self._weight_update_in_progress
-        ), "end_weight_update called without begin_weight_update"
+        if not self._weight_update_in_progress:
+            return EndWeightUpdateReqOutput(
+                success=recv_req.abort, message="No open weight-update session"
+            )
+        if recv_req.session_id != self._weight_update_session_id:
+            return EndWeightUpdateReqOutput(
+                success=False, message="Weight-update session_id mismatch"
+            )
+        if recv_req.abort:
+            if self._weight_update_new_lora_names is None:
+                return EndWeightUpdateReqOutput(
+                    success=False, message="Cannot abort a base-weight session"
+                )
+            self._lora_stash = {}
+            self._weight_update_in_progress = False
+            torch.distributed.barrier(group=self.tp_cpu_group)
+            return EndWeightUpdateReqOutput(
+                success=True, message="Discarded staged LoRA tensors"
+            )
+        if self._weight_update_new_lora_names is not None and (
+            recv_req.expected_lora_checksums is None
+            or set(recv_req.expected_lora_checksums)
+            != self._weight_update_new_lora_names
+        ):
+            return EndWeightUpdateReqOutput(
+                success=False, message="Missing new-version checksum manifest"
+            )
         if self._weight_update_sync_base:
             run_post_load = not self._weight_update_loaded
             for _, runner in self.get_model_runners(self._weight_update_selector):
@@ -431,12 +478,34 @@ class SchedulerWeightUpdaterManager:
         torch.distributed.barrier(group=self.tp_cpu_group)
         return EndWeightUpdateReqOutput(success=success, message=message)
 
+    def _validate_new_lora_tensors(self, recv_req, base_tensors, lora_tensors):
+        if self._weight_update_new_lora_names is None:
+            return
+        if recv_req.session_id != self._weight_update_session_id:
+            raise ValueError("Weight-update session_id mismatch")
+        if (
+            recv_req.flush_cache
+            or recv_req.abort_all_requests
+            or recv_req.weight_version is not None
+        ):
+            raise ValueError(
+                "New LoRA versions cannot change inference state or the base version"
+            )
+        if base_tensors:
+            raise ValueError("Base tensors cannot enter a new-version LoRA session")
+        names = {name.split(":", 1)[0] for name, _ in lora_tensors}
+        if not names <= self._weight_update_new_lora_names:
+            raise ValueError(
+                "A new-version LoRA session cannot overwrite another adapter"
+            )
+
     def forget_lora_adapter(self, lora_name: str) -> None:
         """Drop the partial-stream guard entry: a re-registered or unloaded name
         is a new adapter identity and may stream a different tensor set."""
         self._lora_applied_names.pop(lora_name, None)
 
-    def _stash_lora_tensors(self, lora_tensors) -> None:
+    def _stash_lora_tensors(self, lora_tensors, *, copy_tensors: bool = False) -> None:
+        copied_devices = set()
         for prefixed_name, tensor in lora_tensors:
             lora_name, hf_key = prefixed_name.split(":", 1)
             if isinstance(tensor, LocalSerializedTensor):
@@ -444,7 +513,14 @@ class SchedulerWeightUpdaterManager:
             assert isinstance(
                 tensor, torch.Tensor
             ), f"streamed LoRA tensor {prefixed_name!r} must arrive as a plain tensor"
+            if copy_tensors:
+                # IPC senders can reuse a bucket as soon as this RPC replies.
+                tensor = tensor.clone()
+                if tensor.is_cuda:
+                    copied_devices.add(tensor.device)
             self._lora_stash.setdefault(lora_name, {})[hf_key] = tensor
+        for device in copied_devices:
+            torch.cuda.current_stream(device).synchronize()
 
     def _apply_lora_stash(
         self, expected_checksums: Optional[Dict[str, Dict[str, str]]]
