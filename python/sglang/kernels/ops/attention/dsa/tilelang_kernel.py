@@ -271,6 +271,7 @@ def sparse_attention_fwd_kernel_v1(
     block_I=64,
     num_stages=2,
     threads=256,
+    heads_per_block=64,
 ):
     assert dim == tilelang.math.next_power_of_2(dim) or dim % 64 == 0, (
         f"dim={dim} must be a power of 2 or a multiple of 64"
@@ -310,13 +311,17 @@ def sparse_attention_fwd_kernel_v1(
     D = dim
     D_tail = tail_dim
 
-    if head_kv > 64:
-        assert head_kv % 64 == 0, "head_kv should be a multiple of 64"
-        REPLICATE_H = head_kv // 64
+    # heads_per_block bounds the Q/O tiles held in shared memory; a rank with more
+    # heads runs several blocks per query position (REPLICATE_H) instead.
+    if head_kv > heads_per_block:
+        assert head_kv % heads_per_block == 0, (
+            f"head_kv should be a multiple of {heads_per_block}"
+        )
+        REPLICATE_H = head_kv // heads_per_block
     else:
         REPLICATE_H = 1
 
-    H_per_block = padded_H if REPLICATE_H == 1 else 64
+    H_per_block = padded_H if REPLICATE_H == 1 else heads_per_block
 
     @T.prim_func
     def main(
@@ -357,7 +362,9 @@ def sparse_attention_fwd_kernel_v1(
             q_i = s_i
             max_kv_i = q_i
 
-            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
+            H0 = g_i * padded_H + (
+                0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * heads_per_block
+            )
             H1 = H0 + H_per_block
 
             T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
