@@ -109,7 +109,7 @@ class BaseReasoningFormatDetector:
     def _maybe_apply_force_nonempty_content(
         self, ret: StreamingParseResult
     ) -> StreamingParseResult:
-        if self._force_nonempty_content and not ret.normal_text:
+        if self._force_nonempty_content and not ret.normal_text.strip():
             ret.normal_text, ret.reasoning_text = ret.reasoning_text, ret.normal_text
         return ret
 
