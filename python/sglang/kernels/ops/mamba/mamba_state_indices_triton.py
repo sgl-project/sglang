@@ -38,9 +38,7 @@ def _fused_replay_state_indices_kernel(
     req = tl.load(req_pool_indices_ptr + offs, mask=valid, other=0)
     idx = tl.load(mamba_map_ptr + req, mask=valid, other=0)
     if HAS_V2P:
-        # Unified pool: the mapping yields a VIRTUAL slot id. Its allocator runs
-        # at page_size 1, so the translate is one more gather -- and it must
-        # happen BEFORE the padding sentinel, matching the reference chain.
+        # Must gather before the padding sentinel, as the reference chain does.
         idx = tl.load(v2p_ptr + idx, mask=valid, other=0)
     out_val = tl.where(valid, idx.to(tl.int32), -1)
     tl.store(out_ptr + offs, out_val, mask=in_range)

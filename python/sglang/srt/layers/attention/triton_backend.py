@@ -746,21 +746,11 @@ class TritonAttnBackend(AttentionBackend):
     def _fill_cuda_graph_write_locs(
         self, forward_batch: ForwardBatch, bs: int
     ) -> Optional[torch.Tensor]:
-        """Translate the cuda-graph WRITE loc into the capture-stable buffer
-        and return the ``[:n]`` view; no-op for non-unified pools.
-
-        Runs BEFORE graph.replay() so it reads the live post-compaction v2p.
-        The capture batch is runner-built with zeros, which is safe because
-        slot 0 is the reserved sink in every id space.
-        """
-        # The buffer exists only for a translating pool, so this must return
-        # before naming it.
+        """Runs BEFORE graph.replay(), so it reads the live post-compaction
+        v2p; no-op for non-unified pools."""
+        # The buffer exists only for a translating pool; return before naming it.
         if not self.kv_index_translator.is_translating:
             return None
-        # One launch: the live prefix is translated straight in and the padded
-        # tail cleared. A smaller replay batch would otherwise leave [n:]
-        # holding stale ids that the captured store writes; zeroing sends those
-        # rows to slot 0 (the sink).
         return self.kv_index_translator.fill_capture_write_loc(
             out=self.cuda_graph_out_cache_loc_full_physical,
             forward_batch=forward_batch,

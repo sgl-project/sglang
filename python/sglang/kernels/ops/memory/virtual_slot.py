@@ -267,9 +267,7 @@ def write_loc_to_kernel_ids(
     tail cleared here instead of by a follow-up ``zero_``.
     """
     N = int(loc.numel())
-    # The kernel flat-indexes `loc` and `out` (`ptr + offs`), so a strided view
-    # would be silently mis-addressed; the torch chain this replaced tolerated
-    # one.
+    # Flat-indexed as `ptr + offs`, so a strided view is mis-addressed.
     assert loc.is_contiguous(), (
         f"write_loc_to_kernel_ids: loc must be contiguous, got shape "
         f"{tuple(loc.shape)} stride {tuple(loc.stride())}"
@@ -282,15 +280,12 @@ def write_loc_to_kernel_ids(
         f"got {out.dtype}"
     )
     if out_width is None:
-        # Element-for-element: `out` mirrors `loc`, whatever its shape -- a 2-D
-        # page table is a legitimate destination.
+        # `out` mirrors `loc` whatever its shape; a 2-D page table is legal.
         assert out.shape == loc.shape and out.is_contiguous(), (
             f"write_loc_to_kernel_ids: out shape {tuple(out.shape)} must match "
             f"loc shape {tuple(loc.shape)}"
         )
     else:
-        # Wide destination: a capture-stable buffer whose tail this call
-        # clears, so it must be packed, 1-D, and at least `width` long.
         assert out.dim() == 1 and out.is_contiguous() and out.numel() >= width, (
             f"write_loc_to_kernel_ids: out_width needs a packed 1-D out of at "
             f"least {width}, got {tuple(out.shape)}"

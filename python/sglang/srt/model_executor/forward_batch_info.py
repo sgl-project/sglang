@@ -413,9 +413,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
 
-    # The write loc before `KVIndexTranslator.rebind_write_loc` replaced it
-    # with kernel-facing ids. Kept so a backend can re-derive straight into its
-    # capture-stable buffer at metadata-init time; None on a static pool.
+    # The write loc before `rebind_write_loc` replaced it with kernel-facing
+    # ids; a backend re-derives from it into its capture-stable buffer.
     out_cache_loc_virtual: Optional[torch.Tensor] = None
     # DSV4-NPU only: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator,
     # consumed by the Ascend backend for PA_ND block tables. None elsewhere.
@@ -1819,10 +1818,8 @@ def build_inner_fb_view(
         seq_lens_cpu=forward_batch.seq_lens_cpu,
         encoder_lens=encoder_lens,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
-        # The write contract's virtual source. `getattr` on purpose, unlike
-        # `build_replay_fb_view`: that one is handed the live ForwardBatch,
-        # while this can be handed another hand-built view (the speculative
-        # runners and DSV4 each build their own) that predates this field.
+        # Defensive like its neighbours: the caller may pass another
+        # hand-built view that predates this field.
         out_cache_loc_virtual=getattr(forward_batch, "out_cache_loc_virtual", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         spec_info=forward_batch.spec_info,
