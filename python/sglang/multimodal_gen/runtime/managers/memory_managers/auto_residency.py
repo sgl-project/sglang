@@ -31,6 +31,7 @@ from itertools import chain, product
 from typing import TYPE_CHECKING, Callable, Collection, Iterable, Mapping, Sequence
 
 import msgspec
+import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
@@ -42,6 +43,8 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
     is_fsdp_managed_module,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    HOST_COPY_RESERVE_BYTES,
+    host_memory_available_bytes,
     tensor_storage_bytes,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
@@ -50,6 +53,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     estimate_layer_weight_bytes,
     is_layerwise_offloaded_module,
     iter_materialized_weights,
+    release_unused_pinned_memory,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     RESIDENCY_POLICIES,
@@ -346,6 +350,47 @@ def residency_device_growth_bytes(candidate: ResidencyTarget) -> int:
         candidate.present_device_delta_bytes,
         candidate.inactive_device_delta_bytes,
     )
+
+
+def pre_warmup_residency_targets(
+    candidates: Iterable[ResidencyTarget],
+    *,
+    excluded_components: Collection[str] = (),
+) -> list[ResidencyTarget]:
+    """Keep only weight-safe choices before activation memory is measured.
+
+    Static planning knows complete component weights but not the runtime
+    working set. It may demote an unsafe configured layout, but a pure
+    residency promotion can consume activation headroom that only the first
+    shape probe can reveal.
+
+    A layerwise layout can require a small persistent non-layer footprint even
+    when the coarse component-offload state keeps every weight on the host.
+    Keep that alternative when it reduces the component's active working set:
+    the joint solver still checks its inactive, transition, and HostPin costs.
+    Excluding it here would leave no pre-warmup escape when the full component
+    fits neither the device nor the representative request.
+    """
+    candidates = list(candidates)
+    current_device_bytes = {
+        candidate.component_name: candidate.target_device_weight_bytes
+        for candidate in candidates
+        if candidate.current_placement
+    }
+    return [
+        candidate
+        for candidate in candidates
+        if candidate.component_name not in excluded_components
+        and candidate.component_name in current_device_bytes
+        and (
+            candidate.target_device_weight_bytes
+            <= current_device_bytes[candidate.component_name]
+            or (
+                candidate.target_residency_mode == LAYERWISE_OFFLOAD
+                and candidate.active_device_delta_bytes < 0
+            )
+        )
+    ]
 
 
 def resolve_default_workload(server_args: ServerArgs) -> DefaultWorkload:
@@ -3423,6 +3468,491 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
     )
 
 
+def apply_residency_changes(
+    *,
+    plan: AutoResidencyPlan,
+    modules: Mapping[str, object],
+    server_args: ServerArgs,
+    rank: int | None = None,
+) -> list[AppliedResidencyChange]:
+    """Apply complete target states transactionally on this rank.
+
+    Component-offload targets move back to CPU immediately; resident targets
+    materialize on the local device before validation. Layerwise targets may
+    change resident counts and HostPin placement or disable the streaming
+    hooks entirely. Because targets can move in either direction, a later
+    calibration round can replace an earlier placement.
+
+    Raises on failure after undoing the changes already applied, so a
+    caller observing an exception knows this rank is back on the original
+    strategy -- unless the undo itself fails, which raises
+    ``AutoResidencyRollbackError`` (the rank is in a mixed state and startup
+    must abort).
+    """
+    applied: list[AppliedResidencyChange] = []
+    previous_host_pin_budget_state = None
+    try:
+        ordered_changes = sorted(
+            plan.changes,
+            key=lambda candidate: (
+                candidate.device_transition_delta_bytes,
+                max(
+                    candidate.active_device_delta_bytes,
+                    candidate.inactive_device_delta_bytes,
+                ),
+                candidate.pinned_host_delta_bytes,
+                candidate.option_key(),
+            ),
+        )
+        target_modules: dict[str, nn.Module] = {}
+        snapshots: dict[str, AppliedResidencyChange] = {}
+        previous_pins_by_component: dict[str, tuple[tuple[int, ...], ...]] = {}
+        resident_only = bool(ordered_changes) and all(
+            candidate.target_mode() == RESIDENT for candidate in ordered_changes
+        )
+        if rank is not None and rank in plan.host_pin_target_bytes_by_rank:
+            previous_host_pin_budget_state = (
+                server_args.host_pin_budget().set_spendable_capacity(
+                    plan.host_pin_target_bytes_by_rank[rank]
+                )
+            )
+        for candidate in ordered_changes:
+            if candidate.component_name in target_modules:
+                raise RuntimeError(
+                    f"multiple placement options selected for "
+                    f"{candidate.component_name!r}"
+                )
+            module = modules.get(candidate.component_name)
+            if not isinstance(module, nn.Module):
+                raise RuntimeError(
+                    f"residency target {candidate.component_name!r} is missing"
+                )
+            layerwise_transition = (
+                candidate.residency_mode == LAYERWISE_OFFLOAD
+                or candidate.target_mode() == LAYERWISE_OFFLOAD
+            )
+            if layerwise_transition and not isinstance(
+                module, LayerwiseOffloadableModuleMixin
+            ):
+                raise RuntimeError(
+                    f"residency target {candidate.component_name!r} lost its "
+                    "layerwise offload capability between planning and apply"
+                )
+            if candidate.residency_mode == COMPONENT_OFFLOAD and (
+                is_layerwise_offloaded_module(module)
+            ):
+                raise RuntimeError(
+                    f"residency target {candidate.component_name!r} became "
+                    "layerwise-managed between planning and apply"
+                )
+            target_modules[candidate.component_name] = module
+            previous_auto_mode = server_args.auto_residency_mode(
+                candidate.component_name
+            )
+            applied_device_delta_bytes = residency_device_growth_bytes(candidate)
+            if layerwise_transition:
+                if not isinstance(module, LayerwiseOffloadableModuleMixin):
+                    raise RuntimeError(
+                        f"partial residency target {candidate.component_name!r} "
+                        "lost its layerwise offload capability"
+                    )
+                previous_configured = bool(module.layerwise_offload_managers)
+                previous = (
+                    tuple(
+                        manager.resident_layers
+                        for manager in module.layerwise_offload_managers
+                    )
+                    if previous_configured
+                    else ()
+                )
+                previous_policies = (
+                    module.layerwise_residency_policies() if previous_configured else ()
+                )
+                previous_pinned = (
+                    module.layerwise_pinned_layers() if previous_configured else ()
+                )
+                enabled = (
+                    {manager.enabled for manager in module.layerwise_offload_managers}
+                    if previous_configured
+                    else {False}
+                )
+                if len(enabled) != 1:
+                    raise RuntimeError(
+                        f"placement target {candidate.component_name!r} has mixed "
+                        "layerwise manager states"
+                    )
+                previous_pins_by_component[candidate.component_name] = previous_pinned
+                snapshots[candidate.component_name] = AppliedResidencyChange(
+                    component_name=candidate.component_name,
+                    residency_mode=candidate.residency_mode,
+                    module_ref=module,
+                    previous_layerwise_resident_layers=previous,
+                    previous_layerwise_residency_policies=previous_policies,
+                    previous_layerwise_pinned_layers=previous_pinned,
+                    previous_layerwise_offload_enabled=enabled.pop(),
+                    previous_layerwise_configured=previous_configured,
+                    previous_auto_residency_mode=previous_auto_mode,
+                    previous_host_pin_budget_state=previous_host_pin_budget_state,
+                    pinned_host_changed=(
+                        previous_configured
+                        and candidate.target_layerwise_pinned_layers != previous_pinned
+                    ),
+                    applied_device_delta_bytes=applied_device_delta_bytes,
+                )
+                if candidate.target_layerwise_pinned_layers is None:
+                    raise RuntimeError(
+                        f"layerwise placement {candidate.option_key()!r} has no "
+                        "host pin target"
+                    )
+                continue
+
+            snapshots[candidate.component_name] = AppliedResidencyChange(
+                component_name=candidate.component_name,
+                residency_mode=candidate.residency_mode,
+                module_ref=module,
+                previous_auto_residency_mode=previous_auto_mode,
+                previous_host_pin_budget_state=previous_host_pin_budget_state,
+                applied_device_delta_bytes=applied_device_delta_bytes,
+            )
+        pinning_changes = [
+            candidate
+            for candidate in ordered_changes
+            if snapshots[candidate.component_name].previous_layerwise_configured
+            if not (resident_only and candidate.target_mode() == RESIDENT)
+            if candidate.target_layerwise_pinned_layers is not None
+            and candidate.target_layerwise_pinned_layers
+            != previous_pins_by_component[candidate.component_name]
+        ]
+        host_transition_changes = [
+            candidate
+            for candidate in ordered_changes
+            if candidate.host_unpin_scratch_bytes
+            or candidate.host_pin_scratch_bytes
+            or candidate.host_materialize_scratch_bytes
+        ]
+        if host_transition_changes:
+            host_headroom = max(
+                0, host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES
+            )
+            required_unpin = sum(
+                candidate.host_unpin_scratch_bytes
+                for candidate in host_transition_changes
+            )
+            required_pin = sum(
+                candidate.host_pin_scratch_bytes
+                for candidate in host_transition_changes
+            )
+            required_materialize = sum(
+                candidate.host_materialize_scratch_bytes
+                for candidate in host_transition_changes
+            )
+            required_host_headroom = max(
+                required_unpin, required_pin, required_materialize
+            )
+            if required_host_headroom > host_headroom:
+                raise MemoryError(
+                    "host memory changed after planning: placement transition needs "
+                    f"{required_host_headroom / GIB_BYTES:.2f} GiB "
+                    f"but {host_headroom / GIB_BYTES:.2f} GiB is available"
+                )
+        applied_names: set[str] = set()
+        # 1. release every component's old allowance
+        # 2. return cached pinned blocks to the driver
+        # 3. acquire the final allowances
+        # This avoids a transient HostPin oversubscription when one component
+        # hands its budget to another.
+        for candidate in pinning_changes:
+            applied.append(snapshots[candidate.component_name])
+            applied_names.add(candidate.component_name)
+            module = target_modules[candidate.component_name]
+            assert isinstance(module, LayerwiseOffloadableModuleMixin)
+            module.release_layerwise_pins_outside(
+                candidate.target_layerwise_pinned_layers or ()
+            )
+        if pinning_changes:
+            release_unused_pinned_memory()
+        for candidate in ordered_changes:
+            if candidate.component_name not in applied_names:
+                applied.append(snapshots[candidate.component_name])
+                applied_names.add(candidate.component_name)
+            module = target_modules[candidate.component_name]
+            target_mode = candidate.target_mode()
+            if (
+                candidate.residency_mode == LAYERWISE_OFFLOAD
+                or target_mode == LAYERWISE_OFFLOAD
+            ):
+                assert isinstance(module, LayerwiseOffloadableModuleMixin)
+                snapshot = snapshots[candidate.component_name]
+                if not snapshot.previous_layerwise_configured:
+                    module.configure_layerwise_offload(
+                        server_args,
+                        pin_budget=server_args.host_pin_budget(),
+                        component_name=candidate.component_name,
+                        pin_during_initialization=False,
+                    )
+                    if not module.layerwise_offload_managers:
+                        raise RuntimeError(
+                            f"residency target {candidate.component_name!r} "
+                            "did not configure any layerwise groups"
+                        )
+                if not (resident_only and target_mode == RESIDENT):
+                    module.set_layerwise_pinned_layers(
+                        candidate.target_layerwise_pinned_layers or ()
+                    )
+                if target_mode == COMPONENT_OFFLOAD:
+                    module.remove_layerwise_offload(to_cpu=True)
+                    server_args.set_auto_residency_mode(
+                        candidate.component_name, COMPONENT_OFFLOAD
+                    )
+                elif target_mode == RESIDENT:
+                    server_args.set_auto_residency_mode(
+                        candidate.component_name, RESIDENT
+                    )
+                    if is_layerwise_offloaded_module(module):
+                        module.restore_non_layer_weights()
+                        module.disable_offload()
+                else:
+                    if not is_layerwise_offloaded_module(module):
+                        module.enable_offload()
+                    server_args.set_auto_residency_mode(
+                        candidate.component_name, LAYERWISE_OFFLOAD
+                    )
+                    target_resident_layers = candidate.target_layerwise_resident_layers
+                    if target_resident_layers is None:
+                        raise RuntimeError(
+                            f"layerwise placement {candidate.option_key()!r} has no "
+                            "resident-layer target"
+                        )
+                    target_policies = (
+                        candidate.target_layerwise_residency_policies
+                        or module.layerwise_residency_policies()
+                    )
+                    module.set_layerwise_residency_layout(
+                        target_resident_layers,
+                        target_policies,
+                    )
+                continue
+            if target_mode == RESIDENT:
+                server_args.set_auto_residency_mode(candidate.component_name, RESIDENT)
+                if not is_fsdp_managed_module(module):
+                    module.to(
+                        current_platform.get_local_torch_device(),
+                        non_blocking=True,
+                    )
+            elif target_mode == COMPONENT_OFFLOAD:
+                server_args.set_auto_residency_mode(
+                    candidate.component_name, COMPONENT_OFFLOAD
+                )
+                module.to("cpu")
+            else:
+                raise RuntimeError(
+                    f"unsupported target mode {target_mode!r} for "
+                    f"{candidate.component_name!r}"
+                )
+    except Exception as apply_error:
+        try:
+            rollback_residency_changes(
+                applied=applied, modules=modules, server_args=server_args
+            )
+            if previous_host_pin_budget_state is not None and not applied:
+                server_args.host_pin_budget().restore_capacity(
+                    previous_host_pin_budget_state
+                )
+        except Exception as rollback_error:
+            raise AutoResidencyRollbackError(
+                f"residency adjustment failed ({describe_error(apply_error)}) and rollback "
+                f"failed ({describe_error(rollback_error)})"
+            ) from apply_error
+        raise
+    return applied
+
+
+def commit_residency_changes(
+    *,
+    applied: Iterable[AppliedResidencyChange],
+    modules: Mapping[str, object],
+    server_args: ServerArgs,
+) -> None:
+    """Release rollback-only stores after post-adjustment validation succeeds."""
+    for adjustment in applied:
+        if (
+            adjustment.previous_layerwise_resident_layers is None
+            or server_args.residency_mode(adjustment.component_name) != RESIDENT
+        ):
+            continue
+        module = (
+            adjustment.module_ref
+            if adjustment.module_ref is not None
+            else modules.get(adjustment.component_name)
+        )
+        if not isinstance(module, LayerwiseOffloadableModuleMixin):
+            raise RuntimeError(
+                f"residency target {adjustment.component_name!r} lost its "
+                "layerwise offload capability before commit"
+            )
+        module.finalize_resident_layerwise_placement()
+
+
+def rollback_residency_changes(
+    *,
+    applied: Iterable[AppliedResidencyChange],
+    modules: Mapping[str, object],
+    server_args: ServerArgs,
+) -> None:
+    """Restore the exact placement that preceded a target-state change.
+
+    Every change is undone even when one of them fails; the collected
+    failures are re-raised at the end so one broken component cannot leave
+    the later (earlier-applied) ones adjusted.
+    """
+    applied = list(applied)
+    errors: list[str] = []
+    previous_host_pin_budget_states = {
+        adjustment.previous_host_pin_budget_state
+        for adjustment in applied
+        if adjustment.previous_host_pin_budget_state is not None
+    }
+    if len(previous_host_pin_budget_states) > 1:
+        errors.append("host pin capacity history is inconsistent")
+    elif previous_host_pin_budget_states:
+        try:
+            server_args.host_pin_budget().restore_capacity(
+                previous_host_pin_budget_states.pop()
+            )
+        except Exception as e:
+            errors.append(f"host pin capacity: {describe_error(e)}")
+    pinning_changes = [
+        adjustment
+        for adjustment in applied
+        if adjustment.pinned_host_changed
+        and adjustment.previous_layerwise_pinned_layers is not None
+    ]
+    for adjustment in pinning_changes:
+        try:
+            module = (
+                adjustment.module_ref
+                if adjustment.module_ref is not None
+                else modules.get(adjustment.component_name)
+            )
+            if not isinstance(module, LayerwiseOffloadableModuleMixin):
+                raise RuntimeError("lost layerwise offload capability")
+            if not module.layerwise_offload_managers:
+                continue
+            module.release_layerwise_pins_outside(
+                adjustment.previous_layerwise_pinned_layers or ()
+            )
+        except Exception as e:
+            errors.append(f"{adjustment.component_name}: {describe_error(e)}")
+    if pinning_changes:
+        release_unused_pinned_memory()
+    reverse_apply_order = list(reversed(applied))
+    release_first = [
+        adjustment
+        for adjustment in reverse_apply_order
+        if adjustment.applied_device_delta_bytes > 0
+    ]
+    remaining = [
+        adjustment
+        for adjustment in reverse_apply_order
+        if adjustment.applied_device_delta_bytes <= 0
+    ]
+    for index, adjustment in enumerate(release_first + remaining):
+        if (
+            index == len(release_first)
+            and release_first
+            and torch.get_device_module().is_available()
+        ):
+            torch.get_device_module().empty_cache()
+        try:
+            module = (
+                adjustment.module_ref
+                if adjustment.module_ref is not None
+                else modules.get(adjustment.component_name)
+            )
+            if adjustment.previous_layerwise_resident_layers is not None:
+                if not isinstance(module, LayerwiseOffloadableModuleMixin):
+                    raise RuntimeError("lost layerwise offload capability")
+                if not adjustment.previous_layerwise_configured:
+                    if adjustment.previous_auto_residency_mode is None:
+                        server_args.clear_auto_residency_mode(adjustment.component_name)
+                    else:
+                        server_args.set_auto_residency_mode(
+                            adjustment.component_name,
+                            adjustment.previous_auto_residency_mode,
+                        )
+                    module.remove_layerwise_offload(
+                        to_cpu=(
+                            server_args.residency_mode(adjustment.component_name)
+                            != RESIDENT
+                        )
+                    )
+                    continue
+                currently_enabled = {
+                    manager.enabled for manager in module.layerwise_offload_managers
+                }
+                if not currently_enabled:
+                    module.configure_layerwise_offload(
+                        server_args,
+                        pin_budget=server_args.host_pin_budget(),
+                        component_name=adjustment.component_name,
+                        pin_during_initialization=False,
+                    )
+                    currently_enabled = {
+                        manager.enabled for manager in module.layerwise_offload_managers
+                    }
+                if len(currently_enabled) != 1:
+                    raise RuntimeError("layerwise managers have mixed enabled states")
+                current_enabled = currently_enabled.pop()
+                previous_enabled = adjustment.previous_layerwise_offload_enabled
+                if previous_enabled and not current_enabled:
+                    module.enable_offload()
+                elif not previous_enabled and current_enabled:
+                    module.disable_offload()
+                if adjustment.previous_auto_residency_mode is None:
+                    server_args.clear_auto_residency_mode(adjustment.component_name)
+                else:
+                    server_args.set_auto_residency_mode(
+                        adjustment.component_name,
+                        adjustment.previous_auto_residency_mode,
+                    )
+                previous_policies = (
+                    adjustment.previous_layerwise_residency_policies
+                    or module.layerwise_residency_policies()
+                )
+                module.restore_layerwise_residency_layout(
+                    adjustment.previous_layerwise_resident_layers,
+                    previous_policies,
+                )
+                if adjustment.previous_layerwise_pinned_layers is None:
+                    raise RuntimeError("lost previous layerwise host placement")
+                module.restore_layerwise_pinned_layers(
+                    adjustment.previous_layerwise_pinned_layers
+                )
+                continue
+            if adjustment.previous_auto_residency_mode is None:
+                server_args.clear_auto_residency_mode(adjustment.component_name)
+            else:
+                server_args.set_auto_residency_mode(
+                    adjustment.component_name,
+                    adjustment.previous_auto_residency_mode,
+                )
+            if not isinstance(module, nn.Module):
+                continue
+            if is_layerwise_offloaded_module(module):
+                # A layerwise manager owns this module's placement (e.g. the
+                # offload_during_compile window); moving it to CPU behind the
+                # manager would strand its bookkeeping.
+                pass
+            elif server_args.residency_mode(adjustment.component_name) != RESIDENT:
+                module.to("cpu")
+        except Exception as e:
+            errors.append(f"{adjustment.component_name}: {describe_error(e)}")
+    if torch.get_device_module().is_available():
+        torch.get_device_module().empty_cache()
+    if errors:
+        raise RuntimeError("; ".join(errors))
+
+
 def format_plan_summary(
     *,
     plan: AutoResidencyPlan,
@@ -3454,6 +3984,35 @@ def format_plan_summary(
         f"budget={plan.budget_bytes / GIB_BYTES:.1f} GiB, "
         f"changes=[{changes}]"
     )
+
+
+def format_applied_changes(*, plan: AutoResidencyPlan) -> str:
+    """Describe runtime transitions without claiming startup equivalence."""
+    changes = "; ".join(
+        _format_residency_change(candidate) for candidate in plan.changes
+    )
+    return (
+        f"Auto residency: adjusted {changes}. Startup flags may use a different "
+        f"load path; disable with SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY=1."
+    )
+
+
+def _format_residency_change(candidate: ResidencyTarget) -> str:
+    target_mode = candidate.target_mode()
+    if (
+        target_mode == LAYERWISE_OFFLOAD
+        and candidate.target_layerwise_resident_layers is not None
+    ):
+        pin_counts = tuple(
+            len(indices) for indices in candidate.target_layerwise_pinned_layers or ()
+        )
+        return (
+            f"{candidate.component_name}: layerwise resident layers="
+            f"{candidate.target_layerwise_resident_layers}, pinned layers="
+            f"{pin_counts}, policies="
+            f"{candidate.target_layerwise_residency_policies or 'unchanged'}"
+        )
+    return f"{candidate.component_name}: {candidate.residency_mode} -> {target_mode}"
 
 
 def _format_candidate_summary(candidate: ResidencyTarget) -> str:

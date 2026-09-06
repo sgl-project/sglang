@@ -1,20 +1,13 @@
 import bisect
 import gc
+import math
 import queue
 import re
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from contextlib import nullcontext
 from time import perf_counter
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    List,
-    Optional,
-    Set,
-    Tuple,
-)
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -52,13 +45,77 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+def _align_numel_offset(
+    offset: int, dtype: torch.dtype, alignment_bytes: int = 32
+) -> int:
+    element_size = torch.empty((), dtype=dtype).element_size()
+    alignment_numel = max(1, alignment_bytes // element_size)
+    remainder = offset % alignment_numel
+    return offset if remainder == 0 else offset + alignment_numel - remainder
+
+
+def estimate_layer_weight_bytes(
+    layers: torch.nn.ModuleList | torch.nn.Sequential,
+) -> dict[int, int]:
+    """Physical per-layer store sizes using the real manager's packing rules."""
+    grouped: dict[int, dict[torch.dtype, list[torch.Tensor]]] = {}
+    for name, tensor in layers.named_parameters():
+        layer_index_text, separator, _ = name.partition(".")
+        if not separator or not layer_index_text.isdigit():
+            continue
+        layer_index = int(layer_index_text)
+        local_tensor = tensor.to_local() if isinstance(tensor, DTensor) else tensor
+        grouped.setdefault(layer_index, {}).setdefault(local_tensor.dtype, []).append(
+            local_tensor
+        )
+
+    totals = {layer_index: 0 for layer_index in range(len(layers))}
+    for layer_index, dtype_to_tensors in grouped.items():
+        for dtype, tensors in dtype_to_tensors.items():
+            contiguous_numel = 0
+            for tensor in tensors:
+                if tensor.is_contiguous():
+                    contiguous_numel = _align_numel_offset(contiguous_numel, dtype)
+                    contiguous_numel += tensor.numel()
+                    continue
+                storage_numel = (
+                    0
+                    if tensor.numel() == 0
+                    else 1
+                    + sum(
+                        (size - 1) * abs(stride)
+                        for size, stride in zip(tensor.shape, tensor.stride())
+                    )
+                )
+                totals[layer_index] += storage_numel * tensor.element_size()
+            totals[layer_index] += (
+                contiguous_numel * torch.empty((), dtype=dtype).element_size()
+            )
+    return totals
+
+
+def release_unused_pinned_memory() -> None:
+    """Return unreferenced cached HostPin blocks to the CUDA driver.
+
+    ``torch.cuda.empty_cache()`` only covers device allocations. PyTorch's
+    host caching allocator currently exposes its corresponding operation via
+    this internal binding; keeping the call isolated makes the compatibility
+    boundary explicit until a public API is available.
+    """
+    if not current_platform.is_cuda():
+        return
+    gc.collect()
+    torch._C._host_emptyCache()
+
+
 def compute_streamed_layers(
     *, num_layers: int, resident_layers: int, policy: str
 ) -> tuple[int, ...]:
     """Which layer indices are streamed rather than held on the GPU.
 
-    Both policies stream the same *count* of layers, so they cost the same
-    memory and move the same bytes. They differ only in when those bytes move:
+    Both policies stream the same *count* of layers. Their byte footprints are
+    usually close, but can differ when layer sizes are nonuniform. Their main
+    difference is when those bytes move:
 
     ``leading``  keeps layers ``0..r-1`` and streams the tail. Every streamed
                  layer sits next to another streamed layer, so the transfers
@@ -66,8 +123,8 @@ def compute_streamed_layers(
                  step, and each has exactly one layer of compute to hide behind.
 
     ``strided``  spreads the streamed layers evenly across the whole step, so
-                 the same bytes move over ``n`` layers instead of ``n-r`` and
-                 the peak concurrent traffic drops by ``n/(n-r)``.
+                 traffic moves over ``n`` layers instead of ``n-r`` and the
+                 peak concurrent traffic drops by ``n/(n-r)``.
 
     What that buys is contention, not bandwidth and not stalls. Profiling the
     two policies on an 8-GPU run shows the same HtoD volume to within 0.1%, the
@@ -191,19 +248,22 @@ def restore_host_resident_tables(
 def _install_host_gather_hooks(
     module: torch.nn.Module, device: torch.device | str
 ) -> None:
-    """Run this module's gather on the host, move only the result."""
+    """Run this module's gather beside its current weight, move only the result."""
 
-    def _inputs_to_host(_module, args, kwargs):
+    def _inputs_to_table(_module, args, kwargs):
         if not args or not torch.is_tensor(args[0]):
             return None
-        return (args[0].to("cpu"),) + args[1:], kwargs
+        # A runtime residency promotion can later materialize this table on
+        # the device.  Keep the gather input colocated with its current
+        # weight instead of unconditionally moving it back to the host.
+        return (args[0].to(_module.weight.device),) + args[1:], kwargs
 
     def _output_to_device(_module, _args, output):
         if not torch.is_tensor(output):
             return output
         return output.to(device, non_blocking=True)
 
-    module.register_forward_pre_hook(_inputs_to_host, with_kwargs=True)
+    module.register_forward_pre_hook(_inputs_to_table, with_kwargs=True)
     module.register_forward_hook(_output_to_device)
 
 
@@ -377,6 +437,7 @@ class LayerwiseOffloadManager:
         residency_policy: str = RESIDENCY_POLICY_LEADING,
         pin_budget: HostPinBudget | None = None,
         pin_component_name: str = "layerwise offload",
+        pin_during_initialization: bool = True,
     ) -> None:
         self.model = model
         self.layers_attr_str = layers_attr_str
@@ -392,6 +453,8 @@ class LayerwiseOffloadManager:
         # was never reached. A private budget reads the same host limit.
         self._pin_budget = pin_budget if pin_budget is not None else HostPinBudget()
         self._pin_component_name = pin_component_name
+        self._pin_during_initialization = pin_during_initialization
+        self._layer_hosting: Dict[int, str] = {}
         # an explicit MPS zero avoids staging the next layer alongside the
         # active one; MPS has no transfer overlap to recover from that cost
         self.prefetch_size = (
@@ -522,7 +585,10 @@ class LayerwiseOffloadManager:
     ) -> torch.Tensor:
         if isinstance(target, DTensor):
             return DTensor.from_local(
-                local_tensor, target.device_mesh, target.placements
+                local_tensor,
+                target.device_mesh,
+                target.placements,
+                run_check=False,
             )
         return local_tensor
 
@@ -530,21 +596,6 @@ class LayerwiseOffloadManager:
         self, target: torch.Tensor, dtype: torch.dtype
     ) -> torch.Tensor:
         return self._wrap_for_target(target, self._get_shared_empty_tensor(dtype))
-
-    @staticmethod
-    def _get_alignment_numel(dtype: torch.dtype, alignment_bytes: int = 32) -> int:
-        element_size = torch.empty((), dtype=dtype).element_size()
-        return max(1, alignment_bytes // element_size)
-
-    @classmethod
-    def _align_numel_offset(
-        cls, offset: int, dtype: torch.dtype, alignment_bytes: int = 32
-    ) -> int:
-        alignment_numel = cls._get_alignment_numel(dtype, alignment_bytes)
-        remainder = offset % alignment_numel
-        if remainder == 0:
-            return offset
-        return offset + alignment_numel - remainder
 
     @torch.compiler.disable
     def _initialize(self) -> None:
@@ -572,19 +623,41 @@ class LayerwiseOffloadManager:
     def _layer_byte_totals(
         self, layer_groups: Dict
     ) -> Tuple[Dict[int, int], Dict[int, int]]:
-        """Per layer: (all weight bytes, the subset that are checkpoint views)."""
+        """Per layer: (planned host-store bytes, checkpoint-view bytes)."""
         totals: Dict[int, int] = {}
         mapped: Dict[int, int] = {}
         for layer_idx, dtype_to_params in layer_groups.items():
             total = 0
             from_mapping = 0
-            for weights in dtype_to_params.values():
+            for dtype, weights in dtype_to_params.items():
+                contiguous_numel = 0
+                anonymous_numel = 0
                 for _, weight in weights:
                     tensor = self._to_local_tensor(weight)
-                    nbytes = tensor.untyped_storage().nbytes()
-                    total += nbytes
+                    if tensor.is_contiguous():
+                        contiguous_numel = _align_numel_offset(contiguous_numel, dtype)
+                        contiguous_numel += tensor.numel()
+                        if not self._mapped_regions.holds(tensor):
+                            anonymous_numel = _align_numel_offset(
+                                anonymous_numel, dtype
+                            )
+                            anonymous_numel += tensor.numel()
+                        continue
+                    storage_numel = (
+                        0
+                        if tensor.numel() == 0
+                        else 1
+                        + sum(
+                            (size - 1) * abs(stride)
+                            for size, stride in zip(tensor.shape, tensor.stride())
+                        )
+                    )
+                    storage_bytes = storage_numel * tensor.element_size()
+                    total += storage_bytes
                     if self._mapped_regions.holds(tensor):
-                        from_mapping += nbytes
+                        from_mapping += storage_bytes
+                total += contiguous_numel * dtype.itemsize
+                from_mapping += (contiguous_numel - anonymous_numel) * dtype.itemsize
             totals[layer_idx] = total
             mapped[layer_idx] = from_mapping
         return totals, mapped
@@ -618,12 +691,16 @@ class LayerwiseOffloadManager:
         pinned_bytes = 0
         hosting: Dict[int, str] = {}
         pin_order: List[int] = []
-        spendable = self._pin_budget.spendable_bytes if self._pin_budget else 0
+        spendable = self._pin_budget.spendable_bytes
         streamed = [idx for idx in self._streamed_order if idx in totals]
         resident = [idx for idx in sorted(totals) if idx not in set(streamed)]
         for layer_idx in streamed + resident:
             layer_bytes = totals[layer_idx]
-            if self.pin_cpu_memory and pinned_bytes + layer_bytes <= spendable:
+            if (
+                self.pin_cpu_memory
+                and self._pin_during_initialization
+                and pinned_bytes + layer_bytes <= spendable
+            ):
                 hosting[layer_idx] = "pinned"
                 pinned_bytes += layer_bytes
                 pin_order.append(layer_idx)
@@ -666,7 +743,7 @@ class LayerwiseOffloadManager:
                     anonymous_new_bytes() / 1024**3,
                     host_memory_available_bytes() / 1024**3,
                 )
-        if pinned_bytes and self._pin_budget is not None:
+        if pinned_bytes:
             self._pin_budget.request(
                 component_name=self._pin_component_name, weight_bytes=pinned_bytes
             )
@@ -711,6 +788,7 @@ class LayerwiseOffloadManager:
             ).append((name, tensor))
 
         layer_hosting = self._plan_layer_hosting(layer_groups)
+        self._layer_hosting = dict(layer_hosting)
 
         # 2. concat and offload (in pinned memory)
         for layer_idx, dtype_to_params in layer_groups.items():
@@ -791,7 +869,7 @@ class LayerwiseOffloadManager:
                     # satisfy a 32-byte alignment contract. Reusing one flat buffer
                     # is still fine, but each logical tensor slice must start on an
                     # aligned offset inside that buffer.
-                    current_offset = self._align_numel_offset(current_offset, dtype)
+                    current_offset = _align_numel_offset(current_offset, dtype)
                     aligned_offsets[name] = current_offset
                     current_offset += local_weight.numel()
 
@@ -1219,7 +1297,45 @@ class LayerwiseOffloadManager:
 
         for layer_idx in range(self.num_layers):
             if layer_idx not in self._gpu_layers:
-                self.prefetch_layer(layer_idx, non_blocking=False)
+                # Anonymous host stores can fill the copy stream without a
+                # per-layer host wait. Checkpoint mappings still use the
+                # synchronous path: the mapped courier has a bounded slot ring
+                # intended to overlap one forward, not materialize a whole
+                # model at once.
+                self.prefetch_layer(
+                    layer_idx,
+                    non_blocking=not bool(self._mapped_cpu_weights.get(layer_idx)),
+                )
+        if self.copy_stream is not None:
+            torch.get_device_module().current_stream().wait_stream(self.copy_stream)
+
+    def release_host_stores(self) -> None:
+        """Drop rollback stores after a resident placement is validated.
+
+        The real device tensors must already be materialized and the manager
+        disabled. Repacking pinned stores as pageable here would copy the full
+        checkpoint for data that will never be streamed again.
+        """
+        if self.enabled:
+            raise RuntimeError("cannot release host stores while offload is enabled")
+        if self._mapped_courier is not None:
+            self._mapped_courier.close()
+            self._mapped_courier = None
+        if self._courier_inflight:
+            raise RuntimeError(
+                "cannot release host stores with mapped copies in flight"
+            )
+
+        self._pin_budget.release(self.pinned_host_weight_bytes())
+        self._consolidated_cpu_weights.clear()
+        self._strided_cpu_weights.clear()
+        self._mapped_cpu_weights.clear()
+        self._mps_cpu_weights.clear()
+        self._weight_metadata.clear()
+        self._layer_hosting.clear()
+        self._prefetch_events.clear()
+        self._mapped_bytes = 0
+        self._configured = False
 
     @torch.compiler.disable
     def sync_layer_to_cpu(self, layer_idx: int) -> None:
@@ -1375,6 +1491,255 @@ class LayerwiseOffloadManager:
 
         return updated_names
 
+    def offloaded_weight_bytes(self) -> int:
+        """Total bytes of this manager's offloadable weights, from metadata.
+
+        Size-only companion to ``iter_cpu_weights`` -- it never materializes
+        the per-weight buffer views, so it is safe to call per request.
+        """
+        total = 0
+        for layer_meta in self._weight_metadata.values():
+            for meta in layer_meta.values():
+                if meta.get("preserve_strides", False):
+                    numel = math.prod(meta["shape"])
+                else:
+                    numel = meta["numel"]
+                total += int(numel) * meta["dtype"].itemsize
+        return total
+
+    def layer_weight_bytes(self) -> dict[int, int]:
+        """Physical bytes copied to the device for each managed layer."""
+        totals = {layer_idx: 0 for layer_idx in self._weight_metadata}
+        for layer_idx, buffers in self._consolidated_cpu_weights.items():
+            totals[layer_idx] += sum(
+                buffer.untyped_storage().nbytes() for buffer in buffers.values()
+            )
+        for layer_idx, tensors in self._strided_cpu_weights.items():
+            totals[layer_idx] += sum(
+                tensor.untyped_storage().nbytes() for tensor in tensors.values()
+            )
+        for layer_idx, tensors in self._mapped_cpu_weights.items():
+            totals[layer_idx] += sum(
+                tensor.numel() * tensor.element_size() for tensor in tensors.values()
+            )
+        return totals
+
+    def layer_host_store_bytes(self) -> dict[int, int]:
+        """Physical anonymous host-store bytes booked for each managed layer."""
+        totals = {layer_idx: 0 for layer_idx in self._weight_metadata}
+        for layer_idx, buffers in self._consolidated_cpu_weights.items():
+            totals[layer_idx] += sum(
+                buffer.untyped_storage().nbytes() for buffer in buffers.values()
+            )
+        for layer_idx, tensors in self._strided_cpu_weights.items():
+            totals[layer_idx] += sum(
+                tensor.untyped_storage().nbytes() for tensor in tensors.values()
+            )
+        return totals
+
+    def pinned_host_weight_bytes(self) -> int:
+        """Logical managed-weight bytes currently backed by pinned memory."""
+        layer_bytes = self.layer_host_store_bytes()
+        return sum(
+            layer_bytes.get(layer_idx, 0)
+            for layer_idx, placement in self._layer_hosting.items()
+            if placement == "pinned"
+        )
+
+    def pinnable_layer_indices(self) -> tuple[int, ...]:
+        """Layers whose anonymous host store can switch pinning in place."""
+        return tuple(
+            layer_idx
+            for layer_idx, placement in sorted(self._layer_hosting.items())
+            if placement != "mapped"
+        )
+
+    def pinned_layer_indices(self) -> tuple[int, ...]:
+        return tuple(
+            layer_idx
+            for layer_idx, placement in sorted(self._layer_hosting.items())
+            if placement == "pinned"
+        )
+
+    def _repack_layer_host_store(self, layer_idx: int, *, pinned: bool) -> None:
+        if self._mapped_cpu_weights.get(layer_idx):
+            raise ValueError(
+                f"layer {layer_idx} retains checkpoint mappings and cannot be repacked"
+            )
+
+        consolidated: Dict[torch.dtype, torch.Tensor] = {}
+        for dtype, source in self._consolidated_cpu_weights.get(layer_idx, {}).items():
+            target = torch.empty(
+                source.shape,
+                dtype=dtype,
+                pin_memory=pinned,
+            )
+            target.copy_(source)
+            consolidated[dtype] = target
+
+        strided: Dict[str, torch.Tensor] = {}
+        for name, source in self._strided_cpu_weights.get(layer_idx, {}).items():
+            target = torch.empty_strided(
+                size=source.shape,
+                stride=source.stride(),
+                dtype=source.dtype,
+                pin_memory=pinned,
+            )
+            target.copy_(source)
+            strided[name] = target
+
+        self._consolidated_cpu_weights[layer_idx] = consolidated
+        self._strided_cpu_weights[layer_idx] = strided
+
+    def _set_layer_pinned(self, layer_idx: int, *, pinned: bool) -> None:
+        current = self._layer_hosting[layer_idx]
+        if (current == "pinned") == pinned:
+            return
+        layer_bytes = self.layer_host_store_bytes().get(layer_idx, 0)
+        if pinned and not self._pin_budget.request(
+            component_name=self._pin_component_name,
+            weight_bytes=layer_bytes,
+        ):
+            raise MemoryError(
+                f"host pin budget cannot pin {self._pin_component_name} "
+                f"layer {layer_idx}"
+            )
+        try:
+            self._repack_layer_host_store(layer_idx, pinned=pinned)
+        except Exception:
+            if pinned:
+                self._pin_budget.release(layer_bytes)
+            raise
+        if not pinned:
+            self._pin_budget.release(layer_bytes)
+        self._layer_hosting[layer_idx] = "pinned" if pinned else "pageable"
+
+    def set_pinned_layers(self, pinned_layers: Iterable[int]) -> tuple[int, ...]:
+        """Reassign the manager's anonymous host stores between pin tiers.
+
+        Mapped layers stay mapped: materializing them would consume host RAM
+        outside the pin budget and can turn a bounded configuration into a host
+        OOM. Unpins run before new pins, allowing one component to hand its
+        allowance to another without a transient HostPin oversubscription.
+        """
+        target = set(pinned_layers)
+        pinnable = set(self.pinnable_layer_indices())
+        if not target <= pinnable:
+            raise ValueError(
+                f"pinned layer selection contains non-pinnable layers: "
+                f"{sorted(target - pinnable)}"
+            )
+        previous = self.pinned_layer_indices()
+        current = set(previous)
+        to_unpin = sorted(current - target)
+        to_pin = sorted(target - current)
+        changed_unpinned: list[int] = []
+        changed_pinned: list[int] = []
+        try:
+            for layer_idx in to_unpin:
+                self._set_layer_pinned(layer_idx, pinned=False)
+                changed_unpinned.append(layer_idx)
+            for layer_idx in to_pin:
+                self._set_layer_pinned(layer_idx, pinned=True)
+                changed_pinned.append(layer_idx)
+        except Exception:
+            for layer_idx in reversed(changed_pinned):
+                self._set_layer_pinned(layer_idx, pinned=False)
+            for layer_idx in reversed(changed_unpinned):
+                self._set_layer_pinned(layer_idx, pinned=True)
+            raise
+        return previous
+
+    @property
+    def pin_budget(self) -> HostPinBudget:
+        return self._pin_budget
+
+    def resident_weight_bytes(
+        self,
+        resident_layers: int | None = None,
+        residency_policy: str | None = None,
+    ) -> int:
+        """Managed bytes retained across denoise steps for a layer count."""
+        count = self.resident_layers if resident_layers is None else resident_layers
+        policy = self.residency_policy if residency_policy is None else residency_policy
+        streamed = compute_streamed_layers(
+            num_layers=self.num_layers,
+            resident_layers=count,
+            policy=policy,
+        )
+        resident = set(range(self.num_layers)) - set(streamed)
+        layer_bytes = self.layer_weight_bytes()
+        return sum(layer_bytes.get(layer_idx, 0) for layer_idx in resident)
+
+    def peak_managed_device_weight_bytes(
+        self,
+        resident_layers: int | None = None,
+        residency_policy: str | None = None,
+    ) -> int:
+        """Conservative managed-weight working set during this component's use.
+
+        Resident layers coexist with the copy window. The exact layers in that
+        window change throughout the forward, so use the largest streamed
+        layers as a placement-independent upper bound. This is tighter than
+        charging every newly resident byte on top of the measured phase peak:
+        the measured peak already contains the current copy window.
+        """
+        count = self.resident_layers if resident_layers is None else resident_layers
+        policy = self.residency_policy if residency_policy is None else residency_policy
+        streamed = compute_streamed_layers(
+            num_layers=self.num_layers,
+            resident_layers=count,
+            policy=policy,
+        )
+        layer_bytes = self.layer_weight_bytes()
+        resident = set(range(self.num_layers)) - set(streamed)
+        resident_bytes = sum(layer_bytes.get(index, 0) for index in resident)
+        copy_window = min(max(1, self.prefetch_size), len(streamed))
+        streamed_window_bytes = sum(
+            sorted((layer_bytes.get(index, 0) for index in streamed), reverse=True)[
+                :copy_window
+            ]
+        )
+        return resident_bytes + streamed_window_bytes
+
+    @torch.compiler.disable
+    def set_residency_layout(
+        self, resident_layers: int, residency_policy: str
+    ) -> tuple[int, str]:
+        """Change the stage-scoped resident set between requests.
+
+        CPU stores and hooks stay intact. The next component use loads the new
+        resident set once and keeps it across denoise steps; request teardown
+        still releases every layer, so other pipeline phases recover the VRAM.
+        """
+        target = min(max(0, int(resident_layers)), self.num_layers)
+        if residency_policy not in RESIDENCY_POLICIES:
+            raise ValueError(
+                f"unknown residency policy {residency_policy!r}; expected one of "
+                f"{RESIDENCY_POLICIES}"
+            )
+        previous = (self.resident_layers, self.residency_policy)
+        if (target, residency_policy) == previous:
+            return previous
+        self.release_all()
+        self.resident_layers = target
+        self.residency_policy = residency_policy
+        self._streamed_order = compute_streamed_layers(
+            num_layers=self.num_layers,
+            resident_layers=target,
+            policy=residency_policy,
+        )
+        self._resident_set = frozenset(range(self.num_layers)) - set(
+            self._streamed_order
+        )
+        self._residency_active = False
+        return previous
+
+    def set_resident_layers(self, resident_layers: int) -> int:
+        """Change only the stage-scoped resident-layer count."""
+        previous, _ = self.set_residency_layout(resident_layers, self.residency_policy)
+        return previous
+
     def iter_cpu_weights(self):
         """Yield (name, tensor) pairs from consolidated CPU buffers.
 
@@ -1410,60 +1775,67 @@ class LayerwiseOffloadManager:
                 cpu_buffer = self._consolidated_cpu_weights[layer_idx][dtype]
                 yield name, cpu_buffer[offset : offset + numel].reshape(shape)
 
+    def prepare_layer_for_forward(self, layer_idx: int) -> None:
+        """Materialize one managed layer and schedule its successors.
+
+        Forward hooks normally own this lifecycle. Model-specific forwards that
+        intentionally call a block's internals instead of ``block(...)`` must
+        invoke this method explicitly, because PyTorch cannot run that block's
+        hooks when its ``__call__`` is bypassed.
+        """
+        if layer_idx == 0:
+            self._activate_residency()
+            self.prepare_for_next_req(non_blocking=False)
+        elif (
+            self._last_forwarded_layer is not None
+            and layer_idx > self._last_forwarded_layer + 1
+        ):
+            self._release_skip_gap(
+                last_ran=self._last_forwarded_layer, next_ran=layer_idx
+            )
+        if layer_idx not in self._gpu_layers:
+            # LTX audio VAE traverses decoder.up in reverse order.
+            self.prefetch_layer(layer_idx, non_blocking=False)
+        if layer_idx in self._prefetch_events and self.copy_stream is not None:
+            torch.get_device_module().current_stream().wait_event(
+                self._prefetch_events[layer_idx]
+            )
+
+        if self.residency_policy == RESIDENCY_POLICY_STRIDED:
+            # Top up the stream at every layer rather than in bursts of
+            # prefetch_size. Under `strided` the next streamed layer can be
+            # several layers away, so index-based bursts would issue it late.
+            for layer_to_prefetch in self._next_streamed(
+                after=layer_idx, count=self.prefetch_size
+            ):
+                self.prefetch_layer(layer_to_prefetch, non_blocking=True)
+        elif self.prefetch_size and layer_idx % self.prefetch_size == 0:
+            for index in range(
+                layer_idx + self.prefetch_size,
+                layer_idx + 2 * self.prefetch_size,
+            ):
+                self.prefetch_layer(index % self.num_layers, non_blocking=True)
+
+    def finish_layer_forward(self, layer_idx: int) -> None:
+        """Release a streamed layer after its forward completes."""
+        self._last_forwarded_layer = layer_idx
+        self.release_layer(layer_idx)
+
     def register_forward_hooks(self) -> None:
         if not self.enabled:
             return
 
         layers = dict(self.model.named_modules())[self.layers_attr_str]
 
-        def make_pre_hook(i):
+        def make_pre_hook(layer_idx):
             def hook(module, input):
-                if i == 0:
-                    self._activate_residency()
-                    self.prepare_for_next_req(non_blocking=False)
-                elif (
-                    self._last_forwarded_layer is not None
-                    and i > self._last_forwarded_layer + 1
-                ):
-                    self._release_skip_gap(
-                        last_ran=self._last_forwarded_layer, next_ran=i
-                    )
-                if i not in self._gpu_layers:
-                    # LTX audio VAE traverses decoder.up in reverse order
-                    self.prefetch_layer(i, non_blocking=False)
-                if i in self._prefetch_events and self.copy_stream is not None:
-                    torch.get_device_module().current_stream().wait_event(
-                        self._prefetch_events[i]
-                    )
-
-                if self.residency_policy == RESIDENCY_POLICY_STRIDED:
-                    # Top up the stream at every layer rather than in bursts of
-                    # prefetch_size. Under `strided` the next streamed layer can
-                    # be several layers away, so a burst schedule keyed on index
-                    # arithmetic would either skip it or issue it late; asking
-                    # for "the next N streamed layers" is the same request every
-                    # layer and prefetch_layer is idempotent, so the repeats are
-                    # free. This is what buys the wider hiding window: the
-                    # transfer is issued as soon as the previous streamed layer
-                    # is done with, not one layer before it is needed.
-                    for layer_to_prefetch in self._next_streamed(
-                        after=i, count=self.prefetch_size
-                    ):
-                        self.prefetch_layer(layer_to_prefetch, non_blocking=True)
-                # trigger batch prefetch (i + prefetch_size ~ i + 2 * prefetch_size) if needed
-                elif self.prefetch_size and i % self.prefetch_size == 0:
-                    for j in range(i + self.prefetch_size, i + 2 * self.prefetch_size):
-                        layer_to_prefetch = j % self.num_layers
-                        self.prefetch_layer(layer_to_prefetch, non_blocking=True)
+                self.prepare_layer_for_forward(layer_idx)
 
             return hook
 
-        def make_post_hook(i):
+        def make_post_hook(layer_idx):
             def hook(module, input, output):
-                # previous, we wait here, until the copy stream for next layer is finished,
-                # now with any prefetch_size, only wait for the copy stream, when the copy stream is for the next layer
-                self._last_forwarded_layer = i
-                self.release_layer(i)
+                self.finish_layer_forward(layer_idx)
 
             return hook
 
@@ -1715,6 +2087,7 @@ class LayerwiseOffloadableModuleMixin:
         *,
         pin_budget: HostPinBudget | None = None,
         component_name: str | None = None,
+        pin_during_initialization: bool = True,
     ):
         self.park_non_layer_weights_between_uses = (
             server_args.performance_mode == "memory"
@@ -1793,6 +2166,7 @@ class LayerwiseOffloadableModuleMixin:
                 pin_cpu_memory=server_args.pin_cpu_memory,
                 pin_budget=pin_budget,
                 pin_component_name=pin_component_name,
+                pin_during_initialization=pin_during_initialization,
                 prefetch_size=prefetch_size,
                 resident_layers=resident_layers,
                 initialize=False,
@@ -1862,6 +2236,128 @@ class LayerwiseOffloadableModuleMixin:
         for manager in self.layerwise_offload_managers:
             manager.prepare_for_next_req(non_blocking=True)
 
+    def set_layerwise_resident_layers(self, resident_layers: int) -> tuple[int, ...]:
+        """Apply one CLI-compatible resident-layer value to every layer group."""
+        targets = tuple(
+            min(max(0, int(resident_layers)), manager.num_layers)
+            for manager in self.layerwise_offload_managers
+        )
+        return self.set_layerwise_resident_layer_counts(targets)
+
+    def set_layerwise_resident_layer_counts(
+        self, resident_layers: Sequence[int]
+    ) -> tuple[int, ...]:
+        """Apply an exact resident-layer count to every managed layer group."""
+        previous, _ = self.set_layerwise_residency_layout(
+            resident_layers,
+            self.layerwise_residency_policies(),
+        )
+        return previous
+
+    def layerwise_residency_policies(self) -> tuple[str, ...]:
+        return tuple(
+            manager.residency_policy for manager in self.layerwise_offload_managers
+        )
+
+    def set_layerwise_residency_layout(
+        self,
+        resident_layers: Sequence[int],
+        residency_policies: Sequence[str],
+    ) -> tuple[tuple[int, ...], tuple[str, ...]]:
+        """Apply exact resident counts and policies to every managed group."""
+        if len(resident_layers) != len(self.layerwise_offload_managers):
+            raise ValueError("layerwise resident-layer group count changed")
+        if len(residency_policies) != len(self.layerwise_offload_managers):
+            raise ValueError("layerwise residency-policy group count changed")
+        previous = tuple(
+            (manager.resident_layers, manager.residency_policy)
+            for manager in self.layerwise_offload_managers
+        )
+        updated: list[LayerwiseOffloadManager] = []
+        try:
+            for manager, count, policy in zip(
+                self.layerwise_offload_managers,
+                resident_layers,
+                residency_policies,
+            ):
+                manager.set_residency_layout(count, policy)
+                updated.append(manager)
+        except Exception:
+            for manager, (count, policy) in zip(updated, previous):
+                manager.set_residency_layout(count, policy)
+            raise
+        return (
+            tuple(count for count, _ in previous),
+            tuple(policy for _, policy in previous),
+        )
+
+    def layerwise_pinned_host_bytes(self) -> int:
+        return sum(
+            manager.pinned_host_weight_bytes()
+            for manager in self.layerwise_offload_managers
+            if manager.enabled
+        )
+
+    def layerwise_pinned_layers(self) -> tuple[tuple[int, ...], ...]:
+        return tuple(
+            manager.pinned_layer_indices()
+            for manager in self.layerwise_offload_managers
+        )
+
+    def _apply_layerwise_pinned_layers(
+        self, pinned_layers: Sequence[Sequence[int]]
+    ) -> None:
+        if len(pinned_layers) != len(self.layerwise_offload_managers):
+            raise ValueError("layerwise host-placement group count changed")
+        targets = [set(indices) for indices in pinned_layers]
+        # Release every allowance first. A later manager can then consume the
+        # bytes without the application order creating a transient rejection.
+        for manager, target in zip(self.layerwise_offload_managers, targets):
+            retained = set(manager.pinned_layer_indices()) & target
+            manager.set_pinned_layers(retained)
+        for manager, target in zip(self.layerwise_offload_managers, targets):
+            manager.set_pinned_layers(target)
+
+    def set_layerwise_pinned_layers(
+        self, pinned_layers: Sequence[Sequence[int]]
+    ) -> tuple[tuple[int, ...], ...]:
+        previous = self.layerwise_pinned_layers()
+        try:
+            self._apply_layerwise_pinned_layers(pinned_layers)
+        except Exception:
+            self._apply_layerwise_pinned_layers(previous)
+            raise
+        return previous
+
+    def release_layerwise_pins_outside(
+        self, pinned_layers: Sequence[Sequence[int]]
+    ) -> None:
+        """Release pins not used by a target before any new pins are acquired."""
+        if len(pinned_layers) != len(self.layerwise_offload_managers):
+            raise ValueError("layerwise host-placement group count changed")
+        for manager, target in zip(self.layerwise_offload_managers, pinned_layers):
+            retained = set(manager.pinned_layer_indices()) & set(target)
+            manager.set_pinned_layers(retained)
+
+    def restore_layerwise_pinned_layers(
+        self, pinned_layers: Sequence[Sequence[int]]
+    ) -> None:
+        self._apply_layerwise_pinned_layers(pinned_layers)
+
+    def restore_layerwise_resident_layers(self, resident_layers: Sequence[int]) -> None:
+        """Restore exact per-group counts captured before an automatic change."""
+        if len(resident_layers) != len(self.layerwise_offload_managers):
+            raise ValueError("layerwise resident-layer group count changed")
+        self.set_layerwise_resident_layer_counts(resident_layers)
+
+    def restore_layerwise_residency_layout(
+        self,
+        resident_layers: Sequence[int],
+        residency_policies: Sequence[str],
+    ) -> None:
+        """Restore exact per-group counts and policies after a failed adjustment."""
+        self.set_layerwise_residency_layout(resident_layers, residency_policies)
+
     def disable_offload(self) -> None:
         """Disable layerwise offload: load all layers to GPU and remove hooks.
 
@@ -1875,22 +2371,208 @@ class LayerwiseOffloadableModuleMixin:
         """
         if self.layerwise_offload_managers is None:
             return
-        for manager in self.layerwise_offload_managers:
-            if manager.enabled:
+        disabled: list[LayerwiseOffloadManager] = []
+        try:
+            for manager in self.layerwise_offload_managers:
+                if not manager.enabled:
+                    continue
                 manager.remove_forward_hooks()
-                manager.load_all_layers()
+                try:
+                    manager.load_all_layers()
+                except Exception:
+                    # Loading every layer is the step most likely to OOM. Re-arm
+                    # this manager before re-raising: leaving it hook-less with
+                    # enabled=True would let release_all() swap weights for (1,)
+                    # placeholders that nothing ever streams back in.
+                    manager.release_all()
+                    manager.register_forward_hooks()
+                    raise
                 manager.enabled = False
+                disabled.append(manager)
+        except Exception:
+            # A module may own multiple layer groups. Do not leave earlier
+            # groups resident and later groups streaming when one group fails.
+            for manager in reversed(disabled):
+                manager.enabled = True
+                manager.release_all()
+                manager.register_forward_hooks()
+            raise
 
     def enable_offload(self) -> None:
         """Re-enable layerwise offload: sync weights to CPU, release layers, and restore hooks."""
         if self.layerwise_offload_managers is None:
             return
         for manager in self.layerwise_offload_managers:
+            if manager.enabled:
+                # already armed; re-registering would double the forward hooks
+                continue
             if manager._configured:
                 manager.enabled = True
                 manager.sync_all_layers_to_cpu()
                 manager.release_all()
                 manager.register_forward_hooks()
+
+    def remove_layerwise_offload(self, *, to_cpu: bool = False) -> None:
+        """Restore an ordinary component-managed module.
+
+        HostPin allowances are returned first. Resident targets materialize
+        every real layer on the device. Component-offload targets instead bind
+        the manager's existing host tensors directly, avoiding a transient full
+        device copy that can OOM while undoing a lazily configured placement.
+        """
+        managers = list(self.layerwise_offload_managers or ())
+        if not managers:
+            return
+        for manager in managers:
+            manager.set_pinned_layers(())
+        if to_cpu:
+            parameters = dict(self.named_parameters())
+            with torch.inference_mode(False), torch.no_grad():
+                for manager in managers:
+                    if manager.enabled:
+                        # Inference weights are immutable, but preserve any
+                        # materialized update before releasing device tensors.
+                        manager.sync_all_layers_to_cpu()
+                        manager.release_all()
+                        manager.remove_forward_hooks()
+                        manager.enabled = False
+                    for name, host_tensor in manager.iter_cpu_weights():
+                        parameter = parameters.get(name)
+                        if parameter is None:
+                            raise RuntimeError(
+                                f"layerwise parameter {name!r} disappeared"
+                            )
+                        local_tensor = host_tensor.detach()
+                        parameter.data = (
+                            manager._wrap_for_target(parameter, local_tensor)
+                            if isinstance(parameter, DTensor)
+                            else local_tensor
+                        )
+                for name, host_tensor in self._parked_non_layer_weights.items():
+                    parameter = parameters.get(name)
+                    if parameter is not None:
+                        parameter.data = host_tensor
+            if current_platform.is_mps():
+                self.restore_mps_cpu_non_layer_weights()
+            self.to("cpu")
+        else:
+            self.restore_non_layer_weights()
+            self.disable_offload()
+        self.layerwise_offload_managers = []
+        self._parked_non_layer_weights.clear()
+        self._park_placeholders.clear()
+
+    def finalize_resident_layerwise_placement(self) -> None:
+        """Discard offload stores once a resident placement has passed validation."""
+        managers = list(self.layerwise_offload_managers or ())
+        if not managers:
+            return
+        if any(manager.enabled for manager in managers):
+            raise RuntimeError(
+                "cannot finalize a resident placement while offload is enabled"
+            )
+        for manager in managers:
+            manager.release_host_stores()
+        self.layerwise_offload_managers = []
+        self._parked_non_layer_weights.clear()
+        self._park_placeholders.clear()
+        release_unused_pinned_memory()
+
+
+class LayerwiseUsageTracker:
+    """Temporary per-layer call counters for one calibration request.
+
+    Managers cannot provide this information when layerwise offload has not
+    been configured yet or was disabled by a resident placement. Observe the
+    declared layer groups directly and remove every hook before returning, so
+    ordinary serving requests pay no counter or hook-dispatch cost.
+    """
+
+    def __init__(
+        self,
+        modules: Mapping[str, object],
+        *,
+        stage_name_provider: Callable[[], str | None] | None = None,
+    ) -> None:
+        self._handles: list[Any] = []
+        self._counts: dict[str, dict[str, list[int]]] = {}
+        self._counts_by_stage: dict[str, dict[str, dict[str, list[int]]]] = {}
+        self._stage_name_provider = stage_name_provider
+        for component_name, module in modules.items():
+            if not isinstance(module, LayerwiseOffloadableModuleMixin):
+                continue
+            named_modules = dict(module.named_modules())
+            component_counts: dict[str, list[int]] = {}
+            for layer_name in module.layer_names:
+                layers = named_modules.get(layer_name)
+                if not isinstance(layers, (torch.nn.ModuleList, torch.nn.Sequential)):
+                    continue
+                counts = [0] * len(layers)
+                if not counts:
+                    continue
+                component_counts[layer_name] = counts
+                for layer_index, layer in enumerate(layers):
+
+                    def record_use(
+                        _module,
+                        _inputs,
+                        *,
+                        target_counts=counts,
+                        target_index=layer_index,
+                        target_component_name=component_name,
+                        target_layer_name=layer_name,
+                        target_layer_count=len(layers),
+                    ) -> None:
+                        target_counts[target_index] += 1
+                        if self._stage_name_provider is None:
+                            return
+                        stage_name = self._stage_name_provider()
+                        if stage_name is None:
+                            return
+                        stage_counts = self._counts_by_stage.setdefault(stage_name, {})
+                        component_stage_counts = stage_counts.setdefault(
+                            target_component_name, {}
+                        )
+                        layer_stage_counts = component_stage_counts.setdefault(
+                            target_layer_name, [0] * target_layer_count
+                        )
+                        layer_stage_counts[target_index] += 1
+
+                    self._handles.append(layer.register_forward_pre_hook(record_use))
+            if component_counts:
+                self._counts[component_name] = component_counts
+
+    def finish(self) -> dict[str, dict[str, tuple[int, ...]]]:
+        counts, _ = self.finish_with_stages()
+        return counts
+
+    def finish_with_stages(
+        self,
+    ) -> tuple[
+        dict[str, dict[str, tuple[int, ...]]],
+        dict[str, dict[str, dict[str, tuple[int, ...]]]],
+    ]:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+        counts = {
+            component_name: {
+                layer_name: tuple(counts)
+                for layer_name, counts in component_counts.items()
+            }
+            for component_name, component_counts in self._counts.items()
+        }
+        counts_by_stage = {
+            stage_name: {
+                component_name: {
+                    layer_name: tuple(counts)
+                    for layer_name, counts in component_counts.items()
+                }
+                for component_name, component_counts in stage_counts.items()
+            }
+            for stage_name, stage_counts in self._counts_by_stage.items()
+        }
+        return counts, counts_by_stage
 
 
 def iter_materialized_weights(module: torch.nn.Module):
@@ -2037,6 +2719,16 @@ def configure_layerwise_offload_modules(
                 normalized_component_names,
             )
         )
+        # Startup auto residency may replace the configured layerwise baseline
+        # with a reversible resident seed before this post-load setup runs.
+        # Configure only components whose effective placement is still
+        # layerwise; warmup can create managers lazily if it later demotes one.
+        selected_pipeline_component_names = [
+            component_name
+            for component_name in selected_pipeline_component_names
+            if server_args.auto_residency_mode(component_name) is None
+            or server_args.residency_mode(component_name) == LAYERWISE_OFFLOAD
+        ]
 
     if (
         warn_missing
@@ -2124,18 +2816,18 @@ def configure_layerwise_offload_modules(
             # back to 1 here turns the benefit ranking into a bare-bytes
             # ranking, and a once-per-request encoder can then outrank the
             # stepped DiT for the pin budget.
-            model_path = getattr(server_args, "model_path", None)
+            model_path = server_args.model_path
             if model_path:
                 model_info = get_model_info(
                     model_path,
-                    backend=getattr(server_args, "backend", None),
-                    model_id=getattr(server_args, "model_id", None),
+                    backend=server_args.backend,
+                    model_id=server_args.model_id,
                 )
                 if model_info is not None:
                     sampling_cls = model_info.sampling_param_cls
         if sampling_cls is None:
             return 1
-        steps = getattr(sampling_cls(), "num_inference_steps", None)
+        steps = sampling_cls().num_inference_steps
         if not steps:
             return 1
         return max(1, int(steps))
@@ -2169,8 +2861,15 @@ def configure_layerwise_offload_modules(
         key=_h2d_bytes_a_pin_would_save,
         reverse=True,
     )
-    pin_budget = HostPinBudget()
-    logger.info("Layerwise offload host memory: %s", describe_host_memory())
+    local_worker_count = max(1, server_args.num_gpus // server_args.nnodes)
+    pin_budget = server_args.host_pin_budget()
+    logger.info(
+        "Layerwise offload host memory: %s; this worker may pin %.2f GiB "
+        "after splitting the node allowance across %d local workers",
+        describe_host_memory(),
+        pin_budget.spendable_bytes / 1024**3,
+        local_worker_count,
+    )
 
     for component_name in selected_pipeline_component_names:
         module = modules[component_name]
@@ -2214,162 +2913,3 @@ def configure_layerwise_offload_modules(
     elif warn_missing:
         logger.debug("No selected pipeline component enabled layerwise offload")
     return configured_component_names
-
-
-def _align_numel_offset(
-    offset: int, dtype: torch.dtype, alignment_bytes: int = 32
-) -> int:
-    element_size = torch.empty((), dtype=dtype).element_size()
-    alignment_numel = max(1, alignment_bytes // element_size)
-    remainder = offset % alignment_numel
-    return offset if remainder == 0 else offset + alignment_numel - remainder
-
-
-def estimate_layer_weight_bytes(
-    layers: torch.nn.ModuleList | torch.nn.Sequential,
-) -> dict[int, int]:
-    """Physical per-layer store sizes using the real manager's packing rules."""
-    grouped: dict[int, dict[torch.dtype, list[torch.Tensor]]] = {}
-    for name, tensor in layers.named_parameters():
-        layer_index_text, separator, _ = name.partition(".")
-        if not separator or not layer_index_text.isdigit():
-            continue
-        layer_index = int(layer_index_text)
-        local_tensor = tensor.to_local() if isinstance(tensor, DTensor) else tensor
-        grouped.setdefault(layer_index, {}).setdefault(local_tensor.dtype, []).append(
-            local_tensor
-        )
-
-    totals = {layer_index: 0 for layer_index in range(len(layers))}
-    for layer_index, dtype_to_tensors in grouped.items():
-        for dtype, tensors in dtype_to_tensors.items():
-            contiguous_numel = 0
-            for tensor in tensors:
-                if tensor.is_contiguous():
-                    contiguous_numel = _align_numel_offset(contiguous_numel, dtype)
-                    contiguous_numel += tensor.numel()
-                    continue
-                storage_numel = (
-                    0
-                    if tensor.numel() == 0
-                    else 1
-                    + sum(
-                        (size - 1) * abs(stride)
-                        for size, stride in zip(tensor.shape, tensor.stride())
-                    )
-                )
-                totals[layer_index] += storage_numel * tensor.element_size()
-            totals[layer_index] += (
-                contiguous_numel * torch.empty((), dtype=dtype).element_size()
-            )
-    return totals
-
-
-def release_unused_pinned_memory() -> None:
-    """Return unreferenced cached HostPin blocks to the CUDA driver.
-
-    ``torch.cuda.empty_cache()`` only covers device allocations. PyTorch's
-    host caching allocator currently exposes its corresponding operation via
-    this internal binding; keeping the call isolated makes the compatibility
-    boundary explicit until a public API is available.
-    """
-    if not current_platform.is_cuda():
-        return
-    gc.collect()
-    torch._C._host_emptyCache()
-
-
-class LayerwiseUsageTracker:
-    """Temporary per-layer call counters for one calibration request.
-
-    Managers cannot provide this information when layerwise offload has not
-    been configured yet or was disabled by a resident placement. Observe the
-    declared layer groups directly and remove every hook before returning, so
-    ordinary serving requests pay no counter or hook-dispatch cost.
-    """
-
-    def __init__(
-        self,
-        modules: Mapping[str, object],
-        *,
-        stage_name_provider: Callable[[], str | None] | None = None,
-    ) -> None:
-        self._handles: list[Any] = []
-        self._counts: dict[str, dict[str, list[int]]] = {}
-        self._counts_by_stage: dict[str, dict[str, dict[str, list[int]]]] = {}
-        self._stage_name_provider = stage_name_provider
-        for component_name, module in modules.items():
-            if not isinstance(module, LayerwiseOffloadableModuleMixin):
-                continue
-            named_modules = dict(module.named_modules())
-            component_counts: dict[str, list[int]] = {}
-            for layer_name in module.layer_names:
-                layers = named_modules.get(layer_name)
-                if not isinstance(layers, (torch.nn.ModuleList, torch.nn.Sequential)):
-                    continue
-                counts = [0] * len(layers)
-                if not counts:
-                    continue
-                component_counts[layer_name] = counts
-                for layer_index, layer in enumerate(layers):
-
-                    def record_use(
-                        _module,
-                        _inputs,
-                        *,
-                        target_counts=counts,
-                        target_index=layer_index,
-                        target_component_name=component_name,
-                        target_layer_name=layer_name,
-                        target_layer_count=len(layers),
-                    ) -> None:
-                        target_counts[target_index] += 1
-                        if self._stage_name_provider is None:
-                            return
-                        stage_name = self._stage_name_provider()
-                        if stage_name is None:
-                            return
-                        stage_counts = self._counts_by_stage.setdefault(stage_name, {})
-                        component_stage_counts = stage_counts.setdefault(
-                            target_component_name, {}
-                        )
-                        layer_stage_counts = component_stage_counts.setdefault(
-                            target_layer_name, [0] * target_layer_count
-                        )
-                        layer_stage_counts[target_index] += 1
-
-                    self._handles.append(layer.register_forward_pre_hook(record_use))
-            if component_counts:
-                self._counts[component_name] = component_counts
-
-    def finish(self) -> dict[str, dict[str, tuple[int, ...]]]:
-        counts, _ = self.finish_with_stages()
-        return counts
-
-    def finish_with_stages(
-        self,
-    ) -> tuple[
-        dict[str, dict[str, tuple[int, ...]]],
-        dict[str, dict[str, dict[str, tuple[int, ...]]]],
-    ]:
-        for handle in self._handles:
-            handle.remove()
-        self._handles.clear()
-        counts = {
-            component_name: {
-                layer_name: tuple(counts)
-                for layer_name, counts in component_counts.items()
-            }
-            for component_name, component_counts in self._counts.items()
-        }
-        counts_by_stage = {
-            stage_name: {
-                component_name: {
-                    layer_name: tuple(counts)
-                    for layer_name, counts in component_counts.items()
-                }
-                for component_name, component_counts in stage_counts.items()
-            }
-            for stage_name, stage_counts in self._counts_by_stage.items()
-        }
-        return counts, counts_by_stage

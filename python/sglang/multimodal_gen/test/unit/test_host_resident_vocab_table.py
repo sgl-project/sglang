@@ -91,6 +91,17 @@ class TestDetachAndRestore:
             restore_host_resident_tables(detach_host_resident_tables(model), "cpu")
         assert torch.equal(model.embed(ids), expected)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_the_gather_follows_a_table_promoted_to_cuda(self):
+        model = _Declared()
+        with patch(THRESHOLD_PATH, 1024):
+            restore_host_resident_tables(detach_host_resident_tables(model), "cuda")
+        model.embed.to("cuda")
+
+        output = model.embed(torch.tensor([[1, 2, 3]]))
+
+        assert output.device.type == "cuda"
+
     def test_nothing_is_hooked_when_nothing_qualifies(self):
         model = _Undeclared()
         with patch(THRESHOLD_PATH, 1024):

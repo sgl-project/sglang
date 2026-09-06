@@ -52,17 +52,64 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     save_outputs,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
+    GIB_BYTES,
+    MIN_POST_ADJUSTMENT_REGRESSION_NS,
+    PLACEMENT_STATUS_ADJUSTED,
+    PLACEMENT_STATUS_ROLLBACK_FAILED,
+    PLACEMENT_STATUS_ROLLED_BACK,
+    PLACEMENT_STATUS_SKIPPED,
+    PLACEMENT_STATUS_VALIDATED,
+    POST_ADJUSTMENT_REGRESSION_FRACTION,
+    AppliedResidencyChange,
+    AutoResidencyPlan,
+    AutoResidencyRollbackError,
     DefaultWorkload,
+    RankResidencyReport,
+    ResidencyTarget,
     WarmupMemoryRecord,
+    apply_residency_changes,
+    collect_residency_targets,
+    commit_residency_changes,
+    component_current_device_weight_bytes,
+    component_runtime_weight_bytes,
+    current_placement_reserve_shortfall_bytes,
+    describe_error,
+    estimate_allocator_headroom_bytes,
+    estimate_candidate_latency_savings_ns,
     estimate_default_workload_peak_bytes,
+    estimate_default_workload_timing,
+    estimate_layerwise_layer_uses,
+    estimate_workload_phase_peaks,
+    format_applied_changes,
+    format_plan_summary,
+    layerwise_host_pin_capacity_bytes,
+    layerwise_pinned_host_bytes,
+    measured_failed_workload_phase_peaks,
+    plan_auto_residency,
+    plan_summary_payload,
+    pre_warmup_residency_targets,
+    rank_candidates_by_h2d_savings,
     resolve_default_workload,
+    resolve_measured_default_workload,
+    rollback_residency_changes,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    get_global_component_residency_manager,
     peek_global_component_residency_manager,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    RESIDENT,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    HOST_COPY_RESERVE_BYTES,
+    host_memory_available_bytes,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseUsageTracker,
     configure_layerwise_offload_modules,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    is_dit_component_name,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
     MemoryOccupationController,
@@ -80,6 +127,9 @@ from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin 
 )
 from sglang.multimodal_gen.runtime.realtime.session import RealtimeSessionCache
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
+from sglang.multimodal_gen.runtime.server_args.auto_tune import (
+    fixed_loading_residency_components,
+)
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
@@ -131,15 +181,6 @@ def _worker_cpu_intra_op_threads(num_gpus: int) -> int | None:
         return None
     cpu_count = os.cpu_count() or 1
     return max(1, min(16, cpu_count // max(1, num_gpus)))
-
-
-OFFLOAD_DISABLE_RECOMMENDATION_ORDER = (
-    "vae",
-    "image_encoder",
-    "text_encoder",
-    "text_encoder_2",
-    "transformer",
-)
 
 
 PROBE_FIT_MIN_MARGIN_BYTES = 1 << 30
@@ -242,6 +283,16 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         # per-rank memory measurements of server warmup forwards; consumed by
         # the auto-residency placement decision before the server turns ready
         self._auto_residency_warmup_records: list[WarmupMemoryRecord] = []
+        self._auto_residency_applied: list[AppliedResidencyChange] = []
+        self._auto_residency_round_sizes: list[int] = []
+        self._auto_residency_last_applied_plan: AutoResidencyPlan | None = None
+        # Keep the serving solve and its validation on one objective. The
+        # measured candidate layout may be accepted or rolled back, but does
+        # not rewrite utility and start another search.
+        self._auto_residency_reference_request_duration_ns: int | None = None
+        self._auto_residency_reference_stage_duration_ns: dict[str, int] = {}
+        self._auto_residency_reference_component_stages: dict[str, tuple[str, ...]] = {}
+        self._auto_residency_repeated_components: set[str] = set()
         # default workload resolved once for the per-request residency hint
         self._cached_default_workload: DefaultWorkload | None = None
         self._cached_default_workload_failed = False
@@ -447,8 +498,13 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         peak_reserved_gb = peak_reserved_bytes / (1024**3)
         peak_allocated_gb = peak_allocated_bytes / (1024**3)
 
-        remaining_gpu_mem_gb = (
-            current_platform.get_device_total_memory() / (1024**3) - peak_reserved_gb
+        # Use the same process-visible capacity as auto residency. Physical
+        # card memory can be larger than this worker's allocator cap or can be
+        # partly occupied by another process; either case would make a hint
+        # based on total device memory unsafe.
+        remaining_gpu_mem_gb = max(
+            0.0,
+            self._auto_residency_budget_bytes() / GIB_BYTES - peak_reserved_gb,
         )
         try:
             can_stay_resident = self.get_can_stay_resident_components(
@@ -623,6 +679,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             else None
         )
         warmup_baseline_allocated_bytes = 0
+        warmup_baseline_reserved_bytes = 0
         layerwise_usage_tracker: LayerwiseUsageTracker | None = None
         layerwise_layer_uses_by_stage: dict[
             str, dict[str, dict[str, tuple[int, ...]]]
@@ -639,6 +696,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             if measure_server_warmup:
                 warmup_baseline_allocated_bytes = (
                     torch.get_device_module().memory_allocated()
+                )
+                warmup_baseline_reserved_bytes = (
+                    torch.get_device_module().memory_reserved()
                 )
                 if (
                     self.server_args.performance_mode == "auto"
@@ -785,6 +845,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     req=req,
                     workload=warmup_workload,
                     baseline_allocated_bytes=warmup_baseline_allocated_bytes,
+                    baseline_reserved_bytes=warmup_baseline_reserved_bytes,
                     succeeded=output_batch is not None and output_batch.error is None,
                     layerwise_layer_uses=layerwise_layer_uses,
                     layerwise_layer_uses_by_stage=layerwise_layer_uses_by_stage,
@@ -797,6 +858,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         req: Req,
         workload: tuple[int, int, int, int],
         baseline_allocated_bytes: int,
+        baseline_reserved_bytes: int,
         succeeded: bool,
         layerwise_layer_uses: dict[str, dict[str, tuple[int, ...]]] | None = None,
         layerwise_layer_uses_by_stage: (
@@ -806,6 +868,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         phase_allocated_peaks: dict[str, int] = {}
         phase_components: dict[str, tuple[str, ...]] = {}
         phase_used_components: dict[str, tuple[str, ...]] = {}
+        phase_prefetched_components: dict[str, tuple[str, ...]] = {}
         phase_full_weight_transition_components: dict[str, tuple[str, ...]] = {}
         untracked_active_components: tuple[str, ...] = ()
         residency_manager = peek_global_component_residency_manager()
@@ -814,6 +877,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 phase_allocated_peaks[phase_name] = peak.allocated_bytes
                 phase_components[phase_name] = peak.active_components
                 phase_used_components[phase_name] = peak.used_components
+                phase_prefetched_components[phase_name] = peak.prefetched_components
                 phase_full_weight_transition_components[phase_name] = (
                     peak.full_weight_transition_components
                 )
@@ -831,8 +895,19 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             phase_allocated_peaks["request:untracked"] = request_allocated_peak
             phase_components["request:untracked"] = untracked_active_components
             phase_used_components["request:untracked"] = ()
+            phase_prefetched_components["request:untracked"] = ()
             phase_full_weight_transition_components["request:untracked"] = ()
         metrics = req.metrics
+        stage_duration_ms = {}
+        if metrics is not None:
+            profile_to_component_stage = {
+                stage._active_profile_stage_name(): stage._component_stage_name()
+                for stage in self.pipeline.stages
+            }
+            stage_duration_ms = {
+                profile_to_component_stage.get(stage_name, stage_name): duration_ms
+                for stage_name, duration_ms in metrics.stages.items()
+            }
         width, height, num_frames, num_inference_steps = workload
         self._auto_residency_warmup_records.append(
             WarmupMemoryRecord(
@@ -842,12 +917,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 baseline_allocated_bytes=int(baseline_allocated_bytes),
                 peak_allocated_bytes=request_allocated_peak,
                 succeeded=succeeded,
+                baseline_reserved_bytes=int(baseline_reserved_bytes),
                 peak_reserved_bytes=int(
                     torch.get_device_module().max_memory_reserved()
                 ),
                 phase_peak_allocated_bytes=phase_allocated_peaks,
                 phase_active_components=phase_components,
                 phase_used_components=phase_used_components,
+                phase_prefetched_components=phase_prefetched_components,
                 phase_full_weight_transition_components=(
                     phase_full_weight_transition_components
                 ),
@@ -857,7 +934,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 total_duration_ms=(
                     float(metrics.total_duration_ms) if metrics is not None else 0.0
                 ),
-                stage_duration_ms=(dict(metrics.stages) if metrics is not None else {}),
+                stage_duration_ms=stage_duration_ms,
                 step_duration_ms=(tuple(metrics.steps) if metrics is not None else ()),
                 step_duration_ms_by_stage=(
                     {
@@ -1394,40 +1471,950 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def get_can_stay_resident_components(
         self, remaining_gpu_mem_gb: float
     ) -> List[str]:
-        """
-        Calculate which components can stay resident on GPU without being offloaded.
-        """
-        can_stay_resident = []
-        if not self.pipeline:
-            return can_stay_resident
+        """Which currently offloaded components would fit in the headroom.
 
-        memory_usages = self.pipeline.memory_usages
-        ordered_names = [
-            name
-            for name in OFFLOAD_DISABLE_RECOMMENDATION_ORDER
-            if name in memory_usages
-        ]
-        ordered_names.extend(
-            name
-            for name in memory_usages
-            if name not in OFFLOAD_DISABLE_RECOMMENDATION_ORDER
+        Reuses the auto-residency candidate frontier and benefit ranking, but
+        remains a raw-capacity hint rather than the phase-constrained joint
+        plan. It omits components driven by fixed pipeline-custom residency
+        strategies and applies no reserve or activation margin.
+        """
+        if not self.pipeline:
+            return []
+
+        modules = self._auto_residency_modules()
+        if not modules:
+            return []
+        workload = self._default_workload_for_hint()
+        candidates = collect_residency_targets(
+            modules=modules,
+            residency_mode_of=self.server_args.residency_mode,
+            # The hint also covers explicitly offloaded components: the user
+            # chose offload and should learn when the headroom no longer
+            # requires it (automatic adjustment never touches explicit ones).
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=self._fixed_custom_residency_strategy_names(),
+            num_inference_steps=(
+                workload.num_inference_steps if workload is not None else 1
+            ),
+            # this hint only consumes permanent-residency targets; HostPin
+            # alternatives cannot change its answer
+            allow_host_pin_reallocation=False,
+            mixed_dtype_components=self._mixed_dtype_residency_components(),
         )
-        for name in ordered_names:
-            usage = memory_usages[name]
-            if not (
-                self.server_args.should_cpu_offload_component(name)
-                or self.server_args.should_configure_layerwise_offload_for_lazy_component(
-                    name
-                )
+
+        can_stay_resident = []
+        seen_components: set[str] = set()
+        for candidate in rank_candidates_by_h2d_savings(candidates):
+            if (
+                not candidate.permanent_residency
+                or candidate.component_name in seen_components
             ):
                 continue
-            if usage is None:
-                continue
-            if usage <= remaining_gpu_mem_gb:
-                can_stay_resident.append(name)
-                remaining_gpu_mem_gb -= usage
-
+            seen_components.add(candidate.component_name)
+            usage_gb = candidate.target_resident_weight_bytes / GIB_BYTES
+            if usage_gb <= remaining_gpu_mem_gb:
+                can_stay_resident.append(candidate.component_name)
+                remaining_gpu_mem_gb -= usage_gb
         return can_stay_resident
+
+    def apply_auto_residency(
+        self, *, pre_warmup: bool = False, validate_only: bool = False
+    ) -> OutputBatch:
+        """Apply one warmup-calibrated residency adjustment round.
+
+        Every rank executes this handler at the same queue position; the plan
+        is computed from all-gathered rank reports so each rank reaches the
+        same decision. After applying a plan, the server calls this once in
+        validation-only mode with measurements from the new layout. Validation
+        may keep or roll back that plan, but never starts another placement
+        search. A failure on any rank rolls every rank back to the previously
+        calibrated placement.
+
+        Everything before the first all-gather is fenced into a skip report:
+        an uncaught raise there would leave the peer ranks parked in the
+        collective until the group timeout.
+        """
+        if pre_warmup and validate_only:
+            raise ValueError("static placement cannot be validation-only")
+        records = list(self._auto_residency_warmup_records)
+        # Each round must describe one placement. Intersecting phase ownership
+        # across old and newly adjusted layouts would double-count weights that
+        # are already resident in the new layout.
+        self._auto_residency_warmup_records.clear()
+
+        try:
+            workload = resolve_default_workload(self.server_args)
+            workload = resolve_measured_default_workload(workload, records)
+            local_report = (
+                self._build_pre_warmup_auto_residency_report(workload=workload)
+                if pre_warmup
+                else self._build_auto_residency_report(
+                    workload=workload,
+                    records=records,
+                    include_candidates=not validate_only,
+                )
+            )
+        except Exception as e:
+            logger.warning(
+                "Auto residency: rank %d could not build its report: %s",
+                self.rank,
+                e,
+                exc_info=True,
+            )
+            workload = DefaultWorkload(
+                width=None, height=None, num_frames=1, num_inference_steps=1
+            )
+            local_report = RankResidencyReport(
+                rank=self.rank,
+                budget_bytes=0,
+                estimated_peak_bytes=None,
+                candidates=[],
+                skip_reason=describe_error(e),
+            )
+        reports = self._auto_residency_all_gather(local_report)
+        recovering_from_oom = any(report.warmup_oom for report in reports)
+        if validate_only:
+            invalid_report = next(
+                (
+                    report
+                    for report in reports
+                    if report.skip_reason is not None
+                    or report.estimated_peak_bytes is None
+                ),
+                None,
+            )
+            if invalid_report is not None:
+                reason = invalid_report.skip_reason or "no usable warmup measurement"
+                return self._rollback_everywhere(
+                    cause=(
+                        "post-adjustment calibration could not validate rank "
+                        f"{invalid_report.rank}: {reason}"
+                    ),
+                    already_failed=False,
+                    latest_round_only=True,
+                )
+        if (
+            not pre_warmup
+            and self._auto_residency_round_sizes
+            and not recovering_from_oom
+            and not self._latest_auto_residency_round_is_resident_only()
+        ):
+            regressions = []
+            for report in reports:
+                reference_ns = report.estimated_request_duration_ns
+                measured_ns = report.measured_request_duration_ns
+                tolerance_ns = max(
+                    MIN_POST_ADJUSTMENT_REGRESSION_NS,
+                    int(reference_ns * POST_ADJUSTMENT_REGRESSION_FRACTION),
+                )
+                if reference_ns > 0 and measured_ns > reference_ns + tolerance_ns:
+                    regressions.append((measured_ns - reference_ns, report))
+            if regressions:
+                _, regressed = max(regressions, key=lambda item: item[0])
+                cause = (
+                    "post-adjustment calibration regressed request duration "
+                    f"from {regressed.estimated_request_duration_ns / 1e9:.2f}s "
+                    f"to {regressed.measured_request_duration_ns / 1e9:.2f}s"
+                )
+                if self.is_output_rank:
+                    logger.warning("Auto residency: %s; rolling back", cause)
+                return self._rollback_everywhere(
+                    cause=cause,
+                    already_failed=False,
+                    latest_round_only=True,
+                )
+        if validate_only:
+            shortfall_bytes = current_placement_reserve_shortfall_bytes(reports)
+            if shortfall_bytes > 0:
+                shortfall_gib = shortfall_bytes / GIB_BYTES
+                if self.is_output_rank:
+                    logger.warning(
+                        "Auto residency calibration exceeded the VRAM reserve by "
+                        "%.1f GiB; rolling back the latest adjustment round.",
+                        shortfall_gib,
+                    )
+                return self._rollback_everywhere(
+                    cause=f"VRAM reserve exceeded by {shortfall_gib:.1f} GiB",
+                    already_failed=False,
+                    latest_round_only=True,
+                )
+            plan = self._auto_residency_last_applied_plan
+            if plan is None:
+                return self._rollback_everywhere(
+                    cause="post-adjustment validation lost the selected plan",
+                    already_failed=False,
+                    latest_round_only=True,
+                )
+            latest_round = self._latest_auto_residency_round()
+            short_validation = (
+                self._latest_auto_residency_round_supports_short_validation()
+            )
+            self._commit_auto_residency_changes(latest_round)
+            self._auto_residency_applied = []
+            self._auto_residency_round_sizes = []
+            self._auto_residency_last_applied_plan = None
+            if self.is_output_rank:
+                reference_ns = local_report.estimated_request_duration_ns
+                measured_ns = local_report.measured_request_duration_ns
+                if short_validation:
+                    result = "full-shape one-step memory check passed"
+                elif reference_ns > 0 and measured_ns > 0:
+                    change = (measured_ns - reference_ns) / reference_ns
+                    result = (
+                        "calibrated request estimate "
+                        f"{reference_ns / 1e9:.2f}s -> {measured_ns / 1e9:.2f}s "
+                        f"({change:+.1%})"
+                    )
+                else:
+                    result = "memory and execution checks passed"
+                logger.info(
+                    "Auto residency: post-adjustment validation passed (%s); "
+                    "keeping the selected placement.",
+                    result,
+                )
+            return OutputBatch(
+                output=plan_summary_payload(
+                    plan=plan, status=PLACEMENT_STATUS_VALIDATED
+                )
+            )
+        plan = plan_auto_residency(reports=reports)
+        summary = format_plan_summary(plan=plan, workload=workload, records=records)
+        if plan.skip_reason is not None or not plan.changes:
+            if self.is_output_rank:
+                logger.info("%s", summary)
+            return OutputBatch(
+                output=plan_summary_payload(plan=plan, status=PLACEMENT_STATUS_SKIPPED)
+            )
+
+        apply_error: str | None = None
+        local_rollback_failed = False
+        # Keep round history aligned across ranks. A zero entry means this
+        # rank's transactional apply failed before committing the round, so a
+        # peer-triggered rollback must leave earlier calibrated rounds alone.
+        self._auto_residency_round_sizes.append(0)
+        try:
+            newly_applied = apply_residency_changes(
+                plan=plan,
+                modules=self._auto_residency_modules(),
+                server_args=self.server_args,
+                rank=self.rank,
+            )
+            if not newly_applied:
+                raise RuntimeError("placement plan applied no residency changes")
+            self._auto_residency_applied.extend(newly_applied)
+            self._auto_residency_round_sizes[-1] = len(newly_applied)
+        except AutoResidencyRollbackError as e:
+            logger.error(
+                "Auto residency adjustment failed on rank %d and the rank "
+                "could not roll itself back: %s",
+                self.rank,
+                e,
+                exc_info=True,
+            )
+            apply_error = describe_error(e)
+            local_rollback_failed = True
+        except Exception as e:  # this rank already rolled itself back
+            logger.error(
+                "Auto residency adjustment failed on rank %d: %s",
+                self.rank,
+                e,
+                exc_info=True,
+            )
+            apply_error = describe_error(e)
+
+        gathered = self._auto_residency_all_gather((apply_error, local_rollback_failed))
+        rank_errors = [error for error, _ in gathered if error is not None]
+        any_rollback_failed = any(failed for _, failed in gathered)
+        if rank_errors:
+            return self._rollback_everywhere(
+                cause=rank_errors[0],
+                already_failed=any_rollback_failed,
+                latest_round_only=True,
+            )
+
+        self._invalidate_component_strategies(
+            [candidate.component_name for candidate in plan.changes]
+        )
+        if pre_warmup:
+            self._commit_auto_residency_changes(self._latest_auto_residency_round())
+            self._auto_residency_applied = []
+            self._auto_residency_round_sizes = []
+            self._auto_residency_last_applied_plan = None
+        else:
+            self._auto_residency_last_applied_plan = plan
+        if self.is_output_rank:
+            logger.info("%s", summary)
+            logger.info("%s", format_applied_changes(plan=plan))
+        return OutputBatch(
+            output=plan_summary_payload(
+                plan=plan,
+                status=PLACEMENT_STATUS_ADJUSTED,
+                short_validation=(
+                    self._latest_auto_residency_round_supports_short_validation()
+                ),
+            )
+        )
+
+    def rollback_auto_residency(self) -> OutputBatch:
+        """Undo the latest adjustment round after its calibration failed."""
+        return self._rollback_everywhere(
+            cause=None, already_failed=False, latest_round_only=True
+        )
+
+    def _commit_auto_residency_changes(
+        self, changes: list[AppliedResidencyChange]
+    ) -> None:
+        modules = (
+            self._auto_residency_modules()
+            if any(
+                change.previous_layerwise_resident_layers is not None
+                for change in changes
+            )
+            else {}
+        )
+        commit_error = None
+        try:
+            commit_residency_changes(
+                applied=changes,
+                modules=modules,
+                server_args=self.server_args,
+            )
+        except Exception as error:
+            commit_error = describe_error(error)
+        commit_errors = self._auto_residency_all_gather(commit_error)
+        if any(error is not None for error in commit_errors):
+            raise RuntimeError(
+                "residency commit failed: "
+                + next(error for error in commit_errors if error is not None)
+            )
+
+    def _rollback_everywhere(
+        self,
+        *,
+        cause: str | None,
+        already_failed: bool,
+        latest_round_only: bool = False,
+    ) -> OutputBatch:
+        """Roll this rank back and gather the replica-wide outcome.
+
+        ``cause`` is the adjustment failure that triggered the rollback (None
+        when the rollback was requested after a failed re-warm);
+        ``already_failed`` marks that some rank already failed its in-apply
+        rollback, which is fatal regardless of what the remaining ranks do.
+        Collective-symmetric: every rank gathers exactly once.
+        """
+        rollback_error = self._rollback_applied_residency_changes(
+            latest_round_only=latest_round_only
+        )
+        gathered = self._auto_residency_all_gather(rollback_error)
+        rank_errors = [error for error in gathered if error is not None]
+        if already_failed and not rank_errors:
+            rank_errors = ["a rank could not undo its own residency changes"]
+        if rank_errors:
+            prefix = (
+                f"auto residency adjustment failed ({cause}) and rollback failed"
+                if cause is not None
+                else "auto residency rollback failed"
+            )
+            return OutputBatch(
+                error=f"{prefix}: {rank_errors[0]}",
+                output={"status": PLACEMENT_STATUS_ROLLBACK_FAILED},
+            )
+        if cause is not None:
+            restored = (
+                "previously calibrated placement"
+                if self._auto_residency_applied
+                else "original strategy"
+            )
+            return OutputBatch(
+                error=(
+                    f"auto residency adjustment failed; {restored} restored: {cause}"
+                ),
+                output={"status": PLACEMENT_STATUS_ROLLED_BACK},
+            )
+        if self.is_output_rank:
+            if self._auto_residency_applied:
+                logger.info(
+                    "Auto residency: rolled back the latest adjustment round; "
+                    "the previously calibrated placement remains active."
+                )
+            else:
+                logger.info(
+                    "Auto residency: rolled back; the residency configured at "
+                    "startup is in effect again (no equivalent server-arg "
+                    "changes remain)."
+                )
+        return OutputBatch(output={"status": PLACEMENT_STATUS_ROLLED_BACK})
+
+    def _auto_residency_budget_bytes(self) -> int:
+        # Free VRAM plus this process's reserved allocator pool excludes memory
+        # held by unrelated processes while preserving reusable local capacity.
+        free_bytes, _ = torch.get_device_module().mem_get_info()
+        budget_bytes = int(free_bytes) + int(
+            torch.get_device_module().memory_reserved()
+        )
+        test_cap_gib = envs.SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB
+        if test_cap_gib is not None:
+            budget_bytes = min(budget_bytes, int(test_cap_gib * GIB_BYTES))
+        return budget_bytes
+
+    def _collect_auto_residency_targets(
+        self,
+        workload: DefaultWorkload,
+        *,
+        allow_host_pin_reallocation: bool = True,
+        used_components: set[str] | None = None,
+        layerwise_layer_uses: dict[str, dict[str, tuple[int, ...]]] | None = None,
+        host_pin_headroom_bytes: int | None = None,
+        request_duration_ns: int = 0,
+        latency_upper_bound_ns_by_component: dict[str, int] | None = None,
+    ) -> list[ResidencyTarget]:
+        assert self.pipeline is not None
+        modules = self._auto_residency_modules()
+        local_worker_count = max(
+            1, self.server_args.num_gpus // self.server_args.nnodes
+        )
+        return collect_residency_targets(
+            modules=modules,
+            residency_mode_of=self.server_args.residency_mode,
+            baseline_residency_mode_of=(self.server_args.configured_residency_mode),
+            explicit_residency_mode_of=self.server_args.explicit_residency_mode,
+            custom_strategy_names=self._fixed_custom_residency_strategy_names(),
+            num_inference_steps=workload.num_inference_steps,
+            allow_host_pin_reallocation=allow_host_pin_reallocation,
+            mixed_dtype_components=self._mixed_dtype_residency_components(),
+            required_resident_components={
+                name
+                for name in modules
+                if self.server_args.component_residency_requirement(name) is not None
+            },
+            layerwise_tuning_of=lambda name, dit_group: (
+                self.server_args.layerwise_tuning_for(name, dit_group=dit_group)
+            ),
+            layerwise_policy_is_explicit=lambda name, dit_group: (
+                self.server_args.is_layerwise_residency_policy_explicit(
+                    name, dit_group=dit_group
+                )
+            ),
+            pin_cpu_memory=self.server_args.pin_cpu_memory,
+            used_components=used_components,
+            layerwise_layer_uses=layerwise_layer_uses,
+            host_transition_headroom_bytes=(
+                max(0, host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES)
+                // local_worker_count
+            ),
+            host_pin_headroom_bytes=host_pin_headroom_bytes,
+            request_duration_ns=request_duration_ns,
+            latency_upper_bound_ns_by_component=(latency_upper_bound_ns_by_component),
+        )
+
+    def _build_pre_warmup_auto_residency_report(
+        self, *, workload: DefaultWorkload
+    ) -> RankResidencyReport:
+        """Build exact weight lower bounds before the first serving forward."""
+        if self.pipeline is None:
+            return RankResidencyReport(
+                rank=self.rank,
+                budget_bytes=0,
+                estimated_peak_bytes=None,
+                candidates=[],
+                skip_reason="pipeline not initialized",
+            )
+
+        budget_bytes = self._auto_residency_budget_bytes()
+        all_candidates = self._collect_auto_residency_targets(
+            workload,
+            # static weights cannot score pin placement; keep the current layout
+            allow_host_pin_reallocation=False,
+        )
+        candidates = pre_warmup_residency_targets(
+            all_candidates,
+            excluded_components=(self.pipeline.preload_residency_excluded_components),
+        )
+        if not candidates:
+            return RankResidencyReport(
+                rank=self.rank,
+                budget_bytes=budget_bytes,
+                estimated_peak_bytes=None,
+                candidates=[],
+                skip_reason="no eligible residency alternatives",
+            )
+        modules = self._auto_residency_modules()
+        active_weights = component_runtime_weight_bytes(modules)
+        current_device_weights = component_current_device_weight_bytes(modules)
+        permanent_components = {
+            candidate.component_name
+            for candidate in all_candidates
+            if candidate.current_placement and candidate.permanent_residency
+        }
+        baseline_allocated = int(torch.get_device_module().memory_allocated())
+        phase_peaks = {}
+        phase_active = {}
+        phase_used = {}
+        for component_name in sorted(active_weights):
+            phase_name = f"static:{component_name}"
+            phase_peaks[phase_name] = baseline_allocated + (
+                0
+                if component_name in permanent_components
+                else active_weights.get(component_name, 0)
+            )
+            phase_active[phase_name] = tuple(
+                sorted(permanent_components | {component_name})
+            )
+            phase_used[phase_name] = (component_name,)
+
+        local_worker_count = max(
+            1, self.server_args.num_gpus // self.server_args.nnodes
+        )
+        pin_budget = self.server_args.host_pin_budget()
+        return RankResidencyReport(
+            rank=self.rank,
+            budget_bytes=budget_bytes,
+            estimated_peak_bytes=max(phase_peaks.values()),
+            estimated_peak_bytes_by_phase=phase_peaks,
+            active_components_by_phase=phase_active,
+            used_components_by_phase=phase_used,
+            prefetched_components_by_phase={},
+            current_device_weight_bytes_by_component=current_device_weights,
+            current_active_weight_bytes_by_component=active_weights,
+            node_rank=self.server_args.node_rank,
+            pinned_host_bytes=layerwise_pinned_host_bytes(
+                modules, pin_budget=pin_budget
+            ),
+            host_pin_capacity_bytes=layerwise_host_pin_capacity_bytes(
+                modules, pin_budget=pin_budget
+            ),
+            host_transition_headroom_bytes=max(
+                0, host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES
+            )
+            // local_worker_count,
+            device_transition_allocated_bytes=baseline_allocated,
+            candidates=candidates,
+            require_feasible_placement=True,
+            # Static weight accounting establishes feasibility, but contains no
+            # latency observation. Give each exact current state one synthetic
+            # unit so the solver preserves the maximum number of current
+            # placements and only demotes what is necessary before the first
+            # target-shape probe.
+            estimated_request_duration_ns=1,
+            candidate_latency_savings_ns={
+                candidate.option_key(): int(candidate.current_placement)
+                for candidate in candidates
+            },
+        )
+
+    def _build_auto_residency_report(
+        self,
+        *,
+        workload: DefaultWorkload,
+        records: List[WarmupMemoryRecord],
+        include_candidates: bool = True,
+    ) -> RankResidencyReport:
+        skip_reason = None
+        if self.pipeline is None:
+            skip_reason = "pipeline not initialized"
+        elif not records:
+            skip_reason = "no server warmup measurements"
+        elif workload.workload_units() is None:
+            skip_reason = "default workload resolution unknown"
+        if skip_reason is not None:
+            return RankResidencyReport(
+                rank=self.rank,
+                budget_bytes=0,
+                estimated_peak_bytes=None,
+                candidates=[],
+                skip_reason=skip_reason,
+            )
+        modules = self._auto_residency_modules()
+        target_units = workload.workload_units()
+        assert target_units is not None
+        target_records = [
+            record
+            for record in records
+            if record.succeeded and record.workload_units() >= target_units
+        ]
+        warmup_oom = any(
+            not record.succeeded and record.workload_units() <= target_units
+            for record in records
+        )
+        runtime_weights_by_component = component_runtime_weight_bytes(modules)
+        allocator_headroom_bytes = estimate_allocator_headroom_bytes(
+            records=records,
+            target_units=target_units,
+        )
+        if warmup_oom:
+            (
+                estimated_peak_bytes,
+                estimated_phase_peaks,
+                active_components_by_phase,
+                used_components_by_phase,
+                prefetched_components_by_phase,
+                full_weight_transition_components_by_phase,
+            ) = measured_failed_workload_phase_peaks(
+                records=records,
+                target_units=target_units,
+            )
+        else:
+            estimated_peak_bytes = estimate_default_workload_peak_bytes(
+                records=records,
+                target_units=target_units,
+                constant_weight_bytes=max(
+                    runtime_weights_by_component.values(), default=0
+                ),
+            )
+            (
+                estimated_phase_peaks,
+                active_components_by_phase,
+                used_components_by_phase,
+                prefetched_components_by_phase,
+                full_weight_transition_components_by_phase,
+            ) = estimate_workload_phase_peaks(
+                records=records,
+                target_units=target_units,
+                component_weight_bytes=runtime_weights_by_component,
+            )
+        measured_used_components = {
+            component_name
+            for component_names in used_components_by_phase.values()
+            for component_name in component_names
+        }
+        has_component_use_measurement = any(
+            record.phase_used_components for record in records if record.succeeded
+        )
+        layerwise_layer_uses = estimate_layerwise_layer_uses(
+            records=records,
+            target_units=target_units,
+            target_num_inference_steps=workload.num_inference_steps,
+        )
+        (
+            measured_request_duration_ns,
+            measured_stage_duration_ns,
+            measured_component_stages,
+        ) = estimate_default_workload_timing(
+            records=records,
+            target_units=target_units,
+            target_num_inference_steps=workload.num_inference_steps,
+        )
+        explicitly_repeated_stages = {
+            stage_name
+            for record in records
+            if record.succeeded
+            for stage_name in record.stage_iterations
+        }
+        repeated_components = {
+            component_name
+            for component_name in layerwise_layer_uses
+            if is_dit_component_name(component_name)
+        }
+        repeated_components.update(
+            component_name
+            for component_name, stage_names in measured_component_stages.items()
+            if any(
+                stage_name in explicitly_repeated_stages
+                or (
+                    stage_name.endswith("DenoisingStage")
+                    and not stage_name.endswith("BeforeDenoisingStage")
+                )
+                for stage_name in stage_names
+            )
+        )
+        if include_candidates:
+            self._auto_residency_repeated_components = repeated_components
+        reference_request_duration_ns = (
+            self._auto_residency_reference_request_duration_ns
+        )
+        if (
+            not warmup_oom
+            and reference_request_duration_ns is None
+            and measured_request_duration_ns > 0
+        ):
+            reference_request_duration_ns = measured_request_duration_ns
+            self._auto_residency_reference_request_duration_ns = (
+                reference_request_duration_ns
+            )
+            self._auto_residency_reference_stage_duration_ns = (
+                measured_stage_duration_ns
+            )
+            self._auto_residency_reference_component_stages = measured_component_stages
+        estimated_request_duration_ns = (
+            reference_request_duration_ns or measured_request_duration_ns
+        )
+        reference_stage_duration_ns = (
+            self._auto_residency_reference_stage_duration_ns
+            or measured_stage_duration_ns
+        )
+        reference_component_stages = (
+            self._auto_residency_reference_component_stages or measured_component_stages
+        )
+        latency_upper_bound_ns_by_component = {}
+        for component_name in modules:
+            component_stage_duration_ns = sum(
+                reference_stage_duration_ns.get(stage_name, 0)
+                for stage_name in reference_component_stages.get(component_name, ())
+            )
+            latency_upper_bound_ns_by_component[component_name] = (
+                estimated_request_duration_ns
+                if is_dit_component_name(component_name)
+                or component_name in repeated_components
+                else component_stage_duration_ns or estimated_request_duration_ns
+            )
+        budget_bytes = self._auto_residency_budget_bytes()
+        local_worker_count = max(
+            1, self.server_args.num_gpus // self.server_args.nnodes
+        )
+        pin_budget = self.server_args.host_pin_budget()
+        host_transition_headroom_bytes = (
+            max(0, host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES)
+            // local_worker_count
+        )
+        pinned_host_bytes = (
+            layerwise_pinned_host_bytes(modules, pin_budget=pin_budget)
+            if include_candidates
+            else 0
+        )
+        host_pin_capacity_bytes = (
+            layerwise_host_pin_capacity_bytes(modules, pin_budget=pin_budget)
+            if include_candidates
+            else 0
+        )
+        candidates = []
+        if include_candidates:
+            candidate_started = time.perf_counter()
+            candidates = self._collect_auto_residency_targets(
+                workload,
+                used_components=(
+                    measured_used_components if has_component_use_measurement else None
+                ),
+                layerwise_layer_uses=layerwise_layer_uses,
+                host_pin_headroom_bytes=max(
+                    0, host_pin_capacity_bytes - pinned_host_bytes
+                ),
+                request_duration_ns=estimated_request_duration_ns,
+                latency_upper_bound_ns_by_component=(
+                    latency_upper_bound_ns_by_component
+                ),
+            )
+            candidates_by_component: dict[str, int] = {}
+            for candidate in candidates:
+                candidates_by_component[candidate.component_name] = (
+                    candidates_by_component.get(candidate.component_name, 0) + 1
+                )
+            logger.debug(
+                "Auto residency candidate frontier built in %.3fs: %s",
+                time.perf_counter() - candidate_started,
+                candidates_by_component,
+            )
+        if warmup_oom:
+            dit_candidate_deltas: dict[str, list[tuple[int, int, int]]] = {}
+            for candidate in candidates:
+                if not is_dit_component_name(candidate.component_name):
+                    continue
+                dit_candidate_deltas.setdefault(candidate.component_name, []).append(
+                    (
+                        round(candidate.active_device_delta_bytes / 1024**2),
+                        round(candidate.inactive_device_delta_bytes / 1024**2),
+                        round(candidate.device_transition_delta_bytes / 1024**2),
+                    )
+                )
+            candidate_summary = {
+                name: {
+                    "count": len(deltas),
+                    "active_mib": (
+                        min(d[0] for d in deltas),
+                        max(d[0] for d in deltas),
+                    ),
+                    "inactive_mib": (
+                        min(d[1] for d in deltas),
+                        max(d[1] for d in deltas),
+                    ),
+                    "transition_mib": (
+                        min(d[2] for d in deltas),
+                        max(d[2] for d in deltas),
+                    ),
+                }
+                for name, deltas in dit_candidate_deltas.items()
+            }
+            logger.debug(
+                "Auto residency OOM report on rank %d: phase_peaks_gib=%s, "
+                "active=%s, used=%s, prefetched=%s, candidate_deltas_mib=%s",
+                self.rank,
+                {
+                    phase: round(peak / GIB_BYTES, 3)
+                    for phase, peak in estimated_phase_peaks.items()
+                },
+                active_components_by_phase,
+                used_components_by_phase,
+                prefetched_components_by_phase,
+                candidate_summary,
+            )
+        candidate_latency_savings_ns = (
+            estimate_candidate_latency_savings_ns(
+                candidates=candidates,
+                request_duration_ns=estimated_request_duration_ns,
+                stage_duration_ns=reference_stage_duration_ns,
+                component_stages=reference_component_stages,
+                repeated_components=repeated_components,
+            )
+            if include_candidates
+            else {}
+        )
+        return RankResidencyReport(
+            rank=self.rank,
+            budget_bytes=budget_bytes,
+            estimated_peak_bytes=estimated_peak_bytes,
+            planning_headroom_correction_bytes=allocator_headroom_bytes,
+            target_workload_measured=bool(target_records),
+            observed_reserved_bytes=max(
+                (record.peak_reserved_bytes for record in target_records), default=0
+            ),
+            estimated_peak_bytes_by_phase=estimated_phase_peaks,
+            active_components_by_phase=active_components_by_phase,
+            used_components_by_phase=used_components_by_phase,
+            prefetched_components_by_phase=prefetched_components_by_phase,
+            full_weight_transition_components_by_phase=(
+                full_weight_transition_components_by_phase
+            ),
+            current_device_weight_bytes_by_component=(
+                component_current_device_weight_bytes(modules)
+                if include_candidates
+                else {}
+            ),
+            current_active_weight_bytes_by_component=runtime_weights_by_component,
+            node_rank=self.server_args.node_rank,
+            pinned_host_bytes=pinned_host_bytes,
+            host_pin_capacity_bytes=host_pin_capacity_bytes,
+            host_transition_headroom_bytes=(
+                host_transition_headroom_bytes if include_candidates else 0
+            ),
+            device_transition_allocated_bytes=(
+                int(torch.get_device_module().memory_allocated())
+                if include_candidates
+                else 0
+            ),
+            estimated_request_duration_ns=estimated_request_duration_ns,
+            measured_request_duration_ns=measured_request_duration_ns,
+            candidate_latency_savings_ns=candidate_latency_savings_ns,
+            candidates=candidates,
+            warmup_oom=warmup_oom,
+            skip_reason=skip_reason,
+        )
+
+    def _auto_residency_all_gather(self, obj: Any) -> list[Any]:
+        replica_group = get_replica_group()
+        if replica_group.world_size == 1:
+            return [obj]
+        gathered: list[Any] = [None] * replica_group.world_size
+        torch.distributed.all_gather_object(
+            gathered, obj, group=replica_group.cpu_group
+        )
+        return gathered
+
+    def _mixed_dtype_residency_components(self) -> set[str]:
+        if self.pipeline is None:
+            return set()
+        manager = get_global_component_residency_manager(
+            self.pipeline, self.server_args
+        )
+        return manager.components_with_mixed_use_dtypes(
+            self.pipeline.stages, self.server_args
+        )
+
+    def _auto_residency_modules(self) -> dict[str, object]:
+        assert self.pipeline is not None
+        manager = peek_global_component_residency_manager()
+        if manager is None:
+            return dict(self.pipeline.modules)
+        return manager.placement_modules()
+
+    def _fixed_custom_residency_strategy_names(self) -> set[str]:
+        if self.pipeline is None:
+            return set()
+        fixed = {
+            name
+            for name, strategy in self.pipeline.component_residency_strategies.items()
+            if not strategy.supports_auto_residency()
+        }
+        fixed.update(
+            fixed_loading_residency_components(self.server_args, self.pipeline.modules)
+        )
+        return fixed
+
+    def _latest_auto_residency_round(self) -> list[AppliedResidencyChange]:
+        if not self._auto_residency_round_sizes:
+            return []
+        round_size = self._auto_residency_round_sizes[-1]
+        if round_size <= 0 or round_size > len(self._auto_residency_applied):
+            return []
+        return self._auto_residency_applied[-round_size:]
+
+    def _latest_auto_residency_round_is_resident_only(self) -> bool:
+        """Whether validation follows only execution-monotonic promotions.
+
+        Moving an offloaded component to resident removes transfer/hooks from
+        its existing compute path. Its post-adjustment warmup must still prove
+        VRAM safety, but one noisy duration sample must not undo that promotion.
+        Layerwise layout and lower-memory transitions retain latency rollback.
+        """
+        changes = self._latest_auto_residency_round()
+        return all(
+            adjustment.residency_mode != RESIDENT
+            and self.server_args.residency_mode(adjustment.component_name) == RESIDENT
+            for adjustment in changes
+        ) and bool(changes)
+
+    def _latest_auto_residency_round_supports_short_validation(self) -> bool:
+        """Whether one full-shape step covers every changed execution path."""
+        return self._latest_auto_residency_round_is_resident_only()
+
+    def _rollback_applied_residency_changes(
+        self, *, latest_round_only: bool = False
+    ) -> str | None:
+        if latest_round_only:
+            if not self._auto_residency_round_sizes:
+                return None
+            round_size = self._auto_residency_round_sizes[-1]
+            if round_size == 0:
+                self._auto_residency_round_sizes.pop()
+                return None
+            if round_size > len(self._auto_residency_applied):
+                return "auto residency round history is inconsistent"
+            applied = self._auto_residency_applied[-round_size:]
+        else:
+            if not self._auto_residency_applied:
+                self._auto_residency_round_sizes = []
+                return None
+            applied = self._auto_residency_applied
+        try:
+            rollback_residency_changes(
+                applied=applied,
+                modules=self._auto_residency_modules(),
+                server_args=self.server_args,
+            )
+        except Exception as e:
+            logger.error(
+                "Auto residency rollback failed on rank %d: %s",
+                self.rank,
+                e,
+                exc_info=True,
+            )
+            return describe_error(e)
+        self._invalidate_component_strategies(
+            [adjustment.component_name for adjustment in applied]
+        )
+        if latest_round_only and self._auto_residency_round_sizes:
+            del self._auto_residency_applied[-len(applied) :]
+            self._auto_residency_round_sizes.pop()
+        else:
+            self._auto_residency_applied = []
+            self._auto_residency_round_sizes = []
+        self._auto_residency_last_applied_plan = None
+        return None
+
+    @staticmethod
+    def _invalidate_component_strategies(component_names: List[str]) -> None:
+        manager = peek_global_component_residency_manager()
+        if manager is not None:
+            manager.invalidate_component_strategies(component_names)
 
     def set_lora(
         self,

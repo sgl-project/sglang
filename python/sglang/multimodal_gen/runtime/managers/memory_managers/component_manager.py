@@ -63,6 +63,7 @@ class WarmupPhasePeak:
     active_components: tuple[str, ...]
     allocated_bytes: int
     used_components: tuple[str, ...] = ()
+    prefetched_components: tuple[str, ...] = ()
     full_weight_transition_components: tuple[str, ...] = ()
 
 
@@ -141,8 +142,11 @@ class ComponentResidencyManager:
         self._warmup_phase_key: str | None = None
         self._warmup_phase_components: tuple[str, ...] = ()
         self._warmup_phase_used_components: tuple[str, ...] = ()
+        self._warmup_phase_prefetched_components: tuple[str, ...] = ()
         self._warmup_phase_full_weight_transition_components: tuple[str, ...] = ()
         self._warmup_phase_peaks: dict[str, WarmupPhasePeak] = {}
+        self._warmup_phase_occurrences: dict[str, int] = {}
+        self._failed_warmup_phase_peaks: dict[str, WarmupPhasePeak] = {}
         self._completed_warmup_phase_peaks: dict[str, WarmupPhasePeak] = {}
 
     def refresh_pipeline(self, pipeline: ComponentResidencyPipeline) -> None:
@@ -168,6 +172,65 @@ class ComponentResidencyManager:
             self._strategy_cache.clear()
         self.server_args = server_args
 
+    def invalidate_component_strategies(self, component_names: Iterable[str]) -> None:
+        """Drop cached strategies after an in-place residency change.
+
+        The cache only auto-invalidates when the ``server_args`` object
+        identity changes; runtime promotions mutate residency on the same
+        object and must invalidate explicitly.
+        """
+        for component_name in component_names:
+            self._strategy_cache.pop(component_name, None)
+
+    def declared_stage_uses(
+        self,
+        stages: Sequence[ComponentResidencyStage],
+        server_args: ServerArgs,
+    ) -> tuple[tuple[ComponentUse, ...], ...]:
+        """Resolve the stage timeline without starting a request.
+
+        Static placement runs before the first forward, so it cannot rely on
+        ``begin_request`` having populated the cached timeline already.
+        """
+        return tuple(
+            tuple(stage.component_uses(server_args, self.stage_name(stage)))
+            for stage in stages
+        )
+
+    def components_with_mixed_use_dtypes(
+        self,
+        stages: Sequence[ComponentResidencyStage] | None = None,
+        server_args: ServerArgs | None = None,
+    ) -> set[str]:
+        """Components whose stages request more than one runtime dtype.
+
+        Layerwise offload keeps its managed weight stores in one fixed dtype,
+        while resident placement honors each ``ComponentUse.target_dtype``.
+        Switching such a component between those strategies would therefore
+        change its numerical path, even when both placements fit.
+        """
+        if stages is None:
+            ordered_uses = self._ordered_uses
+        else:
+            resolved_server_args = (
+                self.server_args if server_args is None else server_args
+            )
+            ordered_uses = tuple(
+                use
+                for uses in self.declared_stage_uses(stages, resolved_server_args)
+                for use in uses
+            )
+        dtypes_by_component: dict[str, set[torch.dtype | None]] = {}
+        for use in ordered_uses:
+            dtypes_by_component.setdefault(use.component_name, set()).add(
+                use.target_dtype
+            )
+        return {
+            component_name
+            for component_name, dtypes in dtypes_by_component.items()
+            if len(dtypes) > 1
+        }
+
     def begin_request(
         self,
         stages: Sequence[ComponentResidencyStage],
@@ -186,10 +249,7 @@ class ComponentResidencyManager:
         self._prefetched_use_keys.clear()
         self._uses_seen.clear()
         self._modules_seen.clear()
-        self._stage_uses_by_index = [
-            tuple(stage.component_uses(server_args, self.stage_name(stage)))
-            for stage in stages
-        ]
+        self._stage_uses_by_index = list(self.declared_stage_uses(stages, server_args))
         self._ordered_uses = tuple(
             use for uses in self._stage_uses_by_index for use in uses
         )
@@ -202,8 +262,11 @@ class ComponentResidencyManager:
         self._warmup_phase_key = None
         self._warmup_phase_components = ()
         self._warmup_phase_used_components = ()
+        self._warmup_phase_prefetched_components = ()
         self._warmup_phase_full_weight_transition_components = ()
         self._warmup_phase_peaks = {}
+        self._warmup_phase_occurrences = {}
+        self._failed_warmup_phase_peaks = {}
         self._completed_warmup_phase_peaks = {}
         if self._track_warmup_memory:
             # GPUWorker reset the request peak before entering the pipeline.
@@ -275,6 +338,7 @@ class ComponentResidencyManager:
             self._warmup_phase_key,
             self._warmup_phase_components,
             self._warmup_phase_used_components,
+            self._warmup_phase_prefetched_components,
             self._warmup_phase_full_weight_transition_components,
         )
         self._begin_warmup_phase(
@@ -289,7 +353,13 @@ class ComponentResidencyManager:
         try:
             yield
         finally:
-            previous_key, components, used_components, transitions = previous_phase
+            (
+                previous_key,
+                components,
+                used_components,
+                prefetched_components,
+                transitions,
+            ) = previous_phase
             if previous_key is None:
                 self._record_warmup_phase_peak()
                 self._warmup_phase_key = None
@@ -298,7 +368,9 @@ class ComponentResidencyManager:
                     key=previous_key,
                     components=components,
                     used_components=used_components,
+                    prefetched_components=prefetched_components,
                     full_weight_transition_components=transitions,
+                    new_occurrence=False,
                 )
 
     def begin_stage(self) -> None:
@@ -657,14 +729,23 @@ class ComponentResidencyManager:
         key: str,
         components: tuple[str, ...],
         used_components: tuple[str, ...],
+        prefetched_components: tuple[str, ...] = (),
         full_weight_transition_components: tuple[str, ...] = (),
+        new_occurrence: bool = True,
     ) -> None:
         if not self._track_warmup_memory:
             return
         self._record_warmup_phase_peak()
+        if new_occurrence:
+            occurrence = self._warmup_phase_occurrences.get(key, 0)
+            self._warmup_phase_occurrences[key] = occurrence + 1
+            key = key if occurrence == 0 else f"{key}:occurrence:{occurrence}"
         self._warmup_phase_key = key
         self._warmup_phase_components = tuple(sorted(set(components)))
         self._warmup_phase_used_components = tuple(sorted(set(used_components)))
+        self._warmup_phase_prefetched_components = tuple(
+            sorted(set(prefetched_components))
+        )
         self._warmup_phase_full_weight_transition_components = tuple(
             sorted(set(full_weight_transition_components))
         )
@@ -707,10 +788,20 @@ class ComponentResidencyManager:
 
     def _begin_warmup_prefetch(self, use: ComponentUse) -> None:
         phase = use.phase or use.component_name
+        active_uses = tuple(
+            active_use
+            for active_use in (self._active_use, use)
+            if active_use is not None
+        )
         self._begin_warmup_phase(
             key=f"{self.state.stage_index}:{self.state.stage_name}:prefetch:{phase}",
-            components=self._warmup_active_components((use,)),
-            used_components=(use.component_name,),
+            components=self._warmup_active_components(active_uses),
+            used_components=(
+                (self._active_use.component_name,)
+                if self._active_use is not None
+                else ()
+            ),
+            prefetched_components=(use.component_name,),
         )
 
     def _warmup_active_components(
@@ -733,6 +824,7 @@ class ComponentResidencyManager:
             active_components=self._warmup_phase_components,
             allocated_bytes=int(torch.get_device_module().max_memory_allocated()),
             used_components=self._warmup_phase_used_components,
+            prefetched_components=self._warmup_phase_prefetched_components,
             full_weight_transition_components=(
                 self._warmup_phase_full_weight_transition_components
             ),
@@ -751,6 +843,12 @@ class ComponentResidencyManager:
                 used_components=tuple(
                     sorted(set(previous.used_components) & set(peak.used_components))
                 ),
+                prefetched_components=tuple(
+                    sorted(
+                        set(previous.prefetched_components)
+                        & set(peak.prefetched_components)
+                    )
+                ),
                 full_weight_transition_components=tuple(
                     sorted(
                         set(previous.full_weight_transition_components)
@@ -763,7 +861,9 @@ class ComponentResidencyManager:
         self,
     ) -> dict[str, WarmupPhasePeak]:
         """Return and clear the most recently completed warmup phase peaks."""
-        peaks = self._completed_warmup_phase_peaks
+        peaks = dict(self._failed_warmup_phase_peaks)
+        peaks.update(self._completed_warmup_phase_peaks)
+        self._failed_warmup_phase_peaks = {}
         self._completed_warmup_phase_peaks = {}
         return peaks
 
@@ -775,6 +875,19 @@ class ComponentResidencyManager:
         the managed phase timeline instead.
         """
         return self._warmup_active_components()
+
+    def placement_modules(self) -> dict[str, object]:
+        """Return every module available to post-request placement planning.
+
+        Some stages materialize request-dependent components lazily, so those
+        modules are absent from ``pipeline.modules`` until they are first used.
+        ``_modules_seen`` retains the concrete module passed through the
+        residency manager for the current request. Pipeline-owned modules win
+        if a component was replaced after it was observed.
+        """
+        modules = dict(self._modules_seen)
+        modules.update(self.pipeline.modules)
+        return modules
 
     def stage_name(self, stage: ComponentResidencyStage) -> str:
         return self._stage_names_by_id.get(id(stage), stage.__class__.__name__)

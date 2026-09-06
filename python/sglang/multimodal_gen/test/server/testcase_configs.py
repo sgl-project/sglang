@@ -23,7 +23,7 @@ import json
 import os
 import shlex
 import statistics
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Sequence
@@ -814,22 +814,42 @@ def _get_extra_arg_value(extras: Sequence[str], option_name: str) -> str | None:
     return None
 
 
-def get_model_task_type_for_server_args(
+def _get_config_classes_for_server_args(
     server_args: DiffusionServerArgs,
-) -> ModelTaskType:
+) -> tuple[type, type]:
     pipeline_class_name = _get_extra_arg_value(
         server_args.extras, "--pipeline-class-name"
     )
     if pipeline_class_name:
         config_classes = get_pipeline_config_classes(pipeline_class_name)
         if config_classes is not None:
-            pipeline_config_cls, _ = config_classes
-            return pipeline_config_cls.task_type
+            return config_classes
 
     model_info = get_model_info(server_args.model_path)
     if model_info is None:
         raise ValueError(f"Could not resolve model info for {server_args.model_path!r}")
-    return model_info.pipeline_config_cls.task_type
+    return model_info.pipeline_config_cls, model_info.sampling_param_cls
+
+
+def get_model_task_type_for_server_args(
+    server_args: DiffusionServerArgs,
+) -> ModelTaskType:
+    pipeline_config_cls, _ = _get_config_classes_for_server_args(server_args)
+    return pipeline_config_cls.task_type
+
+
+def supports_auto_residency_for_server_args(
+    server_args: DiffusionServerArgs,
+) -> bool:
+    pipeline_config_cls, _ = _get_config_classes_for_server_args(server_args)
+    return pipeline_config_cls.supports_auto_residency
+
+
+def get_sampling_param_field_names_for_server_args(
+    server_args: DiffusionServerArgs,
+) -> frozenset[str]:
+    _, sampling_param_cls = _get_config_classes_for_server_args(server_args)
+    return frozenset(item.name for item in fields(sampling_param_cls))
 
 
 def get_default_sampling_params_for_model_task(

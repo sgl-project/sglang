@@ -60,6 +60,10 @@ def is_fsdp_managed_module(module: nn.Module) -> bool:
 class ComponentResidencyStrategy:
     """Controls one component's device placement around declared use intervals."""
 
+    def supports_auto_residency(self) -> bool:
+        """Whether runtime placement may change underneath this strategy."""
+        return False
+
     def prepare_for_use(
         self,
         module: nn.Module,
@@ -130,7 +134,24 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
         use: ComponentUse,
         state: ResidencyState,
     ) -> None:
-        _module_to_local_device(module, dtype=use.target_dtype)
+        try:
+            _module_to_local_device(module, dtype=use.target_dtype)
+        except BaseException:
+            self._restore_cpu_after_failed_transfer(module)
+            raise
+
+    def _restore_cpu_after_failed_transfer(
+        self, module: nn.Module, *, stream: object | None = None
+    ) -> None:
+        """Undo a partial ``Module.to(device)`` after allocation failure."""
+        if stream is None:
+            module.to("cpu", non_blocking=False)
+        else:
+            with torch.get_device_module().stream(stream):
+                module.to("cpu", non_blocking=False)
+            stream.synchronize()
+        if current_platform.is_cuda():
+            torch.get_device_module().empty_cache()
 
     def wait_for_use(
         self,
@@ -158,10 +179,17 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
             self._prefetch_stream = torch.get_device_module().Stream(
                 device=get_local_torch_device()
             )
-        with torch.get_device_module().stream(self._prefetch_stream):
-            _module_to_local_device(module, dtype=use.target_dtype)
-            event = torch.get_device_module().Event()
-            event.record(self._prefetch_stream)
+        try:
+            with torch.get_device_module().stream(self._prefetch_stream):
+                _module_to_local_device(module, dtype=use.target_dtype)
+                event = torch.get_device_module().Event()
+                event.record(self._prefetch_stream)
+        except BaseException:
+            self._ready_events.pop(use.component_name, None)
+            self._restore_cpu_after_failed_transfer(
+                module, stream=self._prefetch_stream
+            )
+            raise
         self._ready_events[use.component_name] = event
         return True
 

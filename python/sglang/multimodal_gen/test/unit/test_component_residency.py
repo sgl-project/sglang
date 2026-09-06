@@ -1,9 +1,15 @@
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import (
+    Mock,
+    patch,
+)
 
 import pytest
 import torch
 
+from sglang.multimodal_gen.runtime.managers.memory_managers import (
+    component_residency_strategies,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentResidencyManager,
     ComponentUse,
@@ -175,6 +181,31 @@ class _Stage:
 
     def component_uses(self, server_args, stage_name=None):
         return self.uses
+
+
+def test_reports_components_with_mixed_use_dtypes():
+    encode = _Stage(ComponentUse("encode", "vae", target_dtype=torch.float32))
+    decode = _Stage(ComponentUse("decode", "vae", target_dtype=torch.bfloat16))
+    denoise = _Stage(
+        ComponentUse("denoise", "transformer", target_dtype=torch.bfloat16)
+    )
+    pipeline = SimpleNamespace(
+        modules={},
+        _stage_name_mapping={
+            "encode": encode,
+            "denoise": denoise,
+            "decode": decode,
+        },
+        component_residency_strategies={},
+    )
+    server_args = _server_args()
+    manager = ComponentResidencyManager(pipeline, server_args)
+
+    manager.begin_request(
+        [encode, denoise, decode], SimpleNamespace(is_warmup=True), server_args
+    )
+
+    assert manager.components_with_mixed_use_dtypes() == {"vae"}
 
 
 def test_warmup_records_use_and_transition_peaks(monkeypatch):
@@ -372,7 +403,12 @@ def test_warmup_attributes_prefetch_peak_to_prefetched_component(monkeypatch):
 
     assert manager._warmup_phase_peaks[
         "0:encode:prefetch:transformer"
-    ] == WarmupPhasePeak(("transformer",), 7, used_components=("transformer",))
+    ] == WarmupPhasePeak(
+        ("text_encoder", "transformer"),
+        7,
+        used_components=("text_encoder",),
+        prefetched_components=("transformer",),
+    )
     assert manager._warmup_phase_peaks["0:encode:between"] == WarmupPhasePeak((), 7)
 
 
@@ -728,3 +764,106 @@ def test_component_is_not_kept_across_another_component_use():
     manager.end_use(text_use)
 
     strategy.finish_use.assert_called_once_with(module, text_use, manager.state)
+
+
+def test_component_offload_restores_cpu_after_failed_device_transfer():
+    strategy = ComponentOffloadStrategy()
+    module = Mock()
+    use = ComponentUse("DenoiseStage", "transformer")
+    error = RuntimeError("CUDA out of memory")
+
+    with patch.object(
+        component_residency_strategies,
+        "_module_to_local_device",
+        side_effect=error,
+    ):
+        try:
+            strategy.prepare_for_use(module, use, ResidencyState())
+        except RuntimeError as caught:
+            assert caught is error
+        else:
+            raise AssertionError("expected the simulated device transfer to fail")
+
+    module.to.assert_called_once_with("cpu", non_blocking=False)
+
+
+def test_placement_modules_include_lazy_request_components():
+    pipeline_module = torch.nn.Linear(2, 2)
+    stale_seen_module = torch.nn.Linear(2, 2)
+    lazy_module = torch.nn.Linear(2, 2)
+    pipeline = SimpleNamespace(
+        modules={"transformer": pipeline_module},
+        _stage_name_mapping={},
+        component_residency_strategies={},
+    )
+    manager = ComponentResidencyManager(
+        pipeline,
+        SimpleNamespace(enable_layerwise_nvtx_marker=False),
+    )
+    manager._modules_seen = {
+        "transformer": stale_seen_module,
+        "condition_image_encoder": lazy_module,
+    }
+
+    assert manager.placement_modules() == {
+        "transformer": pipeline_module,
+        "condition_image_encoder": lazy_module,
+    }
+
+
+def test_reports_mixed_use_dtypes_before_first_request():
+    encode = _Stage(ComponentUse("encode", "vae", target_dtype=torch.float32))
+    decode = _Stage(ComponentUse("decode", "vae", target_dtype=torch.bfloat16))
+    pipeline = SimpleNamespace(
+        modules={},
+        _stage_name_mapping={"encode": encode, "decode": decode},
+        component_residency_strategies={},
+    )
+    server_args = SimpleNamespace(enable_layerwise_nvtx_marker=False)
+    manager = ComponentResidencyManager(pipeline, server_args)
+    manager.refresh_pipeline(pipeline)
+
+    assert manager.components_with_mixed_use_dtypes([encode, decode], server_args) == {
+        "vae"
+    }
+    assert manager._ordered_uses == ()
+
+
+def test_warmup_preserves_repeated_phase_layouts(monkeypatch):
+    device_module = SimpleNamespace(
+        is_available=lambda: True,
+        reset_peak_memory_stats=Mock(),
+        max_memory_allocated=lambda: 7,
+    )
+    monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+
+    stage = _Stage()
+    pipeline = SimpleNamespace(
+        modules={},
+        _stage_name_mapping={"stage": stage},
+        component_residency_strategies={},
+    )
+    server_args = _server_args()
+    manager = ComponentResidencyManager(pipeline, server_args)
+    manager.refresh_pipeline(pipeline)
+    manager.begin_request([stage], SimpleNamespace(is_warmup=True), server_args)
+
+    manager._begin_warmup_phase(
+        key="0:stage:between",
+        components=("text_encoder",),
+        used_components=(),
+    )
+    manager._begin_warmup_phase(
+        key="0:stage:between",
+        components=("transformer",),
+        used_components=(),
+    )
+    manager._record_warmup_phase_peak()
+
+    assert manager._warmup_phase_peaks["0:stage:between"] == WarmupPhasePeak(
+        ("text_encoder",), 7
+    )
+    assert manager._warmup_phase_peaks[
+        "0:stage:between:occurrence:1"
+    ] == WarmupPhasePeak(("transformer",), 7)
