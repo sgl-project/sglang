@@ -381,9 +381,12 @@ def handle_model_specific_adjustments(server_args: Any):
         validate_deepseek_v4_mega_moe_token_budget(server_args)
 
         if get_platform().is_sm120:
-            # SM120 lacks tcgen05/TMEM: disable features that depend on
-            # DeepGEMM or require >99KB SMEM (topk_v2).
-            envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+            # Keep FP8 wo_a opt-in on SM120. Recent DeepGEMM builds provide
+            # dedicated SM120 kernels, while older installations do not; the
+            # API/capability validation in serving_hook handles explicit opt-in.
+            if not envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
+                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+            # The default top-k v2 path still requires unsupported resources.
             envs.SGLANG_OPT_USE_TOPK_V2.set(False)
             if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.is_set():
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
