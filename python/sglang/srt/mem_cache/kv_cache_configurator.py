@@ -974,32 +974,34 @@ class KVCacheConfigurator:
     def _build_req_to_token_pool(self, *, max_num_reqs: int) -> ReqToTokenPool:
         extra_max_context_len = get_req_to_token_extra_context_len()
 
-        if get_disagg().disaggregation_mode == "decode":
-            # Extra slots for pre-allocated requests
-            pre_alloc_size = get_disagg().disaggregation_decode_extra_slots
+        disagg = get_disagg()
+        if disagg.disaggregation_mode == "decode" or disagg.enable_pd_role_switch:
+            # A flip-capable prefill needs the decode pool shape, and the extra-slot
+            # default is only computed for a decode launch.
+            pre_alloc_size = disagg.disaggregation_decode_extra_slots
+            if disagg.enable_pd_role_switch:
+                pre_alloc_size = pre_alloc_size or 0
             if self.mambaish_config:
-                req_to_token_pool = self._build_hybrid_mamba_decode_req_pool(
+                return self._build_hybrid_mamba_decode_req_pool(
                     max_num_reqs=max_num_reqs,
                     extra_max_context_len=extra_max_context_len,
                     pre_alloc_size=pre_alloc_size,
                 )
-            else:
-                req_to_token_pool = self._build_decode_req_pool(
-                    max_num_reqs=max_num_reqs,
-                    extra_max_context_len=extra_max_context_len,
-                    pre_alloc_size=pre_alloc_size,
-                )
-        elif self.mambaish_config:
-            req_to_token_pool = self._build_hybrid_req_pool(
+            return self._build_decode_req_pool(
+                max_num_reqs=max_num_reqs,
+                extra_max_context_len=extra_max_context_len,
+                pre_alloc_size=pre_alloc_size,
+            )
+
+        if self.mambaish_config:
+            return self._build_hybrid_req_pool(
                 max_num_reqs=max_num_reqs,
                 extra_max_context_len=extra_max_context_len,
             )
-        else:
-            req_to_token_pool = self._build_default_req_pool(
-                max_num_reqs=max_num_reqs,
-                extra_max_context_len=extra_max_context_len,
-            )
-        return req_to_token_pool
+        return self._build_default_req_pool(
+            max_num_reqs=max_num_reqs,
+            extra_max_context_len=extra_max_context_len,
+        )
 
     def _get_mamba_layer_ids_for_req_pool(self) -> list:
         mamba_layer_ids = [
