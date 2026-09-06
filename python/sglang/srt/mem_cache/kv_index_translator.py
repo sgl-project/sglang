@@ -474,7 +474,7 @@ class KVIndexTranslator:
         """
         if not self.is_translating:
             return None
-        virtual = getattr(forward_batch, "out_cache_loc_virtual", None)
+        virtual = forward_batch.out_cache_loc_virtual
         if virtual is None:
             # No rebind ran for this batch (no write loc at all).
             return None

@@ -194,7 +194,7 @@ def build_replay_fb_view(
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         # The pre-translate loc, which the unified pool's backends re-derive
         # from straight into their capture-stable buffer. None on a static pool.
-        out_cache_loc_virtual=getattr(forward_batch, "out_cache_loc_virtual", None),
+        out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         # The mamba-track registry slot (VIRTUAL ids) is the v2p translate SOURCE
         # for the backend, which copies the result into its own static buffer and
@@ -997,6 +997,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             next_token_logits_buffer=next_token_logits_buffer,
             orig_seq_lens=seq_lens,
             out_cache_loc=out_cache_loc,
+            # This batch is built here, not by `init_new`, so no rebind marks
+            # its virtual source. Without it the capture-time fill is skipped
+            # and the graph bakes this slot instead of the backend's
+            # capture-stable buffer. The slot holds zeros, which translate to
+            # kernel id 0, the sink.
+            out_cache_loc_virtual=out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,

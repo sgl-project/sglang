@@ -413,12 +413,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
 
-    # DSV4-NPU only: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator,
-    # consumed by the Ascend backend for PA_ND block tables. None elsewhere.
     # The write loc before `KVIndexTranslator.rebind_write_loc` replaced it
     # with kernel-facing ids. Kept so a backend can re-derive straight into its
     # capture-stable buffer at metadata-init time; None on a static pool.
     out_cache_loc_virtual: Optional[torch.Tensor] = None
+    # DSV4-NPU only: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator,
+    # consumed by the Ascend backend for PA_ND block tables. None elsewhere.
     out_cache_loc_dsv4: Optional[DSV4OutCacheLoc] = None
     # The indices to track mamba state with
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
@@ -1819,6 +1819,9 @@ def build_inner_fb_view(
         seq_lens_cpu=forward_batch.seq_lens_cpu,
         encoder_lens=encoder_lens,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+        # The write contract's virtual source: a view that omits it silently
+        # skips the capture-stable fill.
+        out_cache_loc_virtual=getattr(forward_batch, "out_cache_loc_virtual", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         spec_info=forward_batch.spec_info,
     )
