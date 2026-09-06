@@ -981,9 +981,9 @@ class Gemma4TextModel(PreTrainedModel):
             )
             hidden_states = input_embeds
         else:
-            assert (
-                pp_proxy_tensors is not None
-            ), "pp_proxy_tensors is required on non-first PP ranks"
+            assert pp_proxy_tensors is not None, (
+                "pp_proxy_tensors is required on non-first PP ranks"
+            )
             hidden_states = pp_proxy_tensors["hidden_states"]
             # PLE inputs were computed on rank 0 and forwarded along the
             # pipeline; non-PLE models simply omit the key.

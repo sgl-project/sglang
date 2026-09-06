@@ -168,7 +168,7 @@ class EncoderPreprocessor:
             self.image_processor = AutoImageProcessor.from_pretrained(
                 get_serving().tokenizer_path or get_model().model_path,
                 trust_remote_code=get_model().trust_remote_code,
-                revision=server_args.revision,
+                revision=get_model().revision,
                 **image_processor_kwargs,
             )
         except Exception as e:
@@ -179,7 +179,7 @@ class EncoderPreprocessor:
             self.video_processor = AutoVideoProcessor.from_pretrained(
                 get_serving().tokenizer_path or get_model().model_path,
                 trust_remote_code=get_model().trust_remote_code,
-                revision=server_args.revision,
+                revision=get_model().revision,
             )
         except Exception as e:
             logger.warning(f"Failed to load video processor: {e}")
@@ -189,7 +189,7 @@ class EncoderPreprocessor:
             _audio_proc = AutoProcessor.from_pretrained(
                 get_serving().tokenizer_path or get_model().model_path,
                 trust_remote_code=get_model().trust_remote_code,
-                revision=server_args.revision,
+                revision=get_model().revision,
             )
             if not hasattr(_audio_proc, "feature_extractor"):
                 logger.warning(
@@ -550,6 +550,7 @@ class EncoderPreprocessor:
                 "qwen3_5",
                 "qwen3_5_moe",
                 "intern_s2_preview",
+                "cosmos3_omni",
             ]
             and video_processor_kwargs.get("video_metadata", None) is not None
         ):

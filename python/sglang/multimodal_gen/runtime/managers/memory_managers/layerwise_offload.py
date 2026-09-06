@@ -150,11 +150,16 @@ def _host_resident_tables(model: torch.nn.Module) -> List[torch.nn.Module]:
 def detach_host_resident_tables(
     model: torch.nn.Module,
 ) -> List[Tuple[torch.nn.Module, torch.Tensor]]:
-    """Swap large vocab tables for placeholders so a `.to(device)` skips them."""
+    """Park large vocab tables on the host so a `.to(device)` skips them."""
     detached = []
     for module in _host_resident_tables(model):
         weight = module.weight
-        detached.append((module, weight.data))
+        # Most loaders leave the table on the host, but model-owned loading
+        # paths may already have placed it on the accelerator.  The input hook
+        # below always sends indices to the host, so retaining accelerator data
+        # here would restore a CUDA weight and create a CPU-index/CUDA-weight
+        # mismatch in the embedding gather.
+        detached.append((module, weight.data.to("cpu")))
         weight.data = torch.empty(0, dtype=weight.dtype, device=weight.device)
     return detached
 
@@ -463,6 +468,7 @@ class LayerwiseOffloadManager:
         self._mapped_regions = MappedRegions()
         # Store forward hooks for removal
         self._forward_hooks: List[Any] = []
+        self._last_forwarded_layer: int | None = None  # skip-compute can jump
 
         if initialize:
             self._initialize()
@@ -728,9 +734,9 @@ class LayerwiseOffloadManager:
                         # below swaps that same object's storage for a (1,)
                         # placeholder, leaving the placeholder in the store.
                         # Keep an independent tensor over the mapped storage.
-                        self._mapped_cpu_weights[layer_idx][
-                            name
-                        ] = local_weight.detach().view_as(local_weight)
+                        self._mapped_cpu_weights[layer_idx][name] = (
+                            local_weight.detach().view_as(local_weight)
+                        )
                         self._weight_metadata[layer_idx][name] = {
                             "dtype": local_weight.dtype,
                             "shape": tuple(local_weight.shape),
@@ -872,6 +878,9 @@ class LayerwiseOffloadManager:
         """
         Prepare for the next round of denoising loop with prefetching the necessary layers
         """
+        self._last_forwarded_layer = None
+        self._release_unneeded_streamed_layers(keep=set(self._head_of_stream()))
+
         # The resident set first: it has to be there for the whole step, and the
         # caller decides whether to block on it.
         for layer_idx in sorted(self._retained_set):
@@ -922,6 +931,22 @@ class LayerwiseOffloadManager:
             self._streamed_order[(start + offset) % total]
             for offset in range(min(count, total))
         ]
+
+    def _release_unneeded_streamed_layers(self, *, keep: Set[int]) -> None:
+        """Free streamed layers that are on GPU but not in ``keep`` or resident."""
+        retain = set(self._retained_set) | keep
+        for layer_idx in list(self._gpu_layers):
+            if layer_idx not in retain:
+                self.release_layer(layer_idx)
+
+    def _release_skip_gap(self, *, last_ran: int, next_ran: int) -> None:
+        """Free speculative prefetches in ``(last_ran, next_ran)`` after a jump."""
+        if next_ran <= last_ran + 1:
+            return
+        retain = set(self._retained_set)
+        for layer_idx in range(last_ran + 1, next_ran):
+            if layer_idx not in retain:
+                self.release_layer(layer_idx)
 
     @torch.compiler.disable
     def _activate_residency(self) -> None:
@@ -1110,11 +1135,16 @@ class LayerwiseOffloadManager:
             self._courier_inflight.discard(layer_idx)
             self.prefetch_layer(layer_idx, non_blocking=False)
             return
+        compute_stream = torch.get_device_module().current_stream()
+        compute_stream.wait_event(event)
         with torch.inference_mode(False), torch.no_grad():
             for name, gpu_tensor in tensors.items():
+                # wait_event orders the copy; record_stream keeps its storage
+                # live until the consuming kernels finish.
+                if gpu_tensor.device.type != "cpu":
+                    gpu_tensor.record_stream(compute_stream)
                 target = self.get_target_with_name(name)
                 target.data = self._wrap_for_target(target, gpu_tensor)
-        torch.get_device_module().current_stream().wait_event(event)
         self._courier_inflight.discard(layer_idx)
         self._gpu_layers.add(layer_idx)
 
@@ -1382,6 +1412,13 @@ class LayerwiseOffloadManager:
                 if i == 0:
                     self._activate_residency()
                     self.prepare_for_next_req(non_blocking=False)
+                elif (
+                    self._last_forwarded_layer is not None
+                    and i > self._last_forwarded_layer + 1
+                ):
+                    self._release_skip_gap(
+                        last_ran=self._last_forwarded_layer, next_ran=i
+                    )
                 if i not in self._gpu_layers:
                     # LTX audio VAE traverses decoder.up in reverse order
                     self.prefetch_layer(i, non_blocking=False)
@@ -1416,6 +1453,7 @@ class LayerwiseOffloadManager:
             def hook(module, input, output):
                 # previous, we wait here, until the copy stream for next layer is finished,
                 # now with any prefetch_size, only wait for the copy stream, when the copy stream is for the next layer
+                self._last_forwarded_layer = i
                 self.release_layer(i)
 
             return hook
@@ -1494,6 +1532,9 @@ class LayerwiseOffloadableModuleMixin:
         holds = sum(p.numel() * p.element_size() for _, p in resident)
         if holds <= self._device_headroom_bytes() * PARK_SIGNIFICANCE:
             # There is room. Give back any host copies rather than hold them.
+            # Restore any parameters still bound to placeholders first so we
+            # do not leave weights as (1,) tensors after clearing the copies.
+            self.restore_non_layer_weights()
             self._parked_non_layer_weights.clear()
             return
 

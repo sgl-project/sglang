@@ -76,7 +76,7 @@ def make_processor(case, config, image_processor_cls=None):
         skip_tokenizer_init=False,
         mm_preprocess_cache_size_mb=0,
         trust_mm_content_hashes=False,
-        # Read by NativeMmHost._use_feature_shm (single-rank fixture → the
+        # Read by RustMmProcessor._use_feature_shm (single-rank fixture → the
         # inline zero-copy transport, like the 1-GPU e2e).
         tp_size=1,
         dist_init_addr=None,

@@ -388,6 +388,8 @@ def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
     )
     copy_done = CopyDone()
     scheduler = object.__new__(Scheduler)
+    scheduler.scheduler_stage_metrics = None
+    scheduler.metrics_reporter = Mock()
     scheduler.forward_ct = 0
     scheduler._sched_idled = False
     scheduler.scripted_scheduler_hook = None
@@ -441,6 +443,8 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
     req = SimpleNamespace(
         output_ids=[],
         finished_len=None,
+        to_finish=None,
+        finished_reason=None,
         inflight_middle_chunks=0,
         pending_bootstrap=False,
         return_logprob=False,

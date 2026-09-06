@@ -3,6 +3,8 @@
 The Qwen3-8B test checks end-to-end accuracy with FlashInfer. The smaller
 DeepSeek-Coder-V2-Lite test checks that an MLA radix-prefix hit selects the
 OSS FA4 cached-prefix graph variant and matches an eager cold request.
+The EAGLE3 test checks that target prefills replay FullCG rather than silently
+falling back to eager while speculative decoding remains active.
 
 The attention backend is pinned to flashinfer: plain EXTEND under full
 CUDA graph requires the backend's init_forward_metadata_out_graph to
@@ -20,6 +22,7 @@ from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.mock_model.utils import run_mock_model_bench_serving
 from sglang.test.run_eval import run_eval
+from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -30,7 +33,18 @@ from sglang.test.test_utils import (
 
 # OSS FA4 coverage requires Blackwell. The PP test uses two GPUs; the other
 # tests use one GPU.
-register_cuda_ci(est_time=240, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=300, stage="base-b", runner_config="4-gpu-b200")
+
+
+def _prefill_graph_count(base_url: str) -> float:
+    metrics = requests.get(base_url + "/metrics", timeout=30).text
+    matches = re.findall(
+        r'^sglang:cuda_graph_passes_total\{[^}]*mode="prefill_cuda_graph"[^}]*\}'
+        r"\s+([0-9.eE+-]+)$",
+        metrics,
+        re.MULTILINE,
+    )
+    return sum(map(float, matches), 0.0)
 
 
 class TestFullCudaGraphPrefill(CustomTestCase):
@@ -93,6 +107,52 @@ class TestFullCudaGraphPipelineParallel(CustomTestCase):
         )
 
 
+class TestFullCudaGraphPrefillWithEagle3(Eagle3Base):
+    """EAGLE3 target prefills replay a FullCG captured with full hidden states."""
+
+    spec_steps = 3
+    spec_topk = 1
+    spec_tokens = 4
+    mem_fraction_static = 0.6
+    max_running_requests = 1
+    chunked_prefill_size = 64
+    extra_args = (
+        "--enable-metrics",
+        "--disable-flashinfer-autotune",
+        "--cuda-graph-config",
+        (
+            '{"decode":{"backend":"full","max_bs":1},'
+            '"prefill":{"backend":"full","bs":[16],'
+            '"full_prefill_max_req":1}}'
+        ),
+    )
+
+    def test_eagle_target_prefill_replays_full_cuda_graph(self):
+        prompt = (
+            "The capital of France is Paris. Write a concise paragraph about "
+            "its history, architecture, food, and culture."
+        )
+        input_ids = self.tokenizer.encode(prompt)[:16]
+        self.assertEqual(len(input_ids), 16)
+        graph_count = _prefill_graph_count(self.base_url)
+
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "input_ids": input_ids,
+                "sampling_params": {"max_new_tokens": 32, "temperature": 0},
+            },
+            timeout=120,
+        )
+        response.raise_for_status()
+        output = response.json()
+
+        self.assertTrue(output["output_ids"])
+        self.assertGreater(output["meta_info"]["spec_verify_ct"], 0)
+        self.assertGreater(output["meta_info"]["spec_num_proposed_drafts"], 0)
+        self.assertEqual(_prefill_graph_count(self.base_url), graph_count + 1)
+
+
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
 class TestFullCudaGraphChunkedPrefix(unittest.TestCase):
     """A radix-cache hit replays the OSS FA4 FullCG prefix variant."""
@@ -117,10 +177,12 @@ class TestFullCudaGraphChunkedPrefix(unittest.TestCase):
                 "--skip-server-warmup",
                 "--enable-metrics",
                 "--cuda-graph-config",
-                '{"decode":{"backend":"disabled"},'
-                '"prefill":{"backend":"full","bs":[32],"max_bs":32,'
-                '"full_prefill_max_req":1,'
-                '"full_prefill_prefix_chunk_tokens":64}}',
+                (
+                    '{"decode":{"backend":"disabled"},'
+                    '"prefill":{"backend":"full","bs":[32],"max_bs":32,'
+                    '"full_prefill_max_req":1,'
+                    '"full_prefill_prefix_chunk_tokens":64}}'
+                ),
             ],
         )
 

@@ -413,9 +413,9 @@ def fuse_scale_shift_kernel(
         num_warps = 2 if block_n == 64 else 4
         grid = (rows, triton.cdiv(C, block_n))
         num_frames = scale.shape[1]
-        assert (
-            L % num_frames == 0
-        ), "seq_len must be divisible by num_frames for 4D scale/shift"
+        assert L % num_frames == 0, (
+            "seq_len must be divisible by num_frames for 4D scale/shift"
+        )
         frame_seqlen = L // num_frames
 
         # Compact scale [B, F, 1, C] -> [B*F, C] (per-frame)

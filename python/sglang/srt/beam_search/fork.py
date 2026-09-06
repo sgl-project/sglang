@@ -93,7 +93,7 @@ def free_member_rows(group, req_to_token_pool, token_to_kv_pool_allocator) -> No
         # release frees this decode region a second time.
         slots = req_to_token_pool.req_to_token[group.all_rows, start:end]
         token_to_kv_pool_allocator.free(slots.flatten().unique())
-        leader.kv_committed_len = start
+        leader.kv.kv_committed_len = start
         leader.kv.kv_allocated_len = start
     req_to_token_pool.free_rows(group.member_rows_cpu.tolist())
     group.member_rows = None
