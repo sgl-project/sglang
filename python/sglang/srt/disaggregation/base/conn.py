@@ -91,6 +91,7 @@ class KVArgs:
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
     total_kv_layers: int
+    num_draft_entries: int = 0
 
 
 class KVPoll:

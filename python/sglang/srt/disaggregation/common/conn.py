@@ -327,17 +327,34 @@ class CommonKVManager(BaseKVManager):
             f"Unsupported PD DCP topology: {self.dcp_size} -> {dst_dcp_size}"
         )
 
-    def prepare_dcp_token_item_lens(self, dst_page_item_lens: List[int]) -> List[int]:
+    def prepare_dcp_token_item_lens(
+        self, dst_page_item_lens: List[Optional[int]], dst_dcp_size: int
+    ) -> List[int]:
         page_size = self.kv_args.page_size
+        num_draft = self.kv_args.num_draft_entries
+        num_entries = len(self.kv_args.kv_item_lens)
+        if len(dst_page_item_lens) != num_entries:
+            raise RuntimeError(
+                "PD DCP requires the decode to register one KV entry per "
+                f"prefill entry: src={num_entries} (draft={num_draft}), "
+                f"dst={len(dst_page_item_lens)}"
+            )
         src_token_lens = [
             item_len // page_size for item_len in self.kv_args.kv_item_lens
         ]
-        dst_token_lens = [item_len // page_size for item_len in dst_page_item_lens]
-        if src_token_lens != dst_token_lens:
-            raise RuntimeError(
-                "PD DCP source/destination KV geometry differs: "
-                f"src={src_token_lens}, dst={dst_token_lens}"
+        for i, dst_item_len in enumerate(dst_page_item_lens):
+            if dst_item_len is None:
+                continue
+            dst_page_scale = page_size * (
+                dst_dcp_size if i >= num_entries - num_draft else 1
             )
+            if dst_item_len // dst_page_scale != src_token_lens[i]:
+                raise RuntimeError(
+                    "PD DCP source/destination KV geometry differs at entry "
+                    f"{i}: src token bytes={src_token_lens[i]}, "
+                    f"dst token bytes={dst_item_len // dst_page_scale} "
+                    f"(dst item_len={dst_item_len}, page scale={dst_page_scale})"
+                )
         return src_token_lens
 
     def _register_staging_memory(self, ptr: int, size: int) -> None:
