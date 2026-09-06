@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_hip
+
 from ..common.utils import (
     _bitonic_merge,
     _sort_ids_ascending,
@@ -15,6 +17,9 @@ from ..common.utils import (
     sparse_out_dtype,
     unit_scale,
 )
+
+_is_hip = is_hip()
+_MAX_PER_PAGE_SLOT_UNROLL = 8
 
 
 @triton.heuristics(
@@ -439,6 +444,165 @@ def _topk_index_kernel(
     tl.store(ti_ptrs, topk_idx.to(ti_ptrs.dtype.element_ty), mask=topk_mask)
 
 
+@triton.heuristics(
+    {"BLOCK_SIZE_KD": lambda args: triton.next_power_of_2(args["qk_head_dim"])}
+)
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE_Q": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE_Q": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_SIZE_Q": 64}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_Q": 128}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_Q": 128}, num_warps=8, num_stages=3),
+    ],
+    key=["qk_head_dim", "block_size"],
+)
+@triton.jit
+def _index_block_score_only_kernel(
+    q_ptr,  # Q: [total_q, h, d]
+    k_cache_ptr,  # K paged: [max_slots, kh, d]
+    score_ptr,  # Score: [h, total_q, max_seqblock]
+    req_to_token_ptr,  # [max_reqs, max_kv_len]
+    cu_seqlens,
+    seq_lens,
+    prefix_lens,
+    slot_ids,
+    max_slots,
+    num_heads,
+    gqa_group_size,
+    qk_head_dim,
+    sm_scale,
+    stride_q_n,
+    stride_q_h,
+    stride_q_d,
+    stride_k_s,
+    stride_k_h,
+    stride_k_d,
+    stride_s_h,
+    stride_s_q,
+    stride_s_k,
+    stride_r2t_b,
+    BLOCK_SIZE_Q: tl.constexpr,
+    block_size: tl.constexpr,  # sparse K block size (== 128)
+    page_size: tl.constexpr,  # paged-cache page size; block_size % page_size == 0
+    PER_PAGE_SLOTS: tl.constexpr,  # derive slots from one base slot per page
+    BLOCK_SIZE_KD: tl.constexpr,
+    IS_FP8: tl.constexpr,
+):
+    """Score-only variant of the index attention (per-page addressing).
+
+    Computes the causal maximum index score for each query token and KV block
+    without producing the index-value attention output.
+
+    With ``PER_PAGE_SLOTS`` K addressing is PER-PAGE: a sparse block
+    of ``block_size`` tokens spans ``block_size // page_size`` physical pages, and
+    within a page the paged allocator lays the ``page_size`` slots out
+    contiguously and ascending (slot = base_slot + offset). So instead of a
+    per-token req_to_token lookup for every token in the block (``block_size``
+    loads), we read ONE base slot per page (``block_size // page_size`` loads) and
+    derive every token's slot as ``base_slot + in-page offset``. The resulting
+    slot vector is page-contiguous, so the single wide QK K-load coalesces. That
+    unrolls one load per page, so it is only selected while the page count is
+    small; otherwise the plain per-token gather runs and only the score-only
+    register saving applies. Either way: one BLOCK_SIZE_Q x block_size QK tile per
+    KV block, reduced with tl.max over the block. Only score_type == "max".
+    """
+    sm_scale_log2e = sm_scale * 1.4426950409
+    pid_q, pid_bh = tl.program_id(0), tl.program_id(1)
+    pid_b = pid_bh // num_heads
+    pid_h = pid_bh % num_heads
+    pid_kh = pid_h // gqa_group_size
+    seq_start = tl.load(cu_seqlens + pid_b)
+    q_len = tl.load(cu_seqlens + pid_b + 1) - seq_start
+    seq_len = tl.load(seq_lens + pid_b)
+    prefix_len = tl.load(prefix_lens + pid_b)
+    if BLOCK_SIZE_Q * pid_q >= q_len:
+        return
+    sid = (tl.load(slot_ids + pid_b).to(tl.int64) + max_slots) % max_slots
+
+    q_ptrs = tl.make_block_ptr(
+        base=q_ptr + seq_start * stride_q_n + pid_h * stride_q_h,
+        shape=(q_len, qk_head_dim),
+        strides=(stride_q_n, stride_q_d),
+        offsets=(pid_q * BLOCK_SIZE_Q, 0),
+        block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_KD),
+        order=(1, 0),
+    )
+    q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+
+    off_q = tl.arange(0, BLOCK_SIZE_Q) + pid_q * BLOCK_SIZE_Q + prefix_len
+    off_k = tl.arange(0, block_size)
+    off_kd = tl.arange(0, BLOCK_SIZE_KD)
+    q_row = pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+    q_store_mask = q_row < q_len
+    pages_per_block: tl.constexpr = block_size // page_size
+    # Within a sparse block, each token's page index and in-page offset are fixed.
+    page_of = off_k // page_size  # [block_size] which physical page (0..pages-1)
+    in_page = off_k % page_size  # [block_size] offset inside that page
+
+    hi = min(seq_len, prefix_len + (pid_q + 1) * BLOCK_SIZE_Q)
+    for i in tl.range(0, hi, block_size):
+        blk = i // block_size
+        pos = i + off_k
+        pos_mask = pos < seq_len
+        # A sparse block spans `pages_per_block` physical pages. The paged
+        # allocator lays out each page's `page_size` slots contiguously
+        # (slot = base_slot + in-page offset), so ONE base-slot lookup per page
+        # (pages_per_block total) yields every token's slot -- replacing the
+        # per-token req_to_token gather (block_size lookups). We build the full
+        # [block_size] slot vector affinely, then do ONE wide QK dot over the
+        # whole block (a single 128-wide MFMA is far more efficient than
+        # per-page narrow dots).
+        # PER_PAGE_SLOTS is off when a block spans too many pages for the unroll
+        # to pay (notably page_size 1, where it would degenerate into one scalar
+        # load per token); then take the plain wide per-token gather instead.
+        if PER_PAGE_SLOTS:
+            slots = tl.zeros([block_size], dtype=tl.int64)
+            for p in tl.static_range(0, pages_per_block):
+                page_tok0 = i + p * page_size
+                base_slot = tl.load(
+                    req_to_token_ptr + sid * stride_r2t_b + page_tok0,
+                    mask=page_tok0 < seq_len,
+                    other=0,
+                ).to(tl.int64)
+                base_slot = (base_slot + max_slots) % max_slots
+                slots = tl.where(page_of == p, base_slot + in_page, slots)
+        else:
+            slots = tl.load(
+                req_to_token_ptr + sid * stride_r2t_b + pos,
+                mask=pos_mask,
+                other=0,
+            ).to(tl.int64)
+            slots = (slots + max_slots) % max_slots
+        # head_dim (128) is a power of 2 == BLOCK_SIZE_KD, so the dim mask is
+        # always true -> only mask the K (token) dimension.
+        k = tl.load(
+            k_cache_ptr
+            + slots[None, :] * stride_k_s
+            + pid_kh * stride_k_h
+            + off_kd[:, None] * stride_k_d,
+            mask=pos_mask[None, :],
+            other=0.0,
+        )
+        if IS_FP8:
+            # Widening dequant for an fp8 index-K cache with bf16 Q; exact
+            # no-op cast when Q is fp8 too. Compiled out for bf16 K.
+            k = k.to(q.dtype)
+        qk = tl.dot(q, k) * sm_scale_log2e
+        # single fused causal + K-boundary mask
+        qk = tl.where(
+            (off_q[:, None] >= pos[None, :]) & pos_mask[None, :], qk, float("-inf")
+        )
+        score = tl.max(qk, axis=1)  # [BLOCK_SIZE_Q]
+        s_ptrs = (
+            score_ptr
+            + pid_h * stride_s_h
+            + (seq_start + q_row) * stride_s_q
+            + blk * stride_s_k
+        )
+        tl.store(s_ptrs, score, mask=q_store_mask)
+
+
 @torch.no_grad()
 def flash_prefill_with_topk_index(
     q: torch.Tensor,
@@ -466,6 +630,7 @@ def flash_prefill_with_topk_index(
     all_seqblock_q: Optional[int] = None,
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
+    page_size: int = 1,
     v_scale: Optional[float] = None,
 ):
     assert score_type in (
@@ -525,51 +690,91 @@ def flash_prefill_with_topk_index(
     def grid(META):
         return (triton.cdiv(max_seqlen_q, META["BLOCK_SIZE_Q"]), batch_size * num_heads)
 
-    _flash_attn_fwd_with_block_score_kernel[grid](
-        q,
-        k_cache,
-        v_cache,
-        sink,
-        o,
-        score,
-        req_to_token,
-        cu_seqlens,
-        seq_lens,
-        prefix_lens,
-        slot_ids,
-        max_slots,
-        num_heads,
-        gqa_group_size,
-        qk_head_dim,
-        v_head_dim,
-        block_size_k,
-        sm_scale,
-        k_scale,
-        v_scale,
-        False,
-        1,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        k_cache.stride(0),
-        k_cache.stride(1),
-        k_cache.stride(2),
-        v_cache.stride(0) if v_cache is not None else 0,
-        v_cache.stride(1) if v_cache is not None else 0,
-        v_cache.stride(2) if v_cache is not None else 0,
-        sink.stride(0) if sink is not None else 0,
-        sink.stride(1) if sink is not None else 0,
-        o.stride(0) if o is not None else 0,
-        o.stride(1) if o is not None else 0,
-        o.stride(2) if o is not None else 0,
-        score.stride(0),
-        score.stride(1),
-        score.stride(2),
-        req_to_token.stride(0),
-        SCORE_TYPE=score_type,
-        DISABLE_INDEX_VALUE=disable_index_value,
-        IS_FP8=is_fp8,
-    )
+    if (
+        _is_hip
+        and disable_index_value
+        and score_type == "max"
+        and sink is None
+        and q_scale in (None, 1.0)
+        and k_scale == 1.0
+        and block_size_k % page_size == 0
+    ):
+        # Source layers do not use idx_o, so run the score-only kernel.
+        _index_block_score_only_kernel[grid](
+            q,
+            k_cache,
+            score,
+            req_to_token,
+            cu_seqlens,
+            seq_lens,
+            prefix_lens,
+            slot_ids,
+            max_slots,
+            num_heads,
+            gqa_group_size,
+            qk_head_dim,
+            sm_scale,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(2),
+            score.stride(0),
+            score.stride(1),
+            score.stride(2),
+            req_to_token.stride(0),
+            block_size=block_size_k,
+            page_size=page_size,
+            PER_PAGE_SLOTS=(block_size_k // page_size <= _MAX_PER_PAGE_SLOT_UNROLL),
+            IS_FP8=is_fp8,
+        )
+    else:
+        _flash_attn_fwd_with_block_score_kernel[grid](
+            q,
+            k_cache,
+            v_cache,
+            sink,
+            o,
+            score,
+            req_to_token,
+            cu_seqlens,
+            seq_lens,
+            prefix_lens,
+            slot_ids,
+            max_slots,
+            num_heads,
+            gqa_group_size,
+            qk_head_dim,
+            v_head_dim,
+            block_size_k,
+            sm_scale,
+            k_scale,
+            v_scale,
+            False,
+            1,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(2),
+            v_cache.stride(0) if v_cache is not None else 0,
+            v_cache.stride(1) if v_cache is not None else 0,
+            v_cache.stride(2) if v_cache is not None else 0,
+            sink.stride(0) if sink is not None else 0,
+            sink.stride(1) if sink is not None else 0,
+            o.stride(0) if o is not None else 0,
+            o.stride(1) if o is not None else 0,
+            o.stride(2) if o is not None else 0,
+            score.stride(0),
+            score.stride(1),
+            score.stride(2),
+            req_to_token.stride(0),
+            SCORE_TYPE=score_type,
+            DISABLE_INDEX_VALUE=disable_index_value,
+            IS_FP8=is_fp8,
+        )
 
     # topk extraction kernel
     topk_idx = torch.full(

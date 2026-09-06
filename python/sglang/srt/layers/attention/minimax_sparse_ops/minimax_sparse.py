@@ -19,9 +19,15 @@ from sglang.kernels.ops.attention.minimax_sparse.prefill.flash_with_topk_idx imp
 from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
     flash_prefill_with_gqa_share_sparse,
 )
+from sglang.srt.environ import envs
+from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
+
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+_use_aiter_gfx95 = _use_aiter and is_gfx95_supported()
 
 logger = logging.getLogger(__name__)
 _msa_fallback_warned = False
+_gluon_fallback_warned = False
 
 
 def _warn_msa_fallback(err: Exception) -> None:
@@ -33,6 +39,18 @@ def _warn_msa_fallback(err: Exception) -> None:
         err,
     )
     _msa_fallback_warned = True
+
+
+def _warn_gluon_fallback(msg: str) -> None:
+    global _gluon_fallback_warned
+    if _gluon_fallback_warned:
+        return
+    logger.warning(
+        "SGLANG_MINIMAX_OPT_USE_GLUON_PREFILL is set, but the Gluon sparse prefill "
+        "path is unavailable (%s); falling back to Triton.",
+        msg,
+    )
+    _gluon_fallback_warned = True
 
 
 def minimax_sparse_prefill(
@@ -73,6 +91,8 @@ def minimax_sparse_prefill(
     idx_q_scale: Optional[float] = None,
     idx_k_scale: Optional[float] = None,
     idx_v_scale: Optional[float] = None,
+    page_size: int = 1,
+    seq_lens_cpu: Optional[torch.Tensor] = None,
 ):
     """Run MiniMax-M3 sparse prefill.
 
@@ -81,6 +101,10 @@ def minimax_sparse_prefill(
     kernels. Supplying them avoids recomputing the same block layout twice.
     ``seqlens_cpu`` (host copy of ``torch.diff(cu_seqlens)``) is forwarded to
     ``get_cu_seqblocks`` to avoid a per-layer device sync when it recomputes.
+
+    ``seq_lens_cpu`` (host copy of ``seq_lens``, i.e. prefix + current chunk
+    per request) is only consumed by the env-gated Gluon prefill path for
+    sync-free scratch-page sizing; ``None`` disables that path.
     """
     if cu_seqblocks_q is None or max_seqblock_q is None or all_seqblock_q is None:
         cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = get_cu_seqblocks(
@@ -112,6 +136,7 @@ def minimax_sparse_prefill(
         cu_seqblocks_q=cu_seqblocks_q,
         max_seqblock_q=max_seqblock_q,
         all_seqblock_q=all_seqblock_q,
+        page_size=page_size,
         q_scale=idx_q_scale,
         k_scale=idx_k_scale,
         v_scale=idx_v_scale,
@@ -124,10 +149,44 @@ def minimax_sparse_prefill(
         topk_idx = topk_index_reduce(
             topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
         )
-    # Step 3: Sparse attention using topk index (main head). The MSA path only
-    # replaces this step; the indexer above is unchanged. MSA has no attn-sink
-    # input, so keep the Triton path when sink is present.
-    if use_msa and sink is None:
+    # Step 3: Sparse attention using topk index (main head). The Gluon and
+    # MSA paths only replace this step; the indexer above is unchanged. MSA has
+    # no attn-sink input, so keep the Triton path when sink is present.
+    o = None
+    if _use_aiter_gfx95 and envs.SGLANG_MINIMAX_OPT_USE_GLUON_PREFILL.get():
+        try:
+            from .gluon_prefill import can_use_gluon_prefill, gluon_sparse_prefill
+
+            if can_use_gluon_prefill(
+                q,
+                k_cache,
+                v_cache,
+                sink,
+                block_size_k,
+                seq_lens_cpu,
+                q_scale,
+                k_scale,
+                v_scale,
+            ):
+                o = gluon_sparse_prefill(
+                    q=q,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    topk_idx=topk_idx,
+                    req_to_token=req_to_token,
+                    req_pool_indices=slot_ids,
+                    cu_seqlens=cu_seqlens,
+                    seq_lens=seq_lens,
+                    prefix_lens=prefix_lens,
+                    seq_lens_cpu=seq_lens_cpu,
+                    block_size_k=block_size_k,
+                    sm_scale=sm_scale,
+                )
+            else:
+                _warn_gluon_fallback("unsupported batch/cache layout or dtype")
+        except Exception as exc:
+            _warn_gluon_fallback(repr(exc))
+    if o is None and use_msa and sink is None:
         from .msa import MSAUnavailableError, msa_sparse_prefill_main
 
         try:
@@ -170,7 +229,7 @@ def minimax_sparse_prefill(
                 k_scale=k_scale,
                 v_scale=v_scale,
             )
-    else:
+    elif o is None:
         o = flash_prefill_with_gqa_share_sparse(
             q=q,
             k_cache=k_cache,
