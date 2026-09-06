@@ -29,7 +29,6 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         select_template = (
             "{{ messages | selectattr('tool_call_id', 'equalto', 'call-a') | list }}"
         )
-
         self.assertTrue(jinja_template_may_reorder_tool_results(attribute_template))
         self.assertTrue(jinja_template_may_reorder_tool_results(item_template))
         self.assertTrue(jinja_template_may_reorder_tool_results(get_template))
