@@ -42,7 +42,7 @@ export const config = {
   // Two NVFP4 exports exist: RadixArk's (routed experts NVFP4, everything else
   // BF16 with an FP8 N-gram table) and NVIDIA's ModelOpt MIXED_PRECISION export
   // (NVFP4 experts, FP8 N-gram table, FP8 block-scaled MTP experts). The NVIDIA
-  // one currently has recipes only for the DGX Spark pair.
+  // one has recipes for the DGX Spark pair and the single RTX PRO 6000.
   quantizations: [
     { id: "bf16",       label: "BF16"         },
     { id: "fp8",        label: "FP8"          },
@@ -949,6 +949,80 @@ export const config = {
         "--max-mamba-cache-size 384",
         "--reasoning-parser qwen3",
         "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ==== NVFP4 (NVDA) on 1x RTX PRO 6000 — nvidia/Qwen3.8-Flash-Next-NVFP4 ====
+    // Same ModelOpt MIXED_PRECISION export as the Spark NVDA cells. Its loader
+    // (sgl-project/sglang#38121) is merged into qwen4-main-squashed but not in
+    // the qwen38flashnext image yet, hence in-progress. Same shape, pools and
+    // headroom as the RDXA cells above, with three differences:
+    //   - no `--quantization` (the checkpoint resolves to modelopt_mixed);
+    //   - no `--mamba-track-interval` (not on qwen4-main-squashed; the default
+    //     256 satisfies the page and draft-token constraints);
+    //   - low latency keeps the in-checkpoint MTP head. At TP=1 its fp8
+    //     block-scaled experts need no sharding, and #38121 runs them on triton
+    //     under the flashinfer_cutlass pin. The RadixArk BF16 draft
+    //     (--speculative-draft-model-path) measured the same on this card
+    //     (accept 3.33 vs 3.31, TPOT 18.5 vs 19.1 ms at 16), so the
+    //     single-checkpoint command stays.
+    // Measured 2026-09-06 on the qwen4-main-squashed tip 9b2aee2283, TP=1,
+    // 1024-in/256-out random prompts. With MTP: 6.1 ms TPOT at 1 request,
+    // 19.1 ms / 628 tok/s at 16, accept length 3.3 of 4, GSM8K (chat API,
+    // thinking off, n=200) 96.5% (97.5% on an earlier run of the same code),
+    // 2.6 GB left at peak. Without: 11.5 ms at 1, 25.4 ms at 16, 55.8 ms /
+    // 879 tok/s at 64, GSM8K 97.0%, 4.0 GB left at peak. The smaller fp8 draft
+    // leaves a ~170k-token KV pool with MTP (vs ~78k for the RDXA cell).
+    {
+      match: { hw: "rtx6000", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      verificationStatus: "in-progress",
+      warn: "Single RTX PRO 6000 (96 GB). Needs the ModelOpt MIXED_PRECISION loader from [sgl-project/sglang#38121](https://github.com/sgl-project/sglang/pull/38121), merged into qwen4-main-squashed but not yet in the qwen38flashnext image — run the Python command from that branch until it lands. The FP8 N-gram table lives in pinned host RAM: keep >= 64 GB of host memory free and run Docker with --ulimit memlock=-1. The KV pool is ~170k tokens (~10k per request at 16 concurrent). See [RTX PRO 6000 notes](#rtx6000-note).",
+      env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True", "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--fp4-gemm-backend flashinfer_cutlass",
+        "--moe-runner-backend flashinfer_cutlass",
+        "--page-size 64",
+        "--chunked-prefill-size 4096",
+        "--context-length 262144",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--mamba-radix-cache-strategy extra_buffer_lazy",
+        "--max-running-requests 16",
+        "--max-mamba-cache-size 48",
+        "--mamba-ssm-dtype bfloat16",
+        "--reasoning-parser qwen3",
+        "--mem-fraction-static 0.96",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "rtx6000", variant: "default", quant: "nvfp4-nvda", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      verificationStatus: "in-progress",
+      warn: "Single RTX PRO 6000 (96 GB). Needs the ModelOpt MIXED_PRECISION loader from [sgl-project/sglang#38121](https://github.com/sgl-project/sglang/pull/38121), merged into qwen4-main-squashed but not yet in the qwen38flashnext image — run the Python command from that branch until it lands. The FP8 N-gram table lives in pinned host RAM: keep >= 64 GB of host memory free and run Docker with --ulimit memlock=-1. At 64 concurrent requests the KV pool is ~98k tokens (~1.5k per request when full); lower --max-running-requests for long-context workloads. See [RTX PRO 6000 notes](#rtx6000-note).",
+      env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True", "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--fp4-gemm-backend flashinfer_cutlass",
+        "--moe-runner-backend flashinfer_cutlass",
+        "--page-size 64",
+        "--chunked-prefill-size 4096",
+        "--context-length 262144",
+        "--mamba-radix-cache-strategy extra_buffer_lazy",
+        "--max-running-requests 64",
+        "--max-mamba-cache-size 192",
+        "--mamba-ssm-dtype bfloat16",
+        "--reasoning-parser qwen3",
+        "--mem-fraction-static 0.93",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

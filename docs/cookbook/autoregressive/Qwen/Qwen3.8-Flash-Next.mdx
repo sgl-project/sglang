@@ -96,6 +96,8 @@ The NVFP4 checkpoint fits a single 96 GB RTX PRO 6000 Blackwell (SM120) only wit
 - **Accuracy.** GSM8K via the chat API with thinking off, n=200: 97.0% / 97.5% on two runs of the MTP cell, 98.0% / 97.0% on the no-MTP cell — the same band as the fp32-state runs at the capped concurrency (97.0% / 97.5%).
 - **Measured (1024-in / 256-out random prompts, `ignore_eos`).** MTP vs no-MTP at 1 request: TTFT 115 vs 116 ms median, TPOT 5.9 vs 11.4 ms, 148 vs 83 tok/s. At 16: TPOT 19.3 vs 25.6 ms, 613 vs 524 tok/s. No-MTP at 64: TPOT 55 ms, 861 tok/s, 3.4 req/s. ShareGPT chat (thinking off, ≤ 512 output tokens): 785 tok/s at 16-way with MTP, 1,258 tok/s at 64-way without. MTP accept length 3.3 of 4 on GSM8K / random prompts, 2.9 on long-form ShareGPT answers.
 
+- **NVIDIA export (NVFP4 (NVDA)).** `nvidia/Qwen3.8-Flash-Next-NVFP4` runs on this card with the same shape and pools once the loader from [#38121](https://github.com/sgl-project/sglang/pull/38121) is in the image (it is merged into `qwen4-main-squashed`; hence the in-progress badge). Do not pass `--quantization` (it resolves to `modelopt_mixed`); `--mamba-track-interval` is not on that branch and the default 256 is fine. Low latency keeps the in-checkpoint MTP head: at TP=1 its fp8 block-scaled experts need no sharding, and #38121 runs them on triton under the `flashinfer_cutlass` pin. The RadixArk BF16 draft measured the same here (accept 3.33 vs 3.31, TPOT 18.5 vs 19.1 ms at 16), so the cell stays single-checkpoint. Measured on tip `9b2aee2283`: GSM8K 96.5% (97.5% on an earlier run) with MTP and 97.0% without; 6.1 ms TPOT at 1 request with MTP, 879 tok/s output at 64 without — the same as the RadixArk export. The smaller fp8 draft leaves a ~170k-token KV pool at 16 concurrent.
+
 </Accordion>
 
 ## Playground
@@ -159,7 +161,7 @@ Each precision is its own repository:
     <tr>
       <td style={{padding: "9px 12px"}}><strong>NVFP4 (NVDA)</strong></td>
       <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4">nvidia/Qwen3.8-Flash-Next-NVFP4</a> (ModelOpt MIXED_PRECISION)</td>
-      <td style={{padding: "9px 12px"}}>2x DGX Spark, with <a href="https://github.com/sgl-project/sglang/pull/38121">#38121</a> (in progress)</td>
+      <td style={{padding: "9px 12px"}}>RTX PRO 6000, 2x DGX Spark, with <a href="https://github.com/sgl-project/sglang/pull/38121">#38121</a> (in progress)</td>
     </tr>
   </tbody>
 </table>
