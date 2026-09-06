@@ -40,7 +40,7 @@ class RACERWorker(NGRAMWorker):
             "SGLANG_RACER_PROMPT_WARMUP", "0"
         ).lower() in ("1", "true", "yes", "on")
         self.racer_prompt_warmup_chunk = max(
-            1, int(os.getenv("SGLANG_RACER_PROMPT_WARMUP_CHUNK", "64"))
+            1, int(os.getenv("SGLANG_RACER_PROMPT_WARMUP_CHUNK", "1024"))
         )
 
         self.racer_stats_enabled = os.getenv("SGLANG_RACER_STATS", "0").lower() in (
@@ -303,6 +303,63 @@ class RACERWorker(NGRAMWorker):
         )
         return gathered_values, gathered_ids
 
+    @staticmethod
+    def _select_prompt_last_occurrence_rows(
+        prompt_tokens: torch.Tensor,
+        prompt_lens: list[int],
+        vocab_size: int,
+    ) -> tuple[torch.Tensor, list[int]]:
+        """Keep only the latest EXTEND row for each token id per request.
+
+        TokenBin is a mapping from token id to its latest copy-logit top-k row,
+        so earlier occurrences of the same token in one EXTEND segment are
+        overwritten before decoding can observe them. Selecting exactly the
+        last row for each token therefore preserves the final TokenBin state.
+
+        The selection stays on GPU. A reusable vocab-sized int32 workspace
+        stores the maximum local position for every token id via scatter-reduce,
+        making the work O(total EXTEND rows + batch * vocab) without Python
+        per-token loops or a prompt-sized CPU hash table. Returned rows remain
+        grouped per request; order within a request is irrelevant because every
+        selected token id is unique.
+        """
+
+        selected: list[torch.Tensor] = []
+        selected_lens: list[int] = []
+        offset = 0
+        last_positions = torch.empty(
+            (int(vocab_size),), dtype=torch.int32, device=prompt_tokens.device
+        )
+
+        for length in prompt_lens:
+            length = int(length)
+            end = offset + length
+            if length <= 0:
+                selected_lens.append(0)
+                offset = end
+                continue
+
+            tokens = prompt_tokens[offset:end]
+            last_positions.fill_(-1)
+            positions = torch.arange(
+                length, dtype=torch.int32, device=prompt_tokens.device
+            )
+            last_positions.scatter_reduce_(
+                0,
+                tokens.to(torch.int64),
+                positions,
+                reduce="amax",
+                include_self=True,
+            )
+            local_indices = last_positions[last_positions.ge(0)].to(torch.int64)
+            selected.append(local_indices + offset)
+            selected_lens.append(int(local_indices.numel()))
+            offset = end
+
+        if selected:
+            return torch.cat(selected, dim=0), selected_lens
+        return torch.empty(0, dtype=torch.int64, device=prompt_tokens.device), selected_lens
+
     def _warm_prompt_tokenbin(self, batch, hidden_states: torch.Tensor) -> None:
         """Seed RACER's copy-logit adjacency from prompt positions.
 
@@ -311,17 +368,20 @@ class RACERWorker(NGRAMWorker):
         logits therefore provide valid initial rows for the same top-k adjacency
         used by Logits Tree expansion.
 
-        SGLang adaptation: EXTEND already computed the prompt hidden states, so
-        this path applies only the LM head in small chunks instead of rerunning
-        the transformer. Under TP, each rank first computes top-k on its own
-        vocabulary shard, then all-gathers one packed ``(value, global_token_id)``
-        candidate tensor and performs a final top-k over ``TP * k`` candidates:
+        SGLang adaptation: EXTEND already computed the prompt hidden states. We
+        first keep only the latest occurrence of each token id per request,
+        because those are exactly the rows left in TokenBin after the full
+        sequential update. The selected hidden states are then passed through
+        the LM head in chunks. Under TP, each rank computes top-k on its local
+        vocabulary shard, all-gathers one packed ``(value, global_token_id)``
+        candidate tensor, and performs a final top-k over ``TP * k`` candidates:
 
-            hidden_states      : [Tc, H]
-            local logits       : [Tc, V / TP]
-            local candidates   : [Tc, k]
-            gathered candidates: [Tc, TP * k]
-            global top-k ids   : [Tc, k]
+            EXTEND rows         : [T, H]
+            selected latest rows: [Tu, H], Tu <= T
+            local logits        : [Tc, V / TP]
+            local candidates    : [Tc, k]
+            gathered candidates : [Tc, TP * k]
+            global top-k ids    : [Tc, k]
 
         Any global top-k token must be in its shard's local top-k, so this is
         exactly equivalent to gathering full logits before top-k (up to
@@ -361,6 +421,29 @@ class RACERWorker(NGRAMWorker):
         vocab_size = self.model_runner.model_config.vocab_size
         topk = min(self.racer_topk, vocab_size)
 
+        device_module = (
+            torch.get_device_module(self.device) if self.racer_stats_enabled else None
+        )
+        if device_module is not None:
+            select_start = device_module.Event(enable_timing=True)
+            select_end = device_module.Event(enable_timing=True)
+            select_start.record()
+        else:
+            select_start = select_end = None
+
+        selected_indices, selected_lens = self._select_prompt_last_occurrence_rows(
+            prompt_tokens, prompt_lens, vocab_size
+        )
+        hidden_states = hidden_states.index_select(0, selected_indices)
+        prompt_tokens = prompt_tokens.index_select(0, selected_indices)
+        selected_total = int(selected_indices.numel())
+
+        if select_end is not None:
+            select_end.record()
+
+        if selected_total <= 0:
+            return
+
         base_lm_head = getattr(lm_head, "base_layer", lm_head)
         lm_head_tp_size = int(getattr(base_lm_head, "tp_size", 1))
         use_sharded_topk = (
@@ -375,12 +458,9 @@ class RACERWorker(NGRAMWorker):
         topk_chunks: list[torch.Tensor] = []
         timing_events = []
         num_chunks = 0
-        device_module = (
-            torch.get_device_module(self.device) if self.racer_stats_enabled else None
-        )
 
-        for start in range(0, total, self.racer_prompt_warmup_chunk):
-            end = min(total, start + self.racer_prompt_warmup_chunk)
+        for start in range(0, selected_total, self.racer_prompt_warmup_chunk):
+            end = min(selected_total, start + self.racer_prompt_warmup_chunk)
 
             if device_module is not None:
                 events = [device_module.Event(enable_timing=True) for _ in range(5)]
@@ -453,13 +533,21 @@ class RACERWorker(NGRAMWorker):
             # The CPU copy below must wait for the same work anyway. Splitting
             # the wait here makes D2H timing uncontaminated by LM-head/top-k/NCCL.
             timing_events[-1][-1].synchronize()
+            select_gpu_ms = select_start.elapsed_time(select_end)
             lm_head_ms = sum(e[0].elapsed_time(e[1]) for e in timing_events)
             local_topk_ms = sum(e[1].elapsed_time(e[2]) for e in timing_events)
             gather_ms = sum(e[2].elapsed_time(e[3]) for e in timing_events)
             merge_topk_ms = sum(e[3].elapsed_time(e[4]) for e in timing_events)
-            gpu_ms = lm_head_ms + local_topk_ms + gather_ms + merge_topk_ms
+            gpu_ms = (
+                select_gpu_ms
+                + lm_head_ms
+                + local_topk_ms
+                + gather_ms
+                + merge_topk_ms
+            )
             d2h_start = time.perf_counter()
         else:
+            select_gpu_ms = 0.0
             lm_head_ms = local_topk_ms = gather_ms = merge_topk_ms = gpu_ms = 0.0
             d2h_start = 0.0
 
@@ -477,19 +565,23 @@ class RACERWorker(NGRAMWorker):
             [req.rid for req in batch.reqs],
             prompt_tokens_cpu,
             topk_ids.numpy(),
-            prompt_lens,
+            selected_lens,
         )
 
         if self.racer_stats_enabled:
             seed_cpu_ms = (time.perf_counter() - seed_start) * 1000.0
             logger.info(
-                "[RACER_PROMPT_WARMUP] tp=%d rows=%d chunks=%d topk=%d "
-                "lm_head_gpu_ms=%.3f local_topk_gpu_ms=%.3f gather_gpu_ms=%.3f "
+                "[RACER_PROMPT_WARMUP] tp=%d input_rows=%d rows=%d retained=%.1f%% "
+                "chunks=%d topk=%d select_gpu_ms=%.3f lm_head_gpu_ms=%.3f "
+                "local_topk_gpu_ms=%.3f gather_gpu_ms=%.3f "
                 "merge_topk_gpu_ms=%.3f gpu_ms=%.3f d2h_ms=%.3f seed_cpu_ms=%.3f",
                 self.model_runner.server_args.tp_size,
                 total,
+                selected_total,
+                100.0 * selected_total / total,
                 num_chunks,
                 topk,
+                select_gpu_ms,
                 lm_head_ms,
                 local_topk_ms,
                 gather_ms,
