@@ -99,6 +99,9 @@ from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend impor
 from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
 )
+from sglang.srt.model_executor.runner_backend.tc_piecewise_cuda_graph_backend import (
+    TcPiecewiseCudaGraphBackend,
+)
 from sglang.srt.model_executor.runner_backend.utils import (
     resolve_prefill_backend,
 )
@@ -131,6 +134,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.utils import (
     get_available_gpu_memory,
+    get_bool_env_var,
     is_cuda,
     is_npu,
     require_attn_tp_gather,
@@ -538,12 +542,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     dtype=model_runner.dtype,
                 )
 
-        # Some attention backends (e.g. DSV4) opt into a captured-metadata
-        # contract under BCG: capture-time builds a per-bucket metadata
-        # object the backend then refreshes in place at replay. We honor
-        # the contract only when the backend is Breakable; FullCG and
-        # TC_PIECEWISE use the eager init_forward_metadata path.
-        if isinstance(self.backend, BreakableCudaGraphBackend):
+        # Some attention backends (e.g. DSV4) opt into a captured-metadata contract:
+        # capture builds one metadata object per bucket, the backend refreshes it in
+        # place at replay. TC_PIECEWISE needs it too -- rebuilding metadata per batch
+        # moves the shapes Dynamo guards on, and the recompiled entry holds no CUDA
+        # graph, so prefill silently runs eager.
+        _wants_captured_metadata = isinstance(
+            self.backend, BreakableCudaGraphBackend
+        ) or (
+            isinstance(self.backend, TcPiecewiseCudaGraphBackend)
+            and not get_bool_env_var("SGLANG_PIECEWISE_NO_CAPTURED_METADATA")
+        )
+        if _wants_captured_metadata:
             self.use_captured_attn_metadata = model_runner.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
         else:
             self.use_captured_attn_metadata = False

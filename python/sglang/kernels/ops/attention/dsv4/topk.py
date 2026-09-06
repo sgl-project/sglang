@@ -12,6 +12,7 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 from sglang.srt.utils import is_xpu
+from sglang.srt.utils.custom_op import register_custom_op
 
 from .utils import make_name
 
@@ -75,6 +76,13 @@ def topk_transform_paged(
 _PLAN_METADATA_INTS_PER_BATCH = 2
 
 
+@register_custom_op(op_name="dsv4_topk_plan_v2", mutates_args=["metadata"])
+def _topk_plan_v2_jit(
+    seq_lens: torch.Tensor, metadata: torch.Tensor, static_threshold: int
+) -> None:
+    _jit_topk_v2_module().topk_plan(seq_lens, metadata, static_threshold)
+
+
 def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = 0) -> torch.Tensor:
     """Preprocess the per-batch routing plan for :func:`topk_transform_paged_v2`.
 
@@ -85,11 +93,26 @@ def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = 0) -> torch.Ten
     Producers of padded rows must clamp their lengths to 0 (0 selects the
     trivial all-(-1) output path, which is safe).
     """
-    module = _jit_topk_v2_module()
     bs = seq_lens.shape[0]
     metadata = seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
-    module.topk_plan(seq_lens, metadata, static_threshold)
+    _topk_plan_v2_jit(seq_lens, metadata, static_threshold)
     return metadata
+
+
+# `scores` is masked in place by the kernel, so it is a mutated arg too.
+@register_custom_op(
+    op_name="dsv4_topk_transform_ragged_v2", mutates_args=["scores", "out_indices"]
+)
+def _topk_transform_ragged_v2_jit(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    row_starts: Optional[torch.Tensor],
+    out_offsets: torch.Tensor,
+    out_indices: torch.Tensor,
+) -> None:
+    _jit_topk_v2_module().topk_transform_ragged(
+        scores, seq_lens, row_starts, out_offsets, out_indices
+    )
 
 
 def topk_transform_ragged_v2(
@@ -125,8 +148,29 @@ def topk_transform_ragged_v2(
             row_starts,
         )
         return
-    module = _jit_topk_v2_module()
-    module.topk_transform_ragged(scores, seq_lens, row_starts, out_offsets, out_indices)
+    _topk_transform_ragged_v2_jit(
+        scores, seq_lens, row_starts, out_offsets, out_indices
+    )
+
+
+# The JIT module exposes a bare tvm_ffi Function; Dynamo cannot trace its __call__,
+# which is fatal under the fullgraph piecewise prefill backend. Keep the launch opaque
+# behind a custom op. Only `page_indices` is written -- the kernel takes `scores` as
+# `const float*`. The XPU branch already goes through a registered op.
+@register_custom_op(
+    op_name="dsv4_topk_transform_paged_v2", mutates_args=["out_page_indices"]
+)
+def _topk_transform_paged_v2_jit(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: Optional[torch.Tensor],
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    metadata: torch.Tensor,
+) -> None:
+    _jit_topk_v2_module().topk_transform_paged(
+        scores, seq_lens, page_tables, out_page_indices, page_size, metadata
+    )
 
 
 def topk_transform_paged_v2(
@@ -167,8 +211,7 @@ def topk_transform_paged_v2(
             metadata,
         )
         return
-    module = _jit_topk_v2_module()
-    module.topk_transform_paged(
+    _topk_transform_paged_v2_jit(
         scores,
         seq_lens,
         page_tables,

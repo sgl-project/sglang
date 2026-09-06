@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
 )
 from sglang.srt.utils import is_hip, is_xpu
+from sglang.srt.utils.custom_op import register_custom_op
 
 from .utils import make_name
 
@@ -377,6 +378,40 @@ class CompressorPrefillPlan(NamedTuple):
         return False
 
 
+# Wrapped for the same reason as _jit_main_q_norm_rope_custom_op in elementwise.py.
+# The op also absorbs the decode/prefill module selection, which Dynamo never sees.
+@register_custom_op(op_name="dsv4_jit_compress_forward", mutates_args=["out"])
+def _jit_compress_forward_custom_op(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    out: torch.Tensor,
+    ape: torch.Tensor,
+    plan_a: torch.Tensor,
+    plan_b: Optional[torch.Tensor],
+    head_dim: int,
+    compress_ratio: int,
+    is_decode: bool,
+    is_online: bool,
+) -> None:
+    if is_online:
+        assert compress_ratio == 128 and head_dim == 512
+        module = _jit_compress_128_online_module(512, kv_score_buffer.dtype)
+    else:
+        module = _jit_compress_module(
+            head_dim,
+            kv_score_buffer.dtype,
+            kv_score_input.dtype,
+            out.dtype,
+            compress_ratio,
+        )
+    fn = module.decode if is_decode else module.prefill
+    # CompressorDecodePlan carries one plan tensor, CompressorPrefillPlan two.
+    if plan_b is None:
+        fn(kv_score_buffer, kv_score_input, out, ape, plan_a)
+    else:
+        fn(kv_score_buffer, kv_score_input, out, ape, plan_a, plan_b)
+
+
 def compress_forward(
     kv_score_buffer: torch.Tensor,
     kv_score_input: torch.Tensor,
@@ -392,30 +427,71 @@ def compress_forward(
         num_q_tokens = plan[1].shape[0]  # NOTE: decode = bs, prefill = dynamic
         out = kv_score_input.new_empty((num_q_tokens, head_dim))
     assert plan.compress_ratio == compress_ratio
-    if is_online:
-        assert compress_ratio == 128 and head_dim == 512
-        module = _jit_compress_128_online_module(512, kv_score_buffer.dtype)
-    else:
-        if _is_xpu:
-            decode_fn, prefill_fn = _XPU_COMPRESS_FNS[compress_ratio]
-        else:
-            dtype_in, dtype_out = kv_score_input.dtype, out.dtype
-            module = _jit_compress_module(
-                head_dim, kv_score_buffer.dtype, dtype_in, dtype_out, compress_ratio
-            )
-
-    if _is_xpu:
-        fn = decode_fn if plan.is_decode else prefill_fn
-    else:
-        fn = module.decode if plan.is_decode else module.prefill
-
     # C4/C128 kernels use the same InputFloat type for APE and kv_score_input.
     # Keep the model parameter in FP32 but convert it to the kernel input dtype
     # at the fused-kernel boundary.
     if ape.dtype != kv_score_input.dtype:
         ape = ape.to(dtype=kv_score_input.dtype)
-    fn(kv_score_buffer, kv_score_input, out, ape, *plan[1:3])
+    if _is_xpu:
+        if is_online:
+            assert compress_ratio == 128 and head_dim == 512
+            module = _jit_compress_128_online_module(512, kv_score_buffer.dtype)
+            fn = module.decode if plan.is_decode else module.prefill
+        else:
+            decode_fn, prefill_fn = _XPU_COMPRESS_FNS[compress_ratio]
+            fn = decode_fn if plan.is_decode else prefill_fn
+        fn(kv_score_buffer, kv_score_input, out, ape, *plan[1:3])
+    else:
+        # isinstance, not plan.is_decode: Dynamo cannot evaluate a property on a
+        # NamedTupleVariable and aborts the trace. is_decode is a per-class constant,
+        # so the isinstance check is equivalent.
+        _jit_compress_forward_custom_op(
+            kv_score_buffer,
+            kv_score_input,
+            out,
+            ape,
+            plan[1],
+            plan[2] if len(plan) > 2 else None,
+            head_dim,
+            compress_ratio,
+            isinstance(plan, CompressorDecodePlan),
+            is_online,
+        )
     return out
+
+
+@register_custom_op(
+    op_name="dsv4_jit_compress_norm_rope_store", mutates_args=["kvcache"]
+)
+def _jit_compress_norm_rope_store_custom_op(
+    kv: torch.Tensor,
+    plan_c: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    freq_cis: torch.Tensor,
+    out_loc: torch.Tensor,
+    kvcache: torch.Tensor,
+    is_decode: bool,
+    compress_ratio: int,
+    page_size: int,
+    use_fp4: bool,
+    bf16_store: bool,
+) -> None:
+    module = _jit_compress_norm_rope_module(
+        kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store
+    )
+    fn = module.forward_fp4 if use_fp4 else module.forward
+    fn(
+        kv,
+        plan_c,
+        norm_weight,
+        norm_eps,
+        freq_cis,
+        out_loc,
+        kvcache,
+        is_decode,
+        compress_ratio,
+    )
 
 
 def compress_norm_rope_store(
@@ -473,13 +549,11 @@ def compress_norm_rope_store(
             use_fp4,
         )
     else:
-        module = _jit_compress_norm_rope_module(
-            kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store
-        )
-        fn = module.forward_fp4 if use_fp4 else module.forward
         if norm_weight.dtype != kv.dtype:
             norm_weight = norm_weight.to(dtype=kv.dtype)
-        fn(
+        # See _jit_compress_forward_custom_op for why the call is wrapped and why the
+        # decode flag comes from isinstance rather than plan.is_decode.
+        _jit_compress_norm_rope_store_custom_op(
             kv,
             plan[1],
             norm_weight,
@@ -487,6 +561,9 @@ def compress_norm_rope_store(
             freq_cis,
             out_loc,
             kvcache,
-            plan.is_decode,
+            isinstance(plan, CompressorDecodePlan),
             plan.compress_ratio,
+            page_size,
+            use_fp4,
+            bf16_store,
         )
