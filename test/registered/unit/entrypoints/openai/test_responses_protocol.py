@@ -377,6 +377,43 @@ class InputItemStringIdTestCase(CustomTestCase):
         )
 
 
+class ToolOutputImageDetailTestCase(CustomTestCase):
+    """input_image.detail is required by the SDK types but omitted by clients
+    such as Codex, so it is defaulted for tool-output parts too."""
+
+    def test_detail_defaulted_under_output_as_well_as_content(self):
+        norm = ResponsesRequest._normalize_input_item_for_validation
+        item = norm(
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": [
+                    {"type": "input_image", "image_url": "data:image/png;base64,iVB"}
+                ],
+            }
+        )
+        self.assertEqual(item["output"][0]["detail"], "auto")
+
+    def test_request_accepts_image_tool_output_without_detail(self):
+        # Construction must not raise (the bug returned 400).
+        ResponsesRequest(
+            model="x",
+            store=False,
+            input=[
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": [
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,iVB",
+                        }
+                    ],
+                }
+            ],
+        )
+
+
 class ToolChoiceObjectFormTestCase(CustomTestCase):
     def test_echoed_choice_is_what_the_server_honors(self):
         import openai.types.responses as ort

@@ -80,6 +80,7 @@ from sglang.srt.entrypoints.openai.utils import (
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.environ import envs
+from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
@@ -269,6 +270,14 @@ class OpenAIServingChat(OpenAIServingBase):
         self.default_chat_template_kwargs = (
             self.tokenizer_manager.server_args.default_chat_template_kwargs or {}
         )
+        # Detector used only to clean text, so it needs no tools.
+        self._artifact_detector: Optional[BaseFormatDetector] = None
+        if self.tool_call_parser in FunctionCallParser.ToolCallParserEnum:
+            self._artifact_detector = FunctionCallParser(
+                [],
+                self.tool_call_parser,
+                tokenizer=self.tokenizer_manager.tokenizer,
+            ).detector
         self._reasoning_detector = None
         if self.reasoning_parser:
             try:
@@ -2165,6 +2174,19 @@ class OpenAIServingChat(OpenAIServingBase):
             choice_meta_info = (
                 ret_item["meta_info"] if request.return_meta_info else None
             )
+            stripped_text = self._strip_template_artifacts(
+                text, reasoning_separated=reasoning_text is not None
+            )
+            if choice_logprobs is not None and stripped_text != text:
+                logger.debug(
+                    "Dropping chat logprobs because template artifacts were "
+                    "stripped from the response text"
+                )
+                choice_logprobs = None
+            text = stripped_text
+            if reasoning_text:
+                reasoning_text = self._strip_template_markers(reasoning_text)
+
             # NOTE: content should not be None but empty string to make sure retokenize consistency.
             reasoning_text, tool_calls = self._get_parsed_response_fields(
                 reasoning_text, tool_calls
@@ -2297,6 +2319,21 @@ class OpenAIServingChat(OpenAIServingBase):
             f"Process tool call idx, parser: {self.tool_call_parser}, tool_call_id: {tool_call_id}, history_cnt: {history_tool_calls_cnt}"
         )
         return tool_call_id
+
+    def _strip_template_artifacts(
+        self, text: str, reasoning_separated: bool = False
+    ) -> str:
+        """Keep chat-template syntax no parser consumed out of assistant text."""
+        if self._artifact_detector is None:
+            return text
+        return self._artifact_detector.strip_template_artifacts(
+            text, reasoning_separated=reasoning_separated
+        )
+
+    def _strip_template_markers(self, text: str) -> str:
+        if self._artifact_detector is None:
+            return text
+        return self._artifact_detector.strip_template_markers(text)
 
     def _process_tool_calls(
         self,

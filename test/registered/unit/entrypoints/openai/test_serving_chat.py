@@ -37,6 +37,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     normalize_tool_content,
 )
 from sglang.srt.environ import envs
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.jinja_template_utils import (
@@ -1976,6 +1977,40 @@ class ServingChatTestCase(unittest.TestCase):
                 self.assertEqual(remaining, "")
                 self.assertEqual(finish_reason["type"], "stop")
                 self.assertIn("no complete call", "\n".join(logs.output))
+
+    def test_unparsed_template_syntax_never_reaches_the_client(self):
+        """K3 emits its tool channel as literal text, so a reply generated with
+        parsing off (no tools / tool_choice="none") used to be returned raw."""
+        self.chat.tool_call_parser = "kimi_k3"
+        self.chat._artifact_detector = FunctionCallParser([], "kimi_k3").detector
+        leaked = (
+            "on it"
+            + TOOLS_OPEN
+            + '<|open|>call tool="get_weather" index="1"<|sep|>'
+            + TOOLS_CLOSE
+        )
+        for label, text in (("unparsed tools", leaked), ("truncated", "on it<|open")):
+            with self.subTest(payload=label):
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi?"}],
+                    tool_choice="none",
+                )
+                ret = [
+                    {
+                        "text": text,
+                        "meta_info": {
+                            "id": "chatcmpl-leak",
+                            "prompt_tokens": 3,
+                            "completion_tokens": 5,
+                            "cached_tokens": 0,
+                            "finish_reason": {"type": "stop", "matched": None},
+                            "weight_version": "default",
+                        },
+                    }
+                ]
+                response = self.chat._build_chat_response(req, ret, created=123)
+                self.assertEqual(response.choices[0].message.content, "on it")
 
     def test_required_tool_choice_json_fallback_tolerates_odd_shapes(self):
         """Parsers without a structural tag keep the JSON array fallback, but a
