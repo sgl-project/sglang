@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
@@ -54,6 +55,9 @@ if TYPE_CHECKING:
         UnifiedRadixCache,
         UnifiedTreeNode,
     )
+
+
+logger = logging.getLogger(__name__)
 
 
 class MambaComponent(TreeComponent):
@@ -526,6 +530,30 @@ class MambaComponent(TreeComponent):
         else:
             self.cache.req_to_token_pool.mamba_allocator.free(mamba_value)
 
+    def _select_finished_checkpoint(
+        self, req: Req, token_ids_len: int
+    ) -> Optional[tuple[int, int]]:
+        # None means donate nothing, not "no slot found".
+        pool = self.cache.req_to_token_pool
+        keep_idx = pool.get_mamba_ping_pong_keep_idx(req)
+        cache_len = req.kv.mamba_last_track_seqlen or 0
+
+        if req.kv_key_capped_at_prompt:
+            return cache_len, keep_idx
+        if cache_len <= token_ids_len:
+            return cache_len, keep_idx
+
+        # Overshoot: the latest state ran past the key. The other slot always
+        # holds a tensor; only this seqlen says whether a key can name it.
+        previous_cache_len = req.kv.mamba_prev_track_seqlen
+        if (
+            pool.mamba_ping_pong_track_buffer_size != 2
+            or previous_cache_len is None
+            or previous_cache_len > token_ids_len
+        ):
+            return None
+        return previous_cache_len, pool.get_mamba_ping_pong_other_idx(keep_idx)
+
     def prepare_for_caching_req(
         self,
         req: Req,
@@ -555,9 +583,20 @@ class MambaComponent(TreeComponent):
             if cache_len is None:
                 cache_len = 0
             if self.cache.enable_mamba_extra_buffer:
-                keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_keep_idx(
-                    req
-                )
+                selected = self._select_finished_checkpoint(req, token_ids_len)
+                if selected is None:
+                    # An empty key stores nothing and frees the whole range --
+                    # the path a request that never crossed a boundary takes.
+                    logger.debug(
+                        "mamba checkpoint dropped: no slot names a state within "
+                        "the key (cache_len=%s, token_ids_len=%s, rid=%s)",
+                        req.kv.mamba_last_track_seqlen,
+                        token_ids_len,
+                        req.rid,
+                    )
+                    return 0
+                cache_len, keep_idx = selected
+                insert_params.mamba_keep_idx = keep_idx
                 active_value = (
                     req.kv.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()
                 )
@@ -630,11 +669,11 @@ class MambaComponent(TreeComponent):
                 return
 
             if self.cache.enable_mamba_extra_buffer:
-                keep_idx = (
-                    pool.get_mamba_ping_pong_keep_idx(req)
-                    if mamba_value_inserted
-                    else None
+                # Keep the slot prepare picked, so cleanup cannot pick another.
+                selected = (
+                    insert_params.mamba_keep_idx if insert_params is not None else None
                 )
+                keep_idx = selected if mamba_value_inserted else None
                 pool.free_mamba_cache(
                     req, mamba_ping_pong_track_buffer_to_keep=keep_idx
                 )

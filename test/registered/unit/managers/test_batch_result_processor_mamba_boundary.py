@@ -180,5 +180,43 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
                     self.assertTrue(cache_update.call_args.kwargs["known_boundary"])
 
 
+class TestMambaPrevTrackSeqlen(unittest.TestCase):
+    """A boundary flip must name the checkpoint it leaves in the other slot:
+    that slot always holds a tensor, so a finished insert may only fall back
+    to it while mamba_prev_track_seqlen names what is in it."""
+
+    def test_flip_names_the_slot_it_leaves(self):
+        req, batch = _make_batch()
+        processor = _make_processor()
+        result = _make_result()
+        req.kv.mamba_ping_pong_track_buffer = torch.tensor([10, 11])
+        req.kv.mamba_next_track_idx = 0
+        req.kv.mamba_last_track_idx = 1
+        batch.mamba_track_buffer_indices = None
+        batch.req_to_token_pool = SimpleNamespace(
+            get_mamba_ping_pong_other_idx=lambda idx: 1 - idx
+        )
+
+        with (
+            get_context().override_server_args(
+                mamba_radix_cache_strategy="extra_buffer",
+                mamba_track_interval=TRACK_INTERVAL,
+                _mamba_cache_chunk_size=TRACK_INTERVAL,
+            ),
+            patch.object(
+                SchedulerBatchResultProcessor,
+                "_mamba_check_track_boundary",
+                side_effect=[(True, TRACK_INTERVAL), (True, 2 * TRACK_INTERVAL)],
+            ),
+        ):
+            processor._mamba_prefix_cache_update(req, batch, result, 0)
+            # Nothing to fall back to yet: the other slot was never written.
+            self.assertIsNone(req.kv.mamba_prev_track_seqlen)
+            processor._mamba_prefix_cache_update(req, batch, result, 0)
+
+        self.assertEqual(req.kv.mamba_last_track_seqlen, 2 * TRACK_INTERVAL)
+        self.assertEqual(req.kv.mamba_prev_track_seqlen, TRACK_INTERVAL)
+
+
 if __name__ == "__main__":
     unittest.main()
