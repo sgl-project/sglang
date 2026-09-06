@@ -493,7 +493,10 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
             spec_info=spec_info,
         )
-        if not self.metadata_captured_in_graph:
+        if (
+            not self.metadata_captured_in_graph
+            and not self.attn_backend.supports_draft_extend_metadata_staging
+        ):
             self.eagle_worker.draft_extend_attn_backend_list[
                 self.step
             ].init_forward_metadata_out_graph(fb_view)
@@ -712,7 +715,46 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
     def _prepare_extra(self, forward_batch: ForwardBatch) -> None:
         """Hook for subclasses to populate extra per-call buffers (e.g. sconv)."""
 
-    def prepare(self, forward_batch: ForwardBatch):
+    def stage_shared_reads(
+        self, *, seq_lens, req_pool_indices, out_cache_loc, positions=None
+    ):
+        raw_bs = req_pool_indices.shape[0]
+        bs = self.get_runner(0)._pad_to_bucket(raw_bs, self.capture_bs)
+        buffers = self.buffers
+        buffers.seq_lens[:bs].fill_(self.seq_len_fill_value)
+        buffers.seq_lens[:raw_bs].copy_(seq_lens)
+        buffers.req_pool_indices[:bs].zero_()
+        buffers.req_pool_indices[:raw_bs].copy_(req_pool_indices)
+        num_tokens = raw_bs * self.captured_req_width
+        buffers.out_cache_loc[: bs * self.captured_req_width].zero_()
+        buffers.out_cache_loc[:num_tokens].copy_(out_cache_loc)
+        if positions is not None:
+            buffers.positions[:num_tokens].copy_(positions)
+        self._stage_metadata(bs, raw_bs)
+        self._staged_bs = bs
+
+    def _stage_metadata(self, bs: int, raw_bs: int):
+        backends = [
+            b
+            for b in self.draft_extend_attn_backend_list
+            if b.supports_draft_extend_metadata_staging
+        ]
+        if not backends:
+            return
+        buffers = self.buffers
+        buffers.req_pool_indices[raw_bs:bs].zero_()
+        batch = SimpleNamespace(
+            batch_size=bs,
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            req_pool_indices=buffers.req_pool_indices[:bs],
+            seq_lens=buffers.seq_lens[:bs],
+            extend_seq_lens=buffers.extend_seq_lens[:bs],
+            out_cache_loc=buffers.out_cache_loc[: bs * self.captured_req_width],
+        )
+        for backend in backends:
+            backend.init_forward_metadata_out_graph(batch)
+
+    def prepare(self, forward_batch: ForwardBatch, *, staged: bool = False):
         """Populate the shared buffers once from ``forward_batch`` and bucketize
         the batch size. Subsequent ``replay(step)`` calls reuse this state."""
         buffers = self.buffers
@@ -801,6 +843,10 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             seq_lens_sum = seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
         self.seq_lens_sum = seq_lens_sum
 
+        if staged:
+            assert bs == self._staged_bs
+        else:
+            self._stage_metadata(bs, raw_bs)
         self._prepare_extra(forward_batch)
 
     def replay(self, step: int):
@@ -861,10 +907,9 @@ class OneGraphMultiLayerEagleMultiStepDraftExtendCudaGraphRunner(
     forwards + the inter-step input_ids rotation in ONE graph per bucket, instead
     of one graph per step. The worker drops its per-step rotation (rotates_in_graph).
 
-    Each step's replay metadata is emitted in-graph via
-    init_forward_metadata_in_graph (no Python may run between
-    captured steps). seq_lens / req_pool_indices / extend_seq_lens are chain-constant
-    (only input_ids rotates), so per-step in-graph metadata is correct.
+    Each step refreshes metadata in-graph or stages it before replay; no Python
+    may run between captured steps. seq_lens / req_pool_indices / extend_seq_lens
+    are chain-constant (only input_ids rotates).
 
     Rejection sampling is supported by sampling X ~ q inside the graph
     (_sample_draft_proposal, selected by the draft_probs buffer's presence):
