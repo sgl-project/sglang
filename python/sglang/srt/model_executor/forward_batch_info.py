@@ -56,6 +56,7 @@ from sglang.srt.runtime_context import (
     get_lora,
     get_parallel,
 )
+from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -1739,6 +1740,26 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     logits_output.hidden_states = logits_output.hidden_states[
                         :num_tokens
                     ]
+            elif (
+                self.spec_info.spec_input_type == SpecInputType.EAGLE_DRAFT_EXTEND
+                and not self.forward_mode.is_draft_extend_v2()
+            ):
+                if self.spec_info.num_correct_drafts is not None:
+                    self.spec_info.num_correct_drafts = (
+                        self.spec_info.num_correct_drafts[:bs]
+                    )
+                if self.spec_info.num_accept_tokens is not None:
+                    self.spec_info.num_accept_tokens = self.spec_info.num_accept_tokens[
+                        :bs
+                    ]
+                if self.extend_seq_lens is not None:
+                    self.extend_seq_lens = self.extend_seq_lens[:bs]
+                if logits_output.next_token_logits is not None:
+                    logits_output.next_token_logits = logits_output.next_token_logits[
+                        :bs
+                    ]
+                if logits_output.hidden_states is not None:
+                    logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_draft_extend_v2():  # draft extend_v2
                 bs = bs * self.spec_info.num_tokens_per_req
                 if logits_output.next_token_logits is not None:
