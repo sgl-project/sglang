@@ -186,7 +186,7 @@ export const config = {
       "Run the same command on both Sparks: rank 1 first, then rank 0 (node 0 = --dist-init-addr host).",
       "Point the rendezvous and NCCL at the ConnectX-7 link, not the management NIC:",
       "  NCCL_SOCKET_IFNAME=<200GbE-nic>  GLOO_SOCKET_IFNAME=<200GbE-nic>",
-      "The image loads NCCL 2.30.7 (needed for cross-node decode CUDA graphs);",
+      "Cross-node decode CUDA graphs verified with the NCCL these images load (2.29.7 in dev-qwen38-next-local, 2.30.7 in qwen38flashnext);",
       "confirm with the startup log line 'sglang is using nccl=='.",
     ],
   },
@@ -747,7 +747,8 @@ export const config = {
     // Low latency: in-checkpoint MTP head (NEXTN 3/1/4), 24 concurrent
     // requests (120 mamba slots), 1.48M-token KV pool, MTP accept length
     // 3.5-3.7 on non-thinking output. No env is required: the image loads its
-    // pip NCCL 2.30.7 by default (verified via /proc/<pid>/maps), and the cell
+    // pip NCCL by default (2.29.7 in dev-qwen38-next-local, 2.30.7 in
+    // qwen38flashnext; verified via /proc/<pid>/maps), and the cell
     // passed the same checks without PYTORCH_CUDA_ALLOC_CONF; see the notes
     // for when expandable_segments is still worth setting.
     {
