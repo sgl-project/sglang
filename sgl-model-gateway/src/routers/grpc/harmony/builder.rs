@@ -271,15 +271,17 @@ impl HarmonyBuilder {
     }
 
     fn build_system_message_from_chat(&self, request: &ChatCompletionRequest) -> HarmonyMessage {
+        // Harmony knows only low/medium/high; outer OpenAI tiers clamp inward
+        // (mirrors smg #2410 harmony_reasoning_effort_from_str). Chat carries
+        // the tier as a free-form string, so this works without enum variants.
         let reasoning_effort = request
             .reasoning_effort
             .as_deref()
             .map(|effort| match effort {
-                "high" => ReasoningEffort::High,
+                "high" | "xhigh" | "max" => ReasoningEffort::High,
                 "medium" => ReasoningEffort::Medium,
-                "low" => ReasoningEffort::Low,
-                // Harmony does not support minimal reasoning effort
-                "minimal" => ReasoningEffort::Low,
+                "low" | "minimal" | "none" => ReasoningEffort::Low,
+                // Unknown values keep the medium default.
                 _ => ReasoningEffort::Medium,
             });
 
@@ -306,6 +308,9 @@ impl HarmonyBuilder {
                 ResponsesReasoningEffort::Medium => ReasoningEffort::Medium,
                 ResponsesReasoningEffort::Low => ReasoningEffort::Low,
                 ResponsesReasoningEffort::Minimal => ReasoningEffort::Low,
+                // TODO: clamp None→Low and Xhigh/Max→High like the Chat path once
+                // openai-protocol with smg#2410 (7-tier enum) is released. Until
+                // then none/xhigh/max are rejected at deserialization upstream.
             });
 
         self.build_system_message(reasoning_effort, with_custom_tools)
