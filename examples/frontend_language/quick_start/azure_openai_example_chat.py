@@ -1,7 +1,7 @@
 """
 Usage:
 export AZURE_OPENAI_API_KEY=sk-******
-python3 openai_example_chat.py
+python3 azure_openai_example_chat.py
 """
 
 import os
