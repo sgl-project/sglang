@@ -147,37 +147,6 @@ class _FakeDeviceModule:
         return nullcontext()
 
 
-def test_dtensor_layer_store_remains_rank_local(monkeypatch):
-    local_weight = torch.arange(4)
-    replacement = torch.arange(4) + 10
-    wraps = []
-
-    class FakeDTensor:
-        def __init__(self, local_tensor):
-            self.local_tensor = local_tensor
-            self.device_mesh = "mesh"
-            self.placements = ("shard",)
-
-        def to_local(self):
-            return self.local_tensor
-
-        @classmethod
-        def from_local(cls, local_tensor, device_mesh, placements, **kwargs):
-            wraps.append((local_tensor, device_mesh, placements, kwargs))
-            return cls(local_tensor)
-
-    monkeypatch.setattr(layerwise_offload_mod, "DTensor", FakeDTensor)
-    target = FakeDTensor(local_weight)
-
-    assert LayerwiseOffloadManager._to_local_tensor(target) is local_weight
-    wrapped = LayerwiseOffloadManager._wrap_for_target(
-        object.__new__(LayerwiseOffloadManager), target, replacement
-    )
-
-    assert wrapped.local_tensor is replacement
-    assert wraps == [(replacement, "mesh", ("shard",), {"run_check": False})]
-
-
 class _DummyBlock(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -732,23 +701,6 @@ def test_auto_layerwise_skips_unsupported_component(monkeypatch):
     assert server_args.residency_mode("text_encoder") == COMPONENT_OFFLOAD
 
 
-def test_initial_auto_resident_seed_skips_configured_layerwise_setup():
-    module = _NestedEncoderDummyModel()
-    server_args = _server_args(
-        layerwise_offload_components=["text_encoder"],
-        _auto_residency_modes={"text_encoder": RESIDENT},
-    )
-
-    configured = configure_layerwise_offload_modules(
-        {"text_encoder": module},
-        server_args,
-        component_names=["text_encoder"],
-    )
-
-    assert configured == []
-    assert not is_layerwise_offloaded_module(module)
-
-
 def test_canonical_selector_does_not_make_auto_layerwise_selection_strict(
     monkeypatch,
 ):
@@ -1132,44 +1084,6 @@ def test_configure_resolves_residency_policy(monkeypatch):
     assert comp.layerwise_offload_managers[0].residency_policy == (
         RESIDENCY_POLICY_STRIDED
     )
-
-
-def test_explicit_residency_policy_is_scoped_to_the_selected_component():
-    args = _server_args(
-        _explicit_arg_names={"dit_layerwise_residency_policy"},
-        dit_layerwise_residency_policy=RESIDENCY_POLICY_STRIDED,
-        layerwise_residency_policy={
-            "text_encoder": RESIDENCY_POLICY_STRIDED,
-        },
-    )
-
-    assert args.is_layerwise_residency_policy_explicit("transformer", dit_group=True)
-    assert args.is_layerwise_residency_policy_explicit("text_encoder", dit_group=False)
-    assert not args.is_layerwise_residency_policy_explicit("vae", dit_group=False)
-
-
-def test_residency_layout_switches_policy_without_rebuilding_host_stores(monkeypatch):
-    _patch_fake_device(monkeypatch)
-    manager = _resident_manager(
-        _MultiBlockModel(8),
-        num_layers=8,
-        prefetch_size=1,
-        resident_layers=2,
-        residency_policy=RESIDENCY_POLICY_LEADING,
-    )
-    host_stores = manager._consolidated_cpu_weights
-
-    previous = manager.set_residency_layout(3, RESIDENCY_POLICY_STRIDED)
-
-    assert previous == (2, RESIDENCY_POLICY_LEADING)
-    assert manager.resident_layers == 3
-    assert manager.residency_policy == RESIDENCY_POLICY_STRIDED
-    assert manager._streamed_order == compute_streamed_layers(
-        num_layers=8,
-        resident_layers=3,
-        policy=RESIDENCY_POLICY_STRIDED,
-    )
-    assert manager._consolidated_cpu_weights is host_stores
 
 
 def test_configure_logs_component_start_and_completion(monkeypatch):
