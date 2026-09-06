@@ -30,6 +30,7 @@ from sglang.srt.arg_groups.validation_hook import check_load_publish_args
 from sglang.srt.entrypoints import http_server
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.mem_cache.hicache_info import HiCacheInfo
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -59,6 +60,7 @@ def _call_server_info_with(
     server_args: ServerArgs,
     internal_states: list[dict] | None = None,
     config_updates: dict | None = None,
+    scheduler_info: dict | None = None,
 ) -> dict:
     """Invoke `http_server.server_info()` against a stub global state.
 
@@ -81,7 +83,9 @@ def _call_server_info_with(
     tokenizer_manager = _stub_tokenizer_manager(server_args, _fake_internal_state)
     stub_state = SimpleNamespace(
         tokenizer_manager=tokenizer_manager,
-        scheduler_info={"max_req_input_len": 1024},
+        scheduler_info=(
+            {"max_req_input_len": 1024} if scheduler_info is None else scheduler_info
+        ),
     )
     prior_state = http_server.get_global_state()
     http_server.set_global_state(stub_state)
@@ -434,6 +438,20 @@ class TestServerInfoControlPlaneUpdates(CustomTestCase):
             self.assertEqual(overlaid["weight_version"], "v2")
         finally:
             reset_context()
+
+
+class TestServerInfoHiCacheField(CustomTestCase):
+    def test_hicache_dataclass_is_exposed_as_json_object(self):
+        info = _call_server_info_with(
+            ServerArgs(model_path="dummy"),
+            scheduler_info={
+                "max_req_input_len": 1024,
+                "hicache": HiCacheInfo(host_total_tokens=8192),
+            },
+        )
+
+        self.assertEqual(info["hicache"], {"host_total_tokens": 8192})
+        json.dumps(info)
 
 
 class TestServerInfoExistingFieldsPreserved(CustomTestCase):

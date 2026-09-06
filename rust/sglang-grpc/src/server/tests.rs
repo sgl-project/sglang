@@ -1,8 +1,8 @@
 use super::{
-    DEFAULT_GRPC_MAX_MESSAGE_SIZE, openai_status_code, resolve_max_message_size,
-    terminal_error_status,
+    DEFAULT_GRPC_MAX_MESSAGE_SIZE, build_server_info_response, openai_status_code,
+    resolve_max_message_size, terminal_error_status,
 };
-use crate::bridge::TerminalError;
+use crate::bridge::{ServerInfo, TerminalError};
 use std::collections::HashMap;
 use tonic::Code;
 
@@ -36,6 +36,21 @@ fn terminal_error_status_maps_abort_to_cancelled() {
     });
 
     assert_eq!(status.code(), Code::Cancelled);
+}
+
+#[test]
+fn server_info_maps_optional_hicache_capacity() {
+    let response = build_server_info_response(ServerInfo {
+        json_info: r#"{"hicache":{"host_total_tokens":8192}}"#.to_string(),
+        hicache_host_total_tokens: Some(8192),
+    });
+    assert_eq!(response.hicache.unwrap().host_total_tokens, 8192);
+
+    let response = build_server_info_response(ServerInfo {
+        json_info: "{}".to_string(),
+        hicache_host_total_tokens: None,
+    });
+    assert!(response.hicache.is_none());
 }
 
 // SAFETY: env vars are process-global; bundle all SGLANG_TONIC_PAYLOAD cases into one

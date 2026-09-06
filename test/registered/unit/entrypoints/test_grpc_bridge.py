@@ -1,9 +1,12 @@
 import asyncio
 import enum
+import json
 import unittest
 from types import SimpleNamespace
 
 from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
+from sglang.srt.mem_cache.hicache_info import HiCacheInfo
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -109,6 +112,22 @@ class TestNativeGrpcParallelResponses(CustomTestCase):
             [[1], [2], [3]],
         )
         self.assertEqual([call[1] for call in callback.calls], [False, False, True])
+
+
+class TestGrpcServerInfo(CustomTestCase):
+    def test_returns_hicache_in_json_and_typed_bridge_value(self):
+        handle = RuntimeHandle.__new__(RuntimeHandle)
+        handle.tokenizer_manager = SimpleNamespace(
+            server_args=ServerArgs(model_path="dummy")
+        )
+        handle.scheduler_info = {
+            "hicache": HiCacheInfo(host_total_tokens=8192),
+        }
+
+        json_info, host_total_tokens = handle.get_server_info()
+
+        self.assertEqual(host_total_tokens, 8192)
+        self.assertEqual(json.loads(json_info)["hicache"], {"host_total_tokens": 8192})
 
 
 if __name__ == "__main__":

@@ -284,6 +284,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
     retraction_discard,
 )
+from sglang.srt.mem_cache.hicache_info import get_hicache_info
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -1833,6 +1834,9 @@ class Scheduler(
             "max_req_input_len": self.max_req_input_len,
             "startup_time": self.startup_time,
         }
+
+        if self.enable_hierarchical_cache:
+            result_dict["hicache"] = get_hicache_info(self.tree_cache)
 
         return result_dict
 
