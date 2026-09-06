@@ -145,6 +145,58 @@ class TestLocalAttentionMetadataBuilder(CustomTestCase):
             md.local_block_table.data_ptr(), bufs["local_block_table"].data_ptr()
         )
 
+    def _paged_builder(self, swa_translate):
+        # chunk 32 / page 16: two pages per local block.
+        return LocalAttentionMetadataBuilder(
+            attention_chunk_size=32,
+            page_size=16,
+            max_context_len=64,
+            device=CPU,
+            swa_translate=swa_translate,
+        )
+
+    def test_replay_reads_page_ids_from_swa_page_table(self):
+        """Regression: with page_size > 1 the CUDA-graph replay must not push the
+        page-granular table through the token-slot full->swa mapping."""
+        # Any translation applied to page ids would land far outside {7, 8}.
+        b = self._paged_builder(swa_translate=lambda t: t * 1000)
+        bufs = b.alloc_cuda_graph_buffers(max_bs=2)
+        metadata = SimpleNamespace(
+            cache_seqlens_int32=torch.tensor([6, 9], dtype=torch.int32),
+            page_table=torch.tensor([[3], [5]], dtype=torch.int32),
+            swa_page_table=torch.tensor([[7], [8]], dtype=torch.int32),
+            local_attn_metadata=LocalAttentionMetadata(),
+        )
+        b.update_for_replay(metadata, 2, buffers=bufs)
+        table = bufs["local_block_table"][:2]
+        self.assertEqual(table[:, 0].tolist(), [7, 8])
+        self.assertTrue(set(table.flatten().tolist()) <= {0, 7, 8})
+
+    def test_replay_without_swa_pool_reads_page_table(self):
+        b = self._paged_builder(swa_translate=None)
+        bufs = b.alloc_cuda_graph_buffers(max_bs=2)
+        metadata = SimpleNamespace(
+            cache_seqlens_int32=torch.tensor([6, 9], dtype=torch.int32),
+            page_table=torch.tensor([[3], [5]], dtype=torch.int32),
+            local_attn_metadata=LocalAttentionMetadata(),
+        )
+        b.update_for_replay(metadata, 2, buffers=bufs)
+        self.assertEqual(bufs["local_block_table"][:2, 0].tolist(), [3, 5])
+
+    def test_capture_and_replay_share_the_table_source(self):
+        b = self._paged_builder(swa_translate=lambda t: t * 1000)
+        bufs = b.alloc_cuda_graph_buffers(max_bs=2)
+        metadata = SimpleNamespace(
+            cu_seqlens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
+            cache_seqlens_int32=torch.tensor([6, 9], dtype=torch.int32),
+            page_table=torch.tensor([[3], [5]], dtype=torch.int32),
+            swa_page_table=torch.tensor([[7], [8]], dtype=torch.int32),
+        )
+        md = b.build_for_capture(metadata, 2, buffers=bufs)
+        self.assertEqual(
+            tuple(md.local_block_table.shape), (2, 2)
+        )  # 2 reqs x 2 pages per block
+
     def test_replay_refills_buffers_in_place_and_zeroes_the_tail(self):
         b = self._builder()
         bufs = b.alloc_cuda_graph_buffers(max_bs=2)
