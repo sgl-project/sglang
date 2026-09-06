@@ -40,7 +40,7 @@ sglang generate \
 
 ### 3.2 Recommended Resolutions
 
-SenseNova-U1 was trained around the 2K-pixel resolution tier. Although the pipeline supports arbitrary `--width` and `--height` values, generation quality may degrade for untrained size combinations.
+SenseNova-U1 was trained around the 2K-pixel resolution tier. The SGLang pipeline only supports positive `--width` and `--height` values that are divisible by 32, and generation quality may degrade for untrained size combinations.
 
 Recommended resolution tiers:
 

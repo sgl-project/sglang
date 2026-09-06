@@ -359,12 +359,87 @@ def test_sensenova_u1_rejects_multi_gpu_during_arg_validation():
         )
 
 
+def test_sensenova_u1_clears_auto_tuned_runtime_defaults():
+    config = SenseNovaU1PipelineConfig()
+    args = SimpleNamespace(
+        num_gpus=1,
+        enable_torch_compile=False,
+        lora_path=None,
+        component_residency={"transformer": "layerwise-offload"},
+        cpu_offload_components=["transformer"],
+        dit_cpu_offload=True,
+        text_encoder_cpu_offload=True,
+        image_encoder_cpu_offload=True,
+        vae_cpu_offload=True,
+        dit_layerwise_offload=True,
+        layerwise_offload_components=["transformer"],
+        quantization=None,
+        quantization_ignored_layers=None,
+        transformer_weights_path=None,
+        component_quantizations={},
+        component_quantization_ignored_layers={},
+        component_precisions={},
+        attention_backend="aiter",
+        component_attention_backends={"text_encoder": "torch_sdpa"},
+        attention_backend_config={"foo": "bar"},
+        is_arg_explicitly_set=lambda _name: False,
+    )
+
+    config.validate_server_args(args)
+
+    assert args.component_residency is None
+    assert args.cpu_offload_components is None
+    assert args.dit_cpu_offload is False
+    assert args.text_encoder_cpu_offload is False
+    assert args.image_encoder_cpu_offload is False
+    assert args.vae_cpu_offload is False
+    assert args.dit_layerwise_offload is False
+    assert args.layerwise_offload_components is None
+    assert args.attention_backend is None
+    assert args.component_attention_backends == {}
+    assert args.attention_backend_config is None
+
+
+def test_sensenova_u1_allows_explicit_resident_component_residency():
+    config = SenseNovaU1PipelineConfig()
+    args = SimpleNamespace(
+        num_gpus=1,
+        enable_torch_compile=False,
+        lora_path=None,
+        component_residency={"transformer": "resident"},
+        cpu_offload_components=None,
+        dit_cpu_offload=False,
+        text_encoder_cpu_offload=False,
+        image_encoder_cpu_offload=False,
+        vae_cpu_offload=False,
+        dit_layerwise_offload=False,
+        layerwise_offload_components=None,
+        quantization=None,
+        quantization_ignored_layers=None,
+        transformer_weights_path=None,
+        component_quantizations={},
+        component_quantization_ignored_layers={},
+        component_precisions={},
+        attention_backend=None,
+        component_attention_backends={},
+        attention_backend_config={},
+        is_arg_explicitly_set=lambda name: name == "component_residency",
+    )
+
+    config.validate_server_args(args)
+
+    assert args.component_residency == {"transformer": "resident"}
+
+
 @pytest.mark.parametrize(
     ("override", "expected"),
     [
         ({"enable_torch_compile": True}, "torch.compile"),
         ({"lora_path": "sensenova/SenseNova-U1.5-8B-MoT-LoRAs"}, "LoRA adapters"),
-        ({"component_residency": {"transformer": "cpu"}}, "component residency"),
+        (
+            {"component_residency": {"transformer": "component-offload"}},
+            "component residency offload",
+        ),
         ({"cpu_offload_components": ["transformer"]}, "CPU offload"),
         ({"dit_cpu_offload": True}, "DiT CPU offload"),
         ({"text_encoder_cpu_offload": True}, "text encoder CPU offload"),
@@ -373,11 +448,16 @@ def test_sensenova_u1_rejects_multi_gpu_during_arg_validation():
         ({"dit_layerwise_offload": True}, "DiT layerwise offload"),
         ({"layerwise_offload_components": ["transformer"]}, "layerwise offload"),
         ({"quantization": "fp8"}, "quantization"),
+        ({"quantization_ignored_layers": ["foo"]}, "quantization ignored layers"),
         (
             {"transformer_weights_path": "/tmp/transformer.safetensors"},
             "pre-quantized transformer weights",
         ),
         ({"component_quantizations": {"transformer": "fp8"}}, "component quantization"),
+        (
+            {"component_quantization_ignored_layers": {"transformer": ["foo"]}},
+            "component quantization ignored layers",
+        ),
         ({"component_precisions": {"transformer": "fp16"}}, "component precision"),
         ({"attention_backend": "fa"}, "custom attention backends"),
         (
@@ -402,8 +482,10 @@ def test_sensenova_u1_rejects_unsupported_runtime_modes(override, expected):
         "dit_layerwise_offload": None,
         "layerwise_offload_components": None,
         "quantization": None,
+        "quantization_ignored_layers": None,
         "transformer_weights_path": None,
         "component_quantizations": {},
+        "component_quantization_ignored_layers": {},
         "component_precisions": {},
         "attention_backend": None,
         "component_attention_backends": {},

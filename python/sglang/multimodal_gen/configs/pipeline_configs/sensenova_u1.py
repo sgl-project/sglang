@@ -20,6 +20,55 @@ def _is_runtime_option_requested(value) -> bool:
     return True
 
 
+def _is_arg_explicitly_set(server_args, option: str) -> bool:
+    is_explicit = getattr(server_args, "is_arg_explicitly_set", None)
+    if callable(is_explicit):
+        return is_explicit(option)
+    return _is_runtime_option_requested(getattr(server_args, option, None))
+
+
+def _component_residency_requests_offload(value) -> bool:
+    if not _is_runtime_option_requested(value):
+        return False
+    if isinstance(value, dict):
+        values = value.values()
+    elif isinstance(value, str):
+        values = value.split(",")
+    else:
+        values = value
+
+    for raw_value in values:
+        mode = str(raw_value).split("=", 1)[-1].strip().replace("_", "-").lower()
+        if mode in ("component-offload", "layerwise-offload"):
+            return True
+    return False
+
+
+def _set_compatible_runtime_defaults(server_args) -> None:
+    compatible_defaults = {
+        "component_residency": None,
+        "cpu_offload_components": None,
+        "dit_cpu_offload": False,
+        "text_encoder_cpu_offload": False,
+        "image_encoder_cpu_offload": False,
+        "vae_cpu_offload": False,
+        "dit_layerwise_offload": False,
+        "layerwise_offload_components": None,
+        "quantization": None,
+        "quantization_ignored_layers": None,
+        "transformer_weights_path": None,
+        "component_quantizations": {},
+        "component_quantization_ignored_layers": {},
+        "component_precisions": {},
+        "attention_backend": None,
+        "component_attention_backends": {},
+        "attention_backend_config": None,
+    }
+    for option, value in compatible_defaults.items():
+        if not _is_arg_explicitly_set(server_args, option):
+            setattr(server_args, option, value)
+
+
 @dataclass
 class SenseNovaU1PipelineConfig(PipelineConfig):
     """Native SenseNova-U1 text-to-image pipeline configuration."""
@@ -54,8 +103,17 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
                 "SenseNovaU1Pipeline does not support LoRA adapters yet. "
                 "Please omit --lora-path."
             )
+        _set_compatible_runtime_defaults(server_args)
+        if _is_arg_explicitly_set(
+            server_args, "component_residency"
+        ) and _component_residency_requests_offload(
+            getattr(server_args, "component_residency", None)
+        ):
+            raise ValueError(
+                "SenseNovaU1Pipeline does not support component residency "
+                "offload modes yet. Please omit --component-residency."
+            )
         unsupported_runtime_options = {
-            "component_residency": "component residency",
             "cpu_offload_components": "CPU offload",
             "dit_cpu_offload": "DiT CPU offload",
             "text_encoder_cpu_offload": "text encoder CPU offload",
@@ -64,27 +122,45 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
             "dit_layerwise_offload": "DiT layerwise offload",
             "layerwise_offload_components": "layerwise offload",
             "quantization": "quantization",
+            "quantization_ignored_layers": "quantization ignored layers",
             "transformer_weights_path": "pre-quantized transformer weights",
             "component_quantizations": "component quantization",
+            "component_quantization_ignored_layers": (
+                "component quantization ignored layers"
+            ),
             "component_precisions": "component precision overrides",
         }
         for option, description in unsupported_runtime_options.items():
-            if _is_runtime_option_requested(getattr(server_args, option, None)):
+            if _is_arg_explicitly_set(
+                server_args, option
+            ) and _is_runtime_option_requested(getattr(server_args, option, None)):
                 raise ValueError(
                     f"SenseNovaU1Pipeline does not support {description} yet. "
                     f"Please omit --{option.replace('_', '-')}."
                 )
-        if getattr(server_args, "attention_backend", None) is not None:
+        if _is_arg_explicitly_set(
+            server_args, "attention_backend"
+        ) and _is_runtime_option_requested(
+            getattr(server_args, "attention_backend", None)
+        ):
             raise ValueError(
                 "SenseNovaU1Pipeline does not support custom attention backends yet. "
                 "Please omit --attention-backend."
             )
-        if getattr(server_args, "component_attention_backends", None):
+        if _is_arg_explicitly_set(
+            server_args, "component_attention_backends"
+        ) and _is_runtime_option_requested(
+            getattr(server_args, "component_attention_backends", None)
+        ):
             raise ValueError(
                 "SenseNovaU1Pipeline does not support component attention backends yet. "
                 "Please omit --component-attention-backends."
             )
-        if getattr(server_args, "attention_backend_config", None):
+        if _is_arg_explicitly_set(
+            server_args, "attention_backend_config"
+        ) and _is_runtime_option_requested(
+            getattr(server_args, "attention_backend_config", None)
+        ):
             raise ValueError(
                 "SenseNovaU1Pipeline does not support attention backend config yet. "
                 "Please omit --attention-backend-config."
