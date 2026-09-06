@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
@@ -434,13 +435,13 @@ class PrefillBootstrapQueue:
         failed_reqs = []
         indices_to_remove = set()
 
-        if len(self.queue) == 0:
-            if return_failed_reqs is False:
-                return []
-            else:
-                return [], []
-
         if self.pp_size > 1:
+            if len(self.queue) == 0:
+                if return_failed_reqs is False:
+                    return []
+                else:
+                    return [], []
+
             polls = poll_and_all_reduce_pp(
                 (req.rid for req in self.queue),
                 KVPoll.WaitingForInput,
@@ -458,11 +459,70 @@ class PrefillBootstrapQueue:
                     if local_poll == KVPoll.Failed:
                         polls[i] = KVPoll.Failed
         else:
-            polls = poll_and_all_reduce_attn_cp_tp_group(
-                [req.disagg_kv_sender for req in self.queue],
-                self.scheduler.attn_cp_cpu_group,
-                self.scheduler.attn_tp_cpu_group,
-            )
+            tp_group = self.scheduler.attn_tp_cpu_group
+            cp_group = self.scheduler.attn_cp_cpu_group
+
+            need_rid_align = (
+                tp_group is not None and dist.get_world_size(tp_group) > 1
+            ) or (cp_group is not None and dist.get_world_size(cp_group) > 1)
+
+            if not need_rid_align:
+                if len(self.queue) == 0:
+                    if return_failed_reqs is False:
+                        return []
+                    else:
+                        return [], []
+                polls = poll_and_all_reduce_attn_cp_tp_group(
+                    [req.disagg_kv_sender for req in self.queue],
+                    cp_group,
+                    tp_group,
+                )
+            else:
+
+                def _empty():
+                    return [] if not return_failed_reqs else ([], [])
+
+                has_req = torch.tensor(
+                    [1 if self.queue else 0], dtype=torch.uint8, device="cpu"
+                )
+
+                for group in (tp_group, cp_group):
+                    if group is not None and dist.get_world_size(group) > 1:
+                        dist.all_reduce(has_req, op=dist.ReduceOp.MAX, group=group)
+                if int(has_req.item()) == 0:
+                    return _empty()
+
+                common_rids = [req.rid for req in self.queue]
+                for group in (tp_group, cp_group):
+                    if group is None or dist.get_world_size(group) <= 1:
+                        common_rids = sorted(set(common_rids))
+                        continue
+                    gathered = [None] * dist.get_world_size(group)
+                    dist.all_gather_object(gathered, common_rids, group=group)
+                    common_rids = sorted(
+                        set.intersection(*(set(rids or []) for rids in gathered))
+                    )
+
+                if not common_rids:
+                    return _empty()
+
+                rid_to_req = {req.rid: req for req in self.queue}
+                aligned_reqs = [
+                    rid_to_req[rid] for rid in common_rids if rid in rid_to_req
+                ]
+                if not aligned_reqs:
+                    return _empty()
+
+                aligned_polls = poll_and_all_reduce_attn_cp_tp_group(
+                    [req.disagg_kv_sender for req in aligned_reqs],
+                    cp_group,
+                    tp_group,
+                )
+
+                rid_to_poll = {
+                    req.rid: poll for req, poll in zip(aligned_reqs, aligned_polls)
+                }
+                polls = [rid_to_poll.get(req.rid) for req in self.queue]
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
             if poll is None:
