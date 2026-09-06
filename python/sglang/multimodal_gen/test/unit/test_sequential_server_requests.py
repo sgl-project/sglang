@@ -240,14 +240,18 @@ def test_perf_fixture_retains_failed_case_results(pytester, monkeypatch):
 
         from sglang.multimodal_gen.test.server.test_server_common import DiffusionServerBase
         from sglang.multimodal_gen.test.server.testcase_configs import (
-            DiffusionServerArgs, DiffusionTestCase, PerformanceSummary,
+            DiffusionSamplingParams, DiffusionServerArgs, DiffusionTestCase, PerformanceSummary,
         )
 
         class TestRequests(DiffusionServerBase):
             @pytest.mark.parametrize("case_id", ["failed", "passed"])
             def test_diffusion_generation(self, case_id):
                 assert self._perf_results == []
-                case = DiffusionTestCase(case_id, DiffusionServerArgs("test"))
+                case = DiffusionTestCase(
+                    case_id,
+                    DiffusionServerArgs("test", modality="image"),
+                    DiffusionSamplingParams(prompt="test"),
+                )
                 summary = PerformanceSummary(100, 5, 5, {}, [], {}, {})
                 for index in (1, 2):
                     self._record_performance_result(case, summary, index)
