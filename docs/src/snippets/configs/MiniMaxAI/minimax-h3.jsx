@@ -428,10 +428,10 @@ return {
           id: "dp",
           label: "Data parallel",
           flags: ["--encoder-parallel dp"],
-          disabled: (s) => (s.topology_mode === "manual"
+          disabled: (s) => CONSUMER_SINGLE.includes(s.hw) || (s.topology_mode === "manual"
             ? Number(s.tp_size)
             : config.commandBuilder.resource.autoTopology(s).tp_size) > 1,
-          disableReason: "The server rejects encoder DP with TP > 1 (encoder_parallel=dp requires tp_size=1).",
+          disableReason: "Encoder DP requires TP1 and a multi-GPU DP group; TP > 1 and the single-card consumer recipes do not qualify.",
           soft: (s) => s.nodes > 1,
           softReason: "Runs across nodes, but the measured 1.9× encode speedup comes from a single-node 2× H100 run; cross-node encoder DP is unverified.",
           description: "Useful for a real request batch; it is not bitwise-identical to fold scheduling.",
@@ -714,7 +714,7 @@ return {
         automaticAttention = "AITER (auto)";
       } else if (topology.ring_degree === 1 && ["b200", "b300"].includes(s.hw)) {
         automaticAttention = "Dynamic cuDNN / FA (auto)";
-      } else if (topology.ring_degree === 1 && s.hw === "rtx5090") {
+      } else if (topology.ring_degree === 1 && ["rtx5090", "rtx4090"].includes(s.hw)) {
         automaticAttention = "Torch SDPA (auto)";
       }
 
