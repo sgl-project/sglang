@@ -332,6 +332,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             extend_seq_lens_cpu=[1],
             extend_prefix_lens_cpu=[0],
             forward_mode=SimpleNamespace(
+                is_target_verify=lambda: False,
                 is_extend_or_draft_extend_or_mixed=lambda: True,
             ),
         )
@@ -483,6 +484,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             extend_prefix_lens_cpu=[49, 199],
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             forward_mode=SimpleNamespace(
+                is_target_verify=lambda: False,
                 is_extend_or_draft_extend_or_mixed=lambda: True,
             ),
         )
@@ -571,6 +573,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             out_cache_loc=torch.tensor([0, 1], dtype=torch.int64),
             forward_mode=SimpleNamespace(
                 is_draft_extend_v2=lambda: False,
+                is_target_verify=lambda: False,
             ),
         )
 
@@ -674,6 +677,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         forward_batch = SimpleNamespace(
             batch_size=2,
             out_cache_loc=torch.tensor([1, 2], dtype=torch.int64),
+            forward_mode=SimpleNamespace(is_target_verify=lambda: False),
         )
 
         with patch.object(
@@ -810,6 +814,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         backend.k1_kernel_stride = 16
         backend.k2_kernel_size = 128
         backend.k2_kernel_stride = 64
+        backend.speculative_num_draft_tokens = None
 
         backend.init_cuda_graph_state(max_bs=1, max_num_tokens=1)
 
@@ -1083,6 +1088,7 @@ import sglang.srt.layers.attention.minicpm.backend
     def test_mixed_prefill_compiles_fused_topk_for_sparse_batch_only(self):
         """A mixed batch must compile fused top-k for its sparse sub-batch only."""
         backend = MiniCPMSparseBackend.__new__(MiniCPMSparseBackend)
+        backend._use_cuda_graph_buffers = False
         backend.forward_metadata = SimpleNamespace(
             sparse_bs_list=[1],
             base=SimpleNamespace(
