@@ -614,7 +614,9 @@ class DiffusionServerBase:
                 f"avg_denoise={summary.avg_denoise_ms:.2f}ms, "
                 f"median_denoise={summary.median_denoise_ms:.2f}ms, "
                 f"load_peak_vram={summary.load_peak_vram_mb:.0f}MiB, "
-                f"runtime_peak_vram={summary.runtime_peak_vram_mb:.0f}MiB"
+                f"runtime_peak_vram={summary.runtime_peak_vram_mb:.0f}MiB, "
+                f"load_peak_alloc={summary.load_peak_allocated_mb:.0f}MiB, "
+                f"runtime_peak_alloc={summary.runtime_peak_allocated_mb:.0f}MiB"
             ),
         ]
         if scenario is not None:
