@@ -1549,6 +1549,39 @@ class ServingChatTestCase(unittest.TestCase):
 
                 self.chat._process_messages(req, is_multimodal=False)
 
+    def test_dsv4_tool_injection_excludes_unset_defaults(self):
+        """DSV4 receives only fields set in the request tool schema."""
+        from sglang.srt.entrypoints.openai import encoding_dsv4
+
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.chat_encoding_spec = "dsv4"
+        self.chat._dsv4_reasoning_effort_profile = "preview"
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get the weather.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
+            },
+        }
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is the weather?"}],
+            tools=[tool],
+        )
+
+        with patch.object(
+            encoding_dsv4, "encode_messages", return_value="prompt"
+        ) as mock_encode_messages:
+            self.chat._process_messages(req, is_multimodal=False)
+
+        injected_tools = mock_encode_messages.call_args.args[0][0]["tools"]
+        self.assertEqual(injected_tools, [tool])
+
     def test_stop_str_isolation_between_requests(self):
         """Test that stop strings from one request don't affect subsequent requests.
 
