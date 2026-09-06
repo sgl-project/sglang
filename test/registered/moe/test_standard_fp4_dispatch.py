@@ -47,12 +47,18 @@ register_cuda_ci(est_time=90, stage="extra-b", runner_config="4-gpu-b200")
 
 
 def _check_dispatch(
-    rank, runner, per_token, sizes, packed_routing=False, quantized=True
+    rank,
+    runner,
+    per_token,
+    sizes,
+    packed_routing=False,
+    quantized=True,
+    hidden_size=256,
 ):
     total = sum(sizes)
     start = sum(sizes[:rank])
     stop = start + sizes[rank]
-    hidden_size, num_experts = 256, 8
+    num_experts = 8
     torch.manual_seed(42)
     hidden = torch.randn(total, hidden_size, device="cuda", dtype=torch.bfloat16)
     # Different row magnitudes make an incorrectly gathered row scale visible.
@@ -257,6 +263,11 @@ def _worker(rank, world_size, port):
                     if quantization == "nvfp4_online":
                         _check_dispatch(
                             rank, runner, per_token, [0, 1, 3, 129], quantized=False
+                        )
+                        # Latent MoE width can differ from the model's DP buffer
+                        # width (256 here); combine must keep the expert width.
+                        _check_dispatch(
+                            rank, runner, per_token, [0, 1, 3, 129], hidden_size=128
                         )
                     if runner == MoeRunnerBackend.FLASHINFER_CUTEDSL:
                         with envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(True):

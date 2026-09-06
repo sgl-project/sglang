@@ -100,6 +100,11 @@ def test_standard_cutedsl_forwards_fp4_dispatch(num_tokens, per_token):
             MoeRunnerConfig(),
         )
     quantize.assert_not_called()
+    if num_tokens == 0:
+        wrapper.run.assert_not_called()
+        assert result.hidden_states.shape == (0, 32)
+        assert result.hidden_states.dtype == torch.bfloat16
+        return
     call = wrapper.run.call_args.kwargs
     assert call["x"] is hidden
     assert call["x_sf"].data_ptr() == block_scales.data_ptr()
@@ -177,16 +182,19 @@ def test_empty_topk_matches_fp4_dispatch_routing(
 
 @pytest.mark.parametrize("routed", [False, True])
 @pytest.mark.parametrize("per_token", [False, True])
-@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float16])
-def test_standard_trtllm_forwards_fp4_dispatch(routed, per_token, output_dtype):
+@pytest.mark.parametrize("params_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("tokens", [0, 3])
+def test_standard_trtllm_forwards_fp4_dispatch(routed, per_token, params_dtype, tokens):
     import sglang.srt.layers.moe.moe_runner.flashinfer_trtllm as trtllm_runner
 
-    hidden = torch.empty(3, 16, dtype=torch.uint8)
-    block_scales = torch.empty(3, 2, dtype=torch.uint8)
-    token_scales = torch.ones(3, dtype=torch.float32) if per_token else None
-    router_logits = torch.empty(3, 2, dtype=torch.float32)
+    hidden = torch.empty(tokens, 16, dtype=torch.uint8)
+    block_scales = torch.empty(tokens, 2, dtype=torch.uint8)
+    token_scales = torch.ones(tokens, dtype=torch.float32) if per_token else None
+    router_logits = torch.empty(tokens, 2, dtype=torch.float32)
     topk = (
-        StandardTopKOutput(torch.ones(3, 1), torch.zeros(3, 1, dtype=torch.int32), None)
+        StandardTopKOutput(
+            torch.ones(tokens, 1), torch.zeros(tokens, 1, dtype=torch.int32), None
+        )
         if routed
         else BypassedTopKOutput(hidden, router_logits, TopKConfig(top_k=1))
     )
@@ -211,7 +219,7 @@ def test_standard_trtllm_forwards_fp4_dispatch(routed, per_token, output_dtype):
     )
     raw_kernel = Mock(side_effect=lambda **kwargs: [kwargs["output"]])
     routed_kernel = Mock(side_effect=lambda **kwargs: [kwargs["output"]])
-    packed_topk = torch.zeros(3, 1, dtype=torch.int32)
+    packed_topk = torch.zeros(tokens, 1, dtype=torch.int32)
     with (
         patch.dict(
             sys.modules,
@@ -241,10 +249,17 @@ def test_standard_trtllm_forwards_fp4_dispatch(routed, per_token, output_dtype):
         result = trtllm_runner.fused_experts_none_to_flashinfer_trtllm_fp4(
             dispatch,
             quant_info,
-            MoeRunnerConfig(params_dtype=output_dtype),
+            MoeRunnerConfig(params_dtype=params_dtype),
             use_routed_topk=routed,
         )
     quantize.assert_not_called()
+    assert result.hidden_states.shape == (tokens, 32)
+    assert result.hidden_states.dtype == torch.bfloat16
+    if tokens == 0:
+        raw_kernel.assert_not_called()
+        routed_kernel.assert_not_called()
+        pack_topk.assert_not_called()
+        return
     selected, other = (
         (routed_kernel, raw_kernel) if routed else (raw_kernel, routed_kernel)
     )
@@ -253,11 +268,9 @@ def test_standard_trtllm_forwards_fp4_dispatch(routed, per_token, output_dtype):
     call = selected.call_args.kwargs
     assert call["hidden_states"] is hidden
     assert call["hidden_states_scale"].data_ptr() == block_scales.data_ptr()
-    assert call["hidden_states_scale"].shape == (3, 2)
+    assert call["hidden_states_scale"].shape == (tokens, 2)
     assert call["hidden_states_scale"].dtype == torch.float8_e4m3fn
     assert call["per_token_scale"] is token_scales
-    assert result.hidden_states.shape == (3, 32)
-    assert result.hidden_states.dtype == output_dtype
     if routed:
         pack_topk.assert_called_once_with(topk)
         assert call["topk_ids"] is packed_topk

@@ -12,7 +12,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
-    get_local_dp_buffer,
+    get_local_dp_buffer_len,
     is_allocation_symmetric,
     is_dp_max_padding,
     mask_dp_pad_moe_topk_ids,
@@ -319,11 +319,14 @@ class StandardDispatcher(BaseDispatcher):
     def combine(self, combine_input: StandardCombineInput) -> torch.Tensor:
         (hidden_states,) = combine_input
         if should_use_flashinfer_moe_fp4_allgather():
-            hidden_states, global_hidden_states = (
-                get_local_dp_buffer(get_tp_group()),
-                hidden_states,
-            )
-            get_tp_group().reduce_scatterv(
+            global_hidden_states = hidden_states
+            group = get_tp_group()
+            # Latent MoE outputs can be narrower than the model's DP buffer.
+            with use_symmetric_memory(group, disabled=not is_dp_max_padding()):
+                hidden_states = global_hidden_states.new_empty(
+                    (get_local_dp_buffer_len(), *global_hidden_states.shape[1:])
+                )
+            group.reduce_scatterv(
                 global_hidden_states,
                 output=hidden_states,
                 sizes=get_dp_global_num_tokens(),
