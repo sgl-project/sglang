@@ -17,7 +17,7 @@
 // a single Spark serves it with the table file-backed on the local NVMe (the
 // "On (NVMe file)" PLE Offload chip). NVFP4 also runs on one 96 GB
 // RTX PRO 6000 Blackwell (SM120) once the 47.7 GiB FP8 N-gram table is offloaded
-// to pinned host memory (--ple-offload-embedding), leaving ~81 GiB of weights on
+// to pinned host memory (--ple-offload-embedding), leaving the other 78 GiB of the checkpoint on
 // the card.
 //
 // A hardware x quantization x strategy combination with no launch recipe has no
@@ -90,7 +90,7 @@ export const config = {
       // usable option in each case.
       //
       // RTX PRO 6000 is the opposite case: on a 96 GB discrete card the FP8
-      // N-gram table (47.7 GiB) has to leave the GPU for the remaining ~81 GiB
+      // N-gram table (47.7 GiB) has to leave the GPU for the remaining 78 GiB
       // of weights plus the pools to fit, so Auto and Off are greyed out and On
       // is the only pick — the forced chip appends --ple-offload-embedding, so
       // the cells do not list it themselves.
@@ -111,7 +111,7 @@ export const config = {
           disabled: (sel) => sel.hw === "rtx6000" || (sel.hw === "dgx-spark" && sel.nodes === "single"),
           disableReason: (sel) => sel.hw === "dgx-spark"
             ? "A single DGX Spark cannot hold the 126 GiB checkpoint in its 128 GB of unified memory; the verified single-Spark cells keep the 47.7 GiB FP8 N-gram table in a file on the local NVMe (On (NVMe file))."
-            : "RTX PRO 6000 (96 GB) cannot hold the 47.7 GiB FP8 N-gram table alongside the ~81 GiB of NVFP4 weights; the table must be offloaded to pinned host RAM (On).",
+            : "RTX PRO 6000 (96 GB) cannot hold the 47.7 GiB FP8 N-gram table alongside the other 78 GiB of the checkpoint; the table must be offloaded to pinned host RAM (On).",
           flags: ["--no-ple-offload-embedding"] },
         // File-backed table (sgl-project/sglang#37068, merged into qwen4-main-squashed):
         // a sparse 47.7 GiB file under $SGLANG_CACHE_DIR/ple/<model> (override
@@ -807,8 +807,13 @@ export const config = {
     // A single 96 GB workstation card holds the NVFP4 checkpoint only with the
     // 47.7 GiB FP8 N-gram table offloaded to pinned host memory: the PLE Offload
     // row is forced to On on this hardware (see overlayDims), which appends
-    // --ple-offload-embedding, and the boot then leaves ~81 GiB of weights
-    // resident with ~19 GiB (no MTP) / ~12 GiB (with MTP) for the pools.
+    // --ple-offload-embedding. The load log reports an 81 GiB delta (loader
+    // temporaries included); once those are collected, 74.7 GiB stays resident
+    // without speculative decoding and 81.8 GiB with it (the draft head is
+    // 0.5 GiB, the rest is memory the loader still holds), leaving 19.4 / 12.3
+    // GiB of the 94.2 GiB the process can use. --mem-fraction-static keeps
+    // (1 - fraction) x 94.2 GiB of that as runtime slack and the pools take the
+    // rest: 6.6 GiB slack + 12.8 GiB of pools at 0.93, 3.8 + 8.3 GiB at 0.96.
     // The host needs >= 64 GB of free RAM for the locked table and Docker
     // needs --ulimit memlock=-1.
     //

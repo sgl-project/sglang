@@ -189,7 +189,8 @@ export const benchmarks = [
   // (qwen4-main-squashed 9b2aee2283), 2026-09-06: all four cells run as the
   // command generator emits them. Same chat-API GSM8K protocol as the DGX
   // Spark rows (thinking off, n=200) and the same 1024/256 bench workload;
-  // tokens_per_sec_per_gpu is the server's output throughput (one GPU).
+  // tokens_per_sec_per_gpu is (input + output) tok/s on the one GPU; output alone
+  // is one fifth of it (1024 in / 256 out, range ratio 1, ignore_eos).
   // AIME26 and MMMU-Pro not run. The RDXA cells first passed on the
   // qwen38flashnext image (593134d17a) on 2026-09-05 at 97.0-97.5 / 97.0-98.0.
   {
@@ -198,9 +199,9 @@ export const benchmarks = [
     accuracy: { gsm8k_pct: 97.0 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
-        ttft_ms: 235.23, tpot_ms: 6.21, tokens_per_sec_per_gpu: 141 },
+        ttft_ms: 235.23, tpot_ms: 6.21, tokens_per_sec_per_gpu: 705 },
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 16 },
-        ttft_ms: 1007.94, tpot_ms: 19.54, tokens_per_sec_per_gpu: 613 },
+        ttft_ms: 1007.94, tpot_ms: 19.54, tokens_per_sec_per_gpu: 3065 },
     ],
   },
   {
@@ -209,11 +210,11 @@ export const benchmarks = [
     accuracy: { gsm8k_pct: 97.0 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
-        ttft_ms: 162.25, tpot_ms: 11.49, tokens_per_sec_per_gpu: 83 },
+        ttft_ms: 162.25, tpot_ms: 11.49, tokens_per_sec_per_gpu: 415 },
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 16 },
-        ttft_ms: 1327.21, tpot_ms: 25.11, tokens_per_sec_per_gpu: 529 },
+        ttft_ms: 1327.21, tpot_ms: 25.11, tokens_per_sec_per_gpu: 2645 },
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 64 },
-        ttft_ms: 3212.36, tpot_ms: 54.93, tokens_per_sec_per_gpu: 885 },
+        ttft_ms: 3212.36, tpot_ms: 54.93, tokens_per_sec_per_gpu: 4425 },
     ],
   },
   // nvidia/Qwen3.8-Flash-Next-NVFP4 on the same card and image; second GSM8K
@@ -224,9 +225,9 @@ export const benchmarks = [
     accuracy: { gsm8k_pct: 97.5 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
-        ttft_ms: 225.43, tpot_ms: 5.86, tokens_per_sec_per_gpu: 149 },
+        ttft_ms: 225.43, tpot_ms: 5.86, tokens_per_sec_per_gpu: 745 },
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 16 },
-        ttft_ms: 1032.11, tpot_ms: 18.74, tokens_per_sec_per_gpu: 634 },
+        ttft_ms: 1032.11, tpot_ms: 18.74, tokens_per_sec_per_gpu: 3170 },
     ],
   },
   {
@@ -235,11 +236,11 @@ export const benchmarks = [
     accuracy: { gsm8k_pct: 96.5 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
-        ttft_ms: 158.37, tpot_ms: 11.54, tokens_per_sec_per_gpu: 83 },
+        ttft_ms: 158.37, tpot_ms: 11.54, tokens_per_sec_per_gpu: 415 },
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 16 },
-        ttft_ms: 1184.19, tpot_ms: 25.12, tokens_per_sec_per_gpu: 539 },
+        ttft_ms: 1184.19, tpot_ms: 25.12, tokens_per_sec_per_gpu: 2695 },
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 64 },
-        ttft_ms: 3314.12, tpot_ms: 55.67, tokens_per_sec_per_gpu: 871 },
+        ttft_ms: 3314.12, tpot_ms: 55.67, tokens_per_sec_per_gpu: 4355 },
     ],
   },
   { match: { hw: "mi350x", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
