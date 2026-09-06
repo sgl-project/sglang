@@ -66,8 +66,10 @@ export const benchmarks = [
   { match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" } },
   { match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" } },
   // 2x DGX Spark, TP=2, lmsysorg/sglang:qwen38flashnext (SGLang 593134d17a),
-  // 2026-09-04. Accuracy (GSM8K, full 1,319-question set) is being run and
-  // will be added; AIME26 and MMMU-Pro not run.
+  // 2026-09-04. GSM8K is the full 1,319-question set via the chat API (thinking
+  // off, greedy, 8192 max tokens) on lmsysorg/sglang:dev-qwen38-next-local
+  // (9b2aee2283), 2026-09-06; rows without it are still being run. AIME26 and
+  // MMMU-Pro not run.
   {
     match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2" },
     sglang_version: "qwen38flashnext image @ 593134d17a",
@@ -83,6 +85,7 @@ export const benchmarks = [
   {
     match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "multi-2" },
     sglang_version: "qwen38flashnext image @ 593134d17a",
+    accuracy: { gsm8k_pct: 97.0 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 416.42, tpot_ms: 39.33, tokens_per_sec_per_gpu: 60 },
