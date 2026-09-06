@@ -95,7 +95,6 @@ from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
 from torch.utils._contextlib import _DecoratorContextManager
-from torchvision.io import decode_jpeg
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
@@ -1891,6 +1890,12 @@ def _load_image(
 
                 return decode_jpeg_with_fancy_upsampling(image_bytes)
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
+            # Lazy import: torchvision pulls in torch._dynamo and the full
+            # torchvision.models tree, which is expensive on the import path
+            # of `sglang.srt.managers.scheduler` and only needed for
+            # CUDA JPEG decoding here.
+            from torchvision.io import decode_jpeg
+
             image_tensor = decode_jpeg(encoded_image, device="cuda")
             return image_tensor
         except Exception as e:

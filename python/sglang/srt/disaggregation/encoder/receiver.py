@@ -17,12 +17,9 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import aiohttp
 import numpy as np
 import torch
-import uvicorn
 import zmq
 import zmq.asyncio
 from aiohttp import ClientSession, ClientTimeout
-from fastapi import FastAPI
-from fastapi.responses import ORJSONResponse, Response
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed.parallel_state import (
@@ -63,6 +60,8 @@ from sglang.srt.utils.network import (
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    import uvicorn
+
     from sglang.srt.managers.scheduler import Scheduler
 
 
@@ -150,6 +149,12 @@ class EncoderBootstrapServer:
         self._health_fail_threshold = 3
         self._health_fail_counts: Dict[str, int] = {}
         self._evicted_urls: Dict[str, float] = {}
+
+        # Lazy import: FastAPI/uvicorn are only needed once this bootstrap
+        # server actually starts, and importing them here keeps fastapi off
+        # the scheduler import path (this module is imported by the scheduler).
+        from fastapi import FastAPI
+        from fastapi.responses import ORJSONResponse, Response
 
         @asynccontextmanager
         async def lifespan(fast_api_app: FastAPI):
@@ -330,6 +335,7 @@ class EncoderBootstrapServer:
     # Lifecycle                                                          #
     # ------------------------------------------------------------------ #
     def _run_server(self):
+        import uvicorn
 
         config = uvicorn.Config(
             self.app,
