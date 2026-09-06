@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolGroup,
     resolve_hybrid_device_pool_group,
 )
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -203,11 +204,21 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             None,
             state_pool(),
         ]
+        draft_swa_buffers = [
+            torch.zeros((8, 13), dtype=torch.uint8),
+            torch.zeros((8, 17), dtype=torch.uint8),
+        ]
 
         group = resolve_hybrid_device_pool_group(
             kvcache=kvcache,
             page_size=2,
-            params=SimpleNamespace(),
+            params=SimpleNamespace(
+                mtp_draft_device_pools=(
+                    SimpleNamespace(
+                        swa_kv_pool=SimpleNamespace(kv_buffer=draft_swa_buffers)
+                    ),
+                )
+            ),
             components={ComponentType.FULL, ComponentType.SWA},
         )
 
@@ -236,27 +247,37 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(offsets, [[5]])
         self.assertIsNone(c4_pool.get_prepared_layer_range_meta([0], 1))
 
+        swa_pool = group.entry_map[PoolName.SWA]
+        _, sizes, offsets = swa_pool.get_prepared_layer_range_meta([0], 0)
+        self.assertEqual(sizes, [[3, 13]])
+        self.assertEqual(offsets, [[0, 9]])
+        _, sizes, offsets = swa_pool.get_prepared_layer_range_meta([0], 1)
+        self.assertEqual(sizes, [[3, 17]])
+        self.assertEqual(offsets, [[3, 22]])
+
     def test_dsa_uses_hybrid_assembler_strategy(self):
         from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
-        kvcache = DSATokenToKVPool.__new__(DSATokenToKVPool)
-        kvcache.page_size = 2
+        def dsa_pool(kv_width, index_width, *, index_rows=4):
+            pool = DSATokenToKVPool.__new__(DSATokenToKVPool)
+            pool.page_size = 2
+            pool.layer_num = 1
+            pool.kv_buffer = [torch.zeros((8, kv_width), dtype=torch.uint8)]
+            pool.index_key_cache = SimpleNamespace(
+                buffer=[torch.zeros((index_rows, index_width), dtype=torch.uint8)]
+            )
+            return pool
+
+        kvcache = dsa_pool(3, 7)
         kvcache.layer_num = 2
-        kvcache.kv_buffer = [
-            torch.zeros((8, 3), dtype=torch.uint8),
-            torch.zeros((8, 5), dtype=torch.uint8),
-        ]
-        kvcache.index_key_cache = SimpleNamespace(
-            buffer=[
-                torch.zeros((4, 7), dtype=torch.uint8),
-                torch.zeros((4, 11), dtype=torch.uint8),
-            ]
-        )
+        kvcache.kv_buffer.append(torch.zeros((8, 5), dtype=torch.uint8))
+        kvcache.index_key_cache.buffer.append(torch.zeros((0, 11), dtype=torch.uint8))
+        draft_pools = (dsa_pool(13, 17), dsa_pool(19, 23, index_rows=0))
 
         group = resolve_hybrid_device_pool_group(
             kvcache=kvcache,
             page_size=2,
-            params=SimpleNamespace(),
+            params=SimpleNamespace(mtp_draft_device_pools=draft_pools),
             components={ComponentType.FULL},
         )
 
@@ -270,6 +291,65 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 PoolName.INDEXER: PoolName.KV,
             },
         )
+        _, sizes, offsets = group.entry_map[PoolName.KV].get_prepared_layer_range_meta(
+            [0], 0
+        )
+        self.assertEqual(sizes, [[6, 26]])
+        self.assertEqual(offsets, [[0, 16]])
+        _, sizes, offsets = group.entry_map[
+            PoolName.INDEXER
+        ].get_prepared_layer_range_meta([0], 0)
+        self.assertEqual(sizes, [[7, 17]])
+        self.assertEqual(offsets, [[0, 7]])
+        self.assertIsNone(
+            group.entry_map[PoolName.INDEXER].get_prepared_layer_range_meta([0], 1)
+        )
+
+    def test_mha_draft_uses_rank_sharded_sidecar(self):
+        from sglang.srt.mem_cache.memory_pool import (
+            DSATokenToKVPool,
+            MHATokenToKVPool,
+        )
+
+        kvcache = DSATokenToKVPool.__new__(DSATokenToKVPool)
+        kvcache.page_size = 2
+        kvcache.layer_num = 1
+        kvcache.kv_buffer = [torch.zeros((8, 3), dtype=torch.uint8)]
+        kvcache.index_key_cache = SimpleNamespace(
+            buffer=[torch.zeros((4, 7), dtype=torch.uint8)]
+        )
+        draft_pool = MHATokenToKVPool.__new__(MHATokenToKVPool)
+        draft_pool.page_size = 2
+        draft_pool.layer_num = 1
+        draft_pool.kv_cache_layout = "nhd"
+        draft_pool.k_scale_buffer = None
+        draft_pool.k_buffer = [torch.zeros((8, 13), dtype=torch.uint8)]
+        draft_pool.v_buffer = [torch.zeros((8, 17), dtype=torch.uint8)]
+
+        group = resolve_hybrid_device_pool_group(
+            kvcache=kvcache,
+            page_size=2,
+            params=SimpleNamespace(
+                mtp_draft_device_pools=(),
+                direct_linker_draft_device_pools=(draft_pool,),
+            ),
+            components={ComponentType.FULL},
+        )
+
+        draft_entry = group.entry_map[PoolName.DRAFT]
+        self.assertEqual(draft_entry.indices_from_pool, PoolName.KV)
+        self.assertEqual(len(draft_entry.components), 2)
+        self.assertFalse(draft_entry.packed)
+
+        store = MooncakeStore.__new__(MooncakeStore)
+        store.registered_pools = {PoolName.DRAFT: draft_entry}
+        store.mla_suffix = "shared"
+        store.mha_suffix = "tp3"
+        keys, multiplier = store._get_hybrid_page_component_keys(
+            ["page"], PoolTransfer(name=PoolName.DRAFT)
+        )
+        self.assertEqual(keys, ["page_tp3_draft_k", "page_tp3_draft_v"])
+        self.assertEqual(multiplier, 2)
 
     def test_unsupported_strategy_fails_with_context(self):
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
