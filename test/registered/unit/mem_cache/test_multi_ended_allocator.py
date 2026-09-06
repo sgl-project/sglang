@@ -3033,5 +3033,84 @@ class TestDcpWidening(unittest.TestCase):
                     self.assertLess(base_cost * full_entry, mamba_bytes * dcp_size)
 
 
+class TestFusedWriteLocTranslate(unittest.TestCase):
+    """`write_loc_to_kernel_ids` must equal the eager formula it replaced.
+
+    The fused kernel collapses ~12 launches into one, so nothing downstream
+    can tell them apart except by value -- which is why the reference here is
+    the arithmetic definition rather than a recorded expectation.
+
+    Triton truncates division toward zero where torch floors it, so the
+    negative-loc and tombstoned-page cases are the ones that matter.
+    """
+
+    def _reference(self, loc, v2p, page_size, stride, dcp_size, dcp_rank):
+        out = []
+        for raw in loc.tolist():
+            if raw < 0 or (dcp_size > 1 and raw % dcp_size != dcp_rank):
+                out.append(0)
+                continue
+            collapsed = raw // dcp_size
+            page = collapsed // page_size
+            offset = collapsed % page_size if page_size > 1 else 0
+            out.append(max(int(v2p[page]) * stride + offset, 0))
+        return out
+
+    def _check(self, *, page_size, multiplier, dcp_size, dcp_rank, device):
+        from sglang.kernels.ops.memory.virtual_slot import write_loc_to_kernel_ids
+
+        span = page_size * dcp_size
+        locs = [0, 1, span - 1, span, 2 * span + 3, 5 * span + dcp_rank, -1]
+        locs += [3 * span + dcp_rank]  # lands on the tombstoned page
+        loc = torch.tensor(locs, dtype=torch.int64, device=device)
+        # Table sized past the highest page any loc can name, scrambled, with
+        # one tombstone (-1) so a missing clamp shows up.
+        num_pages = max(locs) // (page_size * dcp_size) + 2
+        v2p = torch.tensor(
+            [(5 * i + 2) % num_pages for i in range(num_pages)] + [-1],
+            dtype=torch.int64,
+            device=device,
+        )
+        v2p[min(3, num_pages - 1)] = -1
+        stride = page_size * multiplier
+
+        got = write_loc_to_kernel_ids(
+            loc=loc,
+            v2p=v2p,
+            page_size=page_size,
+            stride=stride,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+        )
+        want = self._reference(
+            loc.cpu(), v2p.cpu(), page_size, stride, dcp_size, dcp_rank
+        )
+        self.assertEqual(got.tolist(), want, f"ps={page_size} dcp={dcp_size}")
+        # `out=` must write in place and agree (the cuda-graph-stable path).
+        dst = torch.full_like(loc, -7)
+        ret = write_loc_to_kernel_ids(
+            loc=loc,
+            v2p=v2p,
+            page_size=page_size,
+            stride=stride,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+            out=dst,
+        )
+        self.assertIs(ret, dst)
+        self.assertEqual(dst.tolist(), want)
+
+    def test_matches_reference_on_cpu(self):
+        for page_size in (1, 64):
+            for dcp_size, dcp_rank in ((1, 0), (2, 1), (4, 2)):
+                self._check(
+                    page_size=page_size,
+                    multiplier=7,
+                    dcp_size=dcp_size,
+                    dcp_rank=dcp_rank,
+                    device="cpu",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
