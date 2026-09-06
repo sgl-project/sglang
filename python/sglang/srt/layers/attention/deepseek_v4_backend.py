@@ -2303,6 +2303,9 @@ class DeepseekV4AttnBackend(
         )
         return swa_page_indices, swa_topk_lengths
 
+    def supports_draft_extend_cuda_graph(self) -> bool:
+        return True
+
 
 class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
     def __init__(
