@@ -7,13 +7,15 @@ metatags:
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
-<DiffusionModelTags tags={["video", "audio-video", "multi-shot", "memory bank"]} />
+<DiffusionModelTags tags={["video + audio", "multi-shot", "minute-scale", "memory bank", "8-step"]} />
 
 ## 1. Model Introduction
 
-[JoyAI-Echo](https://huggingface.co/jdopensource/JoyAI-Echo) (JoyEcho) is a long-form audio–video generation model built on the LTX-2 backbone. Its core idea is a **paired audio–video memory bank**: each shot commits decoded frames and audio latents into a rolling bank, and subsequent shots condition on that memory prefix. This enables **multi-shot, minute-scale generation** with visual and audio continuity across prompts.
+[JoyAI-Echo](https://huggingface.co/jdopensource/JoyAI-Echo) is an 8-step long-form audio-video model built on LTX-2. Its paired memory bank carries decoded visual context and audio latents across prompt changes, making it strongest for multi-shot, minute-scale sequences that need continuity in both picture and soundtrack.
 
-Use `jdopensource/JoyAI-Echo` as `--model-path`. SGLang loads the monolithic release through the built-in [JoyAI-Echo-overlay](https://huggingface.co/Niehen6174/JoyAI-Echo-overlay) materialization path, similar to LTX-2.3-overlay.
+Choose JoyEcho over a standard LTX pipeline when shots must share audiovisual memory. Its distilled 832×480 path prioritizes long-form continuity and throughput rather than the higher-resolution two-stage quality modes offered by LTX-2.3.
+
+Use `jdopensource/JoyAI-Echo` as `--model-path`; SGLang materializes the monolithic release through the built-in [JoyAI-Echo overlay](https://huggingface.co/Niehen6174/JoyAI-Echo-overlay).
 
 | Aspect | Standard LTX-2.3 | JoyEcho |
 | --- | --- | --- |

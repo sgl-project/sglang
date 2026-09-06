@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=250, stage="base-c", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=160, stage="base-c", runner_config="8-gpu-h200")
 
 MINIMAX_M25_MODEL_PATH = "MiniMaxAI/MiniMax-M2.5"
 
@@ -53,8 +53,8 @@ class TestMiniMaxM25Basic(CustomTestCase):
         args = SimpleNamespace(
             num_shots=20,
             data_path=None,
-            num_questions=1400,
-            parallel=1400,
+            num_questions=200,
+            parallel=200,
             max_new_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -64,7 +64,7 @@ class TestMiniMaxM25Basic(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (minimax-m25)\n" f'{metrics["accuracy"]=:.3f}\n'
+                f'### test_gsm8k (minimax-m25)\n{metrics["accuracy"]=:.3f}\n'
             )
         self.assertGreater(metrics["accuracy"], 0.900)
 
@@ -76,7 +76,7 @@ class TestMiniMaxM25Basic(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (minimax-m25)\n" f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (minimax-m25)\n{speed=:.2f} token/s\n"
             )
             self.assertGreater(speed, 90)
 

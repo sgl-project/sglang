@@ -13,12 +13,11 @@ from sglang.test.ascend.test_ascend_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=400, suite="stage-b-test-4-npu-a3", nightly=False)
+register_npu_ci(est_time=400, suite="base-b-test-4-npu-a3")
 register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
 
 
 class TestAscendW4A4(GSM8KAscendMixin, CustomTestCase):
-
     model = ECO_TECH_QWEN3_32B_W4A4_LAOS_WEIGHTS_PATH
     other_args = [
         "--trust-remote-code",

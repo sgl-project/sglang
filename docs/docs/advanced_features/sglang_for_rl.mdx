@@ -578,6 +578,20 @@ Training workers gather weights (typically on TP rank 0), broadcast them to the 
 - `engine.update_weights_from_distributed(names, dtypes, shapes, ...)`
 - `engine.destroy_weights_update_group(group_name)`
 
+### Per-Token Weight Version Attribution
+
+A request can outlive a version change: the RL flow retracts it with `pause_generation`, refits, and continues it, or `POST /update_weight_version` relabels while it is still generating. `meta_info` then reports which tokens came from which weights:
+
+```json Output
+"weight_version": "42",
+"weight_versions": [
+    {"version": "41", "start": 0, "end": 57},
+    {"version": "42", "start": 57, "end": 128}
+]
+```
+
+- Ranges are half-open `[start, end)` over output-token indices, prompt excluded. The usual case is a single span.
+
 ## Easy To Postpone Generation
 
 Multi-turn RL rollouts often suffer from long-tail requests that block the entire batch. A small number of slow interactions can stall all GPUs, and the long-tail behavior makes profiling and monitoring difficult.

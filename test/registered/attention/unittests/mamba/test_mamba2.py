@@ -1,6 +1,4 @@
-import sys
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -11,10 +9,6 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.test_utils import CustomTestCase
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.mamba2_attention import (
     DEFAULT_CONV_KERNEL,
@@ -36,6 +30,7 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_
     run_mamba2_eagle_verify_case,
     run_mamba2_eagle_verify_cuda_graph_case,
 )
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
@@ -171,9 +166,9 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
     # exactly, with no padding tolerance. The shared split-op runner
     # pads `hidden_states` to a fixed `static_num_tokens` upper bound
     # and then relies on the backend's per-layer slicing contract via
-    # `num_token_non_padded_cpu`. Mamba2 doesn't support this padding
+    # `global_num_token_non_padded_cpu`. Mamba2 doesn't support this padding
     # because its mixer projects BEFORE the attention dispatch sees
-    # `num_token_non_padded_cpu`. Landing this needs either a Mamba2
+    # `global_num_token_non_padded_cpu`. Landing this needs either a Mamba2
     # mixer change to accept padded `hidden_states`, or a split-op
     # runner variant that passes unpadded `hidden_states` while still
     # padding the `forward_batch.input_ids` / `out_cache_loc`.

@@ -56,6 +56,9 @@ class SanaWMPipelineConfig(PipelineConfig):
     optional 6-DoF camera trajectory, optional Stage-2 LTX-2 refiner)."""
 
     task_type: ModelTaskType = ModelTaskType.TI2V
+    # The current two-stage path is not numerically invariant when its primary
+    # transformer and connectors are promoted after warmup.
+    supports_auto_residency: bool = False
 
     # SanaWMBeforeDenoisingStage._splice_first_frame handles condition-image
     # resize + VAE-encode itself, so bypass the framework's generic TI2V
@@ -161,10 +164,12 @@ class SanaWMPipelineConfig(PipelineConfig):
     # --- Deployment ---
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
-            auto_dit_layerwise_offload=True,
+            dit_layerwise_offload_modes=("memory",),
             # Conservative auto-FSDP gate for the 720p world-model path. Users
             # can still force FSDP explicitly on smaller cards.
             fsdp_auto_min_available_memory_gb=60,
+            keep_resident_min_available_gb=120,
+            keep_resident_components=("dit", "vae"),
         )
 
     # --- Latent shape ---
@@ -328,7 +333,7 @@ class SanaWMRealtimeConfig(SanaWMPipelineConfig):
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
-            auto_dit_layerwise_offload=True,
+            dit_layerwise_offload_modes=("memory",),
             keep_resident_min_available_gb=120,
             keep_resident_components=("dit",),
             auto_enable_cfg_parallel=False,

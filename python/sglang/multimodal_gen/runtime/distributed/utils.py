@@ -18,7 +18,14 @@ from typing import Any
 import torch
 from torch.distributed import TCPStore
 
+try:
+    from torch.distributed import all_gather_single as _all_gather_single
+except ImportError:
+    from torch.distributed import all_gather_into_tensor as _all_gather_single
+
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+all_gather_single = _all_gather_single
 
 logger = init_logger(__name__)
 
@@ -127,13 +134,13 @@ class StatelessProcessGroup:
         """
         if self.rank == src:
             self.expire_data()
-            key = f"broadcast_from/{src}/" f"{self.broadcast_send_counter}"
+            key = f"broadcast_from/{src}/{self.broadcast_send_counter}"
             self.store.set(key, pickle.dumps(obj))
             self.broadcast_send_counter += 1
             self.entries.append((key, time.perf_counter()))
             return obj
         else:
-            key = f"broadcast_from/{src}/" f"{self.broadcast_recv_src_counter[src]}"
+            key = f"broadcast_from/{src}/{self.broadcast_recv_src_counter[src]}"
             recv_obj = pickle.loads(self.store.get(key))
             self.broadcast_recv_src_counter[src] += 1
             return recv_obj

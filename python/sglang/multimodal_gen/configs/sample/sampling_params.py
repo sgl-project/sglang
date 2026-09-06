@@ -51,10 +51,68 @@ def generate_request_id() -> str:
     return str(uuid.uuid4())
 
 
-# Validated request-level quality levels. "lossless" is the exact reference
-# path (bit-exact against the CI golden outputs); "high" opts into validated
-# accelerated paths whose quality is guaranteed but not bit-exact.
-QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
+# Validated request-level quality levels, ordered from the strictest numerical
+# contract to the broadest optimization set. "lossless" keeps the exact
+# reference path; "extra-high" adds only request-gated kernel fusions; "high"
+# is cumulative and may also enable model-owned approximate optimizations.
+QUALITY_LEVELS: tuple[str, ...] = ("lossless", "extra-high", "high")
+KERNEL_FUSION_QUALITY_LEVELS = frozenset({"extra-high", "high"})
+
+
+@dataclass(frozen=True)
+class SkipSoftmaxParams:
+    """Validated request-scoped BLASST/Skip-Softmax controls."""
+
+    threshold_scale_factor: float
+    start_step: int = 0
+
+
+def resolve_skip_softmax_params(
+    params: dict[str, Any] | None,
+) -> SkipSoftmaxParams | None:
+    if params is None:
+        return None
+    if not isinstance(params, dict):
+        raise ValueError(f"skip_softmax_params must be a dict, got {params!r}")
+
+    valid_keys = {"threshold_scale_factor", "start_step"}
+    unknown = sorted(set(params) - valid_keys)
+    if unknown:
+        raise ValueError(
+            f"Unknown skip_softmax_params keys: {unknown}. "
+            f"Valid keys: {sorted(valid_keys)}."
+        )
+    if "threshold_scale_factor" not in params:
+        raise ValueError("skip_softmax_params requires 'threshold_scale_factor'.")
+
+    threshold = params["threshold_scale_factor"]
+    if (
+        isinstance(threshold, bool)
+        or not isinstance(threshold, (int, float))
+        or not math.isfinite(float(threshold))
+        or float(threshold) <= 0
+    ):
+        raise ValueError(
+            "skip_softmax_params.threshold_scale_factor must be a finite "
+            f"positive number, got {threshold!r}"
+        )
+
+    start_step = params.get("start_step", 0)
+    if (
+        isinstance(start_step, bool)
+        or not isinstance(start_step, int)
+        or start_step < 0
+    ):
+        raise ValueError(
+            "skip_softmax_params.start_step must be a non-negative int, "
+            f"got {start_step!r}"
+        )
+    return SkipSoftmaxParams(float(threshold), start_step)
+
+
+def quality_allows_kernel_fusions(quality: str) -> bool:
+    """Return whether a quality level includes request-gated kernel fusions."""
+    return quality in KERNEL_FUSION_QUALITY_LEVELS
 
 
 def _sanitize_filename(name: str, replacement: str = "_", max_length: int = 150) -> str:
@@ -78,6 +136,58 @@ def _sanitize_filename(name: str, replacement: str = "_", max_length: int = 150)
     return ascii_name
 
 
+_SEQUENCE_SHARD_PIPELINE_FAMILIES = ("wan", "helios", "joy", "cosmos3")
+
+
+def resolve_sequence_shard(
+    pipeline_config: Any, enable_sequence_shard: bool | None
+) -> bool:
+    """Whether this pipeline shards the sequence dim instead of aligning frames.
+
+    Shared by ``SamplingParams._adjust_visual_fields`` and the synthetic
+    warmup builder so warmup requests follow the same frame contract as real
+    requests.
+    """
+    pipeline_name_lower = pipeline_config.__class__.__name__.lower()
+    return any(
+        family in pipeline_name_lower for family in _SEQUENCE_SHARD_PIPELINE_FAMILIES
+    ) and (enable_sequence_shard is None or enable_sequence_shard)
+
+
+def align_num_frames_for_num_gpus(
+    num_frames: int,
+    *,
+    num_gpus: int,
+    vae_config: Any,
+    round_down: bool,
+) -> int:
+    """Align the latent frame count to be divisible by ``num_gpus``."""
+    if num_gpus <= 1:
+        return num_frames
+    use_temporal_scaling_frames = vae_config.use_temporal_scaling_frames
+    temporal_scale_factor = vae_config.arch_config.temporal_compression_ratio
+
+    if use_temporal_scaling_frames:
+        orig_latent_num_frames = (num_frames - 1) // temporal_scale_factor + 1
+    else:
+        orig_latent_num_frames = num_frames
+
+    if orig_latent_num_frames % num_gpus == 0:
+        return num_frames
+
+    if round_down:
+        # Ensure we have at least 1 batch per GPU
+        new_latent_num_frames = max(1, (orig_latent_num_frames // num_gpus)) * num_gpus
+    else:
+        new_latent_num_frames = math.ceil(orig_latent_num_frames / num_gpus) * num_gpus
+
+    if use_temporal_scaling_frames:
+        # Convert back to frames, keeping num_frames-1 a multiple of the
+        # temporal scale factor
+        return (new_latent_num_frames - 1) * temporal_scale_factor + 1
+    return new_latent_num_frames
+
+
 class DataType(Enum):
     IMAGE = auto()
     VIDEO = auto()
@@ -97,10 +207,17 @@ class DataType(Enum):
 @dataclass
 class SamplingParams:
     """
-    Sampling parameters for generation.
+    Model-agnostic sampling parameters for generation.
 
     Dynamic batching compares these fields for compatibility, except fields
     marked with `batch_sig_exclude`.
+
+    New fields in this base class must be shared across model families; legacy
+    compatibility fields are not precedent. A model-specific field belongs on
+    that model's SamplingParams subclass and, when accepted by an online
+    endpoint, must also be declared via ``image_request_extra_fields`` or
+    ``video_request_extra_fields``. Do not add model fields here merely to make
+    the common API transport accept them.
     """
 
     data_type: DataType = DataType.VIDEO
@@ -119,9 +236,7 @@ class SamplingParams:
     prompt: str | list[str] | None = field(
         default=None, metadata={"batch_sig_exclude": True}
     )
-    negative_prompt: str = (
-        "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
-    )
+    negative_prompt: str = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
     prompt_path: str | None = field(default=None, metadata={"batch_sig_exclude": True})
     output_path: str | None = field(default=None, metadata={"batch_sig_exclude": True})
     output_file_name: str | None = field(
@@ -134,15 +249,15 @@ class SamplingParams:
     # - "lossless" (default): the exact reference path. Output is expected to
     #   be bit-identical to the HF reference implementation and to pass the
     #   CI golden/ground-truth comparisons.
-    # - "high": opt into validated accelerated paths. Quality stays
-    #   guaranteed (the intent is to back every such path with mathematical
-    #   acceptance thresholds, e.g. PSNR > 25 against the reference), but
-    #   the output is no longer bit-exact versus the HF reference or the CI
-    #   ground truth.
+    # - "extra-high": add only validated kernel fusions. These may change
+    #   half-precision rounding order, so output is not bit-exact versus the
+    #   reference, but this tier does not itself enable sparse or approximate
+    #   optimizations.
+    # - "high": include every "extra-high" fusion and allow model-owned
+    #   approximate optimizations such as sparse computation or feature
+    #   caching. These paths require model-specific quality validation.
     #
-    # Models that support "high" must validate the deployment and workload
-    # explicitly. It intentionally participates in the dynamic-batch
-    # signature.
+    # It intentionally participates in the dynamic-batch signature.
     quality: str = "lossless"
 
     # Frame interpolation
@@ -185,9 +300,6 @@ class SamplingParams:
         default=None, metadata={"batch_sig_exclude": True}
     )  # None means all resolutions allowed
 
-    # Output audio duration in seconds (models without an audio modality ignore this).
-    sound_duration: float = 0.0
-
     # Denoising parameters
     num_inference_steps: int = None
     guidance_scale: float = 1.0
@@ -196,6 +308,10 @@ class SamplingParams:
     guidance_rescale: float = 0.0
     cfg_normalization: float | bool = 0.0
     boundary_ratio: float | None = None
+    # CFG gating (lossy): reuse the cached cond-uncond residual after this
+    # fraction of the steps. None = follow the SGLANG_DIFFUSION_CFG_GATE_STEP
+    # server default; 1.0 = off for this request.
+    cfg_gate_step: float | None = None
 
     progressive_mode: str = "fullres"
     progressive_levels: int = 1
@@ -206,6 +322,27 @@ class SamplingParams:
     teacache_params: Any = (
         None  # TeaCacheParams or WanTeaCacheParams, set by model-specific subclass
     )
+
+    # Cache-DiT (lossy). None = follow the SGLANG_CACHE_DIT_ENABLED server
+    # default; True/False = explicit per-request opt-in/out.
+    enable_cache_dit: bool | None = None
+    # Per-request knob overrides on top of the SGLANG_CACHE_DIT_* defaults.
+    # Valid keys: CACHE_DIT_REQUEST_PARAM_KEYS in cache_dit_integration.py.
+    cache_dit_params: dict[str, Any] | None = None
+
+    # Per-request DiT attention backend ("fa", "torch_sdpa", "sage_attn",
+    # "sage_attn_3"; sage is lossy). Incompatible server settings reject the
+    # request; see DenoisingStage._maybe_override_attention_backend.
+    attention_backend_override: str | None = None
+
+    # Request-scoped BLASST/Skip-Softmax sparse attention. This is an explicit
+    # lossy opt-in; compatible self-attention layers are dispatched through
+    # FlashInfer while cross-attention remains on its normal backend.
+    skip_softmax_params: dict[str, Any] | None = None
+
+    # Spectrum parameters
+    enable_spectrum: bool = False
+    spectrum_params: Any = None  # SpectrumParams
 
     # Profiling
     profile: bool = field(default=False, metadata={"batch_sig_exclude": True})
@@ -232,12 +369,8 @@ class SamplingParams:
     )
     return_trajectory_latents: bool = False  # returns all latents for each timestep
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
-    rollout_return_denoising_env: bool = (
-        False  # populate ``denoising_env`` (image/pos/neg kwargs, guidance) for RL replay
-    )
-    rollout_return_dit_trajectory: bool = (
-        False  # per-step noisy latents + final latent + timesteps (RolloutDitTrajectory)
-    )
+    rollout_return_denoising_env: bool = False  # populate ``denoising_env`` (image/pos/neg kwargs, guidance) for RL replay
+    rollout_return_dit_trajectory: bool = False  # per-step noisy latents + final latent + timesteps (RolloutDitTrajectory)
     # 0-indexed denoising-loop step filters; None = all steps.
     rollout_sde_step_indices: list[int] | None = None
     rollout_return_step_indices: list[int] | None = None
@@ -257,16 +390,8 @@ class SamplingParams:
     max_sequence_length: int | None = None
     flow_shift: float | None = None
 
-    # cosmos-related
-    use_duration_template: bool | None = None
-    use_resolution_template: bool | None = None
-    use_system_prompt: bool | None = None
-    use_guardrails: bool | None = None
     condition_inputs: dict[str, Any] = field(default_factory=dict)
     realtime_chunk_size: int | None = None
-
-    # Prompt enhancement (ErnieImage)
-    use_pe: bool | None = None
 
     def _set_output_file_ext(self):
         # add extension if needed
@@ -330,6 +455,16 @@ class SamplingParams:
         if env_steps is not None and self.num_inference_steps is not None:
             self.num_inference_steps = int(env_steps)
 
+        if self.enable_spectrum and isinstance(self.spectrum_params, dict):
+            from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
+
+            self.spectrum_params = SpectrumParams(**self.spectrum_params)
+
+        if self.enable_spectrum and self.spectrum_params is None:
+            from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
+
+            self.spectrum_params = SpectrumParams()
+
     def build_request_extra(self) -> dict[str, Any]:
         """Return optional request-scoped extras for downstream pipeline stages."""
         extra = {}
@@ -350,10 +485,38 @@ class SamplingParams:
             req.realtime_chunk_size = self.realtime_chunk_size
 
     @classmethod
-    def video_request_extra_fields(cls) -> frozenset[str]:
-        """Declare model-specific multipart video fields accepted by this type."""
+    def image_request_extra_fields(cls) -> frozenset[str]:
+        """Declare model-owned JSON fields accepted by the image API.
+
+        Every returned name must be an init field on ``cls``. The common
+        endpoint resolves the active subclass before reading these fields, so
+        model-specific extraction and defaults stay out of the API layer.
+        """
 
         return frozenset()
+
+    @classmethod
+    def video_request_extra_fields(cls) -> frozenset[str]:
+        """Declare model-owned JSON or multipart fields accepted by the video API.
+
+        Dataclass-backed names are forwarded to ``cls``. Transport-only aliases
+        may also be declared so multipart parsing preserves them, but the
+        subclass must consume those aliases in ``lower_video_request_kwargs``.
+        """
+
+        return frozenset()
+
+    @classmethod
+    def default_image_output_format(cls) -> str | None:
+        """Return a model-owned default format for the image API, if any."""
+
+        return None
+
+    @classmethod
+    def default_image_response_format(cls) -> str | None:
+        """Return a model-owned default response format for the image API, if any."""
+
+        return None
 
     @classmethod
     def lower_video_request_kwargs(
@@ -427,9 +590,10 @@ class SamplingParams:
 
         if self.quality not in QUALITY_LEVELS:
             raise ValueError(
-                f"quality must be one of {list(QUALITY_LEVELS)}, "
-                f"got {self.quality!r}"
+                f"quality must be one of {list(QUALITY_LEVELS)}, got {self.quality!r}"
             )
+
+        resolve_skip_softmax_params(self.skip_softmax_params)
 
         # These are always required to be sane regardless of pipeline.
         if (
@@ -546,6 +710,11 @@ class SamplingParams:
                 raise ValueError(
                     f"boundary_ratio must be within [0, 1], got {self.boundary_ratio!r}"
                 )
+
+        if self.enable_teacache and self.enable_spectrum:
+            raise ValueError(
+                "enable_teacache and enable_spectrum are mutually exclusive; enable only one."
+            )
 
         RLRolloutArgs.validate_sampling_params(self)
 
@@ -675,14 +844,9 @@ class SamplingParams:
                     )
                     logger.warning(error_msg)
 
-        pipeline_name_lower = server_args.pipeline_config.__class__.__name__.lower()
-
-        if (
-            "wan" in pipeline_name_lower
-            or "helios" in pipeline_name_lower
-            or "joy" in pipeline_name_lower
-            or "cosmos3" in pipeline_name_lower
-        ) and (self.enable_sequence_shard is None or self.enable_sequence_shard):
+        if resolve_sequence_shard(
+            server_args.pipeline_config, self.enable_sequence_shard
+        ):
             self.enable_sequence_shard = True
             logger.debug("Automatically enabled enable_sequence_shard")
         else:
@@ -715,43 +879,13 @@ class SamplingParams:
             )
 
             if self.adjust_frames:
-                # Adjust number of frames based on number of GPUs for video task
-                use_temporal_scaling_frames = (
-                    pipeline_config.vae_config.use_temporal_scaling_frames
+                new_num_frames = align_num_frames_for_num_gpus(
+                    self.num_frames,
+                    num_gpus=server_args.num_gpus,
+                    vae_config=pipeline_config.vae_config,
+                    round_down=self.num_frames_round_down,
                 )
-                num_frames = self.num_frames
-                num_gpus = server_args.num_gpus
-                temporal_scale_factor = (
-                    pipeline_config.vae_config.arch_config.temporal_compression_ratio
-                )
-
-                if use_temporal_scaling_frames:
-                    orig_latent_num_frames = (
-                        num_frames - 1
-                    ) // temporal_scale_factor + 1
-                else:
-                    orig_latent_num_frames = num_frames
-
-                if orig_latent_num_frames % server_args.num_gpus != 0:
-                    # Adjust latent frames to be divisible by number of GPUs
-                    if self.num_frames_round_down:
-                        # Ensure we have at least 1 batch per GPU
-                        new_latent_num_frames = (
-                            max(1, (orig_latent_num_frames // num_gpus)) * num_gpus
-                        )
-                    else:
-                        new_latent_num_frames = (
-                            math.ceil(orig_latent_num_frames / num_gpus) * num_gpus
-                        )
-
-                    if use_temporal_scaling_frames:
-                        # Convert back to number of frames, ensuring num_frames-1 is a multiple of temporal_scale_factor
-                        new_num_frames = (
-                            new_latent_num_frames - 1
-                        ) * temporal_scale_factor + 1
-                    else:
-                        new_num_frames = new_latent_num_frames
-
+                if new_num_frames != self.num_frames:
                     logger.info(
                         "Adjusting number of frames from %s to %s based on number of GPUs (%s)",
                         self.num_frames,
@@ -854,13 +988,24 @@ class SamplingParams:
 
     @staticmethod
     def add_cli_args(parser: Any) -> Any:
-        """Add CLI arguments for SamplingParam fields"""
+        """Add CLI arguments for SamplingParam fields.
+
+        This shared parser still contains legacy model-specific flags because
+        argparse is constructed before the active model is resolved. Do not add
+        new model-specific dataclass fields to ``SamplingParams`` or new API
+        special cases here; model request ownership remains on subclasses.
+        """
 
         def add_argument(*name_or_flags, **kwargs):
             kwargs.setdefault("default", argparse.SUPPRESS)
             return parser.add_argument(*name_or_flags, **kwargs)
 
         add_argument("--data-type", type=str, nargs="+")
+        # Predict the shot length from the caption, overriding `--num-frames`.
+        add_argument("--use-diffusion-decoder", action="store_true")
+        add_argument("--auto-duration", action="store_true")
+        add_argument("--auto-duration-min-seconds", type=float)
+        add_argument("--auto-duration-max-seconds", type=float)
         add_argument(
             "--num-frames-round-down",
             action="store_true",
@@ -868,6 +1013,102 @@ class SamplingParams:
         add_argument(
             "--enable-teacache",
             action="store_true",
+        )
+        add_argument(
+            "--enable-cache-dit",
+            action=StoreBoolean,
+        )
+        add_argument(
+            "--cache-dit-params",
+            type=json.loads,
+        )
+        add_argument(
+            "--cfg-gate-step",
+            type=float,
+        )
+        add_argument(
+            "--attention-backend-override",
+            type=str,
+        )
+        add_argument(
+            "--enable-spectrum",
+            action="store_true",
+        )
+        add_argument("--w", type=float)
+        add_argument(
+            "--taylor-order",
+            "--taylor_order",
+            dest="taylor_order",
+            type=int,
+        )
+        add_argument(
+            "--history-size",
+            "--history_size",
+            dest="history_size",
+            type=int,
+        )
+        add_argument(
+            "--spectrum-window-size",
+            "--spectrum_window_size",
+            "--window-size",
+            "--window_size",
+            dest="spectrum_window_size",
+            type=float,
+            help="Spectrum initial skip window size.",
+        )
+        add_argument(
+            "--spectrum-flex-window",
+            "--spectrum_flex_window",
+            "--flex-window",
+            "--flex_window",
+            dest="spectrum_flex_window",
+            type=float,
+            help="Spectrum adaptive window growth slope.",
+        )
+        add_argument(
+            "--spectrum-warmup-steps",
+            "--spectrum_warmup_steps",
+            dest="spectrum_warmup_steps",
+            type=int,
+            help="Spectrum warmup denoising steps before caching.",
+        )
+        add_argument(
+            "--spectrum-m",
+            "--spectrum_m",
+            dest="spectrum_m",
+            type=int,
+            help="Spectrum Chebyshev polynomial degree (M).",
+        )
+        add_argument(
+            "--spectrum-lam",
+            "--spectrum_lam",
+            dest="spectrum_lam",
+            type=float,
+            help="Spectrum ridge regularization strength.",
+        )
+        add_argument(
+            "--spectrum-tau-num-steps",
+            "--spectrum_tau_num_steps",
+            dest="spectrum_tau_num_steps",
+            type=int,
+            help="Spectrum tau normalization horizon.",
+        )
+
+        # LongCat-Image parameters
+        add_argument(
+            "--enable-cfg-renorm",
+            action=StoreBoolean,
+            help="Enable CFG renormalization for LongCat-Image (enabled by default).",
+        )
+        add_argument(
+            "--cfg-renorm-min",
+            type=float,
+            help="Minimum CFG renorm scale for LongCat-Image (default: 0.0).",
+        )
+        add_argument(
+            "--enable-prompt-rewrite",
+            action=StoreBoolean,
+            help="Enable prompt rewriting via Qwen2.5-VL before encoding for LongCat-Image (enabled by default).",
         )
 
         # profiling
@@ -954,10 +1195,12 @@ class SamplingParams:
             help=(
                 "Request-level quality: 'lossless' (default) keeps the exact "
                 "reference path, bit-exact against the reference "
-                "implementation; 'high' opts into the model-owned validated "
-                "accelerated path, whose quality stays guaranteed but is not "
-                "bit-exact. Support and validated deployment constraints are "
-                "model-specific."
+                "implementation; 'extra-high' adds only request-gated kernel "
+                "fusions and does not itself enable sparse or approximate "
+                "optimization; 'high' includes every extra-high fusion and "
+                "may also enable "
+                "model-owned approximate paths. Support and validated "
+                "deployment constraints are model-specific."
             ),
         )
         add_argument(
@@ -1299,6 +1542,34 @@ class SamplingParams:
         }
         if isinstance(cli_args.get("seed"), list) and len(cli_args["seed"]) == 1:
             cli_args["seed"] = cli_args["seed"][0]
+
+        spectrum_overrides = {}
+        spectrum_flag_map = {
+            "w": "w",
+            "taylor_order": "taylor_order",
+            "window_size": "spectrum_window_size",
+            "flex_window": "spectrum_flex_window",
+            "history_size": "history_size",
+            "warmup_steps": "spectrum_warmup_steps",
+            "m": "spectrum_m",
+            "lam": "spectrum_lam",
+            "tau_num_steps": "spectrum_tau_num_steps",
+        }
+        for field_name, arg_name in spectrum_flag_map.items():
+            if hasattr(args, arg_name) and getattr(args, arg_name) is not None:
+                spectrum_overrides[field_name] = getattr(args, arg_name)
+        if spectrum_overrides:
+            if not cli_args.get("enable_spectrum", False):
+                logger.info(
+                    "Spectrum override flags were provided without --enable-spectrum; "
+                    "auto-enabling Spectrum caching."
+                )
+                cli_args["enable_spectrum"] = True
+            existing_spectrum_params = cli_args.get("spectrum_params")
+            if isinstance(existing_spectrum_params, dict):
+                spectrum_overrides = {**existing_spectrum_params, **spectrum_overrides}
+            cli_args["spectrum_params"] = spectrum_overrides
+
         return cli_args
 
     def output_file_path(self):

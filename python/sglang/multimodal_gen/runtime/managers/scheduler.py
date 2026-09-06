@@ -16,15 +16,7 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
     SchedulerDisaggMixin,
 )
-from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
-    GetWeightsChecksumReqInput,
-    ReleaseMemoryOccupationReqInput,
-    ResumeMemoryOccupationReqInput,
-    UpdateWeightFromDiskReqInput,
-    UpdateWeightFromTensorCheckerReqInput,
-    UpdateWeightFromTensorReqInput,
-)
-from sglang.multimodal_gen.runtime.entrypoints.utils import (
+from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     GetDisaggStatsReq,
     ListLorasReq,
     MergeLoraWeightsReq,
@@ -32,6 +24,14 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
+)
+from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+    GetWeightsChecksumReqInput,
+    ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightFromTensorCheckerReqInput,
+    UpdateWeightFromTensorReqInput,
 )
 from sglang.multimodal_gen.runtime.ipc_array import (
     is_local_endpoint,
@@ -64,6 +64,7 @@ from sglang.multimodal_gen.runtime.server_warmup import (
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
 
 logger = init_logger(__name__)
@@ -104,15 +105,23 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         set_global_server_args(server_args=server_args)
 
-        # Inter-process Communication
+        # Each DP replica is a contiguous rank block (dp is the outermost
+        # layout axis); its first rank binds the replica's ingress, and the
+        # sp/cfg/tp broadcast relay in recv_reqs -- replica-internal by
+        # construction -- fans requests out within the replica only.
+        gpus_per_replica = max(1, server_args.num_gpus // server_args.dp_size)
+        self.dp_replica = gpu_id // gpus_per_replica
         self.context = zmq.Context(io_threads=2)
-        endpoint = server_args.scheduler_endpoint
-        if gpu_id == 0:
+        if gpu_id % gpus_per_replica == 0:
+            endpoint = server_args.scheduler_endpoint_for(self.dp_replica)
             # router allocates identify (envelope) for each connection
             self.receiver, actual_endpoint = get_zmq_socket(
                 self.context, zmq.ROUTER, endpoint, True
             )
-            logger.info(f"Scheduler bind at endpoint: {actual_endpoint}")
+            logger.info(
+                f"Scheduler (dp replica {self.dp_replica}) bind at endpoint: "
+                f"{actual_endpoint}"
+            )
         else:
             self.receiver = None
         from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -203,6 +212,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             req.target,
             req.strength,
             req.merge_mode,
+            req.lora_alpha,
         )
 
     def _handle_merge_lora(self, reqs: List[Any]):
@@ -715,25 +725,38 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         replies to client, only on rank 0
         """
         if not should_not_return and self.receiver is not None and identity is not None:
-            # if the server is local, use temp file to spill the frame array instead of
-            # leaving it in OutputBatch to be pickled later
-            if is_local_endpoint(self.server_args.scheduler_endpoint):
+            with maybe_record_function("REPLY spill+pickle+send"):
+                # if the server is local, use temp file to spill the frame array
+                # instead of leaving it in OutputBatch to be pickled later
+                if is_local_endpoint(self.server_args.scheduler_endpoint):
+                    with self._record_return_stage(
+                        output_batch, "Scheduler.return_result.spill_arrays"
+                    ):
+                        output_batch.output = spill_large_arrays_to_file_refs(
+                            output_batch.output
+                        )
+
                 with self._record_return_stage(
-                    output_batch, "Scheduler.return_result.spill_arrays"
+                    output_batch, "Scheduler.return_result.pickle"
                 ):
-                    output_batch.output = spill_large_arrays_to_file_refs(
-                        output_batch.output
-                    )
+                    payload = pickle.dumps(output_batch)
 
-            with self._record_return_stage(
-                output_batch, "Scheduler.return_result.pickle"
-            ):
-                payload = pickle.dumps(output_batch)
+                with self._record_return_stage(
+                    output_batch, "Scheduler.return_result.send"
+                ):
+                    self.receiver.send_multipart([identity, b"", payload])
 
-            with self._record_return_stage(
-                output_batch, "Scheduler.return_result.send"
-            ):
-                self.receiver.send_multipart([identity, b"", payload])
+    @staticmethod
+    def _req_label(items: list) -> str:
+        """Short request tag for profiler span names."""
+        req = items[0][1] if items else None
+        if isinstance(req, list) and req:
+            req = req[0]
+        # request_id is Optional; server warmup and bare server-test
+        # requests arrive without one.
+        if isinstance(req, Req) and req.request_id:
+            return req.request_id[:8]
+        return type(req).__name__
 
     def _return_item_result(
         self,
@@ -1172,9 +1195,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             self._disagg_event_loop()
             return
 
-        logger.debug(
-            f"Rank 0 scheduler listening on tcp://*:{self.server_args.scheduler_port}"
-        )
+        if self.receiver is not None:
+            logger.debug("Driver scheduler of dp replica %d listening", self.dp_replica)
 
         while self._running:
             # Update queue depth for metrics
@@ -1223,7 +1245,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 continue
 
             try:
-                handler_result = self._dispatch_items(items)
+                with maybe_record_function(
+                    f"REQ {self._req_label(items)} dispatch+forward"
+                ):
+                    handler_result = self._dispatch_items(items)
             except Exception as e:
                 logger.error(
                     f"Error executing request in scheduler event loop: {e}",

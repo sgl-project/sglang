@@ -13,10 +13,9 @@ from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
 )
 
 
-def _fake_sp(monkeypatch, sp_size, sp_rank=0, ring=1):
+def _fake_sp(monkeypatch, sp_size, sp_rank=0):
     monkeypatch.setattr(sps, "get_sp_world_size", lambda: sp_size)
     monkeypatch.setattr(sps, "get_sp_parallel_rank", lambda: sp_rank)
-    monkeypatch.setattr(sps, "get_ring_parallel_world_size", lambda: ring)
 
 
 # --- build_shard_plan math --------------------------------------------------------
@@ -109,6 +108,29 @@ def test_tail_meta_max_seqlen_covers_pad_segment():
     assert meta["max_seqlen_tail"] == 3
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA graph capture")
+def test_tail_meta_is_cuda_graph_capturable():
+    """The meta is built inside the DiT forward, which breakable-cuda-graph
+    captures; host-staged tensor construction aborts capture with 'Cannot copy
+    between CPU and CUDA tensors'."""
+    device = torch.device("cuda")
+    shard = SpShard(orig_len=15, local_len=8, num_pad=1, sp_size=2, sp_rank=1)
+    eager = tail_attn_meta(shard, 2, device, image_seq_len=100)
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        tail_attn_meta(shard, 2, device, image_seq_len=100)
+    torch.cuda.current_stream().wait_stream(side)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = tail_attn_meta(shard, 2, device, image_seq_len=100)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured["cu_seqlens_tail"], eager["cu_seqlens_tail"])
+
+
 def test_tail_meta_matches_legacy_gap_formula():
     # The tail layout puts the pad exactly where the legacy per-model gap
     # formula pointed, minus the relocation: end == S (global tail).
@@ -140,10 +162,22 @@ def test_strategy_shard_when_legal(monkeypatch):
     assert sps.plan_text_strategy(16) == "shard"
 
 
-def test_strategy_ring_blocks_padded_shard(monkeypatch):
-    _fake_sp(monkeypatch, 2, ring=2)
-    assert sps.plan_text_strategy(15) == "replicate"  # padded shard needs mask
-    assert sps.plan_text_strategy(16) == "shard"  # divisible: no mask needed
+def test_strategy_replicates_when_padding_spans_multiple_shards(monkeypatch):
+    _fake_sp(monkeypatch, 8)
+    assert sps.plan_text_strategy(1) == "replicate"
+    assert sps.plan_text_strategy(6) == "replicate"
+    assert sps.plan_text_strategy(7) == "shard"
+    assert sps.plan_text_strategy(9) == "replicate"
+    assert sps.plan_text_strategy(13) == "replicate"
+    assert sps.plan_text_strategy(14) == "shard"
+
+
+def test_strategy_shards_padded_text_under_ring(monkeypatch):
+    # Tail-padded shards ride the ring kernel now; the strategy no longer
+    # consults the ring degree at all.
+    _fake_sp(monkeypatch, 2)
+    assert sps.plan_text_strategy(15) == "shard"
+    assert sps.plan_text_strategy(16) == "shard"
 
 
 def test_strategy_min_len_threshold(monkeypatch):

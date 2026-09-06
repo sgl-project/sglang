@@ -173,16 +173,16 @@ def test_solve_ipm_matches_torch_reference():
     max_diff = (cuda_x - torch_x).abs().max().item()
     print(
         f"\n[ipm-compare] converged={converged}  max|cuda-torch|={max_diff:.3e}  "
-        f"cuda={[round(v,4) for v in cuda_x.tolist()]}  "
-        f"torch={[round(v,4) for v in torch_x.tolist()]}"
+        f"cuda={[round(v, 4) for v in cuda_x.tolist()]}  "
+        f"torch={[round(v, 4) for v in torch_x.tolist()]}"
     )
     assert converged, (
         "IPM returned the 0.5 non-convergence sentinel — the comparison would "
         "be trivial. Adjust the LP instance so it converges."
     )
-    assert torch.allclose(
-        cuda_x, torch_x, atol=1e-2, rtol=1e-2
-    ), f"fused IPM diverges from torch reference: max abs diff {max_diff:.3e}"
+    assert torch.allclose(cuda_x, torch_x, atol=1e-2, rtol=1e-2), (
+        f"fused IPM diverges from torch reference: max abs diff {max_diff:.3e}"
+    )
 
 
 @pytest.mark.skipif(
@@ -363,9 +363,9 @@ def _check_all_ranks_empty(rank: int, world_size: int, device: torch.device):
 
     assert torch.isfinite(actual).all(), f"rank {rank}: non-finite for empty-batch"
     assert (actual >= 0).all(), f"rank {rank}: negative for empty-batch"
-    assert torch.allclose(
-        actual, expected, atol=1e-4, rtol=1e-3
-    ), f"rank {rank}: empty-batch output disagrees with all-zero oracle"
+    assert torch.allclose(actual, expected, atol=1e-4, rtol=1e-3), (
+        f"rank {rank}: empty-batch output disagrees with all-zero oracle"
+    )
 
 
 def _check_solver_determinism(rank: int, world_size: int, device: torch.device):

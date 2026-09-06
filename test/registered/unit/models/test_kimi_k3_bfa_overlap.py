@@ -8,7 +8,10 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.models.kimi_k3 import KimiK3DeltaAttention
+from sglang.srt.models.kimi_k3 import (
+    KimiK3DeltaAttention,
+    _get_k3_dense_weight,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -39,9 +42,9 @@ def _make_owner(with_stream: bool):
     owner = SimpleNamespace(
         use_full_rank_gate=True,
         _bfa_w=_randn(_BFA_W_ROWS, _H).contiguous(),
+        _bfa_f_b_w=_randn(1536, _N_FA).contiguous(),
         _bfa_fa_size=_N_FA,
         _bfa_b_size=_N_B,
-        f_b_proj=SimpleNamespace(weight=_randn(1536, _N_FA).contiguous()),
         fused_qkvg_proj=fused_qkvg_proj,
         split_sizes=[3 * 1536, 1536],
         _bfa_alt_stream=torch.cuda.Stream() if with_stream else None,
@@ -96,6 +99,39 @@ class TestKimiK3BfaOverlap(CustomTestCase):
         overlap = _run(_make_owner(with_stream=True), x)  # capture mode False
         for got, ref in zip(overlap, serial):
             self.assertTrue(torch.equal(got, ref))
+
+    def test_block_fp8_weight_is_dequantized_for_tiny_gemm(self):
+        module = SimpleNamespace(
+            weight=torch.nn.Parameter(
+                torch.ones((130, 129), device="cuda", dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            ),
+            weight_scale_inv=torch.nn.Parameter(
+                torch.tensor([[1.0, 2.0], [3.0, 4.0]], device="cuda"),
+                requires_grad=False,
+            ),
+            quant_method=SimpleNamespace(weight_block_size=[128, 128]),
+            params_dtype=torch.bfloat16,
+        )
+
+        weight = _get_k3_dense_weight(module)
+
+        self.assertEqual(weight.dtype, torch.bfloat16)
+        torch.testing.assert_close(
+            weight[[0, 0, 128, 128], [0, 128, 0, 128]].float(),
+            torch.tensor([1.0, 2.0, 3.0, 4.0], device="cuda"),
+        )
+
+    def test_per_tensor_fp8_weight_is_not_block_dequantized(self):
+        weight = torch.nn.Parameter(
+            torch.ones((2, 2), device="cuda", dtype=torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        module = SimpleNamespace(
+            weight=weight, weight_scale=torch.ones(1, device="cuda")
+        )
+
+        self.assertEqual(_get_k3_dense_weight(module).data_ptr(), weight.data_ptr())
 
 
 if __name__ == "__main__":

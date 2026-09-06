@@ -332,6 +332,11 @@ class MockDSV4ModelRunner:
         self.dtype = dtype
         self.kv_cache_dtype = dtype
         self.kv_cache_dtype_str = "auto"
+        # This runner's own resolved backends (production stamps these in
+        # ModelRunner.initialize); a draft runner would carry its own.
+        self.prefill_attention_backend_str = case.backend
+        self.decode_attention_backend_str = case.backend
+        self.draft_attention_backend = None
         self.gpu_id = 0
         self.canary_manager = None
         self.page_size = case.page_size
@@ -366,7 +371,7 @@ class MockDSV4ModelRunner:
             max_running_requests=None,
             pp_size=1,
             revision=None,
-            speculative_algorithm=None,
+            speculative_algorithm=("EAGLE" if speculative_num_draft_tokens else None),
             speculative_eagle_topk=speculative_eagle_topk,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_num_steps=max(0, speculative_num_draft_tokens - 1),
@@ -395,7 +400,7 @@ class MockDSV4ModelRunner:
             c4_state_pool_size=pool_batch_size,
             c128_state_pool_size=pool_batch_size,
             page_size=case.page_size,
-            swa_page_size=DSV4_SWA_WINDOW,
+            swa_page_size=case.page_size,
             dtype=torch.float8_e4m3fn,
             c4_state_dtype=dtype,
             c128_state_dtype=dtype,
@@ -1010,8 +1015,7 @@ def make_dsv4_padded_replay_inputs(
     pad_token_count = case.num_input_tokens - base_inputs["input_hidden"].shape[0]
     if pad_token_count < 0:
         raise ValueError(
-            f"replay input shrink not supported: {pad_token_count=}; "
-            f"case={case.name}"
+            f"replay input shrink not supported: {pad_token_count=}; case={case.name}"
         )
     if pad_token_count == 0:
         padded_input_hidden = base_inputs["input_hidden"]
@@ -1441,12 +1445,12 @@ def _seed_c4_sparse_prefill_indices(
     max_len = int(lens.max().item())
     pool = fixture.runner.token_to_kv_pool
     c4_page_size = pool.get_extra_key_page_size(layer_id=0)
-    assert max_len <= min(
-        num_entries, c4_page_size
-    ), f"case attends {max_len} c4 entries; only {min(num_entries, c4_page_size)} populated"
-    assert (
-        md.page_table[:, 0] == 0
-    ).all(), "sparse seeding requires the raw==physical identity (first page 0)"
+    assert max_len <= min(num_entries, c4_page_size), (
+        f"case attends {max_len} c4 entries; only {min(num_entries, c4_page_size)} populated"
+    )
+    assert (md.page_table[:, 0] == 0).all(), (
+        "sparse seeding requires the raw==physical identity (first page 0)"
+    )
     seq = (
         torch.arange(width, dtype=raw_indices.dtype, device=raw_indices.device)
         .unsqueeze(0)
@@ -1482,9 +1486,9 @@ def run_dsv4_target_verify_attention_case(
         "DSV4 target_verify is chain-only — `deepseek_v4_backend.py:369` "
         "asserts `self.topk in [0, 1]`. Pass topk=1."
     )
-    assert (
-        case.forward_mode.is_target_verify()
-    ), f"run_dsv4_target_verify_attention_case requires TARGET_VERIFY case; got {case.forward_mode}"
+    assert case.forward_mode.is_target_verify(), (
+        f"run_dsv4_target_verify_attention_case requires TARGET_VERIFY case; got {case.forward_mode}"
+    )
     # Lazy import to avoid cycles (runner_modes imports attention_methods).
     from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (
         _make_eagle_verify_input,
@@ -1555,9 +1559,9 @@ def run_dsv4_draft_extend_attention_case(
         "`deepseek_v4_backend.py:636-663` and the 'Production-Unsupported' "
         "section in dsv4/README.md."
     )
-    assert (
-        case.forward_mode.is_draft_extend_v2()
-    ), f"run_dsv4_draft_extend_attention_case requires DRAFT_EXTEND; got {case.forward_mode}"
+    assert case.forward_mode.is_draft_extend_v2(), (
+        f"run_dsv4_draft_extend_attention_case requires DRAFT_EXTEND; got {case.forward_mode}"
+    )
     from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (
         _make_eagle_draft_extend_input,
     )
@@ -1626,11 +1630,13 @@ def run_dsv4_compress_attention_case(
     assert case.compress_ratio in (
         4,
         128,
-    ), f"DSV4 compact runner requires compress_ratio in (4, 128); got {case.compress_ratio}"
+    ), (
+        f"DSV4 compact runner requires compress_ratio in (4, 128); got {case.compress_ratio}"
+    )
     if sparse_prefill:
-        assert (
-            case.forward_mode.is_extend_without_speculative()
-        ), f"sparse prefill only serves extend; got {case.forward_mode}"
+        assert case.forward_mode.is_extend_without_speculative(), (
+            f"sparse prefill only serves extend; got {case.forward_mode}"
+        )
     fixture = build_dsv4_attention_fixture(
         testcase,
         case,

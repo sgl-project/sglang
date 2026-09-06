@@ -34,10 +34,7 @@ import sglang as sgl
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(
-    est_time=300,
-    suite="nightly-8-gpu-b200",
-)
+register_cuda_ci(est_time=1800, stage="weekly", runner_config="8-gpu-b200")
 
 BASE_MODEL = "deepseek-ai/DeepSeek-V3.1-Base"
 LORA_HF_REPO = "yushengsu/lora-diff-DeepSeek-V3.1-Base"
@@ -76,7 +73,6 @@ def get_prompt_logprobs(engine, input_ids, lora_path):
 
 
 class TestLoRADeepSeekV3BaseLogprobDiff(CustomTestCase):
-
     def test_lora_deepseek_v3_base_logprob_accuracy(self):
         adapter_path = snapshot_download(
             LORA_HF_REPO,

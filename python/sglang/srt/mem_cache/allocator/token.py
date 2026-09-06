@@ -44,8 +44,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_pages = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device
         )
-        self.is_not_in_free_group = True
-        self.free_group = []
+        self.free_group = None
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
 
     def available_size(self):
@@ -67,18 +66,27 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
-        if self.is_not_in_free_group:
+        if self.free_group is None:
             if self.need_sort:
                 self.release_pages = torch.cat((self.release_pages, free_index))
             else:
                 self.free_pages = torch.cat((self.free_pages, free_index))
         else:
-            self.free_group.append(free_index)
+            self.free_group.append(self._copy_for_free_group(free_index))
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
-        return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        return self._kvcache.get_cpu_copy(
+            indices,
+            mamba_indices=mamba_indices,
+            req_pool_index=req_pool_index,
+        )
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         return self._kvcache.load_cpu_copy(
-            kv_cache_cpu, indices, mamba_indices=mamba_indices
+            kv_cache_cpu,
+            indices,
+            mamba_indices=mamba_indices,
+            req_pool_index=req_pool_index,
         )

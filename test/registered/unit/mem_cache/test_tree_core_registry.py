@@ -3,6 +3,8 @@
 import unittest
 from unittest import mock
 
+from unified_tree_core_inspection_interface import UnifiedTreeCoreInspectionInterface
+
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -98,6 +100,7 @@ class TreeCoreRegistryTest(CustomTestCase):
             components={ComponentType.FULL: component},
         )
         self.assertIsInstance(core, UnifiedTreeCore)
+        self.assertNotIsInstance(core, UnifiedTreeCoreInspectionInterface)
         self.assertIs(component.tree_core, core)
 
     def test_unknown_backend_raises_naming_the_known_backends(self):

@@ -7,9 +7,12 @@ import unittest
 import requests
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.weight_cache.protocol import get_ready_path, get_socket_path
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
+    DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -26,8 +29,8 @@ DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
 # IPC handoff is exercised on every PR. Since the CI runner executes the whole
 # file per suite, TestWeightCacheDaemonTP2 self-skips when fewer than 2 GPUs are
 # visible (i.e. on the 1-gpu runner).
-register_cuda_ci(est_time=100, stage="extra-a", runner_config="2-gpu-large")
-register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=280, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-small")
 
 # Capture the client server's logs so test_loaded_via_ipc can assert the IPC
 # load path actually ran (and did not silently fall back to disk).
@@ -43,6 +46,11 @@ PROMPTS = [
 ]
 
 
+def _gpu_uuids(tp_size: int) -> list:
+    # Single-node, default base_gpu_id/gpu_id_step: rank i runs on physical GPU i.
+    return [current_platform.get_device_uuid(i) for i in range(tp_size)]
+
+
 @unittest.skipIf(
     torch.cuda.device_count() < 2,
     "TP=2 weight cache daemon test requires >=2 GPUs (skipped on the 1-gpu runner)",
@@ -50,16 +58,20 @@ PROMPTS = [
 class TestWeightCacheDaemonTP2(CustomTestCase):
     """E2E test: start weight cache daemons, then launch server in client mode with TP2."""
 
+    model_override = None
+    daemon_args = []
+    server_args = []
+
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL
+        cls.model = cls.model_override or DEFAULT_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.tp_size = 2
+        cls.gpu_uuids = _gpu_uuids(cls.tp_size)
 
         # Clean up stale ready/socket files from previous runs
-        for rank in range(cls.tp_size):
-            for suffix in (".ready", ".sock"):
-                path = f"/tmp/sglang_weight_cache_rank{rank}{suffix}"
+        for device_uuid in cls.gpu_uuids:
+            for path in (get_ready_path(device_uuid), get_socket_path(device_uuid)):
                 if os.path.exists(path):
                     os.unlink(path)
 
@@ -74,19 +86,21 @@ class TestWeightCacheDaemonTP2(CustomTestCase):
                 cls.model,
                 "--tp-size",
                 str(cls.tp_size),
+                *cls.daemon_args,
             ]
         )
 
         # Step 2: Wait for all daemon ready files
         timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
         start = time.time()
-        for rank in range(cls.tp_size):
-            ready_path = f"/tmp/sglang_weight_cache_rank{rank}.ready"
+        for device_uuid in cls.gpu_uuids:
+            ready_path = get_ready_path(device_uuid)
             while not os.path.exists(ready_path):
                 if time.time() - start > timeout:
                     kill_process_tree(cls.daemon_process.pid)
                     raise TimeoutError(
-                        f"Weight cache daemon rank {rank} not ready within {timeout}s"
+                        f"Weight cache daemon for GPU {device_uuid} not ready "
+                        f"within {timeout}s"
                     )
                 if cls.daemon_process.poll() is not None:
                     raise RuntimeError(
@@ -107,6 +121,7 @@ class TestWeightCacheDaemonTP2(CustomTestCase):
                 str(cls.tp_size),
                 "--weight-cache-mode",
                 "client",
+                *cls.server_args,
             ],
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
@@ -129,9 +144,8 @@ class TestWeightCacheDaemonTP2(CustomTestCase):
                     os.unlink(path)
                 except OSError:
                     pass
-        for rank in range(getattr(cls, "tp_size", 2)):
-            for suffix in (".ready", ".sock"):
-                path = f"/tmp/sglang_weight_cache_rank{rank}{suffix}"
+        for device_uuid in getattr(cls, "gpu_uuids", ()):
+            for path in (get_ready_path(device_uuid), get_socket_path(device_uuid)):
                 if os.path.exists(path):
                     try:
                         os.unlink(path)
@@ -213,11 +227,11 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
         cls.model = DEFAULT_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.tp_size = 1
+        cls.gpu_uuids = _gpu_uuids(cls.tp_size)
 
         # Clean up stale ready/socket files from previous runs.
-        for rank in range(cls.tp_size):
-            for suffix in (".ready", ".sock"):
-                path = f"/tmp/sglang_weight_cache_rank{rank}{suffix}"
+        for device_uuid in cls.gpu_uuids:
+            for path in (get_ready_path(device_uuid), get_socket_path(device_uuid)):
                 if os.path.exists(path):
                     os.unlink(path)
 
@@ -238,13 +252,14 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
         # Step 2: Wait for the daemon ready file.
         timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
         start = time.time()
-        for rank in range(cls.tp_size):
-            ready_path = f"/tmp/sglang_weight_cache_rank{rank}.ready"
+        for device_uuid in cls.gpu_uuids:
+            ready_path = get_ready_path(device_uuid)
             while not os.path.exists(ready_path):
                 if time.time() - start > timeout:
                     kill_process_tree(cls.daemon_process.pid)
                     raise TimeoutError(
-                        f"Weight cache daemon rank {rank} not ready within {timeout}s"
+                        f"Weight cache daemon for GPU {device_uuid} not ready "
+                        f"within {timeout}s"
                     )
                 if cls.daemon_process.poll() is not None:
                     raise RuntimeError(
@@ -287,9 +302,8 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
                     os.unlink(path)
                 except OSError:
                     pass
-        for rank in range(getattr(cls, "tp_size", 1)):
-            for suffix in (".ready", ".sock"):
-                path = f"/tmp/sglang_weight_cache_rank{rank}{suffix}"
+        for device_uuid in getattr(cls, "gpu_uuids", ()):
+            for path in (get_ready_path(device_uuid), get_socket_path(device_uuid)):
                 if os.path.exists(path):
                     try:
                         os.unlink(path)
@@ -332,6 +346,40 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
             "Expected the client server to load weights via IPC, but the IPC "
             "load log line was not found — the loader likely fell back to disk.",
         )
+
+
+class TestWeightCacheDaemonQwen3MoeDP(TestWeightCacheDaemonTP2):
+    """Qwen3 with static attention DP through the existing IPC fixture."""
+
+    daemon_args = [
+        "--dp",
+        "2",
+        "--ep-size",
+        "1",
+        "--enable-dp-attention",
+        "--enable-dp-lm-head",
+        "--random-seed",
+        "42",
+    ]
+    server_args = daemon_args[:]
+
+
+class TestWeightCacheDaemonQwen3MoeEP(TestWeightCacheDaemonTP2):
+    """Qwen3 MoE with static expert parallelism through the existing IPC fixture."""
+
+    model_override = DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN
+    daemon_args = [
+        "--dp",
+        "1",
+        "--ep-size",
+        "2",
+        "--enable-eplb",
+        "--ep-num-redundant-experts",
+        "2",
+        "--random-seed",
+        "42",
+    ]
+    server_args = daemon_args[:]
 
 
 if __name__ == "__main__":

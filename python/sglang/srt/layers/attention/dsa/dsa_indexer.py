@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 import torch
 from einops import rearrange
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.ops.attention.fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
@@ -32,7 +33,6 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_graph_dsa_split_op_surface,
 )
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
-from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
@@ -44,7 +44,6 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_schedule,
-    get_server_args,
 )
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
@@ -133,15 +132,18 @@ if TYPE_CHECKING:
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
+if _is_cuda or _is_hip:
+    # Plain-torch graph helpers: usable wherever the split-op surface is.
+    from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
+        logits_head_gate_graph,
+        scale_head_gate_graph,
+    )
+
 if _is_cuda:
     from sglang.kernels.ops.attention.dsv4 import fused_q_indexer_rope_first_quant
     from sglang.kernels.ops.quantization.dsv32 import (
         fused_k_indexer_norm_rope,
         fused_k_indexer_norm_rope_store,
-    )
-    from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
-        logits_head_gate_graph,
-        scale_head_gate_graph,
     )
 
     @register_custom_op(mutates_args=["topk_indices"])
@@ -155,11 +157,14 @@ def _broadcast_indexer_topk_from_rank0_impl(topk_indices: torch.Tensor) -> None:
     if group.world_size == 1:
         return
 
-    if topk_indices.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
-        if group.pynccl_comm is None:
-            raise RuntimeError(
-                "SGLANG_DSA_TOPK_BROADCAST requires PyNCCL during CUDA graph capture."
-            )
+    # PyNCCL is the faster path under capture, but it is not a precondition:
+    # a split attn-TP group is built without one (parallel_state.py), and the
+    # process-group broadcast captures and replays correctly.
+    if (
+        topk_indices.device.type == "cuda"
+        and torch.cuda.is_current_stream_capturing()
+        and group.pynccl_comm is not None
+    ):
         with group.pynccl_comm.change_state(enable=True):
             group.pynccl_comm.broadcast(topk_indices, src=0)
     else:
@@ -191,16 +196,18 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
         from sglang.kernels.ops.quantization.hadamard import hadamard_transform
 
     hidden_size = x.size(-1)
-    assert (
-        hidden_size & (hidden_size - 1)
-    ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
+    assert (hidden_size & (hidden_size - 1)) == 0, (
+        "Hidden size must be a power of 2 for Hadamard transform."
+    )
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
-class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
+class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     _MQA_LOGITS_BYTES_PER_ELEM = 4
     _MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
     _MQA_LOGITS_TOTAL_MEM_FRACTION = 0.3
+    # aiter's fp8_mqa_logits only compiles below 2 GiB of logits (buffer_store).
+    _MQA_LOGITS_MAX_BYTES_ROCM = 2**31 - 1
     _mqa_logits_budget_bytes: Dict[int, int] = {}
 
     @staticmethod
@@ -249,7 +256,7 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
         if _is_cuda:
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
-            pp_size = get_server_args().pp_size
+            pp_size = get_parallel().pp_size
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
         else:
             self.logits_with_pp_recv = False
@@ -389,12 +396,70 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
         return x if self.use_dsa_indexer_fusion else rotate_activation(x)
 
     def _should_skip_logits_computation(self, forward_batch: ForwardBatch) -> bool:
-        if (
-            forward_batch.forward_mode.is_extend_without_speculative()
-            and forward_batch.seq_lens_cpu is not None
-        ):
-            max_kv_len = forward_batch.seq_lens_cpu.max().item()
+        # When kv_len <= index_topk the top-k selects ALL valid positions, so the
+        # indexer's logits GEMM + paged_mqa_logits + top-k are wasted work: a plain
+        # topk_transform(dummy_logits) already yields the correct "select-all"
+        # (physical page-slot) indices. Skipping the logits path is safe here.
+        #
+        # Prefill/extend: original fast path, all platforms.
+        # Decode: new here, and ROCm-only for now (see the _is_hip gate below).
+        # Under a captured decode cuda graph the chosen branch is frozen at
+        # capture time and would replay incorrectly for kv_len > index_topk, so
+        # the decode skip is not decided per-step during capture; it is driven by
+        # which graph variant is being captured instead.
+        fb = forward_batch
+
+        # Prefill/extend: original per-step gate (host sync on seq_lens_cpu is fine).
+        if fb.forward_mode.is_extend_without_speculative():
+            if fb.seq_lens_cpu is None or fb.seq_lens_cpu.numel() == 0:
+                return False
+            return int(fb.seq_lens_cpu.max().item()) <= self.index_topk
+
+        # Decode/idle.
+        if fb.forward_mode.is_decode_or_idle():
+            # Decode k-only skip (both the captured dual-graph "dense" variant
+            # and the eager per-step skip below) is currently HIP-only. On CUDA
+            # this common code keeps the original behavior (decode never skips
+            # the indexer, i.e. always runs the full logits path) because the
+            # decode k-only path has not been validated on CUDA yet. Mirrors the
+            # is_hip() gate on dsa_dual_graph in decode_cuda_graph_runner, which
+            # already prevents the CUDA capture path from setting a "dense"
+            # variant.
+            if not _is_hip:
+                return False
+            if get_is_capture_mode():
+                # Under a captured decode cuda graph the taken branch is frozen at
+                # capture time, so we must NOT branch on a runtime seq_len (also a
+                # host sync would break capture). The chosen branch is instead
+                # driven by which graph variant is being captured.
+                #
+                # The decode runner captures a "dense" (k-only) and a "sparse"
+                # (full indexer) graph per bs bucket and dispatches on max_kv_len
+                # at replay. The capture-variant signal tells us which one to
+                # bake in.
+                from sglang.srt.model_executor.runner_utils.capture_mode import (
+                    get_capture_dsa_variant,
+                )
+
+                variant = get_capture_dsa_variant()
+                if variant == "dense":
+                    return True
+                if variant == "sparse":
+                    return False
+
+                # No dual-variant capture signal: default to the correct-for-all
+                # full-indexer (sparse) path.
+                return False
+            # Eager decode: safe to check per-step (host sync OK); correct for both
+            # kv_len<=index_topk (k-only) and kv_len>index_topk (falls through).
+            if fb.seq_lens_cpu is not None and fb.seq_lens_cpu.numel() > 0:
+                max_kv_len = int(fb.seq_lens_cpu.max().item())
+            elif fb.seq_lens is not None and fb.seq_lens.numel() > 0:
+                max_kv_len = int(fb.seq_lens.max().item())
+            else:
+                return False
             return max_kv_len <= self.index_topk
+
         return False
 
     def _get_q_k_bf16(
@@ -421,7 +486,6 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
                     dim=-1,
                 )
             with torch.cuda.stream(self.alt_stream):
-                # TODO we should also put DeepGEMM half SM here?
                 if self.use_dsa_indexer_fusion:
                     key, weights_raw = self._fused_k_weights(x)
                 else:
@@ -517,7 +581,13 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
             key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
         )
 
-        _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
+        # Rotary may update both inputs in place, so the K-only path must not
+        # alias its dummy query with the key.
+        if _is_cuda or _is_hip or _is_xpu:
+            dummy_q_rope = torch.empty_like(k_rope)
+        else:
+            dummy_q_rope = k_rope
+        _, k_rope = self.rotary_emb(positions, dummy_q_rope, k_rope)
         self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
         key = rotate_activation(key)
 
@@ -738,13 +808,13 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
         if _is_hip:
             if _use_aiter_preshuffle:
-                assert (
-                    page_size % 16 == 0
-                ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+                assert page_size % 16 == 0, (
+                    f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+                )
             else:
-                assert (
-                    page_size == 1
-                ), f"HIP legacy DSA path requires page_size == 1, got {page_size}"
+                assert page_size == 1, (
+                    f"HIP legacy DSA path requires page_size == 1, got {page_size}"
+                )
         else:
             assert page_size == 64, "only support page size 64"
         # NOTE(dark): this support extend/decode/decode+graph
@@ -805,10 +875,18 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
 
         if use_dg_native:
             seqlens_32_2d = ctx_2d
+        elif ctx_2d is not None:
+            if ctx_2d.size(1) == 1:
+                seqlens_32_2d = ctx_2d
+            else:
+                seqlens_32_2d = ctx_2d.reshape(-1).contiguous().view(-1, 1)
         elif seqlens_32.dim() == 2:
-            seqlens_32_2d = seqlens_32
+            if seqlens_32.size(1) == 1:
+                seqlens_32_2d = seqlens_32.contiguous()
+            else:
+                seqlens_32_2d = seqlens_32.reshape(-1).contiguous().view(-1, 1)
         else:
-            seqlens_32_2d = seqlens_32.unsqueeze(-1)
+            seqlens_32_2d = seqlens_32.contiguous().view(-1, 1)
         if _is_cuda:
             if schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
@@ -824,6 +902,52 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
         )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
+
+        # SM100 DeepGEMM paged MQA requires batch_size <= num_sms; chunk larger batches.
+        def _chunked_fp8_paged_mqa_logits(
+            q: torch.Tensor,
+            kv_cache: torch.Tensor,
+            w: torch.Tensor,
+            context_lens: torch.Tensor,
+            block_table: torch.Tensor,
+            mqa_schedule_metadata: torch.Tensor,
+            max_len: int,
+            clean_logits: bool = False,
+        ) -> torch.Tensor:
+            batch_size, chunk_next_n = q.shape[:2]
+            if batch_size == 0:
+                return torch.empty((0, max_len), dtype=torch.float32, device=q.device)
+            if batch_size <= self.sm_count:
+                return deep_gemm.fp8_paged_mqa_logits(
+                    q,
+                    kv_cache,
+                    w,
+                    context_lens,
+                    block_table,
+                    mqa_schedule_metadata,
+                    max_len,
+                    clean_logits=clean_logits,
+                )
+            logits_chunks = []
+            for start in range(0, batch_size, self.sm_count):
+                end = min(start + self.sm_count, batch_size)
+                chunk_context_lens = context_lens[start:end]
+                chunk_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    chunk_context_lens, blocksize, self.sm_count
+                )
+                logits_chunks.append(
+                    deep_gemm.fp8_paged_mqa_logits(
+                        q[start:end],
+                        kv_cache,
+                        w[start * chunk_next_n : end * chunk_next_n],
+                        chunk_context_lens,
+                        block_table[start:end],
+                        chunk_schedule_metadata,
+                        max_len,
+                        clean_logits=clean_logits,
+                    )
+                )
+            return torch.cat(logits_chunks, dim=0)
 
         if self.paged_mqa_logits_backend.is_aiter():
             logits = aiter_paged_mqa_logits(
@@ -857,7 +981,7 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
             )
         elif use_dg_native:
             logits = deepgemm_paged_mqa_logits_native(
-                deep_gemm.fp8_paged_mqa_logits,
+                _chunked_fp8_paged_mqa_logits,
                 q_fp8,
                 kv_cache_fp8,
                 weights,
@@ -871,7 +995,7 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
             )
         else:
             logits = deepgemm_paged_mqa_logits_split(
-                deep_gemm.fp8_paged_mqa_logits,
+                _chunked_fp8_paged_mqa_logits,
                 q_fp8,
                 kv_cache_fp8,
                 weights,
@@ -937,7 +1061,8 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
         self, num_q: int, num_k: int, device_index: int
     ) -> Tuple[bool, int]:
         """
-        Detect whether we need to chunk the MQA logits computation to avoid OOM
+        Detect whether we need to chunk the MQA logits computation to avoid OOM,
+        and on ROCm to stay under aiter's 2 GiB logits limit
         Return: (need_chunk, logits_budget_bytes)
         """
         # Quick static check for normal batches
@@ -946,6 +1071,10 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
 
         logits_bytes = num_q * num_k * self._MQA_LOGITS_BYTES_PER_ELEM
         logits_budget_bytes = self._get_mqa_logits_budget_bytes(device_index)
+        if _is_hip:
+            logits_budget_bytes = min(
+                logits_budget_bytes, self._MQA_LOGITS_MAX_BYTES_ROCM
+            )
 
         need_chunk = logits_bytes > logits_budget_bytes
         return need_chunk, logits_budget_bytes
@@ -968,13 +1097,13 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
         page_size = get_token_to_kv_pool().page_size
         if _is_hip:
             if _use_aiter_preshuffle:
-                assert (
-                    page_size % 16 == 0
-                ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+                assert page_size % 16 == 0, (
+                    f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+                )
             else:
-                assert (
-                    page_size == 1
-                ), f"HIP legacy DSA path requires page_size == 1, got {page_size}"
+                assert page_size == 1, (
+                    f"HIP legacy DSA path requires page_size == 1, got {page_size}"
+                )
         else:
             assert page_size == 64, "only support page size 64"
 
@@ -1086,13 +1215,13 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
         if global_topk_offset is None:
             cu_seqlens_q_full = torch.ones(q_offset, dtype=torch.int32, device=device)
 
-        assert (
-            seq_lens_expanded.shape[0] == q_offset
-        ), f"seq_lens_expanded length mismatch: {seq_lens_expanded.shape[0]} != {q_offset}"
+        assert seq_lens_expanded.shape[0] == q_offset, (
+            f"seq_lens_expanded length mismatch: {seq_lens_expanded.shape[0]} != {q_offset}"
+        )
         if global_topk_offset is not None:
-            assert (
-                global_topk_offset.shape[0] >= q_offset
-            ), f"topk_indices_offset too short: {global_topk_offset.shape[0]} < {q_offset}"
+            assert global_topk_offset.shape[0] >= q_offset, (
+                f"topk_indices_offset too short: {global_topk_offset.shape[0]} < {q_offset}"
+            )
 
         start = 0
         while start < q_offset:
@@ -1175,7 +1304,10 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
         #   - topk_result: pre-allocated padded buffer to fill in place (a downstream
         #     captured graph reads it at a fixed address). None => return a fresh,
         #     naturally-sized tensor.
-        assert forward_batch.forward_mode.is_extend_without_speculative()
+        assert (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            or forward_batch.forward_mode.is_decode_or_idle()
+        )
         x_meta = x[0] if isinstance(x, tuple) else x
 
         # Fast path: only compute and store k cache, skip all q and weights ops.
@@ -1472,6 +1604,24 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
             loc=out_cache_loc,
             index_k=k_fp8,
             index_k_scale=k_scale,
+        )
+
+    def forward_native(self, *args, **kwargs):
+        # The indexer has no pure-torch reference path; it only runs on
+        # platforms with a dedicated forward below.
+        raise NotImplementedError("Indexer has no native (pure-torch) path")
+
+    def forward_xpu(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        return_indices: bool = True,
+    ) -> Optional[torch.Tensor]:
+        return self.forward_cuda(
+            x, q_lora, positions, forward_batch, layer_id, return_indices
         )
 
     def forward_cuda(

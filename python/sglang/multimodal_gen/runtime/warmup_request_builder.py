@@ -6,6 +6,12 @@ first real request, without copying user traffic. It starts from the model's
 sampling defaults, then keeps startup bounded by choosing common low-cost
 resolution/frame buckets and trimming the denoising step count.
 
+When warmup-calibrated auto residency is active, warmup uses the full default
+serving shape but keeps the trimmed step count. Memory depends on the
+activation shape rather than the number of repeated denoising steps, so this
+directly measures placement headroom without running a full generation or an
+extra stateful pipeline request.
+
 Image models may run a tiny second step because first/last step paths often
 initialize different kernels or scheduler state. Video models cap frames and
 steps to keep startup bounded. Explicit warmup resolutions share this builder;
@@ -13,16 +19,25 @@ callers send them through the scheduler client so warmup exercises the same
 request transport path as real generation.
 """
 
+import json
 from copy import copy
+from dataclasses import fields, replace
 from typing import Any
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    SamplingParams,
+    align_num_frames_for_num_gpus,
+    resolve_sequence_shard,
+)
 from sglang.multimodal_gen.registry import get_pipeline_config_classes
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     is_ltx2_two_stage_pipeline_name,
+)
+from sglang.multimodal_gen.runtime.server_args.auto_tune import (
+    auto_residency_args_skip_reason,
 )
 from sglang.multimodal_gen.runtime.utils.common import parse_size
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -39,8 +54,14 @@ SERVER_WARMUP_IMAGE_MAX_AREA = 768 * 768
 SERVER_WARMUP_DIFFUSERS_IMAGE_MAX_AREA = 512 * 512
 SERVER_WARMUP_VIDEO_MAX_AREA = 832 * 480
 SERVER_WARMUP_MAX_VIDEO_FRAMES = 17
+SERVER_WARMUP_LTX2_TWO_STAGE_MAX_VIDEO_FRAMES = 25
 SERVER_WARMUP_IMAGE_STEPS = 2
 SERVER_WARMUP_VIDEO_STEPS = 2
+# Two-step schedulers can have one compile-heavy step and one lower-order
+# boundary step, leaving no representative steady-state timing sample. Auto
+# residency extrapolates this timing to the default request, so collect four
+# steps while retaining the shorter warmup for every non-planning path.
+AUTO_RESIDENCY_TIMING_STEPS = 4
 
 
 def get_model_sampling_defaults(server_args: ServerArgs) -> SamplingParams:
@@ -49,13 +70,44 @@ def get_model_sampling_defaults(server_args: ServerArgs) -> SamplingParams:
         config_classes = get_pipeline_config_classes(pipeline_class_name)
         if config_classes is not None:
             _, sampling_params_cls = config_classes
-            return sampling_params_cls()
+            defaults = sampling_params_cls()
+            return _apply_warmup_sampling_overrides(server_args, defaults)
 
-    return SamplingParams.from_pretrained(
+    defaults = SamplingParams.from_pretrained(
         server_args.model_path,
         backend=server_args.backend,
         model_id=server_args.model_id,
     )
+    return _apply_warmup_sampling_overrides(server_args, defaults)
+
+
+def _apply_warmup_sampling_overrides(
+    server_args: ServerArgs, defaults: SamplingParams
+) -> SamplingParams:
+    value = server_args.warmup_sampling_params
+    if value is None:
+        return defaults
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                "--warmup-sampling-params must be a JSON object"
+            ) from error
+    if not isinstance(value, dict):
+        raise ValueError("--warmup-sampling-params must be a JSON object")
+    field_names = {item.name for item in fields(defaults)}
+    unknown = value.keys() - field_names
+    if unknown:
+        raise ValueError(
+            f"invalid --warmup-sampling-params fields: {', '.join(sorted(unknown))}"
+        )
+    updated = copy(defaults)
+    for name, field_value in value.items():
+        # Some model contracts intentionally expose fixed dataclass fields
+        # with init=False; a warmup workload still needs to mirror the request.
+        object.__setattr__(updated, name, field_value)
+    return updated
 
 
 def _resolve_default_warmup_resolution(
@@ -220,6 +272,72 @@ def _fit_resolution_to_area(
     )
 
 
+def _halve_num_frames(server_args: ServerArgs, num_frames: int) -> int:
+    """Halve the latent frame count, keeping the model's frame arithmetic."""
+    if num_frames <= 1:
+        return num_frames
+    ratio = (
+        server_args.pipeline_config.vae_config.arch_config.temporal_compression_ratio
+    )
+    if not ratio or ratio <= 1:
+        return max(1, num_frames // 2)
+    latent_frames = (num_frames - 1) // ratio + 1
+    # round up: halving 5 latent frames should land on 3 (9 frames), not 2 (5)
+    return ((latent_frames + 1) // 2 - 1) * ratio + 1
+
+
+def _lighter_valid_num_frames(server_args: ServerArgs, num_frames: int) -> int:
+    """Largest frame count at or below half that the model's frame contract accepts.
+
+    ``adjust_num_frames`` rounds up (LongLive2 maps 17 frames to 29), so the
+    halved count is walked down until it is a fixed point of the contract.
+    """
+    halved = _halve_num_frames(server_args, num_frames)
+    adjust = getattr(server_args.pipeline_config, "adjust_num_frames", None)
+    for candidate in range(halved, 0, -1):
+        adjusted = adjust(candidate) if callable(adjust) else candidate
+        if not isinstance(adjusted, int) or isinstance(adjusted, bool):
+            adjusted = candidate
+        if adjusted == candidate:
+            return candidate if candidate < num_frames else num_frames
+    return num_frames
+
+
+def lighten_warmup_req(server_args: ServerArgs, req: Req) -> Req | None:
+    """Roughly halve a warmup probe, or None once it cannot shrink further.
+
+    Warmup peak memory tracks width * height * num_frames, so a card that could
+    not hold the full probe usually holds half of it while still walking the
+    same code path. Frames go first: they drive video activation size, and
+    cutting them leaves the spatial kernels at their serving shape.
+    """
+    params = req.sampling_params
+    if params is None:
+        return None
+
+    num_frames = params.num_frames or 1
+    lighter_frames = _lighter_valid_num_frames(server_args, num_frames)
+    if lighter_frames < num_frames:
+        return _replace_warmup_workload(req, num_frames=lighter_frames)
+
+    width = params.width
+    height = params.height
+    if not width or not height:
+        return None
+    alignment = _warmup_resolution_alignment(server_args)
+    lighter = _fit_resolution_to_area(width, height, width * height // 2, alignment)
+    # below the alignment floor the fit rounds back up; only take a real cut
+    if lighter[0] * lighter[1] >= width * height:
+        return None
+    return _replace_warmup_workload(req, width=lighter[0], height=lighter[1])
+
+
+def _replace_warmup_workload(req: Req, **changes: int) -> Req:
+    lighter = copy(req)
+    lighter.sampling_params = replace(req.sampling_params, **changes)
+    return lighter
+
+
 def _is_resolution_aligned(resolution: tuple[int, int], alignment: int) -> bool:
     width, height = resolution
     return width % alignment == 0 and height % alignment == 0
@@ -231,16 +349,123 @@ def _resolve_warmup_num_frames(
     *,
     server_based_warmup: bool,
 ) -> int:
-    num_frames = getattr(sampling_defaults, "num_frames", 1)
-    if (
-        not server_based_warmup
-        or not _is_video_warmup_task(server_args)
-        or num_frames is None
-    ):
-        # use default num frames
+    default_num_frames = getattr(sampling_defaults, "num_frames", 1)
+    if not _is_video_warmup_task(server_args):
+        return default_num_frames
+
+    # Most tests and a few lightweight integrations use MagicMock server args,
+    # whose missing attributes resolve to another mock. Only accept a concrete
+    # integer as an explicit override.
+    explicit_num_frames = getattr(server_args, "warmup_num_frames", None)
+    num_frames = (
+        explicit_num_frames
+        if isinstance(explicit_num_frames, int)
+        else default_num_frames
+    )
+    if num_frames is None:
         return num_frames
 
-    return min(num_frames, SERVER_WARMUP_MAX_VIDEO_FRAMES)
+    # Breakable CUDA graph replays only exact latent shapes: the warmup
+    # request must run the full serving frame count so its captured graphs
+    # match serving signatures (mirrors the uncapped-steps rule in
+    # _resolve_warmup_steps).
+    if (
+        not server_based_warmup
+        or getattr(server_args, "enable_breakable_cuda_graph", False) is True
+    ):
+        warmup_num_frames = num_frames
+    else:
+        # Multi-GPU LTX two-stage aligns a one-second request to 25 frames;
+        # cover its latent shape during warmup
+        frame_budget = (
+            SERVER_WARMUP_LTX2_TWO_STAGE_MAX_VIDEO_FRAMES
+            if is_ltx2_two_stage_pipeline_name(server_args.pipeline_class_name)
+            and server_args.num_gpus > 1
+            else SERVER_WARMUP_MAX_VIDEO_FRAMES
+        )
+        warmup_num_frames = min(num_frames, frame_budget)
+
+    return _apply_warmup_frame_contract(
+        server_args, sampling_defaults, num_frames=warmup_num_frames
+    )
+
+
+def _apply_warmup_frame_contract(
+    server_args: ServerArgs, sampling_defaults: SamplingParams, *, num_frames: int
+) -> int:
+    """Re-apply the real-request frame contract to a capped warmup frame count.
+
+    Warmup requests skip ``SamplingParams._adjust``, so the cap must run the
+    model frame contract itself -- without this, e.g. LongLive2's capped 17
+    frames map to 5 latent frames (not divisible by its 8-frame causal block)
+    and every server warmup fails silently under fail-open. Pipelines that
+    align frames to ``num_gpus`` (rather than sharding the sequence dim) get
+    the same latent alignment real requests get.
+    """
+    num_frames = server_args.pipeline_config.adjust_num_frames(num_frames)
+    if (
+        sampling_defaults.adjust_frames
+        and not resolve_sequence_shard(
+            server_args.pipeline_config, sampling_defaults.enable_sequence_shard
+        )
+        and server_args.num_gpus > 1
+    ):
+        num_frames = align_num_frames_for_num_gpus(
+            num_frames,
+            num_gpus=server_args.num_gpus,
+            vae_config=server_args.pipeline_config.vae_config,
+            round_down=sampling_defaults.num_frames_round_down,
+        )
+    return num_frames
+
+
+def resolve_default_workload_shape(
+    server_args: ServerArgs,
+    sampling_defaults: SamplingParams,
+) -> tuple[int | None, int | None, int]:
+    """Resolve the serving shape used by warmup-based memory planning."""
+    width = sampling_defaults.width
+    height = sampling_defaults.height
+    if (width is None or height is None) and sampling_defaults.supported_resolutions:
+        width, height = max(
+            sampling_defaults.supported_resolutions,
+            key=lambda size: size[0] * size[1],
+        )
+    num_frames = sampling_defaults.num_frames or 1
+    if num_frames > 1:
+        num_frames = _apply_warmup_frame_contract(
+            server_args, sampling_defaults, num_frames=num_frames
+        )
+    return width, height, num_frames
+
+
+def _resolve_auto_residency_warmup_shape(
+    server_args: ServerArgs,
+    sampling_defaults: SamplingParams,
+    *,
+    warmup_shape: tuple[int, int, int | None],
+    server_based_warmup: bool,
+) -> tuple[int, int, int] | None:
+    """Return the full serving shape when bounded warmup is smaller.
+
+    The probe still runs only the bounded warmup step count. Denoising steps
+    repeat the same activation shape, so one full-shape forward measures the
+    placement constraints directly without paying for a full generation or
+    extrapolating a small-shape allocator peak.
+    """
+    if not server_based_warmup:
+        return None
+    if auto_residency_args_skip_reason(server_args) is not None:
+        return None
+    width, height, num_frames = resolve_default_workload_shape(
+        server_args, sampling_defaults
+    )
+    if width is None or height is None:
+        return None
+    target = (width, height, num_frames)
+    if target == warmup_shape:
+        return None
+    return target
 
 
 def _effective_cfg_scale(sampling_defaults: SamplingParams) -> float | None:
@@ -298,6 +523,14 @@ def should_include_warmup_image(
         return False
     if task_type.requires_image_input():
         return True
+    if getattr(server_args, "enable_breakable_cuda_graph", False) is True:
+        # BCG replays only exact input signatures. A synthetic warmup image
+        # flips optional-TI2V pipelines (e.g. LTX-2) into image-conditioned
+        # kwargs (denoise-mask -> per-token timestep) that pure T2V serving
+        # never produces, so every T2V request would miss the captured
+        # graphs and silently run eager. Capture the T2V signature instead;
+        # image-conditioned requests fall back to eager.
+        return False
     if type(server_args.pipeline_config).__name__ == "GlmImagePipelineConfig":
         return False
     if server_based_warmup:
@@ -345,11 +578,42 @@ def build_warmup_reqs(
         sampling_defaults,
         server_based_warmup=server_based_warmup,
     )
+    auto_residency_warmup_shape = (
+        _resolve_auto_residency_warmup_shape(
+            server_args,
+            sampling_defaults,
+            warmup_shape=(width, height, warmup_num_frames),
+            server_based_warmup=server_based_warmup,
+        )
+        if warmup_resolutions is None
+        else None
+    )
+    collect_auto_residency_metrics = (
+        warmup_resolutions is None
+        and server_based_warmup
+        and auto_residency_args_skip_reason(server_args) is None
+    )
+    if collect_auto_residency_metrics and sampling_defaults.num_inference_steps:
+        warmup_steps = min(
+            int(sampling_defaults.num_inference_steps),
+            max(warmup_steps, AUTO_RESIDENCY_TIMING_STEPS),
+        )
+    shapes = [
+        (width, height, warmup_num_frames, False) for width, height in resolutions
+    ]
+    if auto_residency_warmup_shape is not None:
+        # The bounded warmup runs first: its measurement lets the worker size
+        # the full-shape probe to the memory the card actually has left. The
+        # bounded shape then runs once more so the allocator pool and kernel
+        # caches serving starts from are shaped by a serving-sized request,
+        # not by the probe (the worker drops the probe's pool before it).
+        shapes.append((*auto_residency_warmup_shape, True))
+        shapes.append(shapes[0])
 
     # build warmup reqs
     warmup_reqs = []
     include_warmup_image = should_include_warmup_image(server_args, server_based_warmup)
-    for width, height in resolutions:
+    for width, height, num_frames, is_probe in shapes:
         req_kwargs = dict(
             data_type=task_type.data_type(),
             width=width,
@@ -363,7 +627,7 @@ def build_warmup_reqs(
             guidance_scale_2=sampling_defaults.guidance_scale_2,
             true_cfg_scale=sampling_defaults.true_cfg_scale,
             num_inference_steps=sampling_defaults.num_inference_steps,
-            num_frames=warmup_num_frames,
+            num_frames=num_frames,
         )
         if include_warmup_image:
             if warmup_input_path is None:
@@ -371,7 +635,13 @@ def build_warmup_reqs(
                     "Warmup image path is required for image-input model"
                 )
             req_kwargs["prompt"] = DEFAULT_PLACEHOLDER_PROMPT
-            req_kwargs["image_path"] = [warmup_input_path]
+            default_image_path = sampling_defaults.image_path
+            image_count = (
+                len(default_image_path)
+                if isinstance(default_image_path, (list, tuple))
+                else 1
+            )
+            req_kwargs["image_path"] = [warmup_input_path] * max(1, image_count)
         if server_args.enable_cfg_parallel:
             if not req_kwargs.get("negative_prompt"):
                 req_kwargs["negative_prompt"] = DEFAULT_PLACEHOLDER_PROMPT
@@ -405,6 +675,13 @@ def build_warmup_reqs(
                 req.extra["return_warmup_result"] = True
             if server_based_warmup:
                 req.extra["server_based_warmup"] = True
+            if collect_auto_residency_metrics:
+                # Stage timers already synchronize around warmup stages. Keep
+                # their values for residency planning instead of discarding
+                # the measurements after paying that cost.
+                req.metrics.suppress_stage_breakdown = False
+            if is_probe:
+                req.extra["auto_residency_full_shape_probe"] = True
             warmup_reqs.append(req)
 
     return warmup_reqs

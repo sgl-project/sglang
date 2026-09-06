@@ -33,6 +33,51 @@ utilities, and common action-policy helpers. Model packages may call these
 helpers. Keep ownership in shared runtime folders unless the code is truly
 architecture-specific.
 
+## Out-of-Tree Models and Pipelines
+
+An installed package can register native component models and a pipeline
+without modifying SGLang-Diffusion. Register them in the package's
+`__init__.py`:
+
+```python
+from sglang.multimodal_gen.registry import register_pipeline
+from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
+
+from .configs import CustomPipelineConfig, CustomSamplingParams
+from .pipeline import CustomPipeline
+
+
+ModelRegistry.register_model(
+    "CustomTransformer2DModel",
+    "custom_diffusion.models:CustomTransformer2DModel",
+)
+register_pipeline(
+    CustomPipeline,
+    sampling_param_cls=CustomSamplingParams,
+    pipeline_config_cls=CustomPipelineConfig,
+    hf_model_paths=["my-org/custom-diffusion-model"],
+    model_detectors=[lambda value: "custom-diffusion" in value.lower()],
+)
+```
+
+Install the package in the server environment and set the same environment
+variable used by SRT plugins:
+
+```bash
+pip install -e /path/to/custom-diffusion
+SGLANG_EXTERNAL_MODEL_PACKAGE=custom_diffusion \
+  sglang serve --model-path my-org/custom-diffusion-model
+```
+
+Notes:
+
+- The string form of `register_model` keeps component imports lazy.
+- `hf_model_paths` also supports checkpoints without `model_index.json`. Other
+  Diffusers checkpoints can select the pipeline through `_class_name`.
+- For a standalone safetensors file, pass `--pipeline CustomPipeline`.
+- Set the environment variable before startup. Each process imports the package
+  once. Use `overwrite=True` only to intentionally replace a built-in pipeline.
+
 ## Start With the Smallest Change
 
 Before adding files, decide which path fits the model.
@@ -314,6 +359,54 @@ class MyModelPipeline(LoRAPipeline, ComposedPipelineBase):
 EntryClass = [MyModelPipeline]
 ```
 
+#### Reuse component loaders
+
+Most components should keep the default loader for their role (transformer,
+text encoder, VAE, scheduler, or tokenizer). For an auxiliary module that accepts
+`model_cls(**config)` and loads an unchanged state dict, select
+`PlainStateDictComponentLoader` instead of adding a model-specific loader class:
+
+```python
+from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    PlainStateDictComponentLoader,
+)
+
+
+class MyModelPipeline(ComposedPipelineBase):
+    _required_config_modules = ["transformer", "queryformer", "text_projection"]
+    component_loaders = {
+        "queryformer": PlainStateDictComponentLoader,
+        "text_projection": PlainStateDictComponentLoader,
+    }
+
+    # Wire the stages as in the examples above.
+```
+
+The mapping uses exact pipeline component names, including aliases declared in
+`_extra_config_module_map`. It is local to this pipeline; omitted components keep
+their existing dispatch. An explicitly selected loader fails on errors instead
+of falling back to a different implementation.
+
+Register each module through `EntryClass` in its model file, or
+`ModelRegistry.register_model` for an out-of-tree package. The shared loader:
+
+- Resolves the registered class from `config.json`'s `_class_name`, falling back
+  to the architecture in `model_index.json`, and passes non-metadata config
+  fields to its constructor.
+- Loads a single safetensors file or an indexed sharded checkpoint using the
+  shared checkpoint selector, with strict key and shape checks.
+- Honors exact overrides such as `--component-weights-paths.queryformer PATH`
+  and `--component-precisions.queryformer bf16`. Precision defaults to the
+  pipeline's `dit_precision`.
+- Leaves eval mode and final CPU/GPU placement to the shared loading lifecycle.
+  It does not implement TP/FSDP weight sharding, quantization, or direct GPU
+  loading. Explicit quantization and direct-GPU-loading overrides are rejected.
+
+Keep a specialized loader when the component needs a config-object constructor,
+weight remapping or fusion, sharding, or a non-standard checkpoint format. Such
+a loader can also be selected through `component_loaders`; registering a model
+alone does not opt it into the plain state-dict protocol.
+
 ### 4. Last-Resort Before-Denoising Stage
 
 A `BeforeDenoisingStage` is not a catch-all replacement for the native stages.
@@ -356,17 +449,29 @@ Required fields for `DenoisingStage`:
 | `batch.num_inference_steps` | Number of denoising iterations. |
 | `batch.raw_latent_shape` | Original latent shape before packing, if decode needs it. |
 
-### 5. Denoising Module
+### 5. Distributed and memory integration
 
-Add a file under `runtime/models/dits/` only when the architecture is new. Reuse
-existing encoders, VAEs, schedulers, normalization layers, and fused kernels
-whenever possible.
+Single-GPU parity is only the first milestone. Complete native support also
+requires:
 
-For multi-GPU serving, add TP/SP support after the single-GPU path is correct.
-Useful references:
+- **Encoder and DiT TP/SP:** use native parallel projections and sharded weight
+  loading for TP, and `USPAttention` for SP. Handle masks, RoPE, padding, and
+  output gathering without falling back to a replicated full model. TP and SP
+  must work together.
+- **VAE parallel decode:** subclass `ParallelTiledVAE`, or reuse an existing
+  native base with the same contract. Support tiled and `spatial_shard` decode
+  through `DecodingStage` and the shared decode group. Reuse
+  `runtime/layers/parallel_conv.py` and
+  `runtime/models/vaes/parallel/diffusers_spatial.py` where applicable.
+- **Layerwise offload:** every loaded neural module must inherit
+  `LayerwiseOffloadableModuleMixin` and list all repeated block paths in
+  `layer_names`. Set `layerwise_offload_dit_group_enabled = False` for non-DiT
+  modules. Component CPU offload is not a substitute.
 
-- `runtime/models/dits/wanvideo.py` for TP plus SP.
-- `runtime/models/dits/qwen_image.py` for USP attention.
+See `wanvideo.py` and `qwen_image.py` for DiT TP/SP, `gemma_3.py` for encoder TP
+and offload, and `autoencoder_kl_qwenimage.py` or `ltx_2_vae.py` for VAE decode.
+The Diffusers backend is compatibility-first and does not need to meet this
+native integration contract.
 
 ### 6. Registry
 
@@ -393,11 +498,15 @@ implementation.
    content.
 2. Compare latent scale and shift, timestep order, sigma values, and conditioning
    kwargs against Diffusers or the official implementation.
-3. Verify VAE decode and post-processing separately from denoising.
-4. If the model supports LoRA, CFG parallelism, TP, SP, or disaggregation, test
-   each feature explicitly.
-5. Add or update docs, examples, or the compatibility matrix when users need a
-   new launch command.
+3. Compare VAE decode separately, including tiled and multi-GPU `spatial_shard`.
+4. Run encoder and DiT TP, SP, combined TP x SP, and
+   `--layerwise-offload-components all`; compare with the single-GPU resident
+   baseline.
+5. If the model supports LoRA, CFG parallelism, or disaggregation, test each
+   feature explicitly.
+6. Add or update the cookbook, examples, and
+   [Supported Models](./compatibility_matrix) catalog when users need a new
+   launch command.
 
 Common failure points:
 
@@ -419,5 +528,5 @@ Common failure points:
       `_class_name` when applicable.
 - [ ] Confirmed `_required_config_modules` matches the model repo.
 - [ ] Verified image or video quality against a reference output.
-- [ ] Tested multi-GPU paths if the PR claims TP, SP, CFG parallelism, or
-      distributed serving support.
+- [ ] Completed the distributed and memory integration checks above.
+- [ ] Tested CFG parallelism and distributed serving paths when they apply.

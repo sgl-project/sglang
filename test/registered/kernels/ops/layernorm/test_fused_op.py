@@ -10,7 +10,7 @@ import pytest
 import torch
 
 import sglang.kernels as K
-from sglang.kernels.fused_op import BaseFusedOp
+from sglang.kernels.fused_op import BACKEND_METHODS, DEFAULT_PRIORITY, BaseFusedOp
 from sglang.kernels.registry import KernelRegistry
 from sglang.kernels.spec import CapabilityRequirement as Cap
 from sglang.kernels.spec import KernelBackend, KernelSpec
@@ -22,6 +22,8 @@ register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 class _ToyAdd(BaseFusedOp):
     op = "test.toy_add"
     priority = (KernelBackend.TRITON, KernelBackend.TORCH)
+    # Auto-selection requires backends to be declared (empty set = any device).
+    capabilities = {KernelBackend.TRITON: frozenset()}
 
     def forward_native(self, a, b):
         return a + b
@@ -60,6 +62,14 @@ def test_available_backends():
         KernelBackend.TORCH_COMPILE,
         KernelBackend.TRITON,
     }
+
+
+def test_kda_backend_contract():
+    assert KernelBackend.KDA.value == "KDA"
+    assert BACKEND_METHODS[KernelBackend.KDA] == "forward_kda"
+    assert DEFAULT_PRIORITY[0] is KernelBackend.KDA
+    with pytest.raises(NotImplementedError, match="no KDA backend"):
+        _ToyAdd().forward(_t(1.0), _t(2.0), backend=KernelBackend.KDA)
 
 
 def test_priority_dispatch():

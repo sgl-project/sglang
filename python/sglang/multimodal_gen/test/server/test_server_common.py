@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server import conftest
 from sglang.multimodal_gen.test.server.realtime_consistency import (
+    RealtimeChunkStats,
     pop_realtime_key_frames,
     pop_realtime_perf_stats,
     validate_realtime_perf_stats,
@@ -36,6 +37,7 @@ from sglang.multimodal_gen.test.server.test_server_utils import (
     ServerContext,
     ServerManager,
     get_generate_fn,
+    is_missing_diffusers_pipeline_error,
 )
 from sglang.multimodal_gen.test.server.testcase_configs import (
     BASELINE_CONFIG,
@@ -43,17 +45,24 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     PerformanceSummary,
     ScenarioConfig,
     get_model_task_type_for_server_args,
-    get_perf_baseline_path,
+    get_perf_baseline_update_path,
 )
 from sglang.multimodal_gen.test.test_utils import (
     SGL_TEST_FILES_CI_DATA_REVISION,
     _consistency_gt_filenames,
     _get_consistency_gt_dir,
     action_gt_exists,
+    audio_gt_exists,
+    compare_audio_with_gt,
     compare_with_gt,
+    encode_audio_gt_wav,
+    extract_audio_pcm_from_video_bytes,
     extract_key_frames_from_video,
     get_action_consistency_gt_candidates,
     get_action_consistency_gt_remote_files,
+    get_audio_consistency_gt_candidates,
+    get_audio_consistency_gt_remote_files,
+    get_audio_consistency_thresholds,
     get_consistency_gt_candidates,
     get_consistency_gt_remote_files,
     get_consistency_threshold_path,
@@ -62,7 +71,9 @@ from sglang.multimodal_gen.test.test_utils import (
     gt_exists,
     image_bytes_to_numpy,
     load_action_consistency_gt,
+    load_audio_consistency_gt,
     load_consistency_gt,
+    save_audio_gt_artifact,
     save_consistency_failure_artifact,
     save_missing_consistency_gt_artifact,
     wait_for_req_perf_record,
@@ -157,22 +168,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     # picking another one (which causes the test client to connect to the wrong server).
     extra_args += " --strict-ports"
 
-    # Shape-only mesh cases (e.g. hunyuan3d_shape_gen) validate geometry via
-    # mesh-correctness and must NOT run the paint/texture stages, whose
-    # verification checks texture artifacts (paint_mesh/normal_maps/renderer)
-    # that the shape-only path never produces. Inject a pipeline-config override
-    # disabling paint for these cases.
-    if server_args.custom_validator == "mesh":
-        import json as _json
-        import tempfile as _tempfile
-
-        _paint_off_cfg = os.path.join(
-            _tempfile.gettempdir(), f"{case.id}_paint_off.json"
-        )
-        with open(_paint_off_cfg, "w") as _f:
-            _json.dump({"paint_enable": False}, _f)
-        extra_args += f" --config {_paint_off_cfg}"
-
     for arg in server_args.extras:
         extra_args += f" {arg}"
 
@@ -213,9 +208,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         # pipeline class.  This avoids hard failures when a model needs a
         # newer diffusers release than what is currently installed in CI.
         msg = str(exc)
-        if "not found in diffusers" in msg or (
-            "has no attribute" in msg and "diffusers" in msg.lower()
-        ):
+        if is_missing_diffusers_pipeline_error(msg):
             pytest.skip(
                 f"Skipping {case.id}: required diffusers pipeline class "
                 f"is not available in the installed version. "
@@ -251,14 +244,14 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         if needs_estimated_time and not is_baseline_generation_mode:
             _MISSING_ESTIMATED_TIME_CASES.add(case.id)
             logger.error(
-                f'\n{"=" * 60}\n'
+                f"\n{'=' * 60}\n"
                 f'Add "estimated_full_test_time_s" to scenario "{case.id}":\n\n'
-                f"File: {get_perf_baseline_path()}\n\n"
+                f"File: {get_perf_baseline_update_path()}\n\n"
                 f'    "{case.id}": {{\n'
                 f"        ...\n"
                 f'        "estimated_full_test_time_s": {_measured_full_time:.1f}\n'
                 f"    }}\n"
-                f'{"=" * 60}\n'
+                f"{'=' * 60}\n"
             )
         _print_case_log_separator(case.id, "END diffusion testcase")
 
@@ -326,8 +319,7 @@ class DiffusionServerBase:
 
         tail = ctx.log_tail()
         message = (
-            f"{case_id}: server process exited during generation "
-            f"(code {returncode})."
+            f"{case_id}: server process exited during generation (code {returncode})."
         )
         if tail:
             message += f"\n\nServer log tail:\n{tail}"
@@ -420,18 +412,7 @@ class DiffusionServerBase:
         scenario = BASELINE_CONFIG.scenarios.get(case.id)
         missing_scenario = False
         if scenario is None:
-            # Create dummy scenario to allow metric collection
-            scenario = type(
-                "DummyScenario",
-                (),
-                {
-                    "expected_e2e_ms": 0,
-                    "expected_avg_denoise_ms": 0,
-                    "expected_median_denoise_ms": 0,
-                    "stages_ms": {},
-                    "denoise_step_ms": {},
-                },
-            )()
+            scenario = ScenarioConfig({}, {}, 0, 0, 0)
             if not is_baseline_generation_mode:
                 missing_scenario = True
 
@@ -463,9 +444,42 @@ class DiffusionServerBase:
                 self._dump_baseline_for_testcase(case, summary, missing_scenario)
                 if missing_scenario:
                     pytest.fail(
-                        f"Testcase '{case.id}' not found in {get_perf_baseline_path()}"
+                        f"Testcase '{case.id}' not found in {get_perf_baseline_update_path()}"
                     )
                 return
+
+            if current_platform.is_cuda():
+                expected_load_peak_vram_mb = scenario.load_peak_vram_mb
+                expected_runtime_peak_vram_mb = scenario.runtime_peak_vram_mb
+                if (
+                    expected_load_peak_vram_mb is None
+                    or expected_runtime_peak_vram_mb is None
+                ):
+                    self._dump_baseline_for_testcase(case, summary, missing_scenario)
+                    pytest.fail(
+                        f"Testcase '{case.id}' is missing a load/runtime peak VRAM "
+                        f"baseline in {get_perf_baseline_update_path()}"
+                    )
+                try:
+                    validator.validate_peak_vram(
+                        summary,
+                        expected_load_peak_vram_mb,
+                        expected_runtime_peak_vram_mb,
+                        scenario.warmup_peak_vram_mb,
+                        expected_load_peak_allocated_mb=scenario.load_peak_allocated_mb,
+                        expected_runtime_peak_allocated_mb=(
+                            scenario.runtime_peak_allocated_mb
+                        ),
+                    )
+                    validator.validate_peak_host_anon(
+                        summary,
+                        scenario.load_peak_host_anon_mb,
+                        scenario.runtime_peak_host_anon_mb,
+                    )
+                except AssertionError as e:
+                    logger.error(f"Peak memory validation failed for {case.id}:\n{e}")
+                    self._dump_baseline_for_testcase(case, summary, missing_scenario)
+                    raise
 
             # only run performance validation if run_perf_check is True
             try:
@@ -475,12 +489,103 @@ class DiffusionServerBase:
                 self._dump_baseline_for_testcase(case, summary, missing_scenario)
                 raise
 
+        self._record_performance_result(case, summary)
+
+    def _validate_realtime_performance(
+        self,
+        ctx: ServerContext,
+        case: DiffusionTestCase,
+        chunk_stats: list[RealtimeChunkStats],
+    ) -> None:
+        validate_realtime_perf_stats(
+            case.id,
+            chunk_stats,
+            case.sampling_params.realtime_perf_thresholds,
+            ignore_initial_chunks=(
+                case.sampling_params.realtime_perf_ignore_initial_chunks
+            ),
+        )
+        if not case.run_perf_check or not current_platform.is_cuda():
+            return
+
+        request_id = next(
+            (stat.request_id for stat in reversed(chunk_stats) if stat.request_id),
+            None,
+        )
+        if request_id is None:
+            pytest.fail(f"{case.id}: realtime chunk stats are missing request IDs")
+
+        perf_record = wait_for_req_perf_record(
+            request_id,
+            ctx.perf_log_path,
+            timeout=30,
+        )
+        if perf_record is None:
+            pytest.fail(f"{case.id}: realtime request performance record is missing")
+
+        scenario = BASELINE_CONFIG.scenarios.get(case.id)
+        if scenario is None:
+            pytest.fail(
+                f"Testcase '{case.id}' not found in {get_perf_baseline_update_path()}"
+            )
+
+        validator = PerformanceValidator(
+            scenario=scenario,
+            tolerances=BASELINE_CONFIG.tolerances,
+            step_fractions=BASELINE_CONFIG.step_fractions,
+        )
+        summary = validator.collect_metrics(perf_record)
+        self._print_performance_log(case, summary, scenario)
+        self._record_performance_result(case, summary)
+
+        if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
+            logger.info(
+                "%s realtime peak VRAM baseline: load=%.0fMiB, runtime=%.0fMiB, "
+                "warmup=%.0fMiB",
+                case.id,
+                summary.load_peak_vram_mb,
+                summary.runtime_peak_vram_mb,
+                summary.warmup_peak_vram_mb,
+            )
+            return
+
+        if scenario.load_peak_vram_mb is None or scenario.runtime_peak_vram_mb is None:
+            pytest.fail(
+                f"Testcase '{case.id}' is missing a load/runtime peak VRAM "
+                f"baseline in {get_perf_baseline_update_path()}; measured "
+                f"load={summary.load_peak_vram_mb:.0f}MiB, "
+                f"runtime={summary.runtime_peak_vram_mb:.0f}MiB"
+            )
+
+        try:
+            validator.validate_peak_vram(
+                summary,
+                scenario.load_peak_vram_mb,
+                scenario.runtime_peak_vram_mb,
+                scenario.warmup_peak_vram_mb,
+                expected_load_peak_allocated_mb=scenario.load_peak_allocated_mb,
+                expected_runtime_peak_allocated_mb=scenario.runtime_peak_allocated_mb,
+            )
+        except AssertionError as e:
+            logger.error(f"Peak VRAM validation failed for {case.id}:\n{e}")
+            raise
+
+    def _record_performance_result(
+        self,
+        case: DiffusionTestCase,
+        summary: PerformanceSummary,
+    ) -> None:
         result = {
             "test_name": case.id,
             "modality": case.server_args.modality,
             "e2e_ms": summary.e2e_ms,
             "avg_denoise_ms": summary.avg_denoise_ms,
             "median_denoise_ms": summary.median_denoise_ms,
+            "load_peak_vram_mb": summary.load_peak_vram_mb,
+            "runtime_peak_vram_mb": summary.runtime_peak_vram_mb,
+            "warmup_peak_vram_mb": summary.warmup_peak_vram_mb,
+            "load_peak_allocated_mb": summary.load_peak_allocated_mb,
+            "runtime_peak_allocated_mb": summary.runtime_peak_allocated_mb,
             "stage_metrics": summary.stage_metrics,
             "sampled_steps": summary.sampled_steps,
         }
@@ -512,7 +617,11 @@ class DiffusionServerBase:
             (
                 f"  e2e={summary.e2e_ms:.2f}ms, "
                 f"avg_denoise={summary.avg_denoise_ms:.2f}ms, "
-                f"median_denoise={summary.median_denoise_ms:.2f}ms"
+                f"median_denoise={summary.median_denoise_ms:.2f}ms, "
+                f"load_peak_vram={summary.load_peak_vram_mb:.0f}MiB, "
+                f"runtime_peak_vram={summary.runtime_peak_vram_mb:.0f}MiB, "
+                f"load_peak_alloc={summary.load_peak_allocated_mb:.0f}MiB, "
+                f"runtime_peak_alloc={summary.runtime_peak_allocated_mb:.0f}MiB"
             ),
         ]
         if scenario is not None:
@@ -521,6 +630,16 @@ class DiffusionServerBase:
                 f"e2e={scenario.expected_e2e_ms:.2f}ms, "
                 f"avg_denoise={scenario.expected_avg_denoise_ms:.2f}ms, "
                 f"median_denoise={scenario.expected_median_denoise_ms:.2f}ms"
+            )
+        if (
+            scenario is not None
+            and scenario.load_peak_vram_mb is not None
+            and scenario.runtime_peak_vram_mb is not None
+        ):
+            lines.append(
+                "  peak_vram_baseline: "
+                f"load={scenario.load_peak_vram_mb:.0f}MiB, "
+                f"runtime={scenario.runtime_peak_vram_mb:.0f}MiB"
             )
         if summary.stage_metrics:
             stages = ", ".join(
@@ -561,6 +680,23 @@ class DiffusionServerBase:
             "expected_median_denoise_ms": round(summary.median_denoise_ms, 2),
         }
 
+        if current_platform.is_cuda():
+            baseline.update(
+                {
+                    "load_peak_vram_mb": round(summary.load_peak_vram_mb, 2),
+                    "runtime_peak_vram_mb": round(summary.runtime_peak_vram_mb, 2),
+                    "warmup_peak_vram_mb": round(summary.warmup_peak_vram_mb, 2),
+                    "load_peak_allocated_mb": round(summary.load_peak_allocated_mb, 2),
+                    "runtime_peak_allocated_mb": round(
+                        summary.runtime_peak_allocated_mb, 2
+                    ),
+                    "load_peak_host_anon_mb": round(summary.load_peak_host_anon_mb, 2),
+                    "runtime_peak_host_anon_mb": round(
+                        summary.runtime_peak_host_anon_mb, 2
+                    ),
+                }
+            )
+
         if measured_full_time is not None:
             baseline["estimated_full_test_time_s"] = round(measured_full_time, 1)
 
@@ -574,7 +710,7 @@ class DiffusionServerBase:
                 )
         action = "add" if missing_scenario else "update"
         output = f"""
-{action} this baseline in the "scenarios" section of {get_perf_baseline_path()}:
+{action} this baseline in the "scenarios" section of {get_perf_baseline_update_path()}:
 
 "{case.id}": {json.dumps(baseline, indent=4)}
 
@@ -629,6 +765,15 @@ class DiffusionServerBase:
                 logger.info(
                     "[Artifact] Saved missing consistency GT: %s", artifact_path
                 )
+            if case.sampling_params.expect_audio_output:
+                audio_path = save_audio_gt_artifact(
+                    os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR"),
+                    case.id,
+                    num_gpus,
+                    extract_audio_pcm_from_video_bytes(content),
+                )
+                if audio_path is not None:
+                    logger.info("[Artifact] Saved missing audio GT: %s", audio_path)
             if _get_consistency_gt_dir() is not None:
                 names = ", ".join(
                     get_consistency_gt_candidates(
@@ -754,6 +899,67 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             f"min_ssim={result.min_ssim:.4f}, "
             f"min_psnr={result.min_psnr:.4f}, "
             f"max_mean_abs_diff={result.max_mean_abs_diff:.4f})"
+        )
+
+        if case.sampling_params.expect_audio_output:
+            self._validate_audio_consistency(case, content)
+
+    def _validate_audio_consistency(
+        self,
+        case: DiffusionTestCase,
+        content: bytes,
+    ) -> None:
+        num_gpus = case.server_args.num_gpus
+        output_audio = extract_audio_pcm_from_video_bytes(content)
+        if not audio_gt_exists(case.id, num_gpus):
+            artifact_path = save_audio_gt_artifact(
+                os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR"),
+                case.id,
+                num_gpus,
+                output_audio,
+            )
+            if artifact_path is not None:
+                logger.info("[Artifact] Saved missing audio GT: %s", artifact_path)
+            names = ", ".join(get_audio_consistency_gt_candidates(case.id, num_gpus))
+            pytest.fail(f"Audio GT not found for {case.id}. Expected one of: {names}")
+
+        gt_audio = load_audio_consistency_gt(case.id, num_gpus)
+        result = compare_audio_with_gt(
+            output_audio,
+            gt_audio,
+            get_audio_consistency_thresholds(case.id),
+        )
+        if not result.passed:
+            gt_remote_info = "\n".join(
+                f"    - {filename}: {url}"
+                for filename, url in get_audio_consistency_gt_remote_files(
+                    case.id, num_gpus
+                )
+            )
+            pytest.fail(
+                f"Audio consistency check failed for {case.id}:\n"
+                f"  Metrics: spectral_similarity={result.spectral_similarity:.4f}, "
+                f"waveform_correlation={result.waveform_correlation:.4f}, "
+                f"rms_db_diff={result.rms_db_diff:.4f}, "
+                f"duration_diff={result.duration_diff:.4f}s\n"
+                f"  Thresholds: spectral_similarity>="
+                f"{result.thresholds.spectral_similarity_threshold}, "
+                f"waveform_correlation>="
+                f"{result.thresholds.waveform_correlation_threshold}, "
+                f"rms_db_diff<={result.thresholds.rms_db_diff_threshold}, "
+                f"duration_diff<={result.thresholds.duration_diff_threshold}s\n"
+                f"  Compared GT files and links:\n{gt_remote_info}"
+            )
+
+        logger.info(
+            "[Consistency] %s: PASSED audio GT check "
+            "(spectral_similarity=%.4f, waveform_correlation=%.4f, "
+            "rms_db_diff=%.4f, duration_diff=%.4fs)",
+            case.id,
+            result.spectral_similarity,
+            result.waveform_correlation,
+            result.rms_db_diff,
+            result.duration_diff,
         )
 
     def _extract_action_array(
@@ -882,16 +1088,22 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                 logger.warning(
                     f"{case.id}: expected 3 frames, got {len(frames)}, skipping frame save"
                 )
-                return
+            else:
+                # Save frames (reuse naming from _consistency_gt_filenames)
+                filenames = _consistency_gt_filenames(case.id, num_gpus, is_video=True)
+                from PIL import Image
 
-            # Save frames (reuse naming from _consistency_gt_filenames)
-            filenames = _consistency_gt_filenames(case.id, num_gpus, is_video=True)
-            from PIL import Image
+                for frame, fn in zip(frames, filenames):
+                    frame_path = out_dir / fn
+                    Image.fromarray(frame).save(frame_path)
+                    logger.info(f"Saved GT frame: {frame_path}")
 
-            for frame, fn in zip(frames, filenames):
-                frame_path = out_dir / fn
-                Image.fromarray(frame).save(frame_path)
-                logger.info(f"Saved GT frame: {frame_path}")
+            if case.sampling_params.expect_audio_output:
+                audio_path = out_dir / f"{case.id}_{num_gpus}gpu_audio.wav"
+                audio_path.write_bytes(
+                    encode_audio_gt_wav(extract_audio_pcm_from_video_bytes(content))
+                )
+                logger.info("Saved GT audio: %s", audio_path)
         else:
             # Save image
             from sglang.multimodal_gen.test.test_utils import detect_image_format
@@ -991,7 +1203,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         ), "loaded_adapters should be a non-empty list"
         assert any(
             a.get("nickname") == "default" for a in lora_info["loaded_adapters"]
-        ), f"nickname 'default' not found in loaded_adapters: {lora_info['loaded_adapters']}"
+        ), (
+            f"nickname 'default' not found in loaded_adapters: {lora_info['loaded_adapters']}"
+        )
         logger.info("[LoRA E2E] list_loras returned expected LoRA adapters")
 
         logger.info("[LoRA E2E] All LoRA API E2E tests passed for %s", case.id)
@@ -1033,9 +1247,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             json={"lora_nickname": "lora2", "lora_path": second_lora_path},
             timeout=_CONTROL_API_TIMEOUT_SECS,
         )
-        assert (
-            resp.status_code == 200
-        ), f"set_lora to second adapter failed: {resp.text}"
+        assert resp.status_code == 200, (
+            f"set_lora to second adapter failed: {resp.text}"
+        )
 
         logger.info(
             "[LoRA Switch E2E] Verifying generation with second LoRA for %s", case.id
@@ -1127,9 +1341,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             },
             timeout=_CONTROL_API_TIMEOUT_SECS,
         )
-        assert (
-            resp.status_code == 200
-        ), f"set_lora with multiple adapters failed: {resp.text}"
+        assert resp.status_code == 200, (
+            f"set_lora with multiple adapters failed: {resp.text}"
+        )
         rid, _ = self._run_generation_with_server_watchdog(
             ctx, case.id, generate_fn, client
         )
@@ -1146,9 +1360,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             },
             timeout=_CONTROL_API_TIMEOUT_SECS,
         )
-        assert (
-            resp.status_code == 200
-        ), f"set_lora with different strengths failed: {resp.text}"
+        assert resp.status_code == 200, (
+            f"set_lora with different strengths failed: {resp.text}"
+        )
         rid, _ = self._run_generation_with_server_watchdog(
             ctx, case.id, generate_fn, client
         )
@@ -1170,9 +1384,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             },
             timeout=_CONTROL_API_TIMEOUT_SECS,
         )
-        assert (
-            resp.status_code == 200
-        ), f"set_lora with cached adapters failed: {resp.text}"
+        assert resp.status_code == 200, (
+            f"set_lora with cached adapters failed: {resp.text}"
+        )
         rid, _ = self._run_generation_with_server_watchdog(
             ctx, case.id, generate_fn, client
         )
@@ -1184,9 +1398,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             json={"lora_nickname": "default"},
             timeout=_CONTROL_API_TIMEOUT_SECS,
         )
-        assert (
-            resp.status_code == 200
-        ), f"set_lora back to single adapter failed: {resp.text}"
+        assert resp.status_code == 200, (
+            f"set_lora back to single adapter failed: {resp.text}"
+        )
         rid, content = self._run_generation_with_server_watchdog(
             ctx, case.id, generate_fn, client
         )
@@ -1210,28 +1424,28 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         assert resp.status_code == 200, f"/v1/models failed: {resp.text}"
 
         data = resp.json()
-        assert (
-            data["object"] == "list"
-        ), f"Expected object='list', got {data.get('object')}"
+        assert data["object"] == "list", (
+            f"Expected object='list', got {data.get('object')}"
+        )
         assert len(data["data"]) >= 1, "Expected at least one model in response"
 
         model = data["data"][0]
         assert "id" in model, "Model missing 'id' field"
-        assert (
-            model["object"] == "model"
-        ), f"Expected object='model', got {model.get('object')}"
-        assert (
-            model["id"] == case.server_args.model_path
-        ), f"Model ID mismatch: expected {case.server_args.model_path}, got {model['id']}"
+        assert model["object"] == "model", (
+            f"Expected object='model', got {model.get('object')}"
+        )
+        assert model["id"] == case.server_args.model_path, (
+            f"Model ID mismatch: expected {case.server_args.model_path}, got {model['id']}"
+        )
 
         # Verify extended diffusion-specific fields
         assert "num_gpus" in model, "Model missing 'num_gpus' field"
         assert "task_type" in model, "Model missing 'task_type' field"
         assert "dit_precision" in model, "Model missing 'dit_precision' field"
         assert "vae_precision" in model, "Model missing 'vae_precision' field"
-        assert (
-            model["num_gpus"] == case.server_args.num_gpus
-        ), f"num_gpus mismatch: expected {case.server_args.num_gpus}, got {model['num_gpus']}"
+        assert model["num_gpus"] == case.server_args.num_gpus, (
+            f"num_gpus mismatch: expected {case.server_args.num_gpus}, got {model['num_gpus']}"
+        )
         expected_task_type = get_model_task_type_for_server_args(case.server_args).name
         assert model["task_type"] == expected_task_type, (
             f"task_type mismatch: expected {expected_task_type}, "
@@ -1273,9 +1487,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         assert resp.status_code == 404, f"Expected 404, got {resp.status_code}"
         error_data = resp.json()
         assert "error" in error_data, "404 response missing 'error' field"
-        assert (
-            error_data["error"]["code"] == "model_not_found"
-        ), f"Incorrect error code: {error_data['error'].get('code')}"
+        assert error_data["error"]["code"] == "model_not_found", (
+            f"Incorrect error code: {error_data['error'].get('code')}"
+        )
         logger.info("[Models API] GET /v1/models/non_existent returns 404 as expected")
 
         logger.info("[Models API] All /v1/models tests passed for %s", case.id)
@@ -1307,13 +1521,13 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             json=payload,
             timeout=_CONTROL_API_TIMEOUT_SECS,
         )
-        assert (
-            resp.status_code == 400
-        ), f"Expected 400 for T2V input_reference, got {resp.status_code}: {resp.text}"
+        assert resp.status_code == 400, (
+            f"Expected 400 for T2V input_reference, got {resp.status_code}: {resp.text}"
+        )
         detail = resp.json().get("detail", "")
-        assert (
-            "input_reference is not supported" in detail
-        ), f"Unexpected error detail for T2V input_reference: {detail}"
+        assert "input_reference is not supported" in detail, (
+            f"Unexpected error detail for T2V input_reference: {detail}"
+        )
 
     def test_diffusion_generation(
         self,
@@ -1364,14 +1578,18 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             sampling_params=case.sampling_params,
         )
 
-        # Single generation - output is reused for both validations
+        # Generation - output of the last request is used for both validations.
+        # perf_repeat_requests > 1 asserts a warm second request meets the same
+        # baselines as the first: residency or courier state leaking between
+        # requests shows up here as degradation or an OOM.
         is_realtime_case = case.sampling_params.realtime_num_chunks is not None
-        perf_record, content = self.run_and_collect(
-            diffusion_server,
-            case.id,
-            generate_fn,
-            collect_perf=not is_gt_gen_mode and not is_realtime_case,
-        )
+        for _ in range(max(1, case.perf_repeat_requests)):
+            perf_record, content = self.run_and_collect(
+                diffusion_server,
+                case.id,
+                generate_fn,
+                collect_perf=not is_gt_gen_mode and not is_realtime_case,
+            )
 
         if is_gt_gen_mode:
             # GT generation mode: save output and skip all validations/tests
@@ -1389,15 +1607,13 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                 failures.append((name, str(exc)))
 
         if is_realtime_case:
+            chunk_stats = pop_realtime_perf_stats(case.id)
             run_case_check(
                 "performance",
-                lambda: validate_realtime_perf_stats(
-                    case.id,
-                    pop_realtime_perf_stats(case.id),
-                    case.sampling_params.realtime_perf_thresholds,
-                    ignore_initial_chunks=(
-                        case.sampling_params.realtime_perf_ignore_initial_chunks
-                    ),
+                lambda: self._validate_realtime_performance(
+                    diffusion_server,
+                    case,
+                    chunk_stats,
                 ),
             )
         else:

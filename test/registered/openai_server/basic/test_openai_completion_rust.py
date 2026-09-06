@@ -26,13 +26,19 @@ class TestOpenAICompletionRustParity(CustomTestCase):
     api_key = "sk-123456"
 
     def _get_logprobs(self, *, rust_frontend):
+        # compare identical prefill shapes, without graph padding or warmup cache hits
         process = popen_launch_server(
             self.model,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=self.api_key,
             env={"SGLANG_RUST_SERVER": "1" if rust_frontend else "0"},
-            other_args=["--random-seed", "42"],
+            other_args=[
+                "--random-seed",
+                "42",
+                "--disable-prefill-cuda-graph",
+                "--disable-radix-cache",
+            ],
         )
         try:
             response = requests.post(

@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.srt.managers.schedule_batch import Modality
-from sglang.srt.mem_cache.storage.mooncake_store.embedding_cache_controller import (
+from sglang.srt.mem_cache.embedding_cache_controller import (
     EmbeddingCacheController,
     EmbeddingCacheEntry,
     EmbeddingPool,
@@ -16,7 +16,8 @@ from sglang.srt.mem_cache.storage.mooncake_store.embedding_cache_controller impo
     EvictableLRU,
     PageRun,
     RangePageAllocator,
-    build_transfer_buffers,
+    _build_host_device_transfer_plan,
+    _build_storage_transfer_buffers,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -55,7 +56,7 @@ def _make_controller(num_pages=16, dim=4, page_size=2, enable_eviction=True):
     ctrl.element_size = torch.float32.itemsize
     ctrl.enable_eviction = enable_eviction
     ctrl.max_eviction_batch = 10
-    ctrl.mooncake_store = MagicMock()
+    ctrl.embedding_store = MagicMock()
     ctrl.total_pool_size_bytes = num_pages * page_size * dim * torch.float32.itemsize
     ctrl.vision_pool = _make_pool(num_pages, dim, page_size)
     ctrl.audio_pool = _make_pool(num_pages, dim, page_size, modality="audio")
@@ -249,6 +250,35 @@ class TestStoreToPool(unittest.TestCase):
         with self.assertRaises(ValueError):
             ctrl.store_to_pool_async(["h"], [tensor], Modality.IMAGE)
 
+    def test_wait_store_isolates_failed_copy_and_waits_for_the_rest(self):
+        ctrl = _make_controller(num_pages=4, dim=4, page_size=2)
+        entries = []
+        for mm_hash in ("first", "failed", "last"):
+            page_runs = ctrl.vision_pool.allocator.allocate(2, 2)
+            entry = EmbeddingCacheEntry(
+                hash=mm_hash,
+                modality=Modality.IMAGE,
+                num_tokens=2,
+                dim=4,
+                page_runs=page_runs,
+                state=EntryState.FILLING,
+            )
+            ctrl.entries[mm_hash] = entry
+            entries.append(entry)
+
+        handles = [MagicMock(), MagicMock(), MagicMock()]
+        handles[1].wait.side_effect = RuntimeError("D2H copy failed")
+
+        with self.assertRaisesRegex(RuntimeError, "D2H copy failed"):
+            ctrl.wait_store_to_pool(list(zip(entries, handles)))
+
+        for handle in handles:
+            handle.wait.assert_called_once_with()
+        self.assertEqual(ctrl.entries["first"].state, EntryState.READY)
+        self.assertNotIn("failed", ctrl.entries)
+        self.assertEqual(ctrl.entries["last"].state, EntryState.READY)
+        self.assertEqual(ctrl.vision_pool.allocator.free_pages, 2)
+
 
 def _insert_ready_entry(ctrl, mm_hash, tensor, modality=Modality.IMAGE):
     """Manually write tensor into pool pages and create a READY entry."""
@@ -361,7 +391,7 @@ class TestTransferBuffers(unittest.TestCase):
             state=EntryState.READY,
         )
 
-        ptrs, sizes = build_transfer_buffers(entry, pool)
+        ptrs, sizes = _build_storage_transfer_buffers(entry, pool)
 
         self.assertEqual(ptrs, [pool.tensor[4].data_ptr()])
         self.assertEqual(sizes, [5 * 4 * torch.float32.itemsize])
@@ -377,7 +407,7 @@ class TestTransferBuffers(unittest.TestCase):
             state=EntryState.READY,
         )
 
-        ptrs, sizes = build_transfer_buffers(entry, pool)
+        ptrs, sizes = _build_storage_transfer_buffers(entry, pool)
 
         self.assertEqual(ptrs, [pool.tensor[0].data_ptr(), pool.tensor[6].data_ptr()])
         self.assertEqual(
@@ -387,6 +417,38 @@ class TestTransferBuffers(unittest.TestCase):
                 3 * 4 * torch.float32.itemsize,
             ],
         )
+
+    def test_build_h2d_copy_plan_for_fragmented_entry(self):
+        pool = _make_pool(num_pages=10, dim=4, page_size=2)
+        entry = EmbeddingCacheEntry(
+            hash="h",
+            modality=Modality.IMAGE,
+            num_tokens=5,
+            dim=4,
+            page_runs=[PageRun(2, 1), PageRun(7, 2)],
+            state=EntryState.READY,
+        )
+
+        plan = _build_host_device_transfer_plan(
+            entry, pool, src_is_pool=True, dst_token_offset=3
+        )
+
+        self.assertEqual(plan, ([4, 14], [3, 5], [2, 3]))
+
+    def test_build_d2h_copy_plan_for_fragmented_entry(self):
+        pool = _make_pool(num_pages=10, dim=4, page_size=2)
+        entry = EmbeddingCacheEntry(
+            hash="h",
+            modality=Modality.IMAGE,
+            num_tokens=5,
+            dim=4,
+            page_runs=[PageRun(2, 1), PageRun(7, 2)],
+            state=EntryState.READY,
+        )
+
+        plan = _build_host_device_transfer_plan(entry, pool, src_is_pool=False)
+
+        self.assertEqual(plan, ([0, 2], [4, 14], [2, 3]))
 
 
 class TestMooncakeEmbeddingStoreWrappers(unittest.TestCase):

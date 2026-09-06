@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
@@ -15,6 +17,14 @@ from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingPar
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+    AttentionRequirements,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    LAYERWISE_OFFLOAD,
+    RESIDENT,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
     MiniMaxH3PartitionAdmissionStage,
     MiniMaxH3ReleaseMetadata,
@@ -25,10 +35,16 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
     minimax_h3_resolve_plan,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
+    MiniMaxH3DenoisingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
     partition_for_task,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args.server_args import Backend
 
 TARGET = {
@@ -98,6 +114,26 @@ TARGET = {
                 "video_audio.reference_preserve",
             ],
         ),
+        (
+            "ref2va",
+            [
+                {
+                    "type": "image",
+                    "uri": "file:///first.png",
+                    "role": "keyframe",
+                    "frame_index": 0,
+                },
+                {
+                    "type": "image",
+                    "uri": "file:///subject.png",
+                    "role": "reference",
+                },
+            ],
+            "ref2va",
+            [0, 1],
+            [],
+            ["image.target_canvas", "image.reference_preserve"],
+        ),
     ],
 )
 def test_public_tasks_resolve_to_exact_partition_and_encoder_plan(
@@ -118,9 +154,33 @@ def test_public_tasks_resolve_to_exact_partition_and_encoder_plan(
     assert plan.encoders["audio"] == audio
     assert [material.material_chain for material in plan.materials] == chains
     if task == "ref2va":
-        assert plan.materials[1].start_time_seconds == 12.5
+        assert plan.encoders["qwen"]["ordered_condition_indices"] == [
+            index
+            for index, condition in enumerate(conditions)
+            if condition["role"] == "reference"
+        ]
+    for index, condition in enumerate(conditions):
+        if condition.get("start_time_seconds") is not None:
+            assert plan.materials[index].start_time_seconds == 12.5
     assert plan.shape["frame_count"] == 124
     assert plan.shape["video_latent_t"] == 37
+
+
+def test_ref2va_rejects_keyframes_without_a_reference():
+    with pytest.raises(ValueError, match="at least one reference"):
+        minimax_h3_validate_canonical_request(
+            task="ref2va",
+            prompt="contract",
+            conditions=[
+                {
+                    "type": "image",
+                    "uri": "file:///first.png",
+                    "role": "keyframe",
+                    "frame_index": 0,
+                }
+            ],
+            target=TARGET,
+        )
 
 
 @pytest.mark.parametrize(
@@ -144,6 +204,22 @@ def test_loaded_weight_partition_admits_only_its_declared_tasks(partition, tasks
     rejected = "ref2va" if partition == "fl2va" else "t2va"
     with pytest.raises(ValueError):
         metadata.canonical_task(rejected)
+
+
+def test_synthetic_warmup_target_honors_warmup_flags():
+    def target(num_frames=None, resolution=None):
+        width, height = map(int, (resolution or "896x512").split("x"))
+        req = SimpleNamespace(num_frames=17, width=width, height=height)
+        server_args = SimpleNamespace(
+            warmup_num_frames=num_frames,
+            warmup_resolutions=None if resolution is None else [resolution],
+        )
+        return MiniMaxH3SamplingParams._synthetic_warmup_target(req, server_args)
+
+    assert target() == TARGET
+    assert target(num_frames=345) == {**TARGET, "duration_seconds": 345 / 24.0}
+    assert target(resolution="768x1344") == {**TARGET, "aspect_ratio": "9:16"}
+    assert target(resolution="832x464") == TARGET
 
 
 def test_duration_admission_accepts_released_4_to_15_second_range():
@@ -238,8 +314,10 @@ def _quality_server_args():
         enable_breakable_cuda_graph=False,
         enable_torch_compile=False,
         is_dit_layerwise_offload_selected=False,
+        minimax_h3_adaln_online=False,
         performance_mode="speed",
         quantization=None,
+        transformer_weights_path=None,
         regional_compile=False,
         ring_degree=1,
         sp_degree=4,
@@ -247,6 +325,104 @@ def _quality_server_args():
         ulysses_degree=4,
         use_fsdp_inference=False,
     )
+
+
+def test_high_quality_deployment_rejects_transformer_weight_override():
+    config = MiniMaxH3PipelineConfig()
+    server_args = _quality_server_args()
+    server_args.transformer_weights_path = "model.gguf"
+
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch.object(current_platform, "get_device_name", return_value="NVIDIA H200"),
+        patch.object(
+            current_platform,
+            "get_device_capability",
+            return_value=_HopperCapability(),
+        ),
+        pytest.raises(ValueError, match="transformer_weights_path"),
+    ):
+        config.validate_quality_deployment(server_args)
+
+
+def test_high_quality_request_warns_when_bcg_suppresses_cache_dit():
+    stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
+    stage.server_args = SimpleNamespace(enable_breakable_cuda_graph=True)
+    stage._cache_dit_enabled = False
+    batch = SimpleNamespace(
+        sampling_params=SimpleNamespace(
+            quality="high",
+            _explicit_fields={"quality"},
+            enable_cache_dit=None,
+            cache_dit_params=None,
+        )
+    )
+
+    with patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages.denoising."
+        "logger.warning_once"
+    ) as warning_once:
+        stage._maybe_enable_cache_dit(50, batch)
+
+    warning_once.assert_called_once_with(
+        "Cache-DiT was requested but is disabled because breakable CUDA graphs "
+        "are enabled."
+    )
+
+
+def test_admission_rejects_steps_exceeding_online_adaln_gpu_plans():
+    metadata = MiniMaxH3ReleaseMetadata.from_model_index(
+        {
+            "_minimax_h3": {
+                "schema_version": 1,
+                "partition": "fl2va",
+                "tasks": ["t2va", "fl2va"],
+                "task_aliases": {},
+                "sigma_shift_scales": {"video": 12.0, "audio": 3.0},
+            }
+        }
+    )
+    stage = MiniMaxH3PartitionAdmissionStage(metadata)
+    server_args = _quality_server_args()
+    server_args.minimax_h3_adaln_online = True
+    batch = SimpleNamespace(
+        sampling_params=SimpleNamespace(task="t2va", quality="lossless"),
+        num_inference_steps=50,
+        is_warmup=False,
+    )
+    with patch.dict(os.environ, {"SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS": "8"}):
+        with pytest.raises(
+            ValueError, match="SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS"
+        ):
+            stage.forward(batch, server_args)
+
+        batch.num_inference_steps = 9
+        assert stage.forward(batch, server_args) is batch
+
+
+def test_extra_high_quality_does_not_enable_h3_cache_dit():
+    stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
+    stage.server_args = SimpleNamespace(enable_breakable_cuda_graph=False)
+    stage._cache_dit_enabled = False
+    stage._minimax_h3_cache_mode = None
+    stage._minimax_h3_quality = "lossless"
+    batch = SimpleNamespace(
+        sampling_params=SimpleNamespace(
+            quality="extra-high",
+            _explicit_fields={"quality"},
+            enable_cache_dit=None,
+            cache_dit_params=None,
+        )
+    )
+
+    # Even a server-wide generic Cache-DiT default must not turn an explicit
+    # fusion-only quality tier into an approximate H3 request.
+    with patch.object(DenoisingStage, "_cache_dit_requested", return_value=True):
+        stage._maybe_enable_cache_dit(50, batch)
+
+    assert stage._minimax_h3_quality == "extra-high"
+    assert stage._minimax_h3_cache_mode is None
+    assert not stage._cache_dit_enabled
 
 
 def test_quality_admission_fails_closed_outside_validated_request():
@@ -301,10 +477,127 @@ def test_quality_admission_fails_closed_outside_validated_request():
     batch.sampling_params.quality = "lossless"
     batch.num_inference_steps = 50
     server_args.attention_backend = "sage_attn"
-    with pytest.raises(ValueError, match="does not support SageAttention"):
-        stage.forward(batch, server_args)
+    assert stage.forward(batch, server_args) is batch
+
+    batch.sampling_params.quality = "extra-high"
+    assert stage.forward(batch, server_args) is batch
 
     batch.sampling_params.quality = "ultra"
     server_args.attention_backend = None
     with pytest.raises(ValueError, match="quality must be one of"):
         stage.forward(batch, server_args)
+
+
+def test_validate_server_args_requires_packed_varlen_backend():
+    config = MiniMaxH3PipelineConfig()
+    server_args = SimpleNamespace(
+        component_attention_backends={},
+        attention_backend="sage_attn",
+        ring_degree=1,
+        resolve_component_attention_backend=lambda *_names: (None, None),
+    )
+    with patch(
+        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.get_attn_backend"
+    ) as get_attn_backend:
+        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+    get_attn_backend.assert_called_once_with(
+        128,
+        torch.bfloat16,
+        selected_attention_backend=AttentionBackendEnum.SAGE_ATTN,
+        attention_requirements=AttentionRequirements(packed_varlen=True),
+    )
+    with patch(
+        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.get_attn_backend",
+        side_effect=ValueError("does not implement packed varlen attention"),
+    ):
+        with pytest.raises(ValueError, match="does not implement packed varlen"):
+            MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+
+    server_args.component_attention_backends = {"transformer": "cube_sparse_attn"}
+    server_args.resolve_component_attention_backend = lambda *_names: (
+        AttentionBackendEnum.CUBE_SPARSE_ATTN,
+        "transformer",
+    )
+    server_args.ring_degree = 2
+    with pytest.raises(ValueError, match="ring parallelism requires"):
+        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+
+
+def test_validate_server_args_accepts_transformer_backend_override():
+    config = MiniMaxH3PipelineConfig()
+    server_args = SimpleNamespace(
+        component_attention_backends={"transformer": "subblock_sparse_attn"},
+        attention_backend="fa",
+        ring_degree=1,
+        resolve_component_attention_backend=lambda *_names: (
+            AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
+            "transformer",
+        ),
+    )
+
+    with patch(
+        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.get_attn_backend"
+    ) as get_attn_backend:
+        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+    get_attn_backend.assert_called_once_with(
+        128,
+        torch.bfloat16,
+        selected_attention_backend=AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
+        attention_requirements=AttentionRequirements(packed_varlen=True),
+    )
+
+
+def test_resolve_transformer_attention_backend_uses_selector_precedence():
+    config = MiniMaxH3PipelineConfig()
+    subblock = AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+    fa = AttentionBackendEnum.FA
+    sdpa = AttentionBackendEnum.TORCH_SDPA
+    cases = (
+        ("fa", subblock, None, subblock),
+        ("subblock_sparse_attn", fa, None, fa),
+        (subblock, None, None, subblock),
+        ("fa", subblock, sdpa, sdpa),
+    )
+    for global_backend, component_backend, forced_backend, expected in cases:
+        server_args = SimpleNamespace(
+            attention_backend=global_backend,
+            resolve_component_attention_backend=lambda *_names: (
+                component_backend,
+                "transformer" if component_backend is not None else None,
+            ),
+        )
+        with patch(
+            "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+            "get_global_forced_attn_backend",
+            return_value=forced_backend,
+        ):
+            resolved = config.resolve_transformer_attention_backend(server_args)
+            assert resolved is expected
+            assert config.uses_subblock_attention(server_args) is (
+                expected is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+            )
+
+
+def test_mps_admission_requires_layerwise_residency_for_every_h3_component():
+    config = MiniMaxH3PipelineConfig()
+    modes = {
+        "transformer": LAYERWISE_OFFLOAD,
+        "text_encoder": LAYERWISE_OFFLOAD,
+        "video_vae": LAYERWISE_OFFLOAD,
+        "audio_vae": LAYERWISE_OFFLOAD,
+    }
+    server_args = SimpleNamespace(
+        component_attention_backends={},
+        attention_backend=None,
+        enable_torch_compile=False,
+        ring_degree=1,
+        residency_mode=modes.get,
+        resolve_component_attention_backend=lambda *_names: (None, None),
+    )
+
+    with patch.object(current_platform, "is_mps", return_value=True):
+        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+
+        modes["audio_vae"] = RESIDENT
+        with pytest.raises(ValueError, match="audio_vae"):
+            MiniMaxH3PipelineConfig.validate_server_args(config, server_args)

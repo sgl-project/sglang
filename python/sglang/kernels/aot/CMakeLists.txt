@@ -20,7 +20,8 @@ set(GITHUB_ARTIFACTORY "github.com" CACHE STRING "GitHub mirror URL")
 find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
 
 # CXX
-set(CMAKE_CXX_STANDARD 17)
+set(SGL_KERNEL_CXX_STANDARD "17" CACHE STRING "C++ standard used for host and CUDA compilation")
+set(CMAKE_CXX_STANDARD ${SGL_KERNEL_CXX_STANDARD})
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
 
 # CUDA
@@ -65,8 +66,8 @@ FetchContent_Populate(repo-fmt)
 # Triton kernel
 FetchContent_Declare(
     repo-triton
-    URL      https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/v3.6.0.tar.gz
-    URL_HASH SHA256=be270ed11ca5a8fbd9d7941c5bbe9a23a9f6e2ffd372c8398346928bee464774
+    URL      https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/v3.7.1.tar.gz
+    URL_HASH SHA256=7d998625d1035ac496d06a81117727647169422ee67b8889609f06fd5367c491
 )
 FetchContent_Populate(repo-triton)
 
@@ -125,7 +126,7 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-Xcompiler"
     "-fPIC"
     "-gencode=arch=compute_90,code=sm_90"
-    "-std=c++17"
+    "-std=c++${SGL_KERNEL_CXX_STANDARD}"
     "-DFLASHINFER_ENABLE_F16"
     "-DCUTE_USE_PACKED_TUPLE=1"
     "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1"
@@ -399,7 +400,7 @@ if (SGL_KERNEL_ENABLE_FA3)
         "-Xcompiler"
         "-fPIC"
         "-gencode=arch=compute_90a,code=sm_90a"
-        "-std=c++17"
+        "-std=c++${SGL_KERNEL_CXX_STANDARD}"
         "-DCUTE_USE_PACKED_TUPLE=1"
         "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1"
         "-DCUTLASS_VERSIONS_GENERATED"
@@ -493,7 +494,7 @@ endif()
 set(INFLLM_FLASH_CUDA_FLAGS
     "-DNDEBUG"
     "-O3"
-    "-std=c++17"
+    "-std=c++${SGL_KERNEL_CXX_STANDARD}"
     "-Xcompiler"
     "-fPIC"
     "-U__CUDA_NO_HALF_OPERATORS__"

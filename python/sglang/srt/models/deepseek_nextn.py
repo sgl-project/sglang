@@ -35,6 +35,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
     is_dsa_prefill_cp_round_robin_split,
 )
+from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.cp.utils import cp_gather_after_forward, is_cp_v2_active
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -98,7 +99,6 @@ _is_npu = is_npu()
 
 
 class DeepseekModelNextN(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -116,7 +116,7 @@ class DeepseekModelNextN(nn.Module):
             moe_quant_config_override = None
 
         if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
-            logger.warning(
+            logger.debug(
                 "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
             )
             quant_config = None
@@ -182,6 +182,7 @@ class DeepseekModelNextN(nn.Module):
             is_nextn=True,
             prefix=add_prefix(layer_name, prefix),
             alt_stream=self.alt_stream,
+            skip_rope=config.qk_rope_head_dim == 0,
             dsa_enable_prefill_cp=self.dsa_enable_prefill_cp,
             mla_enable_prefill_cp=self.mla_enable_prefill_cp,
         )
@@ -220,9 +221,28 @@ class DeepseekModelNextN(nn.Module):
             )
 
             if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
-            else:
-                hidden_states = input_embeds
+                # MM positions in input_ids hold MM_PAD_SHIFT_VALUE+hash sentinels
+                # (far above vocab_size). Use target-produced mm_input_embeds for
+                # these positions and only call embed_tokens on the appended
+                # next-token to avoid embed OOB.
+                input_embeds = forward_batch.mm_input_embeds
+                if (
+                    forward_batch.forward_mode.is_extend()
+                    and forward_batch.contains_mm_inputs()
+                    and not forward_batch.forward_mode.is_draft_extend_v2()
+                ):
+                    assert input_embeds is not None
+                    last_indices = (
+                        forward_batch.extend_start_loc
+                        + forward_batch.extend_seq_lens
+                        - 1
+                    ).long()
+                    input_embeds[last_indices] = self.embed_tokens(
+                        input_ids[last_indices]
+                    )
+                if input_embeds is None:
+                    input_embeds = self.embed_tokens(input_ids)
+            hidden_states = input_embeds
 
             if hidden_states.shape[0] > 0:
                 previous_hidden_states = forward_batch.spec_info.hidden_states
@@ -261,14 +281,7 @@ class DeepseekModelNextN(nn.Module):
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
                 positions = cp_split_and_rebuild_position(forward_batch, positions)
             residual = None
-            seed_buf = (
-                forward_batch.spec_info.dsa_seed_topk_capture
-                if forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
-                else None
-            )
-            should_update_dsa_topk_indices = (
-                forward_batch.reuse_dsa_topk_indices or seed_buf is not None
-            )
+            index_topk_share = IndexTopKShareState.from_mtp_carry(forward_batch)
             with get_global_expert_distribution_recorder().disable_this_region():
                 hidden_states, residual, topk_indices = self.decoder(
                     positions,
@@ -276,11 +289,7 @@ class DeepseekModelNextN(nn.Module):
                     forward_batch,
                     residual,
                     zero_allocator,
-                    prev_topk_indices=(
-                        forward_batch.spec_info.dsa_topk_indices
-                        if forward_batch.reuse_dsa_topk_indices
-                        else None
-                    ),
+                    prev_topk_indices=index_topk_share.topk_indices,
                 )
             if not forward_batch.forward_mode.is_idle():
                 if residual is not None:
@@ -296,7 +305,7 @@ class DeepseekModelNextN(nn.Module):
                         forward_batch,
                         torch.cuda.current_stream(),
                     )
-                    if should_update_dsa_topk_indices and topk_indices is not None:
+                    if index_topk_share.should_publish and topk_indices is not None:
                         topk_indices = _gather_dsa_topk_indices_for_cp(
                             topk_indices,
                             local_num_tokens,
@@ -306,21 +315,12 @@ class DeepseekModelNextN(nn.Module):
                         )
                 elif (
                     cp_v2_active
-                    and should_update_dsa_topk_indices
+                    and index_topk_share.should_publish
                     and topk_indices is not None
                 ):
                     topk_indices = cp_gather_after_forward(topk_indices, forward_batch)
-            if should_update_dsa_topk_indices and topk_indices is not None:
-                if forward_batch.reuse_dsa_topk_indices:
-                    forward_batch.spec_info.dsa_topk_indices = topk_indices
-                if seed_buf is not None:
-                    sel = forward_batch.spec_info.dsa_seed_topk_select
-                    src = (
-                        topk_indices[: seed_buf.shape[0]]
-                        if sel is None
-                        else topk_indices[sel]
-                    )
-                    seed_buf[: src.shape[0]].copy_(src)
+            index_topk_share.update(topk_indices)
+            index_topk_share.publish()
         finally:
             exit_stack.close()
 
@@ -328,6 +328,8 @@ class DeepseekModelNextN(nn.Module):
 
 
 class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
+    # The draft checkpoint reports the NextN architecture name.
+    fused_shared_experts_architecture = "DeepseekV3ForCausalLMNextN"
 
     # Support amd/DeepSeek-R1-0528-MXFP4 renaming: model.layers.61*.
     # Ref: HF config.json for amd/DeepSeek-R1-0528-MXFP4
@@ -338,6 +340,10 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         },
     )
 
+    @classmethod
+    def get_hf_to_sglang_mapper(cls, config) -> WeightsMapper:
+        return cls.hf_to_sglang_mapper
+
     def _resolve_nextn_quant_config(self, config, quant_config):
         if quant_config is None or quant_config.get_name() != "quark":
             return quant_config
@@ -345,7 +351,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
 
         ckpt_prefix = f"model.layers.{config.num_hidden_layers}"
-        mapped_prefix = self.hf_to_sglang_mapper._map_name(ckpt_prefix)
+        mapped_prefix = self.get_hf_to_sglang_mapper(config)._map_name(ckpt_prefix)
         if should_ignore_layer(mapped_prefix, quant_config.exclude_layers):
             return None
         return quant_config
@@ -362,7 +368,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.quant_config = quant_config
         # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
         self.pp_group = get_pp_group()
-        self.determine_num_fused_shared_experts("DeepseekV3ForCausalLMNextN")
+        self.determine_num_fused_shared_experts()
         self.use_dsa = is_deepseek_dsa(config)
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.mla_enable_prefill_cp = is_mla_prefill_cp_enabled() and not self.use_dsa

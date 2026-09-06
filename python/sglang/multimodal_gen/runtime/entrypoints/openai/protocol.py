@@ -13,6 +13,7 @@ class ImageResponseData(BaseModel):
     url: Optional[str] = None
     revised_prompt: Optional[str] = None
     file_path: Optional[str] = None
+    resize: Optional[str] = None
 
 
 class ImagePromptTokensDetails(BaseModel):
@@ -37,6 +38,10 @@ class ImageResponse(BaseModel):
     usage: Optional[ImageUsage] = None
 
 
+# Keep request schemas limited to OpenAI fields and stable cross-model SGLang
+# extensions. Model-owned controls travel as allowed extras and are interpreted
+# only after the active SamplingParams subclass is resolved; do not add them to
+# these shared protocol models.
 class ImageGenerationsRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 

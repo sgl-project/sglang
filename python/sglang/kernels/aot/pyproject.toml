@@ -1,14 +1,14 @@
 [build-system]
 requires = [
   "scikit-build-core>=0.10",
-  "torch>=2.8.0",
+  "torch==2.13.0",
   "wheel",
 ]
 build-backend = "scikit_build_core.build"
 
 [project]
 name = "sglang-kernel"
-version = "0.4.5"
+version = "0.4.6.post1"
 authors = [
   { name="SGLang Kernel Team", email="sglang@lmsys.org" },
 ]
@@ -21,7 +21,7 @@ classifiers = [
   "License :: OSI Approved :: Apache Software License",
   "Environment :: GPU :: NVIDIA CUDA"
 ]
-dependencies = []
+dependencies = ["torch==2.13.0"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang/tree/main/python/sglang/kernels/aot"

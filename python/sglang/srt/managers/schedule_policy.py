@@ -5,8 +5,11 @@ from array import array
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
-from sglang.srt.runtime_context import get_disagg
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_schedule,
+)
+from sglang.srt.utils import get_bool_env_var, is_hip
 
 _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
 logger = logging.getLogger(__name__)
@@ -28,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
-from collections import Counter, defaultdict
+from collections import Counter
 from contextlib import contextmanager
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
@@ -38,13 +41,23 @@ import torch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    Req,
+    ScheduleBatch,
+    split_cached_prefix_by_tier,
+)
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+    UnifiedMambaSWATokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.allocator.unified_mamba import (
+    UnifiedMambaTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -53,11 +66,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     zero_match_result,
 )
-from sglang.srt.mem_cache.multi_ended_allocator import (
-    UnifiedMambaTokenToKVPoolAllocator,
-)
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -87,6 +96,48 @@ IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD = int(
 
 
 IGNORE_EOS_RESERVE_TOKENS = 1
+# AMD/HIP-only: the prefill tile-budget admission control is part of the AMD
+# compact extend-attention work and is gated on HIP (see _check_prefill_tile_budget),
+# so non-AMD vendors keep the exact legacy scheduler behavior.
+_IS_HIP = is_hip()
+PREFILL_TILE_BUDGET = envs.SGLANG_PREFILL_TILE_BUDGET.get()
+PREFILL_TILE_BUDGET_MODE = envs.SGLANG_PREFILL_TILE_BUDGET_MODE.get().strip().lower()
+if PREFILL_TILE_BUDGET_MODE not in {"legacy", "compact"}:
+    logger.warning(
+        "Unsupported SGLANG_PREFILL_TILE_BUDGET_MODE=%s. Falling back to compact.",
+        PREFILL_TILE_BUDGET_MODE,
+    )
+    PREFILL_TILE_BUDGET_MODE = "compact"
+
+
+def _ceil_div(value: int, divisor: int) -> int:
+    return -(-value // divisor)
+
+
+def estimate_prefill_extend_tile_metrics(
+    extend_lens: List[int], block_m: int
+) -> Dict[str, Union[int, float, List[int], None]]:
+    """Estimate extend-attention query tiles per head for a prefill batch."""
+    normalized_lens = [max(0, int(length)) for length in extend_lens]
+    q_tiles = [
+        _ceil_div(length, block_m) if length > 0 else 0 for length in normalized_lens
+    ]
+    legacy_tiles = len(q_tiles) * max(q_tiles) if q_tiles else 0
+    compact_tiles = sum(q_tiles)
+    saved_tiles = legacy_tiles - compact_tiles
+    saved_ratio = saved_tiles / legacy_tiles if legacy_tiles else None
+    return {
+        "block_m": int(block_m),
+        "request_count": len(normalized_lens),
+        "extend_lens": normalized_lens,
+        "q_tiles_per_request": q_tiles,
+        "max_extend_len": max(normalized_lens) if normalized_lens else 0,
+        "sum_extend_len": sum(normalized_lens),
+        "legacy_q_tiles_per_head": legacy_tiles,
+        "compact_q_tiles_per_head": compact_tiles,
+        "saved_q_tiles_per_head": saved_tiles,
+        "saved_q_tile_ratio": saved_ratio,
+    }
 
 
 def match_prefix_for_req(
@@ -109,7 +160,12 @@ def match_prefix_for_req(
 
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
-            key=RadixKey(token_ids=token_ids, extra_key=req.extra_key, limit=key_limit),
+            key=RadixKey(
+                token_ids=token_ids,
+                extra_key=req.extra_key,
+                limit=key_limit,
+                cache_salt=req.cache_salt,
+            ),
             cow_mamba=cow_mamba,
             req=req if include_req else None,
         )
@@ -139,10 +195,11 @@ def match_prefix_for_req(
     req.num_matched_prefix_tokens = min(
         len(req.prefix_indices) + req.host_hit_length, max_len
     )
+    req.swa_branching_seqlen = match_result.swa_branching_seqlen
     if match_result.mamba_branching_seqlen is not None:
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
     if match_result.cache_protected_len is not None:
-        req.cache_protected_len = match_result.cache_protected_len
+        req.kv.cache_protected_len = match_result.cache_protected_len
     return match_result
 
 
@@ -242,6 +299,13 @@ class SchedulePolicy:
             return CacheAgnosticPolicy.FCFS
         return self.policy
 
+    def waiting_queue_prefix_matched(self, waiting_queue: List[Req]) -> bool:
+        policy = self._determine_active_policy(waiting_queue)
+        return (
+            isinstance(policy, CacheAwarePolicy)
+            or self.tree_cache.supports_fast_match_prefix()
+        )
+
     def _validate_and_adjust_policy(
         self, policy: str, tree_cache: BasePrefixCache
     ) -> Policy:
@@ -273,6 +337,7 @@ class SchedulePolicy:
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
+            cache_salt = r.cache_salt
             match_result = match_prefix_for_req(
                 self.tree_cache, r, prefix_ids, include_req=True
             )
@@ -287,7 +352,11 @@ class SchedulePolicy:
             if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
                 match_result = self.waiting_queue_radix_tree.match_prefix(
                     MatchPrefixParams(
-                        key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
+                        key=RadixKey(
+                            token_ids=prefix_ids,
+                            extra_key=extra_key,
+                            cache_salt=cache_salt,
+                        )
                     )
                 )
                 if envs.SGLANG_RADIX_FORCE_MISS.get():
@@ -304,7 +373,11 @@ class SchedulePolicy:
                     # Insert with a dummy key
                     self.waiting_queue_radix_tree.insert(
                         InsertParams(
-                            key=RadixKey(token_ids=prefix_ids, extra_key=extra_key),
+                            key=RadixKey(
+                                token_ids=prefix_ids,
+                                extra_key=extra_key,
+                                cache_salt=cache_salt,
+                            ),
                             value=torch.empty(len(prefix_ids), dtype=torch.bool),
                         )
                     )
@@ -328,23 +401,8 @@ class SchedulePolicy:
         waiting_queue: List[Req], tree_cache: BasePrefixCache
     ) -> None:
         """Sorts the waiting queue based on a depth-first search weighting."""
-        last_node_to_reqs = defaultdict(list)
-        for req in waiting_queue:
-            last_node = tree_cache.resolve_node_handle(req.last_node)
-            last_node_to_reqs[last_node].append(req)
-
-        node_to_weight = defaultdict(int)
-        for node in last_node_to_reqs:
-            node_to_weight[node] = len(last_node_to_reqs[node])
-        SchedulePolicy._calc_weight(tree_cache.root_node, node_to_weight)
-
-        waiting_queue.clear()
-        SchedulePolicy._get_dfs_priority(
-            tree_cache.root_node,
-            node_to_weight,
-            last_node_to_reqs,
-            waiting_queue,
-        )
+        order = tree_cache.dfs_weight_order([req.last_node for req in waiting_queue])
+        waiting_queue[:] = [waiting_queue[index] for index in order]
 
     @staticmethod
     def _sort_by_longest_output(
@@ -413,27 +471,6 @@ class SchedulePolicy:
             waiting_keys_after = [r.routing_key for r in waiting_queue]
             logger.info(f"waiting_keys_after={waiting_keys_after}")
 
-    @staticmethod
-    def _calc_weight(cur_node: TreeNode, node_to_weight: Dict[TreeNode, int]) -> None:
-        for child in cur_node.children.values():
-            SchedulePolicy._calc_weight(child, node_to_weight)
-            node_to_weight[cur_node] += node_to_weight[child]
-
-    @staticmethod
-    def _get_dfs_priority(
-        cur_node: TreeNode,
-        node_to_priority: Dict[TreeNode, int],
-        last_node_to_reqs: Dict[TreeNode, List[Req]],
-        q: List,
-    ) -> None:
-        children = [child for child in cur_node.children.values()]
-        children.sort(key=lambda x: -node_to_priority[x])
-        for child in children:
-            SchedulePolicy._get_dfs_priority(
-                child, node_to_priority, last_node_to_reqs, q
-            )
-        q.extend(last_node_to_reqs[cur_node])
-
 
 class AddReqResult(Enum):
     CONTINUE = auto()  # Continue to add requests
@@ -459,8 +496,10 @@ class PrefillAdder:
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
+        prefill_tile_block_m: int = 64,
     ):
         self.page_size = page_size
+        self.prefill_tile_block_m = prefill_tile_block_m
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
@@ -483,6 +522,9 @@ class PrefillAdder:
         self.new_chunked_req = None
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
+        self.log_device_hit_tokens = 0
+        self.log_host_hit_tokens = 0
+        self.log_storage_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
         self.reprocessed_log_input_tokens = 0
@@ -509,15 +551,17 @@ class PrefillAdder:
 
         self.rem_swa_token_offset = 0
 
-        # Unified-pool joint budget: a new mamba state consumes shared-gap bytes
-        # that `rem_total_tokens` (full KV) otherwise counts as free, so reserve
-        # the gap per new mamba slot or admission over-commits. Gate on the
-        # ALLOCATOR being the unified Mamba composite, NOT on `is_hybrid_ssm_cache`
-        # (False for `ChunkCache`, which would skip the reservation on the
-        # chunk-cache path): the gap coupling is a property of the byte buffer.
+        # A new state slot eats shared-gap bytes that `rem_total_tokens` counts
+        # as free, so reserve per slot or admission over-commits. Gate on the
+        # ALLOCATOR, not `is_hybrid_ssm_cache`: that is False for `ChunkCache`,
+        # which would skip the reservation on the chunk-cache path.
         self._mamba_slot_cost = 0
         if isinstance(
-            self.token_to_kv_pool_allocator, UnifiedMambaTokenToKVPoolAllocator
+            self.token_to_kv_pool_allocator,
+            (
+                UnifiedMambaTokenToKVPoolAllocator,
+                UnifiedMambaSWATokenToKVPoolAllocator,
+            ),
         ):
             self._mamba_slot_cost = (
                 self.token_to_kv_pool_allocator.mamba_slot_full_token_cost()
@@ -531,9 +575,7 @@ class PrefillAdder:
         # fail-loud `RuntimeError`. `None` outside the unified Mamba pool.
         self.rem_mamba_slots = None
         if self._mamba_slot_cost:
-            self.rem_mamba_slots = (
-                self.token_to_kv_pool_allocator.mamba_allocator.schedulable_available_size()
-            )
+            self.rem_mamba_slots = self.token_to_kv_pool_allocator.mamba_allocator.schedulable_available_size()
             if self.is_hybrid_ssm_cache:
                 self.rem_mamba_slots += self.tree_cache.mamba_evictable_size()
 
@@ -549,6 +591,36 @@ class PrefillAdder:
         # Snapshot of scheduler waiting_queue length at the start of this
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
+
+    def _admitted_extend_lens(self) -> List[int]:
+        return [int(getattr(req, "extend_input_len", 0)) for req in self.can_run_list]
+
+    def _tile_admission_metric_key(self) -> str:
+        return f"{PREFILL_TILE_BUDGET_MODE}_q_tiles_per_head"
+
+    def _candidate_tile_metrics(self, candidate_extend_len: int) -> Dict[str, object]:
+        return estimate_prefill_extend_tile_metrics(
+            [*self._admitted_extend_lens(), int(candidate_extend_len)],
+            block_m=self.prefill_tile_block_m,
+        )
+
+    def _check_prefill_tile_budget(
+        self, candidate_extend_len: int
+    ) -> Optional[AddReqResult]:
+        # AMD-only: leave non-AMD scheduler admission unchanged even if the env
+        # budget is set.
+        if not _IS_HIP or PREFILL_TILE_BUDGET <= 0:
+            return None
+
+        if not self.can_run_list:
+            return None
+
+        metrics = self._candidate_tile_metrics(candidate_extend_len)
+        candidate_metric = int(metrics.get(self._tile_admission_metric_key()) or 0)
+        if candidate_metric <= PREFILL_TILE_BUDGET:
+            return None
+
+        return AddReqResult.OTHER
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
@@ -697,6 +769,27 @@ class PrefillAdder:
             return 0
         return cap // self.page_size * self.page_size
 
+    def _swa_req_never_fits(
+        self, extend_input_len: int, max_new_tokens: int, swa_host_hit_length: int = 0
+    ) -> bool:
+        """True when a request's SWA budget exceeds the *entire* SWA pool, so it
+        can never be admitted whole no matter how far the pool drains.
+
+        This is the head-of-line livelock the _swa_chunk_cap escape hatch exists
+        for; the hatch must fire only in this case. A request that merely
+        exceeds *current* rem_swa (transient pressure) would fit once running
+        decodes free their windows, so it must wait — admitting it into the
+        decode headroom collapses the SWA evictable cushion and forces running
+        requests to retract (observed as a severe retraction/re-prefill storm on
+        hybrid-SWA models at high concurrency)."""
+        capacity = self.token_to_kv_pool_allocator.size_swa
+        return (
+            self._swa_budget_for_req(
+                extend_input_len, max_new_tokens, swa_host_hit_length
+            )
+            >= capacity
+        )
+
     def _mamba_gap_budget_for_req(self, req: Req) -> int:
         """Shared-gap reservation (full-token-equivalents) for a request's new
         mamba state. Charged only on the SHARED Mamba pool (`_mamba_slot_cost > 0`)
@@ -708,7 +801,7 @@ class PrefillAdder:
         backstopped by the fail-loud RuntimeError in `alloc_req_slots`. FIXME: if
         over-admission crashes under pressure, make this more conservative (e.g.
         multiply by `MAMBA_STATE_PER_REQ_PREFIX_CACHE`)."""
-        if self._mamba_slot_cost and req.mamba_pool_idx is None:
+        if self._mamba_slot_cost and not req.kv.holds_mamba:
             return self._mamba_slot_cost
         return 0
 
@@ -785,6 +878,40 @@ class PrefillAdder:
             self.reprocessed_log_hit_tokens += prefix_len
             self.reprocessed_log_input_tokens += extend_input_len
 
+    def _account_prefill_cache_admission(self, req: Req, prefix_len: int) -> None:
+        if req.retracted_stain:
+            # Retraction attribution is intentionally omitted for now; discard
+            # its lifecycle state so a later abort cannot report it as a drop.
+            self.tree_cache.discard_storage_prefetch_accounting(req.rid)
+            return
+
+        if prefix_len > 0:
+            device_hit, host_hit, storage_hit = split_cached_prefix_by_tier(
+                prefix_len=prefix_len,
+                host_hit_len=req.materialized_host_hit_len(),
+                storage_hit_len=req.storage_hit_length,
+                storage_hit_start=req.storage_hit_start,
+                host_hit_is_storage=req.host_hit_is_storage,
+            )
+            self.log_device_hit_tokens += device_hit
+            self.log_host_hit_tokens += host_hit
+            self.log_storage_hit_tokens += storage_hit
+
+        fulfilled_storage_hit = req.fulfilled_storage_hit_len(prefix_len)
+        reason = None
+        if fulfilled_storage_hit < req.storage_hit_length:
+            reason = (
+                "device_capacity"
+                if req.needs_host_load_back()
+                and req.host_loaded_length < req.host_hit_length
+                else "shrunk"
+            )
+        self.tree_cache.finish_storage_prefetch_admission(
+            req.rid,
+            fulfilled_tokens=fulfilled_storage_hit,
+            reason=reason,
+        )
+
     def _get_dllm_remain_tokens(self) -> int:
         _rem_tokens = min(
             self.rem_dllm_tokens,
@@ -817,6 +944,7 @@ class PrefillAdder:
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
         )
+        self._account_prefill_cache_admission(req, prefix_len)
 
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)
@@ -1016,11 +1144,21 @@ class PrefillAdder:
             if self.rem_dllm_tokens <= 0:
                 return AddReqResult.OTHER
 
+            if (
+                tile_stop := self._check_prefill_tile_budget(cand_extend_input_len)
+            ) is not None:
+                return tile_stop
+
             self._add_dllm_req(req, 0)
         elif (
             self.rem_chunk_tokens is None  # chunked prefill is disabled
             or cand_extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
         ):
+            if (
+                tile_stop := self._check_prefill_tile_budget(cand_extend_input_len)
+            ) is not None:
+                return tile_stop
+
             # Non-chunked prefill — the whole sequence is committed this iter.
             req.set_extend_range(
                 len(req.prefix_indices), len(req.full_untruncated_fill_ids)
@@ -1039,6 +1177,9 @@ class PrefillAdder:
 
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens
+
+            if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
+                return tile_stop
 
             assert len(req.prefix_indices) == 0
             req.set_extend_range(
@@ -1084,7 +1225,10 @@ class PrefillAdder:
         total_tokens = cand_extend_input_len + max_new + self.page_size
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
-        total_tokens += self._mamba_gap_budget_for_req(req)
+        # Read before `init_load_back` binds `req.mamba_pool_idx` — after that
+        # this returns 0, so the debit sites below reuse the value.
+        mamba_gap_reserve = self._mamba_gap_budget_for_req(req)
+        total_tokens += mamba_gap_reserve
 
         # adjusting the input_tokens based on host_hit_length and page_size
         real_input_tokens = cand_extend_input_len - req.host_hit_length
@@ -1105,6 +1249,12 @@ class PrefillAdder:
                 swa_host_hit_length=req.swa_host_hit_length,
             )
             if swa_needed >= self.rem_swa_tokens:
+                if not self._swa_req_never_fits(
+                    real_input_tokens,
+                    self._swa_new_tokens(req),
+                    req.swa_host_hit_length,
+                ):
+                    return AddReqResult.NO_TOKEN
                 swa_cap = self._swa_chunk_cap(
                     self._swa_new_tokens(req), req.swa_host_hit_length
                 )
@@ -1135,6 +1285,12 @@ class PrefillAdder:
                     swa_host_hit_length=req.swa_host_hit_length,
                 )
                 if swa_needed >= self.rem_swa_tokens:
+                    if not self._swa_req_never_fits(
+                        real_input_tokens,
+                        self._swa_new_tokens(req),
+                        req.swa_host_hit_length,
+                    ):
+                        return AddReqResult.NO_TOKEN
                     swa_cap = self._swa_chunk_cap(
                         self._swa_new_tokens(req), req.swa_host_hit_length
                     )
@@ -1164,9 +1320,10 @@ class PrefillAdder:
                         req=req,
                     )
                 )
+                req.host_loaded_length = len(new_indices)
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
-                req.cache_protected_len = prefix_len
+                req.kv.cache_protected_len = prefix_len
 
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
@@ -1186,13 +1343,23 @@ class PrefillAdder:
                 if self.rem_dllm_tokens <= 0:
                     return AddReqResult.OTHER
 
-                assert (
-                    truncation_align_size is None
-                ), "truncation_align_size is not supported for dllm prefill"
+                assert truncation_align_size is None, (
+                    "truncation_align_size is not supported for dllm prefill"
+                )
+
+                if (
+                    tile_stop := self._check_prefill_tile_budget(input_tokens)
+                ) is not None:
+                    return tile_stop
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
             elif chunk_tokens_limit is None or input_tokens <= chunk_tokens_limit:
+                if (
+                    tile_stop := self._check_prefill_tile_budget(input_tokens)
+                ) is not None:
+                    return tile_stop
+
                 # Non-chunked prefill — the whole sequence is committed this iter.
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.full_untruncated_fill_ids)
@@ -1208,8 +1375,9 @@ class PrefillAdder:
                         CLIP_MAX_NEW_TOKENS,
                     ),
                     req.retracted_stain,
-                    mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                    mamba_gap_reserve=mamba_gap_reserve,
                 )
+                self._account_prefill_cache_admission(req, prefix_len)
             else:
                 # Make sure at least one page is available
                 trunc_len = chunk_tokens_limit // self.page_size * self.page_size
@@ -1235,6 +1403,11 @@ class PrefillAdder:
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
 
+                if (
+                    tile_stop := self._check_prefill_tile_budget(trunc_len)
+                ) is not None:
+                    return tile_stop
+
                 # Chunked prefill
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.prefix_indices) + trunc_len
@@ -1249,18 +1422,19 @@ class PrefillAdder:
                     trunc_len,
                     0,
                     req.retracted_stain,
-                    mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                    mamba_gap_reserve=mamba_gap_reserve,
                 )
+                self._account_prefill_cache_admission(req, prefix_len)
 
         return self.budget_state()
 
-    def preempt_to_schedule(self, req: Req, server_args: ServerArgs) -> bool:
+    def preempt_to_schedule(self, req: Req) -> bool:
         """
         Preempt running requests to serve the new request if the priority threshold is met and token count sum is verified.
         Returns True if preemption was committed, and the new request can be scheduled.
         """
         # Iterate running requests to find preemptible requests
-        priority_sign = 1 if server_args.schedule_low_priority_values_first else -1
+        priority_sign = 1 if get_schedule().schedule_low_priority_values_first else -1
 
         # NOTE: A request finishes in two phases:
         #   1) update_finish_state + release_kv_cache  (in process_batch_result)
@@ -1318,7 +1492,7 @@ class PrefillAdder:
                 )
                 release_counter += 1
                 self.running_batch.release_req(
-                    i, len(self.running_batch.reqs) - release_counter, server_args
+                    i, len(self.running_batch.reqs) - release_counter
                 )
             else:
                 keep_indices.append(i)

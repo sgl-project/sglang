@@ -12,8 +12,13 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
+    get_parallel,
+    process_model_config,
+)
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import ceil_align, ceil_div
 
 
@@ -66,33 +71,61 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
-    return original_seq_lens.clamp(max=dsa_index_topk)
+def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int, index_kpool: int = 1):
+    if index_kpool <= 1:
+        return original_seq_lens.clamp(max=dsa_index_topk)
 
-
-def should_use_dsa_fused_topk(
-    server_args, seed_dsa_topk_from_draft_extend: bool
-) -> bool:
-    pd_index_share_seed = (
-        server_args.disaggregation_mode != "null" and seed_dsa_topk_from_draft_extend
+    # Clamp only complete pools; the unfinished tail must remain selectable
+    # outside the pooled top-k budget.
+    full_pool_tokens = (
+        torch.div(original_seq_lens, index_kpool, rounding_mode="floor") * index_kpool
     )
-    # TODO(kpham-sgl): Transfer request-relative IndexShare seeds and remap them
-    # to decode-local KV slots so fused top-k can remain enabled under PD.
-    return envs.SGLANG_DSA_FUSE_TOPK.get() and not pd_index_share_seed
+    selected_history_tokens = full_pool_tokens.clamp(max=dsa_index_topk)
+    tail_tokens = original_seq_lens - full_pool_tokens
+    return selected_history_tokens + tail_tokens
+
+
+def should_remap_pd_dsa_seed_to_local_slots() -> bool:
+    """Whether a PD seed should enter the allocator-local fused TopK domain."""
+    return (
+        (is_cuda() or is_hip())
+        and envs.SGLANG_DSA_FUSE_TOPK.get()
+        and get_disagg().disaggregation_mode == "decode"
+        and not get_memory().enable_hisparse
+        and not get_parallel().dcp_enabled
+    )
+
+
+def should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend: bool) -> bool:
+    """Select fused TopK for PD IndexShare.
+
+    PD Prefill worker:
+    - Target prefill: fused TopK enabled.
+    - Draft extend: fused TopK disabled.
+
+    PD Decode worker:
+    - Draft decode / target verify / draft extend: fused TopK enabled.
+    """
+    pd_index_share_seed = (
+        get_disagg().disaggregation_mode != "null" and seed_dsa_topk_from_draft_extend
+    )
+    return envs.SGLANG_DSA_FUSE_TOPK.get() and (
+        not pd_index_share_seed or should_remap_pd_dsa_seed_to_local_slots()
+    )
 
 
 def is_dsa_enable_prefill_cp():
-    if not envs.SGLANG_ENABLE_CP_V2.get():
+    if is_hip() or is_npu():
         return get_parallel().enable_dsa_prefill_context_parallel
 
-    # Derive from the runtime CP topology + model arch rather than the legacy
-    # flag under CP-v2: DSA prefill CP is active when the CP group is on for a
-    # DeepSeek Sparse Attention model.
+    # Generic prefill CP derives activation from the runtime topology and model
+    # architecture. Protected HIP/NPU paths continue to use their legacy field.
     if get_parallel().attn_cp_size <= 1:
         return False
-    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 
-    return is_deepseek_dsa(get_server_args().get_model_config().hf_config)
+    hf_config = process_model_config().hf_config
+    return is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
 
 
 def is_dsa_prefill_cp_in_seq_split():
@@ -163,14 +196,25 @@ def dsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
         return input_[indices]
 
     # for torch device tensor
-    return input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank].contiguous()
+    shard = input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank]
+    # .contiguous() is not sufficient here. When tokens == cp_size every rank's
+    # shard has a single row, and a size-1 outer dimension imposes no contiguity
+    # constraint, so is_contiguous() is True whatever stride(0) is and
+    # .contiguous() becomes a no-op. The shard then keeps the cp_size-inflated
+    # row pitch (cp_size * row_numel instead of row_numel), which any kernel that
+    # takes its row pitch from stride(0) will read as an oversized tensor.
+    # Compare the pitch against the parent's explicitly, so the copy happens
+    # exactly when the shard really is strided -- and not at all for cp_size == 1.
+    if shard.stride(0) != input_.stride(0):
+        shard = shard.clone(memory_format=torch.contiguous_format)
+    return shard
 
 
 def cal_padded_tokens(forward_batch: "ForwardBatch"):
     # Consistent with the padding calculation logic in ForwardBatch.prepare_mlp_sync_batch,
     # calculate the actual token length after padding when attn_tp_size > 1 or in the MAX_LEN padding mode.
     from sglang.srt.layers.cp.padding import get_cp_padding_align_size
-    from sglang.srt.layers.cp.utils import is_cp_v2_active
+    from sglang.srt.layers.cp.utils import enable_cp_v2, is_cp_v2_active
 
     # CP-v2 already pads each rank-local shard to its physical size
     if is_cp_v2_active(forward_batch):
@@ -181,10 +225,16 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
     global_num_tokens = forward_batch.global_num_tokens_cpu.copy()
     sync_group_size = len(global_num_tokens)
     attn_cp_size = get_parallel().attn_cp_size
-    # Must match the CP padding in ForwardBatch.prepare_mlp_sync_batch.
-    cp_align_size = get_cp_padding_align_size()
-    for i in range(sync_group_size):
-        global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
+    # Must mirror ForwardBatch.prepare_mlp_sync_batch, which applies cp_align_size only when
+    # CP-v2 is disabled. Under enable_cp_v2() the speculative forwards (TARGET_VERIFY /
+    # DRAFT_EXTEND_V2) reach here with is_cp_v2_active False, and q is padded to attn_tp_size only
+    # (not cp-aligned). Applying cp_align here over-pads the flashmla metadata past q, so
+    # num_splits ends up longer than q -> fwd_kvcache_mla fails "num_splits must have shape (b+1)".
+    # (attn_cp analog of the attn_tp fix in PR #30642 / issue #30296.)
+    if not enable_cp_v2():
+        cp_align_size = get_cp_padding_align_size()
+        for i in range(sync_group_size):
+            global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
     # Reuse the mode selected when the DP buffer was prepared.
     dp_padding_mode = forward_batch.dp_padding_mode
     if dp_padding_mode is None:
@@ -234,9 +284,9 @@ def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
 
     if is_dsa_prefill_cp_round_robin_split():
         cur_cp_seq_len = seq_len // cp_size
-        assert (
-            seq_len % cp_size == 0
-        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when dsa_prefill_cp_mode is round-robin-split"
+        assert seq_len % cp_size == 0, (
+            f"seq_len {seq_len} is not divisible by cp_size {cp_size} when dsa_prefill_cp_mode is round-robin-split"
+        )
     else:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         # Note: (self.cp_size * 2) To achieve load balancing for seq computation,

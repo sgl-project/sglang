@@ -189,15 +189,15 @@ def _state_passing_fwd(
             # - if cu_seqlens is provided, then the initial states
             #   are used for continuous batching. In which case we
             #   require seq_idx to be provided
-            assert (
-                seq_idx is not None
-            ), "seq_idx must be provided for continuous batching"
+            assert seq_idx is not None, (
+                "seq_idx must be provided for continuous batching"
+            )
             # - we also need chunk_offsets to be provided, to account
             #   for computation of dA_cumsum from the start of the
             #   sequence
-            assert (
-                chunk_offsets is not None
-            ), "chunk_offsets must be provided for continuous batching"
+            assert chunk_offsets is not None, (
+                "chunk_offsets must be provided for continuous batching"
+            )
         else:
             # - this is the regular batching case, where initial
             #   states are used are for each example of the batch.

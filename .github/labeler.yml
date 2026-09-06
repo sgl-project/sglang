@@ -102,11 +102,42 @@ deepseek:
     - any-glob-to-any-file:
       - '**/*deepseek*'
 
-# HiCache
+memory-pool:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'python/sglang/srt/mem_cache/pool/**/*'
+      - 'python/sglang/srt/mem_cache/allocator/**/*'
+      - 'python/sglang/srt/mem_cache/layout/**/*'
+      - 'python/sglang/srt/mem_cache/**/*memory_pool*'
+      - 'test/registered/mem_cache/**/*'
+
+unified-radix-cache:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'python/sglang/srt/mem_cache/unified_cache/**/*'
+      - 'python/sglang/srt/mem_cache/cpp_radix_tree/**/*'
+      - 'python/sglang/srt/mem_cache/**/*radix*'
+      - 'python/sglang/srt/mem_cache/chunk_cache.py'
+      - 'python/sglang/srt/mem_cache/evict_policy.py'
+      - 'python/sglang/srt/mem_cache/base_prefix_cache.py'
+      - 'test/registered/radix_cache/**/*'
+
 hicache:
   - changed-files:
     - any-glob-to-any-file:
       - '**/*hicache*'
+      - '**/*hiradix*'
+      - '**/HiCache/**/*'
+      - 'benchmark/hicache/**/*'
+      - 'test/registered/hicache/**/*'
+      - 'python/sglang/srt/managers/cache_controller.py'
+      - 'python/sglang/srt/mem_cache/pool_host/**/*'
+      - 'python/sglang/srt/mem_cache/hybrid_cache/**/*'
+      - 'python/sglang/srt/mem_cache/storage/**/*'
+      - 'python/sglang/srt/mem_cache/buffer_mode/**/*'
+      - 'python/sglang/srt/mem_cache/**/*host*'
+      - 'python/sglang/srt/mem_cache/**/*storage*'
+      - 'python/sglang/srt/mem_cache/l2_transfer.py'
 
 # Deterministic
 deterministic:

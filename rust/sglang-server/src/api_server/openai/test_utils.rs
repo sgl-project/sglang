@@ -18,22 +18,22 @@ use axum::response::Response;
 use serde_json::json;
 use tower::util::ServiceExt;
 
-use super::routes;
-use crate::ids::Rid;
-use crate::message::{ChunkEvent, EgressItem};
-use crate::runtime::ServerArgs;
-use crate::tokenizer_manager::Senders;
+use super::{openai_error, routes};
+use crate::message::config::ServerArgs;
+use crate::message::ids::Rid;
+use crate::message::response::{ChunkEvent, ResponseItem};
+use crate::tokenizer_manager::wiring::Senders;
 
 pub(super) fn senders() -> Senders {
     Senders {
-        tm: flume::unbounded().0,
-        abort: flume::unbounded().0,
-        tok: flume::unbounded().0,
-        detok: vec![],
+        tok_manager_tx: flume::unbounded().0,
+        abort_tx: flume::unbounded().0,
+        tokenizer_tx: flume::unbounded().0,
+        detokenizer_tx: vec![],
     }
 }
 
-pub(super) fn chunk(rid: &str, text: &str, done: bool) -> EgressItem {
+pub(super) fn chunk(rid: &str, text: &str, done: bool) -> ResponseItem {
     let output = ChunkEvent {
         rid: rid.into(),
         text: text.into(),
@@ -50,20 +50,20 @@ pub(super) fn chunk(rid: &str, text: &str, done: bool) -> EgressItem {
         ..Default::default()
     };
     if done {
-        EgressItem::Done(output)
+        ResponseItem::Done(output)
     } else {
-        EgressItem::Frame(output)
+        ResponseItem::Frame(output)
     }
 }
 
-/// A submitted legacy completion choice with its egress channel.
+/// A submitted legacy completion choice.
 pub(super) fn submitted(
     index: usize,
     prompt_index: usize,
     rid: &str,
 ) -> (
     super::completions::SubmittedChoice,
-    tokio::sync::mpsc::Sender<EgressItem>,
+    tokio::sync::mpsc::Sender<ResponseItem>,
 ) {
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     (
@@ -78,41 +78,33 @@ pub(super) fn submitted(
     )
 }
 
-/// A submitted chat choice (the tuple `chat_event_stream` consumes) with its
-/// egress channel.
+/// A submitted chat choice (the tuple `chat_event_stream` consumes).
 pub(super) fn chat_submitted(
     index: usize,
     rid: &str,
 ) -> (
-    (usize, Rid, tokio::sync::mpsc::Receiver<EgressItem>),
-    tokio::sync::mpsc::Sender<EgressItem>,
+    (usize, Rid, tokio::sync::mpsc::Receiver<ResponseItem>),
+    tokio::sync::mpsc::Sender<ResponseItem>,
 ) {
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     ((index, rid.into(), rx), tx)
 }
 
-// ---------------------------------------------------------------------
-// Handler-level tests: full router, real extractors, no scheduler. A
-// request that reaches `submit` with an OPEN tm lane would wait on the
-// egress receiver forever, so submission-reaching cases use `senders_closed`
-// (503) and everything else fails validation before submit.
-// ---------------------------------------------------------------------
-
 pub(super) fn server_args() -> Arc<ServerArgs> {
-    Arc::new(
-        serde_json::from_value(serde_json::json!({ "served_model_name": "model" }))
-            .expect("ServerArgs must deserialize"),
-    )
+    Arc::new(ServerArgs {
+        served_model_name: "model".into(),
+        ..Default::default()
+    })
 }
 
-pub(super) fn app_state(senders: Senders) -> super::AppState {
-    super::AppState {
+pub(super) fn app_state(senders: Senders) -> Arc<super::AppState> {
+    Arc::new(super::AppState {
         senders,
-        egress_buf: 8,
+        response_buf: 8,
         server_args: server_args(),
         chat_formatter: None,
-        egress_activity: Default::default(),
-    }
+        response_activity: Default::default(),
+    })
 }
 
 pub(super) fn senders_closed() -> Senders {
@@ -126,10 +118,10 @@ pub(super) fn senders_closed() -> Senders {
     let (tok_tx, tok_rx) = flume::unbounded();
     drop(tok_rx);
     Senders {
-        tm: tm_tx,
-        abort: abort_tx,
-        tok: tok_tx,
-        detok: vec![],
+        tok_manager_tx: tm_tx,
+        abort_tx,
+        tokenizer_tx: tok_tx,
+        detokenizer_tx: vec![],
     }
 }
 
@@ -157,13 +149,13 @@ pub(super) async fn body_json(response: Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
-/// The common StatusCode→error helper follows `pre_submit_error`'s shape:
+/// The common StatusCode→error helper follows `error_response`'s shape:
 /// unary requests get the JSON error with its status; a committed stream gets
 /// 200 + one SSE error frame + `[DONE]`, and the frame carries the OpenAI
 /// error fields (`type`, `param`, `code`) that the SDKs dispatch on.
 #[tokio::test]
 async fn openai_error_response_covers_unary_and_sse() {
-    let unary = super::openai_error_response(StatusCode::BAD_REQUEST, "bad input", false);
+    let unary = openai_error(StatusCode::BAD_REQUEST, "bad input", false);
     assert_eq!(unary.status(), StatusCode::BAD_REQUEST);
     let value = body_json(unary).await;
     assert_eq!(value["error"]["message"], "bad input");
@@ -171,7 +163,7 @@ async fn openai_error_response_covers_unary_and_sse() {
     assert_eq!(value["error"]["code"], 400);
     assert!(value["error"]["param"].is_null());
 
-    let streamed = super::openai_error_response(StatusCode::BAD_REQUEST, "bad input", true);
+    let streamed = openai_error(StatusCode::BAD_REQUEST, "bad input", true);
     assert_eq!(streamed.status(), StatusCode::OK);
     let bytes = axum::body::to_bytes(streamed.into_body(), 64 * 1024)
         .await
@@ -290,7 +282,7 @@ async fn basic_openai_router_excludes_responses_api() {
 
 /// A closed tm inbox with a *streaming* request must answer inside the
 /// committed stream: 200 + one OpenAI-shaped SSE error frame + `[DONE]` (the
-/// same rule `pre_submit_error` applies to the native API), not a unary 503.
+/// same `error_response` rule the native API applies), not a unary 503.
 #[tokio::test]
 async fn streaming_submit_failure_answers_inside_the_stream() {
     let app = routes().with_state(app_state(senders_closed()));

@@ -8,15 +8,25 @@ import os
 import tempfile
 import time
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterator, List, Union
 
 import numpy as np
 import torch
 from setproctitle import setproctitle
 
+from sglang.multimodal_gen.runtime.warmup_request_builder import lighten_warmup_req
+
+from sglang.multimodal_gen.runtime.utils.logging_utils import (  # isort: skip
+    globally_suppress_loggers,
+)
+
+# spawned workers import model dependencies before entering run_scheduler_process
+globally_suppress_loggers()
+
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import (
+    get_replica_group,
     get_sp_group,
     get_tp_rank,
     get_tp_world_size,
@@ -41,7 +51,17 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     post_process_sample,
     save_outputs,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
+    DefaultWorkload,
+    WarmupMemoryRecord,
+    estimate_default_workload_peak_bytes,
+    resolve_default_workload,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    peek_global_component_residency_manager,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseUsageTracker,
     configure_layerwise_offload_modules,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
@@ -58,20 +78,18 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin import (
     GPUWorkerPostTrainingMixin,
 )
-from sglang.multimodal_gen.runtime.realtime.session import (
-    RealtimeSessionCache,
-)
+from sglang.multimodal_gen.runtime.realtime.session import RealtimeSessionCache
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
-    globally_suppress_loggers,
     init_logger,
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
 )
+from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.multimodal_gen.runtime.utils.realtime_video import (
     RAW_RGB_CONTENT_TYPE,
     build_raw_rgb_frame_batches,
@@ -82,17 +100,10 @@ from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
     trace_slice,
 )
 from sglang.multimodal_gen.utils import kill_itself_when_parent_died
+from sglang.srt.environ import third_party_cache_defaults
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
-
-OFFLOAD_DISABLE_RECOMMENDATION_ORDER = (
-    "vae",
-    "image_encoder",
-    "text_encoder",
-    "text_encoder_2",
-    "transformer",
-)
 
 
 @dataclass
@@ -122,6 +133,64 @@ def _worker_cpu_intra_op_threads(num_gpus: int) -> int | None:
     return max(1, min(16, cpu_count // max(1, num_gpus)))
 
 
+OFFLOAD_DISABLE_RECOMMENDATION_ORDER = (
+    "vae",
+    "image_encoder",
+    "text_encoder",
+    "text_encoder_2",
+    "transformer",
+)
+
+
+PROBE_FIT_MIN_MARGIN_BYTES = 1 << 30
+
+
+def _shape_label(req: Req) -> str:
+    return f"{req.width}x{req.height}x{req.num_frames or 1}f"
+
+
+def fit_auto_residency_probe(
+    req: Req,
+    *,
+    records: list[WarmupMemoryRecord],
+    free_bytes: int,
+    total_bytes: int,
+    server_args: ServerArgs,
+) -> tuple[Req, int | None, int]:
+    """Shrink a full-shape probe until its extrapolated peak fits the memory left.
+
+    The probe measures the default workload under the load-safe placement, so
+    a probe the card cannot hold would only be found out by running out of
+    memory. The bounded warmup that runs before it gives one measurement to
+    extrapolate from; while that extrapolation exceeds free memory minus the
+    reserve, frames go first and then area, the ladder the OOM retry walks.
+    Returns the fitted request, its estimate and the number of shrink steps.
+    """
+    # Only the probe has to fit, so the margin is allocator slack, not the
+    # planner's placement reserve (which held back 4 GiB of a 32 GiB card and
+    # shrank a probe that had 10 GiB to spare).
+    budget = free_bytes - max(PROBE_FIT_MIN_MARGIN_BYTES, total_bytes // 50)
+    # The bounded warmup already ran at the smallest measured shape; a probe
+    # below it measures nothing new and degenerate shapes fail inside models.
+    floor_units = min((record.workload_units() for record in records), default=0)
+    fitted, steps = req, 0
+    while True:
+        units = (
+            max(1, int(fitted.width or 1))
+            * max(1, int(fitted.height or 1))
+            * max(1, int(fitted.num_frames or 1))
+        )
+        estimate = estimate_default_workload_peak_bytes(
+            records=records, target_units=units
+        )
+        if estimate is None or estimate <= budget or units <= floor_units:
+            return fitted, estimate, steps
+        lighter = lighten_warmup_req(server_args, fitted)
+        if lighter is None:
+            return fitted, estimate, steps
+        fitted, steps = lighter, steps + 1
+
+
 class GPUWorker(GPUWorkerPostTrainingMixin):
     """
     A worker that executes the model on a single GPU.
@@ -136,12 +205,31 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ):
         self.local_rank = local_rank
         self.rank = rank
+        # the rank that materializes output and replies to the client: the
+        # first rank of this DP replica, which is global rank 0 only at dp=1
+        gpus_per_replica = max(1, server_args.num_gpus // (server_args.dp_size or 1))
+        self.is_output_rank = rank % gpus_per_replica == 0
         self.master_port = master_port
         # FIXME: should we use tcp as distribute init method?
         self.server_args = server_args
         self.pipeline: ComposedPipelineBase = None
 
         self.init_device_and_model()
+        load_snapshot = None if current_platform.is_cpu() else capture_memory_snapshot()
+        self._load_peak_reserved_mb = (
+            load_snapshot.peak_reserved_mb if load_snapshot is not None else 0.0
+        )
+        # Allocated peaks are the guarded figure: reserved peaks also track the
+        # allocator's pool history and move a few percent for identical work.
+        self._load_peak_allocated_mb = (
+            load_snapshot.peak_allocated_mb if load_snapshot is not None else 0.0
+        )
+        self._runtime_peak_reserved_mb = 0.0
+        # Warmup probes run the default workload's full shape and may exceed any
+        # serving request; keep their peak out of the runtime figure.
+        self._warmup_peak_reserved_mb = 0.0
+        self._release_warmup_pool_before_serving = False
+        self._runtime_peak_allocated_mb = 0.0
         self.sp_group = get_sp_group()
         self.sp_cpu_group = self.sp_group.cpu_group
         self.tp_group = get_tp_group()
@@ -151,6 +239,26 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self.cfg_cpu_group = self.cfg_group.cpu_group
         self._realtime_sessions = RealtimeSessionCache(max_sessions=1)
         self.memory_occupation: MemoryOccupationController | None = None
+        # per-rank memory measurements of server warmup forwards; consumed by
+        # the auto-residency placement decision before the server turns ready
+        self._auto_residency_warmup_records: list[WarmupMemoryRecord] = []
+        # default workload resolved once for the per-request residency hint
+        self._cached_default_workload: DefaultWorkload | None = None
+        self._cached_default_workload_failed = False
+
+    def _default_workload_for_hint(self) -> DefaultWorkload | None:
+        if (
+            self._cached_default_workload is None
+            and not self._cached_default_workload_failed
+        ):
+            try:
+                self._cached_default_workload = resolve_default_workload(
+                    self.server_args
+                )
+            except Exception:
+                logger.debug("Default workload unresolvable", exc_info=True)
+                self._cached_default_workload_failed = True
+        return self._cached_default_workload
 
     def release_realtime_session(self, session_id: str) -> OutputBatch:
         """release the session of a realtime connection"""
@@ -175,12 +283,17 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             envs.SGLANG_DIFFUSION_CACHE_ROOT, "torch_compile_cache"
         )
         tmp_root = tempfile.gettempdir()
+        sglang_defaults = third_party_cache_defaults()
         for env_name, sub in (
             ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
             ("TRITON_CACHE_DIR", "triton"),
         ):
             current = os.environ.get(env_name)
-            if current and not current.startswith(tmp_root):
+            if (
+                current
+                and current != sglang_defaults.get(env_name)
+                and not current.startswith(tmp_root)
+            ):
                 # Respect an explicit, non-ephemeral user-provided cache dir.
                 continue
             cache_path = os.path.join(compile_cache_root, sub)
@@ -210,15 +323,46 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             )
         return self.memory_occupation
 
+    def _cap_device_memory_for_tests(self) -> None:
+        """Make a large CI card behave like the consumer card a case targets.
+
+        The caching allocator otherwise reserves past the pretended budget
+        whenever the physical card has room, and a peak-VRAM baseline stops
+        meaning "fits the card". OOM inside the cap is the intended signal.
+        """
+        cap_gib = envs.SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB
+        if cap_gib is None or not current_platform.is_cuda():
+            return
+        device = torch.cuda.current_device()
+        total = torch.cuda.get_device_properties(device).total_memory
+        fraction = min(1.0, cap_gib * 1024**3 / total)
+        torch.cuda.set_per_process_memory_fraction(fraction, device)
+        logger.info(
+            "Test hook: CUDA allocator capped at %.1f GiB (fraction %.4f)",
+            cap_gib,
+            fraction,
+        )
+
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
-        torch.get_device_module().set_device(self.local_rank)
-        intra_op_threads = _worker_cpu_intra_op_threads(self.server_args.num_gpus)
+        if not current_platform.is_mps():
+            current_platform.set_device(current_platform.get_device(self.local_rank))
+        self._cap_device_memory_for_tests()
+        # num_gpus is the total world size across every node; the co-located,
+        # CPU-contending worker count on THIS host is num_gpus // nnodes.
+        local_num_gpus = self.server_args.num_gpus // self.server_args.nnodes
+        intra_op_threads = _worker_cpu_intra_op_threads(local_num_gpus)
         if intra_op_threads is not None:
             torch.set_num_threads(intra_op_threads)
-        # Set environment variables for distributed initialization
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = str(self.master_port)
+        # Set environment variables for distributed initialization. Single
+        # node rendezvous stays on loopback; cross-node rendezvous must use
+        # an address every node can reach, so --dist-init-addr takes over.
+        if self.server_args.nnodes > 1:
+            rendezvous_addr = NetworkAddress.parse(self.server_args.dist_init_addr)
+        else:
+            rendezvous_addr = NetworkAddress("127.0.0.1", self.master_port)
+        os.environ["MASTER_ADDR"] = rendezvous_addr.host
+        os.environ["MASTER_PORT"] = str(rendezvous_addr.port)
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         os.environ["RANK"] = str(self.rank)
         os.environ["WORLD_SIZE"] = str(self.server_args.num_gpus)
@@ -231,11 +375,20 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             ring_degree=self.server_args.ring_degree,
             sp_size=self.server_args.sp_degree,
             dp_size=self.server_args.dp_size,
-            distributed_init_method=NetworkAddress(
-                "127.0.0.1", self.master_port
-            ).to_tcp(),
+            distributed_init_method=rendezvous_addr.to_tcp(),
             dist_timeout=self.server_args.dist_timeout,
         )
+
+        from sglang.srt.runtime_context import get_context, publish
+        from sglang.srt.server_args import ServerArgs as SrtServerArgs
+
+        if get_context()._server_args is None:
+            # srt reads the size from the configuration and the rank from the
+            # live group, so the dummy carries the width just installed.
+            publish(
+                SrtServerArgs(model_path="dummy", tp_size=self.server_args.tp_size),
+                role="diffusion_gpu_worker",
+            )
 
         # set proc title
         if model_parallel_is_initialized():
@@ -260,13 +413,18 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         # apply layerwise offload after lora is applied while building LoRAPipeline
         # otherwise empty offloaded weights could fail lora converting
-        if self.server_args.layerwise_offload_components:
+        if self.server_args.has_layerwise_offload_components():
             configure_layerwise_offload_modules(
                 self.pipeline.modules,
                 self.server_args,
-                component_names=self.server_args.layerwise_offload_components,
+                component_names=(
+                    None
+                    if self.server_args.component_residency is not None
+                    else self.server_args.layerwise_offload_components
+                ),
                 warn_missing=(
-                    self.server_args.is_arg_explicitly_set(
+                    self.server_args.component_residency is not None
+                    or self.server_args.is_arg_explicitly_set(
                         "layerwise_offload_components"
                     )
                     or self.server_args.is_arg_explicitly_set("dit_layerwise_offload")
@@ -282,9 +440,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if output_batch.metrics:
             output_batch.metrics.record_memory_snapshot("mem_analysis", final_snapshot)
 
-        # for details on max_memory_reserved: https://docs.pytorch.org/docs/stable/generated/torch.cuda.memory.max_memory_reserved.html
-        peak_reserved_bytes = torch.get_device_module().max_memory_reserved()
-        peak_allocated_bytes = torch.get_device_module().max_memory_allocated()
+        peak_reserved_bytes = final_snapshot.peak_reserved_mb * (1024**2)
+        peak_allocated_bytes = final_snapshot.peak_allocated_mb * (1024**2)
 
         output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
         peak_reserved_gb = peak_reserved_bytes / (1024**3)
@@ -293,47 +450,38 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         remaining_gpu_mem_gb = (
             current_platform.get_device_total_memory() / (1024**3) - peak_reserved_gb
         )
-        can_stay_resident = self.get_can_stay_resident_components(remaining_gpu_mem_gb)
-        suggested_args_str = self._format_offload_disable_suggestions(can_stay_resident)
+        try:
+            can_stay_resident = self.get_can_stay_resident_components(
+                remaining_gpu_mem_gb
+            )
+        except Exception:
+            # a debug-only hint must never fail a completed request
+            logger.debug("Residency hint unavailable", exc_info=True)
+            can_stay_resident = []
 
         pool_overhead_gb = peak_reserved_gb - peak_allocated_gb
-
-        logger.debug(
-            f"Peak GPU memory: {peak_reserved_gb:.2f} GB, "
-            f"Peak allocated: {peak_allocated_gb:.2f} GB, "
-            f"Memory pool overhead: {pool_overhead_gb:.2f} GB ({pool_overhead_gb / peak_reserved_gb * 100:.1f}%), "
-            f"Remaining GPU memory at peak: {remaining_gpu_mem_gb:.2f} GB. "
-            f"Components that could stay resident (based on the last request workload): {can_stay_resident}. "
-            f"Related offload server args to disable: {suggested_args_str}"
+        pool_overhead_pct = (
+            pool_overhead_gb / peak_reserved_gb * 100 if peak_reserved_gb else 0.0
         )
 
-    def _format_offload_disable_suggestions(self, components: List[str]) -> str:
-        component_set = set(components)
-        suggestions = []
-        seen_args = set()
-
-        for component in OFFLOAD_DISABLE_RECOMMENDATION_ORDER:
-            if component not in component_set:
-                continue
-
-            arg = None
-            if component == "vae":
-                arg = "--vae-cpu-offload"
-            elif component == "image_encoder":
-                arg = "--image-encoder-cpu-offload"
-            elif component in ("text_encoder", "text_encoder_2"):
-                arg = "--text-encoder-cpu-offload"
-            elif component == "transformer":
-                if self.server_args.is_dit_layerwise_offload_selected:
-                    arg = "--dit-layerwise-offload"
-                elif self.server_args.dit_cpu_offload:
-                    arg = "--dit-cpu-offload"
-
-            if arg is not None and arg not in seen_args:
-                suggestions.append(arg)
-                seen_args.add(arg)
-
-        return ", ".join(suggestions) if suggestions else "None"
+        residency_hint = (
+            f" Components that can remain on GPU: {can_stay_resident}. "
+            "Make it explicit with --component-residency <name>=resident; "
+            "--performance-mode auto with server warmup applies safe "
+            "adjustments automatically."
+            if can_stay_resident
+            else ""
+        )
+        logger.debug(
+            "GPU memory: peak=%.2f GB, allocated=%.2f GB, pool=%.2f GB (%.1f%%), "
+            "headroom=%.2f GB.%s",
+            peak_reserved_gb,
+            peak_allocated_gb,
+            pool_overhead_gb,
+            pool_overhead_pct,
+            remaining_gpu_mem_gb,
+            residency_hint,
+        )
 
     def execute_forward(
         self, batch: List[Req], return_req: bool = False
@@ -360,6 +508,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             return self._execute_forward_batch(batch)
 
         req = batch[0]
+        if req.is_warmup and req.extra.get("auto_residency_full_shape_probe"):
+            self._fit_auto_residency_probe(req)
         return self._execute_forward_common(
             req,
             forward_fn=lambda: self.pipeline.forward(req, self.server_args),
@@ -391,8 +541,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     ),
                     log_reqs=[req],
                     return_req=False,
-                    save_output_paths=lambda output_batch, req=req: self._save_output_paths(
-                        req, output_batch
+                    save_output_paths=lambda output_batch, req=req: (
+                        self._save_output_paths(req, output_batch)
                     ),
                     error_context=f"grouped request {req.request_id}",
                     execution_start_time=group_start_time,
@@ -453,9 +603,57 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         output_batch = None
         forward_failed = False
+        # Prewarm reqs (is_warmup=False) run a different offload layout and
+        # must not contaminate the calibration records. Pipelines that cannot
+        # apply a residency plan also skip the temporary per-layer hooks.
+        measure_server_warmup = (
+            req.is_warmup
+            and bool(req.extra.get("server_based_warmup"))
+            and self.server_args.pipeline_config.supports_auto_residency
+            and current_platform.is_cuda()
+        )
+        warmup_workload = (
+            (
+                int(req.width or 0),
+                int(req.height or 0),
+                int(req.num_frames or 1),
+                max(1, int(req.num_inference_steps or 1)),
+            )
+            if measure_server_warmup
+            else None
+        )
+        warmup_baseline_allocated_bytes = 0
+        layerwise_usage_tracker: LayerwiseUsageTracker | None = None
+        layerwise_layer_uses_by_stage: dict[
+            str, dict[str, dict[str, tuple[int, ...]]]
+        ] = {}
         try:
-            if self.rank == 0 and not current_platform.is_cpu():
+            if measure_server_warmup:
+                # Drop the previous request's allocator pool so each probe
+                # starts from the same placement and can return released
+                # component storage before its allocated peak is measured.
+                torch.get_device_module().empty_cache()
+            self._release_warmup_pool(req)
+            if not current_platform.is_cpu() and not current_platform.is_mps():
                 torch.get_device_module().reset_peak_memory_stats()
+            if measure_server_warmup:
+                warmup_baseline_allocated_bytes = (
+                    torch.get_device_module().memory_allocated()
+                )
+                if (
+                    self.server_args.performance_mode == "auto"
+                    and self.pipeline is not None
+                ):
+                    layerwise_usage_tracker = LayerwiseUsageTracker(
+                        self.pipeline.modules,
+                        stage_name_provider=(
+                            lambda: (
+                                req.metrics.active_stage_name
+                                if req.metrics is not None
+                                else None
+                            )
+                        ),
+                    )
 
             start_time = (
                 execution_start_time
@@ -468,7 +666,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             request_metrics = [
                 item.metrics for item in log_reqs if item.metrics is not None
             ]
-            if self.rank == 0 and request_metrics and not current_platform.is_cpu():
+            if (
+                self.is_output_rank
+                and request_metrics
+                and not current_platform.is_cpu()
+            ):
                 baseline_snapshot = capture_memory_snapshot()
                 for metrics in request_metrics:
                     metrics.record_memory_snapshot("before_forward", baseline_snapshot)
@@ -492,34 +694,43 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 return result
 
             output_batch = self._to_output_batch(result)
-            self._record_output_peak_memory(output_batch)
 
             output_metrics = self._iter_output_metrics(output_batch)
-            if self.rank == 0 and output_metrics and not current_platform.is_cpu():
+            if self.is_output_rank and output_metrics and not current_platform.is_cpu():
                 peak_snapshot = capture_memory_snapshot()
                 for metrics in output_metrics:
                     metrics.record_memory_snapshot("after_forward", peak_snapshot)
 
+            duration_ms = (time.monotonic() - start_time) * 1000
+            for metrics in output_metrics:
+                metrics.total_duration_ms = duration_ms
+
+            req_label = req.request_id[:8] if req.request_id else "unnamed"
+            with maybe_record_function(f"SAVE_OUTPUTS {req_label}"):
+                self._materialize_output_transport(output_batch, req, save_output_paths)
+            self._record_output_peak_memory(output_batch, is_warmup=req.is_warmup)
+
+            collect_perf = (
+                req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING
+            )
+            if collect_perf and not req.is_warmup:
+                self._record_replica_peak_memory(output_metrics)
+
             if (
-                self.rank == 0
+                self.is_output_rank
                 and not req.suppress_logs
                 and not current_platform.is_cpu()
                 and logger.isEnabledFor(logging.DEBUG)
             ):
                 self.do_mem_analysis(output_batch)
 
-            duration_ms = (time.monotonic() - start_time) * 1000
-            for metrics in output_metrics:
-                metrics.total_duration_ms = duration_ms
-
-            self._materialize_output_transport(output_batch, req, save_output_paths)
-
             if (
                 not current_platform.is_cpu()
                 and output_batch.output is None
                 and not req.return_raw_frames
             ):
-                torch.get_device_module().empty_cache()
+                with maybe_record_function("EMPTY_CACHE"):
+                    torch.get_device_module().empty_cache()
 
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
                 if not req.is_warmup:
@@ -553,11 +764,114 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             if output_batch is None:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing {error_context}: {e}"
-            self._record_output_peak_memory(output_batch)
+            self._record_output_peak_memory(output_batch, is_warmup=req.is_warmup)
             # clean cache if OOM
             if not current_platform.is_cpu():
                 torch.get_device_module().empty_cache()
+        finally:
+            # also runs on the propagate_forward_errors re-raise: a warmup
+            # forward that never completed must still leave a failed record,
+            # or the estimator would plan from the remaining partial data
+            if measure_server_warmup:
+                assert warmup_workload is not None
+                if layerwise_usage_tracker is not None:
+                    (
+                        layerwise_layer_uses,
+                        layerwise_layer_uses_by_stage,
+                    ) = layerwise_usage_tracker.finish_with_stages()
+                else:
+                    layerwise_layer_uses = {}
+                self._record_server_warmup_memory(
+                    req=req,
+                    workload=warmup_workload,
+                    baseline_allocated_bytes=warmup_baseline_allocated_bytes,
+                    succeeded=output_batch is not None and output_batch.error is None,
+                    layerwise_layer_uses=layerwise_layer_uses,
+                    layerwise_layer_uses_by_stage=layerwise_layer_uses_by_stage,
+                )
         return output_batch
+
+    def _record_server_warmup_memory(
+        self,
+        *,
+        req: Req,
+        workload: tuple[int, int, int, int],
+        baseline_allocated_bytes: int,
+        succeeded: bool,
+        layerwise_layer_uses: dict[str, dict[str, tuple[int, ...]]] | None = None,
+        layerwise_layer_uses_by_stage: (
+            dict[str, dict[str, dict[str, tuple[int, ...]]]] | None
+        ) = None,
+    ) -> None:
+        phase_allocated_peaks: dict[str, int] = {}
+        phase_components: dict[str, tuple[str, ...]] = {}
+        phase_used_components: dict[str, tuple[str, ...]] = {}
+        phase_full_weight_transition_components: dict[str, tuple[str, ...]] = {}
+        untracked_active_components: tuple[str, ...] = ()
+        residency_manager = peek_global_component_residency_manager()
+        if residency_manager is not None:
+            for phase_name, peak in residency_manager.take_warmup_phase_peaks().items():
+                phase_allocated_peaks[phase_name] = peak.allocated_bytes
+                phase_components[phase_name] = peak.active_components
+                phase_used_components[phase_name] = peak.used_components
+                phase_full_weight_transition_components[phase_name] = (
+                    peak.full_weight_transition_components
+                )
+            untracked_active_components = residency_manager.current_device_components()
+        request_allocated_peak = max(
+            int(torch.get_device_module().max_memory_allocated()),
+            max(phase_allocated_peaks.values(), default=0),
+        )
+        if request_allocated_peak > max(phase_allocated_peaks.values(), default=0):
+            # Work after the residency-managed stage timeline (for example,
+            # output materialization) must remain a placement constraint.
+            # A reserved-only increase is not a second live placement. Record
+            # it separately so post-placement validation can still require
+            # allocator headroom without charging cache to candidate deltas.
+            phase_allocated_peaks["request:untracked"] = request_allocated_peak
+            phase_components["request:untracked"] = untracked_active_components
+            phase_used_components["request:untracked"] = ()
+            phase_full_weight_transition_components["request:untracked"] = ()
+        metrics = req.metrics
+        width, height, num_frames, num_inference_steps = workload
+        self._auto_residency_warmup_records.append(
+            WarmupMemoryRecord(
+                width=width,
+                height=height,
+                num_frames=num_frames,
+                baseline_allocated_bytes=int(baseline_allocated_bytes),
+                peak_allocated_bytes=request_allocated_peak,
+                succeeded=succeeded,
+                peak_reserved_bytes=int(
+                    torch.get_device_module().max_memory_reserved()
+                ),
+                phase_peak_allocated_bytes=phase_allocated_peaks,
+                phase_active_components=phase_components,
+                phase_used_components=phase_used_components,
+                phase_full_weight_transition_components=(
+                    phase_full_weight_transition_components
+                ),
+                layerwise_layer_uses=layerwise_layer_uses or {},
+                layerwise_layer_uses_by_stage=layerwise_layer_uses_by_stage or {},
+                num_inference_steps=num_inference_steps,
+                total_duration_ms=(
+                    float(metrics.total_duration_ms) if metrics is not None else 0.0
+                ),
+                stage_duration_ms=(dict(metrics.stages) if metrics is not None else {}),
+                step_duration_ms=(tuple(metrics.steps) if metrics is not None else ()),
+                step_duration_ms_by_stage=(
+                    {
+                        stage_name: tuple(durations)
+                        for stage_name, durations in metrics.steps_by_stage.items()
+                    }
+                    if metrics is not None
+                    else {}
+                ),
+                stage_iterations=(
+                    dict(metrics.stage_iterations) if metrics is not None else {}
+                ),
+            )
+        )
 
     def _materialize_output_transport(
         self,
@@ -575,7 +889,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def _materialize_raw_frame_transport(
         self, output_batch: OutputBatch, req: Req
     ) -> None:
-        if self.rank != 0:
+        if not self.is_output_rank:
             return
         if output_batch.output is not None:
             output_batch.raw_frame_content_type = RAW_RGB_CONTENT_TYPE
@@ -597,7 +911,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         output_batch: OutputBatch,
         save_output_paths: Callable[[OutputBatch], None],
     ) -> None:
-        if self.rank == 0:
+        if self.is_output_rank:
             save_output_paths(output_batch)
         output_batch.output = None
         output_batch.audio = None
@@ -608,7 +922,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> None:
         """materialize the output from tensor to numpy frames for faster serialization"""
         if (
-            self.rank != 0
+            not self.is_output_rank
             or output_batch.output is None
             or not getattr(req, "return_frames", False)
         ):
@@ -671,11 +985,151 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         )
         return np.asarray(materialized.frames)
 
-    def _record_output_peak_memory(self, output_batch: OutputBatch) -> None:
-        if self.rank != 0 or current_platform.is_cpu():
+    def _fit_auto_residency_probe(self, req: Req) -> None:
+        """Size the full-shape probe to what the card has left, on every rank alike."""
+        records = [r for r in self._auto_residency_warmup_records if r.succeeded]
+        if not records or not current_platform.is_cuda():
             return
-        peak_reserved_bytes = torch.get_device_module().max_memory_reserved()
-        output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
+        device = current_platform.get_device(self.local_rank)
+        free_bytes = int(
+            current_platform.get_available_gpu_memory(empty_cache=True) * (1 << 30)
+        )
+        total_bytes = int(torch.cuda.get_device_properties(device).total_memory)
+        _, _, steps = fit_auto_residency_probe(
+            req,
+            records=records,
+            free_bytes=free_bytes,
+            total_bytes=total_bytes,
+            server_args=self.server_args,
+        )
+        requested_units = (
+            max(1, int(req.width or 1))
+            * max(1, int(req.height or 1))
+            * max(1, int(req.num_frames or 1))
+        )
+        estimate = estimate_default_workload_peak_bytes(
+            records=records, target_units=requested_units
+        )
+        # Ranks see different free memory and hold different records; the
+        # forward must run one shape everywhere, so the most cautious rank wins.
+        agreed = torch.tensor([steps], dtype=torch.int64, device=device)
+        agreed = get_replica_group().all_reduce(
+            agreed, op=torch.distributed.ReduceOp.MAX
+        )
+        steps = int(agreed.item())
+        if steps == 0:
+            return
+        fitted = req
+        for _ in range(steps):
+            lighter = lighten_warmup_req(self.server_args, fitted)
+            if lighter is None:
+                break
+            fitted = lighter
+        if self.is_output_rank:
+            logger.warning(
+                "Auto residency probe %s would not fit: extrapolated peak %.1f GiB "
+                "against %.1f GiB free; probing at %s instead",
+                _shape_label(req),
+                (estimate or 0) / (1 << 30),
+                free_bytes / (1 << 30),
+                _shape_label(fitted),
+            )
+        req.sampling_params = fitted.sampling_params
+
+    def _release_warmup_pool(self, req: Req) -> None:
+        """Drop what the full-shape probe left behind before the next request.
+
+        The probe runs a shape serving may never see. Its cached allocator
+        blocks would become the floor of every runtime peak measurement, and
+        the all-to-all staging buffers it created (IPC and Ulysses) stay
+        allocated at its message size. The request after the probe (the
+        bounded re-warm) regrows all of them at a serving-sized shape.
+        """
+        if req.is_warmup and req.extra.get("auto_residency_full_shape_probe"):
+            self._release_warmup_pool_before_serving = True
+            return
+        if not self._release_warmup_pool_before_serving:
+            return
+        self._release_warmup_pool_before_serving = False
+        if current_platform.is_cpu() or current_platform.is_mps():
+            return
+        from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+            IPC_A2A,
+        )
+        from sglang.multimodal_gen.runtime.layers.usp import drop_a2a_staging_buffers
+
+        IPC_A2A.drop_staging()
+        drop_a2a_staging_buffers()
+        torch.get_device_module().empty_cache()
+
+    def _record_output_peak_memory(
+        self, output_batch: OutputBatch, *, is_warmup: bool = False
+    ) -> None:
+        if current_platform.is_cpu():
+            return
+        snapshot = capture_memory_snapshot()
+        if is_warmup:
+            self._warmup_peak_reserved_mb = max(
+                self._warmup_peak_reserved_mb, snapshot.peak_reserved_mb
+            )
+        else:
+            self._runtime_peak_reserved_mb = max(
+                self._runtime_peak_reserved_mb, snapshot.peak_reserved_mb
+            )
+            self._runtime_peak_allocated_mb = max(
+                self._runtime_peak_allocated_mb, snapshot.peak_allocated_mb
+            )
+        if self.is_output_rank:
+            output_batch.peak_memory_mb = snapshot.peak_reserved_mb
+
+    def _record_replica_peak_memory(self, output_metrics: list[Any]) -> None:
+        """Record replica-wide loading and runtime allocator peaks."""
+        if not current_platform.is_cuda():
+            return
+
+        peaks = torch.tensor(
+            [
+                self._load_peak_reserved_mb,
+                self._runtime_peak_reserved_mb,
+                self._warmup_peak_reserved_mb,
+                self._load_peak_allocated_mb,
+                self._runtime_peak_allocated_mb,
+            ],
+            dtype=torch.float64,
+            device=current_platform.get_device(self.local_rank),
+        )
+        peaks = get_replica_group().all_reduce(peaks, op=torch.distributed.ReduceOp.MAX)
+        if not self.is_output_rank:
+            return
+
+        snapshot = capture_memory_snapshot()
+        (
+            load_peak_mb,
+            runtime_peak_mb,
+            warmup_peak_mb,
+            load_peak_allocated_mb,
+            runtime_peak_allocated_mb,
+        ) = peaks.tolist()
+        for metrics in output_metrics:
+            metrics.record_memory_snapshot(
+                "load_peak",
+                replace(
+                    snapshot,
+                    peak_reserved_mb=load_peak_mb,
+                    peak_allocated_mb=load_peak_allocated_mb,
+                ),
+            )
+            metrics.record_memory_snapshot(
+                "runtime_peak",
+                replace(
+                    snapshot,
+                    peak_reserved_mb=runtime_peak_mb,
+                    peak_allocated_mb=runtime_peak_allocated_mb,
+                ),
+            )
+            metrics.record_memory_snapshot(
+                "warmup_peak", replace(snapshot, peak_reserved_mb=warmup_peak_mb)
+            )
 
     def _forward_group(self, batch: list[Req]) -> OutputBatch:
         assert self.pipeline is not None
@@ -685,7 +1139,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
     def _save_output_paths(self, req: Req, output_batch: OutputBatch) -> None:
         """save outputs to files"""
-        if self.rank != 0 or output_batch.output is None:
+        if not self.is_output_rank or output_batch.output is None:
             return
 
         dynamic_output_paths = None
@@ -736,7 +1190,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         reqs: list[Req],
         output_batch: OutputBatch,
     ) -> None:
-        if self.rank != 0 or output_batch.output is None:
+        if not self.is_output_rank or output_batch.output is None:
             return
         if len(output_batch.output) != len(reqs):
             raise RuntimeError(
@@ -947,28 +1401,28 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if not self.pipeline:
             return can_stay_resident
 
-        # Map memory_usage keys to server_args offload flags.
-        # If the flag is False, the component is already resident, so we do not suggest it.
-        # If the flag is True, it is currently offloaded, so it is a candidate to stay resident.
-        offload_flags = {
-            "transformer": self.server_args.dit_cpu_offload
-            or self.server_args.is_dit_layerwise_offload_selected,
-            "vae": self.server_args.vae_cpu_offload,
-            "text_encoder": self.server_args.text_encoder_cpu_offload,
-            "text_encoder_2": self.server_args.text_encoder_cpu_offload,
-            "image_encoder": self.server_args.image_encoder_cpu_offload,
-        }
-
-        for name in OFFLOAD_DISABLE_RECOMMENDATION_ORDER:
-            # Only consider components that are currently configured to be offloaded
-            is_offload_configured = offload_flags.get(name, False)
-            if not is_offload_configured:
+        memory_usages = self.pipeline.memory_usages
+        ordered_names = [
+            name
+            for name in OFFLOAD_DISABLE_RECOMMENDATION_ORDER
+            if name in memory_usages
+        ]
+        ordered_names.extend(
+            name
+            for name in memory_usages
+            if name not in OFFLOAD_DISABLE_RECOMMENDATION_ORDER
+        )
+        for name in ordered_names:
+            usage = memory_usages[name]
+            if not (
+                self.server_args.should_cpu_offload_component(name)
+                or self.server_args.should_configure_layerwise_offload_for_lazy_component(
+                    name
+                )
+            ):
                 continue
-
-            usage = self.pipeline.memory_usages.get(name)
             if usage is None:
                 continue
-
             if usage <= remaining_gpu_mem_gb:
                 can_stay_resident.append(name)
                 remaining_gpu_mem_gb -= usage
@@ -982,6 +1436,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         target: Union[str, List[str]] = "all",
         strength: Union[float, List[float]] = 1.0,
         merge_mode: str | None = None,
+        lora_alpha: int | None | list[int | None] = None,
     ) -> OutputBatch:
         """
         Set the LoRA adapter(s) for the pipeline.
@@ -997,7 +1452,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
         self.pipeline.set_lora(
-            lora_nickname, lora_path, target, strength, merge_mode=merge_mode
+            lora_nickname,
+            lora_path,
+            target,
+            strength,
+            merge_mode=merge_mode,
+            lora_alpha=lora_alpha,
         )
         return OutputBatch()
 
@@ -1032,7 +1492,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         List loaded LoRA adapters and current application status per module.
         """
-        from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
+        from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
             LoRAPipeline,
         )
 

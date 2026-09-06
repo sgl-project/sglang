@@ -62,6 +62,9 @@ from sglang.srt.managers.load_snapshot import (
     zmq_reader_owner,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.runtime_context import (
+    get_disagg,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
@@ -258,8 +261,12 @@ def _handle_output_by_index(output, i):
                 output, "indexer_topk", i, check_length=False
             ),
             retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
+            weight_versions=_extract_field_by_index(output, "weight_versions", i),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            beam_search_output=_extract_field_by_index(
+                output, "beam_search_output", i, check_length=True
+            ),
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),
@@ -381,6 +388,10 @@ def _handle_output_by_index(output, i):
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
+            beam_search_output=_extract_field_by_index(
+                output, "beam_search_output", i, check_length=True
+            ),
+            weight_versions=_extract_field_by_index(output, "weight_versions", i),
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),
@@ -468,13 +479,13 @@ class MultiTokenizerRouter:
         # read SHM only. Drain it event-driven via the socket's fd instead of
         # polling on a timer.
         self.load_snapshot_reader = None
-        if zmq_reader_owner(server_args, "MultiTokenizerRouter"):
+        if zmq_reader_owner("MultiTokenizerRouter"):
             self.load_snapshot_reader = create_load_snapshot_reader(
-                server_args, port_args, caller="MultiTokenizerRouter"
+                port_args, caller="MultiTokenizerRouter"
             )
             self._loop.call_soon_threadsafe(self._register_load_snapshot_reader)
 
-        self.disaggregation_bootstrap_server = start_disagg_service(self.server_args)
+        self.disaggregation_bootstrap_server = start_disagg_service()
 
         # Worker IPC names for pause/continue broadcasting
         self.all_worker_ipcs: set[str] = set()
@@ -593,9 +604,9 @@ class MultiDetokenizerRouter:
 
             # Single request: route by its own rid.
             if isinstance(recv_obj, BaseReq):
-                assert (
-                    recv_obj.rid is not None
-                ), f"Single req {type(recv_obj).__name__} missing rid"
+                assert recv_obj.rid is not None, (
+                    f"Single req {type(recv_obj).__name__} missing rid"
+                )
                 self._send(self._pick(recv_obj.rid), recv_obj)
                 continue
 
@@ -675,7 +686,7 @@ class TokenizerWorker(TokenizerManager):
 
         # For PD disaggregation
         self.disaggregation_transfer_backend = TransferBackend(
-            self.server_args.disaggregation_transfer_backend
+            get_disagg().disaggregation_transfer_backend
         )
 
         # Register this worker with the router for pause/continue broadcasting

@@ -20,7 +20,7 @@ from sglang.test.server_fixtures.spec_eagle_fixture import EagleLlama2Base
 # Measured 780s all-green on a 40-core GNR socket (1 launch + 18 methods).
 register_cpu_ci(
     est_time=800,
-    suite="base-b-test-cpu",
+    suite="stage-a-test-cpu-intel",
     disabled="EagleLlama2Base needs gated meta-llama/Llama-2-7b-chat-hf",
 )
 
@@ -40,6 +40,8 @@ class _Core(EagleLlama2Base):
     attention_backend = "intel_amx"
     disable_overlap = True
     mem_fraction_static = 0.3
+    # CPU decode is compute-bound; a wider batch buys nothing here.
+    max_running_requests = 8
     gsm8k_num_examples = 64
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 

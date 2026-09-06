@@ -18,12 +18,20 @@ class StateType(str, enum.Enum):
     MAMBA = "mamba"
     SWA = "swa"
     DSA = "dsa"
+    # DSA kpool-compress tail: one per-request ring row. The indices encode
+    # only the live subrange of that row for the current open pool.
+    DSA_TAIL = "dsa_tail"
     MINIMAX_INDEX_K = "minimax_index_k"
     # DeepSeek-V4 unified_kv SWA ring: addressed per-row by ring slot
     # (req_pool_idx * ring_stride + pos % ring_stride), needs its own component.
     SWA_RING = "swa_ring"
     # DeepSeek-V4 online C128 request-scoped state.
     C128_STATE = "c128_state"
+    # A block-scaled KV dtype keeps its per-block scales in buffers parallel to
+    # K/V, one component per sub-pool so each carries the index payload of the
+    # KV it describes (whole sequence for full attention, window for SWA).
+    BLOCK_SCALE = "block_scale"
+    BLOCK_SCALE_SWA = "block_scale_swa"
 
 
 @dataclasses.dataclass
@@ -60,7 +68,6 @@ class KVArgs:
     # per tensor when the single contiguous slice already matches the layout.
     state_conv_shard_groups: List[List[Optional[List[int]]]]
     ib_device: str
-    ib_traffic_class: str
     gpu_id: int
     kv_head_num: int
     total_kv_head_num: int
@@ -96,6 +103,8 @@ class KVPoll:
 
 class BaseKVManager(ABC):
     """Base class for managing transfer states"""
+
+    enable_deferred_decode_kv_release: bool = False
 
     @abstractmethod
     def __init__(

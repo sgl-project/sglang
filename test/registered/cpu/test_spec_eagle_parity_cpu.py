@@ -9,7 +9,7 @@ from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
 # (CUDA sibling: 360); tune from CI TIMINGS once it has run there.
 register_cpu_ci(
     est_time=480,
-    suite="base-b-test-cpu",
+    suite="stage-a-test-cpu-intel",
     disabled="EAGLE3 numerical parity mismatches on CPU intel_amx",
 )
 
@@ -20,6 +20,8 @@ class TestEagle3ParityCPU(SpecParityKit, Eagle3Base):
     attention_backend = "intel_amx"
     disable_overlap = True
     mem_fraction_static = 0.3
+    # CPU decode is compute-bound; a wider batch buys nothing here.
+    max_running_requests = 8
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 

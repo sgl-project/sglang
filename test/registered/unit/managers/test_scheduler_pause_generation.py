@@ -20,13 +20,23 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
-register_cpu_ci(est_time=9, suite="base-c-test-cpu")
+register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 
 
 class TestSchedulerPauseGeneration(unittest.TestCase):
+    def setUp(self):
+        # The scheduler runs after its process publishes; retraction reads the
+        # disaggregation and schedule bags rather than the record it is handed.
+        from sglang.srt.server_args import ServerArgs
+
+        super().setUp()
+        publish(ServerArgs(model_path="dummy"), role="test")
+        self.addCleanup(reset_context)
+
     def _new_scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler._engine_paused = False
@@ -132,6 +142,24 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         self.assertIs(scheduler.last_batch, original_last_batch)
         self.assertIs(scheduler.cur_batch_for_debug, original_cur_batch)
         self.assertIs(scheduler.chunked_req, original_chunked_req)
+
+    def test_paused_engine_accounting_uses_current_scheduler_state(self):
+        scheduler = self._new_scheduler()
+        scheduler.is_fully_idle = MagicMock()
+
+        for is_idle in (True, False):
+            with self.subTest(is_idle=is_idle):
+                scheduler.is_fully_idle.return_value = is_idle
+                scheduler.metrics_reporter.reset_mock()
+
+                scheduler._record_scheduler_state_for_paused_engine()
+
+                if is_idle:
+                    scheduler.metrics_reporter.record_scheduler_idle.assert_called_once_with()
+                    scheduler.metrics_reporter.record_scheduler_active.assert_not_called()
+                else:
+                    scheduler.metrics_reporter.record_scheduler_active.assert_called_once_with()
+                    scheduler.metrics_reporter.record_scheduler_idle.assert_not_called()
 
     def test_inplace_does_not_drain_overlap_queue(self):
         """in_place should not process the overlap result_queue."""

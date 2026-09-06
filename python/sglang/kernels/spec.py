@@ -43,6 +43,8 @@ class KernelBackend(str, Enum):
     JIT = "jit"  # sglang.kernels.jit (nvcc / hipcc)
     AOT = "aot"  # sgl_kernel wheel (CUDA / ROCm builds)
     CUTE_DSL = "cute_dsl"
+    FLYDSL = "flydsl"  # FlyDSL MLIR compiler (device=HIP, gfx950)
+    KDA = "KDA"  # Kernel Design Agents generated implementation
     FLASHINFER = "flashinfer"
     DEEPGEMM = "deepgemm"
     AITER = "aiter"  # AMD aiter library (device=HIP)

@@ -17,6 +17,10 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
+from sglang.srt.models.cosmos3 import Cosmos3ForConditionalGeneration
+from sglang.srt.models.interns2_mobius import (
+    InternS2MobiusForConditionalGeneration,
+)
 from sglang.srt.models.interns2preview import InternS2PreviewForConditionalGeneration
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
@@ -33,6 +37,9 @@ from sglang.srt.multimodal.processors.base_processor import (
 )
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
+)
+from sglang.srt.multimodal.transport.cuda_ipc import (
+    DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
 from sglang.srt.utils import cpu_has_amx_support, is_cpu
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
@@ -92,9 +99,7 @@ if _is_cpu and _is_cpu_amx_available:
 
         from sglang.srt.layers.amx_utils import fast_preprocess_cpu
 
-        transformers.models.qwen2_vl.image_processing_qwen2_vl_fast.Qwen2VLImageProcessorFast._preprocess = (
-            fast_preprocess_cpu
-        )
+        transformers.models.qwen2_vl.image_processing_qwen2_vl_fast.Qwen2VLImageProcessorFast._preprocess = fast_preprocess_cpu
     except Exception as e:
         logger.warning(
             f"Failed to hack Qwen2VLImageProcessorFast with AMX optimization: {e}"
@@ -172,9 +177,9 @@ def smart_nframes(
     Returns:
         int: the number of frames for video used for model inputs.
     """
-    assert not (
-        "fps" in ele and "nframes" in ele
-    ), "Only accept either `fps` or `nframes`"
+    assert not ("fps" in ele and "nframes" in ele), (
+        "Only accept either `fps` or `nframes`"
+    )
     if "nframes" in ele:
         nframes = round_by_factor(ele["nframes"], FRAME_FACTOR)
     else:
@@ -292,7 +297,9 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         Qwen3_5MoeForConditionalGeneration,
         Qwen3_5ForCausalLMMTP,
         InternS2PreviewForConditionalGeneration,
+        InternS2MobiusForConditionalGeneration,
         Qwen3OmniMoeForConditionalGeneration,
+        Cosmos3ForConditionalGeneration,
     ]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
@@ -305,6 +312,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5",
             "qwen3_5_moe",
             "intern_s2_preview",
+            "interns2_mobius",
         ):
             # Two workers overlap CPU preprocessing without over-fragmenting
             # burst arrivals into smaller GPU prefill batches. Higher counts can
@@ -514,6 +522,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5",
             "qwen3_5_moe",
             "intern_s2_preview",
+            "interns2_mobius",
+            "cosmos3_omni",
         ):
             return None
 
@@ -649,6 +659,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 "qwen3_5",
                 "qwen3_5_moe",
                 "intern_s2_preview",
+                "cosmos3_omni",
             ]
             and video_timestamps is not None
         ):
@@ -757,6 +768,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5",
             "qwen3_5_moe",
             "intern_s2_preview",
+            "interns2_mobius",
+            "cosmos3_omni",
         ):
             processor_kwargs.update(
                 video_metadata=video_metadata,
@@ -766,6 +779,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens, **processor_kwargs
         )
+
+        self._mark_dp_encoder_features_for_deferred_reconstruction(mm_items)
 
         audio_feature_lengths = None
 
@@ -878,3 +893,17 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             mrope_positions=mrope_positions,
             mrope_position_delta=mrope_position_delta,
         )
+
+    def _mark_dp_encoder_features_for_deferred_reconstruction(self, mm_items):
+        if not (
+            self.keep_mm_features_on_device
+            and self.server_args.mm_enable_dp_encoder
+            and self.model_type
+            in ("qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe")
+        ):
+            return
+        for item in mm_items:
+            if item.is_image() or item.is_video():
+                item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
+                    True
+                )

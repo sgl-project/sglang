@@ -4,7 +4,7 @@ Launches TP=4 with flashinfer_mxfp4 MoE runner + EAGLE speculative decoding.
 Runs 12 ServerSanity probes (correctness, streaming, concurrency, determinism)
 plus a GSM8K accuracy gate.
 
-Registry: extra-b-test-deepep-4-gpu-b200 (label-gated, 4x B200)
+Registry: extra-b-test-4-gpu-b200 (label-gated, 4x B200)
 """
 
 import unittest
@@ -21,9 +21,9 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=900, stage="extra-b", runner_config="deepep-4-gpu-b200")
+register_cuda_ci(est_time=900, stage="extra-b", runner_config="4-gpu-b200")
 
-MODEL = "deepseek-ai/DeepSeek-V4-Flash"
+MODEL = "deepseek-ai/DeepSeek-V4-Flash-0731"
 SERVER_LAUNCH_TIMEOUT = 3600
 
 
@@ -34,8 +34,6 @@ _W4A8_MEGAMOE_ENV = {
 
 _W4A4_MEGAMOE_ENV = {
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "4096",
-    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS": "1",
-    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND": "1",
 }
 
 
@@ -66,16 +64,11 @@ class TestDSV4FlashFP4B200W4A8MegaMoE(
                 "--dp",
                 "4",
                 "--enable-dp-attention",
+                "--enable-dp-lm-head",
                 "--moe-a2a-backend",
                 "megamoe",
                 "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-num-steps",
-                "1",
-                "--speculative-eagle-topk",
-                "1",
-                "--speculative-num-draft-tokens",
-                "2",
+                "DSPARK",
             ],
             env=_W4A8_MEGAMOE_ENV,
         )
@@ -113,16 +106,12 @@ class TestDSV4FlashFP4B200W4A4MegaMoE(
                 "--dp",
                 "4",
                 "--enable-dp-attention",
+                "--enable-dp-lm-head",
                 "--moe-a2a-backend",
                 "megamoe",
+                "--enable-w4a4-mxfp4-megamoe",
                 "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-num-steps",
-                "3",
-                "--speculative-eagle-topk",
-                "1",
-                "--speculative-num-draft-tokens",
-                "4",
+                "DSPARK",
             ],
             env=_W4A4_MEGAMOE_ENV,
         )

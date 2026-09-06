@@ -3,17 +3,12 @@ import unittest
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     AISBENCHMARK_DATASET_DEFAULT,
     BENCHMARK_TOOL_DEFAULT,
-    DEEPSEEK_V4_FLASH_W8A8_MTP_MODEL_PATH,
+    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
     TestNpuPerformanceTestCaseBase,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(
-    est_time=3600,
-    suite="",
-    nightly=True,
-    disabled="performance testcase",
-)
+register_npu_ci(est_time=1800, suite="nightly-perf-16-npu-a3", nightly=True)
 
 # Environment variables for DSV4-Flash single-node PD-mix deployment.
 DEEPSEEK_V4_FLASH_W8A8_8P_ENVS = {
@@ -24,12 +19,14 @@ DEEPSEEK_V4_FLASH_W8A8_8P_ENVS = {
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
+    "SGLANG_NPU_USE_MULTI_STREAM": "1",
     # deepep
-    "DEEPEP_HCCL_BUFFSIZE": "1000",
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
-    "DEEPEP_NORMAL_LONG_SEQ_ROUND": "16",
-    "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "2048",
-    "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1",
+    "DEEPEP_HCCL_BUFFSIZE": "2048",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "35",
+    # war barrier
+    "SGLANG_ENABLE_WAR_BARRIER": "1",
+    "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
     # skip gpu branch
     "SGLANG_OPT_FP8_WO_A_GEMM": "0",
     "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "False",
@@ -41,7 +38,7 @@ DEEPSEEK_V4_FLASH_W8A8_8P_ENVS = {
     "SGLANG_OPT_USE_TILELANG_MHC_PRE": "False",
     "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "False",
     "SGLANG_OPT_USE_TILELANG_MHC_POST": "False",
-    # MTP (EAGLE) related envs
+    # mtp
     "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
 }
@@ -55,17 +52,18 @@ DEEPSEEK_V4_FLASH_W8A8_8P_OTHER_ARGS = [
     "--trust-remote-code",
     "--device",
     "npu",
+    "--prefill-max-requests",
+    160,
+    "--max-prefill-tokens",
+    80000,
     "--attention-backend",
     "dsv4",
     "--watchdog-timeout",
     9000,
     "--mem-fraction-static",
-    0.7,
-    "--prefill-max-requests",
-    2,
-    "--disable-radix-cache",
+    0.68,
     "--chunked-prefill-size",
-    -1,
+    131072,
     "--max-running-requests",
     160,
     "--dp-size",
@@ -80,6 +78,7 @@ DEEPSEEK_V4_FLASH_W8A8_8P_OTHER_ARGS = [
     "--enable-dp-lm-head",
     "--kv-cache-dtype",
     "bfloat16",
+    "--skip-server-warmup",
     "--cuda-graph-bs",
     1,
     2,
@@ -95,6 +94,9 @@ DEEPSEEK_V4_FLASH_W8A8_8P_OTHER_ARGS = [
     1,
     "--speculative-num-draft-tokens",
     3,
+    "--ep-size",
+    16,
+    "--disable-radix-cache",
 ]
 
 
@@ -103,20 +105,22 @@ class TestNPUDeepSeekV4FlashW8A88PIn8kOut1k50ms(TestNpuPerformanceTestCaseBase):
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     dataset_type = AISBENCHMARK_DATASET_DEFAULT
-    model = DEEPSEEK_V4_FLASH_W8A8_MTP_MODEL_PATH
+    model = DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH
     other_args = DEEPSEEK_V4_FLASH_W8A8_8P_OTHER_ARGS
     envs = DEEPSEEK_V4_FLASH_W8A8_8P_ENVS
     dataset_name = "random"
+    dataset_path = "/root/.cache/modelscope/hub/datasets/gsm8k_deepseekv4/cache0_8000/formal_run1_160_8000_cache0.json"
     input_len = 8000
     output_len = 1000
     num_prompts = 160
     max_concurrency = 160
     random_range_ratio = 1
-    warmup_requests = 0
+    warmup_requests = 16
     request_rate = float("inf")
     seed = 1
     tpot = 50
-    output_token_throughput = 1708
+    max_attempts = 3
+    output_token_throughput = 2825
 
     def test_npu_deepseek_v4_flash_w8a8_8p_in8k_out1k_50ms(self):
         """Run NPU performance test for DeepSeek-V4-Flash W8A8 8p in8k out1k."""

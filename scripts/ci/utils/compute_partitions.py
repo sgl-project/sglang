@@ -11,6 +11,7 @@ import importlib.util
 import json
 import math
 import os
+import re
 from collections import defaultdict
 from datetime import datetime, timedelta
 
@@ -49,6 +50,18 @@ _REUSABLE_STAGE_USES = {
 }
 
 
+_MATRIX_REF = re.compile(r"\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+
+
+def _resolve_matrix_refs(value, row: dict):
+    """Substitute `${{ matrix.key }}` from one `strategy.matrix.include` row.
+
+    A caller may declare its runners as a matrix instead of one job each, which
+    leaves `self_name` and `run_timeout_minutes` as expressions here -- GitHub
+    resolves them at dispatch, this static read has to do it itself."""
+    return _MATRIX_REF.sub(lambda m: str(row[m.group(1)]), str(value))
+
+
 def load_run_timeouts(pr_test_yml_path: str) -> dict:
     """Map `self_name -> run_timeout_minutes` from one pr-test*.yml. The input
     is required in both reusable stage workflows -- KeyError surfaces missing."""
@@ -60,8 +73,17 @@ def load_run_timeouts(pr_test_yml_path: str) -> dict:
         if not isinstance(job, dict) or job.get("uses") not in _REUSABLE_STAGE_USES:
             continue
         with_ = job.get("with") or {}
-        suite = with_.get("self_name", job_id)
-        timeouts[suite] = int(with_["run_timeout_minutes"])
+        rows = ((job.get("strategy") or {}).get("matrix") or {}).get("include") or [
+            None
+        ]
+        for row in rows:
+            if row is None:
+                suite = with_.get("self_name", job_id)
+                timeout = with_["run_timeout_minutes"]
+            else:
+                suite = _resolve_matrix_refs(with_.get("self_name", job_id), row)
+                timeout = _resolve_matrix_refs(with_["run_timeout_minutes"], row)
+            timeouts[suite] = int(timeout)
     if not timeouts:
         raise RuntimeError(
             f"load_run_timeouts: no jobs matched uses in {_REUSABLE_STAGE_USES!r} "
@@ -88,7 +110,8 @@ def discover_files(repo_root: str) -> list[str]:
         for f in glob.glob(
             os.path.join(test_dir, "registered", "**", "*.py"), recursive=True
         )
-        if not f.endswith("/conftest.py") and not f.endswith("/__init__.py")
+        # Same exclusion as run_suite.py: pytest+package structure files.
+        if os.path.basename(f) not in ("conftest.py", "__init__.py")
     ]
     jit_kernel_dir = os.path.join(repo_root, "python", "sglang", "jit_kernel")
     files += glob.glob(
@@ -128,8 +151,11 @@ def compute_partitions(
     in-source `est_time` / `(1.0, 0.0)`.
     `full_parallel=True` lifts the matrix-fanout throttle.
     """
-    # Allowlist: stages pr-test.yml dispatches. Stress / weekly /
-    # nightly-* live in test/registered/ but pr-test doesn't run them.
+    # Allowlist of the stages this workflow dispatches -- what keeps stress /
+    # weekly / nightly out, since CUDA scheduled suites no longer carry
+    # `nightly=True`. The nightly filter still matters for CPU: some tests sit on
+    # a dispatched suite with the flag set, so run_suite.py skips them and their
+    # est_time must not inflate the shard count.
     dispatched_suites = set(run_timeouts) | set(_BASE_A_OVERRIDES)
     suite_tests = defaultdict(list)
     for t in tests:

@@ -25,9 +25,11 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         padded_stop_token_ids = torch.nn.utils.rnn.pad_sequence(
             sequences=[
                 torch.tensor(
-                    data=(
-                        list(
+                    data=[
+                        token_id
+                        for token_id in (
                             (req.sampling_params.stop_token_ids or set())
+                            | (req.eos_token_ids or set())
                             | (req.tokenizer.additional_stop_token_ids or set())
                             | (
                                 {req.tokenizer.eos_token_id}
@@ -35,7 +37,8 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
                                 else set()
                             )
                         )
-                    ),
+                        if token_id is not None
+                    ],
                     dtype=torch.int64,
                     device=self.orchestrator.device,
                 )
@@ -57,9 +60,7 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
                 fill_value=float("-inf"),
                 device=self.orchestrator.device,
             ),
-        )[
-            :, : self.orchestrator.vocab_size
-        ]
+        )[:, : self.orchestrator.vocab_size]
 
         self.len_output_tokens = torch.zeros(
             size=(len(self.orchestrator.reqs()), 1),

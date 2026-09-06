@@ -103,8 +103,7 @@ class LlamaMLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -348,9 +347,13 @@ class LlamaDecoderLayer(nn.Module):
         # Self Attention
         if residual is None:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states = self.input_layernorm(
+                hidden_states, quant_linear=self.self_attn.qkv_proj
+            )
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual, quant_linear=self.self_attn.qkv_proj
+            )
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -358,7 +361,9 @@ class LlamaDecoderLayer(nn.Module):
         )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual, quant_linear=self.mlp.gate_up_proj
+        )
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -479,7 +484,7 @@ class LlamaModel(nn.Module):
                 layer_self_attn.attn.v_scale = scaling_factor
             else:
                 raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
+                    "Self attention has no KV cache scaling factor attribute!"
                 )
 
     def get_input_embeddings(self) -> nn.Embedding:
