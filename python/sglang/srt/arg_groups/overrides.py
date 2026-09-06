@@ -1027,7 +1027,7 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
         and model_arch in _FLASHINFER_ALLREDUCE_FUSION_ARCHS
         and (get_platform().is_sm90 or get_platform().is_sm100)
         and view.tp_size > 1
-        and not view.enable_dp_attention
+        and not getattr(view, "enable_dp_attention", False)
         and (view.nnodes == 1 or get_platform().is_sm100)
         and view.moe_a2a_backend == "none"
     ):
@@ -1436,7 +1436,11 @@ def _page_size_default(view: Any) -> dict:
 
 @register_post_process
 def _data_parallelism_defaults(view: Any) -> dict:
-    if view.dp_size == 1 and view.ep_join_mode != "scale":
+    if (
+        view.dp_size == 1
+        and view.ep_join_mode != "scale"
+        and not getattr(view, "enable_dp_attention", False)
+    ):
         return {"enable_dp_attention": False, "enable_dp_lm_head": False}
     return {}
 

@@ -22,6 +22,25 @@ if is_npu():
     import torch_npu
 
 
+def resolve_npu_state_layout_draft_tokens(
+    speculative_num_draft_tokens: Optional[int],
+) -> Optional[int]:
+    """Resolve the draft width for persistent NPU state layout.
+
+    PD prefill has no draft count, so infer Decode's verify width from the
+    shared DSPARK block size without enabling speculative execution.
+    """
+    if speculative_num_draft_tokens is not None:
+        return speculative_num_draft_tokens
+
+    from sglang.srt.runtime_context import get_disagg, get_spec
+
+    if get_disagg().disaggregation_mode != "prefill":
+        return None
+    gamma = get_spec().speculative_dspark_block_size
+    return int(gamma) + 1 if gamma is not None else None
+
+
 def _init_npu_conv_state(
     conv_state_in,
     conv_state_shape,

@@ -1109,6 +1109,7 @@ class KVCacheConfigurator:
             # A PD prefill server never runs TARGET_VERIFY, so skip the
             # verify-only per-draft-token state snapshots (see the draft-head
             # case above: None => the pool skips SpeculativeState).
+            # Persistent NPU state layout is aligned separately in MambaPool.
             speculative_num_draft_tokens=(
                 None
                 if get_disagg().disaggregation_mode == "prefill"
