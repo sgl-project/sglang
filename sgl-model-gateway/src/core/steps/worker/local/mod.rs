@@ -361,3 +361,84 @@ pub fn create_worker_update_workflow_data(
         updated_workers: None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! What `create_worker` does when metadata discovery found no model name.
+    //!
+    //! `discover_metadata` is declared `FailureAction::ContinueNextStep`, so a
+    //! worker whose `/model_info` and `/server_info` never answered still
+    //! reaches `create_worker` with empty labels. Under IGW that worker cannot
+    //! be routed to -- `get_by_model` selects by name -- and the service
+    //! discovery resync will not revisit it, because it only re-submits pods
+    //! that have no registered worker at all. Refusing is what keeps it in the
+    //! state the resync retries.
+
+    use std::{collections::HashMap, sync::Arc};
+
+    use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowInstanceId, WorkflowResult};
+
+    use super::*;
+    use crate::{app_context::AppContext, core::ConnectionMode};
+
+    /// A worker config with a url and nothing else: no `model_id`, which is
+    /// what Kubernetes service discovery builds.
+    fn worker_data_without_identity() -> LocalWorkerWorkflowData {
+        LocalWorkerWorkflowData {
+            config: serde_json::from_value(serde_json::json!({
+                "url": "http://worker-that-never-answered:30000"
+            }))
+            .expect("a url-only worker config should deserialize"),
+            connection_mode: Some(ConnectionMode::Http),
+            discovered_labels: HashMap::new(),
+            dp_info: None,
+            workers: None,
+            final_labels: HashMap::new(),
+            detected_runtime_type: None,
+            app_context: None,
+            actual_workers: None,
+        }
+    }
+
+    async fn app_context(enable_igw: bool) -> Arc<AppContext> {
+        let config = RouterConfig {
+            enable_igw,
+            ..RouterConfig::default()
+        };
+        Arc::new(
+            AppContext::from_config(config, 60)
+                .await
+                .expect("a default AppContext should build"),
+        )
+    }
+
+    /// Runs the real step, not a scripted stand-in. No network is involved:
+    /// empty `discovered_labels` is what a failed discovery leaves behind.
+    async fn create_worker_without_identity(enable_igw: bool) -> WorkflowResult<StepResult> {
+        let mut data = worker_data_without_identity();
+        data.app_context = Some(app_context(enable_igw).await);
+        let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
+        CreateLocalWorkerStep.execute(&mut context).await
+    }
+
+    #[tokio::test]
+    async fn igw_refuses_a_worker_with_no_model_identity() {
+        let error = create_worker_without_identity(true)
+            .await
+            .expect_err("IGW cannot route to an unnamed worker, so it must not register one");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("no model identity"),
+            "the failure has to name its cause, or an operator sees only a failed \
+             AddWorker; got {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_igw_an_unnamed_worker_still_registers() {
+        create_worker_without_identity(false)
+            .await
+            .expect("outside IGW the model filter is off, so an unnamed worker still serves");
+    }
+}
