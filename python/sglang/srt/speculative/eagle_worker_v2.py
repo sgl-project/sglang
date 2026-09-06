@@ -130,6 +130,22 @@ _is_xpu = is_xpu()
 logger = logging.getLogger(__name__)
 
 
+def _shift_mm_input_embeds_for_draft_prefill(
+    mm_input_embeds: torch.Tensor, extend_lens: List[int]
+) -> torch.Tensor:
+    shifted_embeds = torch.empty_like(mm_input_embeds)
+    pt = 0
+    for extend_len in extend_lens:
+        request_embeds = mm_input_embeds[pt : pt + extend_len]
+        # The draft model replaces this retained final row with the tail token embedding.
+        shifted_embeds[pt : pt + extend_len].copy_(
+            torch.cat((request_embeds[1:], request_embeds[-1:]))
+        )
+        pt += extend_len
+    assert pt == mm_input_embeds.shape[0]
+    return shifted_embeds
+
+
 class EagleDraftWorker(EagleDraftWorkerBase):
     def __init__(
         self,
@@ -811,6 +827,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 pt += extend_len
             assert pt == batch.input_ids.numel()
             batch.input_ids = new_input_ids
+            if mm_input_embeds is not None:
+                mm_input_embeds = _shift_mm_input_embeds_for_draft_prefill(
+                    mm_input_embeds, batch.extend_lens
+                )
 
         # Draft-extend spec_info for the extend forward; carries only
         # hidden_states + shape info.
