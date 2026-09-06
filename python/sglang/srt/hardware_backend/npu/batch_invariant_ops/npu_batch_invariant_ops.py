@@ -9,6 +9,12 @@ def npu_mm_batch_invariant(a, b):
     return torch.ops.batch_invariant_ops.npu_mm_batch_invariant(a, b)
 
 
+def npu_mm_dtype_batch_invariant(a, b, out_dtype):
+    # A cast, not a wider store, but it keeps out_dtype= off the stock NPU matmul.
+    out = torch.ops.batch_invariant_ops.npu_mm_batch_invariant(a, b)
+    return out if out.dtype == out_dtype else out.to(out_dtype)
+
+
 def npu_matmul_batch_invariant(a, b):
     return torch.ops.batch_invariant_ops.npu_matmul_batch_invariant(a, b)
 

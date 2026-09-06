@@ -536,7 +536,8 @@ class MoEGate(nn.Module):
             )
 
         if get_exec().deterministic.enable_deterministic_inference:
-            return F.linear(hidden_states, self.weight, None)
+            # fp32 logits, one kernel for every M: bf16 rounding flips noaux_tc top-k.
+            return torch.mm(hidden_states, self.weight.t(), out_dtype=torch.float32)
 
         if (
             not self.is_deepseek_v4
