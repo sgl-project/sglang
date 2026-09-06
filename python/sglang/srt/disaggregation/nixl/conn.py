@@ -2669,12 +2669,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 ].num_pp_ranks_expected = self.required_prefill_response_num_table.get(
                     room, 1
                 )
-            if (
-                self.enable_staging
-                and self._staging_handler is not None
-                and self._staging_handler.is_staging_room(room)
-            ):
-                self._maybe_submit_last_scatter(room)
+        # Staging may defer chunks, so an earlier chunk can arrive after the last one.
+        # any arrival chunk maybe the last for scatter.
+        if (
+            self.enable_staging
+            and self._staging_handler is not None
+            and self._staging_handler.is_staging_room(room)
+        ):
+            self._maybe_submit_last_scatter(room)
 
     def _track_kv_part_arrival(
         self,
