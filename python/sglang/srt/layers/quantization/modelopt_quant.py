@@ -855,6 +855,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             exclude_modules = quantization_section.get("exclude_modules")
             quantized_layers = quantization_section.get("quantized_layers", {})
 
+        # ModelOpt emits `ignore: []` or omits it; is_layer_skipped iterates it.
+        exclude_modules = list(exclude_modules or [])
+
         if quant_algo != "MIXED_PRECISION":
             raise ValueError(
                 "ModelOptMixedPrecisionConfig only supports MIXED_PRECISION checkpoints."
@@ -977,8 +980,16 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             candidates.append(
                 "language_model.model." + prefix[len("model.language_model.") :]
             )
+            candidates.append("model." + prefix[len("model.language_model.") :])
+        elif prefix.startswith("model."):
+            # VL models such as Qwen4-Exp name the text stack `model.layers.*`
+            # while ModelOpt keys it `model.language_model.layers.*`.
+            candidates.append("model.language_model." + prefix[len("model.") :])
 
         return tuple(dict.fromkeys(candidates))
+
+    def resolve_quant_algo(self, prefix: str) -> Optional[str]:
+        return self._resolve_quant_algo(prefix)
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -999,7 +1010,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return UnquantizedLinearMethod()
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
-            if quant_algo == "FP8_PB_WO":
+            if quant_algo in ("FP8_PB_WO", "FP8_BLOCK_SCALES"):
                 return Fp8LinearMethod(self.fp8_pb_wo_config)
             if quant_algo == "MXFP8":
                 return Fp8LinearMethod(self.mxfp8_config)
@@ -1030,6 +1041,10 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return ModelOptFp8MoEMethod(self.fp8_config)
             if quant_algo == "MXFP8":
                 return Fp8MoEMethod(self.mxfp8_config)
+            # ModelOpt spells 128x128 block fp8 experts (weight_scale_inv)
+            # FP8_BLOCK_SCALES, e.g. the MTP head of Qwen3.8-Flash-Next-NVFP4.
+            if quant_algo == "FP8_BLOCK_SCALES":
+                return Fp8MoEMethod(self.fp8_pb_wo_config)
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
