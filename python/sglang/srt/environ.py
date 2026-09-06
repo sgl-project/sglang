@@ -692,6 +692,10 @@ class Envs:
     SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE = EnvStr(None)
     SGLANG_IS_FIRST_RANK_ON_NODE = EnvBool(True)
     SGLANG_SYNC_TOKEN_IDS_ACROSS_TP = EnvBool(False)
+    # Experimental: keep greedy LM-head logits vocab-sharded and exchange only
+    # each rank's argmax candidate. Unsupported sampling features fall back to
+    # the full-logits all-gather path.
+    SGLANG_ENABLE_TP_SHARDED_GREEDY = EnvBool(False)
     SGLANG_ENABLE_COLOCATED_BATCH_GEN = EnvBool(False)
     SGLANG_SHARED_EXPERT_TP1 = EnvBool(False)
     # Replicate the input embedding across TP ranks instead of sharding it

@@ -1896,17 +1896,19 @@ class ModelRunner:
         # a previous replay into a request with no observer state.
         logits_output.auxiliary_device_output = None
         observer = self.sampling_observer
-        # Preserve two-argument overrides when observation is inactive.
-        if observer is not None and observer.is_active(forward_batch.sampling_info):
-            observer_state = self._preprocess_logits(
-                logits_output,
-                forward_batch.sampling_info,
-                observer=observer,
-            )
-        else:
-            observer_state = self._preprocess_logits(
-                logits_output, forward_batch.sampling_info
-            )
+        observer_state = None
+        if logits_output.tp_sharded_greedy_token_ids is None:
+            # Preserve two-argument overrides when observation is inactive.
+            if observer is not None and observer.is_active(forward_batch.sampling_info):
+                observer_state = self._preprocess_logits(
+                    logits_output,
+                    forward_batch.sampling_info,
+                    observer=observer,
+                )
+            else:
+                observer_state = self._preprocess_logits(
+                    logits_output, forward_batch.sampling_info
+                )
 
         # Sample the next tokens
         next_token_ids = self.sampler(
