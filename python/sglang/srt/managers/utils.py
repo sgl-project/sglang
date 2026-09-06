@@ -212,6 +212,31 @@ class GenerationBatchResult:
         )
 
 
+def batch_convert_2d_tensors_to_lists(tensors: List[torch.Tensor]) -> List:
+    """Convert a list of 2D GPU tensors with a uniform last dim into nested
+    Python lists using a single GPU->CPU sync (``torch.cat`` + one ``.tolist()``).
+
+    Used in the multi-item scoring classification / reward path where the pooler
+    returns one 2D tensor of shape ``(num_items, cols)`` per request. Calling
+    ``.tolist()`` per tensor would cost N device-to-host syncs at batch size N.
+
+    Falls back to per-tensor ``.tolist()`` on empty input or shape-irregular
+    batches (e.g. per-request matryoshka truncation).
+    """
+    if not tensors or not all(
+        t.dim() == 2 and t.shape[1] == tensors[0].shape[1] for t in tensors
+    ):
+        return [t.tolist() for t in tensors]
+
+    sizes = [t.shape[0] for t in tensors]
+    flat = torch.cat(tensors, dim=0).tolist()
+    out, offset = [], 0
+    for n in sizes:
+        out.append(flat[offset : offset + n])
+        offset += n
+    return out
+
+
 def validate_input_length(
     req: Req, max_req_input_len: int, allow_auto_truncate: bool
 ) -> Optional[str]:
