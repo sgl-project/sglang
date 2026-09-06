@@ -324,6 +324,11 @@ class Session:
 
         if abort:
             new_req.set_finish_with_abort(abort_message)
+            if self.streaming:
+                # A rejected overlapping turn never acquired the session.
+                # Keep scheduler-side pre-abort cleanup from releasing the
+                # request that still owns the streaming session.
+                new_req.session = None
         elif self.streaming:
             # req_nodes is NOT updated here — finish_req() handles it.
             self._inflight = True
