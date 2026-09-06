@@ -881,6 +881,56 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(kwargs["reasoning_effort"], "medium")
         self.assertEqual(req.chat_template_kwargs["reasoning_effort"], "medium")
 
+    def test_request_reasoning_effort_beats_default_after_conversion(self):
+        # Request-first precedence must hold for reasoning_effort too, whether
+        # the request sets it in chat_template_kwargs (which
+        # _convert_to_internal_request moves onto the request) or as the
+        # top-level field. Before the fix the server default was merged back
+        # into chat_template_kwargs and overwrote the request's value at
+        # template time.
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.default_chat_template_kwargs = {"reasoning_effort": "medium"}
+
+        cases = [
+            ({"reasoning_effort": "xhigh"}, None, "xhigh"),
+            (None, "low", "low"),
+        ]
+        for template_kwargs, top_level, expected in cases:
+            with self.subTest(template_kwargs=template_kwargs, top_level=top_level):
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "What is 2+2?"}],
+                    reasoning_effort=top_level,
+                    chat_template_kwargs=template_kwargs,
+                )
+
+                self.chat._convert_to_internal_request(req)
+
+                kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+                self.assertEqual(req.reasoning_effort, expected)
+                self.assertEqual(kwargs["reasoning_effort"], expected)
+
+    def test_default_reasoning_effort_applies_when_request_unset_after_conversion(
+        self,
+    ):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.default_chat_template_kwargs = {"reasoning_effort": "medium"}
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+
+        self.chat._convert_to_internal_request(req)
+
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertEqual(req.reasoning_effort, "medium")
+        self.assertEqual(kwargs["reasoning_effort"], "medium")
+
     def test_k2_selected_terminator_reaches_sampling_params(self):
         self.tm._config_overrides["reasoning_parser"] = "k2_horizon"
         self.chat = OpenAIServingChat(self.tm, self.template_manager)
