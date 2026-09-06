@@ -44,6 +44,66 @@ _MAP_FAILED = ctypes.c_void_p(-1).value
 _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
 _PROT_RW = mmap.PROT_READ | mmap.PROT_WRITE
 
+# Hugetlb pools as the kernel exposes them: one sysfs directory per page size.
+_HUGEPAGE_SYSFS_DIR = "/sys/kernel/mm/hugepages"
+_HUGEPAGE_SIZES = {"2MB": 2 * 1024 * 1024, "1GB": 1024 * 1024 * 1024}
+_HUGEPAGE_MMAP_FLAGS = {
+    2 * 1024 * 1024: _MAP_HUGETLB | _MAP_HUGE_2MB,
+    1024 * 1024 * 1024: _MAP_HUGETLB | _MAP_HUGE_1GB,
+}
+
+
+def hugepage_size_requested() -> int:
+    """Hugepage size in bytes that SGLANG_HUGEPAGE_SIZE asks alloc_mmap() for.
+
+    0 when the variable is unset or unrecognized (the latter with a warning),
+    in which case alloc_mmap() maps plain pages. Re-read per call, not cached,
+    so that envs.SGLANG_HUGEPAGE_SIZE.override() works in tests.
+    """
+    raw = envs.SGLANG_HUGEPAGE_SIZE.get() or ""
+    key = raw.strip().upper()
+    if key == "":
+        return 0
+    size = _HUGEPAGE_SIZES.get(key)
+    if size is None:
+        logger.warning(
+            "Unrecognized SGLANG_HUGEPAGE_SIZE=%r; expected '2MB' or '1GB'. "
+            "Falling back to plain page-size mmap.",
+            raw,
+        )
+        return 0
+    return size
+
+
+def _hugetlb_count(pool_dir: str, counter: str) -> int:
+    with open(os.path.join(pool_dir, counter)) as f:
+        return int(f.read().strip())
+
+
+def hugetlb_pool_free_bytes() -> int:
+    """Bytes a new alloc_mmap() mapping could take from the hugetlb pool, else 0.
+
+    That is the pool of the size SGLANG_HUGEPAGE_SIZE names, and only while
+    libc is loadable: without it alloc_mmap() maps plain pages before ever
+    trying hugetlb. Read from sysfs, which reports every pool size (the whole
+    hugetlb pool is excluded from MemAvailable). Pages a mapping has reserved
+    but not yet faulted in still count as free, so only ``free - resv`` can
+    back a new mapping.
+    """
+    size = hugepage_size_requested()
+    if size == 0 or _libc is None:
+        return 0
+    pool_dir = os.path.join(_HUGEPAGE_SYSFS_DIR, f"hugepages-{size // 1024}kB")
+    try:
+        free = _hugetlb_count(pool_dir, "free_hugepages")
+        resv = _hugetlb_count(pool_dir, "resv_hugepages")
+    except (OSError, ValueError) as e:
+        logger.warning(
+            "Cannot read the hugetlb pool at %s (%s); not crediting it.", pool_dir, e
+        )
+        return 0
+    return max(free - resv, 0) * size
+
 
 @functools.cache
 def _has_madv_populate_write() -> bool:
@@ -118,24 +178,10 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
 
     The tensor owns the mapping; munmap fires when the tensor is freed.
     """
-    # Re-read per call (not cached) so that envs.SGLANG_HUGEPAGE_SIZE.override()
-    # works correctly in tests.
-    hugepage_size = (envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip().upper()
+    hugepage_size = hugepage_size_requested()
     n_bytes = math.prod(dims) * torch.empty([], dtype=dtype).element_size()
-
-    if hugepage_size == "":
-        page_size, extra_flags = mmap.PAGESIZE, 0
-    elif hugepage_size == "2MB":
-        page_size, extra_flags = 2 * 1024 * 1024, _MAP_HUGETLB | _MAP_HUGE_2MB
-    elif hugepage_size == "1GB":
-        page_size, extra_flags = 1024 * 1024 * 1024, _MAP_HUGETLB | _MAP_HUGE_1GB
-    else:
-        logger.warning(
-            "Unrecognized SGLANG_HUGEPAGE_SIZE=%r; expected '2MB' or '1GB'. "
-            "Falling back to plain page-size mmap.",
-            envs.SGLANG_HUGEPAGE_SIZE.get(),
-        )
-        page_size, extra_flags = mmap.PAGESIZE, 0
+    page_size = hugepage_size or mmap.PAGESIZE
+    extra_flags = _HUGEPAGE_MMAP_FLAGS.get(hugepage_size, 0)
 
     alloc_bytes = math.ceil(n_bytes / page_size) * page_size
 
@@ -144,7 +190,7 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
             logger.error(
                 "Hugepage mmap requested but libc.so.6 could not be loaded; "
                 "falling back to plain mmap. SGLANG_HUGEPAGE_SIZE=%s will be ignored.",
-                hugepage_size,
+                envs.SGLANG_HUGEPAGE_SIZE.get(),
             )
         else:
             try:
@@ -157,7 +203,7 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
                     "Hugepage mmap via libc failed (%s); falling back to plain mmap. "
                     "SGLANG_HUGEPAGE_SIZE=%s will be ignored.",
                     e,
-                    hugepage_size,
+                    envs.SGLANG_HUGEPAGE_SIZE.get(),
                 )
         alloc_bytes = math.ceil(n_bytes / mmap.PAGESIZE) * mmap.PAGESIZE
 
