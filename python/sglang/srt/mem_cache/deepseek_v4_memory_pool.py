@@ -20,7 +20,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
-from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.mem_cache.memory_pool import KVCache, get_tensor_size_bytes
 from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.utils import ceil_div, is_hip
 
@@ -109,6 +109,11 @@ class DeepSeekV4SingleKVPool(KVCache):
                     )
                     for _ in range(self.layer_num)
                 ]
+
+        self._finalize_allocation_log(self.size)
+
+    def get_kv_size_bytes(self) -> int:
+        return get_tensor_size_bytes(self.kv_buffer)
 
     def get_bytes_per_token(self) -> int:
         dim_per_token = (
@@ -329,17 +334,34 @@ class DeepSeekV4IndexerPool(KVCache):
                         for _ in range(self.layer_num)
                     ]
                     self.index_k_with_scale_buffer = None
-                    return
+                else:
+                    self.index_k_with_scale_buffer = [
+                        torch.zeros(
+                            num_pages,
+                            page_bytes,
+                            dtype=self.index_k_with_scale_buffer_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
 
-                self.index_k_with_scale_buffer = [
-                    torch.zeros(
-                        num_pages,
-                        page_bytes,
-                        dtype=self.index_k_with_scale_buffer_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
+        self._finalize_allocation_log(self.size)
+
+    def get_kv_size_bytes(self) -> int:
+        buffers = []
+        for name in (
+            "index_k_with_scale_buffer",
+            "index_k_payload_buffer",
+            "index_k_scale_buffer",
+            # NPU adds dedicated buffers alongside the packed compatibility
+            # buffer allocated by the base indexer pool.
+            "index_k_buffer",
+            "index_scale_buffer",
+        ):
+            buffer = getattr(self, name, None)
+            if buffer is not None:
+                buffers.append(buffer)
+        return sum(get_tensor_size_bytes(buffer) for buffer in buffers)
 
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError()
@@ -501,6 +523,9 @@ class DeepSeekV4UnifiedKVPool:
 
     def get_unified_kv(self, local_layer_id: int) -> torch.Tensor:
         return self.kv_buffer[local_layer_id]
+
+    def get_kv_size_bytes(self) -> int:
+        return get_tensor_size_bytes(self.kv_buffer)
 
     def get_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs = [b.data_ptr() for b in self.kv_buffer]
@@ -702,6 +727,26 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self._init_compressed_layer_mapping()
 
         self._init_paged_compress_states(enable_memory_saver)
+        self._finalize_allocation_log(swa_size)
+
+    def get_kv_size_bytes(self) -> int:
+        if self._unified_kv:
+            kv_size_bytes = self.unified_kv_pool.get_kv_size_bytes()
+        else:
+            kv_size_bytes = sum(
+                pool.get_kv_size_bytes()
+                for pool in (self.swa_kv_pool, self.c4_kv_pool, self.c128_kv_pool)
+                if pool is not None
+            )
+
+        kv_size_bytes += self.c4_indexer_kv_pool.get_kv_size_bytes()
+        kv_size_bytes += sum(
+            get_tensor_size_bytes(pool.kv_score_buffer.kv_score)
+            for pools in (self.compress_state_pools, self.indexer_compress_state_pools)
+            for pool in pools
+            if pool is not None
+        )
+        return kv_size_bytes
 
     def get_unified_kv(self, layer_id: int) -> torch.Tensor:
         # Under HiCache the compressed region is loaded H->D per layer; wait for this
