@@ -97,7 +97,8 @@ export const benchmarks = [
   },
   // 1x DGX Spark, TP=1, N-gram table file-backed on NVMe (PLE Offload = On
   // (NVMe file)), qwen4-main-squashed @ 9b2aee2283. Same bench workload as
-  // the 2-node rows; single GPU, so per-GPU = total tok/s. Accuracy pending.
+  // the 2-node rows; single GPU, so per-GPU = total tok/s. GSM8K as in the
+  // 2-node rows (full set, dev-qwen38-next-local image, 2026-09-06).
   {
     match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "qwen4-main-squashed @ 9b2aee2283",
@@ -113,6 +114,7 @@ export const benchmarks = [
   {
     match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "qwen4-main-squashed @ 9b2aee2283",
+    accuracy: { gsm8k_pct: 96.8 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 580.18, tpot_ms: 61.63, tokens_per_sec_per_gpu: 80 },
