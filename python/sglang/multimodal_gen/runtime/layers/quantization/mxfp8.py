@@ -21,6 +21,7 @@ from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config as SRTFp8Config
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod as SRTFp8LinearMethod
+from sglang.srt.layers.utils import copy_or_rebind_param
 
 
 class MXFP8Config(SRTFp8Config, QuantizationConfig):
@@ -76,7 +77,41 @@ class MXFP8Config(SRTFp8Config, QuantizationConfig):
             return UnquantizedLinearMethod()
         if current_platform.is_npu():
             return NPUMXFP8LinearMethod(self)
-        return SRTFp8LinearMethod(self)
+        return ComfyMXFP8LinearMethod(self)
 
 
-__all__ = ["MXFP8Config"]
+class ComfyMXFP8LinearMethod(SRTFp8LinearMethod):
+    """Load MXFP8 scales that the checkpoint already stores swizzled.
+
+    ``comfy-kitchen`` serializes MXFP8 block scales in the ``SWIZZLE_32_4_4``
+    byte order that FlashInfer's cutlass and cutedsl kernels consume, but
+    safetensors keeps their logical ``[N, K // 32]`` shape.  Nothing in the file
+    distinguishes those bytes from row-major scales, so
+    :meth:`Fp8LinearMethod._process_mxfp8_linear_weight_scale` interleaves them a
+    second time.  The second permutation is silent -- the checkpoint loads, the
+    kernels run at full speed, and the sample decodes to noise.
+
+    Only checkpoints that carry comfy layer markers take this path;
+    :class:`MXFP8Config` resolved from a ``config.json`` has
+    ``layer_markers is None`` and keeps SRT's behaviour byte for byte.
+    """
+
+    def _process_mxfp8_linear_weight_scale(self, layer: torch.nn.Module) -> None:
+        backend = self.mxfp8_dense_backend
+        if (
+            self.use_mxfp8
+            and self.quant_config.layer_markers is not None
+            and backend is not None
+            and (backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl())
+        ):
+            # Hand FlashInfer the serialized bytes flattened, not re-interleaved.
+            copy_or_rebind_param(
+                layer,
+                "weight_scale_inv_swizzled",
+                layer.weight_scale_inv.data.contiguous().view(-1),
+            )
+            return
+        super()._process_mxfp8_linear_weight_scale(layer)
+
+
+__all__ = ["ComfyMXFP8LinearMethod", "MXFP8Config"]
