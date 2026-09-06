@@ -545,6 +545,16 @@ class UnifiedRadixCache(BasePrefixCache):
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
             return InsertResult(prefix_len=0)
+        # Never open an insert walk for an empty key. The tree core already
+        # refuses to create a zero-length node, but its guard reports
+        # last_device_node=root, which cache_finished_req would then assign to
+        # req.last_node even though the request holds no lock on root (and a
+        # session ref would be registered for a zero-length prefix). Short-
+        # circuit here instead. mamba_exist=True follows the cleanup
+        # convention: params.mamba_value was NOT consumed and must be freed
+        # by the caller's cleanup_after_caching_req.
+        if params.key is None or len(params.key) == 0:
+            return InsertResult(prefix_len=0, mamba_exist=True)
         # Fail fast on re-entrancy without touching the in-flight walk.
         assert not self.tree_core.has_ongoing_insert(), "re-entrant insert"
         # Pump the resumable insert, applying each step's actions at its barrier.
@@ -886,6 +896,33 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
                 if cl is not None:
                     effective_cache_len = min(effective_cache_len, cl)
+
+            # Nothing to cache: no component claimed a single token (e.g. a
+            # short finished mamba request that never hit a track boundary
+            # reports cache_len 0). Skip the insert entirely rather than
+            # walking an empty key: besides being a no-op, the tree core's
+            # empty-key guard would repoint req.last_node to root (a node
+            # this request holds no lock on) and register a zero-length
+            # session ref. Free the unprotected KV rows exactly like the
+            # is_insert=False branch, release the request's tree lock, and
+            # let the components' cleanup (insert_result=None == "no insert
+            # happened") release the donated mamba value and the request's
+            # mamba slot. Mirrors the effective_cache_len <= 0 early-return
+            # already present in cache_unfinished_req.
+            if effective_cache_len <= 0:
+                self.free_kv_row(
+                    req.kv, [(req.kv.cache_protected_len, kv_len_to_handle)]
+                )
+                if req.last_node is not None:
+                    self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
+                for comp in self._components_tuple:
+                    comp.cleanup_after_caching_req(
+                        req,
+                        is_finished=True,
+                        insert_result=None,
+                        insert_params=insert_params,
+                    )
+                return
 
             # Truncate if needed; the tail free is deferred and batched with
             # the unaligned tail below so a shared boundary page is emitted once.
