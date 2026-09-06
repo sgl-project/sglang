@@ -13,7 +13,6 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 class AITERSageBackend(AttentionBackend):
-
     @staticmethod
     def get_enum() -> AttentionBackendEnum:
         return AttentionBackendEnum.AITER_SAGE
@@ -35,7 +34,6 @@ class AITERSageBackend(AttentionBackend):
 
 
 class AITERSageImpl(AttentionImpl):
-
     def __init__(
         self,
         num_heads: int,

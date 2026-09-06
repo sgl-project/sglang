@@ -26,6 +26,7 @@ from sglang.srt.arg_groups.overrides import (
     max_prefill_buffer_tokens as max_prefill_buffer_tokens_of,
 )
 from sglang.srt.arg_groups.overrides import (
+    resolution_result,
     resolved_view,
 )
 from sglang.srt.runtime_context import (
@@ -377,10 +378,12 @@ class TestServerArgsScopedOverride(_IsolatedServerArgs):
         )
         published = override.install()
         self.assertIs(get_server_args(), published)
-        self.assertEqual(published.attention_backend, "triton")
-        self.assertEqual(published.chunked_prefill_size, -1)
+        # The hook declares; the record keeps the operator's input, so the
+        # values are read where resolution puts them.
+        self.assertEqual(resolution_result(published, "attention_backend"), "triton")
+        self.assertEqual(resolution_result(published, "chunked_prefill_size"), -1)
         # unnamed fields keep their dataclass defaults
-        self.assertEqual(published.tp_size, 1)
+        self.assertEqual(resolution_result(published, "tp_size"), 1)
 
     def test_unknown_fields_are_rejected(self):
         with self.assertRaises(ValueError):
@@ -391,7 +394,7 @@ class TestServerArgsScopedOverride(_IsolatedServerArgs):
         get_context().set_server_args(previous)
         override = get_context().override_server_args(tp_size=8)
         override.install()
-        self.assertEqual(get_server_args().tp_size, 8)
+        self.assertEqual(get_parallel().tp_size, 8)
         override.restore()
         self.assertIs(get_server_args(), previous)
 
@@ -406,9 +409,9 @@ class TestServerArgsScopedOverride(_IsolatedServerArgs):
         reset_context()
         with get_context().override_server_args(tp_size=2) as outer:
             with get_context().override_server_args(tp_size=4):
-                self.assertEqual(get_server_args().tp_size, 4)
+                self.assertEqual(get_parallel().tp_size, 4)
             self.assertIs(get_server_args(), outer)
-            self.assertEqual(get_server_args().tp_size, 2)
+            self.assertEqual(get_parallel().tp_size, 2)
 
     def test_private_attribute_seeding(self):
         # Property caches (e.g. _mamba_cache_chunk_size) are seeded through
@@ -418,13 +421,35 @@ class TestServerArgsScopedOverride(_IsolatedServerArgs):
         )
         self.assertEqual(mamba_cache_chunk_size_of(published), 64)
 
+    def test_an_underscore_field_is_declared_like_any_other(self):
+        """The split is fields vs not-fields, not the leading underscore.
+
+        `_speculative_draft_quantization_explicitly_set` is a real field
+        published under `spec`. Seeding it as a raw attribute instead of
+        declaring it would leave the earlier resolution authoritative, so both
+        the resolution and the bag would keep answering the pre-override value
+        while the record said otherwise.
+        """
+        from sglang.srt.arg_groups.overrides import resolution_result
+        from sglang.srt.runtime_context import get_spec
+
+        name = "_speculative_draft_quantization_explicitly_set"
+        self.assertIn(name, ServerArgs.__dataclass_fields__)
+
+        published = get_context().override_server_args(**{name: True}).install()
+        # The record keeps the operator's input, as it does for every other
+        # field; the override travels as a declaration.
+        self.assertIsNone(getattr(published, name))
+        self.assertIs(resolution_result(published, name), True)
+        self.assertIs(getattr(get_spec(), name), True)
+
     def test_installed_config_arms_the_strict_guard(self):
         # The published dummy must behave like a resolved config: bare writes
         # raise.
         published = get_context().override_server_args(tp_size=2).install()
         with self.assertRaises(AttributeError):
             published.tp_size = 4
-        self.assertEqual(published.tp_size, 2)
+        self.assertEqual(resolution_result(published, "tp_size"), 2)
 
     def test_restore_resets_the_capture_seed(self):
         # install() seeds flags.capture from the published dummy; restore()
@@ -505,6 +530,7 @@ class _FakeResolvedArgs:
     decode_attention_backend: A[str | None, Arg(help="dab"), NS("exec.kernel")] = None
     disable_radix_cache: A[bool, Arg(help="drc"), NS("memory")] = False
     mamba_radix_cache_strategy: A[str, Arg(help="mrcs"), NS("exec.mamba")] = "auto"
+    speculative_algorithm: A[str | None, Arg(help="sa"), NS("spec")] = None
     speculative_num_draft_tokens: A[int | None, Arg(help="d"), NS("spec")] = None
     speculative_adaptive: A[bool, Arg(help="a"), NS("spec")] = False
     speculative_adaptive_config: A[str | None, Arg(help="c"), NS("spec")] = None
@@ -1175,6 +1201,9 @@ class TestDerivedPredicatesAgreeAcrossTiers(_IsolatedServerArgs):
     def test_activation_reserve_matches_the_member(self):
         from types import SimpleNamespace
 
+        from sglang.srt.arg_groups.overrides import (
+            pre_capture_activation_reserve_mb_of,
+        )
         from sglang.srt.runtime_context import pre_capture_activation_reserve_mb
 
         graph = SimpleNamespace(decode=SimpleNamespace(max_bs=64))
@@ -1206,7 +1235,7 @@ class TestDerivedPredicatesAgreeAcrossTiers(_IsolatedServerArgs):
                     args = _FakeResolvedArgs(cuda_graph_config=graph, **case)
                     get_context().set_server_args(args)
                     self.assertEqual(
-                        ServerArgs.pre_capture_activation_reserve_mb(args, gpu_mem),
+                        pre_capture_activation_reserve_mb_of(args, gpu_mem),
                         pre_capture_activation_reserve_mb(gpu_mem),
                     )
 
@@ -1261,13 +1290,7 @@ class TestDerivedPredicatesAgreeAcrossTiers(_IsolatedServerArgs):
 
 
 class TestAdaptiveDraftBoundLifecycle(_IsolatedServerArgs):
-    """The adaptive draft-token bound is memoized on the config path, so the
-    memo has to end with the publication it was computed under.
-
-    Without that, a process that republishes with the same adaptive-config path
-    -- the file having been rewritten in between -- keeps the previous bound and
-    under-allocates the draft-token buffers sized from it.
-    """
+    """The adaptive draft-token bound is snapshotted at each publication."""
 
     def _write_config(self, steps):
         path = os.path.join(tempfile.mkdtemp(prefix="adaptive_cfg_"), "adaptive.json")
@@ -1289,7 +1312,7 @@ class TestAdaptiveDraftBoundLifecycle(_IsolatedServerArgs):
 
         with open(path, "w") as handle:
             json.dump({"1": {"candidate_steps": [4]}}, handle)
-        # Same path, new contents: the memo must not survive the republish.
+        # The new publication must not retain the previous capacity.
         get_context().set_server_args(
             _FakeResolvedArgs(
                 speculative_num_draft_tokens=3,

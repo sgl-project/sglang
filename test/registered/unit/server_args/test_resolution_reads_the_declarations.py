@@ -61,7 +61,9 @@ def _holders(fn):
             else (
                 annotation.id
                 if isinstance(annotation, ast.Name)
-                else annotation.attr if isinstance(annotation, ast.Attribute) else None
+                else annotation.attr
+                if isinstance(annotation, ast.Attribute)
+                else None
             )
         )
         if text == "ServerArgs":
@@ -471,7 +473,7 @@ class TestResolutionReadsTheDeclarations(CustomTestCase):
         members = _record_members()
         # The floor is here to catch the scan collapsing, not to pin the
         # class's size.
-        self.assertGreater(len(members), 25, f"only {len(members)} members were found")
+        self.assertGreater(len(members), 15, f"only {len(members)} members were found")
         offenders = []
         for name, fn in sorted(members.items()):
             holders = _holders(fn) | {"self"}

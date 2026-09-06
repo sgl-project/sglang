@@ -9,7 +9,11 @@ import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.common.staging_buffer import (
+    StagingAllocator,
+)
 from sglang.srt.disaggregation.common.staging_handler import (
+    DecodeStagingHandler,
     handle_staging_req,
 )
 from sglang.srt.disaggregation.common.utils import (
@@ -34,6 +38,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.eagle_disaggregation import (
@@ -102,7 +107,7 @@ class TestDisaggregationWire(unittest.TestCase):
 
     def test_prebuilt_skips_unused_prompt_tensor(self):
         req = SimpleNamespace(
-            req_pool_idx=0,
+            kv=ReqKvInfo(req_pool_idx=0),
             prefix_indices=[0, 1],
             extend_range=SimpleNamespace(length=3),
             origin_input_ids=[0, 1, 2, 3, 4],
@@ -218,6 +223,37 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
     def test_mismatched_nonempty_lengths_raise(self):
         with self.assertRaises(ValueError):
             group_concurrent_contiguous(self._arr([1, 2, 3]), self._arr([1, 2]))
+
+
+class TestStagingWatermark(unittest.TestCase):
+    @patch("sglang.srt.disaggregation.common.staging_buffer.StagingBuffer")
+    def test_empty_ring_restarts_at_zero(self, staging_buffer):
+        staging_buffer.return_value.data_ptr = 0
+        allocator = StagingAllocator(100, "cpu", 0)
+        alloc_id, _, _ = allocator.assign(60)
+
+        allocator.free(alloc_id)
+
+        self.assertEqual(allocator.get_watermark(), (1, 0))
+        self.assertEqual(allocator.assign(70)[1:], (0, 1))
+
+    def test_new_watermark_subscriber_receives_current_allocator_state(self):
+        sock = Mock()
+        bootstrap_info = {"host": "prefill", "port": 7200}
+        receiver = Mock(
+            bootstrap_infos=[bootstrap_info],
+        )
+        receiver._connect_to_bootstrap_server.return_value = (sock, threading.Lock())
+        handler = object.__new__(DecodeStagingHandler)
+        handler.staging_allocator = Mock()
+        handler.staging_allocator.get_watermark.return_value = (3, 0)
+        handler._wm_subscribers = {}
+
+        handler.register_wm_subscriber(receiver, "session-new")
+
+        sock.send_multipart.assert_called_once_with(
+            [b"WATERMARK", b"3", b"0", b"session-new"]
+        )
 
 
 class TestMooncakePPStaging(unittest.TestCase):
@@ -409,12 +445,13 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             # positions are passed through unremapped.
             ("other", False, False, False, unremapped),
         ):
-            with self.subTest(platform=platform), envs.SGLANG_DSA_FUSE_TOPK.override(
-                True
-            ), patch(
-                "sglang.srt.layers.attention.dsa.utils.is_cuda", return_value=cuda
-            ), patch(
-                "sglang.srt.layers.attention.dsa.utils.is_hip", return_value=hip
+            with (
+                self.subTest(platform=platform),
+                envs.SGLANG_DSA_FUSE_TOPK.override(True),
+                patch(
+                    "sglang.srt.layers.attention.dsa.utils.is_cuda", return_value=cuda
+                ),
+                patch("sglang.srt.layers.attention.dsa.utils.is_hip", return_value=hip),
             ):
                 self.assertEqual(
                     should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend=True),

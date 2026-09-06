@@ -70,7 +70,6 @@ logger = logging.getLogger(__name__)
 
 
 class Llama4MoE(nn.Module):
-
     @torch.compile(dynamic=True, backend=get_compiler_backend())
     @staticmethod
     def custom_routing_function(
@@ -195,7 +194,6 @@ def _get_or_create_alt_stream(device_module):
 
 
 class Llama4Attention(nn.Module):
-
     def __init__(
         self,
         config: Llama4TextConfig,

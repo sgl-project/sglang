@@ -6,11 +6,13 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_platform,
+)
 from sglang.srt.utils.common import (
     get_device_capability,
     is_cuda,
-    is_sm100_supported,
 )
 from sglang.srt.utils.custom_op import register_custom_op_from_extern
 
@@ -21,7 +23,7 @@ fp4_quantize = None
 try:
     from flashinfer import fp4_quantize as _flashinfer_fp4_quantize
 
-    _flashinfer_fp4_quantize_backend = "cute-dsl" if is_sm100_supported() else "cuda"
+    _flashinfer_fp4_quantize_backend = "cute-dsl" if get_platform().is_sm100 else "cuda"
 
     def _round_up(x: int, y: int) -> int:
         return ((x + y - 1) // y) * y
@@ -146,7 +148,7 @@ def initialize_fp4_gemm_config() -> None:
 
     backend = get_exec().kernel.fp4_gemm_runner_backend
     if backend == "auto":
-        if is_sm100_supported():
+        if get_platform().is_sm100:
             backend = "flashinfer_cutedsl"
         elif is_cuda() and (10, 0) > get_device_capability() >= (8, 0):
             backend = "marlin"

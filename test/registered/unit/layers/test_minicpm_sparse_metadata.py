@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 import torch
 
+from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -96,7 +97,7 @@ def _construct_sparse_backend(
     with (
         get_schedule().override(chunked_prefill_size=chunked_prefill_size),
         patch.object(backend_module, "MiniCPMHybridConfig", SimpleNamespace),
-        patch.object(backend_module, "is_blackwell_supported", return_value=blackwell),
+        override_platform(is_blackwell=blackwell),
         patch.object(
             backend_module,
             "FlashAttentionBackend",
@@ -292,7 +293,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
                 {"sglang.srt.layers.attention.minicpm.fuse_kernel": fake_fuse_kernel},
             ),
             patch.object(backend_module, "MiniCPMHybridConfig", SimpleNamespace),
-            patch.object(backend_module, "is_blackwell_supported", return_value=True),
+            override_platform(is_blackwell=True),
             patch.object(
                 backend_module,
                 "FlashAttentionBackend",
@@ -318,7 +319,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         model_config.num_attention_heads = 8
         with (
             patch.object(backend_module, "MiniCPMHybridConfig", SimpleNamespace),
-            patch.object(backend_module, "is_blackwell_supported", return_value=True),
+            override_platform(is_blackwell=True),
             patch.object(
                 backend_module,
                 "FlashAttentionBackend",
@@ -337,7 +338,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         model_runner.server_args.attention_backend = "minicpm_flashattn"
         with (
             patch.object(backend_module, "MiniCPMHybridConfig", SimpleNamespace),
-            patch.object(backend_module, "is_blackwell_supported", return_value=False),
+            override_platform(is_blackwell=False),
             patch.object(
                 backend_module,
                 "FlashAttentionBackend",
@@ -397,7 +398,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         with (
             backend_module.envs.SGLANG_MINICPM_DENSE_AS_SPARSE.override(True),
             patch.object(backend_module, "MiniCPMHybridConfig", SimpleNamespace),
-            patch.object(backend_module, "is_blackwell_supported", return_value=False),
+            override_platform(is_blackwell=False),
             patch.object(
                 backend_module,
                 "FlashAttentionBackend",

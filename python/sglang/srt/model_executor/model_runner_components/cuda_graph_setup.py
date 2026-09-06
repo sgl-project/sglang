@@ -31,9 +31,6 @@ from sglang.srt.model_executor.graph_memory_usage import (
 )
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
-from sglang.srt.model_executor.model_runner_components.layer_setup import (
-    compute_attention_and_moe_layers,
-)
 from sglang.srt.model_executor.runner import (
     EagerRunner,
     PrefillCudaGraphRunner,
@@ -45,6 +42,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_flags,
+    get_parallel,
     get_schedule,
     get_spec,
 )
@@ -55,26 +53,29 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.base_runner import BaseRunner
 
 logger = logging.getLogger(__name__)
+_deep_gemm_layout_memory_budget_initialized = False
 
 
 def _align_pipeline_layers(layers: list, layer_model) -> list:
     has_start_layer = hasattr(layer_model, "start_layer")
     has_end_layer = hasattr(layer_model, "end_layer")
-    assert (
-        has_start_layer == has_end_layer
-    ), "pipeline layer ranges must define start_layer and end_layer together"
+    assert has_start_layer == has_end_layer, (
+        "pipeline layer ranges must define start_layer and end_layer together"
+    )
     start_layer = layer_model.start_layer if has_start_layer else 0
     end_layer = layer_model.end_layer if has_end_layer else len(layer_model.layers)
-    assert isinstance(start_layer, int) and isinstance(
-        end_layer, int
-    ), "pipeline layer ranges must define integer start_layer and end_layer"
+    assert isinstance(start_layer, int) and isinstance(end_layer, int), (
+        "pipeline layer ranges must define integer start_layer and end_layer"
+    )
     assert 0 <= start_layer <= end_layer <= len(layer_model.layers), (
         f"invalid pipeline layer range [{start_layer}, {end_layer}) for "
         f"{len(layer_model.layers)} layers"
     )
-    assert (
-        len(layers) <= end_layer - start_layer
-    ), f"found {len(layers)} layers in PP range [{start_layer}, {end_layer})"
+    if len(layers) == len(layer_model.layers):
+        return layers
+    assert len(layers) <= end_layer - start_layer, (
+        f"found {len(layers)} layers in PP range [{start_layer}, {end_layer})"
+    )
     return (
         [None] * start_layer + layers + [None] * (len(layer_model.layers) - end_layer)
     )
@@ -154,6 +155,75 @@ class CudaGraphsCapture(msgspec.Struct, frozen=True, kw_only=True):
         )
 
 
+def refresh_deep_gemm_layout_memory_budget(
+    model_runner: ModelRunner, *, only_if_initialized: bool = False
+) -> None:
+    """Set the all-rank budget before capture, then refresh after startup."""
+    global _deep_gemm_layout_memory_budget_initialized
+    if (
+        model_runner.device != "cuda"
+        or envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.get().lower() != "auto"
+    ):
+        return
+
+    if only_if_initialized:
+        # Target and draft share the budget. Its pre-capture initialization
+        # already used a world-wide collective, so this guard is rank-uniform
+        # and also covers a draft-only DeepGEMM backend outside draft context.
+        if not _deep_gemm_layout_memory_budget_initialized:
+            return
+    else:
+        if model_runner.is_draft_worker:
+            moe_runner_backend = (
+                get_spec().speculative_moe_runner_backend
+                or get_exec().moe.moe_runner_backend
+            )
+            moe_a2a_backend = (
+                get_spec().speculative_moe_a2a_backend or get_exec().moe.moe_a2a_backend
+            )
+        else:
+            moe_runner_backend = get_exec().moe.moe_runner_backend
+            moe_a2a_backend = get_exec().moe.moe_a2a_backend
+
+        uses_deep_gemm_moe_runner = moe_runner_backend == "deep_gemm"
+        if moe_runner_backend == "auto" and model_runner.model_config.quantization in (
+            "fp8",
+            "mxfp8",
+        ):
+            from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
+            from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+
+            uses_deep_gemm_moe_runner = (
+                Fp8MoEMethod.is_deepgemm_moe_runner_backend_enabled(
+                    MoeRunnerBackend(moe_runner_backend),
+                    MoeA2ABackend(moe_a2a_backend),
+                )
+            )
+        if not uses_deep_gemm_moe_runner:
+            return
+
+    from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+        set_masked_standard_layout_memory_budget,
+    )
+
+    world_group = get_world_group()
+    available_memory_gb = get_available_gpu_memory(
+        model_runner.device,
+        model_runner.gpu_id,
+        distributed=world_group.world_size > 1,
+        cpu_group=world_group.cpu_group,
+    )
+    budget_bytes = set_masked_standard_layout_memory_budget(
+        int(available_memory_gb * (1 << 30))
+    )
+    _deep_gemm_layout_memory_budget_initialized = True
+    logger.info(
+        "DeepGEMM masked layout budget: %.2f GiB from %.2f GiB free.",
+        budget_bytes / (1 << 30),
+        available_memory_gb,
+    )
+
+
 def capture_cuda_graphs(
     *, model_runner: ModelRunner, capture_decode_cuda_graph: bool = True
 ) -> CudaGraphsCapture:
@@ -176,56 +246,7 @@ def capture_cuda_graphs(
     # runners point at it) and the eager fallback when a cg runner can't run a
     # batch.
     eager_runner = EagerRunner(model_runner)
-
-    if model_runner.is_draft_worker:
-        moe_runner_backend = (
-            get_spec().speculative_moe_runner_backend
-            or get_exec().moe.moe_runner_backend
-        )
-        moe_a2a_backend = (
-            get_spec().speculative_moe_a2a_backend or get_exec().moe.moe_a2a_backend
-        )
-    else:
-        moe_runner_backend = get_exec().moe.moe_runner_backend
-        moe_a2a_backend = get_exec().moe.moe_a2a_backend
-
-    uses_deep_gemm_moe_runner = moe_runner_backend == "deep_gemm"
-    if moe_runner_backend == "auto" and model_runner.model_config.quantization in (
-        "fp8",
-        "mxfp8",
-    ):
-        from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
-        from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
-
-        uses_deep_gemm_moe_runner = Fp8MoEMethod.is_deepgemm_moe_runner_backend_enabled(
-            MoeRunnerBackend(moe_runner_backend),
-            MoeA2ABackend(moe_a2a_backend),
-        )
-
-    if (
-        model_runner.device == "cuda"
-        and envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.get().lower() == "auto"
-        and uses_deep_gemm_moe_runner
-    ):
-        from sglang.srt.layers.moe.moe_runner.deep_gemm import (
-            set_masked_standard_layout_memory_budget,
-        )
-
-        world_group = get_world_group()
-        available_memory_gb = get_available_gpu_memory(
-            model_runner.device,
-            model_runner.gpu_id,
-            distributed=world_group.world_size > 1,
-            cpu_group=world_group.cpu_group,
-        )
-        budget_bytes = set_masked_standard_layout_memory_budget(
-            int(available_memory_gb * (1 << 30))
-        )
-        logger.info(
-            "DeepGEMM masked layout budget: %.2f GiB from %.2f GiB free.",
-            budget_bytes / (1 << 30),
-            available_memory_gb,
-        )
+    refresh_deep_gemm_layout_memory_budget(model_runner)
 
     # cuda-graph capture: prefill before decode, so both coalesce onto the
     # eager buffer allocated above. (capture_prefill_graph routes prefill
@@ -287,6 +308,7 @@ def capture_prefill_graph(
     """Initialize a prefill graph and return its startup resource usage."""
 
     memory_phase = "draft_prefill" if model_runner.is_draft_worker else "prefill"
+    role = "draft" if model_runner.is_draft_worker else "target"
 
     def result(
         runner: Optional[BaseRunner],
@@ -322,14 +344,14 @@ def capture_prefill_graph(
     # Skip prefill CG for EAGLE target on tc_piecewise when the fixed server
     # capture ceiling is below FULL. EAGLE target prefill requests FULL, so a
     # NULL or LAST graph is dead; capturing it can perturb FP4/TRTLLM-MoE
-    # state and corrupt decode replay (see #28386 and #28870). BCG captures
-    # FULL for EAGLE target in PrefillCudaGraphRunner.__init__, so it does not
-    # need this skip.
+    # state and corrupt decode replay (see #28386 and #28870). BCG and FullCG
+    # capture FULL for EAGLE targets in PrefillCudaGraphRunner.__init__, so
+    # they do not need this skip.
     if (
         model_runner.spec_algorithm.is_eagle()
         and not model_runner.is_draft_worker
         and get_server_return_hidden_states_mode() < CaptureHiddenMode.FULL
-        and not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
+        and check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
     ):
         logger.info(
             "Disable prefill CUDA graph for EAGLE target on tc_piecewise "
@@ -365,6 +387,17 @@ def capture_prefill_graph(
 
     prefill_config = get_exec().graph.cuda_graph_config.prefill
     prefill_backend = prefill_config.backend
+    parallel = get_parallel()
+    if (
+        prefill_backend == Backend.BREAKABLE
+        and parallel.enable_prefill_cp
+        and parallel.pp_size > 1
+    ):
+        logger.warning(
+            "Disable prefill CUDA graph because pipeline parallelism combined "
+            "with prefill context parallelism is not validated."
+        )
+        return result(eager_runner)
     context_length = model_runner.model_config.context_len
     if prefill_backend == Backend.FULL:
         max_capture_requests = prefill_config.full_prefill_max_req
@@ -419,8 +452,10 @@ def capture_prefill_graph(
         layer_model = layer_model.model
 
     if not hasattr(layer_model, "layers"):
-        logger.warning(
-            "Disable prefill CUDA graph because the model does not have a 'layers' attribute"
+        log_info_on_rank0(
+            logger,
+            f"Disable {role} prefill CUDA graph because the {role} model does "
+            "not have a 'layers' attribute",
         )
         return result(None)
 
@@ -430,7 +465,7 @@ def capture_prefill_graph(
         model_runner.moe_fusions,
         model_runner.dsa_indexers,
         model_runner.mha_companion_layers,
-    ) = compute_attention_and_moe_layers(layer_model)
+    ) = model_runner.get_cuda_graph_layers(layer_model)
     (
         model_runner.attention_layers,
         model_runner.mha_companion_layers,
@@ -456,7 +491,6 @@ def capture_prefill_graph(
 
     tic = time.perf_counter()
     before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
-    role = "draft" if model_runner.is_draft_worker else "target"
     capture_name = f"{role} prefill"
     logger.info(
         f"Capture {capture_name} CUDA graph begin. "

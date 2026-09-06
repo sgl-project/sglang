@@ -1009,10 +1009,10 @@ class CommonKVManager(BaseKVManager):
         returned unchanged.
         """
         start_layer = self.kv_args.prefill_start_layer
-        end_layer = getattr(self.kv_args, "prefill_end_layer", None)
-        assert (
-            end_layer is not None
-        ), "KVArgs.prefill_end_layer must be set when using compressed-MLA PD with PP"
+        end_layer = self.kv_args.prefill_end_layer
+        assert end_layer is not None, (
+            "KVArgs.prefill_end_layer must be set when using compressed-MLA PD with PP"
+        )
 
         c4_full = sum(1 for r in mla_ratios if r == 4)
         c128_full = sum(1 for r in mla_ratios if r == 128)
@@ -1066,8 +1066,7 @@ class CommonKVManager(BaseKVManager):
             list(dst_kv_ptrs[swa_s:swa_e])
             + list(
                 dst_kv_ptrs[
-                    compress_section_start
-                    + c4_off_s : compress_section_start
+                    compress_section_start + c4_off_s : compress_section_start
                     + c4_off_e
                 ]
             )
@@ -1669,6 +1668,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.app = web.Application()
         self.store = dict()
         self.lock = asyncio.Lock()
+        # The event loop only keeps weak references to tasks, so a long-lived
+        # task needs a strong reference to survive garbage collection.
+        self._background_tasks: Set[asyncio.Task] = set()
         self._setup_routes()
         self.pp_size = None
         self.attn_tp_size = None
@@ -1916,7 +1918,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
 
-            self._loop.create_task(self._cleanup_expired_entries())
+            cleanup_task = self._loop.create_task(self._cleanup_expired_entries())
+            self._background_tasks.add(cleanup_task)
+            cleanup_task.add_done_callback(self._background_tasks.discard)
 
             access_log = None
             if logging.getLogger(__name__).getEffectiveLevel() <= logging.DEBUG:

@@ -210,12 +210,12 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
 
         if not isinstance(pixel_values, (torch.Tensor, list)):
             raise ValueError(
-                "Incorrect type of pixel values. " f"Got type: {type(pixel_values)}"
+                f"Incorrect type of pixel values. Got type: {type(pixel_values)}"
             )
 
         if not isinstance(tgt_sizes, (torch.Tensor, list)):
             raise ValueError(
-                "Incorrect type of target sizes. " f"Got type: {type(tgt_sizes)}"
+                f"Incorrect type of target sizes. Got type: {type(tgt_sizes)}"
             )
 
         if len(pixel_values) != len(tgt_sizes):
@@ -232,7 +232,7 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
             # per image
             if len(pixel_b) != len(tgt_b):
                 raise ValueError(
-                    "Inconsistent N lengths, found: " f"{len(pixel_b)} vs {len(tgt_b)}"
+                    f"Inconsistent N lengths, found: {len(pixel_b)} vs {len(tgt_b)}"
                 )
             slices_per_image.append(len(pixel_b))
             for pixel_n, tgt_n in zip(pixel_b, tgt_b):

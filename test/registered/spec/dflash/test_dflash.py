@@ -1,4 +1,5 @@
 import unittest
+from contextlib import ExitStack
 
 import openai
 
@@ -22,7 +23,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=420, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=500, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=420, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
@@ -45,6 +46,8 @@ class TestDFlashServerBase(
     draft_model = DEFAULT_DRAFT_MODEL_DFLASH
     gsm8k_accuracy_thres = 0.75
     gsm8k_accept_length_thres = 2.8
+    # (env, value) pairs applied around the server launch.
+    extra_env_overrides: tuple = ()
 
     @classmethod
     def setUpClass(cls):
@@ -71,12 +74,15 @@ class TestDFlashServerBase(
         if cls.disable_overlap:
             launch_args.append("--disable-overlap-schedule")
         launch_args.extend(cls.other_launch_args)
-        with (
-            envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.override(cls.overlap_plan_stream),
-            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
-            envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True),
-            envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(True),
-        ):
+        with ExitStack() as stack:
+            for env, value in (
+                (envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM, cls.overlap_plan_stream),
+                (envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),
+                (envs.SGLANG_ENABLE_ASYNC_ASSERT, True),
+                (envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN, True),
+                *cls.extra_env_overrides,
+            ):
+                stack.enter_context(env.override(value))
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
@@ -171,6 +177,28 @@ class TestDFlashServerOverlap(TestDFlashServerBase):
 
 class TestDFlashServerOverlapPlanStream(TestDFlashServerOverlap):
     overlap_plan_stream = True
+
+
+@unittest.skipIf(
+    is_hip(),
+    "borrowing is CUDA-only and ROCm has no DFLASH sampling-verify kernel",
+)
+class TestDFlashServerGraphPoolBorrow(TestDFlashServerBase):
+    """Verify probabilities served out of idle CUDA graph storage. Only the
+    non-greedy accept path borrows, hence the sampled GSM8K below."""
+
+    extra_env_overrides = (
+        (envs.SGLANG_ENABLE_GRAPH_POOL_BORROW, 1),
+        (envs.SGLANG_ENABLE_GRAPH_POOL_PRECARVE, 1),
+    )
+    disable_overlap = False
+    gsm8k_temperature = 0.6
+    gsm8k_top_p = 0.95
+    # Measured over 4x200 examples per arm: score 0.7525 (sd 0.021) and accept
+    # length 2.80, borrowing on or off. Corruption collapses accept length
+    # toward 1.0; the accuracy floor is loose to absorb other hardware.
+    gsm8k_accuracy_thres = 0.60
+    gsm8k_accept_length_thres = 2.0
 
 
 if __name__ == "__main__":

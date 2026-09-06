@@ -13,7 +13,11 @@ from sglang.srt.disaggregation.decode import (  # noqa: E402
     SchedulerDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req  # noqa: E402
+from sglang.srt.managers.schedule_batch import (  # noqa: E402
+    FINISH_ABORT,
+    Req,
+    ReqKvInfo,
+)
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.runtime_context import get_context  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -93,11 +97,10 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
             priority=priority,
             origin_input_ids=[1, 2, 3],
             output_ids=[],
-            req_pool_idx=int(priority) % 8,
             finished_reason=FINISH_ABORT("failed") if failed else None,
             return_logprob=False,
             sampling_params=SimpleNamespace(max_new_tokens=8),
-            cache_protected_len=0,
+            kv=ReqKvInfo(req_pool_idx=int(priority) % 8, cache_protected_len=0),
             time_stats=MagicMock(),
         )
         return SimpleNamespace(
@@ -448,18 +451,21 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.waiting_queue[0].priority = 1
         scheduler.waiting_queue[1].priority = 10
         scheduler.enable_priority_scheduling = True
-        scheduler.policy.calc_priority.side_effect = (
-            lambda waiting_queue, _: waiting_queue.sort(key=lambda req: -req.priority)
+        scheduler.policy.calc_priority.side_effect = lambda waiting_queue, _: (
+            waiting_queue.sort(key=lambda req: -req.priority)
         )
 
         new_batch = MagicMock()
         # get_new_prebuilt_batch reads the published disagg config
         # (disaggregation_decode_enable_radix_cache).
-        with patch(
-            "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
-            return_value=new_batch,
-        ) as init_new, get_context().override_server_args(
-            disaggregation_decode_enable_radix_cache=False
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+                return_value=new_batch,
+            ) as init_new,
+            get_context().override_server_args(
+                disaggregation_decode_enable_radix_cache=False
+            ),
         ):
             ret = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
                 scheduler, scheduler.running_batch
@@ -487,11 +493,14 @@ class TestDecodePrebuilt(unittest.TestCase):
         )
         new_batch.process_prebuilt.side_effect = lambda *_: call_order.append("process")
 
-        with patch(
-            "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
-            return_value=new_batch,
-        ), get_context().override_server_args(
-            disaggregation_decode_enable_radix_cache=False
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+                return_value=new_batch,
+            ),
+            get_context().override_server_args(
+                disaggregation_decode_enable_radix_cache=False
+            ),
         ):
             ret = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
                 scheduler, scheduler.running_batch
