@@ -235,12 +235,7 @@ class TestDraftFactoryStamping(CustomTestCase):
 
         from sglang.srt.speculative.draft_utils import DraftBackendFactory
 
-        runner = SimpleNamespace(
-            draft_attention_backend=draft_backend,
-            model_config=SimpleNamespace(
-                hf_config=SimpleNamespace(), hf_text_config=SimpleNamespace()
-            ),
-        )
+        runner = SimpleNamespace(draft_attention_backend=draft_backend)
         return DraftBackendFactory(runner, topk=1, speculative_num_steps=2)
 
     def test_a_decode_container_stamps_its_per_step_children(self):

@@ -1,7 +1,6 @@
-from sglang.srt.layers.attention.qsa.config import (
-    QSA_VARIANT_COMPRESSED,
-    parse_qsa_profile,
-)
+from typing import Optional
+
+from sglang.srt.layers.attention.qsa.config import QSA_VARIANT_COMPRESSED, QSAProfile
 from sglang.srt.runtime_context import attention_backends, get_spec
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
@@ -35,14 +34,15 @@ class DraftBackendFactory:
         topk: int,
         speculative_num_steps: int,
         seed_dsa_topk_from_draft_extend: bool = False,
+        qsa_profile: Optional[QSAProfile] = None,
     ):
         self.draft_model_runner = draft_model_runner
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.seed_dsa_topk_from_draft_extend = seed_dsa_topk_from_draft_extend
+        self.qsa_profile = qsa_profile
         # The draft runner's own backend, not the process-wide config.
         self.draft_attn_backend = draft_model_runner.draft_attention_backend
-        self.qsa_profile = parse_qsa_profile(draft_model_runner.model_config.hf_config)
 
     def _create_backend(
         self,

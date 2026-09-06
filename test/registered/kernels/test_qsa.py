@@ -396,6 +396,7 @@ def test_qsa_cuda_graph_padding_reaches_hybrid_children():
 
 
 def test_qsa_draft_extend_backend_decision_follows_profile():
+    from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
     from sglang.srt.speculative.draft_utils import DraftBackendFactory
 
     def factory(config):
@@ -404,7 +405,10 @@ def test_qsa_draft_extend_backend_decision_follows_profile():
             draft_attention_backend=None,
         )
         return DraftBackendFactory(
-            draft_model_runner=runner, topk=1, speculative_num_steps=3
+            draft_model_runner=runner,
+            topk=1,
+            speculative_num_steps=3,
+            qsa_profile=parse_qsa_profile(config),
         )
 
     compressed = factory(_compressed_config_namespace())
