@@ -142,10 +142,11 @@ def expand_prefill_causally(
         seq_lens_casual = torch.nn.functional.pad(
             seq_lens_casual, (0, pad_size), value=1
         )
-        req_pool_indices_repeated = torch.nn.functional.pad(
-            req_pool_indices_repeated,
-            (0, pad_size),
-            value=req_pool_indices_repeated[-1].item(),
+        req_pool_indices_repeated = torch.cat(
+            (
+                req_pool_indices_repeated,
+                req_pool_indices_repeated[-1:].expand(pad_size),
+            )
         )
     return ExpandPrefillCausallyResult(
         seq_lens_casual=seq_lens_casual,

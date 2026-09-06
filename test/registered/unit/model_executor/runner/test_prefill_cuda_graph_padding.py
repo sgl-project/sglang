@@ -24,18 +24,21 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         runner._capture_chunked_prefix = False
         runner.prefill_backend_name = Backend.TC_PIECEWISE
         runner.has_mha_companion_layers = False
+        runner.prefer_eager_mixed_prefill = False
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [4, 16]
         runner.max_num_tokens = 16
         return runner
 
-    def _make_forward_batch(self, num_tokens):
+    def _make_forward_batch(self, num_tokens, mode=ForwardMode.EXTEND):
         return SimpleNamespace(
             batch_size=1,
             input_embeds=None,
             replace_embeds=None,
             mm_inputs=None,
-            forward_mode=ForwardMode.EXTEND,
+            forward_mode=mode,
+            global_forward_mode=None,
+            _original_forward_mode=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             global_num_tokens_cpu=None,
             return_logprob=False,
@@ -52,6 +55,14 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         runner = self._make_runner()
 
         self.assertTrue(runner.can_run_graph(self._make_forward_batch(8)))
+
+    def test_mixed_batch_uses_scoped_runner_policy(self):
+        runner = self._make_runner()
+        batch = self._make_forward_batch(8, mode=ForwardMode.MIXED)
+
+        self.assertTrue(runner.can_run_graph(batch))
+        runner.prefer_eager_mixed_prefill = True
+        self.assertFalse(runner.can_run_graph(batch))
 
     def test_replay_snapshot_uses_padded_token_count(self):
         runner = self._make_runner()

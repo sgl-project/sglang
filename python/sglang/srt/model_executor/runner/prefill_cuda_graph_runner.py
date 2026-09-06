@@ -298,6 +298,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- prefill graph config -------------------------------------
         prefill_config = get_exec().graph.cuda_graph_config.prefill
         self.prefill_backend_name = prefill_config.backend
+        self.prefer_eager_mixed_prefill = (
+            self.prefill_backend_name == Backend.BREAKABLE
+            and get_parallel().enable_dp_attention
+            and getattr(
+                model_runner.attn_backend,
+                "prefer_eager_mixed_prefill_under_dp_attention",
+                False,
+            )
+        )
         # bs in prefill carries the captured shape (token count for
         # tc_piecewise) — one shape knob per phase.
         capture_tokens = prefill_config.bs
@@ -1145,6 +1154,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         capture_hidden_mode,
         return_logprob: bool,
         lora_ineligible: bool = False,
+        is_mixed: bool = False,
     ) -> bool:
         """Rank-local replay eligibility: the single source of truth for
         ``can_run_graph`` (ForwardBatch, forward time) and the dp mlp-sync
@@ -1159,6 +1169,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # keeps LoRA prefill eager on every rank under dp attention, so the
         # schedule-time vote derives this from enable_lora alone.
         if lora_ineligible:
+            return False
+        if is_mixed and getattr(self, "prefer_eager_mixed_prefill", False):
             return False
         if input_embeds is not None:
             return False
@@ -1227,6 +1239,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self._capture_lora
                 and self.model_runner.lora_manager.can_use_prefill_cuda_graph(
                     forward_batch
+                )
+            ),
+            is_mixed=any(
+                getattr(forward_batch, field, None) == ForwardMode.MIXED
+                for field in (
+                    "forward_mode",
+                    "global_forward_mode",
+                    "_original_forward_mode",
                 )
             ),
         ):
