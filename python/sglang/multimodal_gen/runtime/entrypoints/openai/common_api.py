@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils.auth import AuthLevel, auth_level
 from sglang.srt.utils.json_response import orjson_response
 
 router = APIRouter(prefix="/v1")
@@ -85,6 +86,7 @@ async def _handle_lora_request(req: Any, success_msg: str, failure_msg: str):
 
 
 @router.post("/set_lora")
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def set_lora(
     lora_nickname: Union[str, List[str]] = Body(..., embed=True),
     lora_path: Optional[Union[str, List[Optional[str]]]] = Body(None, embed=True),
@@ -133,6 +135,7 @@ async def set_lora(
 
 
 @router.post("/merge_lora_weights")
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def merge_lora_weights(
     target: str = Body("all", embed=True),
     strength: float = Body(1.0, embed=True),
@@ -155,6 +158,7 @@ async def merge_lora_weights(
 
 
 @router.post("/unmerge_lora_weights")
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def unmerge_lora_weights(
     target: str = Body("all", embed=True),
 ):

@@ -42,6 +42,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
     init_logger,
 )
+from sglang.srt.utils.auth import (
+    add_api_key_middleware,
+    app_has_admin_force_endpoints,
+)
 from sglang.srt.utils.json_response import orjson_response
 from sglang.version import __version__
 
@@ -432,6 +436,17 @@ def create_app(server_args: ServerArgs):
     app.include_router(mesh_api.router)
     app.include_router(weights_api.router)
     app.include_router(rollout_api.router)
+
+    if (
+        server_args.api_key
+        or server_args.admin_api_key
+        or app_has_admin_force_endpoints(app)
+    ):
+        add_api_key_middleware(
+            app,
+            api_key=server_args.api_key,
+            admin_api_key=server_args.admin_api_key,
+        )
 
     app.state.server_args = server_args
     return app
