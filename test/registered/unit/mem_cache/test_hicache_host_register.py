@@ -10,12 +10,15 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
 )
+from sglang.srt.mem_cache.pool_host import common as pool_host_common
 from sglang.srt.mem_cache.pool_host import mha as mha_pool_host
 from sglang.srt.mem_cache.pool_host import mla as mla_pool_host
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    HostTensorAllocator,
     _cuda_host_register,
     _cuda_host_unregister,
+    alloc_with_host_register,
 )
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
@@ -406,6 +409,134 @@ class TestHiCacheHostRegister(unittest.TestCase):
         )
         for ptr, _, _ in cudart.registrations:
             self.assertEqual((ptr - base) % page_copy_bytes, 0)
+
+
+class _FakeOwningAllocator(HostTensorAllocator):
+    """Stands in for ShmHostTensorAllocator: a subclass, so the exact type test
+    in alloc_with_host_register() must not read it as the default allocator."""
+
+    def __init__(self, buffer):
+        super().__init__()
+        self.buffer = buffer
+        self.call = None
+
+    def allocate(self, dims, dtype, device):
+        self.call = (dims, dtype, device)
+        return self.buffer
+
+
+class _IsolatedLedger(unittest.TestCase):
+    def setUp(self):
+        # The ledger is module state, and two tests above leave 0x10000000 in
+        # it, which is the base every _FakeBuffer here uses. Swap in an empty
+        # set so a collision cannot decide the outcome either way.
+        patcher = mock.patch.object(pool_host_common, "_registered_host_ptrs", set())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+class TestHostRegisterLedger(_IsolatedLedger):
+    def test_a_buffer_that_was_never_registered_is_left_alone(self):
+        cudart = _FakeCudart()
+
+        with (
+            mock.patch.object(pool_host_common, "_is_hip", True),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
+            _cuda_host_unregister(_FakeBuffer(0x10000000, 4096))
+
+        self.assertEqual(cudart.unregistrations, [])
+
+    def test_the_ledger_still_releases_what_it_recorded(self):
+        cudart = _FakeCudart()
+        buffer = _FakeBuffer(0x10000000, 4096)
+
+        with (
+            mock.patch.object(pool_host_common, "_is_hip", True),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
+            _cuda_host_register(buffer)
+            _cuda_host_unregister(buffer)
+
+        self.assertEqual(cudart.unregistrations, [0x10000000])
+
+    def test_non_rocm_preserves_unregister_without_the_ledger(self):
+        cudart = _FakeCudart()
+
+        with (
+            mock.patch.object(pool_host_common, "_is_hip", False),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
+            _cuda_host_unregister(_FakeBuffer(0x10000000, 4096))
+
+        self.assertEqual(cudart.unregistrations, [0x10000000])
+
+
+class TestRocmPinsInsteadOfRegistering(_IsolatedLedger):
+    """Which branch of alloc_with_host_register() runs, and nothing more.
+
+    torch.empty is stubbed: pinning needs a HIP runtime that CPU CI has not
+    got, so these pin the branch choice and the pin_memory request, not that
+    the result is page-locked at an address the GPU can reach.
+    """
+
+    def _alloc(self, *, is_hip, allocator, pin_memory=True):
+        self.cudart = _FakeCudart()
+        self.empty = mock.Mock(return_value=mock.sentinel.pinned)
+        with (
+            mock.patch.object(pool_host_common, "_is_hip", is_hip),
+            mock.patch.object(torch, "empty", self.empty),
+            mock.patch.object(torch.cuda, "cudart", return_value=self.cudart),
+        ):
+            return alloc_with_host_register(
+                (4, 8), torch.float16, "cpu", pin_memory, allocator
+            )
+
+    def test_rocm_pins_the_default_allocators_buffer(self):
+        allocator = HostTensorAllocator()
+
+        with mock.patch.object(allocator, "allocate") as allocate:
+            buffer = self._alloc(is_hip=True, allocator=allocator)
+
+        self.assertIs(buffer, mock.sentinel.pinned)
+        self.assertEqual(
+            self.empty.call_args,
+            mock.call((4, 8), dtype=torch.float16, device="cpu", pin_memory=True),
+        )
+        allocate.assert_not_called()
+        self.assertEqual(self.cudart.registrations, [])
+
+    def test_rocm_still_registers_an_allocator_that_owns_its_memory(self):
+        buffer = _FakeBuffer(0x20000000, 4096)
+        allocator = _FakeOwningAllocator(buffer)
+
+        self.assertIs(self._alloc(is_hip=True, allocator=allocator), buffer)
+        self.assertEqual(allocator.call, ((4, 8), torch.float16, "cpu"))
+        self.empty.assert_not_called()
+        self.assertEqual(self.cudart.registrations, [(0x20000000, 4096, 0)])
+
+    def test_off_rocm_the_default_allocator_still_registers(self):
+        buffer = _FakeBuffer(0x30000000, 4096)
+        allocator = HostTensorAllocator()
+
+        with mock.patch.object(allocator, "allocate", return_value=buffer):
+            self.assertIs(self._alloc(is_hip=False, allocator=allocator), buffer)
+
+        self.empty.assert_not_called()
+        self.assertEqual(self.cudart.registrations, [(0x30000000, 4096, 0)])
+
+    def test_rocm_leaves_an_unpinned_request_unpinned(self):
+        buffer = _FakeBuffer(0x40000000, 4096)
+        allocator = HostTensorAllocator()
+
+        with mock.patch.object(allocator, "allocate", return_value=buffer):
+            self.assertIs(
+                self._alloc(is_hip=True, allocator=allocator, pin_memory=False),
+                buffer,
+            )
+
+        self.empty.assert_not_called()
+        self.assertEqual(self.cudart.registrations, [])
 
 
 if __name__ == "__main__":

@@ -1578,6 +1578,132 @@ class TestHiCacheArgs(unittest.TestCase):
         self.assertEqual(resolution_result(args, "hicache_mem_layout"), "page_first")
         self.assertIsNone(resolution_result(args, "decode_attention_backend"))
 
+    def test_rocm_kernel_io_backend_yields_to_an_owned_host_allocator(self):
+        cases = [
+            {
+                "name": "no_storage_backend_keeps_kernel",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                },
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "page_first",
+            },
+            {
+                "name": "shm",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "shm",
+                },
+                "expected_io_backend": "direct",
+                "expected_mem_layout": "page_first_direct",
+            },
+            {
+                "name": "mooncake",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "mooncake",
+                },
+                "expected_io_backend": "direct",
+                "expected_mem_layout": "page_first_direct",
+            },
+            {
+                "name": "mori",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "mori",
+                },
+                "expected_io_backend": "direct",
+                "expected_mem_layout": "page_first_direct",
+            },
+            {
+                "name": "dynamic_with_shm_allocator",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "dynamic",
+                    "hicache_storage_backend_extra_config": '{"allocator": "shm"}',
+                },
+                "expected_io_backend": "direct",
+                "expected_mem_layout": "page_first_direct",
+            },
+            {
+                "name": "dynamic_without_allocator",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "dynamic",
+                },
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "page_first",
+            },
+            {
+                "name": "file",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "file",
+                },
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "page_first",
+            },
+            {
+                "name": "hf3fs",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "hf3fs",
+                },
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "page_first",
+            },
+            {
+                "name": "nixl",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "nixl",
+                },
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "page_first",
+            },
+            {
+                "name": "kernel_ascend_with_shm",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "shm",
+                    "hicache_io_backend": "kernel_ascend",
+                },
+                "expected_io_backend": "kernel_ascend",
+                "expected_mem_layout": "page_first",
+            },
+            {
+                "name": "explicit_direct_with_shm",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "shm",
+                    "hicache_io_backend": "direct",
+                },
+                "expected_io_backend": "direct",
+                "expected_mem_layout": "page_first_direct",
+            },
+            {
+                "name": "shm_off_rocm_keeps_kernel",
+                "is_hip": False,
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "shm",
+                },
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "page_first",
+            },
+        ]
+
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                args = self._make_args(**case["overrides"])
+                with override_platform(is_hip=case.get("is_hip", True)):
+                    handle_hicache(args)
+                self._assert_hicache_fields(
+                    args,
+                    expected_io_backend=case["expected_io_backend"],
+                    expected_mem_layout=case["expected_mem_layout"],
+                )
+
     def test_decode_offload_rejects_host_pool_retraction(self):
         args = self._make_args(
             disaggregation_mode="decode",
