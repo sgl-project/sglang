@@ -188,7 +188,8 @@ export const benchmarks = [
   // (qwen4-main-squashed 9b2aee2283), 2026-09-06: all four cells run as the
   // command generator emits them. GSM8K is the full 1,319-question set with the
   // same chat protocol as the DGX Spark rows (chat completions API, thinking off,
-  // greedy, answer parsed from a final "The answer is N" line); the run_eval
+  // greedy, 8,192-token budget, answer parsed from a final "The answer is N"
+  // line); the run_eval
   // 5-shot / thinking-on figures are in the notes. Same 1024/256 bench workload;
   // tokens_per_sec_per_gpu is (input + output) tok/s on the one GPU; output alone
   // is one fifth of it (1024 in / 256 out, range ratio 1, ignore_eos).
@@ -196,7 +197,7 @@ export const benchmarks = [
   {
     match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "dev-qwen38-next-local image @ 9b2aee2283",
-    accuracy: { gsm8k_pct: 95.8 },
+    accuracy: { gsm8k_pct: 97.0 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 235.23, tpot_ms: 6.21, tokens_per_sec_per_gpu: 705 },
@@ -207,7 +208,7 @@ export const benchmarks = [
   {
     match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "dev-qwen38-next-local image @ 9b2aee2283",
-    accuracy: { gsm8k_pct: 95.8 },
+    accuracy: { gsm8k_pct: 97.1 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 162.25, tpot_ms: 11.49, tokens_per_sec_per_gpu: 415 },
@@ -221,7 +222,7 @@ export const benchmarks = [
   {
     match: { hw: "rtx6000", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
     sglang_version: "dev-qwen38-next-local image @ 9b2aee2283",
-    accuracy: { gsm8k_pct: 95.9 },
+    accuracy: { gsm8k_pct: 97.3 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 225.43, tpot_ms: 5.86, tokens_per_sec_per_gpu: 745 },
@@ -232,7 +233,7 @@ export const benchmarks = [
   {
     match: { hw: "rtx6000", variant: "default", quant: "nvfp4-nvda", strategy: "high-throughput", nodes: "single" },
     sglang_version: "dev-qwen38-next-local image @ 9b2aee2283",
-    accuracy: { gsm8k_pct: 96.4 },
+    accuracy: { gsm8k_pct: 97.1 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 158.37, tpot_ms: 11.54, tokens_per_sec_per_gpu: 415 },
