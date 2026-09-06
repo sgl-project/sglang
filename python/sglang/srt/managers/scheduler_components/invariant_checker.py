@@ -394,10 +394,14 @@ class SchedulerInvariantChecker:
 
         # Sub-allocators to check: a flat allocator is its own single sub; a
         # hybrid-SWA wrapper exposes full_attn_allocator + swa_attn_allocator.
-        # DSV4-HiSparse nests the real SWA allocator under logical_attn_allocator,
-        # so unwrap first (no-op for a plain/flat allocator).
         alloc = self.token_to_kv_pool_allocator
-        alloc = getattr(alloc, "logical_attn_allocator", alloc)
+        # Unified-KV DSV4-HiSparse nests the real SWA allocator one level
+        # down; elsewhere the wrapper is the object this invariant asserts on.
+        if (
+            getattr(getattr(alloc, "get_kvcache", lambda: None)(), "_unified_kv", False)
+            is True
+        ):
+            alloc = getattr(alloc, "logical_attn_allocator", alloc)
         sub_allocs = (
             [alloc]
             if getattr(alloc, "free_pages", None) is not None

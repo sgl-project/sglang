@@ -499,6 +499,16 @@ class PrefillAdder:
         self.prefill_tile_block_m = prefill_tile_block_m
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        # Unified-KV DSV4 sizes SWA as a fixed per-request ring slot, not a
+        # token budget. `is True`: a duck-typed stub must not select that path.
+        self._unified_kv = (
+            getattr(
+                getattr(token_to_kv_pool_allocator, "get_kvcache", lambda: None)(),
+                "_unified_kv",
+                False,
+            )
+            is True
+        )
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
@@ -661,7 +671,7 @@ class PrefillAdder:
     @property
     def rem_swa_tokens(self):
         allocator = self.token_to_kv_pool_allocator
-        if getattr(allocator.get_kvcache(), "_unified_kv", False):
+        if self._unified_kv:
             # Unified-KV: SWA is a per-request ring, not a tree-reusable token
             # pool. swa_available_size() already reports ring capacity
             # (free_slots * ring_cost). tree swa_evictable is in the old linear
@@ -717,7 +727,7 @@ class PrefillAdder:
         from double-counting extend, so budget <= extend + max_new_tokens + page.
         """
         allocator = self.token_to_kv_pool_allocator
-        if getattr(allocator.get_kvcache(), "_unified_kv", False):
+        if self._unified_kv:
             # Unified-KV: each request occupies exactly one fixed SWA ring slot,
             # independent of context / chunk length; a host-hit prefix reuses the
             # same ring. Budget the fixed per-slot ring cost (paired with the
@@ -850,8 +860,6 @@ class PrefillAdder:
         max_new_tokens: int,
         retracted_stain: bool,
         mamba_gap_reserve: int = 0,
-        host_hit_len: int = 0,
-        storage_hit_len: int = 0,
         is_chunked_continuation: bool = False,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
@@ -880,10 +888,7 @@ class PrefillAdder:
             # first admission and already reflected in swa_available_size() on
             # later rounds. Charging it again on a chunked continuation would
             # double-count the slot and over-throttle admission, so skip it.
-            _unified = getattr(
-                self.token_to_kv_pool_allocator.get_kvcache(), "_unified_kv", False
-            )
-            if not (_unified and is_chunked_continuation):
+            if not (self._unified_kv and is_chunked_continuation):
                 self.rem_swa_token_offset += self._swa_budget_for_req(
                     extend_input_len, max_new_tokens
                 )
@@ -1021,9 +1026,7 @@ class PrefillAdder:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
-            if self.is_hybrid_swa and not getattr(
-                self.token_to_kv_pool_allocator.get_kvcache(), "_unified_kv", False
-            ):
+            if self.is_hybrid_swa and not self._unified_kv:
                 # alloc_extend needs extend_num_tokens + page_size per request,
                 # so reserve one page here to avoid OOM.
                 # Unified-KV: rem_swa_tokens is ring capacity (free_slots * ring
@@ -1278,7 +1281,14 @@ class PrefillAdder:
                 self._swa_new_tokens(req),
                 swa_host_hit_length=req.swa_host_hit_length,
             )
-            if swa_needed > self.rem_swa_tokens:
+            # Unified-KV: rem_swa_tokens is an exact ring-slot capacity, so a
+            # request needing exactly what is left still fits. The legacy
+            # SWA-token path keeps its original conservative `>=`.
+            if (
+                swa_needed > self.rem_swa_tokens
+                if self._unified_kv
+                else swa_needed >= self.rem_swa_tokens
+            ):
                 if not self._swa_req_never_fits(
                     real_input_tokens,
                     self._swa_new_tokens(req),
@@ -1314,7 +1324,11 @@ class PrefillAdder:
                     self._swa_new_tokens(req),
                     swa_host_hit_length=req.swa_host_hit_length,
                 )
-                if swa_needed > self.rem_swa_tokens:
+                if (
+                    swa_needed > self.rem_swa_tokens
+                    if self._unified_kv
+                    else swa_needed >= self.rem_swa_tokens
+                ):
                     if not self._swa_req_never_fits(
                         real_input_tokens,
                         self._swa_new_tokens(req),

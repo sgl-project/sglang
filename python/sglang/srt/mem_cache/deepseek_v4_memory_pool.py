@@ -564,11 +564,18 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.c4_size = c4_size
         self.c4_logical_size = c4_logical_size
         self.c128_size = c128_size
-        # Keep the legacy SWA-addressed pool large enough on non-unified paths.
-        # Unified request-addressed sizing is set exactly after resolving the
-        # unified-kv gate below.
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
+        # Resolve the unified-kv gate before any sizing so the two cannot drift.
+        self._unified_kv = is_unified_kv_triton()
         c4_ring_size = self.get_ring_size(4)
-        c4_state_pool_size = max(c4_state_pool_size, self.num_req_slots * c4_ring_size)
+        if self._unified_kv:
+            # Unified C4 state is request-addressed: one ring per req slot,
+            # so the caller-supplied, SWA-scaled size does not apply here.
+            c4_state_pool_size = self.num_req_slots * c4_ring_size
+        # Non-unified (fp8) keeps the caller-supplied, SWA-addressed size.
         self.c4_state_pool_size = c4_state_pool_size
         c128_ring_size = self.get_ring_size(128)
         if ONLINE_C128:
@@ -623,15 +630,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         c128_layer_num = sum(1 for r in stage_ratios if r == 128)
         c4_page_size = page_size // 4
         c128_page_size = page_size // 128
-
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_triton,
-        )
-
-        self._unified_kv = is_unified_kv_triton()
-        if self._unified_kv:
-            # Unified C4 state is request-scoped: no SWA-derived over-allocation.
-            self.c4_state_pool_size = self.num_req_slots * c4_ring_size
 
         if self._unified_kv:
             self.swa_kv_pool = None

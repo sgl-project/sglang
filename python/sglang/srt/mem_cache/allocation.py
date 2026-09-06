@@ -261,7 +261,18 @@ def alloc_req_slots(
                 tree_cache.evict_for_alloc(
                     EvictParams(num_tokens=0, mamba_num=mamba_num)
                 )
-    newly_allocated = [req.kv.req_pool_idx is None for req in reqs]
+    # Unified-KV DSV4 only: a freshly allocated req slot carries stale C4 ring
+    # state. Resolve the hook before alloc() overwrites req_pool_idx.
+    clear_c4_req_states = (
+        getattr(token_to_kv_pool, "clear_c4_req_states", None)
+        if getattr(token_to_kv_pool, "_unified_kv", False) is True
+        else None
+    )
+    newly_allocated = (
+        [req.kv.req_pool_idx is None for req in reqs]
+        if clear_c4_req_states is not None
+        else None
+    )
     req_pool_indices = req_to_token_pool.alloc(reqs)
     if req_pool_indices is None:
         raise RuntimeError(
@@ -270,12 +281,12 @@ def alloc_req_slots(
             f"{req_to_token_pool.available_size()=}, {num_reqs=}, "
         )
 
-    new_req_pool_indices = [
-        idx for idx, is_new in zip(req_pool_indices, newly_allocated) if is_new
-    ]
-    clear_c4_req_states = getattr(token_to_kv_pool, "clear_c4_req_states", None)
-    if new_req_pool_indices and clear_c4_req_states is not None:
-        clear_c4_req_states(new_req_pool_indices)
+    if clear_c4_req_states is not None:
+        new_req_pool_indices = [
+            idx for idx, is_new in zip(req_pool_indices, newly_allocated) if is_new
+        ]
+        if new_req_pool_indices:
+            clear_c4_req_states(new_req_pool_indices)
     return req_pool_indices
 
 

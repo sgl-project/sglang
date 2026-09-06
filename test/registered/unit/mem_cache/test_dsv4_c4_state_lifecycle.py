@@ -83,6 +83,9 @@ class TestUnifiedC4StateLifecycle(unittest.TestCase):
     def test_alloc_clears_new_slots_but_not_reused_slots(self):
         req_pool = ReqToTokenPool(3, 16, "cpu", enable_memory_saver=False)
         token_pool = MagicMock()
+        # A bare MagicMock auto-creates a truthy `_unified_kv`, so the stub
+        # must declare it; the gate identity-compares against True.
+        token_pool._unified_kv = True
         reused = _request()
 
         # First admission: a brand-new slot, so its C4 ring must be cleared.
@@ -113,6 +116,23 @@ class TestUnifiedC4StateLifecycle(unittest.TestCase):
         self.assertEqual(indices[0], reused_idx)
         self.assertNotEqual(indices[1], reused_idx)
         token_pool.clear_c4_req_states.assert_called_once_with([indices[1]])
+
+    def test_alloc_does_not_clear_c4_state_off_the_unified_path(self):
+        """The reset must not reach the non-unified (fp8) path.
+
+        A duck-typed `hasattr(pool, "clear_c4_req_states")` check is not enough:
+        the attribute exists on every DeepSeekV4TokenToKVPool, unified or not.
+        """
+        for unified in (False, None, 1, "yes"):
+            with self.subTest(unified_kv=unified):
+                # Fresh pool per subtest: each iteration consumes a req slot.
+                req_pool = ReqToTokenPool(1, 16, "cpu", enable_memory_saver=False)
+                token_pool = MagicMock()
+                token_pool._unified_kv = unified
+                alloc_req_slots(
+                    req_pool, [_request()], None, token_to_kv_pool=token_pool
+                )
+                token_pool.clear_c4_req_states.assert_not_called()
 
 
 if __name__ == "__main__":

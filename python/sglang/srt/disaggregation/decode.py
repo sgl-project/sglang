@@ -1774,7 +1774,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         assert req_pool_indices is not None, (
             "req_pool_indices is full! There is a bug in memory estimation."
         )
-        if is_new_req_slot:
+        if (
+            is_new_req_slot
+            and getattr(self.token_to_kv_pool, "_unified_kv", False) is True
+        ):
+            # Unified-KV DSV4 only: reset the stale C4 ring on a fresh slot.
             clear_c4_req_states = getattr(
                 self.token_to_kv_pool, "clear_c4_req_states", None
             )
