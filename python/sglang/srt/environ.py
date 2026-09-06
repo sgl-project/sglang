@@ -776,6 +776,10 @@ class Envs:
     MOONCAKE_ENABLE_SSD_OFFLOAD = EnvBool(False)
     MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr(None)
     MOONCAKE_TENANT_ID = EnvStr("default")
+    # Number of memory replicas for each Mooncake put (default 1).
+    MOONCAKE_REPLICA_NUM = EnvInt(1)
+    # Number of NoF (NVMe-oF) replicas for each Mooncake put (default 0).
+    MOONCAKE_NOF_REPLICA_NUM = EnvInt(0)
 
     # ===================================================================
     # MoRI transport and expert dispatch
