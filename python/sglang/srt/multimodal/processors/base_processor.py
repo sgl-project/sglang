@@ -1101,10 +1101,9 @@ class BaseMultimodalProcessor(ABC):
                 try:
                     data = next(data_iterator)
                 except StopIteration:
-                    logger.warning(
+                    raise ValueError(
                         f"Mismatch: More '{modality.name}' tokens found than corresponding data provided."
                     )
-                    return futures, task_info
 
                 frame_count_limit = None
                 if modality == Modality.IMAGE and image_estimated_frames_iter:
