@@ -1,4 +1,4 @@
-"""Regression tests for the SWA chunked-req stash gate (#24252)."""
+"""Regression tests for scheduler prefill/decode transition gates."""
 
 import unittest
 from array import array
@@ -108,6 +108,7 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.tree_cache = tree_cache
     s.chunked_req = chunked_req
     s._pending_chunked_abort_req = None
+    s.result_queue = []
     return s
 
 
@@ -178,6 +179,77 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
             s, running_batch=s.running_batch, last_batch=s.last_batch
         )
         self.assertIsNone(s.chunked_req)
+
+
+class TestPendingPrefillAbortGate(CustomTestCase):
+    @staticmethod
+    def _make_last_batch():
+        aborted_prefill = MagicMock(rid="aborted-prefill", to_finish=object())
+        live_prefill = MagicMock(rid="live-prefill", to_finish=None)
+        aborted_decode = MagicMock(rid="aborted-decode", to_finish=object())
+        for req in (aborted_prefill, live_prefill, aborted_decode):
+            req.finished.return_value = False
+
+        last_batch = MagicMock()
+        last_batch.forward_mode.is_extend.return_value = True
+        last_batch.reqs = [aborted_prefill, live_prefill, aborted_decode]
+        last_batch.decoding_reqs = [aborted_decode]
+        last_batch.chunked_req = None
+        last_batch.is_prefill_only = False
+        last_batch.batch_size.side_effect = lambda: len(last_batch.reqs)
+        last_batch.is_empty.side_effect = lambda: not last_batch.reqs
+
+        def filter_batch(*, chunked_req_to_exclude):
+            excluded = set(chunked_req_to_exclude)
+            last_batch.reqs = [req for req in last_batch.reqs if req not in excluded]
+
+        last_batch.filter_batch.side_effect = filter_batch
+        return last_batch, aborted_prefill, live_prefill, aborted_decode
+
+    def _scheduled_reqs(self, *, has_pending_result):
+        scheduler = _scheduler_for_get_next_batch(
+            tree_cache=MagicMock(), chunked_req=None
+        )
+        scheduler.result_queue = [object()] if has_pending_result else []
+        last_batch, aborted_prefill, live_prefill, aborted_decode = (
+            self._make_last_batch()
+        )
+        scheduler.get_new_batch_prefill.side_effect = lambda running_batch: (
+            NextBatchPlan(batch_to_run=None, running_batch=running_batch)
+        )
+        scheduled_reqs = []
+
+        def update_running_batch(batch):
+            scheduled_reqs.extend(batch.reqs)
+            return batch
+
+        scheduler.update_running_batch.side_effect = update_running_batch
+
+        Scheduler.get_next_batch_to_run(
+            scheduler,
+            running_batch=scheduler.running_batch,
+            last_batch=last_batch,
+        )
+
+        return scheduled_reqs, aborted_prefill, live_prefill, aborted_decode
+
+    def test_abort_is_excluded_before_optimistic_decode(self):
+        scheduled_reqs, aborted_prefill, live_prefill, aborted_decode = (
+            self._scheduled_reqs(has_pending_result=True)
+        )
+
+        self.assertNotIn(aborted_prefill, scheduled_reqs)
+        self.assertIn(live_prefill, scheduled_reqs)
+        self.assertIn(aborted_decode, scheduled_reqs)
+
+    def test_abort_is_not_excluded_after_prefill_result_was_processed(self):
+        scheduled_reqs, aborted_prefill, live_prefill, aborted_decode = (
+            self._scheduled_reqs(has_pending_result=False)
+        )
+
+        self.assertIn(aborted_prefill, scheduled_reqs)
+        self.assertIn(live_prefill, scheduled_reqs)
+        self.assertIn(aborted_decode, scheduled_reqs)
 
 
 if __name__ == "__main__":
