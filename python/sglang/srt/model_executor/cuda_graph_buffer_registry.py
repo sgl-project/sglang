@@ -656,7 +656,11 @@ def build_decode_registry(
             # init_new -- they leave the GLOBAL None and set the replicated LOCAL
             # count directly, so carry that through.
             if fb.global_num_token_non_padded is None:
-                buf.copy_(fb.num_token_non_padded)
+                # DFLASH's dense draft can omit both optional counts, even
+                # when EP on the target enables this slot. Preserve the
+                # registry's skip-missing-field behavior for that path.
+                if fb.num_token_non_padded is not None:
+                    buf.copy_(fb.num_token_non_padded)
                 return
             sharded = not enable_prefill_cp and attn_tp_sharded_fn(
                 ctx.padded_num_tokens

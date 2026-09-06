@@ -109,3 +109,22 @@ class TestDetachAndRestore:
             restore_host_resident_tables(detached, "cpu")
         assert detached == []
         assert not model.embed._forward_pre_hooks
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_a_device_resident_table_is_parked_on_the_host(self):
+        model = _Declared().to("cuda")
+        ids = torch.tensor([[1, 2, 3], [4, 5, 6]], device="cuda")
+        with torch.no_grad():
+            expected = model.embed(ids)
+
+        with patch(THRESHOLD_PATH, 1024):
+            detached = detach_host_resident_tables(model)
+            assert model.embed.weight.numel() == 0
+            model.to("cuda")
+            restore_host_resident_tables(detached, "cuda")
+
+        with torch.no_grad():
+            actual = model.embed(ids)
+        assert model.embed.weight.device.type == "cpu"
+        assert actual.device.type == "cuda"
+        assert torch.equal(actual, expected)
