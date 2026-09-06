@@ -1245,6 +1245,13 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
+        """Caller contract: max_total_num_tokens must not exceed the value
+        calculate_pool_sizes derived from the same budget (config_from_budget
+        asserts this). No fixed-pool bias is subtracted here -- the input is a
+        token count, not a byte budget, so subtracting bytes would double-count
+        what calculate_pool_sizes already removed. The request-scoped pools are
+        re-derived from the capped token count by
+        finalize_with_max_running_requests, so they shrink with it."""
         assert page_size % 128 == 0, (
             "page_size must be multiple of 128 for compressed attention"
         )

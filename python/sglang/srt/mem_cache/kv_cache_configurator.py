@@ -2262,6 +2262,13 @@ class KVCacheConfigurator:
         max_tokens = self._apply_token_constraints(config.max_total_num_tokens)
         if cap_tokens is not None:
             max_tokens = min(max_tokens, cap_tokens)
+        # calculate_pool_sizes_from_max_tokens takes a token count, not a byte
+        # budget, so it cannot re-subtract the request-scoped fixed pools; it is
+        # only safe because every constraint above is a min(). Assert that here.
+        assert max_tokens <= config.max_total_num_tokens, (
+            f"token constraints must not raise capacity: {max_tokens} > "
+            f"{config.max_total_num_tokens}"
+        )
         if max_tokens != config.max_total_num_tokens:
             # Token-capped re-derivation: the profiled budget no longer
             # applies; the recalced config's unified_total_bytes stays None

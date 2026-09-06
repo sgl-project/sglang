@@ -1070,6 +1070,68 @@ class TestSWAPoolFloor(CustomTestCase):
         # Non-unified: the c4 state pool scales with the paged SWA pool.
         self.assertEqual(sizes.c4_state_pool_size, 3072 // 128 * 8)
 
+    def test_dsv4_token_cap_never_grows_total_footprint(self):
+        """Regression: the token-cap path subtracts no fixed-pool bias, which is
+        only safe while every constraint in config_from_budget is a min(). Cap
+        the budget-derived token count and check the total footprint shrinks."""
+        cfg = self._dsv4_configurator_for_budget()
+        page_size = 128
+        budget = 256 * (1 << 30)
+        base = cfg.calculate_pool_sizes(budget, page_size)
+        base_bytes = self._dsv4_total_bytes(cfg, base.max_total_num_tokens)
+        self.assertLessEqual(base_bytes, budget)
+        for numerator in (999, 900, 500, 100, 1):
+            capped_tokens = (
+                base.max_total_num_tokens * numerator // 1000 // page_size * page_size
+            )
+            if capped_tokens <= 0:
+                continue
+            capped = cfg.calculate_pool_sizes_from_max_tokens(capped_tokens, page_size)
+            capped_bytes = self._dsv4_total_bytes(cfg, capped.max_total_num_tokens)
+            with self.subTest(numerator=numerator):
+                self.assertLessEqual(capped_bytes, base_bytes)
+
+    def _dsv4_configurator_for_budget(self):
+        """DSV4 configurator with a 671B-class shape, built white-box so the
+        byte arithmetic runs without a real model fixture."""
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        cfg = object.__new__(DSV4PoolConfigurator)
+        cfg.qk_nope_head_dim, cfg.qk_rope_head_dim = 128, 64
+        cfg.attn_head_dim = 192
+        cfg.indexer_head_dim = 128
+        cfg.num_layers_total = 61
+        cfg.num_layers_ca4 = 61
+        cfg.num_layers_ca128 = 61
+        cfg.c4_ring_size = 8
+        cfg.c128_ring_size = 128
+        cfg._swa_ring_size = 128
+        cfg._spec_infl = 1.0
+        cfg.context_len = 65536
+        cfg.bytes_per_full_token = 576.0
+        cfg.requested_max_running_requests_per_worker = None
+        cfg.swa_ratio = 0.1
+        cfg.sliding_window_size = 4096
+        cfg.swa_page_size = 128
+        cfg.c4_shrink_factor = 1
+        cfg.online_c128_mtp_max_draft_tokens = 0
+        cfg.disaggregation_mode = None
+        cfg.disaggregation_decode_extra_slots = 0
+        cfg._unified = True
+        return cfg
+
+    def _dsv4_total_bytes(self, cfg, tokens):
+        """Token pool plus the three request-scoped fixed pools, sized from the
+        concurrency that resolve_max_num_reqs derives from this token count."""
+        estimated = max(min(int(tokens / cfg.context_len * 512), 4096), 2048)
+        max_running_requests = min(estimated, tokens // 2)
+        return int(
+            tokens * cfg.bytes_per_full_token
+            + cfg._fixed_swa_bytes(max_running_requests)
+            + cfg._fixed_c4_state_bytes(max_running_requests)
+            + cfg._get_c128_state_fixed_bytes(max_running_requests)
+        )
+
     def test_dsv4_unified_c4_state_not_token_scaled(self):
         # Unified-KV sizes the c4 state ring from max_running_requests in
         # finalize_with_max_running_requests, so it must not scale here.
