@@ -91,6 +91,9 @@ class TestOpAutoPolicy(CustomTestCase):
             return_value=True,
         ):
             self.assertTrue(should_prefer_native_aot_fallback("layernorm.rmsnorm"))
+            self.assertTrue(
+                should_prefer_native_aot_fallback("activation.silu_and_mul")
+            )
 
     def test_native_aot_fallback_off_when_disabled(self):
         enable_opauto(False)

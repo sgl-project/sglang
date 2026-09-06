@@ -12,7 +12,10 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.kernels.opauto import should_skip_cold_jit
+from sglang.kernels.opauto import (
+    should_prefer_native_aot_fallback,
+    should_skip_cold_jit,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -155,7 +158,21 @@ def run_activation(
     hidden_size = input.shape[-1] // 2
     if out is None:
         out = input.new_empty(*input.shape[:-1], hidden_size)
-    if should_skip_cold_jit("activation.silu_and_mul"):
+    op_id = f"activation.{op_name}_and_mul"
+    if should_prefer_native_aot_fallback(op_id):
+        # Pre-Ampere / demoted AOT: torch. sgl_kernel often has no sm_75 cubin.
+        if expert_ids is not None:
+            raise RuntimeError("filtered activation requires a CUDA kernel backend")
+        import torch.nn.functional as F
+
+        act = {
+            "silu": F.silu,
+            "gelu": F.gelu,
+            "gelu_tanh": lambda t: F.gelu(t, approximate="tanh"),
+        }[op_name]
+        out.copy_(act(input[..., :hidden_size]) * input[..., hidden_size:])
+        return out
+    if should_skip_cold_jit(op_id):
         _run_activation_aot(op_name, input, out, expert_ids, expert_step)
         return out
     if expert_ids is None:
