@@ -29,6 +29,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo,
     MooncakeKVManager,
+    TransferInfo,
 )
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
@@ -184,6 +185,65 @@ class TestCPReplicatedStateTransfer(unittest.TestCase):
                 manager._get_dsa_cache_transfer_skip_flags(None),
                 (False, True),
             )
+
+
+class TestMooncakeTransferInfoIsDummy(unittest.TestCase):
+    """Truth table for mooncake's payload-inferred is_dummy, with frames built
+    as KVSender sends them: kv and aux are empty iff dummy, state indices are
+    gated on dummy, decode_prefix_len and required_dst_info_num are sent
+    unconditionally."""
+
+    def _frames(self, kv, aux, state, prefix):
+        return [
+            b"7",
+            b"127.0.0.1",
+            b"1234",
+            b"session",
+            kv,
+            aux,
+            state,
+            b"1",
+            prefix,
+            b"",
+        ]
+
+    def test_real_transfer_is_not_dummy(self):
+        kv = np.array([3, 5], dtype=np.int32)
+        info = TransferInfo.from_zmq(
+            self._frames(kv.tobytes(), b"4", pack_int_lists([[1]], "i"), b"0")
+        )
+
+        self.assertFalse(info.is_dummy)
+        np.testing.assert_array_equal(info.dst_kv_indices, kv)
+        self.assertEqual(info.dst_aux_index, 4)
+        self.assertEqual(info.dst_state_indices, [[1]])
+
+    def test_full_prefix_hit_with_empty_kv_is_not_dummy(self):
+        # Empty kv indices serialize to an empty frame, so only the non-empty
+        # aux frame distinguishes a full-prefix-hit transfer from a dummy one.
+        info = TransferInfo.from_zmq(
+            self._frames(np.array([], dtype=np.int32).tobytes(), b"4", b"", b"128")
+        )
+
+        self.assertFalse(info.is_dummy)
+        self.assertEqual(info.dst_aux_index, 4)
+        self.assertEqual(info.decode_prefix_len, 128)
+
+    def test_dummy_parses_dummy_and_clears_payload_fields(self):
+        info = TransferInfo.from_zmq(self._frames(b"", b"", b"", b"0"))
+
+        self.assertTrue(info.is_dummy)
+        self.assertEqual(info.dst_kv_indices.size, 0)
+        self.assertIsNone(info.dst_aux_index)
+        self.assertEqual(info.dst_state_indices, [])
+
+    def test_dummy_with_prefix_hit_still_parses_dummy(self):
+        # decode_prefix_len is sent unconditionally and the inference ignores
+        # it, so a dummy rank with a decode-side prefix hit stays dummy.
+        info = TransferInfo.from_zmq(self._frames(b"", b"", b"", b"128"))
+
+        self.assertTrue(info.is_dummy)
+        self.assertEqual(info.decode_prefix_len, 128)
 
 
 class TestGroupConcurrentContiguous(unittest.TestCase):
