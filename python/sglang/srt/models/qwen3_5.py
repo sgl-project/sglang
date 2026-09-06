@@ -143,6 +143,22 @@ _gdn_decode_fused_proj_conv = (
 _is_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 
+# Qwen3.5 dense-FP8 policy (applied by quark under --enable-dense-fp8): promote only
+# the big excluded bf16 shared_expert.down_proj; skip tiny/routing/embedding layers and
+# small-N. Aiter-tuned, so it lives with the model.
+_DENSE_FP8_INCLUDE: tuple[str, ...] = (".shared_expert.down_proj",)
+_DENSE_FP8_EXCLUDE: tuple[str, ...] = (
+    "conv1d",
+    "shared_expert_gate",
+    "mlp.gate",
+    "in_proj_a",
+    "in_proj_b",
+    "in_proj_ba",
+    "lm_head",
+    "embed",
+)
+_DENSE_FP8_MIN_N = 2048
+
 # Head-group ratios (num_v_heads // num_k_heads) served by the fused
 # split/reshape/cat Triton kernel. On AMD/aiter the ratio-8 layout is also
 # covered by the fused kernel, which removes the two `.contiguous()` copies
@@ -1567,6 +1583,17 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
+
+        if (
+            _use_aiter
+            and quant_config is not None
+            and hasattr(quant_config, "register_dense_fp8_modules")
+        ):
+            quant_config.register_dense_fp8_modules(
+                include=_DENSE_FP8_INCLUDE,
+                exclude=_DENSE_FP8_EXCLUDE,
+                min_output_size=_DENSE_FP8_MIN_N,
+            )
 
         alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
 
