@@ -33,6 +33,7 @@ from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
     ExpandPrefillCausally,
+    ExpandUniformVerify,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     BuildBlockSeqLensCausal,
@@ -142,7 +143,10 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
         return None
     curr_size = x.shape[-1]
     target_size = ceil_align(curr_size, multiples_of)
-    return F.pad(x, pad=(0, target_size - curr_size), mode="constant", value=-1)
+    padding = target_size - curr_size
+    if padding == 0:
+        return x
+    return F.pad(x, pad=(0, padding), mode="constant", value=-1)
 
 
 def _create_flashmla_metadata():
@@ -597,10 +601,13 @@ class DeepseekV4AttnBackend(
             # an inference_mode forward would forbid the in-place updates the
             # graph-capture path performs outside inference mode.
             num_reqs = self.req_to_token.shape[0]
+            # Compressor planners consume these lengths as int64. Keeping the
+            # persistent buffer in that dtype avoids one cast per C4/C128 plan.
             self.extend_seq_lens_buffer = torch.full(
                 (num_reqs,),
                 self.speculative_num_draft_tokens,
-                **self.cuda_int32_kwargs,
+                dtype=torch.int64,
+                device=self.device,
             )
             self.extend_start_loc_buffer = torch.zeros(
                 num_reqs, **self.cuda_int32_kwargs
@@ -949,16 +956,15 @@ class DeepseekV4AttnBackend(
                 )
             )
         else:
-            seq_lens = seq_lens + self.speculative_num_draft_tokens
             num_q_tokens = num_draft_tokens * bs
-            seq_lens_casual, req_pool_indices_repeated = (
-                self.expand_extend_with_same_length(
-                    bs=bs,
-                    qo_len=num_draft_tokens,
-                    seq_lens=seq_lens,
-                    req_pool_indices=req_pool_indices,
-                )
+            expanded = ExpandUniformVerify.execute(
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                num_draft_tokens=num_draft_tokens,
             )
+            seq_lens = expanded.seq_lens_extended
+            seq_lens_casual = expanded.seq_lens_casual
+            req_pool_indices_repeated = expanded.req_pool_indices_repeated
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
