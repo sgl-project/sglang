@@ -1933,13 +1933,7 @@ class MHATokenToKVPool(KVCache):
         self.row_dim = self.head_num * self.head_dim
         self.v_row_dim = self.head_num * self.v_head_dim
 
-    def _init_kv_copy_and_warmup(self):
-        # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.
-        if self.layer_num == 0:
-            self._kv_copy_config = None
-            return
-
-        # Heuristics for KV copy tiling
+    def _get_kv_copy_config(self, stride_bytes: int) -> dict[str, int]:
         _KV_COPY_STRIDE_THRESHOLD_LARGE = 8192
         _KV_COPY_STRIDE_THRESHOLD_MEDIUM = 4096
         _KV_COPY_TILE_SIZE_LARGE = 512
@@ -1948,7 +1942,6 @@ class MHATokenToKVPool(KVCache):
         _KV_COPY_NUM_WARPS_LARGE_TILE = 8
         _KV_COPY_NUM_WARPS_SMALL_TILE = 4
 
-        stride_bytes = int(self.data_strides[0].item())
         if stride_bytes >= _KV_COPY_STRIDE_THRESHOLD_LARGE:
             bytes_per_tile = _KV_COPY_TILE_SIZE_LARGE
         elif stride_bytes >= _KV_COPY_STRIDE_THRESHOLD_MEDIUM:
@@ -1959,7 +1952,7 @@ class MHATokenToKVPool(KVCache):
         # Calculate num_locs_upper to avoid large Triton specialization (e.g. 8192)
         chunk_upper = 128 if bytes_per_tile >= _KV_COPY_TILE_SIZE_LARGE else 256
 
-        self._kv_copy_config = {
+        return {
             "bytes_per_tile": bytes_per_tile,
             "byte_tiles": (stride_bytes + bytes_per_tile - 1) // bytes_per_tile,
             "num_warps": (
@@ -1969,6 +1962,16 @@ class MHATokenToKVPool(KVCache):
             ),
             "num_locs_upper": chunk_upper,
         }
+
+    def _init_kv_copy_and_warmup(self):
+        # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.
+        if self.layer_num == 0:
+            self._kv_copy_config = None
+            return
+
+        stride_bytes = int(self.data_strides[0].item())
+        self._kv_copy_config = self._get_kv_copy_config(stride_bytes)
+        chunk_upper = self._kv_copy_config["num_locs_upper"]
 
         dummy_loc = torch.zeros(chunk_upper, dtype=torch.int64, device=self.device)
         copy_all_layer_kv_cache_func(
