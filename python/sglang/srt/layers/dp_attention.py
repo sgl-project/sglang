@@ -812,12 +812,19 @@ def _dp_gather_via_all_gatherv(
     get_tp_group().all_gatherv(local_real, sizes=sizes, output=global_tokens)
 
 
+def _note_dp_gather_in_prefill_graph() -> None:
+    dp = get_flags().dp
+    if dp.capturing_prefill_graph:
+        dp.prefill_graph_has_dp_gather = True
+
+
 def _dp_gather(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
+    _note_dp_gather_in_prefill_graph()
     if (
         is_dp_gatherv_active()
         and forward_batch.dp_padding_mode is not None
@@ -875,6 +882,7 @@ def dp_scatter(
     global_tokens: torch.Tensor,  # input
     forward_batch: ForwardBatch,
 ):
+    _note_dp_gather_in_prefill_graph()
     # local_num_tokens is not necessarily the same as local_tokens.shape[0],
     # since local_tokens may be padded for cuda graph
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
@@ -891,6 +899,7 @@ def dp_scatter(
 
 
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
+    _note_dp_gather_in_prefill_graph()
     if is_dp_gatherv_active():
         # Variable-length combine matching all_gatherv dispatch: scatter the
         # global (sum_len) tensor back to per-rank token counts. Fall through to
