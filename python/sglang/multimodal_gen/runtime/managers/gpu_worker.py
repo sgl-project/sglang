@@ -191,49 +191,6 @@ def fit_auto_residency_probe(
         fitted, steps = lighter, steps + 1
 
 
-def _debug_live_allocation_sites(worker, tag: str, limit: int = 12) -> None:
-    """DEBUG (temporary): log the largest live allocations by allocation site."""
-    try:
-        snap = torch.cuda.memory._snapshot()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("[warmup-mem] %s: snapshot unavailable: %r", tag, exc)
-        return
-    by_site: dict[str, int] = {}
-    counts: dict[str, int] = {}
-    total = 0
-    for seg in snap.get("segments", []):
-        for blk in seg.get("blocks", []):
-            if blk.get("state") != "active_allocated":
-                continue
-            size = int(blk.get("size", 0))
-            total += size
-            frames = blk.get("frames") or []
-            picked = [f for f in frames if "sglang" in f.get("filename", "")][:3]
-            if not picked:
-                picked = frames[:3]
-            key = (
-                " <- ".join(
-                    f"{f['filename'].rsplit('/sglang/', 1)[-1]}:{f['line']} {f['name']}"
-                    for f in picked
-                )
-                or "<no frames>"
-            )
-            by_site[key] = by_site.get(key, 0) + size
-            counts[key] = counts.get(key, 0) + 1
-    logger.warning(
-        "[warmup-mem] %s rank=%s live=%.2f GiB allocated=%.2f GiB reserved=%.2f GiB",
-        tag,
-        getattr(worker, "local_rank", "?"),
-        total / 2**30,
-        torch.cuda.memory_allocated() / 2**30,
-        torch.cuda.memory_reserved() / 2**30,
-    )
-    for key, size in sorted(by_site.items(), key=lambda kv: -kv[1])[:limit]:
-        logger.warning(
-            "[warmup-mem]   %6.2f GiB x%-4d %s", size / 2**30, counts[key], key[:230]
-        )
-
-
 class GPUWorker(GPUWorkerPostTrainingMixin):
     """
     A worker that executes the model on a single GPU.
@@ -258,12 +215,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self.pipeline: ComposedPipelineBase = None
 
         self.init_device_and_model()
-        # DEBUG (temporary): attribute what warmup leaves allocated.
-        if current_platform.is_cuda():
-            try:
-                torch.cuda.memory._record_memory_history(max_entries=200000)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[warmup-mem] history recording unavailable: %r", exc)
         self._load_peak_reserved_mb = (
             0.0
             if current_platform.is_cpu()
@@ -677,27 +628,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 # starts from the same placement and can return released
                 # component storage before its allocated peak is measured.
                 torch.get_device_module().empty_cache()
-            # DEBUG (temporary): live allocation sites around the warmup probe.
-            try:
-                if current_platform.is_cuda() and req.is_warmup:
-                    self._debug_warmup_index = (
-                        getattr(self, "_debug_warmup_index", 0) + 1
-                    )
-                    if self._debug_warmup_index > 1:
-                        _debug_live_allocation_sites(
-                            self,
-                            f"before warmup request {self._debug_warmup_index} ({_shape_label(req)})",
-                        )
-                elif (
-                    current_platform.is_cuda()
-                    and getattr(self, "_debug_warmup_index", 0)
-                    and not getattr(self, "_debug_serving_done", False)
-                ):
-                    self._debug_serving_done = True
-                    _debug_live_allocation_sites(self, "before first serving request")
-                    torch.cuda.memory._record_memory_history(enabled=None)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[warmup-mem] debug hook failed: %r", exc)
             self._release_warmup_pool(req)
             if not current_platform.is_cpu() and not current_platform.is_mps():
                 torch.get_device_module().reset_peak_memory_stats()
