@@ -2965,6 +2965,15 @@ class ServerArgs:
         "available backend.",
         NS("mm"),
     ] = "auto"
+    mm_preprocessing_device: A[
+        Literal["auto", "cpu", "cuda"],
+        "Device for fast visual (image and video) preprocessing, which runs in "
+        "the tokenizer process. 'auto' takes the model processor's default, "
+        "otherwise the platform's choice (the serving GPU on CUDA). 'cpu' keeps "
+        "preprocessing and JPEG decode off the GPU so the tokenizer process "
+        "creates no CUDA context. 'cuda' forces the serving GPU.",
+        NS("mm"),
+    ] = "auto"
     mm_global_cache_backend: A[
         str,
         Arg(

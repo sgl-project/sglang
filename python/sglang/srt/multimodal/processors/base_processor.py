@@ -59,6 +59,7 @@ from sglang.srt.utils import (
     logger,
     smart_to_rgb,
 )
+from sglang.srt.utils.common import GPUImageDecodeMode
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -223,6 +224,11 @@ class BaseMultimodalProcessor(ABC):
     # `_resolve_auto_mm_processor_worker_num`.
     auto_mm_processor_worker_num = None
     auto_mm_io_worker_num = 4
+    # The model's default device for fast visual (image and video)
+    # preprocessing: a device string, or None for the platform's choice. See
+    # `_resolve_mm_preprocessing_device` for how it ranks against the server
+    # setting; the device is handed to the HF processor call as a whole.
+    mm_preprocessing_device: Optional[str] = None
     # Models opt in by assigning a non-zero default. A user-provided server
     # argument overrides this value; zero disables storage and cache-key work.
     auto_mm_preprocess_cache_size_mb = 0
@@ -258,6 +264,18 @@ class BaseMultimodalProcessor(ABC):
         if get_mm().disable_fast_image_processor:
             self.image_processor_backend = "pil"
         self.disable_fast_image_processor = self.image_processor_backend == "pil"
+        self.gpu_image_decode = self._resolve_gpu_image_decode()
+        if (
+            server_args.mm_preprocessing_device != "auto"
+            and self._places_preprocessing_itself()
+        ):
+            logger.warning(
+                "--mm-preprocessing-device=%s is not applied to the fast "
+                "processor call of %s, which places its own preprocessing; "
+                "only JPEG decode follows the setting.",
+                server_args.mm_preprocessing_device,
+                type(self).__name__,
+            )
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
 
         mm_process_config = get_mm().mm_process_config
@@ -715,20 +733,54 @@ class BaseMultimodalProcessor(ABC):
             return self._processor, self._tokenizer
         return processor, _tokenizer_of(processor)
 
-    def _preprocessing_competes_with_the_scheduler(self) -> bool:
-        """Whether image preprocessing submits its work to the serving GPU.
+    def _resolve_gpu_image_decode(self) -> GPUImageDecodeMode:
+        """The JPEG decode mode: the class default unless preprocessing is on CPU.
 
-        The fast image processor runs inside the tokenizer process but on
-        ``cuda:{base_gpu_id}`` -- the device the scheduler serves from. A second
-        preprocessing worker there is one more competitor for that device rather
-        than added parallelism.
+        nvJPEG decode would create a CUDA context on the current device just
+        as the fast processor would, so a CPU placement (from the server
+        setting or the class default) turns it off as well.
         """
-        if _is_cpu or self.server_args.rl_on_policy_target is not None:
+        if self._mm_preprocessing_device_choice() == "cpu":
             return False
+        return type(self).gpu_image_decode
+
+    def _uses_fast_image_processor(self, processor) -> bool:
+        """Whether ``processor`` takes the fast path that accepts a device."""
         if self.disable_fast_image_processor:
             return False
-        image_processor = getattr(self._processor, "image_processor", None)
+        image_processor = getattr(processor, "image_processor", None)
         return isinstance(image_processor, BaseImageProcessor)
+
+    def _places_preprocessing_itself(self) -> bool:
+        """Whether this class overrides ``process_mm_data`` without overriding
+        the placement decision, so the base resolver never sees its call."""
+        cls = type(self)
+        return (
+            cls.process_mm_data is not BaseMultimodalProcessor.process_mm_data
+            and cls._mm_preprocessing_device_choice
+            is BaseMultimodalProcessor._mm_preprocessing_device_choice
+        )
+
+    def _preprocessing_competes_with_the_scheduler(self) -> bool:
+        """Whether visual preprocessing submits its work to the serving GPU.
+
+        The fast image processor runs inside the tokenizer process but, by
+        default, on ``cuda:{base_gpu_id}`` -- the device the scheduler serves
+        from. A second preprocessing worker there is one more competitor for
+        that device rather than added parallelism. The answer follows the same
+        placement decision that ``process_mm_data`` uses. A class that places
+        the fast processor call itself (its own ``process_mm_data``, no
+        ``_mm_preprocessing_device_choice`` override) is sized for the
+        platform's device, since neither the server setting nor a class
+        default reaches its call.
+        """
+        if not self._uses_fast_image_processor(self._processor):
+            return False
+        if self._places_preprocessing_itself():
+            device = self._platform_mm_preprocessing_device()
+        else:
+            device = self._mm_preprocessing_device_choice()
+        return device is None or torch.device(device).type != "cpu"
 
     def _resolve_auto_mm_processor_worker_num(self) -> int:
         """The worker count to use when the user did not ask for one.
@@ -752,21 +804,60 @@ class BaseMultimodalProcessor(ABC):
         declared = self.auto_mm_processor_worker_num
         return 2 if declared is None else declared
 
-    def _fast_image_processor_device(self, processor) -> Optional[str]:
-        """The device for the fast image processor, or None to leave it unset.
+    def _platform_mm_preprocessing_device(self) -> str:
+        """The platform's device for fast visual preprocessing.
 
-        Resolved from this processor's own ``server_args``: engines sharing a
-        tokenizer process each carry their own ``base_gpu_id``.
+        The answer comes from this processor's own ``server_args``: engines
+        sharing a tokenizer process each carry their own ``base_gpu_id``.
         """
         server_args = self.server_args
         if _is_cpu or server_args.rl_on_policy_target is not None:
             return "cpu"
         if _is_xpu:
             return "xpu"
-        if not _is_npu:
-            # Per-worker placement travels as a constructor argument, and
-            # this record is that argument.
+        if _is_npu:
+            return "npu"
+        # Per-worker placement travels as a constructor argument, and this
+        # record is that argument.
+        return f"cuda:{server_args.base_gpu_id}"
+
+    def _mm_preprocessing_device_choice(self) -> str:
+        """Where fast visual preprocessing runs; pure and safe to call from
+        ``__init__`` (reads only ``server_args``, class attributes and the
+        platform flags, never ``self._processor``).
+
+        Precedence: ``--mm-preprocessing-device`` when it is not ``auto``;
+        otherwise the platform, except that on a CUDA platform the class's
+        ``mm_preprocessing_device`` replaces ``cuda:{base_gpu_id}`` when set.
+        A class default therefore cannot move XPU or NPU preprocessing onto a
+        CUDA device.
+
+        This is the override point for a subclass whose ``process_mm_data``
+        places the work itself: report that placement here so the worker
+        count and the JPEG decode mode follow it. The override must be
+        init-safe under the same rule.
+        """
+        server_args = self.server_args
+        configured = server_args.mm_preprocessing_device
+        if configured == "cpu":
+            return "cpu"
+        if configured == "cuda":
             return f"cuda:{server_args.base_gpu_id}"
+        platform = self._platform_mm_preprocessing_device()
+        if platform.startswith("cuda") and self.mm_preprocessing_device is not None:
+            return self.mm_preprocessing_device
+        return platform
+
+    def _resolve_mm_preprocessing_device(self, processor) -> Optional[str]:
+        """The device to hand to this fast processor call, or None to leave
+        it unset: the placement choice, plus the NPU processor patches that
+        the NPU path applies on first use."""
+        device = self._mm_preprocessing_device_choice()
+        if device == "npu":
+            return self._apply_npu_processor_patches(processor)
+        return device
+
+    def _apply_npu_processor_patches(self, processor) -> Optional[str]:
         if processor.__class__.__name__ == "MiniMaxVLProcessor":
             # MiniMax's image/video processors create 10-dim tensors during
             # patch extraction, exceeding the Ascend 8-dim limit; patch them
@@ -868,12 +959,8 @@ class BaseMultimodalProcessor(ABC):
                 kwargs.setdefault("audio_kwargs", {}).update(self.audio_config)
 
         processor_device = None
-        if (
-            hasattr(processor, "image_processor")
-            and isinstance(processor.image_processor, BaseImageProcessor)
-            and not self.disable_fast_image_processor
-        ):
-            processor_device = self._fast_image_processor_device(processor)
+        if self._uses_fast_image_processor(processor):
+            processor_device = self._resolve_mm_preprocessing_device(processor)
             if processor_device is not None:
                 kwargs["device"] = processor_device
 
@@ -950,19 +1037,23 @@ class BaseMultimodalProcessor(ABC):
         frame_count_limit=None,
         audio_sample_rate: Optional[int] = None,
         discard_alpha_channel=True,
+        gpu_image_decode: Optional[GPUImageDecodeMode] = None,
     ):
         """
         Load a single multimodal data.
 
         If data is processor_output or precomputed embedding, return directly.
 
-        Class method that can be pickled for multiprocessing
+        Class method that can be pickled for multiprocessing. ``gpu_image_decode``
+        is the instance's resolved mode; None falls back to the class default.
         """
         if cls._is_preprocessed_input(data):
             return data
+        if gpu_image_decode is None:
+            gpu_image_decode = cls.gpu_image_decode
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data, cls.gpu_image_decode)
+                img, _ = load_image(data, gpu_image_decode)
                 if isinstance(img, torch.Tensor):
                     return img  # JPEG already decoded on GPU by nvJPEG
                 # PIL decodes lazily; do it here in the io worker so the decode
@@ -1069,6 +1160,7 @@ class BaseMultimodalProcessor(ABC):
                 None,  # frame_count_limit: no consider for fast path
                 audio_sample_rate,
                 discard_alpha_channel,
+                self.gpu_image_decode,
             )
             futures.append((modality, idx, future))
 
@@ -1129,6 +1221,7 @@ class BaseMultimodalProcessor(ABC):
                         frame_count_limit,
                         audio_sample_rate,
                         discard_alpha_channel,
+                        self.gpu_image_decode,
                     )
                 )
                 task_info.append((modality, data, frame_count_limit))

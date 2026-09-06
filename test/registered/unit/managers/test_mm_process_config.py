@@ -299,6 +299,7 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
             base_gpu_id=2,
             tp_size=8,
             rl_on_policy_target=None,
+            mm_preprocessing_device="auto",
             allowed_media_domains=[],
             media_url_max_file_size_mb=64,
         )
