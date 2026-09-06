@@ -32,7 +32,10 @@ class TestOpenAICompletionRustParity(CustomTestCase):
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=self.api_key,
-            env={"SGLANG_RUST_SERVER": "1" if rust_frontend else "0"},
+            env={
+                "SGLANG_RUST_SERVER": "1" if rust_frontend else "0",
+                "SGLANG_RUST_RENDERER": "1" if rust_frontend else "0",
+            },
             other_args=[
                 "--random-seed",
                 "42",

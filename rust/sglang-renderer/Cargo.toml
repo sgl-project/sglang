@@ -1,0 +1,59 @@
+[package]
+name = "sglang-renderer"
+description = "Reusable SGLang request preprocessing with an optional OpenAI frontend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.sglang]
+python-bin = "sglang-renderer"
+features = ["http"]
+debug = false
+
+[features]
+default = []
+http = [
+    "dep:axum",
+    "dep:clap",
+    "dep:reqwest",
+    "dep:tokio",
+    "dep:tracing-subscriber",
+    "dep:uuid",
+    "hf-hub/rustls-tls",
+    "hf-hub/tokio",
+]
+
+[[bin]]
+name = "sglang-renderer"
+path = "src/main.rs"
+required-features = ["http"]
+
+[dependencies]
+async-stream = { workspace = true }
+flume = "0.12.0"
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+
+axum = { version = "0.8.9", features = ["json"], optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"], optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+dynamo-parsers = "7.0.1"
+dynamo-protocols = "5.1.0"
+dynamo-renderer = "5.0.0"
+hf-hub = { version = "0.4", default-features = false }
+minijinja = { version = "2.24.0", features = ["unstable_machinery"] }
+regex-syntax = "=0.8.11"
+
+# Keep this paired with the server until Dynamo exposes a smaller tokenizer API.
+dynamo-tokenizers = "1.7.0"
+
+[dev-dependencies]
+rmp-serde = "1"
+rmpv = { version = "1", features = ["with-serde"] }
+tower = { version = "0.5", features = ["util"] }

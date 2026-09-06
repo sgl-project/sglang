@@ -52,6 +52,7 @@ runs:
       with:
         path: |
           python/sglang/srt/rust_extensions/_*.so
+          python/sglang/srt/rust_extensions/sglang-renderer
           python/sglang/srt/mem_cache/rust_tree_core/mem_cache*.so
         key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py', 'python/pyproject.toml', 'python/sglang/srt/rust_extensions/torch_build.py', '.github/workflows/_pr-test-rust-ext-build.yml', 'scripts/ci/utils/stage_rust_ext_modules.sh') }}
 
@@ -66,6 +67,9 @@ runs:
         set -uo pipefail
         if [ "${{ steps.artifact.outcome }}" = "success" ] \
            || [ "${{ steps.cache.outputs.cache-hit }}" = "true" ]; then
+            renderer="${GITHUB_WORKSPACE}/python/sglang/srt/rust_extensions/sglang-renderer"
+            chmod +x "${renderer}"
+            echo "${renderer%/*}" >> "$GITHUB_PATH"
             echo "hit=true" >> "$GITHUB_OUTPUT"
             echo "SGLANG_BUILD_RUST_EXTS=none" >> "$GITHUB_ENV"
             # A source checkout normally ignores in-package native artifacts

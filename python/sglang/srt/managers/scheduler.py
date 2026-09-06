@@ -5782,6 +5782,8 @@ def run_scheduler_process(
                 pass
     finally:
         if scheduler is not None:
+            if scheduler.rust_server is not None:
+                scheduler.rust_server.close()
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()

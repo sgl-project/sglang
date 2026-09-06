@@ -1659,6 +1659,9 @@ class Envs:
     # Rust server
     # ===================================================================
     SGLANG_RUST_SERVER = EnvBool(False)
+    # Host the Rust renderer on the public Rust-server address and proxy the
+    # remaining routes to an internal loopback Rust-server listener.
+    SGLANG_RUST_RENDERER = EnvBool(False)
     # Build a missing Rust extension from source (auto), require a bundled or
     # cached extension (never), or rebuild the local cache entry (force).
     SGLANG_RUST_BUILD_MODE = EnvStr("auto")
