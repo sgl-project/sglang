@@ -1,4 +1,5 @@
 import glob
+import importlib.util
 import json
 import os
 import re
@@ -35,6 +36,59 @@ CHANGED_TESTS_SHORT_FLAG = "-c"
 
 
 MAINTENANCE_ISSUE_NUMBER = 21065
+_CI_REGISTER_MODULE = None
+
+
+def _load_ci_register_module():
+    global _CI_REGISTER_MODULE
+    if _CI_REGISTER_MODULE is None:
+        module_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..",
+            "..",
+            "..",
+            "python",
+            "sglang",
+            "test",
+            "ci",
+            "ci_register.py",
+        )
+        spec = importlib.util.spec_from_file_location("ci_register", module_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Could not load ci_register from {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _CI_REGISTER_MODULE = module
+    return _CI_REGISTER_MODULE
+
+
+def _validate_registered_test_main_entries(resolved_specs):
+    """
+    Mirror run_suite.py's collect_tests(..., sanity_check=True) gate for
+    /rerun-test before any workflow dispatch.
+
+    Returns a list of {"spec", "error"} dicts.
+    """
+    ci_register = _load_ci_register_module()
+    failures = []
+    checked_files = set()
+
+    for spec in resolved_specs:
+        if spec["mode"] == "multimodal_gen":
+            continue
+
+        test_file = spec["test_command"].split(" ", 1)[0].split("::", 1)[0]
+        repo_path = os.path.join("test", test_file)
+        if repo_path in checked_files:
+            continue
+        checked_files.add(repo_path)
+
+        try:
+            ci_register.collect_tests([repo_path], sanity_check=True)
+        except ValueError as exc:
+            failures.append({"spec": spec["spec"], "error": str(exc)})
+
+    return failures
 
 
 def _check_rebase_gate(gh_repo, pr, token):
@@ -1369,6 +1423,9 @@ def handle_rerun_test(
                 continue
             seen_commands.add(key)
             resolved.append(r)
+
+    for failure in _validate_registered_test_main_entries(resolved):
+        _record_failure(failure["spec"], failure["error"])
 
     if refresh_precision_baseline:
         is_exact_precision_test = (
