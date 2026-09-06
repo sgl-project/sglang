@@ -310,6 +310,21 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if not self.new_pages_available(num_full_pages, num_swa_pages):
             return None
 
+        if self._unified:
+            # Unified SWA ring is slot-addressed and not paged here, so the tail
+            # needs no SWA allocation and no full->swa mapping, as in
+            # alloc_extend. new_pages_available already ignored num_swa_pages,
+            # so the paged SWA allocator below has no capacity gate left.
+            return self.full_attn_allocator.alloc_extend(
+                prefix_lens,
+                prefix_lens_cpu,
+                seq_lens,
+                seq_lens_cpu,
+                last_loc,
+                extend_num_tokens,
+                num_new_pages=num_full_pages,
+            )
+
         alloc_full_indices = self.full_attn_allocator.alloc_extend(
             prefix_lens,
             prefix_lens_cpu,
