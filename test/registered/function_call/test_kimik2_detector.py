@@ -899,13 +899,15 @@ class TestKimiK2EndToEnd(unittest.TestCase):
 
         # ``weird@id`` matches the broad ``[^\\s<|]+`` capture in
         # ``stream_tool_call_portion_regex`` but fails both the standard
-        # ``name:idx`` form and the bare-counter form, so
-        # ``_parse_tool_call_id`` returns ``(None, 0)``.
+        # ``name:idx`` form and the bare-counter form. Non-standard ids fall
+        # back to inferring the name from the arguments, so give it arguments
+        # that match no tool: ``_resolve_function_name`` returns ``None`` and
+        # the section is skipped.
         chunks = [
             "normal text before",
             "<|tool_calls_section_begin|>"
             "<|tool_call_begin|>weird@id"
-            '<|tool_call_argument_begin|>{"city"'
+            '<|tool_call_argument_begin|>{"unknown_key"'
             ': "London"}'
             "<|tool_call_end|>"
             "<|tool_calls_section_end|>",
@@ -1392,6 +1394,471 @@ class TestKimiK2BareCounterParsing(unittest.TestCase):
         tool_calls, _ = _collect_streaming_tool_calls(detector, chunks, single_tool)
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(tool_calls[0]["name"], "search")
+
+
+class TestKimiK2ClientStyleIdFallback(unittest.TestCase):
+    """Client-style tool_call_ids: ``call_3``, ``call_<hex>``, ``toolu_01...``, UUIDs.
+
+    The chat template renders history ``tool_call.id`` values verbatim, so a
+    client that rewrites the ``functions.{name}:{N}`` ids SGLang returned
+    teaches the model to emit the client's id style on its next call. The
+    call is well-formed; only the id is foreign. The detector must infer the
+    name from the arguments (as it already does for bare counters) instead of
+    dropping the call, which surfaced to the client as ``content=""``,
+    ``tool_calls=null``, ``finish_reason="stop"`` after a full reasoning block.
+    """
+
+    # Shapes observed in K2.6 server logs when the client rewrote history ids.
+    CLIENT_IDS = [
+        "call_3",
+        "call_7f3a9c2b1e4d5f6a7b8c9d0e",
+        "toolu_01AkmjoowNgNx2qNfJzc8z2F",
+        "0b3d1c2e-4f5a-6b7c-8d9e-0f1a2b3c4d5e",
+        "tooltoolu_01KPuJ9wUyn6EMNvM6D3vSWE",
+    ]
+
+    def setUp(self):
+        self.detector = KimiK2FuncDetector()
+        self.tools = [
+            _make_tool("ReadFile"),
+            _make_tool(
+                "get_weather",
+                {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                        "unit": {"type": "string"},
+                    },
+                    "required": ["city"],
+                },
+            ),
+        ]
+
+    @staticmethod
+    def _call(function_id, args):
+        return (
+            f"<|tool_call_begin|>{function_id}"
+            f"<|tool_call_argument_begin|>{args}"
+            "<|tool_call_end|>"
+        )
+
+    def _section(self, *calls):
+        return (
+            "<|tool_calls_section_begin|>"
+            + "".join(calls)
+            + "<|tool_calls_section_end|>"
+        )
+
+    # --- _parse_tool_call_id / _resolve_function_name ---
+
+    def test_parse_tool_call_id_infers_name_from_args(self):
+        for fid in self.CLIENT_IDS:
+            with self.subTest(function_id=fid):
+                name, idx = self.detector._parse_tool_call_id(
+                    fid, self.tools, '{"city": "Tokyo"}'
+                )
+                self.assertEqual(name, "get_weather")
+                self.assertEqual(idx, 0)
+
+    def test_parse_tool_call_id_single_tool_needs_no_args(self):
+        name, _ = self.detector._parse_tool_call_id(
+            "call_3", [_make_tool("search")], None
+        )
+        self.assertEqual(name, "search")
+
+    def test_parse_tool_call_id_unresolvable_returns_none(self):
+        name, idx = self.detector._parse_tool_call_id(
+            "call_3", self.tools, '{"unknown_key": 1}'
+        )
+        self.assertIsNone(name)
+        self.assertEqual(idx, 0)
+        name, _ = self.detector._parse_tool_call_id("call_3", [], '{"city": "x"}')
+        self.assertIsNone(name)
+
+    def test_resolve_function_name_client_id(self):
+        for fid in self.CLIENT_IDS:
+            with self.subTest(function_id=fid):
+                self.assertEqual(
+                    self.detector._resolve_function_name(
+                        fid, self.tools, '{"path": "/a.py"}'
+                    ),
+                    "ReadFile",
+                )
+
+    # --- non-streaming ---
+
+    def test_detect_and_parse_client_id(self):
+        for fid in self.CLIENT_IDS:
+            with self.subTest(function_id=fid):
+                detector = KimiK2FuncDetector()
+                text = self._section(self._call(fid, '{"path": "/a.py"}'))
+                result = detector.detect_and_parse(text, self.tools)
+                self.assertEqual(len(result.calls), 1)
+                self.assertEqual(result.calls[0].name, "ReadFile")
+                self.assertEqual(result.calls[0].parameters, '{"path": "/a.py"}')
+                self.assertEqual(result.calls[0].tool_index, 0)
+                self.assertEqual(result.normal_text, "")
+
+    def test_detect_and_parse_client_id_multiple_calls(self):
+        text = self._section(
+            self._call("call_3", '{"path": "/a.py"}'),
+            self._call("call_4", '{"city": "Tokyo"}'),
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual([c.name for c in result.calls], ["ReadFile", "get_weather"])
+        self.assertEqual([c.tool_index for c in result.calls], [0, 1])
+
+    def test_detect_and_parse_client_id_mixed_with_standard(self):
+        text = self._section(
+            self._call("toolu_01AkmjoowNgNx2qNfJzc8z2F", '{"city": "Tokyo"}'),
+            self._call("functions.ReadFile:7", '{"path": "/a.py"}'),
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual([c.name for c in result.calls], ["get_weather", "ReadFile"])
+        self.assertEqual([c.tool_index for c in result.calls], [0, 1])
+
+    def test_detect_and_parse_client_id_unresolvable_is_dropped(self):
+        text = self._section(self._call("call_3", '{"unknown_key": "value"}'))
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 0)
+        self.assertEqual(result.normal_text, "")
+
+    def test_detect_and_parse_client_id_reasoning_prefix_kept(self):
+        text = "Let me check.\n" + self._section(
+            self._call("call_3", '{"path": "/a.py"}')
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(result.normal_text, "Let me check.\n")
+        self.assertEqual(len(result.calls), 1)
+
+    # --- streaming ---
+
+    def test_streaming_client_id_multi_tool_resolves_at_end_marker(self):
+        """With several tools the name cannot be inferred from partial JSON,
+        so nothing is emitted until the chunk carrying <|tool_call_end|>."""
+        before = [
+            "<|tool_calls_section_begin|>",
+            "<|tool_call_begin|>call_3<|tool_call_argument_begin|>",
+            '{"city": ',
+            '"Tokyo"}',
+        ]
+        for chunk in before:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            self.assertEqual(result.calls, [])
+            self.assertEqual(result.normal_text, "")
+        final = self.detector.parse_streaming_increment("<|tool_call_end|>", self.tools)
+        self.assertEqual(len(final.calls), 1)
+        self.assertEqual(final.calls[0].name, "get_weather")
+        self.assertEqual(json.loads(final.calls[0].parameters), {"city": "Tokyo"})
+        tail = self.detector.parse_streaming_increment(
+            "<|tool_calls_section_end|>", self.tools
+        )
+        self.assertEqual(tail.calls, [])
+        self.assertEqual(tail.normal_text, "")
+
+    def test_streaming_client_id_single_tool_streams_before_end_marker(self):
+        single_tool = [_make_tool("search")]
+        first = self.detector.parse_streaming_increment(
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>toolu_01AkmjoowNgNx2qNfJzc8z2F"
+            '<|tool_call_argument_begin|>{"path',
+            single_tool,
+        )
+        self.assertEqual(len(first.calls), 1)
+        self.assertEqual(first.calls[0].name, "search")
+        rest = self.detector.parse_streaming_increment(
+            '": "/x"}<|tool_call_end|><|tool_calls_section_end|>', single_tool
+        )
+        streamed = first.calls[0].parameters + "".join(c.parameters for c in rest.calls)
+        self.assertEqual(json.loads(streamed), {"path": "/x"})
+
+    def test_streaming_client_id_mixed_with_standard(self):
+        chunks = [
+            "<|tool_calls_section_begin|>",
+            '<|tool_call_begin|>call_3<|tool_call_argument_begin|>{"path": "/a.py"}',
+            "<|tool_call_end|>",
+            "<|tool_call_begin|>functions.get_weather:4"
+            '<|tool_call_argument_begin|>{"city": "Paris"}',
+            "<|tool_call_end|>",
+            "<|tool_calls_section_end|>",
+        ]
+        tool_calls, _ = _collect_streaming_tool_calls(self.detector, chunks, self.tools)
+        self.assertEqual([tc["name"] for tc in tool_calls], ["ReadFile", "get_weather"])
+        self.assertEqual(json.loads(tool_calls[0]["parameters"]), {"path": "/a.py"})
+        self.assertEqual(json.loads(tool_calls[1]["parameters"]), {"city": "Paris"})
+
+    def test_streaming_client_id_unresolvable_skips_only_that_section(self):
+        chunks = [
+            "<|tool_calls_section_begin|>",
+            '<|tool_call_begin|>call_3<|tool_call_argument_begin|>{"unknown_key": 1}',
+            "<|tool_call_end|>",
+            '<|tool_call_begin|>call_4<|tool_call_argument_begin|>{"city": "Paris"}',
+            "<|tool_call_end|>",
+            "<|tool_calls_section_end|>",
+        ]
+        tool_calls, normal = _collect_streaming_tool_calls(
+            self.detector, chunks, self.tools
+        )
+        self.assertEqual([tc["name"] for tc in tool_calls], ["get_weather"])
+        self.assertNotIn("<|tool_call", normal)
+
+
+class TestKimiK2ToolNameInferenceStrictness(unittest.TestCase):
+    """``_infer_tool_name`` returns a name only when the arguments satisfy
+    exactly one tool schema (all required keys present, no undeclared keys).
+
+    Agent tool sets share argument names (``file_path`` across Read, Write and
+    Edit; ``pattern``/``path`` across Glob, Grep and LS). A key-overlap score
+    with list-order tie-breaking would silently pick the first tool, handing
+    the client an executable call to a tool the model did not choose. That
+    is worse than dropping the call, so ambiguity resolves to ``None``.
+    """
+
+    def setUp(self):
+        self.detector = KimiK2FuncDetector()
+        self.tools = [
+            _make_tool(
+                "Read",
+                {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "offset": {"type": "number"},
+                        "limit": {"type": "number"},
+                    },
+                    "required": ["file_path"],
+                },
+            ),
+            _make_tool(
+                "Write",
+                {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["file_path", "content"],
+                },
+            ),
+            _make_tool(
+                "Edit",
+                {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "old_string": {"type": "string"},
+                        "new_string": {"type": "string"},
+                    },
+                    "required": ["file_path", "old_string", "new_string"],
+                },
+            ),
+            _make_tool(
+                "Glob",
+                {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string"},
+                        "path": {"type": "string"},
+                    },
+                    "required": ["pattern"],
+                },
+            ),
+            _make_tool(
+                "Grep",
+                {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string"},
+                        "path": {"type": "string"},
+                        "output_mode": {"type": "string"},
+                    },
+                    "required": ["pattern"],
+                },
+            ),
+            _make_tool(
+                "LS",
+                {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "ignore": {"type": "array"},
+                    },
+                    "required": ["path"],
+                },
+            ),
+            _make_tool("Ping", {"type": "object", "properties": {}}),
+        ]
+
+    def _infer(self, args, tools=None):
+        return self.detector._infer_tool_name(tools or self.tools, args)
+
+    def test_required_keys_disambiguate_shared_names(self):
+        self.assertEqual(self._infer('{"file_path": "/x"}'), "Read")
+        self.assertEqual(self._infer('{"file_path": "/x", "content": "c"}'), "Write")
+        self.assertEqual(
+            self._infer('{"file_path": "/x", "old_string": "a", "new_string": "b"}'),
+            "Edit",
+        )
+        self.assertEqual(self._infer('{"path": "/x"}'), "LS")
+        self.assertEqual(self._infer('{"pattern": "a", "output_mode": "c"}'), "Grep")
+
+    def test_result_does_not_depend_on_tool_order(self):
+        reversed_tools = list(reversed(self.tools))
+        for args in ('{"file_path": "/x"}', '{"path": "/x"}', '{"pattern": "a"}'):
+            with self.subTest(args=args):
+                self.assertEqual(self._infer(args), self._infer(args, reversed_tools))
+
+    def test_ambiguous_arguments_return_none_and_warn(self):
+        # {"pattern", "path"} satisfies both Glob and Grep.
+        with self.assertLogs(
+            "sglang.srt.function_call.kimik2_detector", level="WARNING"
+        ) as logs:
+            self.assertIsNone(self._infer('{"pattern": "a", "path": "/x"}'))
+        self.assertTrue(any("ambiguous" in line for line in logs.output))
+        self.assertIsNone(self._infer('{"pattern": "a"}'))
+
+    def test_missing_required_or_unknown_key_returns_none(self):
+        self.assertIsNone(self._infer('{"old_string": "a", "new_string": "b"}'))
+        self.assertIsNone(self._infer('{"file_path": "/x", "bogus": 1}'))
+        self.assertIsNone(self._infer('{"bogus": 1}'))
+
+    def test_empty_object_matches_only_a_no_argument_tool(self):
+        self.assertEqual(self._infer("{}"), "Ping")
+        two_no_arg = self.tools + [_make_tool("Pong", {"type": "object"})]
+        self.assertIsNone(self._infer("{}", two_no_arg))
+
+    def test_non_object_json_returns_none_without_leaking(self):
+        self.assertIsNone(self._infer("[1, 2]"))
+        self.assertIsNone(self._infer('"text"'))
+        text = (
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>call_3"
+            '<|tool_call_argument_begin|>{"file_path": "/x", "bogus": 1}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(result.calls, [])
+        self.assertNotIn("<|tool_call", result.normal_text)
+
+    def test_single_tool_is_accepted_without_argument_check(self):
+        # Mirrors the malformed-arguments contract elsewhere in this file:
+        # with one tool the name is unambiguous and argument validation is
+        # the client's job.
+        self.assertEqual(self._infer('{"bogus": 1}', [self.tools[0]]), "Read")
+
+    def test_bare_counter_and_client_id_share_the_rule(self):
+        for fid in ("0", "call_3", "toolu_01AkmjoowNgNx2qNfJzc8z2F"):
+            with self.subTest(function_id=fid):
+                name, _ = self.detector._parse_tool_call_id(
+                    fid, self.tools, '{"path": "/x"}'
+                )
+                self.assertEqual(name, "LS")
+                name, _ = self.detector._parse_tool_call_id(
+                    fid, self.tools, '{"pattern": "a", "path": "/x"}'
+                )
+                self.assertIsNone(name)
+
+    def test_boolean_schema_does_not_raise_and_matches_only_empty_object(self):
+        # ``parameters: true`` is a legal schema that accepts anything; it must
+        # not crash the matcher, and under the undeclared-key policy it only
+        # matches ``{}``.
+        tools = [
+            _make_tool("anything", True),
+            _make_tool(
+                "query",
+                {
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}},
+                    "required": ["q"],
+                },
+            ),
+        ]
+        self.assertEqual(self._infer('{"q": "x"}', tools), "query")
+        self.assertEqual(self._infer("{}", tools), "anything")
+        text = (
+            "<|tool_calls_section_begin|>"
+            '<|tool_call_begin|>call_3<|tool_call_argument_begin|>{"q": "x"}'
+            "<|tool_call_end|><|tool_calls_section_end|>"
+        )
+        result = KimiK2FuncDetector().detect_and_parse(text, tools)
+        self.assertEqual([c.name for c in result.calls], ["query"])
+        self.assertNotIn("<|tool_call", result.normal_text)
+        false_tool = [_make_tool("never", False)] + tools
+        self.assertEqual(self._infer("{}", false_tool), "anything")
+
+    def test_composite_required_is_validated_not_flattened(self):
+        # anyOf(city | zip): ``{}`` satisfies neither branch, so it must not be
+        # matched even though the merged property set makes it look valid.
+        tools = [
+            _make_tool(
+                "locate",
+                {
+                    "type": "object",
+                    "anyOf": [
+                        {
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"],
+                        },
+                        {
+                            "properties": {"zip": {"type": "string"}},
+                            "required": ["zip"],
+                        },
+                    ],
+                },
+            ),
+            _make_tool(
+                "query",
+                {
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}},
+                    "required": ["q"],
+                },
+            ),
+        ]
+        self.assertIsNone(self._infer("{}", tools))
+        self.assertEqual(self._infer('{"zip": "94110"}', tools), "locate")
+
+    def test_value_constraints_and_additional_properties_are_honored(self):
+        tools = [
+            _make_tool(
+                "delete",
+                {
+                    "type": "object",
+                    "properties": {"action": {"const": "delete"}},
+                    "required": ["action"],
+                },
+            ),
+            _make_tool(
+                "dispatch",
+                {"type": "object", "additionalProperties": {"type": "string"}},
+            ),
+        ]
+        # const mismatch rules out ``delete``; ``dispatch`` explicitly allows
+        # extra string-valued keys, so it is the unique candidate.
+        self.assertEqual(self._infer('{"action": "read"}', tools), "dispatch")
+        self.assertEqual(self._infer('{"action": "delete"}', tools), None)
+        # a non-string value violates dispatch's additionalProperties type
+        self.assertIsNone(self._infer('{"action": 5}', tools))
+        # type mismatch on a declared property
+        self.assertIsNone(self._infer('{"path": 5}', self.tools))
+        self.assertEqual(self._infer('{"path": "/x"}', self.tools), "LS")
+
+    def test_streaming_ambiguous_section_is_skipped_without_wedging(self):
+        chunks = [
+            "<|tool_calls_section_begin|>",
+            '<|tool_call_begin|>call_3<|tool_call_argument_begin|>{"pattern": "a", "path": "/x"}',
+            "<|tool_call_end|>",
+            '<|tool_call_begin|>call_4<|tool_call_argument_begin|>{"path": "/y"}',
+            "<|tool_call_end|>",
+            "<|tool_calls_section_end|>",
+        ]
+        tool_calls, normal = _collect_streaming_tool_calls(
+            self.detector, chunks, self.tools
+        )
+        self.assertEqual([tc["name"] for tc in tool_calls], ["LS"])
+        self.assertEqual(json.loads(tool_calls[0]["parameters"]), {"path": "/y"})
+        self.assertNotIn("<|tool_call", normal)
 
 
 if __name__ == "__main__":
