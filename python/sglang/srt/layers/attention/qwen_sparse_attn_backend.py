@@ -604,6 +604,22 @@ class QwenSparseAttnBackend(AttentionBackend):
             self.device = forward_batch.seq_lens.device
         if not self.max_context_len:
             self.max_context_len = self.req_to_token.shape[1]
+        if forward_batch.forward_mode.is_mixed():
+            # Mixed chunked prefill injects running decode rows into an
+            # EXTEND batch (ForwardMode.MIXED): each decode row is given
+            # extend_len == 1 so its prefix_len == seq_len - 1, which is
+            # almost never a multiple of indexer_compress_ratio. That
+            # violates the ratio-aligned prefix invariant the compressed
+            # write plan relies on, so the ratio assert in
+            # ``_qsa_build_write_plan`` would fire device-side. Compressed
+            # QSA does not support mixed chunked prefill.
+            raise NotImplementedError(
+                "QwenSparseAttnBackend does not support ForwardMode.MIXED "
+                "(--enable-mixed-chunk): decode rows mixed into an extend "
+                "batch have prefix_len = seq_len - 1, which is not a "
+                "multiple of indexer_compress_ratio and breaks the "
+                "compressed write plan. Disable --enable-mixed-chunk."
+            )
         if forward_batch.forward_mode.is_idle() or forward_batch.seq_lens.numel() == 0:
             # DP attention runs IDLE dummy forwards on ranks without work, and
             # the MTP multi-step wrapper forwards them as zero-row DECODE
