@@ -226,16 +226,15 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         _measured_full_time = _fixture_end_time - _fixture_start_time
         is_baseline_generation_mode = os.environ.get("SGLANG_GEN_BASELINE", "0") == "1"
 
-        for request_case in case.request_cases():
-            pending_dump = _PENDING_BASELINE_DUMPS.pop(request_case.id, None)
-            if pending_dump is not None:
-                summary, missing_scenario = pending_dump
-                DiffusionServerBase()._dump_baseline_for_testcase(
-                    request_case,
-                    summary,
-                    missing_scenario=missing_scenario,
-                    measured_full_time=_measured_full_time,
-                )
+        pending_dump = _PENDING_BASELINE_DUMPS.pop(case.id, None)
+        if pending_dump is not None:
+            summary, missing_scenario = pending_dump
+            DiffusionServerBase()._dump_baseline_for_testcase(
+                case,
+                summary,
+                missing_scenario=missing_scenario,
+                measured_full_time=_measured_full_time,
+            )
 
         scenario = BASELINE_CONFIG.scenarios.get(case.id)
         needs_estimated_time = (
@@ -1552,24 +1551,21 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         if case.run_lora_dynamic_load_check:
             self._test_dynamic_lora_loading(diffusion_server, case)
 
-        request_cases = case.request_cases()
-        total_requests = len(request_cases) * case.perf_repeat_requests
         failures = []
-        request_index = 0
-        for request_case in request_cases:
-            for _ in range(case.perf_repeat_requests):
-                request_index += 1
-                label = f"request {request_index}/{total_requests} ({request_case.id})"
-                _print_case_log_separator(case.id, f"BEGIN {label}")
-                try:
-                    self._test_diffusion_request(
-                        request_case, diffusion_server, request_index
-                    )
-                except (Exception, pytest.fail.Exception) as exc:
-                    failures.append(f"[{label}] {exc}")
-                    _print_case_log_separator(case.id, f"FAILED {label}")
-                else:
-                    _print_case_log_separator(case.id, f"PASSED {label}")
+        for request_index in range(1, case.perf_repeat_requests + 1):
+            label = f"request {request_index}/{case.perf_repeat_requests}"
+            _print_case_log_separator(case.id, f"BEGIN {label}")
+            try:
+                self._test_diffusion_request(case, diffusion_server, request_index)
+            except pytest.skip.Exception:
+                if not failures:
+                    raise
+                break
+            except (Exception, pytest.fail.Exception) as exc:
+                failures.append(f"[{label}] {exc}")
+                _print_case_log_separator(case.id, f"FAILED {label}")
+            else:
+                _print_case_log_separator(case.id, f"PASSED {label}")
 
         if failures:
             pytest.fail("\n\n".join(failures), pytrace=False)

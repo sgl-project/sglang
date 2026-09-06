@@ -21,16 +21,14 @@ load/runtime peak memory; consistency checks include audio when
 the other succeeds. Reports retain the request index instead of overwriting the
 first result with the second.
 
-For different prompts or tasks supported by the **same server deployment**, use
-`follow_up_requests=(DiffusionTestRequest("image_edit", edit_params),)`. Each
-follow-up inherits the case's checks and uses its own ID for performance
-baselines, thresholds, and ground truth. Keep workloads small, but regenerate
-baselines and GT whenever sampling parameters change. Distinct checkpoint
-partitions cannot be combined by changing a request's task alone.
+Keep workloads small, but regenerate baselines and GT whenever sampling
+parameters change. MiniMax-H3 T2VA and ref2va use different checkpoint
+partitions, so they remain separate cases, each issuing two requests to its
+own server.
 
 Use `SGLANG_GEN_BASELINE=1 pytest -s ... -k <case_id>` to collect baselines in
 the same sequential order. `SGLANG_GEN_GT=1` with `SGLANG_GT_OUTPUT_DIR` saves
-GT for each request scenario; repeated requests share one GT.
+GT; repeated requests share one GT.
 
 ## Perf Baseline Generation Script
 

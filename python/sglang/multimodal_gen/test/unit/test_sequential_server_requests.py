@@ -11,7 +11,6 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionSamplingParams,
     DiffusionServerArgs,
     DiffusionTestCase,
-    DiffusionTestRequest,
     ScenarioConfig,
     ToleranceConfig,
 )
@@ -110,34 +109,20 @@ def test_each_request_failure_fails_case(harness, monkeypatch, bad_request, fail
     assert [r["request_index"] for r in runner._perf_results] == expected
 
 
-def test_follow_up_uses_own_params_baseline_and_gt(harness, monkeypatch):
+def test_both_requests_pass(harness, monkeypatch):
     runner, case = harness
-    second_params = DiffusionSamplingParams(prompt="second", expect_audio_output=True)
-    case = replace(
-        case,
-        perf_repeat_requests=1,
-        follow_up_requests=(DiffusionTestRequest("second", second_params),),
-    )
     monkeypatch.setattr(runner, "run_and_collect", Mock(side_effect=[(_perf_record(), b"first"), (_perf_record(), b"second")]))
     runner.test_diffusion_generation(case, object())
-
-    requests = [call.args[0] for call in runner._validate_consistency.call_args_list]
-    assert [request.id for request in requests] == ["first", "second"]
-    assert requests[1].sampling_params is second_params
-    assert all(request.server_args is case.server_args for request in requests)
-    assert all(request.run_perf_check and request.run_consistency_check for request in requests)
-    assert [call.args[1] for call in runner._validate_consistency.call_args_list] == [b"first", b"second"]
-    assert [r["test_name"] for r in runner._perf_results] == ["first", "second"]
-    assert [call.kwargs["sampling_params"] for call in test_server_common.get_generate_fn.call_args_list] == [case.sampling_params, second_params]
-
-
-def test_missing_follow_up_baseline_fails(harness, monkeypatch):
-    runner, case = harness
-    case = replace(case, perf_repeat_requests=1, follow_up_requests=(DiffusionTestRequest("missing", case.sampling_params),))
-    monkeypatch.setattr(runner, "run_and_collect", Mock(return_value=(_perf_record(), b"output")))
-    with pytest.raises(pytest.fail.Exception, match="Testcase 'missing' not found"):
-        runner.test_diffusion_generation(case, object())
     assert runner._validate_consistency.call_count == 2
+    assert [call.args[1] for call in runner._validate_consistency.call_args_list] == [b"first", b"second"]
+    assert [r["request_index"] for r in runner._perf_results] == [1, 2]
+
+
+def test_later_skip_cannot_hide_earlier_failure(harness, monkeypatch):
+    runner, case = harness
+    monkeypatch.setattr(runner, "run_and_collect", Mock(side_effect=[RuntimeError("failed first"), pytest.skip.Exception("skip second")]))
+    with pytest.raises(pytest.fail.Exception, match="failed first"):
+        runner.test_diffusion_generation(case, object())
 
 
 def test_empty_content_is_not_a_consistency_pass(harness):
@@ -153,12 +138,6 @@ def test_invalid_repeat_count(harness, repeat):
         replace(case, perf_repeat_requests=repeat)
 
 
-def test_duplicate_follow_up_id_rejected(harness):
-    _, case = harness
-    with pytest.raises(ValueError, match="request IDs must be unique"):
-        replace(case, follow_up_requests=(DiffusionTestRequest(case.id, case.sampling_params),))
-
-
 def test_report_keeps_both_requests_and_replaces_retry(tmp_path):
     path = tmp_path / "results.json"
     records = [
@@ -170,15 +149,14 @@ def test_report_keeps_both_requests_and_replaces_retry(tmp_path):
     assert json.loads(path.read_text()) == [{**records[0], "e2e_ms": 3}, records[1]]
 
 
-def test_gt_generation_saves_both_scenarios(harness, monkeypatch):
+def test_gt_generation_runs_both_requests(harness, monkeypatch):
     runner, case = harness
     monkeypatch.setenv("SGLANG_GEN_GT", "1")
-    case = replace(case, perf_repeat_requests=1, follow_up_requests=(DiffusionTestRequest("second", DiffusionSamplingParams(prompt="second")),))
     generate = Mock(side_effect=[(None, b"first"), (None, b"second")])
     monkeypatch.setattr(runner, "run_and_collect", generate)
     save = Mock()
     monkeypatch.setattr(runner, "_save_gt_output", save)
     runner.test_diffusion_generation(case, object())
-    assert [(call.args[0].id, call.args[1]) for call in save.call_args_list] == [("first", b"first"), ("second", b"second")]
+    assert [(call.args[0].id, call.args[1]) for call in save.call_args_list] == [("first", b"first"), ("first", b"second")]
     assert all(not call.kwargs["collect_perf"] for call in generate.call_args_list)
     runner._validate_consistency.assert_not_called()

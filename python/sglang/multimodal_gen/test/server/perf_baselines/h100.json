@@ -2912,12 +2912,32 @@
             "estimated_full_test_time_s": 55.4
         },
         "minimax_h3_ref2va_video_audio_2gpu_h100": {
-            "stages_ms": {},
-            "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
-            "expected_avg_denoise_ms": 0.0,
-            "expected_median_denoise_ms": 0.0,
-            "estimated_full_test_time_s": 266.7
+            "stages_ms": {
+                "InputValidationStage": 0.08,
+                "MiniMaxH3PartitionAdmissionStage": 0.04,
+                "MiniMaxH3TextEncodingStage": 1429.48,
+                "MiniMaxH3VisualEncodingStage": 7065.71,
+                "MiniMaxH3AudioEncodingStage": 647.92,
+                "MiniMaxH3LatentPreparationStage": 24.37,
+                "MiniMaxH3TimestepPreparationStage": 0.28,
+                "MiniMaxH3DenoisingStage": 55168.59,
+                "MiniMaxH3DecodingStage": 3183.0
+            },
+            "denoise_step_ms": {
+                "0": 1064.67,
+                "1": 7783.29,
+                "2": 7809.31,
+                "3": 7796.83,
+                "4": 7802.67,
+                "5": 7813.31,
+                "6": 7807.76
+            },
+            "expected_e2e_ms": 67793.18,
+            "expected_avg_denoise_ms": 6839.69,
+            "expected_median_denoise_ms": 7802.67,
+            "load_peak_vram_mb": 15242.0,
+            "runtime_peak_vram_mb": 34560.0,
+            "estimated_full_test_time_s": 340.0
         },
         "minimax_h3_t2va_2gpu_h100": {
             "stages_ms": {
@@ -2946,7 +2966,7 @@
             "expected_median_denoise_ms": 2332.99,
             "load_peak_vram_mb": 45428.0,
             "runtime_peak_vram_mb": 63312.0,
-            "estimated_full_test_time_s": 208.0
+            "estimated_full_test_time_s": 235.0
         },
         "mova_360p_tp2": {
             "stages_ms": {},
