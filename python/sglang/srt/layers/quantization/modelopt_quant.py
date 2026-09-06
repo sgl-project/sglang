@@ -2522,6 +2522,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             prepare_moe_nvfp4_layer_for_marlin(layer)
             return
 
+        use_cutedsl_w4a16 = (
+            self._is_cutedsl_v2_standard
+            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+        )
+
         # Calculate input scales based on strategy
         if self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_trtllm_moe:
             w13_input_scale = layer.w13_input_scale.max().to(torch.float32)
@@ -2548,17 +2553,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = _slice_scale(w13_input_scale)
             w2_input_scale = _slice_scale(w2_input_scale)
 
-            if MOE_NVFP4_DISPATCH:
+            if MOE_NVFP4_DISPATCH and not use_cutedsl_w4a16:
                 assert torch.all(w13_input_scale == w13_input_scale[0])
                 w13_input_scale = w13_input_scale[0]
         else:
             w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
 
-        use_cutedsl_w4a16 = (
-            self._is_cutedsl_v2_standard
-            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
-        )
         if self.quant_config.use_per_token_activation or use_cutedsl_w4a16:
             # FlashInfer computes activation scales dynamically per token, so
             # the static checkpoint activation scale is intentionally neutral.

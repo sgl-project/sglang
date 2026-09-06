@@ -75,7 +75,17 @@ def handle_moe_kernel_config(server_args: Any):
             f"flashinfer_cutedsl supports moe_a2a_backend='none', 'deepep', or 'flashinfer', "
             f"got '{view.moe_a2a_backend}'."
         )
-        if view.moe_a2a_backend == "deepep" and (
+        if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get():
+            import torch
+
+            if not get_platform().is_sm100:
+                raise ValueError("CuTe DSL NVFP4 W4A16 requires SM10X GPUs.")
+            if model_config_of(server_args).dtype != torch.bfloat16:
+                raise ValueError(
+                    "CuTe DSL NVFP4 W4A16 requires BF16 activations; "
+                    "use --dtype bfloat16."
+                )
+        elif view.moe_a2a_backend == "deepep" and (
             view.quantization == "nvfp4_online"
             or envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
         ):
@@ -143,6 +153,14 @@ def handle_a2a_moe(server_args: Any):
     run_post_process_pass(server_args, _a2a_fusion_adjustments)
 
     a2a_backend = resolved_view(server_args).moe_a2a_backend
+    if (
+        resolved_view(server_args).moe_runner_backend == "flashinfer_cutedsl"
+        and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+        and a2a_backend not in ("none", "flashinfer")
+    ):
+        raise ValueError(
+            "CuTe DSL NVFP4 W4A16 requires moe_a2a_backend='none' or 'flashinfer'."
+        )
     if cfg.enable_waterfill:
         declare_resolution(
             server_args, "_handle_a2a_moe", enforce_shared_experts_fusion=True
